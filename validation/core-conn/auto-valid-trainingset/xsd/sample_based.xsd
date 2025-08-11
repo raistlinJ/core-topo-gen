@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+
+  <xs:element name="scenario">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="networks" minOccurs="0">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="network" minOccurs="0" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="position" minOccurs="0">
+                      <xs:complexType>
+                        <xs:attribute name="x" type="xs:decimal" use="optional"/>
+                        <xs:attribute name="y" type="xs:decimal" use="optional"/>
+                        <xs:attribute name="lat" type="xs:decimal" use="optional"/>
+                        <xs:attribute name="lon" type="xs:decimal" use="optional"/>
+                        <xs:attribute name="alt" type="xs:decimal" use="optional"/>
+                      </xs:complexType>
+                    </xs:element>
+                  </xs:sequence>
+                  <xs:attribute name="id" type="xs:string" use="optional"/>
+                  <xs:attribute name="name" type="xs:string" use="optional"/>
+                  <xs:attribute name="type" type="xs:string" use="optional"/>
+                  <xs:attribute name="grekey" type="xs:string" use="optional"/>
+                </xs:complexType>
+              </xs:element>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+        <xs:element name="devices" minOccurs="0">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="device" minOccurs="0" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="position" minOccurs="0">
+                      <xs:complexType>
+                        <xs:attribute name="x" type="xs:decimal" use="optional"/>
+                        <xs:attribute name="y" type="xs:decimal" use="optional"/>
+                        <xs:attribute name="lat" type="xs:decimal" use="optional"/>
+                        <xs:attribute name="lon" type="xs:decimal" use="optional"/>
+                        <xs:attribute name="alt" type="xs:decimal" use="optional"/>
+                      </xs:complexType>
+                    </xs:element>
+                    <xs:element name="services" minOccurs="0">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="service" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:attribute name="name" type="xs:string" use="required"/>
+                            </xs:complexType>
+                          </xs:element>
+                        </xs:sequence>
+                      </xs:complexType>
+                    </xs:element>
+                  </xs:sequence>
+                  <xs:attribute name="id" type="xs:string" use="required"/>
+                  <xs:attribute name="name" type="xs:string" use="required"/>
+                  <xs:attribute name="type" type="xs:string" use="required"/>
+                  <xs:attribute name="icon" type="xs:string" use="optional"/>
+                  <xs:attribute name="class" type="xs:string" use="optional"/>
+                  <xs:attribute name="image" type="xs:string" use="optional"/>
+                </xs:complexType>
+              </xs:element>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+        <xs:element name="links" minOccurs="0">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="link" minOccurs="0" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="iface1" minOccurs="0">
+                      <xs:complexType>
+                        <xs:attribute name="id" type="xs:string" use="optional"/>
+                        <xs:attribute name="name" type="xs:string" use="optional"/>
+                        <xs:attribute name="mac" type="xs:string" use="optional"/>
+                        <xs:attribute name="ip4" type="xs:string" use="optional"/>
+                        <xs:attribute name="ip4_mask" type="xs:string" use="optional"/>
+                        <xs:attribute name="ip6" type="xs:string" use="optional"/>
+                        <xs:attribute name="ip6_mask" type="xs:string" use="optional"/>
+                      </xs:complexType>
+                    </xs:element>
+                    <xs:element name="iface2" minOccurs="0">
+                      <xs:complexType>
+                        <xs:attribute name="id" type="xs:string" use="optional"/>
+                        <xs:attribute name="name" type="xs:string" use="optional"/>
+                        <xs:attribute name="mac" type="xs:string" use="optional"/>
+                        <xs:attribute name="ip4" type="xs:string" use="optional"/>
+                        <xs:attribute name="ip4_mask" type="xs:string" use="optional"/>
+                        <xs:attribute name="ip6" type="xs:string" use="optional"/>
+                        <xs:attribute name="ip6_mask" type="xs:string" use="optional"/>
+                      </xs:complexType>
+                    </xs:element>
+                    <xs:element name="options" minOccurs="0">
+                      <xs:complexType>
+                        <xs:attribute name="delay" type="xs:string" use="optional"/>
+                        <xs:attribute name="bandwidth" type="xs:string" use="optional"/>
+                        <xs:attribute name="loss" type="xs:string" use="optional"/>
+                        <xs:attribute name="dup" type="xs:string" use="optional"/>
+                        <xs:attribute name="jitter" type="xs:string" use="optional"/>
+                        <xs:attribute name="unidirectional" type="xs:string" use="optional"/>
+                      </xs:complexType>
+                    </xs:element>
+                  </xs:sequence>
+                  <xs:attribute name="node1" type="xs:string" use="required"/>
+                  <xs:attribute name="node2" type="xs:string" use="required"/>
+                </xs:complexType>
+              </xs:element>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+        <!-- service_configurations, session_origin, session_options, etc., defined similarly -->
+        <xs:element name="service_configurations" minOccurs="0">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="service" minOccurs="0" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:sequence>
+                    <xs:element name="startups" minOccurs="0">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="startup" type="xs:string" minOccurs="0" maxOccurs="unbounded"/>
+                        </xs:sequence>
+                      </xs:complexType>
+                    </xs:element>
+                    <xs:element name="files" minOccurs="0">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="file" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType mixed="true">
+                              <xs:attribute name="name" type="xs:string" use="required"/>
+                            </xs:complexType>
+                          </xs:element>
+                        </xs:sequence>
+                      </xs:complexType>
+                    </xs:element>
+                  </xs:sequence>
+                  <xs:attribute name="name" type="xs:string" use="required"/>
+                  <xs:attribute name="node" type="xs:string" use="optional"/>
+                </xs:complexType>
+              </xs:element>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+        <xs:element name="session_origin" minOccurs="0">
+          <xs:complexType>
+            <xs:attribute name="lat" type="xs:decimal" use="optional"/>
+            <xs:attribute name="lon" type="xs:decimal" use="optional"/>
+            <xs:attribute name="alt" type="xs:decimal" use="optional"/>
+            <xs:attribute name="scale" type="xs:decimal" use="optional"/>
+          </xs:complexType>
+        </xs:element>
+        <xs:element name="session_options" minOccurs="0">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="configuration" minOccurs="0" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:attribute name="name" type="xs:string" use="required"/>
+                  <xs:attribute name="value" type="xs:string" use="optional"/>
+                </xs:complexType>
+              </xs:element>
+            </xs:sequence>
+          </xs:complexType>
+        </xs:element>
+      </xs:sequence>
+      <xs:attribute name="name" type="xs:string" use="required"/>
+    </xs:complexType>
+  </xs:element>
+
+</xs:schema>

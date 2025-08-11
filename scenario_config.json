@@ -1,0 +1,25 @@
+{
+  "devices": {
+    "SWITCH": 2,
+    "HUB": 0,
+    "WIRELESS_LAN": 0,
+    "PC": 4,
+    "router": 2,
+    "mdr":0
+  
+  },
+
+  
+
+  
+
+  "autogenerate_links": true,
+
+  "deterministic_links": false,
+
+  "custom_ipv4s": "192.23.4.4"
+
+  
+
+  
+}

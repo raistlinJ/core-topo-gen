@@ -1,0 +1,15 @@
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="scenario">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="networks" minOccurs="0" maxOccurs="1"/>
+        <xs:element name="devices" minOccurs="0" maxOccurs="1"/>
+        <xs:element name="links" minOccurs="0" maxOccurs="1"/>
+        <xs:element name="service_configurations" minOccurs="0" maxOccurs="1"/>
+        <xs:element name="session_origin" minOccurs="0" maxOccurs="1"/>
+        <xs:element name="session_options" minOccurs="0" maxOccurs="1"/>
+      </xs:sequence>
+      <xs:attribute name="name" type="xs:string" use="required"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>
