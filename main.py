@@ -6,7 +6,7 @@ import json
 
 from PyQt6.QtCore import Qt, QPoint, QStandardPaths
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit, QPushButton, QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QScrollArea, QTreeWidget, QTreeWidgetItem, QMenu, QSplitter, QInputDialog, QLineEdit, QMessageBox, QMainWindow, QStackedWidget, QSizePolicy)
+    QApplication, QWidget, QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit, QPushButton, QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QScrollArea, QTreeWidget, QTreeWidgetItem, QMenu, QSplitter, QInputDialog, QLineEdit, QMessageBox, QMainWindow, QStackedWidget, QSizePolicy, QFrame, QLayout)
 
 
 # ---------------------------
@@ -295,16 +295,18 @@ class NotesWidget(QWidget):
 # ---------------------------
 # Generic Section (with factors)
 # ---------------------------
+
 class SectionWidget(QWidget):
+    """
+    Generic section widget. Special-cases the Traffic section to avoid overlapping
+    by placing each profile in a flat QGroupBox whose layout has a minimum-size
+    constraint so it always grows to fit visible child controls.
+    """
     def __init__(self, section_name, dropdown_items=None, parent=None):
         super().__init__(parent)
         self.max_rows = 10
-
-        if dropdown_items is None:
-            dropdown_items = ["Random", "Option 1", "Option 2", "Option 3"]
-
         self.section_name = section_name
-        self.dropdown_items = dropdown_items
+        self.dropdown_items = dropdown_items or ["Random", "Option 1", "Option 2", "Option 3"]
 
         # Per-section overrides
         if self.section_name == "Node Information":
@@ -320,17 +322,16 @@ class SectionWidget(QWidget):
         elif self.section_name == "Vulnerabilities":
             self.dropdown_items = ["SSHCreds", "Bashbug", "FileArtifact", "Incompetence", "Random"]
         elif self.section_name == "Segmentation":
-            # Changed to segmentation-specific items
-            self.dropdown_items = ["Firewall", "NAT", "VPN", "Random"]
+            self.dropdown_items = ["Base Router", "Firewall", "NAT", "VPN", "Random"]
 
-        # UI skeleton
-        self.setLayout(QVBoxLayout())
-        self.traffic_extras = {}  # map main row layout -> (pattern_combo, pattern_row, extra_row, rate_spin, period_spin, jitter_spin, group_box)
+        # Layout skeleton
+        root_v = QVBoxLayout(self)
+        root_v.setContentsMargins(0, 0, 0, 0)
+        root_v.setSpacing(8)
 
+        # Header row
         top_row = QHBoxLayout()
         top_row.addWidget(QLabel(section_name))
-
-        # Update button text for different sections
         self.add_dropdown_btn = QPushButton("Add Entry")
         if self.section_name == "Traffic":
             self.add_dropdown_btn.setText("Add traffic profile")
@@ -344,22 +345,16 @@ class SectionWidget(QWidget):
             self.add_dropdown_btn.setText("Add service")
         elif self.section_name == "Events":
             self.add_dropdown_btn.setText("Add event")
-        elif self.section_name == "Vulnerabilities":
-            self.add_dropdown_btn.setText("Add vulnerability")
         self.add_dropdown_btn.clicked.connect(self.add_dropdown)
         top_row.addWidget(self.add_dropdown_btn)
-        
-        self.normalize_btn = QPushButton("Normalize")
-        self.normalize_btn.setToolTip("Evenly redistribute weights so the total is 1.000")
-        self.normalize_btn.clicked.connect(self.normalize_factors)
-        top_row.addWidget(self.normalize_btn)
+
         self.count_label = QLabel("")
         self.count_label.setStyleSheet("color:#666; margin-left:6px;")
         top_row.addWidget(self.count_label)
-        top_row.addStretch()
-        self.layout().addLayout(top_row)
+        top_row.addStretch(1)
+        root_v.addLayout(top_row)
 
-        # Node Information and Segmentation: total nodes/segments (between top row and dropdowns)
+        # Optional spinners for nodes/segments
         self.nodes_spin = None
         if self.section_name == "Node Information":
             nodes_row = QHBoxLayout()
@@ -368,72 +363,95 @@ class SectionWidget(QWidget):
             self.nodes_spin.setRange(1, 100)
             self.nodes_spin.setValue(1)
             nodes_row.addWidget(self.nodes_spin)
-            self.layout().addLayout(nodes_row)
+            root_v.addLayout(nodes_row)
         elif self.section_name == "Segmentation":
-            # Add total segments spinner for segmentation section
             segments_row = QHBoxLayout()
             segments_row.addWidget(QLabel("Total Segments:"))
             self.nodes_spin = QSpinBox()
             self.nodes_spin.setRange(1, 100)
             self.nodes_spin.setValue(1)
             segments_row.addWidget(self.nodes_spin)
-            self.layout().addLayout(segments_row)
+            root_v.addLayout(segments_row)
 
-        # Where the rows live (in a scroll area to avoid overlap)
-
-        self.dropdowns_layout = QVBoxLayout()
-
-        self.dropdowns_layout.setSpacing(6)
-
-        self.dropdowns_layout.setContentsMargins(0, 0, 0, 0)
-
+        # Scroll area with container
         self._dropdowns_container = QWidget()
-
+        self._dropdowns_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.dropdowns_layout = QVBoxLayout()
+        self.dropdowns_layout.setContentsMargins(0, 0, 0, 0)
+        self.dropdowns_layout.setSpacing(8)
         self._dropdowns_container.setLayout(self.dropdowns_layout)
 
         self._scroll = QScrollArea()
-
         self._scroll.setWidgetResizable(True)
-
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setWidget(self._dropdowns_container)
+        root_v.addWidget(self._scroll, 1)
 
-        self.layout().addWidget(self._scroll)
-
-        # Store tuples: (combo, spinbox, row_layout, remove_button)
-        self.dropdown_factor_pairs = []
+        # State
+        self.dropdown_factor_pairs = []  # (combo, factor_spin, key, remove_button)
+        self.traffic_extras = {}         # key -> (pattern_combo, rate_spin, period_spin, jitter_spin, group_box)
 
         self.warning_label = QLabel("")
         self.warning_label.setStyleSheet("color: red")
-        self.layout().addWidget(self.warning_label)
+        root_v.addWidget(self.warning_label)
 
         # Start with one row
         self.add_dropdown()
         self.update_count_label()
 
-    # --- Row management ---
+    # ---- helpers ----
+    def _apply_limits(self):
+        at_max = len(self.dropdown_factor_pairs) >= self.max_rows
+        self.warning_label.setText("Max reached" if at_max else "")
+        self.add_dropdown_btn.setEnabled(not at_max)
+
+    def _refresh_scroll(self):
+        # force relayout/resize to avoid overlap when toggling visibility
+        self._dropdowns_container.adjustSize()
+        self._scroll.widget().adjustSize()
+        self._scroll.ensureVisible(0, 0, 1, 1)
+
+    def _remove_entry(self, key):
+        # find tuple with key
+        for (combo, spin, k, rm) in list(self.dropdown_factor_pairs):
+            if k is key:
+                self.dropdown_factor_pairs.remove((combo, spin, k, rm))
+                if self.section_name == "Traffic":
+                    extra = self.traffic_extras.pop(k, None)
+                    if extra and extra[-1] is not None:
+                        box = extra[-1]
+                        box.setParent(None)
+                        box.deleteLater()
+                else:
+                    # key is a layout; remove its widgets
+                    layout = k
+                    while layout.count():
+                        item = layout.takeAt(0)
+                        w = item.widget()
+                        if w:
+                            w.setParent(None)
+                            w.deleteLater()
+                    layout.setParent(None)
+                break
+        self.redistribute_factors()
+        self.update_count_label()
+        self._apply_limits()
+        self._refresh_scroll()
+
+    # ---- public API ----
     def add_dropdown(self):
-        # Enforce max rows per section
-        if len(self.dropdown_factor_pairs) >= getattr(self, 'max_rows', 10):
-            try:
-                from PyQt6.QtWidgets import QMessageBox
-                QMessageBox.information(self, "Limit reached", f"You can add at most {self.max_rows} entries in {self.section_name}.")
-            except Exception:
-                pass
+        if len(self.dropdown_factor_pairs) >= self.max_rows:
+            self._apply_limits()
             return
+
         is_traffic = (self.section_name == "Traffic")
-        profile_index = len(self.traffic_extras) + 1 if is_traffic else None
 
-        # Main row
+        # Main row for selection + factor + remove
         row = QHBoxLayout()
-
         row.setSpacing(8)
         combo = QComboBox()
         combo.addItems(self.dropdown_items)
-        if self.section_name == "Segmentation":
-            try:
-                combo.setCurrentText("Random")
-            except Exception:
-                pass
+        # default to "Random" when present
         idx = combo.findText("Random")
         if idx >= 0:
             combo.setCurrentIndex(idx)
@@ -450,30 +468,31 @@ class SectionWidget(QWidget):
         remove_btn = QPushButton("Remove")
         remove_btn.setFixedWidth(70)
         row.addWidget(remove_btn)
-
-        
         row.addStretch(1)
-# Defaults
-        pattern_combo = pattern_row = extra_row = None
-        rate_spin = period_spin = jitter_spin = None
 
         if is_traffic:
-            group_box = QGroupBox(f"Profile {profile_index}")
-            group_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+            # Build grouped panel
+            group_box = QGroupBox(f"Profile {len(self.traffic_extras) + 1}")
+            group_box.setFlat(True)
+            group_box.setStyleSheet(
+                "QGroupBox { background: transparent; border: 1px solid rgba(0,0,0,40); margin-top: 12px; }"
+                "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
+            )
+            group_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             group_v = QVBoxLayout(group_box)
-
             group_v.setContentsMargins(8, 8, 8, 8)
             group_v.setSpacing(6)
+            group_v.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+
             # Pattern row
             pattern_row = QHBoxLayout()
             pattern_row.setSpacing(8)
-            pattern_label = QLabel("Pattern:")
+            pattern_row.addWidget(QLabel("Pattern:"))
             pattern_combo = QComboBox()
             pattern_combo.addItems(["1kbps", "5kbps", "Jitter", "Periodic (1s)", "Periodic (5s)", "Random", "Custom"])
-            pattern_row.addWidget(pattern_label)
             pattern_row.addWidget(pattern_combo)
 
-            # Extra inputs row
+            # Extra inputs
             extra_row = QHBoxLayout()
             extra_row.setSpacing(8)
             rate_label = QLabel("Rate (kbps):")
@@ -485,127 +504,88 @@ class SectionWidget(QWidget):
             for w in (rate_label, rate_spin, period_label, period_spin, jitter_label, jitter_spin):
                 extra_row.addWidget(w)
 
-            # Visibility logic
             def _apply_vis():
-                sel = pattern_combo.currentText()
-                show_rate = (sel == "Custom")
-                show_period = sel.startswith("Periodic")
-                show_jitter = (sel == "Jitter")
+                s = pattern_combo.currentText()
+                show_rate = (s == "Custom")
+                show_period = s.startswith("Periodic")
+                show_jitter = (s == "Jitter")
                 rate_label.setVisible(show_rate); rate_spin.setVisible(show_rate)
                 period_label.setVisible(show_period); period_spin.setVisible(show_period)
                 jitter_label.setVisible(show_jitter); jitter_spin.setVisible(show_jitter)
-                if sel == "Periodic (1s)":
+                if s == "Periodic (1s)":
                     period_spin.setValue(1.0)
-                elif sel == "Periodic (5s)":
+                elif s == "Periodic (5s)":
                     period_spin.setValue(5.0)
-            pattern_combo.currentTextChanged.connect(lambda _: _apply_vis())
+                group_box.adjustSize()
+                group_box.updateGeometry()
+                self._refresh_scroll()
+
+            pattern_combo.currentTextChanged.connect(_apply_vis)
             _apply_vis()
 
-            # Assemble group
+            # Assemble
             group_v.addLayout(row)
             group_v.addLayout(pattern_row)
             group_v.addLayout(extra_row)
             self.dropdowns_layout.addWidget(group_box)
+
+            key = group_box
+            self.traffic_extras[key] = (pattern_combo, rate_spin, period_spin, jitter_spin, group_box)
+            remove_btn.clicked.connect(lambda: self._remove_entry(key))
+            self.dropdown_factor_pairs.append((combo, factor_spin, key, remove_btn))
         else:
-            # Non-traffic rows go directly in the container
+            # Non-traffic: plain row
             self.dropdowns_layout.addLayout(row)
-
-        # Bookkeeping
-        self.dropdown_factor_pairs.append((combo, factor_spin, row, remove_btn))
-        if is_traffic:
-            self.traffic_extras[row] = (pattern_combo, pattern_row, extra_row, rate_spin, period_spin, jitter_spin, group_box)
-
-        remove_btn.clicked.connect(lambda _, r=row: self.remove_dropdown(r))
+            key = row
+            remove_btn.clicked.connect(lambda: self._remove_entry(key))
+            self.dropdown_factor_pairs.append((combo, factor_spin, key, remove_btn))
 
         self.redistribute_factors()
-        self.update_remove_buttons()
-        self.validate_factors()
         self.update_count_label()
+        self._apply_limits()
+        self._refresh_scroll()
 
-    def remove_dropdown(self, row):
-        # Locate record
-        index_to_remove = -1
-        for i, (_, _, layout, _) in enumerate(self.dropdown_factor_pairs):
-            if layout == row:
-                index_to_remove = i
-                break
-        if index_to_remove == -1:
-            return
-
-        layout = self.dropdown_factor_pairs[index_to_remove][2]
-
-        # Traffic entries are wrapped in a group box
-        if layout in self.traffic_extras:
-            vals = self.traffic_extras.pop(layout)
-            if len(vals) == 7:
-                pattern_combo, pattern_row, extra_row, rate_spin, period_spin, jitter_spin, group_box = vals
+    def clear_all_rows(self):
+        # remove all entries from container
+        for (combo, spin, key, rm) in list(self.dropdown_factor_pairs):
+            if self.section_name == "Traffic":
+                extra = self.traffic_extras.pop(key, None)
+                if extra and extra[-1] is not None:
+                    box = extra[-1]
+                    box.setParent(None)
+                    box.deleteLater()
             else:
-                pattern_combo, pattern_row, extra_row, rate_spin, period_spin, jitter_spin = vals
-                group_box = None
+                layout = key
+                while layout.count():
+                    item = layout.takeAt(0)
+                    w = item.widget()
+                    if w: 
+                        w.setParent(None)
+                        w.deleteLater()
+                layout.setParent(None)
+        self.dropdown_factor_pairs.clear()
+        self._refresh_scroll()
 
-            if group_box is not None:
-                group_box.deleteLater()
-                try:
-                    self.dropdowns_layout.removeWidget(group_box)
-                except Exception:
-                    pass
-        else:
-            # Non-traffic: remove widgets from the row
-            for i in reversed(range(layout.count())):
-                w = layout.itemAt(i).widget()
-                if w:
-                    w.deleteLater()
-            self.dropdowns_layout.removeItem(layout)
-
-        self.dropdown_factor_pairs.pop(index_to_remove)
-
-        self.redistribute_factors()
-        self.update_remove_buttons()
-        self.validate_factors()
-        self.update_count_label()
-
-    def update_remove_buttons(self):
-        count = len(self.dropdown_factor_pairs)
-        for _, _, _, btn in self.dropdown_factor_pairs:
-            btn.setEnabled(count > 1)
-
-    
+    # ---- factor management ----
     def redistribute_factors(self):
-        count = len(self.dropdown_factor_pairs)
-        if count == 0:
+        n = len(self.dropdown_factor_pairs)
+        if n == 0:
             return
-        # Use the same precision as spinboxes to avoid rounding drift
-        decimals = 3
-        even = round(1.0 / count, decimals)
-        running = 0.0
-        for i, (_, spin, _, _) in enumerate(self.dropdown_factor_pairs):
-            spin.blockSignals(True)
-            if i < count - 1:
-                spin.setValue(even)
-                running += even
+        even = round(1.0 / n, 3)
+        # last spin takes the residual to ensure sum ~1.0
+        for i, (_, spin, *_rest) in enumerate(self.dropdown_factor_pairs):
+            if i < n - 1:
+                spin.blockSignals(True); spin.setValue(even); spin.blockSignals(False)
             else:
-                # Last one gets the remainder to force exact sum = 1.0 (to displayed precision)
-                remainder = round(1.0 - running, decimals)
-                # Clamp just in case
-                remainder = max(0.0, min(1.0, remainder))
-                spin.setValue(remainder)
-            spin.blockSignals(False)
-    
+                resid = max(0.0, 1.0 - sum(s.value() for _, s, *_ in self.dropdown_factor_pairs[:-1]))
+                spin.blockSignals(True); spin.setValue(round(resid, 3)); spin.blockSignals(False)
+
     def validate_factors(self):
-        total = sum(spin.value() for _, spin, _, _ in self.dropdown_factor_pairs)
-        at_max = len(self.dropdown_factor_pairs) >= getattr(self, 'max_rows', 10)
-        # Compare using the same precision as the spinboxes to avoid float drift
-        if round(total, 3) != 1.000:
-            self.warning_label.setText(f"Weights must sum to 1. Current sum: {total:.3f}")
-            self.add_dropdown_btn.setEnabled(False)
+        s = round(sum(spin.value() for _, spin, *_ in self.dropdown_factor_pairs), 3)
+        if abs(s - 1.0) > 0.005:
+            self.warning_label.setText(f"Warning: weights sum to {s:.3f} (should be 1.000)")
         else:
-            self.warning_label.setText("Max reached" if at_max else "")
-            self.add_dropdown_btn.setEnabled(not at_max)
-    
-    def normalize_factors(self):
-        """Evenly redistribute weights so they sum to 1.000 at the current precision."""
-        self.redistribute_factors()
-        self.validate_factors()
+            self.warning_label.setText("")
 
     def update_count_label(self):
         try:
@@ -616,165 +596,78 @@ class SectionWidget(QWidget):
         except Exception:
             pass
 
-
-    # --- XML ---
+    # ---- XML IO ----
     def to_xml(self):
         section_elem = ET.Element("section", name=self.section_name)
-        # Node Information and Segmentation
         if self.nodes_spin is not None:
             if self.section_name == "Node Information":
                 section_elem.set("total_nodes", str(self.nodes_spin.value()))
             elif self.section_name == "Segmentation":
                 section_elem.set("total_segments", str(self.nodes_spin.value()))
-        for combo, factor, layout, _ in self.dropdown_factor_pairs:
+        for combo, factor, key, _ in self.dropdown_factor_pairs:
             item_elem = ET.SubElement(section_elem, "item")
             item_elem.set("selected", combo.currentText())
             item_elem.set("factor", f"{factor.value():.3f}")
-            if self.section_name == "Traffic" and layout in self.traffic_extras:
-                pattern_combo, pattern_row, extra_row, rate_spin, period_spin, jitter_spin, group_box = self.traffic_extras[layout]
+            if self.section_name == "Traffic" and key in self.traffic_extras:
+                pattern_combo, rate_spin, period_spin, jitter_spin, _box = self.traffic_extras[key]
                 sel = pattern_combo.currentText()
                 item_elem.set("pattern", sel)
-                if sel == "Custom":
-                    item_elem.set("pattern_rate_kbps", f"{rate_spin.value():.1f}")
-                elif sel.startswith("Periodic"):
-                    item_elem.set("pattern_period_s", f"{period_spin.value():.1f}")
-                elif sel == "Jitter":
-                    item_elem.set("pattern_jitter_pct", f"{jitter_spin.value():.1f}")
+                # Save extra parameters
+                item_elem.set("rate_kbps", f"{rate_spin.value():.1f}")
+                item_elem.set("period_s", f"{period_spin.value():.1f}")
+                item_elem.set("jitter_pct", f"{jitter_spin.value():.1f}")
         return section_elem
 
     def from_xml(self, section_elem):
-        # Clear container
-        while self.dropdowns_layout.count():
-            item = self.dropdowns_layout.takeAt(0)
-            if item is None:
-                break
-            lay = item.layout()
-            if lay:
-                while lay.count():
-                    w = lay.takeAt(0).widget()
-                    if w:
-                        w.deleteLater()
-
-        self.dropdown_factor_pairs.clear()
-        self.traffic_extras.clear()
-
-        # Node Information and Segmentation
+        # optional totals
         if self.nodes_spin is not None:
-            try:
-                if self.section_name == "Node Information":
-                    self.nodes_spin.setValue(int(section_elem.get("total_nodes", "1")))
-                elif self.section_name == "Segmentation":
-                    self.nodes_spin.setValue(int(section_elem.get("total_segments", "1")))
-            except Exception:
-                self.nodes_spin.setValue(1)
+            if self.section_name == "Node Information":
+                v = section_elem.get("total_nodes")
+                if v: self.nodes_spin.setValue(int(v))
+            elif self.section_name == "Segmentation":
+                v = section_elem.get("total_segments")
+                if v: self.nodes_spin.setValue(int(v))
 
-        items = list(section_elem.findall("item"))
-        # Cap to max_rows if file has more
-        items = items[:getattr(self, 'max_rows', 10)]
+        # rebuild rows
+        self.clear_all_rows()
+        items = section_elem.findall("item")
         if not items:
             self.add_dropdown()
             return
 
         for item_elem in items:
-            row = QHBoxLayout()
-
-            combo = QComboBox()
-            combo.addItems(self.dropdown_items)
-            if self.section_name == "Segmentation":
-                try:
-                    combo.setCurrentText("Random")
-                except Exception:
-                    pass
+            self.add_dropdown()
+            combo, factor, key, _rm = self.dropdown_factor_pairs[-1]
+            # selection
             sel = item_elem.get("selected", "Random")
             idx = combo.findText(sel)
             if idx >= 0:
                 combo.setCurrentIndex(idx)
-            row.addWidget(combo)
-
-            row.addWidget(QLabel("Weight:"))
-            factor_spin = QDoubleSpinBox()
-            factor_spin.setRange(0.0, 1.0)
-            factor_spin.setDecimals(3)
-            factor_spin.setSingleStep(0.05)
+            # factor
             try:
-                factor_spin.setValue(float(item_elem.get("factor", "1.0")))
+                factor.setValue(float(item_elem.get("factor", "1.0")))
             except Exception:
                 pass
-            factor_spin.valueChanged.connect(self.validate_factors)
-            row.addWidget(factor_spin)
 
-            remove_btn = QPushButton("Remove")
-            remove_btn.setFixedWidth(70)
-            row.addWidget(remove_btn)
+            if self.section_name == "Traffic" and key in self.traffic_extras:
+                pattern_combo, rate_spin, period_spin, jitter_spin, box = self.traffic_extras[key]
+                psel = item_elem.get("pattern", "Random")
+                idxp = pattern_combo.findText(psel)
+                if idxp >= 0:
+                    pattern_combo.setCurrentIndex(idxp)
+                # extra params
+                try:
+                    if item_elem.get("rate_kbps") is not None:
+                        rate_spin.setValue(float(item_elem.get("rate_kbps")))
+                    if item_elem.get("period_s") is not None:
+                        period_spin.setValue(float(item_elem.get("period_s")))
+                    if item_elem.get("jitter_pct") is not None:
+                        jitter_spin.setValue(float(item_elem.get("jitter_pct")))
+                except Exception:
+                    pass
 
-            # Add to container (grouped for Traffic)
-            if self.section_name == "Traffic":
-                profile_index = len(self.traffic_extras) + 1
-                group_box = QGroupBox(f"Profile {profile_index}")
-                group_v = QVBoxLayout(group_box)
-
-                group_v.addLayout(row)
-
-                pattern_row = QHBoxLayout()
-                pattern_label = QLabel("Pattern:")
-                pattern_combo = QComboBox()
-                pattern_combo.addItems(["1kbps", "5kbps", "Jitter", "Periodic (1s)", "Periodic (5s)", "Random", "Custom"])
-                pv = item_elem.get("pattern", "Random")
-                ii = pattern_combo.findText(pv)
-                if ii >= 0:
-                    pattern_combo.setCurrentIndex(ii)
-                pattern_row.addWidget(pattern_label)
-                pattern_row.addWidget(pattern_combo)
-                group_v.addLayout(pattern_row)
-
-                extra_row = QHBoxLayout()
-                rate_label = QLabel("Rate (kbps):"); rate_spin = QDoubleSpinBox(); rate_spin.setRange(0.1, 100000.0); rate_spin.setDecimals(1); rate_spin.setValue(64.0)
-                period_label = QLabel("Period (s):"); period_spin = QDoubleSpinBox(); period_spin.setRange(0.1, 3600.0); period_spin.setDecimals(1); period_spin.setValue(1.0)
-                jitter_label = QLabel("Jitter (%):"); jitter_spin = QDoubleSpinBox(); jitter_spin.setRange(0.0, 100.0); jitter_spin.setDecimals(1); jitter_spin.setValue(10.0)
-                for w in (rate_label, rate_spin, period_label, period_spin, jitter_label, jitter_spin):
-                    extra_row.addWidget(w)
-                group_v.addLayout(extra_row)
-
-                # Visibility and saved values
-                def _apply_vis():
-                    s = pattern_combo.currentText()
-                    show_rate = (s == "Custom")
-                    show_period = s.startswith("Periodic")
-                    show_jitter = (s == "Jitter")
-                    rate_label.setVisible(show_rate); rate_spin.setVisible(show_rate)
-                    period_label.setVisible(show_period); period_spin.setVisible(show_period)
-                    jitter_label.setVisible(show_jitter); jitter_spin.setVisible(show_jitter)
-                    if s == "Periodic (1s)":
-                        period_spin.setValue(1.0)
-                    elif s == "Periodic (5s)":
-                        period_spin.setValue(5.0)
-                pattern_combo.currentTextChanged.connect(lambda _: _apply_vis())
-                try: rate_spin.setValue(float(item_elem.get("pattern_rate_kbps", rate_spin.value())))
-                except Exception: pass
-                try: period_spin.setValue(float(item_elem.get("pattern_period_s", period_spin.value())))
-                except Exception: pass
-                try: jitter_spin.setValue(float(item_elem.get("pattern_jitter_pct", jitter_spin.value())))
-                except Exception: pass
-                _apply_vis()
-
-                self.dropdowns_layout.addWidget(group_box)
-                # Bookkeeping
-                self.dropdown_factor_pairs.append((combo, factor_spin, row, remove_btn))
-                self.traffic_extras[row] = (pattern_combo, pattern_row, extra_row, rate_spin, period_spin, jitter_spin, group_box)
-            else:
-                self.dropdowns_layout.addLayout(row)
-                self.dropdown_factor_pairs.append((combo, factor_spin, row, remove_btn))
-
-            remove_btn.clicked.connect(lambda _, r=row: self.remove_dropdown(r))
-
-        self.update_remove_buttons()
         self.validate_factors()
-        self.update_count_label()
-
-
-# ---------------------------
-# Scenario Editor (stacked view)
-# ---------------------------
+        self._refresh_scroll()
 class ScenarioEditor(QWidget):
     def __init__(self):
         super().__init__()
@@ -903,7 +796,10 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(self.tree)
         splitter.addWidget(self.right_panel)
+        self.tree.setMinimumWidth(220)
+        splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        self.right_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCentralWidget(splitter)
 
         # File menu (basic Save/Load)
