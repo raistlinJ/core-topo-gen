@@ -1,211 +1,42 @@
+
 import sys
 import os
+import subprocess
 import xml.etree.ElementTree as ET
+
+from PyQt6.QtCore import Qt, QPoint
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QComboBox, QDoubleSpinBox,
+    QApplication, QWidget, QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit,
     QPushButton, QVBoxLayout, QHBoxLayout, QGroupBox,
     QFileDialog, QScrollArea, QTreeWidget, QTreeWidgetItem, QMenu, QSplitter,
-    QInputDialog, QLineEdit, QMessageBox, QMainWindow
+    QInputDialog, QLineEdit, QMessageBox, QMainWindow, QStackedWidget
 )
-from PyQt6.QtCore import Qt, QPoint
 
 
-class SectionWidget(QWidget):
-    def __init__(self, section_name, dropdown_items=None, parent=None):
-        super().__init__(parent)
-
-        if dropdown_items is None:
-            dropdown_items = ["Random", "Option 1", "Option 2", "Option 3"]
-
-        self.dropdown_items = dropdown_items
-
-        self.setLayout(QVBoxLayout())
-        self.section_name = section_name
-
-        top_row = QHBoxLayout()
-        label = QLabel(section_name)
-        top_row.addWidget(label)
-
-        self.add_dropdown_btn = QPushButton("Add Dropdown")
-        self.add_dropdown_btn.clicked.connect(self.add_dropdown)
-        top_row.addWidget(self.add_dropdown_btn)
-        top_row.addStretch()
-        self.layout().addLayout(top_row)
-
-        self.dropdowns_layout = QVBoxLayout()
-        self.layout().addLayout(self.dropdowns_layout)
-
-        self.warning_label = QLabel("")
-        self.warning_label.setStyleSheet("color: red")
-        self.layout().addWidget(self.warning_label)
-
-        # Store tuples: (combo, spinbox, row_layout, remove_button)
-        self.dropdown_factor_pairs = []
-
-        self.add_dropdown()
-
-    def add_dropdown(self):
-        row = QHBoxLayout()
-
-        combo = QComboBox()
-        combo.addItems(self.dropdown_items)
-        index = combo.findText("Random")
-        if index >= 0:
-            combo.setCurrentIndex(index)
-        row.addWidget(combo)
-
-        factor_label = QLabel("Factor:")
-        row.addWidget(factor_label)
-
-        factor_spin = QDoubleSpinBox()
-        factor_spin.setRange(0.0, 1.0)
-        factor_spin.setSingleStep(0.05)
-        factor_spin.setDecimals(3)
-        factor_spin.setFixedWidth(80)
-        factor_spin.valueChanged.connect(self.validate_factors)
-        row.addWidget(factor_spin)
-
-        remove_btn = QPushButton("Remove")
-        remove_btn.setFixedWidth(70)
-        row.addWidget(remove_btn)
-
-        self.dropdowns_layout.addLayout(row)
-        self.dropdown_factor_pairs.append((combo, factor_spin, row, remove_btn))
-
-        remove_btn.clicked.connect(lambda _, r=row: self.remove_dropdown(r))
-
-        self.redistribute_factors()
-        self.update_remove_buttons()
-        self.validate_factors()
-
-    def remove_dropdown(self, row):
-        # Find index of the row to remove
-        index_to_remove = -1
-        for i, (_, _, layout, _) in enumerate(self.dropdown_factor_pairs):
-            if layout == row:
-                index_to_remove = i
-                break
-        if index_to_remove == -1:
-            return
-
-        # Remove all widgets in the layout
-        layout = self.dropdown_factor_pairs[index_to_remove][2]
-        for i in reversed(range(layout.count())):
-            widget = layout.itemAt(i).widget()
-            if widget:
-                widget.deleteLater()
-
-        self.dropdowns_layout.removeItem(layout)
-        self.dropdown_factor_pairs.pop(index_to_remove)
-
-        self.redistribute_factors()
-        self.update_remove_buttons()
-        self.validate_factors()
-
-    def update_remove_buttons(self):
-        # Disable remove button if only one dropdown left
-        count = len(self.dropdown_factor_pairs)
-        for _, _, _, remove_btn in self.dropdown_factor_pairs:
-            remove_btn.setEnabled(count > 1)
-
-    def redistribute_factors(self):
-        count = len(self.dropdown_factor_pairs)
-        if count == 0:
-            return
-        even_value = 1.0 / count
-        for _, factor, _, _ in self.dropdown_factor_pairs:
-            factor.blockSignals(True)
-            factor.setValue(even_value)
-            factor.blockSignals(False)
-
-    def validate_factors(self):
-        total = sum(factor.value() for _, factor, _, _ in self.dropdown_factor_pairs)
-        if abs(total - 1.0) > 0.01:
-            self.warning_label.setText(f"Factors must sum to 1. Current sum: {total:.3f}")
-            self.add_dropdown_btn.setEnabled(False)
-        else:
-            self.warning_label.setText("")
-            self.add_dropdown_btn.setEnabled(True)
-
-    def to_xml(self):
-        section_elem = ET.Element("section", name=self.section_name)
-        for combo, factor, _, _ in self.dropdown_factor_pairs:
-            item_elem = ET.SubElement(section_elem, "item")
-            selected_text = combo.currentText()
-            item_elem.set("selected", selected_text)
-            item_elem.set("factor", f"{factor.value():.3f}")
-        return section_elem
-
-    def from_xml(self, section_elem):
-        # Clear existing dropdowns
-        for i in reversed(range(self.dropdowns_layout.count())):
-            layout_item = self.dropdowns_layout.itemAt(i)
-            if layout_item:
-                for j in reversed(range(layout_item.count())):
-                    widget = layout_item.itemAt(j).widget()
-                    if widget:
-                        widget.deleteLater()
-                self.dropdowns_layout.removeItem(layout_item)
-        self.dropdown_factor_pairs.clear()
-
-        # Add dropdowns from XML without redistributing
-        for item_elem in section_elem.findall("item"):
-            row = QHBoxLayout()
-
-            combo = QComboBox()
-            combo.addItems(self.dropdown_items)
-            selected = item_elem.get("selected", "Random")
-            idx = combo.findText(selected)
-            if idx >= 0:
-                combo.setCurrentIndex(idx)
-            row.addWidget(combo)
-
-            factor_label = QLabel("Factor:")
-            row.addWidget(factor_label)
-
-            factor_spin = QDoubleSpinBox()
-            factor_spin.setRange(0.0, 1.0)
-            factor_spin.setSingleStep(0.05)
-            factor_spin.setDecimals(3)
-            factor_spin.setFixedWidth(80)
-            factor_spin.blockSignals(True)
-            try:
-                factor_val = float(item_elem.get("factor", "0.0"))
-            except ValueError:
-                factor_val = 0.0
-            factor_spin.setValue(factor_val)
-            factor_spin.blockSignals(False)
-            factor_spin.valueChanged.connect(self.validate_factors)
-            row.addWidget(factor_spin)
-
-            remove_btn = QPushButton("Remove")
-            remove_btn.setFixedWidth(70)
-            row.addWidget(remove_btn)
-
-            self.dropdowns_layout.addLayout(row)
-            self.dropdown_factor_pairs.append((combo, factor_spin, row, remove_btn))
-
-            remove_btn.clicked.connect(lambda _, r=row: self.remove_dropdown(r))
-
-        self.update_remove_buttons()
-        self.validate_factors()
-
-
+# ---------------------------
+# Base Scenario (file + validate)
+# ---------------------------
 class BaseScenarioWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout()
         label = QLabel("Base Scenario File:")
         self.file_input = QLineEdit()
+
         browse_button = QPushButton("Browse")
         browse_button.clicked.connect(self.browse_file)
+
+        validate_button = QPushButton("Validate")
+        validate_button.clicked.connect(self.validate_file)
+
         layout.addWidget(label)
-        layout.addWidget(self.file_input)
+        layout.addWidget(self.file_input, 1)
         layout.addWidget(browse_button)
+        layout.addWidget(validate_button)
         self.setLayout(layout)
 
     def browse_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select File")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Scenario XML", "", "XML Files (*.xml);;All Files (*)")
         if file_path:
             self.file_input.setText(file_path)
 
@@ -218,55 +49,574 @@ class BaseScenarioWidget(QWidget):
         filepath = elem.get("filepath", "")
         self.file_input.setText(filepath)
 
+    def validate_file(self):
+        path = self.file_input.text().strip()
+        if not path:
+            QMessageBox.warning(self, "No file selected", "Please choose a scenario XML file first.")
+            return
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "File not found", f"The selected file does not exist:\n{path}")
+            return
 
+        # validator and schema expected in project tree
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        validator = os.path.join(base_dir, "validation", "core-xml-syntax", "xml_validator.py")
+        schema = os.path.join(base_dir, "validation", "core-xml-syntax", "corexml_codebased.xsd")
+
+        if not os.path.exists(validator):
+            QMessageBox.critical(self, "Missing validator", f"Could not find validator script:\n{validator}")
+            return
+        if not os.path.exists(schema):
+            QMessageBox.critical(self, "Missing schema", f"Could not find schema file:\n{schema}")
+            return
+
+        try:
+            proc = subprocess.run([sys.executable, validator, path, schema], capture_output=True, text=True, check=False)
+            out = (proc.stdout or "").strip()
+            err = (proc.stderr or "").strip()
+            first = out.splitlines()[:1]
+            if proc.returncode == 0 and first == ["VALID"]:
+                QMessageBox.information(self, "Validation Passed", "The XML validates against the schema.")
+            else:
+                details = out if out else err
+                if not details:
+                    details = f"Exit code: {proc.returncode}"
+                QMessageBox.critical(self, "Validation Failed", details)
+        except Exception as e:
+            QMessageBox.critical(self, "Validation Error", str(e))
+
+
+# ---------------------------
+# Notes (text only)
+# ---------------------------
+class NotesWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout()
+        label = QLabel("Description / Notes:")
+        self.text = QTextEdit()
+        self.text.setPlaceholderText("Enter scenario notes here...")
+        self.text.setMinimumHeight(200)
+        lay.addWidget(label)
+        lay.addWidget(self.text, 1)
+        self.setLayout(lay)
+
+    def to_xml(self):
+        section_elem = ET.Element("section", name="Notes")
+        note_elem = ET.SubElement(section_elem, "notes")
+        note_elem.text = self.text.toPlainText() or ""
+        return section_elem
+
+    def from_xml(self, section_elem):
+        note_elem = section_elem.find("notes")
+        self.text.setPlainText(note_elem.text if note_elem is not None and note_elem.text else "")
+
+
+# ---------------------------
+# Generic Section (with factors)
+# ---------------------------
+class SectionWidget(QWidget):
+    def __init__(self, section_name, dropdown_items=None, parent=None):
+        super().__init__(parent)
+        self.max_rows = 10
+
+        if dropdown_items is None:
+            dropdown_items = ["Random", "Option 1", "Option 2", "Option 3"]
+
+        self.section_name = section_name
+        self.dropdown_items = dropdown_items
+
+        # Per-section overrides
+        if self.section_name == "Node Information":
+            self.dropdown_items = ["Server", "Workstation", "PC", "Random"]
+        elif self.section_name == "Routing":
+            self.dropdown_items = ["RIP", "RIPv2", "BGP", "OSPFv2", "OSPFv3"]
+        elif self.section_name == "Services":
+            self.dropdown_items = ["SSH", "HTTP", "DHCPClient", "Random"]
+        elif self.section_name == "Traffic":
+            self.dropdown_items = ["Custom", "TCP", "UDP"]
+        elif self.section_name == "Events":
+            self.dropdown_items = ["Script Path"]
+        elif self.section_name == "Vulnerabilities":
+            self.dropdown_items = ["SSHCreds", "Bashbug", "FileArtifact", "Incompetence", "Random"]
+        elif self.section_name == "Segmentation":
+            self.dropdown_items = ["Random"]
+
+        # UI skeleton
+        self.setLayout(QVBoxLayout())
+        self.traffic_extras = {}  # map main row layout -> (pattern_combo, pattern_row, extra_row, rate_spin, period_spin, jitter_spin, group_box)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel(section_name))
+
+        self.add_dropdown_btn = QPushButton("Add Dropdown")
+        if self.section_name == "Traffic":
+            self.add_dropdown_btn.setText("Add traffic profile")
+        self.add_dropdown_btn.clicked.connect(self.add_dropdown)
+        top_row.addWidget(self.add_dropdown_btn)
+        self.normalize_btn = QPushButton("Normalize")
+        self.normalize_btn.setToolTip("Evenly redistribute factors so the total is 1.000")
+        self.normalize_btn.clicked.connect(self.normalize_factors)
+        top_row.addWidget(self.normalize_btn)
+        self.count_label = QLabel("")
+        self.count_label.setStyleSheet("color:#666; margin-left:6px;")
+        top_row.addWidget(self.count_label)
+        top_row.addStretch()
+        self.layout().addLayout(top_row)
+
+        # Node Information: total nodes
+        self.nodes_spin = None
+        if self.section_name == "Node Information":
+            nodes_row = QHBoxLayout()
+            nodes_row.addWidget(QLabel("Total Nodes:"))
+            self.nodes_spin = QSpinBox()
+            self.nodes_spin.setRange(1, 100)
+            self.nodes_spin.setValue(1)
+            nodes_row.addWidget(self.nodes_spin)
+            self.layout().addLayout(nodes_row)
+
+        # Where the rows live
+        self.dropdowns_layout = QVBoxLayout()
+        self.layout().addLayout(self.dropdowns_layout)
+
+        # Store tuples: (combo, spinbox, row_layout, remove_button)
+        self.dropdown_factor_pairs = []
+
+        self.warning_label = QLabel("")
+        self.warning_label.setStyleSheet("color: red")
+        self.layout().addWidget(self.warning_label)
+
+        # Start with one row
+        self.add_dropdown()
+        self.update_count_label()
+        self.update_count_label()
+
+    # --- Row management ---
+    def add_dropdown(self):
+        # Enforce max rows per section
+        if len(self.dropdown_factor_pairs) >= getattr(self, 'max_rows', 10):
+            try:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.information(self, "Limit reached", f"You can add at most {self.max_rows} entries in {self.section_name}.")
+            except Exception:
+                pass
+            return
+        is_traffic = (self.section_name == "Traffic")
+        profile_index = len(self.traffic_extras) + 1 if is_traffic else None
+
+        # Main row
+        row = QHBoxLayout()
+
+        combo = QComboBox()
+        combo.addItems(self.dropdown_items)
+        idx = combo.findText("Random")
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        row.addWidget(combo)
+
+        row.addWidget(QLabel("Factor:"))
+        factor_spin = QDoubleSpinBox()
+        factor_spin.setRange(0.0, 1.0)
+        factor_spin.setDecimals(3)
+        factor_spin.setSingleStep(0.05)
+        factor_spin.valueChanged.connect(self.validate_factors)
+        row.addWidget(factor_spin)
+
+        remove_btn = QPushButton("Remove")
+        remove_btn.setFixedWidth(70)
+        row.addWidget(remove_btn)
+
+        # Defaults
+        pattern_combo = pattern_row = extra_row = None
+        rate_spin = period_spin = jitter_spin = None
+
+        if is_traffic:
+            group_box = QGroupBox(f"Profile {profile_index}")
+            group_v = QVBoxLayout(group_box)
+
+            # Pattern row
+            pattern_row = QHBoxLayout()
+            pattern_label = QLabel("Pattern:")
+            pattern_combo = QComboBox()
+            pattern_combo.addItems(["1kbps", "5kbps", "Jitter", "Periodic (1s)", "Periodic (5s)", "Random", "Custom"])
+            pattern_row.addWidget(pattern_label)
+            pattern_row.addWidget(pattern_combo)
+
+            # Extra inputs row
+            extra_row = QHBoxLayout()
+            rate_label = QLabel("Rate (kbps):")
+            rate_spin = QDoubleSpinBox(); rate_spin.setRange(0.1, 100000.0); rate_spin.setDecimals(1); rate_spin.setValue(64.0)
+            period_label = QLabel("Period (s):")
+            period_spin = QDoubleSpinBox(); period_spin.setRange(0.1, 3600.0); period_spin.setDecimals(1); period_spin.setValue(1.0)
+            jitter_label = QLabel("Jitter (%):")
+            jitter_spin = QDoubleSpinBox(); jitter_spin.setRange(0.0, 100.0); jitter_spin.setDecimals(1); jitter_spin.setValue(10.0)
+            for w in (rate_label, rate_spin, period_label, period_spin, jitter_label, jitter_spin):
+                extra_row.addWidget(w)
+
+            # Visibility logic
+            def _apply_vis():
+                sel = pattern_combo.currentText()
+                show_rate = (sel == "Custom")
+                show_period = sel.startswith("Periodic")
+                show_jitter = (sel == "Jitter")
+                rate_label.setVisible(show_rate); rate_spin.setVisible(show_rate)
+                period_label.setVisible(show_period); period_spin.setVisible(show_period)
+                jitter_label.setVisible(show_jitter); jitter_spin.setVisible(show_jitter)
+                if sel == "Periodic (1s)":
+                    period_spin.setValue(1.0)
+                elif sel == "Periodic (5s)":
+                    period_spin.setValue(5.0)
+            pattern_combo.currentTextChanged.connect(lambda _: _apply_vis())
+            _apply_vis()
+
+            # Assemble group
+            group_v.addLayout(row)
+            group_v.addLayout(pattern_row)
+            group_v.addLayout(extra_row)
+            self.dropdowns_layout.addWidget(group_box)
+        else:
+            # Non-traffic rows go directly in the container
+            self.dropdowns_layout.addLayout(row)
+
+        # Bookkeeping
+        self.dropdown_factor_pairs.append((combo, factor_spin, row, remove_btn))
+        if is_traffic:
+            self.traffic_extras[row] = (pattern_combo, pattern_row, extra_row, rate_spin, period_spin, jitter_spin, group_box)
+
+        remove_btn.clicked.connect(lambda _, r=row: self.remove_dropdown(r))
+
+        self.redistribute_factors()
+        self.update_remove_buttons()
+        self.validate_factors()
+        self.update_count_label()
+        self.update_count_label()
+        self.update_count_label()
+        self.update_count_label()
+        self.update_count_label()
+
+    def remove_dropdown(self, row):
+        # Locate record
+        index_to_remove = -1
+        for i, (_, _, layout, _) in enumerate(self.dropdown_factor_pairs):
+            if layout == row:
+                index_to_remove = i
+                break
+        if index_to_remove == -1:
+            return
+
+        layout = self.dropdown_factor_pairs[index_to_remove][2]
+
+        # Traffic entries are wrapped in a group box
+        if layout in self.traffic_extras:
+            vals = self.traffic_extras.pop(layout)
+            if len(vals) == 7:
+                pattern_combo, pattern_row, extra_row, rate_spin, period_spin, jitter_spin, group_box = vals
+            else:
+                pattern_combo, pattern_row, extra_row, rate_spin, period_spin, jitter_spin = vals
+                group_box = None
+
+            if group_box is not None:
+                group_box.deleteLater()
+                try:
+                    self.dropdowns_layout.removeWidget(group_box)
+                except Exception:
+                    pass
+        else:
+            # Non-traffic: remove widgets from the row
+            for i in reversed(range(layout.count())):
+                w = layout.itemAt(i).widget()
+                if w:
+                    w.deleteLater()
+            self.dropdowns_layout.removeItem(layout)
+
+        self.dropdown_factor_pairs.pop(index_to_remove)
+
+        self.redistribute_factors()
+        self.update_remove_buttons()
+        self.validate_factors()
+        self.update_count_label()
+        self.update_count_label()
+        self.update_count_label()
+        self.update_count_label()
+        self.update_count_label()
+
+    def update_remove_buttons(self):
+        count = len(self.dropdown_factor_pairs)
+        for _, _, _, btn in self.dropdown_factor_pairs:
+            btn.setEnabled(count > 1)
+
+    
+    def redistribute_factors(self):
+        count = len(self.dropdown_factor_pairs)
+        if count == 0:
+            return
+        # Use the same precision as spinboxes to avoid rounding drift
+        decimals = 3
+        even = round(1.0 / count, decimals)
+        running = 0.0
+        for i, (_, spin, _, _) in enumerate(self.dropdown_factor_pairs):
+            spin.blockSignals(True)
+            if i < count - 1:
+                spin.setValue(even)
+                running += even
+            else:
+                # Last one gets the remainder to force exact sum = 1.0 (to displayed precision)
+                remainder = round(1.0 - running, decimals)
+                # Clamp just in case
+                remainder = max(0.0, min(1.0, remainder))
+                spin.setValue(remainder)
+            spin.blockSignals(False)
+    
+    def validate_factors(self):
+        total = sum(spin.value() for _, spin, _, _ in self.dropdown_factor_pairs)
+        at_max = len(self.dropdown_factor_pairs) >= getattr(self, 'max_rows', 10)
+        # Compare using the same precision as the spinboxes to avoid float drift
+        if round(total, 3) != 1.000:
+            self.warning_label.setText(f"Factors must sum to 1. Current sum: {total:.3f}")
+            self.add_dropdown_btn.setEnabled(False)
+        else:
+            self.warning_label.setText("Max reached" if at_max else "")
+            self.add_dropdown_btn.setEnabled(not at_max)
+    
+    def normalize_factors(self):
+        """Evenly redistribute factors so they sum to 1.000 at the current precision."""
+        self.redistribute_factors()
+        self.validate_factors()
+
+    def update_count_label(self):
+        try:
+            current = len(self.dropdown_factor_pairs)
+            max_rows = getattr(self, 'max_rows', 10)
+            if hasattr(self, 'count_label') and self.count_label is not None:
+                self.count_label.setText(f"({current}/{max_rows})")
+        except Exception:
+            pass
+
+
+    # --- XML ---
+    def to_xml(self):
+        section_elem = ET.Element("section", name=self.section_name)
+        # Node Information
+        if self.nodes_spin is not None:
+            section_elem.set("total_nodes", str(self.nodes_spin.value()))
+        for combo, factor, layout, _ in self.dropdown_factor_pairs:
+            item_elem = ET.SubElement(section_elem, "item")
+            item_elem.set("selected", combo.currentText())
+            item_elem.set("factor", f"{factor.value():.3f}")
+            if self.section_name == "Traffic" and layout in self.traffic_extras:
+                pattern_combo, pattern_row, extra_row, rate_spin, period_spin, jitter_spin, group_box = self.traffic_extras[layout]
+                sel = pattern_combo.currentText()
+                item_elem.set("pattern", sel)
+                if sel == "Custom":
+                    item_elem.set("pattern_rate_kbps", f"{rate_spin.value():.1f}")
+                elif sel.startswith("Periodic"):
+                    item_elem.set("pattern_period_s", f"{period_spin.value():.1f}")
+                elif sel == "Jitter":
+                    item_elem.set("pattern_jitter_pct", f"{jitter_spin.value():.1f}")
+        return section_elem
+
+    def from_xml(self, section_elem):
+        # Clear container
+        while self.dropdowns_layout.count():
+            item = self.dropdowns_layout.takeAt(0)
+            if item is None:
+                break
+            lay = item.layout()
+            if lay:
+                while lay.count():
+                    w = lay.takeAt(0).widget()
+                    if w:
+                        w.deleteLater()
+
+        self.dropdown_factor_pairs.clear()
+        self.traffic_extras.clear()
+
+        # Node Information
+        if self.nodes_spin is not None:
+            try:
+                self.nodes_spin.setValue(int(section_elem.get("total_nodes", "1")))
+            except Exception:
+                self.nodes_spin.setValue(1)
+
+        items = list(section_elem.findall("item"))
+        # Cap to max_rows if file has more
+        items = items[:getattr(self, 'max_rows', 10)]
+        if not items:
+            self.add_dropdown()
+            return
+
+        for item_elem in items:
+            row = QHBoxLayout()
+
+            combo = QComboBox()
+            combo.addItems(self.dropdown_items)
+            sel = item_elem.get("selected", "Random")
+            idx = combo.findText(sel)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            row.addWidget(combo)
+
+            row.addWidget(QLabel("Factor:"))
+            factor_spin = QDoubleSpinBox()
+            factor_spin.setRange(0.0, 1.0)
+            factor_spin.setDecimals(3)
+            factor_spin.setSingleStep(0.05)
+            try:
+                factor_spin.setValue(float(item_elem.get("factor", "1.0")))
+            except Exception:
+                pass
+            factor_spin.valueChanged.connect(self.validate_factors)
+            row.addWidget(factor_spin)
+
+            remove_btn = QPushButton("Remove")
+            remove_btn.setFixedWidth(70)
+            row.addWidget(remove_btn)
+
+            # Add to container (grouped for Traffic)
+            if self.section_name == "Traffic":
+                profile_index = len(self.traffic_extras) + 1
+                group_box = QGroupBox(f"Profile {profile_index}")
+                group_v = QVBoxLayout(group_box)
+
+                group_v.addLayout(row)
+
+                pattern_row = QHBoxLayout()
+                pattern_label = QLabel("Pattern:")
+                pattern_combo = QComboBox()
+                pattern_combo.addItems(["1kbps", "5kbps", "Jitter", "Periodic (1s)", "Periodic (5s)", "Random", "Custom"])
+                pv = item_elem.get("pattern", "Random")
+                ii = pattern_combo.findText(pv)
+                if ii >= 0:
+                    pattern_combo.setCurrentIndex(ii)
+                pattern_row.addWidget(pattern_label)
+                pattern_row.addWidget(pattern_combo)
+                group_v.addLayout(pattern_row)
+
+                extra_row = QHBoxLayout()
+                rate_label = QLabel("Rate (kbps):"); rate_spin = QDoubleSpinBox(); rate_spin.setRange(0.1, 100000.0); rate_spin.setDecimals(1); rate_spin.setValue(64.0)
+                period_label = QLabel("Period (s):"); period_spin = QDoubleSpinBox(); period_spin.setRange(0.1, 3600.0); period_spin.setDecimals(1); period_spin.setValue(1.0)
+                jitter_label = QLabel("Jitter (%):"); jitter_spin = QDoubleSpinBox(); jitter_spin.setRange(0.0, 100.0); jitter_spin.setDecimals(1); jitter_spin.setValue(10.0)
+                for w in (rate_label, rate_spin, period_label, period_spin, jitter_label, jitter_spin):
+                    extra_row.addWidget(w)
+                group_v.addLayout(extra_row)
+
+                # Visibility and saved values
+                def _apply_vis():
+                    s = pattern_combo.currentText()
+                    show_rate = (s == "Custom")
+                    show_period = s.startswith("Periodic")
+                    show_jitter = (s == "Jitter")
+                    rate_label.setVisible(show_rate); rate_spin.setVisible(show_rate)
+                    period_label.setVisible(show_period); period_spin.setVisible(show_period)
+                    jitter_label.setVisible(show_jitter); jitter_spin.setVisible(show_jitter)
+                    if s == "Periodic (1s)":
+                        period_spin.setValue(1.0)
+                    elif s == "Periodic (5s)":
+                        period_spin.setValue(5.0)
+                pattern_combo.currentTextChanged.connect(lambda _: _apply_vis())
+                try: rate_spin.setValue(float(item_elem.get("pattern_rate_kbps", rate_spin.value())))
+                except Exception: pass
+                try: period_spin.setValue(float(item_elem.get("pattern_period_s", period_spin.value())))
+                except Exception: pass
+                try: jitter_spin.setValue(float(item_elem.get("pattern_jitter_pct", jitter_spin.value())))
+                except Exception: pass
+                _apply_vis()
+
+                self.dropdowns_layout.addWidget(group_box)
+                # Bookkeeping
+                self.dropdown_factor_pairs.append((combo, factor_spin, row, remove_btn))
+                self.traffic_extras[row] = (pattern_combo, pattern_row, extra_row, rate_spin, period_spin, jitter_spin, group_box)
+            else:
+                self.dropdowns_layout.addLayout(row)
+                self.dropdown_factor_pairs.append((combo, factor_spin, row, remove_btn))
+
+            remove_btn.clicked.connect(lambda _, r=row: self.remove_dropdown(r))
+
+        self.update_remove_buttons()
+        self.validate_factors()
+        self.update_count_label()
+
+
+# ---------------------------
+# Scenario Editor (stacked view)
+# ---------------------------
 class ScenarioEditor(QWidget):
     def __init__(self):
         super().__init__()
         layout = QVBoxLayout()
 
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        content_widget = QWidget()
-        content_layout = QVBoxLayout()
+        self.stacked = QStackedWidget()
+        self.pages = {}
+        self.sections = {}
 
+        # Base Scenario page
+        base_page = QWidget()
+        base_v = QVBoxLayout()
         self.base_scenario_group = QGroupBox("Base Scenario")
         base_layout = QVBoxLayout()
         self.base_scenario_widget = BaseScenarioWidget()
         base_layout.addWidget(self.base_scenario_widget)
         self.base_scenario_group.setLayout(base_layout)
-        content_layout.addWidget(self.base_scenario_group)
+        base_v.addWidget(self.base_scenario_group)
+        base_v.addStretch()
+        base_page.setLayout(base_v)
+        self.stacked.addWidget(base_page)
+        self.pages["Base Scenario"] = base_page
 
-        self.sections = {}
-        section_names = [
+        # Section pages
+        for name in [
             "Node Information",
             "Routing",
             "Services",
             "Traffic",
             "Events",
-            "Vulnerabilities",  # Moved above "Other"
-            "Other"
-        ]
-        for name in section_names:
+            "Vulnerabilities",
+            "Segmentation",
+        ]:
             section = SectionWidget(name)
             self.sections[name] = section
+
+            page = QWidget()
+            pv = QVBoxLayout()
             group_box = QGroupBox(name)
             group_layout = QVBoxLayout()
             group_layout.addWidget(section)
             group_box.setLayout(group_layout)
-            content_layout.addWidget(group_box)
+            pv.addWidget(group_box)
+            pv.addStretch()
+            page.setLayout(pv)
 
-        content_layout.addStretch()
-        content_widget.setLayout(content_layout)
-        scroll_area.setWidget(content_widget)
+            self.stacked.addWidget(page)
+            self.pages[name] = page
 
-        layout.addWidget(scroll_area)
+        # Notes page
+        notes_page = QWidget()
+        notes_v = QVBoxLayout()
+        self.notes_widget = NotesWidget()
+        notes_group = QGroupBox("Notes")
+        notes_layout = QVBoxLayout()
+        notes_layout.addWidget(self.notes_widget)
+        notes_group.setLayout(notes_layout)
+        notes_v.addWidget(notes_group)
+        notes_v.addStretch()
+        notes_page.setLayout(notes_v)
+        self.stacked.addWidget(notes_page)
+        self.pages["Notes"] = notes_page
+
+        layout.addWidget(self.stacked)
         self.setLayout(layout)
+
+    def set_active_section(self, section_name: str | None):
+        if not section_name or section_name not in self.pages:
+            section_name = "Base Scenario"
+        self.stacked.setCurrentWidget(self.pages[section_name])
 
     def to_xml(self):
         scenario_elem = ET.Element("ScenarioEditor")
         scenario_elem.append(self.base_scenario_widget.to_xml())
         for name, section in self.sections.items():
             scenario_elem.append(section.to_xml())
+        scenario_elem.append(self.notes_widget.to_xml())
         return scenario_elem
 
     def from_xml(self, scenario_elem):
@@ -278,178 +628,203 @@ class ScenarioEditor(QWidget):
             name = section_elem.get("name", "")
             if name in self.sections:
                 self.sections[name].from_xml(section_elem)
+            elif name == "Notes":
+                self.notes_widget.from_xml(section_elem)
 
+
+# ---------------------------
+# Main Window + Tree
+# ---------------------------
+SECTION_ORDER = [
+    "Base Scenario",
+    "Node Information",
+    "Routing",
+    "Services",
+    "Traffic",
+    "Events",
+    "Vulnerabilities",
+    "Segmentation",
+    "Notes",
+]
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Scenario Editor")
 
-        menubar = self.menuBar()
-        file_menu = menubar.addMenu("File")
+        self.current_item: QTreeWidgetItem | None = None
+        self.current_editor: ScenarioEditor | None = None
 
-        save_action = file_menu.addAction("Save")
-        save_action.triggered.connect(self.save_to_file)
-
-        load_action = file_menu.addAction("Load")
-        load_action.triggered.connect(self.load_from_file)
-
-        splitter = QSplitter()
+        splitter = QSplitter(self)
         self.tree = QTreeWidget()
-        self.tree.setHeaderHidden(True)
+        self.tree.setHeaderLabels(["Scenarios"])
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.open_context_menu)
-        self.tree.itemClicked.connect(self.load_scenario)
+        self.tree.itemClicked.connect(self.on_tree_click)
 
         self.right_panel = QWidget()
+        self.right_panel.setLayout(QVBoxLayout())
+
         splitter.addWidget(self.tree)
         splitter.addWidget(self.right_panel)
-        splitter.setSizes([200, 600])
+        splitter.setStretchFactor(1, 1)
+        self.setCentralWidget(splitter)
 
-        central_widget = QWidget()
-        layout = QHBoxLayout()
-        layout.addWidget(splitter)
-        central_widget.setLayout(layout)
-        self.setCentralWidget(central_widget)
+        # File menu (basic Save/Load)
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("File")
+        save_action = file_menu.addAction("Save…")
+        save_action.triggered.connect(self.save_all)
+        load_action = file_menu.addAction("Load…")
+        load_action.triggered.connect(self.load_from_path)
 
-        self.current_editor = None
-        self.current_item = None
+        # Start with one scenario
+        self.add_scenario("Scenario 1")
 
-        self.default_save_path = "scenarios.xml"
-        if os.path.exists(self.default_save_path):
-            self.load_from_path(self.default_save_path)
+    # ---- Tree helpers ----
+    def add_scenario(self, name: str):
+        item = QTreeWidgetItem([name])
+        self.tree.addTopLevelItem(item)
+        for sec in SECTION_ORDER[1:]:
+            child = QTreeWidgetItem([sec])
+            item.addChild(child)
+        item.setExpanded(True)
+        self.build_editor_for_item(item)
 
-    def closeEvent(self, event):
-        if self.current_editor and self.current_item:
+    def build_editor_for_item(self, item: QTreeWidgetItem):
+        # Save old
+        if self.current_item and self.current_editor:
             self.save_scenario_data(self.current_item, self.current_editor)
-        try:
-            self.save_all(self.default_save_path)
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to autosave scenarios:\n{str(e)}")
-        event.accept()
 
-    def open_context_menu(self, position: QPoint):
-        menu = QMenu()
-        add_action = menu.addAction("Add New Scenario")
-
-        selected = self.tree.currentItem()
-        if selected:
-            remove_action = menu.addAction("Remove Selected Scenario")
-
-        action = menu.exec(self.tree.viewport().mapToGlobal(position))
-        if action == add_action:
-            name, ok = QInputDialog.getText(self, "New Scenario", "Enter scenario name:")
-            if ok and name.strip():
-                new_item = QTreeWidgetItem([name.strip()])
-                self.tree.addTopLevelItem(new_item)
-        elif selected and action == remove_action:
-            index = self.tree.indexOfTopLevelItem(selected)
-            if index >= 0:
-                self.tree.takeTopLevelItem(index)
-                if selected == self.current_item:
-                    self.clear_right_panel()
-
-    def load_scenario(self, item):
-        if self.current_editor and self.current_item:
-            self.save_scenario_data(self.current_item, self.current_editor)
+        # Replace right panel content
+        for i in reversed(range(self.right_panel.layout().count())):
+            w = self.right_panel.layout().itemAt(i).widget()
+            if w:
+                w.setParent(None)
 
         editor = ScenarioEditor()
-        self.load_scenario_data(item, editor)
-
-        self.clear_right_panel()
-
-        if not self.right_panel.layout():
-            self.right_panel.setLayout(QVBoxLayout())
         self.right_panel.layout().addWidget(editor)
-
         self.current_editor = editor
         self.current_item = item
 
-    def clear_right_panel(self):
-        if self.right_panel.layout() and self.right_panel.layout().count() > 0:
-            old_widget = self.right_panel.layout().itemAt(0).widget()
-            if old_widget:
-                old_widget.deleteLater()
-                self.right_panel.layout().removeWidget(old_widget)
-        self.current_editor = None
-        self.current_item = None
+        # Load any stored XML
+        self.load_scenario_data(item, editor)
 
-    def save_scenario_data(self, item, editor):
+    def get_top_item(self, item: QTreeWidgetItem) -> QTreeWidgetItem:
+        while item and item.parent():
+            item = item.parent()
+        return item
+
+    def on_tree_click(self, item: QTreeWidgetItem):
+        top = self.get_top_item(item)
+        if top is None:
+            return
+
+        if top != self.current_item:
+            self.build_editor_for_item(top)
+
+        section = item.text(0) if item != top else "Base Scenario"
+        if self.current_editor:
+            self.current_editor.set_active_section(section)
+
+    def open_context_menu(self, pos: QPoint):
+        menu = QMenu(self)
+        add_action = menu.addAction("Add Scenario")
+        rename_action = menu.addAction("Rename Scenario")
+        remove_action = menu.addAction("Remove Scenario")
+
+        selected = self.tree.itemAt(pos)
+        action = menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+        if action == add_action:
+            name, ok = QInputDialog.getText(self, "New Scenario", "Name:")
+            if ok and name.strip():
+                self.add_scenario(name.strip())
+        elif action == rename_action and selected:
+            top = self.get_top_item(selected)
+            name, ok = QInputDialog.getText(self, "Rename Scenario", "Name:", text=top.text(0))
+            if ok and name.strip():
+                top.setText(0, name.strip())
+        elif action == remove_action and selected:
+            top = self.get_top_item(selected)
+            idx = self.tree.indexOfTopLevelItem(top)
+            if idx >= 0:
+                if self.current_item == top:
+                    # clear right panel
+                    for i in reversed(range(self.right_panel.layout().count())):
+                        w = self.right_panel.layout().itemAt(i).widget()
+                        if w:
+                            w.setParent(None)
+                    self.current_item = None
+                    self.current_editor = None
+                self.tree.takeTopLevelItem(idx)
+
+    # ---- Save/Load ----
+    def save_scenario_data(self, item: QTreeWidgetItem, editor: ScenarioEditor):
         scenario_xml = editor.to_xml()
         xml_str = ET.tostring(scenario_xml, encoding="unicode")
         item.setData(0, Qt.ItemDataRole.UserRole, xml_str)
 
-    def load_scenario_data(self, item, editor):
+    def load_scenario_data(self, item: QTreeWidgetItem, editor: ScenarioEditor):
         xml_str = item.data(0, Qt.ItemDataRole.UserRole)
-        if xml_str:
-            try:
-                root = ET.fromstring(xml_str)
-                editor.from_xml(root)
-            except ET.ParseError:
-                QMessageBox.warning(self, "Error", "Failed to parse scenario data.")
-
-    def save_to_file(self):
-        if self.current_editor and self.current_item:
-            self.save_scenario_data(self.current_item, self.current_editor)
-
-        path, _ = QFileDialog.getSaveFileName(self, "Save Scenarios", "", "XML Files (*.xml)")
-        if path:
-            self.save_all(path)
-
-    def load_from_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Load Scenarios", "", "XML Files (*.xml)")
-        if path:
-            self.load_from_path(path)
-
-    def save_all(self, path):
-        if self.current_editor and self.current_item:
-            self.save_scenario_data(self.current_item, self.current_editor)
-
-        root = ET.Element("Scenarios")
-        for i in range(self.tree.topLevelItemCount()):
-            item = self.tree.topLevelItem(i)
-            item_elem = ET.SubElement(root, "Scenario")
-            item_elem.set("name", item.text(0))
-            data_xml_str = item.data(0, Qt.ItemDataRole.UserRole)
-            if data_xml_str:
-                try:
-                    data_elem = ET.fromstring(data_xml_str)
-                    item_elem.append(data_elem)
-                except ET.ParseError:
-                    pass
-        tree = ET.ElementTree(root)
+        if not xml_str:
+            return
         try:
-            tree.write(path, encoding="utf-8", xml_declaration=True)
+            elem = ET.fromstring(xml_str)
+            if elem.tag == "ScenarioEditor":
+                editor.from_xml(elem)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to load scenario from tree data:\n{e}")
+
+    def save_all(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Scenarios", "", "XML Files (*.xml);;All Files (*)")
+        if not path:
+            return
+        try:
+            root = ET.Element("Scenarios")
+            for i in range(self.tree.topLevelItemCount()):
+                item = self.tree.topLevelItem(i)
+                if item == self.current_item and self.current_editor:
+                    self.save_scenario_data(item, self.current_editor)
+                scen = ET.Element("Scenario", name=item.text(0))
+                scen_xml = item.data(0, Qt.ItemDataRole.UserRole)
+                if scen_xml:
+                    scen.append(ET.fromstring(scen_xml))
+                root.append(scen)
+            ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
             QMessageBox.information(self, "Success", f"Scenarios saved to {path}")
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to save file:\n{str(e)}")
+            QMessageBox.warning(self, "Error", f"Failed to save scenarios:\n{e}")
 
-    def load_from_path(self, path):
+    def load_from_path(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Scenarios", "", "XML Files (*.xml);;All Files (*)")
+        if not path:
+            return
         try:
             tree = ET.parse(path)
             root = tree.getroot()
+            if root.tag != "Scenarios":
+                raise ValueError("Root element must be <Scenarios>")
             self.tree.clear()
-            self.clear_right_panel()
-            for scenario_elem in root.findall("Scenario"):
-                name = scenario_elem.get("name", "Unnamed")
+            for scen in root.findall("Scenario"):
+                name = scen.get("name", "Scenario")
                 item = QTreeWidgetItem([name])
-                scenario_xml_str = ""
-                scenario_editor_elem = scenario_elem.find("ScenarioEditor")
-                if scenario_editor_elem is not None:
-                    scenario_xml_str = ET.tostring(scenario_editor_elem, encoding="unicode")
-                elif len(scenario_elem):
-                    scenario_xml_str = ET.tostring(scenario_elem[0], encoding="unicode")
-                if scenario_xml_str:
-                    item.setData(0, Qt.ItemDataRole.UserRole, scenario_xml_str)
                 self.tree.addTopLevelItem(item)
+                for sec in SECTION_ORDER[1:]:
+                    item.addChild(QTreeWidgetItem([sec]))
+                item.setExpanded(True)
+                scen_editor = scen.find("ScenarioEditor")
+                if scen_editor is not None:
+                    xml_str = ET.tostring(scen_editor, encoding="unicode")
+                    item.setData(0, Qt.ItemDataRole.UserRole, xml_str)
             QMessageBox.information(self, "Success", f"Scenarios loaded from {path}")
         except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to load scenarios:\n{str(e)}")
+            QMessageBox.warning(self, "Error", f"Failed to load scenarios:\n{e}")
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = MainWindow()
-    window.resize(900, 600)
-    window.show()
+    w = MainWindow()
+    w.resize(1100, 700)
+    w.show()
     sys.exit(app.exec())
