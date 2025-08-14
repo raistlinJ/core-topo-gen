@@ -1,42 +1,58 @@
-
 import sys
 import os
 import subprocess
 import xml.etree.ElementTree as ET
+import json
 
-from PyQt6.QtCore import Qt, QPoint
+from PyQt6.QtCore import Qt, QPoint, QStandardPaths
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit,
-    QPushButton, QVBoxLayout, QHBoxLayout, QGroupBox,
-    QFileDialog, QScrollArea, QTreeWidget, QTreeWidgetItem, QMenu, QSplitter,
-    QInputDialog, QLineEdit, QMessageBox, QMainWindow, QStackedWidget
-)
+    QApplication, QWidget, QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit, QPushButton, QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QScrollArea, QTreeWidget, QTreeWidgetItem, QMenu, QSplitter, QInputDialog, QLineEdit, QMessageBox, QMainWindow, QStackedWidget, QSizePolicy)
 
 
 # ---------------------------
 # Base Scenario (file + validate)
 # ---------------------------
+
+
 class BaseScenarioWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        layout = QHBoxLayout()
+        # Top row with file, browse, validate, analyze
+        top_row = QHBoxLayout()
         label = QLabel("Base Scenario File:")
         self.file_input = QLineEdit()
-
         browse_button = QPushButton("Browse")
         browse_button.clicked.connect(self.browse_file)
-
         validate_button = QPushButton("Validate")
         validate_button.clicked.connect(self.validate_file)
+        self.analyze_button = QPushButton("Analyze")
+        self.analyze_button.setEnabled(False)
+        self.analyze_button.clicked.connect(self.analyze_file)
 
-        layout.addWidget(label)
-        layout.addWidget(self.file_input, 1)
-        layout.addWidget(browse_button)
-        layout.addWidget(validate_button)
-        self.setLayout(layout)
+        top_row.addWidget(label)
+        top_row.addWidget(self.file_input, 1)
+        top_row.addWidget(browse_button)
+        top_row.addWidget(validate_button)
+        top_row.addWidget(self.analyze_button)
+
+        # Analysis results tree
+        self.analysis_group = QGroupBox("Analysis Results")
+        ag_layout = QVBoxLayout()
+        self.analysis_tree = QTreeWidget()
+        self.analysis_tree.setHeaderLabels(["Item", "Value"])
+        ag_layout.addWidget(self.analysis_tree)
+        self.analysis_group.setLayout(ag_layout)
+
+        # Outer layout
+        outer = QVBoxLayout()
+        outer.addLayout(top_row)
+        outer.addWidget(self.analysis_group, 1)
+        self.setLayout(outer)
 
     def browse_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Scenario XML", "", "XML Files (*.xml);;All Files (*)")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Scenario XML", "", "XML Files (*.xml);;All Files (*)"
+        )
         if file_path:
             self.file_input.setText(file_path)
 
@@ -77,6 +93,7 @@ class BaseScenarioWidget(QWidget):
             first = out.splitlines()[:1]
             if proc.returncode == 0 and first == ["VALID"]:
                 QMessageBox.information(self, "Validation Passed", "The XML validates against the schema.")
+                self.analyze_button.setEnabled(True)
             else:
                 details = out if out else err
                 if not details:
@@ -85,10 +102,110 @@ class BaseScenarioWidget(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Validation Error", str(e))
 
+    def analyze_file(self):
+        """Heuristic analysis of the selected XML file."""
+        path = self.file_input.text().strip()
+        if not path:
+            QMessageBox.warning(self, "No file selected", "Please choose a scenario XML file first.")
+            return
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "File not found", f"The selected file does not exist:\n{path}")
+            return
 
-# ---------------------------
-# Notes (text only)
-# ---------------------------
+        try:
+            tree = ET.parse(path)
+            root = tree.getroot()
+        except Exception as e:
+            QMessageBox.critical(self, "XML Error", f"Could not parse XML:\n{e}")
+            return
+
+        # Collect nodes
+        def tagname(el):
+            return el.tag.split('}')[-1].lower()
+
+        nodes = {}
+        for el in root.iter():
+            if tagname(el) == "node":
+                nid = el.get("id") or el.get("name") or el.findtext("id") or el.findtext("name")
+                if nid:
+                    nodes[nid] = el
+        if not nodes:
+            for el in root.iter():
+                if tagname(el) in {"host","router","switch","pc","server","workstation"}:
+                    nid = el.get("id") or el.get("name") or el.findtext("id") or el.findtext("name")
+                    if nid:
+                        nodes[nid] = el
+
+        # Connections
+        connections = []
+        for el in root.iter():
+            t = tagname(el)
+            if t in {"link","connection","edge","net","interfacepair","wire"}:
+                a = el.get("node1") or el.get("src") or el.get("source") or el.get("from")
+                b = el.get("node2") or el.get("dst") or el.get("target") or el.get("to")
+                if not a or not b:
+                    refs = []
+                    for ch in el.iter():
+                        for key in ("node","node_id","src","dst","source","target","from","to","end1","end2"):
+                            v = ch.get(key) or ch.findtext(key)
+                            if v:
+                                refs.append(v)
+                                break
+                        if len(refs) >= 2:
+                            break
+                    if len(refs) >= 2:
+                        a, b = refs[0], refs[1]
+                if a and b:
+                    connections.append((a, b))
+
+        # Services
+        services = []
+        for el in root.iter():
+            if "service" in tagname(el):
+                name = el.get("name") or (el.text.strip() if el.text else None)
+                if name:
+                    services.append(name)
+
+        # Traffic flows
+        flows = []
+        for el in root.iter():
+            t = tagname(el)
+            if "flow" in t or "traffic" in t:
+                src = el.get("src") or el.get("source") or el.get("from") or el.findtext("src") or el.findtext("from")
+                dst = el.get("dst") or el.get("target") or el.get("to") or el.findtext("dst") or el.findtext("to")
+                desc = el.get("type") or el.get("protocol") or el.findtext("type") or el.findtext("protocol") or ""
+                if src or dst or desc:
+                    flows.append({"src": src, "dst": dst, "desc": desc})
+
+        # Non-connected nodes
+        degrees = {nid: 0 for nid in nodes}
+        for a, b in connections:
+            if a in degrees: degrees[a] += 1
+            if b in degrees: degrees[b] += 1
+        non_connected = [nid for nid, d in degrees.items() if d == 0]
+
+        # Populate Analysis Results tree
+        self.analysis_tree.clear()
+        root_item = QTreeWidgetItem(["Summary", ""])
+        self.analysis_tree.addTopLevelItem(root_item)
+
+        QTreeWidgetItem(root_item, ["Node count", str(len(nodes))])
+        QTreeWidgetItem(root_item, ["Connection count", str(len(connections))])
+
+        services_item = QTreeWidgetItem(root_item, ["Services used", str(len(set(services)))])
+        for s in sorted(set(services)):
+            QTreeWidgetItem(services_item, [s, ""])
+
+        flows_item = QTreeWidgetItem(root_item, ["Traffic flows", str(len(flows))])
+        for f in flows:
+            label = f"{(f['src'] or '?')} → {(f['dst'] or '?')}"
+            QTreeWidgetItem(flows_item, [label, f.get('desc') or ""])
+
+        nc_item = QTreeWidgetItem(root_item, ["Non-connected nodes", str(len(non_connected))])
+        for nid in non_connected:
+            QTreeWidgetItem(nc_item, [str(nid), ""])
+
+        self.analysis_tree.expandAll()
 class NotesWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -140,7 +257,8 @@ class SectionWidget(QWidget):
         elif self.section_name == "Vulnerabilities":
             self.dropdown_items = ["SSHCreds", "Bashbug", "FileArtifact", "Incompetence", "Random"]
         elif self.section_name == "Segmentation":
-            self.dropdown_items = ["Random"]
+            # Changed to segmentation-specific items
+            self.dropdown_items = ["Firewall", "NAT", "VPN", "Random"]
 
         # UI skeleton
         self.setLayout(QVBoxLayout())
@@ -149,13 +267,27 @@ class SectionWidget(QWidget):
         top_row = QHBoxLayout()
         top_row.addWidget(QLabel(section_name))
 
-        self.add_dropdown_btn = QPushButton("Add Dropdown")
+        # Update button text for different sections
+        self.add_dropdown_btn = QPushButton("Add Entry")
         if self.section_name == "Traffic":
             self.add_dropdown_btn.setText("Add traffic profile")
+        elif self.section_name == "Segmentation":
+            self.add_dropdown_btn.setText("Add segment type")
+        elif self.section_name == "Node Information":
+            self.add_dropdown_btn.setText("Add node type")
+        elif self.section_name == "Routing":
+            self.add_dropdown_btn.setText("Add protocol")
+        elif self.section_name == "Services":
+            self.add_dropdown_btn.setText("Add service")
+        elif self.section_name == "Events":
+            self.add_dropdown_btn.setText("Add event")
+        elif self.section_name == "Vulnerabilities":
+            self.add_dropdown_btn.setText("Add vulnerability")
         self.add_dropdown_btn.clicked.connect(self.add_dropdown)
         top_row.addWidget(self.add_dropdown_btn)
+        
         self.normalize_btn = QPushButton("Normalize")
-        self.normalize_btn.setToolTip("Evenly redistribute factors so the total is 1.000")
+        self.normalize_btn.setToolTip("Evenly redistribute weights so the total is 1.000")
         self.normalize_btn.clicked.connect(self.normalize_factors)
         top_row.addWidget(self.normalize_btn)
         self.count_label = QLabel("")
@@ -164,7 +296,7 @@ class SectionWidget(QWidget):
         top_row.addStretch()
         self.layout().addLayout(top_row)
 
-        # Node Information: total nodes
+        # Node Information and Segmentation: total nodes/segments (between top row and dropdowns)
         self.nodes_spin = None
         if self.section_name == "Node Information":
             nodes_row = QHBoxLayout()
@@ -174,10 +306,35 @@ class SectionWidget(QWidget):
             self.nodes_spin.setValue(1)
             nodes_row.addWidget(self.nodes_spin)
             self.layout().addLayout(nodes_row)
+        elif self.section_name == "Segmentation":
+            # Add total segments spinner for segmentation section
+            segments_row = QHBoxLayout()
+            segments_row.addWidget(QLabel("Total Segments:"))
+            self.nodes_spin = QSpinBox()
+            self.nodes_spin.setRange(1, 100)
+            self.nodes_spin.setValue(1)
+            segments_row.addWidget(self.nodes_spin)
+            self.layout().addLayout(segments_row)
 
-        # Where the rows live
+        # Where the rows live (in a scroll area to avoid overlap)
+
         self.dropdowns_layout = QVBoxLayout()
-        self.layout().addLayout(self.dropdowns_layout)
+
+        self.dropdowns_layout.setSpacing(6)
+
+        self.dropdowns_layout.setContentsMargins(0, 0, 0, 0)
+
+        self._dropdowns_container = QWidget()
+
+        self._dropdowns_container.setLayout(self.dropdowns_layout)
+
+        self._scroll = QScrollArea()
+
+        self._scroll.setWidgetResizable(True)
+
+        self._scroll.setWidget(self._dropdowns_container)
+
+        self.layout().addWidget(self._scroll)
 
         # Store tuples: (combo, spinbox, row_layout, remove_button)
         self.dropdown_factor_pairs = []
@@ -188,7 +345,6 @@ class SectionWidget(QWidget):
 
         # Start with one row
         self.add_dropdown()
-        self.update_count_label()
         self.update_count_label()
 
     # --- Row management ---
@@ -207,14 +363,20 @@ class SectionWidget(QWidget):
         # Main row
         row = QHBoxLayout()
 
+        row.setSpacing(8)
         combo = QComboBox()
         combo.addItems(self.dropdown_items)
+        if self.section_name == "Segmentation":
+            try:
+                combo.setCurrentText("Random")
+            except Exception:
+                pass
         idx = combo.findText("Random")
         if idx >= 0:
             combo.setCurrentIndex(idx)
         row.addWidget(combo)
 
-        row.addWidget(QLabel("Factor:"))
+        row.addWidget(QLabel("Weight:"))
         factor_spin = QDoubleSpinBox()
         factor_spin.setRange(0.0, 1.0)
         factor_spin.setDecimals(3)
@@ -226,16 +388,22 @@ class SectionWidget(QWidget):
         remove_btn.setFixedWidth(70)
         row.addWidget(remove_btn)
 
-        # Defaults
+        
+        row.addStretch(1)
+# Defaults
         pattern_combo = pattern_row = extra_row = None
         rate_spin = period_spin = jitter_spin = None
 
         if is_traffic:
             group_box = QGroupBox(f"Profile {profile_index}")
+            group_box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
             group_v = QVBoxLayout(group_box)
 
+            group_v.setContentsMargins(8, 8, 8, 8)
+            group_v.setSpacing(6)
             # Pattern row
             pattern_row = QHBoxLayout()
+            pattern_row.setSpacing(8)
             pattern_label = QLabel("Pattern:")
             pattern_combo = QComboBox()
             pattern_combo.addItems(["1kbps", "5kbps", "Jitter", "Periodic (1s)", "Periodic (5s)", "Random", "Custom"])
@@ -244,6 +412,7 @@ class SectionWidget(QWidget):
 
             # Extra inputs row
             extra_row = QHBoxLayout()
+            extra_row.setSpacing(8)
             rate_label = QLabel("Rate (kbps):")
             rate_spin = QDoubleSpinBox(); rate_spin.setRange(0.1, 100000.0); rate_spin.setDecimals(1); rate_spin.setValue(64.0)
             period_label = QLabel("Period (s):")
@@ -289,10 +458,6 @@ class SectionWidget(QWidget):
         self.update_remove_buttons()
         self.validate_factors()
         self.update_count_label()
-        self.update_count_label()
-        self.update_count_label()
-        self.update_count_label()
-        self.update_count_label()
 
     def remove_dropdown(self, row):
         # Locate record
@@ -335,10 +500,6 @@ class SectionWidget(QWidget):
         self.update_remove_buttons()
         self.validate_factors()
         self.update_count_label()
-        self.update_count_label()
-        self.update_count_label()
-        self.update_count_label()
-        self.update_count_label()
 
     def update_remove_buttons(self):
         count = len(self.dropdown_factor_pairs)
@@ -372,14 +533,14 @@ class SectionWidget(QWidget):
         at_max = len(self.dropdown_factor_pairs) >= getattr(self, 'max_rows', 10)
         # Compare using the same precision as the spinboxes to avoid float drift
         if round(total, 3) != 1.000:
-            self.warning_label.setText(f"Factors must sum to 1. Current sum: {total:.3f}")
+            self.warning_label.setText(f"Weights must sum to 1. Current sum: {total:.3f}")
             self.add_dropdown_btn.setEnabled(False)
         else:
             self.warning_label.setText("Max reached" if at_max else "")
             self.add_dropdown_btn.setEnabled(not at_max)
     
     def normalize_factors(self):
-        """Evenly redistribute factors so they sum to 1.000 at the current precision."""
+        """Evenly redistribute weights so they sum to 1.000 at the current precision."""
         self.redistribute_factors()
         self.validate_factors()
 
@@ -396,9 +557,12 @@ class SectionWidget(QWidget):
     # --- XML ---
     def to_xml(self):
         section_elem = ET.Element("section", name=self.section_name)
-        # Node Information
+        # Node Information and Segmentation
         if self.nodes_spin is not None:
-            section_elem.set("total_nodes", str(self.nodes_spin.value()))
+            if self.section_name == "Node Information":
+                section_elem.set("total_nodes", str(self.nodes_spin.value()))
+            elif self.section_name == "Segmentation":
+                section_elem.set("total_segments", str(self.nodes_spin.value()))
         for combo, factor, layout, _ in self.dropdown_factor_pairs:
             item_elem = ET.SubElement(section_elem, "item")
             item_elem.set("selected", combo.currentText())
@@ -431,10 +595,13 @@ class SectionWidget(QWidget):
         self.dropdown_factor_pairs.clear()
         self.traffic_extras.clear()
 
-        # Node Information
+        # Node Information and Segmentation
         if self.nodes_spin is not None:
             try:
-                self.nodes_spin.setValue(int(section_elem.get("total_nodes", "1")))
+                if self.section_name == "Node Information":
+                    self.nodes_spin.setValue(int(section_elem.get("total_nodes", "1")))
+                elif self.section_name == "Segmentation":
+                    self.nodes_spin.setValue(int(section_elem.get("total_segments", "1")))
             except Exception:
                 self.nodes_spin.setValue(1)
 
@@ -450,13 +617,18 @@ class SectionWidget(QWidget):
 
             combo = QComboBox()
             combo.addItems(self.dropdown_items)
+            if self.section_name == "Segmentation":
+                try:
+                    combo.setCurrentText("Random")
+                except Exception:
+                    pass
             sel = item_elem.get("selected", "Random")
             idx = combo.findText(sel)
             if idx >= 0:
                 combo.setCurrentIndex(idx)
             row.addWidget(combo)
 
-            row.addWidget(QLabel("Factor:"))
+            row.addWidget(QLabel("Weight:"))
             factor_spin = QDoubleSpinBox()
             factor_spin.setRange(0.0, 1.0)
             factor_spin.setDecimals(3)
@@ -654,6 +826,7 @@ class MainWindow(QMainWindow):
 
         self.current_item: QTreeWidgetItem | None = None
         self.current_editor: ScenarioEditor | None = None
+        self.settings_file = self.get_settings_file_path()
 
         splitter = QSplitter(self)
         self.tree = QTreeWidget()
@@ -678,7 +851,50 @@ class MainWindow(QMainWindow):
         load_action = file_menu.addAction("Load…")
         load_action.triggered.connect(self.load_from_path)
 
-        # Start with one scenario
+        # Try to load last file or start with defaults
+        self.load_last_file_or_defaults()
+
+    def get_settings_file_path(self):
+        """Get the path for storing application settings."""
+        app_data_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+        if not os.path.exists(app_data_dir):
+            os.makedirs(app_data_dir)
+        return os.path.join(app_data_dir, "scenario_editor_settings.json")
+
+    def save_settings(self, last_file_path=None):
+        """Save application settings including last loaded file."""
+        settings = {
+            "last_file": last_file_path
+        }
+        try:
+            with open(self.settings_file, 'w') as f:
+                json.dump(settings, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Could not save settings: {e}")
+
+    def load_settings(self):
+        """Load application settings."""
+        try:
+            if os.path.exists(self.settings_file):
+                with open(self.settings_file, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"Warning: Could not load settings: {e}")
+        return {}
+
+    def load_last_file_or_defaults(self):
+        """Load the last opened file, or start with defaults if file doesn't exist."""
+        settings = self.load_settings()
+        last_file = settings.get("last_file")
+        
+        if last_file and os.path.exists(last_file):
+            try:
+                self.load_scenarios_from_file(last_file)
+                return
+            except Exception as e:
+                print(f"Warning: Could not load last file {last_file}: {e}")
+        
+        # Fall back to default scenario
         self.add_scenario("Scenario 1")
 
     # ---- Tree helpers ----
@@ -694,8 +910,11 @@ class MainWindow(QMainWindow):
     def build_editor_for_item(self, item: QTreeWidgetItem):
         # Save old
         if self.current_item and self.current_editor:
-            self.save_scenario_data(self.current_item, self.current_editor)
-
+            try:
+                self.save_scenario_data(self.current_item, self.current_editor)
+            except RuntimeError as e:
+                if "has been deleted" not in str(e):
+                    raise
         # Replace right panel content
         for i in reversed(range(self.right_panel.layout().count())):
             w = self.right_panel.layout().itemAt(i).widget()
@@ -791,6 +1010,9 @@ class MainWindow(QMainWindow):
                 if scen_xml:
                     scen.append(ET.fromstring(scen_xml))
                 root.append(scen)
+            
+            # Pretty print the XML
+            ET.indent(root, space="  ", level=0)
             ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
             QMessageBox.information(self, "Success", f"Scenarios saved to {path}")
         except Exception as e:
@@ -805,6 +1027,15 @@ class MainWindow(QMainWindow):
             root = tree.getroot()
             if root.tag != "Scenarios":
                 raise ValueError("Root element must be <Scenarios>")
+            # Reset current pointers to avoid using deleted items
+            self.current_item = None
+            self.current_editor = None
+            # Clear right panel widgets
+            if self.right_panel and self.right_panel.layout():
+                for i in reversed(range(self.right_panel.layout().count())):
+                    w = self.right_panel.layout().itemAt(i).widget()
+                    if w:
+                        w.setParent(None)
             self.tree.clear()
             for scen in root.findall("Scenario"):
                 name = scen.get("name", "Scenario")
