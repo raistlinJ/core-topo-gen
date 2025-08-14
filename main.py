@@ -119,61 +119,122 @@ class BaseScenarioWidget(QWidget):
             QMessageBox.critical(self, "XML Error", f"Could not parse XML:\n{e}")
             return
 
-        # Collect nodes
-        def tagname(el):
-            return el.tag.split('}')[-1].lower()
+        
+        # Collect nodes (robust, namespace-agnostic)
+        def tname(el):
+            return el.tag.split('}', 1)[-1].lower()
 
+        def first(*vals):
+            for v in vals:
+                if v is not None and str(v).strip() != "":
+                    return str(v).strip()
+            return None
+
+        def child_text_by_names(el, names):
+            names_l = {n.lower() for n in names}
+            for ch in el.iter():
+                if tname(ch) in names_l:
+                    if ch.text and ch.text.strip():
+                        return ch.text.strip()
+                    # also try common id/name attrs
+                    for k in ("id", "name", "node", "node_id", "nodeid", "uuid"):
+                        v = ch.get(k)
+                        if v:
+                            return str(v).strip()
+            return None
+
+        def id_or_name(el):
+            # prefer explicit id, then name, then common variants or child elements
+            v = first(el.get("id"), el.get("name"), el.get("nodeid"), el.get("node_id"), el.get("uuid"))
+            if v:
+                return v
+            return child_text_by_names(el, {"id", "name", "nodeid", "node_id", "uuid"})
+
+        node_like = {"node","host","router","switch","pc","server","workstation","device","vertex"}
         nodes = {}
+        node_types = {}
         for el in root.iter():
-            if tagname(el) == "node":
-                nid = el.get("id") or el.get("name") or el.findtext("id") or el.findtext("name")
+            if tname(el) in node_like:
+                nid = id_or_name(el)
                 if nid:
-                    nodes[nid] = el
+                    nid_s = str(nid)
+                    nodes[nid_s] = el
+                    node_types[nid_s] = tname(el)
+
+        # If still nothing, try a very generic search for elements that contain a child id/name
         if not nodes:
             for el in root.iter():
-                if tagname(el) in {"host","router","switch","pc","server","workstation"}:
-                    nid = el.get("id") or el.get("name") or el.findtext("id") or el.findtext("name")
-                    if nid:
-                        nodes[nid] = el
+                nid = id_or_name(el)
+                if nid:
+                    nid_s = str(nid)
+                    nodes.setdefault(nid_s, el)
+                    node_types.setdefault(nid_s, tname(el))
 
-        # Connections
+        # Connections (support CORE-style <link><node1 id=../><node2 id=../></link> and many others)
         connections = []
+        conn_like = {"link","connection","edge","net","interfacepair","wire","channel","connector"}
         for el in root.iter():
-            t = tagname(el)
-            if t in {"link","connection","edge","net","interfacepair","wire"}:
-                a = el.get("node1") or el.get("src") or el.get("source") or el.get("from")
-                b = el.get("node2") or el.get("dst") or el.get("target") or el.get("to")
+            if tname(el) in conn_like:
+                # 1) attribute forms
+                a = first(el.get("node1"), el.get("node_1"), el.get("a"),
+                          el.get("src"), el.get("source"), el.get("from"))
+                b = first(el.get("node2"), el.get("node_2"), el.get("b"),
+                          el.get("dst"), el.get("target"), el.get("to"))
+
+                # 2) CORE-style child tags: <node1 id="..."/>, <node2 id="..."/>
+                if not a or not b:
+                    n1 = n2 = None
+                    for ch in el:
+                        ct = tname(ch)
+                        if ct in {"node1","end1"}:
+                            n1 = first(ch.get("id"), ch.get("name"), child_text_by_names(ch, {"id","name"}))
+                        elif ct in {"node2","end2"}:
+                            n2 = first(ch.get("id"), ch.get("name"), child_text_by_names(ch, {"id","name"}))
+                    if n1 and n2:
+                        a, b = n1, n2
+
+                # 3) generic nested references: any child with node-ish attributes or tags
                 if not a or not b:
                     refs = []
                     for ch in el.iter():
-                        for key in ("node","node_id","src","dst","source","target","from","to","end1","end2"):
-                            v = ch.get(key) or ch.findtext(key)
+                        ct = tname(ch)
+                        # consider both attributes and element text
+                        for key in ("node","node_id","nodeid","id","name","src","dst","source","target","from","to"):
+                            v = ch.get(key)
                             if v:
-                                refs.append(v)
-                                break
+                                refs.append(str(v).strip()); break
+                        else:
+                            # fallback to element text if tag name itself is a ref name
+                            if ct in {"node","node_id","nodeid","id","name","src","dst","source","target","from","to"}:
+                                if ch.text and ch.text.strip():
+                                    refs.append(ch.text.strip())
                         if len(refs) >= 2:
                             break
                     if len(refs) >= 2:
                         a, b = refs[0], refs[1]
+
                 if a and b:
-                    connections.append((a, b))
+                    connections.append((str(a), str(b)))
 
         # Services
         services = []
         for el in root.iter():
-            if "service" in tagname(el):
-                name = el.get("name") or (el.text.strip() if el.text else None)
+            if "service" in tname(el):
+                name = first(el.get("name"), el.text.strip() if el.text else None, child_text_by_names(el, {"name"}))
                 if name:
                     services.append(name)
 
         # Traffic flows
         flows = []
         for el in root.iter():
-            t = tagname(el)
-            if "flow" in t or "traffic" in t:
-                src = el.get("src") or el.get("source") or el.get("from") or el.findtext("src") or el.findtext("from")
-                dst = el.get("dst") or el.get("target") or el.get("to") or el.findtext("dst") or el.findtext("to")
-                desc = el.get("type") or el.get("protocol") or el.findtext("type") or el.findtext("protocol") or ""
+            tt = tname(el)
+            if "flow" in tt or "traffic" in tt:
+                src = first(el.get("src"), el.get("source"), el.get("from"),
+                            child_text_by_names(el, {"src","source","from"}))
+                dst = first(el.get("dst"), el.get("target"), el.get("to"),
+                            child_text_by_names(el, {"dst","target","to"}))
+                desc = first(el.get("type"), el.get("protocol"),
+                             child_text_by_names(el, {"type","protocol"}), "")
                 if src or dst or desc:
                     flows.append({"src": src, "dst": dst, "desc": desc})
 
@@ -185,6 +246,7 @@ class BaseScenarioWidget(QWidget):
         non_connected = [nid for nid, d in degrees.items() if d == 0]
 
         # Populate Analysis Results tree
+# Populate Analysis Results tree
         self.analysis_tree.clear()
         root_item = QTreeWidgetItem(["Summary", ""])
         self.analysis_tree.addTopLevelItem(root_item)
@@ -206,6 +268,7 @@ class BaseScenarioWidget(QWidget):
             QTreeWidgetItem(nc_item, [str(nid), ""])
 
         self.analysis_tree.expandAll()
+
 class NotesWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
