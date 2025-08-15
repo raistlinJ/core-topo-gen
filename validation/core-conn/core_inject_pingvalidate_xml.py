@@ -8,6 +8,7 @@ It also generates a bash script for each device that pings all other devices in 
 
 import lxml.etree as ET
 import logging
+import sys
 
 def validate_xml(xml_path, xsd_path):
     # Parse XSD schema
@@ -81,7 +82,7 @@ def add_service_to_userdefined(xml_file, nodeip_map, output_file):
             service_configurations = ET.SubElement(scenario, "service_configurations")
         if service_configurations is None or service_configurations == []:
             logging.error("Could not create service_configuration. Quitting.")
-            exit -1
+            sys.exit(1)
         userdefined = service_configurations.find(f".//service[@name='UserDefined'][@node='{device_id}']")
         if userdefined == None or userdefined == []:
             logging.debug(f"No <UserDefined> found for device id {device_id}. Adding it.")
