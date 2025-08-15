@@ -260,7 +260,7 @@ class BaseScenarioWidget(QWidget):
 
         flows_item = QTreeWidgetItem(root_item, ["Traffic flows", str(len(flows))])
         for f in flows:
-            label = f"{(f['src'] or '?')} → {(f['dst'] or '?')}"
+            label = f"{(f['src'] or '?')} â†' {(f['dst'] or '?')}"
             QTreeWidgetItem(flows_item, [label, f.get('desc') or ""])
 
         nc_item = QTreeWidgetItem(root_item, ["Non-connected nodes", str(len(non_connected))])
@@ -307,6 +307,9 @@ class SectionWidget(QWidget):
         self.max_rows = 10
         self.section_name = section_name
         self.dropdown_items = dropdown_items or ["Random", "Option 1", "Option 2", "Option 3"]
+
+        # Set size policy to expand in both directions
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         # Per-section overrides
         if self.section_name == "Node Information":
@@ -373,18 +376,28 @@ class SectionWidget(QWidget):
             segments_row.addWidget(self.nodes_spin)
             root_v.addLayout(segments_row)
 
-        # Scroll area with container
+        # Create container widget that will expand to fill available space
         self._dropdowns_container = QWidget()
         self._dropdowns_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
+        # Use a layout that expands properly
         self.dropdowns_layout = QVBoxLayout()
         self.dropdowns_layout.setContentsMargins(0, 0, 0, 0)
         self.dropdowns_layout.setSpacing(8)
+        # Add stretch at the end to push content to top but allow expansion
+        self.dropdowns_layout.addStretch(1)
         self._dropdowns_container.setLayout(self.dropdowns_layout)
 
+        # Configure scroll area to expand properly
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._scroll.setWidget(self._dropdowns_container)
+        
+        # Add scroll area with stretch factor to fill remaining space
         root_v.addWidget(self._scroll, 1)
 
         # State
@@ -413,9 +426,10 @@ class SectionWidget(QWidget):
 
     def _remove_entry(self, key):
         # find tuple with key
-        for (combo, spin, k, rm) in list(self.dropdown_factor_pairs):
+        for entry in list(self.dropdown_factor_pairs):
+            combo, spin, k, rm = entry[:4]  # Get first 4 elements
             if k is key:
-                self.dropdown_factor_pairs.remove((combo, spin, k, rm))
+                self.dropdown_factor_pairs.remove(entry)
                 if self.section_name == "Traffic":
                     extra = self.traffic_extras.pop(k, None)
                     if extra and extra[-1] is not None:
@@ -431,6 +445,8 @@ class SectionWidget(QWidget):
                         if w:
                             w.setParent(None)
                             w.deleteLater()
+                    # Remove from parent layout
+                    self.dropdowns_layout.removeItem(layout)
                     layout.setParent(None)
                 break
         self.redistribute_factors()
@@ -456,6 +472,26 @@ class SectionWidget(QWidget):
         if idx >= 0:
             combo.setCurrentIndex(idx)
         row.addWidget(combo)
+
+        # For Events section, add script path field and browse button
+        script_path_edit = None
+        script_browse_btn = None
+        if self.section_name == "Events":
+            script_path_edit = QLineEdit()
+            script_path_edit.setPlaceholderText("Enter script path...")
+            script_browse_btn = QPushButton("Browse")
+            script_browse_btn.setFixedWidth(70)
+            
+            def browse_script():
+                file_path, _ = QFileDialog.getOpenFileName(
+                    self, "Select Script File", "", "All Files (*)"
+                )
+                if file_path:
+                    script_path_edit.setText(file_path)
+            
+            script_browse_btn.clicked.connect(browse_script)
+            row.addWidget(script_path_edit, 1)
+            row.addWidget(script_browse_btn)
 
         row.addWidget(QLabel("Weight:"))
         factor_spin = QDoubleSpinBox()
@@ -527,7 +563,9 @@ class SectionWidget(QWidget):
             group_v.addLayout(row)
             group_v.addLayout(pattern_row)
             group_v.addLayout(extra_row)
-            self.dropdowns_layout.addWidget(group_box)
+            
+            # Insert before the stretch at the end
+            self.dropdowns_layout.insertWidget(self.dropdowns_layout.count() - 1, group_box)
 
             key = group_box
             self.traffic_extras[key] = (pattern_combo, rate_spin, period_spin, jitter_spin, group_box)
@@ -535,10 +573,15 @@ class SectionWidget(QWidget):
             self.dropdown_factor_pairs.append((combo, factor_spin, key, remove_btn))
         else:
             # Non-traffic: plain row
-            self.dropdowns_layout.addLayout(row)
+            # Insert before the stretch at the end
+            self.dropdowns_layout.insertLayout(self.dropdowns_layout.count() - 1, row)
             key = row
             remove_btn.clicked.connect(lambda: self._remove_entry(key))
-            self.dropdown_factor_pairs.append((combo, factor_spin, key, remove_btn))
+            # Store script path components for Events section
+            if self.section_name == "Events":
+                self.dropdown_factor_pairs.append((combo, factor_spin, key, remove_btn, script_path_edit, script_browse_btn))
+            else:
+                self.dropdown_factor_pairs.append((combo, factor_spin, key, remove_btn))
 
         self.redistribute_factors()
         self.update_count_label()
@@ -547,7 +590,8 @@ class SectionWidget(QWidget):
 
     def clear_all_rows(self):
         # remove all entries from container
-        for (combo, spin, key, rm) in list(self.dropdown_factor_pairs):
+        for entry in list(self.dropdown_factor_pairs):
+            combo, spin, key = entry[:3]  # Get first 3 elements
             if self.section_name == "Traffic":
                 extra = self.traffic_extras.pop(key, None)
                 if extra and extra[-1] is not None:
@@ -562,6 +606,7 @@ class SectionWidget(QWidget):
                     if w: 
                         w.setParent(None)
                         w.deleteLater()
+                self.dropdowns_layout.removeItem(layout)
                 layout.setParent(None)
         self.dropdown_factor_pairs.clear()
         self._refresh_scroll()
@@ -573,15 +618,16 @@ class SectionWidget(QWidget):
             return
         even = round(1.0 / n, 3)
         # last spin takes the residual to ensure sum ~1.0
-        for i, (_, spin, *_rest) in enumerate(self.dropdown_factor_pairs):
+        for i, entry in enumerate(self.dropdown_factor_pairs):
+            _, spin = entry[:2]  # Get first 2 elements (combo, factor_spin)
             if i < n - 1:
                 spin.blockSignals(True); spin.setValue(even); spin.blockSignals(False)
             else:
-                resid = max(0.0, 1.0 - sum(s.value() for _, s, *_ in self.dropdown_factor_pairs[:-1]))
+                resid = max(0.0, 1.0 - sum(e[1].value() for e in self.dropdown_factor_pairs[:-1]))
                 spin.blockSignals(True); spin.setValue(round(resid, 3)); spin.blockSignals(False)
 
     def validate_factors(self):
-        s = round(sum(spin.value() for _, spin, *_ in self.dropdown_factor_pairs), 3)
+        s = round(sum(entry[1].value() for entry in self.dropdown_factor_pairs), 3)
         if abs(s - 1.0) > 0.005:
             self.warning_label.setText(f"Warning: weights sum to {s:.3f} (should be 1.000)")
         else:
@@ -604,10 +650,18 @@ class SectionWidget(QWidget):
                 section_elem.set("total_nodes", str(self.nodes_spin.value()))
             elif self.section_name == "Segmentation":
                 section_elem.set("total_segments", str(self.nodes_spin.value()))
-        for combo, factor, key, _ in self.dropdown_factor_pairs:
+        for entry in self.dropdown_factor_pairs:
+            combo, factor, key = entry[:3]  # Get first 3 elements
             item_elem = ET.SubElement(section_elem, "item")
             item_elem.set("selected", combo.currentText())
             item_elem.set("factor", f"{factor.value():.3f}")
+            
+            # Handle Events section script path
+            if self.section_name == "Events" and len(entry) >= 6:
+                script_path_edit = entry[4]  # script_path_edit is 5th element (index 4)
+                if script_path_edit and script_path_edit.text().strip():
+                    item_elem.set("script_path", script_path_edit.text().strip())
+                    
             if self.section_name == "Traffic" and key in self.traffic_extras:
                 pattern_combo, rate_spin, period_spin, jitter_spin, _box = self.traffic_extras[key]
                 sel = pattern_combo.currentText()
@@ -637,7 +691,9 @@ class SectionWidget(QWidget):
 
         for item_elem in items:
             self.add_dropdown()
-            combo, factor, key, _rm = self.dropdown_factor_pairs[-1]
+            entry = self.dropdown_factor_pairs[-1]
+            combo, factor, key = entry[:3]  # Get first 3 elements
+            
             # selection
             sel = item_elem.get("selected", "Random")
             idx = combo.findText(sel)
@@ -648,6 +704,13 @@ class SectionWidget(QWidget):
                 factor.setValue(float(item_elem.get("factor", "1.0")))
             except Exception:
                 pass
+
+            # Handle Events section script path
+            if self.section_name == "Events" and len(entry) >= 6:
+                script_path_edit = entry[4]  # script_path_edit is 5th element (index 4)
+                script_path = item_elem.get("script_path", "")
+                if script_path_edit and script_path:
+                    script_path_edit.setText(script_path)
 
             if self.section_name == "Traffic" and key in self.traffic_extras:
                 pattern_combo, rate_spin, period_spin, jitter_spin, box = self.traffic_extras[key]
@@ -668,26 +731,34 @@ class SectionWidget(QWidget):
 
         self.validate_factors()
         self._refresh_scroll()
+
 class ScenarioEditor(QWidget):
     def __init__(self):
         super().__init__()
-        layout = QVBoxLayout()
+        # Set size policy to expand in both directions
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
         self.stacked = QStackedWidget()
+        self.stacked.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.pages = {}
         self.sections = {}
 
         # Base Scenario page
         base_page = QWidget()
-        base_v = QVBoxLayout()
+        base_page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        base_v = QVBoxLayout(base_page)
+        base_v.setContentsMargins(8, 8, 8, 8)
         self.base_scenario_group = QGroupBox("Base Scenario")
+        self.base_scenario_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         base_layout = QVBoxLayout()
         self.base_scenario_widget = BaseScenarioWidget()
         base_layout.addWidget(self.base_scenario_widget)
         self.base_scenario_group.setLayout(base_layout)
-        base_v.addWidget(self.base_scenario_group)
-        base_v.addStretch()
-        base_page.setLayout(base_v)
+        base_v.addWidget(self.base_scenario_group, 1)
         self.stacked.addWidget(base_page)
         self.pages["Base Scenario"] = base_page
 
@@ -705,13 +776,15 @@ class ScenarioEditor(QWidget):
             self.sections[name] = section
 
             page = QWidget()
-            pv = QVBoxLayout()
+            page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            pv = QVBoxLayout(page)
+            pv.setContentsMargins(8, 8, 8, 8)
             group_box = QGroupBox(name)
+            group_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             group_layout = QVBoxLayout()
-            group_layout.addWidget(section)
+            group_layout.addWidget(section, 1)
             group_box.setLayout(group_layout)
-            pv.addWidget(group_box)
-            pv.addStretch()
+            pv.addWidget(group_box, 1)
             page.setLayout(pv)
 
             self.stacked.addWidget(page)
@@ -719,20 +792,20 @@ class ScenarioEditor(QWidget):
 
         # Notes page
         notes_page = QWidget()
-        notes_v = QVBoxLayout()
+        notes_page.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        notes_v = QVBoxLayout(notes_page)
+        notes_v.setContentsMargins(8, 8, 8, 8)
         self.notes_widget = NotesWidget()
         notes_group = QGroupBox("Notes")
+        notes_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         notes_layout = QVBoxLayout()
-        notes_layout.addWidget(self.notes_widget)
+        notes_layout.addWidget(self.notes_widget, 1)
         notes_group.setLayout(notes_layout)
-        notes_v.addWidget(notes_group)
-        notes_v.addStretch()
-        notes_page.setLayout(notes_v)
+        notes_v.addWidget(notes_group, 1)
         self.stacked.addWidget(notes_page)
         self.pages["Notes"] = notes_page
 
-        layout.addWidget(self.stacked)
-        self.setLayout(layout)
+        layout.addWidget(self.stacked, 1)
 
     def set_active_section(self, section_name: str | None):
         if not section_name or section_name not in self.pages:
@@ -792,14 +865,16 @@ class MainWindow(QMainWindow):
         self.tree.itemClicked.connect(self.on_tree_click)
 
         self.right_panel = QWidget()
-        self.right_panel.setLayout(QVBoxLayout())
+        self.right_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        right_layout = QVBoxLayout(self.right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
 
         splitter.addWidget(self.tree)
         splitter.addWidget(self.right_panel)
         self.tree.setMinimumWidth(220)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        self.right_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCentralWidget(splitter)
 
         # File menu (basic Save/Load)
@@ -875,13 +950,14 @@ class MainWindow(QMainWindow):
                 if "has been deleted" not in str(e):
                     raise
         # Replace right panel content
-        for i in reversed(range(self.right_panel.layout().count())):
-            w = self.right_panel.layout().itemAt(i).widget()
+        layout = self.right_panel.layout()
+        for i in reversed(range(layout.count())):
+            w = layout.itemAt(i).widget()
             if w:
                 w.setParent(None)
 
         editor = ScenarioEditor()
-        self.right_panel.layout().addWidget(editor)
+        layout.addWidget(editor, 1)
         self.current_editor = editor
         self.current_item = item
 
@@ -929,8 +1005,9 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 if self.current_item == top:
                     # clear right panel
-                    for i in reversed(range(self.right_panel.layout().count())):
-                        w = self.right_panel.layout().itemAt(i).widget()
+                    layout = self.right_panel.layout()
+                    for i in reversed(range(layout.count())):
+                        w = layout.itemAt(i).widget()
                         if w:
                             w.setParent(None)
                     self.current_item = None
@@ -974,6 +1051,7 @@ class MainWindow(QMainWindow):
             ET.indent(root, space="  ", level=0)
             ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
             QMessageBox.information(self, "Success", f"Scenarios saved to {path}")
+            self.save_settings(path)
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to save scenarios:\n{e}")
 
@@ -981,6 +1059,9 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Load Scenarios", "", "XML Files (*.xml);;All Files (*)")
         if not path:
             return
+        self.load_scenarios_from_file(path)
+
+    def load_scenarios_from_file(self, path):
         try:
             tree = ET.parse(path)
             root = tree.getroot()
@@ -991,8 +1072,9 @@ class MainWindow(QMainWindow):
             self.current_editor = None
             # Clear right panel widgets
             if self.right_panel and self.right_panel.layout():
-                for i in reversed(range(self.right_panel.layout().count())):
-                    w = self.right_panel.layout().itemAt(i).widget()
+                layout = self.right_panel.layout()
+                for i in reversed(range(layout.count())):
+                    w = layout.itemAt(i).widget()
                     if w:
                         w.setParent(None)
             self.tree.clear()
@@ -1008,6 +1090,7 @@ class MainWindow(QMainWindow):
                     xml_str = ET.tostring(scen_editor, encoding="unicode")
                     item.setData(0, Qt.ItemDataRole.UserRole, xml_str)
             QMessageBox.information(self, "Success", f"Scenarios loaded from {path}")
+            self.save_settings(path)
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to load scenarios:\n{e}")
 
