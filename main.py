@@ -260,7 +260,7 @@ class BaseScenarioWidget(QWidget):
 
         flows_item = QTreeWidgetItem(root_item, ["Traffic flows", str(len(flows))])
         for f in flows:
-            label = f"{(f['src'] or '?')} â†' {(f['dst'] or '?')}"
+            label = f"{(f['src'] or '?')} Ã¢â€ ' {(f['dst'] or '?')}"
             QTreeWidgetItem(flows_item, [label, f.get('desc') or ""])
 
         nc_item = QTreeWidgetItem(root_item, ["Non-connected nodes", str(len(non_connected))])
@@ -325,7 +325,7 @@ class SectionWidget(QWidget):
         elif self.section_name == "Vulnerabilities":
             self.dropdown_items = ["SSHCreds", "Bashbug", "FileArtifact", "Incompetence", "Random"]
         elif self.section_name == "Segmentation":
-            self.dropdown_items = ["Base Router", "Firewall", "NAT", "VPN", "Random"]
+            self.dropdown_items = ["Firewall", "NAT", "VPN", "Random"]
 
         # Layout skeleton
         root_v = QVBoxLayout(self)
@@ -357,8 +357,11 @@ class SectionWidget(QWidget):
         top_row.addStretch(1)
         root_v.addLayout(top_row)
 
-        # Optional spinners for nodes/segments
+        # Optional spinners for nodes and density
         self.nodes_spin = None
+        self.density_spin = None
+        
+        # Only add Total Nodes spinner for Node Information section
         if self.section_name == "Node Information":
             nodes_row = QHBoxLayout()
             nodes_row.addWidget(QLabel("Total Nodes:"))
@@ -367,14 +370,19 @@ class SectionWidget(QWidget):
             self.nodes_spin.setValue(1)
             nodes_row.addWidget(self.nodes_spin)
             root_v.addLayout(nodes_row)
-        elif self.section_name == "Segmentation":
-            segments_row = QHBoxLayout()
-            segments_row.addWidget(QLabel("Total Segments:"))
-            self.nodes_spin = QSpinBox()
-            self.nodes_spin.setRange(1, 100)
-            self.nodes_spin.setValue(1)
-            segments_row.addWidget(self.nodes_spin)
-            root_v.addLayout(segments_row)
+        
+        # Add density spin box for specified sections (including Segmentation)
+        if self.section_name in ["Routing", "Services", "Traffic", "Events", "Vulnerabilities", "Segmentation"]:
+            density_row = QHBoxLayout()
+            density_row.addWidget(QLabel("Density:"))
+            self.density_spin = QDoubleSpinBox()
+            self.density_spin.setRange(0.0, 1.0)
+            self.density_spin.setDecimals(3)
+            self.density_spin.setSingleStep(0.01)
+            self.density_spin.setValue(0.5)
+            density_row.addWidget(self.density_spin)
+            density_row.addStretch(1)
+            root_v.addLayout(density_row)
 
         # Create container widget that will expand to fill available space
         self._dropdowns_container = QWidget()
@@ -525,7 +533,7 @@ class SectionWidget(QWidget):
             pattern_row.setSpacing(8)
             pattern_row.addWidget(QLabel("Pattern:"))
             pattern_combo = QComboBox()
-            pattern_combo.addItems(["1kbps", "5kbps", "Jitter", "Periodic (1s)", "Periodic (5s)", "Random", "Custom"])
+            pattern_combo.addItems(["1kbps", "5kbps", "Jitter", "Periodic (repeat every x seconds)", "Random", "Custom"])
             pattern_row.addWidget(pattern_combo)
 
             # Extra inputs
@@ -648,8 +656,11 @@ class SectionWidget(QWidget):
         if self.nodes_spin is not None:
             if self.section_name == "Node Information":
                 section_elem.set("total_nodes", str(self.nodes_spin.value()))
-            elif self.section_name == "Segmentation":
-                section_elem.set("total_segments", str(self.nodes_spin.value()))
+        
+        # Save density value for applicable sections
+        if self.density_spin is not None:
+            section_elem.set("density", f"{self.density_spin.value():.3f}")
+            
         for entry in self.dropdown_factor_pairs:
             combo, factor, key = entry[:3]  # Get first 3 elements
             item_elem = ET.SubElement(section_elem, "item")
@@ -678,9 +689,15 @@ class SectionWidget(QWidget):
             if self.section_name == "Node Information":
                 v = section_elem.get("total_nodes")
                 if v: self.nodes_spin.setValue(int(v))
-            elif self.section_name == "Segmentation":
-                v = section_elem.get("total_segments")
-                if v: self.nodes_spin.setValue(int(v))
+        
+        # Load density value for applicable sections
+        if self.density_spin is not None:
+            density_val = section_elem.get("density")
+            if density_val:
+                try:
+                    self.density_spin.setValue(float(density_val))
+                except Exception:
+                    pass
 
         # rebuild rows
         self.clear_all_rows()
