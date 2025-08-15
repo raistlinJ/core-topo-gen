@@ -84,10 +84,16 @@ def strip_ns(tag: str) -> str:
 
 def text_content(el) -> str:
     """Concatenate text and tail (namespace-agnostic)."""
-    parts = []
-    t = (el.text or "").strip()
-    if t:
-        parts.append(t)
+    if el is None:
+        return ""
+    # ``ElementTree`` provides ``itertext`` which yields all text nodes
+    # including tails of children in document order.  We trim whitespace and
+    # join the pieces so callers receive a single normalized string.
+    parts: List[str] = []
+    for txt in el.itertext():
+        txt = txt.strip()
+        if txt:
+            parts.append(txt)
     return " ".join(parts)
 
 def first(*vals):
