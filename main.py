@@ -260,7 +260,7 @@ class BaseScenarioWidget(QWidget):
 
         flows_item = QTreeWidgetItem(root_item, ["Traffic flows", str(len(flows))])
         for f in flows:
-            label = f"{(f['src'] or '?')} Ã¢â€ ' {(f['dst'] or '?')}"
+            label = f"{(f['src'] or '?')} -> {(f['dst'] or '?')}"
             QTreeWidgetItem(flows_item, [label, f.get('desc') or ""])
 
         nc_item = QTreeWidgetItem(root_item, ["Non-connected nodes", str(len(non_connected))])
