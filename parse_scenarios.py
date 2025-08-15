@@ -83,11 +83,14 @@ def strip_ns(tag: str) -> str:
     return tag
 
 def text_content(el) -> str:
-    """Concatenate text and tail (namespace-agnostic)."""
+    """Concatenate element text and tail strings (namespace-agnostic)."""
     parts = []
     t = (el.text or "").strip()
     if t:
         parts.append(t)
+    tail = (el.tail or "").strip()
+    if tail:
+        parts.append(tail)
     return " ".join(parts)
 
 def first(*vals):
