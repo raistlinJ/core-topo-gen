@@ -288,6 +288,7 @@ class NotesWidget(QWidget):
         return section_elem
 
     def from_xml(self, section_elem):
+        self._loading = True
         note_elem = section_elem.find("notes")
         self.text.setPlainText(note_elem.text if note_elem is not None and note_elem.text else "")
 
@@ -304,6 +305,7 @@ class SectionWidget(QWidget):
     """
     def __init__(self, section_name, dropdown_items=None, parent=None):
         super().__init__(parent)
+        self._loading = False
         self.max_rows = 10
         self.section_name = section_name
         self.dropdown_items = dropdown_items or ["Random", "Option 1", "Option 2", "Option 3"]
@@ -319,7 +321,7 @@ class SectionWidget(QWidget):
         elif self.section_name == "Services":
             self.dropdown_items = ["SSH", "HTTP", "DHCPClient", "Random"]
         elif self.section_name == "Traffic":
-            self.dropdown_items = ["Custom", "TCP", "UDP"]
+            self.dropdown_items = ["Custom", "TCP", "UDP", "Random"]
         elif self.section_name == "Events":
             self.dropdown_items = ["Script Path"]
         elif self.section_name == "Vulnerabilities":
@@ -457,7 +459,8 @@ class SectionWidget(QWidget):
                     self.dropdowns_layout.removeItem(layout)
                     layout.setParent(None)
                 break
-        self.redistribute_factors()
+        if not self._loading:
+            self.redistribute_factors()
         self.update_count_label()
         self._apply_limits()
         self._refresh_scroll()
@@ -591,7 +594,8 @@ class SectionWidget(QWidget):
             else:
                 self.dropdown_factor_pairs.append((combo, factor_spin, key, remove_btn))
 
-        self.redistribute_factors()
+        if not self._loading:
+            self.redistribute_factors()
         self.update_count_label()
         self._apply_limits()
         self._refresh_scroll()
@@ -621,6 +625,8 @@ class SectionWidget(QWidget):
 
     # ---- factor management ----
     def redistribute_factors(self):
+        if getattr(self, "_loading", False):
+            return
         n = len(self.dropdown_factor_pairs)
         if n == 0:
             return
@@ -634,12 +640,16 @@ class SectionWidget(QWidget):
                 resid = max(0.0, 1.0 - sum(e[1].value() for e in self.dropdown_factor_pairs[:-1]))
                 spin.blockSignals(True); spin.setValue(round(resid, 3)); spin.blockSignals(False)
 
+
     def validate_factors(self):
+        if getattr(self, "_loading", False):
+            return
         s = round(sum(entry[1].value() for entry in self.dropdown_factor_pairs), 3)
         if abs(s - 1.0) > 0.005:
             self.warning_label.setText(f"Warning: weights sum to {s:.3f} (should be 1.000)")
         else:
             self.warning_label.setText("")
+
 
     def update_count_label(self):
         try:
@@ -684,6 +694,7 @@ class SectionWidget(QWidget):
         return section_elem
 
     def from_xml(self, section_elem):
+        self._loading = True
         # optional totals
         if self.nodes_spin is not None:
             if self.section_name == "Node Information":
@@ -746,6 +757,7 @@ class SectionWidget(QWidget):
                 except Exception:
                     pass
 
+        self._loading = False
         self.validate_factors()
         self._refresh_scroll()
 
@@ -873,6 +885,7 @@ class MainWindow(QMainWindow):
         self.current_item: QTreeWidgetItem | None = None
         self.current_editor: ScenarioEditor | None = None
         self.settings_file = self.get_settings_file_path()
+        self.current_file: str | None = None
 
         splitter = QSplitter(self)
         self.tree = QTreeWidget()
@@ -897,9 +910,14 @@ class MainWindow(QMainWindow):
         # File menu (basic Save/Load)
         menubar = self.menuBar()
         file_menu = menubar.addMenu("File")
-        save_action = file_menu.addAction("Save…")
-        save_action.triggered.connect(self.save_all)
+        save_action = file_menu.addAction("Save")
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(self.save_to_current)
+        save_as_action = file_menu.addAction("Save As…")
+        save_as_action.setShortcut("Ctrl+Shift+S")
+        save_as_action.triggered.connect(self.save_all)
         load_action = file_menu.addAction("Load…")
+        load_action.setShortcut("Ctrl+O")
         load_action.triggered.connect(self.load_from_path)
 
         # Try to load last file or start with defaults
@@ -1048,10 +1066,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to load scenario from tree data:\n{e}")
 
-    def save_all(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Scenarios", "", "XML Files (*.xml);;All Files (*)")
-        if not path:
-            return
+    def _write_to_path(self, path: str):
         try:
             root = ET.Element("Scenarios")
             for i in range(self.tree.topLevelItemCount()):
@@ -1063,14 +1078,41 @@ class MainWindow(QMainWindow):
                 if scen_xml:
                     scen.append(ET.fromstring(scen_xml))
                 root.append(scen)
-            
-            # Pretty print the XML
-            ET.indent(root, space="  ", level=0)
-            ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
-            QMessageBox.information(self, "Success", f"Scenarios saved to {path}")
+            tree = ET.ElementTree(root)
+            tree.write(path, encoding="utf-8", xml_declaration=True)
+            self.current_file = path
             self.save_settings(path)
+            QMessageBox.information(self, "Saved", f"Scenarios saved to {path}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to save scenarios:\n{e}")
+
+    def save_to_current(self):
+        # Save without prompting if we have a known file; otherwise fall back to Save As…
+        target = self.current_file
+        if not target:
+            # Try settings as fallback
+            settings = self.load_settings()
+            target = settings.get("last_file")
+        if target:
+            self._write_to_path(target)
+        else:
+            self.save_all()
+
+    def save_all(self):
+        # Save As…
+        default_dir = ""
+        if self.current_file:
+            default_dir = self.current_file
+        else:
+            settings = self.load_settings()
+            last_file = settings.get("last_file")
+            if last_file:
+                default_dir = last_file
+        path, _ = QFileDialog.getSaveFileName(self, "Save Scenarios", default_dir, "XML Files (*.xml);;All Files (*)")
+        if not path:
+            return
+        self._write_to_path(path)
+
 
     def load_from_path(self):
         path, _ = QFileDialog.getOpenFileName(self, "Load Scenarios", "", "XML Files (*.xml);;All Files (*)")
@@ -1108,6 +1150,7 @@ class MainWindow(QMainWindow):
                     item.setData(0, Qt.ItemDataRole.UserRole, xml_str)
             QMessageBox.information(self, "Success", f"Scenarios loaded from {path}")
             self.save_settings(path)
+            self.current_file = path
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to load scenarios:\n{e}")
 
