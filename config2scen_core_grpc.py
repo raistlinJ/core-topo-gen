@@ -23,11 +23,16 @@ from dataclasses import dataclass
 import argparse
 import math
 import os
+import random
+import logging
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from core.api.grpc import client
 from core.api.grpc.wrappers import NodeType, Position, Interface
+
+# module logger
+logger = logging.getLogger(__name__)
 
 
 # ---------------- XML parsing ----------------
@@ -43,7 +48,55 @@ def _find_scenario(root: ET.Element, scenario_name: str | None) -> ET.Element | 
     return scenarios[0]
 
 
-def parse_node_info(xml_path: str, scenario_name: str | None) -> Tuple[int, List[Tuple[str, float]]]:
+@dataclass
+class ServiceInfo:
+    name: str
+    factor: float  # Distribution across selected nodes
+    density: float  # Distribution across entire scenario
+
+def parse_services(scenario: ET.Element) -> List[ServiceInfo]:
+    """
+    Parse services under:
+      <Scenario>
+        <Services>
+          <Service selected="HTTP" factor="0.5" density="0.3" />
+    """
+    services: List[ServiceInfo] = []
+
+    # Prefer ScenarioEditor section style: <section name="Services" density="..."><item .../></section>
+    section = scenario.find(".//section[@name='Services']")
+    if section is not None:
+        den_section_raw = (section.get("density") or "").strip()
+        if not den_section_raw:
+            logger.warning("'Services' section missing 'density'; no services will be assigned from this section")
+        try:
+            section_density = float(den_section_raw) if den_section_raw else 0.0
+        except Exception:
+            logger.warning("'Services' section has invalid 'density' value '%s'", den_section_raw)
+            section_density = 0.0
+        for it in section.findall("./item"):
+            name = (it.get("selected") or "").strip()
+            if not name:
+                continue
+            try:
+                factor = float((it.get("factor") or "0").strip())
+            except Exception:
+                factor = 0.0
+            # If an item-level density is present, ignore it and warn
+            if it.get("density"):
+                logger.warning("Ignoring item-level 'density' for service '%s'; using section-level density", name)
+            if factor > 0 and section_density > 0:
+                services.append(ServiceInfo(name=name, factor=factor, density=section_density))
+                logger.debug(
+                    "Parsed service (section/item): name=%s factor=%s density=%s",
+                    name, factor, section_density,
+                )
+
+    # No legacy fallback parsing; density must be defined at the Services section level
+
+    return services
+
+def parse_node_info(xml_path: str, scenario_name: str | None) -> Tuple[int, List[Tuple[str, float]], List[ServiceInfo]]:
     """
     Parse total_nodes and (role,factor) items under:
       <Scenario name="...">
@@ -55,32 +108,35 @@ def parse_node_info(xml_path: str, scenario_name: str | None) -> Tuple[int, List
           </section>
 
     Returns:
-      total_nodes (int), items [(role, factor_float), ...]
+      total_nodes (int), items [(role, factor_float), ...], services [ServiceInfo, ...]
     """
     # Safe defaults
     default_count = 5
     default_items = [("Workstation", 1.0)]
 
     if not os.path.exists(xml_path):
-        print(f"[warn] XML file not found: {xml_path}; defaulting total_nodes={default_count}, items={default_items}")
-        return default_count, default_items
+        logger.warning(
+            "XML file not found: %s; defaulting total_nodes=%s, items=%s",
+            xml_path, default_count, default_items,
+        )
+        return default_count, default_items, []
 
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
     except Exception as e:
-        print(f"[warn] Failed to parse XML ({e}); defaulting values")
-        return default_count, default_items
+        logger.warning("Failed to parse XML (%s); defaulting values", e)
+        return default_count, default_items, []
 
     scenario = _find_scenario(root, scenario_name)
     if scenario is None:
-        print("[warn] No <Scenario> found; defaulting values")
-        return default_count, default_items
+        logger.warning("No <Scenario> found; defaulting values")
+        return default_count, default_items, []
 
     section = scenario.find(".//section[@name='Node Information']")
     if section is None:
-        print("[warn] 'Node Information' section not found; defaulting values")
-        return default_count, default_items
+        logger.warning("'Node Information' section not found; defaulting values")
+        return default_count, default_items, []
 
     # total_nodes
     total_str = section.get("total_nodes", "").strip()
@@ -89,7 +145,7 @@ def parse_node_info(xml_path: str, scenario_name: str | None) -> Tuple[int, List
         if total <= 0:
             raise ValueError
     except Exception:
-        print(f"[warn] Invalid total_nodes='{total_str}'; defaulting to {default_count}")
+        logger.warning("Invalid total_nodes='%s'; defaulting to %s", total_str, default_count)
         total = default_count
 
     # items
@@ -112,7 +168,12 @@ def parse_node_info(xml_path: str, scenario_name: str | None) -> Tuple[int, List
     if not parsed:
         parsed = default_items
 
-    return total, parsed
+    # Parse services
+    services = []
+    if scenario is not None:
+        services = parse_services(scenario)
+
+    return total, parsed, services
 
 
 def compute_role_counts(total: int, role_factors: List[Tuple[str, float]]) -> Dict[str, int]:
@@ -124,6 +185,7 @@ def compute_role_counts(total: int, role_factors: List[Tuple[str, float]]) -> Di
       them *evenly* among the non-random roles.
     - If only 'Random' exists, everything becomes 'Workstation' (fallback).
     """
+    logger.debug("Computing role counts: total=%s role_factors=%s", total, role_factors)
     non_random = [(r, f) for r, f in role_factors if r.lower() != "random"]
     random_factor = sum(f for r, f in role_factors if r.lower() == "random")
 
@@ -154,6 +216,7 @@ def compute_role_counts(total: int, role_factors: List[Tuple[str, float]]) -> Di
         for j in range(remaining):
             counts[labels[j % len(labels)]] += 1
 
+    logger.debug("Computed role counts -> %s", counts)
     return counts
 
 
@@ -182,20 +245,82 @@ def _map_role_to_node_type(role: str) -> NodeType:
     return NodeType.DEFAULT
 
 
+def distribute_services(nodes: List[NodeInfo], services: List[ServiceInfo]) -> Dict[int, List[str]]:
+    """
+    Distribute services across nodes based on factor and density attributes.
+    Returns a mapping of node_id -> list of service names to apply.
+    Each service will be assigned at most once to any given node.
+    """
+    node_services: Dict[int, List[str]] = {}
+    
+    # Filter out non-host nodes and routers (they don't get services)
+    host_nodes = [
+        n for n in nodes
+        if _map_role_to_node_type(n.role) == NodeType.DEFAULT and "router" not in n.role.lower()
+    ]
+    if not host_nodes:
+        return node_services
+        
+    for service in services:
+        # Calculate how many nodes should get this service based on density
+        total_service_nodes = max(1, math.floor(len(host_nodes) * service.density))
+        logger.debug(
+            "Distributing service '%s': host_nodes=%s density=%s -> target_nodes=%s",
+            service.name, len(host_nodes), service.density, total_service_nodes,
+        )
+
+        # Only include nodes that don't already have this service
+        eligible_nodes = [
+            node for node in host_nodes
+            if node.node_id not in node_services or service.name not in node_services[node.node_id]
+        ]
+        if not eligible_nodes:
+            logger.debug("No eligible nodes for service '%s'", service.name)
+            continue
+
+        # Shuffle for fairness
+        random.shuffle(eligible_nodes)
+
+        # Preselect nodes with probability = factor
+        preselected = [n for n in eligible_nodes if random.random() < service.factor]
+        if len(preselected) > total_service_nodes:
+            selected_nodes = preselected[:total_service_nodes]
+        else:
+            # Fill remaining from the rest deterministically (already shuffled)
+            remaining_needed = total_service_nodes - len(preselected)
+            remainder = [n for n in eligible_nodes if n not in preselected]
+            selected_nodes = preselected + remainder[:remaining_needed]
+
+        logger.debug(
+            "Selected nodes for service '%s': %s",
+            service.name, [n.node_id for n in selected_nodes],
+        )
+
+        # Assign service to selected nodes (unique per node)
+        for node in selected_nodes:
+            if node.node_id not in node_services:
+                node_services[node.node_id] = []
+            node_services[node.node_id].append(service.name)
+    
+    return node_services
+
 def build_star_from_roles(core: client.CoreGrpcClient,
                           role_counts: Dict[str, int],
+                          services: Optional[List[ServiceInfo]] = None,
                           ip4_prefix: str = "10.0.0.0/24"):
     """
     Build a star with hosts created according to `role_counts` and a central SWITCH.
 
     Returns: (session, switch_node, [NodeInfo...])
     """
+    logger.info("Creating CORE session and building star topology")
     iface_helper = client.InterfaceHelper(ip4_prefix=ip4_prefix)
     session = core.create_session()
 
     # Central switch at center (node id 1)
     cx, cy = 500, 400
     switch = session.add_node(1, _type=NodeType.SWITCH, position=Position(x=cx, y=cy))
+    logger.debug("Added central switch node id=%s at (%s,%s)", switch.id, cx, cy)
 
     # Determine total number of hosts
     total_hosts = sum(role_counts.values())
@@ -208,9 +333,11 @@ def build_star_from_roles(core: client.CoreGrpcClient,
     expanded_roles: List[str] = []
     for role, count in role_counts.items():
         expanded_roles.extend([role] * count)
+    logger.debug("Expanded roles for placement: %s", expanded_roles)
 
     # Create hosts and link to switch
     sw_ifid = 0
+    nodes_by_id: Dict[int, object] = {}
     for idx, role in enumerate(expanded_roles):
         theta = (2 * math.pi * idx) / max(total_hosts, 1)
         x = int(cx + radius * math.cos(theta))
@@ -221,6 +348,8 @@ def build_star_from_roles(core: client.CoreGrpcClient,
         # Host node (even if role is 'Server'/'Workstation', it's a DEFAULT node type in CORE)
         node_name = f"{role.lower()}-{idx+1}"
         node = session.add_node(node_id, _type=node_type, position=Position(x=x, y=y), name=node_name)
+        nodes_by_id[node.id] = node
+        logger.debug("Added node id=%s name=%s type=%s at (%s,%s)", node.id, node_name, node_type, x, y)
 
         # Give host an interface/IP only if it's a host (DEFAULT). Switch/Hub/WLAN nodes don't need IPs.
         if node_type == NodeType.DEFAULT:
@@ -232,14 +361,54 @@ def build_star_from_roles(core: client.CoreGrpcClient,
             sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}")
             sw_ifid += 1
             session.add_link(node1=node, node2=switch, iface1=host_iface, iface2=sw_iface)
+            logger.debug("Linked host node %s <-> switch (sw_ifid=%s)", node.id, sw_ifid - 1)
         else:
             # Non-host roles (if present) still connect to the switch with a link (no IP on their side)
             sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}")
             sw_ifid += 1
             session.add_link(node1=node, node2=switch, iface2=sw_iface)
+            logger.debug("Linked non-host node %s <-> switch (sw_ifid=%s)", node.id, sw_ifid - 1)
 
+    # Apply services if provided
+    service_assignments: Dict[int, List[str]] = {}
+    if services:
+        service_assignments = distribute_services(node_infos, services)
+        for node_id, service_list in service_assignments.items():
+            for service_name in service_list:
+                logger.debug("Assigning service '%s' to node %s", service_name, node_id)
+                assigned = False
+                # Try session-level API first
+                try:
+                    if hasattr(session, "add_service"):
+                        session.add_service(node_id=node_id, service_name=service_name)
+                        assigned = True
+                except Exception as e:
+                    logger.debug("session.add_service failed for node %s service %s: %s", node_id, service_name, e)
+
+                if not assigned:
+                    node_obj = nodes_by_id.get(node_id)
+                    if node_obj is None:
+                        logger.warning("No node object found for node_id=%s to assign service '%s'", node_id, service_name)
+                    else:
+                        # Try common wrapper patterns
+                        try:
+                            if hasattr(node_obj, "services") and hasattr(node_obj.services, "add"):
+                                node_obj.services.add(service_name)
+                                assigned = True
+                            elif hasattr(node_obj, "add_service"):
+                                node_obj.add_service(service_name)
+                                assigned = True
+                        except Exception as e:
+                            logger.warning("Failed to assign service '%s' to node %s: %s", service_name, node_id, e)
+
+                if assigned:
+                    logger.debug("Service '%s' assigned to node %s", service_name, node_id)
+                else:
+                    logger.warning("Service '%s' could not be assigned to node %s", service_name, node_id)
+    
     core.start_session(session)
-    return session, switch, node_infos
+    logger.info("Started CORE session id=%s with %s nodes (plus switch)", session.id, len(node_infos))
+    return session, switch, node_infos, service_assignments
 
 
 # ---------------- CLI ----------------
@@ -253,9 +422,16 @@ def main():
     ap.add_argument("--prefix", default="10.0.0.0/24", help="IPv4 prefix for auto-assigned addresses")
     ap.add_argument("--max-nodes", type=int, default=None,
                     help="Optional cap on hosts to create (useful for very large XMLs)")
+    ap.add_argument("--verbose", action="store_true", help="Enable debug logging")
     args = ap.parse_args()
 
-    total, items = parse_node_info(args.xml, args.scenario)
+    # logging setup
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
+
+    total, items, services = parse_node_info(args.xml, args.scenario)
     if args.max_nodes is not None and args.max_nodes > 0:
         total = min(total, args.max_nodes)
 
@@ -264,17 +440,26 @@ def main():
     core = client.CoreGrpcClient(address=f"{args.host}:{args.port}")
     core.connect()  # ensure core-daemon is running with gRPC enabled
 
-    session, switch, nodes = build_star_from_roles(core, role_counts, ip4_prefix=args.prefix)
+    session, switch, nodes, service_assignments = build_star_from_roles(
+        core, 
+        role_counts, 
+        services=services, 
+        ip4_prefix=args.prefix)
 
-    print(f"Started CORE session id: {session.id}")
-    print(f"Switch node id: {switch.id}")
-    print(f"Created {len(nodes)} nodes from XML")
-    print("Role distribution:")
+    logger.info("Started CORE session id: %s", session.id)
+    logger.info("Switch node id: %s", switch.id)
+    logger.info("Created %s nodes from XML", len(nodes))
+    logger.info("Role distribution:")
     for role, count in role_counts.items():
-        print(f"  {role}: {count}")
-    print("Hosts (DEFAULT type) with IPs:")
+        logger.info("  %s: %s", role, count)
+    logger.info("Hosts (DEFAULT type) with IPs:")
     for n in nodes:
-        print(f"  node {n.node_id} ({n.role}) -> {n.ip4}")
+        logger.info("  node %s (%s) -> %s", n.node_id, n.role, n.ip4)
+    
+    if services and service_assignments:
+        logger.info("Configured services:")
+        for node_id, service_list in service_assignments.items():
+            logger.info("  node %s: %s", node_id, ", ".join(service_list))
 
 
 if __name__ == "__main__":
