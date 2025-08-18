@@ -343,6 +343,24 @@ class UniqueAllocator:
         return "02:" + ":".join(f"{x:02x}" for x in b5)
 
 
+class SubnetAllocator:
+    """
+    Allocate non-overlapping IPv4 subnets from a base network. Supports
+    different requested prefix lengths by aligning to the next suitable boundary.
+    """
+    def __init__(self, ip4_prefix: str):
+        self.base = ipaddress.IPv4Network(ip4_prefix, strict=False)
+        self.next_addr = int(self.base.network_address)
+
+    def next_subnet(self, prefixlen: int) -> ipaddress.IPv4Network:
+        size = 1 << (32 - prefixlen)
+        # align next_addr to prefix boundary
+        aligned = (self.next_addr + size - 1) // size * size
+        net = ipaddress.IPv4Network((ipaddress.IPv4Address(aligned), prefixlen))
+        self.next_addr = aligned + size
+        return net
+
+
 def _map_role_to_node_type(role: str) -> NodeType:
     """
     Map a role label from XML to a CORE NodeType.
@@ -444,7 +462,9 @@ def build_star_from_roles(core: client.CoreGrpcClient,
     Returns: (session, switch_node, [NodeInfo...])
     """
     logger.info("Creating CORE session and building star topology")
-    allocator = UniqueAllocator(ip4_prefix)
+    # allocate MACs; IPs come from subnets per link/segment
+    mac_alloc = UniqueAllocator(ip4_prefix)
+    subnet_alloc = SubnetAllocator(ip4_prefix)
     session = core.create_session()
 
     # Central switch at center (node id 1)
@@ -483,20 +503,20 @@ def build_star_from_roles(core: client.CoreGrpcClient,
 
         # Give host an interface/IP only if it's a host (DEFAULT). Switch/Hub/WLAN nodes don't need IPs.
         if node_type == NodeType.DEFAULT:
-            host_ip, host_mask = allocator.next_ip()
-            host_mac = allocator.next_mac()
+            host_ip, host_mask = mac_alloc.next_ip()
+            host_mac = mac_alloc.next_mac()
             host_iface = Interface(id=0, name="eth0", ip4=host_ip, ip4_mask=host_mask, mac=host_mac)
             node_infos.append(NodeInfo(node_id=node.id,
                                        ip4=f"{host_ip}/{host_mask}",
                                        role=role))
             # Link to switch with explicit ifaces at both ends
-            sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=allocator.next_mac())
+            sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=mac_alloc.next_mac())
             sw_ifid += 1
             session.add_link(node1=node, node2=switch, iface1=host_iface, iface2=sw_iface)
             logger.debug("Linked host node %s <-> switch (sw_ifid=%s)", node.id, sw_ifid - 1)
         else:
             # Non-host roles (if present) still connect to the switch with a link (no IP on their side)
-            sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=allocator.next_mac())
+            sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=mac_alloc.next_mac())
             sw_ifid += 1
             session.add_link(node1=node, node2=switch, iface2=sw_iface)
             logger.debug("Linked non-host node %s <-> switch (sw_ifid=%s)", node.id, sw_ifid - 1)
@@ -618,7 +638,8 @@ def build_segmented_topology(core: client.CoreGrpcClient,
     Returns: (session, routers: List[NodeInfo], hosts: List[NodeInfo], host_service_assignments: Dict[int, List[str]], router_protocols: Dict[int, List[str]])
     """
     logger.info("Creating CORE session and building segmented topology with routers")
-    allocator = UniqueAllocator(ip4_prefix)
+    mac_alloc = UniqueAllocator(ip4_prefix)
+    subnet_alloc = SubnetAllocator(ip4_prefix)
     session = core.create_session()
 
     # Create host nodes according to role_counts first (to know total)
@@ -652,20 +673,28 @@ def build_segmented_topology(core: client.CoreGrpcClient,
         router_nodes[node.id] = node
         logger.debug("Added router id=%s at (%s,%s)", node.id, x, y)
 
-    # Connect routers in a ring
+    # Connect routers in a ring; special-case 2 routers to avoid duplicate link
     if router_count > 1:
-        for i in range(router_count):
-            a = router_nodes[i + 1]
-            b = router_nodes[(i + 1) % router_count + 1]
+        link_pairs = []
+        if router_count == 2:
+            link_pairs = [(1, 2)]
+        else:
+            link_pairs = [(i + 1, (i + 1) % router_count + 1) for i in range(router_count)]
+        for aid, bid in link_pairs:
+            a = router_nodes[aid]
+            b = router_nodes[bid]
             # allocate unique iface ids per router and unique names per link end
             a_ifid = router_next_ifid.get(a.id, 0)
             b_ifid = router_next_ifid.get(b.id, 0)
             router_next_ifid[a.id] = a_ifid + 1
             router_next_ifid[b.id] = b_ifid + 1
-            a_ip, a_mask = allocator.next_ip()
-            b_ip, b_mask = allocator.next_ip()
-            a_if = Interface(id=a_ifid, name=f"r{a.id}-to-r{b.id}", ip4=a_ip, ip4_mask=a_mask, mac=allocator.next_mac())
-            b_if = Interface(id=b_ifid, name=f"r{b.id}-to-r{a.id}", ip4=b_ip, ip4_mask=b_mask, mac=allocator.next_mac())
+            # allocate a unique /30 per router-router link
+            rr_net = subnet_alloc.next_subnet(30)
+            rr_hosts = list(rr_net.hosts())
+            a_ip = str(rr_hosts[0])
+            b_ip = str(rr_hosts[1])
+            a_if = Interface(id=a_ifid, name=f"r{a.id}-to-r{b.id}", ip4=a_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
+            b_if = Interface(id=b_ifid, name=f"r{b.id}-to-r{a.id}", ip4=b_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
             session.add_link(node1=a, node2=b, iface1=a_if, iface2=b_if)
             logger.debug("Linked router %s <-> router %s", a.id, b.id)
 
@@ -689,31 +718,74 @@ def build_segmented_topology(core: client.CoreGrpcClient,
         rx = int(cx + router_radius * math.cos((2 * math.pi * ridx) / router_count))
         ry = int(cy + router_radius * math.sin((2 * math.pi * ridx) / router_count))
         router_node = router_nodes[ridx + 1]
-        for j, role in enumerate(roles):
-            theta = (2 * math.pi * j) / max(len(roles), 1)
+        if len(roles) == 0:
+            continue
+        elif len(roles) == 1:
+            # create a p2p /30 between router and single host
+            role = roles[0]
+            theta = 0
             x = int(rx + host_radius * math.cos(theta))
             y = int(ry + host_radius * math.sin(theta))
-
             node_type = _map_role_to_node_type(role)
-            name = f"{role.lower()}-{ridx+1}-{j+1}"
+            name = f"{role.lower()}-{ridx+1}-1"
             host = session.add_node(node_id_counter, _type=node_type, position=Position(x=x, y=y), name=name)
             node_id_counter += 1
             host_nodes_by_id[host.id] = host
 
-            # Host iface and router iface for the link
-            h_ip, h_mask = allocator.next_ip()
-            h_mac = allocator.next_mac()
-            host_if = Interface(id=0, name="eth0", ip4=h_ip, ip4_mask=h_mask, mac=h_mac)
-            # allocate next router iface id and a unique name per host
+            # allocate subnet and IPs
+            lan_net = subnet_alloc.next_subnet(30)
+            lan_hosts = list(lan_net.hosts())
+            r_ip = str(lan_hosts[0])
+            h_ip = str(lan_hosts[1])
+            h_mac = mac_alloc.next_mac()
+            host_if = Interface(id=0, name="eth0", ip4=h_ip, ip4_mask=lan_net.prefixlen, mac=h_mac)
+
             r_ifid = router_next_ifid.get(router_node.id, 0)
             router_next_ifid[router_node.id] = r_ifid + 1
-            r_ip, r_mask = allocator.next_ip()
-            r_if = Interface(id=r_ifid, name=f"r{router_node.id}-h{host.id}", ip4=r_ip, ip4_mask=r_mask, mac=allocator.next_mac())
+            r_if = Interface(id=r_ifid, name=f"r{router_node.id}-h{host.id}", ip4=r_ip, ip4_mask=lan_net.prefixlen, mac=mac_alloc.next_mac())
             session.add_link(node1=host, node2=router_node, iface1=host_if, iface2=r_if)
 
             if node_type == NodeType.DEFAULT:
-                hosts.append(NodeInfo(node_id=host.id, ip4=f"{h_ip}/{h_mask}", role=role))
-            logger.debug("Added host id=%s role=%s linked to router %s", host.id, role, router_node.id)
+                hosts.append(NodeInfo(node_id=host.id, ip4=f"{h_ip}/{lan_net.prefixlen}", role=role))
+            logger.debug("Added host id=%s role=%s p2p to router %s", host.id, role, router_node.id)
+        else:
+            # multi-host LAN: create a switch, one router iface, multiple host links
+            lan_switch = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=Position(x=rx+40, y=ry+40), name=f"lan-{ridx+1}")
+            node_id_counter += 1
+            # allocate LAN subnet /24
+            lan_net = subnet_alloc.next_subnet(24)
+            lan_hosts = list(lan_net.hosts())
+            # router IP is first usable
+            r_ip = str(lan_hosts[0])
+            r_ifid = router_next_ifid.get(router_node.id, 0)
+            router_next_ifid[router_node.id] = r_ifid + 1
+            r_if = Interface(id=r_ifid, name=f"r{router_node.id}-lan{ridx+1}", ip4=r_ip, ip4_mask=lan_net.prefixlen, mac=mac_alloc.next_mac())
+            sw_if = Interface(id=0, name=f"lan{ridx+1}-r")
+            session.add_link(node1=router_node, node2=lan_switch, iface1=r_if, iface2=sw_if)
+            logger.debug("Linked router %s to LAN switch %s on %s/%s", router_node.id, lan_switch.id, r_ip, lan_net.prefixlen)
+
+            # assign hosts IPs starting from second usable
+            ip_index = 1
+            for j, role in enumerate(roles):
+                theta = (2 * math.pi * j) / len(roles)
+                x = int(rx + host_radius * math.cos(theta))
+                y = int(ry + host_radius * math.sin(theta))
+                node_type = _map_role_to_node_type(role)
+                name = f"{role.lower()}-{ridx+1}-{j+1}"
+                host = session.add_node(node_id_counter, _type=node_type, position=Position(x=x, y=y), name=name)
+                node_id_counter += 1
+                host_nodes_by_id[host.id] = host
+
+                h_ip = str(lan_hosts[ip_index])
+                ip_index += 1
+                h_mac = mac_alloc.next_mac()
+                host_if = Interface(id=0, name="eth0", ip4=h_ip, ip4_mask=lan_net.prefixlen, mac=h_mac)
+                sw_if = Interface(id=j+1, name=f"lan{ridx+1}-h{host.id}")
+                session.add_link(node1=host, node2=lan_switch, iface1=host_if, iface2=sw_if)
+
+                if node_type == NodeType.DEFAULT:
+                    hosts.append(NodeInfo(node_id=host.id, ip4=f"{h_ip}/{lan_net.prefixlen}", role=role))
+                logger.debug("Added host id=%s role=%s to LAN switch %s", host.id, role, lan_switch.id)
 
     # Assign routing protocols to routers per factors
     router_protocols: Dict[int, List[str]] = {r.node_id: [] for r in routers}
