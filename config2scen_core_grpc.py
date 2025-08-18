@@ -27,6 +27,7 @@ import random
 import logging
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple
+import ipaddress
 
 from core.api.grpc import client
 from core.api.grpc.wrappers import NodeType, Position, Interface
@@ -53,6 +54,81 @@ class ServiceInfo:
     name: str
     factor: float  # Distribution across selected nodes
     density: float  # Distribution across entire scenario
+
+@dataclass
+class RoutingInfo:
+    protocol: str
+    factor: float
+
+# Routing protocol services that require zebra base service
+ROUTING_STACK_SERVICES = {
+    "BGP",
+    "Babel",
+    "OSPFv2",
+    "OSPFv3",
+    "OSPFv3MDR",
+    "RIP",
+    "RIPNG",
+    "Xpimd",
+}
+
+def parse_routing_info(xml_path: str, scenario_name: str | None) -> Tuple[float, List[RoutingInfo]]:
+    """
+    Parse the Routing section:
+      <section name="Routing" density="0.5">
+        <item selected="OSPFv2" factor="1.0" />
+      </section>
+
+    Returns: (routing_density, [RoutingInfo...])
+    """
+    density = 0.0
+    items: List[RoutingInfo] = []
+
+    if not os.path.exists(xml_path):
+        logger.warning("XML not found for routing parse: %s", xml_path)
+        return density, items
+
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception as e:
+        logger.warning("Failed to parse XML for routing (%s)", e)
+        return density, items
+
+    scenario = _find_scenario(root, scenario_name)
+    if scenario is None:
+        logger.warning("No <Scenario> found for routing parse")
+        return density, items
+
+    section = scenario.find(".//section[@name='Routing']")
+    if section is None:
+        return density, items
+
+    den_raw = (section.get("density") or "").strip()
+    if den_raw:
+        try:
+            density = float(den_raw)
+            if density < 0:
+                density = 0.0
+            if density > 1:
+                density = 1.0
+        except Exception:
+            logger.warning("Invalid Routing density '%s'", den_raw)
+            density = 0.0
+
+    for it in section.findall("./item"):
+        proto = (it.get("selected") or "").strip()
+        if not proto:
+            continue
+        try:
+            factor = float((it.get("factor") or "0").strip())
+        except Exception:
+            factor = 0.0
+        if factor > 0:
+            items.append(RoutingInfo(protocol=proto, factor=factor))
+
+    logger.debug("Parsed routing: density=%s items=%s", density, [(i.protocol, i.factor) for i in items])
+    return density, items
 
 def parse_services(scenario: ET.Element) -> List[ServiceInfo]:
     """
@@ -229,6 +305,44 @@ class NodeInfo:
     role: str
 
 
+class UniqueAllocator:
+    """
+    Allocate unique IPv4 addresses and MAC addresses across a session.
+    - IPv4s are allocated sequentially from the provided prefix; if exhausted,
+      move to the next contiguous subnet with the same prefix length.
+    - MACs are locally administered (02:xx:xx:xx:xx:xx) and increment per call.
+    """
+    def __init__(self, ip4_prefix: str):
+        self.net = ipaddress.IPv4Network(ip4_prefix, strict=False)
+        # start with first usable host IP
+        self.host_offset = 1
+        self.mac_counter = 1
+
+    def next_ip(self) -> Tuple[str, int]:
+        # if we hit or exceed broadcast, advance to next network
+        if int(self.net.network_address) + self.host_offset >= int(self.net.broadcast_address):
+            base = int(self.net.network_address) + self.net.num_addresses
+            self.net = ipaddress.IPv4Network((ipaddress.IPv4Address(base), self.net.prefixlen))
+            self.host_offset = 1
+        ip_int = int(self.net.network_address) + self.host_offset
+        self.host_offset += 1
+        ip = str(ipaddress.IPv4Address(ip_int))
+        return ip, self.net.prefixlen
+
+    def next_mac(self) -> str:
+        n = self.mac_counter
+        self.mac_counter += 1
+        # construct 6 bytes: 0x02 (locally administered) + 5 bytes of counter
+        b5 = [
+            (n >> 32) & 0xFF,
+            (n >> 24) & 0xFF,
+            (n >> 16) & 0xFF,
+            (n >> 8) & 0xFF,
+            n & 0xFF,
+        ]
+        return "02:" + ":".join(f"{x:02x}" for x in b5)
+
+
 def _map_role_to_node_type(role: str) -> NodeType:
     """
     Map a role label from XML to a CORE NodeType.
@@ -243,6 +357,22 @@ def _map_role_to_node_type(role: str) -> NodeType:
         return NodeType.WIRELESS_LAN
     # Servers/Workstations/Clients/etc. are DEFAULT hosts
     return NodeType.DEFAULT
+
+def _compute_counts_by_factor(total: int, items: List[Tuple[str, float]]) -> Dict[str, int]:
+    """Helper: largest remainder allocation for names with factors summing arbitrarily."""
+    if total <= 0 or not items:
+        return {}
+    exacts = [(name, f * total) for name, f in items]
+    counts = {name: math.floor(x) for name, x in exacts}
+    remaining = total - sum(counts.values())
+    remainders = sorted(((name, x - math.floor(x)) for name, x in exacts), key=lambda t: t[1], reverse=True)
+    i = 0
+    while remaining > 0 and i < len(remainders):
+        name, _ = remainders[i]
+        counts[name] += 1
+        remaining -= 1
+        i += 1
+    return counts
 
 
 def distribute_services(nodes: List[NodeInfo], services: List[ServiceInfo]) -> Dict[int, List[str]]:
@@ -314,7 +444,7 @@ def build_star_from_roles(core: client.CoreGrpcClient,
     Returns: (session, switch_node, [NodeInfo...])
     """
     logger.info("Creating CORE session and building star topology")
-    iface_helper = client.InterfaceHelper(ip4_prefix=ip4_prefix)
+    allocator = UniqueAllocator(ip4_prefix)
     session = core.create_session()
 
     # Central switch at center (node id 1)
@@ -353,18 +483,20 @@ def build_star_from_roles(core: client.CoreGrpcClient,
 
         # Give host an interface/IP only if it's a host (DEFAULT). Switch/Hub/WLAN nodes don't need IPs.
         if node_type == NodeType.DEFAULT:
-            host_iface = iface_helper.create_iface(node_id=node.id, iface_id=0, name="eth0")
+            host_ip, host_mask = allocator.next_ip()
+            host_mac = allocator.next_mac()
+            host_iface = Interface(id=0, name="eth0", ip4=host_ip, ip4_mask=host_mask, mac=host_mac)
             node_infos.append(NodeInfo(node_id=node.id,
-                                       ip4=f"{host_iface.ip4}/{host_iface.ip4_mask}",
+                                       ip4=f"{host_ip}/{host_mask}",
                                        role=role))
             # Link to switch with explicit ifaces at both ends
-            sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}")
+            sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=allocator.next_mac())
             sw_ifid += 1
             session.add_link(node1=node, node2=switch, iface1=host_iface, iface2=sw_iface)
             logger.debug("Linked host node %s <-> switch (sw_ifid=%s)", node.id, sw_ifid - 1)
         else:
             # Non-host roles (if present) still connect to the switch with a link (no IP on their side)
-            sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}")
+            sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=allocator.next_mac())
             sw_ifid += 1
             session.add_link(node1=node, node2=switch, iface2=sw_iface)
             logger.debug("Linked non-host node %s <-> switch (sw_ifid=%s)", node.id, sw_ifid - 1)
@@ -384,6 +516,23 @@ def build_star_from_roles(core: client.CoreGrpcClient,
                         assigned = True
                 except Exception as e:
                     logger.debug("session.add_service failed for node %s service %s: %s", node_id, service_name, e)
+
+                # Try session.services.add helper
+                if not assigned:
+                    try:
+                        if hasattr(session, "services") and hasattr(session.services, "add"):
+                            try:
+                                session.services.add(node_id, service_name)
+                            except TypeError:
+                                # some versions may expect a node object
+                                node_obj_try = nodes_by_id.get(node_id)
+                                if node_obj_try is not None:
+                                    session.services.add(node_obj_try, service_name)
+                                else:
+                                    raise
+                            assigned = True
+                    except Exception as e:
+                        logger.debug("session.services.add failed for node %s service %s: %s", node_id, service_name, e)
 
                 if not assigned:
                     node_obj = nodes_by_id.get(node_id)
@@ -405,10 +554,345 @@ def build_star_from_roles(core: client.CoreGrpcClient,
                     logger.debug("Service '%s' assigned to node %s", service_name, node_id)
                 else:
                     logger.warning("Service '%s' could not be assigned to node %s", service_name, node_id)
+
+                # If a routing protocol service was assigned, also assign zebra
+                if assigned and service_name in ROUTING_STACK_SERVICES:
+                    zebra_assigned = False
+                    try:
+                        if hasattr(session, "add_service"):
+                            session.add_service(node_id=node_id, service_name="zebra")
+                            zebra_assigned = True
+                    except Exception as e:
+                        logger.debug("session.add_service failed for zebra on node %s: %s", node_id, e)
+                    if not zebra_assigned:
+                        try:
+                            if hasattr(session, "services") and hasattr(session.services, "add"):
+                                try:
+                                    session.services.add(node_id, "zebra")
+                                except TypeError:
+                                    node_obj_try = nodes_by_id.get(node_id)
+                                    if node_obj_try is not None:
+                                        session.services.add(node_obj_try, "zebra")
+                                    else:
+                                        raise
+                                zebra_assigned = True
+                        except Exception as e:
+                            logger.debug("session.services.add failed for zebra on node %s: %s", node_id, e)
+                    if not zebra_assigned:
+                        node_obj = nodes_by_id.get(node_id)
+                        if node_obj is not None:
+                            try:
+                                if hasattr(node_obj, "services") and hasattr(node_obj.services, "add"):
+                                    node_obj.services.add("zebra")
+                                    zebra_assigned = True
+                                elif hasattr(node_obj, "add_service"):
+                                    node_obj.add_service("zebra")
+                                    zebra_assigned = True
+                            except Exception as e:
+                                logger.debug("Node-level add zebra failed %s: %s", node_id, e)
+                    if zebra_assigned:
+                        # reflect in service_assignments mapping
+                        svc_list = service_assignments.setdefault(node_id, [])
+                        if "zebra" not in svc_list:
+                            svc_list.append("zebra")
+                        logger.debug("Assigned 'zebra' to node %s due to routing protocol '%s'", node_id, service_name)
     
     core.start_session(session)
     logger.info("Started CORE session id=%s with %s nodes (plus switch)", session.id, len(node_infos))
     return session, switch, node_infos, service_assignments
+
+
+def build_segmented_topology(core: client.CoreGrpcClient,
+                             role_counts: Dict[str, int],
+                             routing_density: float,
+                             routing_items: List[RoutingInfo],
+                             services: Optional[List[ServiceInfo]] = None,
+                             ip4_prefix: str = "10.0.0.0/24"):
+    """
+    Build a segmented topology using routers based on routing_density.
+    - Creates R = floor(total_hosts * routing_density) routers (min 1 if density>0)
+    - Distributes hosts across routers as segments and links hosts directly to routers
+    - Connects routers in a ring to avoid a central star
+    - Assigns routing protocols to routers per factors
+
+    Returns: (session, routers: List[NodeInfo], hosts: List[NodeInfo], host_service_assignments: Dict[int, List[str]], router_protocols: Dict[int, List[str]])
+    """
+    logger.info("Creating CORE session and building segmented topology with routers")
+    allocator = UniqueAllocator(ip4_prefix)
+    session = core.create_session()
+
+    # Create host nodes according to role_counts first (to know total)
+    total_hosts = sum(role_counts.values())
+    if routing_density <= 0 or total_hosts == 0:
+        logger.warning("Routing density <= 0 or no hosts; falling back to star")
+        session, switch, nodes, svc = build_star_from_roles(core, role_counts, services=services, ip4_prefix=ip4_prefix)
+        return session, [], nodes, svc, {}
+
+    router_count = max(1, min(total_hosts, math.floor(total_hosts * routing_density)))
+    logger.debug("Router count computed: %s (density=%s, total_hosts=%s)", router_count, routing_density, total_hosts)
+
+    # Place routers in a large circle
+    cx, cy = 600, 500
+    router_radius = 300
+    host_radius = 120
+
+    routers: List[NodeInfo] = []
+    router_nodes: Dict[int, object] = {}
+    host_nodes_by_id: Dict[int, object] = {}
+    # Track next interface id per router to ensure unique iface ids/names
+    router_next_ifid: Dict[int, int] = {}
+
+    for i in range(router_count):
+        theta = (2 * math.pi * i) / router_count
+        x = int(cx + router_radius * math.cos(theta))
+        y = int(cy + router_radius * math.sin(theta))
+        node_id = i + 1  # start ids at 1 for routers
+        node = session.add_node(node_id, _type=NodeType.DEFAULT, position=Position(x=x, y=y), name=f"router-{i+1}")
+        routers.append(NodeInfo(node_id=node.id, ip4="", role="Router"))
+        router_nodes[node.id] = node
+        logger.debug("Added router id=%s at (%s,%s)", node.id, x, y)
+
+    # Connect routers in a ring
+    if router_count > 1:
+        for i in range(router_count):
+            a = router_nodes[i + 1]
+            b = router_nodes[(i + 1) % router_count + 1]
+            # allocate unique iface ids per router and unique names per link end
+            a_ifid = router_next_ifid.get(a.id, 0)
+            b_ifid = router_next_ifid.get(b.id, 0)
+            router_next_ifid[a.id] = a_ifid + 1
+            router_next_ifid[b.id] = b_ifid + 1
+            a_ip, a_mask = allocator.next_ip()
+            b_ip, b_mask = allocator.next_ip()
+            a_if = Interface(id=a_ifid, name=f"r{a.id}-to-r{b.id}", ip4=a_ip, ip4_mask=a_mask, mac=allocator.next_mac())
+            b_if = Interface(id=b_ifid, name=f"r{b.id}-to-r{a.id}", ip4=b_ip, ip4_mask=b_mask, mac=allocator.next_mac())
+            session.add_link(node1=a, node2=b, iface1=a_if, iface2=b_if)
+            logger.debug("Linked router %s <-> router %s", a.id, b.id)
+
+    # Expand roles to host list for placement and assignment
+    expanded_roles: List[str] = []
+    for role, count in role_counts.items():
+        expanded_roles.extend([role] * count)
+
+    # Shuffle hosts for more even distribution
+    random.shuffle(expanded_roles)
+
+    # Bucket hosts by router
+    buckets: List[List[str]] = [[] for _ in range(router_count)]
+    for idx, role in enumerate(expanded_roles):
+        buckets[idx % router_count].append(role)
+
+    # Create host nodes around each router and link to router
+    hosts: List[NodeInfo] = []
+    node_id_counter = router_count + 1
+    for ridx, roles in enumerate(buckets):
+        rx = int(cx + router_radius * math.cos((2 * math.pi * ridx) / router_count))
+        ry = int(cy + router_radius * math.sin((2 * math.pi * ridx) / router_count))
+        router_node = router_nodes[ridx + 1]
+        for j, role in enumerate(roles):
+            theta = (2 * math.pi * j) / max(len(roles), 1)
+            x = int(rx + host_radius * math.cos(theta))
+            y = int(ry + host_radius * math.sin(theta))
+
+            node_type = _map_role_to_node_type(role)
+            name = f"{role.lower()}-{ridx+1}-{j+1}"
+            host = session.add_node(node_id_counter, _type=node_type, position=Position(x=x, y=y), name=name)
+            node_id_counter += 1
+            host_nodes_by_id[host.id] = host
+
+            # Host iface and router iface for the link
+            h_ip, h_mask = allocator.next_ip()
+            h_mac = allocator.next_mac()
+            host_if = Interface(id=0, name="eth0", ip4=h_ip, ip4_mask=h_mask, mac=h_mac)
+            # allocate next router iface id and a unique name per host
+            r_ifid = router_next_ifid.get(router_node.id, 0)
+            router_next_ifid[router_node.id] = r_ifid + 1
+            r_ip, r_mask = allocator.next_ip()
+            r_if = Interface(id=r_ifid, name=f"r{router_node.id}-h{host.id}", ip4=r_ip, ip4_mask=r_mask, mac=allocator.next_mac())
+            session.add_link(node1=host, node2=router_node, iface1=host_if, iface2=r_if)
+
+            if node_type == NodeType.DEFAULT:
+                hosts.append(NodeInfo(node_id=host.id, ip4=f"{h_ip}/{h_mask}", role=role))
+            logger.debug("Added host id=%s role=%s linked to router %s", host.id, role, router_node.id)
+
+    # Assign routing protocols to routers per factors
+    router_protocols: Dict[int, List[str]] = {r.node_id: [] for r in routers}
+    if routing_items:
+        proto_items = [(ri.protocol, ri.factor) for ri in routing_items]
+        counts = _compute_counts_by_factor(router_count, proto_items)
+        # Create list of protocols to assign across routers
+        expanded_protocols: List[str] = []
+        for proto, c in counts.items():
+            expanded_protocols.extend([proto] * c)
+        # pad if fewer than routers
+        while len(expanded_protocols) < router_count and proto_items:
+            expanded_protocols.append(proto_items[0][0])
+        # assign round-robin
+        for i, rid in enumerate(sorted(router_nodes.keys())):
+            if i < len(expanded_protocols):
+                proto = expanded_protocols[i]
+                router_protocols[rid].append(proto)
+                assigned = False
+                try:
+                    if hasattr(session, "add_service"):
+                        session.add_service(node_id=rid, service_name=proto)
+                        assigned = True
+                except Exception as e:
+                    logger.debug("session.add_service failed for router %s service %s: %s", rid, proto, e)
+                if not assigned:
+                    try:
+                        if hasattr(session, "services") and hasattr(session.services, "add"):
+                            try:
+                                session.services.add(rid, proto)
+                            except TypeError:
+                                node_obj_try = router_nodes.get(rid)
+                                if node_obj_try is not None:
+                                    session.services.add(node_obj_try, proto)
+                                else:
+                                    raise
+                            assigned = True
+                    except Exception as e:
+                        logger.debug("session.services.add failed for router %s service %s: %s", rid, proto, e)
+                if not assigned:
+                    node_obj = router_nodes.get(rid)
+                    if node_obj is not None:
+                        try:
+                            if hasattr(node_obj, "services") and hasattr(node_obj.services, "add"):
+                                node_obj.services.add(proto)
+                                assigned = True
+                            elif hasattr(node_obj, "add_service"):
+                                node_obj.add_service(proto)
+                                assigned = True
+                        except Exception as e:
+                            logger.debug("Router node-level add service failed %s -> %s: %s", rid, proto, e)
+                if not assigned:
+                    logger.warning("Routing protocol '%s' could not be assigned to router %s", proto, rid)
+                else:
+                    logger.debug("Assigned routing protocol '%s' to router %s", proto, rid)
+
+                # If a routing protocol was assigned, also assign zebra to the router
+                if assigned and proto in ROUTING_STACK_SERVICES:
+                    zebra_assigned = False
+                    try:
+                        if hasattr(session, "add_service"):
+                            session.add_service(node_id=rid, service_name="zebra")
+                            zebra_assigned = True
+                    except Exception as e:
+                        logger.debug("session.add_service failed for zebra on router %s: %s", rid, e)
+                    if not zebra_assigned:
+                        try:
+                            if hasattr(session, "services") and hasattr(session.services, "add"):
+                                try:
+                                    session.services.add(rid, "zebra")
+                                except TypeError:
+                                    node_obj_try = router_nodes.get(rid)
+                                    if node_obj_try is not None:
+                                        session.services.add(node_obj_try, "zebra")
+                                    else:
+                                        raise
+                                zebra_assigned = True
+                        except Exception as e:
+                            logger.debug("session.services.add failed for zebra on router %s: %s", rid, e)
+                    if not zebra_assigned:
+                        node_obj = router_nodes.get(rid)
+                        if node_obj is not None:
+                            try:
+                                if hasattr(node_obj, "services") and hasattr(node_obj.services, "add"):
+                                    node_obj.services.add("zebra")
+                                    zebra_assigned = True
+                                elif hasattr(node_obj, "add_service"):
+                                    node_obj.add_service("zebra")
+                                    zebra_assigned = True
+                            except Exception as e:
+                                logger.debug("Router node-level add zebra failed %s: %s", rid, e)
+                    if zebra_assigned:
+                        logger.debug("Assigned 'zebra' to router %s due to routing protocol '%s'", rid, proto)
+
+    # Assign host services (from Services section) if any
+    host_service_assignments: Dict[int, List[str]] = {}
+    if services:
+        host_service_assignments = distribute_services(hosts, services)
+        for node_id, svc_list in host_service_assignments.items():
+            for svc in svc_list:
+                assigned = False
+                try:
+                    if hasattr(session, "add_service"):
+                        session.add_service(node_id=node_id, service_name=svc)
+                        assigned = True
+                except Exception as e:
+                    logger.debug("session.add_service failed for host %s service %s: %s", node_id, svc, e)
+                if not assigned:
+                    try:
+                        if hasattr(session, "services") and hasattr(session.services, "add"):
+                            try:
+                                session.services.add(node_id, svc)
+                            except TypeError:
+                                node_obj_try = host_nodes_by_id.get(node_id)
+                                if node_obj_try is not None:
+                                    session.services.add(node_obj_try, svc)
+                                else:
+                                    raise
+                            assigned = True
+                    except Exception as e:
+                        logger.debug("session.services.add failed for host %s service %s: %s", node_id, svc, e)
+                if not assigned:
+                    node_obj = host_nodes_by_id.get(node_id)
+                    if node_obj is not None:
+                        try:
+                            if hasattr(node_obj, "services") and hasattr(node_obj.services, "add"):
+                                node_obj.services.add(svc)
+                                assigned = True
+                            elif hasattr(node_obj, "add_service"):
+                                node_obj.add_service(svc)
+                                assigned = True
+                        except Exception as e:
+                            logger.debug("Host node-level add service failed %s -> %s: %s", node_id, svc, e)
+                if not assigned:
+                    logger.warning("Service '%s' could not be assigned to host node %s", svc, node_id)
+                # If a routing protocol service was assigned to a host, also assign zebra
+                if assigned and svc in ROUTING_STACK_SERVICES:
+                    zebra_assigned = False
+                    try:
+                        if hasattr(session, "add_service"):
+                            session.add_service(node_id=node_id, service_name="zebra")
+                            zebra_assigned = True
+                    except Exception as e:
+                        logger.debug("session.add_service failed for zebra on host %s: %s", node_id, e)
+                    if not zebra_assigned:
+                        try:
+                            if hasattr(session, "services") and hasattr(session.services, "add"):
+                                try:
+                                    session.services.add(node_id, "zebra")
+                                except TypeError:
+                                    node_obj_try = host_nodes_by_id.get(node_id)
+                                    if node_obj_try is not None:
+                                        session.services.add(node_obj_try, "zebra")
+                                    else:
+                                        raise
+                                zebra_assigned = True
+                        except Exception as e:
+                            logger.debug("session.services.add failed for zebra on host %s: %s", node_id, e)
+                    if not zebra_assigned:
+                        node_obj = host_nodes_by_id.get(node_id)
+                        if node_obj is not None:
+                            try:
+                                if hasattr(node_obj, "services") and hasattr(node_obj.services, "add"):
+                                    node_obj.services.add("zebra")
+                                    zebra_assigned = True
+                                elif hasattr(node_obj, "add_service"):
+                                    node_obj.add_service("zebra")
+                                    zebra_assigned = True
+                            except Exception as e:
+                                logger.debug("Host node-level add zebra failed %s: %s", node_id, e)
+                    if zebra_assigned:
+                        lst = host_service_assignments.setdefault(node_id, [])
+                        if "zebra" not in lst:
+                            lst.append("zebra")
+                        logger.debug("Assigned 'zebra' to host %s due to routing protocol '%s'", node_id, svc)
+
+    core.start_session(session)
+    logger.info("Started CORE session id=%s with %s routers and %s hosts", session.id, len(routers), len(hosts))
+    return session, routers, hosts, host_service_assignments, router_protocols
 
 
 # ---------------- CLI ----------------
@@ -437,29 +921,51 @@ def main():
 
     role_counts = compute_role_counts(total, items)
 
+    # routing parse
+    routing_density, routing_items = parse_routing_info(args.xml, args.scenario)
+
     core = client.CoreGrpcClient(address=f"{args.host}:{args.port}")
     core.connect()  # ensure core-daemon is running with gRPC enabled
 
-    session, switch, nodes, service_assignments = build_star_from_roles(
-        core, 
-        role_counts, 
-        services=services, 
-        ip4_prefix=args.prefix)
+    # Choose builder based on routing density
+    if routing_density and routing_density > 0:
+        session, routers, hosts, service_assignments, router_protocols = build_segmented_topology(
+            core,
+            role_counts,
+            routing_density=routing_density,
+            routing_items=routing_items,
+            services=services,
+            ip4_prefix=args.prefix,
+        )
+    else:
+        session, switch, hosts, service_assignments = build_star_from_roles(
+            core,
+            role_counts,
+            services=services,
+            ip4_prefix=args.prefix,
+        )
 
     logger.info("Started CORE session id: %s", session.id)
-    logger.info("Switch node id: %s", switch.id)
-    logger.info("Created %s nodes from XML", len(nodes))
+    if routing_density and routing_density > 0:
+        logger.info("Created %s routers and %s hosts from XML", len(routers), len(hosts))
+    else:
+        logger.info("Created %s nodes from XML", len(hosts))
     logger.info("Role distribution:")
     for role, count in role_counts.items():
         logger.info("  %s: %s", role, count)
     logger.info("Hosts (DEFAULT type) with IPs:")
-    for n in nodes:
+    for n in hosts:
         logger.info("  node %s (%s) -> %s", n.node_id, n.role, n.ip4)
     
     if services and service_assignments:
         logger.info("Configured services:")
         for node_id, service_list in service_assignments.items():
             logger.info("  node %s: %s", node_id, ", ".join(service_list))
+
+    if routing_density and routing_density > 0 and routing_items:
+        logger.info("Router protocols:")
+        for rid, protos in router_protocols.items():
+            logger.info("  router %s: %s", rid, ", ".join(protos))
 
 
 if __name__ == "__main__":
