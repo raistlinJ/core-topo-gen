@@ -26,6 +26,47 @@ DEFAULT_SERVICE_POOL: List[str] = [
     "DHCPClient",
 ]
 
+def ensure_service(session: object, node_id: int, service_name: str, node_obj: Optional[object] = None) -> bool:
+    """Attempt to add a service to a node without replacing existing services.
+
+    Tries multiple CORE API styles for compatibility. Returns True on success.
+    """
+    # Try direct session.add_service
+    try:
+        if hasattr(session, "add_service"):
+            session.add_service(node_id=node_id, service_name=service_name)
+            return True
+    except Exception:
+        pass
+
+    # Try session.services.add
+    try:
+        if hasattr(session, "services") and hasattr(session.services, "add"):
+            try:
+                session.services.add(node_id, service_name)
+                return True
+            except TypeError:
+                if node_obj is not None:
+                    session.services.add(node_obj, service_name)
+                    return True
+    except Exception:
+        pass
+
+    # Try adding on node object
+    if node_obj is not None:
+        try:
+            if hasattr(node_obj, "services") and hasattr(node_obj.services, "add"):
+                node_obj.services.add(service_name)
+                return True
+            if hasattr(node_obj, "add_service"):
+                node_obj.add_service(service_name)
+                return True
+        except Exception:
+            pass
+
+    logger.warning("Failed to ensure service '%s' on node %s", service_name, node_id)
+    return False
+
 def map_role_to_node_type(role: str) -> NodeType:
     low = role.lower()
     if low in {"router"}:

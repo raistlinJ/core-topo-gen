@@ -13,6 +13,7 @@ from ..utils.services import (
     distribute_services,
     mark_node_as_router,
     set_node_services,
+    ensure_service,
     ROUTING_STACK_SERVICES,
 )
 from ..utils.allocation import compute_counts_by_factor
@@ -65,6 +66,11 @@ def build_star_from_roles(core: client.CoreGrpcClient,
             sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=mac_alloc.next_mac())
             sw_ifid += 1
             session.add_link(node1=node, node2=switch, iface1=host_iface, iface2=sw_iface)
+            # Ensure default routing service on hosts
+            try:
+                ensure_service(session, node.id, "DefaultRoute", node_obj=node)
+            except Exception:
+                pass
         else:
             sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=mac_alloc.next_mac())
             sw_ifid += 1
@@ -225,6 +231,11 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             session.add_link(node1=host, node2=router_node, iface1=host_if, iface2=r_if)
             if node_type == NodeType.DEFAULT:
                 hosts.append(NodeInfo(node_id=host.id, ip4=f"{h_ip}/{lan_net.prefixlen}", role=role))
+                # Ensure default routing service on hosts
+                try:
+                    ensure_service(session, host.id, "DefaultRoute", node_obj=host)
+                except Exception:
+                    pass
         else:
             lan_switch = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=Position(x=rx+40, y=ry+40), name=f"lan-{ridx+1}")
             node_id_counter += 1
@@ -257,6 +268,11 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                 session.add_link(node1=host, node2=lan_switch, iface1=host_if, iface2=sw_if)
                 if node_type == NodeType.DEFAULT:
                     hosts.append(NodeInfo(node_id=host.id, ip4=f"{h_ip}/{lan_net.prefixlen}", role=role))
+                    # Ensure default routing service on hosts
+                    try:
+                        ensure_service(session, host.id, "DefaultRoute", node_obj=host)
+                    except Exception:
+                        pass
 
     router_protocols: Dict[int, List[str]] = {r.node_id: [] for r in routers}
     if routing_items:
