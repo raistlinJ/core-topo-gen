@@ -351,6 +351,8 @@ class SubnetAllocator:
     def __init__(self, ip4_prefix: str):
         self.base = ipaddress.IPv4Network(ip4_prefix, strict=False)
         self.next_addr = int(self.base.network_address)
+        # track allocated subnets as tuples of (network_int, prefixlen)
+        self._allocated: set[tuple[int, int]] = set()
 
     def next_subnet(self, prefixlen: int) -> ipaddress.IPv4Network:
         size = 1 << (32 - prefixlen)
@@ -358,6 +360,70 @@ class SubnetAllocator:
         aligned = (self.next_addr + size - 1) // size * size
         net = ipaddress.IPv4Network((ipaddress.IPv4Address(aligned), prefixlen))
         self.next_addr = aligned + size
+        # record allocation
+        self._allocated.add((int(net.network_address), prefixlen))
+        return net
+
+    def next_random_subnet(self, prefixlen: int, attempts: int = 128) -> ipaddress.IPv4Network:
+        size = 1 << (32 - prefixlen)
+        base_size = self.base.num_addresses
+        total_slots = base_size // size if base_size >= size else 0
+        if total_slots > 0:
+            base_start = int(self.base.network_address)
+            # already full for this size within base?
+            used_slots = { (k[0] - base_start) // size for k in self._allocated if k[1] == prefixlen and base_start <= k[0] < base_start + base_size }
+            if len(used_slots) >= total_slots:
+                return self.next_subnet(prefixlen)
+            for _ in range(max(8, attempts)):
+                slot = random.randrange(0, total_slots)
+                if slot in used_slots:
+                    continue
+                cand = base_start + slot * size
+                net = ipaddress.IPv4Network((ipaddress.IPv4Address(cand), prefixlen))
+                # safe: within base
+                if int(net.broadcast_address) >= base_start + base_size:
+                    continue
+                self._allocated.add((int(net.network_address), prefixlen))
+                return net
+        return self.next_subnet(prefixlen)
+
+    def next_random_subnet(self, prefixlen: int, attempts: int = 256) -> ipaddress.IPv4Network:
+        """
+        Pick a random subnet of the requested size inside the base prefix,
+        avoiding overlaps with previously allocated subnets. If we fail to
+        find an unused subnet in the base after a number of attempts (or the
+        base cannot fit more), fall back to sequential allocation which can
+        progress beyond the base if needed.
+        """
+        size = 1 << (32 - prefixlen)
+        base_size = self.base.num_addresses
+        # number of subnets of given size within base (floor)
+        total_slots = base_size // size if base_size >= size else 0
+
+        if total_slots > 0:
+            base_start = int(self.base.network_address)
+            # quick stop if we've already allocated all possible inside base
+            if sum(1 for k in self._allocated if k[1] == prefixlen and base_start <= k[0] < base_start + base_size) >= total_slots:
+                # exhausted base pool, fall back
+                net = self.next_subnet(prefixlen)
+                return net
+            for _ in range(max(8, attempts)):
+                slot = random.randrange(0, total_slots)
+                cand = base_start + slot * size
+                key = (cand, prefixlen)
+                if key in self._allocated:
+                    continue
+                try:
+                    net = ipaddress.IPv4Network((ipaddress.IPv4Address(cand), prefixlen))
+                except Exception:
+                    continue
+                # ensure it's within base
+                if (int(net.network_address) < base_start) or (int(net.broadcast_address) >= base_start + base_size):
+                    continue
+                self._allocated.add(key)
+                return net
+        # fallback to sequential (may move beyond base)
+        net = self.next_subnet(prefixlen)
         return net
 
 
@@ -367,6 +433,9 @@ def _map_role_to_node_type(role: str) -> NodeType:
     For most host roles (Server/Workstation/Client), DEFAULT is correct.
     """
     low = role.lower()
+    if low in {"router"}:
+        # Prefer a dedicated router type if available in this CORE version
+        return getattr(NodeType, "ROUTER", NodeType.DEFAULT)
     if low in {"switch"}:
         return NodeType.SWITCH
     if low in {"hub"}:
@@ -375,6 +444,61 @@ def _map_role_to_node_type(role: str) -> NodeType:
         return NodeType.WIRELESS_LAN
     # Servers/Workstations/Clients/etc. are DEFAULT hosts
     return NodeType.DEFAULT
+
+def _router_node_type() -> NodeType:
+    """Helper to choose the CORE router node type when available."""
+    return getattr(NodeType, "ROUTER", NodeType.DEFAULT)
+
+def _mark_node_as_router(node: object, session: object) -> None:
+    """
+    Try multiple strategies to mark a node as a router so default router services apply
+    and the GUI shows the router icon. This is resilient across CORE versions:
+    - set a 'type' attribute to 'router' if supported
+    - set an 'icon' or call set_icon('router') if available
+    - as a service fallback, add base router services like IPForward and zebra
+    """
+    # Do NOT override node.type (must remain a NodeType enum)
+    icon_path = os.path.expanduser("~/.coregui/icons/router.png")
+    # Try session-level icon setter first if available
+    try:
+        if hasattr(session, "set_node_icon"):
+            # Some versions may use (node_id=..., icon=...) signature
+            try:
+                session.set_node_icon(node_id=node.id, icon=icon_path)
+            except TypeError:
+                # or (node_id, icon)
+                session.set_node_icon(node.id, icon_path)
+    except Exception:
+        # ignore icon set failures, continue with fallbacks
+        pass
+    # Fallbacks: set on node object
+    try:
+        if hasattr(node, "icon"):
+            setattr(node, "icon", icon_path)
+    except Exception:
+        pass
+    try:
+        if hasattr(node, "set_icon"):
+            node.set_icon(icon_path)
+    except Exception:
+        pass
+
+    # Fallback: ensure core router baseline services present
+    for svc in ("IPForward", "zebra"):
+        try:
+            if hasattr(session, "add_service"):
+                session.add_service(node_id=node.id, service_name=svc)
+                continue
+        except Exception:
+            pass
+        try:
+            if hasattr(session, "services") and hasattr(session.services, "add"):
+                try:
+                    session.services.add(node.id, svc)
+                except TypeError:
+                    session.services.add(node, svc)
+        except Exception:
+            pass
 
 def _compute_counts_by_factor(total: int, items: List[Tuple[str, float]]) -> Dict[str, int]:
     """Helper: largest remainder allocation for names with factors summing arbitrarily."""
@@ -391,6 +515,79 @@ def _compute_counts_by_factor(total: int, items: List[Tuple[str, float]]) -> Dic
         remaining -= 1
         i += 1
     return counts
+
+
+def _set_node_services(session: object, node_id: int, services: List[str], node_obj: Optional[object] = None) -> bool:
+    """
+    Robustly set the complete service list for a node before session start.
+    Tries session.services.set first (preferred), then falls back to adding
+    individually via session/services/node methods. Returns True if successful.
+    """
+    # de-duplicate while preserving order
+    seen = set()
+    ordered: List[str] = []
+    for s in services:
+        if s and s not in seen:
+            ordered.append(s)
+            seen.add(s)
+
+    # Prefer atomic set to ensure ordering and inclusion
+    try:
+        if hasattr(session, "services") and hasattr(session.services, "set"):
+            session.services.set(node_id, tuple(ordered))
+            logger.debug("Set services on node %s -> %s", node_id, ", ".join(ordered))
+            return True
+    except Exception as e:
+        logger.debug("session.services.set failed for node %s: %s", node_id, e)
+
+    # Fallback: clear existing if possible, then add one-by-one
+    try:
+        if hasattr(session, "services") and hasattr(session.services, "clear"):
+            try:
+                session.services.clear(node_id)
+            except TypeError:
+                if node_obj is not None:
+                    session.services.clear(node_obj)
+    except Exception:
+        # ignore; not all versions support clear
+        pass
+
+    success_any = False
+    for svc in ordered:
+        added = False
+        try:
+            if hasattr(session, "add_service"):
+                session.add_service(node_id=node_id, service_name=svc)
+                added = True
+        except Exception:
+            pass
+        if not added:
+            try:
+                if hasattr(session, "services") and hasattr(session.services, "add"):
+                    try:
+                        session.services.add(node_id, svc)
+                    except TypeError:
+                        if node_obj is not None:
+                            session.services.add(node_obj, svc)
+                        else:
+                            raise
+                    added = True
+            except Exception:
+                pass
+        if not added and node_obj is not None:
+            try:
+                if hasattr(node_obj, "services") and hasattr(node_obj.services, "add"):
+                    node_obj.services.add(svc)
+                    added = True
+                elif hasattr(node_obj, "add_service"):
+                    node_obj.add_service(svc)
+                    added = True
+            except Exception:
+                pass
+        success_any = success_any or added
+        if not added:
+            logger.warning("Failed to add service '%s' to node %s", svc, node_id)
+    return success_any
 
 
 def distribute_services(nodes: List[NodeInfo], services: List[ServiceInfo]) -> Dict[int, List[str]]:
@@ -658,7 +855,10 @@ def build_segmented_topology(core: client.CoreGrpcClient,
     host_radius = 120
 
     routers: List[NodeInfo] = []
+    # map: router id -> node object
     router_nodes: Dict[int, object] = {}
+    # list of router node objects in creation order for safe indexing
+    router_objs: List[object] = []
     host_nodes_by_id: Dict[int, object] = {}
     # Track next interface id per router to ensure unique iface ids/names
     router_next_ifid: Dict[int, int] = {}
@@ -668,28 +868,33 @@ def build_segmented_topology(core: client.CoreGrpcClient,
         x = int(cx + router_radius * math.cos(theta))
         y = int(cy + router_radius * math.sin(theta))
         node_id = i + 1  # start ids at 1 for routers
-        node = session.add_node(node_id, _type=NodeType.DEFAULT, position=Position(x=x, y=y), name=f"router-{i+1}")
+        node = session.add_node(node_id, _type=_router_node_type(), position=Position(x=x, y=y), name=f"router-{i+1}")
+        # mark this node as a router for default service sets and iconography
+        _mark_node_as_router(node, session)
+        # Ensure baseline router services are present in 9.2.1
+        _set_node_services(session, node.id, ["IPForward", "zebra"], node_obj=node)
         routers.append(NodeInfo(node_id=node.id, ip4="", role="Router"))
         router_nodes[node.id] = node
+        router_objs.append(node)
         logger.debug("Added router id=%s at (%s,%s)", node.id, x, y)
 
     # Connect routers in a ring; special-case 2 routers to avoid duplicate link
     if router_count > 1:
-        link_pairs = []
+        idx_pairs: List[Tuple[int, int]] = []
         if router_count == 2:
-            link_pairs = [(1, 2)]
+            idx_pairs = [(0, 1)]
         else:
-            link_pairs = [(i + 1, (i + 1) % router_count + 1) for i in range(router_count)]
-        for aid, bid in link_pairs:
-            a = router_nodes[aid]
-            b = router_nodes[bid]
+            idx_pairs = [(i, (i + 1) % router_count) for i in range(router_count)]
+        for aidx, bidx in idx_pairs:
+            a = router_objs[aidx]
+            b = router_objs[bidx]
             # allocate unique iface ids per router and unique names per link end
             a_ifid = router_next_ifid.get(a.id, 0)
             b_ifid = router_next_ifid.get(b.id, 0)
             router_next_ifid[a.id] = a_ifid + 1
             router_next_ifid[b.id] = b_ifid + 1
-            # allocate a unique /30 per router-router link
-            rr_net = subnet_alloc.next_subnet(30)
+            # allocate a unique random /30 per router-router link
+            rr_net = subnet_alloc.next_random_subnet(30)
             rr_hosts = list(rr_net.hosts())
             a_ip = str(rr_hosts[0])
             b_ip = str(rr_hosts[1])
@@ -703,13 +908,12 @@ def build_segmented_topology(core: client.CoreGrpcClient,
     for role, count in role_counts.items():
         expanded_roles.extend([role] * count)
 
-    # Shuffle hosts for more even distribution
+    # Shuffle roles, then randomly assign each node to a router bucket (random subnet grouping)
     random.shuffle(expanded_roles)
-
-    # Bucket hosts by router
     buckets: List[List[str]] = [[] for _ in range(router_count)]
-    for idx, role in enumerate(expanded_roles):
-        buckets[idx % router_count].append(role)
+    for role in expanded_roles:
+        buckets[random.randrange(router_count)].append(role)
+    logger.debug("Random host distribution across routers: %s", [len(b) for b in buckets])
 
     # Create host nodes around each router and link to router
     hosts: List[NodeInfo] = []
@@ -717,7 +921,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
     for ridx, roles in enumerate(buckets):
         rx = int(cx + router_radius * math.cos((2 * math.pi * ridx) / router_count))
         ry = int(cy + router_radius * math.sin((2 * math.pi * ridx) / router_count))
-        router_node = router_nodes[ridx + 1]
+        router_node = router_objs[ridx]
         if len(roles) == 0:
             continue
         elif len(roles) == 1:
@@ -732,8 +936,8 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             node_id_counter += 1
             host_nodes_by_id[host.id] = host
 
-            # allocate subnet and IPs
-            lan_net = subnet_alloc.next_subnet(30)
+            # allocate subnet and IPs using random /30
+            lan_net = subnet_alloc.next_random_subnet(30)
             lan_hosts = list(lan_net.hosts())
             r_ip = str(lan_hosts[0])
             h_ip = str(lan_hosts[1])
@@ -752,8 +956,8 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             # multi-host LAN: create a switch, one router iface, multiple host links
             lan_switch = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=Position(x=rx+40, y=ry+40), name=f"lan-{ridx+1}")
             node_id_counter += 1
-            # allocate LAN subnet /24
-            lan_net = subnet_alloc.next_subnet(24)
+            # allocate LAN subnet /24 randomly within base
+            lan_net = subnet_alloc.next_random_subnet(24)
             lan_hosts = list(lan_net.hosts())
             # router IP is first usable
             r_ip = str(lan_hosts[0])
@@ -764,8 +968,9 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             session.add_link(node1=router_node, node2=lan_switch, iface1=r_if, iface2=sw_if)
             logger.debug("Linked router %s to LAN switch %s on %s/%s", router_node.id, lan_switch.id, r_ip, lan_net.prefixlen)
 
-            # assign hosts IPs starting from second usable
-            ip_index = 1
+            # assign host IPs randomly from the usable pool (excluding router's first usable)
+            host_ip_pool = [str(ip) for ip in lan_hosts[1:]]
+            random.shuffle(host_ip_pool)
             for j, role in enumerate(roles):
                 theta = (2 * math.pi * j) / len(roles)
                 x = int(rx + host_radius * math.cos(theta))
@@ -776,8 +981,12 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                 node_id_counter += 1
                 host_nodes_by_id[host.id] = host
 
-                h_ip = str(lan_hosts[ip_index])
-                ip_index += 1
+                # Pop a random IP from pool per host
+                if host_ip_pool:
+                    h_ip = host_ip_pool.pop()
+                else:
+                    # If pool exhausted for some reason, allocate the next random /32 within LAN (fallback to deterministic)
+                    h_ip = str(lan_hosts[min(j + 1, len(lan_hosts) - 1)])
                 h_mac = mac_alloc.next_mac()
                 host_if = Interface(id=0, name="eth0", ip4=h_ip, ip4_mask=lan_net.prefixlen, mac=h_mac)
                 sw_if = Interface(id=j+1, name=f"lan{ridx+1}-h{host.id}")
@@ -800,85 +1009,16 @@ def build_segmented_topology(core: client.CoreGrpcClient,
         while len(expanded_protocols) < router_count and proto_items:
             expanded_protocols.append(proto_items[0][0])
         # assign round-robin
-        for i, rid in enumerate(sorted(router_nodes.keys())):
+        for i, rnode in enumerate(router_objs):
+            rid = rnode.id
             if i < len(expanded_protocols):
                 proto = expanded_protocols[i]
                 router_protocols[rid].append(proto)
-                assigned = False
-                try:
-                    if hasattr(session, "add_service"):
-                        session.add_service(node_id=rid, service_name=proto)
-                        assigned = True
-                except Exception as e:
-                    logger.debug("session.add_service failed for router %s service %s: %s", rid, proto, e)
-                if not assigned:
-                    try:
-                        if hasattr(session, "services") and hasattr(session.services, "add"):
-                            try:
-                                session.services.add(rid, proto)
-                            except TypeError:
-                                node_obj_try = router_nodes.get(rid)
-                                if node_obj_try is not None:
-                                    session.services.add(node_obj_try, proto)
-                                else:
-                                    raise
-                            assigned = True
-                    except Exception as e:
-                        logger.debug("session.services.add failed for router %s service %s: %s", rid, proto, e)
-                if not assigned:
-                    node_obj = router_nodes.get(rid)
-                    if node_obj is not None:
-                        try:
-                            if hasattr(node_obj, "services") and hasattr(node_obj.services, "add"):
-                                node_obj.services.add(proto)
-                                assigned = True
-                            elif hasattr(node_obj, "add_service"):
-                                node_obj.add_service(proto)
-                                assigned = True
-                        except Exception as e:
-                            logger.debug("Router node-level add service failed %s -> %s: %s", rid, proto, e)
-                if not assigned:
-                    logger.warning("Routing protocol '%s' could not be assigned to router %s", proto, rid)
-                else:
-                    logger.debug("Assigned routing protocol '%s' to router %s", proto, rid)
-
-                # If a routing protocol was assigned, also assign zebra to the router
-                if assigned and proto in ROUTING_STACK_SERVICES:
-                    zebra_assigned = False
-                    try:
-                        if hasattr(session, "add_service"):
-                            session.add_service(node_id=rid, service_name="zebra")
-                            zebra_assigned = True
-                    except Exception as e:
-                        logger.debug("session.add_service failed for zebra on router %s: %s", rid, e)
-                    if not zebra_assigned:
-                        try:
-                            if hasattr(session, "services") and hasattr(session.services, "add"):
-                                try:
-                                    session.services.add(rid, "zebra")
-                                except TypeError:
-                                    node_obj_try = router_nodes.get(rid)
-                                    if node_obj_try is not None:
-                                        session.services.add(node_obj_try, "zebra")
-                                    else:
-                                        raise
-                                zebra_assigned = True
-                        except Exception as e:
-                            logger.debug("session.services.add failed for zebra on router %s: %s", rid, e)
-                    if not zebra_assigned:
-                        node_obj = router_nodes.get(rid)
-                        if node_obj is not None:
-                            try:
-                                if hasattr(node_obj, "services") and hasattr(node_obj.services, "add"):
-                                    node_obj.services.add("zebra")
-                                    zebra_assigned = True
-                                elif hasattr(node_obj, "add_service"):
-                                    node_obj.add_service("zebra")
-                                    zebra_assigned = True
-                            except Exception as e:
-                                logger.debug("Router node-level add zebra failed %s: %s", rid, e)
-                    if zebra_assigned:
-                        logger.debug("Assigned 'zebra' to router %s due to routing protocol '%s'", rid, proto)
+                # set protocols atomically along with zebra baseline
+                base = ["IPForward", "zebra"]
+                proto_list = base + [proto] if proto else base
+                _set_node_services(session, rid, proto_list, node_obj=rnode)
+                logger.debug("Assigned routing protocol '%s' to router %s (with baseline)", proto, rid)
 
     # Assign host services (from Services section) if any
     host_service_assignments: Dict[int, List[str]] = {}
@@ -979,6 +1119,7 @@ def main():
     ap.add_argument("--max-nodes", type=int, default=None,
                     help="Optional cap on hosts to create (useful for very large XMLs)")
     ap.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    ap.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducible topology randomness")
     args = ap.parse_args()
 
     # logging setup
@@ -986,6 +1127,10 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        logger.info("Random seed set to %s", args.seed)
 
     total, items, services = parse_node_info(args.xml, args.scenario)
     if args.max_nodes is not None and args.max_nodes > 0:
