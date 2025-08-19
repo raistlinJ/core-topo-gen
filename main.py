@@ -4,9 +4,9 @@ import subprocess
 import xml.etree.ElementTree as ET
 import json
 
-from PyQt6.QtCore import Qt, QPoint, QStandardPaths
+from PyQt6.QtCore import Qt, QPoint, QStandardPaths, QProcess
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit, QPushButton, QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QScrollArea, QTreeWidget, QTreeWidgetItem, QMenu, QSplitter, QInputDialog, QLineEdit, QMessageBox, QMainWindow, QStackedWidget, QSizePolicy, QFrame, QLayout, QHeaderView)
+    QApplication, QWidget, QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit, QPushButton, QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QScrollArea, QTreeWidget, QTreeWidgetItem, QMenu, QSplitter, QInputDialog, QLineEdit, QMessageBox, QMainWindow, QStackedWidget, QSizePolicy, QFrame, QLayout, QHeaderView, QProgressDialog)
 
 
 # ---------------------------
@@ -1038,6 +1038,7 @@ class MainWindow(QMainWindow):
         add_action = menu.addAction("Add Scenario")
         rename_action = menu.addAction("Rename Scenario")
         remove_action = menu.addAction("Remove Scenario")
+        generate_action = menu.addAction("Generate in CORE…")
 
         selected = self.tree.itemAt(pos)
         action = menu.exec(self.tree.viewport().mapToGlobal(pos))
@@ -1065,6 +1066,128 @@ class MainWindow(QMainWindow):
                     self.current_item = None
                     self.current_editor = None
                 self.tree.takeTopLevelItem(idx)
+        elif action == generate_action and selected:
+            # Determine top-level scenario and ensure it's saved to a file
+            top = self.get_top_item(selected)
+            scenario_name = top.text(0)
+            # save current editor state back to tree item
+            if self.current_item and self.current_editor:
+                try:
+                    self.save_scenario_data(self.current_item, self.current_editor)
+                except RuntimeError:
+                    pass
+            # ensure we have a file on disk with current tree contents
+            if self.current_file:
+                self._write_to_path(self.current_file)
+                xml_path = self.current_file
+            else:
+                # prompt user to save (Save As…)
+                self.save_all()
+                if not self.current_file:
+                    QMessageBox.information(self, "Cancelled", "Generation cancelled: no file selected.")
+                    return
+                xml_path = self.current_file
+
+            # Run generator asynchronously with progress UI
+            if hasattr(self, "_gen_process") and isinstance(getattr(self, "_gen_process"), QProcess):
+                try:
+                    if self._gen_process.state() != QProcess.ProcessState.NotRunning:  # type: ignore[attr-defined]
+                        QMessageBox.information(self, "Busy", "A generation is already in progress.")
+                        return
+                except Exception:
+                    pass
+
+            self._gen_stdout = ""
+            self._gen_stderr = ""
+            self._gen_process = QProcess(self)
+
+            # Capture stdout/stderr
+            def _read_out():
+                try:
+                    data = bytes(self._gen_process.readAllStandardOutput())
+                    self._gen_stdout += data.decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+
+            def _read_err():
+                try:
+                    data = bytes(self._gen_process.readAllStandardError())
+                    self._gen_stderr += data.decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+
+            self._gen_process.readyReadStandardOutput.connect(_read_out)
+            self._gen_process.readyReadStandardError.connect(_read_err)
+
+            # Indeterminate progress while generating
+            self._gen_progress = QProgressDialog("Generating scenario in CORE…", "Cancel", 0, 0, self)
+            self._gen_progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+            self._gen_progress.setAutoClose(True)
+            self._gen_progress.setAutoReset(True)
+            self._gen_progress.setMinimumDuration(0)
+
+            def _on_cancel():
+                try:
+                    self._gen_process.kill()
+                except Exception:
+                    pass
+
+            self._gen_progress.canceled.connect(_on_cancel)
+
+            def _on_finished(code: int, status: QProcess.ExitStatus):
+                try:
+                    self._gen_progress.close()
+                except Exception:
+                    pass
+
+                err = (self._gen_stderr or "").strip()
+                out = (self._gen_stdout or "").strip()
+
+                if code != 0:
+                    if "No module named 'core'" in err or "No module named core" in err:
+                        QMessageBox.critical(
+                            self,
+                            "Missing CORE Python Package",
+                            "The current Python environment cannot import the CORE library (module 'core').\n\n"
+                            "Run this from an environment where CORE is installed and available to Python, "
+                            "or start this app from the same environment used by core-daemon."
+                        )
+                    elif status == QProcess.ExitStatus.CrashExit:
+                        QMessageBox.warning(self, "Generator Crashed", err or out or f"Exit code: {code}")
+                    else:
+                        QMessageBox.warning(self, "Generator Error", err or out or f"Exit code: {code}")
+                else:
+                    QMessageBox.information(self, "Completed", "CORE scenario generation completed. CORE Session is now running.")
+
+                self._gen_stdout = ""
+                self._gen_stderr = ""
+
+            def _on_error(_err: QProcess.ProcessError):
+                try:
+                    self._gen_progress.close()
+                except Exception:
+                    pass
+                err = (self._gen_stderr or "").strip()
+                out = (self._gen_stdout or "").strip()
+                QMessageBox.warning(self, "Generator Error", err or out or "Failed to start generator.")
+                self._gen_stdout = ""
+                self._gen_stderr = ""
+
+            self._gen_process.finished.connect(_on_finished)
+            self._gen_process.errorOccurred.connect(_on_error)
+
+            # Launch
+            self._gen_process.setProgram(sys.executable)
+            self._gen_process.setArguments(["-m", "core_topo_gen.cli", "--xml", xml_path, "--scenario", scenario_name])
+            try:
+                self._gen_process.start()
+                self._gen_progress.show()
+            except Exception as e:
+                try:
+                    self._gen_progress.close()
+                except Exception:
+                    pass
+                QMessageBox.warning(self, "Error", f"Failed to launch generator:\n{e}")
 
     # ---- Save/Load ----
     def save_scenario_data(self, item: QTreeWidgetItem, editor: ScenarioEditor):
