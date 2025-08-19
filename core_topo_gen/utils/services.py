@@ -18,6 +18,14 @@ ROUTING_STACK_SERVICES = {
     "Xpimd",
 }
 
+# Fallback pool used when only "Random" is specified in Services
+# Aligns with default GUI dropdown suggestions
+DEFAULT_SERVICE_POOL: List[str] = [
+    "SSH",
+    "HTTP",
+    "DHCPClient",
+]
+
 def map_role_to_node_type(role: str) -> NodeType:
     low = role.lower()
     if low in {"router"}:
@@ -136,14 +144,36 @@ def distribute_services(nodes: List[NodeInfo], services: List[ServiceInfo]) -> D
     if not host_nodes:
         return node_services
     import random, math
+
+    # Build a list of concrete (non-Random) service names we can select from.
+    # If none are provided (only Random present), fall back to a sensible default pool.
+    concrete_service_names = [s.name for s in services if s.name and s.name.lower() != "random"]
+    if not concrete_service_names:
+        concrete_service_names = list(DEFAULT_SERVICE_POOL)
+
     for service in services:
         total_service_nodes = max(1, math.floor(len(host_nodes) * service.density))
-        eligible_nodes = [
-            node for node in host_nodes
-            if node.node_id not in node_services or service.name not in node_services[node.node_id]
-        ]
+
+        # Determine eligible nodes. For Random, a node is eligible if it has at
+        # least one concrete service not yet assigned to it. For concrete
+        # services, eligible if it doesn't already have that service.
+        if service.name.lower() == "random":
+            eligible_nodes = [
+                node for node in host_nodes
+                if concrete_service_names and (
+                    node.node_id not in node_services or
+                    any(s not in node_services[node.node_id] for s in concrete_service_names)
+                )
+            ]
+        else:
+            eligible_nodes = [
+                node for node in host_nodes
+                if node.node_id not in node_services or service.name not in node_services[node.node_id]
+            ]
+
         if not eligible_nodes:
             continue
+
         random.shuffle(eligible_nodes)
         preselected = [n for n in eligible_nodes if random.random() < service.factor]
         if len(preselected) > total_service_nodes:
@@ -152,8 +182,20 @@ def distribute_services(nodes: List[NodeInfo], services: List[ServiceInfo]) -> D
             remaining_needed = total_service_nodes - len(preselected)
             remainder = [n for n in eligible_nodes if n not in preselected]
             selected_nodes = preselected + remainder[:remaining_needed]
+
         for node in selected_nodes:
             if node.node_id not in node_services:
                 node_services[node.node_id] = []
-            node_services[node.node_id].append(service.name)
+
+            if service.name.lower() == "random":
+                # Choose a random concrete service not yet on this node
+                if not concrete_service_names:
+                    continue
+                remaining = [s for s in concrete_service_names if s not in node_services[node.node_id]]
+                if not remaining:
+                    continue
+                chosen = random.choice(remaining)
+                node_services[node.node_id].append(chosen)
+            else:
+                node_services[node.node_id].append(service.name)
     return node_services
