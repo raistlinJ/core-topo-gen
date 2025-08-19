@@ -6,7 +6,7 @@ import json
 
 from PyQt6.QtCore import Qt, QPoint, QStandardPaths
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit, QPushButton, QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QScrollArea, QTreeWidget, QTreeWidgetItem, QMenu, QSplitter, QInputDialog, QLineEdit, QMessageBox, QMainWindow, QStackedWidget, QSizePolicy, QFrame, QLayout)
+    QApplication, QWidget, QLabel, QComboBox, QDoubleSpinBox, QSpinBox, QTextEdit, QPushButton, QVBoxLayout, QHBoxLayout, QGroupBox, QFileDialog, QScrollArea, QTreeWidget, QTreeWidgetItem, QMenu, QSplitter, QInputDialog, QLineEdit, QMessageBox, QMainWindow, QStackedWidget, QSizePolicy, QFrame, QLayout, QHeaderView)
 
 
 # ---------------------------
@@ -40,6 +40,15 @@ class BaseScenarioWidget(QWidget):
         ag_layout = QVBoxLayout()
         self.analysis_tree = QTreeWidget()
         self.analysis_tree.setHeaderLabels(["Item", "Value"])
+        # Make the Item column expand to fit content and Value stretch to fill remaining space
+        try:
+            header = self.analysis_tree.header()
+            header.setStretchLastSection(False)
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            self.analysis_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        except Exception:
+            pass
         ag_layout.addWidget(self.analysis_tree)
         self.analysis_group.setLayout(ag_layout)
 
@@ -268,6 +277,14 @@ class BaseScenarioWidget(QWidget):
             QTreeWidgetItem(nc_item, [str(nid), ""])
 
         self.analysis_tree.expandAll()
+        # Ensure the Item column resizes to show full text after population
+        try:
+            self.analysis_tree.resizeColumnToContents(0)
+            header = self.analysis_tree.header()
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        except Exception:
+            pass
 
 class NotesWidget(QWidget):
     def __init__(self, parent=None):
@@ -1078,8 +1095,30 @@ class MainWindow(QMainWindow):
                 if scen_xml:
                     scen.append(ET.fromstring(scen_xml))
                 root.append(scen)
-            tree = ET.ElementTree(root)
-            tree.write(path, encoding="utf-8", xml_declaration=True)
+            # Prefer pretty-printed XML using lxml if available
+            wrote_pretty = False
+            try:
+                from lxml import etree as LET  # type: ignore
+                raw = ET.tostring(root, encoding="utf-8")
+                lroot = LET.fromstring(raw)
+                pretty = LET.tostring(
+                    lroot,
+                    pretty_print=True,
+                    xml_declaration=True,
+                    encoding="utf-8",
+                )
+                with open(path, "wb") as f:
+                    f.write(pretty)
+                wrote_pretty = True
+            except Exception:
+                # Fallback to stdlib write without pretty printing
+                tree = ET.ElementTree(root)
+                try:
+                    # Python 3.9+: attempt basic indentation
+                    ET.indent(tree, space="  ", level=0)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                tree.write(path, encoding="utf-8", xml_declaration=True)
             self.current_file = path
             self.save_settings(path)
             QMessageBox.information(self, "Saved", f"Scenarios saved to {path}")
