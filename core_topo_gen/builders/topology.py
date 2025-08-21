@@ -56,6 +56,7 @@ def build_star_from_roles(core: client.CoreGrpcClient,
         node_type = map_role_to_node_type(role)
         node_name = f"{role.lower()}-{idx+1}"
         node = session.add_node(node_id, _type=node_type, position=Position(x=x, y=y), name=node_name)
+        logger.debug("Added node id=%s name=%s type=%s at (%s,%s)", node.id, node_name, node_type, x, y)
         nodes_by_id[node.id] = node
 
         if node_type == NodeType.DEFAULT:
@@ -66,6 +67,7 @@ def build_star_from_roles(core: client.CoreGrpcClient,
             sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=mac_alloc.next_mac())
             sw_ifid += 1
             session.add_link(node1=node, node2=switch, iface1=host_iface, iface2=sw_iface)
+            logger.debug("Link host %s <-> switch (ifids: host=0, sw=%d)", node.id, sw_ifid-1)
             # Ensure default routing service on hosts
             try:
                 ensure_service(session, node.id, "DefaultRoute", node_obj=node)
@@ -75,6 +77,7 @@ def build_star_from_roles(core: client.CoreGrpcClient,
             sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=mac_alloc.next_mac())
             sw_ifid += 1
             session.add_link(node1=node, node2=switch, iface2=sw_iface)
+            logger.debug("Link device %s -> switch (sw ifid=%d)", node.id, sw_ifid-1)
 
     service_assignments: Dict[int, List[str]] = {}
     if services:
@@ -165,6 +168,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
         y = int(cy + router_radius * math.sin(theta))
         node_id = i + 1
         node = session.add_node(node_id, _type=_router_node_type(), position=Position(x=x, y=y), name=f"router-{i+1}")
+        logger.debug("Added router id=%s at (%s,%s)", node.id, x, y)
         mark_node_as_router(node, session)
         set_node_services(session, node.id, ["IPForward", "zebra"], node_obj=node)
         routers.append(NodeInfo(node_id=node.id, ip4="", role="Router"))
@@ -191,6 +195,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             a_if = Interface(id=a_ifid, name=f"r{a.id}-to-r{b.id}", ip4=a_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
             b_if = Interface(id=b_ifid, name=f"r{b.id}-to-r{a.id}", ip4=b_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
             session.add_link(node1=a, node2=b, iface1=a_if, iface2=b_if)
+            logger.debug("Router link r%d (%s/%s) <-> r%d (%s/%s)", a.id, a_ip, rr_net.prefixlen, b.id, b_ip, rr_net.prefixlen)
 
     expanded_roles: List[str] = []
     for role, count in role_counts.items():
@@ -217,6 +222,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             node_type = map_role_to_node_type(role)
             name = f"{role.lower()}-{ridx+1}-1"
             host = session.add_node(node_id_counter, _type=node_type, position=Position(x=x, y=y), name=name)
+            logger.debug("Added host id=%s name=%s type=%s at (%s,%s)", host.id, name, node_type, x, y)
             node_id_counter += 1
             host_nodes_by_id[host.id] = host
             lan_net = subnet_alloc.next_random_subnet(30)
@@ -229,6 +235,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             router_next_ifid[router_node.id] = r_ifid + 1
             r_if = Interface(id=r_ifid, name=f"r{router_node.id}-h{host.id}", ip4=r_ip, ip4_mask=lan_net.prefixlen, mac=mac_alloc.next_mac())
             session.add_link(node1=host, node2=router_node, iface1=host_if, iface2=r_if)
+            logger.debug("Host %s <-> Router %s LAN /%s", host.id, router_node.id, lan_net.prefixlen)
             if node_type == NodeType.DEFAULT:
                 hosts.append(NodeInfo(node_id=host.id, ip4=f"{h_ip}/{lan_net.prefixlen}", role=role))
                 # Ensure default routing service on hosts
@@ -238,6 +245,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                     pass
         else:
             lan_switch = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=Position(x=rx+40, y=ry+40), name=f"lan-{ridx+1}")
+            logger.debug("Added LAN switch id=%s for router %s", lan_switch.id, router_node.id)
             node_id_counter += 1
             lan_net = subnet_alloc.next_random_subnet(24)
             lan_hosts = list(lan_net.hosts())
@@ -256,6 +264,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                 node_type = map_role_to_node_type(role)
                 name = f"{role.lower()}-{ridx+1}-{j+1}"
                 host = session.add_node(node_id_counter, _type=node_type, position=Position(x=x, y=y), name=name)
+                logger.debug("Added host id=%s name=%s type=%s at (%s,%s)", host.id, name, node_type, x, y)
                 node_id_counter += 1
                 host_nodes_by_id[host.id] = host
                 if host_ip_pool:
@@ -266,6 +275,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                 host_if = Interface(id=0, name="eth0", ip4=h_ip, ip4_mask=lan_net.prefixlen, mac=h_mac)
                 sw_if = Interface(id=j+1, name=f"lan{ridx+1}-h{host.id}")
                 session.add_link(node1=host, node2=lan_switch, iface1=host_if, iface2=sw_if)
+                logger.debug("Host %s -> LAN switch %s (/%s)", host.id, lan_switch.id, lan_net.prefixlen)
                 if node_type == NodeType.DEFAULT:
                     hosts.append(NodeInfo(node_id=host.id, ip4=f"{h_ip}/{lan_net.prefixlen}", role=role))
                     # Ensure default routing service on hosts
