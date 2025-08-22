@@ -246,7 +246,10 @@ def distribute_services(nodes: List[NodeInfo], services: List[ServiceInfo]) -> D
         concrete_service_names = list(DEFAULT_SERVICE_POOL)
 
     for service in services:
-        total_service_nodes = max(1, math.floor(len(host_nodes) * service.density))
+        # round-and-clamp: density in [0,1], 1 -> all hosts, else round to nearest, at least 1
+        d = max(0.0, min(1.0, float(service.density)))
+        desired = len(host_nodes) * d
+        total_service_nodes = max(1, min(len(host_nodes), int(round(desired))))
 
         # Determine eligible nodes. For Random, a node is eligible if it has at
         # least one concrete service not yet assigned to it. For concrete

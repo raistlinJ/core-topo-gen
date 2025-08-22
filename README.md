@@ -42,16 +42,25 @@ Common options:
 - `--host HOST`             core-daemon host (default: 127.0.0.1)
 - `--port PORT`             core-daemon gRPC port (default: 50051)
 - `--prefix CIDR`           IPv4 prefix for auto-assigned addresses (default: 10.0.0.0/24)
+- `--ip-mode {private|mixed|public}` control address pool selection (RFC1918 only, mix with public, or public-only)
+- `--ip-region {all|na|eu|apac|latam|africa|middle-east}` region for public pools (default: all = random from all regions)
 - `--max-nodes N`           cap total hosts created
 - `--verbose`               enable debug logging
 - `--seed N`                RNG seed for reproducible randomness
+- `--layout-density {compact|normal|spacious}` adjust node spacing for readability
+ - Traffic overrides:
+	 - `--traffic-pattern {continuous|burst|periodic|poisson|ramp}`
+	 - `--traffic-rate <KB/s>`
+	 - `--traffic-period <seconds>`
+	 - `--traffic-jitter <0-100>`
+	- `--traffic-content {text|photo|audio|video}`
 
 Example:
 
 ```bash
 python -m core_topo_gen.cli \
 	--xml validation/core-xml-syntax/auto-valid-testset/xml_scenarios/sample1.xml \
-	--verbose --seed 42
+	--ip-mode mixed --verbose --seed 42
 ```
 
 Traffic generation:
@@ -60,6 +69,17 @@ Traffic generation:
 	- Receivers: `traffic_{receiverNodeId}_r{n}.py`
 	- Senders:   `traffic_{senderNodeId}_s{n}.py`
 - The directory is cleaned before generation.
+
+Traffic XML attributes (optional):
+- In the `<section name="Traffic">`, each `<item>` can define additional behavior:
+		- `pattern`: continuous | burst | periodic | poisson | ramp (default: continuous)
+	- `rate` or `rate_kbps`: desired sending rate in KB/s (default: 0 = minimal)
+	- `period` or `period_s`: on-duration for a sending burst in seconds (default: 10)
+	- `jitter` or `jitter_pct`: +/- percentage variation applied to sleep intervals (default: 0)
+	- `content` or `content_type`: shape payload to mimic data types:
+		- `text` (HTTP-like lines), `photo`/`image` (JPEG-like markers), `audio` (frame-ish bytes), `video` (NAL-like segments)
+
+These attributes influence only sender scripts. Receivers are simple listeners. For burst/periodic, senders transmit for `period` seconds, then idle for roughly the same duration before repeating. Content type changes only the byte patterns; it does not produce valid media files, but it better approximates media-like flows for testing.
 
 ## Configure CORE custom service (Traffic)
 

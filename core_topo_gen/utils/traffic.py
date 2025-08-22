@@ -50,21 +50,135 @@ except KeyboardInterrupt:
 """
 
 
-def _tcp_sender_script(host: str, port: int) -> str:
+def _tcp_sender_script(host: str, port: int, rate_kbps: float, period_s: float, jitter_pct: float, pattern: str, content_type: str) -> str:
+    # Implement pacing based on approximate bytes per tick and sleep intervals.
+    # For TCP, open/close each period iteration to keep it simple and resilient.
     return f"""#!/usr/bin/env python3
-import socket, time
+import socket, time, os, random
 host = "{host}"; port = {port}
-print(f"[traffic] TCP sender to {{host}}:{{port}}")
-for i in range(100):
+rate_kbps = float({rate_kbps})
+period_s = float({period_s})
+jitter_pct = float({jitter_pct})
+pattern = "{pattern}".lower() or "continuous"
+content_type = "{content_type}".lower()
+print(f"[traffic] TCP sender to {{host}}:{{port}} rate={{rate_kbps}}KB/s period={{period_s}}s jitter={{jitter_pct}}% pattern={{pattern}}")
+
+# If content type isn't specified or is 'random/auto', pick one randomly including gibberish
+if not content_type or content_type in ("random", "auto"):
+    content_type = random.choices(["text", "photo", "audio", "video", "gibberish"], weights=[2, 1, 1, 1, 2])[0]
+
+def sleep_with_jitter(base: float):
+    if base <= 0:
+        return
+    j = base * (jitter_pct / 100.0)
+    time.sleep(max(0.0, random.uniform(base - j, base + j)))
+
+def send_period():
+    # compute bytes per second
+    bps = max(0.0, rate_kbps) * 1024.0
+    if bps <= 0:
+        # default to ~1KB/s if no rate provided
+        bps = 1024.0
+    # 20 ticks per second pacing
+    ticks_per_sec = 20
+    per_tick = int(bps / ticks_per_sec) if bps > 0 else 0
+    if per_tick <= 0:
+        per_tick = 1
+    tick_sleep = 1.0 / ticks_per_sec
+    t_end = time.time() + (period_s if period_s > 0 else 10.0)
+    s = None
+    # payload shaping depending on content_type
+    def payload_bytes(n):
+        if content_type in ("text", "txt", "log"):
+            # use escaped CRLF so generated script keeps literals, not newlines
+            line = ("GET /index.html HTTP/1.1\\r\\nHost: example.com\\r\\nUser-Agent: core-traffic\\r\\n\\r\\n").encode()
+            out = bytearray()
+            while len(out) < n:
+                out.extend(line)
+            return bytes(out[:n])
+        if content_type in ("photo", "image", "jpeg", "jpg", "png"):
+            # JPEG-like segment patterns (0xFF 0xD8 ... 0xFF 0xD9), fill with 0xFF and random
+            out = bytearray()
+            out.extend(b"\\xff\\xd8")
+            while len(out) < max(4, n-2):
+                out.append(0xff)
+                out.append(random.randint(0x00, 0xFE))
+            out.extend(b"\\xff\\xd9")
+            return bytes(out[:n])
+        if content_type in ("audio", "mp3", "aac"):
+            # pseudo-frames ~ 1024 bytes
+            frame = bytes(random.getrandbits(8) for _ in range(1024))
+            out = (frame * ((n // 1024) + 1))[:n]
+            return out
+        if content_type in ("video", "h264", "mp4"):
+            # NAL-like segments prefixed with 0x000001
+            out = bytearray()
+            chunk = max(256, min(8192, n // 4 or 256))
+            while len(out) < n:
+                out.extend(b"\\x00\\x00\\x01")
+                out.extend(os.urandom(min(chunk, n - len(out))))
+            return bytes(out[:n])
+        if content_type in ("gibberish", "bytes", "junk", "rand", "random-bytes"):
+            return os.urandom(n)
+        # default: random bytes
+        return os.urandom(n)
+
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(2.0)
         s.connect((host, port))
-        s.sendall(b"x" * 1024)
-        s.close()
+
+        if pattern == "poisson":
+            # Poisson inter-arrival using exponential distribution around target bps
+            avg_bytes = per_tick
+            avg_interval = tick_sleep if per_tick > 0 else 0.05
+            while time.time() < t_end:
+                try:
+                    if avg_bytes > 0:
+                        size = max(1, int(random.expovariate(1.0 / avg_bytes)))
+                        s.sendall(payload_bytes(size))
+                except Exception:
+                    break
+                # exponential delay
+                delay = random.expovariate(1.0 / max(1e-3, avg_interval))
+                sleep_with_jitter(delay)
+        elif pattern == "ramp":
+            # ramp from 10% to 100% per_tick over the period
+            start = time.time()
+            while time.time() < t_end:
+                elapsed = time.time() - start
+                frac = min(1.0, max(0.1, elapsed / max(0.001, period_s)))
+                size = max(1, int(per_tick * frac))
+                try:
+                    s.sendall(payload_bytes(size))
+                except Exception:
+                    break
+                sleep_with_jitter(tick_sleep)
+        else:
+            while time.time() < t_end:
+                if per_tick > 0:
+                    try:
+                        s.sendall(payload_bytes(per_tick))
+                    except Exception:
+                        break
+                sleep_with_jitter(tick_sleep)
     except Exception:
         pass
-    time.sleep(1.0)
+    finally:
+        try:
+            if s:
+                s.close()
+        except Exception:
+            pass
+
+while True:
+    if pattern in ("burst", "periodic"):
+        send_period()
+        # idle the same period length between bursts
+        sleep_with_jitter(period_s if period_s > 0 else 10.0)
+    else:
+        # continuous: chain periods back-to-back
+        send_period()
 """
 
 
@@ -82,18 +196,108 @@ except KeyboardInterrupt:
 """
 
 
-def _udp_sender_script(host: str, port: int) -> str:
+def _udp_sender_script(host: str, port: int, rate_kbps: float, period_s: float, jitter_pct: float, pattern: str, content_type: str) -> str:
     return f"""#!/usr/bin/env python3
-import socket, time
+import socket, time, random, os
 host = "{host}"; port = {port}
+rate_kbps = float({rate_kbps})
+period_s = float({period_s})
+jitter_pct = float({jitter_pct})
+pattern = "{pattern}".lower() or "continuous"
+content_type = "{content_type}".lower()
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-print(f"[traffic] UDP sender to {{host}}:{{port}}")
-for i in range(300):
-    try:
-        s.sendto(b"x" * 512, (host, port))
-    except Exception:
-        pass
-    time.sleep(0.2)
+print(f"[traffic] UDP sender to {{host}}:{{port}} rate={{rate_kbps}}KB/s period={{period_s}}s jitter={{jitter_pct}}% pattern={{pattern}}")
+
+# If content type isn't specified or is 'random/auto', pick one randomly including gibberish
+if not content_type or content_type in ("random", "auto"):
+    content_type = random.choices(["text", "photo", "audio", "video", "gibberish"], weights=[2, 1, 1, 1, 2])[0]
+
+def sleep_with_jitter(base: float):
+    if base <= 0:
+        return
+    j = base * (jitter_pct / 100.0)
+    time.sleep(max(0.0, random.uniform(base - j, base + j)))
+
+def send_period():
+    bps = max(0.0, rate_kbps) * 1024.0
+    if bps <= 0:
+        # default to ~2.5KB/s (similar to previous 512B every 0.2s)
+        bps = 2560.0
+    ticks_per_sec = 50
+    per_tick = int(bps / ticks_per_sec) if bps > 0 else 0
+    if per_tick <= 0:
+        per_tick = 1
+    tick_sleep = 1.0 / ticks_per_sec
+    t_end = time.time() + (period_s if period_s > 0 else 10.0)
+    # payload shaping by content_type
+    def payload_bytes(n):
+        if content_type in ("text", "txt", "log"):
+            line = ("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").encode()
+            out = bytearray()
+            while len(out) < n:
+                out.extend(line)
+            return bytes(out[:n])
+        if content_type in ("photo", "image", "jpeg", "jpg", "png"):
+            out = bytearray()
+            out.extend(b"\xff\xd8")
+            while len(out) < max(4, n-2):
+                out.append(0xff)
+                out.append(random.randint(0x00, 0xFE))
+            out.extend(b"\xff\xd9")
+            return bytes(out[:n])
+        if content_type in ("audio", "mp3", "aac"):
+            frame = bytes(random.getrandbits(8) for _ in range(256))
+            out = (frame * ((n // 256) + 1))[:n]
+            return out
+        if content_type in ("video", "h264", "mp4"):
+            out = bytearray()
+            chunk = max(64, min(1400, n // 4 or 64))
+            while len(out) < n:
+                out.extend(b"\x00\x00\x01")
+                out.extend(os.urandom(min(chunk, n - len(out))))
+            return bytes(out[:n])
+        if content_type in ("gibberish", "bytes", "junk", "rand", "random-bytes"):
+            return os.urandom(n)
+        return os.urandom(n)
+
+    if pattern == "poisson":
+        avg_bytes = per_tick
+        avg_interval = tick_sleep if per_tick > 0 else 0.05
+        while time.time() < t_end:
+            try:
+                if avg_bytes > 0:
+                    size = max(1, int(random.expovariate(1.0 / avg_bytes)))
+                    s.sendto(payload_bytes(size), (host, port))
+            except Exception:
+                pass
+            delay = random.expovariate(1.0 / max(1e-3, avg_interval))
+            sleep_with_jitter(delay)
+    elif pattern == "ramp":
+        start = time.time()
+        while time.time() < t_end:
+            elapsed = time.time() - start
+            frac = min(1.0, max(0.1, elapsed / max(0.001, period_s)))
+            size = max(1, int(per_tick * frac))
+            try:
+                s.sendto(payload_bytes(size), (host, port))
+            except Exception:
+                pass
+            sleep_with_jitter(tick_sleep)
+    else:
+        while time.time() < t_end:
+            if per_tick > 0:
+                try:
+                    s.sendto(payload_bytes(per_tick), (host, port))
+                except Exception:
+                    pass
+            sleep_with_jitter(tick_sleep)
+
+while True:
+    if pattern in ("burst", "periodic"):
+        send_period()
+        sleep_with_jitter(period_s if period_s > 0 else 10.0)
+    else:
+        send_period()
 """
 
 
@@ -140,8 +344,16 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
     if not weighted:
         weighted = [("TCP", 1.0)]
 
-    # Select subset of hosts by density
-    k = max(1, int(len(hosts) * density))
+    # Select subset of hosts by density (round-and-clamp semantics)
+    # - density <= 0 handled above
+    # - density >= 1 -> select all hosts
+    # - otherwise round to nearest and clamp to [1, len(hosts)]
+    import math
+    if density >= 1:
+        k = len(hosts)
+    else:
+        desired = len(hosts) * max(0.0, min(1.0, float(density)))
+        k = max(1, min(len(hosts), int(round(desired))))
     selected = hosts.copy()
     random.shuffle(selected)
     selected = selected[:k]
@@ -193,7 +405,17 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
                 dst_port = rx_port
                 s_index = send_idx_by_node.get(host.node_id, 1)
                 send_name = os.path.join(out_dir, f"traffic_{host.node_id}_s{s_index}.py")
-                send_content = _tcp_sender_script(dst_ip, dst_port) if kind == "TCP" else _udp_sender_script(dst_ip, dst_port)
+                # Use parsed rate/period/jitter/pattern when available
+                rate_kbps = getattr(it, "rate_kbps", 0.0) or 0.0
+                period_s = getattr(it, "period_s", 10.0) or 10.0
+                jitter_pct = getattr(it, "jitter_pct", 0.0) or 0.0
+                pattern = getattr(it, "pattern", "") or ""
+                content_type = getattr(it, "content_type", "") or ""
+                send_content = (
+                    _tcp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
+                    if kind == "TCP"
+                    else _udp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
+                )
                 with open(send_name, "w", encoding="utf-8") as f:
                     f.write(send_content)
                 os.chmod(send_name, os.stat(send_name).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)

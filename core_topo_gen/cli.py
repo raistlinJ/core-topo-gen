@@ -6,7 +6,7 @@ import os
 from core.api.grpc import client
 from .parsers.xml_parser import parse_node_info, parse_routing_info, parse_traffic_info
 from .utils.allocation import compute_role_counts
-from .builders.topology import build_star_from_roles, build_segmented_topology
+from .builders.topology import build_star_from_roles, build_segmented_topology, build_multi_switch_topology
 from .utils.traffic import generate_traffic_scripts
 from .utils.services import ensure_service
 
@@ -18,9 +18,37 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="core-daemon gRPC host")
     ap.add_argument("--port", type=int, default=50051, help="core-daemon gRPC port")
     ap.add_argument("--prefix", default="10.0.0.0/24", help="IPv4 prefix for auto-assigned addresses")
+    ap.add_argument(
+        "--ip-mode",
+        choices=["private", "mixed", "public"],
+        default="private",
+        help="IP address pool mode: private (RFC1918), mixed (private+public), or public",
+    )
+    ap.add_argument(
+        "--ip-region",
+        choices=["all", "na", "eu", "apac", "latam", "africa", "middle-east"],
+        default="all",
+        help="Region for public pools when ip-mode is mixed/public (default: all)",
+    )
     ap.add_argument("--max-nodes", type=int, default=None, help="Optional cap on hosts to create")
     ap.add_argument("--verbose", action="store_true", help="Enable debug logging")
     ap.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducible topology randomness")
+    ap.add_argument(
+        "--layout-density",
+        choices=["compact", "normal", "spacious"],
+        default="normal",
+        help="Layout spacing for visual clarity (affects node positions)",
+    )
+    # Optional overrides for traffic generation
+    ap.add_argument("--traffic-pattern", choices=["continuous", "burst", "periodic", "poisson", "ramp"], help="Override traffic pattern for all items")
+    ap.add_argument("--traffic-rate", type=float, help="Override traffic rate for all items (KB/s)")
+    ap.add_argument("--traffic-period", type=float, help="Override traffic period for all items (seconds)")
+    ap.add_argument("--traffic-jitter", type=float, help="Override traffic jitter for all items (percent 0-100)")
+    ap.add_argument(
+        "--traffic-content",
+        choices=["text", "photo", "audio", "video"],
+        help="Override traffic content type for all items (text/photo/audio/video)",
+    )
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -48,13 +76,20 @@ def main():
             routing_items=routing_items,
             services=services,
             ip4_prefix=args.prefix,
+            ip_mode=args.ip_mode,
+            ip_region=args.ip_region,
+            layout_density=args.layout_density,
         )
     else:
-        session, switch, hosts, service_assignments = build_star_from_roles(
+        # Use multi-switch for more variety when no routing is requested
+        session, switches, hosts, service_assignments = build_multi_switch_topology(
             core,
             role_counts,
             services=services,
             ip4_prefix=args.prefix,
+            ip_mode=args.ip_mode,
+            ip_region=args.ip_region,
+            layout_density=args.layout_density,
         )
 
     # Parse traffic and generate scripts for non-router hosts
@@ -66,6 +101,20 @@ def main():
     )
     if traffic_density and traffic_density > 0:
         try:
+            # apply CLI overrides, if provided
+            if traffic_items:
+                for i in range(len(traffic_items)):
+                    ti = traffic_items[i]
+                    if args.traffic_pattern:
+                        ti.pattern = args.traffic_pattern
+                    if args.traffic_rate is not None:
+                        ti.rate_kbps = max(0.0, float(args.traffic_rate))
+                    if args.traffic_period is not None:
+                        ti.period_s = max(0.0, float(args.traffic_period)) if float(args.traffic_period) > 0 else 10.0
+                    if args.traffic_jitter is not None:
+                        ti.jitter_pct = max(0.0, min(100.0, float(args.traffic_jitter)))
+                    if args.traffic_content:
+                        ti.content_type = args.traffic_content
             traffic_map = generate_traffic_scripts(hosts, traffic_density, traffic_items, out_dir="/tmp/traffic")
             if not traffic_map:
                 logging.info("No hosts selected for traffic after generation (density too low or no eligible hosts)")
