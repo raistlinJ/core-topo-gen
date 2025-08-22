@@ -130,7 +130,6 @@ def build_star_from_roles(core: client.CoreGrpcClient,
                                     session.services.add(node_obj_try, "zebra")
                     except Exception:
                         pass
-    core.start_session(session)
     return session, switch, node_infos, service_assignments
 
 
@@ -351,5 +350,4 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                                     session.services.add(node_obj_try, "zebra")
                     except Exception:
                         pass
-    core.start_session(session)
     return session, routers, hosts, host_service_assignments, router_protocols

@@ -18,3 +18,8 @@ class NodeInfo:
     node_id: int
     ip4: str
     role: str
+
+@dataclass
+class TrafficInfo:
+    kind: str
+    factor: float

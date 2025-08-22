@@ -27,42 +27,95 @@ DEFAULT_SERVICE_POOL: List[str] = [
 ]
 
 def ensure_service(session: object, node_id: int, service_name: str, node_obj: Optional[object] = None) -> bool:
-    """Attempt to add a service to a node without replacing existing services.
+    """Attempt to add a service to a node without dropping existing services.
 
-    Tries multiple CORE API styles for compatibility. Returns True on success.
+    Strategy:
+    1) Read current services (via session.services.get or node_obj.services) and set union.
+    2) Fall back to additive APIs (session.add_service / session.services.add / node_obj.add).
     """
-    # Try direct session.add_service
+    # Try to fetch node object if not provided
+    if node_obj is None:
+        try:
+            if hasattr(session, "get_node"):
+                node_obj = session.get_node(node_id)
+            elif hasattr(session, "nodes") and isinstance(session.nodes, dict):
+                node_obj = session.nodes.get(node_id)
+        except Exception:
+            node_obj = None
+
+    # First, attempt to read existing and set with union
+    current = None
+    try:
+        if hasattr(session, "services") and hasattr(session.services, "get"):
+            try:
+                current = list(session.services.get(node_id) or [])
+            except TypeError:
+                if node_obj is not None:
+                    current = list(session.services.get(node_obj) or [])
+    except Exception:
+        current = None
+    if current is None and node_obj is not None:
+        try:
+            if hasattr(node_obj, "services"):
+                # node_obj.services might be list-like or have a getter
+                cur = getattr(node_obj, "services")
+                if isinstance(cur, (list, tuple)):
+                    current = list(cur)
+        except Exception:
+            current = None
+
+    if current is not None:
+        if service_name not in current:
+            current.append(service_name)
+        try:
+            if hasattr(session, "services") and hasattr(session.services, "set"):
+                try:
+                    session.services.set(node_id, tuple(current))
+                    logger.info("services.set: updated node %s -> %s", node_id, ", ".join(current))
+                    return True
+                except TypeError:
+                    if node_obj is not None:
+                        session.services.set(node_obj, tuple(current))
+                        logger.info("services.set(node_obj): updated node %s -> %s", node_id, ", ".join(current))
+                        return True
+        except Exception as e:
+            logger.debug("services.set failed for node %s: %s", node_id, e)
+
+    # Fallback: direct additive methods
     try:
         if hasattr(session, "add_service"):
+            logger.debug("add_service(node_id=%s, %s)", node_id, service_name)
             session.add_service(node_id=node_id, service_name=service_name)
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("session.add_service failed for node %s: %s", node_id, e)
 
-    # Try session.services.add
     try:
         if hasattr(session, "services") and hasattr(session.services, "add"):
             try:
+                logger.debug("services.add(node_id=%s, %s)", node_id, service_name)
                 session.services.add(node_id, service_name)
                 return True
             except TypeError:
                 if node_obj is not None:
+                    logger.debug("services.add(node_obj for node_id=%s, %s)", node_id, service_name)
                     session.services.add(node_obj, service_name)
                     return True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("session.services.add failed for node %s: %s", node_id, e)
 
-    # Try adding on node object
     if node_obj is not None:
         try:
             if hasattr(node_obj, "services") and hasattr(node_obj.services, "add"):
+                logger.debug("node_obj.services.add(node_id=%s, %s)", node_id, service_name)
                 node_obj.services.add(service_name)
                 return True
             if hasattr(node_obj, "add_service"):
+                logger.debug("node_obj.add_service(node_id=%s, %s)", node_id, service_name)
                 node_obj.add_service(service_name)
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("node_obj add service failed for node %s: %s", node_id, e)
 
     logger.warning("Failed to ensure service '%s' on node %s", service_name, node_id)
     return False

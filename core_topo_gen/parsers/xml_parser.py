@@ -3,7 +3,7 @@ import os
 import logging
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple
-from ..types import ServiceInfo, RoutingInfo
+from ..types import ServiceInfo, RoutingInfo, TrafficInfo
 
 logger = logging.getLogger(__name__)
 
@@ -137,4 +137,49 @@ def parse_routing_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[flo
         if factor > 0:
             items.append(RoutingInfo(protocol=proto, factor=factor))
     logger.debug("Parsed routing: density=%s items=%s", density, [(i.protocol, i.factor) for i in items])
+    return density, items
+
+
+def parse_traffic_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[float, List[TrafficInfo]]:
+    """Parse the Traffic section density and item factors.
+
+    Returns (density, [TrafficInfo(kind, factor), ...]).
+    """
+    density = 0.0
+    items: List[TrafficInfo] = []
+    if not os.path.exists(xml_path):
+        logger.warning("XML not found for traffic parse: %s", xml_path)
+        return density, items
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception as e:
+        logger.warning("Failed to parse XML for traffic (%s)", e)
+        return density, items
+    scenario = _find_scenario(root, scenario_name)
+    if scenario is None:
+        logger.warning("No <Scenario> found for traffic parse")
+        return density, items
+    section = scenario.find(".//section[@name='Traffic']")
+    if section is None:
+        return density, items
+    den_raw = (section.get("density") or "").strip()
+    if den_raw:
+        try:
+            density = float(den_raw)
+            density = max(0.0, min(1.0, density))
+        except Exception:
+            logger.warning("Invalid Traffic density '%s'", den_raw)
+            density = 0.0
+    for it in section.findall("./item"):
+        kind = (it.get("selected") or "").strip()
+        if not kind:
+            continue
+        try:
+            factor = float((it.get("factor") or "0").strip())
+        except Exception:
+            factor = 0.0
+        if factor > 0:
+            items.append(TrafficInfo(kind=kind, factor=factor))
+    logger.debug("Parsed traffic: density=%s items=%s", density, [(i.kind, i.factor) for i in items])
     return density, items
