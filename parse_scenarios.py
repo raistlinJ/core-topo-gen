@@ -75,9 +75,18 @@ CHILD_NAME_NAMES = {"name", "label", "title", "caption"}
 CHILD_TYPE_NAMES = {"type", "kind", "role", "category", "class"}
 
 def strip_ns(tag: str) -> str:
-    """Return local tag name without namespace."""
+    """Return local tag name without namespace.
+
+    Robust to lxml special nodes (e.g., Comment/PI) where ``.tag`` is not a string.
+    """
     if tag is None:
         return ""
+    # Some lxml node types (Comment, ProcessingInstruction) expose a callable/non-str tag.
+    if not isinstance(tag, str):
+        try:
+            return str(tag)
+        except Exception:
+            return ""
     if "}" in tag:
         return tag.split("}", 1)[1]
     return tag
