@@ -320,6 +320,7 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
     Returns a mapping of node_id -> list of script file paths (created locally).
     """
     result: Dict[int, List[str]] = {}
+    flows: List[Dict[str, object]] = []
     if not hosts or density <= 0:
         return result
 
@@ -421,5 +422,29 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
                 os.chmod(send_name, os.stat(send_name).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
                 send_idx_by_node[host.node_id] = s_index + 1
                 result.setdefault(host.node_id, []).append(send_name)
+
+                # record a flow summary for reporting
+                flows.append({
+                    "src_id": host.node_id,
+                    "dst_id": rx_node_id,
+                    "protocol": kind,
+                    "dst_ip": dst_ip,
+                    "dst_port": dst_port,
+                    "pattern": pattern or "",
+                    "rate_kbps": rate_kbps,
+                    "period_s": period_s,
+                    "jitter_pct": jitter_pct,
+                    "content_type": content_type or "",
+                    "sender_script": send_name,
+                    "receiver_script": recv_name,
+                })
+
+    # write a machine-readable summary to the out_dir for report generator
+    try:
+        import json
+        with open(os.path.join(out_dir, "traffic_summary.json"), "w", encoding="utf-8") as jf:
+            json.dump({"flows": flows}, jf, indent=2)
+    except Exception:
+        pass
 
     return result

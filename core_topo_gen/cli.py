@@ -8,6 +8,7 @@ from .parsers.xml_parser import parse_node_info, parse_routing_info, parse_traff
 from .utils.allocation import compute_role_counts
 from .builders.topology import build_star_from_roles, build_segmented_topology, build_multi_switch_topology
 from .utils.traffic import generate_traffic_scripts
+from .utils.report import write_report
 from .utils.services import ensure_service
 
 
@@ -68,6 +69,16 @@ def main():
     core = client.CoreGrpcClient(address=f"{args.host}:{args.port}")
     core.connect()
 
+    scenario_name = args.scenario
+    generation_meta = {
+        "host": args.host,
+        "port": args.port,
+        "ip_prefix": args.prefix,
+        "ip_mode": args.ip_mode,
+        "ip_region": args.ip_region,
+        "layout_density": args.layout_density,
+        "seed": args.seed,
+    }
     if routing_density and routing_density > 0:
         session, routers, hosts, service_assignments, router_protocols = build_segmented_topology(
             core,
@@ -99,6 +110,8 @@ def main():
         float(traffic_density or 0.0),
         len(traffic_items or []),
     )
+    traffic_out_dir = "/tmp/traffic"
+    traffic_map = {}
     if traffic_density and traffic_density > 0:
         try:
             # apply CLI overrides, if provided
@@ -115,7 +128,7 @@ def main():
                         ti.jitter_pct = max(0.0, min(100.0, float(args.traffic_jitter)))
                     if args.traffic_content:
                         ti.content_type = args.traffic_content
-            traffic_map = generate_traffic_scripts(hosts, traffic_density, traffic_items, out_dir="/tmp/traffic")
+            traffic_map = generate_traffic_scripts(hosts, traffic_density, traffic_items, out_dir=traffic_out_dir)
             if not traffic_map:
                 logging.info("No hosts selected for traffic after generation (density too low or no eligible hosts)")
             # Enable 'Traffic' service on all nodes that have traffic (additive)
@@ -171,6 +184,64 @@ def main():
             logging.warning("Failed generating traffic scripts: %s", e)
     else:
         logging.info("Traffic disabled or density is 0; skipping traffic generation and service enablement")
+
+    # Write scenario report (Markdown) under ./reports/
+    try:
+        import time as _time
+        report_dir = os.path.join(os.getcwd(), "reports")
+        os.makedirs(report_dir, exist_ok=True)
+        traffic_summary_path = os.path.join(traffic_out_dir, "traffic_summary.json")
+        report_path = os.path.join(report_dir, f"scenario_report_{int(_time.time())}.md")
+        routing_cfg = {
+            "density": routing_density,
+            "items": [{"protocol": i.protocol, "factor": i.factor} for i in (routing_items or [])],
+        }
+        traffic_cfg = {
+            "density": traffic_density,
+            "items": [{
+                "kind": i.kind,
+                "factor": i.factor,
+                "pattern": i.pattern,
+                "rate_kbps": i.rate_kbps,
+                "period_s": i.period_s,
+                "jitter_pct": i.jitter_pct,
+                "content_type": i.content_type,
+            } for i in (traffic_items or [])],
+        }
+        services_cfg = [{"name": s.name, "factor": s.factor, "density": s.density} for s in (services or [])]
+        if routing_density and routing_density > 0:
+            write_report(
+                report_path,
+                scenario_name,
+                routers=routers,
+                router_protocols=router_protocols,
+                switches=[],
+                hosts=hosts,
+                service_assignments=service_assignments,
+                traffic_summary_path=traffic_summary_path if os.path.exists(traffic_summary_path) else None,
+                metadata=generation_meta,
+                routing_cfg=routing_cfg,
+                traffic_cfg=traffic_cfg,
+                services_cfg=services_cfg,
+            )
+        else:
+            write_report(
+                report_path,
+                scenario_name,
+                routers=[],
+                router_protocols={},
+                switches=switches,
+                hosts=hosts,
+                service_assignments=service_assignments,
+                traffic_summary_path=traffic_summary_path if os.path.exists(traffic_summary_path) else None,
+                metadata=generation_meta,
+                routing_cfg=routing_cfg,
+                traffic_cfg=traffic_cfg,
+                services_cfg=services_cfg,
+            )
+        logging.info("Scenario report written to %s", report_path)
+    except Exception as e:
+        logging.error("Failed to write scenario report: %s", e)
 
     # Start the CORE session only after all services (including Traffic) are applied
     try:
