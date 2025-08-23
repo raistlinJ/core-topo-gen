@@ -48,6 +48,10 @@ Common options:
 - `--verbose`               enable debug logging
 - `--seed N`                RNG seed for reproducible randomness
 - `--layout-density {compact|normal|spacious}` adjust node spacing for readability
+ - Segmentation:
+	 - `--nat-mode {SNAT|MASQUERADE}` NAT mode for router NAT rules (default: SNAT)
+	 - `--dnat-prob <0..1>` probability to create DNAT (port-forward) for generated flows on routers (default: 0)
+	 - `--seg-include-hosts` include host nodes as candidates for segmentation placement (default: routers only)
  - Traffic overrides:
 	 - `--traffic-pattern {continuous|burst|periodic|poisson|ramp}`
 	 - `--traffic-rate <KB/s>`
@@ -81,6 +85,27 @@ Traffic XML attributes (optional):
 
 These attributes influence only sender scripts. Receivers are simple listeners. For burst/periodic, senders transmit for `period` seconds, then idle for roughly the same duration before repeating. Content type changes only the byte patterns; it does not produce valid media files, but it better approximates media-like flows for testing.
 
+Segmentation generation:
+- If Segmentation is defined in the XML, scripts are written to `/tmp/segmentation` and a custom service named `Segmentation` is enabled on the affected nodes.
+- The generator supports three selection labels in XML/GUI: `Firewall`, `NAT`, and `CUSTOM` (plus `Random`). Internally, all enable a unified `Segmentation` service in CORE.
+- Placement defaults to routers only. Use `--seg-include-hosts` to allow host-level firewall/custom rules when desired. NAT is always router-only and never placed on hosts.
+- NAT mode can be set via `--nat-mode` (SNAT or MASQUERADE). NAT setup enforces default-deny on the router `FORWARD` chain with a stateful allow for ESTABLISHED,RELATED; scripts are idempotent.
+- Allow rules: after traffic generation, allow rules are inserted only when a flow would otherwise be blocked by segmentation policies. These are written into the same `/tmp/segmentation` folder and appended to `segmentation_summary.json`.
+- Optional DNAT: with `--dnat-prob > 0`, per-router DNAT (port-forward) rules for some flows are generated.
+- The directory `/tmp/segmentation` is cleaned before each run. A summary JSON (`segmentation_summary.json`) records all rules and is used to avoid duplicates across runs.
+- Logging mirrors traffic: planning and per-node actions are logged, along with final counts of rules by type and nodes affected.
+
+### Custom traffic profile (pluggable)
+
+You can defer to a custom implementation by setting `pattern="custom"` on a traffic item. The generator will call a registered plugin if present:
+
+- Register a plugin at runtime:
+	- Import `core_topo_gen.plugins.traffic` and call `register(sender, receiver=None)`.
+	- `sender(host, port, rate_kbps, period_s, jitter_pct, content_type, protocol) -> str` should return a full Python script.
+	- `receiver(port, protocol) -> str` is optional; built-ins are used if omitted.
+
+If no plugin is registered, `pattern="custom"` falls back to the built-in TCP/UDP generators.
+
 ## Configure CORE custom service (Traffic)
 
 To auto-start generated traffic scripts inside nodes, CORE needs a custom service named "Traffic".
@@ -102,6 +127,21 @@ Adjust the path to match where you placed `TrafficService.py`.
 3) Restart `core-daemon` (and CORE GUI if open) so the new service is discovered.
 
 When enabled on a node, the Traffic service will copy `/tmp/traffic/traffic_<nodeId>_*.py` into the node and run them in the background.
+
+## Configure CORE custom service (Segmentation)
+
+To auto-start generated segmentation scripts, CORE needs a custom service named "Segmentation".
+
+1) On the CORE machine, install a Segmentation service definition (for example `SegmentationService.py`) into your custom services folder, e.g.:
+
+	- `/usr/local/share/core/custom_services/` (system-wide)
+	- or your configured custom services directory
+
+2) Ensure CORE is pointed at that folder in `~/.core/core.conf` or `/etc/core/core.conf` via `custom_services_path` (see Traffic section above).
+
+3) Restart `core-daemon` so the service is discovered.
+
+When enabled on a node, the Segmentation service will copy and execute `/tmp/segmentation/seg_*_<nodeId>_*.py` scripts.
 
 ## Troubleshooting
 

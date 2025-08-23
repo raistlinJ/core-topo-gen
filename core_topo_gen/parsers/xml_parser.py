@@ -2,8 +2,9 @@ from __future__ import annotations
 import os
 import logging
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 from ..types import ServiceInfo, RoutingInfo, TrafficInfo
+from ..types import SegmentationInfo
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,8 @@ def parse_node_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[int, L
         parsed.append((role, factor))
     if not parsed:
         parsed = default_items
+
+
     services = []
     if scenario is not None:
         services = parse_services(scenario)
@@ -212,4 +215,49 @@ def parse_traffic_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[flo
     logger.debug("Parsed traffic: density=%s items=%s", density, [
         (i.kind, i.factor, i.pattern, i.rate_kbps, i.period_s, i.jitter_pct) for i in items
     ])
+    return density, items
+
+
+def parse_segmentation_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[float, List[SegmentationInfo]]:
+    """Parse the Segmentation section density and item factors.
+
+    Returns (density, [SegmentationInfo(name, factor), ...]).
+    """
+    density = 0.0
+    items: List[SegmentationInfo] = []
+    if not os.path.exists(xml_path):
+        logger.warning("XML not found for segmentation parse: %s", xml_path)
+        return density, items
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception as e:
+        logger.warning("Failed to parse XML for segmentation (%s)", e)
+        return density, items
+    scenario = _find_scenario(root, scenario_name)
+    if scenario is None:
+        logger.warning("No <Scenario> found for segmentation parse")
+        return density, items
+    section = scenario.find(".//section[@name='Segmentation']")
+    if section is None:
+        return density, items
+    den_raw = (section.get("density") or "").strip()
+    if den_raw:
+        try:
+            density = float(den_raw)
+            density = max(0.0, min(1.0, density))
+        except Exception:
+            logger.warning("Invalid Segmentation density '%s'", den_raw)
+            density = 0.0
+    for it in section.findall("./item"):
+        name = (it.get("selected") or "").strip()
+        if not name:
+            continue
+        try:
+            factor = float((it.get("factor") or "0").strip())
+        except Exception:
+            factor = 0.0
+        if factor > 0:
+            items.append(SegmentationInfo(name=name, factor=factor))
+    logger.debug("Parsed segmentation: density=%s items=%s", density, [(i.name, i.factor) for i in items])
     return density, items

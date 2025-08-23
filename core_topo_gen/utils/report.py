@@ -19,6 +19,18 @@ def _read_traffic_summary(path: str) -> List[dict]:
     return []
 
 
+def _read_segmentation_summary(path: str) -> List[dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        rules = data.get("rules", [])
+        if isinstance(rules, list):
+            return rules
+    except Exception:
+        pass
+    return []
+
+
 def write_report(
     out_path: str,
     scenario_name: Optional[str],
@@ -28,10 +40,12 @@ def write_report(
     hosts: Optional[List[NodeInfo]] = None,
     service_assignments: Optional[Dict[int, List[str]]] = None,
     traffic_summary_path: Optional[str] = None,
+    segmentation_summary_path: Optional[str] = None,
     metadata: Optional[Dict[str, object]] = None,
     routing_cfg: Optional[Dict[str, object]] = None,
     traffic_cfg: Optional[Dict[str, object]] = None,
     services_cfg: Optional[List[Dict[str, object]]] = None,
+    segmentation_cfg: Optional[Dict[str, object]] = None,
 ) -> str:
     routers = routers or []
     hosts = hosts or []
@@ -42,6 +56,9 @@ def write_report(
     flows: List[dict] = []
     if traffic_summary_path and os.path.exists(traffic_summary_path):
         flows = _read_traffic_summary(traffic_summary_path)
+    seg_rules: List[dict] = []
+    if segmentation_summary_path and os.path.exists(segmentation_summary_path):
+        seg_rules = _read_segmentation_summary(segmentation_summary_path)
 
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     total_nodes = len(routers) + len(hosts) + len(switches)
@@ -57,6 +74,7 @@ def write_report(
     lines.append(f"- Total nodes: {total_nodes}")
     lines.append(f"- Routers: {len(routers)}  |  Switches: {len(switches)}  |  Hosts: {len(hosts)}")
     lines.append(f"- Traffic flows: {len(flows)}")
+    lines.append(f"- Segmentation rules: {len(seg_rules)}")
     lines.append("")
 
     if routers:
@@ -104,8 +122,51 @@ def write_report(
             )
         lines.append("")
 
+    if seg_rules:
+        lines.append("## Segmentation Rules")
+        lines.append("| Node | Service | Type | Details | Script |")
+        lines.append("| ---: | --- | --- | --- | --- |")
+        for r in seg_rules:
+            typ = (r.get("rule", {}) or {}).get("type", "")
+            det = ""
+            rr = r.get("rule", {}) or {}
+            if typ == "subnet_block":
+                det = f"{rr.get('src','')} -> {rr.get('dst','')}"
+            elif typ == "host_block":
+                det = f"{rr.get('src','')} -> {rr.get('dst','')}"
+            elif typ == "protect_internal":
+                det = f"subnet {rr.get('subnet','')}"
+            elif typ == "nat":
+                # Show internal/external, mode and egress ip when available
+                internal = rr.get("internal", "")
+                external = rr.get("external", "")
+                mode = rr.get("mode", "")
+                eip = rr.get("egress_ip", "")
+                arrow = "->"
+                det = f"{internal} {arrow} {external} (mode={mode or 'SNAT'}, egress={eip})"
+            elif typ == "dnat":
+                rip = rr.get("router_ip", "")
+                dst = rr.get("dst", "")
+                port = rr.get("port", "")
+                proto = rr.get("proto", "")
+                det = f"{proto.upper()} {rip}:{port} -> {dst}:{port}"
+            elif typ == "allow":
+                det = f"{rr.get('src','')} -> {rr.get('dst','')} {rr.get('proto','').upper()}:{rr.get('port','')} ({rr.get('chain','')})"
+            elif typ == "custom":
+                det = "custom policy" + (" (fallback)" if rr.get("fallback") else "")
+            lines.append(
+                "| {node} | {svc} | {typ} | {det} | {script} |".format(
+                    node=r.get("node_id", ""),
+                    svc=r.get("service", ""),
+                    typ=typ,
+                    det=det,
+                    script=os.path.basename(r.get("script", "")),
+                )
+            )
+        lines.append("")
+
     # Optional Details section (extra info grouped at end)
-    if any([metadata, routing_cfg, traffic_cfg, services_cfg]):
+    if any([metadata, routing_cfg, traffic_cfg, services_cfg, segmentation_cfg]):
         lines.append("## Details")
         if metadata:
             lines.append("### Generation parameters")
@@ -150,6 +211,17 @@ def write_report(
                 lines.append("| --- | ---: | ---: |")
                 for s in services_cfg:
                     lines.append(f"| {s.get('name','')} | {s.get('factor','')} | {s.get('density','')} |")
+            lines.append("")
+        if segmentation_cfg:
+            den = segmentation_cfg.get("density", "")
+            items = segmentation_cfg.get("items", []) or []
+            lines.append("### Segmentation config")
+            lines.append(f"- Density: {den}")
+            if items:
+                lines.append("| Service | Factor |")
+                lines.append("| --- | ---: |")
+                for it in items:
+                    lines.append(f"| {it.get('name','')} | {it.get('factor','')} |")
             lines.append("")
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)

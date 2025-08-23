@@ -9,9 +9,6 @@ from basic_core_structure import (
     add_mobility_configurations
 )
 
-
-
-
 # Start scenario
 scenario = ET.Element("scenario", {"name": "/tmp/tmpxwrcvn1n"}) #will need to be dynamic but ok for now 
 
@@ -20,7 +17,6 @@ with open("scenario_config.json") as f:
     config = json.load(f)
 
 device_config = config["devices"]
-
 
 autogenerate = config.get("autogenerate_links", False)
 

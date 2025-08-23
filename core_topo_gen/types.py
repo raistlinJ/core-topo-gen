@@ -28,3 +28,8 @@ class TrafficInfo:
     period_s: float = 10.0
     jitter_pct: float = 0.0
     content_type: str = ""
+
+@dataclass
+class SegmentationInfo:
+    name: str
+    factor: float

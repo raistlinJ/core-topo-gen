@@ -33,6 +33,14 @@ def ensure_service(session: object, node_id: int, service_name: str, node_obj: O
     1) Read current services (via session.services.get or node_obj.services) and set union.
     2) Fall back to additive APIs (session.add_service / session.services.add / node_obj.add).
     """
+    # Normalize to custom segmentation services when applicable
+    try:
+        if isinstance(service_name, str):
+            if service_name in ("Firewall", "NAT", "sFirewall", "sNAT"):
+                service_name = "Segmentation"
+    except Exception:
+        pass
+
     # Try to fetch node object if not provided
     if node_obj is None:
         try:

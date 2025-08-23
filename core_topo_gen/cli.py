@@ -4,7 +4,7 @@ import logging
 import random
 import os
 from core.api.grpc import client
-from .parsers.xml_parser import parse_node_info, parse_routing_info, parse_traffic_info
+from .parsers.xml_parser import parse_node_info, parse_routing_info, parse_traffic_info, parse_segmentation_info
 from .utils.allocation import compute_role_counts
 from .builders.topology import build_star_from_roles, build_segmented_topology, build_multi_switch_topology
 from .utils.traffic import generate_traffic_scripts
@@ -49,6 +49,35 @@ def main():
         "--traffic-content",
         choices=["text", "photo", "audio", "video"],
         help="Override traffic content type for all items (text/photo/audio/video)",
+    )
+    ap.add_argument(
+        "--allow-src-subnet-prob",
+        type=float,
+        default=0.3,
+        help="Probability [0..1] to widen firewall allow rules to the source subnet",
+    )
+    ap.add_argument(
+        "--allow-dst-subnet-prob",
+        type=float,
+        default=0.3,
+        help="Probability [0..1] to widen firewall allow rules to the destination subnet",
+    )
+    ap.add_argument(
+        "--nat-mode",
+        choices=["SNAT", "MASQUERADE"],
+        default="SNAT",
+        help="NAT mode when segmentation selects NAT (routers): SNAT or MASQUERADE",
+    )
+    ap.add_argument(
+        "--dnat-prob",
+        type=float,
+        default=0.0,
+        help="Probability [0..1] to create DNAT (port-forward) on routers for generated flows",
+    )
+    ap.add_argument(
+        "--seg-include-hosts",
+        action="store_true",
+        help="Include host nodes as candidates for segmentation placement (default: routers only)",
     )
     args = ap.parse_args()
 
@@ -103,6 +132,31 @@ def main():
             layout_density=args.layout_density,
         )
 
+    # Parse segmentation and apply policies/services
+    seg_summary = None
+    try:
+        seg_density, seg_items = parse_segmentation_info(args.xml, args.scenario)
+        logging.info("Segmentation config: density=%.3f, items=%d", float(seg_density or 0.0), len(seg_items or []))
+        if seg_density and seg_density > 0 and seg_items:
+            try:
+                from .utils.segmentation import plan_and_apply_segmentation
+                seg_summary = plan_and_apply_segmentation(
+                    session,
+                    routers if 'routers' in locals() else [],
+                    hosts,
+                    seg_density,
+                    seg_items,
+                    nat_mode=str(getattr(args, 'nat_mode', 'SNAT')).upper(),
+                    include_hosts=bool(getattr(args, 'seg_include_hosts', False)),
+                )
+                logging.info("Applied segmentation rules: %d", len(seg_summary.get("rules", [])))
+            except Exception as e:
+                logging.warning("Failed applying segmentation: %s", e)
+        else:
+            logging.info("Segmentation disabled or unspecified; skipping")
+    except Exception as e:
+        logging.warning("Segmentation parse/apply error: %s", e)
+
     # Parse traffic and generate scripts for non-router hosts
     traffic_density, traffic_items = parse_traffic_info(args.xml, args.scenario)
     logging.info(
@@ -150,6 +204,34 @@ def main():
                     logging.info("Traffic service enabled on node %s", node_id)
                 else:
                     logging.warning("Unable to add 'Traffic' service on node %s (service may not be installed in CORE)", node_id)
+            # Ensure firewall allows the generated traffic
+            try:
+                from .utils.segmentation import write_allow_rules_for_flows, write_dnat_for_flows
+                write_allow_rules_for_flows(
+                    session,
+                    routers if 'routers' in locals() else [],
+                    hosts,
+                    os.path.join(traffic_out_dir, "traffic_summary.json"),
+                    out_dir="/tmp/segmentation",
+                    src_subnet_prob=max(0.0, min(1.0, float(getattr(args, 'allow_src_subnet_prob', 0.3)))),
+                    dst_subnet_prob=max(0.0, min(1.0, float(getattr(args, 'allow_dst_subnet_prob', 0.3)))),
+                )
+                logging.info("Inserted allow rules for generated traffic")
+                # Optional DNAT port-forwarding
+                dnat_p = max(0.0, min(1.0, float(getattr(args, 'dnat_prob', 0.0))))
+                if dnat_p > 0:
+                    write_dnat_for_flows(
+                        session,
+                        routers if 'routers' in locals() else [],
+                        hosts,
+                        os.path.join(traffic_out_dir, "traffic_summary.json"),
+                        out_dir="/tmp/segmentation",
+                        dnat_prob=dnat_p,
+                    )
+                    logging.info("Inserted DNAT rules for some flows (prob=%.2f)", dnat_p)
+            except Exception as e:
+                logging.warning("Failed to insert allow rules for traffic: %s", e)
+
             # Summarize traffic scripts (receivers/senders)
             total_r = 0
             total_s = 0
@@ -181,7 +263,30 @@ def main():
                 traffic_density * 100,
             )
         except Exception as e:
-            logging.warning("Failed generating traffic scripts: %s", e)
+            # Log full traceback for diagnostics and attempt a safe fallback
+            logging.exception("Failed generating traffic scripts: %s", e)
+            try:
+                # Map unknown kinds to TCP to avoid legacy KeyErrors; keep TCP/UDP/RANDOM/CUSTOM as-is
+                safe_items = []
+                for ti in (traffic_items or []):
+                    kind_u = (ti.kind or "").upper()
+                    if kind_u not in ("TCP", "UDP", "RANDOM", "CUSTOM"):
+                        kind_u = "TCP"
+                    # create a shallow clone with adjusted kind
+                    from .types import TrafficInfo as _TI
+                    safe_items.append(_TI(
+                        kind=kind_u,
+                        factor=ti.factor,
+                        pattern=ti.pattern,
+                        rate_kbps=ti.rate_kbps,
+                        period_s=ti.period_s,
+                        jitter_pct=ti.jitter_pct,
+                        content_type=ti.content_type,
+                    ))
+                traffic_map = generate_traffic_scripts(hosts, traffic_density, safe_items, out_dir=traffic_out_dir)
+                logging.warning("Traffic generation succeeded after fallback to safe kinds (unknown kinds -> TCP)")
+            except Exception as e2:
+                logging.warning("Fallback traffic generation also failed: %s", e2)
     else:
         logging.info("Traffic disabled or density is 0; skipping traffic generation and service enablement")
 
@@ -209,6 +314,12 @@ def main():
             } for i in (traffic_items or [])],
         }
         services_cfg = [{"name": s.name, "factor": s.factor, "density": s.density} for s in (services or [])]
+        seg_out_dir = "/tmp/segmentation"
+        seg_summary_path = os.path.join(seg_out_dir, "segmentation_summary.json")
+        segmentation_cfg = {
+            "density": seg_density if 'seg_density' in locals() else None,
+            "items": [{"name": i.name, "factor": i.factor} for i in (seg_items or [])] if 'seg_items' in locals() and seg_items else [],
+        }
         if routing_density and routing_density > 0:
             write_report(
                 report_path,
@@ -219,10 +330,12 @@ def main():
                 hosts=hosts,
                 service_assignments=service_assignments,
                 traffic_summary_path=traffic_summary_path if os.path.exists(traffic_summary_path) else None,
+                segmentation_summary_path=seg_summary_path if os.path.exists(seg_summary_path) else None,
                 metadata=generation_meta,
                 routing_cfg=routing_cfg,
                 traffic_cfg=traffic_cfg,
                 services_cfg=services_cfg,
+                segmentation_cfg=segmentation_cfg,
             )
         else:
             write_report(
@@ -234,10 +347,12 @@ def main():
                 hosts=hosts,
                 service_assignments=service_assignments,
                 traffic_summary_path=traffic_summary_path if os.path.exists(traffic_summary_path) else None,
+                segmentation_summary_path=seg_summary_path if os.path.exists(seg_summary_path) else None,
                 metadata=generation_meta,
                 routing_cfg=routing_cfg,
                 traffic_cfg=traffic_cfg,
                 services_cfg=services_cfg,
+                segmentation_cfg=segmentation_cfg,
             )
         logging.info("Scenario report written to %s", report_path)
     except Exception as e:

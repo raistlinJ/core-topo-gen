@@ -24,13 +24,15 @@ class SectionWidget(QWidget):
         elif self.section_name == "Services":
             self.dropdown_items = ["SSH", "HTTP", "DHCPClient", "Random"]
         elif self.section_name == "Traffic":
-            self.dropdown_items = ["Custom", "TCP", "UDP", "Random"]
+            # Align with generator: kind is TCP/UDP/CUSTOM (or Random)
+            self.dropdown_items = ["Random", "TCP", "UDP", "CUSTOM"]
         elif self.section_name == "Events":
             self.dropdown_items = ["Script Path"]
         elif self.section_name == "Vulnerabilities":
             self.dropdown_items = ["SSHCreds", "Bashbug", "FileArtifact", "Incompetence", "Random"]
         elif self.section_name == "Segmentation":
-            self.dropdown_items = ["Firewall", "NAT", "VPN", "Random"]
+            # Only Firewall, NAT, and CUSTOM are supported, plus Random
+            self.dropdown_items = ["Random", "Firewall", "NAT", "CUSTOM"]
 
         root_v = QVBoxLayout(self)
         root_v.setContentsMargins(0, 0, 0, 0)
@@ -132,6 +134,11 @@ class SectionWidget(QWidget):
         is_traffic = (self.section_name == "Traffic")
         row = QHBoxLayout(); row.setSpacing(8)
         combo = QComboBox(); combo.addItems(self.dropdown_items)
+        # Helpful tooltips for specific sections
+        if self.section_name == "Traffic":
+            combo.setToolTip("Traffic kind. Select CUSTOM to use plugin-based traffic; Pattern controls pacing only.")
+        elif self.section_name == "Segmentation":
+            combo.setToolTip("Segmentation type. Firewall/NAT map to a unified 'Segmentation' service; CUSTOM uses plugins. Scripts are written to /tmp/segmentation.")
         idx = combo.findText("Random")
         if idx >= 0:
             combo.setCurrentIndex(idx)
@@ -162,27 +169,69 @@ class SectionWidget(QWidget):
             group_v = QVBoxLayout(group_box); group_v.setContentsMargins(8, 8, 8, 8); group_v.setSpacing(6); group_v.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
             pattern_row = QHBoxLayout(); pattern_row.setSpacing(8); pattern_row.addWidget(QLabel("Pattern:"))
-            pattern_combo = QComboBox(); pattern_combo.addItems(["1kbps", "5kbps", "Jitter", "Periodic (repeat every x seconds)", "Random", "Custom"]); pattern_row.addWidget(pattern_combo)
+            # Only auto-generated patterns supported by backend
+            pattern_combo = QComboBox(); pattern_combo.addItems(["continuous", "periodic", "burst", "poisson", "ramp"]); pattern_row.addWidget(pattern_combo)
+            pattern_combo.setToolTip("Pacing pattern for senders. Does not select plugins; affects timing only.")
 
             extra_row = QHBoxLayout(); extra_row.setSpacing(8)
-            rate_label = QLabel("Rate (kbps):"); rate_spin = QDoubleSpinBox(); rate_spin.setRange(0.1, 100000.0); rate_spin.setDecimals(1); rate_spin.setValue(64.0)
+            # Rate preset dropdown controlling the numeric rate
+            rate_preset_label = QLabel("Rate preset:")
+            rate_preset_combo = QComboBox()
+            rate_presets = [
+                ("custom", None),
+                ("1 kbps", 1.0), ("5 kbps", 5.0), ("10 kbps", 10.0),
+                ("64 kbps", 64.0), ("128 kbps", 128.0), ("512 kbps", 512.0),
+                ("1 Mbps", 1024.0), ("5 Mbps", 5120.0), ("10 Mbps", 10240.0),
+                ("50 Mbps", 51200.0), ("100 Mbps", 102400.0)
+            ]
+            for label, _ in rate_presets:
+                rate_preset_combo.addItem(label)
+            extra_row.addWidget(rate_preset_label); extra_row.addWidget(rate_preset_combo)
+
+            rate_label = QLabel("Rate (kbps):")
+            rate_spin = QDoubleSpinBox(); rate_spin.setRange(0.1, 1000000.0); rate_spin.setDecimals(1); rate_spin.setValue(64.0)
+            rate_spin.setToolTip("Sending rate in kilobits per second. Use preset for quick selection or 'custom' to edit.")
             period_label = QLabel("Period (s):"); period_spin = QDoubleSpinBox(); period_spin.setRange(0.1, 3600.0); period_spin.setDecimals(1); period_spin.setValue(1.0)
+            period_spin.setToolTip("On-duration per burst/period. For 'continuous', periods chain back-to-back.")
             jitter_label = QLabel("Jitter (%):"); jitter_spin = QDoubleSpinBox(); jitter_spin.setRange(0.0, 100.0); jitter_spin.setDecimals(1); jitter_spin.setValue(10.0)
+            jitter_spin.setToolTip("Randomize sleep intervals by +/- this percentage to avoid lockstep pacing.")
             for w in (rate_label, rate_spin, period_label, period_spin, jitter_label, jitter_spin):
                 extra_row.addWidget(w)
 
+            def _apply_rate_preset():
+                idx = rate_preset_combo.currentIndex()
+                if 0 <= idx < len(rate_presets):
+                    _label, value = rate_presets[idx]
+                    if value is None:  # custom
+                        rate_spin.setEnabled(True)
+                    else:
+                        rate_spin.setValue(float(value))
+                        rate_spin.setEnabled(False)
+
+            def _sync_preset_from_value():
+                # Choose matching preset if exact, else custom
+                val = round(rate_spin.value(), 1)
+                target_idx = 0  # custom
+                for i, (_lbl, v) in enumerate(rate_presets):
+                    if v is None:
+                        continue
+                    if abs(val - float(v)) < 0.0001:
+                        target_idx = i; break
+                rate_preset_combo.blockSignals(True)
+                rate_preset_combo.setCurrentIndex(target_idx)
+                rate_preset_combo.blockSignals(False)
+                # Enable spin only if custom
+                _apply_rate_preset()
+
+            rate_preset_combo.currentIndexChanged.connect(_apply_rate_preset)
+            rate_spin.valueChanged.connect(lambda _v: _sync_preset_from_value())
+
             def _apply_vis():
-                s = pattern_combo.currentText()
-                show_rate = (s == "Custom")
-                show_period = s.startswith("Periodic")
-                show_jitter = (s == "Jitter")
-                rate_label.setVisible(show_rate); rate_spin.setVisible(show_rate)
-                period_label.setVisible(show_period); period_spin.setVisible(show_period)
-                jitter_label.setVisible(show_jitter); jitter_spin.setVisible(show_jitter)
-                if s == "Periodic (1s)":
-                    period_spin.setValue(1.0)
-                elif s == "Periodic (5s)":
-                    period_spin.setValue(5.0)
+                s = (pattern_combo.currentText() or "").lower()
+                # rate/period/jitter are broadly applicable; keep them visible always for simplicity
+                rate_label.setVisible(True); rate_spin.setVisible(True)
+                period_label.setVisible(True); period_spin.setVisible(True)
+                jitter_label.setVisible(True); jitter_spin.setVisible(True)
                 group_box.adjustSize(); group_box.updateGeometry()
 
             pattern_combo.currentTextChanged.connect(_apply_vis); _apply_vis()
@@ -190,7 +239,7 @@ class SectionWidget(QWidget):
             group_v.addLayout(row); group_v.addLayout(pattern_row); group_v.addLayout(extra_row)
             self.dropdowns_layout.insertWidget(self.dropdowns_layout.count() - 1, group_box)
             key = group_box
-            self.traffic_extras[key] = (pattern_combo, rate_spin, period_spin, jitter_spin, group_box)
+            self.traffic_extras[key] = (pattern_combo, rate_preset_combo, rate_spin, period_spin, jitter_spin, group_box)
             remove_btn.clicked.connect(lambda: self._remove_entry(key))
             self.dropdown_factor_pairs.append((combo, factor_spin, key, remove_btn))
         else:
@@ -269,9 +318,11 @@ class SectionWidget(QWidget):
                 if script_path_edit and script_path_edit.text().strip():
                     item_elem.set("script_path", script_path_edit.text().strip())
             if self.section_name == "Traffic" and key in self.traffic_extras:
-                pattern_combo, rate_spin, period_spin, jitter_spin, _box = self.traffic_extras[key]
+                # tuple stored as (pattern_combo, rate_preset_combo, rate_spin, period_spin, jitter_spin, box)
+                pattern_combo, _rate_preset_combo, rate_spin, period_spin, jitter_spin, _box = self.traffic_extras[key]
                 sel = pattern_combo.currentText()
-                item_elem.set("pattern", sel)
+                # Store pattern as typed; backend accepts canonical names (continuous/burst/periodic/poisson/ramp)
+                item_elem.set("pattern", (sel or ""))
                 item_elem.set("rate_kbps", f"{rate_spin.value():.1f}")
                 item_elem.set("period_s", f"{period_spin.value():.1f}")
                 item_elem.set("jitter_pct", f"{jitter_spin.value():.1f}")
@@ -312,9 +363,15 @@ class SectionWidget(QWidget):
                 if script_path_edit and script_path:
                     script_path_edit.setText(script_path)
             if self.section_name == "Traffic" and key in self.traffic_extras:
-                pattern_combo, rate_spin, period_spin, jitter_spin, box = self.traffic_extras[key]
+                pattern_combo, rate_preset_combo, rate_spin, period_spin, jitter_spin, box = self.traffic_extras[key]
                 psel = item_elem.get("pattern", "Random")
+                # Try exact match first
                 idxp = pattern_combo.findText(psel)
+                if idxp < 0:
+                    # Fallback to case-insensitive match
+                    for i in range(pattern_combo.count()):
+                        if pattern_combo.itemText(i).lower() == (psel or "").lower():
+                            idxp = i; break
                 if idxp >= 0:
                     pattern_combo.setCurrentIndex(idxp)
                 try:
@@ -324,6 +381,33 @@ class SectionWidget(QWidget):
                         period_spin.setValue(float(item_elem.get("period_s")))
                     if item_elem.get("jitter_pct") is not None:
                         jitter_spin.setValue(float(item_elem.get("jitter_pct")))
+                except Exception:
+                    pass
+                # Sync preset based on loaded rate value
+                try:
+                    # emulate the helper logic locally
+                    rate_val = round(rate_spin.value(), 1)
+                    presets_local = [
+                        ("custom", None),
+                        ("1 kbps", 1.0), ("5 kbps", 5.0), ("10 kbps", 10.0),
+                        ("64 kbps", 64.0), ("128 kbps", 128.0), ("512 kbps", 512.0),
+                        ("1 Mbps", 1024.0), ("5 Mbps", 5120.0), ("10 Mbps", 10240.0),
+                        ("50 Mbps", 51200.0), ("100 Mbps", 102400.0)
+                    ]
+                    target_idx = 0
+                    for i, (_label, v) in enumerate(presets_local):
+                        if v is None:
+                            continue
+                        if abs(rate_val - float(v)) < 0.0001:
+                            target_idx = i; break
+                    rate_preset_combo.blockSignals(True)
+                    rate_preset_combo.setCurrentIndex(target_idx)
+                    rate_preset_combo.blockSignals(False)
+                    # Apply enable/disable state
+                    if target_idx == 0:
+                        rate_spin.setEnabled(True)
+                    else:
+                        rate_spin.setEnabled(False)
                 except Exception:
                     pass
         self._loading = False

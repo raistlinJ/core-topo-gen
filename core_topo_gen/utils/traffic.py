@@ -3,6 +3,8 @@ import os
 import stat
 import random
 from typing import Dict, List, Tuple
+from ..plugins import traffic as custom_traffic
+from ..plugins import static_profile as _static_profile
 from ..types import NodeInfo, TrafficInfo
 
 
@@ -341,7 +343,13 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
                 weighted.append(("TCP", w / 2.0))
                 weighted.append(("UDP", w / 2.0))
         else:
-            weighted.append((k.upper(), max(0.0, float(it.factor))))
+            ku = k.upper()
+            w = max(0.0, float(it.factor))
+            if ku in ("TCP", "UDP", "CUSTOM"):
+                weighted.append((ku, w))
+            else:
+                # Unknown kinds default to TCP for selection
+                weighted.append(("TCP", w))
     if not weighted:
         weighted = [("TCP", 1.0)]
 
@@ -375,7 +383,12 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
                 continue
             kind = _choose_kind(weighted) if ik.lower() == "random" else ik.upper()
 
-            base = 5000 if kind == "TCP" else 6000
+            # Underlying transport protocol: map to TCP/UDP
+            proto_key = kind if kind in ("TCP", "UDP") else "TCP"
+            # Ensure rx_proto_idx has an entry for the chosen protocol (defensive)
+            if proto_key not in rx_proto_idx:
+                rx_proto_idx[proto_key] = {}
+            base = 5000 if proto_key == "TCP" else 6000
 
             target = random.choice(others) if others else None
 
@@ -384,7 +397,7 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
             rx_node_id = rx_node.node_id
 
             # Compute per-node per-protocol receiver port index to avoid collisions
-            proto_map = rx_proto_idx[kind]
+            proto_map = rx_proto_idx[proto_key]
             idx = proto_map.get(rx_node_id, 1)
             rx_port = base + (rx_node_id % 1000) + (idx - 1)
             proto_map[rx_node_id] = idx + 1
@@ -392,7 +405,21 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
             # Receiver script named with the receiver node's id
             r_index = recv_idx_by_node.get(rx_node_id, 1)
             recv_name = os.path.join(out_dir, f"traffic_{rx_node_id}_r{r_index}.py")
-            recv_content = _tcp_receiver_script(rx_port) if kind == "TCP" else _udp_receiver_script(rx_port)
+            # If kind is CUSTOM and a plugin receiver exists, prefer it (auto-register static if none)
+            if kind == "CUSTOM":
+                _sender_fn, _receiver_fn = custom_traffic.get()
+                if _sender_fn is None and _receiver_fn is None:
+                    try:
+                        _static_profile.register()
+                    except Exception:
+                        pass
+                    _sender_fn, _receiver_fn = custom_traffic.get()
+                if _receiver_fn is not None:
+                    recv_content = _receiver_fn(rx_port, proto_key)
+                else:
+                    recv_content = _tcp_receiver_script(rx_port) if proto_key == "TCP" else _udp_receiver_script(rx_port)
+            else:
+                recv_content = _tcp_receiver_script(rx_port) if proto_key == "TCP" else _udp_receiver_script(rx_port)
             with open(recv_name, "w", encoding="utf-8") as f:
                 f.write(recv_content)
             os.chmod(recv_name, os.stat(recv_name).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -412,11 +439,29 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
                 jitter_pct = getattr(it, "jitter_pct", 0.0) or 0.0
                 pattern = getattr(it, "pattern", "") or ""
                 content_type = getattr(it, "content_type", "") or ""
-                send_content = (
-                    _tcp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
-                    if kind == "TCP"
-                    else _udp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
-                )
+                # Use custom sender only when kind is CUSTOM (auto-register static if none)
+                if kind == "CUSTOM":
+                    _sender_fn, _receiver_fn = custom_traffic.get()
+                    if _sender_fn is None and _receiver_fn is None:
+                        try:
+                            _static_profile.register()
+                        except Exception:
+                            pass
+                        _sender_fn, _receiver_fn = custom_traffic.get()
+                    if _sender_fn is not None:
+                        send_content = _sender_fn(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, content_type, proto_key)
+                    else:
+                        send_content = (
+                            _tcp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
+                            if proto_key == "TCP"
+                            else _udp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
+                        )
+                else:
+                    send_content = (
+                        _tcp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
+                        if proto_key == "TCP"
+                        else _udp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
+                    )
                 with open(send_name, "w", encoding="utf-8") as f:
                     f.write(send_content)
                 os.chmod(send_name, os.stat(send_name).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -427,7 +472,8 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
                 flows.append({
                     "src_id": host.node_id,
                     "dst_id": rx_node_id,
-                    "protocol": kind,
+                    # Record actual transport protocol used (TCP/UDP) for downstream tooling
+                    "protocol": proto_key,
                     "dst_ip": dst_ip,
                     "dst_port": dst_port,
                     "pattern": pattern or "",
