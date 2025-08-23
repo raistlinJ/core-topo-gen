@@ -536,9 +536,10 @@ print('[segmentation] applied', len(cmds), 'commands')
             except Exception as e:
                 logger.debug("Failed to write policy script for node %s: %s", node.node_id, e)
 
-        # Ensure the chosen service is enabled; configuration attachment is best-effort
+        # Ensure the chosen service is enabled only on routers; hosts should not be assigned the Segmentation service
         try:
-            if svc.upper() != "CUSTOM":
+            # Enable Segmentation only on routers by default; if include_hosts is True, allow hosts too
+            if svc.upper() != "CUSTOM" and (on_router or include_hosts):
                 to_enable = SERVICE_ENABLE_MAP.get(svc, svc)
                 ok = ensure_service(session, node.node_id, to_enable)
                 if not ok:
@@ -595,6 +596,7 @@ def write_allow_rules_for_flows(
     out_dir: str = "/tmp/segmentation",
     src_subnet_prob: float = 0.3,
     dst_subnet_prob: float = 0.3,
+    include_hosts: bool = False,
 ) -> Dict[str, object]:
     """
     Ensure generated traffic can flow by inserting iptables ACCEPT rules on endpoints and routers,
@@ -637,6 +639,9 @@ def write_allow_rules_for_flows(
     # Build a set of seen allow rules to dedupe across runs
     # Key: (node_id, chain, proto, src, dst, port)
     seen_allow: set[Tuple[int, str, str, str, str, int]] = set()
+    # Coverage index to prevent overlapping rules. Key: (node_id, chain, proto, port) -> [(src_sel, dst_sel)]
+    from collections import defaultdict
+    coverage_index: Dict[Tuple[int, str, str, int], List[Tuple[str, str]]] = defaultdict(list)
     for rr in existing_rules:
         r = (rr.get("rule") or {})
         if (r.get("type") or "").lower() == "allow":
@@ -653,6 +658,7 @@ def write_allow_rules_for_flows(
             except Exception:
                 portv = -1
             seen_allow.add((nid, chain, proto, srcv, dstv, portv))
+            coverage_index[(nid, chain, proto, portv)].append((srcv, dstv))
 
     def cidr_contains(cidr: str, ip: str) -> bool:
         try:
@@ -703,6 +709,46 @@ def write_allow_rules_for_flows(
             return True
         return False
 
+    # Helpers for selector coverage
+    def _to_network(sel: str):
+        try:
+            if not sel:
+                return None
+            if "/" in sel:
+                return ipaddress.ip_network(sel, strict=False)
+            # treat single IP as /32
+            return ipaddress.ip_network(f"{sel}/32", strict=False)
+        except Exception:
+            return None
+
+    def _covers(sel_super: str, sel_sub: str) -> bool:
+        if not sel_super or not sel_sub:
+            return False
+        if sel_super == sel_sub:
+            return True
+        net_super = _to_network(sel_super)
+        if net_super is None:
+            return False
+        # If sub is IP
+        try:
+            ip_sub = ipaddress.ip_address(sel_sub)
+            return ip_sub in net_super
+        except Exception:
+            pass
+        # If sub is network
+        net_sub = _to_network(sel_sub)
+        if net_sub is None:
+            return False
+        # net_sub is covered if all its addresses are within net_super
+        return (net_sub.network_address in net_super) and (net_sub.broadcast_address in net_super)
+
+    def _covering_pair(nid: int, chain: str, proto: str, port: int, src_sel: str, dst_sel: str) -> Optional[Tuple[str, str]]:
+        pairs = coverage_index.get((nid, chain, proto, port), [])
+        for (s_sup, d_sup) in pairs:
+            if _covers(s_sup, src_sel) and _covers(d_sup, dst_sel):
+                return (s_sup, d_sup)
+        return None
+
     # Map node id to NodeInfo and IP address (strip mask)
     host_map: Dict[int, NodeInfo] = {h.node_id: h for h in (hosts or [])}
     def ip_only(s: Optional[str]) -> str:
@@ -726,6 +772,9 @@ def write_allow_rules_for_flows(
 
     rules_out: List[dict] = []
     counters: Dict[Tuple[int, str], int] = {}
+
+    router_ids = {int(r.node_id) for r in (routers or [])}
+    host_ids = {int(h.node_id) for h in (hosts or [])}
 
     def _write_script(node_id: int, commands: List[str]) -> str:
         key = (node_id, "allow")
@@ -786,9 +835,11 @@ def write_allow_rules_for_flows(
             os.chmod(script_path, 0o755)
         except Exception:
             pass
-        # Ensure Segmentation service is enabled on this node for allow rules
+        # Ensure Segmentation service is enabled on routers, and optionally hosts if include_hosts=True
         try:
-            ensure_service(session, int(node_id), "Segmentation")
+            nid = int(node_id)
+            if nid in router_ids or (include_hosts and nid in host_ids):
+                ensure_service(session, nid, "Segmentation")
         except Exception:
             pass
         return script_path
@@ -817,7 +868,8 @@ def write_allow_rules_for_flows(
         if is_flow_blocked(src_ip, dst_ip):
             # Receiver INPUT allow
             recv_key = (int(dst_host.node_id), 'INPUT', proto, src_sel, dst_sel, int(dst_port))
-            if recv_key not in seen_allow:
+            covering = _covering_pair(int(dst_host.node_id), 'INPUT', proto, int(dst_port), src_sel, dst_sel)
+            if recv_key not in seen_allow and covering is None:
                 recv_cmds = [
                     f"iptables -I INPUT 1 -p {proto} -s {src_sel} --dport {dst_port} -j ACCEPT",
                 ]
@@ -829,10 +881,20 @@ def write_allow_rules_for_flows(
                     "script": recv_script,
                 })
                 seen_allow.add(recv_key)
+                coverage_index[(int(dst_host.node_id), 'INPUT', proto, int(dst_port))].append((src_sel, dst_sel))
+            elif covering is not None:
+                try:
+                    logger.debug(
+                        "Allow skip (covered): node=%s chain=INPUT proto=%s port=%s src=%s dst=%s by src=%s dst=%s",
+                        int(dst_host.node_id), proto, int(dst_port), src_sel, dst_sel, covering[0], covering[1]
+                    )
+                except Exception:
+                    pass
 
             # Sender OUTPUT allow
             send_key = (int(src_host.node_id), 'OUTPUT', proto, src_sel, dst_sel, int(dst_port))
-            if send_key not in seen_allow:
+            covering = _covering_pair(int(src_host.node_id), 'OUTPUT', proto, int(dst_port), src_sel, dst_sel)
+            if send_key not in seen_allow and covering is None:
                 send_cmds = [
                     f"iptables -I OUTPUT 1 -p {proto} -d {dst_sel} --dport {dst_port} -j ACCEPT",
                 ]
@@ -844,11 +906,21 @@ def write_allow_rules_for_flows(
                     "script": send_script,
                 })
                 seen_allow.add(send_key)
+                coverage_index[(int(src_host.node_id), 'OUTPUT', proto, int(dst_port))].append((src_sel, dst_sel))
+            elif covering is not None:
+                try:
+                    logger.debug(
+                        "Allow skip (covered): node=%s chain=OUTPUT proto=%s port=%s src=%s dst=%s by src=%s dst=%s",
+                        int(src_host.node_id), proto, int(dst_port), src_sel, dst_sel, covering[0], covering[1]
+                    )
+                except Exception:
+                    pass
 
             # Routers FORWARD allow (insert at top for precedence)
             for r in (routers or []):
                 fwd_key = (int(r.node_id), 'FORWARD', proto, src_sel, dst_sel, int(dst_port))
-                if fwd_key in seen_allow:
+                covering = _covering_pair(int(r.node_id), 'FORWARD', proto, int(dst_port), src_sel, dst_sel)
+                if fwd_key in seen_allow or covering is not None:
                     continue
                 fwd_cmds = [
                     f"iptables -I FORWARD 1 -p {proto} -s {src_sel} -d {dst_sel} --dport {dst_port} -j ACCEPT",
@@ -861,6 +933,7 @@ def write_allow_rules_for_flows(
                     "script": fwd_script,
                 })
                 seen_allow.add(fwd_key)
+                coverage_index[(int(r.node_id), 'FORWARD', proto, int(dst_port))].append((src_sel, dst_sel))
 
     # Summary logging before writing
     try:
@@ -1011,7 +1084,7 @@ def write_dnat_for_flows(
             os.chmod(script_path, 0o755)
         except Exception:
             pass
-        # Ensure Segmentation service is enabled on this node for DNAT rules
+        # Ensure Segmentation service is enabled only on routers for DNAT rules
         try:
             ensure_service(session, int(node_id), "Segmentation")
         except Exception:

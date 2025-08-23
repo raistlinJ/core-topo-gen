@@ -215,6 +215,7 @@ def main():
                     out_dir="/tmp/segmentation",
                     src_subnet_prob=max(0.0, min(1.0, float(getattr(args, 'allow_src_subnet_prob', 0.3)))),
                     dst_subnet_prob=max(0.0, min(1.0, float(getattr(args, 'allow_dst_subnet_prob', 0.3)))),
+                    include_hosts=bool(getattr(args, 'seg_include_hosts', False)),
                 )
                 logging.info("Inserted allow rules for generated traffic")
                 # Optional DNAT port-forwarding
