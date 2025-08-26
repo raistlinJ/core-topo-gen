@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>CORE TopoGen Web GUI</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        /* initial padding; JS will adjust based on dock height */
+        body { padding-bottom: 42vh; }
+        .dock-panel { position: fixed; bottom: 0; left: 0; right: 0; height: 40vh; background: #fff; border-top: 1px solid #dee2e6; box-shadow: 0 -2px 8px rgba(0,0,0,.08); z-index: 1030; }
+        .dock-grip { height: 6px; cursor: ns-resize; background: repeating-linear-gradient(90deg, #e9ecef 0, #e9ecef 6px, #f8f9fa 6px, #f8f9fa 12px); border-bottom: 1px solid #dee2e6; }
+        .dock-panel .tab-content { height: calc(100% - 42px - 6px); }
+        .dock-panel pre { height: 100%; }
+        .dock-toggle-btn { position: fixed; right: 12px; bottom: 12px; z-index: 1040; }
+    </style>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+</head>
+<body>
+<div class="container-fluid mt-4">
+    <!-- Full-width top header -->
+    <div class="row">
+        <div class="col-12">
+            <div class="d-flex align-items-center justify-content-between bg-primary text-white rounded shadow-sm px-3 py-2 mb-3">
+                <div class="d-flex align-items-center gap-2">
+                    <i class="bi bi-shield-lock-fill fs-4"></i>
+                    <h3 class="mb-0">CORE TopoGen Web GUI</h3>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="row">
+            <div class="col-md-3 mb-3">
+                <div class="card shadow-sm h-100 d-flex flex-column">
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <span class="fw-bold">Scenarios</span>
+                                <div class="btn-toolbar gap-2">
+                                    <button type="button" class="btn btn-sm btn-outline-secondary" id="importBtn">Import</button>
+                                    <button type="button" class="btn btn-sm btn-outline-info" id="exportBtn">Export</button>
+                                </div>
+                            </div>
+                    <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="scenarioList" style="min-height:0;"></div>
+                    <form id="hiddenLoadForm" class="d-none" action="{{ url_for('load_xml') }}" method="post" enctype="multipart/form-data">
+                        <input type="file" name="scenarios_xml" id="hiddenLoadInput" accept=".xml">
+                    </form>
+                    <div class="card-footer" style="position: sticky; bottom: 0; background: #fff; z-index: 1;">
+                        <button type="button" class="btn btn-sm btn-primary w-100" id="appendScenarioBtn">Append Scenario</button>
+                    </div>
+                </div>
+            </div>
+    <div class="col-md-9">
+
+            <div class="card shadow mt-3">
+                <div class="card-body">
+                    {% with messages = get_flashed_messages() %}
+                        {% if messages %}
+                            <div class="alert alert-info">{{ messages[0] }}</div>
+                        {% endif %}
+                    {% endwith %}
+
+                    <div class="card mb-3" id="baseCoreScenarioCard">
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <strong>Base CORE Scenario</strong>
+                            <div class="d-flex align-items-center gap-2">
+                                {% if payload.base_upload %}
+                                    {% if payload.base_upload.valid %}
+                                        <span class="badge text-bg-success">VALID</span>
+                                    {% else %}
+                                        <span class="badge text-bg-danger">INVALID</span>
+                                    {% endif %}
+                                    <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('base_details') }}?path={{ payload.base_upload.path | urlencode }}" target="_blank">Details</a>
+                                {% endif %}
+                            </div>
+                        </div>
+                        <div class="card-body">
+                            <div class="mb-3">
+                                <label class="form-label d-flex align-items-center justify-content-between">
+                                    <span>Base Scenario File</span>
+                                </label>
+                                <input class="form-control" id="baseFileInput" readonly>
+                                <div class="form-text">Shows the uploaded file name; full path is stored internally.</div>
+                            </div>
+                            <form class="d-flex gap-2" action="{{ url_for('upload_base') }}" method="post" enctype="multipart/form-data">
+                                <input type="file" class="form-control" name="base_xml" accept=".xml" required>
+                                <button type="submit" class="btn btn-primary">{% if payload.base_upload %}Update{% else %}Upload{% endif %}</button>
+                            </form>
+                            {% if payload.base_upload and not payload.base_upload.valid and logs %}
+                                <div class="alert alert-danger mt-3 mb-0" style="white-space: pre-wrap;">{{ logs }}</div>
+                            {% endif %}
+                        </div>
+                    </div>
+
+                    <form id="editorForm" action="{{ url_for('save_xml') }}" method="post">
+                        <input type="hidden" name="scenarios_json" id="scenarios_json">
+                        <div id="editorRoot"></div>
+                        <div class="d-flex gap-2 mt-3">
+                            <button type="submit" class="btn btn-success">Save XML</button>
+                        </div>
+                    </form>
+
+                    <div class="card mt-3">
+                        <div class="card-header"><strong>CORE Connection</strong></div>
+                        <div class="card-body">
+                            <div class="row g-2 align-items-end">
+                                <div class="col-auto">
+                                    <label for="coreHost" class="form-label mb-0">IP</label>
+                                    <input type="text" class="form-control" id="coreHost" placeholder="localhost" value="{{ (payload.core.host if payload.core else 'localhost') | e }}">
+                                </div>
+                                <div class="col-auto">
+                                    <label for="corePort" class="form-label mb-0">Port</label>
+                                    <input type="number" class="form-control" id="corePort" placeholder="50051" value="{{ (payload.core.port if payload.core else 50051) }}">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    
+
+                    <form class="d-flex gap-2 mt-3 align-items-center" action="{{ url_for('run_cli') }}" method="post" onsubmit="return prepareRunCli()">
+                        <button class="btn btn-secondary" type="button" id="testCoreBtn">Test CORE Connection</button>
+                        <span id="coreStatus" class="small text-muted">Not tested</span>
+                        <input type="hidden" name="xml_path" id="xml_path">
+                        <span class="d-inline-block" tabindex="0" id="runSyncWrap" data-bs-toggle="tooltip" data-bs-title="Test CORE connection first">
+                            <button class="btn btn-warning pe-none" type="submit" id="runSyncBtn" disabled>Run CLI</button>
+                        </span>
+                        <span class="d-inline-block" tabindex="0" id="runAsyncWrap" data-bs-toggle="tooltip" data-bs-title="Test CORE connection first">
+                            <button class="btn btn-outline-warning pe-none" type="button" id="runAsyncBtn" onclick="runAsync()" disabled>Run Async</button>
+                        </span>
+                        <button class="btn btn-outline-danger d-none" type="button" id="cancelRunBtn" onclick="cancelRun()">Cancel</button>
+                    </form>
+                </div>
+            </div>
+            
+        </div>
+    </div>
+</div>
+<div class="dock-panel" id="dockPanel">
+    <div class="dock-grip" id="dockGrip" title="Drag to resize"></div>
+    <ul class="nav nav-tabs px-3 pt-2" role="tablist">
+        <li class="nav-item" role="presentation">
+            <button class="nav-link active" id="tab-logs" data-bs-toggle="tab" data-bs-target="#dock-logs" type="button" role="tab">Logs</button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="tab-xml" data-bs-toggle="tab" data-bs-target="#dock-xml" type="button" role="tab">XML Preview</button>
+        </li>
+        <li class="ms-auto nav-item" role="presentation">
+            <button class="btn btn-sm btn-outline-secondary" id="dockHideBtn" type="button">Hide</button>
+        </li>
+    </ul>
+    <div class="tab-content px-3 pb-2">
+        <div class="tab-pane fade show active" id="dock-logs" role="tabpanel" aria-labelledby="tab-logs">
+            <pre class="w-100 m-0" style="white-space: pre-wrap; overflow:auto; width:100%;" id="logsPre">{{ (logs or '') | e }}</pre>
+        </div>
+        <div class="tab-pane fade" id="dock-xml" role="tabpanel" aria-labelledby="tab-xml">
+            <pre class="w-100 m-0" style="white-space: pre-wrap; overflow:auto; width:100%;" id="xmlPre">{{ (xml_preview or '') | e }}</pre>
+        </div>
+    </div>
+</div>
+<button class="btn btn-primary btn-sm dock-toggle-btn d-none" id="dockShowBtn" type="button">Advanced Information</button>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script id="payload-data" type="application/json">{{ payload | tojson }}</script>
+<script>
+const payloadDataEl = document.getElementById('payload-data');
+let initialPayload = null;
+try {
+    initialPayload = JSON.parse(payloadDataEl?.textContent || 'null');
+} catch (e) {
+    initialPayload = null;
+}
+
+function defaultScenario(name) {
+    return {
+        name: name || `Scenario ${document.querySelectorAll('.scenario-card').length + 1}`,
+        base: { filepath: '' },
+        sections: {
+            'Node Information': { total_nodes: 1, density: null, items: [] },
+            'Routing': { density: 0.5, items: [] },
+            'Services': { density: 0.5, items: [] },
+            'Traffic': { density: 0.5, items: [] },
+            'Events': { density: 0.5, items: [] },
+            'Vulnerabilities': { density: 0.5, items: [] },
+            'Segmentation': { density: 0.5, items: [] }
+        },
+        notes: ''
+    };
+}
+
+let state = initialPayload ?? { scenarios: [ defaultScenario('Scenario 1') ], result_path: null };
+let activeIdx = 0;
+
+const dropdownsBySection = {
+    'Node Information': ['Server','Workstation','PC','Random'],
+    'Routing': ['RIP','RIPv2','BGP','OSPFv2','OSPFv3'],
+    'Services': ['SSH','HTTP','DHCPClient','Random'],
+    'Traffic': ['Random','TCP','UDP','CUSTOM'],
+    'Events': ['Script Path'],
+    'Vulnerabilities': ['SSHCreds','Bashbug','FileArtifact','Incompetence','Random'],
+    'Segmentation': ['Random','Firewall','NAT','CUSTOM']
+};
+
+function render() {
+    renderSidebar();
+    renderMain();
+    // Download link visibility if provided
+        // no download button; export is available in the left panel
+    // Sync Base Scenario File input with active scenario
+    const baseIn = document.getElementById('baseFileInput');
+    if (baseIn && state.scenarios.length) {
+        const full = state.scenarios[activeIdx]?.base?.filepath || '';
+        const baseName = full.split(/[/\\]/).pop();
+        if (baseIn.value !== baseName) baseIn.value = baseName;
+        // Read-only display: no input handler needed to modify state
+    }
+}
+
+function renderSidebar() {
+    const list = document.getElementById('scenarioList');
+    list.innerHTML = '';
+    state.scenarios.forEach((scen, idx) => {
+        const a = document.createElement('a');
+    a.href = '#';
+    a.className = 'list-group-item list-group-item-action' + (idx === activeIdx ? ' active bg-primary text-white' : '');
+        a.textContent = scen.name || `Scenario ${idx+1}`;
+    a.onclick = (e) => { e.preventDefault(); activeIdx = idx; render(); };
+        list.appendChild(a);
+    });
+            const appendScenarioBtn = document.getElementById('appendScenarioBtn');
+            const importBtn = document.getElementById('importBtn');
+            const exportBtn = document.getElementById('exportBtn');
+        const hiddenLoadInput = document.getElementById('hiddenLoadInput');
+        const hiddenLoadForm = document.getElementById('hiddenLoadForm');
+            if (appendScenarioBtn) appendScenarioBtn.onclick = (e) => { e.preventDefault(); state.scenarios.push(defaultScenario()); activeIdx = state.scenarios.length - 1; render(); };
+            if (importBtn) importBtn.onclick = (e) => { e.preventDefault(); hiddenLoadInput.click(); };
+        if (hiddenLoadInput) hiddenLoadInput.onchange = () => { if (hiddenLoadInput.files && hiddenLoadInput.files.length > 0) hiddenLoadForm.submit(); };
+            if (exportBtn) exportBtn.onclick = (e) => {
+                e.preventDefault();
+                const rp = state.result_path || '';
+                if (!rp.endsWith('.xml')) {
+                    alert('Please Save XML first (middle panel) to export the current scenarios.');
+                    return;
+                }
+                window.location.href = window.location.origin + '/download_report?path=' + encodeURIComponent(rp);
+            };
+}
+
+function renderMain() {
+    const root = document.getElementById('editorRoot');
+    root.innerHTML = '';
+    if (!state.scenarios.length) { return; }
+    const scen = state.scenarios[activeIdx] || state.scenarios[0];
+    // Simple scenario header (no group box)
+    const headerRow = document.createElement('div');
+    headerRow.className = 'mb-3 d-flex justify-content-between align-items-center';
+    headerRow.innerHTML = `
+        <div class="d-flex align-items-center gap-2">
+            <strong>Scenario:</strong>
+            <input class="form-control form-control-sm" style="width:260px" value="${scen.name}" data-scen-idx="${activeIdx}" data-field="name" />
+        </div>
+        <button class="btn btn-sm btn-outline-danger" data-action="remove-scenario" data-scen-idx="${activeIdx}">Remove</button>`;
+    root.appendChild(headerRow);
+
+    // Section cards (Node Information first)
+    const secNames = ['Node Information','Routing','Services','Traffic','Events','Vulnerabilities','Segmentation'];
+    secNames.forEach(name => {
+        const sec = scen.sections[name] || { items: [] };
+        const hasNodes = (name === 'Node Information');
+        const densVal = (sec.density ?? (hasNodes ? '' : 0.5));
+        const nodesVal = (hasNodes ? (sec.total_nodes ?? 1) : '');
+        const card = document.createElement('div');
+        card.className = 'card mb-3';
+        card.innerHTML = `
+            <div class="card-header d-flex align-items-center gap-2">
+                <strong>${name}</strong>
+                ${hasNodes ? `<span class="ms-3">Total Nodes:</span><input type="number" min="1" class="form-control form-control-sm" style="width:120px" value="${nodesVal}" data-scen-idx="${activeIdx}" data-sec="${name}" data-field="total_nodes">` : `
+                    <span class="ms-3">Density:</span><input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm" style="width:120px" value="${densVal}" data-scen-idx="${activeIdx}" data-sec="${name}" data-field="density">`
+                }
+                <button class="btn btn-sm btn-outline-primary ms-auto" data-action="add-item" data-scen-idx="${activeIdx}" data-sec="${name}">Add</button>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead><tr><th style="width:280px">Selected</th><th style="width:120px">Weight</th><th>Extras</th><th style="width:80px"></th></tr></thead>
+                        <tbody>
+                            ${sec.items.map((it, iidx) => renderItemRow(activeIdx, name, iidx, it)).join('')}
+                        </tbody>
+                    </table>
+                </div>
+                    <div class="text-danger small mt-1 section-warning" data-scen-idx="${activeIdx}" data-sec="${name}" style="display:none">Weights must sum to 1.000</div>
+            </div>`;
+        root.appendChild(card);
+    });
+
+    // Notes card
+    const notesCard = document.createElement('div');
+    notesCard.className = 'card mb-3';
+    notesCard.innerHTML = `
+        <div class="card-header"><strong>Notes</strong></div>
+        <div class="card-body">
+            <textarea class="form-control" rows="3" data-scen-idx="${activeIdx}" data-field="notes">${scen.notes || ''}</textarea>
+        </div>`;
+    root.appendChild(notesCard);
+
+    wireHandlers();
+    wireCoreControls();
+}
+
+// renderSections was deprecated and removed; rendering is handled in renderMain()
+
+function renderItemRow(sidx, secName, iidx, it) {
+    const opts = (dropdownsBySection[secName] || []).map(o => `<option ${o===it.selected?'selected':''}>${o}</option>`).join('');
+    const weight = it.factor ?? 1.0;
+    const extras = (() => {
+        if (secName === 'Events') {
+            return `<input class="form-control form-control-sm" placeholder="script path" value="${it.script_path || ''}" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" data-field="script_path">`;
+        }
+        if (secName === 'Traffic') {
+            return `
+                <div class="d-flex flex-wrap gap-2">
+                    <div>
+                        <label class="form-label mb-0">Pattern</label>
+                        <select class="form-select form-select-sm" data-field="pattern" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
+                            ${['continuous','periodic','burst','poisson','ramp'].map(p => `<option ${((it.pattern||'')===p)?'selected':''}>${p}</option>`).join('')}
+                        </select>
+                    </div>
+                    <div>
+                        <label class="form-label mb-0">Rate (kbps)</label>
+                        <input type="number" step="0.1" class="form-control form-control-sm" value="${it.rate_kbps ?? 64.0}" data-field="rate_kbps" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
+                    </div>
+                    <div>
+                        <label class="form-label mb-0">Period (s)</label>
+                        <input type="number" step="0.1" class="form-control form-control-sm" value="${it.period_s ?? 1.0}" data-field="period_s" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
+                    </div>
+                    <div>
+                        <label class="form-label mb-0">Jitter (%)</label>
+                        <input type="number" step="0.1" class="form-control form-control-sm" value="${it.jitter_pct ?? 10.0}" data-field="jitter_pct" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
+                    </div>
+                </div>`;
+        }
+        return '';
+    })();
+    return `
+        <tr>
+            <td>
+                <select class="form-select form-select-sm" data-field="selected" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${opts}</select>
+            </td>
+            <td>
+        <input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm weight-input" value="${weight}" data-field="factor" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
+            </td>
+            <td>${extras}</td>
+            <td><button class="btn btn-sm btn-outline-danger" data-action="remove-item" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">Remove</button></td>
+        </tr>`;
+}
+
+function wireHandlers() {
+    document.querySelectorAll('[data-field]').forEach(el => {
+        const sidx = parseInt(el.getAttribute('data-scen-idx'));
+        const sec = el.getAttribute('data-sec');
+        const field = el.getAttribute('data-field');
+        const iidx = el.getAttribute('data-item-idx');
+        el.oninput = () => {
+            if (sec) {
+                if (iidx !== null) {
+                    const item = state.scenarios[sidx].sections[sec].items[parseInt(iidx)];
+                    if (['factor','rate_kbps','period_s','jitter_pct','total_nodes','density'].includes(field)) {
+                        item ? (item[field] = parseFloat(el.value)) : state.scenarios[sidx].sections[sec][field] = parseFloat(el.value);
+                                            if (field === 'factor') {
+                                                adjustWeightsProportionally(sidx, sec, parseInt(iidx));
+                                                updateWeightWarning(sidx, sec);
+                                                updateWeightInputsDisplay(sidx, sec);
+                                            }
+                    } else if (['pattern','selected','script_path'].includes(field)) {
+                        item[field] = el.value;
+                    } else {
+                        state.scenarios[sidx].sections[sec][field] = el.value;
+                    }
+                } else {
+                    if (field === 'density' || field === 'total_nodes') {
+                        state.scenarios[sidx].sections[sec][field] = parseFloat(el.value);
+                    } else {
+                        state.scenarios[sidx].sections[sec][field] = el.value;
+                    }
+                }
+            } else {
+                if (field === 'name') state.scenarios[sidx].name = el.value;
+                if (field === 'base-file') state.scenarios[sidx].base.filepath = el.value;
+                if (field === 'notes') state.scenarios[sidx].notes = el.value;
+            }
+            // keep hidden for submit
+            document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
+        };
+    });
+    document.querySelectorAll('[data-action="remove-item"]').forEach(btn => {
+        btn.onclick = () => {
+            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+            const sec = btn.getAttribute('data-sec');
+            const iidx = parseInt(btn.getAttribute('data-item-idx'));
+            state.scenarios[sidx].sections[sec].items.splice(iidx,1);
+              redistributeEven(sidx, sec);
+              renderMain();
+        };
+    });
+    document.querySelectorAll('[data-action="add-item"]').forEach(btn => {
+        btn.onclick = () => {
+            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+            const sec = btn.getAttribute('data-sec');
+            const item = { selected: 'Random', factor: 1.0 };
+            if (sec === 'Events') item.script_path = '';
+            if (sec === 'Traffic') { item.pattern = 'continuous'; item.rate_kbps = 64.0; item.period_s = 1.0; item.jitter_pct = 10.0; }
+            state.scenarios[sidx].sections[sec].items.push(item);
+              redistributeEven(sidx, sec);
+              renderMain();
+        };
+    });
+        document.querySelectorAll('[data-action="remove-scenario"]').forEach(btn => {
+        btn.onclick = () => {
+                const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+                state.scenarios.splice(sidx,1);
+                if (activeIdx >= state.scenarios.length) activeIdx = Math.max(0, state.scenarios.length - 1);
+                render();
+        };
+    });
+    // keep hidden JSON synced
+    document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
+        // Initialize warnings per section
+        const scen = state.scenarios[activeIdx];
+        if (scen) {
+            ['Node Information','Routing','Services','Traffic','Events','Vulnerabilities','Segmentation'].forEach(sec => updateWeightWarning(activeIdx, sec));
+        }
+}
+
+function wireCoreControls() {
+    // defaults
+    if (!state.core) state.core = { host: (initialPayload?.core?.host || 'localhost'), port: (initialPayload?.core?.port || 50051) };
+    const hostEl = document.getElementById('coreHost');
+    const portEl = document.getElementById('corePort');
+    const btn = document.getElementById('testCoreBtn');
+    const statusEl = document.getElementById('coreStatus');
+    const runSync = document.getElementById('runSyncBtn');
+    const runAsync = document.getElementById('runAsyncBtn');
+    const cancelBtn = document.getElementById('cancelRunBtn');
+    const runSyncWrap = document.getElementById('runSyncWrap');
+    const runAsyncWrap = document.getElementById('runAsyncWrap');
+
+    const setRunEnabled = (ok) => {
+        if (ok) {
+            runSync.removeAttribute('disabled');
+            runAsync.removeAttribute('disabled');
+            runSync.classList.remove('pe-none');
+            runAsync.classList.remove('pe-none');
+            runSyncWrap?.setAttribute('data-bs-title', '');
+            runAsyncWrap?.setAttribute('data-bs-title', '');
+            statusEl.classList.remove('text-danger');
+            statusEl.classList.add('text-success');
+            statusEl.textContent = 'CORE reachable';
+        } else {
+            runSync.setAttribute('disabled', 'disabled');
+            runAsync.setAttribute('disabled', 'disabled');
+            runSync.classList.add('pe-none');
+            runAsync.classList.add('pe-none');
+            runSyncWrap?.setAttribute('data-bs-title', 'Test CORE connection first');
+            runAsyncWrap?.setAttribute('data-bs-title', 'Test CORE connection first');
+            statusEl.classList.remove('text-success');
+            statusEl.classList.add('text-danger');
+        }
+    };
+
+    // initialize values
+    if (hostEl) hostEl.value = state.core.host || 'localhost';
+    if (portEl) portEl.value = state.core.port || 50051;
+    // restore prior success only if host/port unchanged
+    if (state.core_ok === true && state.core_tested_host === (hostEl.value || '').trim() && String(state.core_tested_port) === String(portEl.value)) {
+        setRunEnabled(true);
+    } else {
+        setRunEnabled(false);
+        statusEl.textContent = 'Not tested';
+    }
+
+    const onEdit = () => {
+    state.core.host = hostEl.value.trim();
+    state.core.port = parseInt(portEl.value || '50051', 10) || 50051;
+    state.core_ok = false; // changing values invalidates previous test
+        // any edit resets test state
+        setRunEnabled(false);
+        statusEl.textContent = 'Not tested';
+    };
+    hostEl?.addEventListener('input', onEdit);
+    portEl?.addEventListener('input', onEdit);
+
+    btn?.addEventListener('click', async () => {
+        btn.disabled = true;
+        statusEl.classList.remove('text-danger', 'text-success');
+        statusEl.textContent = 'Testing...';
+        try {
+            const res = await fetch("{{ url_for('test_core') }}", {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ host: hostEl.value.trim() || 'localhost', port: parseInt(portEl.value || '50051', 10) || 50051 })
+            });
+            const data = await res.json();
+            if (data && data.ok) {
+                // persist success and the tested values
+                state.core_ok = true;
+                state.core_tested_host = hostEl.value.trim() || 'localhost';
+                state.core_tested_port = parseInt(portEl.value || '50051', 10) || 50051;
+                setRunEnabled(true);
+            } else {
+                setRunEnabled(false);
+                statusEl.textContent = 'Connection failed' + (data?.error ? `: ${data.error}` : '');
+            }
+        } catch (e) {
+            setRunEnabled(false);
+            statusEl.textContent = 'Connection failed';
+        } finally {
+            btn.disabled = false;
+        }
+    });
+}
+
+function prepareRunCli() {
+    // prefer the last saved XML path or result_path if it's XML
+    const rp = state.result_path || '';
+    if (!rp.endsWith('.xml')) {
+        alert('Please save XML first.');
+        return false;
+    }
+    document.getElementById('xml_path').value = rp;
+    return true;
+}
+
+render();
+
+// Enable Bootstrap tooltips globally
+document.addEventListener('DOMContentLoaded', () => {
+    const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+    tooltipTriggerList.forEach(el => new bootstrap.Tooltip(el));
+    setupDock();
+});
+
+async function runAsync() {
+    const rp = state.result_path || '';
+    if (!rp.endsWith('.xml')) { alert('Please save XML first.'); return; }
+    const form = new FormData(); form.append('xml_path', rp);
+        const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+    if (!res.ok) { alert('Failed to start run'); return; }
+    const { run_id } = await res.json();
+    startLogStream(run_id);
+    pollRunStatus(run_id);
+}
+
+let evtSrc = null;
+function startLogStream(runId) {
+    if (evtSrc) { try { evtSrc.close(); } catch(e){} }
+    evtSrc = new EventSource('/stream/' + runId);
+    const logsPre = document.getElementById('logsPre');
+    logsPre.textContent = '';
+    // Toggle buttons
+    document.getElementById('runAsyncBtn').classList.add('d-none');
+    document.getElementById('runSyncBtn').classList.add('disabled');
+    document.getElementById('cancelRunBtn').classList.remove('d-none');
+    evtSrc.onmessage = (ev) => {
+        logsPre.textContent += ev.data + '\n';
+        logsPre.scrollTop = logsPre.scrollHeight;
+    };
+    evtSrc.addEventListener('end', () => {
+        evtSrc.close();
+        document.getElementById('runAsyncBtn').classList.remove('d-none');
+        document.getElementById('runSyncBtn').classList.remove('disabled');
+        document.getElementById('cancelRunBtn').classList.add('d-none');
+    });
+}
+
+async function pollRunStatus(runId) {
+    const xmlPre = document.getElementById('xmlPre');
+    try {
+    const res = await fetch('/run_status/' + runId);
+        if (!res.ok) return;
+        const data = await res.json();
+        // Update download link
+        const rp = data.report_path || data.xml_path;
+        if (rp) { state.result_path = rp; }
+        // Refresh XML preview if we have the xml path and it's changed
+        if (data.xml_path && xmlPre && !xmlPre.textContent.trim()) {
+                    try {
+                        const txt = await (await fetch('/download_report?path=' + encodeURIComponent(data.xml_path))).text();
+                        xmlPre.textContent = txt;
+                    } catch(e){}
+        }
+        if (!data.done) {
+            setTimeout(() => pollRunStatus(runId), 1000);
+        }
+    } catch(e) {
+        // ignore transient errors
+        setTimeout(() => pollRunStatus(runId), 1500);
+    }
+}
+
+    async function cancelRun() {
+        if (!evtSrc) return;
+        // Extract runId from the EventSource URL
+        const url = evtSrc.url;
+        const runId = url.split('/').pop();
+        try {
+            await fetch('/cancel_run/' + runId, { method: 'POST' });
+        } catch(e) {}
+        try { evtSrc.close(); } catch(e){}
+        document.getElementById('runAsyncBtn').classList.remove('d-none');
+        document.getElementById('runSyncBtn').classList.remove('disabled');
+        document.getElementById('cancelRunBtn').classList.add('d-none');
+    }
+
+    function redistributeEven(sidx, secName) {
+        const items = state.scenarios[sidx].sections[secName].items;
+        const n = items.length;
+        if (n === 0) return;
+        const even = Math.round((1.0 / n) * 1000) / 1000;
+        for (let i = 0; i < n - 1; i++) items[i].factor = even;
+        // last item gets the residual to hit 1.0
+        const sumOther = items.slice(0, n-1).reduce((a,b) => a + (parseFloat(b.factor)||0), 0);
+        items[n-1].factor = Math.max(0, Math.round((1.0 - sumOther) * 1000) / 1000);
+        updateWeightWarning(sidx, secName);
+    }
+
+    function adjustWeightsProportionally(sidx, secName, changedIdx) {
+        const items = state.scenarios[sidx].sections[secName].items;
+        const n = items.length;
+        if (n <= 1) { items[0].factor = 1.0; return; }
+        // clamp changed value
+        items[changedIdx].factor = Math.max(0, Math.min(1, parseFloat(items[changedIdx].factor)||0));
+        const targetSum = 1.0;
+        const changed = parseFloat(items[changedIdx].factor)||0;
+        const others = items.map((x, i) => i !== changedIdx ? (parseFloat(x.factor)||0) : 0);
+        const sumOthers = others.reduce((a,b) => a + b, 0);
+        const residual = Math.max(0, targetSum - changed);
+        if (sumOthers <= 0) {
+            // Distribute evenly across others
+            const even = residual / (n - 1);
+            for (let i = 0; i < n; i++) if (i !== changedIdx) items[i].factor = Math.round(even * 1000) / 1000;
+        } else {
+            // Scale others proportionally to keep overall sum 1.0
+            for (let i = 0; i < n; i++) if (i !== changedIdx) {
+                const ratio = others[i < changedIdx ? i : i - 1] / sumOthers;
+                items[i].factor = Math.round((residual * ratio) * 1000) / 1000;
+            }
+        }
+        // Final normalization to exact 1.000 with 3 decimals
+        normalizeToThousandths(sidx, secName);
+    }
+
+    function updateWeightWarning(sidx, secName) {
+        const items = state.scenarios[sidx].sections[secName].items;
+        if (!items || items.length === 0) return;
+        const sum = Math.round(items.reduce((a,b) => a + (parseFloat(b.factor)||0), 0) * 1000) / 1000;
+    const warn = document.querySelector(".section-warning[data-scen-idx='" + sidx + "'][data-sec='" + secName + "']");
+        if (warn) {
+            warn.style.display = (Math.abs(sum - 1.0) > 0.005) ? 'block' : 'none';
+            warn.textContent = 'Weights must sum to 1.000 (current: ' + sum.toFixed(3) + ')';
+        }
+    }
+
+    function normalizeToThousandths(sidx, secName) {
+        const items = state.scenarios[sidx].sections[secName].items;
+        if (!items || items.length === 0) return;
+        const vals = items.map(it => Math.max(0, Math.min(1, parseFloat(it.factor)||0)));
+        // Convert to thousandths without rounding first
+        const thousandthsRaw = vals.map(v => v * 1000);
+        const floors = thousandthsRaw.map(v => Math.floor(v));
+        let sumFloors = floors.reduce((a,b) => a + b, 0);
+        let remainder = 1000 - sumFloors;
+        if (remainder > 0) {
+            // Distribute +1 to largest fractional parts
+            const remainders = thousandthsRaw.map((v, i) => ({ idx: i, frac: v - floors[i] }));
+            remainders.sort((a,b) => b.frac - a.frac);
+            for (let k = 0; k < remainders.length && remainder > 0; k++) {
+                floors[remainders[k].idx] += 1; remainder -= 1;
+            }
+        } else if (remainder < 0) {
+            // Remove -1 from largest values to reduce sum to 1000
+            const order = floors.map((v,i) => ({ idx: i, v }));
+            order.sort((a,b) => b.v - a.v);
+            while (remainder < 0) {
+                for (let k = 0; k < order.length && remainder < 0; k++) {
+                    const i = order[k].idx;
+                    if (floors[i] > 0) { floors[i] -= 1; remainder += 1; }
+                }
+                if (order.length === 0) break;
+            }
+        }
+        for (let i = 0; i < items.length; i++) {
+            items[i].factor = floors[i] / 1000.0;
+        }
+    }
+
+    function updateWeightInputsDisplay(sidx, secName) {
+        const items = state.scenarios[sidx].sections[secName].items;
+    document.querySelectorAll("input.weight-input[data-scen-idx='" + sidx + "'][data-sec='" + secName + "']").forEach(input => {
+            const iidx = parseInt(input.getAttribute('data-item-idx'));
+            if (!isNaN(iidx) && items[iidx]) {
+                input.value = (parseFloat(items[iidx].factor) || 0).toFixed(3);
+            }
+        });
+    }
+
+    function setupDock() {
+        const dock = document.getElementById('dockPanel');
+        const grip = document.getElementById('dockGrip');
+        const hideBtn = document.getElementById('dockHideBtn');
+        const showBtn = document.getElementById('dockShowBtn');
+        if (!dock || !grip || !hideBtn || !showBtn) return;
+
+        const setBodyPad = (px) => { document.body.style.paddingBottom = Math.max(px, 0) + 'px'; };
+        const applyHeight = (px) => {
+            dock.style.height = px + 'px';
+            setBodyPad(px + 12);
+            localStorage.setItem('coretg_dock_height_px', String(px));
+        };
+        // Init from storage or default to current offsetHeight
+        const savedH = parseInt(localStorage.getItem('coretg_dock_height_px') || '0', 10);
+        const initialH = (savedH > 100 ? savedH : dock.offsetHeight);
+        applyHeight(initialH);
+
+        // Resizing
+        let resizing = false;
+        let startY = 0;
+        let startH = initialH;
+        const onMove = (e) => {
+            if (!resizing) return;
+            const dy = startY - (e.touches ? e.touches[0].clientY : e.clientY);
+            const newH = Math.min(Math.max(startH + dy, 120), window.innerHeight - 80);
+            applyHeight(newH);
+        };
+        const onUp = () => { resizing = false; document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); document.removeEventListener('touchmove', onMove); document.removeEventListener('touchend', onUp); };
+        grip.addEventListener('mousedown', (e) => { resizing = true; startY = e.clientY; startH = dock.offsetHeight; document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp); });
+        grip.addEventListener('touchstart', (e) => { resizing = true; startY = e.touches[0].clientY; startH = dock.offsetHeight; document.addEventListener('touchmove', onMove); document.addEventListener('touchend', onUp); }, { passive: true });
+
+        // Hide/show
+        const applyHidden = (hidden) => {
+            if (hidden) {
+                dock.classList.add('d-none');
+                showBtn.classList.remove('d-none');
+                setBodyPad(12);
+            } else {
+                dock.classList.remove('d-none');
+                showBtn.classList.add('d-none');
+                applyHeight(parseInt(localStorage.getItem('coretg_dock_height_px') || String(initialH), 10));
+            }
+            localStorage.setItem('coretg_dock_hidden', hidden ? '1' : '0');
+        };
+    // Init hidden state (default hidden if no saved preference)
+    const savedHidden = localStorage.getItem('coretg_dock_hidden');
+    applyHidden(savedHidden ? savedHidden === '1' : true);
+        hideBtn.addEventListener('click', () => applyHidden(true));
+        showBtn.addEventListener('click', () => applyHidden(false));
+
+        // Persist active tab across reloads
+        const tabButtons = dock.querySelectorAll(".nav-link[data-bs-toggle='tab']");
+        tabButtons.forEach(btn => {
+            btn.addEventListener('shown.bs.tab', (e) => {
+                const target = e.target.getAttribute('data-bs-target');
+                if (target) localStorage.setItem('coretg_dock_active_tab', target);
+            });
+        });
+        // Restore previously active tab, if any
+        const savedTab = localStorage.getItem('coretg_dock_active_tab');
+        if (savedTab) {
+            const btn = dock.querySelector(".nav-link[data-bs-target='" + savedTab + "']");
+            if (btn) {
+                try { new bootstrap.Tab(btn).show(); } catch(e) {}
+            }
+        }
+    }
+</script>
+</body>
+</html>

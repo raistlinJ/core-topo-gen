@@ -128,3 +128,6 @@ dmypy.json
 .AppleDouble
 .LSOverride
 
+
+webapp/uploads/
+webapp/outputs/

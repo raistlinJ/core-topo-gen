@@ -9,7 +9,7 @@ def test_report_includes_segmentation(tmp_path):
         "rules": [
             {
                 "node_id": 1,
-                "service": "sFirewall",
+                "service": "Firewall",
                 "rule": {"type": "subnet_block", "src": "10.0.0.0/24", "dst": "10.0.1.0/24"},
                 "script": "/tmp/segmentation/subnet_block_1_1.py",
             },
@@ -44,7 +44,7 @@ def test_report_includes_segmentation(tmp_path):
         routing_cfg={"density": 0, "items": []},
         traffic_cfg={"density": 0, "items": []},
         services_cfg=[],
-    segmentation_cfg={"density": 0.5, "items": [{"name": "sFirewall", "factor": 1.0}]},
+        segmentation_cfg={"density": 0.5, "items": [{"name": "Firewall", "factor": 1.0}]},
     )
 
     assert os.path.exists(result_path)
