@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Run Reports</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+  <style>
+    body { padding-bottom: 0; }
+    .sidebar { max-height: calc(100vh - 140px); overflow:auto; }
+  </style>
+</head>
+<body>
+<div class="container-fluid mt-4">
+  <div class="row">
+    <div class="col-12">
+      <div class="d-flex align-items-center justify-content-between bg-primary text-white rounded-top shadow-sm px-3 py-2">
+        <div class="d-flex align-items-center gap-2">
+          <i class="bi bi-shield-lock-fill fs-4"></i>
+          <h3 class="mb-0">CORE TopoGen Web GUI</h3>
+        </div>
+      </div>
+      <nav class="navbar navbar-expand bg-light border rounded-bottom shadow-sm mb-3 px-2 py-0">
+        <ul class="navbar-nav me-auto mb-0 small">
+          <li class="nav-item"><a class="nav-link" href="{{ url_for('index') }}">Scenarios</a></li>
+          <li class="nav-item"><a class="nav-link" href="{{ url_for('data_sources_page') }}">Flag Sources</a></li>
+          <li class="nav-item"><a class="nav-link active" aria-current="page" href="{{ url_for('reports_page') }}">Reports</a></li>
+        </ul>
+        <div class="d-flex align-items-center gap-2 small">
+          <span id="refreshStatus" class="text-muted">auto</span>
+          <button class="btn btn-sm btn-outline-secondary" id="toggleRefreshBtn" type="button">Pause</button>
+        </div>
+      </nav>
+    </div>
+  </div>
+  <div class="row">
+    <div class="col-3">
+      <div class="card mb-3">
+        <div class="card-header py-2 d-flex justify-content-between align-items-center">
+          <strong class="small mb-0">Scenarios</strong>
+          <button class="btn btn-sm btn-outline-secondary" id="clearScenarioFilter" type="button" title="Clear filter" style="display:none">Clear</button>
+        </div>
+        <div class="list-group list-group-flush sidebar" id="scenarioFilterList">
+          {% for s in scenarios %}
+          <button type="button" class="list-group-item list-group-item-action py-1 px-2 small" data-scen-name="{{ s }}">{{ s }}</button>
+          {% endfor %}
+          {% if not scenarios %}
+          <div class="p-2 small text-muted">No scenarios yet</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+    <div class="col-9">
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center py-2">
+          <strong class="mb-0">Run History</strong>
+          <small class="text-muted" id="runCount"></small>
+        </div>
+        <div class="table-responsive" style="max-height:60vh; overflow:auto;">
+          <table class="table table-sm align-middle mb-0" id="runsTable">
+            <thead class="table-light">
+              <tr>
+                <th style="white-space:nowrap;">Timestamp (UTC)</th>
+                <th>Scenario(s)</th>
+                <th>Mode</th>
+                <th>XML</th>
+                <th>Report</th>
+                <th>Pre-Session XML</th>
+                <th>RC</th>
+                <th style="white-space:nowrap;">Run ID</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for r in history %}
+              <tr data-scenarios="{{ (r.scenario_names|join('||')) if r.scenario_names else '' }}">
+                <td>{{ r.timestamp }}</td>
+                <td class="small">{{ r.scenario_names|join(', ') }}</td>
+                <td>{{ r.mode }}</td>
+                <td>{% if r.xml_path %}<a href="{{ url_for('download_report', path=r.xml_path) }}">xml</a>{% else %}-{% endif %}</td>
+                <td>{% if r.report_path %}<a href="{{ url_for('download_report', path=r.report_path) }}">report</a>{% else %}<span class="text-muted">n/a</span>{% endif %}</td>
+                <td>{% if r.pre_xml_path %}<a href="{{ url_for('download_report', path=r.pre_xml_path) }}">pre</a>{% else %}<span class="text-muted">n/a</span>{% endif %}</td>
+                <td>{{ r.returncode }}</td>
+                <td>{{ r.run_id or '-' }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+let autoRefresh = true;
+let refreshTimer = null;
+const intervalMs = 5000;
+const tableBody = document.querySelector('#runsTable tbody');
+function escapeHtml(str){ return (str||'').replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+function buildRow(r){
+  const scenNames = (r.scenario_names||[]).join(', ');
+  return `<tr data-scenarios="${(r.scenario_names||[]).join('||')}">
+    <td>${escapeHtml(r.timestamp||'')}</td>
+    <td class="small">${escapeHtml(scenNames)}</td>
+    <td>${escapeHtml(r.mode||'')}</td>
+    <td>${r.xml_path?`<a href='${encodeURI('/download_report?path='+r.xml_path)}'>xml</a>`:'-'}</td>
+    <td>${r.report_path?`<a href='${encodeURI('/download_report?path='+r.report_path)}'>report</a>`:'<span class=\"text-muted\">n/a</span>'}</td>
+    <td>${r.pre_xml_path?`<a href='${encodeURI('/download_report?path='+r.pre_xml_path)}'>pre</a>`:'<span class=\"text-muted\">n/a</span>'}</td>
+    <td>${r.returncode ?? ''}</td>
+    <td>${escapeHtml(r.run_id||'-')}</td>
+  </tr>`;
+}
+function renderRows(history){
+  if(!tableBody) return;
+  tableBody.innerHTML = history.map(buildRow).join('\n');
+  applyScenarioFilter();
+  updateCount();
+}
+async function fetchHistory(){
+  try {
+    const res = await fetch('/reports_data');
+    if(!res.ok) return;
+    const data = await res.json();
+    if(Array.isArray(data.history)) renderRows(data.history);
+    // Refresh scenario list if new ones appear
+    const list = document.getElementById('scenarioFilterList');
+    if(list && Array.isArray(data.scenarios)){
+      const existing = new Set(Array.from(list.querySelectorAll('[data-scen-name]')).map(b=>b.getAttribute('data-scen-name')));
+      let added = false;
+      data.scenarios.forEach(n => { if(!existing.has(n)){ added=true; const btn=document.createElement('button'); btn.type='button'; btn.className='list-group-item list-group-item-action py-1 px-2 small'; btn.dataset.scenName=n; btn.textContent=n; list.appendChild(btn);} });
+      if(added) wireScenarioButtons();
+    }
+  } catch(e) {
+    // transient errors ignored
+  }
+}
+function schedule(){
+  if(refreshTimer) clearTimeout(refreshTimer);
+  if(!autoRefresh) return;
+  refreshTimer = setTimeout(async () => { await fetchHistory(); schedule(); }, intervalMs);
+}
+document.getElementById('toggleRefreshBtn').addEventListener('click', () => {
+  autoRefresh = !autoRefresh;
+  document.getElementById('toggleRefreshBtn').textContent = autoRefresh? 'Pause':'Resume';
+  document.getElementById('refreshStatus').textContent = autoRefresh? 'auto':'paused';
+  schedule();
+});
+
+let activeScenarioFilter = null;
+function applyScenarioFilter(){
+  const rows = tableBody.querySelectorAll('tr');
+  rows.forEach(r => {
+    if(!activeScenarioFilter){ r.classList.remove('d-none'); return; }
+    const scenAttr = r.getAttribute('data-scenarios')||'';
+    const match = scenAttr.split('||').filter(Boolean).includes(activeScenarioFilter);
+    r.classList.toggle('d-none', !match);
+  });
+}
+function updateCount(){
+  const rows = Array.from(tableBody.querySelectorAll('tr'));
+  const visible = rows.filter(r=>!r.classList.contains('d-none')).length;
+  document.getElementById('runCount').textContent = visible + ' run' + (visible===1?'':'s');
+}
+function wireScenarioButtons(){
+  const list = document.getElementById('scenarioFilterList');
+  list.querySelectorAll('[data-scen-name]').forEach(btn => {
+    btn.onclick = () => {
+      const name = btn.getAttribute('data-scen-name');
+      if(activeScenarioFilter === name){ activeScenarioFilter = null; } else { activeScenarioFilter = name; }
+      list.querySelectorAll('[data-scen-name]').forEach(b=>b.classList.toggle('active', b.getAttribute('data-scen-name')===activeScenarioFilter));
+      document.getElementById('clearScenarioFilter').style.display = activeScenarioFilter? 'inline-block':'none';
+      applyScenarioFilter();
+      updateCount();
+    };
+  });
+}
+document.getElementById('clearScenarioFilter').addEventListener('click', () => { activeScenarioFilter=null; wireScenarioButtons(); applyScenarioFilter(); updateCount(); document.getElementById('clearScenarioFilter').style.display='none'; });
+wireScenarioButtons();
+applyScenarioFilter();
+updateCount();
+schedule();
+</script>
+</body>
+</html>

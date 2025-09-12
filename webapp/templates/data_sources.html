@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Data Sources</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+</head>
+<body class="p-3">
+  <div class="d-flex align-items-center justify-content-between bg-primary text-white rounded-top shadow-sm px-3 py-2">
+    <div class="d-flex align-items-center gap-2">
+      <i class="bi bi-shield-lock-fill fs-5"></i>
+      <h4 class="mb-0 text-white">CORE TopoGen Web GUI</h4>
+    </div>
+  </div>
+  <nav class="navbar navbar-expand bg-light border rounded-bottom shadow-sm mb-3 px-2 py-0">
+    <ul class="navbar-nav me-auto mb-0 small">
+      <li class="nav-item"><a class="nav-link" href="{{ url_for('index') }}">Scenarios</a></li>
+      <li class="nav-item"><a class="nav-link active" aria-current="page" href="{{ url_for('data_sources_page') }}">Flag Sources</a></li>
+    </ul>
+  </nav>
+  {% with messages = get_flashed_messages() %}
+    {% if messages %}
+      <div class="alert alert-info py-2 px-3 mb-3">{{ messages[0] }}</div>
+    {% endif %}
+  {% endwith %}
+  <form class="card p-3 mb-4" action="{{ url_for('data_sources_upload') }}" method="post" enctype="multipart/form-data">
+    <div class="row g-2 align-items-end">
+      <div class="col-sm-6">
+        <label class="form-label mb-1">Import CSV</label>
+        <input type="file" class="form-control" name="csv_file" accept=".csv" required>
+      </div>
+      <div class="col-auto">
+        <button class="btn btn-primary" type="submit">Upload</button>
+      </div>
+      <div class="col-auto">
+        <a class="btn btn-outline-secondary" href="{{ url_for('data_sources_export_all') }}">Export All</a>
+      </div>
+    </div>
+  </form>
+  <div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <strong>Sources</strong>
+      <small class="text-muted">Total: {{ sources|length }}</small>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-sm mb-0 align-middle">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Status</th>
+            <th>Rows</th>
+            <th>Uploaded (UTC)</th>
+            <th style="width:240px"></th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for s in sources %}
+          <tr class="{{ 'table-danger' if s.rows.startswith('ERR:') else '' }}">
+            <td>{{ s.name }}</td>
+            <td>
+              {% if s.enabled %}<span class="badge bg-success">ENABLED</span>{% else %}<span class="badge bg-secondary">DISABLED</span>{% endif %}
+            </td>
+            <td>{{ s.rows }}</td>
+            <td><small>{{ s.uploaded }}</small></td>
+            <td>
+              <div class="d-flex flex-wrap gap-1">
+                <form action="{{ url_for('data_sources_toggle', sid=s.id) }}" method="post" class="d-inline"><button class="btn btn-sm btn-outline-warning" type="submit">{{ 'Disable' if s.enabled else 'Enable' }}</button></form>
+                <form action="{{ url_for('data_sources_refresh', sid=s.id) }}" method="post" class="d-inline"><button class="btn btn-sm btn-outline-info" type="submit">Refresh</button></form>
+                <a class="btn btn-sm btn-outline-primary" href="{{ url_for('data_sources_download', sid=s.id) }}">Download</a>
+                <form action="{{ url_for('data_sources_delete', sid=s.id) }}" method="post" class="d-inline" onsubmit="return confirm('Delete source?')"><button class="btn btn-sm btn-outline-danger" type="submit">Delete</button></form>
+              </div>
+            </td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5" class="text-center text-muted py-4">No data sources imported yet.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>

@@ -12,7 +12,11 @@ services:
       - "9090:9090"
     environment:
       - PYTHONUNBUFFERED=1
+      - CORE_HOST=${CORE_HOST:-host.docker.internal}
+      - CORE_PORT=${CORE_PORT:-50051}
     volumes:
       - ./webapp/uploads:/app/webapp/uploads
       - ./webapp/outputs:/app/webapp/outputs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped

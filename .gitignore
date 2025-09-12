@@ -131,3 +131,7 @@ dmypy.json
 
 webapp/uploads/
 webapp/outputs/
+uploads/
+outputs/
+
+reports/

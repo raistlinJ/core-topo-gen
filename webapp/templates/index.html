@@ -8,10 +8,13 @@
     <style>
         /* initial padding; JS will adjust based on dock height */
         body { padding-bottom: 42vh; }
-        .dock-panel { position: fixed; bottom: 0; left: 0; right: 0; height: 40vh; background: #fff; border-top: 1px solid #dee2e6; box-shadow: 0 -2px 8px rgba(0,0,0,.08); z-index: 1030; }
+        .dock-panel { position: fixed; bottom: 0; left: 0; right: 0; height: 40vh; background: #fff; border-top: 1px solid #dee2e6; box-shadow: 0 -2px 8px rgba(0,0,0,.08); z-index: 1030; display:flex; flex-direction:column; }
         .dock-grip { height: 6px; cursor: ns-resize; background: repeating-linear-gradient(90deg, #e9ecef 0, #e9ecef 6px, #f8f9fa 6px, #f8f9fa 12px); border-bottom: 1px solid #dee2e6; }
-        .dock-panel .tab-content { height: calc(100% - 42px - 6px); }
-        .dock-panel pre { height: 100%; }
+        .dock-panel .nav-tabs { flex-shrink:0; }
+        .dock-panel .tab-content { flex:1 1 auto; min-height:0; overflow:auto; }
+        .dock-panel .tab-pane { height:100%; overflow:auto; }
+        .dock-panel pre { height:auto; min-height:100%; overflow:auto; }
+        #xmlPre, #logsPre { max-height:none; }
         .dock-toggle-btn { position: fixed; right: 12px; bottom: 12px; z-index: 1040; }
     </style>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
@@ -21,12 +24,19 @@
     <!-- Full-width top header -->
     <div class="row">
         <div class="col-12">
-            <div class="d-flex align-items-center justify-content-between bg-primary text-white rounded shadow-sm px-3 py-2 mb-3">
+            <div class="d-flex align-items-center justify-content-between bg-primary text-white rounded-top shadow-sm px-3 py-2">
                 <div class="d-flex align-items-center gap-2">
                     <i class="bi bi-shield-lock-fill fs-4"></i>
                     <h3 class="mb-0">CORE TopoGen Web GUI</h3>
                 </div>
             </div>
+            <nav class="navbar navbar-expand bg-light border rounded-bottom shadow-sm mb-3 px-2 py-0">
+                <ul class="navbar-nav me-auto mb-0 small">
+                    <li class="nav-item"><a class="nav-link active" aria-current="page" href="{{ url_for('index') }}">Scenarios</a></li>
+                    <li class="nav-item"><a class="nav-link" href="{{ url_for('data_sources_page') }}">Flag Sources</a></li>
+                    <li class="nav-item"><a class="nav-link" href="{{ url_for('reports_page') }}">Reports</a></li>
+                </ul>
+            </nav>
         </div>
     </div>
     <div class="row">
@@ -44,7 +54,7 @@
                         <input type="file" name="scenarios_xml" id="hiddenLoadInput" accept=".xml">
                     </form>
                     <div class="card-footer" style="position: sticky; bottom: 0; background: #fff; z-index: 1;">
-                        <button type="button" class="btn btn-sm btn-primary w-100" id="appendScenarioBtn">Append Scenario</button>
+                        <button type="button" class="btn btn-sm btn-primary w-100" id="appendScenarioBtn">New Scenario</button>
                     </div>
                 </div>
             </div>
@@ -69,6 +79,9 @@
                                         <span class="badge text-bg-danger">INVALID</span>
                                     {% endif %}
                                     <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('base_details') }}?path={{ payload.base_upload.path | urlencode }}" target="_blank">Details</a>
+                                    <form action="{{ url_for('remove_base') }}" method="post" class="d-inline" onsubmit="document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });">
+                                        <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
+                                    </form>
                                 {% endif %}
                             </div>
                         </div>
@@ -126,6 +139,7 @@
                         <span class="d-inline-block" tabindex="0" id="runAsyncWrap" data-bs-toggle="tooltip" data-bs-title="Test CORE connection first">
                             <button class="btn btn-outline-warning pe-none" type="button" id="runAsyncBtn" onclick="runAsync()" disabled>Run Async</button>
                         </span>
+                        <a class="btn btn-outline-info pe-none" id="reportsBtn" href="{{ url_for('reports_page') }}" disabled>Reports</a>
                         <button class="btn btn-outline-danger d-none" type="button" id="cancelRunBtn" onclick="cancelRun()">Cancel</button>
                     </form>
                 </div>
@@ -136,9 +150,20 @@
 </div>
 <div class="dock-panel" id="dockPanel">
     <div class="dock-grip" id="dockGrip" title="Drag to resize"></div>
-    <ul class="nav nav-tabs px-3 pt-2" role="tablist">
-        <li class="nav-item" role="presentation">
+    <ul class="nav nav-tabs px-3 pt-2 align-items-center" role="tablist">
+        <li class="nav-item d-flex align-items-center" role="presentation">
             <button class="nav-link active" id="tab-logs" data-bs-toggle="tab" data-bs-target="#dock-logs" type="button" role="tab">Logs</button>
+        </li>
+        <li class="nav-item d-flex align-items-center ms-3 small" role="presentation">
+            <div class="d-flex align-items-center gap-1">
+                <label class="form-label mb-0 me-1">Level</label>
+                <select id="logLevelFilter" class="form-select form-select-sm" style="width:auto;">
+                    <option value="DEBUG">DEBUG</option>
+                    <option value="INFO" selected>INFO</option>
+                    <option value="WARN">WARN</option>
+                    <option value="ERROR">ERROR</option>
+                </select>
+            </div>
         </li>
         <li class="nav-item" role="presentation">
             <button class="nav-link" id="tab-xml" data-bs-toggle="tab" data-bs-target="#dock-xml" type="button" role="tab">XML Preview</button>
@@ -149,10 +174,10 @@
     </ul>
     <div class="tab-content px-3 pb-2">
         <div class="tab-pane fade show active" id="dock-logs" role="tabpanel" aria-labelledby="tab-logs">
-            <pre class="w-100 m-0" style="white-space: pre-wrap; overflow:auto; width:100%;" id="logsPre">{{ (logs or '') | e }}</pre>
+            <pre class="w-100 m-0" style="white-space: pre; overflow:auto; width:100%; font-size:0.8rem;" id="logsPre">{{ (logs or '') | e }}</pre>
         </div>
         <div class="tab-pane fade" id="dock-xml" role="tabpanel" aria-labelledby="tab-xml">
-            <pre class="w-100 m-0" style="white-space: pre-wrap; overflow:auto; width:100%;" id="xmlPre">{{ (xml_preview or '') | e }}</pre>
+            <pre class="w-100 m-0" style="white-space: pre; overflow:auto; width:100%; font-size:0.75rem;" id="xmlPre">{{ (xml_preview or '') | e }}</pre>
         </div>
     </div>
 </div>
@@ -162,6 +187,39 @@
 <script>
 const payloadDataEl = document.getElementById('payload-data');
 let initialPayload = null;
+// ---------------- Logging (buffer + level filter) -----------------
+const LOG_LEVELS = { DEBUG: 10, INFO: 20, WARN: 30, ERROR: 40 };
+let currentLogLevel = LOG_LEVELS.INFO; // default threshold
+let logBuffer = [];
+function renderLogs() {
+    const logsPre = document.getElementById('logsPre');
+    if (!logsPre) return;
+    const filtered = logBuffer.filter(r => r.levelValue >= currentLogLevel).map(r => r.line);
+    logsPre.textContent = filtered.join('\n') + (filtered.length ? '\n' : '');
+    logsPre.scrollTop = logsPre.scrollHeight;
+}
+function setLogLevel(levelName) {
+    if (LOG_LEVELS[levelName] !== undefined) { currentLogLevel = LOG_LEVELS[levelName]; renderLogs(); }
+}
+function logLine(level, msg) {
+    const ts = new Date().toISOString();
+    const lvlVal = LOG_LEVELS[level] ?? LOG_LEVELS.INFO;
+    const line = `[${ts}] ${level.padEnd(5)} ${msg}`;
+    logBuffer.push({ level, levelValue: lvlVal, line });
+    if (lvlVal >= currentLogLevel) {
+        const logsPre = document.getElementById('logsPre');
+        if (logsPre) {
+            logsPre.textContent += line + '\n';
+            logsPre.scrollTop = logsPre.scrollHeight;
+        }
+    }
+}
+function logDebug(m){ logLine('DEBUG', m); }
+function logInfo(m){ logLine('INFO', m); }
+function logWarn(m){ logLine('WARN', m); }
+function logError(m){ logLine('ERROR', m); }
+
+logInfo('UI initialized');
 try {
     initialPayload = JSON.parse(payloadDataEl?.textContent || 'null');
 } catch (e) {
@@ -173,7 +231,7 @@ function defaultScenario(name) {
         name: name || `Scenario ${document.querySelectorAll('.scenario-card').length + 1}`,
         base: { filepath: '' },
         sections: {
-            'Node Information': { total_nodes: 1, density: null, items: [] },
+            'Node Information': { total_nodes: 1, density: null, items: [ { value: 'Random', weight: 1, extras: {} } ] },
             'Routing': { density: 0.5, items: [] },
             'Services': { density: 0.5, items: [] },
             'Traffic': { density: 0.5, items: [] },
@@ -229,13 +287,15 @@ function renderSidebar() {
             const exportBtn = document.getElementById('exportBtn');
         const hiddenLoadInput = document.getElementById('hiddenLoadInput');
         const hiddenLoadForm = document.getElementById('hiddenLoadForm');
-            if (appendScenarioBtn) appendScenarioBtn.onclick = (e) => { e.preventDefault(); state.scenarios.push(defaultScenario()); activeIdx = state.scenarios.length - 1; render(); };
-            if (importBtn) importBtn.onclick = (e) => { e.preventDefault(); hiddenLoadInput.click(); };
+            if (appendScenarioBtn) appendScenarioBtn.onclick = (e) => { e.preventDefault(); logInfo('New scenario created'); state.scenarios.push(defaultScenario()); activeIdx = state.scenarios.length - 1; render(); };
+            if (importBtn) importBtn.onclick = (e) => { e.preventDefault(); logInfo('Import scenarios clicked'); hiddenLoadInput.click(); };
         if (hiddenLoadInput) hiddenLoadInput.onchange = () => { if (hiddenLoadInput.files && hiddenLoadInput.files.length > 0) hiddenLoadForm.submit(); };
             if (exportBtn) exportBtn.onclick = (e) => {
                 e.preventDefault();
+                logInfo('Export clicked');
                 const rp = state.result_path || '';
                 if (!rp.endsWith('.xml')) {
+                    logWarn('Export blocked: no saved XML');
                     alert('Please Save XML first (middle panel) to export the current scenarios.');
                     return;
                 }
@@ -264,19 +324,30 @@ function renderMain() {
     secNames.forEach(name => {
         const sec = scen.sections[name] || { items: [] };
         const hasNodes = (name === 'Node Information');
+        const itemCount = (sec.items || []).length;
+        const showDensity = !hasNodes && itemCount > 0; // generalized rule
         const densVal = (sec.density ?? (hasNodes ? '' : 0.5));
         const nodesVal = (hasNodes ? (sec.total_nodes ?? 1) : '');
+        const collapsed = (!hasNodes && itemCount === 0);
         const card = document.createElement('div');
         card.className = 'card mb-3';
+        const collapseId = `collapse-${name.replace(/\s+/g,'-')}`;
+        const iconHtml = itemCount > 0
+            ? `<i class='bi bi-collection-fill text-success' data-bs-toggle="tooltip" data-bs-title="${itemCount} item(s)"></i>`
+            : `<i class='bi bi-collection text-muted' data-bs-toggle="tooltip" data-bs-title="No items"></i>`;
         card.innerHTML = `
             <div class="card-header d-flex align-items-center gap-2">
+                ${iconHtml}
                 <strong>${name}</strong>
-                ${hasNodes ? `<span class="ms-3">Total Nodes:</span><input type="number" min="1" class="form-control form-control-sm" style="width:120px" value="${nodesVal}" data-scen-idx="${activeIdx}" data-sec="${name}" data-field="total_nodes">` : `
-                    <span class="ms-3">Density:</span><input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm" style="width:120px" value="${densVal}" data-scen-idx="${activeIdx}" data-sec="${name}" data-field="density">`
+                ${hasNodes ? `<span class=\"ms-3\">Total Nodes:</span><input type=\"number\" min=\"1\" class=\"form-control form-control-sm\" style=\"width:120px\" value=\"${nodesVal}\" data-scen-idx=\"${activeIdx}\" data-sec=\"${name}\" data-field=\"total_nodes\">` : (showDensity ? `
+                    <span class=\"ms-3\">Density:</span><input type=\"number\" step=\"0.01\" min=\"0\" max=\"1\" class=\"form-control form-control-sm\" style=\"width:120px\" value=\"${densVal}\" data-scen-idx=\"${activeIdx}\" data-sec=\"${name}\" data-field=\"density\">` : `<span class='ms-3 text-muted small'>Add an item to set density</span>`)
                 }
-                <button class="btn btn-sm btn-outline-primary ms-auto" data-action="add-item" data-scen-idx="${activeIdx}" data-sec="${name}">Add</button>
+                <div class="ms-auto d-flex gap-2">
+                    <button class="btn btn-sm btn-outline-primary" data-action="add-item" data-scen-idx="${activeIdx}" data-sec="${name}">Add</button>
+                    <button class="btn btn-sm btn-outline-secondary" type="button" data-action="toggle-collapse" data-target="#${collapseId}">${collapsed ? 'Expand' : 'Collapse'}</button>
+                </div>
             </div>
-            <div class="card-body">
+            <div id="${collapseId}" class="card-body" style="display:${collapsed ? 'none':'block'};">
                 <div class="table-responsive">
                     <table class="table table-sm align-middle">
                         <thead><tr><th style="width:280px">Selected</th><th style="width:120px">Weight</th><th>Extras</th><th style="width:80px"></th></tr></thead>
@@ -289,6 +360,11 @@ function renderMain() {
             </div>`;
         root.appendChild(card);
     });
+        // activate tooltips for icons
+        if(window.bootstrap){
+            const tts = root.querySelectorAll('[data-bs-toggle="tooltip"]');
+            tts.forEach(el => new bootstrap.Tooltip(el));
+        }
 
     // Notes card
     const notesCard = document.createElement('div');
@@ -387,6 +463,7 @@ function wireHandlers() {
             }
             // keep hidden for submit
             document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
+            logDebug(`Field change: scen=${sidx} sec=${sec||''} field=${field}`);
         };
     });
     document.querySelectorAll('[data-action="remove-item"]').forEach(btn => {
@@ -395,6 +472,7 @@ function wireHandlers() {
             const sec = btn.getAttribute('data-sec');
             const iidx = parseInt(btn.getAttribute('data-item-idx'));
             state.scenarios[sidx].sections[sec].items.splice(iidx,1);
+            logInfo(`Removed item ${iidx} from ${sec}`);
               redistributeEven(sidx, sec);
               renderMain();
         };
@@ -407,16 +485,53 @@ function wireHandlers() {
             if (sec === 'Events') item.script_path = '';
             if (sec === 'Traffic') { item.pattern = 'continuous'; item.rate_kbps = 64.0; item.period_s = 1.0; item.jitter_pct = 10.0; }
             state.scenarios[sidx].sections[sec].items.push(item);
+            logInfo(`Added item to ${sec}`);
               redistributeEven(sidx, sec);
               renderMain();
         };
     });
-        document.querySelectorAll('[data-action="remove-scenario"]').forEach(btn => {
+    document.querySelectorAll('[data-action="toggle-collapse"]').forEach(btn => {
         btn.onclick = () => {
+            const targetSel = btn.getAttribute('data-target');
+            const target = document.querySelector(targetSel);
+            if (!target) return;
+            const visible = target.style.display !== 'none';
+            target.style.display = visible ? 'none' : 'block';
+            btn.textContent = visible ? 'Expand' : 'Collapse';
+            logDebug(`Section toggle ${targetSel} -> ${visible ? 'collapsed':'expanded'}`);
+        };
+    });
+        document.querySelectorAll('[data-action="remove-scenario"]').forEach(btn => {
+        btn.onclick = async () => {
                 const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+                const scen = state.scenarios[sidx];
+                if(!scen){ return; }
+                let runCount = 0;
+                try {
+                    const resp = await fetch('/reports_data');
+                    if(resp.ok){
+                        const data = await resp.json();
+                        runCount = (data.history||[]).filter(r => (r.scenario_names||[]).includes(scen.name)).length;
+                    }
+                } catch(e) {}
+                let lines = [];
+                lines.push(`Delete scenario "${scen.name}"?`);
+                if(runCount > 0){
+                    lines.push("");
+                    lines.push(`WARNING: ${runCount} run history entr${runCount===1?'y':'ies'} and their artifact files (XML, report, pre-session XML) will be permanently deleted.`);
+                }
+                lines.push("");
+                lines.push("This action cannot be undone.");
+                lines.push("");
+                lines.push("Proceed?");
+                const msg = lines.join('\n');
+                if(!window.confirm(msg)) { return; }
                 state.scenarios.splice(sidx,1);
                 if (activeIdx >= state.scenarios.length) activeIdx = Math.max(0, state.scenarios.length - 1);
                 render();
+                if(runCount > 0){
+                    try { await fetch('/purge_history_for_scenario', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name: scen.name })}); } catch(e) {}
+                }
         };
     });
     // keep hidden JSON synced
@@ -487,7 +602,8 @@ function wireCoreControls() {
     portEl?.addEventListener('input', onEdit);
 
     btn?.addEventListener('click', async () => {
-        btn.disabled = true;
+    btn.disabled = true;
+    logInfo('Testing CORE connection');
         statusEl.classList.remove('text-danger', 'text-success');
         statusEl.textContent = 'Testing...';
         try {
@@ -503,13 +619,16 @@ function wireCoreControls() {
                 state.core_tested_host = hostEl.value.trim() || 'localhost';
                 state.core_tested_port = parseInt(portEl.value || '50051', 10) || 50051;
                 setRunEnabled(true);
+                logInfo(`CORE reachable at ${data.host||hostEl.value}:${data.port||portEl.value}`);
             } else {
                 setRunEnabled(false);
                 statusEl.textContent = 'Connection failed' + (data?.error ? `: ${data.error}` : '');
+                logWarn(`CORE connection failed: ${data?.error||'unknown'}`);
             }
         } catch (e) {
             setRunEnabled(false);
             statusEl.textContent = 'Connection failed';
+            logError('CORE test threw exception');
         } finally {
             btn.disabled = false;
         }
@@ -521,28 +640,64 @@ function prepareRunCli() {
     const rp = state.result_path || '';
     if (!rp.endsWith('.xml')) {
         alert('Please save XML first.');
+        logWarn('Run CLI blocked: no saved XML');
+        return false;
+    }
+    // confirmation dialog warning user a CORE scenario will be created and started
+    const confirmMsg = 'This action will generate a new CORE scenario and attempt to start it using the provided daemon connection.\n\nProceed?';
+    if (!window.confirm(confirmMsg)) {
+        logInfo('Run CLI cancelled by user at confirmation');
         return false;
     }
     document.getElementById('xml_path').value = rp;
+    logInfo('Running CLI sync');
     return true;
 }
 
 render();
+
+// Always serialize state just before submitting the Save XML form
+const editorForm = document.getElementById('editorForm');
+if (editorForm) {
+    editorForm.addEventListener('submit', () => {
+        document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
+    });
+}
 
 // Enable Bootstrap tooltips globally
 document.addEventListener('DOMContentLoaded', () => {
     const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
     tooltipTriggerList.forEach(el => new bootstrap.Tooltip(el));
     setupDock();
+    // ingest any server-rendered lines present at load
+    try {
+        const lp = document.getElementById('logsPre');
+        if (lp && lp.textContent.trim()) {
+            lp.textContent.split(/\n/).forEach(line => {
+                if (!line.trim()) return;
+                let lvl = 'INFO';
+                if (line.includes(' ERROR')) lvl = 'ERROR';
+                else if (line.includes(' WARN')) lvl = 'WARN';
+                else if (line.includes(' DEBUG')) lvl = 'DEBUG';
+                logBuffer.push({ level: lvl, levelValue: LOG_LEVELS[lvl], line });
+            });
+            renderLogs();
+        }
+    } catch(e) {}
+    const sel = document.getElementById('logLevelFilter');
+    sel?.addEventListener('change', () => setLogLevel(sel.value));
 });
 
 async function runAsync() {
     const rp = state.result_path || '';
-    if (!rp.endsWith('.xml')) { alert('Please save XML first.'); return; }
+    if (!rp.endsWith('.xml')) { alert('Please save XML first.'); logWarn('Async run blocked: no saved XML'); return; }
+    const confirmMsg = 'This action will generate a new CORE scenario and attempt to start it asynchronously using the daemon connection.\n\nProceed?';
+    if (!window.confirm(confirmMsg)) { logInfo('Async run cancelled by user at confirmation'); return; }
     const form = new FormData(); form.append('xml_path', rp);
         const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
     if (!res.ok) { alert('Failed to start run'); return; }
     const { run_id } = await res.json();
+    logInfo(`Async run started id=${run_id}`);
     startLogStream(run_id);
     pollRunStatus(run_id);
 }
@@ -553,19 +708,25 @@ function startLogStream(runId) {
     evtSrc = new EventSource('/stream/' + runId);
     const logsPre = document.getElementById('logsPre');
     logsPre.textContent = '';
+    logBuffer = [];
     // Toggle buttons
     document.getElementById('runAsyncBtn').classList.add('d-none');
     document.getElementById('runSyncBtn').classList.add('disabled');
     document.getElementById('cancelRunBtn').classList.remove('d-none');
     evtSrc.onmessage = (ev) => {
-        logsPre.textContent += ev.data + '\n';
-        logsPre.scrollTop = logsPre.scrollHeight;
+        const raw = ev.data || '';
+        let lvl = 'INFO';
+        if (/\bERROR\b/.test(raw)) lvl = 'ERROR';
+        else if (/\bWARN(ING)?\b/.test(raw)) lvl = 'WARN';
+        else if (/\bDEBUG\b/.test(raw)) lvl = 'DEBUG';
+        logLine(lvl, raw);
     };
     evtSrc.addEventListener('end', () => {
         evtSrc.close();
         document.getElementById('runAsyncBtn').classList.remove('d-none');
         document.getElementById('runSyncBtn').classList.remove('disabled');
         document.getElementById('cancelRunBtn').classList.add('d-none');
+        logInfo('Async run ended');
     });
 }
 
@@ -602,10 +763,11 @@ async function pollRunStatus(runId) {
         try {
             await fetch('/cancel_run/' + runId, { method: 'POST' });
         } catch(e) {}
-        try { evtSrc.close(); } catch(e){}
+    try { evtSrc.close(); } catch(e){}
         document.getElementById('runAsyncBtn').classList.remove('d-none');
         document.getElementById('runSyncBtn').classList.remove('disabled');
         document.getElementById('cancelRunBtn').classList.add('d-none');
+    logInfo('Run cancelled by user');
     }
 
     function redistributeEven(sidx, secName) {
@@ -648,7 +810,9 @@ async function pollRunStatus(runId) {
 
     function updateWeightWarning(sidx, secName) {
         const items = state.scenarios[sidx].sections[secName].items;
-        if (!items || items.length === 0) return;
+    // Exempt Node Information from weight validation (single Random item default)
+    if (secName === 'Node Information') return;
+    if (!items || items.length === 0) return;
         const sum = Math.round(items.reduce((a,b) => a + (parseFloat(b.factor)||0), 0) * 1000) / 1000;
     const warn = document.querySelector(".section-warning[data-scen-idx='" + sidx + "'][data-sec='" + secName + "']");
         if (warn) {
@@ -770,4 +934,54 @@ async function pollRunStatus(runId) {
     }
 </script>
 </body>
+<!-- Success Modal -->
+<div class="modal fade" id="runSuccessModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Run Completed</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p class="mb-1" id="runSuccessBody">Generation complete.</p>
+                <p class="small text-muted mb-0">View and download artifacts on the Reports page.</p>
+            </div>
+            <div class="modal-footer">
+                <a href="{{ url_for('reports_page') }}" class="btn btn-primary">Open Reports</a>
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+<script>
+function enableReportsButton(){
+    const btn = document.getElementById('reportsBtn');
+    if(!btn) return; btn.removeAttribute('disabled'); btn.classList.remove('pe-none');
+}
+function showRunSuccessModal(msg){
+    try { if(msg) document.getElementById('runSuccessBody').textContent = msg; new bootstrap.Modal(document.getElementById('runSuccessModal')).show(); } catch(e){}
+}
+document.addEventListener('DOMContentLoaded', () => {
+    if (window.runSuccessFlag) { enableReportsButton(); showRunSuccessModal('Synchronous run completed successfully.'); }
+});
+// Capture server-provided flag (injected if present)
+// Inject run success flag
+window.runSuccessFlag = ("{{ '1' if (run_success is defined and run_success) else '0' }}" === '1');
+// Wrap pollRunStatus to detect async completion success
+const __origPollRunStatus = pollRunStatus;
+pollRunStatus = async function(runId){
+    await __origPollRunStatus(runId);
+    try {
+        const res = await fetch('/run_status/' + runId);
+        if(!res.ok) return;
+        const data = await res.json();
+        if(data.done && data.returncode === 0){
+            enableReportsButton();
+            showRunSuccessModal('Asynchronous run completed successfully.');
+        } else if(!data.done) {
+            setTimeout(() => pollRunStatus(runId), 800);
+        }
+    } catch(e){}
+};
+</script>
 </html>

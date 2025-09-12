@@ -143,6 +143,16 @@ To auto-start generated segmentation scripts, CORE needs a custom service named 
 
 When enabled on a node, the Segmentation service will copy and execute `/tmp/segmentation/seg_*_<nodeId>_*.py` scripts.
 
+## Scenario Deletion and Reports
+
+Deleting a scenario from the Web GUI now prompts for confirmation. If there are historical runs (entries on the Reports page) associated with the scenario name, the dialog will warn and display how many will be removed. Confirming the deletion will:
+
+- Remove the scenario from the in-browser editor state.
+- Purge any run history entries whose parsed `scenario_names` include the deleted scenario.
+- Delete associated artifact files (scenario XML, generated report.md, and any pre-session CORE XML snapshot) that reside under the `outputs/` tree.
+
+Directories that become empty in `outputs/` after artifact removal are also cleaned up when safe (only if empty). This helps keep the artifacts directory lean.
+
 ## Troubleshooting
 
 - “No module named core” or connection errors:
