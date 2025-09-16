@@ -168,6 +168,15 @@ def plan_and_apply_segmentation(
     counters: Dict[Tuple[int, str], int] = {}
     # Track nodes that already received a segmentation rule in this run
     used_nodes: set[int] = set()
+    # Index of planned firewall coverage to avoid overlaps per node and chain
+    from collections import defaultdict
+    fw_index = defaultdict(lambda: {
+        "protect_internal": set(),                # {subnet}
+        "subnet_block_forward": set(),            # {(src_net, dst_net)}
+        "subnet_block_input": set(),              # {src_net}
+        "host_block_forward": set(),              # {(src_ip, dst_ip)}
+        "host_block_input": set(),                # {(src_ip, dst_ip)}
+    })
 
     logger.info("Segmentation: planning %d slots across %d subnets (density=%.2f)", slots, len(nets), d)
     for idx in range(slots):
@@ -477,31 +486,72 @@ print('[segmentation] applied', len(cmds), 'commands')
             )[0]
             # Build commands list; will be executed by a generated Python script
             cmd_list: List[str] = []
+            chain_fw = "FORWARD" if on_router else "INPUT"
+
+            # Basic overlap avoidance using coverage from earlier in this run
+            def _cidr_contains(cidr: str, ip: str) -> bool:
+                try:
+                    net = ipaddress.ip_network(cidr, strict=False)
+                    addr = ipaddress.ip_address(ip)
+                    return addr in net
+                except Exception:
+                    return False
 
             if rule_type == "subnet_block" and len(nets) >= 2:
                 src_net, dst_net = random.sample(nets, 2)
-                if on_router:
-                    cmd_list.append(f"iptables -A FORWARD -s {src_net} -d {dst_net} -j DROP")
+                # Skip if covered by existing protect_internal on this node/chain
+                if on_router and dst_net in fw_index[int(node.node_id)]["protect_internal"]:
+                    # Any non-internal -> internal is already blocked
+                    try:
+                        logger.debug("Skip subnet_block on node %s: covered by protect_internal %s", node.node_id, dst_net)
+                    except Exception:
+                        pass
+                    rule = {"type": "none", "svc": svc, "node": node.node_id}
                 else:
-                    # host-level: block inbound from src_net
-                    cmd_list.append(f"iptables -A INPUT -s {src_net} -j DROP")
-                rule = {"type": "subnet_block", "svc": svc, "node": node.node_id, "src": src_net, "dst": dst_net}
+                    if on_router:
+                        # Deduplicate identical pair
+                        key_pair = (src_net, dst_net)
+                        if key_pair in fw_index[int(node.node_id)]["subnet_block_forward"]:
+                            rule = {"type": "none", "svc": svc, "node": node.node_id}
+                        else:
+                            cmd_list.append(f"iptables -A FORWARD -s {src_net} -d {dst_net} -j DROP")
+                            rule = {"type": "subnet_block", "svc": svc, "node": node.node_id, "src": src_net, "dst": dst_net}
+                            fw_index[int(node.node_id)]["subnet_block_forward"].add(key_pair)
+                    else:
+                        # host-level: block inbound from src_net
+                        if src_net in fw_index[int(node.node_id)]["subnet_block_input"]:
+                            rule = {"type": "none", "svc": svc, "node": node.node_id}
+                        else:
+                            cmd_list.append(f"iptables -A INPUT -s {src_net} -j DROP")
+                            rule = {"type": "subnet_block", "svc": svc, "node": node.node_id, "src": src_net, "dst": dst_net}
+                            fw_index[int(node.node_id)]["subnet_block_input"].add(src_net)
             elif rule_type == "host_block" and len(hosts) >= 2:
                 a, b = random.sample(hosts, 2)
                 a_ip = a.ip4.split("/")[0]
                 b_ip = b.ip4.split("/")[0]
                 chain = "FORWARD" if on_router else "INPUT"
-                cmd_list.append(f"iptables -A {chain} -s {a_ip} -d {b_ip} -j DROP")
-                rule = {"type": "host_block", "svc": svc, "node": node.node_id, "src": a_ip, "dst": b_ip}
+                key_pair = (a_ip, b_ip)
+                idx_key = "host_block_forward" if on_router else "host_block_input"
+                if key_pair in fw_index[int(node.node_id)][idx_key]:
+                    rule = {"type": "none", "svc": svc, "node": node.node_id}
+                else:
+                    cmd_list.append(f"iptables -A {chain} -s {a_ip} -d {b_ip} -j DROP")
+                    rule = {"type": "host_block", "svc": svc, "node": node.node_id, "src": a_ip, "dst": b_ip}
+                    fw_index[int(node.node_id)][idx_key].add(key_pair)
             else:
                 # protect_internal: pick one subnet, block from all others to it
                 if nets:
                     internal = random.choice(nets)
-                    if on_router:
-                        cmd_list.append(f"iptables -A FORWARD ! -s {internal} -d {internal} -j DROP")
+                    # Only one protect_internal per internal subnet per node
+                    if internal in fw_index[int(node.node_id)]["protect_internal"]:
+                        rule = {"type": "none", "svc": svc, "node": node.node_id}
                     else:
-                        cmd_list.append(f"iptables -A INPUT ! -s {internal} -j DROP")
-                    rule = {"type": "protect_internal", "svc": svc, "node": node.node_id, "subnet": internal}
+                        if on_router:
+                            cmd_list.append(f"iptables -A FORWARD ! -s {internal} -d {internal} -j DROP")
+                        else:
+                            cmd_list.append(f"iptables -A INPUT ! -s {internal} -j DROP")
+                        rule = {"type": "protect_internal", "svc": svc, "node": node.node_id, "subnet": internal}
+                        fw_index[int(node.node_id)]["protect_internal"].add(internal)
                 else:
                     rule = {"type": "none", "svc": svc, "node": node.node_id}
 
@@ -512,21 +562,65 @@ print('[segmentation] applied', len(cmds), 'commands')
             counters[key] = cnt + 1
             script_name = f"seg_{rtype}_{node.node_id}_{cnt}.py"
             script_path = os.path.join(out_dir, script_name)
+            # Make firewall scripts idempotent and enforce default deny on relevant chain
             py_lines = [
                 "#!/usr/bin/env python3",
                 "import subprocess, shlex",
-                "cmds = [",
+                "def run(cmd: str):",
+                "    try:",
+                "        subprocess.check_call(shlex.split(cmd))",
+                "    except Exception:",
+                "        pass",
+                "def build_check(cmd: str) -> str:",
+                "    tokens = shlex.split(cmd)",
+                "    out = []",
+                "    i = 0",
+                "    while i < len(tokens):",
+                "        t = tokens[i]",
+                "        if t == 'iptables':",
+                "            out.append(t)",
+                "        elif t == '-A' or t == '-I':",
+                "            out.append('-C')",
+                "            if i + 1 < len(tokens):",
+                "                out.append(tokens[i+1])",
+                "                i += 1",
+                "                if t == '-I' and i + 1 < len(tokens) and tokens[i+1].isdigit():",
+                "                    i += 1",
+                "        else:",
+                "            out.append(t)",
+                "        i += 1",
+                "    return ' '.join(out)",
+                "def ensure_rule(cmd: str):",
+                "    check_cmd = build_check(cmd)",
+                "    try:",
+                "        subprocess.check_call(shlex.split(check_cmd))",
+                "        return False",
+                "    except Exception:",
+                "        pass",
+                "    try:",
+                "        subprocess.check_call(shlex.split(cmd))",
+                "        return True",
+                "    except Exception:",
+                "        return False",
+            ]
+            # Set default deny and stateful accept for the chain in use
+            if chain_fw in ("FORWARD", "INPUT"):
+                py_lines += [
+                    f"run('iptables -P {chain_fw} DROP')",
+                    f"ensure_rule('iptables -A {chain_fw} -m state --state ESTABLISHED,RELATED -j ACCEPT')",
+                ]
+            py_lines += [
+                "rules = [",
             ]
             for c in cmd_list:
                 py_lines.append(f"    \"{c}\",")
             py_lines += [
                 "]",
-                "for c in cmds:",
-                "    try:",
-                "        subprocess.check_call(shlex.split(c))",
-                "    except Exception:",
-                "        pass",
-                "print('[segmentation] applied', len(cmds), 'commands')",
+                "applied = 0",
+                "for cmd in rules:",
+                "    if ensure_rule(cmd):",
+                "        applied += 1",
+                f"print('[segmentation-{chain_fw.lower()}] applied', applied, 'new rules (idempotent), default {chain_fw} policy set to DROP')",
             ]
             try:
                 with open(script_path, "w", encoding="utf-8") as f:
@@ -550,6 +644,14 @@ print('[segmentation] applied', len(cmds), 'commands')
             logger.warning("Error enabling segmentation service on node %s: %s", node.node_id, e)
 
         # Record non-NAT/CUSTOM rule for this node
+        if (rule.get("type") or "") not in ("none",):
+            # Annotate default-deny chain for allow logic to recognize
+            try:
+                if chain_fw in ("FORWARD", "INPUT"):
+                    rule["default_deny"] = True
+                    rule["chain"] = chain_fw
+            except Exception:
+                pass
         summary["rules"].append({
             "node_id": node.node_id,
             "service": (SERVICE_ENABLE_MAP.get(svc, svc) if svc.upper() != "CUSTOM" else "CUSTOM"),
@@ -669,13 +771,21 @@ def write_allow_rules_for_flows(
             return False
 
     # Determine if a flow is blocked by any existing DROP-style rule we generate
-    # Detect default-deny on FORWARD (from NAT setup) from existing summary
+    # Detect default-deny on FORWARD (from NAT or firewall setup) and on host INPUT from existing summary
     default_deny_forward = False
+    default_deny_input_nodes: set[int] = set()
     for rr in existing_rules:
         r = rr.get("rule", {}) or {}
-        if (r.get("type") or "").lower() == "nat" and r.get("default_deny"):
-            default_deny_forward = True
-            break
+        try:
+            if (r.get("type") or "").lower() == "nat" and r.get("default_deny"):
+                default_deny_forward = True
+            # firewall entries annotated with default_deny and chain
+            if (r.get("default_deny") and str(r.get("chain")).upper() == "INPUT"):
+                nid = int(rr.get("node_id")) if rr.get("node_id") is not None else None
+                if nid is not None:
+                    default_deny_input_nodes.add(nid)
+        except Exception:
+            pass
 
     def same_subnet_24(a: str, b: str) -> bool:
         try:
@@ -685,7 +795,7 @@ def write_allow_rules_for_flows(
         except Exception:
             return False
 
-    def is_flow_blocked(src_ip: str, dst_ip: str) -> bool:
+    def is_flow_blocked(src_ip: str, dst_ip: str, recv_node_id: Optional[int]) -> bool:
         for rr in existing_rules:
             r = rr.get("rule", {}) or {}
             rtype = (r.get("type") or "").lower()
@@ -707,6 +817,12 @@ def write_allow_rules_for_flows(
         # If default-deny on FORWARD is enabled, treat inter-subnet flows as blocked
         if default_deny_forward and not same_subnet_24(src_ip, dst_ip):
             return True
+        # If receiver host has INPUT default-deny, inbound flows require explicit allow
+        try:
+            if recv_node_id is not None and int(recv_node_id) in default_deny_input_nodes:
+                return True
+        except Exception:
+            pass
         return False
 
     # Helpers for selector coverage
@@ -865,7 +981,7 @@ def write_allow_rules_for_flows(
         dst_sel = subnet_of(dst_host) if use_dst_subnet else dst_ip
 
         # Only add allow rules if currently blocked by segmentation policies
-        if is_flow_blocked(src_ip, dst_ip):
+    if is_flow_blocked(src_ip, dst_ip, int(dst_host.node_id)):
             # Receiver INPUT allow
             recv_key = (int(dst_host.node_id), 'INPUT', proto, src_sel, dst_sel, int(dst_port))
             covering = _covering_pair(int(dst_host.node_id), 'INPUT', proto, int(dst_port), src_sel, dst_sel)

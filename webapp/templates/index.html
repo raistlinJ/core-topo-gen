@@ -33,7 +33,7 @@
             <nav class="navbar navbar-expand bg-light border rounded-bottom shadow-sm mb-3 px-2 py-0">
                 <ul class="navbar-nav me-auto mb-0 small">
                     <li class="nav-item"><a class="nav-link active" aria-current="page" href="{{ url_for('index') }}">Scenarios</a></li>
-                    <li class="nav-item"><a class="nav-link" href="{{ url_for('data_sources_page') }}">Flag Sources</a></li>
+                    <li class="nav-item"><a class="nav-link" href="{{ url_for('data_sources_page') }}">Vulnerability Sources</a></li>
                     <li class="nav-item"><a class="nav-link" href="{{ url_for('reports_page') }}">Reports</a></li>
                 </ul>
             </nav>
@@ -187,6 +187,8 @@
 <script>
 const payloadDataEl = document.getElementById('payload-data');
 let initialPayload = null;
+// Prevent TDZ: define catalog early on window
+window.VULN_CATALOG = window.VULN_CATALOG || { types: [], vectors: [], items: [] };
 // ---------------- Logging (buffer + level filter) -----------------
 const LOG_LEVELS = { DEBUG: 10, INFO: 20, WARN: 30, ERROR: 40 };
 let currentLogLevel = LOG_LEVELS.INFO; // default threshold
@@ -231,7 +233,8 @@ function defaultScenario(name) {
         name: name || `Scenario ${document.querySelectorAll('.scenario-card').length + 1}`,
         base: { filepath: '' },
         sections: {
-            'Node Information': { total_nodes: 1, density: null, items: [ { value: 'Random', weight: 1, extras: {} } ] },
+            // Default: one Count-based row; weight-based nodes/density start at 0
+            'Node Information': { total_nodes: 0, density: 0, items: [ { selected: 'Random', factor: 1.0, v_metric: 'Count', v_count: 1 } ] },
             'Routing': { density: 0.5, items: [] },
             'Services': { density: 0.5, items: [] },
             'Traffic': { density: 0.5, items: [] },
@@ -252,7 +255,7 @@ const dropdownsBySection = {
     'Services': ['SSH','HTTP','DHCPClient','Random'],
     'Traffic': ['Random','TCP','UDP','CUSTOM'],
     'Events': ['Script Path'],
-    'Vulnerabilities': ['SSHCreds','Bashbug','FileArtifact','Incompetence','Random'],
+    'Vulnerabilities': ['Category','Specific','Random'],
     'Segmentation': ['Random','Firewall','NAT','CUSTOM']
 };
 
@@ -308,6 +311,7 @@ function renderMain() {
     root.innerHTML = '';
     if (!state.scenarios.length) { return; }
     const scen = state.scenarios[activeIdx] || state.scenarios[0];
+    // No auto-insertion of Count rows for Node Information; totals should only include user-added Count rows
     // Simple scenario header (no group box)
     const headerRow = document.createElement('div');
     headerRow.className = 'mb-3 d-flex justify-content-between align-items-center';
@@ -323,11 +327,32 @@ function renderMain() {
     const secNames = ['Node Information','Routing','Services','Traffic','Events','Vulnerabilities','Segmentation'];
     secNames.forEach(name => {
         const sec = scen.sections[name] || { items: [] };
-        const hasNodes = (name === 'Node Information');
+    const hasNodes = (name === 'Node Information');
         const itemCount = (sec.items || []).length;
-        const showDensity = !hasNodes && itemCount > 0; // generalized rule
-        const densVal = (sec.density ?? (hasNodes ? '' : 0.5));
-        const nodesVal = (hasNodes ? (sec.total_nodes ?? 1) : '');
+        // Determine if any weight rows exist in this section (used for Node Information behavior)
+        const hasWeightRowsPre = hasNodes ? ((sec.items || []).some(it => ((it.v_metric || (it.selected==='Specific'? 'Count' : 'Weight')) === 'Weight'))) : false;
+        // Always ensure density has a sensible default value
+        if (hasNodes) {
+            if (hasWeightRowsPre) {
+                if (sec.density === undefined || sec.density === null || isNaN(sec.density) || sec.density === 0) {
+                    sec.density = 0.5;
+                }
+            } else {
+                sec.density = 0;
+            }
+        } else {
+            if (sec.density === undefined || sec.density === null || isNaN(sec.density)) {
+                sec.density = 0.5;
+            }
+        }
+        const densVal = sec.density;
+        const nodesVal = (hasNodes ? (sec.total_nodes ?? 0) : '');
+        const extraNodeCount = hasNodes ? ((sec.items || []).reduce((acc, it) => {
+            const metric = it.v_metric || (it.selected==='Specific'?'Count':'Weight');
+            return acc + (metric === 'Count' ? (parseInt(it.v_count) || 0) : 0);
+        }, 0)) : 0;
+    const hasWeightRows = hasNodes ? hasWeightRowsPre : false;
+        const totalNodeCount = hasNodes ? (((hasWeightRows ? (parseInt(nodesVal) || 0) : 0)) + extraNodeCount) : 0;
         const collapsed = (!hasNodes && itemCount === 0);
         const card = document.createElement('div');
         card.className = 'card mb-3';
@@ -339,21 +364,53 @@ function renderMain() {
             <div class="card-header d-flex align-items-center gap-2">
                 ${iconHtml}
                 <strong>${name}</strong>
-                ${hasNodes ? `<span class=\"ms-3\">Total Nodes:</span><input type=\"number\" min=\"1\" class=\"form-control form-control-sm\" style=\"width:120px\" value=\"${nodesVal}\" data-scen-idx=\"${activeIdx}\" data-sec=\"${name}\" data-field=\"total_nodes\">` : (showDensity ? `
-                    <span class=\"ms-3\">Density:</span><input type=\"number\" step=\"0.01\" min=\"0\" max=\"1\" class=\"form-control form-control-sm\" style=\"width:120px\" value=\"${densVal}\" data-scen-idx=\"${activeIdx}\" data-sec=\"${name}\" data-field=\"density\">` : `<span class='ms-3 text-muted small'>Add an item to set density</span>`)
-                }
                 <div class="ms-auto d-flex gap-2">
+                    ${hasNodes ? `<div class=\"d-flex align-items-center small text-muted\" title=\"Weight-based nodes plus count-based nodes\">Total Nodes: <span class=\"ms-1 fw-semibold\">${totalNodeCount}</span></div>` : ''}
                     <button class="btn btn-sm btn-outline-primary" data-action="add-item" data-scen-idx="${activeIdx}" data-sec="${name}">Add</button>
                     <button class="btn btn-sm btn-outline-secondary" type="button" data-action="toggle-collapse" data-target="#${collapseId}">${collapsed ? 'Expand' : 'Collapse'}</button>
                 </div>
             </div>
             <div id="${collapseId}" class="card-body" style="display:${collapsed ? 'none':'block'};">
-                <div class="table-responsive">
-                    <table class="table table-sm align-middle">
-                        <thead><tr><th style="width:280px">Selected</th><th style="width:120px">Weight</th><th>Extras</th><th style="width:80px"></th></tr></thead>
-                        <tbody>
-                            ${sec.items.map((it, iidx) => renderItemRow(activeIdx, name, iidx, it)).join('')}
-                        </tbody>
+                                <div class="table-responsive">
+                                                                                <table class="table table-sm align-middle">
+                                                                                        <thead>
+                                                                                            <tr>
+                                                                                                <th style="width:280px"></th>
+                                                                                                <th></th>
+                                                                                                <th style="width:160px"></th>
+                                                                                                <th style="width:80px"></th>
+                                                                                            </tr>
+                                                                                        </thead>
+                                                                    <tbody>
+                                                                                ${(() => {
+                                                                                const items = sec.items || [];
+                                                                                const rowsByMetric = items.map((it, iidx) => ({ it, iidx, metric: (it.v_metric || (name==='Vulnerabilities' && (it.selected||'Category')==='Specific' ? 'Count' : 'Weight')) }));
+                                                                                const weights = rowsByMetric.filter(x => x.metric === 'Weight');
+                                                                                const counts = rowsByMetric.filter(x => x.metric === 'Count');
+                                                                                const parts = [];
+                                                                                const showWeightHeader = (weights.length > 0);
+                                                                                if (showWeightHeader) {
+                                                                                    const densCtrl = (
+                                                                                        name === 'Node Information'
+                                                                                            ? `<div class=\"d-flex align-items-center justify-content-end gap-2\">`
+                                                                                                + `<span>Nodes</span>`
+                                                                                                + `<input type=\"number\" min=\"1\" step=\"1\" class=\"form-control form-control-sm\" style=\"width:100px\" value=\"${nodesVal}\" data-scen-idx=\"${activeIdx}\" data-sec=\"${name}\" data-field=\"total_nodes\">`
+                                                                                                + `<span>Density</span>`
+                                                                                                + `<input type=\"number\" step=\"0.01\" min=\"0\" max=\"1\" class=\"form-control form-control-sm\" style=\"width:100px\" value=\"${densVal}\" data-scen-idx=\"${activeIdx}\" data-sec=\"${name}\" data-field=\"density\">`
+                                                                                              + `</div>`
+                                                                                            : `<div class=\"d-flex align-items-center justify-content-end gap-2\"><span>Density</span><input type=\"number\" step=\"0.01\" min=\"0\" max=\"1\" class=\"form-control form-control-sm\" style=\"width:100px\" value=\"${densVal}\" data-scen-idx=\"${activeIdx}\" data-sec=\"${name}\" data-field=\"density\"></div>`
+                                                                                    );
+                                                                                    parts.push(`<tr class=\"table-light\"><td colspan=\"2\"><strong>Weight-based</strong></td><td class=\"text-end\">${densCtrl}</td><td></td></tr>`);
+                                                                                    if (weights.length) { parts.push(weights.map(x => renderItemRow(activeIdx, name, x.iidx, x.it)).join('')); }
+                                                                                }
+                                                                                if (counts.length) {
+                                                                                    const countHdr = (name === 'Node Information') ? 'Count-based' : 'Count-based';
+                                                                                    parts.push(`<tr class=\"table-light\"><td colspan=\"4\"><strong>${countHdr}</strong></td></tr>`);
+                                                                                    parts.push(counts.map(x => renderItemRow(activeIdx, name, x.iidx, x.it)).join(''));
+                                                                                }
+                                                                                return parts.join('');
+                                                                            })()}
+                                                                    </tbody>
                     </table>
                 </div>
                     <div class="text-danger small mt-1 section-warning" data-scen-idx="${activeIdx}" data-sec="${name}" style="display:none">Weights must sum to 1.000</div>
@@ -378,13 +435,24 @@ function renderMain() {
 
     wireHandlers();
     wireCoreControls();
+    // Populate dynamic vuln selects after DOM paint
+    populateVulnSelects();
+    // Hook up Specific picker buttons
+    document.querySelectorAll('[data-action="pick-specific"]').forEach(btn => {
+        btn.onclick = () => {
+            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+            const sec = btn.getAttribute('data-sec');
+            const iidx = parseInt(btn.getAttribute('data-item-idx'));
+            openVulnPicker(sidx, sec, iidx);
+        };
+    });
 }
 
 // renderSections was deprecated and removed; rendering is handled in renderMain()
 
 function renderItemRow(sidx, secName, iidx, it) {
     const opts = (dropdownsBySection[secName] || []).map(o => `<option ${o===it.selected?'selected':''}>${o}</option>`).join('');
-    const weight = it.factor ?? 1.0;
+    const weight = (it.factor ?? 1.0);
     const extras = (() => {
         if (secName === 'Events') {
             return `<input class="form-control form-control-sm" placeholder="script path" value="${it.script_path || ''}" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" data-field="script_path">`;
@@ -412,19 +480,118 @@ function renderItemRow(sidx, secName, iidx, it) {
                     </div>
                 </div>`;
         }
+        if (secName === 'Vulnerabilities') {
+            const mode = it.selected || 'Type/Vector';
+            if (mode === 'Specific') {
+                const nm = it.v_name || '';
+                // Try to obtain full description (prefer stored v_desc, else look up in catalog)
+                let fullDesc = it.v_desc || '';
+                if (!fullDesc && nm && window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) {
+                    const match = window.VULN_CATALOG.items.find(x => x.Name === nm && (!it.v_path || x.Path === it.v_path));
+                    if (match && match.Description) { fullDesc = match.Description; }
+                }
+                const abbr = (s, n=80) => (s && s.length > n ? (s.slice(0, n-1) + '…') : (s||''));
+                const esc = (s) => (s||'')
+                    .replace(/&/g,'&amp;')
+                    .replace(/</g,'&lt;')
+                    .replace(/>/g,'&gt;')
+                    .replace(/"/g,'&quot;')
+                    .replace(/'/g,'&#39;');
+                const descShort = abbr(fullDesc);
+                const centerText = nm ? `${nm}${descShort ? ' — ' + descShort : ''}` : '<span class="text-muted">No selection</span>';
+                return `<span class="small" ${fullDesc ? `data-bs-toggle="tooltip" data-bs-title="${esc(fullDesc)}"` : ''}>${centerText}</span>`;
+            }
+            return '';
+        }
         return '';
+    })();
+    // Build first cell content, optionally augmenting Selected with Vulnerabilities controls
+    const firstCell = (() => {
+        const selectedCtl = `<select class="form-select form-select-sm" data-field="selected" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${opts}</select>`;
+        if (secName !== 'Vulnerabilities') return selectedCtl;
+    const mode = it.selected || 'Category';
+    if (mode === 'Category') {
+            return `
+            <div class="d-flex flex-wrap gap-2 align-items-end">
+                <div style="min-width:160px">${selectedCtl}</div>
+                <div>
+                    <label class="form-label mb-0">Type</label>
+                    <select class="form-select form-select-sm vuln-type" data-field="v_type" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></select>
+                </div>
+                <div>
+                    <label class="form-label mb-0">Vector</label>
+                    <select class="form-select form-select-sm vuln-vector" data-field="v_vector" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></select>
+                </div>
+            </div>`;
+        } else if (mode === 'Specific') {
+            const nm = it.v_name || '';
+            // Try to obtain full description (prefer stored v_desc, else look up in catalog)
+            let fullDesc = it.v_desc || '';
+            if (!fullDesc && nm && window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) {
+                const match = window.VULN_CATALOG.items.find(x => x.Name === nm && (!it.v_path || x.Path === it.v_path));
+                if (match && match.Description) { fullDesc = match.Description; }
+            }
+            const abbr = (s, n=80) => (s && s.length > n ? (s.slice(0, n-1) + '…') : (s||''));
+            const esc = (s) => (s||'')
+                .replace(/&/g,'&amp;')
+                .replace(/</g,'&lt;')
+                .replace(/>/g,'&gt;')
+                .replace(/"/g,'&quot;')
+                .replace(/'/g,'&#39;');
+            const descShort = abbr(fullDesc);
+            return `
+            <div class="d-flex flex-wrap gap-2 align-items-center">
+                <div style="min-width:160px">${selectedCtl}</div>
+                <button type="button" class="btn btn-sm btn-outline-primary" data-action="pick-specific" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">Choose...</button>
+            </div>`;
+        }
+        return selectedCtl;
+    })();
+    // Right-most: Weight or Count cell
+    const weightCell = (() => {
+        if (secName === 'Vulnerabilities') {
+            const mode = it.selected || 'Type/Vector';
+            const metric = it.v_metric || (mode === 'Specific' ? 'Count' : 'Weight');
+            const metricSel = `<select class="form-select form-select-sm" style="min-width: 140px" data-field="v_metric" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"><option ${metric==='Weight'?'selected':''}>Weight</option><option ${metric==='Count'?'selected':''}>Count</option></select>`;
+            if (metric === 'Count') {
+                const count = (parseInt(it.v_count, 10) || 1);
+                return `<div class="d-flex gap-2">${metricSel}<select class="form-select form-select-sm" style="min-width: 120px" data-field="v_count" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${Array.from({length:10},(_,k)=>k+1).map(n=>`<option ${n===count?'selected':''}>${n}</option>`).join('')}</select></div>`;
+            }
+            return `<div class="d-flex gap-2">${metricSel}<input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm weight-input" style="min-width: 120px" value="${weight}" data-field="factor" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></div>`;
+        }
+        // For all other sections, provide a Count/Weight selector as well
+        const metric = it.v_metric || 'Weight';
+        const metricSel = `<select class="form-select form-select-sm" style="min-width: 140px" data-field="v_metric" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"><option ${metric==='Weight'?'selected':''}>Weight</option><option ${metric==='Count'?'selected':''}>Count</option></select>`;
+        if (metric === 'Count') {
+            const count = (parseInt(it.v_count, 10) || 1);
+            return `<div class="d-flex gap-2">${metricSel}<select class="form-select form-select-sm" style="min-width: 120px" data-field="v_count" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${Array.from({length:10},(_,k)=>k+1).map(n=>`<option ${n===count?'selected':''}>${n}</option>`).join('')}</select></div>`;
+        }
+        return `<div class="d-flex gap-2">${metricSel}<input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm weight-input" style="min-width: 120px" value="${weight}" data-field="factor" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></div>`;
     })();
     return `
         <tr>
-            <td>
-                <select class="form-select form-select-sm" data-field="selected" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${opts}</select>
-            </td>
-            <td>
-        <input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm weight-input" value="${weight}" data-field="factor" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
-            </td>
+            <td>${firstCell}</td>
             <td>${extras}</td>
-            <td><button class="btn btn-sm btn-outline-danger" data-action="remove-item" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">Remove</button></td>
+            <td>${weightCell}</td>
+            <td><button type="button" class="btn btn-sm btn-outline-danger" data-action="remove-item" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">Remove</button></td>
         </tr>`;
+}
+
+// Render Vulnerabilities rows grouped with two row-headers
+function renderVulnRows(sidx, secName, items) {
+    const withIdx = items.map((it, iidx) => ({ it, iidx }));
+    const typeOrRandom = withIdx.filter(x => (x.it.selected || 'Category') !== 'Specific');
+    const specifics = withIdx.filter(x => (x.it.selected || 'Category') === 'Specific');
+    const parts = [];
+    if (typeOrRandom.length) {
+        parts.push(`<tr class="table-light"><td colspan="4"><strong>Category or Random</strong></td></tr>`);
+        parts.push(typeOrRandom.map(x => renderItemRow(sidx, secName, x.iidx, x.it)).join(''));
+    }
+    if (specifics.length) {
+        parts.push(`<tr class="table-light"><td colspan="4"><strong>Specific</strong></td></tr>`);
+        parts.push(specifics.map(x => renderItemRow(sidx, secName, x.iidx, x.it)).join(''));
+    }
+    return parts.join('');
 }
 
 function wireHandlers() {
@@ -433,7 +600,7 @@ function wireHandlers() {
         const sec = el.getAttribute('data-sec');
         const field = el.getAttribute('data-field');
         const iidx = el.getAttribute('data-item-idx');
-        el.oninput = () => {
+        const handler = () => {
             if (sec) {
                 if (iidx !== null) {
                     const item = state.scenarios[sidx].sections[sec].items[parseInt(iidx)];
@@ -444,14 +611,50 @@ function wireHandlers() {
                                                 updateWeightWarning(sidx, sec);
                                                 updateWeightInputsDisplay(sidx, sec);
                                             }
-                    } else if (['pattern','selected','script_path'].includes(field)) {
-                        item[field] = el.value;
+                    } else if (['pattern','selected','script_path','v_type','v_vector','v_name','v_path','v_count','v_metric'].includes(field)) {
+                        const prev = item[field];
+                        if (field === 'v_count') {
+                            const n = parseInt(el.value, 10) || 1;
+                            item[field] = n;
+                        } else {
+                            item[field] = el.value;
+                        }
+                        if (field === 'selected') {
+                            if (item.selected === 'Specific') {
+                                if (!item.v_count) item.v_count = 1;
+                                if (!item.v_metric) item.v_metric = 'Count';
+                            } else {
+                                if (!item.v_metric) item.v_metric = 'Weight';
+                            }
+                            // Re-render to show/hide appropriate controls and recalc weight warnings
+                            renderMain();
+                        } else if (field === 'v_metric') {
+                            // On metric toggle, normalize weights for current section and re-render
+                            if (item.v_metric === 'Count' && (item.v_count === undefined || item.v_count === null || isNaN(parseInt(item.v_count, 10)))) {
+                                item.v_count = 1;
+                            }
+                            redistributeEven(sidx, sec);
+                            updateWeightWarning(sidx, sec);
+                            renderMain();
+                        } else if (field === 'v_count') {
+                            // Count change affects Total Nodes label
+                            renderMain();
+                        }
                     } else {
                         state.scenarios[sidx].sections[sec][field] = el.value;
                     }
                 } else {
                     if (field === 'density' || field === 'total_nodes') {
-                        state.scenarios[sidx].sections[sec][field] = parseFloat(el.value);
+                        let v = parseFloat(el.value);
+                        if (field === 'density') {
+                            if (isNaN(v)) v = 0.5;
+                            v = Math.max(0, Math.min(1, v));
+                        }
+                        state.scenarios[sidx].sections[sec][field] = v;
+                        // keep hidden for submit and update any warnings
+                        if (field === 'density') { updateWeightWarning(sidx, sec); }
+                        // Ensure Total Nodes label refreshes on total_nodes edits
+                        if (field === 'total_nodes') { renderMain(); }
                     } else {
                         state.scenarios[sidx].sections[sec][field] = el.value;
                     }
@@ -465,6 +668,8 @@ function wireHandlers() {
             document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
             logDebug(`Field change: scen=${sidx} sec=${sec||''} field=${field}`);
         };
+        el.addEventListener('input', handler);
+        el.addEventListener('change', handler);
     });
     document.querySelectorAll('[data-action="remove-item"]').forEach(btn => {
         btn.onclick = () => {
@@ -474,6 +679,7 @@ function wireHandlers() {
             state.scenarios[sidx].sections[sec].items.splice(iidx,1);
             logInfo(`Removed item ${iidx} from ${sec}`);
               redistributeEven(sidx, sec);
+              // Re-render to refresh totals and labels
               renderMain();
         };
     });
@@ -484,6 +690,10 @@ function wireHandlers() {
             const item = { selected: 'Random', factor: 1.0 };
             if (sec === 'Events') item.script_path = '';
             if (sec === 'Traffic') { item.pattern = 'continuous'; item.rate_kbps = 64.0; item.period_s = 1.0; item.jitter_pct = 10.0; }
+            if (sec === 'Vulnerabilities') { item.selected = 'Category'; item.v_type = 'Random'; item.v_vector = 'Random'; }
+            // Default new rows: Node Information -> Count; others -> Weight.
+            if (sec === 'Node Information') { item.v_metric = 'Count'; item.v_count = 1; }
+            else { item.v_metric = 'Weight'; }
             state.scenarios[sidx].sections[sec].items.push(item);
             logInfo(`Added item to ${sec}`);
               redistributeEven(sidx, sec);
@@ -686,7 +896,149 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch(e) {}
     const sel = document.getElementById('logLevelFilter');
     sel?.addEventListener('change', () => setLogLevel(sel.value));
+        setupVulnCatalog();
 });
+
+// Vulnerability catalog and UI helpers
+async function setupVulnCatalog(){
+        try {
+                const res = await fetch('/vuln_catalog');
+        if(res.ok){ window.VULN_CATALOG = await res.json(); }
+    } catch(e) { window.VULN_CATALOG = { types: [], vectors: [], items: [] }; }
+}
+
+function populateVulnSelects() {
+        document.querySelectorAll('.vuln-type').forEach(sel => {
+                const sidx = parseInt(sel.getAttribute('data-scen-idx'));
+                const sec = sel.getAttribute('data-sec');
+                const iidx = parseInt(sel.getAttribute('data-item-idx'));
+                const cur = (state.scenarios[sidx].sections[sec].items[iidx].v_type) || 'Random';
+                const opts = ['Random', ...(window.VULN_CATALOG?.types || [])];
+                sel.innerHTML = opts.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
+        });
+        document.querySelectorAll('.vuln-vector').forEach(sel => {
+                const sidx = parseInt(sel.getAttribute('data-scen-idx'));
+                const sec = sel.getAttribute('data-sec');
+                const iidx = parseInt(sel.getAttribute('data-item-idx'));
+                const cur = (state.scenarios[sidx].sections[sec].items[iidx].v_vector) || 'Random';
+                const opts = ['Random', ...(window.VULN_CATALOG?.vectors || [])];
+                sel.innerHTML = opts.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
+        });
+}
+
+// Modal for Specific selection
+function ensureVulnModal(){
+        if(document.getElementById('vulnModal')) return;
+        const modal = document.createElement('div');
+        modal.className = 'modal fade';
+        modal.id = 'vulnModal';
+        modal.innerHTML = `
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Select Vulnerability</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="d-flex align-items-start gap-2 mb-2">
+                        <div class="flex-grow-1">
+                            <input class="form-control" placeholder="Filter (string or /regex/)" id="vulnFilter">
+                            <div class="invalid-feedback" id="vulnFilterError">Invalid regex</div>
+                        </div>
+                        <button class="btn btn-outline-secondary" type="button" id="vulnFilterClear" title="Clear filter">Clear</button>
+                    </div>
+                    <div class="text-muted small mb-2" id="vulnFilterMeta"></div>
+                    <div class="table-responsive" style="max-height:50vh; overflow:auto;">
+                        <table class="table table-sm">
+                            <thead><tr><th>Name</th><th>Type</th><th>Vector</th><th>Path</th></tr></thead>
+                            <tbody id="vulnList"></tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>`;
+        document.body.appendChild(modal);
+}
+
+function openVulnPicker(sidx, secName, iidx){
+        ensureVulnModal();
+        const modalEl = document.getElementById('vulnModal');
+        const filterInput = modalEl.querySelector('#vulnFilter');
+    const filterClearBtn = modalEl.querySelector('#vulnFilterClear');
+    const filterMeta = modalEl.querySelector('#vulnFilterMeta');
+    const filterError = modalEl.querySelector('#vulnFilterError');
+        const tbody = modalEl.querySelector('#vulnList');
+    let current = (window.VULN_CATALOG?.items || []);
+        const renderRows = () => {
+                tbody.innerHTML = '';
+                current.forEach((it, idx) => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `<td>${it.Name}</td><td>${it.Type}</td><td>${it.Vector}</td><td>${it.Path}</td>`;
+                        tr.style.cursor = 'pointer';
+            tr.onclick = () => {
+                                const item = state.scenarios[sidx].sections[secName].items[iidx];
+                                item.v_name = it.Name;
+                                item.v_path = it.Path;
+                                item.v_type = it.Type;
+                                item.v_vector = it.Vector;
+                if (it.Description) item.v_desc = it.Description;
+                                // also set selected to Specific defensively
+                                item.selected = 'Specific';
+                                // update state	enable
+                                document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
+                                if(window.bootstrap){ bootstrap.Modal.getInstance(modalEl)?.hide(); }
+                                renderMain();
+                        };
+                        tbody.appendChild(tr);
+                });
+        };
+    const applyFilter = () => {
+        const raw = (filterInput.value||'').trim();
+        try { localStorage.setItem('vulnPickerFilter', raw); } catch(e){}
+        // Reset error state by default
+        filterInput.classList.remove('is-invalid');
+        if (filterError) filterError.style.display = '';
+        if(!raw){
+            current = (window.VULN_CATALOG?.items || []);
+            renderRows();
+            if (filterMeta) filterMeta.textContent = `${current.length}/${(window.VULN_CATALOG?.items || []).length} shown`;
+            return;
+        }
+        let matcher = null;
+        if (raw.startsWith('/') && raw.endsWith('/') && raw.length >= 2) {
+            try { matcher = new RegExp(raw.slice(1, -1), 'i'); } catch(e){ matcher = null; }
+            if (!matcher) {
+                // Flag invalid regex, keep previous results (do not change current)
+                filterInput.classList.add('is-invalid');
+                if (filterMeta) filterMeta.textContent = `Invalid regex`;
+                return;
+            }
+        }
+        if (matcher) {
+            current = (window.VULN_CATALOG?.items || []).filter(it => matcher.test(it.Name) || matcher.test(it.Type) || matcher.test(it.Vector) || matcher.test(it.Path));
+        } else {
+            const lower = raw.toLowerCase();
+            current = (window.VULN_CATALOG?.items || []).filter(it => (it.Name||'').toLowerCase().includes(lower) || (it.Type||'').toLowerCase().includes(lower) || (it.Vector||'').toLowerCase().includes(lower) || (it.Path||'').toLowerCase().includes(lower));
+        }
+        renderRows();
+    if (filterMeta) filterMeta.textContent = `${current.length}/${(window.VULN_CATALOG?.items || []).length} shown`;
+    };
+    filterInput.oninput = applyFilter;
+    filterClearBtn.onclick = () => { filterInput.value = ''; applyFilter(); };
+    // Load last-used filter, if any
+    try {
+        const saved = localStorage.getItem('vulnPickerFilter');
+        if (saved) filterInput.value = saved;
+    } catch(e){}
+    // Initial render and apply saved filter
+    renderRows();
+    applyFilter();
+        if(window.bootstrap){ new bootstrap.Modal(modalEl).show(); }
+}
+
 
 async function runAsync() {
     const rp = state.result_path || '';
@@ -774,35 +1126,42 @@ async function pollRunStatus(runId) {
         const items = state.scenarios[sidx].sections[secName].items;
         const n = items.length;
         if (n === 0) return;
-        const even = Math.round((1.0 / n) * 1000) / 1000;
-        for (let i = 0; i < n - 1; i++) items[i].factor = even;
+    const weightIdxs = items.map((it,i) => ({i,it})).filter(x => ((x.it.v_metric|| (x.it.selected==='Specific'?'Count':'Weight')) === 'Weight')).map(x => x.i);
+    const m = weightIdxs.length;
+    if (m === 0) { return; }
+    const even = Math.round((1.0 / m) * 1000) / 1000;
+    weightIdxs.slice(0, -1).forEach(i => { items[i].factor = even; });
         // last item gets the residual to hit 1.0
-        const sumOther = items.slice(0, n-1).reduce((a,b) => a + (parseFloat(b.factor)||0), 0);
-        items[n-1].factor = Math.max(0, Math.round((1.0 - sumOther) * 1000) / 1000);
+    const sumOther = weightIdxs.slice(0, -1).reduce((a, i) => a + (parseFloat(items[i].factor)||0), 0);
+    const lastIdx = weightIdxs[weightIdxs.length - 1];
+    items[lastIdx].factor = Math.max(0, Math.round((1.0 - sumOther) * 1000) / 1000);
         updateWeightWarning(sidx, secName);
     }
 
     function adjustWeightsProportionally(sidx, secName, changedIdx) {
         const items = state.scenarios[sidx].sections[secName].items;
         const n = items.length;
-        if (n <= 1) { items[0].factor = 1.0; return; }
+    const weightIdxs = items.map((it,i) => ({i,it})).filter(x => ((x.it.v_metric|| (x.it.selected==='Specific'?'Count':'Weight')) === 'Weight')).map(x => x.i);
+        const m = weightIdxs.length;
+        if (m <= 1) { if (m === 1) items[weightIdxs[0]].factor = 1.0; return; }
         // clamp changed value
         items[changedIdx].factor = Math.max(0, Math.min(1, parseFloat(items[changedIdx].factor)||0));
         const targetSum = 1.0;
         const changed = parseFloat(items[changedIdx].factor)||0;
-        const others = items.map((x, i) => i !== changedIdx ? (parseFloat(x.factor)||0) : 0);
+        const others = weightIdxs.map(i => i !== changedIdx ? (parseFloat(items[i].factor)||0) : 0);
         const sumOthers = others.reduce((a,b) => a + b, 0);
         const residual = Math.max(0, targetSum - changed);
         if (sumOthers <= 0) {
             // Distribute evenly across others
-            const even = residual / (n - 1);
-            for (let i = 0; i < n; i++) if (i !== changedIdx) items[i].factor = Math.round(even * 1000) / 1000;
+            const even = residual / (m - 1);
+            weightIdxs.forEach(i => { if (i !== changedIdx) items[i].factor = Math.round(even * 1000) / 1000; });
         } else {
             // Scale others proportionally to keep overall sum 1.0
-            for (let i = 0; i < n; i++) if (i !== changedIdx) {
-                const ratio = others[i < changedIdx ? i : i - 1] / sumOthers;
+            weightIdxs.forEach((i, idx) => {
+                if (i === changedIdx) return;
+                const ratio = others[idx] / sumOthers;
                 items[i].factor = Math.round((residual * ratio) * 1000) / 1000;
-            }
+            });
         }
         // Final normalization to exact 1.000 with 3 decimals
         normalizeToThousandths(sidx, secName);
@@ -813,18 +1172,32 @@ async function pollRunStatus(runId) {
     // Exempt Node Information from weight validation (single Random item default)
     if (secName === 'Node Information') return;
     if (!items || items.length === 0) return;
-        const sum = Math.round(items.reduce((a,b) => a + (parseFloat(b.factor)||0), 0) * 1000) / 1000;
+        const sum = Math.round(items.reduce((a,b) => {
+            const metric = b.v_metric || (b.selected==='Specific'?'Count':'Weight');
+            return a + (metric==='Weight' ? (parseFloat(b.factor)||0) : 0);
+        }, 0) * 1000) / 1000;
     const warn = document.querySelector(".section-warning[data-scen-idx='" + sidx + "'][data-sec='" + secName + "']");
         if (warn) {
-            warn.style.display = (Math.abs(sum - 1.0) > 0.005) ? 'block' : 'none';
-            warn.textContent = 'Weights must sum to 1.000 (current: ' + sum.toFixed(3) + ')';
+            const density = parseFloat((state.scenarios[sidx].sections[secName]||{}).density);
+            const weightCount = items.filter(b => (b.v_metric || (b.selected==='Specific'?'Count':'Weight')) === 'Weight').length;
+            const badWeights = weightCount > 0 ? (Math.abs(sum - 1.0) > 0.005) : false;
+            const badDensity = isNaN(density) ? false : (density < 0 || density > 1);
+            warn.style.display = (badWeights || badDensity) ? 'block' : 'none';
+            let msgs = [];
+            if (badWeights) msgs.push('Weights must sum to 1.000 (current: ' + sum.toFixed(3) + ')');
+            if (badDensity) msgs.push('Density must be between 0 and 1 (current: ' + density.toFixed(2) + ')');
+            warn.textContent = msgs.join(' • ');
         }
     }
 
     function normalizeToThousandths(sidx, secName) {
         const items = state.scenarios[sidx].sections[secName].items;
         if (!items || items.length === 0) return;
-        const vals = items.map(it => Math.max(0, Math.min(1, parseFloat(it.factor)||0)));
+        const vals = items.map(it => {
+            const metric = it.v_metric || (it.selected==='Specific'?'Count':'Weight');
+            const v = Math.max(0, Math.min(1, parseFloat(it.factor)||0));
+            return metric==='Weight' ? v : 0;
+        });
         // Convert to thousandths without rounding first
         const thousandthsRaw = vals.map(v => v * 1000);
         const floors = thousandthsRaw.map(v => Math.floor(v));
@@ -850,7 +1223,8 @@ async function pollRunStatus(runId) {
             }
         }
         for (let i = 0; i < items.length; i++) {
-            items[i].factor = floors[i] / 1000.0;
+            const metric = items[i].v_metric || (items[i].selected==='Specific'?'Count':'Weight');
+            items[i].factor = (metric==='Weight') ? (floors[i] / 1000.0) : (items[i].factor||0);
         }
     }
 

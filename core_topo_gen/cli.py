@@ -4,11 +4,12 @@ import logging
 import random
 import os
 from core.api.grpc import client
-from .parsers.xml_parser import parse_node_info, parse_routing_info, parse_traffic_info, parse_segmentation_info
+from .parsers.xml_parser import parse_node_info, parse_routing_info, parse_traffic_info, parse_segmentation_info, parse_vulnerabilities_info
 from .utils.allocation import compute_role_counts
 from .builders.topology import build_star_from_roles, build_segmented_topology, build_multi_switch_topology
 from .utils.traffic import generate_traffic_scripts
 from .utils.report import write_report
+from .utils.vuln_process import load_vuln_catalog, select_vulnerabilities, process_vulnerabilities
 from .utils.services import ensure_service
 
 
@@ -315,6 +316,21 @@ def main():
             } for i in (traffic_items or [])],
         }
         services_cfg = [{"name": s.name, "factor": s.factor, "density": s.density} for s in (services or [])]
+        # Vulnerabilities
+        vuln_density, vuln_items = parse_vulnerabilities_info(args.xml, args.scenario)
+        vulnerabilities_cfg = {"density": vuln_density, "items": vuln_items or []}
+        try:
+            catalog = load_vuln_catalog(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+            selected_vulns = select_vulnerabilities(vuln_density or 0.0, vuln_items or [], catalog)
+            if selected_vulns:
+                logging.info("Selected %d vulnerabilities based on criteria", len(selected_vulns))
+                results = process_vulnerabilities(selected_vulns, out_dir="/tmp/vulns")
+                ok_count = sum(1 for _rec, _act, ok, _dir in results if ok)
+                logging.info("Vulnerability processing done: %d/%d ok", ok_count, len(results))
+            else:
+                logging.info("No vulnerabilities selected (empty catalog or criteria)")
+        except Exception as e:
+            logging.warning("Vulnerability processing failed: %s", e)
         seg_out_dir = "/tmp/segmentation"
         seg_summary_path = os.path.join(seg_out_dir, "segmentation_summary.json")
         segmentation_cfg = {
@@ -337,6 +353,7 @@ def main():
                 traffic_cfg=traffic_cfg,
                 services_cfg=services_cfg,
                 segmentation_cfg=segmentation_cfg,
+                vulnerabilities_cfg=vulnerabilities_cfg,
             )
         else:
             write_report(
@@ -354,6 +371,7 @@ def main():
                 traffic_cfg=traffic_cfg,
                 services_cfg=services_cfg,
                 segmentation_cfg=segmentation_cfg,
+                vulnerabilities_cfg=vulnerabilities_cfg,
             )
         logging.info("Scenario report written to %s", report_path)
     except Exception as e:
@@ -361,6 +379,13 @@ def main():
 
     # Start the CORE session only after all services (including Traffic) are applied
     try:
+        # Emit session id in a parseable form for webapp backend to capture
+        try:
+            sid = getattr(session, 'id', None) or getattr(session, 'session_id', None)
+            if sid is not None:
+                logging.info("CORE_SESSION_ID: %s", sid)
+        except Exception:
+            pass
         core.start_session(session)
         logging.info("CORE session started")
     except Exception as e:

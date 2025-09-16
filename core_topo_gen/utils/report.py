@@ -46,6 +46,7 @@ def write_report(
     traffic_cfg: Optional[Dict[str, object]] = None,
     services_cfg: Optional[List[Dict[str, object]]] = None,
     segmentation_cfg: Optional[Dict[str, object]] = None,
+    vulnerabilities_cfg: Optional[Dict[str, object]] = None,
 ) -> str:
     routers = routers or []
     hosts = hosts or []
@@ -166,7 +167,7 @@ def write_report(
         lines.append("")
 
     # Optional Details section (extra info grouped at end)
-    if any([metadata, routing_cfg, traffic_cfg, services_cfg, segmentation_cfg]):
+    if any([metadata, routing_cfg, traffic_cfg, services_cfg, segmentation_cfg, vulnerabilities_cfg]):
         lines.append("## Details")
         if metadata:
             lines.append("### Generation parameters")
@@ -222,6 +223,26 @@ def write_report(
                 lines.append("| --- | ---: |")
                 for it in items:
                     lines.append(f"| {it.get('name','')} | {it.get('factor','')} |")
+            lines.append("")
+        if vulnerabilities_cfg:
+            den = vulnerabilities_cfg.get("density", "")
+            items = vulnerabilities_cfg.get("items", []) or []
+            lines.append("### Vulnerabilities config")
+            lines.append(f"- Density: {den}")
+            if items:
+                lines.append("| Selected | Metric | Factor | Type | Vector | Name | Path | Count |")
+                lines.append("| --- | --- | ---: | --- | --- | --- | --- | ---: |")
+                for it in items:
+                    lines.append("| {sel} | {metric} | {factor} | {vt} | {vv} | {vn} | {vp} | {vc} |".format(
+                        sel=it.get("selected",""),
+                        metric=it.get("v_metric",""),
+                        factor=it.get("factor",""),
+                        vt=it.get("v_type",""),
+                        vv=it.get("v_vector",""),
+                        vn=it.get("v_name",""),
+                        vp=it.get("v_path",""),
+                        vc=it.get("v_count",""),
+                    ))
             lines.append("")
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)

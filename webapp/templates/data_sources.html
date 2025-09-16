@@ -16,7 +16,8 @@
   <nav class="navbar navbar-expand bg-light border rounded-bottom shadow-sm mb-3 px-2 py-0">
     <ul class="navbar-nav me-auto mb-0 small">
       <li class="nav-item"><a class="nav-link" href="{{ url_for('index') }}">Scenarios</a></li>
-      <li class="nav-item"><a class="nav-link active" aria-current="page" href="{{ url_for('data_sources_page') }}">Flag Sources</a></li>
+  <li class="nav-item"><a class="nav-link active" aria-current="page" href="{{ url_for('data_sources_page') }}">Vulnerability Sources</a></li>
+      <li class="nav-item"><a class="nav-link" href="{{ url_for('reports_page') }}">Reports</a></li>
     </ul>
   </nav>
   {% with messages = get_flashed_messages() %}
@@ -57,7 +58,7 @@
         <tbody>
         {% for s in sources %}
           <tr class="{{ 'table-danger' if s.rows.startswith('ERR:') else '' }}">
-            <td>{{ s.name }}</td>
+            <td><a href="{{ url_for('data_sources_edit', sid=s.id) }}" target="_blank" rel="noopener">{{ s.name }}</a></td>
             <td>
               {% if s.enabled %}<span class="badge bg-success">ENABLED</span>{% else %}<span class="badge bg-secondary">DISABLED</span>{% endif %}
             </td>
@@ -79,5 +80,215 @@
       </table>
     </div>
   </div>
+  <div class="card mt-4" id="catalog-card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <strong>Vulnerability Catalog (docker-compose only)</strong>
+      <div class="d-flex gap-2">
+        <button id="btn-download-selected" class="btn btn-sm btn-outline-primary" disabled>Download Selected</button>
+        <button id="btn-pull-selected" class="btn btn-sm btn-outline-success" disabled>Pull Selected</button>
+      </div>
+    </div>
+    <div class="p-2">
+      <div class="row g-2 align-items-center mb-2">
+        <div class="col-sm-6">
+          <input id="catalog-filter" type="text" class="form-control form-control-sm" placeholder="Filter by name/type/vector/CVE">
+        </div>
+        <div class="col-sm-6 text-end small text-muted">
+          <span id="catalog-count">0</span> items
+        </div>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm align-middle" id="catalog-table">
+          <thead>
+            <tr>
+              <th style="width:28px"><input type="checkbox" id="select-all"></th>
+              <th>Name</th>
+              <th>Type</th>
+              <th>Vector</th>
+              <th>CVE</th>
+              <th>Path</th>
+                  <th>Compose File</th>
+              <th>Status</th>
+              <th style="width:140px">Action</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+          <div class="d-flex justify-content-end mt-2">
+            <button id="btn-check-existence" class="btn btn-sm btn-outline-secondary">Check Files</button>
+          </div>
+    </div>
+  </div>
+  <script>
+  (function(){
+    const TBL = document.querySelector('#catalog-table tbody');
+    const COUNT = document.querySelector('#catalog-count');
+    const FILTER = document.querySelector('#catalog-filter');
+    const BTN_DL = document.querySelector('#btn-download-selected');
+    const BTN_PULL = document.querySelector('#btn-pull-selected');
+    const SEL_ALL = document.querySelector('#select-all');
+    let allItems = [];
+    let filtered = [];
+  let statusMap = new Map(); // key: Name|Path -> {exists,pulled,dir,compose,compose_path}
+  let composeName = new Map(); // key: Name|Path -> compose filename override
+    let selected = new Set(); // key Name|Path
+
+    function keyOf(it){ return (it.Name||'')+'|'+(it.Path||''); }
+    function isCompose(it){ return (it.Type||'').toLowerCase() === 'docker-compose'; }
+
+    function render(){
+      TBL.innerHTML = '';
+      const rows = [];
+      for(const it of filtered){
+        const k = keyOf(it);
+        const st = statusMap.get(k) || {exists:false,pulled:false,dir:'',compose:'docker-compose.yml'};
+        const cmp = composeName.get(k) || st.compose || 'docker-compose.yml';
+        const checked = selected.has(k) ? 'checked' : '';
+        const statusTxt = st.pulled ? 'Pulled' : (st.exists ? 'Downloaded' : 'Not downloaded');
+        const statusBadge = st.pulled ? 'success' : (st.exists ? 'info' : 'secondary');
+        const canDownload = !st.exists;
+        const canPull = st.exists && !st.pulled;
+        const disabledAct = (!canDownload && !canPull) ? 'disabled' : '';
+        const actLabel = canDownload ? 'Download' : (canPull ? 'Pull' : 'Pulled');
+        const rowClass = st.pulled ? 'table-success' : (st.exists ? 'table-info' : '');
+        rows.push(`
+          <tr data-key="${k}" class="${rowClass}">
+            <td><input type="checkbox" class="row-check" ${checked}></td>
+            <td><code>${it.Name||''}</code></td>
+            <td><span class="badge bg-dark">${it.Type||''}</span></td>
+            <td>${it.Vector||''}</td>
+            <td><small>${it.CVE||'n/a'}</small></td>
+            <td><small class="text-break">${it.Path||''}</small></td>
+            <td><input type="text" class="form-control form-control-sm compose-input" value="${cmp}" placeholder="docker-compose.yml"></td>
+            <td><span class="badge bg-${statusBadge}">${statusTxt}</span></td>
+            <td>
+              <button class="btn btn-sm ${canDownload? 'btn-outline-primary':'btn-outline-success'} act-btn" ${disabledAct}>${actLabel}</button>
+            </td>
+          </tr>
+        `);
+      }
+      TBL.innerHTML = rows.join('');
+      COUNT.textContent = String(filtered.length);
+      updateBatchButtons();
+    }
+
+    function updateBatchButtons(){
+      // Enable Download if any selected lacking compose file; Pull if any selected downloaded but not pulled
+      let anySel = selected.size > 0;
+      let anyNeedDl = false, anyNeedPull = false;
+      for(const k of selected){
+        const st = statusMap.get(k) || {exists:false,pulled:false};
+        if(!st.exists) anyNeedDl = true;
+        if(st.exists && !st.pulled) anyNeedPull = true;
+      }
+      BTN_DL.disabled = !(anySel && anyNeedDl);
+      BTN_PULL.disabled = !(anySel && anyNeedPull);
+    }
+
+    async function fetchCatalog(){
+      const resp = await fetch('/vuln_catalog');
+      const data = await resp.json();
+      const items = (data.items||[]).filter(isCompose);
+      allItems = items;
+      applyFilter();
+      await refreshStatus();
+    }
+
+    function applyFilter(){
+      const q = (FILTER.value||'').toLowerCase();
+      if(!q){ filtered = [...allItems]; return; }
+      filtered = allItems.filter(it => {
+        const s = `${it.Name||''} ${it.Type||''} ${it.Vector||''} ${it.CVE||''} ${it.Path||''}`.toLowerCase();
+        return s.includes(q);
+      });
+    }
+
+    async function refreshStatus(){
+      if(filtered.length === 0){ render(); return; }
+      const payload = { items: filtered.map(it => ({Name: it.Name, Path: it.Path, compose: composeName.get(keyOf(it)) || undefined})) };
+      const resp = await fetch('/vuln_compose/status', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+      const data = await resp.json();
+      (data.items||[]).forEach(st => {
+        const k = (st.Name||'')+'|'+(st.Path||'');
+        statusMap.set(k, {exists: !!st.exists, pulled: !!st.pulled, dir: st.dir||'', compose: st.compose || 'docker-compose.yml', compose_path: st.compose_path || ''});
+      });
+      render();
+    }
+
+    async function doDownload(items){
+      const payload = { items: items.map(it => ({Name: it.Name, Path: it.Path, compose: composeName.get(keyOf(it)) || undefined})) };
+      const resp = await fetch('/vuln_compose/download', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+      const data = await resp.json();
+      await refreshStatus();
+      return data;
+    }
+
+    async function doPull(items){
+      const payload = { items: items.map(it => ({Name: it.Name, Path: it.Path, compose: composeName.get(keyOf(it)) || undefined})) };
+      const resp = await fetch('/vuln_compose/pull', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+      const data = await resp.json();
+      await refreshStatus();
+      return data;
+    }
+    // Track compose name edits
+    TBL.addEventListener('input', (e) => {
+      const inp = e.target.closest('.compose-input');
+      if(!inp) return;
+      const tr = inp.closest('tr');
+      const key = tr.getAttribute('data-key');
+      let val = (inp.value||'').trim();
+      if(!val) val = 'docker-compose.yml';
+      composeName.set(key, val);
+    });
+
+    document.querySelector('#btn-check-existence').addEventListener('click', async () => {
+      await refreshStatus();
+    });
+
+    // Event wiring
+    FILTER.addEventListener('input', async () => { applyFilter(); await refreshStatus(); });
+    SEL_ALL.addEventListener('change', () => {
+      if(SEL_ALL.checked){
+        filtered.forEach(it => selected.add(keyOf(it)));
+      } else {
+        selected.clear();
+      }
+      render();
+    });
+    TBL.addEventListener('change', (e) => {
+      if(e.target && e.target.classList.contains('row-check')){
+        const tr = e.target.closest('tr');
+        const key = tr.getAttribute('data-key');
+        if(e.target.checked) selected.add(key); else selected.delete(key);
+        updateBatchButtons();
+      }
+    });
+    TBL.addEventListener('click', async (e) => {
+      const btn = e.target.closest('.act-btn');
+      if(!btn) return;
+      const tr = btn.closest('tr');
+      const key = tr.getAttribute('data-key');
+      const it = filtered.find(x => keyOf(x) === key);
+      const st = statusMap.get(key) || {exists:false,pulled:false};
+      if(!st.exists){
+        await doDownload([it]);
+      } else if(st.exists && !st.pulled){
+        await doPull([it]);
+      }
+    });
+    BTN_DL.addEventListener('click', async () => {
+      const items = filtered.filter(it => selected.has(keyOf(it)) && !(statusMap.get(keyOf(it))||{exists:false}).exists);
+      if(items.length) await doDownload(items);
+    });
+    BTN_PULL.addEventListener('click', async () => {
+      const items = filtered.filter(it => selected.has(keyOf(it)) && (statusMap.get(keyOf(it))||{exists:false,pulled:false}).exists && !(statusMap.get(keyOf(it))||{pulled:false}).pulled);
+      if(items.length) await doPull(items);
+    });
+
+    // Initial load
+    fetchCatalog().catch(err => console.error('catalog error', err));
+  })();
+  </script>
 </body>
 </html>
