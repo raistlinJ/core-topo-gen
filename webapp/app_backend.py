@@ -34,6 +34,15 @@ try:
 except Exception:
     pass
 
+# Ensure project root (parent of this webapp directory) is on sys.path for absolute imports like core_topo_gen.*
+try:
+    _THIS_DIR = os.path.abspath(os.path.dirname(__file__))
+    _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, '..'))
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+except Exception:
+    pass
+
 # ------------- Environment paths (.env/paths.json with env overrides) -------------
 _ENV_PATHS_CACHE: Dict[str, str] | None = None
 
@@ -1765,6 +1774,7 @@ def vuln_compose_status():
         data = request.get_json(silent=True) or {}
         items = data.get('items') or []
         out = []
+        logs: list[str] = []
         base_out = os.path.abspath(_vuln_base_dir())
         os.makedirs(base_out, exist_ok=True)
         for it in items:
@@ -1777,15 +1787,37 @@ def vuln_compose_status():
             base_dir = vdir
             compose_file = None
             if gh.get('is_github'):
+                try:
+                    logs.append(f"[status] {name}: Path={path}")
+                    logs.append(f"[status] {name}: git_url={gh.get('git_url')} branch={gh.get('branch')} subpath={gh.get('subpath')} mode={gh.get('mode')}")
+                except Exception:
+                    pass
                 repo_dir = os.path.join(vdir, _vuln_repo_subdir())
                 sub = gh.get('subpath') or ''
-                base_dir = os.path.join(repo_dir, sub) if sub else repo_dir
-                exists = os.path.isdir(base_dir)
+                # If subpath looks like a compose file, resolve directly
+                is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                if is_file_sub:
+                    compose_file = os.path.join(repo_dir, sub)
+                    base_dir = os.path.dirname(compose_file)
+                    exists = os.path.exists(compose_file)
+                else:
+                    base_dir = os.path.join(repo_dir, sub) if sub else repo_dir
+                    exists = os.path.isdir(base_dir)
+                try:
+                    logs.append(f"[status] {name}: base={base_dir} exists={exists} compose={compose_name}")
+                except Exception:
+                    pass
                 # prefer provided compose name
-                if exists and compose_name:
+                if exists and compose_name and not compose_file:
                     p = os.path.join(base_dir, compose_name)
                     if os.path.exists(p):
                         compose_file = p
+                # log compose candidates
+                try:
+                    cands = _compose_candidates(base_dir) if exists else []
+                    logs.append(f"[status] {name}: compose candidates={cands[:4]}")
+                except Exception:
+                    pass
                 if not compose_file:
                     # find compose candidates within base_dir
                     cand = _compose_candidates(base_dir)
@@ -1794,22 +1826,39 @@ def vuln_compose_status():
                 # legacy direct download to vdir/docker-compose.yml
                 compose_file = os.path.join(vdir, compose_name or 'docker-compose.yml')
                 exists = os.path.exists(compose_file)
+                try:
+                    logs.append(f"[status] {name}: non-github Path={path} compose_path={compose_file} exists={exists}")
+                except Exception:
+                    pass
             pulled = False
             if exists and compose_file and shutil.which('docker'):
                 try:
                     proc = subprocess.run(['docker', 'compose', '-f', compose_file, 'config', '--images'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
+                    try:
+                        logs.append(f"[status] docker compose config --images rc={proc.returncode}")
+                    except Exception:
+                        pass
                     if proc.returncode == 0:
                         images = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
+                        try:
+                            logs.append(f"[status] images discovered: {len(images)}")
+                            logs.append(f"[status] images sample: {images[:4]}")
+                        except Exception:
+                            pass
                         if images:
                             present = []
                             for img in images:
                                 p2 = subprocess.run(['docker', 'image', 'inspect', img], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                try:
+                                    logs.append(f"[status] image inspect {img} rc={p2.returncode}")
+                                except Exception:
+                                    pass
                                 present.append(p2.returncode == 0)
                             pulled = all(present)
                 except Exception:
                     pulled = False
             out.append({'Name': name, 'Path': path, 'compose': compose_name, 'compose_path': compose_file, 'exists': bool(exists), 'pulled': bool(pulled), 'dir': base_dir})
-        return jsonify({'items': out})
+        return jsonify({'items': out, 'log': logs})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1821,13 +1870,36 @@ def vuln_compose_download():
     Returns: { items: [{Name, Path, ok: bool, dir: str, message: str}] }
     """
     try:
-        from core_topo_gen.utils.vuln_process import _github_tree_to_raw as _to_raw
+        try:
+            from core_topo_gen.utils.vuln_process import _github_tree_to_raw as _to_raw
+        except Exception as _imp_err:
+            # Fallback: minimal tree->raw converter for GitHub tree URLs
+            def _to_raw(base_url: str, filename: str) -> str | None:
+                try:
+                    from urllib.parse import urlparse
+                    u = urlparse(base_url)
+                    if u.netloc.lower() != 'github.com':
+                        return None
+                    parts = [p for p in u.path.strip('/').split('/') if p]
+                    if len(parts) < 4 or parts[2] != 'tree':
+                        return None
+                    owner, repo, _tree, branch = parts[:4]
+                    rest = '/'.join(parts[4:])
+                    return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rest}/{filename}"
+                except Exception:
+                    return None
+            try:
+                app.logger.warning("[download] fallback _to_raw used due to import error: %s", _imp_err)
+            except Exception:
+                pass
         data = request.get_json(silent=True) or {}
         items = data.get('items') or []
         out = []
+        logs: list[str] = []
         base_out = os.path.abspath(_vuln_base_dir())
         os.makedirs(base_out, exist_ok=True)
         import urllib.request
+        import shlex
         for it in items:
             name = (it.get('Name') or '').strip()
             path = (it.get('Path') or '').strip()
@@ -1839,12 +1911,38 @@ def vuln_compose_download():
             if gh.get('is_github'):
                 # Clone the repo; use branch if provided
                 if not shutil.which('git'):
+                    try:
+                        logs.append(f"[download] {name}: git not available in PATH")
+                    except Exception:
+                        pass
                     out.append({'Name': name, 'Path': path, 'ok': False, 'dir': vdir, 'message': 'git not available'})
                     continue
                 repo_dir = os.path.join(vdir, _vuln_repo_subdir())
+                try:
+                    logs.append(f"[download] {name}: Path={path}")
+                    logs.append(f"[download] {name}: git_url={gh.get('git_url')} branch={gh.get('branch')} subpath={gh.get('subpath')} -> repo_dir={repo_dir}")
+                except Exception:
+                    pass
                 # If already cloned and looks valid, skip re-clone
                 if os.path.isdir(os.path.join(repo_dir, '.git')):
-                    out.append({'Name': name, 'Path': path, 'ok': True, 'dir': (os.path.join(repo_dir, gh.get('subpath') or '') if gh.get('subpath') else repo_dir), 'message': 'already downloaded'})
+                    try:
+                        logs.append(f"[download] {name}: repo exists {repo_dir}")
+                    except Exception:
+                        pass
+                    base_dir = os.path.join(repo_dir, gh.get('subpath') or '') if gh.get('subpath') else repo_dir
+                    try:
+                        logs.append(f"[download] {name}: base_dir={base_dir}")
+                        # limited directory listing
+                        if os.path.isdir(base_dir):
+                            entries = []
+                            for nm in os.listdir(base_dir)[:10]:
+                                p = os.path.join(base_dir, nm)
+                                kind = 'dir' if os.path.isdir(p) else 'file'
+                                entries.append(f"{nm}({kind})")
+                            logs.append(f"[download] {name}: base_dir entries: {entries}")
+                    except Exception:
+                        pass
+                    out.append({'Name': name, 'Path': path, 'ok': True, 'dir': base_dir, 'message': 'already downloaded'})
                     continue
                 # Ensure empty directory
                 try:
@@ -1857,9 +1955,32 @@ def vuln_compose_download():
                     cmd += ['--branch', gh.get('branch')]
                 cmd += [gh.get('git_url'), repo_dir]
                 try:
+                    try:
+                        logs.append(f"[download] {name}: running: {' '.join(shlex.quote(c) for c in cmd)}")
+                    except Exception:
+                        pass
                     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+                    try:
+                        logs.append(f"[download] git clone rc={proc.returncode} dir={repo_dir}")
+                        if proc.stdout:
+                            for ln in proc.stdout.splitlines()[:100]:
+                                logs.append(f"[git] {ln}")
+                    except Exception:
+                        pass
                     if proc.returncode == 0 and os.path.isdir(repo_dir):
                         base_dir = os.path.join(repo_dir, gh.get('subpath') or '') if gh.get('subpath') else repo_dir
+                        try:
+                            logs.append(f"[download] {name}: base_dir={base_dir}")
+                            # limited directory listing
+                            if os.path.isdir(base_dir):
+                                entries = []
+                                for nm in os.listdir(base_dir)[:10]:
+                                    p = os.path.join(base_dir, nm)
+                                    kind = 'dir' if os.path.isdir(p) else 'file'
+                                    entries.append(f"{nm}({kind})")
+                                logs.append(f"[download] {name}: base_dir entries: {entries}")
+                        except Exception:
+                            pass
                         out.append({'Name': name, 'Path': path, 'ok': True, 'dir': base_dir, 'message': 'downloaded'})
                     else:
                         msg = (proc.stdout or '').strip()
@@ -1871,14 +1992,24 @@ def vuln_compose_download():
                 raw = _to_raw(path, compose_name) or (path.rstrip('/') + '/' + compose_name)
                 yml_path = os.path.join(vdir, compose_name)
                 try:
+                    try:
+                        logs.append(f"[download] {name}: Path={path}")
+                        logs.append(f"[download] {name}: GET {raw}")
+                    except Exception:
+                        pass
                     with urllib.request.urlopen(raw, timeout=30) as resp:
+                        status = getattr(resp, 'status', None) or getattr(resp, 'code', None)
                         data_bin = resp.read(1_000_000)
+                        try:
+                            logs.append(f"[download] {name}: HTTP {status} bytes={len(data_bin) if data_bin else 0}")
+                        except Exception:
+                            pass
                     with open(yml_path, 'wb') as f:
                         f.write(data_bin)
                     out.append({'Name': name, 'Path': path, 'ok': True, 'dir': vdir, 'message': 'downloaded', 'compose': compose_name})
                 except Exception as e:
                     out.append({'Name': name, 'Path': path, 'ok': False, 'dir': vdir, 'message': str(e), 'compose': compose_name})
-        return jsonify({'items': out})
+        return jsonify({'items': out, 'log': logs})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1893,6 +2024,7 @@ def vuln_compose_pull():
         data = request.get_json(silent=True) or {}
         items = data.get('items') or []
         out = []
+        logs: list[str] = []
         base_out = os.path.abspath(_vuln_base_dir())
         for it in items:
             name = (it.get('Name') or '').strip()
@@ -1903,14 +2035,31 @@ def vuln_compose_pull():
             gh = _parse_github_url(path)
             if gh.get('is_github'):
                 repo_dir = os.path.join(vdir, _vuln_repo_subdir())
-                base_dir = os.path.join(repo_dir, gh.get('subpath') or '') if gh.get('subpath') else repo_dir
+                sub = gh.get('subpath') or ''
+                # blob file path -> direct compose path
+                is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
+                try:
+                    logs.append(
+                        f"[pull] {name}: git_url={gh.get('git_url')} branch={gh.get('branch')} subpath={gh.get('subpath')} base_dir={base_dir}"
+                    )
+                except Exception:
+                    pass
                 # prefer provided compose name
-                yml_path = os.path.join(base_dir, compose_name)
+                yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
                 if not os.path.exists(yml_path):
                     cand = _compose_candidates(base_dir)
                     yml_path = cand[0] if cand else None
+                try:
+                    logs.append(f"[pull] {name}: yml_path={yml_path}")
+                except Exception:
+                    pass
             else:
                 yml_path = os.path.join(vdir, compose_name)
+                try:
+                    logs.append(f"[pull] {name}: non-github base_dir={vdir}")
+                except Exception:
+                    pass
             if not yml_path or not os.path.exists(yml_path):
                 out.append({'Name': name, 'Path': path, 'ok': False, 'message': 'compose file missing', 'compose': compose_name})
                 continue
@@ -1919,12 +2068,19 @@ def vuln_compose_pull():
                 continue
             try:
                 proc = subprocess.run(['docker', 'compose', '-f', yml_path, 'pull'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                try:
+                    logs.append(f"[pull] {name}: docker compose pull rc={proc.returncode} file={yml_path}")
+                    if proc.stdout:
+                        for ln in proc.stdout.splitlines()[:200]:
+                            logs.append(f"[docker] {ln}")
+                except Exception:
+                    pass
                 ok = proc.returncode == 0
                 msg = 'ok' if ok else ((proc.stdout or '')[-1000:] if proc.stdout else 'failed')
                 out.append({'Name': name, 'Path': path, 'ok': ok, 'message': msg, 'compose': compose_name})
             except Exception as e:
                 out.append({'Name': name, 'Path': path, 'ok': False, 'message': str(e), 'compose': compose_name})
-        return jsonify({'items': out})
+        return jsonify({'items': out, 'log': logs})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
