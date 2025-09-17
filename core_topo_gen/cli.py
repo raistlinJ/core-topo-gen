@@ -4,6 +4,9 @@ import logging
 import random
 import os
 from core.api.grpc import client
+import types
+import grpc  # type: ignore
+from core.api.grpc import core_pb2_grpc as _core_pb2_grpc  # type: ignore
 from .parsers.xml_parser import parse_node_info, parse_routing_info, parse_traffic_info, parse_segmentation_info, parse_vulnerabilities_info
 from .utils.allocation import compute_role_counts
 from .builders.topology import build_star_from_roles, build_segmented_topology, build_multi_switch_topology
@@ -20,6 +23,11 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="core-daemon gRPC host")
     ap.add_argument("--port", type=int, default=50051, help="core-daemon gRPC port")
     ap.add_argument("--prefix", default="10.0.0.0/24", help="IPv4 prefix for auto-assigned addresses")
+    # TLS options for connecting through Envoy
+    ap.add_argument("--tls", action="store_true", help="Use TLS when connecting to CORE (via Envoy)")
+    ap.add_argument("--ca-cert", default=os.environ.get("CORE_CA_CERT"), help="CA certificate to trust (PEM)")
+    ap.add_argument("--client-cert", default=os.environ.get("CORE_CLIENT_CERT"), help="Client certificate for mTLS (PEM)")
+    ap.add_argument("--client-key", default=os.environ.get("CORE_CLIENT_KEY"), help="Client private key for mTLS (PEM)")
     ap.add_argument(
         "--ip-mode",
         choices=["private", "mixed", "public"],
@@ -97,6 +105,35 @@ def main():
     routing_density, routing_items = parse_routing_info(args.xml, args.scenario)
 
     core = client.CoreGrpcClient(address=f"{args.host}:{args.port}")
+
+    # Enable TLS if requested (flag or env CORE_TLS truthy)
+    use_tls = bool(args.tls or str(os.environ.get("CORE_TLS", "0")).lower() in ("1", "true", "yes", "on"))
+    if use_tls:
+        def _tls_connect(self):
+            root = None
+            pkey = None
+            chain = None
+            try:
+                ca_path = args.ca_cert
+                if ca_path and os.path.exists(ca_path):
+                    with open(ca_path, "rb") as f:
+                        root = f.read()
+            except Exception:
+                root = None
+            try:
+                if args.client_cert and args.client_key and os.path.exists(args.client_cert) and os.path.exists(args.client_key):
+                    with open(args.client_key, "rb") as f:
+                        pkey = f.read()
+                    with open(args.client_cert, "rb") as f:
+                        chain = f.read()
+            except Exception:
+                pkey = chain = None
+            creds = grpc.ssl_channel_credentials(root_certificates=root, private_key=pkey, certificate_chain=chain)
+            options = [("grpc.enable_http_proxy", 0)]
+            self.channel = grpc.secure_channel(self.address, creds, options=options)
+            self.stub = _core_pb2_grpc.CoreApiStub(self.channel)
+        core.connect = types.MethodType(_tls_connect, core)
+
     core.connect()
 
     scenario_name = args.scenario

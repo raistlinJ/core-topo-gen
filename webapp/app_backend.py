@@ -113,7 +113,15 @@ CORE_HOST = os.environ.get('CORE_HOST', 'localhost')
 try:
     CORE_PORT = int(os.environ.get('CORE_PORT', '50051'))
 except Exception:
-    CORE_PORT = 50051
+    CORE_PORT = 7443
+
+# Optional TLS for connecting through Envoy
+# Set CORE_TLS=1 to enable TLS to Envoy on CORE_HOST:CORE_PORT.
+# Optionally set CORE_CA_CERT to trust a custom CA, and CORE_CLIENT_CERT/CORE_CLIENT_KEY for mTLS.
+CORE_TLS = os.environ.get('CORE_TLS', '0').strip() in ('1', 'true', 'yes', 'on')
+CORE_CA_CERT = os.environ.get('CORE_CA_CERT', '')
+CORE_CLIENT_CERT = os.environ.get('CORE_CLIENT_CERT', '')
+CORE_CLIENT_KEY = os.environ.get('CORE_CLIENT_KEY', '')
 
 def _default_core_dict():
     return {"host": CORE_HOST, "port": CORE_PORT}
@@ -582,8 +590,40 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
     os.makedirs(out_dir, exist_ok=True)
     # Pick first running/defined session if any; API lacks direct 'current' concept here.
     try:
-        app.logger.debug("Connecting to CORE gRPC at %s (requested session_id=%s)", address, session_id)
+        app.logger.debug("Connecting to CORE gRPC at %s (requested session_id=%s) TLS=%s", address, session_id, CORE_TLS)
         client = CoreGrpcClient(address=address)
+        # If TLS requested, monkey-patch connect() to use a secure channel.
+        if CORE_TLS:
+            try:
+                import grpc  # type: ignore
+                from core.api.grpc import core_pb2_grpc as _core_pb2_grpc  # type: ignore
+                def _tls_connect(self):
+                    root = None
+                    pkey = None
+                    chain = None
+                    try:
+                        if CORE_CA_CERT and os.path.exists(CORE_CA_CERT):
+                            with open(CORE_CA_CERT, 'rb') as f:
+                                root = f.read()
+                    except Exception:
+                        root = None
+                    try:
+                        if CORE_CLIENT_CERT and CORE_CLIENT_KEY and os.path.exists(CORE_CLIENT_CERT) and os.path.exists(CORE_CLIENT_KEY):
+                            with open(CORE_CLIENT_KEY, 'rb') as f:
+                                pkey = f.read()
+                            with open(CORE_CLIENT_CERT, 'rb') as f:
+                                chain = f.read()
+                    except Exception:
+                        pkey = chain = None
+                    creds = grpc.ssl_channel_credentials(root_certificates=root, private_key=pkey, certificate_chain=chain)
+                    options = [("grpc.enable_http_proxy", 0)]
+                    self.channel = grpc.secure_channel(self.address, creds, options=options)
+                    self.stub = _core_pb2_grpc.CoreApiStub(self.channel)
+                # bind method
+                import types as _types
+                client.connect = _types.MethodType(_tls_connect, client)
+            except Exception as e:
+                app.logger.warning("Failed to set up TLS gRPC channel: %s. Falling back to insecure.", e)
         client.connect()
         try:
             sessions = client.get_sessions()
@@ -1051,7 +1091,7 @@ def run_cli():
     try:
         # Attempt to parse current scenarios JSON (if present) to extract core host/port overrides
         core_host = '127.0.0.1'
-        core_port = 50051
+        core_port = 7443
         try:
             # attempt to load previously saved payload for core info
             payload = _parse_scenarios_xml(xml_path)
@@ -1074,7 +1114,7 @@ def run_cli():
         repo_root = _get_repo_root()
         # Invoke package CLI so it can generate reports under repo_root/reports
         proc = subprocess.run([
-            'core-python', '-m', 'core_topo_gen.cli',
+            'python', '-m', 'core_topo_gen.cli',
             '--xml', xml_path,
             '--host', core_host,
             '--port', str(core_port),
@@ -1218,7 +1258,7 @@ def run_cli_async():
     app.logger.info("[async] Starting CLI; log: %s", log_path)
     # derive core host/port (best-effort) from synchronous parse
     core_host = '127.0.0.1'
-    core_port = 50051
+    core_port = 7443
     try:
         payload = _parse_scenarios_xml(xml_path)
         ch = payload.get('core', {}).get('host') if isinstance(payload.get('core'), dict) else None
@@ -1241,7 +1281,7 @@ def run_cli_async():
     repo_root = _get_repo_root()
     # Use package CLI module invocation
     proc = subprocess.Popen([
-        'core-python', '-u', '-m', 'core_topo_gen.cli',
+        'python', '-u', '-m', 'core_topo_gen.cli',
         '--xml', xml_path,
         '--host', core_host,
         '--port', str(core_port),

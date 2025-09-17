@@ -1,0 +1,37 @@
+# /etc/systemd/system/envoy-core-proxy.service
+# Hardened Envoy unit to proxy CORE gRPC with TLS/mTLS.
+
+[Unit]
+Description=Envoy proxy for CORE gRPC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+# Create a dedicated user/group beforehand or adjust to an existing one.
+User=envoy
+Group=envoy
+
+# Adjust the path to envoy binary if needed
+ExecStart=/usr/bin/envoy -c /home/ubuntu/core-topo-gen/webapp_proxy/envoy.yaml --log-level info
+Restart=on-failure
+RestartSec=2
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/log/envoy /home/ubuntu/core-topo-gen/webapp_proxy/certs
+AmbientCapabilities=
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+SystemCallArchitectures=native
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
