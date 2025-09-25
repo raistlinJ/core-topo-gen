@@ -65,7 +65,9 @@ def add_default_services(scenario):
         "PC": ["DefaultRoute"],
         "prouter": [],
         "router": ["zebra", "OSPFv2", "OSPFv3", "IPForward"],
-        "host": ["DefaultRoute", "SSH"]
+        "host": ["DefaultRoute", "SSH"],
+        # Ensure docker type nodes do not receive DefaultRoute by default in this legacy builder
+        "docker": []
     }
 
     for node_type, services in node_data.items():

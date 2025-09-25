@@ -92,7 +92,7 @@ def plan_and_apply_segmentation(
     Returns a summary dictionary with planned rules per node.
     """
     summary: Dict[str, object] = {"rules": []}
-    if not hosts or density <= 0:
+    if not hosts:
         return summary
     os.makedirs(out_dir, exist_ok=True)
 
@@ -158,8 +158,56 @@ def plan_and_apply_segmentation(
     # Determine the scale for slots: use number of distinct subnets across hosts
     subnets = _group_hosts_by_subnet(hosts)
     base = max(1, len(subnets))
-    d = max(0.0, min(1.0, float(density)))
-    slots = base if d >= 1 else max(1, min(base, int(round(base * d))))
+    # Density semantics for segmentation with per-item counts:
+    # - Count-based slots (sum of abs_count across items) are ALWAYS applied and do not consume density
+    # - Weight-based density adds additional slots: density <=0: 0; 0<density<1: fraction of base; density>=1: absolute slots
+    try:
+        ds = float(density)
+    except Exception:
+        ds = 0.0
+    abs_slots_total = 0
+    try:
+        for it in (items or []):
+            c = getattr(it, "abs_count", 0) or 0
+            if c > 0:
+                abs_slots_total += int(c)
+    except Exception:
+        abs_slots_total = 0
+
+    # Compute density-based slots (weight-based)
+    density_slots = 0
+    if ds >= 1:
+        density_slots = max(1, int(round(ds)))
+    elif ds > 0:
+        d = max(0.0, min(1.0, ds))
+        density_slots = max(1, min(base, int(round(base * d))))
+    # If no explicit counts and density <= 0, nothing to plan
+    if abs_slots_total <= 0 and density_slots <= 0:
+        return summary
+
+    # Total slots = count slots + density slots
+    slots = abs_slots_total + density_slots
+    dens_for_log = max(0.0, min(1.0, float(density)))
+
+    # Build a deterministic service plan honoring per-item abs_count first.
+    # Prioritize NAT first to reserve eligible routers before firewall rules consume them.
+    svc_sequence: List[str] = []
+    nat_seq: List[str] = []
+    other_seq: List[str] = []
+    try:
+        for it in (items or []):
+            c = int(getattr(it, "abs_count", 0) or 0)
+            if c <= 0:
+                continue
+            name = (it.name or "").strip() or "Firewall"
+            if name.upper() == "NAT":
+                nat_seq.extend([name] * c)
+            else:
+                other_seq.extend([name] * c)
+    except Exception:
+        nat_seq, other_seq = [], []
+    # Count-based plan occupies the first abs_slots_total positions; remaining positions use weighted selection
+    svc_sequence = nat_seq + other_seq
 
     # Precompute subnet list and pick targets realistically
     nets = list(subnets.keys())
@@ -178,9 +226,19 @@ def plan_and_apply_segmentation(
         "host_block_input": set(),                # {(src_ip, dst_ip)}
     })
 
-    logger.info("Segmentation: planning %d slots across %d subnets (density=%.2f)", slots, len(nets), d)
+    try:
+        logger.info("Segmentation: planning %d slots across %d subnets (density=%.2f)", slots, len(nets), float(dens_for_log))
+    except Exception:
+        # Best-effort logging; avoid breaking execution due to logging issues
+        pass
     for idx in range(slots):
-        svc = _choose_service_name(items)
+        if idx < len(svc_sequence):
+            try:
+                svc = svc_sequence[idx]
+            except Exception:
+                svc = _choose_service_name(items)
+        else:
+            svc = _choose_service_name(items)
 
         # Choose a node based on service, avoiding NAT+Firewall on same node
         node = None
@@ -981,7 +1039,7 @@ def write_allow_rules_for_flows(
         dst_sel = subnet_of(dst_host) if use_dst_subnet else dst_ip
 
         # Only add allow rules if currently blocked by segmentation policies
-    if is_flow_blocked(src_ip, dst_ip, int(dst_host.node_id)):
+        if is_flow_blocked(src_ip, dst_ip, int(dst_host.node_id)):
             # Receiver INPUT allow
             recv_key = (int(dst_host.node_id), 'INPUT', proto, src_sel, dst_sel, int(dst_port))
             covering = _covering_pair(int(dst_host.node_id), 'INPUT', proto, int(dst_port), src_sel, dst_sel)

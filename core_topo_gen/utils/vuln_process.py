@@ -1,261 +1,784 @@
 from __future__ import annotations
+import os
 import csv
 import json
-import logging
-import os
+import random
 import re
+from typing import Iterable, Tuple, List, Dict, Optional, Set
+import urllib.request
 import shutil
-import subprocess
-import sys
-import tempfile
-from typing import Dict, List, Optional, Tuple
 
-from urllib.parse import urlparse
-from urllib.request import urlopen
+try:
+	import yaml  # type: ignore
+except Exception:  # pragma: no cover - optional dependency handled at runtime
+	yaml = None  # type: ignore
 
 
-def _read_json(path: str) -> Optional[dict]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+def _read_csv(path: str) -> List[Dict[str, str]]:
+	rows: List[Dict[str, str]] = []
+	try:
+		with open(path, newline='', encoding='utf-8', errors='ignore') as f:
+			r = csv.DictReader(f)
+			for row in r:
+				# Normalize keys we care about; ignore rows without mandatory fields
+				name = (row.get('Name') or '').strip()
+				path_val = (row.get('Path') or '').strip()
+				if not name or not path_val:
+					continue
+				rows.append({
+					'Name': name,
+					'Path': path_val,
+					'Type': (row.get('Type') or '').strip(),
+					'Vector': (row.get('Vector') or '').strip(),
+					'Startup': (row.get('Startup') or '').strip(),
+					'CVE': (row.get('CVE') or '').strip(),
+					'Description': (row.get('Description') or '').strip(),
+					'References': (row.get('References') or '').strip(),
+				})
+	except Exception:
+		return []
+	return rows
 
 
-def _read_csv_rows(path: str) -> List[List[str]]:
-    rows: List[List[str]] = []
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
-            rdr = csv.reader(f)
-            for r in rdr:
-                rows.append(r)
-    except Exception as e:
-        logging.debug("Failed reading CSV %s: %s", path, e)
-    return rows
+def load_vuln_catalog(repo_root: str) -> List[Dict[str, str]]:
+	"""Load a vulnerability catalog for CLI selection.
+
+	Best-effort: prefer raw_datasources CSVs shipped with the repo.
+	Returns a list of dicts with at least Name, Path, and optional Type/Vector.
+	"""
+	candidates = [
+		os.path.join(repo_root, 'raw_datasources', 'vuln_list_w_url.csv'),
+		os.path.join(repo_root, 'raw_datasources', 'vuln_list.csv'),
+	]
+	items: List[Dict[str, str]] = []
+	for p in candidates:
+		if os.path.exists(p):
+			items.extend(_read_csv(p))
+	# Deduplicate by (Name, Path)
+	seen = set()
+	out: List[Dict[str, str]] = []
+	for it in items:
+		key = (it.get('Name'), it.get('Path'))
+		if key in seen:
+			continue
+		seen.add(key)
+		out.append(it)
+	return out
 
 
-def _normalize_header(header: List[str]) -> List[str]:
-    # Normalize exact schema expected by webapp data source tool
-    # Required: Name, Path, Type, Startup, Vector
-    # Optional: CVE, Description, References
-    normalized = [h.strip() for h in header]
-    return normalized
+def _norm_type(s: str) -> str:
+	s = (s or '').strip().lower()
+	if s in ("docker", "compose", "docker compose", "docker-compose", "docker_compose"):
+		return "docker-compose"
+	return s
 
 
-def _rows_to_catalog(rows: List[List[str]]) -> List[Dict[str, str]]:
-    if not rows or len(rows) < 2:
-        return []
-    header = _normalize_header(rows[0])
-    col_idx: Dict[str, int] = {h: i for i, h in enumerate(header)}
-    result: List[Dict[str, str]] = []
-    for r in rows[1:]:
-        try:
-            def get(k: str, default: str = "") -> str:
-                i = col_idx.get(k)
-                return (r[i] if i is not None and i < len(r) else default).strip()
-
-            rec = {
-                "Name": get("Name"),
-                "Path": get("Path"),
-                "Type": get("Type").lower(),
-                "Startup": get("Startup"),
-                "Vector": get("Vector").lower(),
-                "CVE": get("CVE", "n/a"),
-                "Description": get("Description", "n/a"),
-                "References": get("References", "n/a"),
-            }
-            if not rec["Name"] or not rec["Path"]:
-                continue
-            # Filter to known types/vectors when provided
-            if rec["Type"] not in ("artifact", "docker", "docker-compose", "misconfig", "incompetence", "unknown"):
-                # keep but normalize unexpected types to lowercase string
-                rec["Type"] = rec["Type"] or "unknown"
-            if rec["Vector"] not in ("local", "remote", "unknown"):
-                rec["Vector"] = rec["Vector"] or "unknown"
-            result.append(rec)
-        except Exception:
-            continue
-    return result
+def _filter_by_type_vector(catalog: Iterable[Dict[str, str]], v_type: str | None, v_vector: str | None) -> List[Dict[str, str]]:
+	vt = _norm_type(v_type or '')
+	vv = (v_vector or '').strip().lower()
+	out: List[Dict[str, str]] = []
+	for it in catalog:
+		it_vt = _norm_type(it.get('Type') or '')
+		it_vv = (it.get('Vector') or '').strip().lower()
+		if vt and it_vt != vt:
+			continue
+		if vv and it_vv != vv:
+			continue
+		out.append(it)
+	return out
 
 
-def load_vuln_catalog(repo_root: Optional[str] = None) -> List[Dict[str, str]]:
-    """Load vulnerability catalog from enabled data sources, or fallback CSV.
+def select_vulnerabilities(density: float, items_cfg: List[dict], catalog: List[Dict[str, str]]) -> List[Dict[str, str]]:
+	"""Select vulnerabilities from catalog based on density and config items.
 
-    Returns a list of dicts with keys: Name, Path, Type, Startup, Vector, CVE, Description, References
-    """
-    if repo_root is None:
-        repo_root = os.getcwd()
-    # Prefer data_sources/_state.json with enabled sources
-    ds_dir = os.path.join(repo_root, "data_sources")
-    state_path = os.path.join(ds_dir, "_state.json")
-    items: List[Dict[str, str]] = []
-    state = _read_json(state_path) or {}
-    for s in (state.get("sources") or []):
-        try:
-            if not s.get("enabled"):
-                continue
-            p = s.get("path")
-            if not p:
-                continue
-            if not os.path.isabs(p):
-                p = os.path.abspath(p)
-            if not os.path.exists(p):
-                continue
-            rows = _read_csv_rows(p)
-            items.extend(_rows_to_catalog(rows))
-        except Exception:
-            continue
-    # Fallback to bundled CSV
-    if not items:
-        fallback = os.path.join(repo_root, "raw_datasources", "vuln_list_w_url.csv")
-        if os.path.exists(fallback):
-            items = _rows_to_catalog(_read_csv_rows(fallback))
-    return items
+	- density in [0..1] scales the total number of selections.
+	- items_cfg is a list of entries with 'selected' and optional fields:
+	  * 'Random': use entire catalog
+	  * 'Type/Vector': filter by keys 'v_type' and 'v_vector'
+	  * 'Specific': use provided 'v_name' and 'v_path'
+	"""
+	# Even if catalog is empty, we can still honor 'Specific' selections by returning them directly
+	dens = max(0.0, min(1.0, float(density or 0.0)))
+	total_target = int(round(dens * len(catalog))) if catalog else 0
+	if dens > 0.0 and total_target == 0 and len(catalog) > 0:
+		total_target = 1
+	# Determine per-item allocations based on factors
+	factors: List[float] = []
+	s_items = items_cfg or []
+	if s_items:
+		total_factor = 0.0
+		for it in s_items:
+			try:
+				total_factor += float(it.get('factor') or 0.0)
+			except Exception:
+				continue
+		if total_factor <= 0:
+			factors = [1.0 / len(s_items) for _ in s_items]
+		else:
+			factors = [max(0.0, float((it.get('factor') or 0.0))) / total_factor for it in s_items]
+	else:
+		s_items = [{'selected': 'Random', 'factor': 1.0}]
+		factors = [1.0]
 
-
-def _choose_random(seq: List[dict]) -> Optional[dict]:
-    try:
-        import random
-        if not seq:
-            return None
-        return random.choice(seq)
-    except Exception:
-        return seq[0] if seq else None
-
-
-def select_vulnerabilities(vuln_density: float, vuln_items: List[dict], catalog: List[dict]) -> List[dict]:
-    """Select concrete vulnerabilities based on Vulnerabilities config.
-
-    Strategy:
-    - For 'Specific': match by Name (and Path if provided).
-    - For 'Type/Vector': filter catalog by Type and Vector (when not 'Random'), choose one at random.
-    - For 'Random': choose one at random from the catalog.
-    Returns a list of catalog entries (dicts) selected. Duplicates are removed preserving order.
-    """
-    out: List[dict] = []
-    seen = set()
-    for it in (vuln_items or []):
-        sel = (it.get("selected") or "Random").strip()
-        rec: Optional[dict] = None
-        if sel == "Specific":
-            nm = (it.get("v_name") or "").strip()
-            vp = (it.get("v_path") or "").strip()
-            if nm:
-                for c in catalog:
-                    if c.get("Name") == nm and (not vp or c.get("Path") == vp):
-                        rec = c
-                        break
-        elif sel == "Type/Vector":
-            vt = (it.get("v_type") or "Random").strip().lower()
-            vv = (it.get("v_vector") or "Random").strip().lower()
-            pool = [c for c in catalog if (vt == "random" or c.get("Type", "").lower() == vt) and (vv == "random" or c.get("Vector", "").lower() == vv)]
-            rec = _choose_random(pool)
-        else:  # Random or unknown
-            rec = _choose_random(catalog)
-        if rec:
-            key = (rec.get("Name"), rec.get("Path"))
-            if key not in seen:
-                seen.add(key)
-                out.append(rec)
-    return out
+	selected: List[Dict[str, str]] = []
+	used = set()
+	remaining = total_target
+	for it, frac in zip(s_items, factors):
+		sel = (it.get('selected') or 'Random').strip()
+		# Accept UI synonym 'Category' for 'Type/Vector'
+		if sel == 'Category':
+			sel = 'Type/Vector'
+		# Specific selections bypass density allocation and are always included
+		if sel == 'Specific':
+			name = (it.get('v_name') or '').strip()
+			path = (it.get('v_path') or '').strip()
+			if name and path:
+				key = (name, path)
+				if key not in used:
+					selected.append({'Name': name, 'Path': path})
+					used.add(key)
+			continue
+		# Determine candidate pool
+		pool = catalog
+		if sel == 'Type/Vector':
+			pool = _filter_by_type_vector(catalog, it.get('v_type'), it.get('v_vector'))
+		# Allocate count
+		alloc = int(round(frac * total_target)) if total_target > 0 else 0
+		alloc = min(max(0, alloc), max(0, remaining))
+		if alloc <= 0:
+			continue
+		# Random sample without replacement respecting already used items
+		pool2 = [p for p in pool if (p.get('Name'), p.get('Path')) not in used] if pool else []
+		if not pool2:
+			continue
+		if alloc >= len(pool2):
+			picks = pool2
+		else:
+			picks = random.sample(pool2, alloc)
+		for p in picks:
+			key = (p.get('Name'), p.get('Path'))
+			if key in used:
+				continue
+			used.add(key)
+			selected.append(p)
+		remaining = max(0, remaining - len(picks))
+		if remaining <= 0:
+			break
+	return selected
 
 
-def _ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+# ---------------- docker-compose assignment helpers ----------------
+
+def _parse_github_url(url: str) -> dict:
+	try:
+		from urllib.parse import urlparse
+		u = urlparse(url)
+		if u.netloc.lower() != 'github.com':
+			return {'is_github': False}
+		parts = [p for p in u.path.strip('/').split('/') if p]
+		if len(parts) < 2:
+			return {'is_github': False}
+		owner, repo = parts[0], parts[1]
+		git_url = f"https://github.com/{owner}/{repo}.git"
+		if len(parts) == 2:
+			return {'is_github': True, 'git_url': git_url, 'branch': None, 'subpath': '', 'mode': 'root'}
+		mode = parts[2]
+		if mode not in ('tree', 'blob') or len(parts) < 4:
+			return {'is_github': True, 'git_url': git_url, 'branch': None, 'subpath': '', 'mode': 'root'}
+		branch = parts[3]
+		rest = '/'.join(parts[4:])
+		return {'is_github': True, 'git_url': git_url, 'branch': branch, 'subpath': rest, 'mode': mode}
+	except Exception:
+		return {'is_github': False}
 
 
-def _github_tree_to_raw(base_url: str, filename: str) -> Optional[str]:
-    """Convert a GitHub tree URL to a raw file URL if possible.
-
-    Example:
-    https://github.com/vulhub/vulhub/tree/master/appweb/CVE-2018-8715 ->
-    https://raw.githubusercontent.com/vulhub/vulhub/master/appweb/CVE-2018-8715/Dockerfile
-    """
-    try:
-        u = urlparse(base_url)
-        if u.netloc.lower() != "github.com":
-            return None
-        parts = u.path.strip("/").split("/")
-        # Expected: owner/repo/tree/branch/rest...
-        if len(parts) < 4 or parts[2] != "tree":
-            return None
-        owner, repo, _tree, branch = parts[:4]
-        rest = "/".join(parts[4:])
-        raw = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rest}/{filename}"
-        return raw
-    except Exception:
-        return None
+def _compose_candidates(base_dir: str) -> List[str]:
+	cands = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']
+	out: List[str] = []
+	try:
+		if not os.path.isdir(base_dir):
+			return out
+		for nm in cands:
+			p = os.path.join(base_dir, nm)
+			if os.path.exists(p):
+				out.append(p)
+	except Exception:
+		pass
+	return out
 
 
-def _download_text(url: str, timeout: float = 20.0) -> Optional[bytes]:
-    try:
-        with urlopen(url, timeout=timeout) as resp:
-            # Basic content size cap: 1MB
-            data = resp.read(1_000_000)
-            return data
-    except Exception as e:
-        logging.debug("Download failed for %s: %s", url, e)
-        return None
+def _compose_path_from_download(rec: Dict[str, str], out_base: str = "/tmp/vulns", compose_name: str = 'docker-compose.yml') -> Optional[str]:
+	"""Resolve local compose path for a previously downloaded catalog item (webapp stores under /tmp/vulns).
+
+	Returns a file path if found, else None.
+	"""
+	try:
+		name = (rec.get('Name') or '').strip()
+		path = (rec.get('Path') or '').strip()
+		safe = _safe_name(name or 'vuln')
+		vdir = os.path.join(out_base, safe)
+		gh = _parse_github_url(path)
+		if gh.get('is_github'):
+			repo_dir = os.path.join(vdir, '_repo')
+			sub = gh.get('subpath') or ''
+			is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+			if is_file_sub:
+				p = os.path.join(repo_dir, sub)
+				return p if os.path.exists(p) else None
+			base = os.path.join(repo_dir, sub) if sub else repo_dir
+			pref = os.path.join(base, compose_name)
+			if os.path.exists(pref):
+				return pref
+			cand = _compose_candidates(base)
+			return cand[0] if cand else None
+		else:
+			p = os.path.join(vdir, compose_name)
+			return p if os.path.exists(p) else None
+	except Exception:
+		return None
+
+
+def _images_pulled_for_compose(yml_path: str) -> bool:
+	try:
+		import subprocess
+		import shutil as _sh
+		if not _sh.which('docker'):
+			return False
+		proc = subprocess.run(['docker', 'compose', '-f', yml_path, 'config', '--images'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+		if proc.returncode != 0:
+			return False
+		images = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
+		if not images:
+			return False
+		for img in images:
+			p2 = subprocess.run(['docker', 'image', 'inspect', img], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+			if p2.returncode != 0:
+				return False
+		return True
+	except Exception:
+		return False
+
+
+def _eligible_compose_items(catalog: Iterable[Dict[str, str]], v_type: Optional[str], v_vector: Optional[str], out_base: str = "/tmp/vulns") -> List[Dict[str, str]]:
+	"""Filter catalog to docker-compose items matching type/vector and with local compose pulled.
+	v_type/v_vector may be 'Random' or falsy to indicate no filtering on that dimension.
+	"""
+	vt = (v_type or '').strip().lower()
+	vv = (v_vector or '').strip().lower()
+	items: List[Dict[str, str]] = []
+	for it in catalog:
+		t = (it.get('Type') or '').strip().lower()
+		if t != 'docker-compose':
+			continue
+		if vt and vt != 'random' and t != vt:
+			# type mismatch; note vt would be 'docker-compose' normally
+			continue
+		vec = (it.get('Vector') or '').strip().lower()
+		if vv and vv != 'random' and vec != vv:
+			continue
+		yml = _compose_path_from_download(it, out_base=out_base)
+		if not yml or not os.path.exists(yml):
+			continue
+		if not _images_pulled_for_compose(yml):
+			continue
+		items.append(it)
+	return items
+
+
+def assign_compose_to_nodes(node_names: List[str], density: float, items_cfg: List[dict], catalog: List[Dict[str, str]], out_base: str = "/tmp/vulns", require_pulled: bool = True, base_host_pool: int | None = None) -> Dict[str, Dict[str, str]]:
+	"""Assign docker-compose vulnerabilities to nodes.
+
+	Rules (updated semantics):
+	- Weight-based vulnerability rows (v_metric == Weight or default) allocate up to
+	  round(density * base_host_pool) nodes, where base_host_pool is the scenario
+	  "Count for Density". Additive Count rows (v_metric == Count or Specific with
+	  explicit v_count) do NOT contribute to the density base and are applied in
+	  addition to the density-derived allocation.
+	- Count rows are allocated first (absolute), consuming nodes from the pool.
+	- Weight rows then allocate from remaining nodes up to the density target.
+	- 'Category' is treated as 'Type/Vector' for normalization.
+	- If require_pulled is True, only locally pulled compose items are eligible.
+
+	Returns: mapping of node_name -> catalog record (docker-compose entries only).
+	"""
+	if not node_names or not items_cfg:
+		return {}
+
+	# Determine base for density (fallback to total nodes if missing)
+	try:
+		base_for_density = int(base_host_pool) if (base_host_pool is not None and int(base_host_pool) >= 0) else len(node_names)
+	except Exception:
+		base_for_density = len(node_names)
+	dens = max(0.0, min(1.0, float(density or 0.0)))
+	# Use floor (not round) to align with router density semantics and avoid over-allocation
+	import math as _math
+	density_target = int(_math.floor(dens * base_for_density + 1e-9))
+
+	# Logging (best-effort)
+	try:
+		import logging as _logging
+		_logging.getLogger(__name__).debug(
+			"assign_compose_to_nodes: base_for_density=%d total_nodes=%d dens=%.3f density_target=%d",
+			base_for_density, len(node_names), dens, density_target
+		)
+	except Exception:
+		pass
+
+	rng = random.Random()
+	nodes_pool = list(node_names)
+	rng.shuffle(nodes_pool)
+	assigned: Dict[str, Dict[str, str]] = {}
+
+	# Normalize and classify items
+	norm_items: List[dict] = []
+	for it in items_cfg:
+		it2 = dict(it)
+		if (it2.get('selected') or '') == 'Category':
+			it2['selected'] = 'Type/Vector'
+		norm_items.append(it2)
+
+	count_items: List[dict] = []
+	weight_items: List[dict] = []
+	for it in norm_items:
+		sel = (it.get('selected') or '').strip()
+		metric = (it.get('v_metric') or '').strip()  # optional
+		has_count = False
+		if metric.lower() == 'count':
+			has_count = True
+		# Specific with v_count provided is also treated as count-based
+		if sel == 'Specific':
+			try:
+				if int(it.get('v_count') or 0) > 0:
+					has_count = True
+			except Exception:
+				pass
+		if has_count:
+			count_items.append(it)
+		else:
+			weight_items.append(it)
+
+	def pop_nodes(k: int) -> List[str]:
+		nonlocal nodes_pool
+		k = max(0, min(k, len(nodes_pool)))
+		taken = nodes_pool[:k]
+		nodes_pool = nodes_pool[k:]
+		return taken
+
+	# 1) Allocate Count items (absolute, additive)
+	for it in count_items:
+		try:
+			req = int(it.get('v_count') or 0)
+		except Exception:
+			req = 0
+		if req <= 0 or not nodes_pool:
+			continue
+		sel = (it.get('selected') or 'Type/Vector').strip()
+		pool: List[Dict[str, str]] = []
+		if sel == 'Specific':
+			nm = (it.get('v_name') or '').strip()
+			pp = (it.get('v_path') or '').strip()
+			rec: Optional[Dict[str, str]] = None
+			for r in catalog:
+				if r.get('Name') == nm and r.get('Path') == pp and _norm_type(r.get('Type') or '') == 'docker-compose':
+					rec = r
+					break
+			if rec is None and pp:
+				# synthetic fallback
+				rec = {"Name": nm or 'vuln', "Path": pp, "Type": 'docker-compose', "Vector": it.get('v_vector') or ''}
+			if rec:
+				pool = [rec]
+		else:  # Type/Vector
+			if require_pulled:
+				pool = _eligible_compose_items(catalog, it.get('v_type'), it.get('v_vector'), out_base=out_base)
+			else:
+				vt = _norm_type(it.get('v_type') or '')
+				vv = (it.get('v_vector') or '').strip().lower()
+				for r in catalog:
+					if _norm_type(r.get('Type') or '') != 'docker-compose':
+						continue
+					if vt and vt != 'random' and _norm_type(r.get('Type') or '') != vt:
+						continue
+					if vv and vv != 'random' and (r.get('Vector') or '').strip().lower() != vv:
+						continue
+					pool.append(r)
+		if not pool:
+			continue
+		take_nodes = pop_nodes(req)
+		if not take_nodes:
+			break
+		# choose (with replacement if needed) for each node
+		for nn in take_nodes:
+			rec = rng.choice(pool)
+			# ensure compose is present if required (only matters for Specific synthetic)
+			if require_pulled:
+				pth = _compose_path_from_download(rec, out_base=out_base)
+				if not pth or not _images_pulled_for_compose(pth):
+					continue
+			assigned[nn] = rec
+
+	# 2) Allocate Weight items up to density_target (independent of how many count nodes consumed)
+	if density_target <= 0 or not weight_items or not nodes_pool:
+		return assigned
+	remaining = min(density_target, len(nodes_pool))
+
+	# Gather weights
+	weights: List[Tuple[dict, float]] = []
+	total_w = 0.0
+	for it in weight_items:
+		try:
+			w = float(it.get('v_weight') or it.get('factor') or 0.0)
+		except Exception:
+			w = 0.0
+		if w > 0:
+			weights.append((it, w))
+			total_w += w
+	if total_w <= 0:
+		# even split
+		weights = [(it, 1.0) for it in weight_items]
+		total_w = float(len(weight_items))
+
+	# Compute integer allocations with remainder distribution
+	allocs: List[Tuple[dict, int]] = []
+	remainders: List[Tuple[float, int]] = []  # (fractional_part, index)
+	for idx, (it, w) in enumerate(weights):
+		exact = (w / total_w) * remaining
+		base_cnt = int(exact)
+		allocs.append((it, base_cnt))
+		remainders.append((exact - base_cnt, idx))
+	used = sum(c for _, c in allocs)
+	left = remaining - used
+	# sort by largest fractional remainder
+	remainders.sort(key=lambda x: x[0], reverse=True)
+	ri = 0
+	while left > 0 and ri < len(remainders):
+		_, idx = remainders[ri]
+		it, c = allocs[idx]
+		allocs[idx] = (it, c + 1)
+		left -= 1
+		ri += 1
+
+	# Perform allocations
+	for it, cnt in allocs:
+		if cnt <= 0 or not nodes_pool:
+			continue
+		sel = (it.get('selected') or '').strip()
+		pool: List[Dict[str, str]] = []
+		if sel == 'Type/Vector':
+			v_type = (it.get('v_type') or 'docker-compose').strip()
+			v_vec = (it.get('v_vector') or 'Random').strip()
+			pool = _eligible_compose_items(catalog, v_type, v_vec, out_base=out_base) if require_pulled else _eligible_compose_items(catalog, v_type, v_vec, out_base=out_base)
+		elif sel == 'Specific':
+			# Specific without count behaves like Type/Vector random
+			pool = _eligible_compose_items(catalog, 'docker-compose', 'Random', out_base=out_base) if require_pulled else _eligible_compose_items(catalog, 'docker-compose', 'Random', out_base=out_base)
+		else:
+			# Default: any docker-compose
+			pool = _eligible_compose_items(catalog, 'docker-compose', 'Random', out_base=out_base) if require_pulled else _eligible_compose_items(catalog, 'docker-compose', 'Random', out_base=out_base)
+		if not pool:
+			continue
+		take_nodes = pop_nodes(cnt)
+		if not take_nodes:
+			break
+		# sample with replacement if pool smaller than cnt
+		for nn in take_nodes:
+			rec = rng.choice(pool)
+			assigned[nn] = rec
+
+	return assigned
 
 
 def _safe_name(s: str) -> str:
-    s = s.strip().lower()
-    s = re.sub(r"[^a-z0-9_.-]+", "-", s)
-    return s[:80] or "vuln"
+	s = s.strip().lower()
+	s = re.sub(r'[^a-z0-9._-]+', '-', s)
+	s = s.strip('-_.')
+	return s or 'vuln'
 
 
-def _has_command(cmd: List[str]) -> bool:
-    try:
-        exe = shutil.which(cmd[0])
-        return exe is not None
-    except Exception:
-        return False
+def _github_tree_to_raw(base_url: str, filename: str) -> str | None:
+	"""Convert a GitHub tree/blob URL to a raw file URL if possible."""
+	try:
+		m = re.match(r'^https?://github.com/([^/]+)/([^/]+)/(tree|blob)/([^/]+)/(.*)$', base_url.strip())
+		if not m:
+			return None
+		user, repo, _kind, branch, path = m.groups()
+		# Use provided filename under that path
+		path = path.strip('/')
+		file_part = filename.strip('/')
+		raw = f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{path}/{file_part}"
+		return raw
+	except Exception:
+		return None
 
 
-def process_vulnerabilities(selected: List[dict], out_dir: str = "/tmp/vulns") -> List[Tuple[dict, str, bool, str]]:
-    """For each selected vulnerability, if Type is docker or docker-compose,
-    download the relevant container file and execute docker build or docker compose pull.
+def _guess_compose_raw_url(path: str, compose_name: str = 'docker-compose.yml') -> Optional[str]:
+	"""Best-effort: given a catalog Path, try to produce a raw URL to a compose file.
 
-    Returns a list of tuples: (vuln_rec, action_desc, success, artifact_dir)
-    """
-    _ensure_dir(out_dir)
-    results: List[Tuple[dict, str, bool, str]] = []
-    docker_ok = _has_command(["docker", "version"])
-    if not docker_ok:
-        logging.warning("Docker not found in PATH; skipping container actions")
-    for rec in selected:
-        vtype = (rec.get("Type") or "").lower()
-        name = rec.get("Name") or "unknown"
-        base_path = rec.get("Path") or ""
-        safe = _safe_name(f"{name}")
-        base_dir = os.path.join(out_dir, safe)
-        _ensure_dir(base_dir)
-        if vtype == "docker-compose":
-            target_name = "docker-compose.yml"
-            raw = _github_tree_to_raw(base_path, target_name) or (base_path.rstrip("/") + "/" + target_name)
-            action = f"docker compose pull ({name})"
-            ok = False
-            if docker_ok:
-                data = _download_text(raw)
-                if data:
-                    try:
-                        yml_path = os.path.join(base_dir, target_name)
-                        with open(yml_path, "wb") as f:
-                            f.write(data)
-                        # docker compose -f <file> pull
-                        cmd = ["docker", "compose", "-f", yml_path, "pull"]
-                        logging.info("Running: %s", " ".join(cmd))
-                        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                        if proc.returncode == 0:
-                            ok = True
-                        else:
-                            logging.warning("docker compose pull failed for %s: %s", name, proc.stdout[-1000:])
-                    except Exception as e:
-                        logging.warning("Error running docker compose for %s: %s", name, e)
-                else:
-                    logging.warning("Failed to download docker-compose.yml for %s from %s", name, raw)
-            results.append((rec, action, ok, base_dir))
-        else:
-            # Skip plain docker and any non-compose types per new requirement
-            results.append((rec, "skip (non-container)", True, base_dir))
-    return results
+	Supports:
+	- GitHub tree URLs pointing to a directory: append compose_name via raw content endpoint
+	- GitHub blob URLs pointing directly to a .yml/.yaml file
+	- Direct HTTP(S) URLs ending with .yml/.yaml
+	"""
+	try:
+		p = (path or '').strip()
+		if not p:
+			return None
+		# direct raw file
+		if p.lower().endswith(('.yml', '.yaml')):
+			# If it's a github blob URL, convert to raw
+			m = re.match(r'^https?://github.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)$', p)
+			if m:
+				user, repo, branch, rest = m.groups()
+				return f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{rest}"
+			return p
+		# GitHub tree URL to a directory
+		raw = _github_tree_to_raw(p, compose_name)
+		if raw:
+			return raw
+		# Otherwise, append compose_name naively
+		p2 = p.rstrip('/') + '/' + compose_name
+		return p2
+	except Exception:
+		return None
+
+
+def _download_to(path: str, dest_path: str, timeout: float = 30.0) -> bool:
+	"""Download a URL or copy a local file to dest_path. Returns True on success."""
+	try:
+		if not path:
+			return False
+		if re.match(r'^https?://', path, re.IGNORECASE):
+			with urllib.request.urlopen(path, timeout=timeout) as resp:
+				data = resp.read(5_000_000)
+			os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+			with open(dest_path, 'wb') as f:
+				f.write(data)
+			return True
+		# Local file path
+		if os.path.exists(path):
+			os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+			shutil.copy2(path, dest_path)
+			return True
+		return False
+	except Exception:
+		return False
+
+
+def _set_container_name_one_service(compose_obj: dict, container_name: str, prefer_service: Optional[str] = None) -> dict:
+	"""Set container_name on one service in the compose file.
+
+	Preference order:
+	1) Service whose name matches `prefer_service` (case-insensitive substring)
+	2) The first service in the mapping
+
+	Returns the mutated object. If services are missing, no changes are made.
+	"""
+	try:
+		if not isinstance(compose_obj, dict):
+			return compose_obj
+		services = compose_obj.get('services')
+		if not isinstance(services, dict) or not services:
+			return compose_obj
+		target_key: Optional[str] = None
+		if prefer_service:
+			pref = prefer_service.strip().lower()
+			for svc_key in services.keys():
+				if pref in str(svc_key).strip().lower():
+					target_key = svc_key
+					break
+		if target_key is None:
+			target_key = next(iter(services.keys()))
+		svc = services.get(target_key)
+		if isinstance(svc, dict):
+			svc['container_name'] = container_name
+		return compose_obj
+	except Exception:
+		return compose_obj
+
+
+def prepare_compose_for_nodes(selected: List[Dict[str, str]], node_names: List[str], out_base: str = "/tmp/vulns", compose_name: str = 'docker-compose.yml') -> List[str]:
+	"""Prepare per-node docker-compose files for selected docker-compose vulnerabilities.
+
+	Steps:
+	- Identify the first selected item that appears to reference a docker-compose catalog entry
+	- Download its compose file to out_base/<safe_name>/<compose_name> (best-effort)
+	- For each node name, copy to out_base/docker-compose-<node>.yml and set `container_name: <node>` for all services
+
+ 	Returns a list of per-node compose file paths created.
+	"""
+	created: List[str] = []
+	if not selected or not node_names:
+		return created
+
+
+def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out_base: str = "/tmp/vulns", compose_name: str = 'docker-compose.yml') -> List[str]:
+	"""Backward compatible helper used by CLI to build per-node compose files.
+
+	Accepts a mapping of node name -> vulnerability record and produces
+	docker-compose-<node>.yml for each record whose Type is docker-compose.
+	"""
+	created: List[str] = []
+	if not name_to_vuln:
+		return created
+	os.makedirs(out_base, exist_ok=True)
+	cache: Dict[Tuple[str, str], Tuple[Optional[dict], Optional[str]]] = {}
+	for node_name, rec in name_to_vuln.items():
+		vtype = (rec.get('Type') or '').strip().lower()
+		if vtype != 'docker-compose':
+			continue
+		key = ((rec.get('Name') or '').strip(), (rec.get('Path') or '').strip())
+		base_compose_obj: Optional[dict]
+		src_path: Optional[str]
+		if key in cache:
+			base_compose_obj, src_path = cache[key]
+		else:
+			safe = _safe_name(key[0] or 'vuln') or 'vuln'
+			base_dir = os.path.join(out_base, safe)
+			os.makedirs(base_dir, exist_ok=True)
+			raw_url = _guess_compose_raw_url(key[1], compose_name=compose_name)
+			src_path = os.path.join(base_dir, compose_name)
+			ok = False
+			if raw_url:
+				ok = _download_to(raw_url, src_path)
+			if not ok and key[1] and os.path.exists(key[1]):
+				ok = _download_to(key[1], src_path)
+			if not ok:
+				cache[key] = (None, None)
+				continue
+			base_compose_obj = None
+			if yaml is not None:
+				try:
+					with open(src_path, 'r', encoding='utf-8') as f:
+						base_compose_obj = yaml.safe_load(f) or {}
+				except Exception:
+					base_compose_obj = None
+			cache[key] = (base_compose_obj, src_path)
+		out_path = os.path.join(out_base, f"docker-compose-{node_name}.yml")
+		if base_compose_obj is not None and yaml is not None:
+			prefer = key[0]
+			obj = _set_container_name_one_service(dict(base_compose_obj), node_name, prefer_service=prefer)
+			try:
+				with open(out_path, 'w', encoding='utf-8') as f:
+					yaml.safe_dump(obj, f, sort_keys=False)
+				created.append(out_path)
+			except Exception:
+				pass
+		elif src_path and os.path.exists(src_path):
+			try:
+				shutil.copy2(src_path, out_path)
+				try:
+					with open(out_path, 'r', encoding='utf-8', errors='ignore') as f:
+						txt = f.read()
+					if 'container_name:' in txt:
+						import re as _re
+						txt = _re.sub(r'container_name\s*:\s*[^\n]+', f'container_name: {node_name}', txt, count=1)
+					else:
+						txt = txt.rstrip() + f"\n\n# injected container_name\ncontainer_name: {node_name}\n"
+					with open(out_path, 'w', encoding='utf-8') as f2:
+						f2.write(txt)
+				except Exception:
+					pass
+				created.append(out_path)
+			except Exception:
+				pass
+	return created
+    # (Removed leftover code from earlier version of prepare_compose_for_nodes)
+	if not ok and picked.get('Path') and os.path.exists(picked['Path']):
+		ok = _download_to(picked['Path'], compose_src_path)
+	if not ok:
+		return created
+	# Load YAML if available
+	base_compose_obj: Optional[dict] = None
+	if yaml is not None:
+		try:
+			with open(compose_src_path, 'r', encoding='utf-8') as f:
+				base_compose_obj = yaml.safe_load(f) or {}
+		except Exception:
+			base_compose_obj = None
+	# For each node, write customized compose
+	for node in node_names:
+		out_path = os.path.join(out_base, f"docker-compose-{node}.yml")
+		try:
+			if base_compose_obj is not None and yaml is not None:
+				# try to match service by vulnerability Name when possible
+				prefer = (picked.get('Name') or '').strip()
+				obj = _set_container_name_one_service(dict(base_compose_obj), node, prefer_service=prefer)
+				with open(out_path, 'w', encoding='utf-8') as f:
+					yaml.safe_dump(obj, f, sort_keys=False)
+				created.append(out_path)
+			else:
+				# Fallback: copy as-is, and if it already has container_name, naive replace first occurrence
+				shutil.copy2(compose_src_path, out_path)
+				try:
+					txt = ''
+					with open(out_path, 'r', encoding='utf-8', errors='ignore') as f:
+						txt = f.read()
+					if 'container_name:' in txt:
+						txt = re.sub(r'container_name\s*:\s*[^\n]+', f'container_name: {node}', txt, count=1)
+					else:
+						# append at end of file under a note
+						txt = txt.rstrip() + f"\n\n# injected by core_topo_gen: per-node container name\n# NOTE: unable to reliably place within services via fallback path\n# Please adjust manually if needed.\ncontainer_name: {node}\n"
+					with open(out_path, 'w', encoding='utf-8') as f:
+						f.write(txt)
+					created.append(out_path)
+				except Exception:
+					# keep the raw copy even if edit fails
+					created.append(out_path)
+		except Exception:
+			continue
+	return created
+
+
+def process_vulnerabilities(selected: List[Dict[str, str]], out_dir: str) -> List[Tuple[Dict[str, str], str, bool, str]]:
+	"""Process selected vulnerabilities.
+
+	Minimal implementation: create a directory per item and write an info.json.
+	Returns list of tuples: (record, action, ok, directory)
+	"""
+	os.makedirs(out_dir, exist_ok=True)
+	results: List[Tuple[Dict[str, str], str, bool, str]] = []
+	for rec in selected:
+		name = (rec.get('Name') or '').strip() or 'vuln'
+		safe = _safe_name(name)
+		vdir = os.path.join(out_dir, safe)
+		ok = False
+		action = 'write-meta'
+		try:
+			os.makedirs(vdir, exist_ok=True)
+			meta = {
+				'Name': rec.get('Name'),
+				'Path': rec.get('Path'),
+				'Type': rec.get('Type'),
+				'Vector': rec.get('Vector'),
+			}
+			with open(os.path.join(vdir, 'info.json'), 'w', encoding='utf-8') as f:
+				json.dump(meta, f, indent=2)
+			ok = True
+		except Exception:
+			ok = False
+		results.append((rec, action, ok, vdir))
+	return results
+
+
+def start_compose_files(paths: List[str]) -> int:
+	"""Start docker compose stacks for the given file paths on the host.
+
+	Returns the number of successful "up -d" operations.
+	"""
+	ok = 0
+	if not paths:
+		return ok
+	try:
+		import subprocess, shutil as _sh
+		if not _sh.which('docker'):
+			return 0
+		for p in paths:
+			try:
+				if not p or not os.path.exists(p):
+					continue
+				proc = subprocess.run(['docker', 'compose', '-f', p, 'up', '-d'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+				if proc.returncode == 0:
+					ok += 1
+			except Exception:
+				continue
+	except Exception:
+		return ok
+	return ok

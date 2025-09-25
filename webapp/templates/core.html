@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CORE Sessions & Topologies</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+  <style>
+    body { padding-bottom: 0; }
+    .sidebar { max-height: calc(100vh - 140px); overflow:auto; }
+  /* Make actions compact and non-wrapping; shrink filename to keep buttons visible */
+  th.actions-col, td.actions-col { white-space: nowrap; }
+  th.col-check, td.col-check { width: 2rem; text-align: center; }
+  th.filename-col, td.filename-col { width: 100%; }
+  /* removed old console dock */
+  .filename-scroll { max-width: 100%; display:block; overflow-x:auto; overflow-y:hidden; white-space:nowrap; }
+  /* Keep Active Sessions action buttons visible and content fitting half-width */
+  #sessionsTable { table-layout: fixed; }
+  #sessionsTable th, #sessionsTable td { padding: .3rem .35rem; }
+  #sessionsTable th.col-id, #sessionsTable td.col-id { width: 5%; white-space: nowrap; text-align: center; overflow: hidden; text-overflow: ellipsis; }
+  #sessionsTable th.col-state, #sessionsTable td.col-state { width: 5%; white-space: nowrap; text-align: center; }
+  #sessionsTable th.col-nodes, #sessionsTable td.col-nodes { width: 10%; white-space: nowrap; text-align: center; overflow: hidden; text-overflow: ellipsis; }
+  #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 60%; }
+    /* Make action buttons extra compact */
+  .actions-col .btn { padding: .15rem .3rem; line-height: 1; vertical-align: middle; display: inline-flex; align-items: center; justify-content: center; }
+  .actions-col .btn i, .actions-col .btn .bi { font-size: .95em; line-height: 1; display: block; }
+  .actions-col .actions-wrap > a { display: inline-flex; align-items: center; margin-right: 2px; }
+  /* Flatten forms so their buttons align like anchors */
+  .actions-col .actions-wrap > form { display: contents; }
+  .actions-col .actions-wrap > form > .btn { margin-right: 2px; }
+  /* Remove trailing margin on last item */
+  .actions-col .actions-wrap > a:last-child { margin-right: 0; }
+  .actions-col .actions-wrap > form:last-child > .btn { margin-right: 0; }
+    @media (max-width: 1200px) {
+      #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 18%; }
+    }
+    @media (max-width: 992px) {
+      #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 16%; }
+    }
+    @media (max-width: 768px) {
+      #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 14%; }
+    }
+    .nav-link.core-link { font-weight: 600; color: #0d6efd !important; border: 1px solid rgba(13,110,253,.2); border-radius: .25rem; padding-left: .5rem; padding-right: .5rem; }
+    .navbar .nav-link.core-link .bi { margin-right: .25rem; }
+
+    /* removed old console dock */
+  </style>
+</head>
+<body>
+<div class="container-fluid mt-4">
+  <div class="row">
+    <div class="col-12">
+      <div class="d-flex align-items-center justify-content-between bg-primary text-white rounded-top shadow-sm px-3 py-2">
+        <div class="d-flex align-items-center gap-2">
+          <i class="bi bi-diagram-3-fill fs-4"></i>
+          <h3 class="mb-0">CORE Sessions & Topologies</h3>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+          {% if current_user and current_user.role == 'admin' %}
+          <div class="dropdown">
+            <button class="btn btn-sm btn-light dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+              Settings
+            </button>
+            <ul class="dropdown-menu dropdown-menu-end">
+              <li><a class="dropdown-item" href="{{ url_for('users_page') }}">Users</a></li>
+            </ul>
+          </div>
+          {% endif %}
+        </div>
+        <div class="d-flex align-items-center gap-2 small">
+          <label for="refreshInterval" class="form-label mb-0">Every</label>
+          <select id="refreshInterval" class="form-select form-select-sm w-auto" title="Auto-refresh interval">
+            <option value="2000">2s</option>
+            <option value="5000" selected>5s</option>
+            <option value="10000">10s</option>
+            <option value="30000">30s</option>
+            <option value="60000">60s</option>
+          </select>
+          <span id="refreshStatus" class="text-white-50">auto</span>
+          <button class="btn btn-sm btn-light" id="toggleRefreshBtn" type="button">Pause</button>
+        </div>
+      </div>
+      <nav class="navbar navbar-expand bg-light border rounded-bottom shadow-sm mb-3 px-2 py-0">
+        <ul class="navbar-nav me-auto mb-0 small">
+          <li class="nav-item"><a class="nav-link" href="{{ url_for('index') }}">Scenarios</a></li>
+          <li class="nav-item"><a class="nav-link" href="{{ url_for('data_sources_page') }}">Vulnerability Sources</a></li>
+          <li class="nav-item"><a class="nav-link" href="{{ url_for('reports_page') }}">Reports</a></li>
+          <li class="nav-item"><a class="nav-link core-link active" aria-current="page" href="{{ url_for('core_page') }}"><i class="bi bi-diagram-3-fill"></i> CORE</a></li>
+        </ul>
+        <div class="d-flex align-items-center gap-3 small">
+          <div class="text-muted">Daemon: {{ host }}:{{ port }}</div>
+          <form action="{{ url_for('logout') }}" method="post" class="d-inline">
+            <button class="btn btn-sm btn-outline-danger">Logout</button>
+          </form>
+        </div>
+      </nav>
+    </div>
+  </div>
+  <div class="row">
+    <div class="col-6">
+      <div class="card mb-3">
+        <div class="card-header py-2 d-flex justify-content-between align-items-center">
+          <strong class="mb-0">Active Sessions</strong>
+          <div class="d-flex align-items-center gap-2">
+            <input id="sessionsFilter" class="form-control form-control-sm" type="text" placeholder="Filter..." style="width: 12rem;">
+            <button class="btn btn-sm btn-outline-danger" id="sessionsDeleteBtn" type="button" title="Delete Selected" disabled>
+              <i class="bi bi-trash"></i> Selected
+            </button>
+            <small class="text-muted ms-2">via gRPC</small>
+          </div>
+        </div>
+        <div class="table-responsive" style="max-height:60vh; overflow:auto;">
+          <table class="table table-sm align-middle mb-0" id="sessionsTable">
+            <thead class="table-light">
+              <tr>
+                <th class="col-check"><input type="checkbox" id="sessionsCheckAll"></th>
+                <th class="col-id">ID</th>
+                <th class="col-state">State</th>
+                <th class="col-nodes">Nodes</th>
+                <th class="filename-col">File</th>
+                <th class="actions-col">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for s in sessions %}
+              <tr>
+                <td class="col-check"><input type="checkbox" class="row-select" data-type="session" data-id="{{ s.id }}"></td>
+                <td class="col-id">{{ s.id }}</td>
+                <td class="col-state">
+                  {% set _state = (s.state|string)|lower %}
+                  {% if 'run' in _state %}
+                    <i class="bi bi-play-circle-fill text-success" data-bs-toggle="tooltip" title="{{ s.state }}"></i>
+                  {% elif 'shutdown' in _state %}
+                    <i class="bi bi-power text-secondary" data-bs-toggle="tooltip" title="{{ s.state }}"></i>
+                  {% else %}
+                    <i class="bi bi-question-circle text-muted" data-bs-toggle="tooltip" title="{{ s.state }}"></i>
+                  {% endif %}
+                </td>
+                <td class="col-nodes">{{ '-' if s.nodes is none else s.nodes }}</td>
+                <td class="filename-col"><div class="filename-scroll" title="{{ s.file or '' }}">{{ s.file or '' }}</div></td>
+                <td class="actions-col">
+                  <div class="d-flex align-items-center flex-nowrap actions-wrap">
+                    <a class="btn btn-sm btn-outline-info" href="{% if s.file %}{{ url_for('base_details') }}?path={{ s.file | urlencode }}{% else %}{{ url_for('core_details') }}?session_id={{ s.id }}{% endif %}" title="Details"><i class="bi bi-info-circle"></i></a>
+                    {% if 'run' in _state %}
+                    <form action="{{ url_for('core_stop') }}" method="post">
+                      <input type="hidden" name="session_id" value="{{ s.id }}">
+                      <button class="btn btn-sm btn-outline-warning" title="Stop"><i class="bi bi-stop-circle"></i></button>
+                    </form>
+                    {% elif 'shutdown' in _state %}
+                    <form action="{{ url_for('core_start_session') }}" method="post">
+                      <input type="hidden" name="session_id" value="{{ s.id }}">
+                      <button class="btn btn-sm btn-outline-success" title="Start"><i class="bi bi-play-circle"></i></button>
+                    </form>
+                    {% endif %}
+                    <form action="{{ url_for('core_delete') }}" method="post" onsubmit="return confirm('Delete session {{ s.id }}?')">
+                      <input type="hidden" name="session_id" value="{{ s.id }}">
+                      <button class="btn btn-sm btn-outline-danger" title="Delete"><i class="bi bi-trash"></i></button>
+                    </form>
+                    <form action="{{ url_for('core_save_xml') }}" method="post" title="Save XML">
+                      <input type="hidden" name="session_id" value="{{ s.id }}">
+                      <button class="btn btn-sm btn-outline-secondary"><i class="bi bi-download"></i></button>
+                    </form>
+                  </div>
+                </td>
+              </tr>
+              {% endfor %}
+              {% if not sessions %}
+              <tr><td colspan="5" class="text-muted">No active sessions</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  <div class="col-6">
+      <div class="card mb-3">
+        <div class="card-header py-2 d-flex justify-content-between align-items-center">
+          <strong class="mb-0">Available Topologies (XML)</strong>
+          <div class="d-flex gap-2 align-items-center">
+            <input id="xmlsFilter" class="form-control form-control-sm" type="text" placeholder="Filter..." style="width: 12rem;">
+            <button class="btn btn-sm btn-outline-danger" id="xmlsDeleteBtn" type="button" title="Delete Selected" disabled>
+              <i class="bi bi-trash"></i> Selected
+            </button>
+            <form action="{{ url_for('core_upload') }}" method="post" enctype="multipart/form-data" class="d-flex gap-2 align-items-center">
+              <input type="file" class="form-control form-control-sm" name="xml_file" accept=".xml" required>
+              <button class="btn btn-sm btn-primary" type="submit">Upload</button>
+            </form>
+          </div>
+        </div>
+        <div class="table-responsive" style="max-height:60vh; overflow:auto;">
+          <table class="table table-sm align-middle mb-0" id="xmlsTable">
+            <thead class="table-light">
+              <tr>
+                <th class="col-check"><input type="checkbox" id="xmlsCheckAll"></th>
+                <th class="filename-col">File</th>
+                <th>Valid</th>
+                <th class="actions-col">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for x in xmls %}
+              <tr>
+                <td class="col-check"><input type="checkbox" class="row-select" data-type="xml" data-path="{{ x.path }}"></td>
+                <td class="filename-col"><div class="filename-scroll" title="{{ x.path }}">{{ x.name }}</div></td>
+                <td>{% if x.valid %}<span class="badge text-bg-success">yes</span>{% else %}<span class="badge text-bg-danger">no</span>{% endif %}</td>
+                <td class="actions-col">
+                  <a class="btn btn-sm btn-outline-info" href="{{ url_for('base_details') }}?path={{ x.path | urlencode }}" title="Details"><i class="bi bi-info-circle"></i></a>
+                  <form action="{{ url_for('core_start') }}" method="post" class="d-inline">
+                    <input type="hidden" name="path" value="{{ x.path }}">
+                    <button class="btn btn-sm btn-outline-success" title="Start" {% if not x.valid %}disabled{% endif %}><i class="bi bi-play-circle"></i></button>
+                  </form>
+                  <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('download_report') }}?path={{ x.path | urlencode }}" title="Download"><i class="bi bi-download"></i></a>
+                  <form action="{{ url_for('core_delete') }}" method="post" class="d-inline" onsubmit="return confirm('Delete file {{ x.name }}?')">
+                    <input type="hidden" name="path" value="{{ x.path }}">
+                    <button class="btn btn-sm btn-outline-danger" title="Delete"><i class="bi bi-trash"></i></button>
+                  </form>
+                </td>
+              </tr>
+              {% endfor %}
+              {% if not xmls %}
+              <tr><td colspan="5" class="text-muted">No XMLs found in uploads/ or outputs/</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="col-12">
+      <div class="card mb-3">
+        <div class="card-header py-2 d-flex justify-content-between align-items-center">
+          <strong class="mb-0">Docker Compose (per-node)</strong>
+          <div class="d-flex gap-2 align-items-center">
+            <button class="btn btn-sm btn-outline-secondary" id="dockerRefreshBtn" type="button">Refresh</button>
+            <button class="btn btn-sm btn-outline-danger" id="dockerCleanupBtn" type="button">Clean Stale Containers</button>
+          </div>
+        </div>
+        <div class="table-responsive" style="max-height:40vh; overflow:auto;">
+          <table class="table table-sm align-middle mb-0" id="dockerTable">
+            <thead class="table-light">
+              <tr>
+                <th>Name</th>
+                <th>Compose</th>
+                <th>File</th>
+                <th>Images</th>
+                <th>Container</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% include 'partials/dock.html' %}
+<!-- Progress Modal -->
+<div class="modal fade" id="progressModal" tabindex="-1" aria-labelledby="progressModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="progressModalLabel">Processing…</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-2 small text-muted" id="progressStatusText"></div>
+        <div class="progress mb-3" role="progressbar" aria-label="Progress" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-bar" id="progressBar" style="width: 0%">0%</div>
+        </div>
+        <div class="border rounded" style="max-height: 200px; overflow: auto;">
+          <pre class="m-0 p-2 small" id="progressLog"></pre>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+  </div>
+
+<!-- console dock removed -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+(function(){
+  let auto = true;
+  let timer = null;
+  let intervalMs = parseInt(localStorage.getItem('coreRefreshMs') || '5000', 10);
+  const sessionsTable = document.getElementById('sessionsTable');
+  const sessionsTBody = sessionsTable?.querySelector('tbody');
+  const xmlsTable = document.getElementById('xmlsTable');
+  const xmlsTBody = xmlsTable?.querySelector('tbody');
+  const dockerTable = document.getElementById('dockerTable');
+  const dockerTBody = dockerTable?.querySelector('tbody');
+  const sessionsFilterInput = document.getElementById('sessionsFilter');
+  const xmlsFilterInput = document.getElementById('xmlsFilter');
+  const sessionsCheckAll = document.getElementById('sessionsCheckAll');
+  const xmlsCheckAll = document.getElementById('xmlsCheckAll');
+  const sessionsDeleteBtn = document.getElementById('sessionsDeleteBtn');
+  const xmlsDeleteBtn = document.getElementById('xmlsDeleteBtn');
+  let sessionsFilterText = '';
+  let xmlsFilterText = '';
+  const selectedSessions = new Set(); // holds ids (string)
+  const selectedXmlPaths = new Set(); // holds paths (string)
+
+  // Progress modal + console helpers
+  let progressModalInstance = null;
+  function ensureProgressModal(){
+    if(!progressModalInstance){
+      const el = document.getElementById('progressModal');
+      if(el) progressModalInstance = new bootstrap.Modal(el, { backdrop: 'static', keyboard: false });
+    }
+    return progressModalInstance;
+  }
+  function openProgress(title, total){
+    ensureProgressModal();
+    document.getElementById('progressModalLabel').textContent = title || 'Processing…';
+    document.getElementById('progressStatusText').textContent = `0 of ${total}`;
+    const bar = document.getElementById('progressBar');
+    bar.style.width = '0%';
+    bar.textContent = '0%';
+    document.getElementById('progressLog').textContent = '';
+    progressModalInstance?.show();
+  }
+  function updateProgress(done, total, msg){
+    const pct = total > 0 ? Math.round((done/total)*100) : 0;
+    const bar = document.getElementById('progressBar');
+    bar.style.width = pct + '%';
+    bar.textContent = pct + '%';
+    document.getElementById('progressStatusText').textContent = `${done} of ${total}`;
+    if(msg){
+      const line = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+      document.getElementById('progressLog').textContent += line;
+      // No per-page console; shared logs dock persists output
+      try {
+        const ev = new CustomEvent('dock-log', { detail: { level: 'INFO', message: msg } });
+        window.dispatchEvent(ev);
+      } catch(e) {}
+    }
+  }
+  function closeProgress(){ progressModalInstance?.hide(); }
+
+  // Console dock removed; shared logs dock is available via partial include
+
+  function esc(s){ return (s||'').toString().replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+
+  function buildSessionRow(s){
+    const id = esc(s.id);
+    const state = esc(s.state||'');
+    const nodesVal = (s.nodes === null || s.nodes === undefined) ? '-' : String(s.nodes);
+    const nodes = esc(nodesVal);
+    const file = esc(s.file||'');
+    const lower = (s.state||'').toString().toLowerCase();
+    const hasFile = !!s.file;
+    // filtering
+    const rowStr = `${id} ${state} ${nodes} ${file}`.toLowerCase();
+    if (sessionsFilterText && !rowStr.includes(sessionsFilterText)) return '';
+    const detailsHref = hasFile
+      ? (`{{ url_for('base_details') }}?path=` + encodeURIComponent(s.file))
+      : (`{{ url_for('core_details') }}?session_id=` + encodeURIComponent(String(s.id||'')));
+    const stopBtn = `
+      <form action="{{ url_for('core_stop') }}" method="post">
+        <input type="hidden" name="session_id" value="${id}">
+        <button class="btn btn-sm btn-outline-warning" title="Stop"><i class="bi bi-stop-circle"></i></button>
+      </form>`;
+    const startBtn = `
+      <form action="{{ url_for('core_start_session') }}" method="post">
+        <input type="hidden" name="session_id" value="${id}">
+        <button class="btn btn-sm btn-outline-success" title="Start"><i class="bi bi-play-circle"></i></button>
+      </form>`;
+    const stateIcon = (
+      lower.includes('run')
+        ? `<i class="bi bi-play-circle-fill text-success" data-bs-toggle="tooltip" title="${state}"></i>`
+        : (lower.includes('shutdown')
+          ? `<i class="bi bi-power text-secondary" data-bs-toggle="tooltip" title="${state}"></i>`
+          : `<i class="bi bi-question-circle text-muted" data-bs-toggle="tooltip" title="${state}"></i>`)
+    );
+    const actions = `
+      <div class="d-flex align-items-center flex-nowrap actions-wrap">
+        <a class=\"btn btn-sm btn-outline-info\" href=\"${detailsHref}\" title=\"Details\"><i class=\"bi bi-info-circle\"></i></a>
+        ${lower.includes('run') ? stopBtn : (lower.includes('shutdown') ? startBtn : '')}
+        <form action=\"{{ url_for('core_delete') }}\" method=\"post\" onsubmit=\"return confirm('Delete session ${id}?')\">
+          <input type=\"hidden\" name=\"session_id\" value=\"${id}\">
+          <button class=\"btn btn-sm btn-outline-danger\" title=\"Delete\"><i class=\"bi bi-trash\"></i></button>
+        </form>
+        <form action=\"{{ url_for('core_save_xml') }}\" method=\"post\" title=\"Save XML\">
+          <input type=\"hidden\" name=\"session_id\" value=\"${id}\">
+          <button class=\"btn btn-sm btn-outline-secondary\"><i class=\"bi bi-download\"></i></button>
+        </form>
+      </div>`;
+    return `<tr>
+      <td class="col-check"><input type="checkbox" class="row-select" data-type="session" data-id="${id}" ${selectedSessions.has(String(s.id))? 'checked':''}></td>
+      <td class="col-id">${id}</td>
+      <td class="col-state">${stateIcon}</td>
+  <td class="col-nodes">${nodes}</td>
+      <td class="filename-col"><div class="filename-scroll" title="${file}">${file}</div></td>
+      <td class="actions-col">${actions}</td>
+    </tr>`;
+  }
+
+  function buildXmlRow(x){
+    const path = esc(x.path);
+    const name = esc(x.name);
+    const validBadge = x.valid ? '<span class="badge text-bg-success">yes</span>' : '<span class="badge text-bg-danger">no</span>';
+    const detailsHref = `{{ url_for('base_details') }}?path=` + encodeURIComponent(x.path);
+    const startDisabled = x.valid ? '' : 'disabled';
+    // filtering
+    const rowStr = `${name} ${path} ${x.valid? 'yes':'no'}`.toLowerCase();
+    if (xmlsFilterText && !rowStr.includes(xmlsFilterText)) return '';
+    return `<tr>
+      <td class="col-check"><input type="checkbox" class="row-select" data-type="xml" data-path="${path}" ${selectedXmlPaths.has(x.path)? 'checked':''}></td>
+      <td class="filename-col"><div class="filename-scroll" title="${path}">${name}</div></td>
+      <td>${validBadge}</td>
+      <td class="actions-col">
+        <a class="btn btn-sm btn-outline-info" href="${detailsHref}" title="Details"><i class="bi bi-info-circle"></i></a>
+        <form action="{{ url_for('core_start') }}" method="post" class="d-inline">
+          <input type="hidden" name="path" value="${path}">
+          <button class="btn btn-sm btn-outline-success" title="Start" ${startDisabled}><i class="bi bi-play-circle"></i></button>
+        </form>
+  <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('download_report') }}?path=${encodeURIComponent(x.path)}" title="Download"><i class="bi bi-download"></i></a>
+        <form action="{{ url_for('core_delete') }}" method="post" class="d-inline" onsubmit="return confirm('Delete file ${name}?')">
+          <input type="hidden" name="path" value="${path}">
+          <button class="btn btn-sm btn-outline-danger" title="Delete"><i class="bi bi-trash"></i></button>
+        </form>
+      </td>
+    </tr>`;
+  }
+
+  async function refresh(){
+    try{
+  const res = await fetch("{{ url_for('core_data') }}");
+      if(!res.ok) return;
+      const data = await res.json();
+      if(Array.isArray(data.sessions) && sessionsTBody){
+        sessionsTBody.innerHTML = data.sessions.map(buildSessionRow).filter(Boolean).join('\n');
+          // Reinitialize Bootstrap tooltips for new icons
+          try { const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]')); tooltipTriggerList.forEach(el => new bootstrap.Tooltip(el)); } catch(e) {}
+        bindSelectionHandlers('session');
+      }
+      if(Array.isArray(data.xmls) && xmlsTBody){
+        xmlsTBody.innerHTML = data.xmls.map(buildXmlRow).filter(Boolean).join('\n');
+        bindSelectionHandlers('xml');
+      }
+      // Refresh docker status panel too
+      await refreshDocker();
+    }catch(e){ /* ignore transient */ }
+  }
+
+  function schedule(){
+    if(timer) clearTimeout(timer);
+    if(!auto) return;
+    timer = setTimeout(async ()=>{ await refresh(); schedule(); }, intervalMs);
+  }
+
+  document.getElementById('toggleRefreshBtn')?.addEventListener('click', ()=>{
+    auto = !auto;
+    document.getElementById('toggleRefreshBtn').textContent = auto ? 'Pause' : 'Resume';
+    document.getElementById('refreshStatus').textContent = auto ? 'auto' : 'paused';
+    schedule();
+  });
+
+  const sel = document.getElementById('refreshInterval');
+  if (sel) {
+    // Initialize selection from stored value
+    if ([2000,5000,10000,30000,60000].includes(intervalMs)) {
+      sel.value = String(intervalMs);
+    }
+    sel.addEventListener('change', ()=>{
+      const v = parseInt(sel.value, 10);
+      if (!isNaN(v) && v > 0) {
+        intervalMs = v;
+        localStorage.setItem('coreRefreshMs', String(intervalMs));
+        schedule();
+      }
+    });
+  }
+
+  schedule();
+  // Bind selection handlers immediately for server-rendered rows (before first async refresh)
+  try { bindSelectionHandlers('session'); } catch(e) {}
+  try { bindSelectionHandlers('xml'); } catch(e) {}
+  // Docker status helpers
+  function badge(ok, yes, no){ return ok ? `<span class="badge text-bg-success">${yes}</span>` : `<span class="badge text-bg-secondary">${no}</span>`; }
+  function badgeWarn(ok, yes, no){ return ok ? `<span class="badge text-bg-success">${yes}</span>` : `<span class="badge text-bg-danger">${no}</span>`; }
+  async function refreshDocker(){
+    if(!dockerTBody) return;
+    try{
+      const res = await fetch("/docker/status");
+      if(!res.ok) return;
+      const js = await res.json();
+      const rows = (js.items||[]).map(it=>{
+        const file = badge(!!it.exists, 'yes', 'no');
+        const pulled = badge(!!it.pulled, 'yes', 'no');
+        const cont = it.container_exists ? badgeWarn(!!it.running, 'running', 'stopped') : '<span class="badge text-bg-secondary">none</span>';
+        const name = (it.name||'');
+        const comp = (it.compose||'');
+        return `<tr>
+          <td>${name}</td>
+          <td><div class="filename-scroll" title="${comp}">${comp}</div></td>
+          <td>${file}</td>
+          <td>${pulled}</td>
+          <td>${cont}</td>
+        </tr>`;
+      });
+      dockerTBody.innerHTML = rows.join('\n');
+    }catch(e){ /* ignore */ }
+  }
+  document.getElementById('dockerRefreshBtn')?.addEventListener('click', refreshDocker);
+  document.getElementById('dockerCleanupBtn')?.addEventListener('click', async ()=>{
+    if(!confirm('Stop and remove containers for all assigned docker nodes?')) return;
+    openProgress('Cleaning stale containers…', 1);
+    try{
+      const res = await fetch('/docker/cleanup', { method:'POST' });
+      if(res.ok){ updateProgress(1,1,'Cleanup done'); await refreshDocker(); }
+      else { updateProgress(0,1,'Cleanup failed'); }
+    }catch(e){ updateProgress(0,1,'Cleanup failed'); }
+    finally{ closeProgress(); }
+  });
+
+  // Filtering
+  sessionsFilterInput?.addEventListener('input', ()=>{
+    sessionsFilterText = sessionsFilterInput.value.trim().toLowerCase();
+    refresh();
+  });
+  xmlsFilterInput?.addEventListener('input', ()=>{
+    xmlsFilterText = xmlsFilterInput.value.trim().toLowerCase();
+    refresh();
+  });
+
+  // Selection / bulk delete
+  function bindSelectionHandlers(type){
+    const table = type==='session' ? sessionsTable : xmlsTable;
+    const checkAll = type==='session' ? sessionsCheckAll : xmlsCheckAll;
+    const deleteBtn = type==='session' ? sessionsDeleteBtn : xmlsDeleteBtn;
+    if (!table) return;
+    const checkboxes = table.querySelectorAll('tbody input.row-select');
+    const updateSetsFromDom = ()=>{
+      if(!checkboxes || checkboxes.length===0){
+        if(checkAll){
+          checkAll.indeterminate = false;
+          checkAll.checked = false;
+          checkAll.disabled = true;
+        }
+        if(deleteBtn) deleteBtn.disabled = true;
+        return;
+      }
+      if(type==='session'){
+        checkboxes.forEach(cb=>{
+          const id = cb.getAttribute('data-id');
+          if(!id) return;
+          if(cb.checked) selectedSessions.add(id); else selectedSessions.delete(id);
+        });
+      } else {
+        checkboxes.forEach(cb=>{
+          const p = cb.getAttribute('data-path');
+          if(!p) return;
+          if(cb.checked) selectedXmlPaths.add(p); else selectedXmlPaths.delete(p);
+        });
+      }
+      const anyChecked = (type==='session') ? (selectedSessions.size>0) : (selectedXmlPaths.size>0);
+      if(deleteBtn){ deleteBtn.disabled = !anyChecked; }
+      // update select-all state
+      const total = checkboxes.length;
+      const checkedCount = Array.from(checkboxes).filter(cb=>cb.checked).length;
+      if(checkAll){
+        if(total === 0){
+          checkAll.indeterminate = false;
+          checkAll.checked = false;
+          checkAll.disabled = true;
+        } else {
+          checkAll.disabled = false;
+          checkAll.indeterminate = checkedCount>0 && checkedCount<total;
+          checkAll.checked = checkedCount===total;
+        }
+      }
+    };
+    checkboxes.forEach(cb=> cb.addEventListener('change', updateSetsFromDom));
+    // initialize states and apply saved selections
+    checkboxes.forEach(cb=>{
+      if(type==='session'){
+        const id = cb.getAttribute('data-id');
+        if(id && selectedSessions.has(id)) cb.checked = true;
+      } else {
+        const p = cb.getAttribute('data-path');
+        if(p && selectedXmlPaths.has(p)) cb.checked = true;
+      }
+    });
+    updateSetsFromDom();
+    if(checkAll){
+      // Robust tri-state behavior for header checkbox:
+      // - Click always toggles between (all selected) and (none selected)
+      // - Indeterminate counts as 'not all selected' and clicking selects all
+      checkAll.onchange = null; // prevent native auto toggling conflicts
+      checkAll.onclick = (e)=>{
+        if(checkAll.disabled) return; // safety
+        // Re-evaluate current row selection (DOM may have changed since bind)
+        const rows = table.querySelectorAll('tbody input.row-select');
+        const allSelected = Array.from(rows).length>0 && Array.from(rows).every(cb=>cb.checked);
+        const target = !allSelected; // if all selected -> unselect all; else select all
+        rows.forEach(cb=>{ cb.checked = target; });
+        updateSetsFromDom(); // will recompute tri-state
+      };
+    }
+  }
+
+  async function postForm(url, formData){
+    const res = await fetch(url, { method: 'POST', body: formData });
+    return res.ok;
+  }
+
+  sessionsDeleteBtn?.addEventListener('click', async ()=>{
+    const ids = Array.from(selectedSessions);
+    if(ids.length===0) return;
+    if(!confirm(`Delete ${ids.length} selected session(s)?`)) return;
+  openProgress(`Deleting ${ids.length} session(s)…`, ids.length);
+    let done = 0;
+    for(const id of ids){
+      const fd = new FormData();
+      fd.append('session_id', id);
+      const ok = await postForm("{{ url_for('core_delete') }}", fd);
+      if(ok){
+        selectedSessions.delete(id);
+        updateProgress(++done, ids.length, `Deleted session ${id}`);
+      } else {
+        updateProgress(done, ids.length, `Failed to delete session ${id}`);
+      }
+    }
+    closeProgress();
+    refresh();
+  });
+
+  xmlsDeleteBtn?.addEventListener('click', async ()=>{
+    const paths = Array.from(selectedXmlPaths);
+    if(paths.length===0) return;
+    if(!confirm(`Delete ${paths.length} selected file(s)?`)) return;
+  openProgress(`Deleting ${paths.length} file(s)…`, paths.length);
+    let done = 0;
+    for(const path of paths){
+      const fd = new FormData();
+      fd.append('path', path);
+      const ok = await postForm("{{ url_for('core_delete') }}", fd);
+      if(ok){
+        selectedXmlPaths.delete(path);
+        updateProgress(++done, paths.length, `Deleted ${path}`);
+      } else {
+        updateProgress(done, paths.length, `Failed to delete ${path}`);
+      }
+    }
+    closeProgress();
+    refresh();
+  });
+
+  // Intercept per-row Start/Stop/Save XML submissions to show progress + logs
+  const PATHS = {
+    stop: "{{ url_for('core_stop') }}",
+    startSession: "{{ url_for('core_start_session') }}",
+    startXml: "{{ url_for('core_start') }}",
+    saveXml: "{{ url_for('core_save_xml') }}",
+  };
+  function actionPathname(url){ try { return new URL(url, window.location.href).pathname; } catch(e){ return url; } }
+  function filenameFromContentDisposition(header){
+    if(!header) return null;
+    // Simple parse for filename="..."; handle RFC5987 if present
+    const match = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(header);
+    if(match){
+      const val = match[1] || match[2];
+      try { return decodeURIComponent(val); } catch { return val; }
+    }
+    return null;
+  }
+  function downloadBlob(blob, filename){
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'download.bin';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 0);
+  }
+  document.addEventListener('submit', async (ev)=>{
+    const form = ev.target;
+    if(!(form instanceof HTMLFormElement)) return;
+    const p = actionPathname(form.action);
+    const targets = [PATHS.stop, PATHS.startSession, PATHS.startXml, PATHS.saveXml];
+    if(!targets.includes(p)) return; // let other forms behave normally
+    ev.preventDefault();
+    const fd = new FormData(form);
+    let title = 'Processing…';
+    if(p === PATHS.stop){
+      const id = fd.get('session_id');
+      title = `Stopping session ${id}…`;
+    } else if(p === PATHS.startSession){
+      const id = fd.get('session_id');
+      title = `Starting session ${id}…`;
+    } else if(p === PATHS.saveXml){
+      const id = fd.get('session_id');
+      title = `Saving XML for session ${id}…`;
+    } else if(p === PATHS.startXml){
+      const path = fd.get('path');
+      title = `Starting topology from ${path}…`;
+    }
+  openProgress(title, 1);
+    try{
+      if(p === PATHS.saveXml){
+        const res = await fetch(p, { method: 'POST', body: fd });
+        if(res.ok){
+          const blob = await res.blob();
+          const cd = res.headers.get('Content-Disposition');
+          const fname = filenameFromContentDisposition(cd) || `session-${fd.get('session_id')||'export'}.xml`;
+          downloadBlob(blob, fname);
+          updateProgress(1, 1, title.replace('…','') + ' done');
+        } else {
+          updateProgress(0, 1, title.replace('…','') + ' failed');
+        }
+      } else {
+        const ok = await postForm(p, fd);
+        if(ok){
+          updateProgress(1, 1, title.replace('…','') + ' done');
+        } else {
+          updateProgress(0, 1, title.replace('…','') + ' failed');
+        }
+      }
+    } catch(e){
+      updateProgress(0, 1, title.replace('…','') + ' failed');
+    } finally {
+      closeProgress();
+      refresh();
+    }
+  });
+})();
+</script>
+</body>
+</html>

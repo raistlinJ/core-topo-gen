@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  XSD schema for CORE TopoGen Scenarios XML (application-level scenario editor format).
+  This describes the structure produced/consumed by webapp/app_backend.py
+  (_build_scenarios_xml / _parse_scenarios_xml).
+
+  Notes:
+  - XML is intentionally namespace-less.
+  - Some attributes are section- or mode-specific (e.g., Traffic, Events, Vulnerabilities),
+    but are modeled as optional attributes on <item> for practical validation under XSD 1.0.
+  - Semantic constraints (e.g., only section name="Notes" contains <notes>, density in [0,1])
+    are captured where feasible via simple restrictions; deeper cross-attribute conditions are
+    documented but not enforced here.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           elementFormDefault="unqualified"
+           attributeFormDefault="unqualified">
+
+  <!-- Common simple types -->
+  <xs:simpleType name="DensityType">
+    <xs:restriction base="xs:decimal">
+      <xs:minInclusive value="0"/>
+      <xs:maxInclusive value="1"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="FactorType">
+    <xs:restriction base="xs:decimal">
+      <xs:minInclusive value="0"/>
+      <xs:maxInclusive value="1"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="NonNegativeDecimal">
+    <xs:restriction base="xs:decimal">
+      <xs:minInclusive value="0"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="PercentageDecimal">
+    <xs:restriction base="xs:decimal">
+      <xs:minInclusive value="0"/>
+      <xs:maxInclusive value="100"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="SectionName">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Node Information"/>
+      <xs:enumeration value="Routing"/>
+      <xs:enumeration value="Services"/>
+      <xs:enumeration value="Traffic"/>
+      <xs:enumeration value="Events"/>
+      <xs:enumeration value="Vulnerabilities"/>
+      <xs:enumeration value="Segmentation"/>
+      <xs:enumeration value="Notes"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="MetricType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Weight"/>
+      <xs:enumeration value="Count"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="TrafficPattern">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="continuous"/>
+      <xs:enumeration value="periodic"/>
+      <xs:enumeration value="burst"/>
+      <xs:enumeration value="poisson"/>
+      <xs:enumeration value="ramp"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <!-- Item element used within sections. Optional attributes are used so one type
+       can serve all sections in XSD 1.0. -->
+  <xs:complexType name="ItemType">
+    <xs:annotation>
+      <xs:documentation>
+        Generic item row. Attribute applicability:
+        - All sections: selected, factor, v_metric, v_count
+        - Events: script_path
+        - Traffic: pattern, rate_kbps, period_s, jitter_pct
+        - Vulnerabilities (selected == "Type/Vector"): v_type, v_vector
+        - Vulnerabilities (selected == "Specific"): v_name, v_path, v_count
+      </xs:documentation>
+    </xs:annotation>
+    <xs:attribute name="selected" type="xs:string" use="optional"/>
+    <xs:attribute name="factor" type="FactorType" use="optional"/>
+    <xs:attribute name="v_metric" type="MetricType" use="optional"/>
+    <xs:attribute name="v_count" type="xs:integer" use="optional"/>
+    <!-- Events -->
+    <xs:attribute name="script_path" type="xs:string" use="optional"/>
+    <!-- Traffic -->
+    <xs:attribute name="pattern" type="TrafficPattern" use="optional"/>
+    <xs:attribute name="rate_kbps" type="NonNegativeDecimal" use="optional"/>
+    <xs:attribute name="period_s" type="NonNegativeDecimal" use="optional"/>
+    <xs:attribute name="jitter_pct" type="PercentageDecimal" use="optional"/>
+    <!-- Vulnerabilities -->
+    <xs:attribute name="v_type" type="xs:string" use="optional"/>
+    <xs:attribute name="v_vector" type="xs:string" use="optional"/>
+    <xs:attribute name="v_name" type="xs:string" use="optional"/>
+    <xs:attribute name="v_path" type="xs:string" use="optional"/>
+  </xs:complexType>
+
+  <xs:complexType name="SectionType">
+    <xs:choice>
+      <!-- Notes-only content -->
+      <xs:element name="notes" type="xs:string" minOccurs="0" maxOccurs="1"/>
+      <!-- Common sections content: zero or more items -->
+      <xs:element name="item" type="ItemType" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:choice>
+    <xs:attribute name="name" type="SectionName" use="required"/>
+    <!-- Only one of the following typically applies depending on section name; left optional for XSD 1.0. -->
+    <xs:attribute name="total_nodes" type="xs:nonNegativeInteger" use="optional"/>
+    <xs:attribute name="density" type="DensityType" use="optional"/>
+  </xs:complexType>
+
+  <xs:complexType name="ScenarioEditorType">
+    <xs:sequence>
+      <xs:element name="BaseScenario" type="BaseScenarioType"/>
+      <xs:element name="section" type="SectionType" minOccurs="0" maxOccurs="unbounded"/>
+    </xs:sequence>
+  </xs:complexType>
+
+  <xs:complexType name="BaseScenarioType">
+    <xs:attribute name="filepath" type="xs:string" use="optional"/>
+  </xs:complexType>
+
+  <xs:complexType name="ScenarioType">
+    <xs:sequence>
+      <xs:element name="ScenarioEditor" type="ScenarioEditorType"/>
+    </xs:sequence>
+    <xs:attribute name="name" type="xs:string" use="required"/>
+  </xs:complexType>
+
+  <!-- Root -->
+  <xs:element name="Scenarios">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="Scenario" type="ScenarioType" minOccurs="1" maxOccurs="unbounded"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+
+  <!-- Also support single top-level ScenarioEditor documents by defining an element.
+       Parser supports both <Scenarios> and a lone <ScenarioEditor> at root. -->
+  <xs:element name="ScenarioEditor" type="ScenarioEditorType"/>
+
+</xs:schema>

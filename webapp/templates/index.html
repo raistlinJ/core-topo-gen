@@ -16,8 +16,16 @@
         .dock-panel pre { height:auto; min-height:100%; overflow:auto; }
         #xmlPre, #logsPre { max-height:none; }
         .dock-toggle-btn { position: fixed; right: 12px; bottom: 12px; z-index: 1040; }
+        .pulse-change { animation: pulseHighlight .9s ease-in-out; }
+        @keyframes pulseHighlight { 0% { box-shadow:0 0 0 0 rgba(13,110,253,.7); transform:scale(1);} 40% { box-shadow:0 0 0 6px rgba(13,110,253,.0); transform:scale(1.03);} 100% { box-shadow:0 0 0 0 rgba(13,110,253,0); transform:scale(1); } }
+        .popover { max-width: 420px; }
+        .host-total-badge + .badge, .host-total-badge + button { margin-left: .25rem; }
     </style>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+    <style>
+        .nav-link.core-link { font-weight: 600; color: #0d6efd !important; border: 1px solid rgba(13,110,253,.2); border-radius: .25rem; padding-left: .5rem; padding-right: .5rem; }
+        .navbar .nav-link.core-link .bi { margin-right: .25rem; }
+    </style>
 </head>
 <body>
 <div class="container-fluid mt-4">
@@ -35,10 +43,31 @@
                     <li class="nav-item"><a class="nav-link active" aria-current="page" href="{{ url_for('index') }}">Scenarios</a></li>
                     <li class="nav-item"><a class="nav-link" href="{{ url_for('data_sources_page') }}">Vulnerability Sources</a></li>
                     <li class="nav-item"><a class="nav-link" href="{{ url_for('reports_page') }}">Reports</a></li>
+                    <li class="nav-item"><a class="nav-link core-link" href="{{ url_for('core_page') }}"><i class="bi bi-diagram-3-fill"></i> CORE</a></li>
                 </ul>
+                <div class="d-flex align-items-center ms-auto gap-3">
+                    {% if current_user and current_user.role == 'admin' %}
+                    <div class="dropdown">
+                        <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">Settings</button>
+                        <ul class="dropdown-menu dropdown-menu-end">
+                            <li><a class="dropdown-item" href="{{ url_for('users_page') }}">Users</a></li>
+                        </ul>
+                    </div>
+                    {% endif %}
+                    {% if current_user %}
+                        <span class="text-muted small">{{ current_user.username }}</span>
+                        <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('me_password') }}">Change Password</a>
+                        <form action="{{ url_for('logout') }}" method="post" class="d-inline">
+                            <button class="btn btn-sm btn-outline-danger">Logout</button>
+                        </form>
+                    {% else %}
+                        <a class="btn btn-sm btn-primary" href="{{ url_for('login') }}">Login</a>
+                    {% endif %}
+                </div>
             </nav>
         </div>
     </div>
+                <!-- Removed Planning Semantics informational banner per request -->
     <div class="row">
             <div class="col-md-3 mb-3">
                 <div class="card shadow-sm h-100 d-flex flex-column">
@@ -79,7 +108,7 @@
                                         <span class="badge text-bg-danger">INVALID</span>
                                     {% endif %}
                                     <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('base_details') }}?path={{ payload.base_upload.path | urlencode }}" target="_blank">Details</a>
-                                    <form action="{{ url_for('remove_base') }}" method="post" class="d-inline" onsubmit="document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });">
+                                    <form action="{{ url_for('remove_base') }}" method="post" class="d-inline" onsubmit="saveScrollBeforeNav(); document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });">
                                         <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
                                     </form>
                                 {% endif %}
@@ -93,7 +122,7 @@
                                 <input class="form-control" id="baseFileInput" readonly>
                                 <div class="form-text">Shows the uploaded file name; full path is stored internally.</div>
                             </div>
-                            <form class="d-flex gap-2" action="{{ url_for('upload_base') }}" method="post" enctype="multipart/form-data">
+                            <form class="d-flex gap-2" action="{{ url_for('upload_base') }}" method="post" enctype="multipart/form-data" onsubmit="saveScrollBeforeNav()">
                                 <input type="file" class="form-control" name="base_xml" accept=".xml" required>
                                 <button type="submit" class="btn btn-primary">{% if payload.base_upload %}Update{% else %}Upload{% endif %}</button>
                             </form>
@@ -108,6 +137,7 @@
                         <div id="editorRoot"></div>
                         <div class="d-flex gap-2 mt-3">
                             <button type="submit" class="btn btn-success">Save XML</button>
+                            <button type="button" class="btn btn-outline-info" id="downloadXmlBtn" disabled title="Save XML first">Download XML</button>
                         </div>
                     </form>
 
@@ -129,7 +159,7 @@
 
                     
 
-                    <form class="d-flex gap-2 mt-3 align-items-center" action="{{ url_for('run_cli') }}" method="post" onsubmit="return prepareRunCli()">
+                    <form class="d-flex gap-2 mt-3 align-items-center" action="{{ url_for('run_cli') }}" method="post" onsubmit="return runSyncWithModal(event)">
                         <button class="btn btn-secondary" type="button" id="testCoreBtn">Test CORE Connection</button>
                         <span id="coreStatus" class="small text-muted">Not tested</span>
                         <input type="hidden" name="xml_path" id="xml_path">
@@ -139,7 +169,7 @@
                         <span class="d-inline-block" tabindex="0" id="runAsyncWrap" data-bs-toggle="tooltip" data-bs-title="Test CORE connection first">
                             <button class="btn btn-outline-warning pe-none" type="button" id="runAsyncBtn" onclick="runAsync()" disabled>Run Async</button>
                         </span>
-                        <a class="btn btn-outline-info pe-none" id="reportsBtn" href="{{ url_for('reports_page') }}" disabled>Reports</a>
+                        
                         <button class="btn btn-outline-danger d-none" type="button" id="cancelRunBtn" onclick="cancelRun()">Cancel</button>
                     </form>
                 </div>
@@ -148,6 +178,32 @@
         </div>
     </div>
 </div>
+<!-- Run Progress Modal -->
+<div class="modal fade" id="runProgressModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Running CLI…</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="d-flex justify-content-between align-items-center mb-2 small text-muted">
+                    <div id="runProgressStatus">Starting…</div>
+                    <div id="runProgressMeta"></div>
+                </div>
+                <div class="progress mb-3" role="progressbar" aria-label="Progress" aria-valuemin="0" aria-valuemax="100">
+                    <div class="progress-bar progress-bar-striped progress-bar-animated" id="runProgressBar" style="width: 100%">Working…</div>
+                </div>
+                <div class="border rounded" style="max-height: 260px; overflow: auto;">
+                    <pre class="m-0 p-2 small" id="runProgressLog" style="white-space: pre-wrap;"></pre>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" id="runProgressHideBtn" data-bs-dismiss="modal">Hide</button>
+            </div>
+        </div>
+    </div>
+    </div>
 <div class="dock-panel" id="dockPanel">
     <div class="dock-grip" id="dockGrip" title="Drag to resize"></div>
     <ul class="nav nav-tabs px-3 pt-2 align-items-center" role="tablist">
@@ -163,6 +219,7 @@
                     <option value="WARN">WARN</option>
                     <option value="ERROR">ERROR</option>
                 </select>
+                <button class="btn btn-sm btn-outline-danger ms-2" id="clearLogsBtn" type="button" title="Clear log buffer">Clear</button>
             </div>
         </li>
         <li class="nav-item" role="presentation">
@@ -193,6 +250,22 @@ window.VULN_CATALOG = window.VULN_CATALOG || { types: [], vectors: [], items: []
 const LOG_LEVELS = { DEBUG: 10, INFO: 20, WARN: 30, ERROR: 40 };
 let currentLogLevel = LOG_LEVELS.INFO; // default threshold
 let logBuffer = [];
+const LOG_STORE_KEY = 'coretg_logs_v1';
+const LOG_MAX = 5000;
+let __LOGS_RESTORED = false;
+function restoreLogsFromStorageOnce(){
+    if(__LOGS_RESTORED) return;
+    try {
+        const raw = localStorage.getItem(LOG_STORE_KEY);
+        if (raw) {
+            const arr = JSON.parse(raw);
+            if (Array.isArray(arr)) {
+                logBuffer = arr.map(x => ({ level: x.level||'INFO', levelValue: x.levelValue||LOG_LEVELS[x.level||'INFO']||20, line: x.line||'' }));
+            }
+        }
+    } catch(e){}
+    __LOGS_RESTORED = true;
+}
 function renderLogs() {
     const logsPre = document.getElementById('logsPre');
     if (!logsPre) return;
@@ -208,6 +281,8 @@ function logLine(level, msg) {
     const lvlVal = LOG_LEVELS[level] ?? LOG_LEVELS.INFO;
     const line = `[${ts}] ${level.padEnd(5)} ${msg}`;
     logBuffer.push({ level, levelValue: lvlVal, line });
+    if (logBuffer.length > LOG_MAX) { logBuffer.splice(0, logBuffer.length - LOG_MAX); }
+    try { localStorage.setItem(LOG_STORE_KEY, JSON.stringify(logBuffer)); } catch(e){}
     if (lvlVal >= currentLogLevel) {
         const logsPre = document.getElementById('logsPre');
         if (logsPre) {
@@ -220,18 +295,30 @@ function logDebug(m){ logLine('DEBUG', m); }
 function logInfo(m){ logLine('INFO', m); }
 function logWarn(m){ logLine('WARN', m); }
 function logError(m){ logLine('ERROR', m); }
-
+// Restore any previously persisted logs before emitting any new entries
+restoreLogsFromStorageOnce();
+// Optional: log UI initialization after restore
 logInfo('UI initialized');
 try {
     initialPayload = JSON.parse(payloadDataEl?.textContent || 'null');
 } catch (e) {
     initialPayload = null;
 }
+// If server provides a fresh result_path (e.g., after Save XML), reflect it in localStorage early
+try {
+    if (initialPayload && initialPayload.result_path) {
+        const persisted = JSON.parse(localStorage.getItem('coretg_editor_state') || 'null') || {};
+        persisted.result_path = initialPayload.result_path;
+        if (initialPayload.core) persisted.core = initialPayload.core;
+        localStorage.setItem('coretg_editor_state', JSON.stringify(persisted));
+    }
+} catch(e){}
 
 function defaultScenario(name) {
     return {
         name: name || `Scenario ${document.querySelectorAll('.scenario-card').length + 1}`,
         base: { filepath: '' },
+        density_count: 10,
         sections: {
             // Default: one Count-based row; weight-based nodes/density start at 0
             'Node Information': { total_nodes: 0, density: 0, items: [ { selected: 'Random', factor: 1.0, v_metric: 'Count', v_count: 1 } ] },
@@ -246,12 +333,50 @@ function defaultScenario(name) {
     };
 }
 
+// Restore persisted editor state (scenarios and last saved xml) and active index from localStorage
+let persistedState = null;
+try { persistedState = JSON.parse(localStorage.getItem('coretg_editor_state') || 'null'); } catch(e){ persistedState = null; }
+let persistedActiveIdx = 0;
+try { const v = parseInt(localStorage.getItem('coretg_active_idx')||'0',10); if(!isNaN(v)) persistedActiveIdx = v; } catch(e){}
+// Base state is from server payload or default
 let state = initialPayload ?? { scenarios: [ defaultScenario('Scenario 1') ], result_path: null };
-let activeIdx = 0;
+// If server provided a concrete result_path (save/load/run), prefer server scenarios; else, restore from localStorage if available
+const serverHasResult = !!(initialPayload && initialPayload.result_path);
+if (!serverHasResult && persistedState && Array.isArray(persistedState.scenarios) && persistedState.scenarios.length) {
+    state.scenarios = persistedState.scenarios;
+    if (persistedState.result_path) state.result_path = persistedState.result_path;
+}
+// Core settings: prefer server-provided if present; otherwise restore from persisted
+if (persistedState && !initialPayload?.core && persistedState.core) {
+    state.core = persistedState.core;
+}
+if (persistedState) {
+    if (persistedState.core_ok !== undefined) state.core_ok = persistedState.core_ok;
+    if (persistedState.core_tested_host !== undefined) state.core_tested_host = persistedState.core_tested_host;
+    if (persistedState.core_tested_port !== undefined) state.core_tested_port = persistedState.core_tested_port;
+}
+let activeIdx = Math.min(Math.max(0, persistedActiveIdx), (state.scenarios.length||1)-1);
+
+function persistEditorState(){
+    try {
+        localStorage.setItem('coretg_editor_state', JSON.stringify({
+            scenarios: state.scenarios,
+            result_path: state.result_path || null,
+            core: state.core || null,
+            core_ok: !!state.core_ok,
+            core_tested_host: state.core_tested_host || null,
+            core_tested_port: state.core_tested_port || null
+        }));
+        localStorage.setItem('coretg_active_idx', String(activeIdx||0));
+    } catch(e){}
+}
+// Persist initial merged state so it survives cross-page navigation immediately
+persistEditorState();
 
 const dropdownsBySection = {
     'Node Information': ['Server','Workstation','PC','Random'],
-    'Routing': ['RIP','RIPv2','BGP','OSPFv2','OSPFv3'],
+    // Added 'Random' entry so user can explicitly request a random routing protocol.
+    'Routing': ['RIP','RIPv2','BGP','OSPFv2','OSPFv3','Random'],
     'Services': ['SSH','HTTP','DHCPClient','Random'],
     'Traffic': ['Random','TCP','UDP','CUSTOM'],
     'Events': ['Script Path'],
@@ -263,7 +388,13 @@ function render() {
     renderSidebar();
     renderMain();
     // Download link visibility if provided
-        // no download button; export is available in the left panel
+    // Enable/disable Download XML button based on saved xml path
+    const dlBtn = document.getElementById('downloadXmlBtn');
+    if (dlBtn) {
+        const rp = state.result_path || '';
+        if (rp && rp.endsWith('.xml')) { dlBtn.removeAttribute('disabled'); dlBtn.classList.remove('pe-none'); dlBtn.setAttribute('title',''); }
+        else { dlBtn.setAttribute('disabled','disabled'); dlBtn.classList.add('pe-none'); dlBtn.setAttribute('title','Save XML first'); }
+    }
     // Sync Base Scenario File input with active scenario
     const baseIn = document.getElementById('baseFileInput');
     if (baseIn && state.scenarios.length) {
@@ -282,7 +413,7 @@ function renderSidebar() {
     a.href = '#';
     a.className = 'list-group-item list-group-item-action' + (idx === activeIdx ? ' active bg-primary text-white' : '');
         a.textContent = scen.name || `Scenario ${idx+1}`;
-    a.onclick = (e) => { e.preventDefault(); activeIdx = idx; render(); };
+    a.onclick = (e) => { e.preventDefault(); activeIdx = idx; persistEditorState(); render(); };
         list.appendChild(a);
     });
             const appendScenarioBtn = document.getElementById('appendScenarioBtn');
@@ -290,9 +421,9 @@ function renderSidebar() {
             const exportBtn = document.getElementById('exportBtn');
         const hiddenLoadInput = document.getElementById('hiddenLoadInput');
         const hiddenLoadForm = document.getElementById('hiddenLoadForm');
-            if (appendScenarioBtn) appendScenarioBtn.onclick = (e) => { e.preventDefault(); logInfo('New scenario created'); state.scenarios.push(defaultScenario()); activeIdx = state.scenarios.length - 1; render(); };
+            if (appendScenarioBtn) appendScenarioBtn.onclick = (e) => { e.preventDefault(); logInfo('New scenario created'); state.scenarios.push(defaultScenario()); activeIdx = state.scenarios.length - 1; persistEditorState(); render(); };
             if (importBtn) importBtn.onclick = (e) => { e.preventDefault(); logInfo('Import scenarios clicked'); hiddenLoadInput.click(); };
-        if (hiddenLoadInput) hiddenLoadInput.onchange = () => { if (hiddenLoadInput.files && hiddenLoadInput.files.length > 0) hiddenLoadForm.submit(); };
+    if (hiddenLoadInput) hiddenLoadInput.onchange = () => { if (hiddenLoadInput.files && hiddenLoadInput.files.length > 0) { saveScrollBeforeNav(); hiddenLoadForm.submit(); } };
             if (exportBtn) exportBtn.onclick = (e) => {
                 e.preventDefault();
                 logInfo('Export clicked');
@@ -311,20 +442,116 @@ function renderMain() {
     root.innerHTML = '';
     if (!state.scenarios.length) { return; }
     const scen = state.scenarios[activeIdx] || state.scenarios[0];
+    // --- Host density normalization for Node Information ---
+    try {
+        const ni = scen.sections && scen.sections['Node Information'];
+        if (ni) {
+            ni.items = ni.items || [];
+            // Ensure at least one weight row (Random) exists for fallback if all removed
+            let randomRow = ni.items.find(it => !(it.v_metric==='Count') && (it.selected||'').toLowerCase()==='random');
+            if (!randomRow) {
+                // Add with temporary factor 0 (will be set if needed)
+                ni.items.unshift({ selected:'Random', factor: 0.0 });
+                randomRow = ni.items[0];
+            }
+            // Mark the first Random weight row as protected residual; unmark any other Random weight rows
+            randomRow._protected_random = true;
+            ni.items.forEach(it => {
+                if (it !== randomRow && (it.v_metric !== 'Count') && ((it.selected||'').toLowerCase()==='random')) {
+                    if (it._protected_random) delete it._protected_random;
+                }
+            });
+            const weightRows = ni.items.filter(it => !(it.v_metric==='Count'));
+            weightRows.forEach(it => { let f = parseFloat(it.factor); if (isNaN(f) || f < 0) f = 0; it.factor = f; });
+            // Sum excluding Random for decision
+            const nonRandom = weightRows.filter(it => (it.selected||'').toLowerCase()!=='random');
+            let nonRandomSum = nonRandom.reduce((a,b)=> a + (parseFloat(b.factor)||0), 0);
+            if (nonRandom.length === 0) {
+                // Only Random exists; set to 1.0
+                randomRow.factor = 1.0; nonRandomSum = 0;
+            } else {
+                if (nonRandomSum >= 1.0) {
+                    randomRow.factor = 0.0; // others define full density
+                } else {
+                    randomRow.factor = 1.0 - nonRandomSum;
+                }
+            }
+            // Final normalization (should already sum to 1.0)
+            const finalSum = weightRows.reduce((a,b)=> a + (parseFloat(b.factor)||0), 0);
+            if (Math.abs(finalSum - 1.0) > 1e-6 && finalSum > 0) {
+                // scale all
+                weightRows.forEach(it => { it.factor = (parseFloat(it.factor)||0)/finalSum; });
+            }
+        }
+    } catch(e) { console.warn('Normalization error', e); }
+    // Load persisted section collapse state (per scenario + section)
+    let collapseState = {};
+    try { collapseState = JSON.parse(localStorage.getItem('sectionCollapseState') || '{}'); } catch(e) { collapseState = {}; }
     // No auto-insertion of Count rows for Node Information; totals should only include user-added Count rows
-    // Simple scenario header (no group box)
+    // Scenario header with Count for Density (base host pool) restored
+    const niSec = scen.sections['Node Information'] || { items: [] };
+    const niItems = niSec.items || [];
+    const niWeightRows = niItems.filter(it => (it.v_metric || (it.selected==='Specific'?'Count':'Weight')) === 'Weight');
+    const niCountRows = niItems.filter(it => (it.v_metric || (it.selected==='Specific'?'Count':'Weight')) === 'Count');
+    // Base removed: host total now purely additive Count rows when no base; or proportional part is implied but base count is scenario-level (not editable here)
+    let densityCountVal = 10;
+    try {
+        if (scen.density_count !== undefined && scen.density_count !== null && scen.density_count !== '') {
+            const parsed = parseInt(scen.density_count, 10);
+            if (!isNaN(parsed)) densityCountVal = parsed;
+        }
+    } catch(e) { densityCountVal = 10; }
+    if (densityCountVal < 0) densityCountVal = 0;
+    const niBase = densityCountVal;
+    const niAdd = niCountRows.reduce((a,it)=> a + (parseInt(it.v_count,10)||0), 0);
+    const niTotal = niBase + niAdd;
+    const niTitle = 'Hosts = Base (Count for Density) allocated by weight rows + additive Count rows';
+    // Build allocation breakdown tooltip for weight rows
+    let allocTip = niTitle;
+    if (niWeightRows.length) {
+        const wTotal = niWeightRows.reduce((a,it)=> a + (parseFloat(it.factor)||0), 0) || 0;
+        if (wTotal > 0) {
+            const parts = niWeightRows.map(it => {
+                const f = parseFloat(it.factor)||0;
+                const pct = wTotal ? ((f / wTotal) * 100).toFixed(1) : '0.0';
+                const label = (it.selected || 'Row');
+                return `${label}:${f}(${pct}%)`;
+            });
+            allocTip += ' | Weights: ' + parts.join(', ');
+        }
+    }
+    const hostBadgeClass = (niWeightRows.length && niBase === 0 && niAdd > 0) ? 'text-bg-warning' : 'text-bg-primary';
+    // Simplified host summary: remove ΣW badge, allocation popover, and auto-scale functionality
+    const hostSummaryHtml = `<span class=\"badge rounded-pill ${hostBadgeClass} host-total-badge\" data-bs-toggle=\"tooltip\" title=\"${allocTip.replace(/"/g,'&quot;')}\">Hosts: ${niWeightRows.length ? (niBase + ' + ' + niAdd + ' = ' + niTotal) : (niAdd)}</span>`;
+    const densityBaseHtml = `<div class=\"d-flex align-items-center gap-1\" title=\"Base host pool used only for weight-based density calculations; Count rows are additive beyond this.\"><label class=\"form-label mb-0\">Count for Density</label><input type=\"number\" min=\"0\" max=\"5000\" step=\"1\" class=\"form-control form-control-sm\" style=\"width:120px\" value=\"${densityCountVal}\" data-scen-idx=\"${activeIdx}\" data-field=\"scenario_density_count\" /></div>`;
     const headerRow = document.createElement('div');
-    headerRow.className = 'mb-3 d-flex justify-content-between align-items-center';
+    headerRow.className = 'mb-3 d-flex flex-wrap gap-3 align-items-center';
     headerRow.innerHTML = `
-        <div class="d-flex align-items-center gap-2">
+        <div class=\"d-flex align-items-center gap-2\">
             <strong>Scenario:</strong>
-            <input class="form-control form-control-sm" style="width:260px" value="${scen.name}" data-scen-idx="${activeIdx}" data-field="name" />
+            <input class=\"form-control form-control-sm\" style=\"width:260px\" value=\"${scen.name}\" data-scen-idx=\"${activeIdx}\" data-field=\"name\" />
         </div>
-        <button class="btn btn-sm btn-outline-danger" data-action="remove-scenario" data-scen-idx="${activeIdx}">Remove</button>`;
+        <div class=\"d-flex align-items-center gap-2 flex-wrap\">
+            ${densityBaseHtml}
+            ${hostSummaryHtml}
+        </div>
+        <div class=\"ms-auto d-flex gap-2\">
+            <button type=\"button\" class=\"btn btn-sm btn-outline-secondary\" data-action=\"preview-plan\">Export Preview</button>
+            <button type=\"button\" class=\"btn btn-sm btn-outline-danger\" data-action=\"remove-scenario\" data-scen-idx=\"${activeIdx}\">Remove</button>
+        </div>`;
     root.appendChild(headerRow);
 
     // Section cards (Node Information first)
     const secNames = ['Node Information','Routing','Services','Traffic','Events','Vulnerabilities','Segmentation'];
+    // Compute base host pool (non-router/docker). Routers/Docker added later should not change this base count.
+    const baseNodeSec = scen.sections['Node Information'] || { items: [] };
+    const baseNodeItems = baseNodeSec.items || [];
+    const baseNodeRows = baseNodeItems.map(it => ({ metric: (it.v_metric || (it.selected==='Specific'?'Count':'Weight')), it }));
+    const baseWeightRows = baseNodeRows.filter(r => r.metric === 'Weight');
+    const baseCountRows = baseNodeRows.filter(r => r.metric === 'Count');
+    const baseCountSum = baseCountRows.reduce((a,r)=> a + (parseInt(r.it.v_count,10)||0), 0);
+    // Base host pool for density-driven (weight) allocations comes from scenario.density_count
+    const baseHostPool = (scen.density_count !== undefined && scen.density_count !== null && scen.density_count !== '' ? (parseInt(scen.density_count,10)||0) : 10);
     secNames.forEach(name => {
         const sec = scen.sections[name] || { items: [] };
     const hasNodes = (name === 'Node Information');
@@ -332,45 +559,96 @@ function renderMain() {
         // Determine if any weight rows exist in this section (used for Node Information behavior)
         const hasWeightRowsPre = hasNodes ? ((sec.items || []).some(it => ((it.v_metric || (it.selected==='Specific'? 'Count' : 'Weight')) === 'Weight'))) : false;
         // Always ensure density has a sensible default value
-        if (hasNodes) {
-            if (hasWeightRowsPre) {
-                if (sec.density === undefined || sec.density === null || isNaN(sec.density) || sec.density === 0) {
-                    sec.density = 0.5;
-                }
-            } else {
-                sec.density = 0;
-            }
-        } else {
+        if (!hasNodes) {
             if (sec.density === undefined || sec.density === null || isNaN(sec.density)) {
                 sec.density = 0.5;
             }
         }
         const densVal = sec.density;
-        const nodesVal = (hasNodes ? (sec.total_nodes ?? 0) : '');
+        const nodesVal = '';
         const extraNodeCount = hasNodes ? ((sec.items || []).reduce((acc, it) => {
             const metric = it.v_metric || (it.selected==='Specific'?'Count':'Weight');
             return acc + (metric === 'Count' ? (parseInt(it.v_count) || 0) : 0);
         }, 0)) : 0;
     const hasWeightRows = hasNodes ? hasWeightRowsPre : false;
-        const totalNodeCount = hasNodes ? (((hasWeightRows ? (parseInt(nodesVal) || 0) : 0)) + extraNodeCount) : 0;
-        const collapsed = (!hasNodes && itemCount === 0);
+    const totalNodeCount = hasNodes ? extraNodeCount : 0;
+    const totalNodesLabel = hasNodes ? (totalNodeCount === 1 ? 'Total Node' : 'Total Nodes') : '';
+    // Define totalPlanned (was previously referenced but never declared, causing a ReferenceError that prevented section rendering)
+    const totalPlanned = hasNodes ? totalNodeCount : 0;
+        // Improved initial collapse behavior:
+        // - Always expand Node Information (primary planning surface)
+        // - Other sections start collapsed only if empty
+        let collapsed;
+        if (name === 'Node Information') collapsed = false; else collapsed = (itemCount === 0);
+        // Override with persisted state if present
+        const collapseKey = `${activeIdx}::${name}`;
+        if (collapseState.hasOwnProperty(collapseKey)) {
+            collapsed = !!collapseState[collapseKey];
+        }
         const card = document.createElement('div');
         card.className = 'card mb-3';
         const collapseId = `collapse-${name.replace(/\s+/g,'-')}`;
         const iconHtml = itemCount > 0
             ? `<i class='bi bi-collection-fill text-success' data-bs-toggle="tooltip" data-bs-title="${itemCount} item(s)"></i>`
             : `<i class='bi bi-collection text-muted' data-bs-toggle="tooltip" data-bs-title="No items"></i>`;
+        // Enhanced tooltip text clarifying how combined total is derived.
+        const totalNodesTooltip = hasNodes ? 'Combined total = (sum of all Count-based row counts) + (Total Nodes if any Weight-based rows exist). Weight rows allocate Total Nodes by their weights; Count rows are absolute and do not affect weights.' : '';
+        // Compute planned badges (hosts / routers / vulns) for this section
+        let hostBadge = '';
+        if (name === 'Node Information') {
+            const basePart = hasWeightRows ? (parseInt(nodesVal) || 0) : 0;
+            const additivePart = extraNodeCount;
+            const title = hasWeightRows
+                ? 'Hosts total = Base (Total Nodes) allocated across weight rows + additive Count rows'
+                : 'Hosts total = Sum of Count rows (no weight rows present)';
+            if ((basePart + additivePart) > 0) {
+                if (hasWeightRows) {
+                    hostBadge = `<span class=\"badge rounded-pill text-bg-primary ms-2\" title=\"${title.replace(/"/g,'&quot;')}\">Hosts: ${basePart} + ${additivePart} = ${totalNodeCount}</span>`;
+                } else {
+                    hostBadge = `<span class=\"badge rounded-pill text-bg-primary ms-2\" title=\"${title.replace(/"/g,'&quot;')}\">Hosts: ${additivePart}</span>`;
+                }
+            }
+        }
+        let routingBadge = '';
+        if (name === 'Routing') {
+            const rItems = sec.items || [];
+            const rRows = rItems.map(it => ({ metric: (it.v_metric || 'Weight'), it }));
+            const rCountRows = rRows.filter(r => r.metric === 'Count');
+            const rWeightRows = rRows.filter(r => r.metric === 'Weight');
+            const densR = (typeof sec.density === 'number') ? sec.density : 0;
+            const explicit = rCountRows.reduce((a,r)=> a + (parseInt(r.it.v_count,10)||0), 0);
+            let derived = 0;
+            if (rWeightRows.length && densR > 0) {
+                const frac = Math.max(0, Math.min(1, densR));
+                derived = Math.round(baseHostPool * frac);
+            }
+            const total = explicit + derived;
+            if (total > 0) routingBadge = `<span class=\"badge rounded-pill text-bg-secondary ms-2\" title=\"Routers planned additively: Count rows + (Density * Base Hosts). Density constrained 0..1.\">Routers: ${total}</span>`;
+        }
+        let vulnBadge = '';
+        if (name === 'Vulnerabilities') {
+            const vItems = sec.items || [];
+            const vRows = vItems.map(it => ({ metric: (it.v_metric || (it.selected==='Specific'?'Count':'Weight')), it }));
+            const vCountRows = vRows.filter(r => r.metric === 'Count');
+            const vWeightRows = vRows.filter(r => r.metric === 'Weight');
+            const densV = (typeof sec.density === 'number') ? sec.density : 0;
+            const explicit = vCountRows.reduce((a,r)=> a + (parseInt(r.it.v_count,10)||0), 0);
+            let derived = 0;
+            if (vWeightRows.length && densV > 0) derived = Math.round(baseHostPool * Math.min(1, densV));
+            const total = explicit + derived;
+            if (total > 0) vulnBadge = `<span class=\"badge rounded-pill text-bg-info ms-2\" title=\"Vulnerability assignments additive: Count rows + (Density * Base Hosts). Density clipped to 1.0 when fractional.\">Vulns: ${total}</span>`;
+        }
+    const badgeSpan = hostBadge + routingBadge + vulnBadge;
         card.innerHTML = `
-            <div class="card-header d-flex align-items-center gap-2">
+            <div class=\"card-header d-flex align-items-center gap-2\">
                 ${iconHtml}
-                <strong>${name}</strong>
-                <div class="ms-auto d-flex gap-2">
-                    ${hasNodes ? `<div class=\"d-flex align-items-center small text-muted\" title=\"Weight-based nodes plus count-based nodes\">Total Nodes: <span class=\"ms-1 fw-semibold\">${totalNodeCount}</span></div>` : ''}
-                    <button class="btn btn-sm btn-outline-primary" data-action="add-item" data-scen-idx="${activeIdx}" data-sec="${name}">Add</button>
-                    <button class="btn btn-sm btn-outline-secondary" type="button" data-action="toggle-collapse" data-target="#${collapseId}">${collapsed ? 'Expand' : 'Collapse'}</button>
+                <strong>${name}</strong>${badgeSpan}
+                <div class=\"ms-auto d-flex gap-2\">
+                    <button class=\"btn btn-sm btn-outline-primary\" data-action=\"add-item\" data-scen-idx=\"${activeIdx}\" data-sec=\"${name}\">Add</button>
+                    <button class=\"btn btn-sm btn-outline-secondary\" type=\"button\" data-action=\"toggle-collapse\" data-target=\"#${collapseId}\">${collapsed ? 'Expand' : 'Collapse'}</button>
                 </div>
             </div>
-            <div id="${collapseId}" class="card-body" style="display:${collapsed ? 'none':'block'};">
+            <div id=\"${collapseId}\" class=\"card-body\" style=\"display:${collapsed ? 'none':'block'};\">
                                 <div class="table-responsive">
                                                                                 <table class="table table-sm align-middle">
                                                                                         <thead>
@@ -387,19 +665,40 @@ function renderMain() {
                                                                                 const rowsByMetric = items.map((it, iidx) => ({ it, iidx, metric: (it.v_metric || (name==='Vulnerabilities' && (it.selected||'Category')==='Specific' ? 'Count' : 'Weight')) }));
                                                                                 const weights = rowsByMetric.filter(x => x.metric === 'Weight');
                                                                                 const counts = rowsByMetric.filter(x => x.metric === 'Count');
+                                                                                // If there are no remaining weight rows but a stale total_nodes exists, clear it (frontend-only cleanup)
+                                                                                if (name === 'Node Information' && weights.length === 0) {
+                                                                                    const secRef = state.scenarios[activeIdx].sections[name];
+                                                                                    if (secRef && secRef.total_nodes) { secRef.total_nodes = 0; }
+                                                                                }
                                                                                 const parts = [];
                                                                                 const showWeightHeader = (weights.length > 0);
-                                                                                if (showWeightHeader) {
+                                        if (showWeightHeader) {
                                                                                     const densCtrl = (
                                                                                         name === 'Node Information'
-                                                                                            ? `<div class=\"d-flex align-items-center justify-content-end gap-2\">`
-                                                                                                + `<span>Nodes</span>`
-                                                                                                + `<input type=\"number\" min=\"1\" step=\"1\" class=\"form-control form-control-sm\" style=\"width:100px\" value=\"${nodesVal}\" data-scen-idx=\"${activeIdx}\" data-sec=\"${name}\" data-field=\"total_nodes\">`
-                                                                                                + `<span>Density</span>`
-                                                                                                + `<input type=\"number\" step=\"0.01\" min=\"0\" max=\"1\" class=\"form-control form-control-sm\" style=\"width:100px\" value=\"${densVal}\" data-scen-idx=\"${activeIdx}\" data-sec=\"${name}\" data-field=\"density\">`
-                                                                                              + `</div>`
-                                                                                            : `<div class=\"d-flex align-items-center justify-content-end gap-2\"><span>Density</span><input type=\"number\" step=\"0.01\" min=\"0\" max=\"1\" class=\"form-control form-control-sm\" style=\"width:100px\" value=\"${densVal}\" data-scen-idx=\"${activeIdx}\" data-sec=\"${name}\" data-field=\"density\"></div>`
-                                                                                    );
+                                                                                            ? `<div class=\"d-flex align-items-center justify-content-end gap-2 small text-muted\"><span>Density</span><input disabled class=\"form-control form-control-sm\" style=\"width:80px\" value=\"1.0\"></div>`
+                                                                                                : (name === 'Routing'
+                                                                                                                                                                                                ? `<div class=\"d-flex align-items-center justify-content-end gap-2\">`
+                                                                                                                                                                                                        + `<span>Density</span>`
+                                                                                                                                                                                                        + `<input type=\"number\" step=\"0.01\" min=\"0\" max=\"1\" class=\"form-control form-control-sm\" style=\"width:120px\" placeholder=\"e.g., 0.25\" value=\"${densVal}\" data-scen-idx=\"${activeIdx}\" data-sec=\"${name}\" data-field=\"density\">`
+                                                                                                                                                                                                    + `</div>`
+                                                                                                                                                                                                : (() => {
+                                                                                                                                                                                                    const tooltip = (name === 'Services')
+                                                                                                                                                                                                        ? 'Services: per-item Count overrides density; assigns exactly that many hosts the selected service.'
+                                                                                                                                                                                                        : (name === 'Traffic')
+                                                                                                                                                                                                            ? 'Traffic: per-item Count overrides density; creates exactly that many sender/receiver pairs.'
+                                                                                                                                                                                                            : (name === 'Segmentation')
+                                                                                                                                                                                                                ? 'Segmentation: per-item Count overrides density; plans exactly that many slots (NAT prioritized).'
+                                                                                                                                                                                                                : '';
+                                                                                                                                                                                                    let info = '';
+                                                                                                                                                                                                    // Density tooltip removed
+                                                                                                                                                                                                    return '<div class="d-flex align-items-center justify-content-end gap-2">'
+                                                                                                                                                                                                        + '<span>Density</span>'
+                                                                                                                                                                                                        + info
+                                                                                                                                                                                                        + '<input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm" style="width:100px" value="' + densVal + '" data-scen-idx="' + activeIdx + '" data-sec="' + name + '" data-field="density">'
+                                                                                                                                                                                                    + '</div>';
+                                                                                                                                                                                                })()
+                                                                                                                                                                                            )
+                                                                                                                                                                        );
                                                                                     parts.push(`<tr class=\"table-light\"><td colspan=\"2\"><strong>Weight-based</strong></td><td class=\"text-end\">${densCtrl}</td><td></td></tr>`);
                                                                                     if (weights.length) { parts.push(weights.map(x => renderItemRow(activeIdx, name, x.iidx, x.it)).join('')); }
                                                                                 }
@@ -439,20 +738,55 @@ function renderMain() {
     populateVulnSelects();
     // Hook up Specific picker buttons
     document.querySelectorAll('[data-action="pick-specific"]').forEach(btn => {
-        btn.onclick = () => {
+        const handler = () => {
             const sidx = parseInt(btn.getAttribute('data-scen-idx'));
             const sec = btn.getAttribute('data-sec');
             const iidx = parseInt(btn.getAttribute('data-item-idx'));
             openVulnPicker(sidx, sec, iidx);
         };
+        // Attach the click handler (fix: previously not wired)
+        btn.addEventListener('click', handler);
     });
 }
 
 // renderSections was deprecated and removed; rendering is handled in renderMain()
-
 function renderItemRow(sidx, secName, iidx, it) {
-    const opts = (dropdownsBySection[secName] || []).map(o => `<option ${o===it.selected?'selected':''}>${o}</option>`).join('');
-    const weight = (it.factor ?? 1.0);
+    // Build Selected options and current weight
+    const weight = ((parseFloat(it.factor) || 0).toFixed(3));
+    let opts = '';
+    if (secName === 'Vulnerabilities') {
+        const cur = it.selected || 'Category';
+        const options = ['Category', 'Specific', 'Random'];
+        opts = options.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
+    } else {
+        const cur = it.selected || 'Random';
+        // Per-section allowed options (excluding 'auto')
+        let options = ['Random'];
+        switch (secName) {
+            case 'Node Information':
+                options = ['Server', 'Workstation', 'PC', 'Random'];
+                break;
+            case 'Routing':
+                options = ['RIP', 'RIPv2', 'BGP', 'OSPFv2', 'OSPFv3', 'Random'];
+                break;
+            case 'Services':
+                options = ['SSH', 'HTTP', 'DHCPClient', 'Random'];
+                break;
+            case 'Traffic':
+                options = ['Random', 'TCP', 'UDP', 'CUSTOM'];
+                break;
+            case 'Events':
+                options = ['Script Path'];
+                break;
+            case 'Segmentation':
+                options = ['Random', 'Firewall', 'NAT', 'CUSTOM'];
+                break;
+            default:
+                options = ['Random'];
+        }
+        opts = options.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
+    }
+
     const extras = (() => {
         if (secName === 'Events') {
             return `<input class="form-control form-control-sm" placeholder="script path" value="${it.script_path || ''}" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" data-field="script_path">`;
@@ -461,20 +795,26 @@ function renderItemRow(sidx, secName, iidx, it) {
             return `
                 <div class="d-flex flex-wrap gap-2">
                     <div>
+                        <label class="form-label mb-0">Payload</label>
+                        <select class="form-select form-select-sm" data-field="content_type" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
+                            ${['Random','text','photo','audio','video','gibberish'].map(ct => `<option value="${ct}" ${((it.content_type||'Random')===ct)?'selected':''}>${ct}</option>`).join('')}
+                        </select>
+                    </div>
+                    <div class="traffic-config" style="display:${((it.content_type||'Random')==='Random')?'none':'block'};">
                         <label class="form-label mb-0">Pattern</label>
                         <select class="form-select form-select-sm" data-field="pattern" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
                             ${['continuous','periodic','burst','poisson','ramp'].map(p => `<option ${((it.pattern||'')===p)?'selected':''}>${p}</option>`).join('')}
                         </select>
                     </div>
-                    <div>
+                    <div class="traffic-config" style="display:${((it.content_type||'Random')==='Random')?'none':'block'};">
                         <label class="form-label mb-0">Rate (kbps)</label>
                         <input type="number" step="0.1" class="form-control form-control-sm" value="${it.rate_kbps ?? 64.0}" data-field="rate_kbps" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
                     </div>
-                    <div>
+                    <div class="traffic-config" style="display:${((it.content_type||'Random')==='Random')?'none':'block'};">
                         <label class="form-label mb-0">Period (s)</label>
                         <input type="number" step="0.1" class="form-control form-control-sm" value="${it.period_s ?? 1.0}" data-field="period_s" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
                     </div>
-                    <div>
+                    <div class="traffic-config" style="display:${((it.content_type||'Random')==='Random')?'none':'block'};">
                         <label class="form-label mb-0">Jitter (%)</label>
                         <input type="number" step="0.1" class="form-control form-control-sm" value="${it.jitter_pct ?? 10.0}" data-field="jitter_pct" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
                     </div>
@@ -507,7 +847,9 @@ function renderItemRow(sidx, secName, iidx, it) {
     })();
     // Build first cell content, optionally augmenting Selected with Vulnerabilities controls
     const firstCell = (() => {
-        const selectedCtl = `<select class="form-select form-select-sm" data-field="selected" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${opts}</select>`;
+        const isProtectedRandom = (secName === 'Node Information') && ((it.selected||'').toLowerCase()==='random') && it._protected_random;
+        const disabledAttr = isProtectedRandom ? 'disabled title="Residual Random row is auto-managed"' : '';
+        const selectedCtl = `<select class="form-select form-select-sm" ${disabledAttr} data-field="selected" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${opts}</select>`;
         if (secName !== 'Vulnerabilities') return selectedCtl;
     const mode = it.selected || 'Category';
     if (mode === 'Category') {
@@ -566,17 +908,23 @@ function renderItemRow(sidx, secName, iidx, it) {
             const count = (parseInt(it.v_count, 10) || 1);
             return `<div class="d-flex gap-2">${metricSel}<select class="form-select form-select-sm" style="min-width: 120px" data-field="v_count" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${Array.from({length:10},(_,k)=>k+1).map(n=>`<option ${n===count?'selected':''}>${n}</option>`).join('')}</select></div>`;
         }
-        return `<div class="d-flex gap-2">${metricSel}<input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm weight-input" style="min-width: 120px" value="${weight}" data-field="factor" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></div>`;
+    const isProtectedRandom = (secName === 'Node Information') && ((it.selected||'').toLowerCase()==='random') && it._protected_random;
+    const metricDisabled = isProtectedRandom ? 'disabled title="Residual Random row metric locked"' : '';
+    const metricSelProtected = `<select class="form-select form-select-sm" ${metricDisabled} style="min-width: 140px" data-field="v_metric" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"><option ${metric==='Weight'?'selected':''}>Weight</option><option ${metric==='Count'?'selected':''}>Count</option></select>`;
+    const ro = isProtectedRandom ? 'readonly class="form-control form-control-sm weight-input bg-light" title="Auto-adjusted to keep sum=1.0"' : 'class="form-control form-control-sm weight-input"';
+    return `<div class="d-flex gap-2">${metricSelProtected}<input type="number" step="0.01" min="0" max="1" ${ro} style="min-width: 120px" value="${weight}" data-field="factor" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></div>`;
     })();
+    const removeBtnHtml = ((secName === 'Node Information') && ((it.selected||'').toLowerCase()==='random') && it._protected_random)
+        ? '<span class="text-muted small" title="Residual Random row">&mdash;</span>'
+        : `<button type="button" class="btn btn-sm btn-outline-danger" data-action="remove-item" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">Remove</button>`;
     return `
         <tr>
             <td>${firstCell}</td>
             <td>${extras}</td>
             <td>${weightCell}</td>
-            <td><button type="button" class="btn btn-sm btn-outline-danger" data-action="remove-item" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">Remove</button></td>
+            <td>${removeBtnHtml}</td>
         </tr>`;
 }
-
 // Render Vulnerabilities rows grouped with two row-headers
 function renderVulnRows(sidx, secName, items) {
     const withIdx = items.map((it, iidx) => ({ it, iidx }));
@@ -595,12 +943,30 @@ function renderVulnRows(sidx, secName, items) {
 }
 
 function wireHandlers() {
+    // Count for Density input handler
+    document.querySelectorAll('input[data-field="scenario_density_count"]').forEach(inp => {
+        inp.addEventListener('change', () => {
+            const idx = parseInt(inp.getAttribute('data-scen-idx'));
+            let val = parseInt(inp.value, 10); if (isNaN(val) || val < 0) val = 0; if (val > 5000) val = 5000;
+            state.scenarios[idx].density_count = val; // store at scenario level; do NOT mutate node rows
+            if (val === '' || val === null) {
+                // If cleared, revert to default 10 in UI but keep undefined so save omits and parser falls back.
+                delete state.scenarios[idx].density_count;
+            }
+            renderMain();
+        });
+        // Prevent Enter key from triggering unintended form behavior (like adding a row)
+        inp.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Enter') { ev.preventDefault(); inp.blur(); }
+        });
+    });
     document.querySelectorAll('[data-field]').forEach(el => {
         const sidx = parseInt(el.getAttribute('data-scen-idx'));
         const sec = el.getAttribute('data-sec');
         const field = el.getAttribute('data-field');
         const iidx = el.getAttribute('data-item-idx');
         const handler = () => {
+            if (field === 'scenario_base_hosts') { return; }
             if (sec) {
                 if (iidx !== null) {
                     const item = state.scenarios[sidx].sections[sec].items[parseInt(iidx)];
@@ -611,7 +977,7 @@ function wireHandlers() {
                                                 updateWeightWarning(sidx, sec);
                                                 updateWeightInputsDisplay(sidx, sec);
                                             }
-                    } else if (['pattern','selected','script_path','v_type','v_vector','v_name','v_path','v_count','v_metric'].includes(field)) {
+                    } else if (['pattern','content_type','selected','script_path','v_type','v_vector','v_name','v_path','v_count','v_metric'].includes(field)) {
                         const prev = item[field];
                         if (field === 'v_count') {
                             const n = parseInt(el.value, 10) || 1;
@@ -619,7 +985,10 @@ function wireHandlers() {
                         } else {
                             item[field] = el.value;
                         }
-                        if (field === 'selected') {
+                        if (field === 'content_type') {
+                            // Re-render to reflect show/hide of traffic-config inputs when Random is selected
+                            renderMain();
+                        } else if (field === 'selected') {
                             if (item.selected === 'Specific') {
                                 if (!item.v_count) item.v_count = 1;
                                 if (!item.v_metric) item.v_metric = 'Count';
@@ -634,6 +1003,11 @@ function wireHandlers() {
                                 item.v_count = 1;
                             }
                             redistributeEven(sidx, sec);
+                            if (sec === 'Node Information') {
+                                const secRef = state.scenarios[sidx].sections[sec];
+                                const hasWeight = (secRef.items || []).some(it => (it.v_metric || 'Weight') === 'Weight');
+                                if (!hasWeight && secRef.total_nodes) { secRef.total_nodes = 0; }
+                            }
                             updateWeightWarning(sidx, sec);
                             renderMain();
                         } else if (field === 'v_count') {
@@ -647,8 +1021,8 @@ function wireHandlers() {
                     if (field === 'density' || field === 'total_nodes') {
                         let v = parseFloat(el.value);
                         if (field === 'density') {
-                            if (isNaN(v)) v = 0.5;
-                            v = Math.max(0, Math.min(1, v));
+                            if (isNaN(v)) v = 0.0;
+                            v = Math.max(0, Math.min(1, v)); // Clamp globally 0..1
                         }
                         state.scenarios[sidx].sections[sec][field] = v;
                         // keep hidden for submit and update any warnings
@@ -666,6 +1040,8 @@ function wireHandlers() {
             }
             // keep hidden for submit
             document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
+            // persist edits across navigation
+            persistEditorState();
             logDebug(`Field change: scen=${sidx} sec=${sec||''} field=${field}`);
         };
         el.addEventListener('input', handler);
@@ -677,27 +1053,47 @@ function wireHandlers() {
             const sec = btn.getAttribute('data-sec');
             const iidx = parseInt(btn.getAttribute('data-item-idx'));
             state.scenarios[sidx].sections[sec].items.splice(iidx,1);
-            logInfo(`Removed item ${iidx} from ${sec}`);
+                        logInfo(`Removed item ${iidx} from ${sec}`);
               redistributeEven(sidx, sec);
+              // Auto-clear total_nodes if Node Information loses its last weight-based row
+              if (sec === 'Node Information') {
+                  const secRef = state.scenarios[sidx].sections[sec];
+                  const hasWeight = (secRef.items || []).some(it => (it.v_metric || 'Weight') === 'Weight');
+                  if (!hasWeight && secRef.total_nodes) { secRef.total_nodes = 0; }
+              }
               // Re-render to refresh totals and labels
-              renderMain();
+                            renderMain();
+                            persistEditorState();
         };
     });
     document.querySelectorAll('[data-action="add-item"]').forEach(btn => {
         btn.onclick = () => {
             const sidx = parseInt(btn.getAttribute('data-scen-idx'));
             const sec = btn.getAttribute('data-sec');
-            const item = { selected: 'Random', factor: 1.0 };
+            // Default selection logic: for Routing we prefer the first concrete protocol (not Random) so
+            // routers don't silently become 'Random' unless user explicitly chooses it. Other sections
+            // still start at 'Random' (or specialized default) as before.
+            let defaultSelected = 'Random';
+            if (sec === 'Routing') {
+                try {
+                    const opts = dropdownsBySection['Routing'] || [];
+                    // pick the first option that isn't 'Random'
+                    const concrete = opts.find(o => o !== 'Random');
+                    if (concrete) defaultSelected = concrete;
+                } catch(e){}
+            }
+            const item = { selected: defaultSelected, factor: 1.0 };
             if (sec === 'Events') item.script_path = '';
-            if (sec === 'Traffic') { item.pattern = 'continuous'; item.rate_kbps = 64.0; item.period_s = 1.0; item.jitter_pct = 10.0; }
+            if (sec === 'Traffic') { item.pattern = 'continuous'; item.rate_kbps = 64.0; item.period_s = 1.0; item.jitter_pct = 10.0; item.content_type = 'Random'; }
             if (sec === 'Vulnerabilities') { item.selected = 'Category'; item.v_type = 'Random'; item.v_vector = 'Random'; }
             // Default new rows: Node Information -> Count; others -> Weight.
             if (sec === 'Node Information') { item.v_metric = 'Count'; item.v_count = 1; }
             else { item.v_metric = 'Weight'; }
             state.scenarios[sidx].sections[sec].items.push(item);
-            logInfo(`Added item to ${sec}`);
+                        logInfo(`Added item to ${sec}`);
               redistributeEven(sidx, sec);
-              renderMain();
+                            renderMain();
+                            persistEditorState();
         };
     });
     document.querySelectorAll('[data-action="toggle-collapse"]').forEach(btn => {
@@ -708,44 +1104,130 @@ function wireHandlers() {
             const visible = target.style.display !== 'none';
             target.style.display = visible ? 'none' : 'block';
             btn.textContent = visible ? 'Expand' : 'Collapse';
+            const secName = targetSel.replace('#collapse-','').replace(/-/g,' ');
+            const collapseKey = `${activeIdx}::${secName}`;
+            collapseState[collapseKey] = visible; // store collapsed state (true means now collapsed)
+            try { localStorage.setItem('sectionCollapseState', JSON.stringify(collapseState)); } catch(e) {}
             logDebug(`Section toggle ${targetSel} -> ${visible ? 'collapsed':'expanded'}`);
         };
     });
-        document.querySelectorAll('[data-action="remove-scenario"]').forEach(btn => {
-        btn.onclick = async () => {
-                const sidx = parseInt(btn.getAttribute('data-scen-idx'));
-                const scen = state.scenarios[sidx];
-                if(!scen){ return; }
-                let runCount = 0;
+    // Export preview handler
+    const previewBtn = document.querySelector('[data-action="preview-plan"]');
+    if (previewBtn) {
+        previewBtn.onclick = () => {
+            const scen = state.scenarios[activeIdx];
+            if (!scen) return;
+            const ni = scen.sections['Node Information'] || { items: [], total_nodes:0 };
+            const weightRows = (ni.items||[]).filter(it => (it.v_metric || (it.selected==='Specific'? 'Count':'Weight'))==='Weight');
+            const countRows = (ni.items||[]).filter(it => (it.v_metric || (it.selected==='Specific'? 'Count':'Weight'))==='Count');
+            const base = weightRows.length ? (parseInt(scen.density_count || 0) || 0) : 0;
+            const addHosts = countRows.reduce((a,it)=> a + (parseInt(it.v_count,10)||0),0);
+            const totalHosts = base + addHosts;
+            let allocTable = [];
+            if (base>0 && weightRows.length) {
+                const sumW = weightRows.reduce((a,it)=> a + (parseFloat(it.factor)||0),0) || 1;
+                const temp = weightRows.map(it => {
+                    const f = parseFloat(it.factor)||0; const share = sumW? f/sumW:0; const raw = base*share; const alloc = Math.floor(raw);
+                    return { it, share, raw, alloc, frac: raw - alloc };
+                });
+                let assigned = temp.reduce((a,r)=> a + r.alloc,0);
+                let remain = base - assigned;
+                temp.sort((a,b)=> b.frac - a.frac);
+                for (let i=0;i<temp.length && remain>0;i++) { temp[i].alloc += 1; remain--; }
+                allocTable = temp.sort((a,b)=> (ni.items.indexOf(a.it) - ni.items.indexOf(b.it))).map(r => ({ label: r.it.selected || 'Row', weight: (parseFloat(r.it.factor)||0), percent: (r.share*100), alloc: r.alloc }));
+            }
+            const routing = scen.sections['Routing'] || { items: [], density: 0 };
+            const rWeight = (routing.items||[]).filter(it => (it.v_metric||'Weight')==='Weight');
+            const rCount = (routing.items||[]).filter(it => (it.v_metric||'Weight')==='Count');
+            const rExplicit = rCount.reduce((a,it)=> a + (parseInt(it.v_count,10)||0),0);
+            let rDerived = 0; if (rWeight.length) { const d = parseFloat(routing.density)||0; rDerived = (d>=1)? d : Math.round((totalHosts - addHosts) * d); }
+            const totalRouters = rExplicit + rDerived;
+            const vulns = scen.sections['Vulnerabilities'] || { items: [], density: 0 };
+            const vWeight = (vulns.items||[]).filter(it => (it.v_metric || (it.selected==='Specific'?'Count':'Weight'))==='Weight');
+            const vCount = (vulns.items||[]).filter(it => (it.v_metric || (it.selected==='Specific'?'Count':'Weight'))==='Count');
+            const vExplicit = vCount.reduce((a,it)=> a + (parseInt(it.v_count,10)||0),0);
+            let vDerived = 0; if (vWeight.length) { const d = Math.min(1, Math.max(0, parseFloat(vulns.density)||0)); vDerived = Math.round((totalHosts - addHosts) * d); }
+            const totalVulns = vExplicit + vDerived;
+            const rowsHtml = allocTable.length ? allocTable.map(r => `<tr><td>${r.label}</td><td>${r.weight.toFixed(3)}</td><td>${r.percent.toFixed(1)}%</td><td>${r.alloc}</td></tr>`).join('') : '<tr><td colspan="4" class="text-muted">No weight allocation</td></tr>';
+            const modalHtml = `
+<div class=\"modal fade\" id=\"previewModal\" tabindex=\"-1\" aria-hidden=\"true\">\n  <div class=\"modal-dialog modal-lg modal-dialog-scrollable\">\n    <div class=\"modal-content\">\n      <div class=\"modal-header\">\n        <h5 class=\"modal-title\">Plan Preview: ${scen.name}</h5>\n        <button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\" aria-label=\"Close\"></button>\n      </div>\n      <div class=\"modal-body\">\n        <div class=\"row mb-3\">\n          <div class=\"col-md-4\"><div class=\"card card-body p-2\"><small class=\"text-muted\">Hosts Total</small><div class=\"fs-5\">${totalHosts}</div><div class=\"small text-muted\">Base ${base} + Add ${addHosts}</div></div></div>\n          <div class=\"col-md-4\"><div class=\"card card-body p-2\"><small class=\"text-muted\">Routers</small><div class=\"fs-5\">${totalRouters}</div><div class=\"small text-muted\">Explicit ${rExplicit} + Derived ${rDerived}</div></div></div>\n          <div class=\"col-md-4\"><div class=\"card card-body p-2\"><small class=\"text-muted\">Vulns</small><div class=\"fs-5\">${totalVulns}</div><div class=\"small text-muted\">Explicit ${vExplicit} + Derived ${vDerived}</div></div></div>\n        </div>\n        <h6>Host Weight Allocation</h6>\n        <div class=\"table-responsive\">\n          <table class=\"table table-sm\">\n            <thead><tr><th>Row</th><th>Weight</th><th>%</th><th>Alloc</th></tr></thead>\n            <tbody>${rowsHtml}</tbody>\n          </table>\n        </div>\n      </div>\n      <div class=\"modal-footer\">\n        <button type=\"button\" class=\"btn btn-sm btn-outline-secondary\" data-bs-dismiss=\"modal\">Close</button>\n      </div>\n    </div>\n  </div>\n</div>`;
+            let container = document.getElementById('previewModalContainer');
+            if (!container) { container = document.createElement('div'); container.id = 'previewModalContainer'; document.body.appendChild(container); }
+            container.innerHTML = modalHtml;
+            if (window.bootstrap) { try { new bootstrap.Modal(document.getElementById('previewModal')).show(); } catch(e) { alert('Bootstrap modal failed; see console'); console.error(e); } }
+            else { alert('Bootstrap not loaded.'); }
+        };
+    }
+    // Initialize popovers & tooltips (Bootstrap 5)
+    if (window.bootstrap) {
+        document.querySelectorAll('[data-bs-toggle="popover"]').forEach(el => { try { new bootstrap.Popover(el); } catch(e) {} });
+        document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => { try { new bootstrap.Tooltip(el); } catch(e) {} });
+    }
+    // Flash animation on Base input change
+    document.querySelectorAll('.base-input').forEach(inp => {
+        inp.addEventListener('change', () => {
+            const badge = document.querySelector('.host-total-badge');
+            if (!badge) return;
+            badge.classList.add('pulse-change');
+            setTimeout(()=> badge.classList.remove('pulse-change'), 900);
+        });
+    });
+    document.querySelectorAll('[data-action="remove-scenario"]').forEach(btn => {
+        btn.onclick = async (ev) => {
+            if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+            if (ev && typeof ev.stopPropagation === 'function') ev.stopPropagation();
+            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+            const scen = state.scenarios[sidx];
+            if (!scen) { return; }
+            let runCount = 0;
+            try {
+                const resp = await fetch('/reports_data');
+                if (resp.ok) {
+                    const data = await resp.json();
+                    runCount = (data.history || []).filter(r => (r.scenario_names || []).includes(scen.name)).length;
+                }
+            } catch (e) {}
+            const lines = [];
+            lines.push(`Delete scenario "${scen.name}"?`);
+            if (runCount > 0) {
+                lines.push("");
+                lines.push(`WARNING: ${runCount} run history entr${runCount===1?'y':'ies'} and their artifact files (XML, report, pre-session XML) will be permanently deleted.`);
+            }
+            lines.push("");
+            lines.push("This action cannot be undone.");
+            lines.push("");
+            lines.push("Proceed?");
+            const msg = lines.join('\n');
+            if (!window.confirm(msg)) { return; }
+
+            // Remove scenario
+            state.scenarios.splice(sidx, 1);
+            // Leave list empty if last scenario removed
+            activeIdx = state.scenarios.length === 0 ? 0 : Math.min(sidx, state.scenarios.length - 1);
+            // Persist immediately before re-render so state survives any navigation
+            const hidden = document.getElementById('scenarios_json');
+            if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios });
+            persistEditorState();
+            logInfo(`Deleted scenario: ${scen.name}`);
+            // Re-render UI
+            render();
+            try { showToast(`Scenario "${scen.name}" deleted`); } catch(e){}
+
+            // Purge matching run history and artifacts in background
+            if (runCount > 0) {
                 try {
-                    const resp = await fetch('/reports_data');
-                    if(resp.ok){
-                        const data = await resp.json();
-                        runCount = (data.history||[]).filter(r => (r.scenario_names||[]).includes(scen.name)).length;
-                    }
-                } catch(e) {}
-                let lines = [];
-                lines.push(`Delete scenario "${scen.name}"?`);
-                if(runCount > 0){
-                    lines.push("");
-                    lines.push(`WARNING: ${runCount} run history entr${runCount===1?'y':'ies'} and their artifact files (XML, report, pre-session XML) will be permanently deleted.`);
-                }
-                lines.push("");
-                lines.push("This action cannot be undone.");
-                lines.push("");
-                lines.push("Proceed?");
-                const msg = lines.join('\n');
-                if(!window.confirm(msg)) { return; }
-                state.scenarios.splice(sidx,1);
-                if (activeIdx >= state.scenarios.length) activeIdx = Math.max(0, state.scenarios.length - 1);
-                render();
-                if(runCount > 0){
-                    try { await fetch('/purge_history_for_scenario', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name: scen.name })}); } catch(e) {}
-                }
+                    await fetch('/purge_history_for_scenario', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ name: scen.name })
+                    });
+                } catch (e) {}
+            }
         };
     });
     // keep hidden JSON synced
     document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
+    persistEditorState();
         // Initialize warnings per section
         const scen = state.scenarios[activeIdx];
         if (scen) {
@@ -808,8 +1290,8 @@ function wireCoreControls() {
         setRunEnabled(false);
         statusEl.textContent = 'Not tested';
     };
-    hostEl?.addEventListener('input', onEdit);
-    portEl?.addEventListener('input', onEdit);
+    hostEl?.addEventListener('input', () => { onEdit(); persistEditorState(); });
+    portEl?.addEventListener('input', () => { onEdit(); persistEditorState(); });
 
     btn?.addEventListener('click', async () => {
     btn.disabled = true;
@@ -830,15 +1312,20 @@ function wireCoreControls() {
                 state.core_tested_port = parseInt(portEl.value || '50051', 10) || 50051;
                 setRunEnabled(true);
                 logInfo(`CORE reachable at ${data.host||hostEl.value}:${data.port||portEl.value}`);
+                persistEditorState();
             } else {
                 setRunEnabled(false);
                 statusEl.textContent = 'Connection failed' + (data?.error ? `: ${data.error}` : '');
                 logWarn(`CORE connection failed: ${data?.error||'unknown'}`);
+                state.core_ok = false;
+                persistEditorState();
             }
         } catch (e) {
             setRunEnabled(false);
             statusEl.textContent = 'Connection failed';
             logError('CORE test threw exception');
+            state.core_ok = false;
+            persistEditorState();
         } finally {
             btn.disabled = false;
         }
@@ -861,41 +1348,104 @@ function prepareRunCli() {
     }
     document.getElementById('xml_path').value = rp;
     logInfo('Running CLI sync');
+    // Preserve scroll so after the round trip we land where we were
+    try { saveScrollBeforeNav(); } catch(e){}
     return true;
 }
 
 render();
 
+// Restore scroll position if previously saved before a Save XML navigation
+function restoreScrollIfAny() {
+    try {
+        const y = parseInt(sessionStorage.getItem('coretg_saved_scroll_y') || '', 10);
+        if (!isNaN(y)) {
+            window.scrollTo(0, y);
+            sessionStorage.removeItem('coretg_saved_scroll_y');
+        }
+    } catch (e) { /* ignore */ }
+}
+// Use load to ensure layout (including dock sizing) has been applied
+window.addEventListener('load', restoreScrollIfAny);
+
+// Small helper to persist current scroll position prior to any navigation (form post or link)
+function saveScrollBeforeNav(){
+    try { sessionStorage.setItem('coretg_saved_scroll_y', String(window.scrollY || window.pageYOffset || 0)); } catch (e) { /* ignore */ }
+}
+
 // Always serialize state just before submitting the Save XML form
 const editorForm = document.getElementById('editorForm');
 if (editorForm) {
     editorForm.addEventListener('submit', () => {
+        // preserve current scroll so we can restore after the server round-trip
+        try { sessionStorage.setItem('coretg_saved_scroll_y', String(window.scrollY || window.pageYOffset || 0)); } catch (e) { /* ignore */ }
         document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
+        persistEditorState();
     });
 }
 
 // Enable Bootstrap tooltips globally
 document.addEventListener('DOMContentLoaded', () => {
     const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
-    tooltipTriggerList.forEach(el => new bootstrap.Tooltip(el));
-    setupDock();
-    // ingest any server-rendered lines present at load
-    try {
-        const lp = document.getElementById('logsPre');
-        if (lp && lp.textContent.trim()) {
-            lp.textContent.split(/\n/).forEach(line => {
-                if (!line.trim()) return;
-                let lvl = 'INFO';
-                if (line.includes(' ERROR')) lvl = 'ERROR';
-                else if (line.includes(' WARN')) lvl = 'WARN';
-                else if (line.includes(' DEBUG')) lvl = 'DEBUG';
-                logBuffer.push({ level: lvl, levelValue: LOG_LEVELS[lvl], line });
-            });
-            renderLogs();
+    tooltipTriggerList.forEach(el => {
+        // Bootstrap 5 throws if title option resolves to null; normalize to empty string
+        const dt = el.getAttribute('data-bs-title') || el.getAttribute('title');
+        if (dt === null) {
+            // skip creating tooltip entirely if no title is present
+            return;
         }
-    } catch(e) {}
+        if (dt.trim() === '') {
+            el.setAttribute('data-bs-title', '');
+        }
+        try { new bootstrap.Tooltip(el); } catch (e) { /* ignore */ }
+    });
+    setupDock();
+    // Wire Download XML button
+    const dlBtn = document.getElementById('downloadXmlBtn');
+    if (dlBtn) {
+        dlBtn.addEventListener('click', () => {
+            const rp = state.result_path || '';
+            if (!rp || !rp.endsWith('.xml')) { alert('Please Save XML first.'); return; }
+            window.location.href = window.location.origin + '/download_report?path=' + encodeURIComponent(rp);
+        });
+        // Initial state based on state.result_path
+        const rp0 = state.result_path || '';
+        if (rp0 && rp0.endsWith('.xml')) { dlBtn.removeAttribute('disabled'); dlBtn.classList.remove('pe-none'); dlBtn.setAttribute('title',''); }
+    }
+    // Capture any server-rendered logs before we render from storage
+    let __serverLogsAtLoad = '';
+    try { __serverLogsAtLoad = (document.getElementById('logsPre')?.textContent || '').trim(); } catch(e){}
+    // Restore persisted logs (idempotent)
+    restoreLogsFromStorageOnce();
+    // Merge server logs (if any), then render and persist
+    if (__serverLogsAtLoad) {
+        __serverLogsAtLoad.split(/\n/).forEach(line => {
+            if (!line.trim()) return;
+            let lvl = 'INFO';
+            if (line.includes(' ERROR')) lvl = 'ERROR';
+            else if (line.includes(' WARN')) lvl = 'WARN';
+            else if (line.includes(' DEBUG')) lvl = 'DEBUG';
+            logBuffer.push({ level: lvl, levelValue: LOG_LEVELS[lvl], line });
+        });
+    }
+    renderLogs();
+    try { localStorage.setItem(LOG_STORE_KEY, JSON.stringify(logBuffer)); } catch(e){}
     const sel = document.getElementById('logLevelFilter');
-    sel?.addEventListener('change', () => setLogLevel(sel.value));
+    // Restore saved log level preference
+    try {
+        const savedLvl = localStorage.getItem('coretg_log_level');
+        if (savedLvl && LOG_LEVELS[savedLvl] !== undefined) {
+            currentLogLevel = LOG_LEVELS[savedLvl];
+            if (sel) sel.value = savedLvl;
+        }
+    } catch(e){}
+    sel?.addEventListener('change', () => { setLogLevel(sel.value); try { localStorage.setItem('coretg_log_level', sel.value); } catch(e){} });
+    const clearBtn = document.getElementById('clearLogsBtn');
+    clearBtn?.addEventListener('click', () => {
+        logBuffer = [];
+        try { localStorage.setItem(LOG_STORE_KEY, JSON.stringify(logBuffer)); } catch(e){}
+        renderLogs();
+    });
         setupVulnCatalog();
 });
 
@@ -940,6 +1490,15 @@ function ensureVulnModal(){
                     <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
                 </div>
                 <div class="modal-body">
+                    <div id="vulnLoadingWrap" class="mb-3" style="display:none;">
+                        <div class="d-flex align-items-center gap-2 mb-2 text-muted small">
+                            <div class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></div>
+                            <span id="vulnLoadMeta">Loading eligible items…</span>
+                        </div>
+                        <div class="progress" style="height: 14px;">
+                            <div class="progress-bar" id="vulnLoadProgressBar" role="progressbar" style="width:0%" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">0%</div>
+                        </div>
+                    </div>
                     <div class="d-flex align-items-start gap-2 mb-2">
                         <div class="flex-grow-1">
                             <input class="form-control" placeholder="Filter (string or /regex/)" id="vulnFilter">
@@ -948,7 +1507,7 @@ function ensureVulnModal(){
                         <button class="btn btn-outline-secondary" type="button" id="vulnFilterClear" title="Clear filter">Clear</button>
                     </div>
                     <div class="text-muted small mb-2" id="vulnFilterMeta"></div>
-                    <div class="table-responsive" style="max-height:50vh; overflow:auto;">
+                    <div class="table-responsive" id="vulnTableWrap" style="max-height:50vh; overflow:auto; display:none;">
                         <table class="table table-sm">
                             <thead><tr><th>Name</th><th>Type</th><th>Vector</th><th>Path</th></tr></thead>
                             <tbody id="vulnList"></tbody>
@@ -963,68 +1522,96 @@ function ensureVulnModal(){
         document.body.appendChild(modal);
 }
 
-function openVulnPicker(sidx, secName, iidx){
-        ensureVulnModal();
-        const modalEl = document.getElementById('vulnModal');
-        const filterInput = modalEl.querySelector('#vulnFilter');
+async function openVulnPicker(sidx, secName, iidx){
+    ensureVulnModal();
+    const modalEl = document.getElementById('vulnModal');
+    const modalObj = window.bootstrap ? new bootstrap.Modal(modalEl, { backdrop: true, keyboard: true }) : null;
+    const filterInput = modalEl.querySelector('#vulnFilter');
     const filterClearBtn = modalEl.querySelector('#vulnFilterClear');
     const filterMeta = modalEl.querySelector('#vulnFilterMeta');
     const filterError = modalEl.querySelector('#vulnFilterError');
-        const tbody = modalEl.querySelector('#vulnList');
-    let current = (window.VULN_CATALOG?.items || []);
-        const renderRows = () => {
-                tbody.innerHTML = '';
-                current.forEach((it, idx) => {
-                        const tr = document.createElement('tr');
-                        tr.innerHTML = `<td>${it.Name}</td><td>${it.Type}</td><td>${it.Vector}</td><td>${it.Path}</td>`;
-                        tr.style.cursor = 'pointer';
+    const tbody = modalEl.querySelector('#vulnList');
+    const tblWrap = modalEl.querySelector('#vulnTableWrap');
+    const loadWrap = modalEl.querySelector('#vulnLoadingWrap');
+    const loadBar = modalEl.querySelector('#vulnLoadProgressBar');
+    const loadMeta = modalEl.querySelector('#vulnLoadMeta');
+    const row = state.scenarios[sidx].sections[secName].items[iidx] || {};
+    const selVector = (row.v_vector || 'Random');
+    // Base: docker-compose only
+    const all = (window.VULN_CATALOG?.items || []);
+    let base = all.filter(it => (it.Type||'').toLowerCase() === 'docker-compose');
+    if (selVector && selVector !== 'Random') {
+        const vv = selVector.toLowerCase();
+        base = base.filter(it => (it.Vector||'').toLowerCase() === vv);
+    }
+    // Do not compute eligibility; show immediately
+    let eligible = base;
+    try {
+        if (modalObj) modalObj.show();
+        if (loadWrap) loadWrap.style.display = 'none';
+        if (tblWrap) tblWrap.style.display = '';
+    } catch(e){}
+    let current = eligible;
+    const renderRows = () => {
+        tbody.innerHTML = '';
+        if (!current || current.length === 0) {
+            const tr = document.createElement('tr');
+            const td = document.createElement('td');
+            td.colSpan = 4;
+            td.className = 'text-center text-muted py-3';
+            td.textContent = 'No results';
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+            return;
+        }
+        current.forEach((it) => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `<td>${it.Name}</td><td>${it.Type}</td><td>${it.Vector}</td><td>${it.Path}</td>`;
+            tr.style.cursor = 'pointer';
             tr.onclick = () => {
-                                const item = state.scenarios[sidx].sections[secName].items[iidx];
-                                item.v_name = it.Name;
-                                item.v_path = it.Path;
-                                item.v_type = it.Type;
-                                item.v_vector = it.Vector;
+                const item = state.scenarios[sidx].sections[secName].items[iidx];
+                item.v_name = it.Name;
+                item.v_path = it.Path;
+                item.v_type = it.Type;
+                item.v_vector = it.Vector;
                 if (it.Description) item.v_desc = it.Description;
-                                // also set selected to Specific defensively
-                                item.selected = 'Specific';
-                                // update state	enable
-                                document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
-                                if(window.bootstrap){ bootstrap.Modal.getInstance(modalEl)?.hide(); }
-                                renderMain();
-                        };
-                        tbody.appendChild(tr);
-                });
-        };
+                // also set selected to Specific defensively
+                item.selected = 'Specific';
+                document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
+                try { if(window.bootstrap){ bootstrap.Modal.getInstance(modalEl)?.hide(); } } catch(e) {}
+                renderMain();
+            };
+            tbody.appendChild(tr);
+        });
+    };
     const applyFilter = () => {
         const raw = (filterInput.value||'').trim();
         try { localStorage.setItem('vulnPickerFilter', raw); } catch(e){}
-        // Reset error state by default
         filterInput.classList.remove('is-invalid');
         if (filterError) filterError.style.display = '';
         if(!raw){
-            current = (window.VULN_CATALOG?.items || []);
+            current = eligible;
             renderRows();
-            if (filterMeta) filterMeta.textContent = `${current.length}/${(window.VULN_CATALOG?.items || []).length} shown`;
+            if (filterMeta) filterMeta.textContent = `${current.length}/${eligible.length} shown`;
             return;
         }
         let matcher = null;
         if (raw.startsWith('/') && raw.endsWith('/') && raw.length >= 2) {
             try { matcher = new RegExp(raw.slice(1, -1), 'i'); } catch(e){ matcher = null; }
             if (!matcher) {
-                // Flag invalid regex, keep previous results (do not change current)
                 filterInput.classList.add('is-invalid');
                 if (filterMeta) filterMeta.textContent = `Invalid regex`;
                 return;
             }
         }
         if (matcher) {
-            current = (window.VULN_CATALOG?.items || []).filter(it => matcher.test(it.Name) || matcher.test(it.Type) || matcher.test(it.Vector) || matcher.test(it.Path));
+            current = eligible.filter(it => matcher.test(it.Name) || matcher.test(it.Type) || matcher.test(it.Vector) || matcher.test(it.Path));
         } else {
             const lower = raw.toLowerCase();
-            current = (window.VULN_CATALOG?.items || []).filter(it => (it.Name||'').toLowerCase().includes(lower) || (it.Type||'').toLowerCase().includes(lower) || (it.Vector||'').toLowerCase().includes(lower) || (it.Path||'').toLowerCase().includes(lower));
+            current = eligible.filter(it => (it.Name||'').toLowerCase().includes(lower) || (it.Type||'').toLowerCase().includes(lower) || (it.Vector||'').toLowerCase().includes(lower) || (it.Path||'').toLowerCase().includes(lower));
         }
         renderRows();
-    if (filterMeta) filterMeta.textContent = `${current.length}/${(window.VULN_CATALOG?.items || []).length} shown`;
+        if (filterMeta) filterMeta.textContent = `${current.length}/${eligible.length} shown`;
     };
     filterInput.oninput = applyFilter;
     filterClearBtn.onclick = () => { filterInput.value = ''; applyFilter(); };
@@ -1033,16 +1620,26 @@ function openVulnPicker(sidx, secName, iidx){
         const saved = localStorage.getItem('vulnPickerFilter');
         if (saved) filterInput.value = saved;
     } catch(e){}
-    // Initial render and apply saved filter
-    renderRows();
-    applyFilter();
-        if(window.bootstrap){ new bootstrap.Modal(modalEl).show(); }
+    // Render immediately and show counts
+    try {
+        renderRows();
+        applyFilter();
+    } catch(e){}
 }
 
 
 async function runAsync() {
-    const rp = state.result_path || '';
-    if (!rp.endsWith('.xml')) { alert('Please save XML first.'); logWarn('Async run blocked: no saved XML'); return; }
+    let rp = state.result_path || '';
+    if (!rp.endsWith('.xml')) {
+        const go = window.confirm('Your XML has not been saved. Save now and then run?');
+        if (!go) { logInfo('Async run cancelled by user (declined save)'); return; }
+        try {
+            const ok = await saveXmlAjax();
+            if (!ok) { logWarn('Save failed; aborting async run'); return; }
+            rp = state.result_path || '';
+            if (!rp.endsWith('.xml')) { logWarn('Save did not produce an XML path; aborting async run'); return; }
+        } catch(e){ logError('Exception during auto-save; aborting async run'); return; }
+    }
     const confirmMsg = 'This action will generate a new CORE scenario and attempt to start it asynchronously using the daemon connection.\n\nProceed?';
     if (!window.confirm(confirmMsg)) { logInfo('Async run cancelled by user at confirmation'); return; }
     const form = new FormData(); form.append('xml_path', rp);
@@ -1054,13 +1651,45 @@ async function runAsync() {
     pollRunStatus(run_id);
 }
 
+// Save XML via JSON API without navigation
+async function saveXmlAjax(){
+    try {
+        const payload = { scenarios: state.scenarios };
+        const res = await fetch('/save_xml_api', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        if (!res.ok) { try { const err = await res.json(); logWarn('Save failed: ' + (err?.error || res.status)); } catch(e){ logWarn('Save failed'); } return false; }
+        const data = await res.json();
+        if (data && data.ok && data.result_path) {
+            state.result_path = data.result_path;
+            persistEditorState();
+            logInfo('Scenarios saved to ' + data.result_path);
+            // Refresh XML preview lazily
+            try {
+                const xmlPre = document.getElementById('xmlPre');
+                if (xmlPre) {
+                    const txt = await (await fetch('/download_report?path=' + encodeURIComponent(data.result_path))).text();
+                    xmlPre.textContent = txt;
+                }
+            } catch(e){}
+            return true;
+        }
+        logWarn('Save did not return a valid path');
+        return false;
+    } catch(e) { logError('Save threw an exception'); return false; }
+}
 let evtSrc = null;
 function startLogStream(runId) {
     if (evtSrc) { try { evtSrc.close(); } catch(e){} }
     evtSrc = new EventSource('/stream/' + runId);
-    const logsPre = document.getElementById('logsPre');
-    logsPre.textContent = '';
-    logBuffer = [];
+    // keep existing logs; do not auto-clear
+    // Ensure dock is visible so users can see live logs
+    try {
+        const showBtn = document.getElementById('dockShowBtn');
+        if (showBtn && !showBtn.classList.contains('d-none')) { showBtn.click(); }
+    } catch(e){}
     // Toggle buttons
     document.getElementById('runAsyncBtn').classList.add('d-none');
     document.getElementById('runSyncBtn').classList.add('disabled');
@@ -1090,7 +1719,7 @@ async function pollRunStatus(runId) {
         const data = await res.json();
         // Update download link
         const rp = data.report_path || data.xml_path;
-        if (rp) { state.result_path = rp; }
+        if (rp) { state.result_path = rp; persistEditorState(); }
         // Refresh XML preview if we have the xml path and it's changed
         if (data.xml_path && xmlPre && !xmlPre.textContent.trim()) {
                     try {
@@ -1100,6 +1729,10 @@ async function pollRunStatus(runId) {
         }
         if (!data.done) {
             setTimeout(() => pollRunStatus(runId), 1000);
+        } else {
+            if (data.returncode === 0) {
+                setTimeout(() => { window.location.href = "{{ url_for('reports_page') }}"; }, 500);
+            }
         }
     } catch(e) {
         // ignore transient errors
@@ -1121,6 +1754,116 @@ async function pollRunStatus(runId) {
         document.getElementById('cancelRunBtn').classList.add('d-none');
     logInfo('Run cancelled by user');
     }
+
+// --- Run CLI via modal (async under the hood) ---
+let runProgressModalInst = null;
+let runProgressEvtSrc = null;
+let runProgressRunId = null;
+function ensureRunProgressModal(){
+    if(!runProgressModalInst){
+        const el = document.getElementById('runProgressModal');
+        if(el){ runProgressModalInst = new bootstrap.Modal(el, { backdrop: 'static', keyboard: false }); }
+    }
+    return runProgressModalInst;
+}
+function runProgressLogLine(s){
+    const pre = document.getElementById('runProgressLog');
+    if(!pre) return;
+    pre.textContent += (s||'') + '\n';
+    pre.parentElement?.scrollTo({ top: pre.parentElement.scrollHeight });
+    // Also mirror into dock logs with level detection
+    try {
+        const raw = s || '';
+        let lvl = 'INFO';
+        if (/\bERROR\b/.test(raw)) lvl = 'ERROR';
+        else if (/\bWARN(ING)?\b/.test(raw)) lvl = 'WARN';
+        else if (/\bDEBUG\b/.test(raw)) lvl = 'DEBUG';
+        logLine(lvl, raw);
+    } catch(e){}
+}
+function openRunProgress(title){
+    ensureRunProgressModal();
+    try {
+        if(title) document.querySelector('#runProgressModal .modal-title').textContent = title;
+        document.getElementById('runProgressStatus').textContent = 'Starting…';
+        document.getElementById('runProgressMeta').textContent = '';
+        document.getElementById('runProgressBar').classList.add('progress-bar-animated');
+        document.getElementById('runProgressLog').textContent = '';
+        // Reset footer buttons to default state
+        const hideBtn = document.getElementById('runProgressHideBtn');
+        if (hideBtn) {
+            hideBtn.textContent = 'Hide';
+            hideBtn.onclick = null; // remove any prior navigation handler
+        }
+        runProgressModalInst?.show();
+    } catch(e){}
+}
+function closeRunProgress(){
+    try { if(runProgressEvtSrc) runProgressEvtSrc.close(); } catch(e){}
+    runProgressEvtSrc = null;
+    runProgressRunId = null;
+    try { runProgressModalInst?.hide(); } catch(e){}
+}
+async function runSyncWithModal(ev){
+    if(ev) ev.preventDefault();
+    // Validate saved XML
+    let rp = state.result_path || '';
+    if (!rp.endsWith('.xml')) {
+        const go = window.confirm('Your XML has not been saved. Save now and then run?');
+        if (!go) { logInfo('Run CLI cancelled by user (declined save)'); return false; }
+        try {
+            const ok = await saveXmlAjax();
+            if (!ok) { logWarn('Save failed; aborting run'); return false; }
+            rp = state.result_path || '';
+            if (!rp.endsWith('.xml')) { logWarn('Save did not produce an XML path; aborting run'); return false; }
+        } catch(e){ logError('Exception during auto-save; aborting run'); return false; }
+    }
+    const confirmMsg = 'This will generate a CORE scenario and attempt to start it. Proceed?';
+    if (!window.confirm(confirmMsg)) { logInfo('Run CLI cancelled by user at confirmation'); return false; }
+    openRunProgress('Running CLI…');
+    try {
+        // Ensure dock is visible
+        try {
+            const showBtn = document.getElementById('dockShowBtn');
+            if (showBtn && !showBtn.classList.contains('d-none')) { showBtn.click(); }
+        } catch(e){}
+        const form = new FormData(); form.append('xml_path', rp);
+        const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+        if(!res.ok){ runProgressLogLine('Failed to start CLI'); return false; }
+        const { run_id } = await res.json();
+        runProgressRunId = run_id;
+        // No Cancel button in modal; runs cannot be cancelled here
+        // Start SSE stream into modal
+        try { if(runProgressEvtSrc) runProgressEvtSrc.close(); } catch(e){}
+        runProgressEvtSrc = new EventSource('/stream/' + run_id);
+        runProgressEvtSrc.onmessage = (ev)=>{ runProgressLogLine(ev.data||''); };
+        runProgressEvtSrc.addEventListener('end', ()=>{ try { runProgressEvtSrc.close(); } catch(e){} logInfo('Run (modal) ended'); });
+        // Poll for completion and update meta
+        (async function poll(){
+            try{
+                const r = await fetch('/run_status/' + run_id);
+                if(!r.ok){ setTimeout(poll, 1200); return; }
+                const data = await r.json();
+                if(data.report_path || data.xml_path){
+                    state.result_path = data.report_path || data.xml_path;
+                    persistEditorState();
+                }
+                const metaEl = document.getElementById('runProgressMeta');
+                if(metaEl){ metaEl.textContent = data.done ? (data.returncode===0 ? 'Completed' : 'Failed') : 'Running…'; }
+                if(!data.done){ setTimeout(poll, 1000); return; }
+                document.getElementById('runProgressStatus').textContent = (data.returncode===0) ? 'Scenario started' : 'Finished with errors';
+                document.getElementById('runProgressBar').classList.remove('progress-bar-animated');
+                // If successful, redirect to Reports page
+                try {
+                    if (data.returncode === 0) {
+                        setTimeout(() => { window.location.href = "{{ url_for('reports_page') }}"; }, 500);
+                    }
+                } catch(e){}
+            } catch(e){ setTimeout(poll, 1500); }
+        })();
+    } catch(e){ runProgressLogLine('Exception starting CLI'); }
+    return false; // prevent default form submit
+}
 
     function redistributeEven(sidx, secName) {
         const items = state.scenarios[sidx].sections[secName].items;
@@ -1181,11 +1924,21 @@ async function pollRunStatus(runId) {
             const density = parseFloat((state.scenarios[sidx].sections[secName]||{}).density);
             const weightCount = items.filter(b => (b.v_metric || (b.selected==='Specific'?'Count':'Weight')) === 'Weight').length;
             const badWeights = weightCount > 0 ? (Math.abs(sum - 1.0) > 0.005) : false;
-            const badDensity = isNaN(density) ? false : (density < 0 || density > 1);
+            // Routing density: allow any density >= 0 (>=1 means absolute router count)
+            // Other sections: keep 0..1 constraint
+            const badDensity = isNaN(density) ? false : (
+                secName === 'Routing' ? (density < 0) : (density < 0 || density > 1)
+            );
             warn.style.display = (badWeights || badDensity) ? 'block' : 'none';
             let msgs = [];
             if (badWeights) msgs.push('Weights must sum to 1.000 (current: ' + sum.toFixed(3) + ')');
-            if (badDensity) msgs.push('Density must be between 0 and 1 (current: ' + density.toFixed(2) + ')');
+            if (badDensity) {
+                if (secName === 'Routing') {
+                    msgs.push('Routing density must be >= 0 (current: ' + density.toFixed(2) + '). Tip: < 1 = fraction of hosts; ≥ 1 = absolute router count.');
+                } else {
+                    msgs.push('Density must be between 0 and 1 (current: ' + density.toFixed(2) + ')');
+                }
+            }
             warn.textContent = msgs.join(' • ');
         }
     }
@@ -1308,6 +2061,33 @@ async function pollRunStatus(runId) {
     }
 </script>
 </body>
+<!-- Toast container -->
+<div aria-live="polite" aria-atomic="true" class="position-fixed" style="z-index: 1080; right: 12px; bottom: 12px;">
+    <div id="toastContainer" class="toast-container"></div>
+    <template id="toastTemplate">
+        <div class="toast align-items-center text-bg-dark border-0" role="alert" aria-live="assertive" aria-atomic="true">
+            <div class="d-flex">
+                <div class="toast-body">Action completed.</div>
+                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+            </div>
+        </div>
+    </template>
+    <script>
+        function showToast(message, opts){
+            try {
+                const container = document.getElementById('toastContainer');
+                const tmpl = document.getElementById('toastTemplate');
+                if(!container || !tmpl) return;
+                const node = tmpl.content.firstElementChild.cloneNode(true);
+                node.querySelector('.toast-body').textContent = message || 'Done';
+                container.appendChild(node);
+                const t = new bootstrap.Toast(node, Object.assign({ delay: 2500, autohide: true }, (opts||{})));
+                t.show();
+                node.addEventListener('hidden.bs.toast', () => { try { node.remove(); } catch(e){} });
+            } catch(e){}
+        }
+    </script>
+</div>
 <!-- Success Modal -->
 <div class="modal fade" id="runSuccessModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered">
@@ -1318,25 +2098,21 @@ async function pollRunStatus(runId) {
             </div>
             <div class="modal-body">
                 <p class="mb-1" id="runSuccessBody">Generation complete.</p>
-                <p class="small text-muted mb-0">View and download artifacts on the Reports page.</p>
             </div>
             <div class="modal-footer">
-                <a href="{{ url_for('reports_page') }}" class="btn btn-primary">Open Reports</a>
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
             </div>
         </div>
     </div>
 </div>
 <script>
-function enableReportsButton(){
-    const btn = document.getElementById('reportsBtn');
-    if(!btn) return; btn.removeAttribute('disabled'); btn.classList.remove('pe-none');
-}
 function showRunSuccessModal(msg){
     try { if(msg) document.getElementById('runSuccessBody').textContent = msg; new bootstrap.Modal(document.getElementById('runSuccessModal')).show(); } catch(e){}
 }
 document.addEventListener('DOMContentLoaded', () => {
-    if (window.runSuccessFlag) { enableReportsButton(); showRunSuccessModal('Synchronous run completed successfully.'); }
+    if (window.runSuccessFlag) {
+        setTimeout(() => { window.location.href = "{{ url_for('reports_page') }}"; }, 300);
+    }
 });
 // Capture server-provided flag (injected if present)
 // Inject run success flag
@@ -1350,12 +2126,68 @@ pollRunStatus = async function(runId){
         if(!res.ok) return;
         const data = await res.json();
         if(data.done && data.returncode === 0){
-            enableReportsButton();
             showRunSuccessModal('Asynchronous run completed successfully.');
         } else if(!data.done) {
             setTimeout(() => pollRunStatus(runId), 800);
         }
     } catch(e){}
 };
+</script>
+<!-- Planning Semantics Modal -->
+<div class="modal fade" id="planningSemanticsModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" data-i18n="modal.planningSemantics.title">Planning Semantics</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="spinner-border text-primary d-none" id="planningSemanticsSpinner" role="status"><span class="visually-hidden">Loading...</span></div>
+                <div id="planningSemanticsContent" class="small"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" data-i18n="common.close">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+<script>
+// i18n keys (basic scaffold)
+const I18N = Object.assign(window.I18N || {}, {
+    'btn.planningSemantics': 'Planning Semantics',
+    'modal.planningSemantics.title': 'Planning Semantics',
+    'common.close': 'Close'
+});
+function applyI18n(root=document){
+    root.querySelectorAll('[data-i18n]').forEach(el => { const k = el.getAttribute('data-i18n'); if(I18N[k]) el.innerText = I18N[k]; });
+}
+applyI18n();
+const planningModalEl = document.getElementById('planningSemanticsModal');
+if(planningModalEl){
+    planningModalEl.addEventListener('show.bs.modal', () => {
+        const spinner = document.getElementById('planningSemanticsSpinner');
+        const content = document.getElementById('planningSemanticsContent');
+        spinner.classList.remove('d-none');
+        content.innerHTML='';
+        fetch('/api/help/planning').then(r=>r.json()).then(data => {
+            spinner.classList.add('d-none');
+            const html=[];
+            html.push('<h6>Routers</h6><ul>');
+            html.push(`<li><strong>Semantics:</strong> ${data.routers.semantics}</li>`);
+            html.push(`<li><strong>Density:</strong> ${data.routers.density}</li>`);
+            html.push(`<li><strong>Counts:</strong> ${data.routers.counts}</li>`);
+            html.push(`<li><strong>Cap:</strong> ${data.routers.cap}</li>`);
+            html.push(`<li><strong>Mesh Styles:</strong> ${data.routers.mesh_styles.join(', ')}</li>`);
+            html.push('</ul><h6>Vulnerabilities</h6><ul>');
+            html.push(`<li><strong>Semantics:</strong> ${data.vulnerabilities.semantics}</li>`);
+            html.push(`<li><strong>Density:</strong> ${data.vulnerabilities.density}</li>`);
+            html.push(`<li><strong>Counts:</strong> ${data.vulnerabilities.counts}</li>`);
+            html.push(`<li><strong>Selection Order:</strong> ${data.vulnerabilities.selection_order.join(' → ')}</li>`);
+            html.push('</ul>');
+            if(data.notes){ html.push('<h6>Notes</h6><ul>'); data.notes.forEach(n=> html.push(`<li>${n}</li>`)); html.push('</ul>'); }
+            content.innerHTML = html.join('');
+        }).catch(err => { spinner.classList.add('d-none'); content.innerHTML = `<div class='text-danger'>Failed to load: ${err}</div>`; });
+    });
+}
 </script>
 </html>

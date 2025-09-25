@@ -1,0 +1,74 @@
+{# Shared persistent logs dock partial. Requires Bootstrap CSS/JS to be present. #}
+<style>
+  .dock-panel { position: fixed; bottom: 0; left: 0; right: 0; height: 40vh; background: #fff; border-top: 1px solid #dee2e6; box-shadow: 0 -2px 8px rgba(0,0,0,.08); z-index: 1030; display:flex; flex-direction:column; }
+  .dock-grip { height: 6px; cursor: ns-resize; background: repeating-linear-gradient(90deg, #e9ecef 0, #e9ecef 6px, #f8f9fa 6px, #f8f9fa 12px); border-bottom: 1px solid #dee2e6; }
+  .dock-panel .nav-tabs { flex-shrink:0; }
+  .dock-panel .tab-content { flex:1 1 auto; min-height:0; overflow:auto; }
+  .dock-panel .tab-pane { height:100%; overflow:auto; }
+  .dock-panel pre { height:auto; min-height:100%; overflow:auto; }
+  .dock-toggle-btn { position: fixed; right: 12px; bottom: 12px; z-index: 1040; }
+</style>
+<div class="dock-panel d-none" id="dockPanel">
+  <div class="dock-grip" id="dockGrip" title="Drag to resize"></div>
+  <ul class="nav nav-tabs px-3 pt-2 align-items-center" role="tablist">
+    <li class="nav-item d-flex align-items-center" role="presentation">
+      <button class="nav-link active" id="tab-logs" data-bs-toggle="tab" data-bs-target="#dock-logs" type="button" role="tab">Logs</button>
+    </li>
+    <li class="nav-item d-flex align-items-center ms-3 small" role="presentation">
+      <div class="d-flex align-items-center gap-1">
+        <label class="form-label mb-0 me-1">Level</label>
+        <select id="logLevelFilter" class="form-select form-select-sm" style="width:auto;">
+          <option value="DEBUG">DEBUG</option>
+          <option value="INFO" selected>INFO</option>
+          <option value="WARN">WARN</option>
+          <option value="ERROR">ERROR</option>
+        </select>
+        <button class="btn btn-sm btn-outline-danger ms-2" id="clearLogsBtn" type="button" title="Clear log buffer">Clear</button>
+      </div>
+    </li>
+    <li class="ms-auto nav-item" role="presentation">
+      <button class="btn btn-sm btn-outline-secondary" id="dockHideBtn" type="button">Hide</button>
+    </li>
+  </ul>
+  <div class="tab-content px-3 pb-2">
+    <div class="tab-pane fade show active" id="dock-logs" role="tabpanel" aria-labelledby="tab-logs">
+      <pre class="w-100 m-0" style="white-space: pre; overflow:auto; width:100%; font-size:0.8rem;" id="logsPre"></pre>
+    </div>
+  </div>
+</div>
+<button class="btn btn-primary btn-sm dock-toggle-btn d-none" id="dockShowBtn" type="button">Advanced Information</button>
+<script>
+(function(){
+  // Shared persistent logs dock behavior
+  const LOG_LEVELS = { DEBUG: 10, INFO: 20, WARN: 30, ERROR: 40 };
+  const LOG_STORE_KEY = 'coretg_logs_v1';
+  const DOCK_HEIGHT_KEY = 'coretg_dock_height_px';
+  const DOCK_HIDDEN_KEY = 'coretg_dock_hidden';
+  let currentLogLevel = LOG_LEVELS.INFO;
+  let logBuffer = [];
+  function renderLogs(){ const el=document.getElementById('logsPre'); if(!el) return; const filtered = logBuffer.filter(r => (r.levelValue||20) >= currentLogLevel).map(r => r.line); el.textContent = filtered.join('\n') + (filtered.length ? '\n' : ''); el.scrollTop = el.scrollHeight; }
+  function setupDock(){
+    const dock = document.getElementById('dockPanel'); const grip = document.getElementById('dockGrip'); const hideBtn = document.getElementById('dockHideBtn'); const showBtn = document.getElementById('dockShowBtn'); if(!dock||!grip||!hideBtn||!showBtn) return;
+    const setBodyPad = (px) => { document.body.style.paddingBottom = Math.max(px, 0) + 'px'; };
+    const applyHeight = (px) => { dock.style.height = px + 'px'; setBodyPad(px + 12); try{ localStorage.setItem(DOCK_HEIGHT_KEY, String(px)); }catch(e){} };
+    const savedH = parseInt(localStorage.getItem(DOCK_HEIGHT_KEY) || '0', 10); const initialH = (savedH > 100 ? savedH : (dock.offsetHeight||300)); applyHeight(initialH);
+    let resizing=false, startY=0, startH=initialH;
+    const onMove = (e) => { if(!resizing) return; const y = (e.touches? e.touches[0].clientY : e.clientY); const dy = startY - y; const nh = Math.min(Math.max(startH + dy, 120), window.innerHeight - 80); applyHeight(nh); };
+    const onUp = () => { resizing=false; document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); document.removeEventListener('touchmove', onMove); document.removeEventListener('touchend', onUp); };
+    grip.addEventListener('mousedown', (e)=>{resizing=true; startY=e.clientY; startH=dock.offsetHeight; document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp);});
+    grip.addEventListener('touchstart', (e)=>{resizing=true; startY=e.touches[0].clientY; startH=dock.offsetHeight; document.addEventListener('touchmove', onMove); document.addEventListener('touchend', onUp);}, {passive:true});
+    const applyHidden = (hidden) => { if(hidden){ dock.classList.add('d-none'); showBtn.classList.remove('d-none'); setBodyPad(12);} else { dock.classList.remove('d-none'); showBtn.classList.add('d-none'); applyHeight(parseInt(localStorage.getItem(DOCK_HEIGHT_KEY) || String(initialH), 10)); } try{ localStorage.setItem(DOCK_HIDDEN_KEY, hidden?'1':'0'); }catch(e){} };
+    const savedHidden = localStorage.getItem(DOCK_HIDDEN_KEY); applyHidden(savedHidden ? savedHidden==='1' : true);
+    hideBtn.addEventListener('click', () => applyHidden(true)); showBtn.addEventListener('click', () => applyHidden(false));
+  }
+  function init(){
+    setupDock();
+    try { const raw = localStorage.getItem(LOG_STORE_KEY); if(raw){ const arr = JSON.parse(raw); if(Array.isArray(arr)){ logBuffer = arr; } } } catch(e){}
+    try { const savedLvl = localStorage.getItem('coretg_log_level'); if(savedLvl && LOG_LEVELS[savedLvl] !== undefined){ currentLogLevel = LOG_LEVELS[savedLvl]; const sel=document.getElementById('logLevelFilter'); if(sel) sel.value=savedLvl; } } catch(e){}
+    renderLogs();
+    const sel = document.getElementById('logLevelFilter'); sel?.addEventListener('change', () => { const v=sel.value; if(LOG_LEVELS[v]!==undefined){ currentLogLevel=LOG_LEVELS[v]; try{ localStorage.setItem('coretg_log_level', v); }catch(e){} renderLogs(); }});
+    document.getElementById('clearLogsBtn')?.addEventListener('click', () => { try { localStorage.setItem(LOG_STORE_KEY, JSON.stringify([])); } catch(e){} logBuffer = []; renderLogs(); });
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+})();
+</script>

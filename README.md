@@ -14,6 +14,25 @@ pip install -r requirements.txt
 
 If you use a virtual environment, activate it before installing.
 
+## Host Planning Semantics
+
+The Node Information section supports an optional Base Hosts value (edited via the spinner near the Scenario name in the Web UI). Semantics:
+
+- Base Hosts (density base) are distributed proportionally across Weight rows using their raw (unnormalized) factors.
+- Count rows add absolute hosts on top of the proportional distribution.
+- If you provide Weight rows but leave Base Hosts empty, a legacy default base of 8 is applied for backward compatibility with earlier behavior/tests.
+- If there are no Weight rows, the base is treated as 0 (only Count rows apply).
+
+Scenario aggregate `scenario_total_nodes` = base_nodes + additive_nodes + total_planned_routers + total_planned_vulnerabilities.
+
+XML metadata attributes written for Node Information:
+- `base_nodes`, `additive_nodes`, `combined_nodes`, `weight_rows`, `count_rows`, `weight_sum`.
+
+Routing/Vulnerabilities sections add:
+- `explicit_count`, `derived_count`, `total_planned`, `weight_rows`, `count_rows`, `weight_sum`.
+
+These enable precise round‑trip planning without recomputing from factors alone. Older XML without them still parses—fallback logic recomputes approximate values.
+
 ## Run the GUI
 
 The GUI lets you load an XML scenario, analyze it, and generate the CORE session asynchronously with progress feedback.
@@ -21,6 +40,103 @@ The GUI lets you load an XML scenario, analyze it, and generate the CORE session
 ```bash
 python main.py
 ```
+
+### Run with HTTPS (nginx container + host Web UI)
+
+By default, an `nginx` reverse proxy service in Docker terminates TLS on port 443 and proxies to a Web UI running on the host at `127.0.0.1:9090`. This lets you use your host `core-python` environment directly.
+
+1. Generate a self-signed certificate (development only). Fast one-liner (idempotent):
+	```bash
+	bash scripts/dev_gen_certs.sh
+	```
+   Customize:
+	```bash
+	CERT_DAYS=30 CERT_SUBJECT="/CN=localhost" CERT_SANS="DNS:localhost,IP:127.0.0.1" bash scripts/dev_gen_certs.sh
+	```
+   Force re-generation (overwrite existing):
+	```bash
+	FORCE_REGEN=1 bash scripts/dev_gen_certs.sh
+	```
+
+   Makefile alternative (also auto-runs before `make up`):
+	```bash
+	make dev-certs            # ensure certs
+	make force-certs          # force regenerate
+	make up                   # generate if needed, then docker compose up --build
+	```
+
+2. Or manual OpenSSL invocation:
+	```bash
+	mkdir -p nginx/certs
+	openssl req -x509 -nodes -newkey rsa:4096 \
+	  -keyout nginx/certs/server.key \
+	  -out nginx/certs/server.crt \
+	  -days 365 -subj "/CN=localhost"
+	```
+
+3. Start the Web UI on the host and choose your proxy (nginx default, or envoy):
+	```bash
+	# Default (nginx)
+	make host-web
+
+	# Explicit (nginx)
+	make host-web-nginx
+
+	# Envoy instead of nginx
+	make host-web PROXY=envoy
+	# or
+	make host-web-envoy
+	```
+4. Access the UI:
+	- HTTPS: https://localhost/
+	- HTTP will redirect to HTTPS automatically.
+
+Certificate files are mounted read-only into the nginx container at `/etc/nginx/certs/server.crt` and `/etc/nginx/certs/server.key`.
+
+For production, replace the self‑signed cert with certificates from a trusted CA (e.g., Let’s Encrypt) and adjust:
+- nginx mode: `server_name` in `nginx/nginx-hostweb.conf`
+- envoy mode: TLS certs in `envoy/envoy.yaml` and optional HSTS/security header settings via Envoy filters
+
+Self-signed SANs: The script accepts `CERT_SANS` as a comma-separated list (e.g. `DNS:localhost,IP:127.0.0.1`). Browsers increasingly require SANs even if the CN is set.
+
+Automatic certificate generation in compose:
+- The `nginx` container self-generates a self-signed cert on startup if `nginx/certs/server.crt` or `server.key` is missing.
+- Generation runs via a `/docker-entrypoint.d/10-gen-certs.sh` hook in the custom nginx image (see `nginx/Dockerfile`).
+- Customize at compose runtime:
+	```bash
+	CERT_DAYS=30 CERT_SUBJECT="/CN=localhost" docker compose up --build
+	```
+- SAN support still requires the script: `CERT_SANS="DNS:localhost,IP:127.0.0.1" bash scripts/dev_gen_certs.sh` (run before `docker compose up`).
+- To force regeneration: delete `nginx/certs/server.*` then rerun compose, or regenerate via the script with `FORCE_REGEN=1`.
+
+Troubleshooting empty `nginx/certs` after startup:
+- Ensure you launched from the repository root (where `docker-compose.yml` lives).
+- Check container logs:
+	```bash
+	docker compose logs -f nginx | grep nginx-init
+	```
+- Inspect inside the container:
+	```bash
+	docker exec -it core-topo-gen-proxy ls -l /etc/nginx/certs
+	```
+- If directory is empty inside: verify the host path exists and is writable:
+	```bash
+	ls -ld nginx/certs
+	```
+- Recreate nginx cleanly:
+	```bash
+	docker compose rm -sf nginx
+	docker compose up -d --build nginx
+	```
+- Still empty? Regenerate explicitly with SAN support:
+	```bash
+	CERT_SANS="DNS:localhost,IP:127.0.0.1" bash scripts/dev_gen_certs.sh
+	docker compose up -d --build nginx
+	```
+
+gRPC connectivity to host CORE:
+- The Web UI runs on the host, so it connects to your host `core-daemon` directly (default port 50051). Adjust in the UI if needed.
+- The nginx container doesn’t need gRPC access—it only proxies HTTP(S).
 
 Tips:
 - Use the context menu action “Generate in CORE…” to build and start a session.
@@ -65,7 +181,71 @@ Example:
 python -m core_topo_gen.cli \
 	--xml validation/core-xml-syntax/auto-valid-testset/xml_scenarios/sample1.xml \
 	--ip-mode mixed --verbose --seed 42
+
+### Additive Planning Semantics & XML Metadata
+
+The scenario editor (Web UI) and CLI share an additive planning model for hosts, routers, and vulnerabilities. A scenario-level attribute `scenario_total_nodes` is now written on `<Scenario>` summarizing the aggregate planned nodes across sections (hosts + routers + vulnerability explicit targets when applicable). Older XML without this attribute remains valid.
+
+- Hosts ("Node Information" section):
+	- Base (density) hosts are distributed proportionally only across Weight rows.
+	- Count rows add absolute host counts on top of the proportional allocation.
+- Routers ("Routing" section):
+	- Section `density` < 1.0: fractional multiplier of the combined host pool (base+additive) for derived routers.
+	- Section `density` >= 1.0: interpreted as an absolute derived router count (not a fraction).
+	- Count rows (items with `v_metric="Count"`) add absolute routers (per protocol) on top of any derived amount.
+- Vulnerabilities ("Vulnerabilities" section):
+	- Section `density` fraction (clipped to 1.0) of the base host pool only (not including additive host rows) for derived vulnerabilities.
+	- Count rows or `Specific` entries with `v_count` supply explicit counts added to the derived amount.
+
+To enable lossless round‑trip of these semantics, additional attributes are written into the XML by the Web UI (`_build_scenarios_xml`). They are optional; older XML remains valid. The CLI now parses and merges this metadata into reports when present.
+
+Section attribute summary (all optional):
+
+"Node Information":
+- `base_nodes`: integer base (density) host count used for proportional allocation (0 if no weight rows).
+- `additive_nodes`: sum of Count row host additions.
+- `combined_nodes`: `base_nodes + additive_nodes`.
+- `weight_rows`: number of Weight rows.
+- `count_rows`: number of Count rows.
+- `weight_sum`: sum of raw (unnormalized) weight factors.
+
+"Routing" and "Vulnerabilities":
+- `explicit_count`: sum of absolute Count (or Specific) item counts.
+- `derived_count`: derived count from density logic (see rules above).
+- `total_planned`: `explicit_count + derived_count`.
+- `weight_rows`: number of weight-factor items in the section.
+- `count_rows`: number of explicit count items.
+- `weight_sum`: sum of weight item factors.
+
+These attributes appear only when the section has relevant items or user input. Downstream tooling can prefer them rather than recomputing from density + factors, ensuring reproducible planning even if factor normalization or remainder distribution algorithms change in future versions.
+
+Programmatic access (Python):
+
+```python
+from core_topo_gen.parsers.xml_parser import parse_planning_metadata
+meta = parse_planning_metadata('scenario.xml', 'ScenarioName')
+print(meta['node_info']['combined_nodes'])
 ```
+
+Report integration: When present, planning metadata is rendered under a dedicated "Planning Metadata" section in the scenario Markdown report with namespaced keys (e.g. `plan_node_base_nodes`).
+
+Runtime API access: A lightweight endpoint `/planning_meta?path=<xml>&scenario=<name>` returns the parsed metadata JSON (see `API.md`). This allows external tools to quickly inspect planned counts without invoking the full CLI run.
+
+Backward compatibility: If attributes are absent, the parser falls back to recomputation (exact values for some legacy scenarios—like precise derived router counts tied to a changing host pool—may differ slightly, but overall semantics are preserved).
+
+Experimental structural metadata (Services / Traffic / Segmentation): the XML builder also emits `explicit_count`, `weight_rows`, `count_rows`, and `weight_sum` for these sections to support future additive extensions and analytical tooling.
+```
+
+## HTTP API (for automation)
+
+If you prefer to drive runs from scripts or external tools, the Web UI exposes a simple HTTP API. See the full reference here:
+
+- API Reference: [API.md](./API.md)
+
+Typical flow:
+- POST `/run_cli_async` with the saved `xml_path`
+- Poll `GET /run_status/<run_id>` until `done: true`
+- Download the generated report via `GET /download_report?path=<abs_or_repo_path>`
 
 Traffic generation:
 - If Traffic is defined in the XML, scripts are written to `/tmp/traffic` and a `Traffic` service is enabled on relevant nodes before the session starts.
@@ -84,6 +264,34 @@ Traffic XML attributes (optional):
 		- `text` (HTTP-like lines), `photo`/`image` (JPEG-like markers), `audio` (frame-ish bytes), `video` (NAL-like segments)
 
 These attributes influence only sender scripts. Receivers are simple listeners. For burst/periodic, senders transmit for `period` seconds, then idle for roughly the same duration before repeating. Content type changes only the byte patterns; it does not produce valid media files, but it better approximates media-like flows for testing.
+
+### Python interpreter selection (CLI + Web UI backend)
+
+The project previously assumed a `core-python` executable (a convenience name some CORE installs provide). The backend and documentation now use a resilient interpreter selection order:
+
+Priority order used by the Web UI when invoking the CLI:
+1. `CORE_PY` environment variable (absolute path or command name)
+2. `core-python` (if found in `PATH`)
+3. `python3`
+4. `python`
+5. `sys.executable` (the interpreter running the Flask app)
+
+Override explicitly (examples):
+```bash
+# When starting the host Web UI
+WEBUI_PY=/usr/bin/python3 make host-web
+```
+
+Inside the running container you can verify which interpreter was chosen by looking at the web container logs; each run logs a line like:
+```
+[sync] Using python interpreter: /usr/bin/python3
+```
+or
+```
+[async] Using python interpreter: /usr/local/bin/python
+```
+
+If you encounter `core-python: not found` when running on the host, export `WEBUI_PY` to point at the desired interpreter, or activate your `core-python` venv before `make host-web`.
 
 Segmentation generation:
 - If Segmentation is defined in the XML, scripts are written to `/tmp/segmentation` and a custom service named `Segmentation` is enabled on the affected nodes.
@@ -143,6 +351,56 @@ To auto-start generated segmentation scripts, CORE needs a custom service named 
 
 When enabled on a node, the Segmentation service will copy and execute `/tmp/segmentation/seg_*_<nodeId>_*.py` scripts.
 
+## Docker-compose vulnerabilities runtime
+
+Docker-compose vulnerabilities are realized using CORE's built-in Docker node type (no custom service required).
+
+Behavior and requirements:
+
+- During topology build, a subset of host slots are converted to Docker nodes based on your Vulnerabilities selection (Category/Specific, Count/Weight, Vector).
+- For each Docker node, the generator writes a per-node compose file at `/tmp/vulns/docker-compose-<node>.yml`, injecting `container_name: <node>`.
+- The generator makes a best-effort to run `docker compose up -d` on the host for those files. You can also manage them manually.
+- Ensure Docker is installed and images are pre-pulled via the Web UI Vulnerability Catalog (Download + Pull). Only downloaded and pulled items are eligible for assignment.
+## CORE management page (Web UI)
+
+The Web UI includes a dedicated page to manage CORE sessions and topologies. Open the Web UI and click the `CORE` link in the navbar.
+
+What you’ll see:
+
+- Active Sessions (left)
+	- Lists active sessions discovered via gRPC: session id, state, nodes count, and (when available) the source XML file path.
+	- Actions:
+		- Details: summary info and nodes list for the session’s XML (if available).
+		- Stop: request the daemon to stop the session.
+		- Delete: request the daemon to delete the session.
+		- Save XML: snapshot the current session to `outputs/core-sessions/` (validated against the XSD).
+
+- Available Topologies (right)
+	- Scans `uploads/` and `outputs/` for `.xml` files that look like CORE scenario XMLs and validates them against the schema.
+	- Each file shows validity, whether it’s currently running, and the mapped session id (best‑effort).
+	- Actions:
+		- Start: open the XML in CORE and start the session (enabled only for valid XMLs).
+		- Details: analyze XML (nodes/networks/links/services) and view a quick summary.
+		- Download: download the XML via the safe `/download_report?path=...` route.
+		- Delete: remove the XML file safely. For safety, deletion is limited to files under `uploads/` or `outputs/`.
+	- Upload form: add a new XML; the server validates it before it appears in the list.
+
+Connectivity and environment:
+
+- gRPC access to `core-daemon` is optional for browsing/uploading XMLs. When gRPC isn’t available, actions requiring it (start/stop/delete/save) show a friendly error but the page remains usable for XML management.
+- Default daemon address is `CORE_HOST:CORE_PORT` (defaults `localhost:50051`). You can override via environment when launching the Web UI:
+
+```bash
+export CORE_HOST=127.0.0.1
+export CORE_PORT=50051
+python webapp/app_backend.py
+```
+
+Security and safety:
+
+- Delete operations from the CORE page are restricted to `uploads/` and `outputs/` to prevent accidental removal of arbitrary files.
+- Session XML snapshots are validated against the same XSD as uploads; invalid snapshots are discarded with a log message.
+
 ## Scenario Deletion and Reports
 
 Deleting a scenario from the Web GUI now prompts for confirmation. If there are historical runs (entries on the Reports page) associated with the scenario name, the dialog will warn and display how many will be removed. Confirming the deletion will:
@@ -160,3 +418,20 @@ Directories that become empty in `outputs/` after artifact removal are also clea
 	- Check gRPC host/port with `--host` and `--port`.
 - Long pause after “Traffic scripts written…”:
 	- Starting a CORE session can take time while services initialize. Use `--verbose` and check `core-daemon` logs for details.
+
+## Authentication and users
+
+The Web UI requires login. On first boot (when no users exist), it seeds a default administrator account:
+
+- Username: `coreadmin`
+- Password: `coreadmin`
+
+Change this password immediately after your first login.
+
+Managing users:
+- Admins can open the `Users` page in the navbar to create/delete users and reset passwords.
+- Any user can change their own password from `Profile` → `Change Password` or at `/me/password`.
+- The user database lives at `outputs/users/users.json`.
+
+Admin fallback safety:
+- If the users file exists but contains no admin, the app will create an `admin` account with a random password (or the value of `ADMIN_PASSWORD`). The generated password is logged on startup.

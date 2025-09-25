@@ -14,6 +14,8 @@
     .table-wrap { max-height: 70vh; overflow: auto; }
     td.invalid, th.invalid { background: #ffe3e3 !important; }
     td.warning { background: #fff3cd !important; }
+    .nav-link.core-link, .btn.core-link { font-weight: 600; color: #0d6efd !important; border: 1px solid rgba(13,110,253,.2); border-radius: .25rem; }
+    .btn.core-link .bi { margin-right: .25rem; }
   </style>
 </head>
 <body class="p-3" data-sid="{{ sid }}" data-name="{{ name }}">
@@ -26,6 +28,17 @@
       <div class="d-flex align-items-center gap-2 small">
         <a class="btn btn-sm btn-outline-light" href="{{ url_for('data_sources_page') }}">Back</a>
         <a class="btn btn-sm btn-outline-light" href="{{ url_for('reports_page') }}">Reports</a>
+        <a class="btn btn-sm btn-outline-light core-link" href="{{ url_for('core_page') }}"><i class="bi bi-diagram-3-fill"></i> CORE</a>
+        {% if current_user and current_user.role == 'admin' %}
+        <div class="dropdown ms-2">
+          <button class="btn btn-sm btn-light dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
+            Settings
+          </button>
+          <ul class="dropdown-menu dropdown-menu-end">
+            <li><a class="dropdown-item" href="{{ url_for('users_page') }}">Users</a></li>
+          </ul>
+        </div>
+        {% endif %}
       </div>
     </div>
     <div class="border rounded-bottom shadow-sm p-3">

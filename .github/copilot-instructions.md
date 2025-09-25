@@ -30,7 +30,9 @@ Purpose: Generate CORE network topologies from XML scenarios via CLI or a Web GU
 ## Conventions & Patterns
 - XML schema:
   - Root `<Scenarios>` with one or more `<Scenario>` containing a `<ScenarioEditor>`.
-  - Sections: `Node Information` (with `total_nodes`), `Routing`, `Services`, `Traffic`, `Segmentation`, optional `Notes`.
+  - Sections: `Node Information`, `Routing`, `Services`, `Traffic`, `Segmentation`, optional `Notes`.
+    - Legacy attribute `total_nodes` (section-level) has been removed. Host counts are now purely additive at the role row level.
+    - A scenario-level aggregate attribute `scenario_total_nodes` (on `<Scenario>`) represents the sum of all planned hosts (node roles + routers + vulnerability additive targets, etc.) written by the web UI.
   - Items use attributes `selected`, `factor`, and section-specific extras (e.g., `pattern`, `rate_kbps`).
 - Report location: always under repo `./reports/`. The CLI logs an absolute path; the web app converts relative paths to absolute.
 - Logs: Web async run tails `cli-<run_id>.log` and emits SSE at `/stream/<run_id>`.

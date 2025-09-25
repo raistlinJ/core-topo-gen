@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 import stat
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from ..plugins import traffic as custom_traffic
 from ..plugins import static_profile as _static_profile
 from ..types import NodeInfo, TrafficInfo
@@ -65,8 +65,8 @@ pattern = "{pattern}".lower() or "continuous"
 content_type = "{content_type}".lower()
 print(f"[traffic] TCP sender to {{host}}:{{port}} rate={{rate_kbps}}KB/s period={{period_s}}s jitter={{jitter_pct}}% pattern={{pattern}}")
 
-# If content type isn't specified or is 'random/auto', pick one randomly including gibberish
-if not content_type or content_type in ("random", "auto"):
+# If content type isn't specified or is Random, pick one randomly including gibberish
+if not content_type or (isinstance(content_type, str) and content_type.lower() == "random"):
     content_type = random.choices(["text", "photo", "audio", "video", "gibberish"], weights=[2, 1, 1, 1, 2])[0]
 
 def sleep_with_jitter(base: float):
@@ -210,8 +210,8 @@ content_type = "{content_type}".lower()
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 print(f"[traffic] UDP sender to {{host}}:{{port}} rate={{rate_kbps}}KB/s period={{period_s}}s jitter={{jitter_pct}}% pattern={{pattern}}")
 
-# If content type isn't specified or is 'random/auto', pick one randomly including gibberish
-if not content_type or content_type in ("random", "auto"):
+# If content type isn't specified or is 'random', pick one randomly including gibberish
+if not content_type or (isinstance(content_type, str) and content_type.lower() == "random"):
     content_type = random.choices(["text", "photo", "audio", "video", "gibberish"], weights=[2, 1, 1, 1, 2])[0]
 
 def sleep_with_jitter(base: float):
@@ -323,7 +323,11 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
     """
     result: Dict[int, List[str]] = {}
     flows: List[Dict[str, object]] = []
-    if not hosts or density <= 0:
+    # Determine if any item specifies an absolute count of flows
+    count_items = [it for it in (items or []) if getattr(it, "abs_count", 0) and int(getattr(it, "abs_count", 0)) > 0]
+    if not hosts:
+        return result
+    if density <= 0 and not count_items:
         return result
 
     os.makedirs(out_dir, exist_ok=True)
@@ -353,12 +357,140 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
     if not weighted:
         weighted = [("TCP", 1.0)]
 
-    # Select subset of hosts by density (round-and-clamp semantics)
+    # Maintain per-node indices for naming and per-node per-protocol RX offsets
+    recv_idx_by_node: Dict[int, int] = {}
+    send_idx_by_node: Dict[int, int] = {}
+    rx_proto_idx: Dict[str, Dict[int, int]] = {"TCP": {}, "UDP": {}}
+
+    # Helper to create a single flow given sender host, receiver node and item
+    def _create_flow(host, rx_node, it, kind_override: Optional[str] = None):
+        nonlocal recv_idx_by_node, send_idx_by_node, rx_proto_idx
+        ik = (it.kind or "").strip()
+        if not ik and not kind_override:
+            return
+        kind = kind_override or (_choose_kind(weighted) if ik.lower() == "random" else ik.upper())
+        proto_key = kind if kind in ("TCP", "UDP") else "TCP"
+        if proto_key not in rx_proto_idx:
+            rx_proto_idx[proto_key] = {}
+        base = 5000 if proto_key == "TCP" else 6000
+        rx_node_id = rx_node.node_id
+        # Compute per-node per-protocol receiver port index to avoid collisions
+        proto_map = rx_proto_idx[proto_key]
+        idx = proto_map.get(rx_node_id, 1)
+        rx_port = base + (rx_node_id % 1000) + (idx - 1)
+        proto_map[rx_node_id] = idx + 1
+        # Receiver script
+        r_index = recv_idx_by_node.get(rx_node_id, 1)
+        recv_name = os.path.join(out_dir, f"traffic_{rx_node_id}_r{r_index}.py")
+        if kind == "CUSTOM":
+            _sender_fn, _receiver_fn = custom_traffic.get()
+            if _sender_fn is None and _receiver_fn is None:
+                try:
+                    _static_profile.register()
+                except Exception:
+                    pass
+                _sender_fn, _receiver_fn = custom_traffic.get()
+            if _receiver_fn is not None:
+                recv_content = _receiver_fn(rx_port, proto_key)
+            else:
+                recv_content = _tcp_receiver_script(rx_port) if proto_key == "TCP" else _udp_receiver_script(rx_port)
+        else:
+            recv_content = _tcp_receiver_script(rx_port) if proto_key == "TCP" else _udp_receiver_script(rx_port)
+        with open(recv_name, "w", encoding="utf-8") as f:
+            f.write(recv_content)
+        os.chmod(recv_name, os.stat(recv_name).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        recv_idx_by_node[rx_node_id] = r_index + 1
+        result.setdefault(rx_node_id, []).append(recv_name)
+
+        # Sender
+        dst_ip = _ip_only(rx_node.ip4)
+        dst_port = rx_port
+        s_index = send_idx_by_node.get(host.node_id, 1)
+        send_name = os.path.join(out_dir, f"traffic_{host.node_id}_s{s_index}.py")
+        rate_kbps = getattr(it, "rate_kbps", 0.0) or 0.0
+        period_s = getattr(it, "period_s", 10.0) or 10.0
+        jitter_pct = getattr(it, "jitter_pct", 0.0) or 0.0
+        pattern = getattr(it, "pattern", "") or ""
+        content_type = getattr(it, "content_type", "") or ""
+        if (content_type or "").lower() == "random":
+            pattern = random.choices(
+                ["continuous", "periodic", "burst", "poisson", "ramp"],
+                weights=[4, 2, 2, 1, 1]
+            )[0]
+            rate_kbps = max(16.0, min(1024.0, float(int(2 ** random.uniform(4, 10)))))
+            period_s = round(random.uniform(0.2, 3.0), 2)
+            jitter_pct = round(random.uniform(0.0, 30.0), 1)
+        if kind == "CUSTOM":
+            _sender_fn, _receiver_fn = custom_traffic.get()
+            if _sender_fn is None and _receiver_fn is None:
+                try:
+                    _static_profile.register()
+                except Exception:
+                    pass
+                _sender_fn, _receiver_fn = custom_traffic.get()
+            if _sender_fn is not None:
+                send_content = _sender_fn(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, content_type, proto_key)
+            else:
+                send_content = (
+                    _tcp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
+                    if proto_key == "TCP"
+                    else _udp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
+                )
+        else:
+            send_content = (
+                _tcp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
+                if proto_key == "TCP"
+                else _udp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
+            )
+        with open(send_name, "w", encoding="utf-8") as f:
+            f.write(send_content)
+        os.chmod(send_name, os.stat(send_name).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        send_idx_by_node[host.node_id] = s_index + 1
+        result.setdefault(host.node_id, []).append(send_name)
+        flows.append({
+            "src_id": host.node_id,
+            "dst_id": rx_node_id,
+            "protocol": proto_key,
+            "dst_ip": dst_ip,
+            "dst_port": dst_port,
+            "pattern": pattern or "",
+            "rate_kbps": rate_kbps,
+            "period_s": period_s,
+            "jitter_pct": jitter_pct,
+            "content_type": content_type or "",
+            "sender_script": send_name,
+            "receiver_script": recv_name,
+        })
+
+    # 1) Generate flows for explicit-count items (abs_count)
+    if count_items:
+        # Round-robin sender/receiver selection across hosts
+        H = len(hosts)
+        if H == 0:
+            return result
+        # Deterministic ordering to avoid duplicate pairs when rerun
+        rr_hosts = hosts.copy()
+        # Don't shuffle rr_hosts: keep stable assignment
+        for it in count_items:
+            total = int(getattr(it, "abs_count", 0) or 0)
+            if total <= 0:
+                continue
+            for i in range(total):
+                sender = rr_hosts[i % H]
+                # pick receiver as next host in the ring if possible, else self
+                if H > 1:
+                    rx = rr_hosts[(i + 1) % H]
+                else:
+                    rx = sender
+                _create_flow(sender, rx, it)
+
+    # 2) Generate flows for remaining items using density-based semantics
     # - density <= 0 handled above
     # - density >= 1 -> select all hosts
     # - otherwise round to nearest and clamp to [1, len(hosts)]
     import math
     if density >= 1:
+        # density >= 1 means all hosts participate (legacy semantics)
         k = len(hosts)
     else:
         desired = len(hosts) * max(0.0, min(1.0, float(density)))
@@ -366,22 +498,19 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
     selected = hosts.copy()
     random.shuffle(selected)
     selected = selected[:k]
+    # Use only normal items for density-based generation
+    normal_items = [it for it in (items or []) if not (getattr(it, "abs_count", 0) and int(getattr(it, "abs_count", 0)) > 0)]
 
-    # Maintain per-node indices for naming and per-node per-protocol RX offsets
-    recv_idx_by_node: Dict[int, int] = {}
-    send_idx_by_node: Dict[int, int] = {}
-    rx_proto_idx: Dict[str, Dict[int, int]] = {"TCP": {}, "UDP": {}}
-
-    # For each selected host, create sender scripts for that host and receiver scripts on the chosen target
-    for host in selected:
-        others = [h for h in hosts if h.node_id != host.node_id]
-        # Decide which items to use (default to single TCP if none provided)
-        items_to_use = items if items else [TrafficInfo(kind="TCP", factor=1.0)]
-        for it in items_to_use:
-            ik = (it.kind or "").strip()
-            if not ik:
-                continue
-            kind = _choose_kind(weighted) if ik.lower() == "random" else ik.upper()
+    if density > 0 and normal_items:
+        # For each selected host, create sender scripts for that host and receiver scripts on the chosen target
+        items_to_use = normal_items
+        for host in selected:
+            others = [h for h in hosts if h.node_id != host.node_id]
+            for it in items_to_use:
+                ik = (it.kind or "").strip()
+                if not ik:
+                    continue
+                kind = _choose_kind(weighted) if ik.lower() == "random" else ik.upper()
 
             # Underlying transport protocol: map to TCP/UDP
             proto_key = kind if kind in ("TCP", "UDP") else "TCP"
@@ -428,62 +557,75 @@ def generate_traffic_scripts(hosts: List[NodeInfo], density: float, items: List[
             result.setdefault(rx_node_id, []).append(recv_name)
 
             # Sender script from the current host to the receiver node/port
-            if target is not None:
-                dst_ip = _ip_only(rx_node.ip4)
-                dst_port = rx_port
-                s_index = send_idx_by_node.get(host.node_id, 1)
-                send_name = os.path.join(out_dir, f"traffic_{host.node_id}_s{s_index}.py")
-                # Use parsed rate/period/jitter/pattern when available
-                rate_kbps = getattr(it, "rate_kbps", 0.0) or 0.0
-                period_s = getattr(it, "period_s", 10.0) or 10.0
-                jitter_pct = getattr(it, "jitter_pct", 0.0) or 0.0
-                pattern = getattr(it, "pattern", "") or ""
-                content_type = getattr(it, "content_type", "") or ""
-                # Use custom sender only when kind is CUSTOM (auto-register static if none)
-                if kind == "CUSTOM":
+            # Always create a sender, even when target is None (self-traffic)
+            dst_ip = _ip_only(rx_node.ip4)
+            dst_port = rx_port
+            s_index = send_idx_by_node.get(host.node_id, 1)
+            send_name = os.path.join(out_dir, f"traffic_{host.node_id}_s{s_index}.py")
+            # Use parsed rate/period/jitter/pattern when available
+            rate_kbps = getattr(it, "rate_kbps", 0.0) or 0.0
+            period_s = getattr(it, "period_s", 10.0) or 10.0
+            jitter_pct = getattr(it, "jitter_pct", 0.0) or 0.0
+            pattern = getattr(it, "pattern", "") or ""
+            content_type = getattr(it, "content_type", "") or ""
+            # If payload is Random, pick reasonable random values for pattern/rate/period/jitter
+            if (content_type or "").lower() == "random":
+                # Pattern weights favor continuous, then periodic/burst, with some poisson/ramp
+                pattern = random.choices(
+                    ["continuous", "periodic", "burst", "poisson", "ramp"],
+                    weights=[4, 2, 2, 1, 1]
+                )[0]
+                # Rate between 16 and 1024 KB/s, skewed towards lower rates
+                rate_kbps = max(16.0, min(1024.0, float(int(2 ** random.uniform(4, 10)))))
+                # Base period between 0.2s and 3.0s
+                period_s = round(random.uniform(0.2, 3.0), 2)
+                # Jitter between 0 and 30%
+                jitter_pct = round(random.uniform(0.0, 30.0), 1)
+            # Use custom sender only when kind is CUSTOM (auto-register static if none)
+            if kind == "CUSTOM":
+                _sender_fn, _receiver_fn = custom_traffic.get()
+                if _sender_fn is None and _receiver_fn is None:
+                    try:
+                        _static_profile.register()
+                    except Exception:
+                        pass
                     _sender_fn, _receiver_fn = custom_traffic.get()
-                    if _sender_fn is None and _receiver_fn is None:
-                        try:
-                            _static_profile.register()
-                        except Exception:
-                            pass
-                        _sender_fn, _receiver_fn = custom_traffic.get()
-                    if _sender_fn is not None:
-                        send_content = _sender_fn(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, content_type, proto_key)
-                    else:
-                        send_content = (
-                            _tcp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
-                            if proto_key == "TCP"
-                            else _udp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
-                        )
+                if _sender_fn is not None:
+                    send_content = _sender_fn(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, content_type, proto_key)
                 else:
                     send_content = (
                         _tcp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
                         if proto_key == "TCP"
                         else _udp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
                     )
-                with open(send_name, "w", encoding="utf-8") as f:
-                    f.write(send_content)
-                os.chmod(send_name, os.stat(send_name).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-                send_idx_by_node[host.node_id] = s_index + 1
-                result.setdefault(host.node_id, []).append(send_name)
+            else:
+                send_content = (
+                    _tcp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
+                    if proto_key == "TCP"
+                    else _udp_sender_script(dst_ip, dst_port, rate_kbps, period_s, jitter_pct, pattern, content_type)
+                )
+            with open(send_name, "w", encoding="utf-8") as f:
+                f.write(send_content)
+            os.chmod(send_name, os.stat(send_name).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            send_idx_by_node[host.node_id] = s_index + 1
+            result.setdefault(host.node_id, []).append(send_name)
 
-                # record a flow summary for reporting
-                flows.append({
-                    "src_id": host.node_id,
-                    "dst_id": rx_node_id,
-                    # Record actual transport protocol used (TCP/UDP) for downstream tooling
-                    "protocol": proto_key,
-                    "dst_ip": dst_ip,
-                    "dst_port": dst_port,
-                    "pattern": pattern or "",
-                    "rate_kbps": rate_kbps,
-                    "period_s": period_s,
-                    "jitter_pct": jitter_pct,
-                    "content_type": content_type or "",
-                    "sender_script": send_name,
-                    "receiver_script": recv_name,
-                })
+            # record a flow summary for reporting
+            flows.append({
+                "src_id": host.node_id,
+                "dst_id": rx_node_id,
+                # Record actual transport protocol used (TCP/UDP) for downstream tooling
+                "protocol": proto_key,
+                "dst_ip": dst_ip,
+                "dst_port": dst_port,
+                "pattern": pattern or "",
+                "rate_kbps": rate_kbps,
+                "period_s": period_s,
+                "jitter_pct": jitter_pct,
+                "content_type": content_type or "",
+                "sender_script": send_name,
+                "receiver_script": recv_name,
+            })
 
     # write a machine-readable summary to the out_dir for report generator
     try:

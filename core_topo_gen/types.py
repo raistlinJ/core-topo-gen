@@ -7,11 +7,17 @@ class ServiceInfo:
     name: str
     factor: float
     density: float
+    # When > 0, indicates an absolute number of hosts to assign this service to.
+    # Takes precedence over fractional density.
+    abs_count: int = 0
 
 @dataclass
 class RoutingInfo:
     protocol: str
     factor: float
+    # When > 0, indicates an absolute number of routers to assign this protocol to.
+    # Used in addition to density-based routers.
+    abs_count: int = 0
 
 @dataclass
 class NodeInfo:
@@ -28,8 +34,12 @@ class TrafficInfo:
     period_s: float = 10.0
     jitter_pct: float = 0.0
     content_type: str = ""
+    # When > 0, indicates an absolute number of sender/receiver pairs to create for this item.
+    abs_count: int = 0
 
 @dataclass
 class SegmentationInfo:
     name: str
     factor: float
+    # When > 0, indicates an absolute number of segmentation slots to plan for this service.
+    abs_count: int = 0

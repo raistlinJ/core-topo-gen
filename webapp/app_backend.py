@@ -7,28 +7,36 @@ import json
 import datetime
 import time
 import uuid
+import threading
 from typing import Dict, Any
 import subprocess
 import sys
 import re
 import xml.etree.ElementTree as ET
 from lxml import etree as LET  # XML validation
-from flask import Flask, render_template, request, redirect, url_for, flash, send_file, Response, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, send_file, Response, jsonify, session, g
 from werkzeug.utils import secure_filename
 import csv
 from pathlib import Path
 import logging
 import logging
 import zipfile
+import secrets
+from werkzeug.security import generate_password_hash, check_password_hash
 
 ALLOWED_EXTENSIONS = {'xml'}
 
 app = Flask(__name__)
-app.secret_key = 'coretopogenweb'
+app.secret_key = os.environ.get('FLASK_SECRET', 'coretopogenweb')
 try:
     app.logger.setLevel(logging.DEBUG)
 except Exception:
     pass
+
+# Provide repo root helper early; used by environment path loaders during import
+def _get_repo_root() -> str:
+    """Return absolute path to project root (parent of this webapp directory)."""
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 try:
     app.logger.setLevel(logging.DEBUG)
 except Exception:
@@ -107,6 +115,332 @@ def _uploads_dir() -> str:
 def _outputs_dir() -> str:
     return _load_env_paths().get('OUTPUTS_DIR')
 
+# ---------------- Planning semantics help API ----------------
+@app.route('/api/help/planning')
+def api_help_planning():
+    """Return JSON describing additive planning semantics for routers & vulnerabilities.
+
+    This documents how counts (absolute) and density (fractional or absolute when >=1) interact.
+    """
+    data = {
+        "routers": {
+            "semantics": "Additive",
+            "density": "Density in [0,1]: routers_density = round(base_host_count * density)",
+            "counts": "Sum of Count rows (v_metric=='Count') added; total capped by base_host_count",
+            "cap": "Total routers limited to base_host_count",
+            "mesh_styles": ["full", "ring", "tree"],
+        },
+        "vulnerabilities": {
+            "semantics": "Additive",
+            "density": "Density in [0,1]: vuln_density_target = round(base_host_count * density)",
+            "counts": "Sum of v_count across Count rows and Specific rows (with v_count) is additive; capped by base_host_count",
+            "selection_order": ["Assign Count rows", "Assign density-based (weight) rows"],
+        },
+        "notes": [
+            "Base host count excludes routers & docker conversions",
+            "Docker vulnerability assignments consume host slots sequentially (slot-1..N)",
+            "Random placeholders are resolved before distribution",
+        ]
+    }
+    return jsonify(data)
+
+
+@app.route('/planning_meta')
+def planning_meta_endpoint():
+    """Return parsed planning metadata for a scenario XML.
+
+    Query params:
+      - path: absolute or repo-relative XML path (required)
+      - scenario: scenario name (optional, defaults to first)
+
+    Response JSON: { ok: bool, meta?: {...}, error?: str }
+    """
+    xml_path = (request.args.get('path') or '').strip()
+    scenario_name = (request.args.get('scenario') or '').strip() or None
+    if not xml_path:
+        return jsonify({ 'ok': False, 'error': 'missing path' }), 400
+    # Resolve repo-relative paths
+    if not os.path.isabs(xml_path):
+        xml_path = os.path.abspath(os.path.join(_get_repo_root(), xml_path))
+    if not os.path.exists(xml_path):
+        return jsonify({ 'ok': False, 'error': f'xml not found: {xml_path}' }), 404
+    try:
+        from core_topo_gen.parsers.xml_parser import parse_planning_metadata
+        meta = parse_planning_metadata(xml_path, scenario_name)
+        return jsonify({ 'ok': True, 'meta': meta, 'path': xml_path, 'scenario': scenario_name })
+    except Exception as e:
+        return jsonify({ 'ok': False, 'error': str(e) }), 500
+
+
+# ---------------- Authentication & Authorization ----------------
+def _users_db_path() -> str:
+    base = os.path.join(_outputs_dir(), 'users')
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, 'users.json')
+
+
+def _load_users() -> dict:
+    p = _users_db_path()
+    if not os.path.exists(p):
+        return {"users": []}
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get('users'), list):
+                return data
+    except Exception:
+        pass
+    return {"users": []}
+
+
+def _save_users(data: dict) -> None:
+    p = _users_db_path()
+    tmp = p + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, p)
+
+
+def _ensure_admin_user() -> None:
+    """Ensure there is at least one admin user.
+
+    First-boot behavior:
+    - If the users database is empty or missing, create a default admin user
+      with username 'coreadmin' and password 'coreadmin'.
+
+    Safety fallback:
+    - If users exist but none have role 'admin', create a new 'admin' user
+      with a generated password (or value from ADMIN_PASSWORD env) to avoid
+      locking out the UI.
+    """
+    db = _load_users()
+    users = db.get('users', [])
+
+    # First boot: no users at all -> seed coreadmin/coreadmin
+    if not users:
+        users = [{
+            'username': 'coreadmin',
+            'password_hash': generate_password_hash('coreadmin'),
+            'role': 'admin',
+        }]
+        db['users'] = users
+        _save_users(db)
+        try:
+            app.logger.warning("Seeded default admin user 'coreadmin' with default password 'coreadmin'. CHANGE THIS IMMEDIATELY via /me/password or /users.")
+        except Exception:
+            pass
+        return
+
+    # Users exist but ensure there's at least one admin
+    has_admin = any(u.get('role') == 'admin' for u in users)
+    if not has_admin:
+        pwd = os.environ.get('ADMIN_PASSWORD') or secrets.token_urlsafe(10)
+        users.append({
+            'username': 'admin',
+            'password_hash': generate_password_hash(pwd),
+            'role': 'admin',
+        })
+        db['users'] = users
+        _save_users(db)
+        try:
+            app.logger.warning("No admin found; seeded user 'admin' with generated password: %s", pwd)
+        except Exception:
+            pass
+
+
+_ensure_admin_user()
+
+
+def _current_user() -> dict | None:
+    u = session.get('user')
+    if not u:
+        return None
+    return { 'username': u.get('username'), 'role': u.get('role') }
+
+
+@app.context_processor
+def _inject_user():
+    return { 'current_user': _current_user() }
+
+
+def _path_exempt_from_auth(path: str) -> bool:
+    if path in ('/login', '/logout', '/healthz', '/save_xml_api'):
+        return True
+    if path.startswith('/static/'):
+        return True
+    return False
+
+
+@app.before_request
+def _require_login():
+    try:
+        g.current_user = _current_user()
+        if _path_exempt_from_auth(request.path):
+            return None
+        if g.current_user is None:
+            # Prefer redirect for normal browser navigation; return JSON for XHR/API
+            if request.method in ('GET', 'HEAD'):
+                return redirect(url_for('login', next=request.url))
+            is_xhr = request.headers.get('X-Requested-With') == 'XMLHttpRequest'
+            prefers_json = False
+            try:
+                if request.accept_mimetypes:
+                    best = request.accept_mimetypes.best_match(['application/json', 'text/html'])
+                    prefers_json = (best == 'application/json')
+            except Exception:
+                prefers_json = False
+            if is_xhr or prefers_json:
+                return jsonify({ 'error': 'unauthorized' }), 401
+            return redirect(url_for('login', next=request.url))
+        return None
+    except Exception:
+        return None
+
+
+def _require_admin() -> bool:
+    u = _current_user()
+    return bool(u and u.get('role') == 'admin')
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'GET':
+        return render_template('login.html')
+    username = (request.form.get('username') or '').strip()
+    password = request.form.get('password') or ''
+    db = _load_users()
+    user = None
+    for u in db.get('users', []):
+        if u.get('username') == username:
+            user = u; break
+    if not user or not check_password_hash(user.get('password_hash', ''), password):
+        flash('Invalid username or password')
+        return redirect(url_for('login'))
+    session['user'] = { 'username': user.get('username'), 'role': user.get('role') }
+    nxt = request.args.get('next')
+    return redirect(nxt or url_for('index'))
+
+
+@app.route('/logout', methods=['POST', 'GET'])
+def logout():
+    try:
+        session.pop('user', None)
+    except Exception:
+        pass
+    return redirect(url_for('login'))
+
+
+@app.route('/users', methods=['GET'])
+def users_page():
+    if not _require_admin():
+        return redirect(url_for('index'))
+    db = _load_users()
+    users = db.get('users', [])
+    return render_template('users.html', users=users)
+
+
+@app.route('/users/create', methods=['POST'])
+def users_create():
+    if not _require_admin():
+        return redirect(url_for('users_page'))
+    username = (request.form.get('username') or '').strip()
+    password = request.form.get('password') or ''
+    role = (request.form.get('role') or 'user').strip() or 'user'
+    if not username or not password:
+        flash('Username and password are required')
+        return redirect(url_for('users_page'))
+    db = _load_users()
+    if any(u.get('username') == username for u in db.get('users', [])):
+        flash('User already exists')
+        return redirect(url_for('users_page'))
+    db.setdefault('users', []).append({
+        'username': username,
+        'password_hash': generate_password_hash(password),
+        'role': 'admin' if role == 'admin' else 'user',
+    })
+    _save_users(db)
+    flash('User created')
+    return redirect(url_for('users_page'))
+
+
+@app.route('/users/delete/<username>', methods=['POST'])
+def users_delete(username: str):
+    if not _require_admin():
+        return redirect(url_for('users_page'))
+    cur = _current_user()
+    db = _load_users()
+    users = db.get('users', [])
+    # Prevent removing self and ensure at least one admin remains
+    remain = [u for u in users if u.get('username') != username]
+    if cur and username == cur.get('username'):
+        flash('Cannot delete your own account')
+        return redirect(url_for('users_page'))
+    if not any(u.get('role') == 'admin' for u in remain):
+        flash('At least one admin must remain')
+        return redirect(url_for('users_page'))
+    db['users'] = remain
+    _save_users(db)
+    flash('User deleted')
+    return redirect(url_for('users_page'))
+
+
+@app.route('/users/password/<username>', methods=['POST'])
+def users_password(username: str):
+    if not _require_admin():
+        return redirect(url_for('users_page'))
+    new_pwd = request.form.get('password') or ''
+    if not new_pwd:
+        flash('New password required')
+        return redirect(url_for('users_page'))
+    db = _load_users()
+    changed = False
+    for u in db.get('users', []):
+        if u.get('username') == username:
+            u['password_hash'] = generate_password_hash(new_pwd)
+            changed = True
+            break
+    if changed:
+        _save_users(db)
+        flash('Password updated')
+    else:
+        flash('User not found')
+    return redirect(url_for('users_page'))
+
+
+@app.route('/me/password', methods=['GET', 'POST'])
+def me_password():
+    if _current_user() is None:
+        return redirect(url_for('login'))
+    if request.method == 'GET':
+        return render_template('users.html', self_change=True)
+    cur = _current_user()
+    cur_pwd = request.form.get('current_password') or ''
+    new_pwd = request.form.get('password') or ''
+    if not cur_pwd or not new_pwd:
+        flash('Current and new passwords required')
+        return redirect(url_for('me_password'))
+    db = _load_users()
+    updated = False
+    for u in db.get('users', []):
+        if u.get('username') == cur.get('username'):
+            if not check_password_hash(u.get('password_hash', ''), cur_pwd):
+                flash('Current password incorrect')
+                return redirect(url_for('me_password'))
+            u['password_hash'] = generate_password_hash(new_pwd)
+            updated = True
+            break
+    if updated:
+        _save_users(db)
+        flash('Password changed')
+    else:
+        flash('User not found')
+    return redirect(url_for('index'))
+
+
+@app.route('/healthz')
+def healthz():
+    return Response('ok', mimetype='text/plain')
+
 
 # Environment-configurable CORE daemon location (useful inside Docker)
 CORE_HOST = os.environ.get('CORE_HOST', 'localhost')
@@ -118,9 +452,37 @@ except Exception:
 def _default_core_dict():
     return {"host": CORE_HOST, "port": CORE_PORT}
 
-def _get_repo_root() -> str:
-    """Return absolute path to project root (parent of this webapp directory)."""
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+def _select_python_interpreter() -> str:
+    """Select the python interpreter to invoke the core_topo_gen CLI.
+
+    Priority order:
+    1. Explicit environment override CORE_PY (if it points to an existing file or is resolvable in PATH)
+    2. 'core-python' if found in PATH (common when CORE provides a renamed interpreter)
+    3. 'python3' if found
+    4. 'python' if found
+    5. sys.executable as final fallback
+
+    Returns the chosen executable string (absolute path or name)."""
+    override = os.environ.get('CORE_PY')
+    candidates: list[str] = []
+    if override:
+        # If override is an absolute path and exists, short-circuit
+        if os.path.isabs(override) and os.path.exists(override):
+            return override
+        # Otherwise treat as a command name to resolve later; put at front
+        candidates.append(override)
+    # Standard discovery chain
+    candidates.extend(['core-python', 'python3', 'python'])
+    for c in candidates:
+        try:
+            path = shutil.which(c)
+            if path:
+                return path
+        except Exception:
+            continue
+    # Fallback to current process executable
+    return sys.executable or 'python'
 
 def _get_cli_script_path() -> str:
     """Return absolute path to config2scen_core_grpc.py script."""
@@ -162,6 +524,11 @@ def _append_run_history(entry: dict):
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(history, f, indent=2)
         os.replace(tmp, RUN_HISTORY_PATH)
+        try:
+            app.logger.info("[history] appended run entry (mode=%s, rc=%s, report=%s, scen_xml=%s, post_xml=%s)",
+                            entry.get('mode'), entry.get('returncode'), entry.get('report_path'), entry.get('scenario_xml_path'), entry.get('post_xml_path'))
+        except Exception:
+            pass
     except Exception:
         try:
             if os.path.exists(tmp):
@@ -337,6 +704,135 @@ def _gather_scripts_into_zip(zf: zipfile.ZipFile) -> int:
     except Exception:
         pass
     return added
+
+def _normalize_core_device_types(xml_path: str) -> None:
+    """Normalize device 'type' attributes in a saved CORE session XML.
+
+    - Docker/podman devices (class='docker'/'podman' or with compose attrs) -> type='docker'
+    - Devices with routing services (zebra/BGP/OSPF*/RIP*/Xpimd) -> type='router'
+    - Otherwise -> type='PC'
+    """
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        devices = root.find('devices')
+        if devices is None:
+            return
+        routing_like = {"zebra", "BGP", "Babel", "OSPFv2", "OSPFv3", "OSPFv3MDR", "RIP", "RIPNG", "Xpimd"}
+        changed = False
+        for dev in list(devices):
+            if not isinstance(dev.tag, str) or dev.tag != 'device':
+                continue
+            clazz = (dev.get('class') or '').strip().lower()
+            compose = (dev.get('compose') or '').strip()
+            compose_name = (dev.get('compose_name') or '').strip()
+            dtype = dev.get('type') or ''
+            # collect services
+            svc_names = set()
+            try:
+                services_el = dev.find('services') or dev.find('configservices')
+                if services_el is not None:
+                    for s in list(services_el):
+                        nm = s.get('name')
+                        if nm:
+                            svc_names.add(nm)
+            except Exception:
+                pass
+            new_type = None
+            if clazz in ('docker', 'podman') or compose or compose_name:
+                new_type = 'docker'
+            elif any(s in routing_like for s in svc_names):
+                new_type = 'router'
+            else:
+                new_type = 'PC'
+            if new_type and new_type != dtype:
+                dev.set('type', new_type)
+                changed = True
+        if changed:
+            try:
+                raw = ET.tostring(root, encoding='utf-8')
+                lroot = LET.fromstring(raw)
+                pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+                with open(xml_path, 'wb') as f:
+                    f.write(pretty)
+            except Exception:
+                tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+    except Exception:
+        pass
+
+def _write_single_scenario_xml(src_xml_path: str, scenario_name: str | None, out_dir: str | None = None) -> str | None:
+    """Create a new XML file containing only the selected Scenario from a Scenarios XML.
+
+    - If `scenario_name` is None, selects the first Scenario present.
+    - Returns the path to the new XML written under `out_dir` (or next to the source file) or None on failure.
+    """
+    try:
+        if not (src_xml_path and os.path.exists(src_xml_path)):
+            return None
+        tree = ET.parse(src_xml_path)
+        root = tree.getroot()
+        # Normalize: if file is a single ScenarioEditor root, just copy it under Scenarios/Scenario
+        chosen_se = None
+        chosen_name = scenario_name
+        if root.tag == 'Scenarios':
+            # find Scenario child with matching name, else use first
+            scenarios = [c for c in list(root) if isinstance(c.tag, str) and c.tag == 'Scenario']
+            target = None
+            if chosen_name:
+                for s in scenarios:
+                    if (s.get('name') or '') == chosen_name:
+                        target = s
+                        break
+            if target is None and scenarios:
+                target = scenarios[0]
+                chosen_name = target.get('name') or 'Scenario'
+            if target is None:
+                return None
+            se = target.find('ScenarioEditor')
+            if se is None:
+                # allow copying entire Scenario element if no ScenarioEditor child
+                chosen_se = target
+            else:
+                chosen_se = se
+        elif root.tag == 'ScenarioEditor':
+            chosen_se = root
+            if not chosen_name:
+                # attempt to infer from nested metadata (not guaranteed)
+                chosen_name = 'Scenario'
+        else:
+            # if root is Scenario, accept it
+            if root.tag == 'Scenario':
+                chosen_se = root.find('ScenarioEditor') or root
+                chosen_name = chosen_name or (root.get('name') or 'Scenario')
+            else:
+                return None
+        # Build new XML
+        new_root = ET.Element('Scenarios')
+        scen_el = ET.SubElement(new_root, 'Scenario')
+        scen_el.set('name', chosen_name or 'Scenario')
+        if chosen_se.tag == 'ScenarioEditor':
+            # deep copy ScenarioEditor
+            scen_el.append(ET.fromstring(ET.tostring(chosen_se)))
+        else:
+            # chosen_se was Scenario; append its contents
+            scen_el.append(ET.fromstring(ET.tostring(chosen_se.find('ScenarioEditor'))) if chosen_se.find('ScenarioEditor') is not None else ET.Element('ScenarioEditor'))
+        new_tree = ET.ElementTree(new_root)
+        # Determine output path
+        base_dir = out_dir or os.path.dirname(os.path.abspath(src_xml_path))
+        os.makedirs(base_dir, exist_ok=True)
+        stem = secure_filename((chosen_name or 'scenario')).strip('_-.') or 'scenario'
+        out_path = os.path.join(base_dir, f"{stem}.xml")
+        try:
+            raw = ET.tostring(new_tree.getroot(), encoding='utf-8')
+            lroot = LET.fromstring(raw)
+            pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+            with open(out_path, 'wb') as f:
+                f.write(pretty)
+        except Exception:
+            new_tree.write(out_path, encoding='utf-8', xml_declaration=True)
+        return out_path if os.path.exists(out_path) else None
+    except Exception:
+        return None
 
 def _build_full_scenario_archive(out_dir: str, scenario_xml_path: str | None, report_path: str | None, pre_xml_path: str | None, post_xml_path: str | None, run_id: str | None = None) -> str | None:
     """Create a zip bundle that includes the scenario XML, pre/post session XML, report, and any generated scripts.
@@ -564,13 +1060,123 @@ def _default_scenarios_payload():
     return {"scenarios": [scen], "result_path": None, "core": _default_core_dict()}
 
 
+# ---------------- Docker (per-node) status & cleanup ----------------
+def _compose_assignments_path() -> str:
+    return os.path.join(_vuln_base_dir() or "/tmp/vulns", "compose_assignments.json")
+
+
+def _load_compose_assignments() -> dict:
+    p = _compose_assignments_path()
+    try:
+        if os.path.exists(p):
+            with open(p, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        app.logger.debug("compose assignments read failed: %s", e)
+    return {}
+
+
+def _compose_file_for_node(node_name: str) -> str:
+    base = _vuln_base_dir() or "/tmp/vulns"
+    return os.path.join(base, f"docker-compose-{node_name}.yml")
+
+
+def _docker_container_exists(name: str) -> tuple[bool, bool]:
+    try:
+        proc = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}}"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if proc.returncode != 0:
+            return (False, False)
+        names = set(ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip())
+        if name not in names:
+            return (False, False)
+        proc2 = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        running = (proc2.returncode == 0 and (proc2.stdout or '').strip().lower() == 'true')
+        return (True, running)
+    except Exception:
+        return (False, False)
+
+
+def _images_pulled_for_compose_safe(yml_path: str) -> bool:
+    try:
+        from core_topo_gen.utils.vuln_process import _images_pulled_for_compose as _pulled  # type: ignore
+        return bool(_pulled(yml_path))
+    except Exception as e:
+        try: app.logger.debug("pull check failed for %s: %s", yml_path, e)
+        except Exception: pass
+        return False
+
+
+@app.route('/docker/status', methods=['GET'])
+def docker_status():
+    data = _load_compose_assignments()
+    assignments = data.get('assignments', {}) if isinstance(data, dict) else {}
+    items = []
+    for node_name in sorted(assignments.keys()):
+        yml = _compose_file_for_node(node_name)
+        exists = os.path.exists(yml)
+        pulled = _images_pulled_for_compose_safe(yml) if exists else False
+        c_exists, running = _docker_container_exists(node_name)
+        items.append({
+            'name': node_name,
+            'compose': yml,
+            'exists': bool(exists),
+            'pulled': bool(pulled),
+            'container_exists': bool(c_exists),
+            'running': bool(running),
+        })
+    return jsonify({'items': items, 'timestamp': int(time.time())})
+
+
+@app.route('/docker/cleanup', methods=['POST'])
+def docker_cleanup():
+    names = []
+    try:
+        if request.is_json:
+            body = request.get_json(silent=True) or {}
+            if isinstance(body.get('names'), list):
+                names = [str(x) for x in body.get('names')]
+        else:
+            raw = request.form.get('names')
+            if raw:
+                try:
+                    arr = json.loads(raw)
+                    if isinstance(arr, list):
+                        names = [str(x) for x in arr]
+                except Exception:
+                    names = [str(raw)]
+        if not names:
+            data = _load_compose_assignments()
+            assignments = data.get('assignments', {}) if isinstance(data, dict) else {}
+            names = list(assignments.keys())
+        results = []
+        for nm in names:
+            stopped = removed = False
+            try:
+                p1 = subprocess.run(['docker', 'stop', nm], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                stopped = (p1.returncode == 0)
+            except Exception:
+                stopped = False
+            try:
+                p2 = subprocess.run(['docker', 'rm', nm], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                removed = (p2.returncode == 0)
+            except Exception:
+                removed = False
+            results.append({'name': nm, 'stopped': bool(stopped), 'removed': bool(removed)})
+        return jsonify({'ok': True, 'results': results})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
 def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_id: str | None = None) -> str | None:
     """Attempt to connect to CORE daemon via gRPC and save the active session XML.
 
     This uses CoreGrpcClient.save_xml if available. If no active session exists
     or the gRPC client modules are unavailable, returns None silently.
 
-    A timestamped filename core-session-<ts>.xml is written to out_dir.
+    A timestamped filename is written to out_dir. Preferred pattern when possible:
+        <scenario-name>-<timestamp>.xml
+    Falls back to:
+        core-session-<session_id>-<timestamp>.xml
     """
     try:
         from core.api.grpc.client import CoreGrpcClient  # type: ignore
@@ -579,11 +1185,26 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
         return None
     address = f"{host}:{port}"
     ts = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')
-    os.makedirs(out_dir, exist_ok=True)
+    # Ensure a centralized session XML directory for discoverability
+    base_sessions_dir = os.path.join(_outputs_dir(), 'core-sessions')
+    try:
+        os.makedirs(base_sessions_dir, exist_ok=True)
+    except Exception:
+        pass
+    # Still ensure caller-provided directory exists (legacy paths)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        pass
     # Pick first running/defined session if any; API lacks direct 'current' concept here.
     try:
         app.logger.debug("Connecting to CORE gRPC at %s (requested session_id=%s)", address, session_id)
         client = CoreGrpcClient(address=address)
+        try:
+            from core_topo_gen.utils.grpc_logging import wrap_core_client  # type: ignore
+            client = wrap_core_client(client, app.logger)
+        except Exception:
+            pass
         client.connect()
         try:
             sessions = client.get_sessions()
@@ -607,7 +1228,21 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
             if session_id is None:
                 app.logger.warning("Selected CORE session has no id; aborting save_xml")
                 return None
-            out_path = os.path.join(out_dir, f"core-session-{session_id}-{ts}.xml")
+            # Derive a friendly stem from the original scenario XML if available
+            stem = None
+            try:
+                orig_file = getattr(target, 'file', None)
+                if orig_file and os.path.exists(orig_file):
+                    # Try to parse scenario names from the original XML
+                    names = _scenario_names_from_xml(orig_file)
+                    raw = (names[0] if names else os.path.splitext(os.path.basename(orig_file))[0])
+                    stem = secure_filename(raw).strip('_-.') or None
+            except Exception:
+                stem = None
+            if not stem:
+                stem = f"core-session-{session_id}"
+            # Always store under outputs/core-sessions so CORE page can find it
+            out_path = os.path.join(base_sessions_dir, f"{stem}-{ts}.xml")
             try:
                 app.logger.info("Invoking save_xml(session_id=%s) -> %s", session_id, out_path)
                 client.save_xml(session_id=session_id, file_path=out_path)
@@ -622,6 +1257,11 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
                     app.logger.warning("CORE XML validation raised exception for %s: %s", out_path, e)
                     ok = False
                 if ok:
+                    # Normalize device types: set 'router' if routing services present; 'docker' for docker class; else 'PC'
+                    try:
+                        _normalize_core_device_types(out_path)
+                    except Exception as e:
+                        app.logger.debug("core xml type normalization skipped for %s: %s", out_path, e)
                     try:
                         size = os.stat(out_path).st_size
                     except Exception:
@@ -676,16 +1316,42 @@ def _parse_scenarios_xml(path):
         raise ValueError("Root element must be <Scenarios> or <ScenarioEditor>")
     for scen_el in root.findall("Scenario"):
         scen = {"name": scen_el.get("name", "Scenario")}
+        # Capture scenario-level density_count attribute if present
+        dc_attr = scen_el.get('density_count')
+        if dc_attr is not None and dc_attr != '':
+            try:
+                scen['density_count'] = int(dc_attr)
+            except Exception:
+                pass
         se = scen_el.find("ScenarioEditor")
         if se is None:
             continue
         scen.update(_parse_scenario_editor(se))
+        # If scenario-level density_count was absent but Node Information section provided one, keep existing.
         data["scenarios"].append(scen)
     return data
 
 
 def _parse_scenario_editor(se):
     scen = {"base": {"filepath": ""}, "sections": {}, "notes": ""}
+    # If parent <Scenario> carries scenario-level density_count attribute, capture it.
+    try:
+        parent = se.getparent()  # lxml style (if ever switched) - fallback below
+    except Exception:
+        parent = None
+    # ElementTree doesn't support getparent; instead inspect tail by traversing immediate children of root in caller.
+    # Simplest: look for density_count on any ancestor via attrib access on 'se' .attrib is only local, so rely on caller to have set scen_el attrib earlier.
+    # We can recover by walking up using a cheap hack: se._parent if present (cpython impl detail) else ignore.
+    try:
+        scen_el = getattr(se, 'attrib', None)
+    except Exception:
+        scen_el = None
+    # Instead of fragile parent access, during parsing of root we can read attribute directly from the sibling Scenario element (handled in outer loop); emulate by checking se.get('density_count') first.
+    # For backward compatibility, allow density_count on Scenario or Node Information section.
+    # We'll set scen['density_count'] here only if Scenario element attribute is available; Node Information section handled later.
+    # Outer loop already hands us 'se'; its parent was processed to create scen dict. We'll modify outer function to inject attribute before calling this if needed.
+    # Simpler: just check if 'density_count' exists on any ancestor by scanning se.iterfind('..') unsupported; fallback: pass.
+    pass
     base = se.find("BaseScenario")
     if base is not None:
         scen["base"]["filepath"] = base.get("filepath", "")
@@ -718,6 +1384,7 @@ def _parse_scenario_editor(se):
                     "rate_kbps": float(item.get("rate_kbps", "64.0")),
                     "period_s": float(item.get("period_s", "1.0")),
                     "jitter_pct": float(item.get("jitter_pct", "10.0")),
+                    "content_type": (item.get("content_type") or item.get("content") or "Random"),
                 })
             if name == "Vulnerabilities":
                 # Extra attributes for Vulnerabilities section
@@ -752,6 +1419,27 @@ def _parse_scenario_editor(se):
                 pass
             entry["items"].append(d)
         scen["sections"][name] = entry
+        # Capture scenario-level density_count if present on Scenario element once
+        if 'density_count' not in scen and se is not None:
+            # Attempt to access parent <Scenario> by scanning for attribute on sec's ancestors is not directly supported.
+            # Instead, rely on convention: during writing we place density_count on <Scenario>. So parse root manually here.
+            try:
+                # Walk up by brute force: find the nearest ancestor named 'Scenario'
+                # We don't have parent links; reconstruct by searching from current element root.
+                root = sec
+                while getattr(root, 'tag', None) and root.tag != 'Scenario':
+                    # ElementTree lacks parent pointer; break to avoid infinite loop
+                    break
+            except Exception:
+                root = None
+        # Fallback: if Node Information section carries density_count/base_nodes and scenario-level missing, propagate to scen.
+        if name == 'Node Information' and 'density_count' not in scen:
+            dc_attr = sec.get('density_count') or sec.get('base_nodes') or sec.get('total_nodes')
+            if dc_attr:
+                try:
+                    scen['density_count'] = int(dc_attr)
+                except Exception:
+                    pass
     # Notes
     notes_sec = None
     for sec in se.findall("section"):
@@ -769,46 +1457,152 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
     for scen in data_dict.get("scenarios", []):
         scen_el = ET.SubElement(root, "Scenario")
         scen_el.set("name", scen.get("name", "Scenario"))
+        # Persist scenario-level density_count (Count for Density) so parser priority can pick it up on reload.
+        try:
+            if 'density_count' in scen and scen.get('density_count') is not None:
+                scen_el.set('density_count', str(int(scen.get('density_count'))))
+        except Exception:
+            pass
         se = ET.SubElement(scen_el, "ScenarioEditor")
         base = ET.SubElement(se, "BaseScenario")
         base.set("filepath", scen.get("base", {}).get("filepath", ""))
-        # Sections in desired order
+
         order = [
             "Node Information", "Routing", "Services", "Traffic",
             "Events", "Vulnerabilities", "Segmentation", "Notes"
         ]
+        combined_host_pool: int | None = None
+        scenario_host_additive = 0
+        scenario_routing_total = 0
+        scenario_vuln_total = 0
+
         for name in order:
             if name == "Notes":
                 sec_el = ET.SubElement(se, "section", name="Notes")
                 ne = ET.SubElement(sec_el, "notes")
                 ne.text = scen.get("notes", "") or ""
                 continue
-            sec = scen.get("sections", {}).get(name, None)
-            if sec is None:
+            sec = scen.get("sections", {}).get(name)
+            if not sec:
                 continue
             sec_el = ET.SubElement(se, "section", name=name)
+            items_list = sec.get("items", []) or []
+            weight_rows = [it for it in items_list if (it.get('v_metric') or (it.get('selected')=='Specific' and name=='Vulnerabilities') or 'Weight') == 'Weight']
+            count_rows = [it for it in items_list if (it.get('v_metric') == 'Count') or (name == 'Vulnerabilities' and it.get('selected') == 'Specific')]
+            weight_sum = sum(float(it.get('factor', 0) or 0) for it in weight_rows) if weight_rows else 0.0
+
             if name == "Node Information":
-                tn = sec.get("total_nodes")
-                if tn is not None:
-                    sec_el.set("total_nodes", str(int(tn)))
+                # Determine if an explicit density_count was provided (scenario-level or legacy section field).
+                explicit_density_raw = None
+                scen_level_dc = scen.get('density_count')
+                if scen_level_dc is not None:
+                    explicit_density_raw = scen_level_dc
+                else:
+                    for legacy_key in ('density_count', 'total_nodes', 'base_nodes'):
+                        if sec.get(legacy_key) not in (None, ""):
+                            explicit_density_raw = sec.get(legacy_key)
+                            break
+                density_count: int | None = None
+                if explicit_density_raw is not None:
+                    try:
+                        density_count = max(0, int(explicit_density_raw))
+                    except Exception:
+                        density_count = 0
+                # additive Count rows always additive even if base omitted
+                additive_nodes = sum(int(it.get('v_count') or 0) for it in count_rows)
+                # For derived counts we only have a combined host pool if explicit density_count provided
+                combined_nodes = (density_count or 0) + additive_nodes
+                norm_sum = 0.0
+                if weight_rows:
+                    raw_sum = sum(float(it.get('factor') or 0) for it in weight_rows)
+                    if raw_sum > 0:
+                        for it in weight_rows:
+                            try:
+                                it['factor'] = float(it.get('factor') or 0) / raw_sum
+                            except Exception:
+                                it['factor'] = 0.0
+                        norm_sum = 1.0
+                    else:
+                        weight_rows[0]['factor'] = 1.0
+                        for it in weight_rows[1:]:
+                            it['factor'] = 0.0
+                        norm_sum = 1.0
+                # Only persist base-related fields if an explicit density_count was supplied. Otherwise omit so parser can apply default.
+                if density_count is not None:
+                    sec_el.set("density_count", str(density_count))
+                    sec_el.set("base_nodes", str(density_count))
+                sec_el.set("additive_nodes", str(additive_nodes))
+                if density_count is not None:
+                    sec_el.set("combined_nodes", str(combined_nodes))
+                sec_el.set("weight_rows", str(len(weight_rows)))
+                sec_el.set("count_rows", str(len(count_rows)))
+                sec_el.set("weight_sum", f"{weight_sum:.3f}")
+                sec_el.set("normalized_weight_sum", f"{norm_sum:.3f}")
+                combined_host_pool = combined_nodes if density_count is not None else None
+                scenario_host_additive += combined_nodes if density_count is not None else additive_nodes
             else:
                 dens = sec.get("density")
                 if dens is not None:
-                    sec_el.set("density", f"{float(dens):.3f}")
-            for item in sec.get("items", []):
+                    try:
+                        sec_el.set("density", f"{float(dens):.3f}")
+                    except Exception:
+                        sec_el.set("density", str(dens))
+                if name in ("Routing", "Vulnerabilities"):
+                    base_pool = combined_host_pool if isinstance(combined_host_pool, int) else None
+                    explicit = sum(int(it.get('v_count') or 0) for it in count_rows)
+                    derived = 0
+                    try:
+                        dens_val = float(dens or 0)
+                    except Exception:
+                        dens_val = 0.0
+                    if weight_rows and base_pool and base_pool > 0:
+                        if name == 'Routing':
+                            if dens_val >= 1:
+                                derived = int(round(dens_val))
+                            elif dens_val > 0:
+                                derived = int(round(base_pool * dens_val))
+                        else:  # Vulnerabilities
+                            if dens_val > 0:
+                                dens_clip = min(1.0, dens_val)
+                                derived = int(round(base_pool * dens_clip))
+                    total_planned = explicit + derived
+                    sec_el.set("explicit_count", str(explicit))
+                    sec_el.set("derived_count", str(derived))
+                    sec_el.set("total_planned", str(total_planned))
+                    sec_el.set("weight_rows", str(len(weight_rows)))
+                    sec_el.set("count_rows", str(len(count_rows)))
+                    sec_el.set("weight_sum", f"{weight_sum:.3f}")
+                    if name == 'Routing':
+                        scenario_routing_total += total_planned
+                    else:
+                        scenario_vuln_total += total_planned
+                elif name in ("Services", "Traffic", "Segmentation"):
+                    explicit = sum(int(it.get('v_count') or 0) for it in count_rows)
+                    sec_el.set("explicit_count", str(explicit))
+                    sec_el.set("weight_rows", str(len(weight_rows)))
+                    sec_el.set("count_rows", str(len(count_rows)))
+                    sec_el.set("weight_sum", f"{weight_sum:.3f}")
+
+            for item in items_list:
                 it = ET.SubElement(sec_el, "item")
                 it.set("selected", str(item.get('selected', 'Random')))
-                it.set("factor", f"{float(item.get('factor', 1.0)):.3f}")
-                if name == "Events":
-                    sp = item.get('script_path', "")
+                try:
+                    it.set("factor", f"{float(item.get('factor', 1.0)):.3f}")
+                except Exception:
+                    it.set("factor", "0.000")
+                if name == 'Events':
+                    sp = item.get('script_path') or ''
                     if sp:
-                        it.set("script_path", sp)
-                if name == "Traffic":
-                    it.set("pattern", str(item.get('pattern', 'continuous')))
-                    it.set("rate_kbps", f"{float(item.get('rate_kbps', 64.0)):.1f}")
-                    it.set("period_s", f"{float(item.get('period_s', 1.0)):.1f}")
-                    it.set("jitter_pct", f"{float(item.get('jitter_pct', 10.0)):.1f}")
-                if name == "Vulnerabilities":
+                        it.set('script_path', sp)
+                if name == 'Traffic':
+                    it.set('pattern', str(item.get('pattern', 'continuous')))
+                    it.set('rate_kbps', f"{float(item.get('rate_kbps', 64.0)):.1f}")
+                    it.set('period_s', f"{float(item.get('period_s', 1.0)):.1f}")
+                    it.set('jitter_pct', f"{float(item.get('jitter_pct', 10.0)):.1f}")
+                    ct = (item.get('content_type') or item.get('content') or '').strip()
+                    if ct:
+                        it.set('content_type', ct)
+                if name == 'Vulnerabilities':
                     sel = str(item.get('selected', 'Random'))
                     if sel == 'Type/Vector':
                         vt = item.get('v_type')
@@ -824,7 +1618,6 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                             it.set('v_name', str(vn))
                         if vp:
                             it.set('v_path', str(vp))
-                # Save metric selection and count (for all sections)
                 vm_any = item.get('v_metric')
                 if vm_any:
                     it.set('v_metric', str(vm_any))
@@ -835,6 +1628,15 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                             it.set('v_count', str(int(vc_any)))
                     except Exception:
                         pass
+
+        # Final scenario-level aggregate
+        try:
+            total_nodes = scenario_host_additive + scenario_routing_total + scenario_vuln_total
+            scen_el.set('scenario_total_nodes', str(total_nodes))
+            scen_el.set('base_nodes', '0')
+        except Exception:
+            pass
+
     return ET.ElementTree(root)
 
 
@@ -868,22 +1670,46 @@ def _validate_core_xml(xml_path: str):
 
 
 def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
-    """Extract basic details from a CORE scenario XML for a summary view."""
+    """Extract basic details from a CORE scenario XML for a summary view.
+
+    Robust to namespaces and minor structural variations.
+    """
     info: Dict[str, Any] = {}
     try:
         tree = LET.parse(xml_path)
         root = tree.getroot()
-        # generic helpers
+
+        # helpers
         def attrs(el, *names):
             return {n: el.get(n) for n in names if el.get(n) is not None}
 
-        devices = root.findall('.//device')
-        networks = root.findall('.//network')
-        links_parent = root.find('.//links')
+        def local(tag: str) -> str:
+            # strip namespace if present
+            if tag is None:
+                return ''
+            if '}' in tag:
+                return tag.split('}', 1)[1]
+            return tag
+
+        def iter_by_local(el, lname: str):
+            for e in el.iter():
+                if local(getattr(e, 'tag', '')) == lname:
+                    yield e
+
+        devices = list(iter_by_local(root, 'device'))
+        networks = list(iter_by_local(root, 'network'))
+        # Prefer <links> parent if available, else collect all <link> elements anywhere
+        links_parent = None
+        for e in root.iter():
+            if local(getattr(e, 'tag', '')) == 'links':
+                links_parent = e
+                break
         links = []
         if links_parent is not None:
-            links = list(links_parent)
-        services = root.findall('.//service')
+            links = [e for e in links_parent if local(getattr(e, 'tag', '')) == 'link']
+        else:
+            links = list(iter_by_local(root, 'link'))
+        services = list(iter_by_local(root, 'service'))
 
         # Build maps for easy lookup
         id_to_name: Dict[str, str] = {}
@@ -900,12 +1726,12 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
         # Adjacency from links
         adj: Dict[str, set] = { (d.get('id') or ''): set() for d in devices }
         for link in links:
-            n1 = link.get('node1')
-            n2 = link.get('node2')
-            # If node1/node2 missing, try infer from iface1/iface2 IPs by matching to device ids present in attributes (common CORE format already provides node1/node2, so this is a no-op for valid samples)
-            if not n1 or not n2:
-                # Some variations may nest iface1/iface2 without node1/node2 on link; in such cases, skip as we cannot safely infer
-                pass
+            n1 = link.get('node1') or link.get('node1_id')
+            n2 = link.get('node2') or link.get('node2_id')
+            if not (n1 and n2):
+                # attempt best-effort inference: check child iface elements for node refs
+                n1 = n1 or (link.find('.//iface1') or {}).get('node') if hasattr(link, 'find') else n1
+                n2 = n2 or (link.find('.//iface2') or {}).get('node') if hasattr(link, 'find') else n2
             if n1 and n2:
                 adj.setdefault(n1, set()).add(n2)
                 adj.setdefault(n2, set()).add(n1)
@@ -999,9 +1825,16 @@ def save_xml():
     try:
         tree = _build_scenarios_xml(data)
         ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        out_dir = os.path.join('outputs', f'scenarios-{ts}')
+        out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
         os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, 'scenarios.xml')
+        # Determine filename: <scenario-name>.xml (no timestamp in filename)
+        try:
+            scen_names = [s.get('name') for s in (data.get('scenarios') or []) if isinstance(s, dict) and s.get('name')]
+        except Exception:
+            scen_names = []
+        stem_raw = (scen_names[0] if scen_names else 'scenarios') or 'scenarios'
+        stem = secure_filename(stem_raw).strip('_-.') or 'scenarios'
+        out_path = os.path.join(out_dir, f"{stem}.xml")
         # Pretty print if lxml available else fallback
         try:
             from lxml import etree as LET  # type: ignore
@@ -1019,7 +1852,7 @@ def save_xml():
                 xml_text = f.read()
         except Exception:
             xml_text = ""
-        flash('Scenarios saved. You can download or run the CLI.')
+        flash(f'Scenarios saved as {os.path.basename(out_path)}. You can download or run the CLI.')
         # Re-parse the saved XML to ensure the UI reflects exactly what was persisted
         try:
             payload = _parse_scenarios_xml(out_path)
@@ -1035,6 +1868,43 @@ def save_xml():
         return redirect(url_for('index'))
 
 
+@app.route('/save_xml_api', methods=['POST'])
+def save_xml_api():
+    try:
+        data = request.get_json(silent=True) or {}
+        scenarios = data.get('scenarios')
+        if not isinstance(scenarios, list):
+            return jsonify({ 'ok': False, 'error': 'Invalid payload (scenarios list required)' }), 400
+        tree = _build_scenarios_xml({ 'scenarios': scenarios })
+        ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
+        os.makedirs(out_dir, exist_ok=True)
+        # Determine filename: <scenario-name>.xml
+        try:
+            scen_names = [s.get('name') for s in scenarios if isinstance(s, dict) and s.get('name')]
+        except Exception:
+            scen_names = []
+        stem_raw = (scen_names[0] if scen_names else 'scenarios') or 'scenarios'
+        stem = secure_filename(stem_raw).strip('_-.') or 'scenarios'
+        out_path = os.path.join(out_dir, f"{stem}.xml")
+        # Pretty print when possible
+        try:
+            raw = ET.tostring(tree.getroot(), encoding='utf-8')
+            lroot = LET.fromstring(raw)
+            pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+            with open(out_path, 'wb') as f:
+                f.write(pretty)
+        except Exception:
+            tree.write(out_path, encoding='utf-8', xml_declaration=True)
+        return jsonify({ 'ok': True, 'result_path': out_path })
+    except Exception as e:
+        try:
+            app.logger.exception("[save_xml_api] failed: %s", e)
+        except Exception:
+            pass
+        return jsonify({ 'ok': False, 'error': str(e) }), 500
+
+
 @app.route('/run_cli', methods=['POST'])
 def run_cli():
     xml_path = request.form.get('xml_path')
@@ -1043,6 +1913,16 @@ def run_cli():
         return redirect(url_for('index'))
     # Always resolve to absolute path
     xml_path = os.path.abspath(xml_path)
+    # Path fallback: if user supplied /app/outputs but actual saved path lives under /app/webapp/outputs (volume mapping difference)
+    if not os.path.exists(xml_path) and '/outputs/' in xml_path:
+        try:
+            # Replace first occurrence of '/app/outputs' with '/app/webapp/outputs'
+            alt = xml_path.replace('/app/outputs', '/app/webapp/outputs')
+            if alt != xml_path and os.path.exists(alt):
+                app.logger.info("[sync] Remapped XML path %s -> %s", xml_path, alt)
+                xml_path = alt
+        except Exception:
+            pass
     if not os.path.exists(xml_path):
         flash(f'XML path not found: {xml_path}')
         return redirect(url_for('index'))
@@ -1064,7 +1944,8 @@ def run_cli():
         app.logger.info("[sync] Running CLI with CORE %s:%s, xml=%s", core_host, core_port, xml_path)
         # Pre-save any existing active CORE session XML (best-effort) using derived host/port
         try:
-            pre_dir = os.path.join(os.path.dirname(xml_path), 'core-pre')
+            # Save pre-run session XML into a sibling 'core-pre' directory next to scenarios.xml
+            pre_dir = os.path.join(os.path.dirname(xml_path) or _outputs_dir(), 'core-pre')
             pre_saved = _grpc_save_current_session_xml(core_host, core_port, pre_dir)
             if pre_saved:
                 flash(f'Captured current CORE session XML: {os.path.basename(pre_saved)}')
@@ -1073,13 +1954,21 @@ def run_cli():
             pass
         repo_root = _get_repo_root()
         # Invoke package CLI so it can generate reports under repo_root/reports
-        proc = subprocess.run([
-            'core-python', '-m', 'core_topo_gen.cli',
-            '--xml', xml_path,
-            '--host', core_host,
-            '--port', str(core_port),
-            '--verbose',
-        ], cwd=repo_root, check=False, capture_output=True, text=True)
+        # Resolve python interpreter with fallback logic
+        py_exec = _select_python_interpreter()
+        app.logger.info("[sync] Using python interpreter: %s", py_exec)
+        # Determine active scenario name (first in the saved editor XML) and pass to CLI
+        active_scenario_name = None
+        try:
+            names_for_cli = _scenario_names_from_xml(xml_path)
+            if names_for_cli:
+                active_scenario_name = names_for_cli[0]
+        except Exception:
+            active_scenario_name = None
+        cli_args = [py_exec, '-m', 'core_topo_gen.cli', '--xml', xml_path, '--host', core_host, '--port', str(core_port), '--verbose']
+        if active_scenario_name:
+            cli_args.extend(['--scenario', active_scenario_name])
+        proc = subprocess.run(cli_args, cwd=repo_root, check=False, capture_output=True, text=True)
         logs = (proc.stdout or '') + ('\n' + proc.stderr if proc.stderr else '')
         app.logger.debug("[sync] CLI return code: %s", proc.returncode)
         # Report path (if generated by CLI): parse logs or fallback to latest under reports/
@@ -1097,52 +1986,66 @@ def run_cli():
                 xml_text = f.read()
         except Exception:
             xml_text = ""
-        run_success = False
+        run_success = (proc.returncode == 0)
         post_saved = None
-        if proc.returncode != 0:
-            flash('CLI finished with errors. See logs.')
-        else:
-            run_success = True
+        # Inform user
+        if run_success:
             if report_md and os.path.exists(report_md):
                 flash('CLI completed. Report ready to download.')
             else:
                 flash('CLI completed. No report found.')
-            # Best-effort: save the active CORE session XML after successful run
-            try:
-                post_dir = os.path.join(os.path.dirname(xml_path), 'core-post')
-                post_saved = _grpc_save_current_session_xml(core_host, core_port, post_dir, session_id=session_id)
-                if post_saved:
-                    flash(f'Captured post-run CORE session XML: {os.path.basename(post_saved)}')
-                    app.logger.debug("[sync] Post-run session XML saved to %s", post_saved)
-            except Exception:
-                post_saved = None
+        else:
+            flash('CLI finished with errors. See logs.')
+        # Best-effort: save the active CORE session XML after run (try even on failures)
+        try:
+            post_dir = os.path.join(os.path.dirname(xml_path), 'core-post')
+            post_saved = _grpc_save_current_session_xml(core_host, core_port, post_dir, session_id=session_id)
+            if post_saved:
+                flash(f'Captured post-run CORE session XML: {os.path.basename(post_saved)}')
+                app.logger.debug("[sync] Post-run session XML saved to %s", post_saved)
+        except Exception:
+            post_saved = None
         payload = _parse_scenarios_xml(xml_path)
         if "core" not in payload:
             payload["core"] = _default_core_dict()
         _attach_base_upload(payload)
         # Always use absolute xml_path for result_path fallback
         payload["result_path"] = report_md if (report_md and os.path.exists(report_md)) else xml_path
-        # Append run history entry on success
-        if run_success:
+        # Append run history entry regardless of intermediate failures; log details
+        scen_names = []
+        try:
+            scen_names = _scenario_names_from_xml(xml_path)
+        except Exception as e_names:
+            app.logger.exception("[sync] failed extracting scenario names from %s: %s", xml_path, e_names)
+        full_bundle_path = None
+        single_scen_xml = None
+        try:
+            # Build a single-scenario XML containing only the active scenario to satisfy bundling constraint
             try:
-                scen_names = _scenario_names_from_xml(xml_path)
-                # Build a Full Scenario bundle including scripts
-                full_bundle = _build_full_scenario_archive(os.path.dirname(xml_path), xml_path, (report_md if (report_md and os.path.exists(report_md)) else None), (pre_saved if 'pre_saved' in locals() else None), post_saved, run_id=None)
-                _append_run_history({
-                    'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
-                    'mode': 'sync',
-                    # Only record session xml if we actually pulled it via gRPC
-                    'xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
-                    'post_xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
-                    'scenario_xml_path': xml_path,
-                    'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
-                    'pre_xml_path': pre_saved if 'pre_saved' in locals() else None,
-                    'full_scenario_path': full_bundle,
-                    'returncode': proc.returncode,
-                    'scenario_names': scen_names,
-                })
+                single_scen_xml = _write_single_scenario_xml(xml_path, (active_scenario_name or (scen_names[0] if scen_names else None)), out_dir=os.path.dirname(xml_path))
             except Exception:
-                pass
+                single_scen_xml = None
+            bundle_xml = single_scen_xml or xml_path
+            app.logger.info("[sync] Building full scenario archive (xml=%s, report=%s, pre=%s, post=%s)", bundle_xml, report_md, (pre_saved if 'pre_saved' in locals() else None), post_saved)
+            full_bundle_path = _build_full_scenario_archive(os.path.dirname(bundle_xml), bundle_xml, (report_md if (report_md and os.path.exists(report_md)) else None), (pre_saved if 'pre_saved' in locals() else None), post_saved, run_id=None)
+        except Exception as e_bundle:
+            app.logger.exception("[sync] failed building full scenario bundle: %s", e_bundle)
+        try:
+            _append_run_history({
+                'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+                'mode': 'sync',
+                'xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
+                'post_xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
+                'scenario_xml_path': xml_path,
+                'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
+                'pre_xml_path': pre_saved if 'pre_saved' in locals() else None,
+                'full_scenario_path': full_bundle_path,
+                'single_scenario_xml_path': single_scen_xml,
+                'returncode': proc.returncode,
+                'scenario_names': scen_names,
+            })
+        except Exception as e_hist:
+            app.logger.exception("[sync] failed appending run history: %s", e_hist)
         return render_template('index.html', payload=payload, logs=logs, xml_preview=xml_text, run_success=run_success)
     except Exception as e:
         flash(f'Error running core-topo-gen: {e}')
@@ -1151,18 +2054,135 @@ def run_cli():
 @app.route('/download_report')
 def download_report():
     result_path = request.args.get('path')
-    if result_path and os.path.exists(result_path):
-        try:
-            app.logger.info("[download] serving file: %s", os.path.abspath(result_path))
-        except Exception:
-            pass
-        return send_file(result_path, as_attachment=True)
+    # Normalize incoming value: strip quotes, decode percent-encoding, handle file://, expand ~
     try:
-        app.logger.warning("[download] file not found: %s", result_path)
+        if result_path:
+            # strip surrounding quotes if present
+            if (result_path.startswith('"') and result_path.endswith('"')) or (result_path.startswith("'") and result_path.endswith("'")):
+                result_path = result_path[1:-1]
+            # convert file:// URIs
+            if result_path.startswith('file://'):
+                result_path = result_path[len('file://'):]
+            # percent-decode
+            try:
+                from urllib.parse import unquote
+                result_path = unquote(result_path)
+            except Exception:
+                pass
+            # expand ~ and normalize slashes
+            result_path = os.path.expanduser(result_path)
+            result_path = os.path.normpath(result_path)
     except Exception:
         pass
-    flash('Report not found.')
-    return redirect(url_for('index'))
+    # Attempt to resolve common path variants to absolute existing file
+    candidates = []
+    if result_path:
+        candidates.append(result_path)
+        # Absolute from repo root if provided as repo-relative
+        try:
+            repo_root = _get_repo_root()
+            if not os.path.isabs(result_path):
+                candidates.append(os.path.abspath(os.path.join(repo_root, result_path)))
+            # Also try if client included an extra 'webapp/' segment
+            if result_path.startswith('webapp' + os.sep):
+                candidates.append(os.path.abspath(os.path.join(repo_root, result_path)))
+                # Strip 'webapp/' and try from repo root
+                candidates.append(os.path.abspath(os.path.join(repo_root, result_path.split(os.sep, 1)[-1])))
+            # If path looks like outputs/<...>, join with configured outputs dir
+            if result_path.startswith('outputs' + os.sep):
+                candidates.append(os.path.abspath(os.path.join(_outputs_dir(), result_path.split(os.sep, 1)[-1])))
+            # If absolute path contains '/webapp/outputs/...', remap to configured outputs dir
+            rp_norm = os.path.normpath(result_path)
+            parts = rp_norm.strip(os.sep).split(os.sep)
+            if os.path.isabs(result_path) and 'outputs' in parts:
+                try:
+                    idx = parts.index('outputs')
+                    tail = os.path.join(*parts[idx+1:]) if idx+1 < len(parts) else ''
+                    candidates.append(os.path.join(_outputs_dir(), tail))
+                except Exception:
+                    pass
+            if os.path.isabs(result_path) and 'webapp' in parts:
+                # Remove the 'webapp' segment entirely
+                parts_wo = [p for p in parts if p != 'webapp']
+                candidates.append(os.path.sep + os.path.join(*parts_wo))
+            # If the path already lives under our configured outputs dir but with different root, try direct mapping
+            try:
+                outputs_dir = os.path.abspath(_outputs_dir())
+                if os.path.isabs(result_path) and 'core-sessions' in parts and not result_path.startswith(outputs_dir):
+                    # replace everything up to 'core-sessions' with outputs_dir/core-sessions
+                    idx = parts.index('core-sessions')
+                    tail = os.path.join(*parts[idx+1:]) if idx+1 < len(parts) else ''
+                    candidates.append(os.path.join(outputs_dir, 'core-sessions', tail))
+            except Exception:
+                pass
+        except Exception:
+            pass
+    # Pick the first existing path
+    chosen = None
+    for p in candidates:
+        if p and os.path.exists(p):
+            chosen = p
+            break
+    if chosen:
+        try:
+            app.logger.info("[download] serving file: %s", os.path.abspath(chosen))
+        except Exception:
+            pass
+        return send_file(chosen, as_attachment=True)
+    # Fallback: try to match by basename within outputs/core-sessions and outputs/scenarios-*
+    try:
+        # Log diagnostics about missing primary candidates
+        app.logger.warning("[download] file not found via direct candidates; requested=%s; candidates=%s", result_path, candidates)
+    except Exception:
+        pass
+    try:
+        base_name = None
+        try:
+            base_name = os.path.basename(result_path) if result_path else None
+        except Exception:
+            base_name = None
+        if base_name and base_name.lower().endswith('.xml'):
+            candidates_found = []
+            # Search core-sessions
+            root_dir = os.path.join(_outputs_dir(), 'core-sessions')
+            if os.path.exists(root_dir):
+                for dp, _dn, files in os.walk(root_dir):
+                    for fn in files:
+                        if fn == base_name:
+                            alt = os.path.join(dp, fn)
+                            if os.path.exists(alt):
+                                candidates_found.append(alt)
+            # Search scenarios-* (Scenario Editor saves)
+            out_dir = _outputs_dir()
+            if os.path.exists(out_dir):
+                try:
+                    for name in os.listdir(out_dir):
+                        if not name.startswith('scenarios-'):
+                            continue
+                        p = os.path.join(out_dir, name)
+                        if not os.path.isdir(p):
+                            continue
+                        for dp, _dn, files in os.walk(p):
+                            for fn in files:
+                                if fn == base_name:
+                                    alt = os.path.join(dp, fn)
+                                    if os.path.exists(alt):
+                                        candidates_found.append(alt)
+                except Exception:
+                    pass
+            if candidates_found:
+                # Prefer the newest by mtime
+                try:
+                    candidates_found.sort(key=lambda p: os.stat(p).st_mtime, reverse=True)
+                except Exception:
+                    pass
+                chosen_alt = candidates_found[0]
+                app.logger.info("[download] basename match: %s -> %s", base_name, chosen_alt)
+                return send_file(chosen_alt, as_attachment=True)
+    except Exception:
+        pass
+    app.logger.warning("[download] file not found: %s (candidates=%s)", result_path, candidates)
+    return "File not found", 404
 
 @app.route('/reports')
 def reports_page():
@@ -1172,7 +2192,9 @@ def reports_page():
         e = dict(entry)
         # Keep xml_path as stored (session xml only if available)
         if 'scenario_names' not in e:
-            e['scenario_names'] = _scenario_names_from_xml(e.get('xml_path'))
+            # Prefer names parsed from the Scenario Editor XML, fall back to session xml if missing
+            src_xml = e.get('scenario_xml_path') or e.get('xml_path')
+            e['scenario_names'] = _scenario_names_from_xml(src_xml)
         enriched.append(e)
     enriched = sorted(enriched, key=lambda x: x.get('timestamp',''), reverse=True)
     # collect unique scenario names
@@ -1192,12 +2214,70 @@ def reports_data():
         e = dict(entry)
         # Keep xml_path as stored (session xml only if available)
         if 'scenario_names' not in e:
-            e['scenario_names'] = _scenario_names_from_xml(e.get('xml_path'))
+            src_xml = e.get('scenario_xml_path') or e.get('xml_path')
+            e['scenario_names'] = _scenario_names_from_xml(src_xml)
         for n in e.get('scenario_names', []) or []:
             scen_names.add(n)
         enriched.append(e)
     enriched = sorted(enriched, key=lambda x: x.get('timestamp',''), reverse=True)
     return jsonify({ 'history': enriched, 'scenarios': sorted(list(scen_names)) })
+
+@app.route('/reports/delete', methods=['POST'])
+def reports_delete():
+    """Delete run history entries by run_id and remove associated artifacts under outputs/.
+    Does not delete files under ./reports (reports are preserved by policy).
+    Body: { "run_ids": ["...", ...] }
+    """
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        run_ids = payload.get('run_ids') or []
+        if not isinstance(run_ids, list):
+            return jsonify({ 'error': 'run_ids must be a list' }), 400
+        run_ids_set = set([str(x) for x in run_ids if x])
+        if not run_ids_set:
+            return jsonify({ 'deleted': 0 })
+        history = _load_run_history()
+        kept = []
+        deleted_count = 0
+        outputs_dir = _outputs_dir()
+        for entry in history:
+            rid = str(entry.get('run_id') or '')
+            # fallback composite id to support entries without run_id
+            rid_fallback = "|".join([
+                str(entry.get('timestamp') or ''),
+                str(entry.get('scenario_xml_path') or entry.get('xml_path') or ''),
+                str(entry.get('report_path') or ''),
+                str(entry.get('full_scenario_path') or ''),
+            ])
+            if (rid and rid in run_ids_set) or (rid_fallback and rid_fallback in run_ids_set):
+                # Delete artifacts scoped to outputs/ only
+                for key in ('full_scenario_path','scenario_xml_path','pre_xml_path','post_xml_path','xml_path','single_scenario_xml_path'):
+                    p = entry.get(key)
+                    if not p: continue
+                    try:
+                        ap = os.path.abspath(p)
+                        if ap.startswith(os.path.abspath(outputs_dir)) and os.path.exists(ap):
+                            try:
+                                os.remove(ap)
+                                app.logger.info("[reports.delete] removed %s", ap)
+                            except IsADirectoryError:
+                                # just in case, do not remove directories recursively here
+                                app.logger.warning("[reports.delete] skipping directory %s", ap)
+                    except Exception as e:
+                        app.logger.warning("[reports.delete] error removing %s: %s", p, e)
+                deleted_count += 1
+            else:
+                kept.append(entry)
+        # Persist pruned history
+        os.makedirs(os.path.dirname(RUN_HISTORY_PATH), exist_ok=True)
+        tmp = RUN_HISTORY_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(kept, f, indent=2)
+        os.replace(tmp, RUN_HISTORY_PATH)
+        return jsonify({ 'deleted': deleted_count })
+    except Exception as e:
+        app.logger.exception("[reports.delete] failed: %s", e)
+        return jsonify({ 'error': 'internal error' }), 500
 
 
 @app.route('/run_cli_async', methods=['POST'])
@@ -1206,6 +2286,14 @@ def run_cli_async():
     if not xml_path:
         return jsonify({"error": "XML path missing. Save XML first."}), 400
     xml_path = os.path.abspath(xml_path)
+    if not os.path.exists(xml_path) and '/outputs/' in xml_path:
+        try:
+            alt = xml_path.replace('/app/outputs', '/app/webapp/outputs')
+            if alt != xml_path and os.path.exists(alt):
+                app.logger.info("[async] Remapped XML path %s -> %s", xml_path, alt)
+                xml_path = alt
+        except Exception:
+            pass
     if not os.path.exists(xml_path):
         return jsonify({"error": f"XML path not found: {xml_path}"}), 400
     # Skip schema validation: format differs from CORE XML
@@ -1230,7 +2318,7 @@ def run_cli_async():
     # Attempt pre-save of current CORE session xml (best-effort) using derived host/port
     pre_saved = None
     try:
-        pre_dir = os.path.join(out_dir, 'core-pre')
+        pre_dir = os.path.join(out_dir or _outputs_dir(), 'core-pre')
         pre_saved = _grpc_save_current_session_xml(core_host, core_port, pre_dir)
     except Exception:
         pre_saved = None
@@ -1240,13 +2328,14 @@ def run_cli_async():
     scen_names = _scenario_names_from_xml(xml_path)
     repo_root = _get_repo_root()
     # Use package CLI module invocation
-    proc = subprocess.Popen([
-        'core-python', '-u', '-m', 'core_topo_gen.cli',
-        '--xml', xml_path,
-        '--host', core_host,
-        '--port', str(core_port),
-        '--verbose',
-    ], cwd=repo_root, stdout=log_f, stderr=subprocess.STDOUT, env=env)
+    py_exec = _select_python_interpreter()
+    app.logger.info("[async] Using python interpreter: %s", py_exec)
+    # Determine active scenario name and pass to CLI
+    active_scenario_name = scen_names[0] if (scen_names and len(scen_names) > 0) else None
+    args = [py_exec, '-u', '-m', 'core_topo_gen.cli', '--xml', xml_path, '--host', core_host, '--port', str(core_port), '--verbose']
+    if active_scenario_name:
+        args.extend(['--scenario', active_scenario_name])
+    proc = subprocess.Popen(args, cwd=repo_root, stdout=log_f, stderr=subprocess.STDOUT, env=env)
     RUNS[run_id] = {
         'proc': proc,
         'log_path': log_path,
@@ -1259,7 +2348,90 @@ def run_cli_async():
         'core_port': core_port,
         'scenario_names': scen_names,
         'post_xml_path': None,
+        'history_added': False,
     }
+    # Start a background finalizer so history is appended even if the UI does not poll /run_status
+    def _wait_and_finalize_async(run_id_local: str):
+        try:
+            meta = RUNS.get(run_id_local)
+            if not meta:
+                return
+            p = meta.get('proc')
+            if not p:
+                return
+            rc = p.wait()
+            meta['done'] = True
+            meta['returncode'] = rc
+            # mirror the logic in run_status to extract artifacts and append history
+            try:
+                xml_path_local = meta.get('xml_path')
+                report_md = None
+                txt = ''
+                try:
+                    lp = meta.get('log_path')
+                    if lp and os.path.exists(lp):
+                        with open(lp, 'r', encoding='utf-8', errors='ignore') as f:
+                            txt = f.read()
+                        report_md = _extract_report_path_from_text(txt)
+                except Exception:
+                    report_md = None
+                if not report_md:
+                    report_md = _find_latest_report_path()
+                if report_md:
+                    app.logger.info("[async-finalizer] Detected report path: %s", report_md)
+                # Best-effort: capture post-run CORE session XML
+                post_saved = None
+                try:
+                    out_dir = os.path.dirname(xml_path_local or '')
+                    post_dir = os.path.join(out_dir, 'core-post') if out_dir else os.path.join(_outputs_dir(), 'core-post')
+                    sid = _extract_session_id_from_text(txt)
+                    post_saved = _grpc_save_current_session_xml(meta.get('core_host') or CORE_HOST, int(meta.get('core_port') or CORE_PORT), post_dir, session_id=sid)
+                except Exception:
+                    post_saved = None
+                if post_saved:
+                    meta['post_xml_path'] = post_saved
+                    app.logger.debug("[async-finalizer] Post-run session XML saved to %s", post_saved)
+                # Build single-scenario XML, then a Full Scenario bundle including scripts
+                single_xml = None
+                try:
+                    single_xml = _write_single_scenario_xml(xml_path_local, active_scenario_name, out_dir=os.path.dirname(xml_path_local or ''))
+                except Exception:
+                    single_xml = None
+                bundle_xml = single_xml or xml_path_local
+                full_bundle = _build_full_scenario_archive(os.path.dirname(bundle_xml or ''), bundle_xml, (report_md if (report_md and os.path.exists(report_md)) else None), meta.get('pre_xml_path'), post_saved, run_id=run_id_local)
+                _append_run_history({
+                    'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+                    'mode': 'async',
+                    'xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
+                    'post_xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
+                    'scenario_xml_path': xml_path_local,
+                    'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
+                    'pre_xml_path': meta.get('pre_xml_path'),
+                    'full_scenario_path': full_bundle,
+                    'single_scenario_xml_path': single_xml,
+                    'returncode': rc,
+                    'run_id': run_id_local,
+                    'scenario_names': meta.get('scenario_names') or [],
+                })
+                meta['history_added'] = True
+            except Exception as e_final:
+                try:
+                    app.logger.exception("[async-finalizer] failed finalizing run %s: %s", run_id_local, e_final)
+                except Exception:
+                    pass
+        except Exception:
+            # swallow all exceptions to avoid crashing the web server
+            try:
+                app.logger.exception("[async-finalizer] unexpected error for run %s", run_id_local)
+            except Exception:
+                pass
+
+    try:
+        t = threading.Thread(target=_wait_and_finalize_async, args=(run_id,), daemon=True)
+        t.start()
+        app.logger.debug("[async] Finalizer thread started for run_id=%s", run_id)
+    except Exception:
+        pass
     return jsonify({"run_id": run_id})
 
 
@@ -1274,12 +2446,20 @@ def run_status(run_id: str):
         if rc is not None:
             meta['done'] = True
             meta['returncode'] = rc
-            # On successful completion (rc==0) append history once
-            if rc == 0:
+            # Append history once (success or failure)
+            if not meta.get('history_added'):
                 try:
+                    active_scenario_name = None
+                    try:
+                        sns = meta.get('scenario_names') or []
+                        if isinstance(sns, list) and sns:
+                            active_scenario_name = sns[0]
+                    except Exception:
+                        active_scenario_name = None
                     xml_path_local = meta.get('xml_path')
                     # Parse report path from log contents; fallback to latest under reports/
                     report_md = None
+                    txt = ''
                     try:
                         lp = meta.get('log_path')
                         if lp and os.path.exists(lp):
@@ -1296,7 +2476,7 @@ def run_status(run_id: str):
                     post_saved = None
                     try:
                         out_dir = os.path.dirname(xml_path_local or '')
-                        post_dir = os.path.join(out_dir, 'core-post') if out_dir else os.path.join('outputs', 'core-post')
+                        post_dir = os.path.join(out_dir, 'core-post') if out_dir else os.path.join(_outputs_dir(), 'core-post')
                         # Parse session id from logs if available for precise save
                         sid = _extract_session_id_from_text(txt)
                         post_saved = _grpc_save_current_session_xml(meta.get('core_host') or CORE_HOST, int(meta.get('core_port') or CORE_PORT), post_dir, session_id=sid)
@@ -1305,8 +2485,14 @@ def run_status(run_id: str):
                     if post_saved:
                         meta['post_xml_path'] = post_saved
                         app.logger.debug("[async] Post-run session XML saved to %s", post_saved)
-                    # Build a Full Scenario bundle including scripts
-                    full_bundle = _build_full_scenario_archive(os.path.dirname(xml_path_local or ''), xml_path_local, (report_md if (report_md and os.path.exists(report_md)) else None), meta.get('pre_xml_path'), post_saved, run_id=run_id)
+                    # Build single-scenario XML, then a Full Scenario bundle including scripts
+                    single_xml = None
+                    try:
+                        single_xml = _write_single_scenario_xml(xml_path_local, active_scenario_name, out_dir=os.path.dirname(xml_path_local or ''))
+                    except Exception:
+                        single_xml = None
+                    bundle_xml = single_xml or xml_path_local
+                    full_bundle = _build_full_scenario_archive(os.path.dirname(bundle_xml or ''), bundle_xml, (report_md if (report_md and os.path.exists(report_md)) else None), meta.get('pre_xml_path'), post_saved, run_id=run_id)
                     _append_run_history({
                         'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
                         'mode': 'async',
@@ -1317,12 +2503,18 @@ def run_status(run_id: str):
                         'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
                         'pre_xml_path': meta.get('pre_xml_path'),
                         'full_scenario_path': full_bundle,
+                        'single_scenario_xml_path': single_xml,
                         'returncode': rc,
                         'run_id': run_id,
                         'scenario_names': meta.get('scenario_names') or [],
                     })
-                except Exception:
-                    pass
+                except Exception as e_hist:
+                    try:
+                        app.logger.exception("[async] failed appending run history: %s", e_hist)
+                    except Exception:
+                        pass
+                finally:
+                    meta['history_added'] = True
     # Determine report path
     xml_path = meta.get('xml_path', '')
     out_dir = os.path.dirname(xml_path)
@@ -1411,6 +2603,489 @@ def base_details():
     ok, errs = _validate_core_xml(xml_path)
     summary = _analyze_core_xml(xml_path) if ok else {'error': errs}
     return render_template('base_details.html', xml_path=xml_path, valid=ok, errors=errs, summary=summary)
+
+
+# ---------------- CORE Management (sessions and XMLs) ----------------
+
+def _core_sessions_store_path() -> str:
+    return os.path.join(_outputs_dir(), 'core_sessions.json')
+
+
+def _load_core_sessions_store() -> dict:
+    p = _core_sessions_store_path()
+    try:
+        if os.path.exists(p):
+            with open(p, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+                return d if isinstance(d, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_core_sessions_store(d: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(_core_sessions_store_path()), exist_ok=True)
+        tmp = _core_sessions_store_path() + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, _core_sessions_store_path())
+    except Exception:
+        pass
+
+
+def _update_xml_session_mapping(xml_path: str, session_id: int | None) -> None:
+    try:
+        store = _load_core_sessions_store()
+        key = os.path.abspath(xml_path)
+        if session_id is None:
+            if key in store:
+                store.pop(key, None)
+        else:
+            store[key] = int(session_id)
+        _save_core_sessions_store(store)
+    except Exception:
+        pass
+
+
+def _list_active_core_sessions(host: str, port: int) -> list[dict]:
+    """Return list of active CORE sessions via gRPC. Best-effort if gRPC missing."""
+    items: list[dict] = []
+    try:
+        from core.api.grpc.client import CoreGrpcClient  # type: ignore
+    except Exception:
+        return items
+    address = f"{host}:{port}"
+    try:
+        client = CoreGrpcClient(address=address)
+        try:
+            from core_topo_gen.utils.grpc_logging import wrap_core_client  # type: ignore
+            client = wrap_core_client(client, app.logger)
+        except Exception:
+            pass
+        client.connect()
+        try:
+            sessions = client.get_sessions()
+            for s in sessions:
+                try:
+                    sid = getattr(s, 'id', None)
+                    state = getattr(getattr(s, 'state', None), 'name', None) or getattr(s, 'state', None)
+                    file_path = getattr(s, 'file', None)
+                    sess_dir = getattr(s, 'dir', None)
+                    # Prefer provided nodes count; if missing or zero, attempt to derive via gRPC
+                    nodes_count = getattr(s, 'nodes', None)
+                    if nodes_count is None or (isinstance(nodes_count, int) and nodes_count == 0):
+                        try:
+                            # Try get_nodes(session_id) -> list
+                            if sid is not None and hasattr(client, 'get_nodes'):
+                                try:
+                                    nlist = client.get_nodes(int(sid))  # type: ignore[attr-defined]
+                                    if nlist is not None:
+                                        # Some clients return dicts or objects; len() is sufficient
+                                        nodes_count = len(nlist)
+                                except Exception:
+                                    pass
+                            # Fallback to fetching session detail if available
+                            if (nodes_count is None or nodes_count == 0) and sid is not None and hasattr(client, 'get_session'):
+                                try:
+                                    sdet = client.get_session(int(sid))  # type: ignore[attr-defined]
+                                    maybe_nodes = getattr(sdet, 'nodes', None)
+                                    if isinstance(maybe_nodes, int):
+                                        nodes_count = maybe_nodes
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    items.append({
+                        'id': sid,
+                        'state': state,
+                        'nodes': nodes_count if nodes_count is not None else None,
+                        'file': file_path,
+                        'dir': sess_dir,
+                    })
+                except Exception:
+                    continue
+        finally:
+            try: client.close()
+            except Exception: pass
+    except Exception:
+        pass
+    return items
+
+
+def _scan_core_xmls(max_count: int = 200) -> list[dict]:
+    """Scan for runnable CORE XMLs and exclude scenario editor saves.
+
+    Include only:
+      - uploads/core/*.xml (user-uploaded CORE XMLs)
+      - outputs/core-sessions/**/*.xml (saved via gRPC from running sessions)
+
+    Exclude:
+      - outputs/scenarios-*/** (scenario editor saves)
+
+    Returns list of dicts: { path, name, size, mtime, valid } sorted by mtime desc.
+    """
+    uploads_core = os.path.join(_uploads_dir(), 'core')
+    outputs_sessions = os.path.join(_outputs_dir(), 'core-sessions')
+    allowed_roots = [uploads_core, outputs_sessions]
+    paths: list[str] = []
+    for root in allowed_roots:
+        try:
+            if not root or not os.path.exists(root):
+                continue
+            for dp, _dn, files in os.walk(root):
+                for fn in files:
+                    if fn.lower().endswith('.xml'):
+                        paths.append(os.path.join(dp, fn))
+        except Exception:
+            continue
+    # Dedup and sort by mtime desc
+    seen = set()
+    recs: list[tuple[float, dict]] = []
+    for p in paths:
+        ap = os.path.abspath(p)
+        if ap in seen:
+            continue
+        seen.add(ap)
+        try:
+            st = os.stat(ap)
+            mt = st.st_mtime
+            size = st.st_size
+        except Exception:
+            mt = 0.0
+            size = -1
+        valid = False
+        ok, _errs = _validate_core_xml(ap)
+        valid = bool(ok)
+        recs.append((mt, {'path': ap, 'name': os.path.basename(ap), 'size': size, 'mtime': mt, 'valid': valid}))
+    recs.sort(key=lambda x: x[0], reverse=True)
+    return [r for _mt, r in recs[:max_count]]
+
+
+@app.route('/core')
+def core_page():
+    # Determine CORE host/port from defaults
+    host = CORE_HOST
+    port = CORE_PORT
+    # Active sessions via gRPC
+    sessions = _list_active_core_sessions(host, port)
+    # Known XMLs
+    xmls = _scan_core_xmls()
+    # Map running by file path, with fallback to local store
+    mapping = _load_core_sessions_store()
+    file_to_sid: dict[str, int] = {}
+    # From gRPC session summaries (file path may be absolute)
+    for s in sessions:
+        f = s.get('file')
+        sid = s.get('id')
+        if f and sid is not None:
+            file_to_sid[os.path.abspath(f)] = int(sid)
+    # Merge with prior mappings
+    for k, v in mapping.items():
+        file_to_sid.setdefault(os.path.abspath(k), int(v))
+    # Annotate xmls
+    for x in xmls:
+        sid = file_to_sid.get(x['path'])
+        x['session_id'] = sid
+        x['running'] = sid is not None
+    return render_template('core.html', sessions=sessions, xmls=xmls, host=host, port=port)
+
+
+@app.route('/core/data')
+def core_data():
+    host = CORE_HOST
+    port = CORE_PORT
+    sessions = _list_active_core_sessions(host, port)
+    xmls = _scan_core_xmls()
+    # annotate xmls with running/session_id best-effort mapping, as in core_page
+    mapping = _load_core_sessions_store()
+    file_to_sid: dict[str, int] = {}
+    for s in sessions:
+        f = s.get('file')
+        sid = s.get('id')
+        if f and sid is not None:
+            file_to_sid[os.path.abspath(f)] = int(sid)
+    for k, v in mapping.items():
+        file_to_sid.setdefault(os.path.abspath(k), int(v))
+    for x in xmls:
+        sid = file_to_sid.get(x['path'])
+        x['session_id'] = sid
+        x['running'] = sid is not None
+    return jsonify({ 'sessions': sessions, 'xmls': xmls })
+
+
+@app.route('/core/upload', methods=['POST'])
+def core_upload():
+    f = request.files.get('xml_file')
+    if not f or f.filename == '':
+        flash('No file selected.')
+        return redirect(url_for('core_page'))
+    filename = secure_filename(f.filename)
+    if not filename.lower().endswith('.xml'):
+        flash('Only .xml allowed.')
+        return redirect(url_for('core_page'))
+    dest_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'core')
+    os.makedirs(dest_dir, exist_ok=True)
+    unique = datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+    path = os.path.join(dest_dir, f"{unique}-{filename}")
+    f.save(path)
+    ok, errs = _validate_core_xml(path)
+    if not ok:
+        try: os.remove(path)
+        except Exception: pass
+        flash(f'Invalid CORE XML: {errs}')
+        return redirect(url_for('core_page'))
+    flash('XML uploaded and validated.')
+    return redirect(url_for('core_page'))
+
+
+@app.route('/core/start', methods=['POST'])
+def core_start():
+    xml_path = request.form.get('path')
+    if not xml_path:
+        flash('Missing XML path')
+        return redirect(url_for('core_page'))
+    ap = os.path.abspath(xml_path)
+    if not os.path.exists(ap):
+        flash('File not found')
+        return redirect(url_for('core_page'))
+    ok, errs = _validate_core_xml(ap)
+    if not ok:
+        flash(f'Invalid CORE XML: {errs}')
+        return redirect(url_for('core_page'))
+    # Start via gRPC open_xml(start=True)
+    try:
+        from core.api.grpc.client import CoreGrpcClient  # type: ignore
+    except Exception:
+        flash('CORE gRPC client not available in this environment.')
+        return redirect(url_for('core_page'))
+    address = f"{CORE_HOST}:{CORE_PORT}"
+    try:
+        client = CoreGrpcClient(address=address)
+        try:
+            from core_topo_gen.utils.grpc_logging import wrap_core_client  # type: ignore
+            client = wrap_core_client(client, app.logger)
+        except Exception:
+            pass
+        client.connect()
+        try:
+            # open_xml requires pathlib.Path
+            sid = None
+            try:
+                from pathlib import Path as _P
+                res, new_sid = client.open_xml(_P(ap), start=True)
+                if not res:
+                    flash('CORE did not accept the XML file.')
+                    return redirect(url_for('core_page'))
+                sid = int(new_sid) if new_sid is not None else None
+            except Exception as e:
+                flash(f'Failed to open XML: {e}')
+                return redirect(url_for('core_page'))
+            if sid is not None:
+                _update_xml_session_mapping(ap, sid)
+                flash(f'Started session {sid}.')
+        finally:
+            try: client.close()
+            except Exception: pass
+    except Exception as e:
+        flash(f'gRPC error: {e}')
+    return redirect(url_for('core_page'))
+
+
+@app.route('/core/stop', methods=['POST'])
+def core_stop():
+    sid = request.form.get('session_id')
+    if not sid:
+        flash('Missing session id')
+        return redirect(url_for('core_page'))
+    try:
+        sid_int = int(sid)
+    except Exception:
+        flash('Invalid session id')
+        return redirect(url_for('core_page'))
+    try:
+        from core.api.grpc.client import CoreGrpcClient  # type: ignore
+    except Exception:
+        flash('CORE gRPC client not available in this environment.')
+        return redirect(url_for('core_page'))
+    address = f"{CORE_HOST}:{CORE_PORT}"
+    try:
+        client = CoreGrpcClient(address=address)
+        try:
+            from core_topo_gen.utils.grpc_logging import wrap_core_client  # type: ignore
+            client = wrap_core_client(client, app.logger)
+        except Exception:
+            pass
+        client.connect()
+        try:
+            client.stop_session(sid_int)
+            flash(f'Stopped session {sid_int}.')
+        finally:
+            try: client.close()
+            except Exception: pass
+    except Exception as e:
+        flash(f'gRPC error: {e}')
+    return redirect(url_for('core_page'))
+
+
+@app.route('/core/start_session', methods=['POST'])
+def core_start_session():
+    sid = request.form.get('session_id')
+    if not sid:
+        flash('Missing session id')
+        return redirect(url_for('core_page'))
+    try:
+        sid_int = int(sid)
+    except Exception:
+        flash('Invalid session id')
+        return redirect(url_for('core_page'))
+    try:
+        from core.api.grpc.client import CoreGrpcClient  # type: ignore
+    except Exception:
+        flash('CORE gRPC client not available in this environment.')
+        return redirect(url_for('core_page'))
+    address = f"{CORE_HOST}:{CORE_PORT}"
+    try:
+        client = CoreGrpcClient(address=address)
+        client.connect()
+        try:
+            client.start_session(sid_int)
+            flash(f'Started session {sid_int}.')
+        finally:
+            try: client.close()
+            except Exception: pass
+    except Exception as e:
+        flash(f'gRPC error: {e}')
+    return redirect(url_for('core_page'))
+
+
+@app.route('/core/delete', methods=['POST'])
+def core_delete():
+    # Delete session (if provided) and/or delete XML file under uploads/ or outputs/
+    sid = request.form.get('session_id')
+    xml_path = request.form.get('path')
+    if sid:
+        try:
+            sid_int = int(sid)
+            from core.api.grpc.client import CoreGrpcClient  # type: ignore
+            client = CoreGrpcClient(address=f"{CORE_HOST}:{CORE_PORT}")
+            try:
+                from core_topo_gen.utils.grpc_logging import wrap_core_client  # type: ignore
+                client = wrap_core_client(client, app.logger)
+            except Exception:
+                pass
+            client.connect()
+            try:
+                client.delete_session(sid_int)
+                flash(f'Deleted session {sid_int}.')
+            finally:
+                try: client.close()
+                except Exception: pass
+        except Exception as e:
+            flash(f'Failed to delete session: {e}')
+    if xml_path:
+        ap = os.path.abspath(xml_path)
+        # Safety: only delete inside uploads/ or outputs/
+        try:
+            allowed = [os.path.abspath(_uploads_dir()), os.path.abspath(_outputs_dir())]
+            if any(ap.startswith(a + os.sep) or ap == a for a in allowed):
+                try:
+                    os.remove(ap)
+                    flash('Deleted XML file.')
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    flash(f'Failed deleting XML: {e}')
+                # clear mapping
+                _update_xml_session_mapping(ap, None)
+            else:
+                flash('Refusing to delete file outside outputs/ or uploads/.')
+        except Exception:
+            pass
+    return redirect(url_for('core_page'))
+
+
+@app.route('/core/details')
+def core_details():
+    xml_path = request.args.get('path')
+    sid = request.args.get('session_id')
+    xml_summary = None
+    xml_valid = False
+    errors = ''
+    # If no XML path given but we have a session id, attempt to export the session XML so we can show details
+    if (not xml_path or not os.path.exists(xml_path)) and sid:
+        try:
+            out_dir = os.path.join(_outputs_dir(), 'core-sessions')
+            os.makedirs(out_dir, exist_ok=True)
+            saved = _grpc_save_current_session_xml(CORE_HOST, CORE_PORT, out_dir, session_id=str(sid))
+            if saved and os.path.exists(saved):
+                xml_path = saved
+        except Exception:
+            pass
+    if xml_path and os.path.exists(xml_path):
+        ok, errs = _validate_core_xml(xml_path)
+        xml_valid = bool(ok)
+        errors = errs if not ok else ''
+        xml_summary = _analyze_core_xml(xml_path) if ok else None
+    session_info = None
+    if sid:
+        try:
+            sid_int = int(sid)
+            # lookup session info via gRPC
+            sessions = _list_active_core_sessions(CORE_HOST, CORE_PORT)
+            for s in sessions:
+                if int(s.get('id')) == sid_int:
+                    session_info = s
+                    break
+        except Exception:
+            session_info = None
+    return render_template('core_details.html', xml_path=xml_path, valid=xml_valid, errors=errors, summary=xml_summary, session=session_info)
+
+
+@app.route('/core/save_xml', methods=['POST'])
+def core_save_xml():
+    sid = request.form.get('session_id')
+    try:
+        sid_int = int(sid) if sid is not None else None
+    except Exception:
+        sid_int = None
+    out_dir = os.path.join(_outputs_dir(), 'core-sessions')
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        saved = _grpc_save_current_session_xml(CORE_HOST, CORE_PORT, out_dir, session_id=str(sid_int) if sid_int is not None else None)
+        if not saved or not os.path.exists(saved):
+            return Response('Failed to save session XML', status=500)
+        # Stream back as a download so frontend can save via blob
+        return send_file(saved, as_attachment=True, download_name=os.path.basename(saved), mimetype='application/xml')
+    except Exception as e:
+        return Response(f'Error saving session XML: {e}', status=500)
+
+
+@app.route('/core/session/<int:sid>')
+def core_session(sid: int):
+    """Convenience route to view a specific session's details.
+    Attempts to look up the session and its file path, then reuses the core_details template.
+    """
+    session_info = None
+    xml_path = None
+    try:
+        sessions = _list_active_core_sessions(CORE_HOST, CORE_PORT)
+        for s in sessions:
+            if int(s.get('id')) == int(sid):
+                session_info = s
+                xml_path = s.get('file')
+                break
+    except Exception:
+        session_info = None
+    xml_valid = False
+    errors = ''
+    xml_summary = None
+    if xml_path and os.path.exists(xml_path):
+        ok, errs = _validate_core_xml(xml_path)
+        xml_valid = bool(ok)
+        errors = errs if not ok else ''
+        xml_summary = _analyze_core_xml(xml_path) if ok else None
+    return render_template('core_details.html', xml_path=xml_path, valid=xml_valid, errors=errors, summary=xml_summary, session=session_info)
 
 
 @app.route('/test_core', methods=['POST'])
@@ -2080,6 +3755,109 @@ def vuln_compose_pull():
                 out.append({'Name': name, 'Path': path, 'ok': ok, 'message': msg, 'compose': compose_name})
             except Exception as e:
                 out.append({'Name': name, 'Path': path, 'ok': False, 'message': str(e), 'compose': compose_name})
+        return jsonify({'items': out, 'log': logs})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/vuln_compose/remove', methods=['POST'])
+def vuln_compose_remove():
+    """Remove docker-compose assets and containers/images for the given catalog items.
+
+    Steps per item:
+    - Resolve compose file path (like status/pull)
+    - docker compose down --volumes --remove-orphans
+    - Optionally remove images referenced by compose (best-effort)
+    - Remove downloaded directories (repo dir or compose file directory) under outputs
+
+    Payload: { items: [{Name, Path}] }
+    Returns: { items: [{Name, Path, ok: bool, message: str}] }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        items = data.get('items') or []
+        out = []
+        logs: list[str] = []
+        base_out = os.path.abspath(_vuln_base_dir())
+        for it in items:
+            name = (it.get('Name') or '').strip()
+            path = (it.get('Path') or '').strip()
+            compose_name = (it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
+            safe = _safe_name(name or 'vuln')
+            vdir = os.path.join(base_out, safe)
+            gh = _parse_github_url(path)
+            yml_path = None
+            base_dir = vdir
+            try:
+                logs.append(f"[remove] {name}: Path={path}")
+            except Exception:
+                pass
+            if gh.get('is_github'):
+                repo_dir = os.path.join(vdir, _vuln_repo_subdir())
+                sub = gh.get('subpath') or ''
+                is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
+                yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
+                if not os.path.exists(yml_path):
+                    cand = _compose_candidates(base_dir)
+                    yml_path = cand[0] if cand else None
+            else:
+                yml_path = os.path.join(vdir, compose_name)
+            # Bring down compose stack
+            if yml_path and os.path.exists(yml_path) and shutil.which('docker'):
+                try:
+                    logs.append(f"[remove] {name}: docker compose down file={yml_path}")
+                except Exception:
+                    pass
+                try:
+                    proc = subprocess.run(['docker', 'compose', '-f', yml_path, 'down', '--volumes', '--remove-orphans'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    try:
+                        logs.append(f"[remove] docker compose down rc={proc.returncode}")
+                        if proc.stdout:
+                            for ln in proc.stdout.splitlines()[:200]:
+                                logs.append(f"[docker] {ln}")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    try: logs.append(f"[remove] compose down error: {e}")
+                    except Exception: pass
+                # Attempt to remove images referenced by compose (best-effort)
+                try:
+                    proc2 = subprocess.run(['docker', 'compose', '-f', yml_path, 'config', '--images'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    if proc2.returncode == 0:
+                        images = [ln.strip() for ln in (proc2.stdout or '').splitlines() if ln.strip()]
+                        for img in images:
+                            p3 = subprocess.run(['docker', 'image', 'rm', '-f', img], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                            try: logs.append(f"[remove] image rm {img} rc={p3.returncode}")
+                            except Exception: pass
+                except Exception:
+                    pass
+            # Remove downloaded files/dirs under outputs for this item
+            try:
+                if gh.get('is_github'):
+                    repo_dir = os.path.join(vdir, _vuln_repo_subdir())
+                    if os.path.isdir(repo_dir):
+                        shutil.rmtree(repo_dir, ignore_errors=True)
+                        logs.append(f"[remove] {name}: deleted {repo_dir}")
+                else:
+                    # legacy direct compose path
+                    yml = os.path.join(vdir, compose_name)
+                    if os.path.exists(yml):
+                        try:
+                            os.remove(yml)
+                            logs.append(f"[remove] {name}: deleted {yml}")
+                        except Exception:
+                            pass
+                # Remove vdir if empty
+                try:
+                    if os.path.isdir(vdir) and not os.listdir(vdir):
+                        os.rmdir(vdir)
+                        logs.append(f"[remove] {name}: cleaned empty {vdir}")
+                except Exception:
+                    pass
+            except Exception as e:
+                try: logs.append(f"[remove] cleanup error: {e}")
+                except Exception: pass
+            out.append({'Name': name, 'Path': path, 'ok': True, 'message': 'removed', 'compose': compose_name})
         return jsonify({'items': out, 'log': logs})
     except Exception as e:
         return jsonify({'error': str(e)}), 500

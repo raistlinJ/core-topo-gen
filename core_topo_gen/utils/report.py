@@ -73,17 +73,139 @@ def write_report(
     lines.append("")
     lines.append("## Summary")
     lines.append(f"- Total nodes: {total_nodes}")
+    # Base host pool removed; show additive breakdown only if provided
+    try:
+        if metadata:
+            if metadata.get('count_rows_additive_total'):
+                lines.append(f"- Additive Count Rows Total: {metadata.get('count_rows_additive_total')}")
+            try:
+                cc = metadata.get('count_rows_breakdown') or {}
+                if cc:
+                    lines.append(f"- Role Additive Counts: {', '.join(f'{r}={c}' for r,c in cc.items())}")
+            except Exception:
+                pass
+    except Exception:
+        pass
     lines.append(f"- Routers: {len(routers)}  |  Switches: {len(switches)}  |  Hosts: {len(hosts)}")
     lines.append(f"- Traffic flows: {len(flows)}")
     lines.append(f"- Segmentation rules: {len(seg_rules)}")
+    # Vulnerability assignment count (best effort):
+    # Prefer runtime assignment summary if present, else infer from vulnerabilities_cfg
+    vuln_assigned = None
+    try:
+        assign_summary_path = "/tmp/vulns/compose_assignments.json"
+        if os.path.exists(assign_summary_path):
+            with open(assign_summary_path, "r", encoding="utf-8") as vf:
+                _assign_data = json.load(vf)
+            assignments = (_assign_data.get("assignments") or {})
+            if isinstance(assignments, dict):
+                vuln_assigned = len(assignments)
+    except Exception:
+        pass
+    if vuln_assigned is None and vulnerabilities_cfg:
+        try:
+            items = vulnerabilities_cfg.get("items") or []
+            # Sum explicit v_count values (Count metric or Specific with v_count)
+            total_counts = 0
+            for it in items:
+                vc = it.get("v_count") if isinstance(it, dict) else None
+                if isinstance(vc, int) and vc > 0:
+                    total_counts += vc
+            if total_counts == 0:
+                # Fallback: treat each item as 1 planned vulnerability if no counts specified
+                total_counts = len(items)
+            vuln_assigned = total_counts
+        except Exception:
+            vuln_assigned = None
+    if vuln_assigned is not None:
+        lines.append(f"- Vulnerabilities assigned: {vuln_assigned}")
+    # Optional additive stats (routers/vulns) from metadata/topo_stats
+    try:
+        if metadata:
+            rdens = metadata.get("routers_density_count") or metadata.get("routers_density")
+            rcount = metadata.get("routers_count_count")
+            rtot = metadata.get("routers_total_planned")
+            if rtot is not None and (rdens is not None or rcount is not None):
+                parts = []
+                count_only_flag = False
+                if (rcount and rcount > 0) and (not rdens or float(rdens) == 0):
+                    count_only_flag = True
+                if rdens is not None:
+                    parts.append(f"density_component={rdens}")
+                if rcount is not None:
+                    parts.append(f"count_component={rcount}")
+                if count_only_flag:
+                    parts.append("mode=count-only")
+                lines.append(f"- Routers planned (additive): {rtot} ({', '.join(parts)})")
+            vden_t = metadata.get("vuln_density_target")
+            vcnt_t = metadata.get("vuln_count_items_total")
+            vadd = metadata.get("vuln_total_planned_additive")
+            vassn = metadata.get("vuln_docker_assignments")
+            if any(x is not None for x in [vden_t, vcnt_t, vadd]):
+                lines.append(f"- Vulnerabilities planned (additive): target={vden_t} count_items={vcnt_t} total_est={vadd} assigned={vassn}")
+    except Exception:
+        pass
     lines.append("")
+
+    # Dedicated Planning Stats section consolidating additive semantics (optional clarity)
+    try:
+        if metadata and any(k.startswith('vuln_') or k.startswith('routers_') for k in metadata.keys()):
+            lines.append("## Planning Stats")
+            # Host role planning breakdown
+            if metadata.get('density_base_count') is not None:
+                lines.append(f"- Hosts base (density): {metadata.get('density_base_count')}")
+            if metadata.get('count_rows_additive_total'):
+                lines.append(f"- Hosts additive (count rows): {metadata.get('count_rows_additive_total')}")
+            if metadata.get('role_counts'):
+                rc = metadata.get('role_counts') or {}
+                lines.append(f"- Final role counts: {', '.join(f'{r}={c}' for r,c in rc.items())}")
+            if 'routers_total_planned' in metadata:
+                lines.append(f"- Routers total (additive): {metadata.get('routers_total_planned')} (density_component={metadata.get('routers_density_count')} count_component={metadata.get('routers_count_count')})")
+            if 'vuln_total_planned_additive' in metadata:
+                lines.append(f"- Vulnerabilities total est (additive): {metadata.get('vuln_total_planned_additive')} (density_target={metadata.get('vuln_density_target')} count_items={metadata.get('vuln_count_items_total')} assigned={metadata.get('vuln_docker_assignments')})")
+            lines.append("")
+    except Exception:
+        pass
+    # New enriched planning metadata (namespaced plan_*)
+    try:
+        if metadata and any(k.startswith('plan_') for k in metadata.keys()):
+            lines.append("## Planning Metadata (from XML)")
+            mapping = [
+                ("Node Base", 'plan_node_base_nodes'),
+                ("Node Additive", 'plan_node_additive_nodes'),
+                ("Node Combined", 'plan_node_combined_nodes'),
+                ("Node Weight Rows", 'plan_node_weight_rows'),
+                ("Node Count Rows", 'plan_node_count_rows'),
+                ("Node Weight Sum", 'plan_node_weight_sum'),
+                ("Routing Explicit", 'plan_routing_explicit'),
+                ("Routing Derived", 'plan_routing_derived'),
+                ("Routing Total", 'plan_routing_total'),
+                ("Routing Weight Rows", 'plan_routing_weight_rows'),
+                ("Routing Count Rows", 'plan_routing_count_rows'),
+                ("Routing Weight Sum", 'plan_routing_weight_sum'),
+                ("Vuln Explicit", 'plan_vuln_explicit'),
+                ("Vuln Derived", 'plan_vuln_derived'),
+                ("Vuln Total", 'plan_vuln_total'),
+                ("Vuln Weight Rows", 'plan_vuln_weight_rows'),
+                ("Vuln Count Rows", 'plan_vuln_count_rows'),
+                ("Vuln Weight Sum", 'plan_vuln_weight_sum'),
+            ]
+            for label, key in mapping:
+                if metadata.get(key) is not None:
+                    lines.append(f"- {label}: {metadata.get(key)}")
+            lines.append("")
+    except Exception:
+        pass
+    except Exception:
+        pass
 
     if routers:
         lines.append("## Routers")
         for r in routers:
             protos = router_protocols.get(r.node_id, [])
             svc = ["IPForward", "zebra"] + protos if protos else ["IPForward", "zebra"]
-            lines.append(f"- Router {r.node_id}: services=[{', '.join(svc)}]")
+            proto_str = ",".join(protos) if protos else "(none)"
+            lines.append(f"- Router {r.node_id}: protocol={proto_str} services=[{', '.join(svc)}]")
         lines.append("")
 
     if switches:
