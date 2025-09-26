@@ -1590,6 +1590,20 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                     it.set("factor", f"{float(item.get('factor', 1.0)):.3f}")
                 except Exception:
                     it.set("factor", "0.000")
+                if name == 'Routing':
+                    em = (item.get('edges_mode') or '').strip()
+                    if em:
+                        it.set('edges_mode', em)
+                    # Only persist edges value if Exact mode; ignore otherwise to reduce noise
+                    try:
+                        if em == 'Exact':
+                            ev_raw = item.get('edges')
+                            if ev_raw is not None and str(ev_raw).strip() != '':
+                                ev = int(ev_raw)
+                                if ev >= 0:
+                                    it.set('edges', str(ev))
+                    except Exception:
+                        pass
                 if name == 'Events':
                     sp = item.get('script_path') or ''
                     if sp:
@@ -1698,6 +1712,19 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
 
         devices = list(iter_by_local(root, 'device'))
         networks = list(iter_by_local(root, 'network'))
+        # Attempt to also locate any scenario-editor style sections (if this XML is from editor not CORE export)
+        routing_edge_policies: list[dict] = []
+        try:
+            for sec in root.findall('.//section'):
+                if (sec.get('name') or '').strip() == 'Routing':
+                    for it in sec.findall('./item'):
+                        em = it.get('edges_mode')
+                        ev = it.get('edges')
+                        if em or ev:
+                            rec = {'edges_mode': em or '', 'edges': int(ev) if (ev and ev.isdigit()) else None, 'protocol': it.get('selected')}
+                            routing_edge_policies.append(rec)
+        except Exception:
+            routing_edge_policies = []
         # Prefer <links> parent if available, else collect all <link> elements anywhere
         links_parent = None
         for e in root.iter():
@@ -1749,21 +1776,124 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
             }
             nodes.append(node)
 
+        # Identify switch nodes explicitly for downstream UI (graph coloring, counts)
+        switches = [n for n in nodes if (n.get('type') or '').lower() == 'switch']
+        # Also treat network elements with 'SWITCH' in their type attribute as switches (not all networks are devices)
+        extra_switch_nodes = []  # network-derived switches not already in device nodes
+        try:
+            for net in networks:
+                ntype = (net.get('type') or '')
+                if 'switch' not in ntype.lower():
+                    continue
+                sw_id = net.get('id') or (net.get('name') or '')
+                sw_name = net.get('name') or sw_id
+                if not sw_id:
+                    continue
+                # Avoid duplicates by id OR name against existing device switches
+                if any((sw_id == s.get('id')) or (sw_name == s.get('name')) for s in switches):
+                    continue
+                extra_switch = {'id': sw_id, 'name': sw_name, 'type': 'switch', 'services': [], 'linked_nodes': []}
+                switches.append(extra_switch)
+                extra_switch_nodes.append(extra_switch)
+                # Allow link resolution to map id->name for network-derived switches
+                id_to_name.setdefault(sw_id, sw_name)
+                id_to_type.setdefault(sw_id, 'switch')
+        except Exception:
+            pass
+
+        # Build explicit link details (ids and names). Avoid duplicates (undirected)
+        link_details = []
+        seen_pairs = set()
+        for link in links:
+            n1 = link.get('node1') or link.get('node1_id')
+            n2 = link.get('node2') or link.get('node2_id')
+            if not (n1 and n2):
+                # attempt iface child inference again (defensive)
+                try:
+                    if not n1:
+                        iface1 = link.find('.//iface1')
+                        if iface1 is not None:
+                            n1 = iface1.get('node')
+                    if not n2:
+                        iface2 = link.find('.//iface2')
+                        if iface2 is not None:
+                            n2 = iface2.get('node')
+                except Exception:
+                    pass
+            if not (n1 and n2):
+                continue
+            # normalize order to prevent duplicates
+            a, b = sorted([n1, n2])
+            key = f"{a}__{b}"
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            link_details.append({
+                'node1': n1,
+                'node2': n2,
+                'node1_name': id_to_name.get(n1, n1),
+                'node2_name': id_to_name.get(n2, n2)
+            })
+
+        # Build adjacency for any extra network-derived switches from explicit link_details (after they are computed)
+        # (We delay population of their linked_nodes until link_details creation below.)
+
         info.update({
             'nodes_count': len(devices),
             'networks_count': len(networks),
             'links_count': len(links),
             'services_count': len(services),
             'nodes': nodes,
+            'switches_count': len(switches),
+            # lightweight list of switch identifiers (names) for quick UI access
+            'switches': [s['name'] for s in switches],
+            # expose any additional network-derived switch nodes not already in nodes list
+            'switch_nodes': extra_switch_nodes,
+            # explicit link detail list (ids & human names)
+            'links_detail': link_details,
+            'routing_edges_policies': routing_edge_policies,
         })
         # legacy fields kept for compatibility with any current UI that may still reference them
         info['devices'] = [attrs(d, 'id', 'name', 'type', 'class', 'image') for d in devices[:50]]
         info['networks'] = [attrs(n, 'id', 'name', 'type', 'model', 'mobility') for n in networks[:50]]
         info['links_sample'] = len(links[:100])
+
+        # Populate linked_nodes for extra network-derived switches using link_details (if present)
+        if extra_switch_nodes and link_details:
+            # map from switch id to set of neighbor ids
+            sw_neighbors = {sw['id']: set() for sw in extra_switch_nodes}
+            for ld in link_details:
+                a = ld.get('node1')
+                b = ld.get('node2')
+                if not a or not b:
+                    continue
+                if a in sw_neighbors and b != a:
+                    sw_neighbors[a].add(b)
+                if b in sw_neighbors and a != b:
+                    sw_neighbors[b].add(a)
+            # Translate neighbor ids to names for readability
+            for sw in extra_switch_nodes:
+                nid = sw['id']
+                neigh_ids = sorted(sw_neighbors.get(nid, set()))
+                sw['linked_nodes'] = [id_to_name.get(x, x) for x in neigh_ids]
         # filesize
         try:
             st = os.stat(xml_path)
             info['file_size_bytes'] = st.st_size
+        except Exception:
+            pass
+        # Compute router degree statistics (devices with type containing 'ROUTER')
+        try:
+            router_ids = [d.get('id') for d in devices if (d.get('type') or '').lower().find('router') >= 0]
+            degs = {rid: len(adj.get(rid, [])) for rid in router_ids if rid}
+            if degs:
+                vals = list(degs.values())
+                info['router_degree_stats'] = {
+                    'min': min(vals),
+                    'max': max(vals),
+                    'avg': round(sum(vals)/len(vals), 2),
+                    'per_router': degs
+                }
         except Exception:
             pass
         return info

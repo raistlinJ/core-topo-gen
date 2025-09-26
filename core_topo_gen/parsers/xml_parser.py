@@ -192,13 +192,24 @@ def parse_routing_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[flo
         if not proto:
             continue
         vm = (it.get("v_metric") or "").strip()
+        edges_mode = (it.get("edges_mode") or "").strip()
+        # Support legacy attribute name 'edges' for Exact mode
+        edges_raw = (it.get("edges") or "").strip()
+        edges_val = 0
+        if edges_raw:
+            try:
+                ev = int(edges_raw)
+                if ev >= 0:
+                    edges_val = ev
+            except Exception:
+                edges_val = 0
         if vm == "Count":
             try:
                 vc = int((it.get("v_count") or "0").strip())
             except Exception:
                 vc = 0
             if vc > 0:
-                count_items.append((proto, vc))
+                count_items.append((proto, vc))  # edges attributes ignored for count planning
                 count_total += vc
         else:
             try:
@@ -206,11 +217,18 @@ def parse_routing_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[flo
             except Exception:
                 f = 0.0
             if f > 0:
-                weight_items.append((proto, f))
+                # Temporarily store in weight_items; edges planning handled after consolidated list built
+                weight_items.append((proto, f, edges_mode, edges_val))
     if count_total > 0:
         items = [RoutingInfo(protocol=p, factor=0.0, abs_count=c) for p, c in count_items]
     if weight_items:
-        items.extend([RoutingInfo(protocol=p, factor=f, abs_count=0) for p, f in weight_items])
+        for rec in weight_items:
+            if len(rec) == 2:  # backward safety
+                p, f = rec
+                items.append(RoutingInfo(protocol=p, factor=f, abs_count=0))
+            else:
+                p, f, em, ev = rec
+                items.append(RoutingInfo(protocol=p, factor=f, abs_count=0, edges_mode=em, edges=ev))
     # If neither density nor counts nor weight items, result is empty list (0 routers)
     if not items:
         density = 0.0

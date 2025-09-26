@@ -89,6 +89,37 @@ def write_report(
     lines.append(f"- Routers: {len(routers)}  |  Switches: {len(switches)}  |  Hosts: {len(hosts)}")
     lines.append(f"- Traffic flows: {len(flows)}")
     lines.append(f"- Segmentation rules: {len(seg_rules)}")
+    # Router edges policy / degree stats if present (from session.topo_stats stored in metadata under keys)
+    try:
+        rep = None; degs = None
+        if metadata:
+            rep = metadata.get('router_edges_policy') or metadata.get('topo_router_edges_policy')
+            degs = metadata.get('router_degrees') or metadata.get('topo_router_degrees')
+        if rep or degs:
+            lines.append("## Router Edge Connectivity")
+            if isinstance(rep, dict):
+                mode = rep.get('mode', 'Unknown'); tgt = rep.get('target_degree')
+                if mode == 'Exact' and tgt:
+                    lines.append(f"- Policy: Exact (target degree ≈ {tgt})")
+                elif mode == 'Max':
+                    lines.append("- Policy: Max (near-mesh within safety caps)")
+                elif mode == 'Min':
+                    lines.append("- Policy: Min (lift low-degree routers to small baseline)")
+                else:
+                    lines.append("- Policy: Random (light stochastic augmentation)")
+            if isinstance(degs, dict) and degs:
+                vals = list(degs.values())
+                mn, mx = min(vals), max(vals)
+                avg = round(sum(vals)/len(vals), 2)
+                lines.append(f"- Degrees: min={mn} avg={avg} max={mx}")
+                # histogram concise
+                from collections import Counter
+                c = Counter(vals)
+                hist = ', '.join(f"{k}:{c[k]}" for k in sorted(c))
+                lines.append(f"- Histogram: {hist}")
+            lines.append("")
+    except Exception:
+        pass
     # Vulnerability assignment count (best effort):
     # Prefer runtime assignment summary if present, else infer from vulnerabilities_cfg
     vuln_assigned = None

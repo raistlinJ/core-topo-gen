@@ -18,6 +18,9 @@ class RoutingInfo:
     # When > 0, indicates an absolute number of routers to assign this protocol to.
     # Used in addition to density-based routers.
     abs_count: int = 0
+    # Optional edge planning directives (from UI Routing row)
+    edges_mode: str = ""  # "", Random, Min, Max, Exact
+    edges: int = 0         # Used only when edges_mode == Exact (>0)
 
 @dataclass
 class NodeInfo:

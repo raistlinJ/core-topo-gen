@@ -1,75 +1,18 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>CORE TopoGen Web GUI</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <style>
-        /* initial padding; JS will adjust based on dock height */
-        body { padding-bottom: 42vh; }
-        .dock-panel { position: fixed; bottom: 0; left: 0; right: 0; height: 40vh; background: #fff; border-top: 1px solid #dee2e6; box-shadow: 0 -2px 8px rgba(0,0,0,.08); z-index: 1030; display:flex; flex-direction:column; }
-        .dock-grip { height: 6px; cursor: ns-resize; background: repeating-linear-gradient(90deg, #e9ecef 0, #e9ecef 6px, #f8f9fa 6px, #f8f9fa 12px); border-bottom: 1px solid #dee2e6; }
-        .dock-panel .nav-tabs { flex-shrink:0; }
-        .dock-panel .tab-content { flex:1 1 auto; min-height:0; overflow:auto; }
-        .dock-panel .tab-pane { height:100%; overflow:auto; }
-        .dock-panel pre { height:auto; min-height:100%; overflow:auto; }
-        #xmlPre, #logsPre { max-height:none; }
-        .dock-toggle-btn { position: fixed; right: 12px; bottom: 12px; z-index: 1040; }
-        .pulse-change { animation: pulseHighlight .9s ease-in-out; }
-        @keyframes pulseHighlight { 0% { box-shadow:0 0 0 0 rgba(13,110,253,.7); transform:scale(1);} 40% { box-shadow:0 0 0 6px rgba(13,110,253,.0); transform:scale(1.03);} 100% { box-shadow:0 0 0 0 rgba(13,110,253,0); transform:scale(1); } }
-        .popover { max-width: 420px; }
-        .host-total-badge + .badge, .host-total-badge + button { margin-left: .25rem; }
-    </style>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-    <style>
-        .nav-link.core-link { font-weight: 600; color: #0d6efd !important; border: 1px solid rgba(13,110,253,.2); border-radius: .25rem; padding-left: .5rem; padding-right: .5rem; }
-        .navbar .nav-link.core-link .bi { margin-right: .25rem; }
-    </style>
-</head>
-<body>
-<div class="container-fluid mt-4">
-    <!-- Full-width top header -->
+{% extends 'layout.html' %}
+{% block title %}Scenarios - CORE TopoGen{% endblock %}
+{% block active_page %}{% set active_page = 'scenarios' %}{% endblock %}
+{% block extra_head %}
+<style>
+    body { padding-bottom: 42vh; }
+    .pulse-change { animation: pulseHighlight .9s ease-in-out; }
+    @keyframes pulseHighlight { 0% { box-shadow:0 0 0 0 rgba(13,110,253,.7); transform:scale(1);} 40% { box-shadow:0 0 0 6px rgba(13,110,253,.0); transform:scale(1.03);} 100% { box-shadow:0 0 0 0 rgba(13,110,253,0); transform:scale(1); } }
+    .popover { max-width: 420px; }
+    .host-total-badge + .badge, .host-total-badge + button { margin-left: .25rem; }
+</style>
+{% endblock %}
+{% block content %}
     <div class="row">
-        <div class="col-12">
-            <div class="d-flex align-items-center justify-content-between bg-primary text-white rounded-top shadow-sm px-3 py-2">
-                <div class="d-flex align-items-center gap-2">
-                    <i class="bi bi-shield-lock-fill fs-4"></i>
-                    <h3 class="mb-0">CORE TopoGen Web GUI</h3>
-                </div>
-            </div>
-            <nav class="navbar navbar-expand bg-light border rounded-bottom shadow-sm mb-3 px-2 py-0">
-                <ul class="navbar-nav me-auto mb-0 small">
-                    <li class="nav-item"><a class="nav-link active" aria-current="page" href="{{ url_for('index') }}">Scenarios</a></li>
-                    <li class="nav-item"><a class="nav-link" href="{{ url_for('data_sources_page') }}">Vulnerability Sources</a></li>
-                    <li class="nav-item"><a class="nav-link" href="{{ url_for('reports_page') }}">Reports</a></li>
-                    <li class="nav-item"><a class="nav-link core-link" href="{{ url_for('core_page') }}"><i class="bi bi-diagram-3-fill"></i> CORE</a></li>
-                </ul>
-                <div class="d-flex align-items-center ms-auto gap-3">
-                    {% if current_user and current_user.role == 'admin' %}
-                    <div class="dropdown">
-                        <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">Settings</button>
-                        <ul class="dropdown-menu dropdown-menu-end">
-                            <li><a class="dropdown-item" href="{{ url_for('users_page') }}">Users</a></li>
-                        </ul>
-                    </div>
-                    {% endif %}
-                    {% if current_user %}
-                        <span class="text-muted small">{{ current_user.username }}</span>
-                        <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('me_password') }}">Change Password</a>
-                        <form action="{{ url_for('logout') }}" method="post" class="d-inline">
-                            <button class="btn btn-sm btn-outline-danger">Logout</button>
-                        </form>
-                    {% else %}
-                        <a class="btn btn-sm btn-primary" href="{{ url_for('login') }}">Login</a>
-                    {% endif %}
-                </div>
-            </nav>
-        </div>
-    </div>
-                <!-- Removed Planning Semantics informational banner per request -->
-    <div class="row">
-            <div class="col-md-3 mb-3">
+        <div class="col-md-3 mb-3">
                 <div class="card shadow-sm h-100 d-flex flex-column">
                             <div class="card-header d-flex justify-content-between align-items-center">
                                 <span class="fw-bold">Scenarios</span>
@@ -177,7 +120,6 @@
             
         </div>
     </div>
-</div>
 <!-- Run Progress Modal -->
 <div class="modal fade" id="runProgressModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered modal-lg">
@@ -204,100 +146,69 @@
         </div>
     </div>
     </div>
-<div class="dock-panel" id="dockPanel">
-    <div class="dock-grip" id="dockGrip" title="Drag to resize"></div>
-    <ul class="nav nav-tabs px-3 pt-2 align-items-center" role="tablist">
-        <li class="nav-item d-flex align-items-center" role="presentation">
-            <button class="nav-link active" id="tab-logs" data-bs-toggle="tab" data-bs-target="#dock-logs" type="button" role="tab">Logs</button>
-        </li>
-        <li class="nav-item d-flex align-items-center ms-3 small" role="presentation">
-            <div class="d-flex align-items-center gap-1">
-                <label class="form-label mb-0 me-1">Level</label>
-                <select id="logLevelFilter" class="form-select form-select-sm" style="width:auto;">
-                    <option value="DEBUG">DEBUG</option>
-                    <option value="INFO" selected>INFO</option>
-                    <option value="WARN">WARN</option>
-                    <option value="ERROR">ERROR</option>
-                </select>
-                <button class="btn btn-sm btn-outline-danger ms-2" id="clearLogsBtn" type="button" title="Clear log buffer">Clear</button>
+{% set xml_preview_enabled = True %}
+{% set xml_preview_text = xml_preview %}
+{% include 'partials/dock.html' %}
+
+<!-- Toast container -->
+<div aria-live="polite" aria-atomic="true" class="position-fixed" style="z-index: 1080; right: 12px; bottom: 12px;">
+    <div id="toastContainer" class="toast-container"></div>
+    <template id="toastTemplate">
+        <div class="toast align-items-center text-bg-dark border-0" role="alert" aria-live="assertive" aria-atomic="true">
+            <div class="d-flex">
+                <div class="toast-body">Action completed.</div>
+                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
             </div>
-        </li>
-        <li class="nav-item" role="presentation">
-            <button class="nav-link" id="tab-xml" data-bs-toggle="tab" data-bs-target="#dock-xml" type="button" role="tab">XML Preview</button>
-        </li>
-        <li class="ms-auto nav-item" role="presentation">
-            <button class="btn btn-sm btn-outline-secondary" id="dockHideBtn" type="button">Hide</button>
-        </li>
-    </ul>
-    <div class="tab-content px-3 pb-2">
-        <div class="tab-pane fade show active" id="dock-logs" role="tabpanel" aria-labelledby="tab-logs">
-            <pre class="w-100 m-0" style="white-space: pre; overflow:auto; width:100%; font-size:0.8rem;" id="logsPre">{{ (logs or '') | e }}</pre>
         </div>
-        <div class="tab-pane fade" id="dock-xml" role="tabpanel" aria-labelledby="tab-xml">
-            <pre class="w-100 m-0" style="white-space: pre; overflow:auto; width:100%; font-size:0.75rem;" id="xmlPre">{{ (xml_preview or '') | e }}</pre>
+    </template>
+</div>
+<!-- Success Modal -->
+<div class="modal fade" id="runSuccessModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Run Completed</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p class="mb-1" id="runSuccessBody">Generation complete.</p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
         </div>
     </div>
 </div>
-<button class="btn btn-primary btn-sm dock-toggle-btn d-none" id="dockShowBtn" type="button">Advanced Information</button>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<!-- Planning Semantics Modal -->
+<div class="modal fade" id="planningSemanticsModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" data-i18n="modal.planningSemantics.title">Planning Semantics</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="spinner-border text-primary d-none" id="planningSemanticsSpinner" role="status"><span class="visually-hidden">Loading...</span></div>
+                <div id="planningSemanticsContent" class="small"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" data-i18n="common.close">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+{% block extra_scripts %}
 <script id="payload-data" type="application/json">{{ payload | tojson }}</script>
 <script>
+// --- BEGIN PAGE JS ---
 const payloadDataEl = document.getElementById('payload-data');
-let initialPayload = null;
+// Prevent TDZ: define catalog early on window
+window.VULN_CATALOG = window.VULN_CATALOG || { types: [], vectors: [], items: [] };
 // Prevent TDZ: define catalog early on window
 window.VULN_CATALOG = window.VULN_CATALOG || { types: [], vectors: [], items: [] };
 // ---------------- Logging (buffer + level filter) -----------------
-const LOG_LEVELS = { DEBUG: 10, INFO: 20, WARN: 30, ERROR: 40 };
-let currentLogLevel = LOG_LEVELS.INFO; // default threshold
-let logBuffer = [];
-const LOG_STORE_KEY = 'coretg_logs_v1';
-const LOG_MAX = 5000;
-let __LOGS_RESTORED = false;
-function restoreLogsFromStorageOnce(){
-    if(__LOGS_RESTORED) return;
-    try {
-        const raw = localStorage.getItem(LOG_STORE_KEY);
-        if (raw) {
-            const arr = JSON.parse(raw);
-            if (Array.isArray(arr)) {
-                logBuffer = arr.map(x => ({ level: x.level||'INFO', levelValue: x.levelValue||LOG_LEVELS[x.level||'INFO']||20, line: x.line||'' }));
-            }
-        }
-    } catch(e){}
-    __LOGS_RESTORED = true;
-}
-function renderLogs() {
-    const logsPre = document.getElementById('logsPre');
-    if (!logsPre) return;
-    const filtered = logBuffer.filter(r => r.levelValue >= currentLogLevel).map(r => r.line);
-    logsPre.textContent = filtered.join('\n') + (filtered.length ? '\n' : '');
-    logsPre.scrollTop = logsPre.scrollHeight;
-}
-function setLogLevel(levelName) {
-    if (LOG_LEVELS[levelName] !== undefined) { currentLogLevel = LOG_LEVELS[levelName]; renderLogs(); }
-}
-function logLine(level, msg) {
-    const ts = new Date().toISOString();
-    const lvlVal = LOG_LEVELS[level] ?? LOG_LEVELS.INFO;
-    const line = `[${ts}] ${level.padEnd(5)} ${msg}`;
-    logBuffer.push({ level, levelValue: lvlVal, line });
-    if (logBuffer.length > LOG_MAX) { logBuffer.splice(0, logBuffer.length - LOG_MAX); }
-    try { localStorage.setItem(LOG_STORE_KEY, JSON.stringify(logBuffer)); } catch(e){}
-    if (lvlVal >= currentLogLevel) {
-        const logsPre = document.getElementById('logsPre');
-        if (logsPre) {
-            logsPre.textContent += line + '\n';
-            logsPre.scrollTop = logsPre.scrollHeight;
-        }
-    }
-}
-function logDebug(m){ logLine('DEBUG', m); }
-function logInfo(m){ logLine('INFO', m); }
-function logWarn(m){ logLine('WARN', m); }
-function logError(m){ logLine('ERROR', m); }
-// Restore any previously persisted logs before emitting any new entries
-restoreLogsFromStorageOnce();
-// Optional: log UI initialization after restore
+// Logging helpers now provided globally by dock partial
 logInfo('UI initialized');
 try {
     initialPayload = JSON.parse(payloadDataEl?.textContent || 'null');
@@ -712,7 +623,23 @@ function renderMain() {
                                                                     </tbody>
                     </table>
                 </div>
-                    <div class="text-danger small mt-1 section-warning" data-scen-idx="${activeIdx}" data-sec="${name}" style="display:none">Weights must sum to 1.000</div>
+                                        <div class="text-danger small mt-1 section-warning" data-scen-idx="${activeIdx}" data-sec="${name}" style="display:none">Weights must sum to 1.000</div>
+                                        ${name==='Routing' ? `
+                                        <div id="routingEdgesWarnings" class="alert alert-warning py-2 px-3 small mt-3 d-none"></div>
+                                        <div class="d-flex flex-wrap align-items-center gap-3 mt-3 small" id="routingEdgesSummary" style="display:none;">
+                                                <div><strong>Policy:</strong> <span data-role="edges-policy">(pending)</span></div>
+                                                <div><strong>Min/Avg/Max:</strong> <span data-role="edges-stats"></span></div>
+                                                <div class="d-flex align-items-center gap-1"><strong>Degrees Spark:</strong> <span data-role="edges-spark" class="font-monospace"></span></div>
+                                        </div>
+                                        <div class="form-text mt-2">
+                                            <span class="fw-semibold">Edges Mode Help:</span>
+                                            <ul class="mb-0 ps-3">
+                                                <li><strong>Random</strong>: baseline random connectivity (light augmentation to raise average modestly).</li>
+                                                <li><strong>Min</strong>: lift all routers to at least degree 2 where feasible.</li>
+                                                <li><strong>Max</strong>: aggressively mesh (caps keep scale sane).</li>
+                                                <li><strong>Exact</strong>: attempt to raise every router to the specified degree (can’t reduce higher existing degrees).</li>
+                                            </ul>
+                                        </div>` : ''}
             </div>`;
         root.appendChild(card);
     });
@@ -790,6 +717,29 @@ function renderItemRow(sidx, secName, iidx, it) {
     const extras = (() => {
         if (secName === 'Events') {
             return `<input class="form-control form-control-sm" placeholder="script path" value="${it.script_path || ''}" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" data-field="script_path">`;
+        }
+        if (secName === 'Routing') {
+            // Edges mode (Random/Min/Max/Exact). Random now acts like previous Auto (no extra links augmentation).
+            const mode = it.edges_mode || (it.edges !== undefined ? 'Exact' : 'Random');
+            const val = (it.edges !== undefined && it.edges !== null) ? it.edges : '';
+            const options = [
+                {v:'Random', l:'Random'},
+                {v:'Min', l:'Min'},
+                {v:'Max', l:'Max'},
+                {v:'Exact', l:'Exact'}
+            ];
+            const selHtml = `<select class="form-select form-select-sm" data-field="edges_mode" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${options.map(o => `<option value="${o.v}" ${o.v===mode?'selected':''}>${o.l}</option>`).join('')}</select>`;
+            return `
+                <div class="d-flex flex-wrap gap-3 align-items-end">
+                    <div>
+                        <label class="form-label mb-0" title="Edge selection mode. Random leaves generation unconstrained; Min/Max guide connectivity; Exact sets a fixed target.">Edges Mode</label>
+                        ${selHtml}
+                    </div>
+                    <div class="edges-exact-input" style="display:${mode==='Exact'?'block':'none'};">
+                        <label class="form-label mb-0" title="Exact number of edges (links) this router type should attempt to form.">Exact #</label>
+                        <input type="number" min="1" class="form-control form-control-sm edges-degree-input" style="width:110px" value="${val}" data-field="edges" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="e.g. 3">
+                    </div>
+                </div>`;
         }
         if (secName === 'Traffic') {
             return `
@@ -970,14 +920,18 @@ function wireHandlers() {
             if (sec) {
                 if (iidx !== null) {
                     const item = state.scenarios[sidx].sections[sec].items[parseInt(iidx)];
-                    if (['factor','rate_kbps','period_s','jitter_pct','total_nodes','density'].includes(field)) {
+                    if (['factor','rate_kbps','period_s','jitter_pct','total_nodes','density','edges'].includes(field)) {
                         item ? (item[field] = parseFloat(el.value)) : state.scenarios[sidx].sections[sec][field] = parseFloat(el.value);
+                                            if (field === 'edges' && (isNaN(item[field]) || el.value === '')) {
+                                                // Allow blank to mean "unset" so generator can apply defaults
+                                                delete item[field];
+                                            }
                                             if (field === 'factor') {
                                                 adjustWeightsProportionally(sidx, sec, parseInt(iidx));
                                                 updateWeightWarning(sidx, sec);
                                                 updateWeightInputsDisplay(sidx, sec);
                                             }
-                    } else if (['pattern','content_type','selected','script_path','v_type','v_vector','v_name','v_path','v_count','v_metric'].includes(field)) {
+                    } else if (['pattern','content_type','selected','script_path','v_type','v_vector','v_name','v_path','v_count','v_metric','edges_mode'].includes(field)) {
                         const prev = item[field];
                         if (field === 'v_count') {
                             const n = parseInt(el.value, 10) || 1;
@@ -985,7 +939,15 @@ function wireHandlers() {
                         } else {
                             item[field] = el.value;
                         }
-                        if (field === 'content_type') {
+                        if(field === 'edges_mode') {
+                            item.edges_mode = el.value;
+                            if(el.value !== 'Exact') { delete item.edges; }
+                            renderMain();
+                            setTimeout(validateRoutingEdges, 50);
+                        }
+                        if (field === 'edges') {
+                            setTimeout(validateRoutingEdges, 20);
+                        } else if (field === 'content_type') {
                             // Re-render to reflect show/hide of traffic-config inputs when Random is selected
                             renderMain();
                         } else if (field === 'selected') {
@@ -1234,6 +1196,62 @@ function wireHandlers() {
             ['Node Information','Routing','Services','Traffic','Events','Vulnerabilities','Segmentation'].forEach(sec => updateWeightWarning(activeIdx, sec));
         }
 }
+// Routing edges validation utilities
+function validateRoutingEdges(){
+    const scen = state.scenarios[activeIdx]; if(!scen) return;
+    const routing = (scen.sections && scen.sections['Routing'] && scen.sections['Routing'].items) || [];
+    const warn = [];
+    routing.forEach((r,i)=>{ if(r.edges_mode==='Exact' && !(r.edges>=1)) warn.push(`Row ${i+1}: Exact mode requires a degree ≥ 1`); });
+    // Highlight inputs
+    document.querySelectorAll('.edges-degree-input').forEach(inp => {
+        const v = parseInt(inp.value,10); const tr = inp.closest('tr');
+        const sel = tr ? tr.querySelector('[data-field="edges_mode"]') : null;
+        const mode = sel ? sel.value : '';
+        if(mode==='Exact' && !(v>=1)) inp.classList.add('is-invalid'); else inp.classList.remove('is-invalid');
+    });
+    // If a separate warning container existed we could populate it here later.
+    computeRoutingEdgePolicyPreview();
+}
+setTimeout(validateRoutingEdges, 500);
+
+// Derive a lightweight preview (pre-generation) of intended policy and an estimated degree band
+function computeRoutingEdgePolicyPreview(){
+    const scen = state.scenarios[activeIdx]; if(!scen) return;
+    const routing = (scen.sections && scen.sections['Routing'] && scen.sections['Routing'].items) || [];
+    const summaryEl = document.getElementById('routingEdgesSummary');
+    if(!summaryEl) return;
+    if(!routing.length){ summaryEl.style.display='none'; return; }
+    // Determine target policy: Exact avg > Max > Min > Random (mirrors backend)
+    const exactVals = routing.filter(r=>r.edges_mode==='Exact' && r.edges>=1).map(r=>r.edges);
+    let mode='Random'; let target=0;
+    if(exactVals.length){
+        target = Math.round(exactVals.reduce((a,b)=>a+b,0)/exactVals.length);
+        if(target<1) target=1; mode='Exact';
+    } else {
+        const modes = routing.map(r=>r.edges_mode).filter(Boolean);
+        if(modes.includes('Max')) mode='Max'; else if(modes.includes('Min')) mode='Min'; else mode='Random';
+    }
+    const policySpan = summaryEl.querySelector('[data-role="edges-policy"]');
+    if(policySpan){ policySpan.textContent = mode + (mode==='Exact'?` (target≈${target})`: ''); }
+    // Estimate degree distribution preview (pure heuristic):
+    let minD=0, avgD=0, maxD=0;
+    if(mode==='Exact'){ minD=target; avgD=target+1; maxD=target+2; }
+    else if(mode==='Max'){ minD=3; avgD=5; maxD=7; }
+    else if(mode==='Min'){ minD=2; avgD=3; maxD=4; }
+    else { minD=1; avgD=2; maxD=4; }
+    const statsSpan = summaryEl.querySelector('[data-role="edges-stats"]');
+    if(statsSpan){ statsSpan.textContent = `${minD} / ${avgD} / ${maxD}`; }
+    // Sparkline: encode a short sequence of degrees: min..avg..max
+    const sparkSpan = summaryEl.querySelector('[data-role="edges-spark"]');
+    if(sparkSpan){
+        const seq = [minD, Math.round((minD+avgD)/2), avgD, Math.round((avgD+maxD)/2), maxD];
+        const blocks = ['▁','▂','▃','▄','▅','▆','▇','█'];
+        const norm = (v)=>{ const mx = Math.max(...seq); if(mx===0) return 0; return Math.round((v/mx)*(blocks.length-1)); };
+        sparkSpan.textContent = seq.map(v=>blocks[norm(v)]).join('');
+        sparkSpan.title = seq.join(', ');
+    }
+    summaryEl.style.display='flex';
+}
 
 function wireCoreControls() {
     // defaults
@@ -1399,7 +1417,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         try { new bootstrap.Tooltip(el); } catch (e) { /* ignore */ }
     });
-    setupDock();
     // Wire Download XML button
     const dlBtn = document.getElementById('downloadXmlBtn');
     if (dlBtn) {
@@ -1415,38 +1432,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Capture any server-rendered logs before we render from storage
     let __serverLogsAtLoad = '';
     try { __serverLogsAtLoad = (document.getElementById('logsPre')?.textContent || '').trim(); } catch(e){}
-    // Restore persisted logs (idempotent)
-    restoreLogsFromStorageOnce();
-    // Merge server logs (if any), then render and persist
-    if (__serverLogsAtLoad) {
-        __serverLogsAtLoad.split(/\n/).forEach(line => {
-            if (!line.trim()) return;
-            let lvl = 'INFO';
-            if (line.includes(' ERROR')) lvl = 'ERROR';
-            else if (line.includes(' WARN')) lvl = 'WARN';
-            else if (line.includes(' DEBUG')) lvl = 'DEBUG';
-            logBuffer.push({ level: lvl, levelValue: LOG_LEVELS[lvl], line });
-        });
-    }
-    renderLogs();
-    try { localStorage.setItem(LOG_STORE_KEY, JSON.stringify(logBuffer)); } catch(e){}
-    const sel = document.getElementById('logLevelFilter');
-    // Restore saved log level preference
-    try {
-        const savedLvl = localStorage.getItem('coretg_log_level');
-        if (savedLvl && LOG_LEVELS[savedLvl] !== undefined) {
-            currentLogLevel = LOG_LEVELS[savedLvl];
-            if (sel) sel.value = savedLvl;
-        }
-    } catch(e){}
-    sel?.addEventListener('change', () => { setLogLevel(sel.value); try { localStorage.setItem('coretg_log_level', sel.value); } catch(e){} });
-    const clearBtn = document.getElementById('clearLogsBtn');
-    clearBtn?.addEventListener('click', () => {
-        logBuffer = [];
-        try { localStorage.setItem(LOG_STORE_KEY, JSON.stringify(logBuffer)); } catch(e){}
-        renderLogs();
-    });
-        setupVulnCatalog();
+    setupVulnCatalog();
 });
 
 // Vulnerability catalog and UI helpers
@@ -1991,74 +1977,7 @@ async function runSyncWithModal(ev){
         });
     }
 
-    function setupDock() {
-        const dock = document.getElementById('dockPanel');
-        const grip = document.getElementById('dockGrip');
-        const hideBtn = document.getElementById('dockHideBtn');
-        const showBtn = document.getElementById('dockShowBtn');
-        if (!dock || !grip || !hideBtn || !showBtn) return;
-
-        const setBodyPad = (px) => { document.body.style.paddingBottom = Math.max(px, 0) + 'px'; };
-        const applyHeight = (px) => {
-            dock.style.height = px + 'px';
-            setBodyPad(px + 12);
-            localStorage.setItem('coretg_dock_height_px', String(px));
-        };
-        // Init from storage or default to current offsetHeight
-        const savedH = parseInt(localStorage.getItem('coretg_dock_height_px') || '0', 10);
-        const initialH = (savedH > 100 ? savedH : dock.offsetHeight);
-        applyHeight(initialH);
-
-        // Resizing
-        let resizing = false;
-        let startY = 0;
-        let startH = initialH;
-        const onMove = (e) => {
-            if (!resizing) return;
-            const dy = startY - (e.touches ? e.touches[0].clientY : e.clientY);
-            const newH = Math.min(Math.max(startH + dy, 120), window.innerHeight - 80);
-            applyHeight(newH);
-        };
-        const onUp = () => { resizing = false; document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); document.removeEventListener('touchmove', onMove); document.removeEventListener('touchend', onUp); };
-        grip.addEventListener('mousedown', (e) => { resizing = true; startY = e.clientY; startH = dock.offsetHeight; document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp); });
-        grip.addEventListener('touchstart', (e) => { resizing = true; startY = e.touches[0].clientY; startH = dock.offsetHeight; document.addEventListener('touchmove', onMove); document.addEventListener('touchend', onUp); }, { passive: true });
-
-        // Hide/show
-        const applyHidden = (hidden) => {
-            if (hidden) {
-                dock.classList.add('d-none');
-                showBtn.classList.remove('d-none');
-                setBodyPad(12);
-            } else {
-                dock.classList.remove('d-none');
-                showBtn.classList.add('d-none');
-                applyHeight(parseInt(localStorage.getItem('coretg_dock_height_px') || String(initialH), 10));
-            }
-            localStorage.setItem('coretg_dock_hidden', hidden ? '1' : '0');
-        };
-    // Init hidden state (default hidden if no saved preference)
-    const savedHidden = localStorage.getItem('coretg_dock_hidden');
-    applyHidden(savedHidden ? savedHidden === '1' : true);
-        hideBtn.addEventListener('click', () => applyHidden(true));
-        showBtn.addEventListener('click', () => applyHidden(false));
-
-        // Persist active tab across reloads
-        const tabButtons = dock.querySelectorAll(".nav-link[data-bs-toggle='tab']");
-        tabButtons.forEach(btn => {
-            btn.addEventListener('shown.bs.tab', (e) => {
-                const target = e.target.getAttribute('data-bs-target');
-                if (target) localStorage.setItem('coretg_dock_active_tab', target);
-            });
-        });
-        // Restore previously active tab, if any
-        const savedTab = localStorage.getItem('coretg_dock_active_tab');
-        if (savedTab) {
-            const btn = dock.querySelector(".nav-link[data-bs-target='" + savedTab + "']");
-            if (btn) {
-                try { new bootstrap.Tab(btn).show(); } catch(e) {}
-            }
-        }
-    }
+    // Dock setup handled by partial
 </script>
 </body>
 <!-- Toast container -->
@@ -2133,61 +2052,4 @@ pollRunStatus = async function(runId){
     } catch(e){}
 };
 </script>
-<!-- Planning Semantics Modal -->
-<div class="modal fade" id="planningSemanticsModal" tabindex="-1" aria-hidden="true">
-    <div class="modal-dialog modal-lg modal-dialog-scrollable">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h5 class="modal-title" data-i18n="modal.planningSemantics.title">Planning Semantics</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-            </div>
-            <div class="modal-body">
-                <div class="spinner-border text-primary d-none" id="planningSemanticsSpinner" role="status"><span class="visually-hidden">Loading...</span></div>
-                <div id="planningSemanticsContent" class="small"></div>
-            </div>
-            <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" data-i18n="common.close">Close</button>
-            </div>
-        </div>
-    </div>
-</div>
-<script>
-// i18n keys (basic scaffold)
-const I18N = Object.assign(window.I18N || {}, {
-    'btn.planningSemantics': 'Planning Semantics',
-    'modal.planningSemantics.title': 'Planning Semantics',
-    'common.close': 'Close'
-});
-function applyI18n(root=document){
-    root.querySelectorAll('[data-i18n]').forEach(el => { const k = el.getAttribute('data-i18n'); if(I18N[k]) el.innerText = I18N[k]; });
-}
-applyI18n();
-const planningModalEl = document.getElementById('planningSemanticsModal');
-if(planningModalEl){
-    planningModalEl.addEventListener('show.bs.modal', () => {
-        const spinner = document.getElementById('planningSemanticsSpinner');
-        const content = document.getElementById('planningSemanticsContent');
-        spinner.classList.remove('d-none');
-        content.innerHTML='';
-        fetch('/api/help/planning').then(r=>r.json()).then(data => {
-            spinner.classList.add('d-none');
-            const html=[];
-            html.push('<h6>Routers</h6><ul>');
-            html.push(`<li><strong>Semantics:</strong> ${data.routers.semantics}</li>`);
-            html.push(`<li><strong>Density:</strong> ${data.routers.density}</li>`);
-            html.push(`<li><strong>Counts:</strong> ${data.routers.counts}</li>`);
-            html.push(`<li><strong>Cap:</strong> ${data.routers.cap}</li>`);
-            html.push(`<li><strong>Mesh Styles:</strong> ${data.routers.mesh_styles.join(', ')}</li>`);
-            html.push('</ul><h6>Vulnerabilities</h6><ul>');
-            html.push(`<li><strong>Semantics:</strong> ${data.vulnerabilities.semantics}</li>`);
-            html.push(`<li><strong>Density:</strong> ${data.vulnerabilities.density}</li>`);
-            html.push(`<li><strong>Counts:</strong> ${data.vulnerabilities.counts}</li>`);
-            html.push(`<li><strong>Selection Order:</strong> ${data.vulnerabilities.selection_order.join(' → ')}</li>`);
-            html.push('</ul>');
-            if(data.notes){ html.push('<h6>Notes</h6><ul>'); data.notes.forEach(n=> html.push(`<li>${n}</li>`)); html.push('</ul>'); }
-            content.innerHTML = html.join('');
-        }).catch(err => { spinner.classList.add('d-none'); content.innerHTML = `<div class='text-danger'>Failed to load: ${err}</div>`; });
-    });
-}
-</script>
-</html>
+{% endblock %}

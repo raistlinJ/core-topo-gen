@@ -1,51 +1,19 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Data Sources</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-  <style>
-    .dock-panel { position: fixed; bottom: 0; left: 0; right: 0; height: 32vh; background: #fff; border-top: 1px solid #dee2e6; box-shadow: 0 -2px 8px rgba(0,0,0,.08); z-index: 1030; display:none; flex-direction:column; }
-    .dock-grip { height: 6px; cursor: ns-resize; background: repeating-linear-gradient(90deg, #e9ecef 0, #e9ecef 6px, #f8f9fa 6px, #f8f9fa 12px); border-bottom: 1px solid #dee2e6; }
-    .dock-panel .nav-tabs { flex-shrink:0; }
-    .dock-panel .tab-content { flex:1 1 auto; min-height:0; overflow:auto; }
-    .dock-panel .tab-pane { height:100%; overflow:auto; }
-    .dock-panel pre { height:auto; min-height:100%; overflow:auto; }
-    /* Dim catalog body while refreshing status */
-    #catalog-body.dimmed { opacity: 0.5; pointer-events: none; transition: opacity .15s ease-in-out; }
-    .updated-badge { font-size: .65rem; vertical-align: middle; }
-    .nav-link.core-link { font-weight: 600; color: #0d6efd !important; border: 1px solid rgba(13,110,253,.2); border-radius: .25rem; padding-left: .5rem; padding-right: .5rem; }
-    .navbar .nav-link.core-link .bi { margin-right: .25rem; }
-  </style>
-</head>
-<body class="p-3">
-  <div class="d-flex align-items-center justify-content-between bg-primary text-white rounded-top shadow-sm px-3 py-2">
-    <div class="d-flex align-items-center gap-2">
-      <i class="bi bi-shield-lock-fill fs-5"></i>
-      <h4 class="mb-0 text-white">CORE TopoGen Web GUI</h4>
-    </div>
-    <div class="d-flex align-items-center gap-2">
-      {% if current_user and current_user.role == 'admin' %}
-      <div class="dropdown">
-        <button class="btn btn-sm btn-light dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
-          Settings
-        </button>
-        <ul class="dropdown-menu dropdown-menu-end">
-          <li><a class="dropdown-item" href="{{ url_for('users_page') }}">Users</a></li>
-        </ul>
-      </div>
-      {% endif %}
-    </div>
-  </div>
-  <nav class="navbar navbar-expand bg-light border rounded-bottom shadow-sm mb-3 px-2 py-0">
-    <ul class="navbar-nav me-auto mb-0 small">
-      <li class="nav-item"><a class="nav-link" href="{{ url_for('index') }}">Scenarios</a></li>
-  <li class="nav-item"><a class="nav-link active" aria-current="page" href="{{ url_for('data_sources_page') }}">Vulnerability Sources</a></li>
-      <li class="nav-item"><a class="nav-link" href="{{ url_for('reports_page') }}">Reports</a></li>
-  <li class="nav-item"><a class="nav-link core-link" href="{{ url_for('core_page') }}"><i class="bi bi-diagram-3-fill"></i> CORE</a></li>
-    </ul>
-  </nav>
+{% extends 'layout.html' %}
+{% block title %}Data Sources{% endblock %}
+{% block active_page %}{% set active_page='data_sources' %}{% endblock %}
+{% block extra_head %}
+<style>
+  .dock-panel { position: fixed; bottom: 0; left: 0; right: 0; height: 32vh; background: #fff; border-top: 1px solid #dee2e6; box-shadow: 0 -2px 8px rgba(0,0,0,.08); z-index: 1030; display:none; flex-direction:column; }
+  .dock-grip { height: 6px; cursor: ns-resize; background: repeating-linear-gradient(90deg, #e9ecef 0, #e9ecef 6px, #f8f9fa 6px, #f8f9fa 12px); border-bottom: 1px solid #dee2e6; }
+  .dock-panel .nav-tabs { flex-shrink:0; }
+  .dock-panel .tab-content { flex:1 1 auto; min-height:0; overflow:auto; }
+  .dock-panel .tab-pane { height:100%; overflow:auto; }
+  .dock-panel pre { height:auto; min-height:100%; overflow:auto; }
+  #catalog-body.dimmed { opacity: 0.5; pointer-events: none; transition: opacity .15s ease-in-out; }
+  .updated-badge { font-size: .65rem; vertical-align: middle; }
+</style>
+{% endblock %}
+{% block content %}
   {% with messages = get_flashed_messages() %}
     {% if messages %}
       <div class="alert alert-info py-2 px-3 mb-3">{{ messages[0] }}</div>
@@ -196,7 +164,8 @@
       </div>
     </div>
   </div>
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+  {% endblock %}
+  {% block extra_scripts %}
   <script>
   (function(){
     // Hash-based routing for subnav tabs
@@ -718,5 +687,4 @@
   // Initial load handled by activateInitialTab; catalog will lazy-load when its tab activates
   })();
   </script>
-</body>
-</html>
+  {% endblock %}

@@ -735,29 +735,220 @@ def build_segmented_topology(core: client.CoreGrpcClient,
         router_objs.append(node)
 
     existing_router_links: Set[Tuple[int, int]] = set()
+    # Defer heavy redundancy until after policy selection; start with just a random spanning tree
+    def add_router_link(a_obj, b_obj, prefix=30):
+        key = (min(a_obj.id, b_obj.id), max(a_obj.id, b_obj.id))
+        if key in existing_router_links:
+            return False
+        a_ifid = router_next_ifid.get(a_obj.id, 0)
+        b_ifid = router_next_ifid.get(b_obj.id, 0)
+        router_next_ifid[a_obj.id] = a_ifid + 1
+        router_next_ifid[b_obj.id] = b_ifid + 1
+        rr_net = subnet_alloc.next_random_subnet(prefix)
+        rr_hosts = list(rr_net.hosts())
+        if len(rr_hosts) < 2:
+            return False
+        a_ip = str(rr_hosts[0]); b_ip = str(rr_hosts[1])
+        a_if = Interface(id=a_ifid, name=f"r{a_obj.id}-to-r{b_obj.id}", ip4=a_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
+        b_if = Interface(id=b_ifid, name=f"r{b_obj.id}-to-r{a_obj.id}", ip4=b_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
+        session.add_link(node1=a_obj, node2=b_obj, iface1=a_if, iface2=b_if)
+        existing_router_links.add(key)
+        logger.debug("[init] router link r%d <-> r%d (/ %s)", a_obj.id, b_obj.id, rr_net.prefixlen)
+        return True
     if router_count > 1:
-        # build a random connected inter-router graph with some redundancy
-        idx_pairs: List[Tuple[int, int]] = _random_connected_pairs(router_count)
-        for aidx, bidx in idx_pairs:
-            a = router_objs[aidx]
-            b = router_objs[bidx]
-            key = (min(a.id, b.id), max(a.id, b.id))
-            if key in existing_router_links:
-                continue
-            a_ifid = router_next_ifid.get(a.id, 0)
-            b_ifid = router_next_ifid.get(b.id, 0)
-            router_next_ifid[a.id] = a_ifid + 1
-            router_next_ifid[b.id] = b_ifid + 1
-            # Use /24 for inter-router links (temporary uniform sizing)
-            rr_net = subnet_alloc.next_random_subnet(24)
-            rr_hosts = list(rr_net.hosts())
-            a_ip = str(rr_hosts[0])
-            b_ip = str(rr_hosts[1])
-            a_if = Interface(id=a_ifid, name=f"r{a.id}-to-r{b.id}", ip4=a_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
-            b_if = Interface(id=b_ifid, name=f"r{b.id}-to-r{a.id}", ip4=b_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
-            session.add_link(node1=a, node2=b, iface1=a_if, iface2=b_if)
-            existing_router_links.add(key)
-            logger.debug("Router link r%d (%s/%s) <-> r%d (%s/%s)", a.id, a_ip, rr_net.prefixlen, b.id, b_ip, rr_net.prefixlen)
+        # Random spanning tree only (keep initial degree minimal ~1-2)
+        available = list(range(router_count))
+        random.shuffle(available)
+        in_tree = {available[0]}
+        remaining = set(available[1:])
+        while remaining:
+            a_idx = random.choice(list(in_tree))
+            b_idx = random.choice(list(remaining))
+            add_router_link(router_objs[a_idx], router_objs[b_idx], prefix=30)
+            in_tree.add(b_idx)
+            remaining.remove(b_idx)
+
+    # Edge planning (experimental): interpret edges_mode / edges across routing_items.
+    try:
+        if router_count > 1 and routing_items:
+            # Consolidate modes. If any Exact, average their edges >0. Else priority: Max > Min > Random.
+            exact_values = [ri.edges for ri in routing_items if getattr(ri, 'edges_mode', '') == 'Exact' and getattr(ri, 'edges', 0) > 0]
+            modes_present = {ri.edges_mode for ri in routing_items if getattr(ri, 'edges_mode', '')}
+            target_mode = ''
+            target_degree: Optional[int] = None
+            if exact_values:
+                avg = sum(exact_values) / len(exact_values)
+                target_degree = max(1, min(router_count - 1, int(round(avg))))
+                target_mode = 'Exact'
+            else:
+                for m in ['Max', 'Min', 'Random']:
+                    if m in modes_present:
+                        target_mode = m
+                        break
+            # Compute current degrees after spanning tree
+            degrees: Dict[int, int] = {r.id: 0 for r in router_objs}
+            for a_id, b_id in list(existing_router_links):
+                degrees[a_id] += 1
+                degrees[b_id] += 1
+            def add_link(a_obj, b_obj):
+                key = (min(a_obj.id, b_obj.id), max(a_obj.id, b_obj.id))
+                if key in existing_router_links:
+                    return False
+                a_ifid = router_next_ifid.get(a_obj.id, 0)
+                b_ifid = router_next_ifid.get(b_obj.id, 0)
+                router_next_ifid[a_obj.id] = a_ifid + 1
+                router_next_ifid[b_obj.id] = b_ifid + 1
+                rr_net = subnet_alloc.next_random_subnet(30)  # /30 for point-to-point to save address space
+                rr_hosts = list(rr_net.hosts())
+                if len(rr_hosts) < 2:
+                    return False
+                a_ip = str(rr_hosts[0]); b_ip = str(rr_hosts[1])
+                a_if = Interface(id=a_ifid, name=f"r{a_obj.id}-to-r{b_obj.id}", ip4=a_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
+                b_if = Interface(id=b_ifid, name=f"r{b_obj.id}-to-r{a_obj.id}", ip4=b_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
+                session.add_link(node1=a_obj, node2=b_obj, iface1=a_if, iface2=b_if)
+                existing_router_links.add(key)
+                degrees[a_obj.id] += 1; degrees[b_obj.id] += 1
+                logger.debug("[edges] added r%d <-> r%d (mode=%s)", a_obj.id, b_obj.id, target_mode or 'Auto')
+                return True
+            # Decide augmentation strategy
+            if target_mode == 'Exact' and target_degree is not None:
+                # Add links until every router degree >= target_degree (can't remove excess from random core graph)
+                # We iterate with a safeguard to avoid infinite loops.
+                attempts = 0
+                max_attempts = router_count * router_count * 4
+                while attempts < max_attempts and min(degrees.values()) < target_degree:
+                    # Pick router with lowest degree and one with second-lowest that's not already linked.
+                    sorted_ids = sorted(degrees.keys(), key=lambda rid: degrees[rid])
+                    a_id = sorted_ids[0]
+                    # choose partner not already linked and not same
+                    partner = None
+                    random.shuffle(sorted_ids)
+                    for cand in sorted_ids:
+                        if cand == a_id:
+                            continue
+                        if (min(a_id, cand), max(a_id, cand)) not in existing_router_links:
+                            partner = cand; break
+                    if partner is None:
+                        break
+                    add_link(router_nodes[a_id], router_nodes[partner])
+                    attempts += 1
+            elif target_mode == 'Max':
+                # Grow toward dense mesh but stop when average degree hits threshold (e.g., ~ (n/2) ) or cap
+                cap_edges = min((router_count * (router_count - 1)) // 2, 1500)
+                desired_avg = min(router_count - 1, max(3, router_count // 2))
+                attempts = 0; max_attempts = cap_edges * 2
+                while attempts < max_attempts and len(existing_router_links) < cap_edges and (sum(degrees.values())/router_count) < desired_avg:
+                    a_obj, b_obj = random.sample(router_objs, 2)
+                    if add_link(a_obj, b_obj):
+                        attempts += 1
+            elif target_mode == 'Min':
+                # Ensure each router has degree >=2 (if possible)
+                if router_count > 2:
+                    attempts = 0; max_attempts = router_count * 8
+                    while attempts < max_attempts and min(degrees.values()) < 2:
+                        low = min(degrees, key=lambda rid: degrees[rid])
+                        # connect to random router with degree <2 or random other
+                        candidates = [rid for rid, deg in degrees.items() if rid != low and (deg < 2 or deg == max(degrees.values()))]
+                        random.shuffle(candidates)
+                        for cand in candidates:
+                            if (min(low, cand), max(low, cand)) not in existing_router_links:
+                                add_link(router_nodes[low], router_nodes[cand])
+                                break
+                        attempts += 1
+            else:
+                # Random mode: Very light augmentation only if any router still degree 1
+                attempts = 0; max_attempts = router_count * 2
+                while attempts < max_attempts and min(degrees.values()) < 2:
+                    a_obj, b_obj = random.sample(router_objs, 2)
+                    if add_link(a_obj, b_obj):
+                        attempts += 1
+                        degrees[a_obj.id] += 0  # degrees map already updated in add_link
+
+            # Stray safety: ensure no router degree is 0
+            for rid, deg in degrees.items():
+                if deg == 0:
+                    # connect to a random different router
+                    partner_list = [r for r in router_objs if r.id != rid]
+                    if partner_list:
+                        add_link(router_nodes[rid], random.choice(partner_list))
+            # Persist interim degree map for stats (will be updated again later after protocol assignment)
+            try:
+                topo_stats = getattr(session, 'topo_stats', {}) or {}
+                # Map legacy empty/Auto semantics to 'Random' now that UI removed Auto.
+                topo_stats['router_edges_policy'] = {
+                    'mode': (target_mode or 'Random'),
+                    'target_degree': target_degree or 0
+                }
+                topo_stats['router_degrees'] = {rid: degrees[rid] for rid in degrees}
+                setattr(session, 'topo_stats', topo_stats)
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("Edge planning phase encountered an error; continuing with existing router topology")
+
+    # Assign routing protocol services to routers based on routing_items distribution
+    try:
+        if routing_items and router_count > 0:
+            # Build allocations list of router indices
+            all_indices = list(range(router_count))
+            random.shuffle(all_indices)
+            protocol_alloc: Dict[int, List[str]] = {router_objs[i].id: [] for i in range(router_count)}
+            # Absolute allocations first
+            remaining_indices = all_indices[:]
+            for ri in routing_items:
+                if getattr(ri, 'abs_count', 0) > 0:
+                    take = min(len(remaining_indices), int(ri.abs_count))
+                    chosen = [remaining_indices.pop(0) for _ in range(take)]
+                    for idx in chosen:
+                        protocol_alloc[router_objs[idx].id].append(ri.protocol)
+            # Weight-based allocations on remaining
+            weighties = [ri for ri in routing_items if getattr(ri, 'abs_count', 0) == 0 and getattr(ri, 'factor', 0) > 0]
+            if remaining_indices and weighties:
+                total_factor = sum(getattr(ri, 'factor', 0) for ri in weighties) or 1.0
+                exact_allocs = []  # (ri, exact_float, floor_int)
+                total_assigned = 0
+                for ri in weighties:
+                    exact = (ri.factor / total_factor) * len(remaining_indices)
+                    floor_v = int(math.floor(exact))
+                    exact_allocs.append((ri, exact, floor_v))
+                    total_assigned += floor_v
+                leftover = len(remaining_indices) - total_assigned
+                # Distribute leftover by largest fractional remainder
+                remainders = sorted(exact_allocs, key=lambda x: (x[1]-x[2]), reverse=True)
+                i_ptr = 0
+                for ri, exact, floor_v in exact_allocs:
+                    alloc = floor_v
+                    if leftover > 0:
+                        # Check if this ri is in top 'leftover' remainders list
+                        for rri, rex, rf in remainders[:leftover]:
+                            if rri is ri:
+                                alloc += 1
+                                break
+                    # Consume indices
+                    for _ in range(alloc):
+                        if i_ptr >= len(remaining_indices):
+                            break
+                        idx = remaining_indices[i_ptr]
+                        i_ptr += 1
+                        protocol_alloc[router_objs[idx].id].append(ri.protocol)
+            # Ensure protocols (services) on routers
+            for rid, protos in protocol_alloc.items():
+                node_obj = router_nodes.get(rid)
+                for proto in protos:
+                    try:
+                        if proto in ROUTING_STACK_SERVICES:
+                            ensure_service(session, rid, proto, node_obj=node_obj)
+                    except Exception:
+                        pass
+            # Stats update with protocol assignment
+            try:
+                topo_stats = getattr(session, 'topo_stats', {}) or {}
+                topo_stats['router_protocols'] = {rid: protocol_alloc[rid] for rid in protocol_alloc}
+                setattr(session, 'topo_stats', topo_stats)
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("Routing protocol assignment phase failed")
 
     expanded_roles: List[str] = []
     for role, count in role_counts.items():
@@ -1026,26 +1217,49 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                 for p in protos:
                     protocol_groups.setdefault(p, []).append(rnode)
             # Track used interface ids per router (continue from router_next_ifid)
+            # Use previously computed topo_stats if available to gauge target degree and avoid over-meshing
+            policy = getattr(session, 'topo_stats', {}) or {}
+            target_policy = (policy.get('router_edges_policy') or {}).get('mode')
+            target_degree = (policy.get('router_edges_policy') or {}).get('target_degree') or 0
+            # Build current degree map (refresh after earlier augmentations)
+            current_degrees: Dict[int, int] = {r.id: 0 for r in router_objs}
+            for a_id, b_id in list(existing_router_links):
+                current_degrees[a_id] += 1
+                current_degrees[b_id] += 1
             for proto, group_nodes in protocol_groups.items():
                 if len(group_nodes) <= 1:
-                    continue  # nothing to interconnect
+                    continue
                 style = (router_mesh_style or "full").lower()
                 ordered = list(group_nodes)
-                if style == "ring" and len(ordered) > 2:
-                    # Connect in a cycle
-                    pairs = [(ordered[i], ordered[(i+1)%len(ordered)]) for i in range(len(ordered))]
-                elif style == "tree":
-                    # Simple chain spanning tree
-                    pairs = [(ordered[i], ordered[i+1]) for i in range(len(ordered)-1)]
+                # Budget: do not exceed target_degree (if specified) by more than +1 when adding protocol links
+                def can_link(a_id, b_id):
+                    if target_policy == 'Exact' and target_degree > 0:
+                        return (current_degrees[a_id] < target_degree + 1) and (current_degrees[b_id] < target_degree + 1)
+                    if target_policy == 'Min':
+                        # allow modest enrichment until degree 3
+                        return current_degrees[a_id] < 3 and current_degrees[b_id] < 3
+                    if target_policy == 'Random':
+                        # very conservative: cap at degree 4
+                        return current_degrees[a_id] < 4 and current_degrees[b_id] < 4
+                    if target_policy == 'Max':
+                        return True
+                    return True
+                candidate_pairs: List[Tuple[object, object]] = []
+                if style == 'ring' and len(ordered) > 2:
+                    candidate_pairs = [(ordered[i], ordered[(i+1)%len(ordered)]) for i in range(len(ordered))]
+                elif style == 'tree':
+                    candidate_pairs = [(ordered[i], ordered[i+1]) for i in range(len(ordered)-1)]
                 else:
-                    # full mesh
-                    pairs = []
+                    # Instead of full mesh, shuffle all potential pairs and apply budget
                     for i in range(len(ordered)):
                         for j in range(i+1, len(ordered)):
-                            pairs.append((ordered[i], ordered[j]))
-                for a, b in pairs:
+                            candidate_pairs.append((ordered[i], ordered[j]))
+                    random.shuffle(candidate_pairs)
+                for a, b in candidate_pairs:
                     key = (min(a.id, b.id), max(a.id, b.id))
                     if key in existing_router_links:
+                        continue
+                    if not can_link(a.id, b.id):
                         continue
                     a_ifid = router_next_ifid.get(a.id, 0)
                     b_ifid = router_next_ifid.get(b.id, 0)
@@ -1055,13 +1269,13 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                     rr_hosts = list(rr_net.hosts())
                     if len(rr_hosts) < 2:
                         continue
-                    a_ip = str(rr_hosts[0])
-                    b_ip = str(rr_hosts[1])
+                    a_ip = str(rr_hosts[0]); b_ip = str(rr_hosts[1])
                     a_if = Interface(id=a_ifid, name=f"r{a.id}-{proto.lower()}-{b.id}", ip4=a_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
                     b_if = Interface(id=b_ifid, name=f"r{b.id}-{proto.lower()}-{a.id}", ip4=b_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
                     session.add_link(node1=a, node2=b, iface1=a_if, iface2=b_if)
                     existing_router_links.add(key)
-                    logger.debug("Protocol %s mesh(%s) link r%d(%s/%s) <-> r%d(%s/%s)", proto, style, a.id, a_ip, rr_net.prefixlen, b.id, b_ip, rr_net.prefixlen)
+                    current_degrees[a.id] += 1; current_degrees[b.id] += 1
+                    logger.debug("Protocol %s link r%d<->r%d (style=%s deg=%s/%s)", proto, a.id, b.id, style, current_degrees[a.id], current_degrees[b.id])
         except Exception as e:
             logger.debug("Failed building protocol-specific router mesh: %s", e)
 
