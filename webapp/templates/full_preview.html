@@ -1,0 +1,254 @@
+{% extends 'base.html' %}
+{% block title %}Full Preview{% endblock %}
+{% block content %}
+<div class="container-fluid mt-3">
+  <div class="d-flex align-items-center mb-2 gap-2">
+    <h2 class="me-auto mb-0">Full Preview {{ scenario or '' }}</h2>
+    <button id="executeRunBtn" class="btn btn-sm btn-warning" title="Execute this scenario now (invokes CLI)">Execute</button>
+    <form method="post" action="/plan/full_preview_page" class="d-flex align-items-center" id="rerollForm">
+      <input type="hidden" name="xml_path" value="{{ xml_path }}" />
+      {% if scenario %}<input type="hidden" name="scenario" value="{{ scenario }}" />{% endif %}
+      <div class="input-group input-group-sm me-2" style="width:160px;">
+        <span class="input-group-text">Seed</span>
+        <input type="text" class="form-control" name="seed" value="" placeholder="random" />
+      </div>
+      <button class="btn btn-sm btn-outline-secondary" type="submit" title="Re-run preview with new / provided seed">Re-roll</button>
+    </form>
+  </div>
+  <p class="text-muted">Current Seed: <strong>{{ seed }}</strong> | XML: {{ xml_path }}</p>
+  <div class="mb-3">
+    <button id="approvePreviewBtn" class="btn btn-sm btn-primary me-2">Approve as Plan</button>
+    <button id="exportJsonBtn" class="btn btn-sm btn-outline-secondary me-2">Export JSON</button>
+    <button id="exportPngBtn" class="btn btn-sm btn-outline-secondary">Export Graph PNG</button>
+    <span id="approveStatus" class="ms-3 small text-muted"></span>
+  </div>
+  <div class="row">
+    <div class="col-md-4">
+      <h5>Overview</h5>
+      <ul class="list-unstyled small">
+        <li>Routers: {{ (full_preview.routers or []).|length }}</li>
+        <li>Hosts: {{ (full_preview.hosts or []).|length }}</li>
+        <li>Switches: {{ (full_preview.switches or []).|length }}</li>
+        <li>R2R Edges: {{ (full_preview.r2r_edges_preview or []).|length }}</li>
+        <li>Seg Rules: {{ (full_preview.segmentation_preview.rules or []).|length if full_preview.segmentation_preview and full_preview.segmentation_preview.rules else 0 }}</li>
+      </ul>
+      <h6>R2R Policy</h6>
+      <pre class="small bg-light p-2">{{ full_preview.r2r_policy_preview | tojson(indent=2) }}</pre>
+      <h6>R2S Policy</h6>
+      <pre class="small bg-light p-2">{{ full_preview.r2s_policy_preview | tojson(indent=2) }}</pre>
+      <h6>Services Preview</h6>
+      <pre class="small bg-light p-2">{{ full_preview.services_preview | tojson(indent=2) }}</pre>
+      <h6>Vulnerabilities Preview</h6>
+      <pre class="small bg-light p-2">{{ full_preview.vulnerabilities_preview | tojson(indent=2) }}</pre>
+    </div>
+    <div class="col-md-8">
+      <ul class="nav nav-tabs" id="fpTabs" role="tablist">
+        <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#fp-graph" type="button">Graph</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-routers" type="button">Routers</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-hosts" type="button">Hosts</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-switches" type="button">Switches</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-seg" type="button">Segmentation</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-json" type="button">Raw JSON</button></li>
+      </ul>
+      <div class="tab-content border border-top-0 p-2" id="fpTabsContent" style="min-height:480px;">
+        <div class="tab-pane fade show active position-relative" id="fp-graph">
+          <div id="previewGraph" style="height:440px; position:relative; background:#fafafa; border:1px solid #e0e0e0; border-radius:4px; overflow:hidden;"></div>
+          <div id="graphZoomControls" class="position-absolute" style="top:6px; right:8px; z-index:10;">
+            <div class="btn-group btn-group-sm shadow-sm" role="group" aria-label="Zoom controls">
+              <button type="button" class="btn btn-outline-secondary" id="zoomInBtn" title="Zoom In">+</button>
+              <button type="button" class="btn btn-outline-secondary" id="zoomOutBtn" title="Zoom Out">−</button>
+              <button type="button" class="btn btn-outline-secondary" id="zoomResetBtn" title="Reset View">Reset</button>
+            </div>
+          </div>
+        </div>
+        <div class="tab-pane fade" id="fp-routers">
+          <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>IP</th></tr></thead><tbody>
+          {% for r in full_preview.routers %}<tr><td>{{ r.node_id }}</td><td>{{ r.name }}</td><td>{{ r.ip4 }}</td></tr>{% endfor %}
+          </tbody></table>
+        </div>
+        <div class="tab-pane fade" id="fp-hosts">
+          <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Role</th><th>IP</th><th>Router</th></tr></thead><tbody>
+          {% set hr = full_preview.host_router_map or {} %}
+          {% for h in full_preview.hosts %}<tr><td>{{ h.node_id }}</td><td>{{ h.name }}</td><td>{{ h.role }}</td><td>{{ h.ip4 }}</td><td>{{ hr[h.node_id|string] or hr[h.node_id] }}</td></tr>{% endfor %}
+          </tbody></table>
+        </div>
+        <div class="tab-pane fade" id="fp-switches">
+          <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Router</th><th>Hosts</th><th>R/S Subnet</th><th>LAN Subnet</th></tr></thead><tbody>
+          {% for sw in full_preview.switches_detail %}<tr><td>{{ sw.switch_id }}</td><td>sw-{{ sw.switch_id }}</td><td>{{ sw.router_id }}</td><td>{{ sw.hosts|join(',') }}</td><td>{{ sw.rsw_subnet }}</td><td>{{ sw.lan_subnet }}</td></tr>{% endfor %}
+          </tbody></table>
+        </div>
+        <div class="tab-pane fade" id="fp-seg">
+          <pre class="small bg-light p-2">{{ full_preview.segmentation_preview | tojson(indent=2) }}</pre>
+        </div>
+        <div class="tab-pane fade" id="fp-json">
+          <pre class="small bg-light p-2" style="max-height:440px;overflow:auto;">{{ preview_json }}</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  const dataEl = document.getElementById('fpDataJson');
+  let data = {};
+  try { data = JSON.parse(dataEl.textContent); } catch(e) { console.warn('Failed parse preview json', e); }
+  // Simple graph using d3-force (assumes d3 is loaded in base template). Fallback to textual if not.
+  function buildGraph(){
+    if(!window.d3){ document.getElementById('previewGraph').textContent='d3 not loaded'; return; }
+    const wrap = d3.select('#previewGraph');
+    wrap.selectAll('*').remove();
+    const width = wrap.node().clientWidth; const height = wrap.node().clientHeight;
+    const svg = wrap.append('svg').attr('width', width).attr('height', height).style('cursor','grab');
+    const container = svg.append('g').attr('class','zoom-layer');
+    // Zoom + Pan
+    let currentTransform = d3.zoomIdentity;
+    const zoom = d3.zoom().scaleExtent([0.2, 4]).on('zoom', (event)=>{
+      currentTransform = event.transform;
+      container.attr('transform', currentTransform);
+    });
+    svg.call(zoom).on('dblclick.zoom', null);
+    const nodes = [];
+    const links = [];
+    const routerIds = new Set();
+    (data.routers||[]).forEach(r=>{ nodes.push({id:r.node_id, label:r.name, type:'router'}); routerIds.add(r.node_id); });
+    (data.hosts||[]).forEach(h=>{ nodes.push({id:h.node_id, label:h.name, type:'host'}); });
+    (data.switches_detail||[]).forEach(sw=>{ nodes.push({id:sw.switch_id, label:'sw-'+sw.switch_id, type:'switch'}); });
+    // R2R edges
+    (data.r2r_edges_preview||[]).forEach(e=>{ links.push({source:e[0], target:e[1], kind:'r2r'}); });
+    // Host -> Router (fallback if no switch) or Host -> Switch
+    const hostRouterMap = data.host_router_map || {};
+    (data.switches_detail||[]).forEach(sw=>{
+      (sw.hosts||[]).forEach(hid=>{ links.push({source:sw.switch_id, target:hid, kind:'sw-host'}); });
+      links.push({source:sw.router_id, target:sw.switch_id, kind:'r-sw'});
+    });
+    Object.entries(hostRouterMap).forEach(([hid,rid])=>{
+      const hIdNum = parseInt(hid,10);
+      // Only add direct link if host not already attached via switch
+      if(!links.find(l=>l.kind==='sw-host' && l.target===hIdNum)){
+        links.push({source:rid, target:hIdNum, kind:'r-host'});
+      }
+    });
+    const sim = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(links).id(d=>d.id).distance(l=> l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40)))
+      .force('charge', d3.forceManyBody().strength(-200))
+      .force('center', d3.forceCenter(width/2, height/2));
+    const link = container.selectAll('line').data(links).enter().append('line')
+      .attr('stroke', l=> l.kind==='r2r'? '#007bff' : (l.kind==='r-sw'? '#28a745' : '#999'))
+      .attr('stroke-width', l=> l.kind==='r2r'? 2 : 1.2)
+      .attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null)
+      .attr('opacity', 0.85);
+    const node = container.selectAll('g.node').data(nodes).enter().append('g').attr('class','node')
+      .call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
+    node.append('circle')
+      .attr('r', d=> d.type==='router'? 10 : (d.type==='switch'? 7 : 5))
+      .attr('fill', d=> d.type==='router'? '#ff5722' : (d.type==='switch'? '#17a2b8' : '#ffc107'))
+      .attr('stroke', '#333').attr('stroke-width', 1);
+    node.append('title').text(d=> d.label+' ('+d.type+')');
+    node.append('text').text(d=> d.label).attr('x', 12).attr('y', 4).attr('font-size', '10px');
+    sim.on('tick', ()=>{
+      link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y).attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
+      node.attr('transform', d=>'translate('+d.x+','+d.y+')');
+    });
+    function dragstarted(event,d){ if(!event.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; }
+    function dragged(event,d){ d.fx=event.x; d.fy=event.y; }
+    function dragended(event,d){ if(!event.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }
+    // Wire zoom control buttons
+    const zoomInBtn = document.getElementById('zoomInBtn');
+    const zoomOutBtn = document.getElementById('zoomOutBtn');
+    const zoomResetBtn = document.getElementById('zoomResetBtn');
+    if(zoomInBtn){ zoomInBtn.onclick = ()=> svg.transition().duration(200).call(zoom.scaleBy, 1.2); }
+    if(zoomOutBtn){ zoomOutBtn.onclick = ()=> svg.transition().duration(200).call(zoom.scaleBy, 1/1.2); }
+    if(zoomResetBtn){ zoomResetBtn.onclick = ()=> svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity); }
+    // Improve grab cursor feedback
+    svg.on('mousedown', ()=> svg.style('cursor','grabbing'));
+    window.addEventListener('mouseup', ()=> svg.style('cursor','grab'));
+  }
+  document.addEventListener('DOMContentLoaded', buildGraph);
+  // Approve preview
+  document.getElementById('approvePreviewBtn')?.addEventListener('click', async ()=>{
+    const statusEl = document.getElementById('approveStatus');
+    statusEl.textContent='Approving...';
+    try {
+      const res = await fetch('/api/plan/approve_full_preview', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ xml_path: '{{ xml_path }}', full_preview: data }) });
+      const js = await res.json();
+      if(!js.ok){ statusEl.textContent='Failed: '+(js.error||''); statusEl.classList.add('text-danger'); }
+      else {
+        statusEl.textContent='Approved. Plan: '+js.approved_path;
+        statusEl.classList.remove('text-danger'); statusEl.classList.add('text-success');
+      }
+    } catch(e){ statusEl.textContent='Error: '+e; statusEl.classList.add('text-danger'); }
+  });
+  // Export JSON
+  document.getElementById('exportJsonBtn')?.addEventListener('click', ()=>{
+    try {
+      const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'full_preview_seed_'+(data.seed||'na')+'.json';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(()=>URL.revokeObjectURL(a.href), 5000);
+    } catch(e){ console.error('Export JSON failed', e); }
+  });
+  // Export Graph PNG
+  document.getElementById('exportPngBtn')?.addEventListener('click', ()=>{
+    try {
+      const svg = document.querySelector('#previewGraph svg');
+      if(!svg){ alert('Graph not ready'); return; }
+      const serializer = new XMLSerializer();
+      const svgStr = serializer.serializeToString(svg);
+      const canvas = document.createElement('canvas');
+      const rect = svg.getBoundingClientRect();
+      canvas.width = rect.width * 2; canvas.height = rect.height * 2; // retina
+      const ctx = canvas.getContext('2d');
+      const img = new Image();
+      img.onload = function(){
+        ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.drawImage(img,0,0,canvas.width,canvas.height);
+        canvas.toBlob(b=>{
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(b); a.download='full_preview_graph_'+(data.seed||'na')+'.png';
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(()=>URL.revokeObjectURL(a.href), 5000);
+        });
+      };
+      img.src = 'data:image/svg+xml;base64,'+btoa(unescape(encodeURIComponent(svgStr)));
+    } catch(e){ console.error('Export PNG failed', e); }
+  });
+  // Execute: start CLI run for provided xml_path
+  document.getElementById('executeRunBtn')?.addEventListener('click', async ()=>{
+    const confirmMsg = 'Execute scenario now? This will invoke the CLI and start a CORE session.';
+    if(!window.confirm(confirmMsg)) return;
+    try {
+      const form = new FormData(); form.append('xml_path', '{{ xml_path }}');
+      const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+      if(!res.ok){ alert('Failed to start execution'); return; }
+      const { run_id } = await res.json();
+      // Open a basic popup / window with streaming logs (reuse existing /stream endpoint)
+      const logWin = window.open('', '_blank');
+      if(logWin){
+        logWin.document.write('<pre id="log" style="font:11px monospace;white-space:pre-wrap;">Starting...\n</pre>');
+      }
+      const evt = new EventSource('/stream/' + run_id);
+      evt.onmessage = (ev)=>{ if(logWin && !logWin.closed){ logWin.document.getElementById('log').textContent += (ev.data||'') + '\n'; } };
+      evt.addEventListener('end', ()=>{ try { evt.close(); } catch(e){} });
+      // Poll status until done then redirect user to reports page
+      (async function poll(){
+        try {
+          const r = await fetch('/run_status/' + run_id);
+          if(!r.ok){ setTimeout(poll, 1200); return; }
+          const data = await r.json();
+          if(!data.done){ setTimeout(poll, 1000); return; }
+          if(data.returncode===0){
+            if(logWin && !logWin.closed){ logWin.document.getElementById('log').textContent += '\nRun complete. Redirecting to Reports...'; }
+            setTimeout(()=>{ window.location.href = "{{ url_for('reports_page') }}"; }, 500);
+          } else {
+            if(logWin && !logWin.closed){ logWin.document.getElementById('log').textContent += '\nRun finished with errors (code '+data.returncode+').'; }
+          }
+        } catch(e){ setTimeout(poll, 1500); }
+      })();
+    } catch(e){ alert('Exception starting execution: '+e); }
+  });
+})();
+</script>
+<script id="fpDataJson" type="application/json">{{ full_preview | tojson }}</script>
+{% endblock %}

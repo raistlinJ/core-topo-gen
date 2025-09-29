@@ -33,6 +33,61 @@ SERVICE_ENABLE_MAP: Dict[str, str] = {
     # CUSTOM is plugin-defined; don't force-enable a specific service here
 }
 
+def apply_preview_segmentation_rules(session: object,
+                                     preview_rules: List[dict],
+                                     out_dir: str = "/tmp/segmentation") -> Dict[str, object]:
+    """Apply (serialize) segmentation rules coming from a full preview.
+
+    This does NOT execute iptables inside the emulated nodes here (that remains the
+    responsibility of runtime service scripts). Instead we normalize the preview
+    rule format into the standard segmentation_summary.json structure so reports
+    and downstream tooling treat them identically to planned/applied rules.
+
+    preview_rules expected shape (subset):
+      { 'node_id': int, 'rule': { 'type': 'nat'|'host_block'|'custom'|..., ... } }
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    norm_rules: List[dict] = []
+    for pr in preview_rules or []:
+        try:
+            node_id = int(pr.get('node_id')) if pr.get('node_id') is not None else -1
+        except Exception:
+            node_id = -1
+        rule = pr.get('rule') or {}
+        rtype = (rule.get('type') or '').lower()
+        norm: Dict[str, object] = { 'node_id': node_id, 'service': 'Segmentation', 'rule': {} }
+        if rtype == 'nat':
+            norm['rule'] = {
+                'type': 'nat',
+                'internal': rule.get('internal') or '',
+                'external': rule.get('external') or '0.0.0.0/0',
+                'mode': rule.get('mode') or 'SNAT',
+                'egress_ip': rule.get('egress_ip') or ''
+            }
+        elif rtype in ('host_block','subnet_block'):
+            norm['rule'] = {
+                'type': 'host_block',
+                'src': rule.get('src') or rule.get('internal') or '',
+                'dst': rule.get('dst') or rule.get('external') or '',
+            }
+        elif rtype == 'custom':
+            norm['rule'] = {
+                'type': 'custom',
+                'description': rule.get('description') or 'custom-seg-preview'
+            }
+        else:
+            # Fallback: copy raw
+            norm['rule'] = dict(rule)
+        norm_rules.append(norm)
+    summary = { 'rules': norm_rules, 'source': 'full_preview' }
+    try:
+        import json
+        with open(os.path.join(out_dir, 'segmentation_summary.json'), 'w', encoding='utf-8') as jf:
+            json.dump(summary, jf, indent=2, sort_keys=True)
+    except Exception:
+        pass
+    return summary
+
 
 def _group_hosts_by_subnet(hosts: List[NodeInfo]) -> Dict[str, List[NodeInfo]]:
     groups: Dict[str, List[NodeInfo]] = {}

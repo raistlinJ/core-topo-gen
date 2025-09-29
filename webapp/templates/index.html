@@ -50,7 +50,7 @@
                                     {% else %}
                                         <span class="badge text-bg-danger">INVALID</span>
                                     {% endif %}
-                                    <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('base_details') }}?path={{ payload.base_upload.path | urlencode }}" target="_blank">Details</a>
+                                    <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('core_details') }}?path={{ payload.base_upload.path | urlencode }}" target="_blank">Details</a>
                                     <form action="{{ url_for('remove_base') }}" method="post" class="d-inline" onsubmit="saveScrollBeforeNav(); document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });">
                                         <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
                                     </form>
@@ -84,10 +84,13 @@
                         </div>
                     </form>
 
-                    <div class="card mt-3">
-                        <div class="card-header"><strong>CORE Connection</strong></div>
+                    <div class="card mt-3" id="coreConnectionCard">
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <strong>CORE Connection</strong>
+                            <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#coreAdvancedCollapse" aria-expanded="false" aria-controls="coreAdvancedCollapse">Advanced</button>
+                        </div>
                         <div class="card-body">
-                            <div class="row g-2 align-items-end">
+                            <div class="row g-2 align-items-end mb-1">
                                 <div class="col-auto">
                                     <label for="coreHost" class="form-label mb-0">IP</label>
                                     <input type="text" class="form-control" id="coreHost" placeholder="localhost" value="{{ (payload.core.host if payload.core else 'localhost') | e }}">
@@ -97,22 +100,52 @@
                                     <input type="number" class="form-control" id="corePort" placeholder="50051" value="{{ (payload.core.port if payload.core else 50051) }}">
                                 </div>
                             </div>
+                            <div class="collapse" id="coreAdvancedCollapse">
+                                <hr class="my-2"/>
+                                <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+                                    <button class="btn btn-sm btn-outline-secondary" type="button" id="testCoreBtn">Test CORE Connection</button>
+                                    <span id="coreStatus" class="small text-muted">Not tested </span>
+                                </div>
+                                <div class="form-text">Testing is optional; if you skip it the run will still attempt to connect using the provided host and port.</div>
+                            </div>
                         </div>
                     </div>
 
                     
 
-                    <form class="d-flex gap-2 mt-3 align-items-center" action="{{ url_for('run_cli') }}" method="post" onsubmit="return runSyncWithModal(event)">
-                        <button class="btn btn-secondary" type="button" id="testCoreBtn">Test CORE Connection</button>
-                        <span id="coreStatus" class="small text-muted">Not tested</span>
+                    <!-- Planning Workflow card visually removed but retained (d-none) for underlying JS functionality -->
+                    <div class="card mt-3 d-none" id="planWorkflowCard">
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <strong>Planning Workflow</strong>
+                            <div id="planStatusBadge" class="badge text-bg-secondary">No Preview</div>
+                        </div>
+                        <div class="card-body">
+                            <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+                                                                <button class="btn btn-sm btn-outline-primary" type="button" id="planPreviewBtn" title="Generate full preview (routers, IPs, services)" disabled>Full Preview</button>
+                                                                <!-- Run (Seed) workflow removed: deterministic seed input and run button eliminated -->
+                                <!-- Single Full Preview button (above) is authoritative; secondary button and strict checkbox removed -->
+                            </div>
+                            <div class="small text-muted" id="planHint">Save XML and test CORE connection to enable planning.</div>
+                            <pre id="planPreviewJson" class="small bg-light p-2 border rounded d-none" style="max-height:260px;overflow:auto;font-size:0.65rem;"></pre>
+                            <div id="fullPreviewStructured" class="mt-2 d-none">
+                                <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+                                    <div class="btn-group btn-group-sm" role="group" aria-label="Full preview sections" id="fullPreviewSectionTabs"></div>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary" id="toggleRawFullPreviewBtn" title="Toggle raw JSON / structured view">Raw JSON</button>
+                                    <!-- Copy seed button removed -->
+                                </div>
+                                <div id="fullPreviewSectionContent" class="border rounded p-2 bg-white small" style="max-height:300px; overflow:auto; font-size:.7rem;"></div>
+                            </div>
+                            <div id="planViolationsWrap" class="d-none mt-2">
+                                <div class="alert alert-warning py-2 mb-0"><strong>Violations</strong><ul id="planViolationsList" class="mb-0 small"></ul></div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- Run form repurposed: Run CLI now triggers Full Preview (no direct execution here) -->
+                    <form class="d-flex gap-2 mt-3 align-items-center" action="javascript:void(0)" id="runLegacyForm">
                         <input type="hidden" name="xml_path" id="xml_path">
-                        <span class="d-inline-block" tabindex="0" id="runSyncWrap" data-bs-toggle="tooltip" data-bs-title="Test CORE connection first">
-                            <button class="btn btn-warning pe-none" type="submit" id="runSyncBtn" disabled>Run CLI</button>
+                        <span class="d-inline-block" tabindex="0" id="runSyncWrap" data-bs-toggle="tooltip" data-bs-title="Runs CLI using current XML (no stored plan)">
+                            <button class="btn btn-warning" type="button" id="runSyncBtn" disabled title="Generates a Full Preview (no execution)">Generate</button>
                         </span>
-                        <span class="d-inline-block" tabindex="0" id="runAsyncWrap" data-bs-toggle="tooltip" data-bs-title="Test CORE connection first">
-                            <button class="btn btn-outline-warning pe-none" type="button" id="runAsyncBtn" onclick="runAsync()" disabled>Run Async</button>
-                        </span>
-                        
                         <button class="btn btn-outline-danger d-none" type="button" id="cancelRunBtn" onclick="cancelRun()">Cancel</button>
                     </form>
                 </div>
@@ -150,6 +183,10 @@
 {% set xml_preview_text = xml_preview %}
 {% include 'partials/dock.html' %}
 
+<!-- Graph libraries for Full Preview Modal -->
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<script src="{{ url_for('static', filename='core_graph.js') }}"></script>
+
 <!-- Toast container -->
 <div aria-live="polite" aria-atomic="true" class="position-fixed" style="z-index: 1080; right: 12px; bottom: 12px;">
     <div id="toastContainer" class="toast-container"></div>
@@ -175,6 +212,90 @@
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+<!-- Full Preview Modal -->
+<div class="modal fade" id="fullPreviewModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-fullscreen-lg-down modal-xl modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Full Preview <span class="text-muted small" id="fpModalSeed"></span></h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="row g-3">
+                    <div class="col-lg-8">
+                        <div class="card" id="fpGraphCard">
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>Graph</strong>
+                                <div class="btn-group btn-group-sm">
+                                    <button class="btn btn-outline-secondary" type="button" id="fpGraphResetBtn">Reset</button>
+                                    <button class="btn btn-outline-secondary" type="button" id="fpGraphPngBtn">PNG</button>
+                                </div>
+                            </div>
+                            <div class="card-body p-2">
+                                <div id="fpGraph" style="height:480px; position:relative; background:#fafafa; border:1px solid #e0e0e0; border-radius:4px; overflow:hidden;">
+                                    <div class="position-absolute top-50 start-50 translate-middle text-muted" id="fpGraphLoading">Rendering...</div>
+                                </div>
+                                <div class="form-text mt-1">Drag to reposition nodes. Hover for details. PNG exports current view.</div>
+                            </div>
+                        </div>
+                        <div class="card mt-3">
+                            <div class="card-header"><strong>Routers</strong></div>
+                            <div class="card-body p-2" id="fpRoutersWrap"><div class="text-muted small">No data</div></div>
+                        </div>
+                        <div class="card mt-3">
+                            <div class="card-header"><strong>Hosts</strong></div>
+                            <div class="card-body p-2" id="fpHostsWrap"><div class="text-muted small">No data</div></div>
+                        </div>
+                        <div class="card mt-3">
+                            <div class="card-header"><strong>Switches</strong></div>
+                            <div class="card-body p-2" id="fpSwitchesWrap"><div class="text-muted small">No data</div></div>
+                        </div>
+                    </div>
+                    <div class="col-lg-4">
+                        <div class="card mb-3">
+                            <div class="card-header"><strong>Counts</strong></div>
+                            <div class="card-body p-2" id="fpCounts"></div>
+                        </div>
+                        <div class="card mb-3">
+                            <div class="card-header"><strong>R2R Policy</strong></div>
+                            <div class="card-body p-2"><pre class="small mb-0" id="fpR2RPolicy" style="max-height:160px; overflow:auto;"></pre></div>
+                        </div>
+                        <div class="card mb-3">
+                            <div class="card-header"><strong>R2S Policy</strong></div>
+                            <div class="card-body p-2"><pre class="small mb-0" id="fpR2SPolicy" style="max-height:160px; overflow:auto;"></pre></div>
+                        </div>
+                        <div class="card mb-3">
+                            <div class="card-header"><strong>Segmentation</strong></div>
+                            <div class="card-body p-2"><pre class="small mb-0" id="fpSegmentation" style="max-height:220px; overflow:auto;"></pre></div>
+                        </div>
+                        <!-- Actions card removed: export / open handled elsewhere or deferred; Execute moved to modal footer -->
+                                    <div class="card mb-3" id="fpHistoryCard">
+                                        <div class="card-header"><strong>History</strong></div>
+                                        <div class="card-body p-2" id="fpHistoryWrap">
+                                            <div class="text-muted small">No history</div>
+                                        </div>
+                                    </div>
+                                    <div class="card mb-3" id="fpRoleDistCard">
+                                        <div class="card-header"><strong>Role Distribution</strong></div>
+                                        <div class="card-body p-2" id="fpRoleDist"><div class="text-muted small">No data</div></div>
+                                    </div>
+                                    <div class="card mb-3" id="fpServiceDistCard">
+                                        <div class="card-header"><strong>Service Distribution</strong></div>
+                                        <div class="card-body p-2" id="fpServiceDist"><div class="text-muted small">No data</div></div>
+                                    </div>
+                                    <!-- Drift card removed (no approved plan concept) -->
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer d-flex justify-content-between align-items-center">
+                <div class="d-flex gap-2">
+                    <button class="btn btn-warning" type="button" id="fpExecuteBtn" title="Execute scenario now">Execute</button>
+                </div>
+                <button class="btn btn-secondary" data-bs-dismiss="modal" type="button">Close</button>
             </div>
         </div>
     </div>
@@ -257,7 +378,486 @@ if (!serverHasResult && persistedState && Array.isArray(persistedState.scenarios
     state.scenarios = persistedState.scenarios;
     if (persistedState.result_path) state.result_path = persistedState.result_path;
 }
+// Preview workflow state (in-memory only; persisted history handled separately)
+let previewState = {
+    fullPreview: null,
+    fullPreviewHistory: [],
+    xmlSaved: !!(state.result_path),
+    dirty: false,
+    coreTested: false
+};
 // Core settings: prefer server-provided if present; otherwise restore from persisted
+// ---------------- Plan Workflow State -----------------
+// (Legacy alias cleanup left intentionally blank. Using previewState below.)
+
+// ---------- Full Preview History Persistence ----------
+function loadFullPreviewHistory(){
+    try { previewState.fullPreviewHistory = JSON.parse(localStorage.getItem('coretg_full_preview_history')||'[]'); } catch(e){ previewState.fullPreviewHistory = []; }
+    if(!Array.isArray(previewState.fullPreviewHistory)) previewState.fullPreviewHistory = [];
+}
+function saveFullPreviewHistory(){
+    try { localStorage.setItem('coretg_full_preview_history', JSON.stringify(previewState.fullPreviewHistory.slice(-25))); } catch(e){}
+}
+loadFullPreviewHistory();
+
+function updatePlanButtons(){
+    const previewBtn = document.getElementById('planPreviewBtn');
+    const statusBadge = document.getElementById('planStatusBadge');
+    const hint = document.getElementById('planHint');
+    const xmlPathVal = (state.result_path || '').trim();
+    previewState.xmlSaved = !!xmlPathVal;
+    const canPreview = previewState.xmlSaved || previewState.dirty;
+    if(previewBtn) previewBtn.disabled = !canPreview;
+    if(hint){
+    if(!previewState.xmlSaved) hint.textContent = 'Save XML to enable planning.';
+    else hint.textContent = previewState.fullPreview ? 'Full preview ready.' : 'Generate a full preview.';
+    }
+    if(statusBadge){
+    statusBadge.className = 'badge ' + (previewState.fullPreview ? 'text-bg-info' : 'text-bg-secondary');
+    statusBadge.textContent = previewState.fullPreview ? 'Preview' : 'No Preview';
+    }
+}
+
+
+function showPlanSummary(summary){
+    const pre = document.getElementById('planPreviewJson');
+    if(!pre) return;
+    pre.classList.remove('d-none');
+    try{ pre.textContent = JSON.stringify(summary, null, 2); }catch(e){ pre.textContent='(error displaying plan)'; }
+}
+
+async function computePlanPreview(){
+    // Deprecated lightweight preview replaced by full preview; delegate
+    return computeFullPlanPreview();
+}
+
+// Approval functions removed
+
+function onCoreTestedSuccess(){ previewState.coreTested = true; updatePlanButtons(); }
+
+// Hook into existing CORE test result update
+const originalUpdateCoreStatus = window.updateCoreStatus; // if defined later, we patch after definition
+window.updateCoreStatus = function(success, msg){
+    if(typeof originalUpdateCoreStatus === 'function') originalUpdateCoreStatus(success, msg);
+    if(success) onCoreTestedSuccess();
+};
+
+document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('planPreviewBtn')?.addEventListener('click', computePlanPreview);
+    // Repurpose Run CLI button to invoke Full Preview logic
+    document.getElementById('runSyncBtn')?.addEventListener('click', ()=>{
+        // Mirror enablement guard from preview button
+        if(document.getElementById('planPreviewBtn')?.disabled){
+            logWarn('Full Preview disabled; cannot run');
+            return;
+        }
+        computePlanPreview();
+    });
+    try { updatePlanButtons(); } catch(e){}
+});
+
+async function computeFullPlanPreview(){
+    const xmlPathVal = (state.result_path || '').trim();
+    if(!xmlPathVal){
+        try { await autoSaveXml(); } catch(e){ alert('Auto-save failed: '+e); return; }
+    }
+    const newXmlPath = (state.result_path || '').trim();
+    if(!newXmlPath){ alert('XML path still unavailable after save.'); return; }
+    const btn = document.getElementById('planPreviewBtn');
+    const pre = document.getElementById('planPreviewJson');
+    btn.disabled = true; btn.dataset.prevLabel = btn.textContent; btn.textContent='Full preview...';
+    pre.classList.remove('d-none'); pre.textContent='Computing full preview...';
+    try {
+    const body = { xml_path: newXmlPath };
+        const res = await fetch('/api/plan/preview_full', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+        const data = await res.json();
+    if(!data.ok){ pre.textContent='Full preview failed: '+(data.error||''); previewState.fullPreview=null; document.getElementById('fullPreviewStructured')?.classList.add('d-none'); }
+        else {
+            previewState.fullPreview = data.full_preview;
+            pre.textContent = JSON.stringify(previewState.fullPreview, null, 2);
+            renderFullPreviewStructured();
+            try { showFullPreviewModal(previewState.fullPreview); } catch(e){ console.warn('Modal render failed', e); }
+            // Append to history
+            try {
+                const fp = previewState.fullPreview;
+                previewState.fullPreviewHistory.push({
+                    ts: Date.now(),
+                    seed: fp.seed,
+                    seed_generated: fp.seed_generated,
+                    stats: {
+                        routers: (fp.routers||[]).length,
+                        hosts: (fp.hosts||[]).length,
+                        switches: (fp.switches||[]).length,
+                        r2r_edges: (fp.r2r_edges_preview||[]).length,
+                        seg_rules: (fp.segmentation_preview && fp.segmentation_preview.rules ? fp.segmentation_preview.rules.length : 0)
+                    },
+                    preview: fp
+                });
+                saveFullPreviewHistory();
+            } catch(e){}
+        }
+    } catch(e){ pre.textContent='Error: '+e; previewState.fullPreview=null; }
+    btn.disabled = false; btn.textContent = btn.dataset.prevLabel || 'Full Preview';
+}
+
+function renderFullPreviewStructured(){
+    const wrap = document.getElementById('fullPreviewStructured');
+    if(!wrap) return;
+    const full = previewState.fullPreview;
+    if(!full){ wrap.classList.add('d-none'); return; }
+    wrap.classList.remove('d-none');
+    const tabsEl = document.getElementById('fullPreviewSectionTabs');
+    const contentEl = document.getElementById('fullPreviewSectionContent');
+    if(!tabsEl || !contentEl) return;
+    const sections = [
+        { id:'overview', label:'Overview' },
+        { id:'routers', label:`Routers (${(full.routers||[]).length})` },
+        { id:'hosts', label:`Hosts (${(full.hosts||[]).length})` },
+        { id:'switches', label:`Switches (${(full.switches||[]).length})` },
+        { id:'subnets', label:'Subnets' },
+        { id:'r2r', label:`R2R Edges (${(full.r2r_edges_preview||[]).length})` },
+        { id:'seg', label:`Seg Rules (${(full.segmentation_preview && full.segmentation_preview.rules ? full.segmentation_preview.rules.length : 0)})` },
+        { id:'history', label:'History' },
+    ];
+    // Build tabs
+    tabsEl.innerHTML = '';
+    sections.forEach((s, idx) => {
+        const b = document.createElement('button');
+        b.type='button'; b.className='btn btn-outline-primary' + (idx===0?' active':'');
+        b.textContent = s.label;
+        b.dataset.section = s.id;
+        b.onclick = () => { tabsEl.querySelectorAll('button').forEach(x=>x.classList.remove('active')); b.classList.add('active'); renderSectionContent(s.id); };
+        tabsEl.appendChild(b);
+    });
+    function esc(x){ return (''+x).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+    function renderSectionContent(id){
+        if(id==='overview'){
+            const stats = [
+                ['Routers', (full.routers||[]).length],
+                ['Hosts', (full.hosts||[]).length],
+                ['Switches', (full.switches||[]).length],
+                ['R2R Edges', (full.r2r_edges_preview||[]).length],
+                ['Avg R2R Deg', full.r2r_stats_preview && full.r2r_stats_preview.avg],
+                ['Seg Rules', full.segmentation_preview && full.segmentation_preview.rules ? full.segmentation_preview.rules.length : 0],
+                ['P2P /30', (full.ptp_subnets||[]).length],
+                ['Router-Sw /30', (full.router_switch_subnets||[]).length],
+                ['LAN /28', (full.lan_subnets||[]).length],
+                // Seed removed from UI summary
+            ];
+            contentEl.innerHTML = '<div class="row g-2">' + stats.map(s=>`<div class="col-auto"><span class="badge text-bg-secondary">${esc(s[0])}: ${esc(s[1]??'-')}</span></div>`).join('') + '</div>';
+            return;
+        }
+        if(id==='routers'){
+            contentEl.innerHTML = tableFromObjects(full.routers || [], ['node_id','name','ip4']); return;
+        }
+        if(id==='hosts'){
+            contentEl.innerHTML = tableFromObjects(full.hosts || [], ['node_id','name','role','ip4']); return;
+        }
+        if(id==='switches'){
+            const rows = full.switches_detail || [];
+            contentEl.innerHTML = tableFromObjects(rows, ['switch_id','router_id','hosts','rsw_subnet','lan_subnet']); return;
+        }
+        if(id==='subnets'){
+            const p2p = (full.ptp_subnets||[]).map(s=>`<li>${esc(s)}</li>`).join('');
+            const rs = (full.router_switch_subnets||[]).map(s=>`<li>${esc(s)}</li>`).join('');
+            const lan = (full.lan_subnets||[]).map(s=>`<li>${esc(s)}</li>`).join('');
+            contentEl.innerHTML = `<div class="row small g-3"><div class="col"><h6 class="fw-bold">Host P2P (/30)</h6><ul class="mb-0">${p2p||'<li>(none)</li>'}</ul></div><div class="col"><h6 class="fw-bold">Router-Switch (/30)</h6><ul class="mb-0">${rs||'<li>(none)</li>'}</ul></div><div class="col"><h6 class="fw-bold">LAN (/28)</h6><ul class="mb-0">${lan||'<li>(none)</li>'}</ul></div></div>`; return;
+        }
+        if(id==='r2r'){
+            const edges = full.r2r_edges_preview || [];
+            const deg = full.r2r_degree_preview || {};
+            const degList = Object.entries(deg).map(([k,v])=>`r${k}:${v}`).join(', ');
+            const spark = Object.values(deg).join(' ');
+            const edgesSample = edges.slice(0,200).map(e=>`(${e[0]}-${e[1]})`).join(' ');
+            contentEl.innerHTML = `<div><div class="mb-2"><strong>Degree Stats:</strong> ${esc(JSON.stringify(full.r2r_stats_preview||{}))}</div><div class="mb-2"><strong>Degrees:</strong> ${esc(degList||'(none)')}</div><div class="mb-2"><strong>Edges (${edges.length}):</strong> ${esc(edgesSample||'(none)')} ${edges.length>200?'...':''}</div><div><strong>Spark:</strong> ${esc(spark)}</div></div>`; return;
+        }
+        if(id==='seg'){
+            const rules = (full.segmentation_preview && full.segmentation_preview.rules) || [];
+            contentEl.innerHTML = tableFromObjects(rules.map(r=>({ node_id:r.node_id, type:r.rule.type, summary: ruleSummary(r.rule) })), ['node_id','type','summary']);
+            return;
+        }
+        if(id==='history'){
+            renderPreviewHistory(contentEl, full);
+            return;
+        }
+        contentEl.textContent='Unknown section';
+    }
+    function ruleSummary(rule){
+        if(!rule) return ''; const t = rule.type;
+        if(t==='nat') return `${rule.mode||''} ${rule.internal||''} -> ${rule.external||''}`.trim();
+        if(t==='host_block') return `${rule.src} X ${rule.dst}`;
+        if(t==='custom') return rule.description || 'custom';
+        return t;
+    }
+    function tableFromObjects(arr, cols){
+        if(!arr.length) return '<div class="text-muted fst-italic">(none)</div>';
+        const head = '<thead><tr>' + cols.map(c=>`<th>${esc(c)}</th>`).join('') + '</tr></thead>';
+        const body = '<tbody>' + arr.map(o=>'<tr>'+cols.map(c=>`<td>${esc((o[c]!==undefined && o[c]!==null)? (Array.isArray(o[c])? o[c].join(','): o[c]): '')}</td>`).join('')+'</tr>').join('') + '</tbody>';
+        return `<div class="table-responsive"><table class="table table-sm table-bordered mb-0">${head}${body}</table></div>`;
+    }
+    // Initial load
+    renderSectionContent('overview');
+    // Wire toggle button
+    const toggleBtn = document.getElementById('toggleRawFullPreviewBtn');
+    if(toggleBtn){
+        toggleBtn.onclick = () => {
+            const raw = document.getElementById('planPreviewJson');
+            const struct = document.getElementById('fullPreviewStructured');
+            if(raw.classList.contains('d-none')){ raw.classList.remove('d-none'); toggleBtn.textContent='Structured'; }
+            else { raw.classList.add('d-none'); toggleBtn.textContent='Raw JSON'; }
+        };
+    }
+    // Seed copy button removed
+}
+
+function renderPreviewHistory(contentEl, currentFull){
+    loadFullPreviewHistory();
+    if(!previewState.fullPreviewHistory.length){ contentEl.innerHTML = '<div class="text-muted fst-italic">No previous full previews</div>'; return; }
+    function esc(x){ return (''+x).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+    const rows = previewState.fullPreviewHistory.slice().reverse().map((rec,idx) => {
+        const dt = new Date(rec.ts).toLocaleTimeString();
+        const diffBtn = `<button class="btn btn-sm btn-outline-primary" data-action="diff" data-seed="${esc(rec.seed)}">Diff</button>`;
+        return `<tr><td>${idx+1}</td><td>${esc(rec.seed)}</td><td>${esc(rec.stats.routers)}/${esc(rec.stats.hosts)}/${esc(rec.stats.switches)}</td><td>${esc(rec.stats.r2r_edges)}</td><td>${esc(rec.stats.seg_rules)}</td><td>${dt}</td><td class="text-nowrap">${diffBtn}</td></tr>`;
+    }).join('');
+    contentEl.innerHTML = `<div class="table-responsive"><table class="table table-sm table-bordered mb-2"><thead><tr><th>#</th><th>Seed</th><th>R/H/S</th><th>R2R</th><th>Seg</th><th>Time</th><th></th></tr></thead><tbody>${rows}</tbody></table></div><div id="previewDiffOutput" class="small"></div>`;
+    // Seed load buttons removed
+    contentEl.querySelectorAll('button[data-action="diff"]').forEach(btn => {
+        btn.addEventListener('click', () => { const seed = btn.getAttribute('data-seed'); const rec = previewState.fullPreviewHistory.find(r=> String(r.seed)===seed); if(!rec){ return; } const diffHtml = buildPreviewDiff(rec.preview, currentFull); document.getElementById('previewDiffOutput').innerHTML = diffHtml; });
+    });
+}
+
+function buildPreviewDiff(a,b){
+    const metrics = [
+        ['Routers', (a.routers||[]).length, (b.routers||[]).length],
+        ['Hosts', (a.hosts||[]).length, (b.hosts||[]).length],
+        ['Switches', (a.switches||[]).length, (b.switches||[]).length],
+        ['R2R Edges', (a.r2r_edges_preview||[]).length, (b.r2r_edges_preview||[]).length],
+        ['Seg Rules', (a.segmentation_preview && a.segmentation_preview.rules ? a.segmentation_preview.rules.length : 0), (b.segmentation_preview && b.segmentation_preview.rules ? b.segmentation_preview.rules.length : 0)]
+    ];
+    function esc(x){ return (''+x).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+    const rows = metrics.map(m => { const delta = m[2]-m[1]; const cls = delta===0?'text-secondary':(delta>0?'text-success':'text-danger'); return `<tr><td>${esc(m[0])}</td><td>${esc(m[1])}</td><td>${esc(m[2])}</td><td class="${cls}">${delta>0?'+':''}${esc(delta)}</td></tr>`; }).join('');
+    return `<div class="card border-info"><div class="card-header py-1 small">Diff vs current preview</div><div class="card-body p-2"><div class="table-responsive"><table class="table table-sm table-bordered mb-0"><thead><tr><th>Metric</th><th>Old</th><th>Current</th><th>Δ</th></tr></thead><tbody>${rows}</tbody></table></div></div></div>`;
+}
+
+// ---------- Full Preview Modal Rendering ----------
+function showFullPreviewModal(full){
+    if(!full) return;
+    const modalEl = document.getElementById('fullPreviewModal');
+    if(!modalEl) return;
+    document.getElementById('fpModalSeed').textContent = `seed=${full.seed}`;
+    // Counts
+    const countsEl = document.getElementById('fpCounts');
+    const stats = [
+        ['Routers',(full.routers||[]).length],
+        ['Hosts',(full.hosts||[]).length],
+        ['Switches',(full.switches||[]).length],
+        ['R2R Edges',(full.r2r_edges_preview||[]).length],
+        ['Seg Rules', (full.segmentation_preview && full.segmentation_preview.rules ? full.segmentation_preview.rules.length:0)],
+        ['P2P /30',(full.ptp_subnets||[]).length],
+        ['R-Sw /30',(full.router_switch_subnets||[]).length],
+        ['LAN /28',(full.lan_subnets||[]).length],
+    ];
+    countsEl.innerHTML = '<div class="row g-1">' + stats.map(s=>`<div class="col-auto"><span class="badge text-bg-secondary">${s[0]}: ${s[1]}</span></div>`).join('') + '</div>';
+    // Policies & segmentation
+    function setJson(id, obj){ const el=document.getElementById(id); if(el) el.textContent = JSON.stringify(obj||{}, null, 2); }
+    setJson('fpR2RPolicy', full.r2r_policy_preview);
+    setJson('fpR2SPolicy', full.r2s_policy_preview);
+    setJson('fpSegmentation', full.segmentation_preview);
+    // Tables
+    function tableHtml(arr, cols){ if(!arr||!arr.length) return '<div class="text-muted small">(none)</div>'; const head='<thead><tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr></thead>'; const body='<tbody>'+arr.map(o=>'<tr>'+cols.map(c=>`<td>${(o[c]!==undefined&&o[c]!==null)? (Array.isArray(o[c])? o[c].join(','): o[c]): ''}</td>`).join('')+'</tr>').join('')+'</tbody>'; return `<div class="table-responsive"><table class="table table-sm table-bordered mb-0">${head}${body}</table></div>`; }
+    const routersWrap = document.getElementById('fpRoutersWrap'); if(routersWrap) routersWrap.innerHTML = tableHtml(full.routers,['node_id','name','ip4']);
+    const hostsWrap = document.getElementById('fpHostsWrap'); if(hostsWrap) hostsWrap.innerHTML = tableHtml(full.hosts,['node_id','name','role','ip4']);
+    const switchesWrap = document.getElementById('fpSwitchesWrap'); if(switchesWrap) switchesWrap.innerHTML = tableHtml(full.switches_detail,['switch_id','router_id','hosts','rsw_subnet','lan_subnet']);
+    // Graph
+    buildFullPreviewModalGraph(full);
+        // History & Diff
+    try { renderFullPreviewHistoryInModal(); } catch(e){ console.warn('History render failed', e); }
+        // Roles & services distribution
+        try { renderRoleDistribution(full); } catch(e){ console.warn('Role dist failed', e); }
+        try { renderServiceDistribution(full); } catch(e){ console.warn('Service dist failed', e); }
+    // Approval & drift removed
+    document.getElementById('fpExportJsonBtn')?.addEventListener('click', ()=>{ try { const blob=new Blob([JSON.stringify(full,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='full_preview_seed_'+(full.seed||'na')+'.json'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),4000);} catch(e){} });
+    // Open standalone full preview page via POST (original GET caused 405 Method Not Allowed)
+    document.getElementById('fpOpenStandaloneBtn')?.addEventListener('click', ()=>{
+        const xmlPath = state.result_path || '';
+        if(!xmlPath.endsWith('.xml')){ alert('Save XML first to open standalone preview.'); return; }
+        const scen = state.scenarios && state.scenarios[activeIdx] ? state.scenarios[activeIdx].name : '';
+        const form = document.createElement('form');
+        form.method='POST';
+        form.action='/plan/full_preview_page';
+        form.target='_blank';
+        const inXml = document.createElement('input'); inXml.type='hidden'; inXml.name='xml_path'; inXml.value=xmlPath; form.appendChild(inXml);
+        if(scen){ const inSc = document.createElement('input'); inSc.type='hidden'; inSc.name='scenario'; inSc.value=scen; form.appendChild(inSc); }
+        document.body.appendChild(form);
+        form.submit();
+        setTimeout(()=>{ try { form.remove(); } catch(e){} }, 1000);
+    });
+    (new bootstrap.Modal(modalEl)).show();
+}
+
+function renderFullPreviewHistoryInModal(){
+    const wrap = document.getElementById('fpHistoryWrap'); if(!wrap) return;
+    loadFullPreviewHistory();
+    const histAll = previewState.fullPreviewHistory || [];
+    if(!histAll.length){ wrap.innerHTML='<div class="text-muted small">No history</div>'; return; }
+    const hist = histAll.slice(-10); // last 10
+    function esc(x){ return (''+x).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+    const rows = hist.slice().reverse().map((rec,i)=>{
+        return `<tr><td>${i+1}</td><td>${esc(rec.seed)}</td><td>${esc(rec.stats.routers)}/${esc(rec.stats.hosts)}/${esc(rec.stats.switches)}</td><td>${esc(rec.stats.r2r_edges)}</td><td>${esc(rec.stats.seg_rules)}</td></tr>`;
+    }).join('');
+    wrap.innerHTML = `<div class='table-responsive'><table class='table table-sm table-bordered mb-0'><thead><tr><th>#</th><th>Seed</th><th>R/H/S</th><th>R2R</th><th>Seg</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function renderRoleDistribution(full){
+    const wrap = document.getElementById('fpRoleDist'); if(!wrap) return;
+    const hosts = full.hosts || [];
+    const counts = {};
+    hosts.forEach(h => { const r = h.role || 'unknown'; counts[r] = (counts[r]||0)+1; });
+    const roles = Object.entries(counts).sort((a,b)=> b[1]-a[1]);
+    if(!roles.length){ wrap.innerHTML='<div class="text-muted small">No hosts</div>'; return; }
+    const total = hosts.length || 1;
+    const bars = roles.map(([role,c])=>{
+        const pct = ((c/total)*100).toFixed(1);
+        return `<div class='mb-1'><div class='d-flex justify-content-between small'><span>${role}</span><span>${c} (${pct}%)</span></div><div class='progress' style='height:6px;'><div class='progress-bar bg-info' style='width:${pct}%;'></div></div></div>`;
+    }).join('');
+    wrap.innerHTML = bars;
+}
+
+function renderServiceDistribution(full){
+    const wrap = document.getElementById('fpServiceDist'); if(!wrap) return;
+    const svcCounts = {};
+    const nodes = [...(full.routers||[]), ...(full.hosts||[])];
+    nodes.forEach(n => { (n.services||[]).forEach(s => { svcCounts[s] = (svcCounts[s]||0)+1; }); });
+    const entries = Object.entries(svcCounts).sort((a,b)=> b[1]-a[1]);
+    if(!entries.length){ wrap.innerHTML='<div class="text-muted small">No services</div>'; return; }
+    const total = entries.reduce((sum,e)=> sum+e[1],0) || 1;
+    wrap.innerHTML = `<div style='max-height:180px; overflow:auto;'>` + entries.map(([svc,c])=>{
+        const pct = ((c/total)*100).toFixed(1);
+        return `<div class='mb-1'><div class='d-flex justify-content-between small'><span>${svc}</span><span>${c} (${pct}%)</span></div><div class='progress' style='height:5px;'><div class='progress-bar bg-secondary' style='width:${pct}%;'></div></div></div>`;
+    }).join('') + '</div>';
+}
+
+// Drift function removed
+
+function buildFullPreviewModalGraph(full){
+    if(!window.d3){ const g=document.getElementById('fpGraphLoading'); if(g) g.textContent='d3 not loaded'; return; }
+    const container = d3.select('#fpGraph');
+    container.selectAll('*').remove();
+    const w = container.node().clientWidth || 800; const h = container.node().clientHeight || 480;
+    const svg = container.append('svg').attr('width', w).attr('height', h).style('cursor','grab');
+    const zoomLayer = svg.append('g').attr('class','zoom-layer');
+    let currentTransform = d3.zoomIdentity;
+    const zoom = d3.zoom().scaleExtent([0.2,4]).on('zoom', (ev)=>{
+        currentTransform = ev.transform; zoomLayer.attr('transform', currentTransform);
+    });
+    svg.call(zoom).on('dblclick.zoom', null);
+    const nodes=[]; const links=[];
+    (full.routers||[]).forEach(r=>nodes.push({id:r.node_id, label:r.name, type:'router'}));
+    (full.hosts||[]).forEach(hn=>nodes.push({id:hn.node_id, label:hn.name, type:'host'}));
+    (full.switches_detail||[]).forEach(sw=>nodes.push({id:sw.switch_id, label:'sw-'+sw.switch_id, type:'switch'}));
+    (full.r2r_edges_preview||[]).forEach(e=>links.push({source:e[0], target:e[1], kind:'r2r'}));
+    (full.switches_detail||[]).forEach(sw=>{ (sw.hosts||[]).forEach(hid=>links.push({source:sw.switch_id, target:hid, kind:'sw-host'})); links.push({source:sw.router_id, target:sw.switch_id, kind:'r-sw'}); });
+    const hr = full.host_router_map || {}; Object.entries(hr).forEach(([hid,rid])=>{ const hIdNum=parseInt(hid,10); if(!links.find(l=>l.kind==='sw-host' && l.target===hIdNum)){ links.push({source:rid, target:hIdNum, kind:'r-host'}); }});
+    const sim = d3.forceSimulation(nodes).force('link', d3.forceLink(links).id(d=>d.id).distance(l=> l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40))).force('charge', d3.forceManyBody().strength(-220)).force('center', d3.forceCenter(w/2,h/2));
+    const link = zoomLayer.selectAll('line').data(links).enter().append('line').attr('stroke', l=> l.kind==='r2r'? '#0d6efd': (l.kind==='r-sw'? '#198754':'#999')).attr('stroke-width', l=> l.kind==='r2r'? 2:1.2).attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null).attr('opacity', .9);
+    const node = zoomLayer.selectAll('g').data(nodes).enter().append('g').call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
+    node.append('circle').attr('r', d=> d.type==='router'? 11: (d.type==='switch'? 8:5)).attr('fill', d=> d.type==='router'? '#ff7043': (d.type==='switch'? '#17a2b8': '#ffc107')).attr('stroke','#333').attr('stroke-width',1.1);
+    node.append('text').text(d=>d.label).attr('x',12).attr('y',4).attr('font-size','10px');
+    node.append('title').text(d=> `${d.label} (${d.type})`);
+    sim.on('tick', ()=>{ link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y).attr('x2', d=>d.target.x).attr('y2', d=>d.target.y); node.attr('transform', d=>`translate(${d.x},${d.y})`); });
+    function dragstarted(event,d){ if(!event.active) sim.alphaTarget(.3).restart(); d.fx=d.x; d.fy=d.y; }
+    function dragged(event,d){ d.fx=event.x; d.fy=event.y; }
+    function dragended(event,d){ if(!event.active) sim.alphaTarget(0); }
+    document.getElementById('fpGraphLoading')?.remove();
+    document.getElementById('fpGraphResetBtn')?.addEventListener('click', ()=>{ sim.alpha(1).restart(); nodes.forEach(n=>{ n.fx=null; n.fy=null; }); svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity); });
+    // Provide wheel zoom hint tooltip (optional) - minimal
+    try { container.append('title').text('Scroll / pinch to zoom, drag background to pan, drag nodes to reposition'); } catch(e){}
+    svg.on('mousedown', ()=> svg.style('cursor','grabbing'));
+    window.addEventListener('mouseup', ()=> svg.style('cursor','grab'));
+    document.getElementById('fpGraphPngBtn')?.addEventListener('click', ()=>{ try { const serializer=new XMLSerializer(); const svgStr=serializer.serializeToString(svg.node()); const canvas=document.createElement('canvas'); canvas.width=w*2; canvas.height=h*2; const ctx=canvas.getContext('2d'); const img=new Image(); img.onload=function(){ ctx.fillStyle='#fff'; ctx.fillRect(0,0,canvas.width,canvas.height); ctx.drawImage(img,0,0,canvas.width,canvas.height); canvas.toBlob(b=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download='full_preview_graph_'+(full.seed||'na')+'.png'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),4000); }); }; img.src='data:image/svg+xml;base64,'+btoa(unescape(encodeURIComponent(svgStr))); } catch(e){ console.error('PNG export failed', e); } });
+}
+
+// Execute button in Full Preview modal
+document.addEventListener('DOMContentLoaded', ()=>{
+    const execBtn = document.getElementById('fpExecuteBtn');
+    if(execBtn){
+        execBtn.addEventListener('click', async ()=>{
+            if(!state.result_path || !state.result_path.endsWith('.xml')){
+                alert('Save XML before executing.'); return;
+            }
+            if(!window.confirm('Execute this scenario now? This will start a CORE session.')) return;
+            try {
+                const form = new FormData(); form.append('xml_path', state.result_path);
+                const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+                if(!res.ok){ alert('Failed to start execution'); return; }
+                const { run_id } = await res.json();
+                const logWin = window.open('', '_blank');
+                if(logWin){ logWin.document.write('<pre id="log" style="font:11px monospace;white-space:pre-wrap;">Starting...\n</pre>'); }
+                const evt = new EventSource('/stream/' + run_id);
+                evt.onmessage = ev => { if(logWin && !logWin.closed){ logWin.document.getElementById('log').textContent += (ev.data||'') + '\n'; } };
+                evt.addEventListener('end', ()=>{ try{ evt.close(); }catch(e){} });
+                (async function poll(){
+                    try {
+                        const r = await fetch('/run_status/' + run_id);
+                        if(!r.ok){ setTimeout(poll, 1200); return; }
+                        const data = await r.json();
+                        if(!data.done){ setTimeout(poll, 1000); return; }
+                        if(data.returncode===0){
+                            if(logWin && !logWin.closed){ logWin.document.getElementById('log').textContent += '\nRun complete; redirecting to Reports...'; }
+                            setTimeout(()=>{ window.location.href = "{{ url_for('reports_page') }}"; }, 600);
+                        } else {
+                            if(logWin && !logWin.closed){ logWin.document.getElementById('log').textContent += '\nRun finished with errors (code '+data.returncode+').'; }
+                        }
+                    } catch(e){ setTimeout(poll, 1500); }
+                })();
+            } catch(e){ alert('Execution error: '+e); }
+        });
+    }
+});
+
+// Seed clear button
+document.addEventListener('DOMContentLoaded', () => {
+  const scb = document.getElementById('seedClearBtn');
+    // seed clear button removed
+});
+
+// ------------- Auto-Save Support for Planning -------------
+async function autoSaveXml(){
+    return new Promise((resolve, reject) => {
+        try {
+            // Mirror logic from manual Save XML submission but use fetch
+            const scenariosJsonInput = document.getElementById('scenarios_json');
+            if(!scenariosJsonInput){ reject('Editor form missing'); return; }
+            try { scenariosJsonInput.value = JSON.stringify({ scenarios: state.scenarios }); } catch(e){ reject('Serialize failed'); return; }
+            const formData = new FormData();
+            formData.append('scenarios_json', scenariosJsonInput.value);
+            fetch('/save_xml', { method:'POST', body: formData })
+                .then(r=>r.text())
+                .then(html => {
+                    // Parse returned HTML for updated payload JSON script tag
+                    try {
+                        const parser = new DOMParser();
+                        const doc = parser.parseFromString(html, 'text/html');
+                        const payloadScript = doc.querySelector('#payload-data');
+                        if(payloadScript){
+                            const newPayload = JSON.parse(payloadScript.textContent || 'null');
+                            if(newPayload && newPayload.result_path){
+                                state.result_path = newPayload.result_path;
+                                try { const persisted = JSON.parse(localStorage.getItem('coretg_editor_state')||'{}'); persisted.result_path = state.result_path; localStorage.setItem('coretg_editor_state', JSON.stringify(persisted)); } catch(e){}
+                                previewState.xmlSaved = true;
+                                updatePlanButtons();
+                                resolve();
+                                return;
+                            }
+                        }
+                        reject('Could not detect saved XML path in response');
+                    } catch(e){ reject(e); }
+                })
+                .catch(err => reject(err));
+        } catch(e){ reject(e); }
+    });
+}
+
 if (persistedState && !initialPayload?.core && persistedState.core) {
     state.core = persistedState.core;
 }
@@ -332,7 +932,7 @@ function renderSidebar() {
             const exportBtn = document.getElementById('exportBtn');
         const hiddenLoadInput = document.getElementById('hiddenLoadInput');
         const hiddenLoadForm = document.getElementById('hiddenLoadForm');
-            if (appendScenarioBtn) appendScenarioBtn.onclick = (e) => { e.preventDefault(); logInfo('New scenario created'); state.scenarios.push(defaultScenario()); activeIdx = state.scenarios.length - 1; persistEditorState(); render(); };
+            if (appendScenarioBtn) appendScenarioBtn.onclick = (e) => { e.preventDefault(); logInfo('New scenario created'); state.scenarios.push(defaultScenario()); activeIdx = state.scenarios.length - 1; persistEditorState(); try { previewState.dirty = true; updatePlanButtons(); } catch(e){} render(); };
             if (importBtn) importBtn.onclick = (e) => { e.preventDefault(); logInfo('Import scenarios clicked'); hiddenLoadInput.click(); };
     if (hiddenLoadInput) hiddenLoadInput.onchange = () => { if (hiddenLoadInput.files && hiddenLoadInput.files.length > 0) { saveScrollBeforeNav(); hiddenLoadForm.submit(); } };
             if (exportBtn) exportBtn.onclick = (e) => {
@@ -632,12 +1232,13 @@ function renderMain() {
                                                 <div class="d-flex align-items-center gap-1"><strong>Degrees Spark:</strong> <span data-role="edges-spark" class="font-monospace"></span></div>
                                         </div>
                                         <div class="form-text mt-2">
-                                            <span class="fw-semibold">Edges Mode Help:</span>
+                                            <span class="fw-semibold">R-to-R Edges Help:</span>
                                             <ul class="mb-0 ps-3">
-                                                <li><strong>Random</strong>: baseline random connectivity (light augmentation to raise average modestly).</li>
-                                                <li><strong>Min</strong>: lift all routers to at least degree 2 where feasible.</li>
-                                                <li><strong>Max</strong>: aggressively mesh (caps keep scale sane).</li>
-                                                <li><strong>Exact</strong>: attempt to raise every router to the specified degree (can’t reduce higher existing degrees).</li>
+                                                <li><strong>Random</strong>: random spanning tree (single simple path between any two routers).</li>
+                                                <li><strong>Min</strong>: chain (linear path r1–r2–…–rn).</li>
+                                                <li><strong>Uniform</strong>: attempt to balance degrees evenly (near-regular distribution).</li>
+                                                <li><strong>Exact</strong>: chain plus random extra links until every router reaches target degree.</li>
+                                                <li><strong>NonUniform</strong>: heterogeneous random degrees (mix of hubs and leaves; more variance than Random).</li>
                                             </ul>
                                         </div>` : ''}
             </div>`;
@@ -649,13 +1250,25 @@ function renderMain() {
             tts.forEach(el => new bootstrap.Tooltip(el));
         }
 
-    // Notes card
+    // Notes card (collapsible, collapsed by default)
     const notesCard = document.createElement('div');
     notesCard.className = 'card mb-3';
+    const hasNotes = (scen.notes||'').trim().length>0;
+    const collapseId = `notesCollapse_${activeIdx}`;
     notesCard.innerHTML = `
-        <div class="card-header"><strong>Notes</strong></div>
-        <div class="card-body">
-            <textarea class="form-control" rows="3" data-scen-idx="${activeIdx}" data-field="notes">${scen.notes || ''}</textarea>
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <button class="btn btn-sm btn-link text-decoration-none p-0 d-flex align-items-center gap-2" type="button" data-bs-toggle="collapse" data-bs-target="#${collapseId}" aria-expanded="false" aria-controls="${collapseId}">
+                <span class="me-1">Notes</span>
+                <span id="notesIndicator_${activeIdx}" class="d-inline-flex align-items-center" data-bs-toggle="tooltip" data-bs-title="${hasNotes? 'Notes present':'No notes'}">
+                    ${hasNotes ? `<i class='bi bi-journal-text text-success'></i>` : `<i class='bi bi-journal text-muted'></i>`}
+                </span>
+            </button>
+            <small class="text-muted">optional</small>
+        </div>
+        <div id="${collapseId}" class="collapse">
+            <div class="card-body p-2">
+                <textarea class="form-control" rows="3" data-scen-idx="${activeIdx}" data-field="notes" placeholder="Add scenario notes (markdown supported)">${scen.notes || ''}</textarea>
+            </div>
         </div>`;
     root.appendChild(notesCard);
 
@@ -720,24 +1333,41 @@ function renderItemRow(sidx, secName, iidx, it) {
         }
         if (secName === 'Routing') {
             // Edges mode (Random/Min/Max/Exact). Random now acts like previous Auto (no extra links augmentation).
-            const mode = it.edges_mode || (it.edges !== undefined ? 'Exact' : 'Random');
-            const val = (it.edges !== undefined && it.edges !== null) ? it.edges : '';
+            const mode = it.r2r_mode || (it.r2r_edges !== undefined ? 'Exact' : 'Random');
+            const val = (it.r2r_edges !== undefined && it.r2r_edges !== null) ? it.r2r_edges : '';
             const options = [
                 {v:'Random', l:'Random'},
                 {v:'Min', l:'Min'},
-                {v:'Max', l:'Max'},
-                {v:'Exact', l:'Exact'}
+                {v:'Uniform', l:'Uniform'},
+                {v:'Exact', l:'Exact'},
+                {v:'NonUniform', l:'NonUniform'}
             ];
-            const selHtml = `<select class="form-select form-select-sm" data-field="edges_mode" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${options.map(o => `<option value="${o.v}" ${o.v===mode?'selected':''}>${o.l}</option>`).join('')}</select>`;
+            const selHtml = `<select class="form-select form-select-sm" data-field="r2r_mode" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${options.map(o => `<option value="${o.v}" ${o.v===mode?'selected':''}>${o.l}</option>`).join('')}</select>`;
+            // R-to-S (router to switch) connectivity policy (same option set)
+            const r2sMode = it.r2s_mode || 'Random';
+            const r2sVal = (it.r2s_edges !== undefined && it.r2s_edges !== null) ? it.r2s_edges : '';
+            const r2sSel = `<select class="form-select form-select-sm" data-field="r2s_mode" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${options.map(o => `<option value="${o.v}" ${o.v===r2sMode?'selected':''}>${o.l}</option>`).join('')}</select>`;
             return `
-                <div class="d-flex flex-wrap gap-3 align-items-end">
-                    <div>
-                        <label class="form-label mb-0" title="Edge selection mode. Random leaves generation unconstrained; Min/Max guide connectivity; Exact sets a fixed target.">Edges Mode</label>
-                        ${selHtml}
+                <div class="d-flex flex-wrap gap-2 align-items-center">
+                    <label class="form-label mb-0 me-1" style="min-width:110px" title="Router-to-Router edge policy. Random = spanning tree; Min = chain; Uniform = balanced degrees; Exact = chain+augment to target; NonUniform = heterogeneous.">R-to-R Edges</label>
+                    <div class="d-flex gap-3 align-items-end">
+                        <div>
+                            ${selHtml}
+                        </div>
+                        <div class="edges-exact-input" style="display:${mode==='Exact'?'block':'none'};">
+                            <label class="form-label mb-0" title="Target degree each router should attempt to reach (cannot reduce existing higher degrees).">Exact #</label>
+                            <input type="number" min="1" class="form-control form-control-sm edges-degree-input" style="width:110px" value="${val}" data-field="r2r_edges" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="e.g. 3">
+                        </div>
                     </div>
-                    <div class="edges-exact-input" style="display:${mode==='Exact'?'block':'none'};">
-                        <label class="form-label mb-0" title="Exact number of edges (links) this router type should attempt to form.">Exact #</label>
-                        <input type="number" min="1" class="form-control form-control-sm edges-degree-input" style="width:110px" value="${val}" data-field="edges" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="e.g. 3">
+                    <label class="form-label mb-0 ms-4 me-1" style="min-width:100px" title="Router-to-Switch attachment policy; controls how many distinct switches each router connects to.">R-to-S Edges</label>
+                    <div class="d-flex gap-3 align-items-end">
+                        <div>
+                            ${r2sSel}
+                        </div>
+                        <div class="r2s-exact-input" style="display:${r2sMode==='Exact'?'block':'none'};">
+                            <label class="form-label mb-0" title="Target number of switches per router (Exact mode).">Exact #</label>
+                            <input type="number" min="1" class="form-control form-control-sm r2s-degree-input" style="width:110px" value="${r2sVal}" data-field="r2s_edges" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="e.g. 2">
+                        </div>
                     </div>
                 </div>`;
         }
@@ -920,18 +1550,21 @@ function wireHandlers() {
             if (sec) {
                 if (iidx !== null) {
                     const item = state.scenarios[sidx].sections[sec].items[parseInt(iidx)];
-                    if (['factor','rate_kbps','period_s','jitter_pct','total_nodes','density','edges'].includes(field)) {
+                    if (['factor','rate_kbps','period_s','jitter_pct','total_nodes','density','r2r_edges','r2s_edges'].includes(field)) {
                         item ? (item[field] = parseFloat(el.value)) : state.scenarios[sidx].sections[sec][field] = parseFloat(el.value);
-                                            if (field === 'edges' && (isNaN(item[field]) || el.value === '')) {
-                                                // Allow blank to mean "unset" so generator can apply defaults
-                                                delete item[field];
-                                            }
-                                            if (field === 'factor') {
-                                                adjustWeightsProportionally(sidx, sec, parseInt(iidx));
-                                                updateWeightWarning(sidx, sec);
-                                                updateWeightInputsDisplay(sidx, sec);
-                                            }
-                    } else if (['pattern','content_type','selected','script_path','v_type','v_vector','v_name','v_path','v_count','v_metric','edges_mode'].includes(field)) {
+                        if ((field === 'edges' || field === 'r2s_edges') && (isNaN(item[field]) || el.value === '')) {
+                            // Allow blank to mean "unset" so generator can apply defaults
+                            delete item[field];
+                        }
+                        if (field === 'factor') {
+                            adjustWeightsProportionally(sidx, sec, parseInt(iidx));
+                            updateWeightWarning(sidx, sec);
+                            updateWeightInputsDisplay(sidx, sec);
+                        }
+                        if (field === 'edges' || field === 'r2s_edges') {
+                            setTimeout(validateRoutingEdges, 20);
+                        }
+                    } else if (['pattern','content_type','selected','script_path','v_type','v_vector','v_name','v_path','v_count','v_metric','r2r_mode','r2s_mode'].includes(field)) {
                         const prev = item[field];
                         if (field === 'v_count') {
                             const n = parseInt(el.value, 10) || 1;
@@ -939,9 +1572,15 @@ function wireHandlers() {
                         } else {
                             item[field] = el.value;
                         }
-                        if(field === 'edges_mode') {
-                            item.edges_mode = el.value;
+                        if(field === 'r2r_mode') {
+                            item.r2r_mode = el.value;
                             if(el.value !== 'Exact') { delete item.edges; }
+                            renderMain();
+                            setTimeout(validateRoutingEdges, 50);
+                        }
+                        if(field === 'r2s_mode') {
+                            item.r2s_mode = el.value;
+                            if(el.value !== 'Exact') { delete item.r2s_edges; }
                             renderMain();
                             setTimeout(validateRoutingEdges, 50);
                         }
@@ -999,12 +1638,24 @@ function wireHandlers() {
                 if (field === 'name') state.scenarios[sidx].name = el.value;
                 if (field === 'base-file') state.scenarios[sidx].base.filepath = el.value;
                 if (field === 'notes') state.scenarios[sidx].notes = el.value;
+                if(field === 'notes'){
+                    try {
+                        const ind = document.getElementById('notesIndicator_'+sidx);
+                        if(ind){
+                            const has = (el.value||'').trim().length>0;
+                            ind.innerHTML = has ? `<i class='bi bi-journal-text text-success'></i>` : `<i class='bi bi-journal text-muted'></i>`;
+                            ind.setAttribute('data-bs-title', has ? 'Notes present' : 'No notes');
+                            if(window.bootstrap){ try { new bootstrap.Tooltip(ind); } catch(e){} }
+                        }
+                    } catch(e){}
+                }
             }
             // keep hidden for submit
             document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
             // persist edits across navigation
             persistEditorState();
             logDebug(`Field change: scen=${sidx} sec=${sec||''} field=${field}`);
+            try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
         };
         el.addEventListener('input', handler);
         el.addEventListener('change', handler);
@@ -1026,6 +1677,7 @@ function wireHandlers() {
               // Re-render to refresh totals and labels
                             renderMain();
                             persistEditorState();
+                            try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
         };
     });
     document.querySelectorAll('[data-action="add-item"]').forEach(btn => {
@@ -1056,6 +1708,7 @@ function wireHandlers() {
               redistributeEven(sidx, sec);
                             renderMain();
                             persistEditorState();
+                            try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
         };
     });
     document.querySelectorAll('[data-action="toggle-collapse"]').forEach(btn => {
@@ -1201,11 +1854,18 @@ function validateRoutingEdges(){
     const scen = state.scenarios[activeIdx]; if(!scen) return;
     const routing = (scen.sections && scen.sections['Routing'] && scen.sections['Routing'].items) || [];
     const warn = [];
-    routing.forEach((r,i)=>{ if(r.edges_mode==='Exact' && !(r.edges>=1)) warn.push(`Row ${i+1}: Exact mode requires a degree ≥ 1`); });
+    routing.forEach((r,i)=>{ const m = r.r2r_mode; if(m==='Exact' && !(r.edges>=1)) warn.push(`Row ${i+1}: Exact mode requires a degree ≥ 1`); });
+    routing.forEach((r,i)=>{ if(r.r2s_mode==='Exact' && !(r.r2s_edges>=1)) warn.push(`Row ${i+1}: R-to-S Exact requires a value ≥ 1`); });
     // Highlight inputs
     document.querySelectorAll('.edges-degree-input').forEach(inp => {
         const v = parseInt(inp.value,10); const tr = inp.closest('tr');
-        const sel = tr ? tr.querySelector('[data-field="edges_mode"]') : null;
+    const sel = tr ? tr.querySelector('[data-field="r2r_mode"]') : null;
+        const mode = sel ? sel.value : '';
+        if(mode==='Exact' && !(v>=1)) inp.classList.add('is-invalid'); else inp.classList.remove('is-invalid');
+    });
+    document.querySelectorAll('.r2s-degree-input').forEach(inp => {
+        const v = parseInt(inp.value,10); const tr = inp.closest('tr');
+        const sel = tr ? tr.querySelector('[data-field="r2s_mode"]') : null;
         const mode = sel ? sel.value : '';
         if(mode==='Exact' && !(v>=1)) inp.classList.add('is-invalid'); else inp.classList.remove('is-invalid');
     });
@@ -1222,21 +1882,37 @@ function computeRoutingEdgePolicyPreview(){
     if(!summaryEl) return;
     if(!routing.length){ summaryEl.style.display='none'; return; }
     // Determine target policy: Exact avg > Max > Min > Random (mirrors backend)
-    const exactVals = routing.filter(r=>r.edges_mode==='Exact' && r.edges>=1).map(r=>r.edges);
+    const exactVals = routing.filter(r=> r.r2r_mode==='Exact' && r.edges>=1).map(r=>r.edges);
     let mode='Random'; let target=0;
     if(exactVals.length){
         target = Math.round(exactVals.reduce((a,b)=>a+b,0)/exactVals.length);
         if(target<1) target=1; mode='Exact';
     } else {
-        const modes = routing.map(r=>r.edges_mode).filter(Boolean);
-        if(modes.includes('Max')) mode='Max'; else if(modes.includes('Min')) mode='Min'; else mode='Random';
+    const modes = routing.map(r=> r.r2r_mode).filter(Boolean);
+    if(modes.includes('Uniform')) mode='Uniform';
+        else if(modes.includes('Min')) mode='Min';
+        else if(modes.includes('NonUniform')) mode='NonUniform';
+        else mode='Random';
+    }
+    // Determine predominant R-to-S mode (simple precedence similar to R-to-R)
+    let r2sMode = 'Random';
+    const r2sExactVals = routing.filter(r=>r.r2s_mode==='Exact' && r.r2s_edges>=1).map(r=>r.r2s_edges);
+    if(r2sExactVals.length){
+        r2sMode = 'Exact';
+    } else {
+        const r2sModes = routing.map(r=>r.r2s_mode).filter(Boolean);
+    if(r2sModes.includes('Uniform')) r2sMode='Uniform';
+        else if(r2sModes.includes('Min')) r2sMode='Min';
+        else if(r2sModes.includes('NonUniform')) r2sMode='NonUniform';
+        else r2sMode='Random';
     }
     const policySpan = summaryEl.querySelector('[data-role="edges-policy"]');
-    if(policySpan){ policySpan.textContent = mode + (mode==='Exact'?` (target≈${target})`: ''); }
+    if(policySpan){ policySpan.textContent = `R-R: ${mode}${mode==='Exact'?`(≈${target})`:''} | R-S: ${r2sMode}`; }
     // Estimate degree distribution preview (pure heuristic):
     let minD=0, avgD=0, maxD=0;
     if(mode==='Exact'){ minD=target; avgD=target+1; maxD=target+2; }
-    else if(mode==='Max'){ minD=3; avgD=5; maxD=7; }
+    else if(mode==='Uniform'){ minD=4; avgD=4; maxD=5; }
+    else if(mode==='NonUniform'){ minD=1; avgD=3; maxD=8; }
     else if(mode==='Min'){ minD=2; avgD=3; maxD=4; }
     else { minD=1; avgD=2; maxD=4; }
     const statsSpan = summaryEl.querySelector('[data-role="edges-stats"]');
@@ -1250,6 +1926,33 @@ function computeRoutingEdgePolicyPreview(){
         sparkSpan.textContent = seq.map(v=>blocks[norm(v)]).join('');
         sparkSpan.title = seq.join(', ');
     }
+    // Resource warning for Uniform (previously Max) mode – still warn if near-dense
+	const warnEl = document.getElementById('routingEdgesWarnings');
+	if(warnEl){
+	    warnEl.classList.add('d-none');
+	    warnEl.innerHTML='';
+        if(mode==='Uniform'){
+	        // Approximate router count: we don't know exact until build; use routing item count as lower bound
+	        let approxRouters = routing.length || 0;
+	        // If scenario embeds an explicit router count in future, prefer it; attempt common field names
+	        if(typeof scen.router_count === 'number' && scen.router_count > approxRouters) approxRouters = scen.router_count;
+	        if(typeof scen.routers_total === 'number' && scen.routers_total > approxRouters) approxRouters = scen.routers_total;
+	        // Compute full mesh edges estimate
+	        const estEdges = approxRouters > 1 ? (approxRouters * (approxRouters - 1) / 2) : 0;
+	        // Thresholds: warn if routers >= 25 OR estimated edges >= 300
+	        if(approxRouters >= 25 || estEdges >= 300){
+	            const edgesFmt = estEdges.toLocaleString();
+                warnEl.innerHTML = `<strong>Uniform Mode:</strong> balanced high degree connectivity can grow ~O(n²). With ~${approxRouters} routers this implies about ${edgesFmt} potential links. This may increase session startup time and resource usage.`;
+	            warnEl.classList.remove('d-none');
+	        } else {
+	            // Light advisory (still show something so users understand cost) for smaller counts
+	            if(approxRouters >= 10){
+                    warnEl.innerHTML = `<strong>Heads up:</strong> Uniform mode aims for evenly high degrees (approaches dense graph). Routers: ~${approxRouters}.`;
+	                warnEl.classList.remove('d-none');
+	            }
+	        }
+	    }
+	}
     summaryEl.style.display='flex';
 }
 
@@ -1261,52 +1964,30 @@ function wireCoreControls() {
     const btn = document.getElementById('testCoreBtn');
     const statusEl = document.getElementById('coreStatus');
     const runSync = document.getElementById('runSyncBtn');
-    const runAsync = document.getElementById('runAsyncBtn');
     const cancelBtn = document.getElementById('cancelRunBtn');
     const runSyncWrap = document.getElementById('runSyncWrap');
-    const runAsyncWrap = document.getElementById('runAsyncWrap');
 
-    const setRunEnabled = (ok) => {
-        if (ok) {
-            runSync.removeAttribute('disabled');
-            runAsync.removeAttribute('disabled');
-            runSync.classList.remove('pe-none');
-            runAsync.classList.remove('pe-none');
-            runSyncWrap?.setAttribute('data-bs-title', '');
-            runAsyncWrap?.setAttribute('data-bs-title', '');
-            statusEl.classList.remove('text-danger');
-            statusEl.classList.add('text-success');
-            statusEl.textContent = 'CORE reachable';
-        } else {
-            runSync.setAttribute('disabled', 'disabled');
-            runAsync.setAttribute('disabled', 'disabled');
-            runSync.classList.add('pe-none');
-            runAsync.classList.add('pe-none');
-            runSyncWrap?.setAttribute('data-bs-title', 'Test CORE connection first');
-            runAsyncWrap?.setAttribute('data-bs-title', 'Test CORE connection first');
-            statusEl.classList.remove('text-success');
-            statusEl.classList.add('text-danger');
-        }
+    // Always enable run buttons (CORE test optional now)
+    const setRunEnabled = () => {
+        runSync?.removeAttribute('disabled');
+        runSync?.classList.remove('pe-none');
+        runSyncWrap?.setAttribute('data-bs-title', '');
+        statusEl.classList.remove('text-danger','text-success');
+        statusEl.textContent = 'Not tested (runs allowed)';
     };
 
     // initialize values
     if (hostEl) hostEl.value = state.core.host || 'localhost';
     if (portEl) portEl.value = state.core.port || 50051;
-    // restore prior success only if host/port unchanged
-    if (state.core_ok === true && state.core_tested_host === (hostEl.value || '').trim() && String(state.core_tested_port) === String(portEl.value)) {
-        setRunEnabled(true);
-    } else {
-        setRunEnabled(false);
-        statusEl.textContent = 'Not tested';
-    }
+    // Immediately enable regardless of prior test
+    setRunEnabled();
 
     const onEdit = () => {
     state.core.host = hostEl.value.trim();
     state.core.port = parseInt(portEl.value || '50051', 10) || 50051;
     state.core_ok = false; // changing values invalidates previous test
         // any edit resets test state
-        setRunEnabled(false);
-        statusEl.textContent = 'Not tested';
+    setRunEnabled();
     };
     hostEl?.addEventListener('input', () => { onEdit(); persistEditorState(); });
     portEl?.addEventListener('input', () => { onEdit(); persistEditorState(); });
@@ -1328,19 +2009,22 @@ function wireCoreControls() {
                 state.core_ok = true;
                 state.core_tested_host = hostEl.value.trim() || 'localhost';
                 state.core_tested_port = parseInt(portEl.value || '50051', 10) || 50051;
-                setRunEnabled(true);
                 logInfo(`CORE reachable at ${data.host||hostEl.value}:${data.port||portEl.value}`);
+                statusEl.classList.add('text-success');
+                statusEl.textContent = 'CORE reachable (optional)';
                 persistEditorState();
             } else {
-                setRunEnabled(false);
-                statusEl.textContent = 'Connection failed' + (data?.error ? `: ${data.error}` : '');
+                statusEl.classList.remove('text-success');
+                statusEl.classList.add('text-danger');
+                statusEl.textContent = 'Connection failed (run still allowed)' + (data?.error ? `: ${data.error}` : '');
                 logWarn(`CORE connection failed: ${data?.error||'unknown'}`);
                 state.core_ok = false;
                 persistEditorState();
             }
         } catch (e) {
-            setRunEnabled(false);
-            statusEl.textContent = 'Connection failed';
+            statusEl.classList.remove('text-success');
+            statusEl.classList.add('text-danger');
+            statusEl.textContent = 'Connection failed (run still allowed)';
             logError('CORE test threw exception');
             state.core_ok = false;
             persistEditorState();
@@ -1849,6 +2533,66 @@ async function runSyncWithModal(ev){
         })();
     } catch(e){ runProgressLogLine('Exception starting CLI'); }
     return false; // prevent default form submit
+}
+
+// Run deterministically with a seed (preview seed or input)
+async function runWithSeedBuild(){
+    // Ensure XML is saved
+    let rp = state.result_path || '';
+    if(!rp.endsWith('.xml')){
+        const go = window.confirm('XML not saved yet. Save now?');
+        if(!go) return;
+        const saved = await saveXmlAjax();
+        if(!saved){ alert('Auto-save failed; cannot run.'); return; }
+        rp = state.result_path || '';
+        if(!rp.endsWith('.xml')){ alert('Saved XML path unresolved.'); return; }
+    }
+    // Derive seed: prefer explicit input, else current preview seed
+    // seedInputEl removed
+    let seedVal = null;
+    if(seedInputEl && seedInputEl.value.trim()){
+        const num = parseInt(seedInputEl.value.trim(),10); if(!isNaN(num) && num>0) seedVal = num;
+    } else if(previewState.fullPreview && previewState.fullPreview.seed){
+        seedVal = previewState.fullPreview.seed;
+    }
+    if(seedVal===null){
+        alert('Enter a seed or generate a Full Preview (which records a seed) first.');
+        return;
+    }
+    const confirmMsg = `Run CLI with seed=${seedVal}? This will start a CORE session.`;
+    if(!window.confirm(confirmMsg)) return;
+    openRunProgress('Running CLI (seed='+seedVal+')…');
+    try {
+        // Show dock logs
+        try { const showBtn=document.getElementById('dockShowBtn'); if(showBtn && !showBtn.classList.contains('d-none')) showBtn.click(); } catch(e){}
+        const res = await fetch("{{ url_for('run_cli_async') }}", {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ xml_path: rp, seed: seedVal })
+        });
+        if(!res.ok){ runProgressLogLine('Failed to start seeded run'); return; }
+        const { run_id } = await res.json();
+        runProgressRunId = run_id;
+        // Stream logs
+        try { if(runProgressEvtSrc) runProgressEvtSrc.close(); } catch(e){}
+        runProgressEvtSrc = new EventSource('/stream/' + run_id);
+        runProgressEvtSrc.onmessage = (ev)=> runProgressLogLine(ev.data||'');
+        runProgressEvtSrc.addEventListener('end', ()=>{ try { runProgressEvtSrc.close(); } catch(e){} });
+        // Poll status similar to runSyncWithModal
+        (async function poll(){
+            try{
+                const r = await fetch('/run_status/' + run_id);
+                if(!r.ok){ setTimeout(poll, 1200); return; }
+                const data = await r.json();
+                if(data.report_path || data.xml_path){ state.result_path = data.report_path || data.xml_path; persistEditorState(); }
+                const metaEl = document.getElementById('runProgressMeta'); if(metaEl) metaEl.textContent = data.done ? (data.returncode===0 ? 'Completed' : 'Failed') : 'Running…';
+                if(!data.done){ setTimeout(poll, 1000); return; }
+                document.getElementById('runProgressStatus').textContent = (data.returncode===0) ? 'Scenario started' : 'Finished with errors';
+                document.getElementById('runProgressBar').classList.remove('progress-bar-animated');
+                if(data.returncode===0){ setTimeout(()=>{ window.location.href = "{{ url_for('reports_page') }}"; }, 600); }
+            } catch(e){ setTimeout(poll, 1500); }
+        })();
+    } catch(e){ runProgressLogLine('Exception starting seeded run'); }
 }
 
     function redistributeEven(sidx, secName) {

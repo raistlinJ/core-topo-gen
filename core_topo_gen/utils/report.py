@@ -67,11 +67,58 @@ def write_report(
     lines: List[str] = []
     lines.append(f"# Scenario Report")
     lines.append("")
+    # Plan Summary (phased builder)
+    try:
+        plan_summary = None
+        if metadata:
+            plan_summary = metadata.get('plan_summary') or metadata.get('planSummary')
+        if isinstance(plan_summary, dict) and plan_summary:
+            lines.append("## Plan Summary (Phased Build)")
+            try:
+                # Show key resource alignment
+                lines.append(f"- Hosts planned: {plan_summary.get('hosts_total')} | allocated: {plan_summary.get('hosts_allocated')}")
+                lines.append(f"- Routers planned: {plan_summary.get('routers_planned')} | allocated: {plan_summary.get('routers_allocated')}")
+                if plan_summary.get('r2s_ratio_used') is not None:
+                    lines.append(f"- R2S ratio used: {plan_summary.get('r2s_ratio_used')}")
+                if plan_summary.get('switches_allocated') is not None:
+                    lines.append(f"- Switches allocated: {plan_summary.get('switches_allocated')}")
+                if plan_summary.get('vulnerabilities_plan'):
+                    vt = sum((plan_summary.get('vulnerabilities_plan') or {}).values())
+                    lines.append(f"- Vulnerabilities planned: {vt} | assigned: {plan_summary.get('vulnerabilities_assigned')}")
+                if plan_summary.get('r2r_policy'):
+                    rp = plan_summary.get('r2r_policy') or {}
+                    mode = rp.get('mode') or 'n/a'
+                    tdeg = rp.get('target_degree') or 0
+                    lines.append(f"- R2R policy: mode={mode} target_degree={tdeg}")
+            except Exception:
+                pass
+            # Drift details if present
+            drift = plan_summary.get('plan_drift') or metadata.get('plan_drift') or metadata.get('preview_drift')
+            if drift:
+                lines.append("### Plan / Preview Drift")
+                for v in drift:
+                    lines.append(f"- {v}")
+            lines.append("")
+    except Exception:
+        pass
     if scenario_name:
         lines.append(f"Scenario: {scenario_name}")
     lines.append(f"Generated: {ts}")
     lines.append("")
     lines.append("## Summary")
+    # Schema / XML diagnostics if provided in metadata
+    try:
+        if metadata and (metadata.get('xml_path') or metadata.get('xml_schema_classification')):
+            lines.append("### Source XML")
+            if metadata.get('xml_path'):
+                lines.append(f"- XML Path: {metadata.get('xml_path')}")
+            if metadata.get('xml_schema_classification'):
+                lines.append(f"- XML Classification: {metadata.get('xml_schema_classification')}")
+            if metadata.get('xml_container_flag') is True:
+                lines.append(f"- Contains <container>: true (session export)")
+            lines.append("")
+    except Exception:
+        pass
     lines.append(f"- Total nodes: {total_nodes}")
     # Base host pool removed; show additive breakdown only if provided
     try:
@@ -89,34 +136,174 @@ def write_report(
     lines.append(f"- Routers: {len(routers)}  |  Switches: {len(switches)}  |  Hosts: {len(hosts)}")
     lines.append(f"- Traffic flows: {len(flows)}")
     lines.append(f"- Segmentation rules: {len(seg_rules)}")
+    try:
+        if metadata and metadata.get('segmentation_preview_rules') and not seg_rules:
+            lines.append(f"- Segmentation (preview injected): {len(metadata.get('segmentation_preview_rules') or [])}")
+    except Exception:
+        pass
+    # Planned vs Actual reconciliation (counts) leveraging plan_summary if present
+    try:
+        plan_summary = None
+        if metadata:
+            plan_summary = metadata.get('plan_summary') or metadata.get('planSummary')
+        if isinstance(plan_summary, dict) and plan_summary:
+            reconc_rows = []
+            def fmt_match(label: str, planned, actual):
+                if planned is None:
+                    return None
+                status = 'MATCH' if planned == actual else f'DRIFT (Δ={actual - planned})'
+                return f"| {label} | {planned} | {actual} | {status} |"
+            planned_hosts = plan_summary.get('hosts_total') or plan_summary.get('hosts_planned')
+            planned_routers = plan_summary.get('routers_planned') or plan_summary.get('routers_allocated')
+            planned_switches = plan_summary.get('switches_allocated') or plan_summary.get('switches_planned')
+            # Edge count (preview vs actual) if available
+            planned_edges = plan_summary.get('r2r_edges_planned') or plan_summary.get('r2r_edges_preview_count')
+            actual_edges = None
+            try:
+                if metadata and metadata.get('router_degrees'):
+                    # Sum degrees /2 gives undirected edge count
+                    dv = list((metadata.get('router_degrees') or {}).values())
+                    if dv:
+                        actual_edges = int(sum(dv)/2)
+            except Exception:
+                actual_edges = None
+            # Segmentation rules
+            planned_seg_rules = None
+            if metadata and metadata.get('segmentation_preview_rules'):
+                planned_seg_rules = len(metadata.get('segmentation_preview_rules') or [])
+            actual_seg_rules = len(seg_rules)
+
+            reconc_rows.extend(filter(None, [
+                fmt_match('Hosts', planned_hosts, len(hosts)),
+                fmt_match('Routers', planned_routers, len(routers)),
+                fmt_match('Switches', planned_switches, len(switches)),
+                fmt_match('R2R Edges', planned_edges, actual_edges) if (planned_edges is not None and actual_edges is not None) else None,
+                fmt_match('Segmentation Rules', planned_seg_rules, actual_seg_rules) if (planned_seg_rules is not None) else None,
+            ]))
+            if reconc_rows:
+                lines.append('')
+                lines.append('### Reconciliation (Planned vs Actual)')
+                lines.append('| Resource | Planned | Actual | Status |')
+                lines.append('| --- | ---: | ---: | --- |')
+                lines.extend(reconc_rows)
+                lines.append('')
+    except Exception:
+        pass
     # Router edges policy / degree stats if present (from session.topo_stats stored in metadata under keys)
     try:
         rep = None; degs = None
         if metadata:
             rep = metadata.get('router_edges_policy') or metadata.get('topo_router_edges_policy')
             degs = metadata.get('router_degrees') or metadata.get('topo_router_degrees')
+        # One-line summary in Summary section
+        if degs and isinstance(degs, dict) and degs:
+            try:
+                dv = list(degs.values())
+                lines.append(f"- Connectivity: degree_min={min(dv)} avg={round(sum(dv)/len(dv),2)} max={max(dv)}")
+            except Exception:
+                pass
         if rep or degs:
             lines.append("## Router Edge Connectivity")
             if isinstance(rep, dict):
                 mode = rep.get('mode', 'Unknown'); tgt = rep.get('target_degree')
                 if mode == 'Exact' and tgt:
-                    lines.append(f"- Policy: Exact (target degree ≈ {tgt})")
+                    meth = rep.get('construction_method') or rep.get('method')
+                    if meth:
+                        lines.append(f"- Policy: Exact (target degree={tgt}, method={meth})")
+                    else:
+                        lines.append(f"- Policy: Exact (target degree={tgt})")
                 elif mode == 'Max':
-                    lines.append("- Policy: Max (near-mesh within safety caps)")
+                    lines.append("- Policy: Max (full mesh)")
                 elif mode == 'Min':
-                    lines.append("- Policy: Min (lift low-degree routers to small baseline)")
+                    lines.append("- Policy: Min (chain path)")
+                elif mode == 'NonUniform':
+                    lines.append("- Policy: NonUniform (heterogeneous random degrees)")
+                elif mode == 'Random':
+                    lines.append("- Policy: Random (spanning tree)")
+                elif mode == 'Uniform':
+                    lines.append("- Policy: Uniform (balanced near-regular degrees)")
                 else:
-                    lines.append("- Policy: Random (light stochastic augmentation)")
+                    lines.append(f"- Policy: {mode}")
+                if rep.get('degree_avg') is not None:
+                    disp_min = rep.get('display_degree_min') or rep.get('degree_min')
+                    disp_max = rep.get('display_degree_max') or rep.get('degree_max')
+                    lines.append("- Degree stats: min={mn} avg={av} max={mx} std={sd} gini={gi}".format(
+                        mn=disp_min, av=rep.get('degree_avg'), mx=disp_max, sd=rep.get('degree_std'), gi=rep.get('degree_gini')))
+                    note = rep.get('note') if isinstance(rep, dict) else None
+                    if note:
+                        lines.append(f"- Note: {note}")
             if isinstance(degs, dict) and degs:
                 vals = list(degs.values())
                 mn, mx = min(vals), max(vals)
                 avg = round(sum(vals)/len(vals), 2)
-                lines.append(f"- Degrees: min={mn} avg={avg} max={mx}")
-                # histogram concise
+                # Normalize display for target_degree=1 (perfect matching with optional single isolated)
+                tdeg = (rep or {}).get('target_degree') if isinstance(rep, dict) else None
+                if tdeg == 1:
+                    note = ''
+                    if (len(vals) % 2 == 1) and 0 in vals:
+                        note = ' (one router isolated due to odd count)'
+                    lines.append(f"- Degrees: min={1 if mn in (0,1) else mn} avg={avg} max={1 if mx in (0,1) else mx}{note}")
+                else:
+                    lines.append(f"- Degrees: min={mn} avg={avg} max={mx}")
                 from collections import Counter
                 c = Counter(vals)
                 hist = ', '.join(f"{k}:{c[k]}" for k in sorted(c))
                 lines.append(f"- Histogram: {hist}")
+            lines.append("")
+    except Exception:
+        pass
+
+    # Segmentation preview rules fallback (only if no runtime rules were produced)
+    try:
+        if not seg_rules and metadata and metadata.get('segmentation_preview_rules'):
+            lines.append("## Segmentation Rules (Preview Injected)")
+            lines.append("| Node | Type | Details | Source |")
+            lines.append("| ---: | --- | --- | --- |")
+            for r in metadata.get('segmentation_preview_rules') or []:
+                node_id = r.get('node_id')
+                rr = r.get('rule') or {}
+                typ = rr.get('type', '')
+                det = ''
+                if typ == 'nat':
+                    det = f"{rr.get('internal','')} -> {rr.get('external','')} ({rr.get('mode','')})"
+                elif typ in ('host_block','subnet_block'):
+                    det = f"{rr.get('src','')} -> {rr.get('dst','')}"
+                elif typ == 'custom':
+                    det = rr.get('description','')
+                lines.append(f"| {node_id} | {typ} | {det} | preview |")
+            lines.append("")
+    except Exception:
+        pass
+
+    # Router-to-Switch connectivity policy (if recorded in metadata)
+    try:
+        r2s = None
+        if metadata:
+            r2s = metadata.get('r2s_policy') or metadata.get('topo_r2s_policy')
+        if isinstance(r2s, dict):
+            lines.append("## Router-to-Switch Connectivity")
+            mode = r2s.get('mode')
+            tgt = r2s.get('target_per_router') or r2s.get('target')
+            if mode == 'Exact' and tgt is not None:
+                lines.append(f"- Policy: Exact (target switches per router={tgt})")
+            else:
+                lines.append(f"- Policy: {mode}")
+            counts = r2s.get('counts') or {}
+            if counts:
+                vals = list(counts.values())
+                mn, mx = min(vals), max(vals)
+                avg = round(sum(vals)/len(vals), 2)
+                from collections import Counter
+                c = Counter(vals)
+                hist = ', '.join(f"{k}:{c[k]}" for k in sorted(c))
+                lines.append(f"- Switch counts per router: min={mn} avg={avg} max={mx}")
+                lines.append(f"- Histogram: {hist}")
+            if r2s.get('count_avg') is not None:
+                lines.append("- Switch count stats: min={mn} avg={av} max={mx} std={sd} gini={gi}".format(
+                    mn=r2s.get('count_min'), av=r2s.get('count_avg'), mx=r2s.get('count_max'), sd=r2s.get('count_std'), gi=r2s.get('count_gini')))
+            reh = r2s.get('rehomed_hosts') or []
+            if reh:
+                lines.append(f"- Hosts rehomed behind new R2S switches: {len(reh)}")
             lines.append("")
     except Exception:
         pass
@@ -227,8 +414,6 @@ def write_report(
             lines.append("")
     except Exception:
         pass
-    except Exception:
-        pass
 
     if routers:
         lines.append("## Routers")
@@ -243,6 +428,13 @@ def write_report(
         lines.append("## Switches")
         lines.append(", ".join(str(sid) for sid in switches))
         lines.append("")
+    elif metadata and metadata.get('switches_allocated') is not None:
+        try:
+            lines.append("## Switches")
+            lines.append(f"(allocated: {metadata.get('switches_allocated')})")
+            lines.append("")
+        except Exception:
+            pass
 
     if hosts:
         lines.append("## Hosts")
@@ -322,6 +514,54 @@ def write_report(
     # Optional Details section (extra info grouped at end)
     if any([metadata, routing_cfg, traffic_cfg, services_cfg, segmentation_cfg, vulnerabilities_cfg]):
         lines.append("## Details")
+        # Connectivity Matrix (router adjacency + R2S counts) if metadata has degrees / edges
+        try:
+            degs = None; rep = None; r2s = None; host_counts = None
+            if metadata:
+                rep = metadata.get('router_edges_policy') or metadata.get('topo_router_edges_policy')
+                degs = metadata.get('router_degrees') or metadata.get('topo_router_degrees')
+                r2s = metadata.get('r2s_policy') or metadata.get('topo_r2s_policy')
+                host_counts = metadata.get('router_host_counts')
+            if isinstance(degs, dict) and degs:
+                lines.append("### Connectivity Matrix")
+                rids = sorted(degs.keys())
+                r2s_counts = {}
+                if isinstance(r2s, dict):
+                    rc = r2s.get('counts') or {}
+                    if isinstance(rc, dict):
+                        r2s_counts = rc
+                # Add host counts column if available
+                has_hosts_col = isinstance(host_counts, dict) and host_counts
+                header = "| Router | Degree | R2S Switches |" + (" Hosts |" if has_hosts_col else "")
+                sep = "| ---: | ---: | ---: |" + (" ---: |" if has_hosts_col else "")
+                lines.append(header)
+                lines.append(sep)
+                matrix_rows: list[str] = []
+                for rid in rids:
+                    deg_v = degs.get(rid, 0)
+                    swc = r2s_counts.get(rid, 0)
+                    hc = host_counts.get(rid, 0) if has_hosts_col else None
+                    row = f"| {rid} | {deg_v} | {swc} |" + (f" {hc} |" if has_hosts_col else "")
+                    lines.append(row)
+                    matrix_rows.append(row)
+                lines.append("")
+                # Emit CSV alongside markdown (same directory) for programmatic consumption
+                try:
+                    csv_path = out_path + ".connectivity.csv"
+                    with open(csv_path, 'w', encoding='utf-8') as cf:
+                        # header row sans pipes for CSV
+                        cols = ["Router","Degree","R2S_Switches"] + (["Hosts"] if has_hosts_col else [])
+                        cf.write(",".join(cols) + "\n")
+                        for rid in rids:
+                            deg_v = degs.get(rid, 0)
+                            swc = r2s_counts.get(rid, 0)
+                            hc = host_counts.get(rid, 0) if has_hosts_col else None
+                            row_vals = [str(rid), str(deg_v), str(swc)] + ([str(hc)] if has_hosts_col else [])
+                            cf.write(",".join(row_vals) + "\n")
+                except Exception:
+                    pass
+        except Exception:
+            pass
         if metadata:
             lines.append("### Generation parameters")
             for k in sorted(metadata.keys()):

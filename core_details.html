@@ -29,9 +29,27 @@
         <div class="d-flex flex-column flex-sm-row align-items-sm-center gap-2">
           <div class="btn-group btn-group-sm">
             <a class="btn btn-outline-secondary" href="{{ url_for('download_report') }}?path={{ xml_path | urlencode }}">Download XML</a>
-            <button class="btn btn-outline-primary" id="createPlanBtn" type="button" data-xml="{{ xml_path }}" title="Compute a plan (direct from XML, no persistence)">Create Plan</button>
+            <button class="btn btn-outline-primary" id="createPlanBtn" type="button" data-xml="{{ xml_path }}" title="Compute a plan (no build)">Create Plan</button>
+            <button class="btn btn-outline-success d-none" id="approvePlanBtn" type="button" title="Approve the last computed plan">Approve Plan</button>
           </div>
-          <div class="small text-muted">Plan approval disabled (plan derived live from XML)</div>
+          <form id="runPlanForm" action="{{ url_for('run_with_plan') }}" method="POST" class="d-flex align-items-center gap-2">
+            <input type="hidden" name="xml_path" value="{{ xml_path }}">
+            <input type="hidden" name="plan_path" id="approvedPlanPathInput" value="{{ approved_plan_path or '' }}">
+            <div class="form-check form-check-inline mb-0">
+              <input class="form-check-input" type="checkbox" value="on" id="strictPlanChk" name="strict_plan">
+              <label class="form-check-label small" for="strictPlanChk" title="Abort build on any plan drift">Strict</label>
+            </div>
+            <button class="btn btn-outline-warning btn-sm {% if not approved_plan_path %}d-none{% endif %}" id="runWithPlanBtn" type="submit" {% if not approved_plan_path %}disabled{% endif %} title="Run CORE build using approved plan">Run With Plan</button>
+          </form>
+          <div id="approvedPlanStatus" class="small {% if approved_plan_path %}text-success{% else %}text-muted{% endif %}">
+            {% if approved_plan_path %}
+              <span class="me-1">Approved plan ready</span>
+              <button type="button" class="btn btn-link btn-sm p-0 align-baseline" id="viewApprovedPlanBtn">view</button>
+              <button type="button" class="btn btn-link btn-sm text-danger p-0 ms-2 align-baseline" id="deleteApprovedPlanBtn" title="Delete approved plan">delete</button>
+            {% else %}
+              No approved plan
+            {% endif %}
+          </div>
         </div>
       {% endif %}
     </div>
@@ -410,14 +428,33 @@
     }
     hydrateApprovedState();
     function computePlan(){
-      // Legacy plan preview removed; instruct user to use full preview feature.
-      planJsonEl.classList.remove('d-none');
-      planJsonEl.textContent = 'Lightweight plan preview removed. Use Full Preview workflow.';
-      planLoadingEl.classList.add('d-none');
-      planViolWrap.classList.add('d-none');
+      if(!createBtn) return;
+      const xml = createBtn.getAttribute('data-xml');
+      if(!xml) return;
+      createBtn.disabled = true;
       approveBtn.classList.add('d-none');
+      planJsonEl.classList.add('d-none');
+      planLoadingEl.classList.remove('d-none');
+      planViolWrap.classList.add('d-none');
       modalApproveBtn.classList.add('d-none');
+      planLoadingEl.textContent = 'Computing plan...';
       showModal();
+      fetch('/api/plan/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ xml_path: xml }) })
+        .then(r => r.json())
+        .then(data => {
+          createBtn.disabled = false;
+            if(!data.ok){ planLoadingEl.textContent = 'Failed: ' + (data.error || 'unknown'); return; }
+            currentPlanPath = data.plan_path;
+            try { planJsonEl.textContent = JSON.stringify(data.plan, null, 2); } catch(e){ planJsonEl.textContent = 'Plan loaded'; }
+            planLoadingEl.classList.add('d-none');
+            planJsonEl.classList.remove('d-none');
+            if(data.violations && data.violations.length){
+              planViolList.innerHTML=''; data.violations.forEach(v=>{ const li=document.createElement('li'); li.textContent=v; planViolList.appendChild(li); });
+              planViolWrap.classList.remove('d-none');
+            }
+            approveBtn.classList.remove('d-none');
+            modalApproveBtn.classList.remove('d-none');
+        }).catch(err => { createBtn.disabled = false; planLoadingEl.textContent='Error: ' + err; });
     }
     function approvePlan(){
       if(!currentPlanPath) return; approveBtn.disabled=true; modalApproveBtn.disabled=true;

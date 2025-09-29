@@ -15,12 +15,13 @@ class ServiceInfo:
 class RoutingInfo:
     protocol: str
     factor: float
-    # When > 0, indicates an absolute number of routers to assign this protocol to.
-    # Used in addition to density-based routers.
-    abs_count: int = 0
-    # Optional edge planning directives (from UI Routing row)
-    edges_mode: str = ""  # "", Random, Min, Max, Exact
-    edges: int = 0         # Used only when edges_mode == Exact (>0)
+    abs_count: int = 0  # Absolute routers for this protocol (additive)
+    # Router-to-Router policy
+    r2r_mode: str = ""   # "", Random, Min, Uniform, Exact, NonUniform
+    r2r_edges: int = 0       # Used only when r2r_mode == Exact (>0)
+    # Router-to-Switch policy
+    r2s_mode: str = ""   # Random, Min, Uniform, Exact, NonUniform
+    r2s_edges: int = 0    # Used only when r2s_mode == Exact (>0)
 
 @dataclass
 class NodeInfo:

@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import shutil
 import subprocess
@@ -23,8 +24,96 @@ import logging
 import zipfile
 import secrets
 from werkzeug.security import generate_password_hash, check_password_hash
+from pathlib import Path
 
 ALLOWED_EXTENSIONS = {'xml'}
+
+"""Flask web backend for core-topo-gen.
+
+Augmented to guarantee the in-repo version of core_topo_gen is imported
+instead of any globally installed distribution so new planning modules
+like planning.full_preview are always available.
+"""
+
+# Ensure repository root (parent directory) precedes any site-packages version & purge shadowed installs
+try:
+    _THIS_DIR = os.path.abspath(os.path.dirname(__file__))
+    _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, '..'))
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+    # Purge any pre-imported site-packages version of core_topo_gen so we always load in-repo
+    import sys as _sys
+    for k in list(_sys.modules.keys()):
+        if k == 'core_topo_gen' or k.startswith('core_topo_gen.'):
+            del _sys.modules[k]
+except Exception:
+    pass
+
+# Proactively ensure the in-repo planning.full_preview module is available even if an
+# older site-packages installation of core_topo_gen (without that module) is first on sys.path.
+def _ensure_full_preview_module():  # safe no-op if already present
+    try:
+        import importlib, sys as _sys
+        try:
+            # Fast path: module already importable
+            import core_topo_gen.planning.full_preview  # type: ignore
+            try:
+                app.logger.debug('[full_preview] already importable (fast path)')
+            except Exception:
+                pass
+            return True
+        except ModuleNotFoundError:
+            # Force reload planning package from repo root then load file directly
+            repo_root = _REPO_ROOT
+            planning_dir = os.path.join(repo_root, 'core_topo_gen', 'planning')
+            candidate = os.path.join(planning_dir, 'full_preview.py')
+            if not os.path.exists(candidate):
+                try:
+                    app.logger.error('[full_preview] candidate missing at %s', candidate)
+                except Exception:
+                    pass
+                return False
+            import importlib.util
+            spec = importlib.util.spec_from_file_location('core_topo_gen.planning.full_preview', candidate)
+            if not spec or not spec.loader:
+                try:
+                    app.logger.error('[full_preview] spec/loader missing for %s', candidate)
+                except Exception:
+                    pass
+                return False
+            module = importlib.util.module_from_spec(spec)
+            _sys.modules['core_topo_gen.planning.full_preview'] = module
+            try:
+                spec.loader.exec_module(module)  # type: ignore
+            except Exception:
+                try:
+                    import traceback, io as _io
+                    buf = _io.StringIO(); traceback.print_exc(file=buf)
+                    app.logger.error('[full_preview] exec_module failed: %s', buf.getvalue())
+                except Exception:
+                    pass
+                return False
+            # Attach as attribute of planning package for attribute-based access patterns
+            try:
+                import core_topo_gen.planning as planning_pkg  # type: ignore
+                setattr(planning_pkg, 'full_preview', module)
+            except Exception:
+                pass
+            try:
+                app.logger.info('[full_preview] dynamically loaded from %s', candidate)
+            except Exception:
+                pass
+            return True
+    except Exception:
+        return False
+
+# Attempt early so later endpoints succeed
+try:
+    if not _ensure_full_preview_module():
+        # Will try again lazily in the endpoint if needed
+        pass
+except Exception:
+    pass
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET', 'coretopogenweb')
@@ -33,156 +122,58 @@ try:
 except Exception:
     pass
 
-# Provide repo root helper early; used by environment path loaders during import
+# ----------------------- Basic Path Helpers (restored) -----------------------
 def _get_repo_root() -> str:
-    """Return absolute path to project root (parent of this webapp directory)."""
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-try:
-    app.logger.setLevel(logging.DEBUG)
-except Exception:
-    pass
-
-# Ensure project root (parent of this webapp directory) is on sys.path for absolute imports like core_topo_gen.*
-try:
-    _THIS_DIR = os.path.abspath(os.path.dirname(__file__))
-    _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, '..'))
-    if _REPO_ROOT not in sys.path:
-        sys.path.insert(0, _REPO_ROOT)
-except Exception:
-    pass
-
-# ------------- Environment paths (.env/paths.json with env overrides) -------------
-_ENV_PATHS_CACHE: Dict[str, str] | None = None
-
-def _load_env_paths() -> Dict[str, str]:
-    global _ENV_PATHS_CACHE
-    if _ENV_PATHS_CACHE is not None:
-        return _ENV_PATHS_CACHE
-    repo_root = _get_repo_root()
-    defaults = {
-        'VULN_BASE_DIR': '/tmp/vulns',
-        'VULN_REPO_SUBDIR': 'repo',
-        'TRAFFIC_DIR': '/tmp/traffic',
-        'SEGMENTATION_DIR': '/tmp/segmentation',
-        'REPORTS_DIR': os.path.join(repo_root, 'reports'),
-        'UPLOADS_DIR': os.path.join(repo_root, 'uploads'),
-        'OUTPUTS_DIR': os.path.join(repo_root, 'outputs'),
-    }
-    cfg = {}
+    """Return absolute repository root (directory containing this webapp folder)."""
     try:
-        p = os.path.join(repo_root, '.env', 'paths.json')
-        if os.path.exists(p):
-            with open(p, 'r', encoding='utf-8') as f:
-                cfg = json.load(f) or {}
+        return _REPO_ROOT
     except Exception:
-        cfg = {}
-    out: Dict[str, str] = {}
-    for k, dv in defaults.items():
-        val = os.environ.get(k, cfg.get(k, dv))
-        # Resolve to absolute for repo-root relative paths
-        if not os.path.isabs(val):
-            # Treat as relative to repo root
-            val = os.path.abspath(os.path.join(repo_root, val))
-        out[k] = val
-    _ENV_PATHS_CACHE = out
-    return out
-
-
-def _vuln_base_dir() -> str:
-    return _load_env_paths().get('VULN_BASE_DIR')
-
-
-def _vuln_repo_subdir() -> str:
-    return _load_env_paths().get('VULN_REPO_SUBDIR') or 'repo'
-
-
-def _traffic_dir() -> str:
-    return _load_env_paths().get('TRAFFIC_DIR')
-
-
-def _segmentation_dir() -> str:
-    return _load_env_paths().get('SEGMENTATION_DIR')
-
-
-def _reports_dir() -> str:
-    return _load_env_paths().get('REPORTS_DIR')
-
-
-def _uploads_dir() -> str:
-    return _load_env_paths().get('UPLOADS_DIR')
-
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 def _outputs_dir() -> str:
-    return _load_env_paths().get('OUTPUTS_DIR')
+    d = os.path.join(_get_repo_root(), 'outputs')
+    os.makedirs(d, exist_ok=True)
+    return d
 
-# ---------------- Planning semantics help API ----------------
-@app.route('/api/help/planning')
-def api_help_planning():
-    """Return JSON describing additive planning semantics for routers & vulnerabilities.
+def _uploads_dir() -> str:
+    d = os.path.join(_get_repo_root(), 'uploads')
+    os.makedirs(d, exist_ok=True)
+    return d
 
-    This documents how counts (absolute) and density (fractional or absolute when >=1) interact.
-    """
-    data = {
-        "routers": {
-            "semantics": "Additive",
-            "density": "Density in [0,1]: routers_density = round(base_host_count * density)",
-            "counts": "Sum of Count rows (v_metric=='Count') added; total capped by base_host_count",
-            "cap": "Total routers limited to base_host_count",
-            "mesh_styles": ["full", "ring", "tree"],
-        },
-        "vulnerabilities": {
-            "semantics": "Additive",
-            "density": "Density in [0,1]: vuln_density_target = round(base_host_count * density)",
-            "counts": "Sum of v_count across Count rows and Specific rows (with v_count) is additive; capped by base_host_count",
-            "selection_order": ["Assign Count rows", "Assign density-based (weight) rows"],
-        },
-        "notes": [
-            "Base host count excludes routers & docker conversions",
-            "Docker vulnerability assignments consume host slots sequentially (slot-1..N)",
-            "Random placeholders are resolved before distribution",
-        ]
-    }
-    return jsonify(data)
+def _reports_dir() -> str:
+    d = os.path.join(_get_repo_root(), 'reports')
+    os.makedirs(d, exist_ok=True)
+    return d
 
+# Additional helper dirs (stubs restored after accidental removal)
+def _traffic_dir() -> str:
+    d = os.path.join(_outputs_dir(), 'traffic')
+    os.makedirs(d, exist_ok=True)
+    return d
 
-@app.route('/planning_meta')
-def planning_meta_endpoint():
-    """Return parsed planning metadata for a scenario XML.
+def _segmentation_dir() -> str:
+    d = os.path.join(_outputs_dir(), 'segmentation')
+    os.makedirs(d, exist_ok=True)
+    return d
 
-    Query params:
-      - path: absolute or repo-relative XML path (required)
-      - scenario: scenario name (optional, defaults to first)
+def _vuln_base_dir() -> str:
+    d = os.path.join(_outputs_dir(), 'vulns')
+    os.makedirs(d, exist_ok=True)
+    return d
 
-    Response JSON: { ok: bool, meta?: {...}, error?: str }
-    """
-    xml_path = (request.args.get('path') or '').strip()
-    scenario_name = (request.args.get('scenario') or '').strip() or None
-    if not xml_path:
-        return jsonify({ 'ok': False, 'error': 'missing path' }), 400
-    # Resolve repo-relative paths
-    if not os.path.isabs(xml_path):
-        xml_path = os.path.abspath(os.path.join(_get_repo_root(), xml_path))
-    if not os.path.exists(xml_path):
-        return jsonify({ 'ok': False, 'error': f'xml not found: {xml_path}' }), 404
-    try:
-        from core_topo_gen.parsers.xml_parser import parse_planning_metadata
-        meta = parse_planning_metadata(xml_path, scenario_name)
-        return jsonify({ 'ok': True, 'meta': meta, 'path': xml_path, 'scenario': scenario_name })
-    except Exception as e:
-        return jsonify({ 'ok': False, 'error': str(e) }), 500
+def _vuln_repo_subdir() -> str:
+    return 'repo'
 
-
-# ---------------- Authentication & Authorization ----------------
+# ---------------- User persistence helpers (restored) ----------------
 def _users_db_path() -> str:
     base = os.path.join(_outputs_dir(), 'users')
     os.makedirs(base, exist_ok=True)
     return os.path.join(base, 'users.json')
 
-
 def _load_users() -> dict:
     p = _users_db_path()
     if not os.path.exists(p):
-        return {"users": []}
+        return { 'users': [] }
     try:
         with open(p, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -190,66 +181,56 @@ def _load_users() -> dict:
                 return data
     except Exception:
         pass
-    return {"users": []}
-
+    return { 'users': [] }
 
 def _save_users(data: dict) -> None:
-    p = _users_db_path()
-    tmp = p + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, p)
-
+    p = _users_db_path(); tmp = p + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            if os.path.exists(tmp): os.remove(tmp)
+        except Exception: pass
 
 def _ensure_admin_user() -> None:
-    """Ensure there is at least one admin user.
-
-    First-boot behavior:
-    - If the users database is empty or missing, create a default admin user
-      with username 'coreadmin' and password 'coreadmin'.
-
-    Safety fallback:
-    - If users exist but none have role 'admin', create a new 'admin' user
-      with a generated password (or value from ADMIN_PASSWORD env) to avoid
-      locking out the UI.
-    """
-    db = _load_users()
-    users = db.get('users', [])
-
-    # First boot: no users at all -> seed coreadmin/coreadmin
+    db = _load_users(); users = db.get('users', [])
     if not users:
-        users = [{
-            'username': 'coreadmin',
-            'password_hash': generate_password_hash('coreadmin'),
-            'role': 'admin',
-        }]
-        db['users'] = users
-        _save_users(db)
-        try:
-            app.logger.warning("Seeded default admin user 'coreadmin' with default password 'coreadmin'. CHANGE THIS IMMEDIATELY via /me/password or /users.")
-        except Exception:
-            pass
+        users = [{ 'username': 'coreadmin', 'password_hash': generate_password_hash('coreadmin'), 'role': 'admin' }]
+        db['users'] = users; _save_users(db)
+        try: app.logger.warning("Seeded default admin user 'coreadmin' / 'coreadmin'. Change immediately.")
+        except Exception: pass
         return
-
-    # Users exist but ensure there's at least one admin
-    has_admin = any(u.get('role') == 'admin' for u in users)
-    if not has_admin:
-        pwd = os.environ.get('ADMIN_PASSWORD') or secrets.token_urlsafe(10)
-        users.append({
-            'username': 'admin',
-            'password_hash': generate_password_hash(pwd),
-            'role': 'admin',
-        })
-        db['users'] = users
-        _save_users(db)
-        try:
-            app.logger.warning("No admin found; seeded user 'admin' with generated password: %s", pwd)
-        except Exception:
-            pass
-
+    if not any(u.get('role') == 'admin' for u in users):
+        import secrets as _secrets
+        pwd = os.environ.get('ADMIN_PASSWORD') or _secrets.token_urlsafe(10)
+        users.append({ 'username': 'admin', 'password_hash': generate_password_hash(pwd), 'role': 'admin' })
+        db['users'] = users; _save_users(db)
+        try: app.logger.warning("No admin found; created 'admin' user with generated password: %s", pwd)
+        except Exception: pass
 
 _ensure_admin_user()
 
+# Diagnostic endpoint for environment/module troubleshooting
+@app.route('/diag/modules')
+def diag_modules():
+    out = {}
+    # core_topo_gen package file
+    try:
+        import core_topo_gen as ctg  # type: ignore
+        out['core_topo_gen.__file__'] = getattr(ctg, '__file__', None)
+    except Exception as e:
+        out['core_topo_gen_error'] = str(e)
+    # planning package
+    try:
+        import core_topo_gen.planning as plan_pkg  # type: ignore
+        planning_file = getattr(plan_pkg, '__file__', None)
+        out['planning_dir'] = os.path.dirname(planning_file) if planning_file else None
+        if not planning_file:
+            out['planning_file_is_none'] = True
+    except Exception as e:
+        out['planning_import_error'] = str(e)
 
 def _current_user() -> dict | None:
     u = session.get('user')
@@ -524,11 +505,6 @@ def _append_run_history(entry: dict):
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(history, f, indent=2)
         os.replace(tmp, RUN_HISTORY_PATH)
-        try:
-            app.logger.info("[history] appended run entry (mode=%s, rc=%s, report=%s, scen_xml=%s, post_xml=%s)",
-                            entry.get('mode'), entry.get('returncode'), entry.get('report_path'), entry.get('scenario_xml_path'), entry.get('post_xml_path'))
-        except Exception:
-            pass
     except Exception:
         try:
             if os.path.exists(tmp):
@@ -536,25 +512,10 @@ def _append_run_history(entry: dict):
         except Exception:
             pass
 
-def _extract_report_path_from_text(text: str) -> str | None:
-    """Parse CLI stdout/stderr text to extract the report path if logged.
-    Looks for a line like: 'Scenario report written to /abs/path/report.md'
-    """
-    try:
-        if not text:
-            return None
-        for line in text.splitlines():
-            line = line.strip()
-            if 'Scenario report written to ' in line:
-                idx = line.find('Scenario report written to ')
-                if idx >= 0:
-                    path = line[idx + len('Scenario report written to '):].strip()
-                    # strip trailing punctuation if any
-                    path = path.rstrip('.;')
-                    return path
-    except Exception:
-        pass
-    return None
+
+## Removed legacy plan approval / status endpoints; full preview is now the sole planning interface.
+
+
 
 def _find_latest_report_path() -> str | None:
     """Find the most recent scenario_report_*.md under repo_root/reports."""
@@ -1376,6 +1337,26 @@ def _parse_scenario_editor(se):
                 "selected": item.get("selected", "Random"),
                 "factor": float(item.get("factor", "1.0")),
             }
+            if name == "Routing":
+                em = item.get('r2r_mode')
+                if em is not None:
+                    # Store under new key r2r_mode; keep legacy key for UI components still referencing it
+                    d['r2r_mode'] = em
+                ev = item.get('r2r_edges') or item.get('edges')
+                if ev is not None and ev.strip() != '':
+                    try:
+                        d['r2r_edges'] = int(ev)
+                    except Exception:
+                        pass
+                r2s_m = item.get('r2s_mode')
+                if r2s_m is not None:
+                    d['r2s_mode'] = r2s_m
+                r2s_ev = item.get('r2s_edges')
+                if r2s_ev is not None and r2s_ev.strip() != '':
+                    try:
+                        d['r2s_edges'] = int(r2s_ev)
+                    except Exception:
+                        pass
             if name == "Events":
                 d["script_path"] = item.get("script_path", "")
             if name == "Traffic":
@@ -1591,17 +1572,27 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                 except Exception:
                     it.set("factor", "0.000")
                 if name == 'Routing':
-                    em = (item.get('edges_mode') or '').strip()
+                    em = (item.get('r2r_mode') or '').strip()
+                    r2s_mode = (item.get('r2s_mode') or '').strip()
                     if em:
-                        it.set('edges_mode', em)
-                    # Only persist edges value if Exact mode; ignore otherwise to reduce noise
+                        it.set('r2r_mode', em)
+                    if r2s_mode:
+                        it.set('r2s_mode', r2s_mode)
+                    # Persist edge budget hints when provided (including Uniform/NonUniform / aggregate modes)
                     try:
-                        if em == 'Exact':
-                            ev_raw = item.get('edges')
-                            if ev_raw is not None and str(ev_raw).strip() != '':
-                                ev = int(ev_raw)
-                                if ev >= 0:
-                                    it.set('edges', str(ev))
+                        ev_raw = item.get('r2r_edges') or item.get('edges')
+                        if em == 'Exact' and ev_raw is not None and str(ev_raw).strip() != '':
+                            ev = int(ev_raw)
+                            if ev > 0:  # only meaningful positive degrees
+                                it.set('r2r_edges', str(ev))
+                    except Exception:
+                        pass
+                    try:
+                        r2s_raw = item.get('r2s_edges')
+                        if r2s_raw is not None and str(r2s_raw).strip() != '':
+                            ev2 = int(r2s_raw)
+                            if ev2 >= 0:
+                                it.set('r2s_edges', str(ev2))
                     except Exception:
                         pass
                 if name == 'Events':
@@ -1671,9 +1662,40 @@ def _validate_core_xml(xml_path: str):
         with open(xsd_path, 'rb') as f:
             schema_doc = LET.parse(f)
         schema = LET.XMLSchema(schema_doc)
-        parser = LET.XMLParser(schema=schema)
-        LET.parse(xml_path, parser)
-        return True, ''
+        # Read original XML; if it contains any <container> elements (session export artifacts),
+        # strip them prior to validation so that user-provided or auto-exported session XML can
+        # still be validated against the scenario schema. This addresses UI errors like:
+        #   Element 'container': This element is not expected.
+        # We purposefully do NOT mutate the source file on disk; sanitization is in-memory.
+        try:
+            raw_tree = LET.parse(xml_path)
+            root = raw_tree.getroot()
+            # Collect and remove any elements whose local-name is 'container'
+            containers = root.xpath('.//*[local-name()="container"]')
+            if containers:
+                for el in containers:
+                    parent = el.getparent()
+                    if parent is not None:
+                        parent.remove(el)
+                # Validate sanitized tree
+                try:
+                    schema.assertValid(root)
+                    return True, ''
+                except LET.DocumentInvalid as e:
+                    # Fall through to structured error collection below
+                    err_log = e.error_log
+                    lines = [f"{er.level_name} L{er.line}:C{er.column} - {er.message}" for er in err_log]
+                    return False, "\n".join(lines) or str(e)
+            else:
+                # No <container>; validate normally using parser bound to schema for speed
+                parser = LET.XMLParser(schema=schema)
+                LET.parse(xml_path, parser)
+                return True, ''
+        except LET.XMLSyntaxError as e:  # low-level parse error before schema phase
+            lines = []
+            for err in e.error_log:
+                lines.append(f"{err.level_name} L{err.line}:C{err.column} - {err.message}")
+            return False, "\n".join(lines) or str(e)
     except LET.XMLSyntaxError as e:
         lines = []
         for err in e.error_log:
@@ -1718,10 +1740,18 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
             for sec in root.findall('.//section'):
                 if (sec.get('name') or '').strip() == 'Routing':
                     for it in sec.findall('./item'):
-                        em = it.get('edges_mode')
-                        ev = it.get('edges')
+                        em = it.get('r2r_mode')
+                        r2s_mode = it.get('r2s_mode')
+                        ev = it.get('r2r_edges') or it.get('edges')
+                        r2s_ev = it.get('r2s_edges')
                         if em or ev:
-                            rec = {'edges_mode': em or '', 'edges': int(ev) if (ev and ev.isdigit()) else None, 'protocol': it.get('selected')}
+                            rec = {
+                                'r2r_mode': em or '',
+                                'r2r_edges': int(ev) if (ev and ev.isdigit()) else None,
+                                'r2s_mode': (r2s_mode or ''),
+                                'r2s_edges': (int(r2s_ev) if (r2s_ev and r2s_ev.isdigit()) else None),
+                                'protocol': it.get('selected')
+                            }
                             routing_edge_policies.append(rec)
         except Exception:
             routing_edge_policies = []
@@ -2181,6 +2211,581 @@ def run_cli():
         flash(f'Error running core-topo-gen: {e}')
         return redirect(url_for('index'))
 
+
+# ----------------------- Planning (Preview / Approve / Run) -----------------------
+
+
+
+@app.route('/api/plan/preview_full', methods=['POST'])
+def api_plan_preview_full():
+    """Compute a full dry-run plan (no CORE session) including routers, hosts, IPs, services,
+    vulnerabilities, segmentation slot preview and connectivity policies.
+
+    Request JSON: { xml_path: "/abs/scenarios.xml", scenario: optionalName }
+    Response: { ok, full_preview: {...} }
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        xml_path = payload.get('xml_path')
+        scenario = payload.get('scenario') or None
+        seed = payload.get('seed')
+        try:
+            if seed is not None:
+                seed = int(seed)
+        except Exception:
+            seed = None
+        if not xml_path:
+            return jsonify({'ok': False, 'error': 'xml_path missing'}), 400
+        xml_path = os.path.abspath(xml_path)
+        if not os.path.exists(xml_path):
+            return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
+        from core_topo_gen.parsers.xml_parser import parse_node_info, parse_routing_info, parse_services, parse_vulnerabilities_info, parse_segmentation_info
+        density_base, weight_items, count_items, services_list = parse_node_info(xml_path, scenario)
+        role_counts: dict[str,int] = {}
+        for r, c in count_items:
+            role_counts[r] = role_counts.get(r, 0) + int(c)
+        # Re-introduce weight-based expansion so preview reflects factor-based host planning
+        try:
+            if weight_items and (density_base or 0) > 0:
+                base_total = int(density_base)
+                # Normalize factors to sum to 1.0 then allocate
+                total_f = sum(f for _, f in weight_items) or 0.0
+                if total_f > 0:
+                    for role, f in weight_items:
+                        alloc = int(round((f/total_f) * base_total))
+                        if alloc > 0:
+                            role_counts[role] = role_counts.get(role, 0) + alloc
+        except Exception:
+            pass
+        routing_density, routing_items = parse_routing_info(xml_path, scenario)
+        prelim_router_count = 0
+        try:
+            host_total_for_density = sum(role_counts.values())
+            if routing_density and routing_density > 0 and host_total_for_density > 0:
+                prelim_router_count = max(1, int(round(routing_density * host_total_for_density)))
+            # Count-based router items can independently raise the router count
+            for ri in routing_items:
+                abs_c = int(getattr(ri, 'abs_count', 0) or 0)
+                if abs_c > 0:
+                    prelim_router_count = max(prelim_router_count, abs_c)
+        except Exception:
+            pass
+        service_plan = {s.name: (s.abs_count if s.abs_count > 0 else int(round(s.density * (density_base or 0)))) for s in services_list}
+        vuln_density, vuln_items = parse_vulnerabilities_info(xml_path, scenario)
+        vplan: dict[str,int] = {}
+        try:
+            import math as _math
+            density_target = int(_math.floor((vuln_density or 0.0) * (density_base or 0) + 1e-9))
+        except Exception:
+            density_target = 0
+        for it in (vuln_items or []):
+            if (it.get('v_metric') == 'Count'):
+                try:
+                    c = int(it.get('v_count') or 0)
+                except Exception:
+                    c = 0
+                if c>0:
+                    name = it.get('selected') or 'Item'
+                    vplan[name] = vplan.get(name,0)+c
+        if density_target>0:
+            vplan['__density_pool__'] = density_target
+        seg_density, seg_items = parse_segmentation_info(xml_path, scenario)
+        seg_items_serial = [{"selected": (it.name or 'Random'), "factor": it.factor} for it in seg_items]
+        try:
+            from core_topo_gen.planning.full_preview import build_full_preview  # type: ignore
+        except ModuleNotFoundError as _e1:
+            app.logger.warning('[plan.preview_full] initial import failed: %s; retrying ensure', _e1)
+            ensure_ok = False
+            try:
+                ensure_ok = _ensure_full_preview_module()
+            except Exception as _e2:
+                app.logger.error('[plan.preview_full] ensure_full_preview_module raised: %s', _e2)
+            try:
+                from core_topo_gen.planning.full_preview import build_full_preview  # type: ignore
+            except Exception as _e3:
+                # Log sys.path and package file locations for diagnostics
+                try:
+                    import core_topo_gen as _ctg, inspect
+                    app.logger.error('[plan.preview_full] final import failed; core_topo_gen file=%s sys.path[0]=%s ensure_ok=%s', getattr(_ctg,'__file__',None), sys.path[0], ensure_ok)
+                except Exception:
+                    pass
+                raise _e3
+        # Derive R2R and R2S policies (parallel to CLI derivation) from first eligible routing items
+        r2r_policy_plan = None
+        r2s_policy_plan = None
+        try:
+            first_r2r = next((ri for ri in routing_items if getattr(ri,'r2r_mode',None)), None)  # type: ignore
+            if first_r2r:
+                m = getattr(first_r2r, 'r2r_mode', '')
+                if m == 'Exact' and getattr(first_r2r, 'r2r_edges', 0) > 0:
+                    r2r_policy_plan = { 'mode': 'Exact', 'target_degree': int(getattr(first_r2r,'r2r_edges',0)) }
+                elif m:
+                    r2r_policy_plan = { 'mode': m }
+            first_r2s = next((ri for ri in routing_items if getattr(ri,'r2s_mode',None)), None)  # type: ignore
+            if first_r2s:
+                m2 = getattr(first_r2s, 'r2s_mode', '')
+                if m2 == 'Exact' and getattr(first_r2s, 'r2s_edges', 0) > 0:
+                    r2s_policy_plan = { 'mode': 'Exact', 'target_per_router': int(getattr(first_r2s,'r2s_edges',0)) }
+                elif m2:
+                    r2s_policy_plan = { 'mode': m2 }
+        except Exception:
+            pass
+        full_prev = build_full_preview(
+            role_counts=role_counts,
+            routers_planned=prelim_router_count,
+            services_plan=service_plan,
+            vulnerabilities_plan=vplan,
+            r2r_policy=r2r_policy_plan,
+            r2s_policy=r2s_policy_plan,
+            routing_items=routing_items,  # allow builder to self-derive if explicit policy absent
+            routing_plan={},
+            segmentation_density=seg_density,
+            segmentation_items=seg_items_serial,
+            seed=seed,
+            ip4_prefix='10.0.0.0/24',
+        )
+        return jsonify({'ok': True, 'full_preview': full_prev})
+    except Exception as e:
+        app.logger.exception('[plan.preview_full] error: %s', e)
+        return jsonify({'ok': False, 'error': str(e) }), 500
+
+@app.route('/plan/full_preview_page', methods=['POST'])
+def plan_full_preview_page():
+    """Generate a full preview and render a dedicated page similar to core_details but without CORE.
+
+    Form fields: xml_path, optional scenario, seed
+    """
+    try:
+        xml_path = request.form.get('xml_path')
+        scenario = request.form.get('scenario') or None
+        seed_raw = request.form.get('seed') or ''
+        seed = None
+        try:
+            if seed_raw:
+                s = int(seed_raw)
+                if s>0: seed = s
+        except Exception:
+            seed = None
+        if not xml_path:
+            flash('xml_path missing (full preview page)')
+            return redirect(url_for('index'))
+        xml_path = os.path.abspath(xml_path)
+        if not os.path.exists(xml_path):
+            flash(f'XML not found: {xml_path}')
+            return redirect(url_for('index'))
+        from core_topo_gen.parsers.xml_parser import parse_node_info, parse_routing_info, parse_services, parse_vulnerabilities_info, parse_segmentation_info
+        density_base, weight_items, count_items, services_list = parse_node_info(xml_path, scenario)
+        role_counts: dict[str,int] = {}
+        for r,c in count_items:
+            role_counts[r] = role_counts.get(r,0)+int(c)
+        # Re-introduce weight-based expansion
+        try:
+            if weight_items and (density_base or 0) > 0:
+                base_total = int(density_base)
+                total_f = sum(f for _, f in weight_items) or 0.0
+                if total_f > 0:
+                    for role, f in weight_items:
+                        alloc = int(round((f/total_f) * base_total))
+                        if alloc > 0:
+                            role_counts[role] = role_counts.get(role,0)+alloc
+        except Exception:
+            pass
+        routing_density, routing_items = parse_routing_info(xml_path, scenario)
+        prelim_router_count = 0
+        try:
+            host_total_for_density = sum(role_counts.values())
+            if routing_density and routing_density>0 and host_total_for_density>0:
+                prelim_router_count = max(1, int(round(routing_density * host_total_for_density)))
+            for ri in routing_items:
+                abs_c = int(getattr(ri,'abs_count',0) or 0)
+                if abs_c>0:
+                    prelim_router_count = max(prelim_router_count, abs_c)
+        except Exception:
+            pass
+        service_plan = {s.name: (s.abs_count if s.abs_count>0 else int(round(s.density * (density_base or 0)))) for s in services_list}
+        vuln_density, vuln_items = parse_vulnerabilities_info(xml_path, scenario)
+        vplan: dict[str,int] = {}
+        try:
+            import math as _math
+            density_target = int(_math.floor((vuln_density or 0.0) * (density_base or 0) + 1e-9))
+        except Exception:
+            density_target = 0
+        for it in (vuln_items or []):
+            if (it.get('v_metric')=='Count'):
+                try: c=int(it.get('v_count') or 0)
+                except Exception: c=0
+                if c>0:
+                    name = it.get('selected') or 'Item'
+                    vplan[name]=vplan.get(name,0)+c
+        if density_target>0: vplan['__density_pool__']=density_target
+        seg_density, seg_items = parse_segmentation_info(xml_path, scenario)
+        seg_items_serial = [{"selected": (it.name or 'Random'), "factor": it.factor} for it in seg_items]
+        # build full preview (with optional seed)
+        try:
+            from core_topo_gen.planning.full_preview import build_full_preview
+        except ModuleNotFoundError:
+            _ensure_full_preview_module()
+            from core_topo_gen.planning.full_preview import build_full_preview
+        # Derive r2s policy (Exact etc.) for preview page as well
+        r2s_policy_plan = None
+        try:
+            first_r2s = next((ri for ri in routing_items if getattr(ri,'r2s_mode',None)), None)  # type: ignore
+            if first_r2s:
+                m2 = getattr(first_r2s, 'r2s_mode', '')
+                if m2 == 'Exact' and getattr(first_r2s, 'r2s_edges', 0) > 0:
+                    r2s_policy_plan = { 'mode': 'Exact', 'target_per_router': int(getattr(first_r2s,'r2s_edges',0)) }
+                elif m2:
+                    r2s_policy_plan = { 'mode': m2 }
+        except Exception:
+            pass
+        full_prev = build_full_preview(
+            role_counts=role_counts,
+            routers_planned=prelim_router_count,
+            services_plan=service_plan,
+            vulnerabilities_plan=vplan,
+            r2r_policy=None,
+            r2s_policy=r2s_policy_plan,
+            routing_items=routing_items,  # pass through for auto-derive
+            routing_plan={},
+            segmentation_density=seg_density,
+            segmentation_items=seg_items_serial,
+            seed=seed,
+            ip4_prefix='10.0.0.0/24',
+        )
+        # Attempt scenario name
+        scenario_name = None
+        try:
+            names_for_cli = _scenario_names_from_xml(xml_path)
+            if names_for_cli: scenario_name = names_for_cli[0]
+        except Exception: pass
+        # Provide JSON string for embedding (stringify smaller subset for safety)
+        import json as _json
+        preview_json_str = _json.dumps(full_prev, indent=2)
+        return render_template('full_preview.html', full_preview=full_prev, preview_json=preview_json_str, xml_path=xml_path, scenario=scenario_name, seed=full_prev.get('seed'))
+    except Exception as e:
+        app.logger.exception('[plan.full_preview_page] error: %s', e)
+        flash(f'Full preview page error: {e}')
+        return redirect(url_for('index'))
+
+def _plan_summary_from_full_preview(full_prev: dict) -> dict:
+    try:
+        role_counts = full_prev.get('role_counts') or {}
+    except Exception:
+        role_counts = {}
+    hosts_total = len(full_prev.get('hosts') or [])
+    routers_planned = len(full_prev.get('routers') or [])
+    switches = full_prev.get('switches_detail') or []
+    services_plan = full_prev.get('services_plan') or full_prev.get('services_preview') or {}
+    vuln_plan = full_prev.get('vulnerabilities_plan') or full_prev.get('vulnerabilities_preview') or {}
+    r2r_policy = full_prev.get('r2r_policy_preview') or {}
+    r2s_policy = full_prev.get('r2s_policy_preview') or {}
+    summary = {
+        'hosts_total': hosts_total,
+        'routers_planned': routers_planned,
+        'hosts_allocated': 0,
+        'routers_allocated': 0,
+        'role_counts': role_counts,
+        'services_plan': services_plan,
+        'services_assigned': {},
+        'vulnerabilities_plan': vuln_plan,
+        'vulnerabilities_assigned': 0,
+        'r2r_policy': r2r_policy,
+        'r2s_policy': r2s_policy,
+        'switches_allocated': len(switches),
+        'notes': ['generated_from_full_preview'],
+        'full_preview_seed': full_prev.get('seed'),
+    }
+    return summary
+
+@app.route('/api/plan/approve_full_preview', methods=['POST'])
+def api_plan_approve_full_preview():
+    """Persist a full preview JSON as an approved plan (without invoking CORE).
+
+    Request JSON: { xml_path: str, full_preview: {...} }
+    Response: { ok, plan_path, approved_path, plan_summary }
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        xml_path = payload.get('xml_path')
+        full_prev = payload.get('full_preview') or {}
+        if not xml_path or not full_prev:
+            return jsonify({'ok': False, 'error': 'xml_path or full_preview missing'}), 400
+        xml_path = os.path.abspath(xml_path)
+        if not os.path.exists(xml_path):
+            return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
+        plan_dir = os.path.join(_outputs_dir(), 'plans')
+        approved_dir = os.path.join(plan_dir, 'approved')
+        os.makedirs(plan_dir, exist_ok=True)
+        os.makedirs(approved_dir, exist_ok=True)
+        import time, json as _json
+        ts = int(time.time())
+        seed = full_prev.get('seed') or 'na'
+        plan_filename = f'plan_from_preview_{seed}_{ts}.json'
+        plan_path = os.path.join(plan_dir, plan_filename)
+        approved_path = os.path.join(approved_dir, plan_filename)
+        plan_summary = _plan_summary_from_full_preview(full_prev)
+        plan_obj = { 'plan': plan_summary, 'full_preview': full_prev }
+        try:
+            with open(plan_path, 'w', encoding='utf-8') as pf:
+                _json.dump(plan_obj, pf, indent=2, sort_keys=True)
+            # Copy to approved directly
+            import shutil
+            shutil.copy(plan_path, approved_path)
+        except Exception as e_write:
+            return jsonify({'ok': False, 'error': f'write_failed: {e_write}'}), 500
+        # Run history entry
+        try:
+            _append_run_history({
+                'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+                'mode': 'preview-approved',
+                'xml_path': xml_path,
+                'plan_path': approved_path,
+                'seed': seed,
+                'scenario_names': None,
+            })
+        except Exception as e_hist:
+            app.logger.warning('[preview-approved] history append failed: %s', e_hist)
+        return jsonify({'ok': True, 'plan_path': plan_path, 'approved_path': approved_path, 'plan_summary': plan_summary})
+    except Exception as e:
+        app.logger.exception('[plan.approve_full_preview] error: %s', e)
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/plan/approve', methods=['POST'])
+def api_plan_approve():
+    """Mark a previously generated plan as approved.
+
+    Request JSON: { plan_path: "/abs/path/plan_x.json", xml_path: "/abs/path/scenarios.xml" }
+    Returns JSON with approved_path (copied) so the original ephemeral path can be discarded later.
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        plan_path = payload.get('plan_path') or request.form.get('plan_path')
+        xml_path = payload.get('xml_path') or request.form.get('xml_path')
+        if not plan_path:
+            return jsonify({ 'ok': False, 'error': 'plan_path missing' }), 400
+        plan_path = os.path.abspath(plan_path)
+        if not os.path.exists(plan_path):
+            return jsonify({ 'ok': False, 'error': f'Plan file not found: {plan_path}' }), 404
+        # Security: ensure inside outputs/plans
+        base_plans = os.path.join(_outputs_dir(), 'plans')
+        if not plan_path.startswith(os.path.abspath(base_plans)):
+            return jsonify({ 'ok': False, 'error': 'Refusing to approve plan outside outputs/plans' }), 400
+        approved_dir = os.path.join(base_plans, 'approved')
+        os.makedirs(approved_dir, exist_ok=True)
+        import shutil, json as _json
+        # Derive new filename (retain original timestamp if present)
+        p_name = os.path.basename(plan_path)
+        approved_path = os.path.join(approved_dir, p_name)
+        shutil.copy(plan_path, approved_path)
+        plan_obj = None
+        try:
+            with open(approved_path, 'r', encoding='utf-8') as pf:
+                plan_obj = _json.load(pf)
+        except Exception:
+            plan_obj = None
+        # Merge optional full_preview provided by client (if user generated a richer full preview before approval)
+        try:
+            if isinstance(plan_obj, dict) and 'full_preview' not in plan_obj:
+                fp_client = payload.get('full_preview')
+                if fp_client:
+                    plan_obj['full_preview'] = fp_client
+                    with open(approved_path, 'w', encoding='utf-8') as pfw:
+                        _json.dump(plan_obj, pfw, indent=2, sort_keys=True)
+        except Exception as e_merge:
+            app.logger.warning('[plan.approve] failed merging full_preview: %s', e_merge)
+        _append_run_history({
+            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+            'mode': 'plan-approved',
+            'xml_path': os.path.abspath(xml_path) if xml_path else None,
+            'plan_path': approved_path,
+            'plan_preview_path': plan_path,
+            'plan_summary': plan_obj.get('plan') if isinstance(plan_obj, dict) else None,
+        })
+        return jsonify({ 'ok': True, 'approved_path': approved_path, 'plan': (plan_obj.get('plan') if isinstance(plan_obj, dict) else None) })
+    except Exception as e:
+        app.logger.exception('[plan.approve] error: %s', e)
+        return jsonify({ 'ok': False, 'error': str(e) }), 500
+
+
+@app.route('/run_with_plan', methods=['POST'])
+def run_with_plan():
+    """Execute a build using an approved plan JSON (phased builder) and provided scenario XML.
+
+    Form fields: xml_path, plan_path, strict_plan (optional 'on')
+    Returns HTML similar to run_cli route (index.html with logs and preview/report info).
+    """
+    xml_path = request.form.get('xml_path')
+    plan_path = request.form.get('plan_path')
+    strict_plan = bool(request.form.get('strict_plan'))
+    if not xml_path or not plan_path:
+        flash('xml_path or plan_path missing')
+        return redirect(url_for('index'))
+    xml_path = os.path.abspath(xml_path)
+    plan_path = os.path.abspath(plan_path)
+    if not os.path.exists(xml_path):
+        flash(f'XML path not found: {xml_path}')
+        return redirect(url_for('index'))
+    if not os.path.exists(plan_path):
+        flash(f'Plan path not found: {plan_path}')
+        return redirect(url_for('index'))
+    # Derive CORE host/port from XML if present
+    core_host = '127.0.0.1'
+    core_port = 50051
+    try:
+        payload = _parse_scenarios_xml(xml_path)
+        ch = payload.get('core', {}).get('host') if isinstance(payload.get('core'), dict) else None
+        cp = payload.get('core', {}).get('port') if isinstance(payload.get('core'), dict) else None
+        if ch: core_host = str(ch)
+        if cp: core_port = int(cp)
+    except Exception:
+        pass
+    # Pre-save existing CORE session (best effort)
+    pre_saved = None
+    try:
+        pre_dir = os.path.join(os.path.dirname(xml_path) or _outputs_dir(), 'core-pre')
+        pre_saved = _grpc_save_current_session_xml(core_host, core_port, pre_dir)
+    except Exception:
+        pre_saved = None
+    repo_root = _get_repo_root()
+    py_exec = _select_python_interpreter()
+    scenario_name = None
+    try:
+        names_for_cli = _scenario_names_from_xml(xml_path)
+        if names_for_cli:
+            scenario_name = names_for_cli[0]
+    except Exception:
+        scenario_name = None
+    args = [py_exec, '-m', 'core_topo_gen.cli', '--xml', xml_path, '--use-plan', plan_path, '--host', core_host, '--port', str(core_port), '--verbose']
+    if scenario_name:
+        args.extend(['--scenario', scenario_name])
+    if strict_plan:
+        args.append('--strict-plan')
+    app.logger.info('[plan.run] Running build with plan: %s', ' '.join(args))
+    proc = subprocess.run(args, cwd=repo_root, check=False, capture_output=True, text=True)
+    logs = (proc.stdout or '') + ('\n' + proc.stderr if proc.stderr else '')
+    report_md = _extract_report_path_from_text(logs) or _find_latest_report_path()
+    if report_md and os.path.exists(report_md):
+        flash('Plan build completed. Report ready.')
+    else:
+        if proc.returncode == 0:
+            flash('Plan build completed (no report found).')
+        else:
+            flash('Plan build finished with errors.')
+    session_id = _extract_session_id_from_text(logs)
+    post_saved = None
+    try:
+        post_dir = os.path.join(os.path.dirname(xml_path), 'core-post')
+        post_saved = _grpc_save_current_session_xml(core_host, core_port, post_dir, session_id=session_id)
+    except Exception:
+        post_saved = None
+    # Run history entry
+    try:
+        _append_run_history({
+            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
+            'mode': 'plan-build',
+            'xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
+            'scenario_xml_path': xml_path,
+            'plan_path': plan_path,
+            'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
+            'pre_xml_path': pre_saved,
+            'post_xml_path': post_saved,
+            'strict_plan': strict_plan,
+            'returncode': proc.returncode,
+            'scenario_names': [scenario_name] if scenario_name else None,
+        })
+    except Exception as e_hist:
+        app.logger.warning('[plan.run] failed appending run history: %s', e_hist)
+    # Prepare payload for template reuse
+    xml_text = ''
+    try:
+        with open(xml_path, 'r', encoding='utf-8', errors='ignore') as f:
+            xml_text = f.read()
+    except Exception:
+        pass
+    payload = _parse_scenarios_xml(xml_path)
+    if 'core' not in payload:
+        payload['core'] = _default_core_dict()
+    payload['result_path'] = report_md if (report_md and os.path.exists(report_md)) else xml_path
+    run_success = (proc.returncode == 0)
+    return render_template('index.html', payload=payload, logs=logs, xml_preview=xml_text, run_success=run_success)
+
+@app.route('/run_with_full_preview', methods=['POST'])
+def run_with_full_preview():
+    """Experimental: build a CORE scenario guided by an approved plan's embedded full_preview.
+
+    This ensures that randomness (seed-resolved) for roles/IP/subnet grouping matches the preview by:
+      - Re-using the plan file via --use-plan (phased builder) for counts and policies
+      - Passing the original seed; builder will still allocate fresh addresses but drift is measured
+    Future optimization could inject explicit subnet/group assignments once builders accept overrides.
+    """
+    xml_path = request.form.get('xml_path')
+    plan_path = request.form.get('plan_path')
+    strict_plan = bool(request.form.get('strict_plan'))
+    if not xml_path or not plan_path:
+        flash('xml_path or plan_path missing (full preview run)')
+        return redirect(url_for('index'))
+    xml_path = os.path.abspath(xml_path)
+    plan_path = os.path.abspath(plan_path)
+    if not os.path.exists(xml_path):
+        flash(f'XML path not found: {xml_path}')
+        return redirect(url_for('index'))
+    if not os.path.exists(plan_path):
+        flash(f'Plan path not found: {plan_path}')
+        return redirect(url_for('index'))
+    # Inspect plan for full_preview seed
+    fp_seed = None
+    full_preview_present = False
+    try:
+        import json as _json
+        with open(plan_path,'r',encoding='utf-8') as f:
+            pobj = _json.load(f)
+        if isinstance(pobj, dict):
+            fp = pobj.get('full_preview') or (pobj.get('plan') and pobj.get('plan').get('full_preview'))
+            if fp and isinstance(fp, dict):
+                fp_seed = fp.get('seed')
+                full_preview_present = True
+    except Exception:
+        fp_seed = None
+    repo_root = _get_repo_root()
+    py_exec = _select_python_interpreter()
+    scenario_name = None
+    try:
+        names_for_cli = _scenario_names_from_xml(xml_path)
+        if names_for_cli:
+            scenario_name = names_for_cli[0]
+    except Exception:
+        scenario_name = None
+    args = [py_exec, '-m', 'core_topo_gen.cli', '--xml', xml_path, '--use-plan', plan_path, '--host', '127.0.0.1', '--port', '50051', '--verbose']
+    if scenario_name:
+        args.extend(['--scenario', scenario_name])
+    if strict_plan:
+        args.append('--strict-plan')
+    if full_preview_present and fp_seed is not None:
+        args.extend(['--seed', str(fp_seed)])
+    else:
+        flash('Full preview seed not found in plan; falling back to plan-only build')
+    app.logger.info('[plan.run_full_preview] Running build with full preview seed: %s', ' '.join(args))
+    proc = subprocess.run(args, cwd=repo_root, check=False, capture_output=True, text=True)
+    logs = (proc.stdout or '') + ('\n' + proc.stderr if proc.stderr else '')
+    report_md = _extract_report_path_from_text(logs) or _find_latest_report_path()
+    if report_md and os.path.exists(report_md):
+        flash('Full preview guided build completed.')
+    else:
+        flash('Full preview build finished (report status unknown).')
+    xml_text = ''
+    try:
+        with open(xml_path,'r',encoding='utf-8',errors='ignore') as xf:
+            xml_text = xf.read()
+    except Exception:
+        pass
+    payload = _parse_scenarios_xml(xml_path)
+    if 'core' not in payload:
+        payload['core'] = _default_core_dict()
+    payload['result_path'] = report_md if (report_md and os.path.exists(report_md)) else xml_path
+    run_success = (proc.returncode == 0)
+    return render_template('index.html', payload=payload, logs=logs, xml_preview=xml_text, run_success=run_success)
+
 @app.route('/download_report')
 def download_report():
     result_path = request.args.get('path')
@@ -2412,7 +3017,24 @@ def reports_delete():
 
 @app.route('/run_cli_async', methods=['POST'])
 def run_cli_async():
-    xml_path = request.form.get('xml_path')
+    seed = None
+    xml_path = None
+    # Prefer form fields (existing UI) but fall back to JSON
+    if request.form:
+        xml_path = request.form.get('xml_path')
+        raw_seed = request.form.get('seed')
+        if raw_seed:
+            try: seed = int(raw_seed)
+            except Exception: seed = None
+    if not xml_path:
+        try:
+            j = request.get_json(silent=True) or {}
+            xml_path = j.get('xml_path')
+            if 'seed' in j:
+                try: seed = int(j.get('seed'))
+                except Exception: seed = None
+        except Exception:
+            pass
     if not xml_path:
         return jsonify({"error": "XML path missing. Save XML first."}), 400
     xml_path = os.path.abspath(xml_path)
@@ -2463,6 +3085,8 @@ def run_cli_async():
     # Determine active scenario name and pass to CLI
     active_scenario_name = scen_names[0] if (scen_names and len(scen_names) > 0) else None
     args = [py_exec, '-u', '-m', 'core_topo_gen.cli', '--xml', xml_path, '--host', core_host, '--port', str(core_port), '--verbose']
+    if seed is not None:
+        args.extend(['--seed', str(seed)])
     if active_scenario_name:
         args.extend(['--scenario', active_scenario_name])
     proc = subprocess.Popen(args, cwd=repo_root, stdout=log_f, stderr=subprocess.STDOUT, env=env)
@@ -2802,6 +3426,29 @@ def _list_active_core_sessions(host: str, port: int) -> list[dict]:
                     state = getattr(getattr(s, 'state', None), 'name', None) or getattr(s, 'state', None)
                     file_path = getattr(s, 'file', None)
                     sess_dir = getattr(s, 'dir', None)
+                    # Fallback: attempt lookup from stored mapping if file_path not provided by gRPC
+                    if (not file_path) and sid is not None:
+                        try:
+                            store_map = _load_core_sessions_store()
+                            # reverse lookup: session id -> first path
+                            for pth, stored_sid in store_map.items():
+                                try:
+                                    if int(stored_sid) == int(sid):
+                                        file_path = pth
+                                        break
+                                except Exception:
+                                    continue
+                        except Exception:
+                            pass
+                    # Second fallback: scan session directory for xml
+                    if (not file_path) and sess_dir and os.path.isdir(sess_dir):
+                        try:
+                            for fn in os.listdir(sess_dir):
+                                if fn.lower().endswith('.xml'):
+                                    file_path = os.path.join(sess_dir, fn)
+                                    break
+                        except Exception:
+                            pass
                     # Prefer provided nodes count; if missing or zero, attempt to derive via gRPC
                     nodes_count = getattr(s, 'nodes', None)
                     if nodes_count is None or (isinstance(nodes_count, int) and nodes_count == 0):
@@ -3142,6 +3789,8 @@ def core_details():
     xml_summary = None
     xml_valid = False
     errors = ''
+    classification = None  # 'scenario' | 'session' | 'unknown'
+    container_flag = False
     # If no XML path given but we have a session id, attempt to export the session XML so we can show details
     if (not xml_path or not os.path.exists(xml_path)) and sid:
         try:
@@ -3153,10 +3802,49 @@ def core_details():
         except Exception:
             pass
     if xml_path and os.path.exists(xml_path):
-        ok, errs = _validate_core_xml(xml_path)
-        xml_valid = bool(ok)
-        errors = errs if not ok else ''
-        xml_summary = _analyze_core_xml(xml_path) if ok else None
+        try:
+            # Lightweight classification: scenario XML should have <Scenarios>, session XML will have <session> and possibly <container>
+            import xml.etree.ElementTree as _ET
+            with open(xml_path, 'rb') as f:
+                data_head = f.read(4096)
+            try:
+                root = _ET.fromstring(data_head + b"</dummy>")
+            except Exception:
+                try:
+                    tree = _ET.parse(xml_path)
+                    root = tree.getroot()
+                except Exception:
+                    root = None
+            if root is not None:
+                tag_lower = root.tag.lower()
+                if 'scenarios' in tag_lower:
+                    classification = 'scenario'
+                elif 'session' in tag_lower:
+                    classification = 'session'
+                else:
+                    classification = 'unknown'
+                if root.find('.//container') is not None:
+                    container_flag = True
+                    if classification != 'scenario':
+                        classification = 'session'
+            if not sid and classification == 'session':
+                errors = 'Provided XML appears to be a CORE session export (contains <container> or <session> root); scenario tools may not apply.'
+            ok, errs = _validate_core_xml(xml_path)
+            xml_valid = bool(ok)
+            if not xml_valid and errs and not errors:
+                errors = errs
+            # Always attempt analysis so graph can render even for invalid/session XML; mark summary with invalid flag
+            try:
+                xml_summary = _analyze_core_xml(xml_path)
+                if xml_summary is None:
+                    xml_summary = {}
+                if not xml_valid:
+                    xml_summary['__invalid'] = True
+            except Exception:
+                # On total failure keep prior xml_summary (None)
+                xml_summary = xml_summary or None
+        except Exception as _e:
+            errors = errors or f'XML inspection failed: {_e}'
     session_info = None
     if sid:
         try:
@@ -3169,7 +3857,69 @@ def core_details():
                     break
         except Exception:
             session_info = None
-    return render_template('core_details.html', xml_path=xml_path, valid=xml_valid, errors=errors, summary=xml_summary, session=session_info)
+    try:
+        if xml_summary is not None:
+            app.logger.debug(
+                "[core_details] xml_path=%s classification=%s valid=%s nodes=%s switch_nodes=%s links_detail=%s",
+                xml_path, classification, xml_valid,
+                len(xml_summary.get('nodes') or []),
+                len(xml_summary.get('switch_nodes') or []),
+                len(xml_summary.get('links_detail') or [])
+            )
+        else:
+            app.logger.debug(
+                "[core_details] xml_path=%s classification=%s valid=%s (no summary)",
+                xml_path, classification, xml_valid
+            )
+    except Exception:
+        pass
+    # Plan approval removed; render without approved plan context
+    return render_template('core_details.html', xml_path=xml_path, valid=xml_valid, errors=errors, summary=xml_summary, session=session_info, classification=classification, container_flag=container_flag)
+
+
+@app.route('/admin/cleanup_pycore', methods=['POST'])
+def admin_cleanup_pycore():
+    """Remove stale /tmp/pycore.* directories not associated with active sessions.
+
+    Returns JSON summary: {removed: [...], kept: [...]}"""
+    try:
+        active_ids = set()
+        try:
+            sessions = _list_active_core_sessions(CORE_HOST, CORE_PORT)
+            for s in sessions:
+                try:
+                    active_ids.add(int(s.get('id')))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        removed = []
+        kept = []
+        for p in Path('/tmp').glob('pycore.*'):
+            try:
+                sid = int(p.name.split('.')[-1])
+            except Exception:
+                kept.append(str(p))
+                continue
+            if sid in active_ids:
+                kept.append(str(p))
+                continue
+            # Only remove if directory exists and not recently modified (older than 30s) to avoid race with creation
+            try:
+                age = time.time() - p.stat().st_mtime
+            except Exception:
+                age = 999
+            if age < 30:
+                kept.append(str(p))
+                continue
+            try:
+                shutil.rmtree(p)
+                removed.append(str(p))
+            except Exception:
+                kept.append(str(p))
+        return jsonify({'ok': True, 'removed': removed, 'kept': kept, 'active_session_ids': sorted(active_ids)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
 
 
 @app.route('/core/save_xml', methods=['POST'])

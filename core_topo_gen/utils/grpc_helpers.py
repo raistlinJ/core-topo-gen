@@ -3,6 +3,8 @@ import logging
 import re
 from typing import Any, Optional
 import time
+import os
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +73,21 @@ def safe_create_session(core: Any, max_attempts: int = 5) -> Any:
     while attempts < max_attempts:
         attempts += 1
         try:
-            return _call_create_session(core, next_try)
+            sess = _call_create_session(core, next_try)
+            # Validate that the underlying /tmp/pycore.<id> directory is unique / not pre-existing leftover.
+            try:
+                sid = getattr(sess, 'id', None) or getattr(sess, 'session_id', None)
+                if sid is not None:
+                    p = Path(f"/tmp/pycore.{sid}")
+                    # If directory already exists (stale), pick next id and retry after slight delay.
+                    if p.exists() and len(list(p.glob('*'))) > 0 and attempts < max_attempts:
+                        logger.info("Detected pre-existing non-empty %s; retrying with next id", p)
+                        next_try = int(sid) + 1
+                        time.sleep(0.2)
+                        continue
+            except Exception:
+                pass
+            return sess
         except BaseException as e:  # noqa: BLE001
             last_err = e
             # Detect pycore.N collision and choose a higher id

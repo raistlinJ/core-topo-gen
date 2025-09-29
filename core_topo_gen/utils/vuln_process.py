@@ -466,13 +466,32 @@ def assign_compose_to_nodes(node_names: List[str], density: float, items_cfg: Li
 		if sel == 'Type/Vector':
 			v_type = (it.get('v_type') or 'docker-compose').strip()
 			v_vec = (it.get('v_vector') or 'Random').strip()
-			pool = _eligible_compose_items(catalog, v_type, v_vec, out_base=out_base) if require_pulled else _eligible_compose_items(catalog, v_type, v_vec, out_base=out_base)
+			if require_pulled:
+				pool = _eligible_compose_items(catalog, v_type, v_vec, out_base=out_base)
+			else:
+				# lenient filter (no file/image checks)
+				vt = _norm_type(v_type)
+				vv = v_vec.strip().lower()
+				for r in catalog:
+					if _norm_type(r.get('Type') or '') != 'docker-compose':
+						continue
+					if vt and vt != 'random' and _norm_type(r.get('Type') or '') != vt:
+						continue
+					if vv and vv != 'random' and (r.get('Vector') or '').strip().lower() != vv:
+						continue
+					pool.append(r)
 		elif sel == 'Specific':
 			# Specific without count behaves like Type/Vector random
-			pool = _eligible_compose_items(catalog, 'docker-compose', 'Random', out_base=out_base) if require_pulled else _eligible_compose_items(catalog, 'docker-compose', 'Random', out_base=out_base)
+			if require_pulled:
+				pool = _eligible_compose_items(catalog, 'docker-compose', 'Random', out_base=out_base)
+			else:
+				pool = [r for r in catalog if _norm_type(r.get('Type') or '') == 'docker-compose']
 		else:
 			# Default: any docker-compose
-			pool = _eligible_compose_items(catalog, 'docker-compose', 'Random', out_base=out_base) if require_pulled else _eligible_compose_items(catalog, 'docker-compose', 'Random', out_base=out_base)
+			if require_pulled:
+				pool = _eligible_compose_items(catalog, 'docker-compose', 'Random', out_base=out_base)
+			else:
+				pool = [r for r in catalog if _norm_type(r.get('Type') or '') == 'docker-compose']
 		if not pool:
 			continue
 		take_nodes = pop_nodes(cnt)

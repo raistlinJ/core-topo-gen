@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Any
 import math
 import random
 import logging
@@ -41,90 +41,82 @@ def set_global_random_seed(seed: Optional[int]) -> None:
         except Exception:
             logger.debug("Failed applying random seed %s", seed)
 
+# --- Helper utilities (restored) ---
 
-def _router_node_type() -> NodeType:
-    return getattr(NodeType, "ROUTER", NodeType.DEFAULT)
-
-
-def _type_desc(t: object) -> str:
-    """Return a readable description of a NodeType-like enum, e.g., DOCKER(5)."""
+def _type_desc(t: NodeType) -> str:
     try:
-        name = getattr(t, "name", None)
-        val = getattr(t, "value", None)
-        if name is not None and val is not None:
-            return f"{name}({val})"
-        if name is not None:
-            return str(name)
+        return getattr(t, 'name', str(t))
     except Exception:
-        pass
-    try:
-        # try int() if possible
-        ival = int(t)  # type: ignore
-        return f"{t}({ival})"
-    except Exception:
-        pass
-    try:
         return str(t)
-    except Exception:
-        return repr(t)
 
+def _make_safe_link_tracker():
+    existing: Set[Tuple[int, int]] = set()
+    def safe_add(session_obj, a_obj, b_obj, iface1=None, iface2=None):
+        try:
+            a_id = getattr(a_obj, 'id', a_obj)
+            b_id = getattr(b_obj, 'id', b_obj)
+        except Exception:
+            a_id, b_id = a_obj, b_obj
+        key = (min(a_id, b_id), max(a_id, b_id))
+        if key in existing:
+            return False
+        try:
+            session_obj.add_link(a_obj, b_obj, iface1=iface1, iface2=iface2)
+            existing.add(key)
+            return True
+        except Exception:
+            return False
+    return existing, safe_add
 
-def _apply_docker_compose_meta(node: object, rec: Optional[Dict[str, str]]) -> None:
-    """Best-effort: set compose and compose_name on a DOCKER node.
-
-    This aligns with per-node compose files created under /tmp/vulns by
-    utils.vuln_process.prepare_compose_for_assignments: docker-compose-<node>.yml
-
-    Attempts multiple attribute locations to be compatible with different CORE
-    wrapper versions:
-      - node.compose / node.compose_name
-      - node.options.compose / node.options.compose_name
-    """
+def _apply_docker_compose_meta(node, rec):
+    """Attach docker compose metadata if available (best-effort, non-fatal)."""
     try:
         if not node:
             return
-        n = getattr(node, "name", None)
+        n = getattr(node, 'name', None)
         if not n:
             return
         compose_path = f"/tmp/vulns/docker-compose-{n}.yml"
         vname = None
         try:
             if rec:
-                vname = rec.get("Name") or rec.get("name") or rec.get("Title") or rec.get("title")
+                vname = rec.get('Name') or rec.get('name') or rec.get('Title') or rec.get('title')
         except Exception:
             vname = None
-        # direct attributes on node
         try:
-            setattr(node, "compose", compose_path)
+            setattr(node, 'compose', compose_path)
         except Exception:
             pass
+        if vname:
+            try:
+                setattr(node, 'compose_name', str(vname))
+            except Exception:
+                pass
         try:
-            if vname:
-                setattr(node, "compose_name", str(vname))
-        except Exception:
-            pass
-        # attempt to set via options object when available
-        try:
-            options = getattr(node, "options", None)
+            options = getattr(node, 'options', None)
             if options is not None:
                 try:
-                    setattr(options, "compose", compose_path)
+                    setattr(options, 'compose', compose_path)
                 except Exception:
                     pass
-                try:
-                    if vname:
-                        setattr(options, "compose_name", str(vname))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            logger.info("Set docker compose metadata for node %s: compose=%s compose_name=%s", n, compose_path, vname or "")
+                if vname:
+                    try:
+                        setattr(options, 'compose_name', str(vname))
+                    except Exception:
+                        pass
         except Exception:
             pass
     except Exception:
-        # never fail topology build due to metadata assignment
-        logger.debug("Failed to set docker compose meta for node %s", getattr(node, "name", None))
+        logger.debug('Failed to set docker compose metadata for node %s', getattr(node, 'name', None))
+
+def _router_node_type():
+    """Return router-capable node type (prefer DOCKER if available for richer services)."""
+    try:
+        if hasattr(NodeType, 'ROUTER'):
+            return getattr(NodeType, 'ROUTER')
+    except Exception:
+        pass
+    return NodeType.DEFAULT
 
 
 def build_star_from_roles(core: client.CoreGrpcClient,
@@ -140,6 +132,9 @@ def build_star_from_roles(core: client.CoreGrpcClient,
     session = safe_create_session(core)
 
     cx, cy = 500, 400
+    # Track every (node_a,node_b) link (unordered) we successfully create in this topology builder
+    # to avoid accidental duplicate link attempts that can trigger interface rename collisions in CORE.
+    existing_links, safe_add_link = _make_safe_link_tracker()
     logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", 1, "switch", _type_desc(NodeType.SWITCH), cx, cy)
     switch = session.add_node(1, _type=NodeType.SWITCH, position=Position(x=cx, y=cy))
     try:
@@ -232,7 +227,7 @@ def build_star_from_roles(core: client.CoreGrpcClient,
             node_infos.append(NodeInfo(node_id=node.id, ip4=f"{host_ip}/{host_mask}", role=role))
             sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=mac_alloc.next_mac())
             sw_ifid += 1
-            session.add_link(node1=node, node2=switch, iface1=host_iface, iface2=sw_iface)
+            safe_add_link(session, node, switch, iface1=host_iface, iface2=sw_iface)
             logger.debug("Link host %s <-> switch (ifids: host=0, sw=%d)", node.id, sw_ifid-1)
             # Ensure default routing service on hosts
             try:
@@ -246,7 +241,7 @@ def build_star_from_roles(core: client.CoreGrpcClient,
             dev_next_ifid[node.id] = dev_ifid + 1
             sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=mac_alloc.next_mac())
             sw_ifid += 1
-            session.add_link(node1=node, node2=switch, iface1=dev_iface, iface2=sw_iface)
+            safe_add_link(session, node, switch, iface1=dev_iface, iface2=sw_iface)
             logger.debug("Link device %s <-> switch (dev ifid=%d, sw ifid=%d)", node.id, dev_ifid, sw_ifid-1)
 
     service_assignments: Dict[int, List[str]] = {}
@@ -322,6 +317,7 @@ def build_multi_switch_topology(core: client.CoreGrpcClient,
     mac_alloc = UniqueAllocator(ip4_prefix)
     subnet_alloc = make_subnet_allocator(ip_mode, ip4_prefix, ip_region)
     session = safe_create_session(core)
+    existing_links, safe_add_link = _make_safe_link_tracker()
 
     cx, cy = 800, 800
     logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", 1, "agg-sw", _type_desc(NodeType.SWITCH), cx, cy)
@@ -333,7 +329,11 @@ def build_multi_switch_topology(core: client.CoreGrpcClient,
     switch_ids: List[int] = [agg.id]
 
     total_hosts = sum(role_counts.values())
+    # Derive initial access switch count heuristically (1 per ~10 hosts) but never exceed host count.
     access_count = max(1, min(access_switches, max(1, total_hosts // 10)))
+    # Ensure we do not create more access switches than there are hosts; each switch should have >=1 host.
+    if total_hosts > 0 and access_count > total_hosts:
+        access_count = total_hosts
     radius = 380 if layout_density == "compact" else (700 if layout_density == "spacious" else 500)
     # create access switches around aggregation
     # maintain interface id counters per-switch and for aggregation switch
@@ -351,7 +351,7 @@ def build_multi_switch_topology(core: client.CoreGrpcClient,
             sw_if = Interface(id=0, name=f"sw{i+1}-agg", mac=None)
             agg_if = Interface(id=agg_ifid, name=f"agg-sw-{i+1}", mac=None)
             agg_ifid += 1
-            session.add_link(node1=sw, node2=agg, iface1=sw_if, iface2=agg_if)
+            safe_add_link(session, sw, agg, iface1=sw_if, iface2=agg_if)
         except Exception:
             # fallback: attempt link without explicit ifaces
             session.add_link(node1=sw, node2=agg)
@@ -448,7 +448,7 @@ def build_multi_switch_topology(core: client.CoreGrpcClient,
             host_if = Interface(id=0, name="eth0", ip4=h_ip, ip4_mask=lan.prefixlen, mac=h_mac)
             sw_ifid[sw_node_id] += 1
             sw_if = Interface(id=sw_ifid[sw_node_id], name=f"sw{sw_node_id}-h{node.id}")
-            session.add_link(node1=node, node2=sw_node, iface1=host_if, iface2=sw_if)
+            safe_add_link(session, node, sw_node, iface1=host_if, iface2=sw_if)
             node_infos.append(NodeInfo(node_id=node.id, ip4=f"{h_ip}/{lan.prefixlen}", role=role))
             try:
                 ensure_service(session, node.id, "DefaultRoute", node_obj=node)
@@ -457,7 +457,7 @@ def build_multi_switch_topology(core: client.CoreGrpcClient,
         else:
             sw_ifid[sw_node_id] += 1
             sw_if = Interface(id=sw_ifid[sw_node_id], name=f"sw{sw_node_id}-d{node.id}")
-            session.add_link(node1=node, node2=sw_node, iface2=sw_if)
+            safe_add_link(session, node, sw_node, iface2=sw_if)
 
     if created_docker:
         logger.info("Docker nodes created in multi-switch topology: %d", created_docker)
@@ -597,11 +597,13 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                              ip_region: str = "all",
                              layout_density: str = "normal",
                              docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None,
-                             router_mesh_style: str = "full"):
+                             router_mesh_style: str = "full",
+                             approved_plan: Optional[Dict[str, Any]] = None):
     logger.info("Creating CORE session and building segmented topology with routers (randomized placement)")
     mac_alloc = UniqueAllocator(ip4_prefix)
     subnet_alloc = make_subnet_allocator(ip_mode, ip4_prefix, ip_region)
     session = safe_create_session(core)
+    existing_links, safe_add_link = _make_safe_link_tracker()
 
     total_hosts = sum(role_counts.values())
     # Density-derived routers use only the base host pool (exclude additive Count rows) as per updated semantics
@@ -612,35 +614,39 @@ def build_segmented_topology(core: client.CoreGrpcClient,
     except Exception:
         count_router_count = 0
 
-    # Determine density-based routers (weight-based) only if routing_density > 0
+    # Determine routers from routing_density. Backward compatibility: if routing_density > 1 treat value
+    # as an absolute desired router count (pre-existing tests used integers like 5). If 0 < routing_density <= 1,
+    # treat as fractional density of effective_base. Always additive with explicit abs_count rows (capped by hosts).
     density_router_count = 0
-    if routing_density and routing_density > 0 and effective_base > 0:
+    density_router_count_effective = 0
+    abs_density_component = 0
+    frac_density_component = 0
+    if routing_density and routing_density > 0 and effective_base >= 0:
         try:
             rd = float(routing_density)
         except Exception:
             rd = 0.0
-        # Clamp density strictly to [0,1] (no absolute-count interpretation)
-        d = max(0.0, min(1.0, rd))
-        desired = effective_base * d
-        # Use floor to avoid over-allocation (e.g., 0.5 * 10 -> 5 exactly; round() could drift with banker's rounding)
-        import math as _math
-        density_router_count = int(_math.floor(desired + 1e-9))
+        if rd > 1.0:  # absolute count interpretation
+            abs_density_component = int(rd)
+        else:
+            d = max(0.0, min(1.0, rd))
+            desired = effective_base * d
+            import math as _math
+            frac_density_component = int(_math.floor(desired + 1e-9))
+        density_router_count = abs_density_component + frac_density_component
+        # Cap density-derived portion to effective_base (can't exceed host pool for density dimension)
         density_router_count = max(0, min(effective_base, density_router_count))
+        density_router_count_effective = density_router_count
         try:
-            logger.debug("Router density computation: base=%s density=%.4f desired=%.4f allocated=%s", effective_base, d, desired, density_router_count)
+            logger.debug(
+                "Router density computation: base=%s rd=%.4f abs_part=%s frac_part=%s allocated=%s", 
+                effective_base, rd, abs_density_component, frac_density_component, density_router_count
+            )
         except Exception:
             pass
 
-    # Updated semantics (user expectation): If any explicit count-based routers are specified,
-    # they take precedence and density-derived routers are NOT added. Density is only used
-    # when there are zero count-based router rows.
-    if count_router_count > 0:
-        router_count = min(total_hosts, count_router_count)
-        # Since density contribution is ignored in this branch, neutralize density_router_count for stats clarity
-        density_router_count_effective = 0
-    else:
-        router_count = min(total_hosts, density_router_count)
-        density_router_count_effective = density_router_count
+    # Additive total (density-derived + explicit count-based) with final cap at total host count
+    router_count = min(total_hosts, density_router_count + count_router_count)
 
     # If no routers requested (no density, no counts) OR no hosts, fall back to simple star topology (no routers)
     if router_count <= 0 or total_hosts == 0:
@@ -693,7 +699,11 @@ def build_segmented_topology(core: client.CoreGrpcClient,
     router_nodes: Dict[int, object] = {}
     router_objs: List[object] = []
     host_nodes_by_id: Dict[int, object] = {}
+    # Track next interface id per host to avoid reusing id=0 during rehome (prevents 'interface(0) already exists')
+    host_next_ifid: Dict[int, int] = {}
     router_next_ifid: Dict[int, int] = {}
+    # Track router-facing interface names to guarantee uniqueness (avoid RTNETLINK rename collisions)
+    router_iface_names: Dict[int, Set[str]] = {}
 
     # place routers on a spacious grid for easier viewing
     r_positions = _grid_positions(router_count, cell_w=cell_w, cell_h=cell_h, jitter=50)
@@ -727,6 +737,8 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             setattr(node, "model", "router")
         except Exception:
             pass
+        # initialize iface name set for router
+        router_iface_names[node.id] = set()
         # Always include mandatory services first, then append user-defined extras
         merged_services = ["IPForward", "zebra"] + user_service_names
         set_node_services(session, node.id, merged_services, node_obj=node)
@@ -734,9 +746,37 @@ def build_segmented_topology(core: client.CoreGrpcClient,
         router_nodes[node.id] = node
         router_objs.append(node)
 
+    # --- New Edge Connectivity Semantics ---
     existing_router_links: Set[Tuple[int, int]] = set()
-    # Defer heavy redundancy until after policy selection; start with just a random spanning tree
-    def add_router_link(a_obj, b_obj, prefix=30):
+    # Helper: compute stats (min/max/avg/std/gini) for a list of ints
+    def _int_list_stats(values: List[int]):
+        out = {"min": 0, "max": 0, "avg": 0.0, "std": 0.0, "gini": 0.0}
+        if not values:
+            return out
+        import math as _math
+        v = list(values)
+        mn = min(v); mx = max(v); sm = sum(v); n = len(v)
+        avg = sm / n if n else 0.0
+        var = 0.0
+        if n > 1:
+            var = sum((x - avg) ** 2 for x in v) / (n - 1)
+        std = _math.sqrt(var) if var > 0 else 0.0
+        # Gini (safe) – if all zero, remains 0
+        gini = 0.0
+        if sm > 0 and n > 1:
+            v_sorted = sorted(v)
+            # Using: G = (2*sum(i*x_i))/(n*sum(x_i)) - (n+1)/n
+            cum = 0
+            for i, x in enumerate(v_sorted, start=1):
+                cum += i * x
+            gini = (2 * cum) / (n * sm) - (n + 1) / n
+            # Numerical guard
+            if gini < 0:
+                gini = 0.0
+        out.update({"min": mn, "max": mx, "avg": round(avg, 4), "std": round(std, 4), "gini": round(gini, 4)})
+        return out
+
+    def add_router_link(a_obj, b_obj, prefix=30, label=""):
         key = (min(a_obj.id, b_obj.id), max(a_obj.id, b_obj.id))
         if key in existing_router_links:
             return False
@@ -749,142 +789,298 @@ def build_segmented_topology(core: client.CoreGrpcClient,
         if len(rr_hosts) < 2:
             return False
         a_ip = str(rr_hosts[0]); b_ip = str(rr_hosts[1])
-        a_if = Interface(id=a_ifid, name=f"r{a_obj.id}-to-r{b_obj.id}", ip4=a_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
-        b_if = Interface(id=b_ifid, name=f"r{b_obj.id}-to-r{a_obj.id}", ip4=b_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
-        session.add_link(node1=a_obj, node2=b_obj, iface1=a_if, iface2=b_if)
+        tag = label or "to"
+        # Unique naming guard
+        def _uniq(router_id: int, base: str) -> str:
+            names = router_iface_names.setdefault(router_id, set())
+            if base not in names:
+                names.add(base)
+                return base
+            # append incremental suffix until unique
+            idx = 1
+            while True:
+                cand = f"{base}-{idx}"
+                if cand not in names:
+                    names.add(cand)
+                    return cand
+                idx += 1
+        a_name = _uniq(a_obj.id, f"r{a_obj.id}-{tag}-r{b_obj.id}")
+        b_name = _uniq(b_obj.id, f"r{b_obj.id}-{tag}-r{a_obj.id}")
+        a_if = Interface(id=a_ifid, name=a_name, ip4=a_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
+        b_if = Interface(id=b_ifid, name=b_name, ip4=b_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
+        # Use global existing_links guard in addition to existing_router_links for safety
+        key_all = (min(a_obj.id, b_obj.id), max(a_obj.id, b_obj.id))
+        if key_all not in existing_links:
+            safe_add_link(session, a_obj, b_obj, iface1=a_if, iface2=b_if)
         existing_router_links.add(key)
-        logger.debug("[init] router link r%d <-> r%d (/ %s)", a_obj.id, b_obj.id, rr_net.prefixlen)
         return True
-    if router_count > 1:
-        # Random spanning tree only (keep initial degree minimal ~1-2)
-        available = list(range(router_count))
-        random.shuffle(available)
-        in_tree = {available[0]}
-        remaining = set(available[1:])
-        while remaining:
-            a_idx = random.choice(list(in_tree))
-            b_idx = random.choice(list(remaining))
-            add_router_link(router_objs[a_idx], router_objs[b_idx], prefix=30)
-            in_tree.add(b_idx)
-            remaining.remove(b_idx)
-
-    # Edge planning (experimental): interpret edges_mode / edges across routing_items.
-    try:
-        if router_count > 1 and routing_items:
-            # Consolidate modes. If any Exact, average their edges >0. Else priority: Max > Min > Random.
-            exact_values = [ri.edges for ri in routing_items if getattr(ri, 'edges_mode', '') == 'Exact' and getattr(ri, 'edges', 0) > 0]
-            modes_present = {ri.edges_mode for ri in routing_items if getattr(ri, 'edges_mode', '')}
-            target_mode = ''
-            target_degree: Optional[int] = None
-            if exact_values:
-                avg = sum(exact_values) / len(exact_values)
-                target_degree = max(1, min(router_count - 1, int(round(avg))))
-                target_mode = 'Exact'
-            else:
-                for m in ['Max', 'Min', 'Random']:
-                    if m in modes_present:
-                        target_mode = m
-                        break
-            # Compute current degrees after spanning tree
-            degrees: Dict[int, int] = {r.id: 0 for r in router_objs}
-            for a_id, b_id in list(existing_router_links):
-                degrees[a_id] += 1
-                degrees[b_id] += 1
-            def add_link(a_obj, b_obj):
-                key = (min(a_obj.id, b_obj.id), max(a_obj.id, b_obj.id))
-                if key in existing_router_links:
-                    return False
-                a_ifid = router_next_ifid.get(a_obj.id, 0)
-                b_ifid = router_next_ifid.get(b_obj.id, 0)
-                router_next_ifid[a_obj.id] = a_ifid + 1
-                router_next_ifid[b_obj.id] = b_ifid + 1
-                rr_net = subnet_alloc.next_random_subnet(30)  # /30 for point-to-point to save address space
-                rr_hosts = list(rr_net.hosts())
-                if len(rr_hosts) < 2:
-                    return False
-                a_ip = str(rr_hosts[0]); b_ip = str(rr_hosts[1])
-                a_if = Interface(id=a_ifid, name=f"r{a_obj.id}-to-r{b_obj.id}", ip4=a_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
-                b_if = Interface(id=b_ifid, name=f"r{b_obj.id}-to-r{a_obj.id}", ip4=b_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
-                session.add_link(node1=a_obj, node2=b_obj, iface1=a_if, iface2=b_if)
-                existing_router_links.add(key)
-                degrees[a_obj.id] += 1; degrees[b_obj.id] += 1
-                logger.debug("[edges] added r%d <-> r%d (mode=%s)", a_obj.id, b_obj.id, target_mode or 'Auto')
-                return True
-            # Decide augmentation strategy
-            if target_mode == 'Exact' and target_degree is not None:
-                # Add links until every router degree >= target_degree (can't remove excess from random core graph)
-                # We iterate with a safeguard to avoid infinite loops.
-                attempts = 0
-                max_attempts = router_count * router_count * 4
-                while attempts < max_attempts and min(degrees.values()) < target_degree:
-                    # Pick router with lowest degree and one with second-lowest that's not already linked.
-                    sorted_ids = sorted(degrees.keys(), key=lambda rid: degrees[rid])
-                    a_id = sorted_ids[0]
-                    # choose partner not already linked and not same
-                    partner = None
-                    random.shuffle(sorted_ids)
-                    for cand in sorted_ids:
-                        if cand == a_id:
+    # Determine connectivity mode & target before creating links (allow deterministic injection)
+    connectivity_mode = 'Random'
+    target_degree: Optional[int] = None
+    injected_r2r = False
+    if approved_plan:
+        try:
+            fp = approved_plan.get('full_preview') or {}
+            pv_edges = fp.get('r2r_edges_preview') or []
+            if pv_edges:
+                valid = True
+                for a, b in pv_edges:
+                    if not (isinstance(a, int) and isinstance(b, int) and a != b and 1 <= a <= router_count and 1 <= b <= router_count):
+                        valid = False; break
+                if valid:
+                    for a, b in pv_edges:
+                        a_obj = router_nodes.get(a); b_obj = router_nodes.get(b)
+                        if not a_obj or not b_obj:
                             continue
-                        if (min(a_id, cand), max(a_id, cand)) not in existing_router_links:
-                            partner = cand; break
-                    if partner is None:
-                        break
-                    add_link(router_nodes[a_id], router_nodes[partner])
-                    attempts += 1
-            elif target_mode == 'Max':
-                # Grow toward dense mesh but stop when average degree hits threshold (e.g., ~ (n/2) ) or cap
-                cap_edges = min((router_count * (router_count - 1)) // 2, 1500)
-                desired_avg = min(router_count - 1, max(3, router_count // 2))
-                attempts = 0; max_attempts = cap_edges * 2
-                while attempts < max_attempts and len(existing_router_links) < cap_edges and (sum(degrees.values())/router_count) < desired_avg:
-                    a_obj, b_obj = random.sample(router_objs, 2)
-                    if add_link(a_obj, b_obj):
-                        attempts += 1
-            elif target_mode == 'Min':
-                # Ensure each router has degree >=2 (if possible)
-                if router_count > 2:
-                    attempts = 0; max_attempts = router_count * 8
-                    while attempts < max_attempts and min(degrees.values()) < 2:
-                        low = min(degrees, key=lambda rid: degrees[rid])
-                        # connect to random router with degree <2 or random other
-                        candidates = [rid for rid, deg in degrees.items() if rid != low and (deg < 2 or deg == max(degrees.values()))]
-                        random.shuffle(candidates)
-                        for cand in candidates:
-                            if (min(low, cand), max(low, cand)) not in existing_router_links:
-                                add_link(router_nodes[low], router_nodes[cand])
-                                break
-                        attempts += 1
+                        add_router_link(a_obj, b_obj, prefix=30, label="inj")
+                    injected_r2r = True
+                    connectivity_mode = 'Injected'
+                    logger.info("[legacy] injected %d R2R edges from approved full preview", len(pv_edges))
+        except Exception as _inj_e:
+            logger.warning("[legacy] failed injecting preview edges: %s", _inj_e)
+    if not injected_r2r and routing_items and router_count > 1:
+        exact_values = [ri.r2r_edges for ri in routing_items if ri.r2r_mode == 'Exact' and getattr(ri, 'r2r_edges', 0) > 0]
+        modes_present = [ri.r2r_mode for ri in routing_items if ri.r2r_mode]
+        if exact_values:
+            avg = sum(exact_values)/len(exact_values)
+            target_degree = max(1, min(router_count - 1, int(round(avg))))
+            connectivity_mode = 'Exact'
+        elif 'Uniform' in modes_present:
+            connectivity_mode = 'Uniform'
+        elif 'Max' in modes_present:
+            connectivity_mode = 'Max'
+        elif 'Min' in modes_present:
+            connectivity_mode = 'Min'
+        elif 'NonUniform' in modes_present:
+            connectivity_mode = 'NonUniform'
+        else:
+            connectivity_mode = 'Random'
+    # Build links according to connectivity_mode (unless injected already)
+    if router_count > 1 and injected_r2r:
+        pass
+    elif router_count > 1:
+        if connectivity_mode == 'Min':
+            # Chain topology: r1-r2-r3-...-rn
+            for i in range(router_count - 1):
+                add_router_link(router_objs[i], router_objs[i+1], prefix=30, label="chain")
+        elif connectivity_mode == 'Random':
+            # Random spanning tree only
+            order = list(range(router_count))
+            random.shuffle(order)
+            in_tree = {order[0]}; remaining = set(order[1:])
+            while remaining:
+                a_idx = random.choice(list(in_tree))
+                b_idx = random.choice(list(remaining))
+                add_router_link(router_objs[a_idx], router_objs[b_idx], prefix=30, label="tree")
+                in_tree.add(b_idx); remaining.remove(b_idx)
+        elif connectivity_mode == 'Uniform':
+            # Balanced (near-regular) degree construction.
+            # Heuristic target degree: bounded moderate value to avoid full mesh blow-up.
+            import math as _math
+            if router_count <= 2:
+                # trivial connect
+                add_router_link(router_objs[0], router_objs[1], prefix=30, label="u") if router_count == 2 else None
             else:
-                # Random mode: Very light augmentation only if any router still degree 1
-                attempts = 0; max_attempts = router_count * 2
-                while attempts < max_attempts and min(degrees.values()) < 2:
-                    a_obj, b_obj = random.sample(router_objs, 2)
-                    if add_link(a_obj, b_obj):
-                        attempts += 1
-                        degrees[a_obj.id] += 0  # degrees map already updated in add_link
-
-            # Stray safety: ensure no router degree is 0
-            for rid, deg in degrees.items():
-                if deg == 0:
-                    # connect to a random different router
-                    partner_list = [r for r in router_objs if r.id != rid]
-                    if partner_list:
-                        add_link(router_nodes[rid], random.choice(partner_list))
-            # Persist interim degree map for stats (will be updated again later after protocol assignment)
+                # Desired target degree: log2(n)+1 capped at 6 and n-1, minimum 2
+                td = min(router_count - 1, max(2, int(round(_math.log2(router_count))) + 1,))
+                # Additional safety cap: never exceed n/2 + 1 (soft cap)
+                td = min(td, max(2, (router_count // 2) + 1))
+                target_degree = td
+                # Start with ring (cycle) ensures degree 2 for all
+                for i in range(router_count):
+                    add_router_link(router_objs[i], router_objs[(i+1) % router_count], prefix=30, label="u-ring")
+                # Degree tracker
+                degrees: Dict[int, int] = {r.id: 0 for r in router_objs}
+                for a_id, b_id in list(existing_router_links):
+                    degrees[a_id] += 1; degrees[b_id] += 1
+                # Iteratively add edges between lowest-degree pairs until all reach td or no pairs remain
+                attempts = 0
+                max_attempts = router_count * router_count
+                while attempts < max_attempts:
+                    attempts += 1
+                    low_nodes = sorted(degrees.items(), key=lambda kv: kv[1])
+                    if not low_nodes:
+                        break
+                    if low_nodes[0][1] >= td:
+                        break  # all satisfied
+                    # Candidate a: lowest degree
+                    a_id = low_nodes[0][0]
+                    # Candidate b: among nodes with degree < td and not already linked
+                    candidates_b = [rid for rid, dval in low_nodes[1:] if dval < td and (min(rid, a_id), max(rid, a_id)) not in existing_router_links]
+                    if not candidates_b:
+                        # Optionally allow linking to a node with smallest degree gap if all others full
+                        candidates_b = [rid for rid, dval in low_nodes[1:] if (min(rid, a_id), max(rid, a_id)) not in existing_router_links]
+                    if not candidates_b:
+                        continue
+                    b_id = random.choice(candidates_b)
+                    a_obj = router_nodes.get(a_id); b_obj = router_nodes.get(b_id)
+                    if not a_obj or not b_obj:
+                        continue
+                    if add_router_link(a_obj, b_obj, prefix=30, label="u-bal"):
+                        degrees[a_id] += 1; degrees[b_id] += 1
+        elif connectivity_mode == 'NonUniform':
+            # Start with a random spanning tree (like Random) then add a random number of extra edges favoring hubs.
+            order = list(range(router_count))
+            random.shuffle(order)
+            in_tree = {order[0]}; remaining = set(order[1:])
+            while remaining:
+                a_idx = random.choice(list(in_tree))
+                b_idx = random.choice(list(remaining))
+                add_router_link(router_objs[a_idx], router_objs[b_idx], prefix=30, label="base")
+                in_tree.add(b_idx); remaining.remove(b_idx)
+            # Compute degrees
+            degrees: Dict[int, int] = {r.id: 0 for r in router_objs}
+            for a_id, b_id in existing_router_links:
+                degrees[a_id] += 1; degrees[b_id] += 1
+            # Decide extra edge budget: between ~ n/3 and ~ n (bounded by remaining possible pairs)
+            max_possible = (router_count * (router_count - 1) // 2) - len(existing_router_links)
+            extra_target = min(max_possible, max(0, random.randint(router_count//3, router_count)))
+            attempts = 0; max_attempts = router_count * router_count
+            # Prefer connecting lower-degree nodes to higher-degree nodes to create heterogeneity
+            router_id_list = [r.id for r in router_objs]
+            while extra_target > 0 and attempts < max_attempts:
+                attempts += 1
+                # pick one low-degree and one high-degree (if available)
+                sorted_ids = sorted(router_id_list, key=lambda rid: degrees[rid])
+                low_candidates = sorted_ids[: max(1, min(3, len(sorted_ids)))]
+                high_candidates = sorted_ids[-max(1, min(5, len(sorted_ids))):]
+                a_id = random.choice(low_candidates)
+                b_id = random.choice(high_candidates)
+                if a_id == b_id:
+                    continue
+                a_obj = router_nodes.get(a_id); b_obj = router_nodes.get(b_id)
+                if not a_obj or not b_obj:
+                    continue
+                if add_router_link(a_obj, b_obj, prefix=30, label="nu"):
+                    degrees[a_id] += 1; degrees[b_id] += 1; extra_target -= 1
+        elif connectivity_mode == 'Max':
+            # Full mesh (legacy 'Max' -> still supported for backward compatibility)
+            for i in range(router_count):
+                for j in range(i+1, router_count):
+                    add_router_link(router_objs[i], router_objs[j], prefix=30, label="mesh")
+        elif connectivity_mode == 'Exact':
+            # Build a k-regular simple graph (k = target_degree) if feasible.
+            # Previous approach (chain + random augment) produced degrees >= target (not exact) and
+            # forced interior nodes to exceed degree 1 when target_degree == 1. Replace with a
+            # configuration-model style pairing to honor exact target degree semantics.
+            def _build_regular_edges(n: int, k: int, max_tries: int = 2000) -> List[Tuple[int,int]]:
+                # Basic feasibility checks: k < n and n*k even (handshaking lemma)
+                if k < 0 or k >= n:
+                    return []
+                if (n * k) % 2 != 0:
+                    return []
+                if k == 0:
+                    return []
+                # Fast path k == 1: random perfect matching (may leave one node unmatched if n odd)
+                import random as _r
+                if k == 1:
+                    nodes_idx = list(range(n))
+                    _r.shuffle(nodes_idx)
+                    pairs = []
+                    while len(nodes_idx) >= 2:
+                        a = nodes_idx.pop(); b = nodes_idx.pop()
+                        pairs.append((a, b))
+                    return pairs
+                # General k: attempt stub matching with rejection of self-loops & duplicates.
+                for _ in range(max_tries):
+                    stubs = []
+                    for i in range(n):
+                        stubs.extend([i] * k)
+                    _r.shuffle(stubs)
+                    edges: set[Tuple[int,int]] = set()
+                    ok = True
+                    # Greedy pairing
+                    while stubs:
+                        if len(stubs) < 2:
+                            ok = False; break
+                        a = stubs.pop(); b = stubs.pop()
+                        if a == b:
+                            ok = False; break
+                        e = (a, b) if a < b else (b, a)
+                        if e in edges:
+                            ok = False; break
+                        edges.add(e)
+                    if ok:
+                        # Verify degrees
+                        degs = {i:0 for i in range(n)}
+                        for a,b in edges: degs[a]+=1; degs[b]+=1
+                        if all(v == k for v in degs.values()):
+                            return list(edges)
+                return []  # failed
+            k = target_degree or 0
+            if k <= 0:
+                pass  # no edges
+            else:
+                reg_edges = _build_regular_edges(router_count, k)
+                construction_method = 'regular'
+                if not reg_edges:
+                    # Fallback to previous chain+augment heuristic if construction failed
+                    construction_method = 'fallback'
+                    for i in range(router_count - 1):
+                        add_router_link(router_objs[i], router_objs[i+1], prefix=30, label="chain")
+                    if k > 1:
+                        degrees: Dict[int, int] = {r.id: 0 for r in router_objs}
+                        for a_id, b_id in existing_router_links:
+                            degrees[a_id] += 1; degrees[b_id] += 1
+                        attempts = 0; max_attempts = router_count * router_count
+                        while attempts < max_attempts and min(degrees.values()) < k:
+                            a_obj, b_obj = random.sample(router_objs, 2)
+                            if a_obj.id == b_obj.id:
+                                continue
+                            if degrees[a_obj.id] >= k and degrees[b_obj.id] >= k:
+                                attempts += 1; continue
+                            if add_router_link(a_obj, b_obj, prefix=30, label="exactF"):
+                                degrees[a_obj.id] += 1; degrees[b_obj.id] += 1
+                            attempts += 1
+                else:
+                    for a_idx, b_idx in reg_edges:
+                        add_router_link(router_objs[a_idx], router_objs[b_idx], prefix=30, label="exactR")
+                # Persist construction method early (will be included in stats later)
+                try:
+                    topo_stats = getattr(session, 'topo_stats', {}) or {}
+                    topo_stats.setdefault('router_edges_policy', {})
+                    topo_stats['router_edges_policy']['construction_method'] = construction_method
+                    setattr(session, 'topo_stats', topo_stats)
+                except Exception:
+                    pass
+    # Persist interim degree stats now
+    try:
+        if router_count > 0:
+            degs: Dict[int, int] = {r.id: 0 for r in router_objs}
+            for a_id, b_id in existing_router_links:
+                degs[a_id] += 1; degs[b_id] += 1
+            topo_stats = getattr(session, 'topo_stats', {}) or {}
+            stats_block = {
+                'mode': connectivity_mode,
+                'target_degree': target_degree or 0,
+            }
+            # If construction method was recorded earlier, propagate
             try:
-                topo_stats = getattr(session, 'topo_stats', {}) or {}
-                # Map legacy empty/Auto semantics to 'Random' now that UI removed Auto.
-                topo_stats['router_edges_policy'] = {
-                    'mode': (target_mode or 'Random'),
-                    'target_degree': target_degree or 0
-                }
-                topo_stats['router_degrees'] = {rid: degrees[rid] for rid in degrees}
-                setattr(session, 'topo_stats', topo_stats)
+                existing = topo_stats.get('router_edges_policy', {})
+                if 'construction_method' in existing:
+                    stats_block['construction_method'] = existing['construction_method']
+                    if existing['construction_method'] == 'fallback':
+                        stats_block['note'] = 'Fallback augmentation used; degrees may deviate within tolerance.'
+                    elif (target_degree or 0) == 1:
+                        stats_block['note'] = 'Perfect matching (degree=1) except possible single isolate if odd router count.'
             except Exception:
                 pass
+            ds = _int_list_stats(list(degs.values())) if degs else {"min":0,"max":0,"avg":0.0,"std":0.0,"gini":0.0}
+            stats_block.update({
+                'degree_min': ds['min'], 'degree_max': ds['max'], 'degree_avg': ds['avg'], 'degree_std': ds['std'], 'degree_gini': ds['gini']
+            })
+            # Add display normalization for degree=1 semantics
+            try:
+                if (target_degree or 0) == 1:
+                    stats_block['display_degree_min'] = 1 if ds['min'] in (0,1) else ds['min']
+                    stats_block['display_degree_max'] = 1 if ds['max'] in (0,1) else ds['max']
+            except Exception:
+                pass
+            topo_stats['router_edges_policy'] = stats_block
+            topo_stats['router_degrees'] = degs
+            setattr(session, 'topo_stats', topo_stats)
     except Exception:
-        logger.exception("Edge planning phase encountered an error; continuing with existing router topology")
+        pass
 
     # Assign routing protocol services to routers based on routing_items distribution
     try:
@@ -961,6 +1157,11 @@ def build_segmented_topology(core: client.CoreGrpcClient,
         buckets[idx % router_count].append(role)
 
     hosts: List[NodeInfo] = []
+    # Track mapping host->router and whether currently directly connected (True) or will later be regrouped
+    host_router_map: Dict[int, int] = {}
+    host_direct_link: Dict[int, bool] = {}
+    # We defer LAN switch creation until AFTER R2S policy so R2S gets first priority creating hierarchical switches.
+    lan_switch_by_router: Dict[int, int] = {}
     node_id_counter = router_count + 1
     host_slot_idx = 0
     docker_by_name: Dict[str, Dict[str, str]] = {}
@@ -970,7 +1171,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
         router_node = router_objs[ridx]
         if len(roles) == 0:
             continue
-        elif len(roles) == 1:
+        if len(roles) == 1:
             role = roles[0]
             # offset around router
             theta = 0.0
@@ -1006,6 +1207,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             logger.debug("Added host id=%s name=%s type=%s at (%s,%s)", host.id, name, node_type, x, y)
             node_id_counter += 1
             host_nodes_by_id[host.id] = host
+            host_next_ifid[host.id] = 1  # eth0 consumed
             # Apply DOCKER compose metadata when applicable
             try:
                 if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
@@ -1042,7 +1244,17 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             r_ifid = router_next_ifid.get(router_node.id, 0)
             router_next_ifid[router_node.id] = r_ifid + 1
             r_if = Interface(id=r_ifid, name=f"r{router_node.id}-h{host.id}", ip4=r_ip, ip4_mask=lan_net.prefixlen, mac=mac_alloc.next_mac())
-            session.add_link(node1=host, node2=router_node, iface1=host_if, iface2=r_if)
+            # enforce uniqueness for router iface names
+            base_name = r_if.name
+            if base_name in router_iface_names.setdefault(router_node.id, set()):
+                suf = 1
+                while f"{base_name}-{suf}" in router_iface_names[router_node.id]:
+                    suf += 1
+                r_if.name = f"{base_name}-{suf}"
+            router_iface_names[router_node.id].add(r_if.name)
+            safe_add_link(session, host, router_node, iface1=host_if, iface2=r_if)
+            host_router_map[host.id] = router_node.id
+            host_direct_link[host.id] = True
             logger.debug("Host %s <-> Router %s LAN /%s", host.id, router_node.id, lan_net.prefixlen)
             if node_type == NodeType.DEFAULT:
                 hosts.append(NodeInfo(node_id=host.id, ip4=f"{h_ip}/{lan_net.prefixlen}", role=role))
@@ -1052,35 +1264,9 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                 except Exception:
                     pass
         else:
-            # place LAN switch slightly offset from router
-            sx = rx + random.randint(30, 70)
-            sy = ry + random.randint(30, 70)
-            logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, f"lan-{ridx+1}", _type_desc(NodeType.SWITCH), sx, sy)
-            lan_switch = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=Position(x=sx, y=sy), name=f"lan-{ridx+1}")
-            try:
-                setattr(lan_switch, "model", "switch")
-            except Exception:
-                pass
-            try:
-                setattr(lan_switch, "model", "switch")
-            except Exception:
-                pass
-            logger.debug("Added LAN switch id=%s for router %s", lan_switch.id, router_node.id)
-            node_id_counter += 1
-            lan_net = subnet_alloc.next_random_subnet(24)
-            lan_hosts = list(lan_net.hosts())
-            r_ip = str(lan_hosts[0])
-            r_ifid = router_next_ifid.get(router_node.id, 0)
-            router_next_ifid[router_node.id] = r_ifid + 1
-            r_if = Interface(id=r_ifid, name=f"r{router_node.id}-lan{ridx+1}", ip4=r_ip, ip4_mask=lan_net.prefixlen, mac=mac_alloc.next_mac())
-            sw_if = Interface(id=0, name=f"lan{ridx+1}-r")
-            session.add_link(node1=router_node, node2=lan_switch, iface1=r_if, iface2=sw_if)
-            host_ip_pool = [str(ip) for ip in lan_hosts[1:]]
-            random.shuffle(host_ip_pool)
+            # Multi-host group: create hosts directly (temporarily) off the router; we'll regroup after R2S.
             for j, role in enumerate(roles):
-                # evenly spaced around the router for legibility
                 theta = (2 * math.pi * j) / len(roles)
-                # scale radius slightly with number of hosts
                 r = max(80, int(random.gauss(host_radius_mean + 10 * math.sqrt(len(roles)), host_radius_jitter)))
                 x = int(rx + r * math.cos(theta))
                 y = int(ry + r * math.sin(theta))
@@ -1096,7 +1282,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                                 docker_by_name[name] = docker_slot_plan[slot_key]
                                 created_docker += 1
                             else:
-                                logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan on segmented (multi-host)")
+                                logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan on segmented (multi-host deferred)")
                     except Exception:
                         pass
                 logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, name, _type_desc(node_type), x, y)
@@ -1110,60 +1296,434 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                         setattr(host, "model", "PC")
                 except Exception:
                     pass
-                try:
-                    if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
-                        setattr(host, "model", "docker")
-                    elif node_type == NodeType.SWITCH:
-                        setattr(host, "model", "switch")
-                    elif node_type == NodeType.DEFAULT:
-                        setattr(host, "model", "PC")
-                except Exception:
-                    pass
-                logger.debug("Added host id=%s name=%s type=%s at (%s,%s)", host.id, name, node_type, x, y)
                 node_id_counter += 1
                 host_nodes_by_id[host.id] = host
-                # Apply DOCKER compose metadata when applicable
-                try:
-                    if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
-                        rec = docker_by_name.get(name)
-                        _apply_docker_compose_meta(host, rec)
-                        # Explicitly ensure DefaultRoute is NOT present on docker nodes
-                        present = False
-                        try:
-                            present = has_service(session, host.id, "DefaultRoute", node_obj=host)
-                        except Exception:
-                            present = False
-                        if present:
-                            try:
-                                logger.info("Removing DefaultRoute from DOCKER node %s (id=%s)", getattr(host, "name", host.id), host.id)
-                            except Exception:
-                                pass
-                            ok = remove_service(session, host.id, "DefaultRoute", node_obj=host)
-                            try:
-                                if ok:
-                                    logger.info("Removed DefaultRoute from DOCKER node %s (id=%s)", getattr(host, "name", host.id), host.id)
-                                else:
-                                    logger.info("DefaultRoute not present or could not remove on DOCKER node %s (id=%s)", getattr(host, "name", host.id), host.id)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-                if host_ip_pool:
-                    h_ip = host_ip_pool.pop()
-                else:
-                    h_ip = str(lan_hosts[min(j + 1, len(lan_hosts) - 1)])
+                host_next_ifid[host.id] = 1
+                # Addressing: allocate per-host /24 directly to router (direct link) for now
+                lan_net = subnet_alloc.next_random_subnet(24)
+                lan_hosts = list(lan_net.hosts())
+                r_ip = str(lan_hosts[0])
+                h_ip = str(lan_hosts[1])
                 h_mac = mac_alloc.next_mac()
                 host_if = Interface(id=0, name="eth0", ip4=h_ip, ip4_mask=lan_net.prefixlen, mac=h_mac)
-                sw_if = Interface(id=j+1, name=f"lan{ridx+1}-h{host.id}")
-                session.add_link(node1=host, node2=lan_switch, iface1=host_if, iface2=sw_if)
-                logger.debug("Host %s -> LAN switch %s (/%s)", host.id, lan_switch.id, lan_net.prefixlen)
+                r_ifid = router_next_ifid.get(router_node.id, 0)
+                router_next_ifid[router_node.id] = r_ifid + 1
+                r_if = Interface(id=r_ifid, name=f"r{router_node.id}-h{host.id}", ip4=r_ip, ip4_mask=lan_net.prefixlen, mac=mac_alloc.next_mac())
+                base_name = r_if.name
+                if base_name in router_iface_names.setdefault(router_node.id, set()):
+                    suf = 1
+                    while f"{base_name}-{suf}" in router_iface_names[router_node.id]:
+                        suf += 1
+                    r_if.name = f"{base_name}-{suf}"
+                router_iface_names[router_node.id].add(r_if.name)
+                safe_add_link(session, host, router_node, iface1=host_if, iface2=r_if)
+                host_router_map[host.id] = router_node.id
+                host_direct_link[host.id] = True
                 if node_type == NodeType.DEFAULT:
                     hosts.append(NodeInfo(node_id=host.id, ip4=f"{h_ip}/{lan_net.prefixlen}", role=role))
-                    # Ensure default routing service on hosts
                     try:
                         ensure_service(session, host.id, "DefaultRoute", node_obj=host)
                     except Exception:
                         pass
+
+        # --- R-to-S (router-to-switch) ratio policy application (secondary pass) ---
+        try:
+            r2s_ratio = 0
+            r2s_mode = 'ratio'
+            if routing_items and router_count > 0:
+                modes_present = [ri.r2s_mode for ri in routing_items if getattr(ri,'r2s_mode',None)]
+                if any(m == 'Exact' for m in modes_present):
+                    r2s_mode = 'Exact'
+                elif 'Uniform' in modes_present:
+                    r2s_mode = 'Uniform'
+                elif 'Min' in modes_present:
+                    r2s_mode = 'Min'
+                elif 'NonUniform' in modes_present:
+                    r2s_mode = 'NonUniform'
+                elif 'Random' in modes_present:
+                    r2s_mode = 'Random'
+                ratios = []
+                for ri in routing_items:
+                    try:
+                        val = int(getattr(ri, 'r2s_edges', 0) or 0)
+                        if val > 0:
+                            ratios.append(val)
+                    except Exception:
+                        pass
+                # For Exact we take the FIRST positive value (user intent) rather than max to preserve exact=1 semantics
+                if r2s_mode == 'Exact':
+                    r2s_ratio = ratios[0] if ratios else 0
+                else:
+                    r2s_ratio = max(ratios) if ratios else 0
+                    # If Exact mode chosen but ratio ended up zero while hosts exist, default to 1 (aggregated intent)
+                    if r2s_mode == 'Exact' and r2s_ratio == 0:
+                        try:
+                            any_hosts = any(len(v) > 0 for v in host_router_map.values())
+                        except Exception:
+                            any_hosts = False
+                        if any_hosts:
+                            r2s_ratio = 1
+            if router_count > 0 and (r2s_mode in ('Exact','Uniform','Min','NonUniform','Random') or r2s_ratio > 0):
+                # Build host list map per router
+                router_host_ids: Dict[int, List[int]] = {r.id: [] for r in router_objs}
+                for hid, rid in host_router_map.items():
+                    if rid in router_host_ids:
+                        router_host_ids[rid].append(hid)
+                r2s_counts: Dict[int, int] = {r.id: 0 for r in router_objs}
+                rehomed_hosts: List[int] = []
+                r2s_seq: Dict[int, int] = {r.id: 0 for r in router_objs}
+
+                def _remove_link(a_id: int, b_id: int):
+                    key = tuple(sorted((a_id, b_id)))
+                    try:
+                        if hasattr(session, 'delete_link'):
+                            session.delete_link(node1_id=key[0], node2_id=key[1])  # type: ignore
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(session, 'links') and isinstance(session.links, list):
+                            new_links = []
+                            for lk in session.links:
+                                try:
+                                    n1 = getattr(lk, 'node1_id', getattr(lk, 'node1', None))
+                                    n2 = getattr(lk, 'node2_id', getattr(lk, 'node2', None))
+                                except Exception:
+                                    n1 = n2 = None
+                                if n1 is None or n2 is None:
+                                    new_links.append(lk); continue
+                                pair = tuple(sorted((n1, n2)))
+                                if pair == key:
+                                    continue
+                                new_links.append(lk)
+                            session.links = new_links
+                    except Exception:
+                        pass
+
+                for r in router_objs:
+                    rid = r.id
+                    host_ids = list(router_host_ids.get(rid, []))
+                    random.shuffle(host_ids)
+                    # Aggregated Exact semantics: if Exact mode with single target (r2s_ratio==1), create one switch and attach ALL hosts
+                    if r2s_mode == 'Exact' and r2s_ratio == 1 and host_ids:
+                        # Remove any existing direct / LAN links for these hosts
+                        for h_sel in host_ids:
+                            if host_direct_link.get(h_sel):
+                                _remove_link(h_sel, rid)
+                            lan_sw_id = lan_switch_by_router.get(rid)
+                            if lan_sw_id:
+                                _remove_link(h_sel, lan_sw_id)
+                            host_direct_link[h_sel] = False
+                        sx = r_positions[rid-1][0] + random.randint(50, 100)
+                        sy = r_positions[rid-1][1] + random.randint(50, 100)
+                        r2s_seq[rid] = r2s_seq.get(rid, 0) + 1
+                        seq = r2s_seq[rid]
+                        logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, f"rsw-{rid}-{seq}", _type_desc(NodeType.SWITCH), sx, sy)
+                        sw_node = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=Position(x=sx, y=sy), name=f"rsw-{rid}-{seq}")
+                        try: setattr(sw_node, 'model', 'switch')
+                        except Exception: pass
+                        node_id_counter += 1
+                        # Router-switch /30
+                        seg_net = subnet_alloc.next_random_subnet(30)
+                        seg_hosts = list(seg_net.hosts())
+                        if len(seg_hosts) >= 2:
+                            r_ip = str(seg_hosts[0]); sw_ip = str(seg_hosts[1])
+                            r_ifid = router_next_ifid.get(rid, 0); router_next_ifid[rid] = r_ifid + 1
+                            r_base = f"r{rid}-rsw{seq}-if{r_ifid}"
+                            nameset = router_iface_names.setdefault(rid, set())
+                            if r_base in nameset:
+                                sidx = 1
+                                while f"{r_base}-{sidx}" in nameset: sidx += 1
+                                r_base = f"{r_base}-{sidx}"
+                            nameset.add(r_base)
+                            r_if = Interface(id=r_ifid, name=r_base, ip4=r_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
+                            sw_if = Interface(id=0, name=f"rsw{seq}-r{rid}", ip4=sw_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
+                            safe_add_link(session, sw_node, r, iface1=sw_if, iface2=r_if)
+                        # Host LAN: choose subnet large enough for all hosts + switch ip
+                        import math as _math
+                        needed = len(host_ids) + 1  # switch + hosts
+                        # find prefix so that usable hosts (2^(32-prefix)-2) >= needed
+                        for host_bits in range(1, 17):  # up to /15 (2^(17) hosts) safety
+                            total = 2 ** host_bits
+                            if total - 2 >= needed:
+                                prefix = 32 - host_bits
+                                break
+                        else:
+                            prefix = 16
+                        try:
+                            lan_net2 = subnet_alloc.next_random_subnet(prefix)
+                        except Exception:
+                            lan_net2 = ipaddress.ip_network(f"10.253.{rid}.0/{prefix}", strict=False)
+                        lan2_hosts = list(lan_net2.hosts())
+                        if len(lan2_hosts) < (len(host_ids) + 1):
+                            # Fallback widen to /16 if insufficient
+                            try:
+                                lan_net2 = subnet_alloc.next_random_subnet(16)
+                                lan2_hosts = list(lan_net2.hosts())
+                            except Exception:
+                                lan_net2 = ipaddress.ip_network(f"10.252.{rid}.0/16", strict=False)
+                                lan2_hosts = list(lan_net2.hosts())
+                        gateway_ip = str(lan2_hosts[0]) if lan2_hosts else None
+                        # Attach each host
+                        for h_index, h_sel in enumerate(host_ids):
+                            try:
+                                h_obj = host_nodes_by_id.get(h_sel)
+                                if not h_obj: continue
+                                hip = str(lan2_hosts[h_index + 1]) if h_index + 1 < len(lan2_hosts) else None
+                                if not hip: break
+                                next_if = host_next_ifid.get(h_sel, 1)
+                                h_if = Interface(id=next_if, name=f"eth{next_if}", ip4=hip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                                host_next_ifid[h_sel] = next_if + 1
+                                sw_l_if = Interface(id=h_index+1, name=f"rsw{seq}-h{h_sel}-if{h_index+1}", ip4=gateway_ip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                                safe_add_link(session, h_obj, sw_node, iface1=h_if, iface2=sw_l_if)
+                            except Exception:
+                                pass
+                        r2s_counts[rid] += 1
+                        rehomed_hosts.extend(host_ids)
+                        continue  # move to next router (skip pair-based logic)
+                    # Determine target switches based on mode
+                    if r2s_mode == 'Exact' and r2s_ratio > 0:
+                        max_switches = min(r2s_ratio, len(host_ids)//2)
+                    elif r2s_mode == 'Min':
+                        max_switches = 1 if len(host_ids) >= 2 else 0
+                    elif r2s_mode == 'Uniform':
+                        import math as _math
+                        max_switches = min(len(host_ids)//2, max(1, int(_math.ceil(len(host_ids)/4))))
+                    elif r2s_mode == 'NonUniform':
+                        import math as _math
+                        max_switches = random.randint(0, max(0, int(_math.ceil(len(host_ids)/3))))
+                    elif r2s_mode == 'Random':
+                        if random.random() < 0.5:
+                            max_switches = min(len(host_ids)//2, 1)
+                        else:
+                            max_switches = 0
+                    else:  # ratio fallback
+                        max_switches = min(r2s_ratio, len(host_ids)//2)
+                    if max_switches <= 0:
+                        continue
+                    for _ in range(max_switches):
+                        if len(host_ids) < 2:
+                            break
+                        h_a = host_ids.pop()
+                        h_b = host_ids.pop()
+                        # Remove direct or LAN links (LAN unlikely here because deferred) for these hosts
+                        for h_sel in (h_a, h_b):
+                            if host_direct_link.get(h_sel):
+                                _remove_link(h_sel, rid)
+                            lan_sw_id = lan_switch_by_router.get(rid)
+                            if lan_sw_id:
+                                _remove_link(h_sel, lan_sw_id)
+                            host_direct_link[h_sel] = False
+                        # Create switch
+                        sx = r_positions[rid-1][0] + random.randint(50, 100)
+                        sy = r_positions[rid-1][1] + random.randint(50, 100)
+                        r2s_seq[rid] = r2s_seq.get(rid, 0) + 1
+                        seq = r2s_seq[rid]
+                        logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, f"rsw-{rid}-{seq}", _type_desc(NodeType.SWITCH), sx, sy)
+                        sw_node = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=Position(x=sx, y=sy), name=f"rsw-{rid}-{seq}")
+                        try: setattr(sw_node, 'model', 'switch')
+                        except Exception: pass
+                        node_id_counter += 1
+                        # Router-switch /30
+                        seg_net = subnet_alloc.next_random_subnet(30)
+                        seg_hosts = list(seg_net.hosts())
+                        if len(seg_hosts) < 2:
+                            try:
+                                if hasattr(session, 'delete_node'): session.delete_node(sw_node.id)  # type: ignore
+                            except Exception: pass
+                            continue
+                        r_ip = str(seg_hosts[0]); sw_ip = str(seg_hosts[1])
+                        r_ifid = router_next_ifid.get(rid, 0); router_next_ifid[rid] = r_ifid + 1
+                        r_base = f"r{rid}-rsw{seq}-if{r_ifid}"
+                        nameset = router_iface_names.setdefault(rid, set())
+                        if r_base in nameset:
+                            sidx = 1
+                            while f"{r_base}-{sidx}" in nameset: sidx += 1
+                            r_base = f"{r_base}-{sidx}"
+                        nameset.add(r_base)
+                        r_if = Interface(id=r_ifid, name=r_base, ip4=r_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
+                        sw_if = Interface(id=0, name=f"rsw{seq}-r{rid}", ip4=sw_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
+                        safe_add_link(session, sw_node, r, iface1=sw_if, iface2=r_if)
+                        # Host LAN /28
+                        lan_net2 = subnet_alloc.next_random_subnet(28)
+                        lan2_hosts = list(lan_net2.hosts())
+                        if len(lan2_hosts) < 3:  # need gateway + 2 hosts
+                            try:
+                                if hasattr(session, 'delete_link'): session.delete_link(node1_id=sw_node.id, node2_id=rid)  # type: ignore
+                            except Exception: pass
+                            try:
+                                if hasattr(session, 'delete_node'): session.delete_node(sw_node.id)  # type: ignore
+                            except Exception: pass
+                            continue
+                        for idx_h, h_sel in enumerate([h_a, h_b]):
+                            try:
+                                h_obj = host_nodes_by_id.get(h_sel)
+                                if not h_obj: continue
+                                hip = str(lan2_hosts[idx_h+1])
+                                next_if = host_next_ifid.get(h_sel, 1)
+                                h_if = Interface(id=next_if, name=f"eth{next_if}", ip4=hip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                                host_next_ifid[h_sel] = next_if + 1
+                                sw_l_if = Interface(id=idx_h+1, name=f"rsw{seq}-h{h_sel}-if{idx_h+1}", ip4=str(lan2_hosts[0]), ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                                safe_add_link(session, h_obj, sw_node, iface1=h_if, iface2=sw_l_if)
+                            except Exception:
+                                pass
+                        r2s_counts[rid] += 1
+                        rehomed_hosts.extend([h_a, h_b])
+                # Persist stats
+                try:
+                    topo_stats = getattr(session, 'topo_stats', {}) or {}
+                    rs_stats = _int_list_stats(list(r2s_counts.values())) if r2s_counts else {"min":0,"max":0,"avg":0.0,"std":0.0,"gini":0.0}
+                    # Adopt unified Exact semantics: target switches per router (integer/float accepted)
+                    # Compute saturation: how many pairs of hosts were available vs consumed for switch regrouping.
+                    try:
+                        total_pairs_possible = sum(len(v)//2 for v in router_host_ids.values())
+                    except Exception:
+                        total_pairs_possible = 0
+                    host_pairs_consumed = len(rehomed_hosts)//2
+                    saturation = 0.0
+                    if total_pairs_possible > 0:
+                        saturation = round(host_pairs_consumed / total_pairs_possible, 3)
+                    topo_stats['r2s_policy'] = {
+                        'mode': 'Exact',
+                        'target_per_router': float(r2s_ratio),
+                        'target': float(r2s_ratio),  # backward compat
+                        'counts': r2s_counts,
+                        'count_min': rs_stats['min'], 'count_max': rs_stats['max'], 'count_avg': rs_stats['avg'], 'count_std': rs_stats['std'], 'count_gini': rs_stats['gini'],
+                        'rehomed_hosts': rehomed_hosts,
+                        'host_pairs_consumed': host_pairs_consumed,
+                        'host_pairs_possible': total_pairs_possible,
+                        'saturation': saturation,
+                    }
+                    if r2s_counts:
+                        topo_stats['r2s_policy']['display_min_count'] = rs_stats['min']
+                        topo_stats['r2s_policy']['display_max_count'] = rs_stats['max']
+                    setattr(session, 'topo_stats', topo_stats)
+                except Exception:
+                    pass
+        except Exception:
+            logger.exception("R-to-S ratio policy application failed")
+
+    # Post-pass cleanup: ensure no host remains connected to both an original LAN switch (lan-*) and a rehome switch (rsw-*).
+    try:
+        if hasattr(session, 'links') and hasattr(session, 'get_node'):
+            # Build adjacency map host -> list of (switch_id, name)
+            for h_id, h_obj in list(host_nodes_by_id.items()):
+                switch_neighbors = []
+                try:
+                    for lk in list(getattr(session, 'links', []) or []):
+                        try:
+                            n1 = getattr(lk, 'node1_id', None)
+                            if n1 is None: n1 = getattr(lk, 'node1', None)
+                            n2 = getattr(lk, 'node2_id', None)
+                            if n2 is None: n2 = getattr(lk, 'node2', None)
+                        except Exception:
+                            n1 = n2 = None
+                        if n1 is None or n2 is None:
+                            continue
+                        if h_id not in (n1, n2):
+                            continue
+                        other = n2 if n1 == h_id else n1
+                        try:
+                            other_node = session.get_node(other)
+                            oname = getattr(other_node, 'name', '') or ''
+                            otype = getattr(other_node, 'type', '')
+                        except Exception:
+                            oname = ''
+                        lname = oname.lower()
+                        if lname.startswith('lan-') or lname.startswith('rsw-'):
+                            switch_neighbors.append((other, oname))
+                except Exception:
+                    continue
+                has_rsw = any(nm.startswith('rsw-') for _, nm in switch_neighbors)
+                has_lan = any(nm.startswith('lan-') for _, nm in switch_neighbors)
+                if has_rsw and has_lan:
+                    # Prefer keeping rsw-*; remove lan-* connections.
+                    for sid, nm in switch_neighbors:
+                        if nm.startswith('lan-'):
+                            _remove_link(h_id, sid)
+                    try:
+                        logger.debug("Host %s: removed legacy LAN switch links to avoid multi-switch attachment", h_id)
+                    except Exception:
+                        pass
+    except Exception:
+        logger.debug("Post R2S cleanup pass failed", exc_info=True)
+
+    # Deferred LAN aggregation: For any router that (a) has multiple directly connected hosts remaining and (b) did not receive R2S switches covering them, create a single LAN switch now.
+    try:
+        if router_count > 0:
+            # Build reverse: router -> list of directly connected host ids (still direct after R2S)
+            router_direct_hosts: Dict[int, List[int]] = {r.id: [] for r in router_objs}
+            for h_id, rid in host_router_map.items():
+                # A host is still "direct" if it has a link to router and NOT a link to any rsw-* switch
+                is_direct = False
+                has_rsw = False
+                try:
+                    for lk in list(getattr(session, 'links', []) or []):
+                        n1 = getattr(lk, 'node1_id', getattr(lk, 'node1', None))
+                        n2 = getattr(lk, 'node2_id', getattr(lk, 'node2', None))
+                        if n1 is None or n2 is None:
+                            continue
+                        if h_id not in (n1, n2):
+                            continue
+                        other = n2 if n1 == h_id else n1
+                        if other == rid:
+                            is_direct = True
+                        else:
+                            try:
+                                other_node = session.get_node(other)
+                                oname = getattr(other_node, 'name', '') or ''
+                            except Exception:
+                                oname = ''
+                            if oname.startswith('rsw-'):
+                                has_rsw = True
+                    if is_direct and not has_rsw:
+                        router_direct_hosts.setdefault(rid, []).append(h_id)
+                except Exception:
+                    pass
+            for rid, hlist in router_direct_hosts.items():
+                if len(hlist) <= 1:
+                    continue  # no need to aggregate a single (or zero) host
+                # Create one LAN switch for these leftover direct hosts
+                try:
+                    rnode = session.get_node(rid)
+                    rx = getattr(rnode, 'position', getattr(rnode, 'position_x', None))
+                    ry = None
+                    try:
+                        if rx and hasattr(rx, 'x'):
+                            ry = rx.y; rx = rx.x
+                        else:
+                            rx = r_positions[rid-1][0]; ry = r_positions[rid-1][1]
+                    except Exception:
+                        rx = r_positions[rid-1][0]; ry = r_positions[rid-1][1]
+                    sx = int(rx + random.randint(30, 70)); sy = int(ry + random.randint(30, 70))
+                    logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, f"lan-{rid}", _type_desc(NodeType.SWITCH), sx, sy)
+                    lan_sw = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=Position(x=sx, y=sy), name=f"lan-{rid}")
+                    try: setattr(lan_sw, 'model', 'switch')
+                    except Exception: pass
+                    node_id_counter += 1
+                    # Link router <-> lan switch
+                    r_ifid = router_next_ifid.get(rid, 0); router_next_ifid[rid] = r_ifid + 1
+                    r_if = Interface(id=r_ifid, name=f"r{rid}-lan", mac=None)
+                    sw_if = Interface(id=0, name=f"lan-r{rid}")
+                    safe_add_link(session, rnode, lan_sw, iface1=r_if, iface2=sw_if)
+                    # Move each direct host onto new LAN switch: remove direct link and create LAN link with new host iface (reuse host eth0)
+                    for h_id in hlist:
+                        _remove_link(h_id, rid)
+                        # host side new iface id 1 (since eth0 id=0 already exists / may be reused for IP); treat as same IP, different link
+                        next_if = host_next_ifid.get(h_id, 1)
+                        h_if = Interface(id=next_if, name=f"eth{next_if}")
+                        host_next_ifid[h_id] = next_if + 1
+                        sw_ifid = next_if  # simplistic alignment
+                        sw_l_if = Interface(id=sw_ifid, name=f"lan{rid}-h{h_id}-if{sw_ifid}")
+                        try:
+                            h_node = session.get_node(h_id)
+                            safe_add_link(session, h_node, lan_sw, iface1=h_if, iface2=sw_l_if)
+                        except Exception:
+                            pass
+                    logger.debug("Deferred LAN switch lan-%s created aggregating %d hosts post-R2S", rid, len(hlist))
+                except Exception:
+                    logger.debug("Failed deferred LAN aggregation for router %s", rid, exc_info=True)
+    except Exception:
+        logger.debug("Deferred LAN aggregation phase failed", exc_info=True)
 
     if created_docker:
         logger.info("Docker nodes created in segmented topology: %d", created_docker)
@@ -1226,29 +1786,57 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             for a_id, b_id in list(existing_router_links):
                 current_degrees[a_id] += 1
                 current_degrees[b_id] += 1
+            # Determine base connectivity policy to avoid over-enrichment
+            base_policy = (policy.get('router_edges_policy') or {}).get('mode')
             for proto, group_nodes in protocol_groups.items():
                 if len(group_nodes) <= 1:
                     continue
+                # If user did not specify an r2r_mode (policy == Random)
+                # but a mesh style was requested (tests), still honor style for a single shared protocol group.
+                # IMPORTANT: Do not enrich topology for Min policy. User expects strict chain.
+                if target_policy == 'Min':
+                    continue
+                # Skip enrichment if base policy is Random and user did not request style that implies more links;
+                # prevents accidental full mesh when protocol groups share one protocol.
+                if target_policy not in ('Max', 'Uniform'):
+                    # detect if all routers share this protocol and no other protocols exist. Previously we
+                    # enriched even for Min which produced unintended full meshes; now Min is excluded above.
+                    all_router_ids = {r.id for r in router_objs}
+                    grp_ids = {r.id for r in group_nodes}
+                    if grp_ids == all_router_ids and len(protocol_groups) == 1:
+                        # proceed (treat as implicit style enrichment for Random / Exact / NonUniform)
+                        pass
+                    else:
+                        continue
                 style = (router_mesh_style or "full").lower()
                 ordered = list(group_nodes)
                 # Budget: do not exceed target_degree (if specified) by more than +1 when adding protocol links
                 def can_link(a_id, b_id):
-                    if target_policy == 'Exact' and target_degree > 0:
-                        return (current_degrees[a_id] < target_degree + 1) and (current_degrees[b_id] < target_degree + 1)
-                    if target_policy == 'Min':
-                        # allow modest enrichment until degree 3
-                        return current_degrees[a_id] < 3 and current_degrees[b_id] < 3
-                    if target_policy == 'Random':
-                        # very conservative: cap at degree 4
-                        return current_degrees[a_id] < 4 and current_degrees[b_id] < 4
-                    if target_policy == 'Max':
-                        return True
+                    # In Max mode we can always add more (bounded by outer loops / full pair enumeration)
                     return True
                 candidate_pairs: List[Tuple[object, object]] = []
                 if style == 'ring' and len(ordered) > 2:
-                    candidate_pairs = [(ordered[i], ordered[(i+1)%len(ordered)]) for i in range(len(ordered))]
+                    ring_pairs = [(ordered[i], ordered[(i+1)%len(ordered)]) for i in range(len(ordered))]
+                    ring_keys = { (min(a.id,b.id), max(a.id,b.id)) for a,b in ring_pairs }
+                    existing_total = sum(1 for k in existing_router_links if k[0] in {r.id for r in ordered} and k[1] in {r.id for r in ordered})
+                    existing_ring = sum(1 for k in existing_router_links if k in ring_keys)
+                    # Extra non-ring edges present
+                    extra = existing_total - existing_ring
+                    target_total = len(ordered)  # ring edge count
+                    # We can only add up to (target_total - existing_total) edges
+                    remaining_budget = max(0, target_total - existing_total)
+                    candidate_pairs = []
+                    for a,b in ring_pairs:
+                        key = (min(a.id,b.id), max(a.id,b.id))
+                        if key in existing_router_links:
+                            continue
+                        if remaining_budget <= 0:
+                            break
+                        candidate_pairs.append((a,b))
+                        remaining_budget -= 1
                 elif style == 'tree':
-                    candidate_pairs = [(ordered[i], ordered[i+1]) for i in range(len(ordered)-1)]
+                    # Tree style: ensure no extra edges beyond existing spanning tree -> no candidate pairs
+                    candidate_pairs = []
                 else:
                     # Instead of full mesh, shuffle all potential pairs and apply budget
                     for i in range(len(ordered)):
@@ -1270,9 +1858,30 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                     if len(rr_hosts) < 2:
                         continue
                     a_ip = str(rr_hosts[0]); b_ip = str(rr_hosts[1])
-                    a_if = Interface(id=a_ifid, name=f"r{a.id}-{proto.lower()}-{b.id}", ip4=a_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
-                    b_if = Interface(id=b_ifid, name=f"r{b.id}-{proto.lower()}-{a.id}", ip4=b_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
-                    session.add_link(node1=a, node2=b, iface1=a_if, iface2=b_if)
+                    # Uniqueness for protocol augmentation links
+                    an_base = f"r{a.id}-{proto.lower()}-{b.id}"
+                    bn_base = f"r{b.id}-{proto.lower()}-{a.id}"
+                    for rid, base in ((a.id, an_base),(b.id, bn_base)):
+                        rset = router_iface_names.setdefault(rid, set())
+                        if base in rset:
+                            si = 1
+                            while f"{base}-{si}" in rset:
+                                si += 1
+                            if rid == a.id:
+                                an_base = f"{base}-{si}"
+                            else:
+                                bn_base = f"{base}-{si}"
+                        # Add after potential rename
+                        if rid == a.id:
+                            router_iface_names[rid].add(an_base)
+                        else:
+                            router_iface_names[rid].add(bn_base)
+                    a_if = Interface(id=a_ifid, name=an_base, ip4=a_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
+                    b_if = Interface(id=b_ifid, name=bn_base, ip4=b_ip, ip4_mask=rr_net.prefixlen, mac=mac_alloc.next_mac())
+                    # Guard against accidental duplicate augmentation links
+                    key_all2 = (min(a.id, b.id), max(a.id, b.id))
+                    if key_all2 not in existing_links:
+                        safe_add_link(session, a, b, iface1=a_if, iface2=b_if)
                     existing_router_links.add(key)
                     current_degrees[a.id] += 1; current_degrees[b.id] += 1
                     logger.debug("Protocol %s link r%d<->r%d (style=%s deg=%s/%s)", proto, a.id, b.id, style, current_degrees[a.id], current_degrees[b.id])
@@ -1328,4 +1937,117 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                                     session.services.add(node_obj_try, "zebra")
                     except Exception:
                         pass
+    # --- Post-build cleanup: remove any orphan switches (only connected to routers, no host endpoints) ---
+    try:
+        # Heuristic: a switch is orphan if (a) its model is 'switch'; (b) it has no directly connected DEFAULT or DOCKER hosts;
+        # and (c) every link involves only routers/switches. We exclude core LAN switches that actually have hosts.
+        # Because CORE API for deletion may differ across versions, we do best-effort: detach links and skip node in stats.
+        orphan_switch_ids: list[int] = []
+        # Build adjacency map if links iterable is available
+        link_entries = []
+        try:
+            if hasattr(session, 'links'):
+                link_entries = list(getattr(session, 'links'))  # type: ignore
+        except Exception:
+            link_entries = []
+        # Collect node objects if accessible
+        node_index: dict[int, object] = {}
+        try:
+            if hasattr(session, 'nodes') and isinstance(session.nodes, dict):  # type: ignore
+                node_index = session.nodes  # type: ignore
+        except Exception:
+            pass
+        # Helper to classify node type quickly
+        def _is_router(nid: int) -> bool:
+            try:
+                n = node_index.get(nid)
+                nm = getattr(n, 'model', '') or getattr(n, 'name', '')
+                return 'router' in str(nm).lower()
+            except Exception:
+                return False
+        def _is_host(nid: int) -> bool:
+            try:
+                n = node_index.get(nid)
+                m = getattr(n, 'model', '')
+                if not m:
+                    return False
+                ml = str(m).lower()
+                return ml in ('pc','docker','host','default')
+            except Exception:
+                return False
+        def _is_switch(nid: int) -> bool:
+            try:
+                n = node_index.get(nid)
+                return str(getattr(n, 'model', '')).lower() == 'switch'
+            except Exception:
+                return False
+        # Count host-attached links per switch
+        sw_links: dict[int, list[tuple[int,int]]] = {}
+        for lk in link_entries:
+            try:
+                a, b = lk[:2]
+            except Exception:
+                continue
+            if _is_switch(a):
+                sw_links.setdefault(a, []).append((a,b))
+            if _is_switch(b):
+                sw_links.setdefault(b, []).append((a,b))
+        for sw_id, edges in sw_links.items():
+            # Determine if any edge connects to a host
+            has_host = any(_is_host(b if a==sw_id else a) for a,b in edges)
+            only_router_or_switch = all((_is_router(b if a==sw_id else a) or _is_switch(b if a==sw_id else a)) for a,b in edges)
+            if not has_host and only_router_or_switch:
+                orphan_switch_ids.append(sw_id)
+        if orphan_switch_ids:
+            try:
+                logger.info("Removing %d orphan switches with no host attachments: %s", len(orphan_switch_ids), orphan_switch_ids)
+            except Exception:
+                pass
+            # Remove associated links
+            try:
+                if hasattr(session, 'links') and isinstance(session.links, list):  # type: ignore
+                    session.links = [lk for lk in session.links if not (lk[0] in orphan_switch_ids or lk[1] in orphan_switch_ids)]  # type: ignore
+            except Exception:
+                pass
+            # Best effort node removal (depends on CORE API)
+            for sw_id in orphan_switch_ids:
+                try:
+                    if hasattr(session, 'delete_node'):
+                        session.delete_node(sw_id)  # type: ignore
+                except Exception:
+                    pass
+                # Also prune from internal maps where used for stats
+                try:
+                    routers[:] = [r for r in routers if r.node_id != sw_id]
+                except Exception:
+                    pass
+    except Exception:
+        logger.debug("Orphan switch cleanup failed", exc_info=True)
+
+    # Record host counts per router (direct + via any switches) for report connectivity matrix enrichment
+    try:
+        topo_stats = getattr(session, 'topo_stats', {}) or {}
+        # Build mapping from existing host_router_map if present in locals; else infer via links
+        if 'host_router_map' in locals() and isinstance(host_router_map, dict):
+            counts = {}
+            for hid, rid in host_router_map.items():
+                counts[rid] = counts.get(rid, 0) + 1
+            topo_stats['router_host_counts'] = counts
+        elif hasattr(session, 'links') and isinstance(session.links, list):  # fallback inference
+            # naive inference: host id > router_count and link to router id <= router_count
+            counts = {}
+            for lk in getattr(session, 'links'):
+                try:
+                    a, b = lk[:2]
+                    for r_id, h_id in ((a,b),(b,a)):
+                        if isinstance(r_id, int) and isinstance(h_id, int) and r_id <= router_count and h_id > router_count:
+                            counts[r_id] = counts.get(r_id, 0) + 1
+                except Exception:
+                    continue
+            if counts:
+                topo_stats['router_host_counts'] = counts
+        setattr(session, 'topo_stats', topo_stats)
+    except Exception:
+        pass
     return session, routers, hosts, host_service_assignments, router_protocols, docker_by_name
+    

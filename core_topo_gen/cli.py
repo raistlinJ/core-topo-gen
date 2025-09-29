@@ -12,8 +12,13 @@ from .parsers.xml_parser import (
     parse_vulnerabilities_info,
     parse_planning_metadata,
 )
+from .utils.segmentation import apply_preview_segmentation_rules
 from .utils.allocation import compute_role_counts
 from .builders.topology import build_star_from_roles, build_segmented_topology, build_multi_switch_topology
+try:
+    from .builders.topology_phased import build_segmented_topology_phased
+except Exception:  # fallback if phased file missing
+    build_segmented_topology_phased = None
 from .utils.traffic import generate_traffic_scripts
 from .utils.report import write_report
 from .utils.vuln_process import (
@@ -25,6 +30,28 @@ from .utils.vuln_process import (
     prepare_compose_for_assignments,
 )
 from .utils.services import ensure_service
+
+# Ensure planning.full_preview is importable even if an older installed core_topo_gen shadows repo version
+try:  # pragma: no cover
+    from .planning.full_preview import build_full_preview  # noqa: F401
+except ModuleNotFoundError:
+    # Attempt manual module load from local filesystem
+    import importlib.util, sys as _sys, os as _os
+    try:
+        _pkg_root = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), '..'))
+        _candidate = _os.path.join(_pkg_root, 'planning', 'full_preview.py')
+        if _os.path.exists(_candidate):
+            _spec = importlib.util.spec_from_file_location('core_topo_gen.planning.full_preview', _candidate)
+            if _spec and _spec.loader:
+                _mod = importlib.util.module_from_spec(_spec)
+                _sys.modules['core_topo_gen.planning.full_preview'] = _mod
+                try:
+                    _spec.loader.exec_module(_mod)  # type: ignore
+                    from .planning.full_preview import build_full_preview  # type: ignore  # noqa: E402,F401
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def main():
@@ -49,6 +76,12 @@ def main():
     ap.add_argument("--max-nodes", type=int, default=None, help="Optional cap on hosts to create")
     ap.add_argument("--verbose", action="store_true", help="Enable debug logging")
     ap.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducible topology randomness")
+    ap.add_argument("--preview", action="store_true", help="Parse and plan only; output plan summary JSON and exit 0")
+    ap.add_argument("--approve-plan", action="store_true", help="If set with --preview, also emit an approval hint (no build)")
+    ap.add_argument("--preview-full", action="store_true", help="Generate a full dry-run plan (routers, hosts, IPs, services, vulnerabilities, segmentation) without contacting CORE; implies --preview style output")
+    ap.add_argument("--plan-output", help="Path to write computed plan JSON (preview or build)")
+    ap.add_argument("--use-plan", help="Path to previously approved plan JSON to drive build (skip recompute)")
+    ap.add_argument("--strict-plan", action="store_true", help="Abort build on any plan drift (default: warn only)")
     ap.add_argument(
         "--router-mesh",
         choices=["full", "ring", "tree"],
@@ -114,6 +147,16 @@ def main():
         except Exception:
             pass
 
+    approved_plan = None
+    if args.use_plan:
+        import json, sys
+        try:
+            with open(args.use_plan, 'r', encoding='utf-8') as pf:
+                approved_plan = json.load(pf)
+        except Exception as e:
+            print(f"ERROR: failed to load plan file {args.use_plan}: {e}", file=sys.stderr)
+            return
+
     density_base, weight_items, count_items, services = parse_node_info(args.xml, args.scenario)
     # Optional additive planning metadata (if XML produced by enhanced web UI)
     planning_meta = {}
@@ -143,6 +186,182 @@ def main():
                 break
     effective_total = sum(role_counts.values())
     routing_density, routing_items = parse_routing_info(args.xml, args.scenario)
+    # Derive R2R / R2S policy directly from the first routing item with a mode (no averaging)
+    r2r_policy_plan = None
+    r2s_policy_plan = None
+    if routing_items:
+        try:
+            first_r2r = next((ri for ri in routing_items if getattr(ri,'r2r_mode',None)), None)
+            if first_r2r:
+                m = getattr(first_r2r, 'r2r_mode', '')
+                if m == 'Exact' and getattr(first_r2r, 'r2r_edges', 0) > 0:
+                    r2r_policy_plan = { 'mode': 'Exact', 'target_degree': int(getattr(first_r2r,'r2r_edges',0)) }
+                elif m:
+                    r2r_policy_plan = { 'mode': m }
+            first_r2s = next((ri for ri in routing_items if getattr(ri,'r2s_mode',None)), None)
+            if first_r2s:
+                m2_raw = getattr(first_r2s, 'r2s_mode', '') or ''
+                m2 = m2_raw.strip()
+                m2_norm = m2.lower()
+                edges_raw = getattr(first_r2s,'r2s_edges',0)
+                try: edges_val = int(edges_raw)
+                except Exception: edges_val = 0
+                if m2_norm == 'exact' and edges_val > 0:
+                    r2s_policy_plan = { 'mode': 'Exact', 'target_per_router': edges_val }
+                elif m2:
+                    r2s_policy_plan = { 'mode': m2 }
+        except Exception:
+            pass
+
+    # --- New planning pool (phase 1) ---
+    service_plan = {s.name: (s.abs_count if s.abs_count > 0 else int(round(s.density * base_total))) for s in services}
+    routing_plan = {}
+    router_plan_breakdown = {}
+    prelim_router_count = 0
+    vulnerabilities_plan = None
+    # (retain r2r_policy_plan from unified derivation above if set)
+    try:
+        routing_plan = {ri.protocol: (ri.abs_count if ri.abs_count > 0 else 0) for ri in routing_items}
+        from .planning.router_plan import compute_router_plan
+        prelim_router_count, router_plan_breakdown = compute_router_plan(
+            total_hosts=sum(role_counts.values()),
+            base_host_pool=base_total,
+            routing_density=routing_density,
+            routing_items=routing_items,
+        )
+        # (Removed legacy mode_counts aggregation; direct policy already set above)
+    except Exception:
+        pass
+    try:
+        from .planning.plan_builder import build_initial_pool
+        from .planning.constraints import validate_pool_final
+        # Vulnerabilities: reuse earlier parsing if available in generation_meta (planning_meta done above). We recompute minimally.
+        try:
+            from .parsers.xml_parser import parse_vulnerabilities_info
+            vuln_density, vuln_items = parse_vulnerabilities_info(args.xml, args.scenario)
+            # Build a simple plan: item name -> planned count (count-based or density target single bucket)
+            vplan: dict[str,int] = {}
+            density_target = 0
+            try:
+                import math as _math
+                density_target = int(_math.floor((vuln_density or 0.0) * (base_total or 0) + 1e-9))
+            except Exception:
+                pass
+            # Count items
+            for it in (vuln_items or []):
+                name = (it.get('selected') or '').strip() or 'Item'
+                vm = (it.get('v_metric') or '').strip()
+                if vm == 'Count':
+                    try:
+                        vc = int(it.get('v_count') or 0)
+                    except Exception:
+                        vc = 0
+                    if vc > 0:
+                        vplan[name] = vplan.get(name, 0) + vc
+            if density_target > 0:
+                vplan['__density_pool__'] = density_target
+            if vplan:
+                vulnerabilities_plan = vplan
+        except Exception:
+            pass
+        if approved_plan:
+            from .planning.pool import AllocationPool
+            plan_core = approved_plan.get('plan') if 'plan' in approved_plan else approved_plan
+            pool = AllocationPool(
+                hosts_total=plan_core.get('hosts_total', sum(role_counts.values())),
+                role_counts=role_counts,
+                routers_planned=plan_core.get('routers_planned', prelim_router_count),
+                services_plan=service_plan,
+                routing_plan=routing_plan,
+                r2r_policy=plan_core.get('r2r_policy'),
+                vulnerabilities_plan=plan_core.get('vulnerabilities_plan'),
+            )
+            pool.notes.append('reconstructed_from_use_plan')
+            try:
+                fp = approved_plan.get('full_preview')
+                if fp:
+                    pool.full_preview = fp
+                    pool.notes.append('full_preview_attached')
+            except Exception:
+                pass
+        else:
+            pool = build_initial_pool(role_counts, prelim_router_count, service_plan, routing_plan, router_breakdown=router_plan_breakdown, r2r_policy=r2r_policy_plan, vulnerabilities_plan=vulnerabilities_plan)
+        if args.preview or args.preview_full:
+            import json, sys
+            summary = pool.summarize()
+            # Provide r2s/r2r placeholders if not yet populated by builders so UI/report
+            # can render consistent sections.
+            if 'r2r_policy' in summary and summary['r2r_policy'] is None:
+                summary['r2r_policy'] = r2r_policy_plan
+            if 'r2s_policy' not in summary or summary['r2s_policy'] is None:
+                summary['r2s_policy'] = r2s_policy_plan
+            # Resolved expansions (already added in summarize) but ensure deterministic ordering
+            try:
+                if isinstance(summary.get('role_assignment_preview'), list):
+                    summary['role_assignment_preview'] = list(summary['role_assignment_preview'])
+            except Exception:
+                pass
+            violations = validate_pool_final(summary)
+            out = {"plan": summary, "violations": violations}
+            if args.preview_full:
+                try:
+                    from .planning.full_preview import build_full_preview
+                    # Derive r2s policy summary (mirror earlier plan pass) for preview fidelity
+                    r2s_policy_plan = None
+                    try:
+                        first_r2s = next((ri for ri in routing_items if getattr(ri,'r2s_mode',None)), None)
+                        if first_r2s:
+                            m2_raw = getattr(first_r2s, 'r2s_mode', '') or ''
+                            m2 = m2_raw.strip()
+                            m2_norm = m2.lower()
+                            edges_raw = getattr(first_r2s,'r2s_edges',0)
+                            try: edges_val = int(edges_raw)
+                            except Exception: edges_val = 0
+                            if m2_norm == 'exact' and edges_val > 0:
+                                r2s_policy_plan = { 'mode': 'Exact', 'target_per_router': edges_val }
+                            elif m2:
+                                r2s_policy_plan = { 'mode': m2 }
+                    except Exception:
+                        pass
+                    full_prev = build_full_preview(
+                        role_counts=role_counts,
+                        routers_planned=prelim_router_count,
+                        services_plan=service_plan,
+                        vulnerabilities_plan=vulnerabilities_plan,
+                        r2r_policy=r2r_policy_plan,
+                        r2s_policy=r2s_policy_plan,
+                        routing_items=routing_items,
+                        routing_plan=routing_plan,
+                        segmentation_density=None,  # segmentation density not computed yet; add later if required
+                        segmentation_items=None,
+                        seed=args.seed,
+                        ip4_prefix=args.prefix,
+                        ip_mode=args.ip_mode,
+                        ip_region=args.ip_region,
+                    )
+                    out['full_preview'] = full_prev
+                except Exception as e:
+                    out['full_preview_error'] = str(e)
+            print(json.dumps(out, indent=2, sort_keys=True))
+            if args.plan_output:
+                try:
+                    with open(args.plan_output, 'w', encoding='utf-8') as wf:
+                        json.dump(out, wf, indent=2, sort_keys=True)
+                except Exception as e:
+                    print(f"WARN: failed to write plan file {args.plan_output}: {e}", file=sys.stderr)
+            if args.approve_plan:
+                print("-- To proceed, rerun with --use-plan plan.json (after saving) to build the CORE scenario --")
+            return
+        else:
+            if args.plan_output:
+                try:
+                    import json
+                    with open(args.plan_output, 'w', encoding='utf-8') as wf:
+                        json.dump({"plan": pool.summarize()}, wf, indent=2, sort_keys=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     core = client.CoreGrpcClient(address=f"{args.host}:{args.port}")
     # Wrap with a logging proxy to trace all gRPC calls
@@ -267,26 +486,92 @@ def main():
         pass
     # If any routing item carries abs_count>0, we should build a segmented topology even if density==0
     has_routing_counts = any(getattr(ri, 'abs_count', 0) and int(getattr(ri, 'abs_count', 0)) > 0 for ri in (routing_items or []))
+    phased_mode = bool(approved_plan) and build_segmented_topology_phased is not None
     if (routing_density and routing_density > 0) or has_routing_counts:
-        session, routers, hosts, service_assignments, router_protocols, docker_by_name = build_segmented_topology(
-            core,
-            role_counts,
-            routing_density=routing_density,
-            routing_items=routing_items,
-            base_host_pool=density_base,
-            services=services,
-            ip4_prefix=args.prefix,
-            ip_mode=args.ip_mode,
-            ip_region=args.ip_region,
-            layout_density=args.layout_density,
-            docker_slot_plan=docker_slot_plan,
-            router_mesh_style=args.router_mesh,
-        )
+        if phased_mode:
+            # Reconstruct AllocationPool skeleton from approved_plan (minimal fields needed)
+            from .planning.pool import AllocationPool
+            from .planning.constraints import enforce_no_drift
+            try:
+                plan_sum = approved_plan.get('plan_summary') or approved_plan  # heuristic
+            except Exception:
+                plan_sum = approved_plan
+            try:
+                routers_planned = int(plan_sum.get('routers_planned') or plan_sum.get('routers_total_planned') or 0)
+            except Exception:
+                routers_planned = 0
+            pool = AllocationPool(
+                hosts_total=sum(role_counts.values()),
+                role_counts=role_counts,
+                routers_planned=routers_planned,
+                services_plan={},
+                routing_plan={},
+                r2r_policy=plan_sum.get('r2r_policy'),
+                vulnerabilities_plan=plan_sum.get('vulnerabilities_plan'),
+            )
+            r2s_ratio = None
+            try:
+                r2s_ratio = float(plan_sum.get('r2s_ratio_used') or plan_sum.get('r2s_policy', {}).get('ratio') or 0.0)
+            except Exception:
+                r2s_ratio = None
+            session, routers, hosts, router_protocols, docker_by_name = build_segmented_topology_phased(
+                core,
+                pool,
+                routing_density=routing_density,
+                routing_items=routing_items,
+                services=services,
+                ip4_prefix=args.prefix,
+                ip_mode=args.ip_mode,
+                ip_region=args.ip_region,
+                layout_density=args.layout_density,
+                docker_slot_plan=docker_slot_plan,
+                router_mesh_style=args.router_mesh,
+                r2s_ratio=r2s_ratio,
+            )
+            service_assignments = {}
+            # Drift enforcement (strict) using pool summary vs plan
+            actual_summary = pool.summarize()
+            drift = enforce_no_drift(plan_sum, actual_summary, strict=args.strict_plan)
+            if drift:
+                import sys, json
+                if args.strict_plan:
+                    logging.error("Plan drift detected (strict): %s", "; ".join(drift))
+                else:
+                    logging.warning("Plan drift detected (non-strict): %s", "; ".join(drift))
+                try:
+                    ts = getattr(session, 'topo_stats', {}) or {}
+                    ts['plan_drift'] = drift
+                    ts['plan_drift_strict'] = args.strict_plan
+                    setattr(session, 'topo_stats', ts)
+                except Exception:
+                    pass
+                if args.strict_plan:
+                    print(json.dumps({"plan_drift": drift, "actual": actual_summary}, indent=2), file=sys.stderr)
+                    return
+        else:
+            session, routers, hosts, service_assignments, router_protocols, docker_by_name = build_segmented_topology(
+                core,
+                role_counts,
+                routing_density=routing_density,
+                routing_items=routing_items,
+                base_host_pool=density_base,
+                services=services,
+                ip4_prefix=args.prefix,
+                ip_mode=args.ip_mode,
+                ip_region=args.ip_region,
+                layout_density=args.layout_density,
+                docker_slot_plan=docker_slot_plan,
+                router_mesh_style=args.router_mesh,
+                approved_plan=approved_plan,
+            )
         # Merge topo stats if present
         try:
             ts = getattr(session, 'topo_stats', None)
             if isinstance(ts, dict):
                 generation_meta.update(ts)
+                # Embed plan summary if phased
+                if phased_mode:
+                    generation_meta['plan_summary'] = pool.summarize() if 'pool' in locals() else {}
         except Exception:
             pass
     else:
@@ -314,7 +599,7 @@ def main():
     except Exception:
         pass
 
-    # Parse segmentation and apply policies/services
+    # Parse segmentation config OR fallback to preview segmentation if available
     seg_summary = None
     try:
         seg_density, seg_items = parse_segmentation_info(args.xml, args.scenario)
@@ -335,7 +620,20 @@ def main():
             except Exception as e:
                 logging.warning("Failed applying segmentation: %s", e)
         else:
-            logging.info("Segmentation disabled or unspecified; skipping")
+            # Attempt preview injection if present
+            if approved_plan and approved_plan.get('full_preview'):
+                seg_prev = approved_plan['full_preview'].get('segmentation_preview') or {}
+                rules_prev = seg_prev.get('rules') or []
+                if rules_prev:
+                    try:
+                        seg_summary = apply_preview_segmentation_rules(session, rules_prev, out_dir="/tmp/segmentation")
+                        logging.info("Injected preview segmentation rules: %d", len(seg_summary.get('rules', [])))
+                    except Exception as e:
+                        logging.warning("Failed injecting preview segmentation rules: %s", e)
+                else:
+                    logging.info("No preview segmentation rules found to inject")
+            else:
+                logging.info("Segmentation disabled or unspecified; skipping")
     except Exception as e:
         logging.warning("Segmentation parse/apply error: %s", e)
 
@@ -576,6 +874,28 @@ def main():
             "items": [{"name": i.name, "factor": i.factor} for i in (seg_items or [])] if 'seg_items' in locals() and seg_items else [],
         }
         if routing_density and routing_density > 0:
+            # Inject XML/source classification metadata if available
+            try:
+                xml_path_meta = os.path.abspath(args.xml)
+                generation_meta.setdefault('xml_path', xml_path_meta)
+                # classification flags may have been computed upstream; if not, attempt lightweight detection
+                if 'xml_schema_classification' not in generation_meta:
+                    try:
+                        import xml.etree.ElementTree as _ET
+                        rt = _ET.parse(xml_path_meta).getroot()
+                        tagl = rt.tag.lower()
+                        if 'scenarios' in tagl:
+                            generation_meta['xml_schema_classification'] = 'scenario'
+                        elif 'session' in tagl:
+                            generation_meta['xml_schema_classification'] = 'session'
+                        else:
+                            generation_meta['xml_schema_classification'] = 'unknown'
+                        if rt.find('.//container') is not None:
+                            generation_meta['xml_container_flag'] = True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             write_report(
                 report_path,
                 scenario_name,
@@ -594,6 +914,26 @@ def main():
                 vulnerabilities_cfg=vulnerabilities_cfg,
             )
         else:
+            try:
+                xml_path_meta = os.path.abspath(args.xml)
+                generation_meta.setdefault('xml_path', xml_path_meta)
+                if 'xml_schema_classification' not in generation_meta:
+                    try:
+                        import xml.etree.ElementTree as _ET
+                        rt = _ET.parse(xml_path_meta).getroot()
+                        tagl = rt.tag.lower()
+                        if 'scenarios' in tagl:
+                            generation_meta['xml_schema_classification'] = 'scenario'
+                        elif 'session' in tagl:
+                            generation_meta['xml_schema_classification'] = 'session'
+                        else:
+                            generation_meta['xml_schema_classification'] = 'unknown'
+                        if rt.find('.//container') is not None:
+                            generation_meta['xml_container_flag'] = True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             write_report(
                 report_path,
                 scenario_name,

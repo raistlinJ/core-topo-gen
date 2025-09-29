@@ -40,9 +40,9 @@ def test_count_only_routing_parsing_exact():
     # Count items should not alter base allocation inside this test scenario (one count row)
     for role, c in count_items:
       roles[role] = roles.get(role, 0) + c
-    # With only a weight row and no explicit total_nodes, default base = 8 (legacy fallback)
-    assert density_base == 8
-    assert sum(roles.values()) == 8
+    # With only a weight row and no explicit total_nodes, default base now = 10
+    assert density_base == 10
+    assert sum(roles.values()) == 10
     density, ritems = parse_routing_info(xml_path, 'demo')
     assert density == 0.0
     # Expect exactly one count-based routing item with abs_count=1

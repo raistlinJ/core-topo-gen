@@ -2,6 +2,18 @@
 
 Generate CORE topologies from XML scenarios via a GUI or CLI. Supports services/routing assignment, segmented or star layouts, and optional traffic script generation.
 
+## Recent Workflow Simplification (2025-09)
+
+The planning and execution workflow has been streamlined:
+
+- Single authoritative "Full Preview" action (no separate lightweight preview, no approval step, no stored plan JSON file). The preview is always computed directly from the saved scenario XML.
+- Deterministic runs via an optional seed. Enter a seed before clicking Full Preview (or reuse/copy one from preview history) to reproduce identical role expansions, service/vulnerability assignments, segmentation picks, switch regrouping, and R2R/R2S edge decisions.
+- A new "Run (Seed)" button will launch the asynchronous CLI using the explicit seed input; if the seed input is empty but a preview has been generated, it reuses the preview's seed for bit‑for‑bit reproducibility.
+- Preview history (last 25) with per‑seed diffs lets you compare topology scale changes across edits or random seeds.
+- Removed concepts: plan approval, drift detection, strict plan checkbox, secondary preview buttons, intermediate plan JSON persistence.
+
+Upgrade note: If you had automation calling removed endpoints (e.g. `/api/plan/preview`, `/api/plan/approve`, `/api/plan/status`), migrate to `/api/plan/preview_full` and drop approval logic. The backend now returns the full preview payload in a single call.
+
 ## Prerequisites
 
 - Python 3.10+ recommended
@@ -16,14 +28,17 @@ If you use a virtual environment, activate it before installing.
 
 ## Host Planning Semantics
 
-The Node Information section supports an optional Base Hosts value (edited via the spinner near the Scenario name in the Web UI). Semantics:
+The Node Information section supports an optional Base Hosts value (edited via the spinner near the Scenario name in the Web UI).
 
-- Base Hosts (density base) are distributed proportionally across Weight rows using their raw (unnormalized) factors.
+Updated defaults & rules:
+
+- Default Base Hosts (density base) when omitted is now **10** (previously 8). This improves small-scenario proportional allocation stability.
+- To request an explicit zero base you must now set the value to 0 in the UI (or include `total_nodes="0"` / `base_nodes="0"` in XML). Leaving it blank no longer implies 0.
+- Base hosts are distributed proportionally across Weight rows using their raw (unnormalized) factors.
 - Count rows add absolute hosts on top of the proportional distribution.
-- If you provide Weight rows but leave Base Hosts empty, a legacy default base of 8 is applied for backward compatibility with earlier behavior/tests.
-- If there are no Weight rows, the base is treated as 0 (only Count rows apply).
+- If there are no Weight rows the base hosts value is still recorded, but with no Weight rows it effectively contributes 0 allocated hosts; only Count rows produce hosts.
 
-Scenario aggregate `scenario_total_nodes` = base_nodes + additive_nodes + total_planned_routers + total_planned_vulnerabilities.
+Scenario aggregate `scenario_total_nodes` = base_nodes + additive_nodes + total_planned_routers + total_planned_vulnerabilities (plus any future additive categories).
 
 XML metadata attributes written for Node Information:
 - `base_nodes`, `additive_nodes`, `combined_nodes`, `weight_rows`, `count_rows`, `weight_sum`.
@@ -35,7 +50,7 @@ These enable precise round‑trip planning without recomputing from factors alon
 
 ## Run the GUI
 
-The GUI lets you load an XML scenario, analyze it, and generate the CORE session asynchronously with progress feedback.
+The GUI lets you edit scenarios, generate a deterministic Full Preview (with optional seed), and start CORE sessions asynchronously with live log streaming.
 
 ```bash
 python main.py
@@ -190,9 +205,11 @@ The scenario editor (Web UI) and CLI share an additive planning model for hosts,
 	- Base (density) hosts are distributed proportionally only across Weight rows.
 	- Count rows add absolute host counts on top of the proportional allocation.
 - Routers ("Routing" section):
-	- Section `density` < 1.0: fractional multiplier of the combined host pool (base+additive) for derived routers.
-	- Section `density` >= 1.0: interpreted as an absolute derived router count (not a fraction).
-	- Count rows (items with `v_metric="Count"`) add absolute routers (per protocol) on top of any derived amount.
+	- Section `density` in (0,1]: treated as a fractional multiplier of the effective base host pool (the base portion only; additive host Count rows are not multiplied).
+	- Section `density` > 1.0: interpreted as an absolute router count contribution (legacy compatibility for earlier tests specifying integers like `5`).
+	- Count rows (items with `v_metric="Count"`) add absolute routers (per protocol) in addition to any density-derived routers.
+	- Final router total = `min(total_hosts, density_contribution + sum(abs_count))`.
+	- This is additive even when both forms are present (earlier semantics sometimes replaced density when count rows existed—now unified for predictability).
 - Vulnerabilities ("Vulnerabilities" section):
 	- Section `density` fraction (clipped to 1.0) of the base host pool only (not including additive host rows) for derived vulnerabilities.
 	- Count rows or `Specific` entries with `v_count` supply explicit counts added to the derived amount.
@@ -233,7 +250,180 @@ Runtime API access: A lightweight endpoint `/planning_meta?path=<xml>&scenario=<
 
 Backward compatibility: If attributes are absent, the parser falls back to recomputation (exact values for some legacy scenarios—like precise derived router counts tied to a changing host pool—may differ slightly, but overall semantics are preserved).
 
+### Full Preview & Seed Usage
+
+Web UI sequence:
+
+1. Edit scenarios (unsaved edits still allow generating a preview; an auto‑save is attempted if XML is missing when you request a preview).
+2. (Optional) Enter a numeric seed in the Seed box.
+3. Click Full Preview.
+4. Inspect structured sections (Overview, Routers, Hosts, Switches, Subnets, R2R, Seg Rules, History) or toggle Raw JSON.
+5. Copy or reuse the seed (Copy Seed button or History "Use Seed").
+6. Click Run (Seed) to launch an async run using either the explicit seed input or, if blank, the last preview's seed.
+
+Determinism contract:
+
+| Element | Deterministic with same seed & unchanged XML |
+|---------|----------------------------------------------|
+| Router count & IDs | Yes |
+| Host role expansion & ordering | Yes |
+| Switch regrouping (R2S) | Yes |
+| R2R edge set (order may differ; set identical) | Yes |
+| Service assignments | Yes |
+| Vulnerability assignments | Yes |
+| Segmentation planned rule list | Yes |
+| Subnet CIDRs (allocator path) | Yes (given ip4_prefix & mode) |
+
+If any source data (XML, env vars influencing allocator, IP mode/region) changes, results can diverge even with identical seed.
+
+API quick start:
+
+POST /api/plan/preview_full
+```json
+{ "xml_path": "/abs/path/scenarios.xml", "seed": 12345 }
+```
+Response includes: `seed`, `seed_generated` (boolean), `routers`, `hosts`, `switches_detail`, `r2r_edges_preview`, `segmentation_preview`, and distribution stats.
+
+The front‑end does not persist previews server‑side; history is stored locally in `localStorage` under `coretg_full_preview_history`.
+
 Experimental structural metadata (Services / Traffic / Segmentation): the XML builder also emits `explicit_count`, `weight_rows`, `count_rows`, and `weight_sum` for these sections to support future additive extensions and analytical tooling.
+
+## Router Connectivity & Switch Aggregation Policies
+
+The routing section now supports richer topology shaping beyond simple full meshes. Two orthogonal policy dimensions can be set per routing item via XML attributes (the Web UI exposes these controls):
+
+1. Router-to-Router (R2R) Connectivity Mode (`r2r_mode` attribute)
+	- `Uniform`: Attempts to produce a near-regular (balanced) degree distribution. Internally starts with a ring (ensuring connectivity) then incrementally adds edges while selecting the currently lowest-degree routers first. Guarantees max degree - min degree is small (typically ≤ 1 when target edge budget is feasible).
+	- `NonUniform`: Produces a heterogeneous degree distribution by preferentially attaching extra edges to already higher-degree routers (rich‑get‑richer bias) after a minimal connectivity backbone.
+	- (Omitted / empty): Falls back to the global mesh style (`--router-mesh-style` / GUI selection) which can be `full`, `ring`, or `tree` and applies when no explicit per‑item policy is set.
+
+2. Router-to-Switch (R2S) Aggregation (`r2s_mode` / `r2s_edges` attributes)
+	- When enabled, host nodes (originally directly connected to the core access switch) are rehomed behind auxiliary layer‑2 switches to simulate aggregation / distribution tiers or load concentration. Existing direct links are removed (rehoming is idempotent per run).
+	- `r2s_edges` sets a target host count per aggregation switch (approximate; remainder hosts are balanced). Statistics are recorded: number of new switches, min/max/avg host counts per switch, std dev, and Gini coefficient.
+
+### Aggregated Exact=1 Semantics (R2S)
+
+When a routing item sets `r2s_mode="Exact"` and `r2s_edges="1"`, the planner applies a special aggregated semantics:
+
+* Each router that has one or more directly attached hosts receives exactly one new aggregation switch.
+* All of that router's hosts are migrated (rehomed) behind the single switch (not just a pair).
+* A router–switch /30 is allocated plus a host LAN sized just large enough to contain every host plus the switch gateway (prefix chosen dynamically; may be larger than /28 when many hosts aggregate).
+* This differs from `Exact` with a target > 1 (or other non-Exact modes) where switches are created in host pairs (each switch typically serving two hosts) until the target (or feasible pairs) is exhausted.
+* If `Exact` mode is declared but `r2s_edges` is 0 or missing, the planner auto-derives a target from the first routing item that has a positive `r2s_edges`; if none is found and hosts exist it defaults to 1 (entering the aggregated behavior) to honor the user's intent to enable aggregation.
+
+Implications:
+* Provides a fast way to collapse all access hosts under a single distribution/aggregation layer per router (common campus style) without hand-tuning per-switch counts.
+* Deterministic: given a seed and unchanged XML, the same switch IDs, LAN subnet prefixes, and host interface assignments repeat.
+* Metrics: In the preview JSON the field `r2s_policy_preview` will include:
+	* `mode: "Exact"`
+	* `target_per_router` (the declared or derived target, often 1 here)
+	* `target_per_router_effective` when the system derived a fallback (e.g. default from 0 to 1)
+	* `counts` mapping router_id -> created switch count (all 1's for routers with hosts under aggregated behavior)
+
+Example XML enabling aggregated behavior for routers introduced purely via Count rows:
+
+```xml
+<section name="Node Information" total_nodes="0">
+	<item selected="Workstation" v_metric="Count" v_count="9" />
+</section>
+<section name="Routing">
+	<!-- Three absolute routers; exact aggregation with one switch each rehoming all of its hosts -->
+	<item selected="OSPF" v_metric="Count" v_count="3" r2s_mode="Exact" r2s_edges="1" />
+</section>
+```
+
+In the Full Preview you should observe:
+* 3 routers (`r1..r3`)
+* 9 hosts (`h1..h9-*`) distributed round‑robin among routers (3 each)
+* 3 aggregation switches (`rsw-<rid>-1`) each listing all 3 hosts of its router in `switches_detail`.
+
+Contrast (pair-based) example creating multiple small switches per router:
+
+```xml
+<section name="Node Information" base_nodes="12">
+	<item selected="Workstation" factor="1" />
+</section>
+<section name="Routing" density="3">
+	<!-- Exact target 2 => planner attempts up to 2 switches per router, each serving a host pair (2 hosts per switch) -->
+	<item selected="OSPF" factor="1" r2s_mode="Exact" r2s_edges="2" />
+</section>
+```
+
+Here each router (3 total) receives up to 2 switches (subject to available host pairs), each switch normally serving 2 hosts; any remainder host without a pair is left directly connected (or, if enhanced later, may be grouped in a final uneven switch).
+
+### Additive (Count-Based) Routing Items & R2S
+
+Count-based routing items (`v_metric="Count"`) now preserve their R2R and R2S attributes (`r2r_mode`, `r2r_edges`, `r2s_mode`, `r2s_edges`). This means you can drive both router presence and aggregation policy solely from Count rows (no density / factor rows required). The preview and runtime builders treat these items equivalently to factor-based ones for policy derivation. If both factor (density) and count items exist, switch aggregation policy is derived from the first item declaring an R2S mode (precedence: first Exact, else first any mode).
+
+### Mesh Styles (Global Fallback)
+
+If no `r2r_mode` is set on a routing item, the builder applies the selected mesh style to the entire router set:
+
+- `full`: Complete graph (n*(n-1)/2 links)
+- `ring`: Simple cycle (n links)
+- `tree`: Spanning chain (n-1 links) to guarantee minimal connectivity
+
+These styles are computed exactly (no over-linking) and coexist with per-item policies when those are explicitly defined.
+
+### Report Metrics
+
+The generated Markdown scenario report now includes advanced connectivity statistics when routers are present:
+
+- Router degree stats: min / max / average / standard deviation / Gini coefficient
+- Router-to-switch aggregation stats: number of aggregation switches, host count distribution stats (min/max/avg/std/Gini), and total rehomed hosts
+
+These metrics help evaluate balance (Uniform) versus intentional skew (NonUniform) and validate aggregation design.
+
+## Vulnerability Assignment Leniency
+
+When the Web UI marks vulnerability images as "downloaded" but not yet pulled locally, the assignment phase can operate in a lenient mode (no strict filesystem/image existence check) so that planning and reports are still produced. This behavior improves testability and CI workflows where image pulls are intentionally skipped. Production deployments should still ensure images are pulled for successful runtime compose launches.
+
+## XML Quick Examples (Connectivity & Aggregation)
+
+Balanced + Skewed Routers with Aggregation:
+```xml
+<section name="Routing" density="0.4">
+	<!-- Derive routers from 40% of base host pool; balanced degree distribution -->
+	<item selected="OSPF" factor="1" r2r_mode="Uniform" />
+	<!-- Add two absolute routers with heterogeneous links and rehome hosts into ~5-host switches -->
+	<item selected="BGP" v_metric="Count" v_count="2" r2r_mode="NonUniform" r2s_mode="aggregate" r2s_edges="5" />
+</section>
+```
+
+Count-Only Routers (no density contribution):
+```xml
+<section name="Routing">
+	<item selected="OSPF" v_metric="Count" v_count="3" />
+</section>
+```
+
+Explicit Zero Base Hosts with Pure Count Additions:
+```xml
+<section name="Node Information" total_nodes="0">
+	<item selected="Workstation" v_metric="Count" v_count="6" />
+	<item selected="Server" v_metric="Count" v_count="2" />
+</section>
+```
+
+Router Density as Absolute Count:
+```xml
+<section name="Routing" density="6">
+	<item selected="OSPF" factor="1" />
+</section>
+```
+
+Host Segmentation + Traffic (abridged):
+```xml
+<section name="Traffic" density="0.3">
+	<item selected="Generic" factor="1" pattern="burst" rate_kbps="128" />
+</section>
+<section name="Segmentation" density="0.5">
+	<item selected="Firewall" factor="1" />
+	<item selected="NAT" v_metric="Count" v_count="1" />
+</section>
+```
+
+Use these snippets as starting points; the Web UI will enrich them with planning metadata on save.
 ```
 
 ## HTTP API (for automation)

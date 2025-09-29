@@ -13,6 +13,16 @@ Conventions
 - File downloads are sent via `/download_report?path=...` and may accept absolute or repo-relative paths. The server resolves common variants.
 - Safe deletes and file operations are scoped under `uploads/` and `outputs/` to avoid accidental removal of arbitrary files.
 
+Planning & Defaults Snapshot
+- Default base host pool (when omitted) is 10; explicit zero requires setting `total_nodes="0"` (or `base_nodes="0"`).
+- Router count formula (builder): `routers = min(total_hosts, density_contribution + sum(abs_count))` where:
+  - If `0 < density <= 1`: `density_contribution = floor(base_host_pool * density)` (base host pool excludes additive Count rows).
+  - If `density > 1`: `density_contribution = int(density)` (legacy absolute form).
+  - `abs_count` gathered from routing items with `v_metric="Count"`.
+- Per-routing-item connectivity shaping: `r2r_mode` (Uniform|NonUniform|Exact|Min|Random) with fallback to global mesh style (`--router-mesh-style` full|ring|tree) when omitted.
+- Host aggregation / rehoming via `r2s_mode` and `r2s_edges` (XML attributes) producing extra layer‑2 switches and balance statistics.
+- Vulnerability assignment lenient mode: downloaded-but-not-pulled catalog entries can still be assigned for planning/report purposes.
+
 Endpoints
 
 - POST `/login`
@@ -55,6 +65,7 @@ Scenario editor & runs
   - Side effects:
     - Writes a Markdown report under `./reports/`.
     - If planning metadata attributes are present in the XML, they are merged into the report under a "Planning Metadata (from XML)" section with namespaced keys (`plan_*`).
+    - Connectivity metrics (router degree distribution, aggregation switch stats) appended when routers are generated.
     - Attempts to capture pre- and post-run CORE session XML into `outputs/core-sessions/`.
     - Appends an entry to `outputs/run_history.json` (even on failure) with `report_path` if found.
 
@@ -234,6 +245,7 @@ The CLI supports the following arguments. The Web endpoints currently forward on
   - `--seed` (int): RNG seed for reproducible randomness
   - `--layout-density` (`compact|normal|spacious`, default `normal`): affects node spacing
     - Additive planning metadata parsing: The CLI automatically detects and parses section-level planning attributes when present (via `parse_planning_metadata`). Resulting keys are merged into generation metadata with a `plan_` prefix and surfaced in scenario reports.
+  - `--router-mesh-style` (`full|ring|tree`, default `full`): fallback mesh style applied to router set when routing items omit `r2r_mode`.
 
 - Traffic overrides (apply to all traffic items if provided)
   - `--traffic-pattern` (`continuous|burst|periodic|poisson|ramp`)
@@ -252,6 +264,22 @@ The CLI supports the following arguments. The Web endpoints currently forward on
 Important
 - The web backend derives CORE `host`/`port` from the saved editor XML’s `core` section when present; otherwise defaults apply.
 - If you need to use additional CLI flags via the Web endpoints, extend the backend to accept and forward those parameters.
+
+### Connectivity Attribute Examples (Routing Section XML)
+
+```xml
+<section name="Routing" density="0.5">
+  <!-- Balanced degree distribution among density-derived routers -->
+  <item selected="OSPF" factor="1" r2r_mode="Uniform" />
+  <!-- Absolute router addition (2) with heterogeneous links and host aggregation (target 5 hosts per new switch) -->
+  <item selected="BGP" v_metric="Count" v_count="2" r2r_mode="NonUniform" r2s_mode="aggregate" r2s_edges="5" />
+</section>
+```
+
+Interpretation:
+- Density 0.5 over a base host pool of 12 hosts -> 6 density routers.
+- 2 BGP count routers => total planned routers = min(total_hosts, 6 + 2).
+- First item influences balanced edge placement; second item contributes NonUniform extra edges and triggers host rehoming behind aggregation switches sized ~5 hosts each.
 
 ## Planning Metadata Quick Reference
 

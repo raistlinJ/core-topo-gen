@@ -21,18 +21,18 @@ def test_node_info_additive_semantics():
         with open(path, 'w') as f:
             f.write(XML)
         density_base, weight_items, count_items, services = parse_node_info(path, 'add')
-    # Density base now defaults to 0 (no implicit legacy base)
-    assert density_base == 0
-    assert services == []
-    assert len(weight_items) == 2
-    assert set(r for r,_ in weight_items) == {'Workstation','Server'}
-    assert sorted(count_items) == [('Database', 2), ('Sensor', 1)]
-    # Allocate weight roles across base (all zero)
-    total_factor = sum(f for _, f in weight_items)
-    norm_items = [(r, f/total_factor) for r, f in weight_items]
-    weight_counts = compute_role_counts(density_base, norm_items)
-    assert sum(weight_counts.values()) == 0
-    # Add additive counts
-    for role, c in count_items:
-      weight_counts[role] = weight_counts.get(role, 0) + c
-    assert sum(weight_counts.values()) == 3  # 0 base + 3 additive
+        # Density base now defaults to 10 when not explicitly provided
+        assert density_base == 10
+        assert services == []
+        assert len(weight_items) == 2
+        assert set(r for r,_ in weight_items) == {'Workstation','Server'}
+        assert sorted(count_items) == [('Database', 2), ('Sensor', 1)]
+        # Allocate weight roles across base (10 distributed by 2:1 ratio => ~6 and ~4 after rounding logic)
+        total_factor = sum(f for _, f in weight_items)
+        norm_items = [(r, f/total_factor) for r, f in weight_items]
+        weight_counts = compute_role_counts(density_base, norm_items)
+        assert sum(weight_counts.values()) == 10
+        # Add additive counts
+        for role, c in count_items:
+            weight_counts[role] = weight_counts.get(role, 0) + c
+        assert sum(weight_counts.values()) == 13  # 10 base + 3 additive

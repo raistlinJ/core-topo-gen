@@ -9,6 +9,14 @@ from ..types import SegmentationInfo
 logger = logging.getLogger(__name__)
 
 
+def _has_unexpected_container(root: ET.Element) -> bool:
+    """Detect if the provided XML root appears to be a CORE session export (contains <container>)."""
+    try:
+        return root.find('.//container') is not None
+    except Exception:
+        return False
+
+
 def _find_scenario(root: ET.Element, scenario_name: Optional[str]) -> Optional[ET.Element]:
     scenarios = root.findall(".//Scenario")
     if not scenarios:
@@ -88,6 +96,9 @@ def parse_node_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[int, L
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
+        if _has_unexpected_container(root):
+            logger.error("Node Info parse aborted: XML contains <container> (CORE session XML). Using defaults.")
+            return default_count, default_items, [], []
     except Exception as e:
         logger.warning("Failed to parse XML (%s); defaulting values", e)
         return default_count, default_items, [], []
@@ -130,7 +141,8 @@ def parse_node_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[int, L
         density_base = 0
     items_el = section.findall("./item")
     count_map: Dict[str, int] = {}
-    weight_items: List[Tuple[str, float]] = []
+    # weight_items extended schema: (protocol, factor, r2r_mode, edges_val, r2s_mode, r2s_edges_val)
+    weight_items: List[Tuple[str, float, str, int, str, int]] = []
     for it in items_el:
         role = (it.get("selected") or "").strip() or "Workstation"
         vm = (it.get("v_metric") or "").strip()
@@ -185,17 +197,22 @@ def parse_routing_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[flo
             density = 0.0
     # Inspect items; if any Count-based entries exist, use them to set absolute router count
     count_total = 0
-    count_items: List[Tuple[str, int]] = []
+    # Store extended metadata for count items: (protocol, count, r2r_mode, r2r_edges, r2s_mode, r2s_edges)
+    count_items: List[Tuple[str, int]] = []  # retained for any legacy expectations inside this function
+    count_items_meta: List[Tuple[str, int, str, int, str, int]] = []
     weight_items: List[Tuple[str, float]] = []
     for it in section.findall("./item"):
         proto = (it.get("selected") or "").strip()
         if not proto:
             continue
         vm = (it.get("v_metric") or "").strip()
-        edges_mode = (it.get("edges_mode") or "").strip()
-        # Support legacy attribute name 'edges' for Exact mode
-        edges_raw = (it.get("edges") or "").strip()
+        r2r_mode = (it.get("r2r_mode") or "").strip()
+        r2s_mode = (it.get("r2s_mode") or "").strip()
+        # r2r_edges attribute for Exact mode degree specification
+        edges_raw = (it.get("r2r_edges") or "").strip()
+        r2s_edges_raw = (it.get("r2s_edges") or "").strip()
         edges_val = 0
+        r2s_edges_val = 0
         if edges_raw:
             try:
                 ev = int(edges_raw)
@@ -203,13 +220,21 @@ def parse_routing_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[flo
                     edges_val = ev
             except Exception:
                 edges_val = 0
+        if r2s_edges_raw:
+            try:
+                ev2 = int(r2s_edges_raw)
+                if ev2 >= 0:
+                    r2s_edges_val = ev2
+            except Exception:
+                r2s_edges_val = 0
         if vm == "Count":
             try:
                 vc = int((it.get("v_count") or "0").strip())
             except Exception:
                 vc = 0
             if vc > 0:
-                count_items.append((proto, vc))  # edges attributes ignored for count planning
+                count_items.append((proto, vc))
+                count_items_meta.append((proto, vc, r2r_mode, edges_val, r2s_mode, r2s_edges_val))
                 count_total += vc
         else:
             try:
@@ -218,17 +243,23 @@ def parse_routing_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[flo
                 f = 0.0
             if f > 0:
                 # Temporarily store in weight_items; edges planning handled after consolidated list built
-                weight_items.append((proto, f, edges_mode, edges_val))
+                weight_items.append((proto, f, r2r_mode, edges_val, r2s_mode, r2s_edges_val))
     if count_total > 0:
-        items = [RoutingInfo(protocol=p, factor=0.0, abs_count=c) for p, c in count_items]
+        # Include policy attributes for count-based items (previously dropped)
+        if count_items_meta:
+            items = [RoutingInfo(protocol=p, factor=0.0, abs_count=c, r2r_mode=rm, r2r_edges=re, r2s_mode=sm, r2s_edges=se) for p,c,rm,re,sm,se in count_items_meta]
+        else:
+            items = [RoutingInfo(protocol=p, factor=0.0, abs_count=c) for p, c in count_items]
     if weight_items:
         for rec in weight_items:
-            if len(rec) == 2:  # backward safety
-                p, f = rec
-                items.append(RoutingInfo(protocol=p, factor=f, abs_count=0))
+            # Backward safety retained conceptually; older tuples length<6 should not appear now
+            if len(rec) < 6:
+                # Fallback interpret positions (protocol, factor, r2r_mode?, edges_val?)
+                p = rec[0]; f = rec[1]; em = rec[2] if len(rec) > 2 else ''; ev = rec[3] if len(rec) > 3 else 0
+                items.append(RoutingInfo(protocol=p, factor=f, abs_count=0, r2r_mode=em, r2r_edges=ev))
             else:
-                p, f, em, ev = rec
-                items.append(RoutingInfo(protocol=p, factor=f, abs_count=0, edges_mode=em, edges=ev))
+                p, f, em, ev, r2sm, r2sev = rec
+                items.append(RoutingInfo(protocol=p, factor=f, abs_count=0, r2r_mode=em, r2r_edges=ev, r2s_mode=r2sm, r2s_edges=r2sev))
     # If neither density nor counts nor weight items, result is empty list (0 routers)
     if not items:
         density = 0.0
@@ -487,6 +518,10 @@ def parse_planning_metadata(xml_path: str, scenario_name: Optional[str]) -> Dict
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
+        if _has_unexpected_container(root):
+            # Likely a CORE session export; scenario planning metadata not applicable.
+            logger.error("Planning metadata parse aborted: XML contains <container> (session XML). Returning empty meta.")
+            return meta
     except Exception:
         return meta
     scenario = _find_scenario(root, scenario_name)

@@ -7,7 +7,7 @@ def build_xml(weight_rows, count_for_density=10, counts=None):
     scen = ET.SubElement(root, 'Scenario', name='d')
     se = ET.SubElement(scen, 'ScenarioEditor')
     ni = ET.SubElement(se, 'section', name='Node Information')
-    if count_for_density:
+    if count_for_density is not None:
         ni.set('total_nodes', str(count_for_density))
     # weight rows
     for name, factor in weight_rows:

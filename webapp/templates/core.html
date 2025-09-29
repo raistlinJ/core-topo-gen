@@ -235,7 +235,7 @@
     const rowStr = `${id} ${state} ${nodes} ${file}`.toLowerCase();
     if (sessionsFilterText && !rowStr.includes(sessionsFilterText)) return '';
     const detailsHref = hasFile
-      ? (`{{ url_for('base_details') }}?path=` + encodeURIComponent(s.file))
+      ? (`{{ url_for('core_details') }}?path=` + encodeURIComponent(s.file))
       : (`{{ url_for('core_details') }}?session_id=` + encodeURIComponent(String(s.id||'')));
     const stopBtn = `
       <form action="{{ url_for('core_stop') }}" method="post">
@@ -281,7 +281,7 @@
     const path = esc(x.path);
     const name = esc(x.name);
     const validBadge = x.valid ? '<span class="badge text-bg-success">yes</span>' : '<span class="badge text-bg-danger">no</span>';
-    const detailsHref = `{{ url_for('base_details') }}?path=` + encodeURIComponent(x.path);
+  const detailsHref = `{{ url_for('core_details') }}?path=` + encodeURIComponent(x.path);
     const startDisabled = x.valid ? '' : 'disabled';
     const rowStr = `${name} ${path} ${x.valid? 'yes':'no'}`.toLowerCase();
     if (xmlsFilterText && !rowStr.includes(xmlsFilterText)) return '';

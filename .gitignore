@@ -137,3 +137,5 @@ outputs/
 reports/
 
 repo
+
+nginx/certs/
