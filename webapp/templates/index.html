@@ -10,6 +10,9 @@
     .host-total-badge + .badge, .host-total-badge + button { margin-left: .25rem; }
 </style>
 {% endblock %}
+/* Hide H/S bounds by default; JS adds .hs-show to display them */
+.hs-bounds-wrapper { display: none; }
+.hs-bounds-wrapper.hs-show { display: flex; }
 {% block content %}
     <div class="row">
         <div class="col-md-3 mb-3">
@@ -404,10 +407,12 @@ function updatePlanButtons(){
     const previewBtn = document.getElementById('planPreviewBtn');
     const statusBadge = document.getElementById('planStatusBadge');
     const hint = document.getElementById('planHint');
+    const genBtn = document.getElementById('runSyncBtn');
     const xmlPathVal = (state.result_path || '').trim();
     previewState.xmlSaved = !!xmlPathVal;
     const canPreview = previewState.xmlSaved || previewState.dirty;
     if(previewBtn) previewBtn.disabled = !canPreview;
+    if(genBtn) genBtn.disabled = !canPreview;
     if(hint){
     if(!previewState.xmlSaved) hint.textContent = 'Save XML to enable planning.';
     else hint.textContent = previewState.fullPreview ? 'Full preview ready.' : 'Generate a full preview.';
@@ -1247,6 +1252,16 @@ function renderMain() {
             </div>`;
         root.appendChild(card);
     });
+    // Apply visibility rule: show H/S bounds only for R-to-S NonUniform mode
+    try {
+        document.querySelectorAll('[data-field="r2s_mode"]').forEach(selEl => {
+            const modeVal = selEl.value;
+            const wrapper = selEl.closest('.routing-edge-groups')?.querySelector('.hs-bounds-wrapper');
+            if (wrapper) {
+                if (modeVal === 'NonUniform') { wrapper.classList.add('hs-show'); } else { wrapper.classList.remove('hs-show'); }
+            }
+        });
+    } catch(e) { /* ignore */ }
         // activate tooltips for icons
         if(window.bootstrap){
             const tts = root.querySelectorAll('[data-bs-toggle="tooltip"]');
@@ -1352,6 +1367,7 @@ function renderItemRow(sidx, secName, iidx, it) {
             const r2sSel = `<select class="form-select form-select-sm routing-mode-select" style="width:105px" data-field="r2s_mode" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${options.map(o => `<option value="${o.v}" ${o.v===r2sMode?'selected':''}>${o.l}</option>`).join('')}</select>`;
             const r2sHostsMin = (it.r2s_hosts_min !== undefined && it.r2s_hosts_min !== null) ? it.r2s_hosts_min : 1;
             const r2sHostsMax = (it.r2s_hosts_max !== undefined && it.r2s_hosts_max !== null) ? it.r2s_hosts_max : 4;
+            const showHsBounds = (r2sMode === 'NonUniform');
             return `
                 <div class="d-flex flex-column gap-1 routing-edge-groups">
                     <div class="d-flex flex-wrap gap-2 align-items-center">
@@ -1370,14 +1386,14 @@ function renderItemRow(sidx, secName, iidx, it) {
                             <div class="r2s-exact-input" style="display:${r2sMode==='Exact'?'block':'none'};">
                                 <input type="number" min="1" class="form-control form-control-sm r2s-degree-input" style="width:110px" value="${r2sVal}" data-field="r2s_edges" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="Exact (e.g. 2)" aria-label="Exact router-to-switch target" title="Target number of switches per router (Exact mode).">
                             </div>
-                            <div class="d-flex gap-2 align-items-end small">
+                            <div class="gap-2 align-items-end small hs-bounds-wrapper">
                                 <div>
                                     <label class="form-label mb-0" style="font-size:0.7rem" title="Minimum hosts per created switch for this router row (preview & build).">H/S Min</label>
-                                    <input type="number" min="1" max="32" class="form-control form-control-sm" style="width:70px" value="${r2sHostsMin}" data-field="r2s_hosts_min" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="min">
+                                    <input type="number" min="1" max="32" class="form-control form-control-sm hs-min-input" style="width:70px" value="${r2sHostsMin}" data-field="r2s_hosts_min" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="min">
                                 </div>
                                 <div>
                                     <label class="form-label mb-0" style="font-size:0.7rem" title="Maximum hosts per created switch for this router row (preview & build).">H/S Max</label>
-                                    <input type="number" min="1" max="64" class="form-control form-control-sm" style="width:70px" value="${r2sHostsMax}" data-field="r2s_hosts_max" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="max">
+                                    <input type="number" min="1" max="64" class="form-control form-control-sm hs-max-input" style="width:70px" value="${r2sHostsMax}" data-field="r2s_hosts_max" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="max">
                                 </div>
                             </div>
                         </div>
@@ -1575,6 +1591,7 @@ function wireHandlers() {
                             if (!isNaN(mn) && !isNaN(mx) && mn > mx) {
                                 item.r2s_hosts_max = mn;
                             }
+                            persistEditorState();
                         }
                         if (field === 'factor') {
                             adjustWeightsProportionally(sidx, sec, parseInt(iidx));
@@ -1603,6 +1620,16 @@ function wireHandlers() {
                             if(el.value !== 'Exact') { delete item.r2s_edges; }
                             renderMain();
                             setTimeout(validateRoutingEdges, 50);
+                            // After re-render ensure H/S bounds inputs visibility toggled only for NonUniform
+                            setTimeout(()=>{
+                                document.querySelectorAll('[data-field="r2s_mode"]').forEach(selEl=>{
+                                    try {
+                                        const modeVal = selEl.value;
+                                        const wrapper = selEl.closest('.routing-edge-groups')?.querySelector('.hs-bounds-wrapper');
+                                        if(wrapper){ wrapper.style.display = (modeVal==='NonUniform') ? 'flex' : 'none'; }
+                                    } catch(e) { /* ignore */ }
+                                });
+                            },60);
                         }
                         if (field === 'edges') {
                             setTimeout(validateRoutingEdges, 20);

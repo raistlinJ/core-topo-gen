@@ -31,13 +31,15 @@ from core_topo_gen.planning.constraints import validate_phase
 logger = logging.getLogger(__name__)
 
 # ---- Switch host grouping configuration (experimental) ----
-SWITCH_HOSTS_MIN = 1        # allow a single host under a switch (avoids orphans)
-SWITCH_HOSTS_MAX = 4        # cap to keep broadcast domains modest
+SWITCH_HOSTS_MIN = 1        # default lower bound (overridden per-routing-item when provided)
+SWITCH_HOSTS_MAX = 4        # default upper bound
 SWITCH_HOST_SIZE_BIAS = 'small'  # 'small' favors smaller groups; 'uniform' equal probability
 
-def _choose_switch_group_size(remaining: int, rnd: random.Random) -> int:
-    lo = max(1, SWITCH_HOSTS_MIN)
-    hi = min(SWITCH_HOSTS_MAX, remaining)
+def _choose_switch_group_size(remaining: int, rnd: random.Random, lo_override: int | None = None, hi_override: int | None = None) -> int:
+    lo_base = SWITCH_HOSTS_MIN if lo_override in (None, 0) else lo_override
+    hi_base = SWITCH_HOSTS_MAX if hi_override in (None, 0) else hi_override
+    lo = max(1, lo_base)
+    hi = min(hi_base, remaining)
     if lo >= hi:
         return lo
     sizes = list(range(lo, hi + 1))
@@ -53,6 +55,73 @@ def _choose_switch_group_size(remaining: int, rnd: random.Random) -> int:
         if pick <= acc:
             return s
     return sizes[0]
+
+def _partition_hosts_with_bounds(host_ids: List[int], desired_switches: int, hmin: int | None, hmax: int | None, rnd: random.Random) -> List[List[int]]:
+    """Partition host ids into groups attempting to satisfy hmin/hmax bounds.
+
+    If bounds make the desired_switches infeasible, adjust switch count.
+    Guarantees: groups non-empty, total hosts conserved. Bounds treated as hard when feasible; may violate if impossible.
+    """
+    n = len(host_ids)
+    if n == 0:
+        return []
+    if desired_switches <= 0:
+        desired_switches = 1
+    # Adjust by feasibility
+    if hmin and hmin > 0 and desired_switches * hmin > n:
+        desired_switches = max(1, n // hmin) or 1
+    if hmax and hmax > 0 and desired_switches * hmax < n:
+        # Need more switches to not exceed max
+        desired_switches = min(n, (n + (hmax - 1)) // hmax)
+    if desired_switches <= 0:
+        desired_switches = 1
+    ids = list(host_ids)
+    rnd.shuffle(ids)
+    groups: List[List[int]] = [[] for _ in range(desired_switches)]
+    # Greedy fill respecting hmax but inject slight randomness to avoid identical distributions
+    for hid in ids:
+        if hmax and hmax > 0:
+            candidate_indices = [i for i,g in enumerate(groups) if len(g) < hmax]
+            if not candidate_indices:
+                groups.append([hid])
+                continue
+            # bias toward smaller groups but random tie-break
+            candidate_indices.sort(key=lambda i: (len(groups[i]), rnd.random()))
+            groups[candidate_indices[0]].append(hid)
+        else:
+            # No upper bound -> always append to smallest (deterministic-ish) with randomness
+            groups.sort(key=lambda g: (len(g), rnd.random()))
+            groups[0].append(hid)
+    # Enforce minimum by borrowing from largest groups
+    if hmin and hmin > 0:
+        # Repeat until all groups meet min or cannot borrow
+        changed = True
+        guard = 0
+        while changed and guard < 100:
+            guard += 1
+            changed = False
+            small_indices = [i for i,g in enumerate(groups) if len(g) < hmin]
+            if not small_indices:
+                break
+            large_indices = [i for i,g in enumerate(groups) if len(g) > hmin]
+            if not large_indices:
+                break
+            large_indices.sort(key=lambda i: len(groups[i]), reverse=True)
+            for si in small_indices:
+                if len(groups[si]) >= hmin:
+                    continue
+                for li in large_indices:
+                    if len(groups[si]) >= hmin:
+                        break
+                    if len(groups[li]) <= hmin:
+                        continue
+                    # Move one host
+                    moved = groups[li].pop()
+                    groups[si].append(moved)
+                    changed = True
+        # Remove any empty groups created during adjustment
+    groups = [g for g in groups if g]
+    return groups
 
 # ---------------- Phase Helpers ---------------- #
 
@@ -765,47 +834,110 @@ def build_segmented_topology_phased(
             max_switches = min(int(r2s_ratio), max(1, len(host_ids)//max(1, SWITCH_HOSTS_MIN))) if r2s_ratio > 0 else 0
             seq = 0
             rnd_local = random.Random(5000 + rid)
-            while max_switches > 0 and len(host_ids) >= SWITCH_HOSTS_MIN:
-                group_size = _choose_switch_group_size(len(host_ids), rnd_local)
-                if group_size > len(host_ids):
-                    group_size = len(host_ids)
-                selected_hosts = [host_ids.pop() for _ in range(group_size)]
-                try:
-                    sw_name = f"rsw-{rid}-{seq+1}"
-                    sw_node = session.add_node(node_id_counter_local, _type=NodeType.SWITCH, position=Position(x=0,y=0), name=sw_name)
-                except Exception:
-                    break
-                node_id_counter_local += 1; seq += 1
-                seg_net = subnet_alloc.next_random_subnet(30)
-                seg_hosts = list(seg_net.hosts())
-                if len(seg_hosts) < 2:
-                    continue
-                r_ip = str(seg_hosts[0]); sw_ip = str(seg_hosts[1])
-                r_ifid = router_next_ifid.get(rid, 0); router_next_ifid[rid] = r_ifid + 1
-                r_if = Interface(id=r_ifid, name=f"r{rid}-rsw{seq}-if{r_ifid}", ip4=r_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
-                sw_if = Interface(id=0, name=f"rsw{seq}-r{rid}", ip4=sw_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
-                r_obj = router_nodes.get(rid)
-                if r_obj:
-                    safe_add_link(session, sw_node, r_obj, iface1=sw_if, iface2=r_if)
-                # LAN size conditional: /30 for single-host else /28
-                lan_net2 = subnet_alloc.next_random_subnet(30 if len(selected_hosts)==1 else 28)
-                lan2_hosts = list(lan_net2.hosts())
-                if len(lan2_hosts) < 2:
-                    continue
-                for idx_h, h_sel in enumerate(selected_hosts):
-                    if idx_h + 1 >= len(lan2_hosts):
+            # Derive any per-router host grouping overrides from routing_items (abs_count mapped earlier)
+            # Build a mapping from protocol assignment (router_protocols) back to its RoutingInfo to inspect r2s hosts bounds.
+            # For now if multiple protocols assigned with conflicting bounds, take min of mins and max of maxes.
+            hmin_override = None; hmax_override = None
+            try:
+                proto_bounds: List[tuple[int,int]] = []
+                for ri in routing_items or []:
+                    if getattr(ri, 'abs_count', 0) > 0 and getattr(ri, 'r2s_hosts_min', 0) >= 0 and getattr(ri, 'r2s_hosts_max', 0) >= 0:
+                        # We don't yet map exact routers to specific routing items here (assigned later in Phase 5). Use any specified bounds as global hints.
+                        if ri.r2s_hosts_min or ri.r2s_hosts_max:
+                            proto_bounds.append((ri.r2s_hosts_min or 0, ri.r2s_hosts_max or 0))
+                if proto_bounds:
+                    mins = [b[0] for b in proto_bounds if b[0] > 0]
+                    maxs = [b[1] for b in proto_bounds if b[1] > 0]
+                    if mins:
+                        hmin_override = min(mins)
+                    if maxs:
+                        hmax_override = max(maxs)
+                    if hmin_override and hmax_override and hmin_override > hmax_override:
+                        hmin_override = hmax_override
+            except Exception:
+                hmin_override = None; hmax_override = None
+            if (hmin_override or hmax_override):
+                # Use strict partitioning when overrides present
+                groups = _partition_hosts_with_bounds(list(host_ids), max_switches, hmin_override, hmax_override, rnd_local)
+                host_ids.clear()
+                for g in groups:
+                    selected_hosts = g
+                    try:
+                        sw_name = f"rsw-{rid}-{seq+1}"
+                        sw_node = session.add_node(node_id_counter_local, _type=NodeType.SWITCH, position=Position(x=0,y=0), name=sw_name)
+                    except Exception:
                         break
-                    h_obj = session.get_node(h_sel) if hasattr(session, 'get_node') else None
-                    if not h_obj:
+                    node_id_counter_local += 1; seq += 1
+                    seg_net = subnet_alloc.next_random_subnet(30)
+                    seg_hosts = list(seg_net.hosts())
+                    if len(seg_hosts) < 2:
                         continue
-                    hip = str(lan2_hosts[idx_h+1])
-                    h_if = Interface(id=1+idx_h, name=f"eth{1+idx_h}", ip4=hip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
-                    sw_l_if = Interface(id=idx_h+1, name=f"rsw{seq}-h{h_sel}-if{idx_h+1}", ip4=str(lan2_hosts[0]), ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
-                    safe_add_link(session, h_obj, sw_node, iface1=h_if, iface2=sw_l_if)
-                r2s_counts[rid] += 1
-                pool.switches_allocated += 1
-                rehomed_hosts.extend(selected_hosts)
-                max_switches -= 1
+                    r_ip = str(seg_hosts[0]); sw_ip = str(seg_hosts[1])
+                    r_ifid = router_next_ifid.get(rid, 0); router_next_ifid[rid] = r_ifid + 1
+                    r_if = Interface(id=r_ifid, name=f"r{rid}-rsw{seq}-if{r_ifid}", ip4=r_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
+                    sw_if = Interface(id=0, name=f"rsw{seq}-r{rid}", ip4=sw_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
+                    r_obj = router_nodes.get(rid)
+                    if r_obj:
+                        safe_add_link(session, sw_node, r_obj, iface1=sw_if, iface2=r_if)
+                    lan_net2 = subnet_alloc.next_random_subnet(30 if len(selected_hosts)==1 else 28)
+                    lan2_hosts = list(lan_net2.hosts())
+                    if len(lan2_hosts) < 2:
+                        continue
+                    for idx_h, h_sel in enumerate(selected_hosts):
+                        if idx_h + 1 >= len(lan2_hosts):
+                            break
+                        h_obj = session.get_node(h_sel) if hasattr(session, 'get_node') else None
+                        if not h_obj:
+                            continue
+                        hip = str(lan2_hosts[idx_h+1])
+                        h_if = Interface(id=1+idx_h, name=f"eth{1+idx_h}", ip4=hip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                        sw_l_if = Interface(id=idx_h+1, name=f"rsw{seq}-h{h_sel}-if{idx_h+1}", ip4=str(lan2_hosts[0]), ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                        safe_add_link(session, h_obj, sw_node, iface1=h_if, iface2=sw_l_if)
+                    r2s_counts[rid] += 1
+                    pool.switches_allocated += 1
+                    rehomed_hosts.extend(selected_hosts)
+            else:
+                while max_switches > 0 and len(host_ids) >= (hmin_override or SWITCH_HOSTS_MIN):
+                    group_size = _choose_switch_group_size(len(host_ids), rnd_local, hmin_override, hmax_override)
+                    if group_size > len(host_ids):
+                        group_size = len(host_ids)
+                    selected_hosts = [host_ids.pop() for _ in range(group_size)]
+                    try:
+                        sw_name = f"rsw-{rid}-{seq+1}"
+                        sw_node = session.add_node(node_id_counter_local, _type=NodeType.SWITCH, position=Position(x=0,y=0), name=sw_name)
+                    except Exception:
+                        break
+                    node_id_counter_local += 1; seq += 1
+                    seg_net = subnet_alloc.next_random_subnet(30)
+                    seg_hosts = list(seg_net.hosts())
+                    if len(seg_hosts) < 2:
+                        continue
+                    r_ip = str(seg_hosts[0]); sw_ip = str(seg_hosts[1])
+                    r_ifid = router_next_ifid.get(rid, 0); router_next_ifid[rid] = r_ifid + 1
+                    r_if = Interface(id=r_ifid, name=f"r{rid}-rsw{seq}-if{r_ifid}", ip4=r_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
+                    sw_if = Interface(id=0, name=f"rsw{seq}-r{rid}", ip4=sw_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
+                    r_obj = router_nodes.get(rid)
+                    if r_obj:
+                        safe_add_link(session, sw_node, r_obj, iface1=sw_if, iface2=r_if)
+                    # LAN size conditional: /30 for single-host else /28
+                    lan_net2 = subnet_alloc.next_random_subnet(30 if len(selected_hosts)==1 else 28)
+                    lan2_hosts = list(lan_net2.hosts())
+                    if len(lan2_hosts) < 2:
+                        continue
+                    for idx_h, h_sel in enumerate(selected_hosts):
+                        if idx_h + 1 >= len(lan2_hosts):
+                            break
+                        h_obj = session.get_node(h_sel) if hasattr(session, 'get_node') else None
+                        if not h_obj:
+                            continue
+                        hip = str(lan2_hosts[idx_h+1])
+                        h_if = Interface(id=1+idx_h, name=f"eth{1+idx_h}", ip4=hip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                        sw_l_if = Interface(id=idx_h+1, name=f"rsw{seq}-h{h_sel}-if{idx_h+1}", ip4=str(lan2_hosts[0]), ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                        safe_add_link(session, h_obj, sw_node, iface1=h_if, iface2=sw_l_if)
+                    r2s_counts[rid] += 1
+                    pool.switches_allocated += 1
+                    rehomed_hosts.extend(selected_hosts)
+                    max_switches -= 1
             # leftover hosts -> final switch
             if host_ids:
                 selected_hosts = list(host_ids)
@@ -864,6 +996,41 @@ def build_segmented_topology_phased(
         topo_stats['r2s_policy'] = { 'ratio': r2s_ratio or 0.0, 'mode': 'ratio', 'target': r2s_ratio or 0.0 }
     if r2s_ratio is not None:
         topo_stats['r2s_policy']['counts'] = {}  # counts populated after regroup in future iteration
+    # Capture switch grouping distribution (host counts per switch) for diagnostics
+    try:
+        switch_host_sizes: List[int] = []
+        if getattr(session, 'links', None):
+            # Approximate: count unique host endpoints per switch by scanning links
+            switch_hosts: Dict[int, set[int]] = {}
+            for lk in getattr(session, 'links', []) or []:
+                n1 = getattr(lk, 'node1_id', None)
+                n2 = getattr(lk, 'node2_id', None)
+                # Identify switches vs hosts through simple heuristics (NodeType.SWITCH or name prefix)
+                for sw, host in ((n1, n2), (n2, n1)):
+                    try:
+                        node_obj = session.get_node(sw)
+                        host_obj = session.get_node(host)
+                    except Exception:
+                        continue
+                    if not node_obj or not host_obj:
+                        continue
+                    try:
+                        if getattr(node_obj, 'type', None) == NodeType.SWITCH and getattr(host_obj, 'type', None) != NodeType.SWITCH:
+                            switch_hosts.setdefault(sw, set()).add(host)
+                    except Exception:
+                        pass
+            for _, hs in switch_hosts.items():
+                switch_host_sizes.append(len(hs))
+        if switch_host_sizes:
+            topo_stats['switch_groups'] = {
+                'count': len(switch_host_sizes),
+                'sizes': switch_host_sizes,
+                'min': min(switch_host_sizes),
+                'max': max(switch_host_sizes),
+                'avg': sum(switch_host_sizes)/len(switch_host_sizes)
+            }
+    except Exception:
+        pass
 
     # Phase 5: Services (routing protocol assignment simplified)
     router_protocols: Dict[int, List[str]] = {r.node_id: [] for r in routers}

@@ -22,6 +22,10 @@ class RoutingInfo:
     # Router-to-Switch policy
     r2s_mode: str = ""   # Random, Min, Uniform, Exact, NonUniform
     r2s_edges: int = 0    # Used only when r2s_mode == Exact (>0)
+    # Per-routing-item host grouping constraints (hosts per switch) propagated from XML/UI.
+    # When 0 (or <1) they are considered unspecified and default scenario-level bounds apply.
+    r2s_hosts_min: int = 0
+    r2s_hosts_max: int = 0
 
 @dataclass
 class NodeInfo:

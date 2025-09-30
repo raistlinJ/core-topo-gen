@@ -1357,6 +1357,19 @@ def _parse_scenario_editor(se):
                         d['r2s_edges'] = int(r2s_ev)
                     except Exception:
                         pass
+                # New per-item hosts-per-switch bounds
+                hmin_attr = item.get('r2s_hosts_min')
+                hmax_attr = item.get('r2s_hosts_max')
+                try:
+                    if hmin_attr is not None and hmin_attr.strip() != '':
+                        d['r2s_hosts_min'] = int(hmin_attr)
+                except Exception:
+                    pass
+                try:
+                    if hmax_attr is not None and hmax_attr.strip() != '':
+                        d['r2s_hosts_max'] = int(hmax_attr)
+                except Exception:
+                    pass
             if name == "Events":
                 d["script_path"] = item.get("script_path", "")
             if name == "Traffic":
@@ -1595,6 +1608,28 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                                 it.set('r2s_edges', str(ev2))
                     except Exception:
                         pass
+                    # Persist per-item host grouping bounds if provided (non-empty and >=0)
+                    try:
+                        hmin_raw = item.get('r2s_hosts_min')
+                        if hmin_raw not in (None, ''):
+                            hmin_val = int(hmin_raw)
+                            if hmin_val >= 0:
+                                it.set('r2s_hosts_min', str(hmin_val))
+                    except Exception:
+                        pass
+                    try:
+                        hmax_raw = item.get('r2s_hosts_max')
+                        if hmax_raw not in (None, ''):
+                            hmax_val = int(hmax_raw)
+                            if hmax_val >= 0:
+                                it.set('r2s_hosts_max', str(hmax_val))
+                    except Exception:
+                        pass
+                    # If still absent, write explicit defaults (UI defaults 1 and 4) for deterministic round-trip
+                    if 'r2s_hosts_min' not in it.attrib:
+                        it.set('r2s_hosts_min', '1')
+                    if 'r2s_hosts_max' not in it.attrib:
+                        it.set('r2s_hosts_max', '4')
                 if name == 'Events':
                     sp = item.get('script_path') or ''
                     if sp:

@@ -197,9 +197,9 @@ def parse_routing_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[flo
             density = 0.0
     # Inspect items; if any Count-based entries exist, use them to set absolute router count
     count_total = 0
-    # Store extended metadata for count items: (protocol, count, r2r_mode, r2r_edges, r2s_mode, r2s_edges)
+    # Store extended metadata for count items: (protocol, count, r2r_mode, r2r_edges, r2s_mode, r2s_edges, r2s_hosts_min, r2s_hosts_max)
     count_items: List[Tuple[str, int]] = []  # retained for any legacy expectations inside this function
-    count_items_meta: List[Tuple[str, int, str, int, str, int]] = []
+    count_items_meta: List[Tuple[str, int, str, int, str, int, int, int]] = []
     weight_items: List[Tuple[str, float]] = []
     for it in section.findall("./item"):
         proto = (it.get("selected") or "").strip()
@@ -227,6 +227,24 @@ def parse_routing_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[flo
                     r2s_edges_val = ev2
             except Exception:
                 r2s_edges_val = 0
+        # Per-item host grouping attributes (hosts per switch bounds)
+        r2s_hmin_raw = (it.get("r2s_hosts_min") or "").strip()
+        r2s_hmax_raw = (it.get("r2s_hosts_max") or "").strip()
+        r2s_hmin = 0; r2s_hmax = 0
+        if r2s_hmin_raw:
+            try:
+                vmin = int(r2s_hmin_raw)
+                if vmin >= 0:
+                    r2s_hmin = vmin
+            except Exception:
+                r2s_hmin = 0
+        if r2s_hmax_raw:
+            try:
+                vmax = int(r2s_hmax_raw)
+                if vmax >= 0:
+                    r2s_hmax = vmax
+            except Exception:
+                r2s_hmax = 0
         if vm == "Count":
             try:
                 vc = int((it.get("v_count") or "0").strip())
@@ -234,7 +252,7 @@ def parse_routing_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[flo
                 vc = 0
             if vc > 0:
                 count_items.append((proto, vc))
-                count_items_meta.append((proto, vc, r2r_mode, edges_val, r2s_mode, r2s_edges_val))
+                count_items_meta.append((proto, vc, r2r_mode, edges_val, r2s_mode, r2s_edges_val, r2s_hmin, r2s_hmax))
                 count_total += vc
         else:
             try:
@@ -243,11 +261,12 @@ def parse_routing_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[flo
                 f = 0.0
             if f > 0:
                 # Temporarily store in weight_items; edges planning handled after consolidated list built
-                weight_items.append((proto, f, r2r_mode, edges_val, r2s_mode, r2s_edges_val))
+                # Weight-based items currently ignore per-item host grouping until weight allocation logic extended
+                weight_items.append((proto, f, r2r_mode, edges_val, r2s_mode, r2s_edges_val, r2s_hmin, r2s_hmax))
     if count_total > 0:
         # Include policy attributes for count-based items (previously dropped)
         if count_items_meta:
-            items = [RoutingInfo(protocol=p, factor=0.0, abs_count=c, r2r_mode=rm, r2r_edges=re, r2s_mode=sm, r2s_edges=se) for p,c,rm,re,sm,se in count_items_meta]
+            items = [RoutingInfo(protocol=p, factor=0.0, abs_count=c, r2r_mode=rm, r2r_edges=re, r2s_mode=sm, r2s_edges=se, r2s_hosts_min=hmin, r2s_hosts_max=hmax) for p,c,rm,re,sm,se,hmin,hmax in count_items_meta]
         else:
             items = [RoutingInfo(protocol=p, factor=0.0, abs_count=c) for p, c in count_items]
     if weight_items:
@@ -258,8 +277,13 @@ def parse_routing_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[flo
                 p = rec[0]; f = rec[1]; em = rec[2] if len(rec) > 2 else ''; ev = rec[3] if len(rec) > 3 else 0
                 items.append(RoutingInfo(protocol=p, factor=f, abs_count=0, r2r_mode=em, r2r_edges=ev))
             else:
-                p, f, em, ev, r2sm, r2sev = rec
-                items.append(RoutingInfo(protocol=p, factor=f, abs_count=0, r2r_mode=em, r2r_edges=ev, r2s_mode=r2sm, r2s_edges=r2sev))
+                # New extended tuple includes r2s host min/max at positions 6/7
+                if len(rec) >= 8:
+                    p, f, em, ev, r2sm, r2sev, hmin, hmax = rec
+                    items.append(RoutingInfo(protocol=p, factor=f, abs_count=0, r2r_mode=em, r2r_edges=ev, r2s_mode=r2sm, r2s_edges=r2sev, r2s_hosts_min=hmin, r2s_hosts_max=hmax))
+                else:
+                    p, f, em, ev, r2sm, r2sev = rec[:6]
+                    items.append(RoutingInfo(protocol=p, factor=f, abs_count=0, r2r_mode=em, r2r_edges=ev, r2s_mode=r2sm, r2s_edges=r2sev))
     # If neither density nor counts nor weight items, result is empty list (0 routers)
     if not items:
         density = 0.0
