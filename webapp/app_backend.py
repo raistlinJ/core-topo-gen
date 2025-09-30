@@ -2229,6 +2229,8 @@ def api_plan_preview_full():
         xml_path = payload.get('xml_path')
         scenario = payload.get('scenario') or None
         seed = payload.get('seed')
+        r2s_hosts_min_list = payload.get('r2s_hosts_min_list') or []
+        r2s_hosts_max_list = payload.get('r2s_hosts_max_list') or []
         try:
             if seed is not None:
                 seed = int(seed)
@@ -2343,6 +2345,8 @@ def api_plan_preview_full():
             segmentation_items=seg_items_serial,
             seed=seed,
             ip4_prefix='10.0.0.0/24',
+            r2s_hosts_min_list=r2s_hosts_min_list,
+            r2s_hosts_max_list=r2s_hosts_max_list,
         )
         return jsonify({'ok': True, 'full_preview': full_prev})
     except Exception as e:

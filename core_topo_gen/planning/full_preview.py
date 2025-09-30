@@ -91,6 +91,8 @@ def build_full_preview(
     ip4_prefix: str = "10.0.0.0/16",
     ip_mode: str = "private",
     ip_region: str = "all",
+    r2s_hosts_min_list: List[int | None] | None = None,
+    r2s_hosts_max_list: List[int | None] | None = None,
 ) -> Dict[str, Any]:
     services_plan = services_plan or {}
     vulnerabilities_plan = vulnerabilities_plan or {}
@@ -336,8 +338,23 @@ def build_full_preview(
                 })
                 next_switch_id += 1; seq += 1; max_sw = 0
                 local.clear()
-            while max_sw > 0 and len(local) >= 2:
-                h_a = local.pop(); h_b = local.pop()
+            while max_sw > 0 and len(local) >= 1:
+                rnd_local2 = random.Random(rnd_seed + 2000 + rid + seq)
+                lo = 1
+                hi = min(4, len(local))
+                sizes = list(range(lo, hi+1))
+                weights = [1.0/(s**1.2) for s in sizes]
+                tot = sum(weights)
+                pick = rnd_local2.random() * tot
+                acc = 0.0; group_size = sizes[0]
+                for s,w in zip(sizes, weights):
+                    acc += w
+                    if pick <= acc:
+                        group_size = s
+                        break
+                if group_size > len(local):
+                    group_size = len(local)
+                selected_hosts = [local.pop() for _ in range(group_size)]
                 # router-switch /30
                 try:
                     rs_net = subnet_alloc.next_random_subnet(30)
@@ -358,7 +375,7 @@ def build_full_preview(
                 switch_nodes.append(PreviewNode(node_id=next_switch_id, name=sw_name, role="Switch", kind="switch"))
                 r2s_counts[rid] += 1
                 host_if_ips: Dict[int, str] = {}
-                for idx_h, h_sel in enumerate([h_a, h_b]):
+                for idx_h, h_sel in enumerate(selected_hosts):
                     if idx_h + 1 < len(lan_hosts2):
                         host_ip = str(lan_hosts2[idx_h + 1])
                         host_if_ips[h_sel] = host_ip + f"/{lan_net2.prefixlen}"
@@ -369,7 +386,7 @@ def build_full_preview(
                 switches_detail.append({
                     'switch_id': next_switch_id,
                     'router_id': rid,
-                    'hosts': [h_a, h_b],
+                    'hosts': selected_hosts,
                     'rsw_subnet': str(rs_net),
                     'lan_subnet': str(lan_net2),
                     'router_ip': r_ip,
@@ -377,6 +394,46 @@ def build_full_preview(
                     'host_if_ips': host_if_ips,
                 })
                 next_switch_id += 1; seq += 1; max_sw -= 1
+            if local:
+                selected_hosts = list(local)
+                local.clear()
+                try:
+                    rs_net = subnet_alloc.next_random_subnet(30)
+                except Exception:
+                    rs_net = ipaddress.ip_network(f"10.254.{rid}.{seq*4}/30", strict=False)
+                router_switch_subnets.append(str(rs_net))
+                rs_hosts = list(rs_net.hosts())
+                r_ip = str(rs_hosts[0]) if rs_hosts else None
+                sw_ip = str(rs_hosts[1]) if len(rs_hosts) > 1 else None
+                try:
+                    lan_net2 = subnet_alloc.next_random_subnet(30 if len(selected_hosts)==1 else 28)
+                except Exception:
+                    lan_net2 = ipaddress.ip_network(f"10.253.{rid}.{seq*16}/28", strict=False)
+                lan_subnets.append(str(lan_net2))
+                lan_hosts2 = list(lan_net2.hosts())
+                sw_name = f"rsw-{rid}-{seq+1}"
+                switch_nodes.append(PreviewNode(node_id=next_switch_id, name=sw_name, role="Switch", kind="switch"))
+                r2s_counts[rid] += 1
+                host_if_ips: Dict[int, str] = {}
+                for idx_h, h_sel in enumerate(selected_hosts):
+                    if idx_h + 1 < len(lan_hosts2):
+                        host_ip = str(lan_hosts2[idx_h + 1])
+                        host_if_ips[h_sel] = host_ip + f"/{lan_net2.prefixlen}"
+                        for hn in host_nodes:
+                            if hn.node_id == h_sel:
+                                hn.ip4 = host_if_ips[h_sel]
+                                break
+                switches_detail.append({
+                    'switch_id': next_switch_id,
+                    'router_id': rid,
+                    'hosts': selected_hosts,
+                    'rsw_subnet': str(rs_net),
+                    'lan_subnet': str(lan_net2),
+                    'router_ip': r_ip,
+                    'switch_ip': sw_ip,
+                    'host_if_ips': host_if_ips,
+                })
+                next_switch_id += 1; seq += 1
             used_pairs = start_pairs - (len(local)//2)
             r2s_host_pairs_used[rid] = used_pairs
             if mode == 'Exact':
@@ -582,4 +639,6 @@ def build_full_preview(
         "role_counts": dict(role_counts),
         "seed": seed,
         "seed_generated": seed_generated,
+        "r2s_hosts_min_list": r2s_hosts_min_list or [],
+        "r2s_hosts_max_list": r2s_hosts_max_list or [],
     }

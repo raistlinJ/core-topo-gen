@@ -30,6 +30,30 @@ from core_topo_gen.planning.constraints import validate_phase
 
 logger = logging.getLogger(__name__)
 
+# ---- Switch host grouping configuration (experimental) ----
+SWITCH_HOSTS_MIN = 1        # allow a single host under a switch (avoids orphans)
+SWITCH_HOSTS_MAX = 4        # cap to keep broadcast domains modest
+SWITCH_HOST_SIZE_BIAS = 'small'  # 'small' favors smaller groups; 'uniform' equal probability
+
+def _choose_switch_group_size(remaining: int, rnd: random.Random) -> int:
+    lo = max(1, SWITCH_HOSTS_MIN)
+    hi = min(SWITCH_HOSTS_MAX, remaining)
+    if lo >= hi:
+        return lo
+    sizes = list(range(lo, hi + 1))
+    if SWITCH_HOST_SIZE_BIAS == 'small':
+        weights = [1.0 / (s ** 1.2) for s in sizes]
+    else:
+        weights = [1.0 for _ in sizes]
+    total = sum(weights)
+    pick = rnd.random() * total
+    acc = 0.0
+    for s, w in zip(sizes, weights):
+        acc += w
+        if pick <= acc:
+            return s
+    return sizes[0]
+
 # ---------------- Phase Helpers ---------------- #
 
 def _int_list_stats(values: List[int]):
@@ -738,19 +762,20 @@ def build_segmented_topology_phased(
         node_id_counter_local = max([h.node_id for h in hosts] + [r.node_id for r in routers]) + 1
         for rid, host_ids in link_index.items():
             random.shuffle(host_ids)
-            # Each switch will aggregate up to 2 hosts (pairing) like legacy logic
-            max_switches = min(int(r2s_ratio), len(host_ids)//2) if r2s_ratio > 0 else 0
+            max_switches = min(int(r2s_ratio), max(1, len(host_ids)//max(1, SWITCH_HOSTS_MIN))) if r2s_ratio > 0 else 0
             seq = 0
-            while max_switches > 0 and len(host_ids) >= 2:
-                h_a = host_ids.pop()
-                h_b = host_ids.pop()
+            rnd_local = random.Random(5000 + rid)
+            while max_switches > 0 and len(host_ids) >= SWITCH_HOSTS_MIN:
+                group_size = _choose_switch_group_size(len(host_ids), rnd_local)
+                if group_size > len(host_ids):
+                    group_size = len(host_ids)
+                selected_hosts = [host_ids.pop() for _ in range(group_size)]
                 try:
                     sw_name = f"rsw-{rid}-{seq+1}"
                     sw_node = session.add_node(node_id_counter_local, _type=NodeType.SWITCH, position=Position(x=0,y=0), name=sw_name)
                 except Exception:
                     break
                 node_id_counter_local += 1; seq += 1
-                # Connect router-switch /30
                 seg_net = subnet_alloc.next_random_subnet(30)
                 seg_hosts = list(seg_net.hosts())
                 if len(seg_hosts) < 2:
@@ -762,23 +787,62 @@ def build_segmented_topology_phased(
                 r_obj = router_nodes.get(rid)
                 if r_obj:
                     safe_add_link(session, sw_node, r_obj, iface1=sw_if, iface2=r_if)
-                # Host LAN /28
-                lan_net2 = subnet_alloc.next_random_subnet(28)
+                # LAN size conditional: /30 for single-host else /28
+                lan_net2 = subnet_alloc.next_random_subnet(30 if len(selected_hosts)==1 else 28)
                 lan2_hosts = list(lan_net2.hosts())
-                if len(lan2_hosts) < 3:
+                if len(lan2_hosts) < 2:
                     continue
-                for idx_h, h_sel in enumerate([h_a, h_b]):
+                for idx_h, h_sel in enumerate(selected_hosts):
+                    if idx_h + 1 >= len(lan2_hosts):
+                        break
                     h_obj = session.get_node(h_sel) if hasattr(session, 'get_node') else None
-                    if not h_obj: continue
+                    if not h_obj:
+                        continue
                     hip = str(lan2_hosts[idx_h+1])
-                    # assign new iface on host
                     h_if = Interface(id=1+idx_h, name=f"eth{1+idx_h}", ip4=hip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
                     sw_l_if = Interface(id=idx_h+1, name=f"rsw{seq}-h{h_sel}-if{idx_h+1}", ip4=str(lan2_hosts[0]), ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
                     safe_add_link(session, h_obj, sw_node, iface1=h_if, iface2=sw_l_if)
                 r2s_counts[rid] += 1
                 pool.switches_allocated += 1
-                rehomed_hosts.extend([h_a, h_b])
+                rehomed_hosts.extend(selected_hosts)
                 max_switches -= 1
+            # leftover hosts -> final switch
+            if host_ids:
+                selected_hosts = list(host_ids)
+                host_ids.clear()
+                try:
+                    sw_name = f"rsw-{rid}-{seq+1}"
+                    sw_node = session.add_node(node_id_counter_local, _type=NodeType.SWITCH, position=Position(x=0,y=0), name=sw_name)
+                except Exception:
+                    sw_node = None
+                if sw_node:
+                    node_id_counter_local += 1; seq += 1
+                    seg_net = subnet_alloc.next_random_subnet(30)
+                    seg_hosts = list(seg_net.hosts())
+                    if len(seg_hosts) >= 2:
+                        r_ip = str(seg_hosts[0]); sw_ip = str(seg_hosts[1])
+                        r_ifid = router_next_ifid.get(rid, 0); router_next_ifid[rid] = r_ifid + 1
+                        r_if = Interface(id=r_ifid, name=f"r{rid}-rsw{seq}-if{r_ifid}", ip4=r_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
+                        sw_if = Interface(id=0, name=f"rsw{seq}-r{rid}", ip4=sw_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
+                        r_obj = router_nodes.get(rid)
+                        if r_obj:
+                            safe_add_link(session, sw_node, r_obj, iface1=sw_if, iface2=r_if)
+                        lan_net2 = subnet_alloc.next_random_subnet(30 if len(selected_hosts)==1 else 28)
+                        lan2_hosts = list(lan_net2.hosts())
+                        if len(lan2_hosts) >= 2:
+                            for idx_h, h_sel in enumerate(selected_hosts):
+                                if idx_h + 1 >= len(lan2_hosts):
+                                    break
+                                h_obj = session.get_node(h_sel) if hasattr(session, 'get_node') else None
+                                if not h_obj:
+                                    continue
+                                hip = str(lan2_hosts[idx_h+1])
+                                h_if = Interface(id=1+idx_h, name=f"eth{1+idx_h}", ip4=hip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                                sw_l_if = Interface(id=idx_h+1, name=f"rsw{seq}-h{h_sel}-if{idx_h+1}", ip4=str(lan2_hosts[0]), ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                                safe_add_link(session, h_obj, sw_node, iface1=h_if, iface2=sw_l_if)
+                        r2s_counts[rid] += 1
+                        pool.switches_allocated += 1
+                        rehomed_hosts.extend(selected_hosts)
         try:
             rs_stats = _int_list_stats(list(r2s_counts.values())) if r2s_counts else {"min":0,"max":0,"avg":0.0,"std":0.0,"gini":0.0}
             # Transition r2s to degree-like semantics (Exact mode) mirroring r2r: target = switches per router

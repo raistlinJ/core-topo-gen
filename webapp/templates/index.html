@@ -468,7 +468,21 @@ async function computeFullPlanPreview(){
     btn.disabled = true; btn.dataset.prevLabel = btn.textContent; btn.textContent='Full preview...';
     pre.classList.remove('d-none'); pre.textContent='Computing full preview...';
     try {
-    const body = { xml_path: newXmlPath };
+    // Collect routing row host-per-switch overrides (min/max)
+    let r2sHostsMinList = [];
+    let r2sHostsMaxList = [];
+    try {
+        const scen = state.scenarios[0];
+        if (scen && scen.sections && scen.sections['Routing']) {
+            (scen.sections['Routing'].items || []).forEach(it => {
+                if (it) {
+                    r2sHostsMinList.push(typeof it.r2s_hosts_min === 'number' ? it.r2s_hosts_min : null);
+                    r2sHostsMaxList.push(typeof it.r2s_hosts_max === 'number' ? it.r2s_hosts_max : null);
+                }
+            });
+        }
+    } catch(e) { /* ignore */ }
+    const body = { xml_path: newXmlPath, r2s_hosts_min_list: r2sHostsMinList, r2s_hosts_max_list: r2sHostsMaxList };
         const res = await fetch('/api/plan/preview_full', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
         const data = await res.json();
     if(!data.ok){ pre.textContent='Full preview failed: '+(data.error||''); previewState.fullPreview=null; document.getElementById('fullPreviewStructured')?.classList.add('d-none'); }
@@ -1336,6 +1350,8 @@ function renderItemRow(sidx, secName, iidx, it) {
             const r2sMode = it.r2s_mode || 'Random';
             const r2sVal = (it.r2s_edges !== undefined && it.r2s_edges !== null) ? it.r2s_edges : '';
             const r2sSel = `<select class="form-select form-select-sm routing-mode-select" style="width:105px" data-field="r2s_mode" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${options.map(o => `<option value="${o.v}" ${o.v===r2sMode?'selected':''}>${o.l}</option>`).join('')}</select>`;
+            const r2sHostsMin = (it.r2s_hosts_min !== undefined && it.r2s_hosts_min !== null) ? it.r2s_hosts_min : 1;
+            const r2sHostsMax = (it.r2s_hosts_max !== undefined && it.r2s_hosts_max !== null) ? it.r2s_hosts_max : 4;
             return `
                 <div class="d-flex flex-column gap-1 routing-edge-groups">
                     <div class="d-flex flex-wrap gap-2 align-items-center">
@@ -1349,10 +1365,20 @@ function renderItemRow(sidx, secName, iidx, it) {
                     </div>
                     <div class="d-flex flex-wrap gap-2 align-items-center">
                         <label class="form-label mb-0 me-1" style="min-width:110px" title="Router-to-Switch attachment policy; controls how many distinct switches each router connects to.">R-to-S Edges</label>
-                        <div class="d-flex gap-3 align-items-end">
+                        <div class="d-flex gap-3 align-items-end flex-wrap align-items-center">
                             <div>${r2sSel}</div>
                             <div class="r2s-exact-input" style="display:${r2sMode==='Exact'?'block':'none'};">
                                 <input type="number" min="1" class="form-control form-control-sm r2s-degree-input" style="width:110px" value="${r2sVal}" data-field="r2s_edges" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="Exact (e.g. 2)" aria-label="Exact router-to-switch target" title="Target number of switches per router (Exact mode).">
+                            </div>
+                            <div class="d-flex gap-2 align-items-end small">
+                                <div>
+                                    <label class="form-label mb-0" style="font-size:0.7rem" title="Minimum hosts per created switch for this router row (preview & build).">H/S Min</label>
+                                    <input type="number" min="1" max="32" class="form-control form-control-sm" style="width:70px" value="${r2sHostsMin}" data-field="r2s_hosts_min" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="min">
+                                </div>
+                                <div>
+                                    <label class="form-label mb-0" style="font-size:0.7rem" title="Maximum hosts per created switch for this router row (preview & build).">H/S Max</label>
+                                    <input type="number" min="1" max="64" class="form-control form-control-sm" style="width:70px" value="${r2sHostsMax}" data-field="r2s_hosts_max" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="max">
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -1537,11 +1563,18 @@ function wireHandlers() {
             if (sec) {
                 if (iidx !== null) {
                     const item = state.scenarios[sidx].sections[sec].items[parseInt(iidx)];
-                    if (['factor','rate_kbps','period_s','jitter_pct','total_nodes','density','r2r_edges','r2s_edges'].includes(field)) {
+                    if (['factor','rate_kbps','period_s','jitter_pct','total_nodes','density','r2r_edges','r2s_edges','r2s_hosts_min','r2s_hosts_max'].includes(field)) {
                         item ? (item[field] = parseFloat(el.value)) : state.scenarios[sidx].sections[sec][field] = parseFloat(el.value);
                         if ((field === 'edges' || field === 'r2s_edges') && (isNaN(item[field]) || el.value === '')) {
                             // Allow blank to mean "unset" so generator can apply defaults
                             delete item[field];
+                        }
+                        if ((field === 'r2s_hosts_min' || field === 'r2s_hosts_max')) {
+                            const mn = parseInt(item.r2s_hosts_min || 1, 10);
+                            const mx = parseInt(item.r2s_hosts_max || 4, 10);
+                            if (!isNaN(mn) && !isNaN(mx) && mn > mx) {
+                                item.r2s_hosts_max = mn;
+                            }
                         }
                         if (field === 'factor') {
                             adjustWeightsProportionally(sidx, sec, parseInt(iidx));
