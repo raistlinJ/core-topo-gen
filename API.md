@@ -102,6 +102,22 @@ Scenario editor & runs
 
   - Streams a report or artifact file. `path` can be absolute or repo-relative.
 
+- POST `/api/plan/preview_full`
+  - JSON body: `{ "xml_path": "/abs/path/scenarios.xml", "scenario": "Scenario 1"?, "seed": 12345? }`
+  - Computes a deterministic full planning preview (no CORE session) including:
+    - Routers / Hosts / Switches (aggregation) with IP samples
+    - `r2r_policy_preview`, `r2r_edges_preview`, degree stats
+    - `r2s_policy_preview` (counts, per-router bounds, host pair saturation)
+    - `r2s_grouping_preview` array (per-router host grouping: groups, group_sizes, bounds)
+    - `services_preview`, `vulnerabilities_preview`
+    - `segmentation_preview` (planned rule names)
+    - `seed` (echo / auto-generated) and `seed_generated` flag
+  - Response: `{ ok: true, full_preview: { ... } }` or `{ ok: false, error }` on failure.
+  - Notes:
+    - If `seed` omitted, a random seed is generated and returned so clients can rerun with identical topology decisions.
+    - Host grouping bounds supplied in the XML via `r2s_hosts_min` / `r2s_hosts_max` (NonUniform R2S) appear under `r2s_policy_preview.per_router_bounds` and in each grouping entry.
+    - Exact aggregation (`r2s_mode=Exact` & `r2s_edges=1`) produces one switch per router with all its hosts; bounds are ignored for this mode.
+
 CORE management
 
 - GET `/core`

@@ -76,6 +76,24 @@
 
   <!-- Item element used within sections. Optional attributes are used so one type
        can serve all sections in XSD 1.0. -->
+  <xs:simpleType name="R2RModeType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Uniform"/>
+      <xs:enumeration value="NonUniform"/>
+      <xs:enumeration value="Exact"/>
+      <xs:enumeration value="Min"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="R2SModeType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="Exact"/>
+      <xs:enumeration value="NonUniform"/>
+      <xs:enumeration value="aggregate"/>
+      <xs:enumeration value="ratio"/>
+    </xs:restriction>
+  </xs:simpleType>
+
   <xs:complexType name="ItemType">
     <xs:annotation>
       <xs:documentation>
@@ -103,6 +121,13 @@
     <xs:attribute name="v_vector" type="xs:string" use="optional"/>
     <xs:attribute name="v_name" type="xs:string" use="optional"/>
     <xs:attribute name="v_path" type="xs:string" use="optional"/>
+    <!-- Routing connectivity / aggregation (new) -->
+    <xs:attribute name="r2r_mode" type="R2RModeType" use="optional"/>
+    <xs:attribute name="r2r_edges" type="xs:nonNegativeInteger" use="optional"/>
+    <xs:attribute name="r2s_mode" type="R2SModeType" use="optional"/>
+    <xs:attribute name="r2s_edges" type="xs:nonNegativeInteger" use="optional"/>
+    <xs:attribute name="r2s_hosts_min" type="xs:nonNegativeInteger" use="optional"/>
+    <xs:attribute name="r2s_hosts_max" type="xs:nonNegativeInteger" use="optional"/>
   </xs:complexType>
 
   <xs:complexType name="SectionType">
@@ -116,6 +141,16 @@
     <!-- Only one of the following typically applies depending on section name; left optional for XSD 1.0. -->
     <xs:attribute name="total_nodes" type="xs:nonNegativeInteger" use="optional"/>
     <xs:attribute name="density" type="DensityType" use="optional"/>
+    <!-- Planning metadata (additive round-trip; optional) -->
+    <xs:attribute name="base_nodes" type="xs:nonNegativeInteger" use="optional"/>
+    <xs:attribute name="additive_nodes" type="xs:nonNegativeInteger" use="optional"/>
+    <xs:attribute name="combined_nodes" type="xs:nonNegativeInteger" use="optional"/>
+    <xs:attribute name="weight_rows" type="xs:nonNegativeInteger" use="optional"/>
+    <xs:attribute name="count_rows" type="xs:nonNegativeInteger" use="optional"/>
+    <xs:attribute name="weight_sum" type="xs:decimal" use="optional"/>
+    <xs:attribute name="explicit_count" type="xs:nonNegativeInteger" use="optional"/>
+    <xs:attribute name="derived_count" type="xs:nonNegativeInteger" use="optional"/>
+    <xs:attribute name="total_planned" type="xs:nonNegativeInteger" use="optional"/>
   </xs:complexType>
 
   <xs:complexType name="ScenarioEditorType">
@@ -134,6 +169,10 @@
       <xs:element name="ScenarioEditor" type="ScenarioEditorType"/>
     </xs:sequence>
     <xs:attribute name="name" type="xs:string" use="required"/>
+    <!-- Scenario-level aggregate planning attribute (optional) -->
+    <xs:attribute name="scenario_total_nodes" type="xs:nonNegativeInteger" use="optional"/>
+    <!-- Scenario-level density_count alias for base host pool (optional legacy/compat) -->
+    <xs:attribute name="density_count" type="xs:nonNegativeInteger" use="optional"/>
   </xs:complexType>
 
   <!-- Root -->

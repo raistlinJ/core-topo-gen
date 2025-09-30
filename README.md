@@ -1,6 +1,6 @@
 # core-topo-gen
 
-Generate CORE topologies from XML scenarios via a GUI or CLI. Supports services/routing assignment, segmented or star layouts, and optional traffic script generation.
+Generate CORE topologies from XML scenarios via a GUI or CLI. Supports services/routing assignment, segmented or star layouts, optional traffic script generation, and per-router host grouping bounds for switch aggregation.
 
 ## Recent Workflow Simplification (2025-09)
 
@@ -12,7 +12,7 @@ The planning and execution workflow has been streamlined:
 - Preview history (last 25) with per‑seed diffs lets you compare topology scale changes across edits or random seeds.
 - Removed concepts: plan approval, drift detection, strict plan checkbox, secondary preview buttons, intermediate plan JSON persistence.
 
-Upgrade note: If you had automation calling removed endpoints (e.g. `/api/plan/preview`, `/api/plan/approve`, `/api/plan/status`), migrate to `/api/plan/preview_full` and drop approval logic. The backend now returns the full preview payload in a single call.
+Upgrade note: If you had automation calling removed endpoints (e.g. `/api/plan/preview`, `/api/plan/approve`, `/api/plan/status`), migrate to `/api/plan/preview_full` and drop approval logic. The backend now returns the full preview payload in a single call. See also the expanded scenario XML schema (`SCENARIO_XML_SCHEMA.md`) and updated XSD (`validation/scenarios.xsd`) which now include connectivity attributes (`r2r_mode`, `r2s_mode`, etc.) and host grouping bounds (`r2s_hosts_min`, `r2s_hosts_max`).
 
 ## Prerequisites
 
@@ -288,6 +288,8 @@ The front‑end does not persist previews server‑side; history is stored local
 
 Experimental structural metadata (Services / Traffic / Segmentation): the XML builder also emits `explicit_count`, `weight_rows`, `count_rows`, and `weight_sum` for these sections to support future additive extensions and analytical tooling.
 
+Schema documentation: see `SCENARIO_XML_SCHEMA.md` for a human-readable summary and examples; machine validation via `validation/scenarios.xsd`.
+
 ## Router Connectivity & Switch Aggregation Policies
 
 The routing section now supports richer topology shaping beyond simple full meshes. Two orthogonal policy dimensions can be set per routing item via XML attributes (the Web UI exposes these controls):
@@ -350,6 +352,24 @@ Contrast (pair-based) example creating multiple small switches per router:
 ```
 
 Here each router (3 total) receives up to 2 switches (subject to available host pairs), each switch normally serving 2 hosts; any remainder host without a pair is left directly connected (or, if enhanced later, may be grouped in a final uneven switch).
+
+### Host Grouping Bounds (NonUniform R2S)
+
+When `r2s_mode="NonUniform"` you can specify per-item bounds `r2s_hosts_min` / `r2s_hosts_max` to influence stochastic grouping of hosts behind switches. The preview exposes:
+
+* `r2s_policy_preview.per_router_bounds` (router_id -> {min,max})
+* `r2s_grouping_preview[]` entries with `group_sizes` honoring provided bounds where feasible.
+
+Rules:
+* Bounds optional; defaults fall back to [2,4].
+* Remainder smaller than min merges into the previous group (may exceed max) to avoid undersized trailing groups.
+* Equal min==max enforces fixed group sizes except for final merged remainder.
+* Exact=1 aggregated behavior ignores bounds.
+
+Example fixed grouping of 3:
+```xml
+<item selected="RIP" v_metric="Count" v_count="4" r2s_mode="NonUniform" r2s_hosts_min="3" r2s_hosts_max="3" />
+```
 
 ### Additive (Count-Based) Routing Items & R2S
 
