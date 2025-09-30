@@ -143,7 +143,7 @@
                     <!-- Run form repurposed: Run CLI now triggers Full Preview (no direct execution here) -->
                     <form class="d-flex gap-2 mt-3 align-items-center" action="javascript:void(0)" id="runLegacyForm">
                         <input type="hidden" name="xml_path" id="xml_path">
-                        <span class="d-inline-block" tabindex="0" id="runSyncWrap" data-bs-toggle="tooltip" data-bs-title="Runs CLI using current XML (no stored plan)">
+                        <span class="d-inline-block" tabindex="0" id="runSyncWrap" data-bs-toggle="tooltip" data-bs-title="Runs CLI using current XML">
                             <button class="btn btn-warning" type="button" id="runSyncBtn" disabled title="Generates a Full Preview (no execution)">Generate</button>
                         </span>
                         <button class="btn btn-outline-danger d-none" type="button" id="cancelRunBtn" onclick="cancelRun()">Cancel</button>
@@ -1228,19 +1228,8 @@ function renderMain() {
                                         <div id="routingEdgesWarnings" class="alert alert-warning py-2 px-3 small mt-3 d-none"></div>
                                         <div class="d-flex flex-wrap align-items-center gap-3 mt-3 small" id="routingEdgesSummary" style="display:none;">
                                                 <div><strong>Policy:</strong> <span data-role="edges-policy">(pending)</span></div>
-                                                <div><strong>Min/Avg/Max:</strong> <span data-role="edges-stats"></span></div>
-                                                <div class="d-flex align-items-center gap-1"><strong>Degrees Spark:</strong> <span data-role="edges-spark" class="font-monospace"></span></div>
                                         </div>
-                                        <div class="form-text mt-2">
-                                            <span class="fw-semibold">R-to-R Edges Help:</span>
-                                            <ul class="mb-0 ps-3">
-                                                <li><strong>Random</strong>: random spanning tree (single simple path between any two routers).</li>
-                                                <li><strong>Min</strong>: chain (linear path r1–r2–…–rn).</li>
-                                                <li><strong>Uniform</strong>: attempt to balance degrees evenly (near-regular distribution).</li>
-                                                <li><strong>Exact</strong>: chain plus random extra links until every router reaches target degree.</li>
-                                                <li><strong>NonUniform</strong>: heterogeneous random degrees (mix of hubs and leaves; more variance than Random).</li>
-                                            </ul>
-                                        </div>` : ''}
+                                        ` : ''}
             </div>`;
         root.appendChild(card);
     });
@@ -1342,31 +1331,29 @@ function renderItemRow(sidx, secName, iidx, it) {
                 {v:'Exact', l:'Exact'},
                 {v:'NonUniform', l:'NonUniform'}
             ];
-            const selHtml = `<select class="form-select form-select-sm" data-field="r2r_mode" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${options.map(o => `<option value="${o.v}" ${o.v===mode?'selected':''}>${o.l}</option>`).join('')}</select>`;
+            const selHtml = `<select class="form-select form-select-sm routing-mode-select" style="width:105px" data-field="r2r_mode" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${options.map(o => `<option value="${o.v}" ${o.v===mode?'selected':''}>${o.l}</option>`).join('')}</select>`;
             // R-to-S (router to switch) connectivity policy (same option set)
             const r2sMode = it.r2s_mode || 'Random';
             const r2sVal = (it.r2s_edges !== undefined && it.r2s_edges !== null) ? it.r2s_edges : '';
-            const r2sSel = `<select class="form-select form-select-sm" data-field="r2s_mode" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${options.map(o => `<option value="${o.v}" ${o.v===r2sMode?'selected':''}>${o.l}</option>`).join('')}</select>`;
+            const r2sSel = `<select class="form-select form-select-sm routing-mode-select" style="width:105px" data-field="r2s_mode" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${options.map(o => `<option value="${o.v}" ${o.v===r2sMode?'selected':''}>${o.l}</option>`).join('')}</select>`;
             return `
-                <div class="d-flex flex-wrap gap-2 align-items-center">
-                    <label class="form-label mb-0 me-1" style="min-width:110px" title="Router-to-Router edge policy. Random = spanning tree; Min = chain; Uniform = balanced degrees; Exact = chain+augment to target; NonUniform = heterogeneous.">R-to-R Edges</label>
-                    <div class="d-flex gap-3 align-items-end">
-                        <div>
-                            ${selHtml}
-                        </div>
-                        <div class="edges-exact-input" style="display:${mode==='Exact'?'block':'none'};">
-                            <label class="form-label mb-0" title="Target degree each router should attempt to reach (cannot reduce existing higher degrees).">Exact #</label>
-                            <input type="number" min="1" class="form-control form-control-sm edges-degree-input" style="width:110px" value="${val}" data-field="r2r_edges" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="e.g. 3">
+                <div class="d-flex flex-column gap-1 routing-edge-groups">
+                    <div class="d-flex flex-wrap gap-2 align-items-center">
+                        <label class="form-label mb-0 me-1" style="min-width:110px" title="Router-to-Router edge policy. Random = spanning tree; Min = chain; Uniform = balanced degrees; Exact = chain+augment to target; NonUniform = heterogeneous.">R-to-R Edges</label>
+                        <div class="d-flex gap-3 align-items-end">
+                            <div>${selHtml}</div>
+                            <div class="edges-exact-input" style="display:${mode==='Exact'?'block':'none'};">
+                                <input type="number" min="1" class="form-control form-control-sm edges-degree-input" style="width:110px" value="${val}" data-field="r2r_edges" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="Exact (e.g. 3)" aria-label="Exact router degree target" title="Target degree each router should attempt to reach (cannot reduce existing higher degrees).">
+                            </div>
                         </div>
                     </div>
-                    <label class="form-label mb-0 ms-4 me-1" style="min-width:100px" title="Router-to-Switch attachment policy; controls how many distinct switches each router connects to.">R-to-S Edges</label>
-                    <div class="d-flex gap-3 align-items-end">
-                        <div>
-                            ${r2sSel}
-                        </div>
-                        <div class="r2s-exact-input" style="display:${r2sMode==='Exact'?'block':'none'};">
-                            <label class="form-label mb-0" title="Target number of switches per router (Exact mode).">Exact #</label>
-                            <input type="number" min="1" class="form-control form-control-sm r2s-degree-input" style="width:110px" value="${r2sVal}" data-field="r2s_edges" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="e.g. 2">
+                    <div class="d-flex flex-wrap gap-2 align-items-center">
+                        <label class="form-label mb-0 me-1" style="min-width:110px" title="Router-to-Switch attachment policy; controls how many distinct switches each router connects to.">R-to-S Edges</label>
+                        <div class="d-flex gap-3 align-items-end">
+                            <div>${r2sSel}</div>
+                            <div class="r2s-exact-input" style="display:${r2sMode==='Exact'?'block':'none'};">
+                                <input type="number" min="1" class="form-control form-control-sm r2s-degree-input" style="width:110px" value="${r2sVal}" data-field="r2s_edges" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}" placeholder="Exact (e.g. 2)" aria-label="Exact router-to-switch target" title="Target number of switches per router (Exact mode).">
+                            </div>
                         </div>
                     </div>
                 </div>`;
@@ -1915,17 +1902,7 @@ function computeRoutingEdgePolicyPreview(){
     else if(mode==='NonUniform'){ minD=1; avgD=3; maxD=8; }
     else if(mode==='Min'){ minD=2; avgD=3; maxD=4; }
     else { minD=1; avgD=2; maxD=4; }
-    const statsSpan = summaryEl.querySelector('[data-role="edges-stats"]');
-    if(statsSpan){ statsSpan.textContent = `${minD} / ${avgD} / ${maxD}`; }
-    // Sparkline: encode a short sequence of degrees: min..avg..max
-    const sparkSpan = summaryEl.querySelector('[data-role="edges-spark"]');
-    if(sparkSpan){
-        const seq = [minD, Math.round((minD+avgD)/2), avgD, Math.round((avgD+maxD)/2), maxD];
-        const blocks = ['▁','▂','▃','▄','▅','▆','▇','█'];
-        const norm = (v)=>{ const mx = Math.max(...seq); if(mx===0) return 0; return Math.round((v/mx)*(blocks.length-1)); };
-        sparkSpan.textContent = seq.map(v=>blocks[norm(v)]).join('');
-        sparkSpan.title = seq.join(', ');
-    }
+    // Removed Min/Avg/Max and sparkline visualization per request
     // Resource warning for Uniform (previously Max) mode – still warn if near-dense
 	const warnEl = document.getElementById('routingEdgesWarnings');
 	if(warnEl){
