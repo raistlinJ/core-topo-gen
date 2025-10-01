@@ -22,6 +22,20 @@ from ..utils.services import (
 from ..utils.allocation import compute_counts_by_factor
 
 logger = logging.getLogger(__name__)
+import os
+
+# Enable verbose gRPC call trace if env var set (default off unless user requests)
+def _env_flag(name: str, default_on: bool = True) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default_on  # default to ON for web GUI unless explicitly disabled
+    return val not in ("0", "false", "False", "")
+
+# By default (no env override) enable diagnostics and gRPC tracing so web GUI users get visibility automatically.
+# Users can explicitly disable by setting the env var to 0/false.
+GRPC_TRACE = _env_flag("CORETG_GRPC_TRACE", default_on=True)
+GRPC_FORCE_SIMPLE = _env_flag("CORETG_GRPC_FORCE_SIMPLE", default_on=False)  # keep simple fallback OFF by default
+DIAG_ENABLED = _env_flag("CORETG_DIAG", default_on=True)
 
 # Optional global seed for deterministic topology aspects (can be overridden externally)
 GLOBAL_RANDOM_SEED: Optional[int] = None
@@ -51,6 +65,142 @@ def _type_desc(t: NodeType) -> str:
 
 def _make_safe_link_tracker():
     existing: Set[Tuple[int, int]] = set()
+    link_failures: int = 0
+    counters = { 'attempts': 0, 'success': 0, 'fail_total': 0 }
+    def _compat_add_link(sess, a_obj, b_obj, iface1=None, iface2=None):
+        """Attempt to add a link using multiple possible CORE API signatures.
+
+        Strategy:
+        1. Detect callable signature parameter names (via inspect) to decide whether positional args are allowed.
+        2. Prefer keyword-based calls (node1/node2) when available to avoid positional mismatch TypeErrors.
+        3. Only attempt positional fallbacks if the signature length suggests it still supports them.
+        4. Log (debug) each failed variant once per distinct error class to aid troubleshooting without spamming.
+        """
+        a_id = getattr(a_obj, 'id', a_obj)
+        b_id = getattr(b_obj, 'id', b_obj)
+        import inspect
+        add_link = getattr(sess, 'add_link', None)
+        if add_link is None:
+            raise RuntimeError('Session has no add_link method')
+        try:
+            sig = inspect.signature(add_link)
+            params = list(sig.parameters.values())
+        except Exception:
+            sig = None
+            params = []
+        # Determine capabilities
+        kw_names = {p.name for p in params}
+        has_var_pos = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        # Default allow positional
+        accepts_positional = True
+        # Only disable positional if we have a very small fixed signature AND no varargs/kwargs AND no known kw names
+        if (len(params) <= 2) and not has_var_pos and not has_var_kw and not (kw_names & {'node1','node2','node1_id','node2_id'}):
+            accepts_positional = False
+        # Prepare attempt call patterns
+        attempt_order = []
+        # Keyword object form
+        if {'node1', 'node2'} & kw_names:
+            attempt_order.append(('kw-obj-ifaces', lambda: add_link(node1=a_obj, node2=b_obj, iface1=iface1, iface2=iface2)))
+            attempt_order.append(('kw-obj-noif', lambda: add_link(node1=a_obj, node2=b_obj)))
+        # Keyword id form (some variants use node1_id/node2_id)
+        if {'node1_id', 'node2_id'} & kw_names:
+            attempt_order.append(('kw-id-ifaces', lambda: add_link(node1_id=a_id, node2_id=b_id, iface1=iface1, iface2=iface2)))
+            attempt_order.append(('kw-id-noif', lambda: add_link(node1_id=a_id, node2_id=b_id)))
+            # QoS keyword variant if user wants delay/bandwidth
+            try:
+                _d = int(os.getenv('CORETG_LINK_DELAY', '0') or 0)
+                _bw = int(os.getenv('CORETG_LINK_BW', '0') or 0)
+            except Exception:
+                _d = 0; _bw = 0
+            if _d or _bw:
+                def _kw_id_if_qos():
+                    kwargs = {'node1_id': a_id, 'node2_id': b_id, 'iface1': iface1, 'iface2': iface2}
+                    if _d: kwargs['delay'] = _d
+                    if _bw: kwargs['bandwidth'] = _bw
+                    return add_link(**kwargs)
+                attempt_order.insert(0, ('kw-id-ifaces-qos', _kw_id_if_qos))
+        # Positional object or id fallback only if accepted
+        if accepts_positional:
+            # with ifaces
+            attempt_order.append(('pos-obj-ifaces', lambda: add_link(a_obj, b_obj, iface1=iface1, iface2=iface2)))
+            attempt_order.append(('pos-id-ifaces', lambda: add_link(a_id, b_id, iface1=iface1, iface2=iface2)))
+            # no ifaces
+            attempt_order.append(('pos-obj-noif', lambda: add_link(a_obj, b_obj)))
+            attempt_order.append(('pos-id-noif', lambda: add_link(a_id, b_id)))
+            # Add positional QoS variant (sample provided by user)
+            try:
+                _d2 = int(os.getenv('CORETG_LINK_DELAY', '0') or 0)
+                _bw2 = int(os.getenv('CORETG_LINK_BW', '0') or 0)
+            except Exception:
+                _d2 = 0; _bw2 = 0
+            if _d2 or _bw2:
+                def _pos_id_ifaces_qos():
+                    return add_link(a_id, b_id, iface1=iface1, iface2=iface2, **({k:v for k,v in {'delay':_d2,'bandwidth':_bw2}.items() if v}))
+                # Put before plain positional iface variant to prefer QoS if requested
+                attempt_order.insert( (0 if not {'node1','node2'} & kw_names else 2), ('pos-id-ifaces-qos', _pos_id_ifaces_qos) )
+        # Heuristic: if we only have *args/**kwargs (generic signature) and no explicit kw variants were added, still try likely keyword patterns.
+        if has_var_kw and not any(lbl.startswith('kw-') for lbl, _ in attempt_order):
+            # Prefer object keyword forms first; id-based forms later (some CORE builds reject *_id kwargs)
+            attempt_order.insert(0, ('kw-guess-obj-ifaces', lambda: add_link(node1=a_obj, node2=b_obj, iface1=iface1, iface2=iface2)))
+            attempt_order.insert(1, ('kw-guess-obj-noif', lambda: add_link(node1=a_obj, node2=b_obj)))
+            attempt_order.insert(2, ('kw-guess-id-ifaces', lambda: add_link(node1_id=a_id, node2_id=b_id, iface1=iface1, iface2=iface2)))
+            attempt_order.insert(3, ('kw-guess-id-noif', lambda: add_link(node1_id=a_id, node2_id=b_id)))
+        if not attempt_order:
+            # Generic fallback for opaque signatures (e.g., def add_link(*args, **kwargs))
+            attempt_order = [
+                ('gen-obj-ifaces', lambda: add_link(a_obj, b_obj, iface1=iface1, iface2=iface2)),
+                ('gen-id-ifaces', lambda: add_link(a_id, b_id, iface1=iface1, iface2=iface2)),
+                ('gen-obj-noif', lambda: add_link(a_obj, b_obj)),
+                ('gen-id-noif', lambda: add_link(a_id, b_id)),
+            ]
+            if GRPC_TRACE or DIAG_ENABLED:
+                try:
+                    logger.warning("[grpc.sig.fallback] using generic variants; params=%s", [p.name for p in params])
+                except Exception:
+                    pass
+        last_exc = None
+        def _iface_repr(ifc):
+            if not ifc: return '-'
+            try:
+                return f"{getattr(ifc,'name','')}({getattr(ifc,'id','')}) {getattr(ifc,'ip4','')}/{getattr(ifc,'ip4_mask','')}"
+            except Exception:
+                return '-'
+        skip_positional = False
+        skip_id_kwargs = False
+        for label, fn in attempt_order:
+            if skip_id_kwargs and ('-id-' in label or label.startswith('kw-id') or label.startswith('kw-guess-id') or label.startswith('kw-id')):
+                continue
+            if skip_positional and label.startswith('pos-'):
+                continue
+            if GRPC_TRACE:
+                logger.info("[grpc.try] variant=%s a=%s b=%s iface1=%s iface2=%s", label, a_id, b_id, _iface_repr(iface1), _iface_repr(iface2))
+            try:
+                fn()
+                if GRPC_TRACE:
+                    logger.info("[grpc.try.ok] variant=%s a=%s b=%s", label, a_id, b_id)
+                return label
+            except Exception as e:
+                last_exc = e
+                # If this is a positional-variant failure complaining about positional args, stop trying further positional variants.
+                try:
+                    msg = str(e)
+                    if label.startswith('pos-') and 'takes 1 positional argument' in msg:
+                        skip_positional = True
+                    if ('unexpected keyword argument' in msg) and ("node1_id" in msg or "node2_id" in msg):
+                        skip_id_kwargs = True
+                        if GRPC_TRACE or DIAG_ENABLED:
+                            logger.info("[grpc.try.prune] pruning remaining id-based variants after %s failure", label)
+                except Exception:
+                    pass
+                if GRPC_TRACE:
+                    logger.info("[grpc.try.fail] variant=%s a=%s b=%s err=%s", label, a_id, b_id, e)
+                else:
+                    logger.debug("add_link fallback '%s' failed: %s", label, e)
+                continue
+        if last_exc:
+            raise last_exc
+
     def safe_add(session_obj, a_obj, b_obj, iface1=None, iface2=None):
         try:
             a_id = getattr(a_obj, 'id', a_obj)
@@ -58,15 +208,53 @@ def _make_safe_link_tracker():
         except Exception:
             a_id, b_id = a_obj, b_obj
         key = (min(a_id, b_id), max(a_id, b_id))
+        if DIAG_ENABLED:
+            try:
+                logger.info("[diag.link.call] attempting link a=%s b=%s dup=%s iface1=%s iface2=%s", a_id, b_id, key in existing, getattr(iface1,'name',None), getattr(iface2,'name',None))
+            except Exception:
+                pass
         if key in existing:
             return False
         try:
-            session_obj.add_link(a_obj, b_obj, iface1=iface1, iface2=iface2)
+            counters['attempts'] += 1
+            label = _compat_add_link(session_obj, a_obj, b_obj, iface1=iface1, iface2=iface2)
+            if label is None:
+                raise RuntimeError('add_link: internal inconsistency, label None after success')
+            if GRPC_TRACE:
+                try:
+                    def _iface_repr(ifc):
+                        if not ifc: return '-'
+                        return f"{getattr(ifc,'name', '')}({getattr(ifc,'id', '')}) {getattr(ifc,'ip4','')}/{getattr(ifc,'ip4_mask','')}"
+                    logger.info("[grpc] add_link a=%s b=%s via=%s iface1=%s iface2=%s", a_id, b_id, label, _iface_repr(iface1), _iface_repr(iface2))
+                except Exception:
+                    pass
             existing.add(key)
+            counters['success'] += 1
             return True
-        except Exception:
+        except Exception as e:
+            nonlocal link_failures
+            link_failures += 1
+            counters['attempts'] += 1
+            counters['fail_total'] += 1
+            if GRPC_TRACE:
+                logger.error("[grpc.fail] add_link all variants failed a=%s b=%s err=%s", a_id, b_id, e)
+            # Optional simple fallback if enabled
+            if GRPC_FORCE_SIMPLE:
+                try:
+                    if hasattr(session_obj, 'add_link'):
+                        try:
+                            session_obj.add_link(node1_id=a_id, node2_id=b_id)
+                        except TypeError:
+                            session_obj.add_link(a_id, b_id)  # type: ignore
+                        existing.add(key)
+                        if GRPC_TRACE:
+                            logger.info("[grpc.force-simple] add_link (no ifaces) a=%s b=%s", a_id, b_id)
+                        return True
+                except Exception as e2:
+                    if GRPC_TRACE:
+                        logger.error("[grpc.force-simple.fail] a=%s b=%s err=%s", a_id, b_id, e2)
             return False
-    return existing, safe_add
+    return existing, safe_add, counters
 
 def _apply_docker_compose_meta(node, rec):
     """Attach docker compose metadata if available (best-effort, non-fatal)."""
@@ -130,11 +318,17 @@ def build_star_from_roles(core: client.CoreGrpcClient,
     mac_alloc = UniqueAllocator(ip4_prefix)
     subnet_alloc = make_subnet_allocator(ip_mode, ip4_prefix, ip_region)
     session = safe_create_session(core)
+    if DIAG_ENABLED:
+        try:
+            al = getattr(session, 'add_link', None)
+            logger.info("[diag.session] star session=%r has_add_link=%s add_link_type=%s", session, bool(al), type(al))
+        except Exception:
+            pass
 
     cx, cy = 500, 400
     # Track every (node_a,node_b) link (unordered) we successfully create in this topology builder
     # to avoid accidental duplicate link attempts that can trigger interface rename collisions in CORE.
-    existing_links, safe_add_link = _make_safe_link_tracker()
+    existing_links, safe_add_link, link_counters = _make_safe_link_tracker()
     logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", 1, "switch", _type_desc(NodeType.SWITCH), cx, cy)
     switch = session.add_node(1, _type=NodeType.SWITCH, position=Position(x=cx, y=cy))
     try:
@@ -297,6 +491,15 @@ def build_star_from_roles(core: client.CoreGrpcClient,
                                     session.services.add(node_obj_try, "zebra")
                     except Exception:
                         pass
+    if DIAG_ENABLED:
+        try:
+            link_len = len(getattr(session, 'links', []) or []) if hasattr(session,'links') else 'n/a'
+            logger.info("[diag.summary.star] nodes=%s links_list=%s attempts=%s success=%s fail=%s", len(getattr(session,'nodes',{}) or {}), link_len, link_counters['attempts'], link_counters['success'], link_counters['fail_total'])
+        except Exception:
+            pass
+        if int(os.getenv('CORETG_LINK_FAIL_HARD','0') not in ('0','false','False','')) and link_counters['success']==0:
+            logger.error('[diag.summary.star] No links created; failing hard due to CORETG_LINK_FAIL_HARD')
+            raise RuntimeError('No links created in star topology')
     return session, switch, node_infos, service_assignments, docker_by_name
 
 
@@ -317,7 +520,13 @@ def build_multi_switch_topology(core: client.CoreGrpcClient,
     mac_alloc = UniqueAllocator(ip4_prefix)
     subnet_alloc = make_subnet_allocator(ip_mode, ip4_prefix, ip_region)
     session = safe_create_session(core)
-    existing_links, safe_add_link = _make_safe_link_tracker()
+    existing_links, safe_add_link, link_counters = _make_safe_link_tracker()
+    if DIAG_ENABLED:
+        try:
+            al = getattr(session, 'add_link', None)
+            logger.info("[diag.session] multi-switch session=%r has_add_link=%s add_link_type=%s", session, bool(al), type(al))
+        except Exception:
+            pass
 
     cx, cy = 800, 800
     logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", 1, "agg-sw", _type_desc(NodeType.SWITCH), cx, cy)
@@ -353,8 +562,21 @@ def build_multi_switch_topology(core: client.CoreGrpcClient,
             agg_ifid += 1
             safe_add_link(session, sw, agg, iface1=sw_if, iface2=agg_if)
         except Exception:
-            # fallback: attempt link without explicit ifaces
-            session.add_link(node1=sw, node2=agg)
+            # fallback: attempt link without explicit ifaces using compatibility helper
+            try:
+                # Reuse internal compatibility logic by constructing a trivial call
+                _ = session.add_link(node1_id=sw.id, node2_id=agg.id)
+            except TypeError:
+                try:
+                    _ = session.add_link(node1=sw, node2=agg)
+                except Exception:
+                    try:
+                        _ = session.add_link(sw.id, agg.id)
+                    except Exception:
+                        try:
+                            _ = session.add_link(sw, agg)
+                        except Exception:
+                            pass
 
     # Expand roles
     expanded_roles: List[str] = []
@@ -489,6 +711,15 @@ def build_multi_switch_topology(core: client.CoreGrpcClient,
                     except Exception:
                         pass
 
+    if DIAG_ENABLED:
+        try:
+            link_len = len(getattr(session, 'links', []) or []) if hasattr(session,'links') else 'n/a'
+            logger.info("[diag.summary.multi] nodes=%s switches=%s links_list=%s attempts=%s success=%s fail=%s", len(getattr(session,'nodes',{}) or {}), len(switch_ids), link_len, link_counters['attempts'], link_counters['success'], link_counters['fail_total'])
+        except Exception:
+            pass
+        if int(os.getenv('CORETG_LINK_FAIL_HARD','0') not in ('0','false','False','')) and link_counters['success']==0:
+            logger.error('[diag.summary.multi] No links created; failing hard due to CORETG_LINK_FAIL_HARD')
+            raise RuntimeError('No links created in multi-switch topology')
     return session, switch_ids, node_infos, service_assignments, docker_by_name
 
 
@@ -603,7 +834,13 @@ def build_segmented_topology(core: client.CoreGrpcClient,
     mac_alloc = UniqueAllocator(ip4_prefix)
     subnet_alloc = make_subnet_allocator(ip_mode, ip4_prefix, ip_region)
     session = safe_create_session(core)
-    existing_links, safe_add_link = _make_safe_link_tracker()
+    existing_links, safe_add_link, link_counters = _make_safe_link_tracker()
+    if DIAG_ENABLED:
+        try:
+            al = getattr(session, 'add_link', None)
+            logger.info("[diag.session] segmented session=%r has_add_link=%s add_link_type=%s", session, bool(al), type(al))
+        except Exception:
+            pass
 
     total_hosts = sum(role_counts.values())
     # Density-derived routers use only the base host pool (exclude additive Count rows) as per updated semantics
@@ -812,6 +1049,8 @@ def build_segmented_topology(core: client.CoreGrpcClient,
         key_all = (min(a_obj.id, b_obj.id), max(a_obj.id, b_obj.id))
         if key_all not in existing_links:
             safe_add_link(session, a_obj, b_obj, iface1=a_if, iface2=b_if)
+            if GRPC_TRACE:
+                logger.info("[grpc] add_router_link r1=%s r2=%s label=%s net=%s ifaceA=%s/%s ifaceB=%s/%s", a_obj.id, b_obj.id, label, rr_net, a_ip, rr_net.prefixlen, b_ip, rr_net.prefixlen)
         existing_router_links.add(key)
         return True
     # Determine connectivity mode & target before creating links (allow deterministic injection)
@@ -822,6 +1061,8 @@ def build_segmented_topology(core: client.CoreGrpcClient,
         try:
             fp = approved_plan.get('full_preview') or {}
             pv_edges = fp.get('r2r_edges_preview') or []
+            if router_count > 1 and fp and not pv_edges:
+                raise ValueError("full_preview provided but r2r_edges_preview missing for >1 router; client must supply edges")
             if pv_edges:
                 valid = True
                 for a, b in pv_edges:
@@ -857,7 +1098,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             connectivity_mode = 'Random'
     # Build links according to connectivity_mode (unless injected already)
     if router_count > 1 and injected_r2r:
-        pass
+        logger.debug("R2R preview injection active: skipping connectivity_mode construction (using injected edges only)")
     elif router_count > 1:
         if connectivity_mode == 'Min':
             # Chain topology: r1-r2-r3-...-rn
@@ -1145,6 +1386,158 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                 pass
     except Exception:
         logger.exception("Routing protocol assignment phase failed")
+
+    # Preview-based R2S/S2H injection (reuse hosts + switches from full_preview if provided)
+    preview_r2s_injected = False
+    if approved_plan and isinstance(approved_plan, dict):
+        try:
+            fp = approved_plan.get('full_preview') or {}
+            fp_hosts = fp.get('hosts') or []
+            fp_switches = fp.get('switches_detail') or []
+            host_router_map_prev = fp.get('host_router_map') or {}
+            ptp_subnets = list(fp.get('ptp_subnets') or [])
+            if (fp_hosts or fp_switches) and not getattr(session, '_legacy_preview_r2s_done', False):
+                logger.info('[legacy] injecting preview hosts/switches: %d hosts, %d switches', len(fp_hosts), len(fp_switches))
+                import ipaddress as _ipaddress
+                host_nodes_by_id: Dict[int, Any] = {}
+                host_next_ifid: Dict[int, int] = {}
+                hosts: List[NodeInfo] = []
+                # Track sets
+                switch_host_members: Set[int] = set()
+                for sd in fp_switches:
+                    for h in sd.get('hosts', []) or []:
+                        try: switch_host_members.add(int(h))
+                        except Exception: pass
+                # Create host nodes
+                for idx, h in enumerate(fp_hosts):
+                    try:
+                        hid = int(h.get('node_id'))
+                    except Exception:
+                        continue
+                    role = h.get('role') or 'Host'
+                    rid_fallback = (hid - 1) % max(1, router_count)
+                    rx, ry = r_positions[rid_fallback]
+                    theta = (2 * math.pi * (idx + 1)) / max(2, len(fp_hosts))
+                    radius = 140 + (idx % 5) * 10
+                    x = int(rx + radius * math.cos(theta))
+                    y = int(ry + radius * math.sin(theta))
+                    node_type = map_role_to_node_type(role)
+                    name = h.get('name') or f"h{idx+1}-{role.lower()}"
+                    node = session.add_node(hid, _type=node_type, position=Position(x=x, y=y), name=name)
+                    if GRPC_TRACE:
+                        logger.info("[grpc] add_node host id=%s role=%s name=%s pos=(%s,%s)", hid, role, name, x, y)
+                    host_nodes_by_id[node.id] = node
+                    host_next_ifid[node.id] = 1
+                    hosts.append(NodeInfo(node_id=node.id, ip4="", role=role))
+                # PTP links for non-switch hosts
+                ptp_iter = iter(ptp_subnets)
+                for h in fp_hosts:
+                    try:
+                        hid = int(h.get('node_id'))
+                    except Exception:
+                        continue
+                    if hid in switch_host_members:
+                        continue
+                    rid = host_router_map_prev.get(str(hid)) or host_router_map_prev.get(hid)
+                    try: rid = int(rid)
+                    except Exception: rid = None
+                    if not rid or rid not in router_nodes:
+                        continue
+                    r_obj = router_nodes.get(rid); h_obj = host_nodes_by_id.get(hid)
+                    if not r_obj or not h_obj:
+                        continue
+                    # Strict: ptp_subnets must enumerate all required PTP networks
+                    sn = _ipaddress.ip_network(next(ptp_iter), strict=False)
+                    hs_sub = list(sn.hosts())
+                    if len(hs_sub) < 2:
+                        continue
+                    r_ip = str(hs_sub[0]); h_ip = str(hs_sub[1])
+                    r_ifid = router_next_ifid.get(rid, 0); router_next_ifid[rid] = r_ifid + 1
+                    h_if = Interface(id=0, name='eth0', ip4=h_ip, ip4_mask=sn.prefixlen, mac=mac_alloc.next_mac())
+                    r_if = Interface(id=r_ifid, name=f'r{rid}-h{hid}', ip4=r_ip, ip4_mask=sn.prefixlen, mac=mac_alloc.next_mac())
+                    safe_add_link(session, h_obj, r_obj, iface1=h_if, iface2=r_if)
+                    for hn in hosts:
+                        if hn.node_id == hid:
+                            hn.ip4 = f"{h_ip}/{sn.prefixlen}"; break
+                # Switches
+                switch_count = 0
+                for sd in fp_switches:
+                    try: swid = int(sd.get('switch_id'))
+                    except Exception: continue
+                    rid = sd.get('router_id')
+                    try: rid_int = int(rid)
+                    except Exception: continue
+                    r_obj = router_nodes.get(rid_int)
+                    if not r_obj:
+                        continue
+                    sw_name = f"{sd.get('name') or 'sw'}-{rid_int}-{switch_count+1}" if sd.get('name') else f"rsw-{rid_int}-{switch_count+1}"
+                    sw_node = session.add_node(swid, _type=NodeType.SWITCH, position=Position(x=0,y=0), name=sw_name)
+                    import ipaddress as _ip2
+                    # Strict: rsw_subnet must parse (validated earlier)
+                    rsn = _ip2.ip_network(sd.get('rsw_subnet'), strict=False)
+                    rsh = list(rsn.hosts())
+                    if len(rsh) >= 2:
+                        r_ip = sd.get('router_ip') or str(rsh[0])
+                        sw_ip = sd.get('switch_ip') or str(rsh[1])
+                        r_ifid = router_next_ifid.get(rid_int, 0); router_next_ifid[rid_int] = r_ifid + 1
+                        sw_if = Interface(id=0, name=f"{sw_name}-r{rid_int}", ip4=sw_ip, ip4_mask=rsn.prefixlen, mac=mac_alloc.next_mac())
+                        r_if = Interface(id=r_ifid, name=f"r{rid_int}-{sw_name}", ip4=r_ip, ip4_mask=rsn.prefixlen, mac=mac_alloc.next_mac())
+                        safe_add_link(session, sw_node, r_obj, iface1=sw_if, iface2=r_if)
+                    # Strict: lan_subnet must parse (validated earlier)
+                    lan_net = _ip2.ip_network(sd.get('lan_subnet'), strict=False)
+                    lan_hosts = list(lan_net.hosts())
+                    sw_lan_ip = str(lan_hosts[0]) if lan_hosts else None
+                    h_if_ips = sd.get('host_if_ips') or {}
+                    for idx_h, hid in enumerate(sd.get('hosts') or []):
+                        h_obj = host_nodes_by_id.get(hid)
+                        if not h_obj: continue
+                        # Strict: require explicit host_if_ips entry
+                        hip_full = h_if_ips.get(hid)
+                        if not hip_full: continue
+                        hip, _, mask = hip_full.partition('/')
+                        h_ifid = host_next_ifid.get(hid, 1); host_next_ifid[hid] = h_ifid + 1
+                        h_if = Interface(id=h_ifid, name=f"eth{h_ifid}", ip4=hip, ip4_mask=int(mask) if mask else lan_net.prefixlen, mac=mac_alloc.next_mac())
+                        sw_if_h = Interface(id=idx_h+1, name=f"{sw_name}-h{hid}", ip4=sw_lan_ip, ip4_mask=lan_net.prefixlen, mac=mac_alloc.next_mac())
+                        safe_add_link(session, h_obj, sw_node, iface1=h_if, iface2=sw_if_h)
+                        for hn in hosts:
+                            if hn.node_id == hid:
+                                hn.ip4 = hip_full; break
+                    switch_count += 1
+                topo_stats = getattr(session, 'topo_stats', {}) or {}
+                topo_stats['switches_allocated'] = switch_count
+                topo_stats['hosts_allocated'] = len(hosts)
+                setattr(session, 'topo_stats', topo_stats)
+                setattr(session, '_legacy_preview_r2s_done', True)
+                preview_r2s_injected = True
+                # Provide variables expected later to avoid NameErrors
+                host_router_map = {int(h.get('node_id')): host_router_map_prev.get(str(h.get('node_id'))) for h in fp_hosts if h.get('node_id')}
+                host_direct_link = {}
+                lan_switch_by_router = {}
+                node_id_counter = max([*router_nodes.keys(), *host_nodes_by_id.keys(), *(sd.get('switch_id') for sd in fp_switches if sd.get('switch_id'))], default=router_count) + 1
+                docker_by_name = {}
+                created_docker = 0
+                buckets = [[] for _ in range(router_count)]  # neutralize dynamic host distribution
+                logger.info('[legacy] preview R2S/S2H injection complete; skipping dynamic host creation path')
+        except Exception as _pr2s_e:
+            logger.warning('[legacy] preview R2S/S2H injection failed: %s', _pr2s_e)
+
+    if preview_r2s_injected:
+        # Skip dynamic host creation path entirely
+        if DIAG_ENABLED:
+            try:
+                ln = len(getattr(session,'links',[]) or []) if hasattr(session,'links') else 'n/a'
+                logger.info("[diag.early-return] preview_r2s_injected routers=%s hosts=%s links=%s", router_count, len(fp_hosts) if 'fp_hosts' in locals() else 'n/a', ln)
+            except Exception:
+                pass
+        if DIAG_ENABLED:
+            try:
+                link_len = len(getattr(session, 'links', []) or []) if hasattr(session,'links') else 'n/a'
+                logger.info('[diag.summary.segmented.early] routers=%s links_list=%s attempts=%s success=%s fail=%s', router_count, link_len, link_counters['attempts'], link_counters['success'], link_counters['fail_total'])
+            except Exception:
+                pass
+            if int(os.getenv('CORETG_LINK_FAIL_HARD','0') not in ('0','false','False','')) and link_counters['success']==0:
+                raise RuntimeError('No links created in early-return segmented topology')
+        return session
 
     expanded_roles: List[str] = []
     for role, count in role_counts.items():
@@ -1768,8 +2161,15 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                     setattr(rnode, "routing_protocol", proto)
                 except Exception:
                     pass
-        # After assigning protocols, ensure routers sharing the same protocol are connected with additional links
+        # After assigning protocols, optionally enrich R2R links for protocol groups.
+        # BUGFIX: Previously this block created a near/full mesh whenever all routers shared one protocol,
+        # even if the base connectivity mode was Random / Exact / Min / NonUniform. We now restrict
+        # enrichment to explicit 'Max' (and optionally 'Uniform' with degree budget) policies to avoid
+        # divergence from preview specification.
         try:
+            if injected_r2r:
+                logger.debug("Skipping protocol-based R2R enrichment because preview edges were injected")
+                raise RuntimeError('skip_enrichment_injected')
             protocol_groups: Dict[str, List[object]] = {}
             for rnode in router_objs:
                 rid = rnode.id
@@ -1791,29 +2191,25 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             for proto, group_nodes in protocol_groups.items():
                 if len(group_nodes) <= 1:
                     continue
-                # If user did not specify an r2r_mode (policy == Random)
-                # but a mesh style was requested (tests), still honor style for a single shared protocol group.
-                # IMPORTANT: Do not enrich topology for Min policy. User expects strict chain.
-                if target_policy == 'Min':
-                    continue
-                # Skip enrichment if base policy is Random and user did not request style that implies more links;
-                # prevents accidental full mesh when protocol groups share one protocol.
-                if target_policy not in ('Max', 'Uniform'):
-                    # detect if all routers share this protocol and no other protocols exist. Previously we
-                    # enriched even for Min which produced unintended full meshes; now Min is excluded above.
-                    all_router_ids = {r.id for r in router_objs}
-                    grp_ids = {r.id for r in group_nodes}
-                    if grp_ids == all_router_ids and len(protocol_groups) == 1:
-                        # proceed (treat as implicit style enrichment for Random / Exact / NonUniform)
-                        pass
-                    else:
-                        continue
+                # Enrichment permission matrix:
+                #   Allow when base policy (connectivity mode) is 'Max'.
+                #   Allow limited (degree-budgeted) augmentation for 'Uniform'.
+                #   Disallow for ('Min','Exact','Random','NonUniform','Injected') to preserve preview edges.
+                allow_mesh = base_policy in ('Max',)
+                allow_uniform = base_policy == 'Uniform'
+                if not allow_mesh and not allow_uniform:
+                    continue  # skip enrichment
                 style = (router_mesh_style or "full").lower()
                 ordered = list(group_nodes)
                 # Budget: do not exceed target_degree (if specified) by more than +1 when adding protocol links
                 def can_link(a_id, b_id):
-                    # In Max mode we can always add more (bounded by outer loops / full pair enumeration)
-                    return True
+                    if allow_mesh:
+                        return True
+                    if allow_uniform and target_degree > 0:
+                        # Only add if both endpoints still below (target_degree + 1) to avoid runaway
+                        return (current_degrees.get(a_id, 0) < (target_degree + 1) and
+                                current_degrees.get(b_id, 0) < (target_degree + 1))
+                    return False
                 candidate_pairs: List[Tuple[object, object]] = []
                 if style == 'ring' and len(ordered) > 2:
                     ring_pairs = [(ordered[i], ordered[(i+1)%len(ordered)]) for i in range(len(ordered))]
@@ -1843,6 +2239,10 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                         for j in range(i+1, len(ordered)):
                             candidate_pairs.append((ordered[i], ordered[j]))
                     random.shuffle(candidate_pairs)
+                    # If not full-mesh allowed, down-select based on degree budget
+                    if not allow_mesh and allow_uniform and target_degree > 0:
+                        # Filter to pairs where at least one endpoint below target_degree
+                        candidate_pairs = [p for p in candidate_pairs if (current_degrees[p[0].id] < target_degree or current_degrees[p[1].id] < target_degree)]
                 for a, b in candidate_pairs:
                     key = (min(a.id, b.id), max(a.id, b.id))
                     if key in existing_router_links:
@@ -1885,6 +2285,9 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                     existing_router_links.add(key)
                     current_degrees[a.id] += 1; current_degrees[b.id] += 1
                     logger.debug("Protocol %s link r%d<->r%d (style=%s deg=%s/%s)", proto, a.id, b.id, style, current_degrees[a.id], current_degrees[b.id])
+        except RuntimeError as e:
+            if str(e) != 'skip_enrichment_injected':
+                logger.debug("RuntimeError during protocol enrichment: %s", e)
         except Exception as e:
             logger.debug("Failed building protocol-specific router mesh: %s", e)
 
@@ -2049,5 +2452,13 @@ def build_segmented_topology(core: client.CoreGrpcClient,
         setattr(session, 'topo_stats', topo_stats)
     except Exception:
         pass
+    if DIAG_ENABLED:
+        try:
+            link_len = len(getattr(session, 'links', []) or []) if hasattr(session,'links') else 'n/a'
+            logger.info('[diag.summary.segmented.final] routers=%s hosts=%s links_list=%s attempts=%s success=%s fail=%s', len(routers), len(hosts), link_len, link_counters['attempts'], link_counters['success'], link_counters['fail_total'])
+        except Exception:
+            pass
+        if int(os.getenv('CORETG_LINK_FAIL_HARD','0') not in ('0','false','False','')) and link_counters['success']==0:
+            raise RuntimeError('No links created in segmented topology')
     return session, routers, hosts, host_service_assignments, router_protocols, docker_by_name
     

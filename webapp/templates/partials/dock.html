@@ -30,6 +30,13 @@
           <option value="WARN">WARN</option>
           <option value="ERROR">ERROR</option>
         </select>
+        <label class="form-label mb-0 ms-3 me-1">Filter</label>
+        <input id="logFilterInput" class="form-control form-control-sm" style="width:180px;" type="text" placeholder="substr or /regex/" />
+        <div class="form-check form-check-inline ms-1 me-0">
+          <input class="form-check-input" type="checkbox" id="logFilterRegex" />
+          <label class="form-check-label small" for="logFilterRegex" title="Interpret filter as RegExp">Regex</label>
+        </div>
+        <button class="btn btn-sm btn-outline-secondary ms-1" id="logFilterClearBtn" type="button" title="Clear filter">✕</button>
         <button class="btn btn-sm btn-outline-danger ms-2" id="clearLogsBtn" type="button" title="Clear log buffer">Clear</button>
       </div>
     </li>
@@ -58,10 +65,24 @@
   const DOCK_HIDDEN_KEY = 'coretg_dock_hidden';
   const DOCK_ACTIVE_TAB_KEY = 'coretg_dock_active_tab';
   let currentLogLevel = LOG_LEVELS.INFO;
+  // Preload any existing buffer immediately so the UI isn't blank between load and init()
   let logBuffer = [];
-  function renderLogs(){ const el=document.getElementById('logsPre'); if(!el) return; const filtered = logBuffer.filter(r => (r.levelValue||20) >= currentLogLevel).map(r => r.line); el.textContent = filtered.join('\n') + (filtered.length ? '\n' : ''); el.scrollTop = el.scrollHeight; }
+  try {
+    const _preRaw = localStorage.getItem(LOG_STORE_KEY);
+    if(_preRaw){ const _arr = JSON.parse(_preRaw); if(Array.isArray(_arr)) logBuffer = _arr; }
+  } catch(e) {}
+  let filterText = '';
+  let filterIsRegex = false;
+  let filterRegexObj = null;
+  const LOG_FILTER_TEXT_KEY = 'coretg_log_filter_text';
+  const LOG_FILTER_REGEX_KEY = 'coretg_log_filter_regex';
+  function compileFilter(){ filterRegexObj=null; if(!filterText) return; if(filterIsRegex){ let pattern=filterText; let flags='i'; const m=filterText.match(/^\/(.*)\/(\w*)$/); if(m){ pattern=m[1]; flags=m[2]||'i'; } try{ filterRegexObj=new RegExp(pattern, flags);}catch(e){ filterRegexObj=null; } } }
+  function passFilter(line){ if(!filterText) return true; if(filterIsRegex){ if(!filterRegexObj) return true; return filterRegexObj.test(line); } return line.toLowerCase().includes(filterText.toLowerCase()); }
+  function renderLogs(){ const el=document.getElementById('logsPre'); if(!el) return; const filtered = logBuffer.filter(r => (r.levelValue||20) >= currentLogLevel).filter(r=>passFilter(r.line)).map(r => r.line); el.textContent = filtered.join('\n') + (filtered.length ? '\n' : ''); el.scrollTop = el.scrollHeight; }
   function persistLogs(){ try{ localStorage.setItem(LOG_STORE_KEY, JSON.stringify(logBuffer)); }catch(e){} }
-  function logLine(level, msg){ const ts=new Date().toISOString(); const lvlVal = LOG_LEVELS[level] ?? LOG_LEVELS.INFO; const line = `[${ts}] ${level.padEnd(5)} ${msg}`; logBuffer.push({ level, levelValue: lvlVal, line }); if(logBuffer.length>5000){ logBuffer.splice(0, logBuffer.length-5000); } persistLogs(); if(lvlVal >= currentLogLevel){ const el=document.getElementById('logsPre'); if(el){ el.textContent += line + '\n'; el.scrollTop = el.scrollHeight; } } }
+  function isFilterActive(){ return !!filterText; }
+  function logLine(level, msg){ const ts=new Date().toISOString(); const lvlVal = LOG_LEVELS[level] ?? LOG_LEVELS.INFO; const line = `[${ts}] ${level.padEnd(5)} ${msg}`; logBuffer.push({ level, levelValue: lvlVal, line }); if(logBuffer.length>5000){ logBuffer.splice(0, logBuffer.length-5000); } persistLogs(); if(lvlVal >= currentLogLevel){ if(isFilterActive()){ renderLogs(); } else { if(passFilter(line)){ const el=document.getElementById('logsPre'); if(el){ // Append without wiping existing preloaded content
+            el.textContent += line + '\n'; el.scrollTop = el.scrollHeight; } } } } }
   function logDebug(m){ logLine('DEBUG', m); }
   function logInfo(m){ logLine('INFO', m); }
   function logWarn(m){ logLine('WARN', m); }
@@ -94,9 +115,17 @@
     setupDock();
     try { const raw = localStorage.getItem(LOG_STORE_KEY); if(raw){ const arr = JSON.parse(raw); if(Array.isArray(arr)){ logBuffer = arr; if(window._coretg_logBuffer) window._coretg_logBuffer = logBuffer; } } } catch(e){}
     try { const savedLvl = localStorage.getItem('coretg_log_level'); if(savedLvl && LOG_LEVELS[savedLvl] !== undefined){ currentLogLevel = LOG_LEVELS[savedLvl]; const sel=document.getElementById('logLevelFilter'); if(sel) sel.value=savedLvl; } } catch(e){}
-    renderLogs();
+  // If we preloaded, paint them before applying filters/level to avoid flash of empty
+  renderLogs();
     const sel = document.getElementById('logLevelFilter'); sel?.addEventListener('change', () => { const v=sel.value; if(LOG_LEVELS[v]!==undefined){ currentLogLevel=LOG_LEVELS[v]; try{ localStorage.setItem('coretg_log_level', v); }catch(e){} renderLogs(); }});
     document.getElementById('clearLogsBtn')?.addEventListener('click', () => { try { localStorage.setItem(LOG_STORE_KEY, JSON.stringify([])); } catch(e){} logBuffer = []; if(window._coretg_logBuffer) window._coretg_logBuffer = logBuffer; renderLogs(); });
+    // Restore filter state
+    try { const ft = localStorage.getItem(LOG_FILTER_TEXT_KEY); if(ft){ filterText=ft; const inp=document.getElementById('logFilterInput'); if(inp) inp.value=filterText; } } catch(e){}
+    try { const fr = localStorage.getItem(LOG_FILTER_REGEX_KEY); if(fr==='1'){ filterIsRegex=true; const cb=document.getElementById('logFilterRegex'); if(cb) cb.checked=true; } } catch(e){}
+    compileFilter(); renderLogs();
+    document.getElementById('logFilterInput')?.addEventListener('input', (ev)=>{ filterText = ev.target.value.trim(); try{ localStorage.setItem(LOG_FILTER_TEXT_KEY, filterText);}catch(_e){} compileFilter(); renderLogs(); });
+    document.getElementById('logFilterRegex')?.addEventListener('change', (ev)=>{ filterIsRegex = !!ev.target.checked; try{ localStorage.setItem(LOG_FILTER_REGEX_KEY, filterIsRegex?'1':'0');}catch(_e){} compileFilter(); renderLogs(); });
+    document.getElementById('logFilterClearBtn')?.addEventListener('click', ()=>{ filterText=''; filterIsRegex=false; const inp=document.getElementById('logFilterInput'); if(inp) inp.value=''; const cb=document.getElementById('logFilterRegex'); if(cb) cb.checked=false; try{ localStorage.removeItem(LOG_FILTER_TEXT_KEY); localStorage.removeItem(LOG_FILTER_REGEX_KEY);}catch(_e){} compileFilter(); renderLogs(); });
   }
   if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 })();

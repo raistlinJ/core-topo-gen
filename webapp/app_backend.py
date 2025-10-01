@@ -2018,7 +2018,12 @@ def save_xml():
         flash(f'Invalid JSON: {e}')
         return redirect(url_for('index'))
     try:
-        tree = _build_scenarios_xml(data)
+        active_index = None
+        try:
+            active_index = int(data.get('active_index')) if 'active_index' in data else None
+        except Exception:
+            active_index = None
+        tree = _build_scenarios_xml({ 'scenarios': data.get('scenarios') })
         ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
         os.makedirs(out_dir, exist_ok=True)
@@ -2027,7 +2032,13 @@ def save_xml():
             scen_names = [s.get('name') for s in (data.get('scenarios') or []) if isinstance(s, dict) and s.get('name')]
         except Exception:
             scen_names = []
-        stem_raw = (scen_names[0] if scen_names else 'scenarios') or 'scenarios'
+        chosen_name = None
+        try:
+            if active_index is not None and 0 <= active_index < len(scen_names):
+                chosen_name = scen_names[active_index]
+        except Exception:
+            chosen_name = None
+        stem_raw = (chosen_name or (scen_names[0] if scen_names else 'scenarios')) or 'scenarios'
         stem = secure_filename(stem_raw).strip('_-.') or 'scenarios'
         out_path = os.path.join(out_dir, f"{stem}.xml")
         # Pretty print if lxml available else fallback
@@ -2068,6 +2079,11 @@ def save_xml_api():
     try:
         data = request.get_json(silent=True) or {}
         scenarios = data.get('scenarios')
+        active_index = None
+        try:
+            active_index = int(data.get('active_index')) if 'active_index' in data else None
+        except Exception:
+            active_index = None
         if not isinstance(scenarios, list):
             return jsonify({ 'ok': False, 'error': 'Invalid payload (scenarios list required)' }), 400
         tree = _build_scenarios_xml({ 'scenarios': scenarios })
@@ -2079,7 +2095,13 @@ def save_xml_api():
             scen_names = [s.get('name') for s in scenarios if isinstance(s, dict) and s.get('name')]
         except Exception:
             scen_names = []
-        stem_raw = (scen_names[0] if scen_names else 'scenarios') or 'scenarios'
+        chosen_name = None
+        try:
+            if active_index is not None and 0 <= active_index < len(scen_names):
+                chosen_name = scen_names[active_index]
+        except Exception:
+            chosen_name = None
+        stem_raw = (chosen_name or (scen_names[0] if scen_names else 'scenarios')) or 'scenarios'
         stem = secure_filename(stem_raw).strip('_-.') or 'scenarios'
         out_path = os.path.join(out_dir, f"{stem}.xml")
         # Pretty print when possible
@@ -2969,6 +2991,19 @@ def reports_page():
             # Prefer names parsed from the Scenario Editor XML, fall back to session xml if missing
             src_xml = e.get('scenario_xml_path') or e.get('xml_path')
             e['scenario_names'] = _scenario_names_from_xml(src_xml)
+        # Hardening: ensure scenario_names is always a list
+        sn = e.get('scenario_names')
+        if not isinstance(sn, list):
+            if sn is None:
+                e['scenario_names'] = []
+            elif isinstance(sn, str):
+                # Split comma or pipe delimited legacy forms
+                if '||' in sn:
+                    e['scenario_names'] = [s for s in sn.split('||') if s]
+                else:
+                    e['scenario_names'] = [s.strip() for s in sn.split(',') if s.strip()]
+            else:
+                e['scenario_names'] = []
         enriched.append(e)
     enriched = sorted(enriched, key=lambda x: x.get('timestamp',''), reverse=True)
     # collect unique scenario names
@@ -2990,6 +3025,18 @@ def reports_data():
         if 'scenario_names' not in e:
             src_xml = e.get('scenario_xml_path') or e.get('xml_path')
             e['scenario_names'] = _scenario_names_from_xml(src_xml)
+        # Hardening: normalize scenario_names to list
+        sn = e.get('scenario_names')
+        if not isinstance(sn, list):
+            if sn is None:
+                e['scenario_names'] = []
+            elif isinstance(sn, str):
+                if '||' in sn:
+                    e['scenario_names'] = [s for s in sn.split('||') if s]
+                else:
+                    e['scenario_names'] = [s.strip() for s in sn.split(',') if s.strip()]
+            else:
+                e['scenario_names'] = []
         for n in e.get('scenario_names', []) or []:
             scen_names.add(n)
         enriched.append(e)

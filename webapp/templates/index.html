@@ -8,20 +8,25 @@
     @keyframes pulseHighlight { 0% { box-shadow:0 0 0 0 rgba(13,110,253,.7); transform:scale(1);} 40% { box-shadow:0 0 0 6px rgba(13,110,253,.0); transform:scale(1.03);} 100% { box-shadow:0 0 0 0 rgba(13,110,253,0); transform:scale(1); } }
     .popover { max-width: 420px; }
     .host-total-badge + .badge, .host-total-badge + button { margin-left: .25rem; }
+    /* Hide H/S bounds by default; JS adds .hs-show to display them */
+    .hs-bounds-wrapper { display: none; }
+    .hs-bounds-wrapper.hs-show { display: flex; }
 </style>
 {% endblock %}
-/* Hide H/S bounds by default; JS adds .hs-show to display them */
-.hs-bounds-wrapper { display: none; }
-.hs-bounds-wrapper.hs-show { display: flex; }
+<!-- hs-bounds-wrapper styles moved into style block above -->
 {% block content %}
     <div class="row">
         <div class="col-md-3 mb-3">
                 <div class="card shadow-sm h-100 d-flex flex-column">
                             <div class="card-header d-flex justify-content-between align-items-center">
                                 <span class="fw-bold">Scenarios</span>
-                                <div class="btn-toolbar gap-2">
-                                    <button type="button" class="btn btn-sm btn-outline-secondary" id="importBtn">Import</button>
-                                    <button type="button" class="btn btn-sm btn-outline-info" id="exportBtn">Export</button>
+                                <div class="btn-toolbar gap-2 align-items-center">
+                                    <button type="button" class="btn btn-sm btn-outline-secondary" id="importBtn" title="Import scenarios XML">Import</button>
+                                    <button type="button" class="btn btn-sm btn-outline-info" id="exportBtn" title="Export last saved XML">Export</button>
+                                    <div class="btn-group" role="group" aria-label="Bulk scenario actions">
+                                        <button type="button" class="btn btn-sm btn-outline-secondary" id="selectAllScenariosBtn" title="Select all (or clear if all selected)">All</button>
+                                        <button type="button" class="btn btn-sm btn-outline-danger" id="deleteSelectedScenariosBtn" title="Delete selected scenarios" disabled>Delete</button>
+                                    </div>
                                 </div>
                             </div>
                     <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="scenarioList" style="min-height:0;"></div>
@@ -80,6 +85,7 @@
 
                     <form id="editorForm" action="{{ url_for('save_xml') }}" method="post">
                         <input type="hidden" name="scenarios_json" id="scenarios_json">
+                        <input type="hidden" name="active_index" id="active_index" value="0">
                         <div id="editorRoot"></div>
                         <div class="d-flex gap-2 mt-3">
                             <button type="submit" class="btn btn-success">Save XML</button>
@@ -331,9 +337,25 @@ const payloadDataEl = document.getElementById('payload-data');
 window.VULN_CATALOG = window.VULN_CATALOG || { types: [], vectors: [], items: [] };
 // Prevent TDZ: define catalog early on window
 window.VULN_CATALOG = window.VULN_CATALOG || { types: [], vectors: [], items: [] };
-// ---------------- Logging (buffer + level filter) -----------------
-// Logging helpers now provided globally by dock partial
-logInfo('UI initialized');
+// ---------------- Unified Logging Bridge -----------------
+// Forward all app/UI logs into dock log system (defined in partial 'dock.html').
+// We DO NOT override existing dock log functions if already present.
+function appendLog(line, level){
+    if(!line) return;
+    let lvl = (level||'INFO').toString().toUpperCase();
+    if(!['DEBUG','INFO','WARN','ERROR'].includes(lvl)) lvl='INFO';
+    if(window.logLine){ window.logLine(lvl, line); return; }
+    // Fallback: create a very small inline buffer if dock not initialized yet.
+    try {
+        const pre = document.getElementById('logsPre') || document.getElementById('runProgressLog');
+        if(pre){ pre.textContent += `[${new Date().toISOString()}] ${lvl} ${line}\n`; }
+    } catch(e){}
+}
+if(!window.logInfo) window.logInfo = (m)=>appendLog(m,'INFO');
+if(!window.logWarn) window.logWarn = (m)=>appendLog(m,'WARN');
+if(!window.logError) window.logError = (m)=>appendLog(m,'ERROR');
+if(!window.logDebug) window.logDebug = (m)=>appendLog(m,'DEBUG');
+appendLog('UI initialized','INFO');
 try {
     initialPayload = JSON.parse(payloadDataEl?.textContent || 'null');
 } catch (e) {
@@ -356,7 +378,7 @@ function defaultScenario(name) {
         density_count: 10,
         sections: {
             // Default: one Count-based row; weight-based nodes/density start at 0
-            'Node Information': { total_nodes: 0, density: 0, items: [ { selected: 'Random', factor: 1.0, v_metric: 'Count', v_count: 1 } ] },
+            'Node Information': { total_nodes: 0, density: 0, items: [ { selected: 'Random', factor: 1.0, v_metric: 'Count', v_count: 5 } ] },
             'Routing': { density: 0.5, items: [] },
             'Services': { density: 0.5, items: [] },
             'Traffic': { density: 0.5, items: [] },
@@ -806,30 +828,36 @@ document.addEventListener('DOMContentLoaded', ()=>{
             }
             if(!window.confirm('Execute this scenario now? This will start a CORE session.')) return;
             try {
+                // Ensure dock visible
+                try { const showBtn=document.getElementById('dockShowBtn'); if(showBtn && !showBtn.classList.contains('d-none')) showBtn.click(); } catch(e){}
+                appendLog('--- Execute (Full Preview) start: '+state.result_path+' ---','info');
                 const form = new FormData(); form.append('xml_path', state.result_path);
                 const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
-                if(!res.ok){ alert('Failed to start execution'); return; }
-                const { run_id } = await res.json();
-                const logWin = window.open('', '_blank');
-                if(logWin){ logWin.document.write('<pre id="log" style="font:11px monospace;white-space:pre-wrap;">Starting...\n</pre>'); }
+                if(!res.ok){ appendLog('Failed to start execution (HTTP '+res.status+')','error'); return; }
+                const dataInit = await res.json();
+                const run_id = dataInit.run_id;
+                if(!run_id){ appendLog('Execution start response missing run_id','error'); return; }
+                appendLog('Run ID: '+run_id,'info');
+                // Stream logs directly into dock log buffer
                 const evt = new EventSource('/stream/' + run_id);
-                evt.onmessage = ev => { if(logWin && !logWin.closed){ logWin.document.getElementById('log').textContent += (ev.data||'') + '\n'; } };
-                evt.addEventListener('end', ()=>{ try{ evt.close(); }catch(e){} });
+                evt.onmessage = ev => { if(ev && typeof ev.data==='string') runProgressLogLine(ev.data); };
+                evt.addEventListener('end', ()=>{ try{ evt.close(); }catch(e){} appendLog('Execution stream ended','info'); });
+                // Poll status until done
                 (async function poll(){
                     try {
                         const r = await fetch('/run_status/' + run_id);
                         if(!r.ok){ setTimeout(poll, 1200); return; }
-                        const data = await r.json();
-                        if(!data.done){ setTimeout(poll, 1000); return; }
-                        if(data.returncode===0){
-                            if(logWin && !logWin.closed){ logWin.document.getElementById('log').textContent += '\nRun complete; redirecting to Reports...'; }
-                            setTimeout(()=>{ window.location.href = "{{ url_for('reports_page') }}"; }, 600);
+                        const st = await r.json();
+                        if(!st.done){ setTimeout(poll, 1000); return; }
+                        if(st.returncode===0){
+                            appendLog('Execution complete: success; redirecting to Reports','info');
+                            setTimeout(()=>{ window.location.href = "{{ url_for('reports_page') }}"; }, 700);
                         } else {
-                            if(logWin && !logWin.closed){ logWin.document.getElementById('log').textContent += '\nRun finished with errors (code '+data.returncode+').'; }
+                            appendLog('Execution finished with errors (code '+st.returncode+')','error');
                         }
                     } catch(e){ setTimeout(poll, 1500); }
                 })();
-            } catch(e){ alert('Execution error: '+e); }
+            } catch(e){ appendLog('Execution exception: '+e,'error'); }
         });
     }
 });
@@ -847,7 +875,7 @@ async function autoSaveXml(){
             // Mirror logic from manual Save XML submission but use fetch
             const scenariosJsonInput = document.getElementById('scenarios_json');
             if(!scenariosJsonInput){ reject('Editor form missing'); return; }
-            try { scenariosJsonInput.value = JSON.stringify({ scenarios: state.scenarios }); } catch(e){ reject('Serialize failed'); return; }
+            try { scenariosJsonInput.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx }); } catch(e){ reject('Serialize failed'); return; }
             const formData = new FormData();
             formData.append('scenarios_json', scenariosJsonInput.value);
             fetch('/save_xml', { method:'POST', body: formData })
@@ -917,6 +945,8 @@ const dropdownsBySection = {
 function render() {
     renderSidebar();
     renderMain();
+    // Ensure H/S bounds visibility reflects initial r2s_mode values
+    updateHsBoundsVisibility();
     // Download link visibility if provided
     // Enable/disable Download XML button based on saved xml path
     const dlBtn = document.getElementById('downloadXmlBtn');
@@ -935,36 +965,112 @@ function render() {
     }
 }
 
+// --- Scenario multi-select support ---
+let selectedScenarioIds = new Set();
+try {
+    const savedSel = JSON.parse(localStorage.getItem('coretg_selected_scenarios')||'[]');
+    if (Array.isArray(savedSel)) savedSel.forEach(id => selectedScenarioIds.add(id));
+} catch(e){}
+
+function persistScenarioSelection() {
+    try { localStorage.setItem('coretg_selected_scenarios', JSON.stringify(Array.from(selectedScenarioIds))); } catch(e){}
+}
+
+function ensureScenarioIds() {
+    let changed = false;
+    state.scenarios.forEach(s => {
+        if (!s._sid) { s._sid = 'scen_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,8); changed = true; }
+    });
+    if (changed) persistEditorState();
+}
+
+function toggleScenarioSelection(id, checked) {
+    if (checked) selectedScenarioIds.add(id); else selectedScenarioIds.delete(id);
+    persistScenarioSelection();
+    updateBulkButtonsState();
+}
+
+function selectAllScenarios() {
+    ensureScenarioIds();
+    const allIds = state.scenarios.map(s => s._sid);
+    const allSelected = allIds.every(id => selectedScenarioIds.has(id));
+    if (allSelected) { selectedScenarioIds.clear(); }
+    else { allIds.forEach(id => selectedScenarioIds.add(id)); }
+    persistScenarioSelection();
+    renderSidebar();
+}
+
+function deleteSelectedScenarios() {
+    if (!selectedScenarioIds.size) return;
+    const count = selectedScenarioIds.size;
+    if (!confirm(`Delete ${count} selected scenario${count>1?'s':''}? This cannot be undone.`)) return;
+    const beforeLen = state.scenarios.length;
+    state.scenarios = state.scenarios.filter(s => !selectedScenarioIds.has(s._sid));
+    selectedScenarioIds.clear();
+    if (!state.scenarios.length) {
+        // Always keep at least one blank scenario to avoid empty editor state hassles
+        state.scenarios.push(defaultScenario());
+        activeIdx = 0;
+    } else {
+        if (activeIdx >= state.scenarios.length) activeIdx = state.scenarios.length - 1;
+    }
+    logInfo(`Deleted ${beforeLen - state.scenarios.length} scenarios`);
+    persistEditorState();
+    persistScenarioSelection();
+    try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
+    render();
+}
+
+function updateBulkButtonsState() {
+    const delBtn = document.getElementById('deleteSelectedScenariosBtn');
+    if (!delBtn) return;
+    if (selectedScenarioIds.size) { delBtn.removeAttribute('disabled'); delBtn.title = 'Delete selected'; }
+    else { delBtn.setAttribute('disabled','disabled'); delBtn.title = 'No scenarios selected'; }
+}
+
 function renderSidebar() {
+    ensureScenarioIds();
     const list = document.getElementById('scenarioList');
     list.innerHTML = '';
     state.scenarios.forEach((scen, idx) => {
+        const sid = scen._sid;
         const a = document.createElement('a');
-    a.href = '#';
-    a.className = 'list-group-item list-group-item-action' + (idx === activeIdx ? ' active bg-primary text-white' : '');
-        a.textContent = scen.name || `Scenario ${idx+1}`;
-    a.onclick = (e) => { e.preventDefault(); activeIdx = idx; persistEditorState(); render(); };
+        a.href = '#';
+        a.className = 'list-group-item list-group-item-action py-1' + (idx === activeIdx ? ' active bg-primary text-white' : '');
+        // Build inner HTML with checkbox
+        const isChecked = selectedScenarioIds.has(sid);
+        const name = scen.name || `Scenario ${idx+1}`;
+        a.innerHTML = `<div class="d-flex align-items-center">
+            <input type="checkbox" class="form-check-input me-2 scenario-select" data-sid="${sid}" ${isChecked? 'checked':''} onclick="event.stopPropagation(); toggleScenarioSelection('${sid}', this.checked);" />
+            <span class="flex-grow-1 text-truncate" title="${name.replace(/"/g,'&quot;')}">${name}</span>
+        </div>`;
+        a.onclick = (e) => { e.preventDefault(); activeIdx = idx; persistEditorState(); render(); };
         list.appendChild(a);
     });
-            const appendScenarioBtn = document.getElementById('appendScenarioBtn');
-            const importBtn = document.getElementById('importBtn');
-            const exportBtn = document.getElementById('exportBtn');
-        const hiddenLoadInput = document.getElementById('hiddenLoadInput');
-        const hiddenLoadForm = document.getElementById('hiddenLoadForm');
-            if (appendScenarioBtn) appendScenarioBtn.onclick = (e) => { e.preventDefault(); logInfo('New scenario created'); state.scenarios.push(defaultScenario()); activeIdx = state.scenarios.length - 1; persistEditorState(); try { previewState.dirty = true; updatePlanButtons(); } catch(e){} render(); };
-            if (importBtn) importBtn.onclick = (e) => { e.preventDefault(); logInfo('Import scenarios clicked'); hiddenLoadInput.click(); };
+    const appendScenarioBtn = document.getElementById('appendScenarioBtn');
+    const importBtn = document.getElementById('importBtn');
+    const exportBtn = document.getElementById('exportBtn');
+    const selectAllBtn = document.getElementById('selectAllScenariosBtn');
+    const deleteSelectedBtn = document.getElementById('deleteSelectedScenariosBtn');
+    const hiddenLoadInput = document.getElementById('hiddenLoadInput');
+    const hiddenLoadForm = document.getElementById('hiddenLoadForm');
+    if (appendScenarioBtn) appendScenarioBtn.onclick = (e) => { e.preventDefault(); logInfo('New scenario created'); state.scenarios.push(defaultScenario()); activeIdx = state.scenarios.length - 1; persistEditorState(); try { previewState.dirty = true; updatePlanButtons(); } catch(e){} render(); };
+    if (importBtn) importBtn.onclick = (e) => { e.preventDefault(); logInfo('Import scenarios clicked'); hiddenLoadInput.click(); };
     if (hiddenLoadInput) hiddenLoadInput.onchange = () => { if (hiddenLoadInput.files && hiddenLoadInput.files.length > 0) { saveScrollBeforeNav(); hiddenLoadForm.submit(); } };
-            if (exportBtn) exportBtn.onclick = (e) => {
-                e.preventDefault();
-                logInfo('Export clicked');
-                const rp = state.result_path || '';
-                if (!rp.endsWith('.xml')) {
-                    logWarn('Export blocked: no saved XML');
-                    alert('Please Save XML first (middle panel) to export the current scenarios.');
-                    return;
-                }
-                window.location.href = window.location.origin + '/download_report?path=' + encodeURIComponent(rp);
-            };
+    if (exportBtn) exportBtn.onclick = (e) => {
+        e.preventDefault();
+        logInfo('Export clicked');
+        const rp = state.result_path || '';
+        if (!rp.endsWith('.xml')) {
+            logWarn('Export blocked: no saved XML');
+            alert('Please Save XML first (middle panel) to export the current scenarios.');
+            return;
+        }
+        window.location.href = window.location.origin + '/download_report?path=' + encodeURIComponent(rp);
+    };
+    if (selectAllBtn) selectAllBtn.onclick = (e) => { e.preventDefault(); selectAllScenarios(); };
+    if (deleteSelectedBtn) deleteSelectedBtn.onclick = (e) => { e.preventDefault(); deleteSelectedScenarios(); };
+    updateBulkButtonsState();
 }
 
 function renderMain() {
@@ -1252,16 +1358,8 @@ function renderMain() {
             </div>`;
         root.appendChild(card);
     });
-    // Apply visibility rule: show H/S bounds only for R-to-S NonUniform mode
-    try {
-        document.querySelectorAll('[data-field="r2s_mode"]').forEach(selEl => {
-            const modeVal = selEl.value;
-            const wrapper = selEl.closest('.routing-edge-groups')?.querySelector('.hs-bounds-wrapper');
-            if (wrapper) {
-                if (modeVal === 'NonUniform') { wrapper.classList.add('hs-show'); } else { wrapper.classList.remove('hs-show'); }
-            }
-        });
-    } catch(e) { /* ignore */ }
+    // Apply visibility rule for H/S bounds after DOM built
+    updateHsBoundsVisibility();
         // activate tooltips for icons
         if(window.bootstrap){
             const tts = root.querySelectorAll('[data-bs-toggle="tooltip"]');
@@ -1305,6 +1403,22 @@ function renderMain() {
         // Attach the click handler (fix: previously not wired)
         btn.addEventListener('click', handler);
     });
+}
+
+function updateHsBoundsVisibility(){
+    try {
+        document.querySelectorAll('[data-field="r2s_mode"]').forEach(selEl => {
+            const modeVal = selEl.value;
+            const wrapper = selEl.closest('.routing-edge-groups')?.querySelector('.hs-bounds-wrapper');
+            if (wrapper) {
+                if (modeVal === 'NonUniform') {
+                    wrapper.classList.add('hs-show');
+                } else {
+                    wrapper.classList.remove('hs-show');
+                }
+            }
+        });
+    } catch(e) { /* ignore */ }
 }
 
 // renderSections was deprecated and removed; rendering is handled in renderMain()
@@ -1505,8 +1619,8 @@ function renderItemRow(sidx, secName, iidx, it) {
             const metric = it.v_metric || (mode === 'Specific' ? 'Count' : 'Weight');
             const metricSel = `<select class="form-select form-select-sm" style="min-width: 140px" data-field="v_metric" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"><option ${metric==='Weight'?'selected':''}>Weight</option><option ${metric==='Count'?'selected':''}>Count</option></select>`;
             if (metric === 'Count') {
-                const count = (parseInt(it.v_count, 10) || 1);
-                return `<div class="d-flex gap-2">${metricSel}<select class="form-select form-select-sm" style="min-width: 120px" data-field="v_count" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${Array.from({length:10},(_,k)=>k+1).map(n=>`<option ${n===count?'selected':''}>${n}</option>`).join('')}</select></div>`;
+                const count = (parseInt(it.v_count, 10) || 5);
+                return `<div class="d-flex gap-2">${metricSel}<input type="number" min="1" step="1" class="form-control form-control-sm" style="min-width: 120px" value="${count}" data-field="v_count" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></div>`;
             }
             return `<div class="d-flex gap-2">${metricSel}<input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm weight-input" style="min-width: 120px" value="${weight}" data-field="factor" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></div>`;
         }
@@ -1514,8 +1628,8 @@ function renderItemRow(sidx, secName, iidx, it) {
         const metric = it.v_metric || 'Weight';
         const metricSel = `<select class="form-select form-select-sm" style="min-width: 140px" data-field="v_metric" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"><option ${metric==='Weight'?'selected':''}>Weight</option><option ${metric==='Count'?'selected':''}>Count</option></select>`;
         if (metric === 'Count') {
-            const count = (parseInt(it.v_count, 10) || 1);
-            return `<div class="d-flex gap-2">${metricSel}<select class="form-select form-select-sm" style="min-width: 120px" data-field="v_count" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${Array.from({length:10},(_,k)=>k+1).map(n=>`<option ${n===count?'selected':''}>${n}</option>`).join('')}</select></div>`;
+            const count = (parseInt(it.v_count, 10) || 5);
+            return `<div class="d-flex gap-2">${metricSel}<input type="number" min="1" step="1" class="form-control form-control-sm" style="min-width: 120px" value="${count}" data-field="v_count" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></div>`;
         }
     const isProtectedRandom = (secName === 'Node Information') && ((it.selected||'').toLowerCase()==='random') && it._protected_random;
     const metricDisabled = isProtectedRandom ? 'disabled title="Residual Random row metric locked"' : '';
@@ -1613,23 +1727,15 @@ function wireHandlers() {
                             item.r2r_mode = el.value;
                             if(el.value !== 'Exact') { delete item.edges; }
                             renderMain();
+                            updateHsBoundsVisibility();
                             setTimeout(validateRoutingEdges, 50);
                         }
                         if(field === 'r2s_mode') {
                             item.r2s_mode = el.value;
                             if(el.value !== 'Exact') { delete item.r2s_edges; }
                             renderMain();
+                            updateHsBoundsVisibility();
                             setTimeout(validateRoutingEdges, 50);
-                            // After re-render ensure H/S bounds inputs visibility toggled only for NonUniform
-                            setTimeout(()=>{
-                                document.querySelectorAll('[data-field="r2s_mode"]').forEach(selEl=>{
-                                    try {
-                                        const modeVal = selEl.value;
-                                        const wrapper = selEl.closest('.routing-edge-groups')?.querySelector('.hs-bounds-wrapper');
-                                        if(wrapper){ wrapper.style.display = (modeVal==='NonUniform') ? 'flex' : 'none'; }
-                                    } catch(e) { /* ignore */ }
-                                });
-                            },60);
                         }
                         if (field === 'edges') {
                             setTimeout(validateRoutingEdges, 20);
@@ -1638,7 +1744,7 @@ function wireHandlers() {
                             renderMain();
                         } else if (field === 'selected') {
                             if (item.selected === 'Specific') {
-                                if (!item.v_count) item.v_count = 1;
+                                if (!item.v_count) item.v_count = 5;
                                 if (!item.v_metric) item.v_metric = 'Count';
                             } else {
                                 if (!item.v_metric) item.v_metric = 'Weight';
@@ -1648,7 +1754,7 @@ function wireHandlers() {
                         } else if (field === 'v_metric') {
                             // On metric toggle, normalize weights for current section and re-render
                             if (item.v_metric === 'Count' && (item.v_count === undefined || item.v_count === null || isNaN(parseInt(item.v_count, 10)))) {
-                                item.v_count = 1;
+                                item.v_count = 5;
                             }
                             redistributeEven(sidx, sec);
                             if (sec === 'Node Information') {
@@ -1698,7 +1804,7 @@ function wireHandlers() {
                 }
             }
             // keep hidden for submit
-            document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
+            document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
             // persist edits across navigation
             persistEditorState();
             logDebug(`Field change: scen=${sidx} sec=${sec||''} field=${field}`);
@@ -1748,7 +1854,7 @@ function wireHandlers() {
             if (sec === 'Traffic') { item.pattern = 'continuous'; item.rate_kbps = 64.0; item.period_s = 1.0; item.jitter_pct = 10.0; item.content_type = 'Random'; }
             if (sec === 'Vulnerabilities') { item.selected = 'Category'; item.v_type = 'Random'; item.v_vector = 'Random'; }
             // Default new rows: Node Information -> Count; others -> Weight.
-            if (sec === 'Node Information') { item.v_metric = 'Count'; item.v_count = 1; }
+            if (sec === 'Node Information') { item.v_metric = 'Count'; item.v_count = 5; }
             else { item.v_metric = 'Weight'; }
             state.scenarios[sidx].sections[sec].items.push(item);
                         logInfo(`Added item to ${sec}`);
@@ -1888,7 +1994,8 @@ function wireHandlers() {
         };
     });
     // keep hidden JSON synced
-    document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
+    const aiHidden = document.getElementById('active_index'); if(aiHidden) aiHidden.value = String(activeIdx);
+    document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
     persistEditorState();
         // Initialize warnings per section
         const scen = state.scenarios[activeIdx];
@@ -2118,7 +2225,7 @@ if (editorForm) {
     editorForm.addEventListener('submit', () => {
         // preserve current scroll so we can restore after the server round-trip
         try { sessionStorage.setItem('coretg_saved_scroll_y', String(window.scrollY || window.pageYOffset || 0)); } catch (e) { /* ignore */ }
-        document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
+    document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
         persistEditorState();
     });
 }
@@ -2284,7 +2391,7 @@ async function openVulnPicker(sidx, secName, iidx){
                 if (it.Description) item.v_desc = it.Description;
                 // also set selected to Specific defensively
                 item.selected = 'Specific';
-                document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });
+                document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
                 try { if(window.bootstrap){ bootstrap.Modal.getInstance(modalEl)?.hide(); } } catch(e) {}
                 renderMain();
             };
@@ -2407,7 +2514,7 @@ function startLogStream(runId) {
         if (/\bERROR\b/.test(raw)) lvl = 'ERROR';
         else if (/\bWARN(ING)?\b/.test(raw)) lvl = 'WARN';
         else if (/\bDEBUG\b/.test(raw)) lvl = 'DEBUG';
-        logLine(lvl, raw);
+    appendLog(raw, lvl);
     };
     evtSrc.addEventListener('end', () => {
         evtSrc.close();
@@ -2476,17 +2583,16 @@ function ensureRunProgressModal(){
 function runProgressLogLine(s){
     const pre = document.getElementById('runProgressLog');
     if(!pre) return;
-    pre.textContent += (s||'') + '\n';
-    pre.parentElement?.scrollTo({ top: pre.parentElement.scrollHeight });
-    // Also mirror into dock logs with level detection
+    const line = (s||'');
+    // Level detection first so we only log once with correct level
+    let lvl = 'INFO';
     try {
-        const raw = s || '';
-        let lvl = 'INFO';
-        if (/\bERROR\b/.test(raw)) lvl = 'ERROR';
-        else if (/\bWARN(ING)?\b/.test(raw)) lvl = 'WARN';
-        else if (/\bDEBUG\b/.test(raw)) lvl = 'DEBUG';
-        logLine(lvl, raw);
+        if(/\bERROR\b/.test(line)) lvl='ERROR';
+        else if(/\bWARN(ING)?\b/.test(line)) lvl='WARN';
+        else if(/\bDEBUG\b/.test(line)) lvl='DEBUG';
     } catch(e){}
+    appendLog(line, lvl);
+    pre.parentElement?.scrollTo({ top: pre.parentElement.scrollHeight });
 }
 function openRunProgress(title){
     ensureRunProgressModal();
@@ -2495,7 +2601,8 @@ function openRunProgress(title){
         document.getElementById('runProgressStatus').textContent = 'Starting…';
         document.getElementById('runProgressMeta').textContent = '';
         document.getElementById('runProgressBar').classList.add('progress-bar-animated');
-        document.getElementById('runProgressLog').textContent = '';
+    // Do NOT clear persistent log buffer; just re-render existing lines
+    renderDockLog();
         // Reset footer buttons to default state
         const hideBtn = document.getElementById('runProgressHideBtn');
         if (hideBtn) {

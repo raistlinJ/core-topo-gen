@@ -6,14 +6,8 @@
 {% block header_right_extra %}
 <div class="d-flex align-items-center gap-3 small flex-wrap justify-content-end">
   <div class="d-flex align-items-center gap-2">
-    <label for="refreshInterval" class="form-label mb-0 text-white">Every</label>
-    <select id="refreshInterval" class="form-select form-select-sm w-auto" title="Auto-refresh interval">
-      <option value="2000">2s</option>
-      <option value="5000" selected>5s</option>
-      <option value="10000">10s</option>
-      <option value="30000">30s</option>
-      <option value="60000">60s</option>
-    </select>
+    <label for="refreshInterval" class="form-label mb-0 text-white">Every (s)</label>
+    <input id="refreshInterval" type="number" min="1" step="1" value="5" class="form-control form-control-sm w-auto" title="Auto-refresh interval in seconds">
     <span id="refreshStatus" class="text-white-50">auto</span>
     <button class="btn btn-sm btn-outline-light" id="toggleRefreshBtn" type="button">Pause</button>
   </div>
@@ -32,7 +26,7 @@
   #sessionsTable th.col-id, #sessionsTable td.col-id { width: 5%; white-space: nowrap; text-align: center; overflow: hidden; text-overflow: ellipsis; }
   #sessionsTable th.col-state, #sessionsTable td.col-state { width: 10%; white-space: nowrap; text-align: center; }
   #sessionsTable th.col-nodes, #sessionsTable td.col-nodes { width: 10%; white-space: nowrap; text-align: center; overflow: hidden; text-overflow: ellipsis; }
-  #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 60%; }
+  #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 50%; }
   .actions-col .btn { padding: .15rem .3rem; line-height: 1; vertical-align: middle; display: inline-flex; align-items: center; justify-content: center; }
   .actions-col .btn i, .actions-col .btn .bi { font-size: .95em; line-height: 1; display: block; }
   .actions-col .actions-wrap > a { display: inline-flex; align-items: center; margin-right: 2px; }
@@ -357,13 +351,13 @@
 
   const sel = document.getElementById('refreshInterval');
   if (sel) {
-    if ([2000,5000,10000,30000,60000].includes(intervalMs)) {
-      sel.value = String(intervalMs);
-    }
+    // Existing localStorage value stored as milliseconds; convert to seconds for display
+    const currentSeconds = Math.max(1, Math.round(intervalMs / 1000));
+    sel.value = String(currentSeconds);
     sel.addEventListener('change', ()=>{
-      const v = parseInt(sel.value, 10);
-      if (!isNaN(v) && v > 0) {
-        intervalMs = v;
+      const sec = parseInt(sel.value, 10);
+      if (!isNaN(sec) && sec > 0) {
+        intervalMs = sec * 1000;
         localStorage.setItem('coreRefreshMs', String(intervalMs));
         schedule();
       }
