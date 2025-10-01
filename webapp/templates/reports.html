@@ -92,14 +92,21 @@ const tableBody = document.querySelector('#runsTable tbody');
 const runsCheckAll = document.getElementById('runsCheckAll');
 const runsDeleteBtn = document.getElementById('runsDeleteBtn');
 const selectedRunIds = new Set();
+// Tracks whether user explicitly activated select-all across currently visible rows.
+let masterSelectAllActive = false;
 function getVisibleCheckboxes(){ return tableBody.querySelectorAll('tr:not(.d-none) input.row-select'); }
 function updateHeader(){
   const checkboxes = getVisibleCheckboxes();
   const total = checkboxes.length;
   const checkedCount = Array.from(checkboxes).filter(cb=>cb.checked).length;
   if(runsCheckAll){
-    runsCheckAll.indeterminate = checkedCount>0 && checkedCount<total;
-    runsCheckAll.checked = total>0 && checkedCount===total;
+    if (masterSelectAllActive) {
+      runsCheckAll.indeterminate = false;
+      runsCheckAll.checked = true;
+    } else {
+      runsCheckAll.indeterminate = checkedCount>0 && checkedCount<total;
+      runsCheckAll.checked = total>0 && checkedCount===total;
+    }
   }
   if(runsDeleteBtn){ runsDeleteBtn.disabled = selectedRunIds.size===0; }
 }
@@ -126,6 +133,9 @@ function renderRows(history){
   applyScenarioFilter();
   updateCount();
   wireSelectionHandlers();
+  if (masterSelectAllActive) {
+    applyMasterSelectAll();
+  }
   updateHeader();
 }
 async function fetchHistory(){
@@ -191,29 +201,47 @@ document.getElementById('clearScenarioFilter').addEventListener('click', () => {
 wireScenarioButtons();
 applyScenarioFilter();
 updateCount();
+// Bind row + header selection handlers for initial server-rendered rows
+wireSelectionHandlers();
 schedule();
 
 function wireSelectionHandlers(){
   const checkboxes = tableBody.querySelectorAll('input.row-select');
   checkboxes.forEach(cb=>{
-    // restore from set
     const id = cb.getAttribute('data-run-id')||'';
     if(id && selectedRunIds.has(id)) cb.checked = true; else cb.checked = false;
     cb.addEventListener('change', ()=>{
       const rid = cb.getAttribute('data-run-id')||'';
       if(!rid) return;
-      if(cb.checked) selectedRunIds.add(rid); else selectedRunIds.delete(rid);
+      if(cb.checked) {
+        selectedRunIds.add(rid);
+      } else {
+        selectedRunIds.delete(rid);
+        if (masterSelectAllActive) masterSelectAllActive = false; // user manually diverged
+      }
       updateHeader();
     });
   });
   if(runsCheckAll){
     runsCheckAll.onchange = ()=>{
       const newVal = !!runsCheckAll.checked;
-      const visibles = getVisibleCheckboxes();
-      visibles.forEach(cb=>{ cb.checked = newVal; const rid = cb.getAttribute('data-run-id')||''; if(!rid) return; if(newVal) selectedRunIds.add(rid); else selectedRunIds.delete(rid); });
-      updateHeader();
+      if (newVal) {
+        masterSelectAllActive = true;
+        applyMasterSelectAll();
+      } else {
+        masterSelectAllActive = false;
+        const visibles = getVisibleCheckboxes();
+        visibles.forEach(cb=>{ const rid = cb.getAttribute('data-run-id')||''; if(!rid) return; cb.checked = false; selectedRunIds.delete(rid); });
+        updateHeader();
+      }
     };
   }
+  updateHeader();
+}
+
+function applyMasterSelectAll(){
+  const visibles = getVisibleCheckboxes();
+  visibles.forEach(cb=>{ const rid = cb.getAttribute('data-run-id')||''; if(!rid) return; cb.checked = true; selectedRunIds.add(rid); });
   updateHeader();
 }
 

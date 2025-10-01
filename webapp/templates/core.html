@@ -6,8 +6,14 @@
 {% block header_right_extra %}
 <div class="d-flex align-items-center gap-3 small flex-wrap justify-content-end">
   <div class="d-flex align-items-center gap-2">
-    <label for="refreshInterval" class="form-label mb-0 text-white">Every (s)</label>
-    <input id="refreshInterval" type="number" min="1" step="1" value="5" class="form-control form-control-sm w-auto" title="Auto-refresh interval in seconds">
+    <label for="refreshInterval" class="form-label mb-0 text-white">Every</label>
+    <select id="refreshInterval" class="form-select form-select-sm w-auto" title="Auto-refresh interval">
+      <option value="2000">2s</option>
+      <option value="5000" selected>5s</option>
+      <option value="10000">10s</option>
+      <option value="30000">30s</option>
+      <option value="60000">60s</option>
+    </select>
     <span id="refreshStatus" class="text-white-50">auto</span>
     <button class="btn btn-sm btn-outline-light" id="toggleRefreshBtn" type="button">Pause</button>
   </div>
@@ -178,8 +184,36 @@
   const xmlsDeleteBtn = document.getElementById('xmlsDeleteBtn');
   let sessionsFilterText = '';
   let xmlsFilterText = '';
-  const selectedSessions = new Set();
-  const selectedXmlPaths = new Set();
+  // Persistent selection state (restored across full page reloads)
+  const LS_KEYS = {
+    sessions: 'coreSelectedSessions',
+    xmls: 'coreSelectedXmls',
+    masterSessions: 'coreMasterSessionsAll',
+    masterXmls: 'coreMasterXmlsAll'
+  };
+  function loadJsonArray(key){
+    try { const raw = localStorage.getItem(key); if(!raw) return []; const arr = JSON.parse(raw); return Array.isArray(arr)? arr: []; } catch(e){ return []; }
+  }
+  function loadBool(key){
+    try { const raw = localStorage.getItem(key); return raw === 'true'; } catch(e){ return false; }
+  }
+  const selectedSessions = new Set(loadJsonArray(LS_KEYS.sessions));
+  const selectedXmlPaths = new Set(loadJsonArray(LS_KEYS.xmls));
+  let sessionsMasterSelectAll = loadBool(LS_KEYS.masterSessions);
+  let xmlsMasterSelectAll = loadBool(LS_KEYS.masterXmls);
+  // Auto reapply flags (so user can permanently opt-out of reapplication until they re-enable)
+  let sessionsAutoReapply = true;
+  let xmlsAutoReapply = true;
+  // Timestamp of last manual header toggle (used if we want throttling)
+  let lastHeaderToggleTs = 0;
+  function persistSelections(){
+    try {
+      localStorage.setItem(LS_KEYS.sessions, JSON.stringify(Array.from(selectedSessions)));
+      localStorage.setItem(LS_KEYS.xmls, JSON.stringify(Array.from(selectedXmlPaths)));
+      localStorage.setItem(LS_KEYS.masterSessions, sessionsMasterSelectAll ? 'true':'false');
+      localStorage.setItem(LS_KEYS.masterXmls, xmlsMasterSelectAll ? 'true':'false');
+    } catch(e) {}
+  }
 
   let progressModalInstance = null;
   function ensureProgressModal(){
@@ -320,10 +354,13 @@
         sessionsTBody.innerHTML = data.sessions.map(buildSessionRow).filter(Boolean).join('\n');
         try { document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => new bootstrap.Tooltip(el)); } catch(e) {}
         bindSelectionHandlers('session');
+        // Re-apply master select-all if active AND auto-reapply still allowed
+        if (sessionsMasterSelectAll && sessionsAutoReapply) applyMasterSelectAll('session');
       }
       if(Array.isArray(data.xmls) && xmlsTBody){
         xmlsTBody.innerHTML = data.xmls.map(buildXmlRow).filter(Boolean).join('\n');
         bindSelectionHandlers('xml');
+        if (xmlsMasterSelectAll && xmlsAutoReapply) applyMasterSelectAll('xml');
       }
       await refreshDocker();
     }catch(e){ }
@@ -351,13 +388,13 @@
 
   const sel = document.getElementById('refreshInterval');
   if (sel) {
-    // Existing localStorage value stored as milliseconds; convert to seconds for display
-    const currentSeconds = Math.max(1, Math.round(intervalMs / 1000));
-    sel.value = String(currentSeconds);
+    if ([2000,5000,10000,30000,60000].includes(intervalMs)) {
+      sel.value = String(intervalMs);
+    }
     sel.addEventListener('change', ()=>{
-      const sec = parseInt(sel.value, 10);
-      if (!isNaN(sec) && sec > 0) {
-        intervalMs = sec * 1000;
+      const v = parseInt(sel.value, 10);
+      if (!isNaN(v) && v > 0) {
+        intervalMs = v;
         localStorage.setItem('coreRefreshMs', String(intervalMs));
         schedule();
       }
@@ -427,9 +464,10 @@
         if(checkAll){
           checkAll.indeterminate = false;
           checkAll.checked = false;
-          checkAll.disabled = true;
+          // keep enabled even with zero rows
         }
         if(deleteBtn) deleteBtn.disabled = true;
+        persistSelections();
         return;
       }
       if(type==='session'){
@@ -453,15 +491,33 @@
         if(total === 0){
           checkAll.indeterminate = false;
           checkAll.checked = false;
-          checkAll.disabled = true;
         } else {
-          checkAll.disabled = false;
-          checkAll.indeterminate = checkedCount>0 && checkedCount<total;
-          checkAll.checked = checkedCount===total;
+          const master = (type==='session') ? sessionsMasterSelectAll : xmlsMasterSelectAll;
+          if (master) {
+            checkAll.indeterminate = false;
+            checkAll.checked = true;
+          } else {
+            checkAll.indeterminate = checkedCount>0 && checkedCount<total;
+            checkAll.checked = checkedCount===total;
+          }
         }
       }
+      persistSelections();
     };
-    checkboxes.forEach(cb=> cb.addEventListener('change', updateSetsFromDom));
+    checkboxes.forEach(cb=> cb.addEventListener('change', ()=>{
+      updateSetsFromDom();
+      // If user manually unchecks any box while master select-all was active, disable master for that table
+      const master = (type==='session') ? sessionsMasterSelectAll : xmlsMasterSelectAll;
+      if (master) {
+        const allChecked = Array.from(checkboxes).every(c=>c.checked);
+        if(!allChecked){
+          if(type==='session') sessionsMasterSelectAll = false; else xmlsMasterSelectAll = false;
+          // disable auto reapply for this table until user re-enables explicitly
+          if(type==='session') sessionsAutoReapply = false; else xmlsAutoReapply = false;
+          updateSetsFromDom();
+        }
+      }
+    }));
     checkboxes.forEach(cb=>{
       if(type==='session'){
         const id = cb.getAttribute('data-id');
@@ -472,17 +528,54 @@
       }
     });
     updateSetsFromDom();
-    if(checkAll){
-      checkAll.onchange = null;
-      checkAll.onclick = null;
+    if(checkAll && !checkAll.dataset.selAllBound){
+      checkAll.dataset.selAllBound = '1';
       checkAll.addEventListener('change', ()=>{
-        if(checkAll.disabled) return;
-        const rows = table.querySelectorAll('tbody input.row-select');
+        lastHeaderToggleTs = Date.now();
         const target = checkAll.checked;
-        rows.forEach(cb=>{ cb.checked = target; });
-        updateSetsFromDom();
+        if (target){
+          if(type==='session') sessionsMasterSelectAll = true; else xmlsMasterSelectAll = true;
+          if(type==='session') sessionsAutoReapply = true; else xmlsAutoReapply = true; // re-enable auto reapply when user explicitly selects all
+          applyMasterSelectAll(type);
+        } else {
+          if(type==='session') sessionsMasterSelectAll = false; else xmlsMasterSelectAll = false;
+          if(type==='session') sessionsAutoReapply = false; else xmlsAutoReapply = false; // user turned it off
+          // Clear ALL selections (including those not currently visible due to filtering)
+          if(type==='session') selectedSessions.clear(); else selectedXmlPaths.clear();
+          const rows = table.querySelectorAll('tbody input.row-select');
+          rows.forEach(cb=>{ cb.checked = false; });
+          // Reflect cleared state in UI (no indeterminate, unchecked)
+          if(checkAll){ checkAll.indeterminate = false; checkAll.checked = false; }
+          updateSetsFromDom(); // will persist cleared sets
+        }
+        persistSelections();
       });
     }
+  }
+
+  function applyMasterSelectAll(type){
+    const table = type==='session' ? sessionsTable : xmlsTable;
+    if(!table) return;
+    const rows = table.querySelectorAll('tbody input.row-select');
+    // Mark all as checked (only current visible rows)
+    rows.forEach(cb=>{ cb.checked = true; });
+    // Update internal selection sets without rebinding handlers (avoid duplicate listeners)
+    if(type==='session'){
+      selectedSessions.clear();
+      rows.forEach(cb=>{ const id = cb.getAttribute('data-id'); if(id) selectedSessions.add(id); });
+    } else {
+      selectedXmlPaths.clear();
+      rows.forEach(cb=>{ const p = cb.getAttribute('data-path'); if(p) selectedXmlPaths.add(p); });
+    }
+    // Reflect header & action button state
+    const checkAll = type==='session' ? sessionsCheckAll : xmlsCheckAll;
+    const deleteBtn = type==='session' ? sessionsDeleteBtn : xmlsDeleteBtn;
+    if(checkAll){
+      checkAll.indeterminate = false;
+      checkAll.checked = rows.length > 0;
+    }
+    if(deleteBtn){ deleteBtn.disabled = rows.length === 0; }
+    persistSelections();
   }
 
   async function postForm(url, formData){
@@ -508,6 +601,7 @@
       }
     }
     closeProgress();
+    persistSelections();
     refresh();
   });
 
@@ -529,6 +623,7 @@
       }
     }
     closeProgress();
+    persistSelections();
     refresh();
   });
 
