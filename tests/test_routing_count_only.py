@@ -1,7 +1,8 @@
 import os
 import tempfile
 import textwrap
-from core_topo_gen.parsers.xml_parser import parse_node_info, parse_routing_info
+from core_topo_gen.parsers.node_info import parse_node_info
+from core_topo_gen.parsers.routing import parse_routing_info
 from core_topo_gen.utils.allocation import compute_role_counts
 
 SIMPLE_XML_TEMPLATE = '''<Scenarios>

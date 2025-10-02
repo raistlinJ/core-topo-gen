@@ -1,5 +1,6 @@
-{% extends 'base.html' %}
+{% extends 'layout.html' %}
 {% block title %}Full Preview{% endblock %}
+{% block active_page %}{% set active_page = 'scenarios' %}{% endblock %}
 {% block content %}
 <div class="container-fluid mt-3">
   <div class="d-flex align-items-center mb-2 gap-2">
@@ -19,27 +20,41 @@
   <div class="mb-3">
     <button id="approvePreviewBtn" class="btn btn-sm btn-primary me-2">Approve as Plan</button>
     <button id="exportJsonBtn" class="btn btn-sm btn-outline-secondary me-2">Export JSON</button>
-    <button id="exportPngBtn" class="btn btn-sm btn-outline-secondary">Export Graph PNG</button>
+    <button id="exportPngBtn" class="btn btn-sm btn-outline-secondary me-2">Export Graph PNG</button>
+    <div class="btn-group btn-group-sm" role="group">
+      <button class="btn btn-sm btn-outline-success" id="openTrafficBtn" type="button" title="List generated traffic scripts (preview/runtime)">Traffic Scripts</button>
+      <button class="btn btn-sm btn-outline-danger" id="openSegBtn" type="button" title="List segmentation scripts">Segmentation Scripts</button>
+    </div>
     <span id="approveStatus" class="ms-3 small text-muted"></span>
   </div>
   <div class="row">
     <div class="col-md-4">
       <h5>Overview</h5>
       <ul class="list-unstyled small">
-        <li>Routers: {{ (full_preview.routers or []).|length }}</li>
-        <li>Hosts: {{ (full_preview.hosts or []).|length }}</li>
-        <li>Switches: {{ (full_preview.switches or []).|length }}</li>
-        <li>R2R Edges: {{ (full_preview.r2r_edges_preview or []).|length }}</li>
-        <li>Seg Rules: {{ (full_preview.segmentation_preview.rules or []).|length if full_preview.segmentation_preview and full_preview.segmentation_preview.rules else 0 }}</li>
+  <li>Routers: {{ (full_preview.routers or [])|length }}</li>
+  <li>Hosts: {{ (full_preview.hosts or [])|length }}</li>
+  <li>Switches: {{ (full_preview.switches or [])|length }}</li>
+  <li>R2R Edges: {{ (full_preview.r2r_edges_preview or [])|length }}</li>
+  <li>Seg Rules: {{ (full_preview.segmentation_preview.rules or [])|length if full_preview.segmentation_preview and full_preview.segmentation_preview.rules else 0 }}</li>
       </ul>
       <h6>R2R Policy</h6>
       <pre class="small bg-light p-2">{{ full_preview.r2r_policy_preview | tojson(indent=2) }}</pre>
       <h6>R2S Policy</h6>
       <pre class="small bg-light p-2">{{ full_preview.r2s_policy_preview | tojson(indent=2) }}</pre>
-      <h6>Services Preview</h6>
-      <pre class="small bg-light p-2">{{ full_preview.services_preview | tojson(indent=2) }}</pre>
-      <h6>Vulnerabilities Preview</h6>
-      <pre class="small bg-light p-2">{{ full_preview.vulnerabilities_preview | tojson(indent=2) }}</pre>
+  <h6>Services Preview</h6>
+  <pre class="small bg-light p-2">{{ full_preview.services_preview | tojson(indent=2) }}</pre>
+  <h6>Vulnerabilities Preview</h6>
+  {% set vuln_prev = full_preview.vulnerabilities_preview or {} %}
+  {% if vuln_prev %}
+  <pre class="small bg-light p-2">{
+{% set first = True %}
+{% for k,v in vuln_prev.items() %}
+{# '__density_pool__' legacy key no longer produced; conditional retained for backward safety #}
+{% if k != '__density_pool__' %}{% if not first %},\n{% endif %}"{{ k }}": {{ v }}{% set first = False %}{% endif %}
+{% endfor %}
+{% if first %}"_note": "(none)"{% endif %}
+}</pre>
+  {% else %}<div class="small text-muted fst-italic">(none)</div>{% endif %}
     </div>
     <div class="col-md-8">
       <ul class="nav nav-tabs" id="fpTabs" role="tablist">
@@ -47,7 +62,9 @@
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-routers" type="button">Routers</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-hosts" type="button">Hosts</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-switches" type="button">Switches</button></li>
-        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-seg" type="button">Segmentation</button></li>
+  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-seg" type="button">Segmentation</button></li>
+  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-traffic" type="button">Traffic</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-node-sections" type="button">Node Sections</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-json" type="button">Raw JSON</button></li>
       </ul>
       <div class="tab-content border border-top-0 p-2" id="fpTabsContent" style="min-height:480px;">
@@ -78,7 +95,100 @@
           </tbody></table>
         </div>
         <div class="tab-pane fade" id="fp-seg">
-          <pre class="small bg-light p-2">{{ full_preview.segmentation_preview | tojson(indent=2) }}</pre>
+          {% set seg_prev = full_preview.segmentation_preview %}
+          <div class="d-flex gap-2 mb-2">
+            <div class="btn-group btn-group-sm" role="group">
+              <button type="button" class="btn btn-outline-secondary" id="segListPreviewBtn">Preview Scripts</button>
+              <button type="button" class="btn btn-outline-secondary" id="segListRuntimeBtn">Runtime Scripts</button>
+            </div>
+            <div class="btn-group btn-group-sm" role="group">
+              <button type="button" class="btn btn-outline-secondary" id="trafficListPreviewBtn">Traffic Preview Scripts</button>
+              <button type="button" class="btn btn-outline-secondary" id="trafficListRuntimeBtn">Traffic Runtime Scripts</button>
+            </div>
+            <div class="btn-group btn-group-sm" role="group">
+              <button type="button" class="btn btn-outline-primary" id="dlSegRuntimeBtn" title="Download runtime segmentation scripts zip">DL Seg Runtime</button>
+              <button type="button" class="btn btn-outline-primary" id="dlSegPreviewBtn" title="Download preview segmentation scripts zip">DL Seg Preview</button>
+              <button type="button" class="btn btn-outline-success" id="dlTrafficRuntimeBtn" title="Download runtime traffic scripts zip">DL Traffic Runtime</button>
+              <button type="button" class="btn btn-outline-success" id="dlTrafficPreviewBtn" title="Download preview traffic scripts zip">DL Traffic Preview</button>
+            </div>
+            <span id="segScriptStatus" class="small text-muted"></span>
+          </div>
+          {% if seg_prev and seg_prev.rules %}
+          <div class="table-responsive" style="max-height:300px;overflow:auto;">
+            <table class="table table-sm table-bordered small align-middle" id="segRulesTable">
+              <thead><tr><th>#</th><th>Node</th><th>Type</th><th>Src</th><th>Dst</th><th>Subnet</th><th>Internal</th><th>External</th><th>Proto</th><th>Port</th><th>Script</th></tr></thead>
+              <tbody>
+              {% for r in seg_prev.rules %}
+                {% set rule = r.rule or r %}
+                <tr>
+                  <td>{{ loop.index }}</td>
+                  <td>{{ r.node_id }}</td>
+                  <td>{{ rule.type or rule.get('type') }}</td>
+                  <td>{{ rule.get('src') or '-' }}</td>
+                  <td>{{ rule.get('dst') or '-' }}</td>
+                  <td>{{ rule.get('subnet') or '-' }}</td>
+                  <td>{{ rule.get('internal') or '-' }}</td>
+                  <td>{{ rule.get('external') or '-' }}</td>
+                  <td>{{ rule.get('proto') or '-' }}</td>
+                  <td>{{ rule.get('port') or '-' }}</td>
+                  <td>{% if r.script %}{% set scr = r.script.split('/')[-1] %}<button class="btn btn-sm btn-outline-primary py-0 px-1 view-script-btn" data-file="{{ scr }}" data-kind="segmentation">View</button>{% else %}-{% endif %}</td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% else %}
+            <div class="small text-muted fst-italic">(no segmentation rules)</div>
+          {% endif %}
+          <div id="segScriptModal" class="modal" tabindex="-1">
+            <div class="modal-dialog modal-lg modal-dialog-scrollable">
+              <div class="modal-content">
+                <div class="modal-header"><h5 class="modal-title">Script</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                <div class="modal-body"><pre class="small mb-0" id="segScriptContent" style="max-height:60vh;overflow:auto;"></pre></div>
+                <div class="modal-footer"><button class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Close</button></div>
+              </div>
+            </div>
+          </div>
+          {% if seg_prev and seg_prev.runtime_summary %}
+          <hr class="my-2" />
+          <h6 class="mt-2">Runtime Segmentation Summary (segmentation_summary.json)</h6>
+          <pre class="small bg-light p-2" style="max-height:260px;overflow:auto;">{{ seg_prev.runtime_summary | tojson(indent=2) }}</pre>
+          {% endif %}
+          {% if seg_prev and seg_prev.scripts_hash_sha256 %}
+          <div class="small text-muted">Scripts Hash (SHA-256): <code>{{ seg_prev.scripts_hash_sha256 }}</code></div>
+          {% endif %}
+        </div>
+        <div class="tab-pane fade" id="fp-node-sections">
+          <div class="table-responsive small">
+            <table class="table table-sm table-bordered mb-0" id="nodeSectionsTable"><thead><tr>
+              <th>Node ID</th><th>Name</th><th>Type</th><th>Services</th><th>Vulns</th><th>Seg Rules</th><th>Traffic S</th><th>Traffic R</th>
+            </tr></thead><tbody></tbody></table>
+          </div>
+        </div>
+        <div class="tab-pane fade" id="fp-traffic">
+          {% set tsummary = full_preview.traffic_summary or {} %}
+          {% set flows = tsummary.flows or [] %}
+          {% if flows %}
+          <div class="table-responsive" style="max-height:440px;overflow:auto;">
+            <table class="table table-sm table-striped small" id="trafficFlowsTable">
+              <thead><tr><th>#</th><th>Src ID</th><th>Dst ID</th><th>Pattern</th><th>Rate (kbps)</th><th>Proto</th></tr></thead>
+              <tbody>
+              {% for f in flows %}
+                <tr>
+                  <td>{{ loop.index }}</td>
+                  <td>{{ f.src_id or f.src }}</td>
+                  <td>{{ f.dst_id or f.dst }}</td>
+                  <td>{{ f.pattern or '-' }}</td>
+                  <td>{{ f.rate_kbps or f.rate or '-' }}</td>
+                  <td>{{ f.protocol or f.kind or 'tcp' }}</td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% else %}
+            <div class="small text-muted fst-italic">(no traffic flows)</div>
+          {% endif %}
         </div>
         <div class="tab-pane fade" id="fp-json">
           <pre class="small bg-light p-2" style="max-height:440px;overflow:auto;">{{ preview_json }}</pre>
@@ -86,19 +196,35 @@
       </div>
     </div>
   </div>
-</div>
+ </div>
+{% block extra_scripts %}
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<script id="fpDataJson" type="application/json">{{ full_preview | tojson }}</script>
 <script>
 (function(){
-  const dataEl = document.getElementById('fpDataJson');
-  let data = {};
-  try { data = JSON.parse(dataEl.textContent); } catch(e) { console.warn('Failed parse preview json', e); }
-  // Simple graph using d3-force (assumes d3 is loaded in base template). Fallback to textual if not.
-  function buildGraph(){
+  let previewData = {};
+  function init(){
+    const dataEl = document.getElementById('fpDataJson');
+    try { previewData = JSON.parse(dataEl.textContent); } catch(e) { console.warn('Failed parse preview json', e); previewData = {}; }
+    // Simple graph using d3-force (assumes d3 is loaded in base template). Fallback to textual if not.
+    function buildGraph(){
     if(!window.d3){ document.getElementById('previewGraph').textContent='d3 not loaded'; return; }
     const wrap = d3.select('#previewGraph');
     wrap.selectAll('*').remove();
     const width = wrap.node().clientWidth; const height = wrap.node().clientHeight;
     const svg = wrap.append('svg').attr('width', width).attr('height', height).style('cursor','grab');
+    // Legend
+    const legend = svg.append('g').attr('class','legend').attr('transform','translate(8,8)');
+    const legendItems = [
+      {label:'Router', color:'#ff5722', r:10},
+      {label:'Switch', color:'#17a2b8', r:7},
+      {label:'Host', color:'#ffc107', r:5}
+    ];
+    legendItems.forEach((li,i)=>{
+      const g=legend.append('g').attr('transform',`translate(0,${i*18})`);
+      g.append('circle').attr('r', li.r).attr('cx', li.r).attr('cy', li.r).attr('fill', li.color).attr('stroke','#333').attr('stroke-width',1);
+      g.append('text').text(li.label).attr('x', li.r*2 + 6).attr('y', li.r+4).attr('font-size','11px');
+    });
     const container = svg.append('g').attr('class','zoom-layer');
     // Zoom + Pan
     let currentTransform = d3.zoomIdentity;
@@ -110,14 +236,14 @@
     const nodes = [];
     const links = [];
     const routerIds = new Set();
-    (data.routers||[]).forEach(r=>{ nodes.push({id:r.node_id, label:r.name, type:'router'}); routerIds.add(r.node_id); });
-    (data.hosts||[]).forEach(h=>{ nodes.push({id:h.node_id, label:h.name, type:'host'}); });
-    (data.switches_detail||[]).forEach(sw=>{ nodes.push({id:sw.switch_id, label:'sw-'+sw.switch_id, type:'switch'}); });
+  (previewData.routers||[]).forEach(r=>{ nodes.push({id:r.node_id, label:r.name, type:'router'}); routerIds.add(r.node_id); });
+  (previewData.hosts||[]).forEach(h=>{ nodes.push({id:h.node_id, label:h.name, type:'host'}); });
+  (previewData.switches_detail||[]).forEach(sw=>{ nodes.push({id:sw.switch_id, label:'sw-'+sw.switch_id, type:'switch'}); });
     // R2R edges
-    (data.r2r_edges_preview||[]).forEach(e=>{ links.push({source:e[0], target:e[1], kind:'r2r'}); });
+  (previewData.r2r_edges_preview||[]).forEach(e=>{ links.push({source:e[0], target:e[1], kind:'r2r'}); });
     // Host -> Router (fallback if no switch) or Host -> Switch
-    const hostRouterMap = data.host_router_map || {};
-    (data.switches_detail||[]).forEach(sw=>{
+  const hostRouterMap = previewData.host_router_map || {};
+  (previewData.switches_detail||[]).forEach(sw=>{
       (sw.hosts||[]).forEach(hid=>{ links.push({source:sw.switch_id, target:hid, kind:'sw-host'}); });
       links.push({source:sw.router_id, target:sw.switch_id, kind:'r-sw'});
     });
@@ -143,8 +269,53 @@
       .attr('r', d=> d.type==='router'? 10 : (d.type==='switch'? 7 : 5))
       .attr('fill', d=> d.type==='router'? '#ff5722' : (d.type==='switch'? '#17a2b8' : '#ffc107'))
       .attr('stroke', '#333').attr('stroke-width', 1);
-    node.append('title').text(d=> d.label+' ('+d.type+')');
-    node.append('text').text(d=> d.label).attr('x', 12).attr('y', 4).attr('font-size', '10px');
+    // Build quick lookup structures for tooltips
+  const servicesByNode = previewData.services_preview || {}; // { node_id: [service,...] }
+  const vulnsRaw = previewData.vulnerabilities_preview || {}; // legacy __density_pool__ removed in planner
+  const vulnsByNode = Object.fromEntries(Object.entries(vulnsRaw).filter(([k,_])=> k !== '__density_pool__'));
+  const segRules = (previewData.segmentation_preview && previewData.segmentation_preview.rules) || []; // rules with node_id
+    const segCountByNode = {};
+    segRules.forEach(r=>{ const nid = r.node_id; segCountByNode[nid] = (segCountByNode[nid]||0)+1; });
+    // Traffic summary (if present) - attempt to infer send/recv counts
+  const trafficSummary = previewData.traffic_summary || previewData.traffic_plan || {}; // optional future field
+    const trafficSend = {};
+    const trafficRecv = {};
+    try {
+      (trafficSummary.flows || trafficSummary || []).forEach(f=>{
+        const s = f.src_id ?? f.src ?? null; const d = f.dst_id ?? f.dst ?? null;
+        if(s!==null) trafficSend[s] = (trafficSend[s]||0)+1;
+        if(d!==null) trafficRecv[d] = (trafficRecv[d]||0)+1;
+      });
+    } catch(e){}
+    function nodeTooltip(d){
+      const id = d.id;
+      const svc = servicesByNode[id] || [];
+      const vul = vulnsByNode[id] || [];
+      const segC = segCountByNode[id] || 0;
+      const ts = trafficSend[id] || 0;
+      const tr = trafficRecv[id] || 0;
+      return `${d.label} (${d.type})\nServices: ${svc.join(',')||'-'}\nVulns: ${vul.join(',')||'-'}\nSegRules: ${segC}\nTraffic S:${ts} R:${tr}`;
+    }
+  // Tooltip removed per request
+    // Populate Node Sections table
+    try {
+      const tbody = document.querySelector('#nodeSectionsTable tbody');
+      if(tbody){
+  const allNodes = [...(previewData.routers||[]).map(r=>({...r, _type:'router'})), ...(previewData.hosts||[]).map(h=>({...h, _type:'host'})), ...(previewData.switches_detail||[]).map(s=>({...s, node_id:s.switch_id, name:'sw-'+s.switch_id, _type:'switch'}))];
+  if(!allNodes.length){ tbody.innerHTML = '<tr><td colspan="8" class="text-muted fst-italic">(no nodes)</td></tr>'; return; }
+        const rowsHtml = allNodes.map(n=>{
+          const nid = n.node_id;
+          const svc = (servicesByNode[nid]||[]).join(',');
+          const vul = (vulnsByNode[nid]||[]).join(',');
+          const segC = segCountByNode[nid]||0;
+          const ts = trafficSend[nid]||0;
+          const tr = trafficRecv[nid]||0;
+          return `<tr><td>${nid}</td><td>${n.name||('node-'+nid)}</td><td>${n._type}</td><td>${svc}</td><td>${vul}</td><td>${segC}</td><td>${ts}</td><td>${tr}</td></tr>`;
+        }).join('');
+        tbody.innerHTML = rowsHtml || '<tr><td colspan="8" class="text-muted fst-italic">(none)</td></tr>';
+      }
+    } catch(e) { console.warn('node section table build failed', e); }
+  // Node labels removed per request
     sim.on('tick', ()=>{
       link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y).attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
       node.attr('transform', d=>'translate('+d.x+','+d.y+')');
@@ -162,14 +333,191 @@
     // Improve grab cursor feedback
     svg.on('mousedown', ()=> svg.style('cursor','grabbing'));
     window.addEventListener('mouseup', ()=> svg.style('cursor','grab'));
+  // Close buildGraph function before invoking it
+  } // END buildGraph
+  // Invoke graph build after definitions
+  buildGraph();
+  function listScripts(kind){
+    fetch(`/api/open_scripts?kind=${kind}`).then(r=>r.json()).then(d=>{
+      if(!d.ok){ alert(`Failed: ${d.error||'unknown error'}`); return; }
+      const lines = d.files.slice(0,50).map(f=>`${f.file} (${f.size} bytes)`).join('\n');
+      const more = d.files.length>50? `\n... (${d.files.length-50} more)` : '';
+      alert(`${kind} scripts in ${d.path}:\n` + (lines||'(none)') + more);
+    }).catch(e=> alert('Error listing scripts: '+e));
   }
-  document.addEventListener('DOMContentLoaded', buildGraph);
+  function listScriptsScoped(kind, scope){
+    fetch(`/api/open_scripts?kind=${kind}&scope=${scope}`).then(r=>r.json()).then(d=>{
+      const statusEl = document.getElementById('segScriptStatus');
+      if(!d.ok){ statusEl.textContent = `List failed (${scope} ${kind}): ${d.error||'error'}`; statusEl.classList.add('text-danger'); return; }
+      statusEl.classList.remove('text-danger');
+      statusEl.textContent = `${scope} ${kind} scripts: ${d.files.length}`;
+      if(d.files.length===0){ return; }
+      // Build a quick alert style list (future: table/modal). Limit 60.
+      const lines = d.files.slice(0,60).map(f=>`${f.file} (${f.size} bytes)`).join('\n');
+      console.log(`${scope} ${kind} scripts in ${d.path}:\n` + lines);
+    }).catch(e=>{ const statusEl = document.getElementById('segScriptStatus'); statusEl.textContent='Error listing scripts: '+e; statusEl.classList.add('text-danger'); });
+  }
+  function viewScript(kind, scope, file){
+    fetch(`/api/open_script_file?kind=${kind}&scope=${scope}&file=${encodeURIComponent(file)}`).then(r=>r.json()).then(d=>{
+      if(!d.ok){ alert('Failed to load script: '+(d.error||'')); return; }
+      const pre = document.getElementById('segScriptContent');
+      pre.textContent = d.content || '(no content)';
+      const modalEl = document.getElementById('segScriptModal');
+      if(window.bootstrap){
+        // Reuse or create a single instance to avoid stacking backdrops
+        const m = (window.bootstrap.Modal.getOrCreateInstance
+          ? window.bootstrap.Modal.getOrCreateInstance(modalEl)
+          : new bootstrap.Modal(modalEl));
+        // One-time attach hidden handler to clean stray backdrops
+        if(!modalEl.__attachedBackdropCleaner){
+          modalEl.addEventListener('hidden.bs.modal', ()=>{
+            // Remove all but the last backdrop if multiples somehow remained
+            const backs = document.querySelectorAll('.modal-backdrop');
+            if(backs.length > 1){
+              backs.forEach((b,i)=>{ if(i < backs.length-1) b.remove(); });
+            }
+            // Safety: ensure body classes/style restored
+            document.body.classList.remove('modal-open');
+            document.body.style.removeProperty('padding-right');
+          });
+          modalEl.__attachedBackdropCleaner = true;
+        }
+        m.show();
+      } else {
+        // Fallback manual modal (no bootstrap JS loaded)
+        modalEl.style.display='block';
+        modalEl.style.background='rgba(0,0,0,0.5)';
+        // Wire close buttons manually
+        modalEl.querySelectorAll('[data-bs-dismiss="modal"]').forEach(btn=>{
+          if(!btn.__manualCloseBound){
+            btn.addEventListener('click', ()=>{ modalEl.style.display='none'; modalEl.style.background=''; });
+            btn.__manualCloseBound = true;
+          }
+        });
+      }
+    }).catch(e=> alert('Error fetching script: '+e));
+  }
+  document.getElementById('openTrafficBtn')?.addEventListener('click', ()=> listScripts('traffic'));
+  document.getElementById('openSegBtn')?.addEventListener('click', ()=> listScripts('segmentation'));
+  document.getElementById('segListPreviewBtn')?.addEventListener('click', ()=> listScriptsScoped('segmentation','preview'));
+  document.getElementById('segListRuntimeBtn')?.addEventListener('click', ()=> listScriptsScoped('segmentation','runtime'));
+  document.getElementById('trafficListPreviewBtn')?.addEventListener('click', ()=> listScriptsScoped('traffic','preview'));
+  document.getElementById('trafficListRuntimeBtn')?.addEventListener('click', ()=> listScriptsScoped('traffic','runtime'));
+  function dl(kind, scope){
+    const url = `/api/download_scripts?kind=${kind}&scope=${scope}`;
+    const a = document.createElement('a'); a.href = url; a.download = `${kind}_${scope}_scripts.zip`; document.body.appendChild(a); a.click(); a.remove();
+  }
+  document.getElementById('dlSegRuntimeBtn')?.addEventListener('click', ()=> dl('segmentation','runtime'));
+  document.getElementById('dlSegPreviewBtn')?.addEventListener('click', ()=> dl('segmentation','preview'));
+  document.getElementById('dlTrafficRuntimeBtn')?.addEventListener('click', ()=> dl('traffic','runtime'));
+  document.getElementById('dlTrafficPreviewBtn')?.addEventListener('click', ()=> dl('traffic','preview'));
+  // Delegate view script buttons
+  document.getElementById('fp-seg')?.addEventListener('click', (e)=>{
+    const btn = e.target.closest('.view-script-btn');
+    if(!btn) return;
+    const file = btn.getAttribute('data-file');
+    const kind = btn.getAttribute('data-kind') || 'segmentation';
+    // Determine if script path looks preview or runtime; heuristic: name starts with 'seg_' and not in /tmp yet -> prefer preview
+    // For simplicity let user choose preview first
+    viewScript(kind, 'preview', file);
+  });
+
+  // --------- Color-coded badges & collapsible tables ---------
+  function applySegmentationRowStyling(){
+    const table = document.getElementById('segRulesTable');
+    if(!table) return;
+    const rows = table.querySelectorAll('tbody tr');
+    const limit = 25;
+    let hiddenCt = 0;
+    rows.forEach((tr, idx)=>{
+      const cells = tr.children;
+      if(cells.length < 3) return;
+      const typeCell = cells[2];
+      const ruleType = (typeCell.textContent||'').trim().toLowerCase();
+      let badgeClass = 'bg-secondary';
+      if(ruleType === 'nat') badgeClass = 'bg-info';
+      else if(ruleType === 'subnet_block') badgeClass = 'bg-danger';
+      else if(ruleType === 'host_block') badgeClass = 'bg-danger-subtle border border-danger';
+      else if(ruleType === 'protect_internal') badgeClass = 'bg-warning';
+      else if(ruleType === 'allow') badgeClass = 'bg-success';
+      else if(ruleType === 'dnat') badgeClass = 'bg-primary';
+      else if(ruleType === 'custom') badgeClass = 'bg-purple';
+      typeCell.innerHTML = `<span class="badge ${badgeClass} text-dark" style="min-width:70px;display:inline-block;">${typeCell.textContent.trim()||'-'}</span>`;
+      if(idx >= limit){
+        tr.classList.add('d-none','seg-extra-row');
+        hiddenCt++;
+      }
+    });
+    if(hiddenCt>0){
+      const toggleBtn = document.createElement('button');
+      toggleBtn.type='button';
+      toggleBtn.className='btn btn-sm btn-outline-secondary mt-1';
+      toggleBtn.id='segShowMoreBtn';
+      toggleBtn.textContent=`Show ${hiddenCt} more rules`; 
+      table.parentElement.insertBefore(toggleBtn, table);
+      toggleBtn.addEventListener('click', ()=>{
+        const hidden = table.querySelectorAll('tbody tr.seg-extra-row');
+        const collapsed = toggleBtn.getAttribute('data-collapsed') !== 'false';
+        if(collapsed){
+          hidden.forEach(r=> r.classList.remove('d-none'));
+          toggleBtn.textContent='Collapse rules';
+          toggleBtn.setAttribute('data-collapsed','false');
+        } else {
+          hidden.forEach(r=> r.classList.add('d-none'));
+          toggleBtn.textContent=`Show ${hiddenCt} more rules`;
+          toggleBtn.setAttribute('data-collapsed','true');
+        }
+      });
+    }
+  }
+  function applyTrafficRowStyling(){
+    const table = document.getElementById('trafficFlowsTable');
+    if(!table) return;
+    const rows = table.querySelectorAll('tbody tr');
+    const limit = 40; // slightly higher for flows
+    let hiddenCt = 0;
+    rows.forEach((tr, idx)=>{
+      const protoCell = tr.children[5];
+      if(protoCell){
+        const proto = (protoCell.textContent||'').trim().toLowerCase();
+        let cls = 'bg-secondary';
+        if(proto==='tcp') cls='bg-success'; else if(proto==='udp') cls='bg-info'; else if(proto==='icmp') cls='bg-warning';
+        protoCell.innerHTML = `<span class="badge ${cls} text-dark">${proto||'-'}</span>`;
+      }
+      if(idx >= limit){
+        tr.classList.add('d-none','traffic-extra-row'); hiddenCt++; }
+    });
+    if(hiddenCt>0){
+      const toggleBtn = document.createElement('button');
+      toggleBtn.type='button'; toggleBtn.className='btn btn-sm btn-outline-secondary my-1';
+      toggleBtn.id='trafficShowMoreBtn';
+      toggleBtn.textContent=`Show ${hiddenCt} more flows`;
+      table.parentElement.insertBefore(toggleBtn, table);
+      toggleBtn.addEventListener('click', ()=>{
+        const hidden = table.querySelectorAll('tbody tr.traffic-extra-row');
+        const collapsed = toggleBtn.getAttribute('data-collapsed') !== 'false';
+        if(collapsed){
+          hidden.forEach(r=> r.classList.remove('d-none'));
+          toggleBtn.textContent='Collapse flows';
+          toggleBtn.setAttribute('data-collapsed','false');
+        } else {
+          hidden.forEach(r=> r.classList.add('d-none'));
+          toggleBtn.textContent=`Show ${hiddenCt} more flows`;
+          toggleBtn.setAttribute('data-collapsed','true');
+        }
+      });
+    }
+  }
+  // Delay styling until after DOM is built
+  setTimeout(()=>{ applySegmentationRowStyling(); applyTrafficRowStyling(); }, 0);
+  }
+  if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
   // Approve preview
   document.getElementById('approvePreviewBtn')?.addEventListener('click', async ()=>{
     const statusEl = document.getElementById('approveStatus');
     statusEl.textContent='Approving...';
     try {
-      const res = await fetch('/api/plan/approve_full_preview', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ xml_path: '{{ xml_path }}', full_preview: data }) });
+      const res = await fetch('/api/plan/approve_full_preview', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ xml_path: '{{ xml_path }}', full_preview: previewData }) });
       const js = await res.json();
       if(!js.ok){ statusEl.textContent='Failed: '+(js.error||''); statusEl.classList.add('text-danger'); }
       else {
@@ -181,10 +529,10 @@
   // Export JSON
   document.getElementById('exportJsonBtn')?.addEventListener('click', ()=>{
     try {
-      const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+  const blob = new Blob([JSON.stringify(previewData, null, 2)], {type:'application/json'});
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = 'full_preview_seed_'+(data.seed||'na')+'.json';
+  a.download = 'full_preview_seed_'+(previewData.seed||'na')+'.json';
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(()=>URL.revokeObjectURL(a.href), 5000);
     } catch(e){ console.error('Export JSON failed', e); }
@@ -206,7 +554,7 @@
         ctx.drawImage(img,0,0,canvas.width,canvas.height);
         canvas.toBlob(b=>{
           const a = document.createElement('a');
-          a.href = URL.createObjectURL(b); a.download='full_preview_graph_'+(data.seed||'na')+'.png';
+          a.href = URL.createObjectURL(b); a.download='full_preview_graph_'+(previewData.seed||'na')+'.png';
           document.body.appendChild(a); a.click(); a.remove();
           setTimeout(()=>URL.revokeObjectURL(a.href), 5000);
         });
@@ -219,7 +567,7 @@
     const confirmMsg = 'Execute scenario now? This will invoke the CLI and start a CORE session.';
     if(!window.confirm(confirmMsg)) return;
     try {
-      const form = new FormData(); form.append('xml_path', '{{ xml_path }}');
+  const form = new FormData(); form.append('xml_path', '{{ xml_path }}');
       const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
       if(!res.ok){ alert('Failed to start execution'); return; }
       const { run_id } = await res.json();
@@ -250,5 +598,5 @@
   });
 })();
 </script>
-<script id="fpDataJson" type="application/json">{{ full_preview | tojson }}</script>
-{% endblock %}
+{% endblock %} {# end extra_scripts #}
+{% endblock %} {# end content #}

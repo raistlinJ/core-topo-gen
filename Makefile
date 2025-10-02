@@ -9,6 +9,8 @@ CERT_DAYS?=365
 # Repo root (resolved when make runs) and backend pattern for process kill
 REPO_ROOT?=$(shell pwd)
 BACKEND_PATTERN?=$(REPO_ROOT)/webapp/app_backend.py
+# Additional fuzzy patterns (space separated) to match different launch styles
+BACKEND_ALT_PATTERNS?="webapp/app_backend.py" "python webapp/app_backend.py" "flask run" "gunicorn" 
 
 # Generate self-signed certs if missing
 .dev-certs:
@@ -75,29 +77,43 @@ stop:
 # Ensure any backend webserver processes are terminated even if no PID file exists
 kill-backend:
 	@echo "Ensuring backend webserver is stopped..."
-	@# First attempt graceful stop via PID file logic
-	@$(MAKE) -s stop-host
-	@# Then, as a safety net, kill any leftover app_backend.py processes under this repo
-	@PIDS=$$(pgrep -f "$(BACKEND_PATTERN)" || true); \
-	 if [ -n "$$PIDS" ]; then \
-	   echo "Killing backend webserver PIDs: $$PIDS"; \
-	   kill $$PIDS || true; \
-	   for i in $$(seq 1 10); do \
-	     ALL_DONE=1; \
-	     for PID in $$PIDS; do \
-	       if ps -p $$PID >/dev/null 2>&1; then ALL_DONE=0; break; fi; \
-	     done; \
-	     if [ $$ALL_DONE -eq 1 ]; then break; fi; \
-	     sleep 0.2; \
-	   done; \
-	   for PID in $$PIDS; do \
-	     if ps -p $$PID >/dev/null 2>&1; then \
-	       echo "Force killing $$PID"; kill -9 $$PID || true; \
-	     fi; \
-	   done; \
-	 else \
-	   echo "No backend webserver processes found by pattern: $(BACKEND_PATTERN)"; \
-	 fi
+	@# First attempt graceful stop via PID file logic (handles stale PID)
+	@HOST_PID_FILE=server.pid; \
+	if [ -f $$HOST_PID_FILE ]; then \
+	  PID=$$(cat $$HOST_PID_FILE 2>/dev/null || true); \
+	  if [ -n "$$PID" ] && ps -p $$PID >/dev/null 2>&1; then \
+	    echo "Gracefully stopping PID $$PID from $$HOST_PID_FILE"; kill $$PID; \
+	    for i in $$(seq 1 15); do ps -p $$PID >/dev/null 2>&1 || break; sleep 0.2; done; \
+	    if ps -p $$PID >/dev/null 2>&1; then echo "Force killing stale PID $$PID"; kill -9 $$PID || true; fi; \
+	  else \
+	    if [ -n "$$PID" ]; then echo "Stale PID file (process $$PID not running)"; fi; \
+	  fi; \
+	  rm -f $$HOST_PID_FILE || true; \
+	fi
+	@# Collect PIDs via primary pattern
+	@FOUND_PIDS=$$(pgrep -f "$(BACKEND_PATTERN)" || true); \
+	for ALT in $(BACKEND_ALT_PATTERNS); do \
+	  MORE=$$(pgrep -f "$$ALT" || true); \
+	  if [ -n "$$MORE" ]; then FOUND_PIDS="$$FOUND_PIDS $$MORE"; fi; \
+	done; \
+	FOUND_PIDS=$$(echo $$FOUND_PIDS | tr ' ' '\n' | sort -u | tr '\n' ' '); \
+	if [ -n "$$FOUND_PIDS" ]; then \
+	  echo "Terminating backend PIDs: $$FOUND_PIDS"; \
+	  kill $$FOUND_PIDS 2>/dev/null || true; \
+	  for i in $$(seq 1 15); do \
+	    ALL_DONE=1; \
+	    for PID in $$FOUND_PIDS; do \
+	      if ps -p $$PID >/dev/null 2>&1; then ALL_DONE=0; break; fi; \
+	    done; \
+	    [ $$ALL_DONE -eq 1 ] && break; \
+	    sleep 0.2; \
+	  done; \
+	  for PID in $$FOUND_PIDS; do \
+	    if ps -p $$PID >/dev/null 2>&1; then echo "Force killing $$PID"; kill -9 $$PID || true; fi; \
+	  done; \
+	else \
+	  echo "No backend processes matched patterns"; \
+	fi
 
 # Clean: stop host process and stop+remove docker containers (and volumes)
 clean:

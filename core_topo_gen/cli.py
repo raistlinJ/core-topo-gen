@@ -4,14 +4,13 @@ import logging
 import random
 import os
 from core.api.grpc import client
-from .parsers.xml_parser import (
-    parse_node_info,
-    parse_routing_info,
-    parse_traffic_info,
-    parse_segmentation_info,
-    parse_vulnerabilities_info,
-    parse_planning_metadata,
-)
+from .parsers.node_info import parse_node_info
+from .parsers.routing import parse_routing_info
+from .parsers.traffic import parse_traffic_info
+from .parsers.segmentation import parse_segmentation_info
+from .parsers.vulnerabilities import parse_vulnerabilities_info
+from .parsers.planning_metadata import parse_planning_metadata
+from .parsers.services import parse_services
 from .utils.segmentation import apply_preview_segmentation_rules
 from .utils.allocation import compute_role_counts
 from .builders.topology import build_star_from_roles, build_segmented_topology, build_multi_switch_topology
@@ -157,6 +156,7 @@ def main():
             print(f"ERROR: failed to load plan file {args.use_plan}: {e}", file=sys.stderr)
             return
 
+    # Unified planning via orchestrator (still parse node_info early for some legacy metadata requirements)
     density_base, weight_items, count_items, services = parse_node_info(args.xml, args.scenario)
     # Optional additive planning metadata (if XML produced by enhanced web UI)
     planning_meta = {}
@@ -213,53 +213,34 @@ def main():
         except Exception:
             pass
 
-    # --- New planning pool (phase 1) ---
-    service_plan = {s.name: (s.abs_count if s.abs_count > 0 else int(round(s.density * base_total))) for s in services}
-    routing_plan = {}
-    router_plan_breakdown = {}
-    prelim_router_count = 0
-    vulnerabilities_plan = None
-    # (retain r2r_policy_plan from unified derivation above if set)
-    try:
-        routing_plan = {ri.protocol: (ri.abs_count if ri.abs_count > 0 else 0) for ri in routing_items}
-        from .planning.router_plan import compute_router_plan
-        prelim_router_count, router_plan_breakdown = compute_router_plan(
-            total_hosts=sum(role_counts.values()),
-            base_host_pool=base_total,
-            routing_density=routing_density,
-            routing_items=routing_items,
-        )
-        # (Removed legacy mode_counts aggregation; direct policy already set above)
-    except Exception:
-        pass
+    # Orchestrator full plan (centralized)
+    from .planning.orchestrator import compute_full_plan
+    orchestrated_plan = compute_full_plan(args.xml, scenario=args.scenario, seed=args.seed, include_breakdowns=True)
+    prelim_router_count = orchestrated_plan['routers_planned']
+    service_plan = orchestrated_plan.get('service_plan') or {}
+    vulnerabilities_plan = orchestrated_plan.get('vulnerability_plan')
+    routing_plan = orchestrated_plan.get('breakdowns', {}).get('router', {}).get('simple_plan', {})
+    router_plan_breakdown = orchestrated_plan.get('breakdowns', {}).get('router', {})
     try:
         from .planning.plan_builder import build_initial_pool
         from .planning.constraints import validate_pool_final
         # Vulnerabilities: reuse earlier parsing if available in generation_meta (planning_meta done above). We recompute minimally.
         try:
-            from .parsers.xml_parser import parse_vulnerabilities_info
-            vuln_density, vuln_items = parse_vulnerabilities_info(args.xml, args.scenario)
-            # Build a simple plan: item name -> planned count (count-based or density target single bucket)
-            vplan: dict[str,int] = {}
-            density_target = 0
-            try:
-                import math as _math
-                density_target = int(_math.floor((vuln_density or 0.0) * (base_total or 0) + 1e-9))
-            except Exception:
-                pass
-            # Count items
-            for it in (vuln_items or []):
+            from .parsers.vulnerabilities import parse_vulnerabilities_info
+            from .planning.vulnerability_plan import VulnerabilityItem, compute_vulnerability_plan
+            vuln_density, vuln_items_xml = parse_vulnerabilities_info(args.xml, args.scenario)
+            vuln_items: list[VulnerabilityItem] = []
+            for it in (vuln_items_xml or []):
                 name = (it.get('selected') or '').strip() or 'Item'
                 vm = (it.get('v_metric') or '').strip()
+                abs_count = 0
                 if vm == 'Count':
                     try:
-                        vc = int(it.get('v_count') or 0)
+                        abs_count = int(it.get('v_count') or 0)
                     except Exception:
-                        vc = 0
-                    if vc > 0:
-                        vplan[name] = vplan.get(name, 0) + vc
-            if density_target > 0:
-                vplan['__density_pool__'] = density_target
+                        abs_count = 0
+                vuln_items.append(VulnerabilityItem(name=name, density=vuln_density, abs_count=abs_count))
+            vplan, vbreak = compute_vulnerability_plan(base_total, vuln_density, vuln_items)
             if vplan:
                 vulnerabilities_plan = vplan
         except Exception:
@@ -302,7 +283,8 @@ def main():
             except Exception:
                 pass
             violations = validate_pool_final(summary)
-            out = {"plan": summary, "violations": violations}
+            # Attach orchestrator plan for parity with web preview
+            out = {"plan": summary, "violations": violations, "orchestrator_plan": orchestrated_plan}
             if args.preview_full:
                 try:
                     from .planning.full_preview import build_full_preview
@@ -332,13 +314,14 @@ def main():
                         r2s_policy=r2s_policy_plan,
                         routing_items=routing_items,
                         routing_plan=routing_plan,
-                        segmentation_density=None,  # segmentation density not computed yet; add later if required
-                        segmentation_items=None,
+                        segmentation_density=orchestrated_plan.get('breakdowns', {}).get('segmentation', {}).get('density'),
+                        segmentation_items=orchestrated_plan.get('breakdowns', {}).get('segmentation', {}).get('raw_items_serialized'),
                         seed=args.seed,
                         ip4_prefix=args.prefix,
                         ip_mode=args.ip_mode,
                         ip_region=args.ip_region,
                     )
+                    full_prev['router_plan'] = router_plan_breakdown
                     out['full_preview'] = full_prev
                 except Exception as e:
                     out['full_preview_error'] = str(e)
@@ -425,10 +408,20 @@ def main():
                 })
     except Exception:
         pass
-    # Pre-parse vulnerabilities to plan docker-compose assignments mapped to host slots
+    # Pre-parse vulnerabilities to plan docker-compose assignments mapped to host slots (reuse orchestrator raw)
     docker_slot_plan: dict | None = None
     try:
-        vuln_density, vuln_items = parse_vulnerabilities_info(args.xml, args.scenario)
+        vuln_density = None
+        vuln_items = []
+        try:
+            vuln_density = orchestrated_plan.get('breakdowns', {}).get('vulnerabilities', {}).get('density_input')
+        except Exception:
+            pass
+        if not vuln_items:
+            vuln_items = orchestrated_plan.get('vulnerability_items_raw') or []
+        if not vuln_density:
+            # fallback legacy parse
+            vuln_density, vuln_items = parse_vulnerabilities_info(args.xml, args.scenario)
         catalog = load_vuln_catalog(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
         total_hosts = sum(role_counts.values())  # total allocated hosts (base + additive)
         slot_names = [f"slot-{i+1}" for i in range(total_hosts)]
@@ -602,7 +595,10 @@ def main():
     # Parse segmentation config OR fallback to preview segmentation if available
     seg_summary = None
     try:
-        seg_density, seg_items = parse_segmentation_info(args.xml, args.scenario)
+        seg_density = orchestrated_plan.get('breakdowns', {}).get('segmentation', {}).get('density')
+        seg_items = orchestrated_plan.get('segmentation_items_raw')
+        if seg_density is None:
+            seg_density, seg_items = parse_segmentation_info(args.xml, args.scenario)
         logging.info("Segmentation config: density=%.3f, items=%d", float(seg_density or 0.0), len(seg_items or []))
         if seg_density and seg_density > 0 and seg_items:
             try:
@@ -624,6 +620,16 @@ def main():
             if approved_plan and approved_plan.get('full_preview'):
                 seg_prev = approved_plan['full_preview'].get('segmentation_preview') or {}
                 rules_prev = seg_prev.get('rules') or []
+                # Reuse preview-generated scripts if out_dir present
+                seg_out_dir_prev = seg_prev.get('out_dir')
+                if seg_out_dir_prev and os.path.isdir(seg_out_dir_prev):
+                    try:
+                        from .utils.segmentation import reuse_preview_segmentation
+                        seg_summary = reuse_preview_segmentation(seg_out_dir_prev, runtime_dir="/tmp/segmentation")
+                        logging.info("Reused preview segmentation scripts (%d rules) from %s", len(seg_summary.get('rules', [])), seg_out_dir_prev)
+                        rules_prev = []  # Skip pure rule injection path below since reuse performed
+                    except Exception as e_reuse:
+                        logging.warning("Preview segmentation reuse failed, falling back to rule injection: %s", e_reuse)
                 if rules_prev:
                     try:
                         seg_summary = apply_preview_segmentation_rules(session, rules_prev, out_dir="/tmp/segmentation")
@@ -698,6 +704,20 @@ def main():
                     include_hosts=bool(getattr(args, 'seg_include_hosts', False)),
                 )
                 logging.info("Inserted allow rules for generated traffic")
+                # Flow verification artifact
+                try:
+                    from .utils.segmentation import verify_flows_allowed
+                    verification = verify_flows_allowed(
+                        os.path.join(traffic_out_dir, "traffic_summary.json"),
+                        segmentation_summary_path="/tmp/segmentation/segmentation_summary.json",
+                        out_path="/tmp/segmentation/allow_verification.json",
+                    )
+                    if verification.get('blocked_count'):
+                        logging.warning("Flow verification: %d blocked flows remain", verification.get('blocked_count'))
+                    else:
+                        logging.info("Flow verification: all %d flows allowed", verification.get('flows_total', 0))
+                except Exception as e_vf:
+                    logging.warning("Flow verification failed: %s", e_vf)
                 # Optional DNAT port-forwarding
                 dnat_p = max(0.0, min(1.0, float(getattr(args, 'dnat_prob', 0.0))))
                 if dnat_p > 0:
@@ -801,7 +821,17 @@ def main():
         }
         services_cfg = [{"name": s.name, "factor": s.factor, "density": s.density} for s in (services or [])]
         # Vulnerabilities (load catalog locally to avoid dependency on earlier planning block)
-        vuln_density, vuln_items = parse_vulnerabilities_info(args.xml, args.scenario)
+        try:
+            vuln_density = orchestrated_plan.get('breakdowns', {}).get('vulnerabilities', {}).get('density_input')
+        except Exception:
+            vuln_density = None
+        vuln_items = orchestrated_plan.get('vulnerability_items_raw')
+        if vuln_density is None or vuln_items is None:
+            vuln_density_fallback, vuln_items_fallback = parse_vulnerabilities_info(args.xml, args.scenario)
+            if vuln_density is None:
+                vuln_density = vuln_density_fallback
+            if vuln_items is None:
+                vuln_items = vuln_items_fallback
         vulnerabilities_cfg = {"density": vuln_density, "items": vuln_items or []}
         try:
             _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))

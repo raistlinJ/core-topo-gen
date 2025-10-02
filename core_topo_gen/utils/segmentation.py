@@ -33,6 +33,79 @@ SERVICE_ENABLE_MAP: Dict[str, str] = {
     # CUSTOM is plugin-defined; don't force-enable a specific service here
 }
 
+def reuse_preview_segmentation(preview_dir: str, runtime_dir: str = "/tmp/segmentation") -> Dict[str, object]:
+    """Copy segmentation scripts and summary from a preview directory into the runtime directory.
+
+    If a segmentation_summary.json exists in the preview directory, return its parsed content.
+    Otherwise, attempt to synthesize a minimal summary by listing script files.
+    """
+    import json
+    if not preview_dir or not os.path.isdir(preview_dir):
+        return {"rules": [], "error": f"preview_dir_missing:{preview_dir}"}
+    # Prepare runtime dir (clean)
+    os.makedirs(runtime_dir, exist_ok=True)
+    try:
+        for name in os.listdir(runtime_dir):
+            p = os.path.join(runtime_dir, name)
+            try:
+                if os.path.isfile(p) or os.path.islink(p):
+                    os.unlink(p)
+                elif os.path.isdir(p):
+                    shutil.rmtree(p)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Copy files
+    copied = []
+    for name in sorted(os.listdir(preview_dir)):
+        src = os.path.join(preview_dir, name)
+        dst = os.path.join(runtime_dir, name)
+        if os.path.isfile(src):
+            try:
+                shutil.copy(src, dst)
+                copied.append(name)
+            except Exception:
+                continue
+    summary_path = os.path.join(runtime_dir, 'segmentation_summary.json')
+    if os.path.exists(summary_path):
+        try:
+            with open(summary_path, 'r', encoding='utf-8') as f:
+                data = json.load(f) or {}
+            data.setdefault('source', 'preview_reuse')
+            data['copied_files'] = copied
+            return data
+        except Exception:
+            pass
+    # Fallback summary: infer rule types from script filenames
+    rules = []
+    for fname in copied:
+        if not fname.endswith('.py'):
+            continue
+        # Attempt to parse type: seg_<rtype>_<nodeid>_N.py
+        parts = fname.split('_')
+        node_id = -1
+        rtype = ''
+        if len(parts) >= 3 and parts[0] == 'seg':
+            rtype = parts[1]
+            try:
+                node_id = int(parts[2])
+            except Exception:
+                node_id = -1
+        rules.append({
+            'node_id': node_id,
+            'service': 'Segmentation',
+            'rule': {'type': rtype, 'inferred': True},
+            'script': os.path.join(runtime_dir, fname)
+        })
+    fallback = {'rules': rules, 'source': 'preview_reuse_inferred', 'copied_files': copied}
+    try:
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(fallback, f, indent=2)
+    except Exception:
+        pass
+    return fallback
+
 def apply_preview_segmentation_rules(session: object,
                                      preview_rules: List[dict],
                                      out_dir: str = "/tmp/segmentation") -> Dict[str, object]:
@@ -286,6 +359,29 @@ def plan_and_apply_segmentation(
     except Exception:
         # Best-effort logging; avoid breaking execution due to logging issues
         pass
+    # Quick indices for validation / membership checks
+    host_ips_set = {h.ip4.split("/")[0] for h in hosts}
+    subnet_list = list(subnets.keys())
+
+    def _ip_in_any_subnet(ip: str) -> bool:
+        for n in subnet_list:
+            try:
+                if ipaddress.ip_address(ip) in ipaddress.ip_network(n, strict=False):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _node_primary_subnet(node: NodeInfo) -> Optional[str]:
+        try:
+            ip = (node.ip4 or '').split('/')[0]
+            for n in subnet_list:
+                if ipaddress.ip_address(ip) in ipaddress.ip_network(n, strict=False):
+                    return n
+        except Exception:
+            return None
+        return None
+
     for idx in range(slots):
         if idx < len(svc_sequence):
             try:
@@ -431,39 +527,32 @@ print('[segmentation] applied', len(cmds), 'commands')
                         continue
                 # Only meaningful on routers
                 if on_router and nets:
-                    # pick an internal subnet as the one with most hosts
-                    # and an external subnet as any other (or 0.0.0.0/0 if none)
-                    try:
-                        # Determine internal as largest group
-                        internal = max(subnets.items(), key=lambda kv: len(kv[1]))[0]
-                    except Exception:
-                        internal = nets[0]
+                    # Choose internal subnet that actually contains the router IP for correctness
+                    router_ip = (node.ip4 or "").split("/", 1)[0]
+                    primary = _node_primary_subnet(node)
+                    if primary is None:
+                        # fallback to largest subnet
+                        try:
+                            primary = max(subnets.items(), key=lambda kv: len(kv[1]))[0]
+                        except Exception:
+                            primary = nets[0]
+                    internal = primary
+                    # External: distinct subnet; if none choose 0.0.0.0/0 sentinel
                     others = [n for n in nets if n != internal]
                     external = random.choice(others) if others else None
-                    # router ip to use for SNAT
-                    router_ip = (node.ip4 or "").split("/", 1)[0]
                     mode = (nat_mode or "SNAT").strip().upper()
-                    if external:
+                    if external and external != internal:
                         rule.update({"internal": internal, "external": external, "mode": mode, "egress_ip": router_ip})
                         if mode == "MASQUERADE":
-                            cmd_list.append(
-                                f"iptables -t nat -A POSTROUTING -s {internal} -d {external} -j MASQUERADE"
-                            )
-                        else:  # SNAT
-                            cmd_list.append(
-                                f"iptables -t nat -A POSTROUTING -s {internal} -d {external} -j SNAT --to-source {router_ip}"
-                            )
+                            cmd_list.append(f"iptables -t nat -A POSTROUTING -s {internal} -d {external} -j MASQUERADE")
+                        else:
+                            cmd_list.append(f"iptables -t nat -A POSTROUTING -s {internal} -d {external} -j SNAT --to-source {router_ip}")
                     else:
-                        # Single subnet case: egress to anywhere
                         rule.update({"internal": internal, "external": "0.0.0.0/0", "mode": mode, "egress_ip": router_ip})
                         if mode == "MASQUERADE":
-                            cmd_list.append(
-                                f"iptables -t nat -A POSTROUTING -s {internal} -j MASQUERADE"
-                            )
+                            cmd_list.append(f"iptables -t nat -A POSTROUTING -s {internal} -j MASQUERADE")
                         else:
-                            cmd_list.append(
-                                f"iptables -t nat -A POSTROUTING -s {internal} -j SNAT --to-source {router_ip}"
-                            )
+                            cmd_list.append(f"iptables -t nat -A POSTROUTING -s {internal} -j SNAT --to-source {router_ip}")
                 else:
                     # Do not apply NAT on hosts; skip this slot
                     logger.debug("Skipping NAT on non-router node %s", node.node_id)
@@ -503,6 +592,17 @@ print('[segmentation] applied', len(cmds), 'commands')
                 script_name = f"seg_{rtype}_{node.node_id}_{cnt}.py"
                 script_path = os.path.join(out_dir, script_name)
                 # Build an idempotent script: set default policy to DROP on FORWARD and ensure stateful accept, then NAT rules
+                # Additionally, explicitly allow internal -> external egress to enable new outbound flows (NAT semantics)
+                internal = rule.get("internal")
+                ext = rule.get("external") or "0.0.0.0/0"
+                forward_allow = None
+                if internal:
+                    try:
+                        # Only add allow if internal and external differ (or external is default 0.0.0.0/0)
+                        if ext == "0.0.0.0/0" or ext != internal:
+                            forward_allow = f"iptables -A FORWARD -s {internal} -d {ext} -j ACCEPT"
+                    except Exception:
+                        forward_allow = None
                 py_lines = [
                     "#!/usr/bin/env python3",
                     "import subprocess, shlex",
@@ -545,6 +645,10 @@ print('[segmentation] applied', len(cmds), 'commands')
                     "# Enforce default deny on FORWARD and allow established/related",
                     "run('iptables -P FORWARD DROP')",
                     "ensure_rule('iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT')",
+                ]
+                if forward_allow:
+                    py_lines.append(f"ensure_rule('{forward_allow}')")
+                py_lines += [
                     "rules = [",
                 ]
                 for c in cmd_list:
@@ -611,40 +715,65 @@ print('[segmentation] applied', len(cmds), 'commands')
                     return False
 
             if rule_type == "subnet_block" and len(nets) >= 2:
-                src_net, dst_net = random.sample(nets, 2)
-                # Skip if covered by existing protect_internal on this node/chain
-                if on_router and dst_net in fw_index[int(node.node_id)]["protect_internal"]:
-                    # Any non-internal -> internal is already blocked
-                    try:
-                        logger.debug("Skip subnet_block on node %s: covered by protect_internal %s", node.node_id, dst_net)
-                    except Exception:
-                        pass
-                    rule = {"type": "none", "svc": svc, "node": node.node_id}
-                else:
-                    if on_router:
-                        # Deduplicate identical pair
-                        key_pair = (src_net, dst_net)
-                        if key_pair in fw_index[int(node.node_id)]["subnet_block_forward"]:
-                            rule = {"type": "none", "svc": svc, "node": node.node_id}
-                        else:
-                            cmd_list.append(f"iptables -A FORWARD -s {src_net} -d {dst_net} -j DROP")
-                            rule = {"type": "subnet_block", "svc": svc, "node": node.node_id, "src": src_net, "dst": dst_net}
-                            fw_index[int(node.node_id)]["subnet_block_forward"].add(key_pair)
+                # For host-level rule ensure the host's own subnet is target
+                if not on_router:
+                    host_subnet = _node_primary_subnet(node) or random.choice(nets)
+                    # Pick another subnet distinct from host_subnet as source (blocked inbound)
+                    candidates = [n for n in nets if n != host_subnet]
+                    if not candidates:
+                        rule = {"type": "none", "svc": svc, "node": node.node_id}
                     else:
-                        # host-level: block inbound from src_net
+                        src_net = random.choice(candidates)
+                        dst_net = host_subnet
                         if src_net in fw_index[int(node.node_id)]["subnet_block_input"]:
                             rule = {"type": "none", "svc": svc, "node": node.node_id}
                         else:
                             cmd_list.append(f"iptables -A INPUT -s {src_net} -j DROP")
                             rule = {"type": "subnet_block", "svc": svc, "node": node.node_id, "src": src_net, "dst": dst_net}
                             fw_index[int(node.node_id)]["subnet_block_input"].add(src_net)
+                else:
+                    # Router-level pick two distinct subnets; prefer one containing router IP as dst
+                    r_sub = _node_primary_subnet(node) or random.choice(nets)
+                    others = [n for n in nets if n != r_sub]
+                    if not others:
+                        rule = {"type": "none", "svc": svc, "node": node.node_id}
+                    else:
+                        src_net = random.choice(others)
+                        dst_net = r_sub
+                        if dst_net in fw_index[int(node.node_id)]["protect_internal"]:
+                            try:
+                                logger.debug("Skip subnet_block on node %s: covered by protect_internal %s", node.node_id, dst_net)
+                            except Exception:
+                                pass
+                            rule = {"type": "none", "svc": svc, "node": node.node_id}
+                        else:
+                            key_pair = (src_net, dst_net)
+                            if key_pair in fw_index[int(node.node_id)]["subnet_block_forward"]:
+                                rule = {"type": "none", "svc": svc, "node": node.node_id}
+                            else:
+                                cmd_list.append(f"iptables -A FORWARD -s {src_net} -d {dst_net} -j DROP")
+                                rule = {"type": "subnet_block", "svc": svc, "node": node.node_id, "src": src_net, "dst": dst_net}
+                                fw_index[int(node.node_id)]["subnet_block_forward"].add(key_pair)
             elif rule_type == "host_block" and len(hosts) >= 2:
-                a, b = random.sample(hosts, 2)
-                a_ip = a.ip4.split("/")[0]
-                b_ip = b.ip4.split("/")[0]
                 chain = "FORWARD" if on_router else "INPUT"
-                key_pair = (a_ip, b_ip)
                 idx_key = "host_block_forward" if on_router else "host_block_input"
+                if on_router:
+                    a, b = random.sample(hosts, 2)
+                    a_ip = a.ip4.split("/")[0]
+                    b_ip = b.ip4.split("/")[0]
+                else:
+                    # Ensure destination is this host
+                    this_ip = (node.ip4 or '').split('/')[0]
+                    # Pick a different host as source
+                    others = [h for h in hosts if h.node_id != node.node_id]
+                    if not others:
+                        rule = {"type": "none", "svc": svc, "node": node.node_id}
+                        a_ip = b_ip = this_ip  # dummy
+                    else:
+                        a = random.choice(others)
+                        a_ip = a.ip4.split('/')[0]
+                        b_ip = this_ip
+                key_pair = (a_ip, b_ip)
                 if key_pair in fw_index[int(node.node_id)][idx_key]:
                     rule = {"type": "none", "svc": svc, "node": node.node_id}
                 else:
@@ -722,6 +851,28 @@ print('[segmentation] applied', len(cmds), 'commands')
                     f"run('iptables -P {chain_fw} DROP')",
                     f"ensure_rule('iptables -A {chain_fw} -m state --state ESTABLISHED,RELATED -j ACCEPT')",
                 ]
+            # For host-level firewall rules, opportunistically open a few common service ports so internal nodes have reachable services.
+            allow_services: List[int] = []
+            if not on_router and chain_fw == "INPUT":
+                service_port_candidates = [22, 53, 80, 443, 8080]
+                # Deterministic selection based on node id for stable previews / runs
+                try:
+                    seed_val = int(getattr(node, 'node_id', 0)) * 9973 + 17
+                except Exception:
+                    seed_val = 17
+                rng = random.Random(seed_val)
+                try:
+                    k = 1 + (seed_val % 3)  # 1..3 stable count
+                except Exception:
+                    k = 1
+                # Shuffle deterministically then take first k
+                shuffled = list(service_port_candidates)
+                rng.shuffle(shuffled)
+                allow_services = shuffled[:k]
+                for p in allow_services:
+                    proto = "udp" if p == 53 else "tcp"
+                    # Insert at head using -I so it has precedence over later DROP rules
+                    py_lines.append(f"ensure_rule('iptables -I INPUT 1 -p {proto} --dport {p} -j ACCEPT')")
             py_lines += [
                 "rules = [",
             ]
@@ -763,6 +914,9 @@ print('[segmentation] applied', len(cmds), 'commands')
                 if chain_fw in ("FORWARD", "INPUT"):
                     rule["default_deny"] = True
                     rule["chain"] = chain_fw
+                if not on_router and 'allow_services' not in rule and 'allow_services' in locals() and allow_services:
+                    # Expose list of opportunistic open service ports for reporting
+                    rule['allow_services'] = allow_services
             except Exception:
                 pass
         summary["rules"].append({
@@ -900,13 +1054,34 @@ def write_allow_rules_for_flows(
         except Exception:
             pass
 
-    def same_subnet_24(a: str, b: str) -> bool:
+    # Build actual LAN subnets from host addresses (mask aware). Fallback grouping by /24 if mask missing.
+    lan_subnets: List[ipaddress._BaseNetwork] = []
+    seen_cidrs: set[str] = set()
+    for h in hosts:
+        if not h.ip4:
+            continue
+        raw = h.ip4
         try:
-            na = ipaddress.ip_network(f"{a}/24", strict=False)
-            nb = ipaddress.ip_network(f"{b}/24", strict=False)
-            return na.network_address == nb.network_address
+            if "/" not in raw:
+                raw = raw + "/24"
+            net = ipaddress.ip_network(raw, strict=False)
+            cidr = str(net)
+            if cidr not in seen_cidrs:
+                seen_cidrs.add(cidr)
+                lan_subnets.append(net)
+        except Exception:
+            continue
+
+    def same_lan(a: str, b: str) -> bool:
+        try:
+            ip_a = ipaddress.ip_address(a)
+            ip_b = ipaddress.ip_address(b)
         except Exception:
             return False
+        for n in lan_subnets:
+            if ip_a in n and ip_b in n:
+                return True
+        return False
 
     def is_flow_blocked(src_ip: str, dst_ip: str, recv_node_id: Optional[int]) -> bool:
         for rr in existing_rules:
@@ -928,7 +1103,7 @@ def write_allow_rules_for_flows(
                         return True
             # Other types (nat/custom/none) do not block
         # If default-deny on FORWARD is enabled, treat inter-subnet flows as blocked
-        if default_deny_forward and not same_subnet_24(src_ip, dst_ip):
+        if default_deny_forward and not same_lan(src_ip, dst_ip):
             return True
         # If receiver host has INPUT default-deny, inbound flows require explicit allow
         try:
@@ -1378,3 +1553,154 @@ def write_dnat_for_flows(
         pass
 
     return {"rules": rules_out}
+
+
+# ---- New Enhancements: Flow Verification & Preview Allow Planning ----
+
+def verify_flows_allowed(
+    traffic_summary_path: str,
+    segmentation_summary_path: str = "/tmp/segmentation/segmentation_summary.json",
+    out_path: str = "/tmp/segmentation/allow_verification.json",
+) -> Dict[str, object]:
+    """Post-pass to confirm every generated traffic flow is now permitted.
+
+    A flow is considered still-blocked if is_flow_blocked() logic (mirroring write_allow_rules_for_flows)
+    would return True after all allow rules have (presumably) been applied. We re-load current segmentation
+    summary, reconstruct default deny signals, and test each flow.
+    """
+    import json
+    flows: List[dict] = []
+    try:
+        if os.path.exists(traffic_summary_path):
+            with open(traffic_summary_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            flows = data.get('flows') or []
+    except Exception:
+        flows = []
+    rules: List[dict] = []
+    try:
+        if os.path.exists(segmentation_summary_path):
+            with open(segmentation_summary_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            rules = data.get('rules') or []
+    except Exception:
+        rules = []
+    # Build blocking context
+    default_deny_forward = any((r.get('rule') or {}).get('default_deny') and (r.get('rule') or {}).get('type') == 'nat' for r in rules)
+    default_deny_input_nodes: set[int] = set()
+    subnet_blocks = []  # (src_net,dst_net)
+    host_blocks = []    # (src_ip,dst_ip)
+    protect_internals = []  # subnets
+    for rr in rules:
+        r = rr.get('rule') or {}
+        rtype = (r.get('type') or '').lower()
+        if rtype == 'subnet_block':
+            subnet_blocks.append((r.get('src'), r.get('dst')))
+        elif rtype == 'host_block':
+            host_blocks.append((r.get('src'), r.get('dst')))
+        elif rtype == 'protect_internal':
+            protect_internals.append(r.get('subnet'))
+        elif rtype in ('nat','firewall') and r.get('default_deny') and (r.get('chain') or 'FORWARD').upper() == 'INPUT':
+            try:
+                default_deny_input_nodes.add(int(rr.get('node_id')))
+            except Exception:
+                pass
+        if r.get('default_deny') and (r.get('chain') or '').upper() == 'INPUT':
+            try:
+                default_deny_input_nodes.add(int(rr.get('node_id')))
+            except Exception:
+                pass
+    blocked: List[dict] = []
+    def cidr_contains(cidr: str, ip: str) -> bool:
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+            return ipaddress.ip_address(ip) in net
+        except Exception:
+            return False
+    for fl in flows:
+        src = (fl.get('src_ip') or '') or ''  # may not include; use sender host IP if missing (not stored currently)
+        dst_ip = (fl.get('dst_ip') or '')
+        proto = (fl.get('protocol') or '').lower()
+        dport = fl.get('dst_port')
+        if not dst_ip or not dport:
+            continue
+        # Determine if host src ip stored; traffic_summary currently stores only dst_ip, so skip src-level checks needing IP
+        # Evaluate blocking rules that require dst only + default deny heuristics must assume src unknown => treat as potentially external
+        is_blocked = False
+        # subnet blocks
+        for s, d in subnet_blocks:
+            if s and d and src and dst_ip and cidr_contains(s, src) and cidr_contains(d, dst_ip):
+                is_blocked = True; break
+        if not is_blocked:
+            for hs, hd in host_blocks:
+                if hs == src and hd == dst_ip:
+                    is_blocked = True; break
+        if not is_blocked:
+            for internal in protect_internals:
+                if internal and not cidr_contains(internal, src) and cidr_contains(internal, dst_ip):
+                    is_blocked = True; break
+        # Default deny forward if present and either src missing or src/dst not in same LAN (heuristic omitted due to missing src)
+        if not is_blocked and default_deny_forward and src and dst_ip:
+            # Without LAN context here, conservatively treat as allowed if src missing; if present, enforce difference at /24
+            try:
+                net_a = ipaddress.ip_network(f"{src}/24", strict=False)
+                net_b = ipaddress.ip_network(f"{dst_ip}/24", strict=False)
+                if net_a.network_address != net_b.network_address:
+                    is_blocked = True
+            except Exception:
+                pass
+        if is_blocked:
+            blocked.append({"dst_ip": dst_ip, "dst_port": dport, "proto": proto})
+    result = {"flows_total": len(flows), "blocked": blocked, "blocked_count": len(blocked)}
+    try:
+        import json
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(result, f, indent=2)
+    except Exception:
+        pass
+    return result
+
+
+def plan_preview_allow_rules(
+    segmentation_preview: dict,
+    traffic_plan: Optional[List[dict]],
+    host_ips: Dict[int, str],
+    seed: int = 0,
+) -> Dict[str, object]:
+    """Dry-run allow planning for preview display.
+
+    We approximate which allow rules would be generated by simulating flows derived from traffic_plan items.
+    This is intentionally coarse: it produces pseudo flows (one per traffic item kind) from a sampled src->dst pair.
+    """
+    if not traffic_plan:
+        return {"predicted_allow_rules": []}
+    rnd = random.Random(seed + 1337)
+    host_ids = list(host_ips.keys())
+    if len(host_ids) < 2:
+        return {"predicted_allow_rules": []}
+    predicted: List[dict] = []
+    for it in traffic_plan:
+        try:
+            proto = (it.get('protocol') or 'tcp').lower() if isinstance(it, dict) else 'tcp'
+        except Exception:
+            proto = 'tcp'
+        if proto not in ('tcp','udp'):
+            proto = 'tcp'
+        a, b = rnd.sample(host_ids, 2)
+        dst_ip = host_ips.get(b)
+        if not dst_ip:
+            continue
+        # choose port deterministically per kind
+        try:
+            port = int(it.get('port')) if isinstance(it, dict) and it.get('port') else 8000 + (hash(it.get('kind','k')) % 1024)
+        except Exception:
+            port = 8000
+        predicted.append({
+            'src_id': a,
+            'dst_id': b,
+            'proto': proto,
+            'dst_ip': dst_ip,
+            'port': port,
+            'explanation': 'preview synthetic allow for traffic kind',
+        })
+    return {"predicted_allow_rules": predicted}

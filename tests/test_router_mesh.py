@@ -117,10 +117,11 @@ def test_random_protocol_expansion(monkeypatch):
 
 
 def test_router_count_additive_density_and_counts(monkeypatch):
-    # density=5 (absolute) + abs_count=3 => 8 routers (capped by total hosts=10)
+    # New semantics: density contributes only if at least one weight-based (non-abs_count) routing item exists.
+    # Here all items are absolute counts, so density=5 is ignored. Only 3 routers created.
     routing_items = [RoutingInfo(protocol="OSPFv2", factor=0.0, abs_count=3)]
     session, routers, proto_map = _build({"workstation": 10}, routing_density=5, routing_items=routing_items, mesh_style="full", monkeypatch=monkeypatch)
-    assert len(routers) == 8, f"Expected 8 routers (5 density + 3 count), got {len(routers)}"
+    assert len(routers) == 3, f"Expected 3 routers (density ignored without weight-based items), got {len(routers)}"
 
 
 def test_report_vulnerability_summary(monkeypatch, tmp_path):

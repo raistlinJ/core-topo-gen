@@ -60,6 +60,15 @@ def write_report(
     seg_rules: List[dict] = []
     if segmentation_summary_path and os.path.exists(segmentation_summary_path):
         seg_rules = _read_segmentation_summary(segmentation_summary_path)
+    # Allow verification (optional)
+    allow_verify: Dict[str, object] | None = None
+    try:
+        av_path = "/tmp/segmentation/allow_verification.json"
+        if os.path.exists(av_path):
+            with open(av_path, 'r', encoding='utf-8') as avf:
+                allow_verify = json.load(avf)
+    except Exception:
+        allow_verify = None
 
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     total_nodes = len(routers) + len(hosts) + len(switches)
@@ -136,6 +145,9 @@ def write_report(
     lines.append(f"- Routers: {len(routers)}  |  Switches: {len(switches)}  |  Hosts: {len(hosts)}")
     lines.append(f"- Traffic flows: {len(flows)}")
     lines.append(f"- Segmentation rules: {len(seg_rules)}")
+    if allow_verify:
+        bc = allow_verify.get('blocked_count') or 0
+        lines.append(f"- Flow verification blocked: {bc} (see allow_verification.json)")
     try:
         if metadata and metadata.get('segmentation_preview_rules') and not seg_rules:
             lines.append(f"- Segmentation (preview injected): {len(metadata.get('segmentation_preview_rules') or [])}")
@@ -510,6 +522,20 @@ def write_report(
                 )
             )
         lines.append("")
+        # Insert flow verification detail right after segmentation rules if available
+        if allow_verify:
+            lines.append("### Flow Allow Verification")
+            lines.append(f"- Total flows examined: {allow_verify.get('flows_total')}")
+            lines.append(f"- Blocked after allow synthesis: {allow_verify.get('blocked_count')}")
+            b_list = allow_verify.get('blocked') or []
+            if b_list:
+                lines.append("| Proto | Dst IP | Port |")
+                lines.append("| --- | --- | ---: |")
+                for b in b_list[:25]:  # cap display
+                    lines.append(f"| {b.get('proto','').upper()} | {b.get('dst_ip','')} | {b.get('dst_port','')} |")
+                if len(b_list) > 25:
+                    lines.append(f"(truncated {len(b_list)-25} more)")
+            lines.append("")
 
     # Optional Details section (extra info grouped at end)
     if any([metadata, routing_cfg, traffic_cfg, services_cfg, segmentation_cfg, vulnerabilities_cfg]):

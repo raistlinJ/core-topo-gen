@@ -6,7 +6,7 @@ Purpose: Generate CORE network topologies from XML scenarios via CLI or a Web GU
 - Python mono-repo with two primary entry points:
   - CLI: `core-python -m core_topo_gen.cli` (see `core_topo_gen/cli.py`). Use `core-python` if available in your environment to match the CORE install; otherwise `python`.
   - Web GUI: Flask app in `webapp/` (entry `webapp/app_backend.py`).
-- Parsing: `core_topo_gen/parsers/xml_parser.py` reads the scenario XML per section (Node Information, Routing, Traffic, Segmentation).
+- Parsing: modular per-section parsers under `core_topo_gen/parsers/` now handle XML: `node_info.py`, `routing.py`, `traffic.py`, `segmentation.py`, `services.py`, `vulnerabilities.py`, `planning_metadata.py`.
 - Topology build: `core_topo_gen/builders/topology.py` composes topologies (segmented, star, multi-switch) using CORE gRPC (`core.api.grpc.client`).
 - Utilities:
   - Traffic: `core_topo_gen/utils/traffic.py` generates sender/receiver scripts under `/tmp/traffic` and enables a `Traffic` service.
@@ -79,7 +79,7 @@ pytest -q
 
 ## File Map (jump starts)
 - Entry points: `core_topo_gen/cli.py`, `webapp/app_backend.py`.
-- Parsing: `core_topo_gen/parsers/xml_parser.py`.
+- Parsing: per-section modules (`node_info`, `routing`, `traffic`, `segmentation`, `services`, `vulnerabilities`, `planning_metadata`). The legacy `xml_parser.py` was removed and now raises ImportError.
 - Builders: `core_topo_gen/builders/topology.py`.
 - Utils: `core_topo_gen/utils/{traffic.py,segmentation.py,services.py,report.py}`.
 - Tests: `tests/`.

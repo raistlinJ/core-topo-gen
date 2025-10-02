@@ -242,6 +242,7 @@
                                 <div class="btn-group btn-group-sm">
                                     <button class="btn btn-outline-secondary" type="button" id="fpGraphResetBtn">Reset</button>
                                     <button class="btn btn-outline-secondary" type="button" id="fpGraphPngBtn">PNG</button>
+                                    <button class="btn btn-outline-secondary" type="button" id="fpOpenStandaloneBtn">Open Page</button>
                                 </div>
                             </div>
                             <div class="card-body p-2">
@@ -263,6 +264,10 @@
                             <div class="card-header"><strong>Switches</strong></div>
                             <div class="card-body p-2" id="fpSwitchesWrap"><div class="text-muted small">No data</div></div>
                         </div>
+                        <div class="card mt-3">
+                            <div class="card-header"><strong>Node Sections</strong></div>
+                            <div class="card-body p-2" style="max-height:240px;overflow:auto;" id="fpNodeSectionsWrap"><div class="text-muted small">No data</div></div>
+                        </div>
                     </div>
                     <div class="col-lg-4">
                         <div class="card mb-3">
@@ -278,25 +283,27 @@
                             <div class="card-body p-2"><pre class="small mb-0" id="fpR2SPolicy" style="max-height:160px; overflow:auto;"></pre></div>
                         </div>
                         <div class="card mb-3">
-                            <div class="card-header"><strong>Segmentation</strong></div>
+                            <div class="card-header"><strong>Segmentation Plan</strong></div>
                             <div class="card-body p-2"><pre class="small mb-0" id="fpSegmentation" style="max-height:220px; overflow:auto;"></pre></div>
                         </div>
-                        <!-- Actions card removed: export / open handled elsewhere or deferred; Execute moved to modal footer -->
-                                    <div class="card mb-3" id="fpHistoryCard">
-                                        <div class="card-header"><strong>History</strong></div>
-                                        <div class="card-body p-2" id="fpHistoryWrap">
-                                            <div class="text-muted small">No history</div>
-                                        </div>
-                                    </div>
-                                    <div class="card mb-3" id="fpRoleDistCard">
-                                        <div class="card-header"><strong>Role Distribution</strong></div>
-                                        <div class="card-body p-2" id="fpRoleDist"><div class="text-muted small">No data</div></div>
-                                    </div>
-                                    <div class="card mb-3" id="fpServiceDistCard">
-                                        <div class="card-header"><strong>Service Distribution</strong></div>
-                                        <div class="card-body p-2" id="fpServiceDist"><div class="text-muted small">No data</div></div>
-                                    </div>
-                                    <!-- Drift card removed (no approved plan concept) -->
+                        <div class="card mb-3">
+                            <div class="card-header"><strong>Router Plan</strong></div>
+                            <div class="card-body p-2"><pre class="small mb-0" id="fpRouterPlan" style="max-height:160px; overflow:auto;"></pre></div>
+                        </div>
+                        <div class="card mb-3">
+                            <div class="card-header"><strong>Services Plan</strong></div>
+                            <div class="card-body p-2"><pre class="small mb-0" id="fpServicesPlan" style="max-height:160px; overflow:auto;"></pre></div>
+                        </div>
+                        <div class="card mb-3">
+                            <div class="card-header"><strong>Vulnerabilities Plan</strong></div>
+                            <div class="card-body p-2"><pre class="small mb-0" id="fpVulnPlan" style="max-height:160px; overflow:auto;"></pre></div>
+                        </div>
+                        <div class="card mb-3">
+                            <div class="card-header"><strong>Traffic Plan</strong></div>
+                            <div class="card-body p-2"><pre class="small mb-0" id="fpTrafficPlan" style="max-height:160px; overflow:auto;"></pre></div>
+                        </div>
+                        <!-- Removed History, Role Distribution, Service Distribution cards -->
+                        <!-- Drift card removed (no approved plan concept) -->
                     </div>
                 </div>
             </div>
@@ -512,11 +519,69 @@ async function computeFullPlanPreview(){
     const body = { xml_path: newXmlPath, r2s_hosts_min_list: r2sHostsMinList, r2s_hosts_max_list: r2sHostsMaxList };
         const res = await fetch('/api/plan/preview_full', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
         const data = await res.json();
+        try {
+            if(window.logLine){ window.logLine('INFO', 'Preview: response received; parsing plan summary'); }
+        } catch(e){}
     if(!data.ok){ pre.textContent='Full preview failed: '+(data.error||''); previewState.fullPreview=null; document.getElementById('fullPreviewStructured')?.classList.add('d-none'); }
         else {
             previewState.fullPreview = data.full_preview;
             pre.textContent = JSON.stringify(previewState.fullPreview, null, 2);
             renderFullPreviewStructured();
+            // Emit detailed calculation logs into dock
+            try {
+                const fp = previewState.fullPreview || {};
+                const counts = fp.counts || {};
+                const routersPlanned = fp.routers_planned ?? counts.routers ?? 'n/a';
+                const hostsPlanned = counts.hosts_total ?? counts.hosts ?? 'n/a';
+                const switchesPlanned = counts.switches ?? 'n/a';
+                const r2rEdges = (fp.r2r_edges_preview || []).length;
+                let densityInfo = '';
+                if(fp.router_plan && typeof fp.router_plan === 'object'){
+                    const rp = fp.router_plan;
+                    densityInfo = ` density_raw=${rp.density_raw} density_component=${rp.density_component} count_based=${rp.count_based_component} has_weight=${rp.has_weight_based}`;
+                }
+                window.logLine && window.logLine('INFO', `[preview.plan] Routers planned=${routersPlanned} Hosts=${hostsPlanned} Switches=${switchesPlanned} R2R_edges=${r2rEdges}${densityInfo}`);
+                if(fp.routing_items && Array.isArray(fp.routing_items)){
+                    fp.routing_items.forEach((ri, idx)=>{
+                        try {
+                            const proto = ri.protocol || `item${idx}`;
+                            const abs_c = ri.abs_count || 0;
+                            const factor = ri.factor || 0;
+                            window.logLine && window.logLine('INFO', `[preview.plan.item] #${idx} protocol=${proto} abs_count=${abs_c} factor=${factor}`);
+                        } catch(e){}
+                    });
+                }
+                // Services breakdown
+                try {
+                    if(fp.services_plan){
+                        const svcKeys = Object.keys(fp.services_plan);
+                        window.logLine && window.logLine('INFO', `[preview.plan.services] total=${svcKeys.length} entries=${svcKeys.slice(0,10).join(',')}${svcKeys.length>10?'...':''}`);
+                    }
+                } catch(e){}
+                // Vulnerabilities breakdown
+                try {
+                    if(fp.vulnerabilities_plan){
+                        const vp = fp.vulnerabilities_plan;
+                        const totalV = Object.values(vp).reduce((a,b)=> a + (typeof b==='number'? b:0), 0);
+                        window.logLine && window.logLine('INFO', `[preview.plan.vuln] total_items=${Object.keys(vp).length} total_alloc=${totalV}`);
+                    }
+                } catch(e){}
+                // Segmentation breakdown
+                try {
+                    if(fp.segmentation_preview){
+                        const rules = (fp.segmentation_preview.rules||[]).length;
+                        window.logLine && window.logLine('INFO', `[preview.plan.segmentation] rules=${rules}`);
+                    }
+                } catch(e){}
+                // Traffic breakdown
+                try {
+                    if(fp.traffic_summary){
+                        const ts = fp.traffic_summary;
+                        const flows = ts.total_flows || ts.flows || 'n/a';
+                        window.logLine && window.logLine('INFO', `[preview.plan.traffic] flows=${flows}`);
+                    }
+                } catch(e){}
+            } catch(e){ /* ignore logging issues */ }
             try { showFullPreviewModal(previewState.fullPreview); } catch(e){ console.warn('Modal render failed', e); }
             // Append to history
             try {
@@ -558,6 +623,11 @@ function renderFullPreviewStructured(){
         { id:'subnets', label:'Subnets' },
         { id:'r2r', label:`R2R Edges (${(full.r2r_edges_preview||[]).length})` },
         { id:'seg', label:`Seg Rules (${(full.segmentation_preview && full.segmentation_preview.rules ? full.segmentation_preview.rules.length : 0)})` },
+        { id:'services_bd', label:'Services Plan' },
+        { id:'vuln_bd', label:'Vuln Plan' },
+        { id:'seg_bd', label:'Seg Plan' },
+        { id:'router_bd', label:'Router Plan' },
+        { id:'traffic_bd', label:'Traffic Plan' },
         { id:'history', label:'History' },
     ];
     // Build tabs
@@ -616,6 +686,26 @@ function renderFullPreviewStructured(){
             const rules = (full.segmentation_preview && full.segmentation_preview.rules) || [];
             contentEl.innerHTML = tableFromObjects(rules.map(r=>({ node_id:r.node_id, type:r.rule.type, summary: ruleSummary(r.rule) })), ['node_id','type','summary']);
             return;
+        }
+        if(id==='router_bd'){
+            const rp = (full.router_plan)||{};
+            contentEl.innerHTML = `<pre class="small mb-0">${esc(JSON.stringify(rp,null,2))}</pre>`; return;
+        }
+        if(id==='services_bd'){
+            const sp = (full.services_plan)||{};
+            contentEl.innerHTML = `<pre class="small mb-0">${esc(JSON.stringify(sp,null,2))}</pre>`; return;
+        }
+        if(id==='vuln_bd'){
+            const vp = (full.vulnerabilities_plan)||{};
+            contentEl.innerHTML = `<pre class="small mb-0">${esc(JSON.stringify(vp,null,2))}</pre>`; return;
+        }
+        if(id==='seg_bd'){
+            const sb = (full.segmentation_preview)||{};
+            contentEl.innerHTML = `<pre class="small mb-0">${esc(JSON.stringify(sb,null,2))}</pre>`; return;
+        }
+        if(id==='traffic_bd'){
+            const tp = (full.traffic_summary)||{};
+            contentEl.innerHTML = `<pre class="small mb-0">${esc(JSON.stringify(tp,null,2))}</pre>`; return;
         }
         if(id==='history'){
             renderPreviewHistory(contentEl, full);
@@ -703,7 +793,55 @@ function showFullPreviewModal(full){
     function setJson(id, obj){ const el=document.getElementById(id); if(el) el.textContent = JSON.stringify(obj||{}, null, 2); }
     setJson('fpR2RPolicy', full.r2r_policy_preview);
     setJson('fpR2SPolicy', full.r2s_policy_preview);
-    setJson('fpSegmentation', full.segmentation_preview);
+    // Render segmentation plan as filtered/minimal JSON (exclude script paths)
+    (function(){
+        const segEl = document.getElementById('fpSegmentation'); if(!segEl) return;
+        const seg = full.segmentation_preview || {};
+        const rulesRaw = seg.rules || [];
+        if(!rulesRaw.length){ segEl.textContent = '(no segmentation plan rules)'; return; }
+        // Normalize rule objects (sometimes nested under r.rule)
+        const cleaned = []; const typeCounts = {};
+        for(const r of rulesRaw){
+            const rule = r.rule || r;
+            const obj = {
+                node_id: r.node_id ?? rule.node_id ?? null,
+                type: rule.type || rule.action || null,
+                src: rule.src || null,
+                dst: rule.dst || null,
+                subnet: rule.subnet || null,
+                proto: rule.proto || rule.protocol || null,
+                port: rule.port || null,
+                action: rule.action || (rule.type && ['allow','dnat'].includes(rule.type)? rule.type : null) || null,
+                internal: rule.internal ?? null,
+                external: rule.external ?? null
+            };
+            // Count types
+            const t = obj.type || 'unknown';
+            typeCounts[t] = (typeCounts[t]||0)+1;
+            cleaned.push(obj);
+        }
+        // Optionally truncate very large rule sets for readability
+        const MAX_RULES_DISPLAY = 400;
+        let truncated = false;
+        let rulesOut = cleaned;
+        if(cleaned.length > MAX_RULES_DISPLAY){
+            rulesOut = cleaned.slice(0, MAX_RULES_DISPLAY);
+            truncated = true;
+        }
+        const minimal = {
+            rules_count: cleaned.length,
+            truncated: truncated || undefined,
+            types_summary: typeCounts,
+            sample_rules: rulesOut
+        };
+        try { segEl.textContent = JSON.stringify(minimal, null, 2); }
+        catch(e){ segEl.textContent = '[error rendering segmentation plan JSON]'; }
+    })();
+    // Breakdown plans
+    try { setJson('fpRouterPlan', full.router_plan); } catch(e){}
+    try { setJson('fpServicesPlan', full.services_plan); } catch(e){}
+    try { setJson('fpVulnPlan', full.vulnerabilities_plan); } catch(e){}
+    try { setJson('fpTrafficPlan', full.traffic_summary || full.traffic_plan || {}); } catch(e){}
     // Tables
     function tableHtml(arr, cols){ if(!arr||!arr.length) return '<div class="text-muted small">(none)</div>'; const head='<thead><tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr></thead>'; const body='<tbody>'+arr.map(o=>'<tr>'+cols.map(c=>`<td>${(o[c]!==undefined&&o[c]!==null)? (Array.isArray(o[c])? o[c].join(','): o[c]): ''}</td>`).join('')+'</tr>').join('')+'</tbody>'; return `<div class="table-responsive"><table class="table table-sm table-bordered mb-0">${head}${body}</table></div>`; }
     const routersWrap = document.getElementById('fpRoutersWrap'); if(routersWrap) routersWrap.innerHTML = tableHtml(full.routers,['node_id','name','ip4']);
@@ -711,11 +849,8 @@ function showFullPreviewModal(full){
     const switchesWrap = document.getElementById('fpSwitchesWrap'); if(switchesWrap) switchesWrap.innerHTML = tableHtml(full.switches_detail,['switch_id','router_id','hosts','rsw_subnet','lan_subnet']);
     // Graph
     buildFullPreviewModalGraph(full);
-        // History & Diff
-    try { renderFullPreviewHistoryInModal(); } catch(e){ console.warn('History render failed', e); }
-        // Roles & services distribution
-        try { renderRoleDistribution(full); } catch(e){ console.warn('Role dist failed', e); }
-        try { renderServiceDistribution(full); } catch(e){ console.warn('Service dist failed', e); }
+    try { buildNodeSectionsTable(full); } catch(e){ console.warn('Node sections table failed', e); }
+        // Removed history, role distribution, service distribution
     // Approval & drift removed
     document.getElementById('fpExportJsonBtn')?.addEventListener('click', ()=>{ try { const blob=new Blob([JSON.stringify(full,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='full_preview_seed_'+(full.seed||'na')+'.json'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),4000);} catch(e){} });
     // Open standalone full preview page via POST (original GET caused 405 Method Not Allowed)
@@ -736,47 +871,7 @@ function showFullPreviewModal(full){
     (new bootstrap.Modal(modalEl)).show();
 }
 
-function renderFullPreviewHistoryInModal(){
-    const wrap = document.getElementById('fpHistoryWrap'); if(!wrap) return;
-    loadFullPreviewHistory();
-    const histAll = previewState.fullPreviewHistory || [];
-    if(!histAll.length){ wrap.innerHTML='<div class="text-muted small">No history</div>'; return; }
-    const hist = histAll.slice(-10); // last 10
-    function esc(x){ return (''+x).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
-    const rows = hist.slice().reverse().map((rec,i)=>{
-        return `<tr><td>${i+1}</td><td>${esc(rec.seed)}</td><td>${esc(rec.stats.routers)}/${esc(rec.stats.hosts)}/${esc(rec.stats.switches)}</td><td>${esc(rec.stats.r2r_edges)}</td><td>${esc(rec.stats.seg_rules)}</td></tr>`;
-    }).join('');
-    wrap.innerHTML = `<div class='table-responsive'><table class='table table-sm table-bordered mb-0'><thead><tr><th>#</th><th>Seed</th><th>R/H/S</th><th>R2R</th><th>Seg</th></tr></thead><tbody>${rows}</tbody></table></div>`;
-}
-
-function renderRoleDistribution(full){
-    const wrap = document.getElementById('fpRoleDist'); if(!wrap) return;
-    const hosts = full.hosts || [];
-    const counts = {};
-    hosts.forEach(h => { const r = h.role || 'unknown'; counts[r] = (counts[r]||0)+1; });
-    const roles = Object.entries(counts).sort((a,b)=> b[1]-a[1]);
-    if(!roles.length){ wrap.innerHTML='<div class="text-muted small">No hosts</div>'; return; }
-    const total = hosts.length || 1;
-    const bars = roles.map(([role,c])=>{
-        const pct = ((c/total)*100).toFixed(1);
-        return `<div class='mb-1'><div class='d-flex justify-content-between small'><span>${role}</span><span>${c} (${pct}%)</span></div><div class='progress' style='height:6px;'><div class='progress-bar bg-info' style='width:${pct}%;'></div></div></div>`;
-    }).join('');
-    wrap.innerHTML = bars;
-}
-
-function renderServiceDistribution(full){
-    const wrap = document.getElementById('fpServiceDist'); if(!wrap) return;
-    const svcCounts = {};
-    const nodes = [...(full.routers||[]), ...(full.hosts||[])];
-    nodes.forEach(n => { (n.services||[]).forEach(s => { svcCounts[s] = (svcCounts[s]||0)+1; }); });
-    const entries = Object.entries(svcCounts).sort((a,b)=> b[1]-a[1]);
-    if(!entries.length){ wrap.innerHTML='<div class="text-muted small">No services</div>'; return; }
-    const total = entries.reduce((sum,e)=> sum+e[1],0) || 1;
-    wrap.innerHTML = `<div style='max-height:180px; overflow:auto;'>` + entries.map(([svc,c])=>{
-        const pct = ((c/total)*100).toFixed(1);
-        return `<div class='mb-1'><div class='d-flex justify-content-between small'><span>${svc}</span><span>${c} (${pct}%)</span></div><div class='progress' style='height:5px;'><div class='progress-bar bg-secondary' style='width:${pct}%;'></div></div></div>`;
-    }).join('') + '</div>';
-}
+// Removed history and distribution functions
 
 // Drift function removed
 
@@ -803,19 +898,61 @@ function buildFullPreviewModalGraph(full){
     const link = zoomLayer.selectAll('line').data(links).enter().append('line').attr('stroke', l=> l.kind==='r2r'? '#0d6efd': (l.kind==='r-sw'? '#198754':'#999')).attr('stroke-width', l=> l.kind==='r2r'? 2:1.2).attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null).attr('opacity', .9);
     const node = zoomLayer.selectAll('g').data(nodes).enter().append('g').call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
     node.append('circle').attr('r', d=> d.type==='router'? 11: (d.type==='switch'? 8:5)).attr('fill', d=> d.type==='router'? '#ff7043': (d.type==='switch'? '#17a2b8': '#ffc107')).attr('stroke','#333').attr('stroke-width',1.1);
-    node.append('text').text(d=>d.label).attr('x',12).attr('y',4).attr('font-size','10px');
-    node.append('title').text(d=> `${d.label} (${d.type})`);
+    // Legend
+    const legend = svg.append('g').attr('class','legend').attr('transform','translate(8,8)');
+    const legendItems = [
+        {label:'Router', color:'#ff7043', r:11},
+        {label:'Switch', color:'#17a2b8', r:8},
+        {label:'Host', color:'#ffc107', r:5},
+    ];
+    legendItems.forEach((li,i)=>{
+        const g=legend.append('g').attr('transform',`translate(0,${i*20})`);
+        g.append('circle').attr('r',li.r).attr('cx',li.r).attr('cy',li.r).attr('fill',li.color).attr('stroke','#333').attr('stroke-width',1);
+        g.append('text').text(li.label).attr('x', li.r*2 + 6).attr('y', li.r+4).attr('font-size','11px');
+    });
+    // Node labels removed per request
+    // Build section lookups
+    const servicesByNode = full.services_preview || {}; // node_id -> [services]
+    const vulnByNode = full.vulnerabilities_preview || {}; // node_id -> [vulns]
+    const segRules = (full.segmentation_preview && full.segmentation_preview.rules) || [];
+    const segCnt = {}; segRules.forEach(r=>{ segCnt[r.node_id] = (segCnt[r.node_id]||0)+1; });
+    const traffic = full.traffic_summary || {};
+    const tSend = {}; const tRecv = {};
+    try { (traffic.flows || traffic || []).forEach(f=>{ const s=f.src_id??f.src; const d=f.dst_id??f.dst; if(s!==undefined) tSend[s]=(tSend[s]||0)+1; if(d!==undefined) tRecv[d]=(tRecv[d]||0)+1; }); } catch(e){}
+    // Tooltip functionality removed per request
     sim.on('tick', ()=>{ link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y).attr('x2', d=>d.target.x).attr('y2', d=>d.target.y); node.attr('transform', d=>`translate(${d.x},${d.y})`); });
     function dragstarted(event,d){ if(!event.active) sim.alphaTarget(.3).restart(); d.fx=d.x; d.fy=d.y; }
     function dragged(event,d){ d.fx=event.x; d.fy=event.y; }
     function dragended(event,d){ if(!event.active) sim.alphaTarget(0); }
     document.getElementById('fpGraphLoading')?.remove();
     document.getElementById('fpGraphResetBtn')?.addEventListener('click', ()=>{ sim.alpha(1).restart(); nodes.forEach(n=>{ n.fx=null; n.fy=null; }); svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity); });
-    // Provide wheel zoom hint tooltip (optional) - minimal
-    try { container.append('title').text('Scroll / pinch to zoom, drag background to pan, drag nodes to reposition'); } catch(e){}
+    // Removed zoom hint tooltip
     svg.on('mousedown', ()=> svg.style('cursor','grabbing'));
     window.addEventListener('mouseup', ()=> svg.style('cursor','grab'));
     document.getElementById('fpGraphPngBtn')?.addEventListener('click', ()=>{ try { const serializer=new XMLSerializer(); const svgStr=serializer.serializeToString(svg.node()); const canvas=document.createElement('canvas'); canvas.width=w*2; canvas.height=h*2; const ctx=canvas.getContext('2d'); const img=new Image(); img.onload=function(){ ctx.fillStyle='#fff'; ctx.fillRect(0,0,canvas.width,canvas.height); ctx.drawImage(img,0,0,canvas.width,canvas.height); canvas.toBlob(b=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download='full_preview_graph_'+(full.seed||'na')+'.png'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(a.href),4000); }); }; img.src='data:image/svg+xml;base64,'+btoa(unescape(encodeURIComponent(svgStr))); } catch(e){ console.error('PNG export failed', e); } });
+}
+
+function buildNodeSectionsTable(full){
+    const wrap = document.getElementById('fpNodeSectionsWrap'); if(!wrap) return;
+    const servicesByNode = full.services_preview || {};
+    const vulnByNode = full.vulnerabilities_preview || {};
+    const segRules = (full.segmentation_preview && full.segmentation_preview.rules) || [];
+    const segCnt = {}; segRules.forEach(r=>{ segCnt[r.node_id]=(segCnt[r.node_id]||0)+1; });
+    const traffic = full.traffic_summary || {};
+    const tSend = {}; const tRecv = {};
+    try { (traffic.flows || traffic || []).forEach(f=>{ const s=f.src_id??f.src; const d=f.dst_id??f.dst; if(s!==undefined) tSend[s]=(tSend[s]||0)+1; if(d!==undefined) tRecv[d]=(tRecv[d]||0)+1; }); } catch(e){}
+    const all = [];
+    (full.routers||[]).forEach(r=> all.push({id:r.node_id, name:r.name, type:'router'}));
+    (full.hosts||[]).forEach(h=> all.push({id:h.node_id, name:h.name, type:h.role||'host'}));
+    (full.switches_detail||[]).forEach(sw=> all.push({id:sw.switch_id, name:'sw-'+sw.switch_id, type:'switch'}));
+    if(!all.length){ wrap.innerHTML='<div class="text-muted small">No nodes</div>'; return; }
+    const rows = all.map(n=>{
+        const svc=(servicesByNode[n.id]||[]).join(',');
+        const vul=(vulnByNode[n.id]||[]).join(',');
+        const sc=segCnt[n.id]||0; const ts=tSend[n.id]||0; const tr=tRecv[n.id]||0;
+        return `<tr><td>${n.id}</td><td>${n.name}</td><td>${n.type}</td><td>${svc}</td><td>${vul}</td><td>${sc}</td><td>${ts}</td><td>${tr}</td></tr>`;
+    }).join('');
+    wrap.innerHTML = `<div class='table-responsive'><table class='table table-sm table-bordered mb-0'><thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Services</th><th>Vulns</th><th>Seg Rules</th><th>Traffic S</th><th>Traffic R</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 // Execute button in Full Preview modal
@@ -840,7 +977,16 @@ document.addEventListener('DOMContentLoaded', ()=>{
                 appendLog('Run ID: '+run_id,'info');
                 // Stream logs directly into dock log buffer
                 const evt = new EventSource('/stream/' + run_id);
-                evt.onmessage = ev => { if(ev && typeof ev.data==='string') runProgressLogLine(ev.data); };
+                evt.onmessage = ev => {
+                    if(ev && typeof ev.data === 'string') {
+                        // Prefer dock logging; fall back to legacy runProgressLogLine if present
+                        try {
+                            if(window.logLine){ window.logLine('INFO', ev.data); }
+                            else if(typeof runProgressLogLine === 'function'){ runProgressLogLine(ev.data); }
+                            else { appendLog(ev.data, 'INFO'); }
+                        } catch(e) { /* swallow */ }
+                    }
+                };
                 evt.addEventListener('end', ()=>{ try{ evt.close(); }catch(e){} appendLog('Execution stream ended','info'); });
                 // Poll status until done
                 (async function poll(){

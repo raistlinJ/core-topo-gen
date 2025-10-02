@@ -589,11 +589,20 @@ def build_segmented_topology_phased(
                 sw_if = Interface(id=0, name=f"{sw_name}-r{rid}", ip4=sw_ip, ip4_mask=rsn.prefixlen, mac=mac_alloc.next_mac())
                 r_if = Interface(id=r_ifid, name=f"r{rid}-{sw_name}", ip4=r_ip, ip4_mask=rsn.prefixlen, mac=mac_alloc.next_mac())
                 safe_add_link(session, sw_node, r_obj, iface1=sw_if, iface2=r_if)
-                # Host LAN /28
+                # Host LAN dynamic (respect preview-provided lan_subnet if present, else size by hosts with 25% headroom)
                 try:
                     lan_net = ipaddress.ip_network(sd.get('lan_subnet'), strict=False)
                 except Exception:
-                    lan_net = subnet_alloc.next_random_subnet(28)
+                    def _lan_prefix_for_hosts(count: int, reserve: int = 2, cap: int = 24) -> int:
+                        needed = int((count + reserve) * 1.25 + 0.9999)
+                        for p in range(30, cap + 1):
+                            size = 1 << (32 - p); usable = size - 2
+                            if usable >= needed:
+                                return p
+                        return cap
+                    h_pair = sd.get('hosts') or []
+                    lan_pref = _lan_prefix_for_hosts(len(h_pair))
+                    lan_net = subnet_alloc.next_random_subnet(lan_pref)
                 lan_hosts = list(lan_net.hosts())
                 sw_lan_ip = str(lan_hosts[0]) if lan_hosts else None
                 h_if_ips = sd.get('host_if_ips') or {}

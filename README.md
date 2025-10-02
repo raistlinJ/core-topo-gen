@@ -239,7 +239,7 @@ These attributes appear only when the section has relevant items or user input. 
 Programmatic access (Python):
 
 ```python
-from core_topo_gen.parsers.xml_parser import parse_planning_metadata
+from core_topo_gen.parsers.planning_metadata import parse_planning_metadata
 meta = parse_planning_metadata('scenario.xml', 'ScenarioName')
 print(meta['node_info']['combined_nodes'])
 ```

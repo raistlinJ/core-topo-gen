@@ -2298,114 +2298,20 @@ def api_plan_preview_full():
         xml_path = os.path.abspath(xml_path)
         if not os.path.exists(xml_path):
             return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
-        from core_topo_gen.parsers.xml_parser import parse_node_info, parse_routing_info, parse_services, parse_vulnerabilities_info, parse_segmentation_info
-        density_base, weight_items, count_items, services_list = parse_node_info(xml_path, scenario)
-        role_counts: dict[str,int] = {}
-        for r, c in count_items:
-            role_counts[r] = role_counts.get(r, 0) + int(c)
-        # Re-introduce weight-based expansion so preview reflects factor-based host planning
-        try:
-            if weight_items and (density_base or 0) > 0:
-                base_total = int(density_base)
-                # Normalize factors to sum to 1.0 then allocate
-                total_f = sum(f for _, f in weight_items) or 0.0
-                if total_f > 0:
-                    for role, f in weight_items:
-                        alloc = int(round((f/total_f) * base_total))
-                        if alloc > 0:
-                            role_counts[role] = role_counts.get(role, 0) + alloc
-        except Exception:
-            pass
-        routing_density, routing_items = parse_routing_info(xml_path, scenario)
-        prelim_router_count = 0
-        try:
-            host_total_for_density = sum(role_counts.values())
-            if routing_density and routing_density > 0 and host_total_for_density > 0:
-                prelim_router_count = max(1, int(round(routing_density * host_total_for_density)))
-            # Count-based router items can independently raise the router count
-            for ri in routing_items:
-                abs_c = int(getattr(ri, 'abs_count', 0) or 0)
-                if abs_c > 0:
-                    prelim_router_count = max(prelim_router_count, abs_c)
-        except Exception:
-            pass
-        service_plan = {s.name: (s.abs_count if s.abs_count > 0 else int(round(s.density * (density_base or 0)))) for s in services_list}
-        vuln_density, vuln_items = parse_vulnerabilities_info(xml_path, scenario)
-        vplan: dict[str,int] = {}
-        try:
-            import math as _math
-            density_target = int(_math.floor((vuln_density or 0.0) * (density_base or 0) + 1e-9))
-        except Exception:
-            density_target = 0
-        for it in (vuln_items or []):
-            if (it.get('v_metric') == 'Count'):
-                try:
-                    c = int(it.get('v_count') or 0)
-                except Exception:
-                    c = 0
-                if c>0:
-                    name = it.get('selected') or 'Item'
-                    vplan[name] = vplan.get(name,0)+c
-        if density_target>0:
-            vplan['__density_pool__'] = density_target
-        seg_density, seg_items = parse_segmentation_info(xml_path, scenario)
-        seg_items_serial = [{"selected": (it.name or 'Random'), "factor": it.factor} for it in seg_items]
-        try:
-            from core_topo_gen.planning.full_preview import build_full_preview  # type: ignore
-        except ModuleNotFoundError as _e1:
-            app.logger.warning('[plan.preview_full] initial import failed: %s; retrying ensure', _e1)
-            ensure_ok = False
+        from core_topo_gen.planning.orchestrator import compute_full_plan
+        from core_topo_gen.planning.plan_cache import hash_xml_file, try_get_cached_plan, save_plan_to_cache
+        xml_hash = hash_xml_file(xml_path)
+        plan = try_get_cached_plan(xml_hash, scenario, seed)
+        if plan:
+            app.logger.debug('[plan.preview_full] using cached plan (%s, scenario=%s, seed=%s)', xml_hash[:12], scenario, seed)
+        else:
+            plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
             try:
-                ensure_ok = _ensure_full_preview_module()
-            except Exception as _e2:
-                app.logger.error('[plan.preview_full] ensure_full_preview_module raised: %s', _e2)
-            try:
-                from core_topo_gen.planning.full_preview import build_full_preview  # type: ignore
-            except Exception as _e3:
-                # Log sys.path and package file locations for diagnostics
-                try:
-                    import core_topo_gen as _ctg, inspect
-                    app.logger.error('[plan.preview_full] final import failed; core_topo_gen file=%s sys.path[0]=%s ensure_ok=%s', getattr(_ctg,'__file__',None), sys.path[0], ensure_ok)
-                except Exception:
-                    pass
-                raise _e3
-        # Derive R2R and R2S policies (parallel to CLI derivation) from first eligible routing items
-        r2r_policy_plan = None
-        r2s_policy_plan = None
-        try:
-            first_r2r = next((ri for ri in routing_items if getattr(ri,'r2r_mode',None)), None)  # type: ignore
-            if first_r2r:
-                m = getattr(first_r2r, 'r2r_mode', '')
-                if m == 'Exact' and getattr(first_r2r, 'r2r_edges', 0) > 0:
-                    r2r_policy_plan = { 'mode': 'Exact', 'target_degree': int(getattr(first_r2r,'r2r_edges',0)) }
-                elif m:
-                    r2r_policy_plan = { 'mode': m }
-            first_r2s = next((ri for ri in routing_items if getattr(ri,'r2s_mode',None)), None)  # type: ignore
-            if first_r2s:
-                m2 = getattr(first_r2s, 'r2s_mode', '')
-                if m2 == 'Exact' and getattr(first_r2s, 'r2s_edges', 0) > 0:
-                    r2s_policy_plan = { 'mode': 'Exact', 'target_per_router': int(getattr(first_r2s,'r2s_edges',0)) }
-                elif m2:
-                    r2s_policy_plan = { 'mode': m2 }
-        except Exception:
-            pass
-        full_prev = build_full_preview(
-            role_counts=role_counts,
-            routers_planned=prelim_router_count,
-            services_plan=service_plan,
-            vulnerabilities_plan=vplan,
-            r2r_policy=r2r_policy_plan,
-            r2s_policy=r2s_policy_plan,
-            routing_items=routing_items,  # allow builder to self-derive if explicit policy absent
-            routing_plan={},
-            segmentation_density=seg_density,
-            segmentation_items=seg_items_serial,
-            seed=seed,
-            ip4_prefix='10.0.0.0/24',
-            r2s_hosts_min_list=r2s_hosts_min_list,
-            r2s_hosts_max_list=r2s_hosts_max_list,
-        )
-        return jsonify({'ok': True, 'full_preview': full_prev})
+                save_plan_to_cache(xml_hash, scenario, seed, plan)
+            except Exception as ce:
+                app.logger.debug('[plan.preview_full] cache save failed: %s', ce)
+        full_prev = _build_full_preview_from_plan(plan, seed, r2s_hosts_min_list, r2s_hosts_max_list)
+        return jsonify({'ok': True, 'full_preview': full_prev, 'plan': plan, 'breakdowns': plan.get('breakdowns')})
     except Exception as e:
         app.logger.exception('[plan.preview_full] error: %s', e)
         return jsonify({'ok': False, 'error': str(e) }), 500
@@ -2434,7 +2340,17 @@ def plan_full_preview_page():
         if not os.path.exists(xml_path):
             flash(f'XML not found: {xml_path}')
             return redirect(url_for('index'))
-        from core_topo_gen.parsers.xml_parser import parse_node_info, parse_routing_info, parse_services, parse_vulnerabilities_info, parse_segmentation_info
+        from core_topo_gen.parsers.node_info import parse_node_info
+        from core_topo_gen.parsers.routing import parse_routing_info
+        from core_topo_gen.parsers.services import parse_services
+        from core_topo_gen.parsers.vulnerabilities import parse_vulnerabilities_info
+        from core_topo_gen.parsers.segmentation import parse_segmentation_info
+        try:
+            from core_topo_gen.parsers.traffic import parse_traffic_info
+            from core_topo_gen.planning.traffic_plan import compute_traffic_plan, TrafficItem
+        except Exception:
+            parse_traffic_info = None
+            compute_traffic_plan = None
         density_base, weight_items, count_items, services_list = parse_node_info(xml_path, scenario)
         role_counts: dict[str,int] = {}
         for r,c in count_items:
@@ -2451,6 +2367,7 @@ def plan_full_preview_page():
                             role_counts[role] = role_counts.get(role,0)+alloc
         except Exception:
             pass
+        # Node role normalization is handled centrally in compute_node_plan now; no further sanitation here
         routing_density, routing_items = parse_routing_info(xml_path, scenario)
         prelim_router_count = 0
         try:
@@ -2478,8 +2395,32 @@ def plan_full_preview_page():
                 if c>0:
                     name = it.get('selected') or 'Item'
                     vplan[name]=vplan.get(name,0)+c
-        if density_target>0: vplan['__density_pool__']=density_target
+    # Deprecated: previously inserted '__density_pool__' placeholder. Now vulnerabilities plan resolves Random allocations directly.
+    # if density_target>0: vplan['__density_pool__']=density_target
         seg_density, seg_items = parse_segmentation_info(xml_path, scenario)
+
+        # Traffic plan (optional)
+        traffic_plan_list = None
+        if parse_traffic_info and compute_traffic_plan:
+            try:
+                _tdensity, titems = parse_traffic_info(xml_path, scenario)
+                t_specs: list[TrafficItem] = []
+                for it in (titems or []):
+                    try:
+                        pattern = it.get('pattern') if hasattr(it,'get') else 'continuous'
+                        rate = it.get('rate_kbps') if hasattr(it,'get') else None
+                        factor_raw = it.get('factor') if hasattr(it,'get') else 1.0
+                        try:
+                            factor = float(factor_raw or 0.0)
+                        except Exception:
+                            factor = 0.0
+                        t_specs.append(TrafficItem(pattern=pattern or 'continuous', rate_kbps=rate, factor=factor))
+                    except Exception:
+                        continue
+                if t_specs:
+                    traffic_plan_list, _tbreak = compute_traffic_plan(t_specs)
+            except Exception:
+                traffic_plan_list = None
         seg_items_serial = [{"selected": (it.name or 'Random'), "factor": it.factor} for it in seg_items]
         # build full preview (with optional seed)
         try:
@@ -2499,20 +2440,22 @@ def plan_full_preview_page():
                     r2s_policy_plan = { 'mode': m2 }
         except Exception:
             pass
-        full_prev = build_full_preview(
-            role_counts=role_counts,
-            routers_planned=prelim_router_count,
-            services_plan=service_plan,
-            vulnerabilities_plan=vplan,
-            r2r_policy=None,
-            r2s_policy=r2s_policy_plan,
-            routing_items=routing_items,  # pass through for auto-derive
-            routing_plan={},
-            segmentation_density=seg_density,
-            segmentation_items=seg_items_serial,
-            seed=seed,
-            ip4_prefix='10.0.0.0/24',
-        )
+        # Reconstruct plan-like structure for unified helper
+        plan_like = {
+            'role_counts': role_counts,
+            'routers_planned': prelim_router_count,
+            'routing_items': routing_items,
+            'service_plan': service_plan,
+            'vulnerability_plan': vplan,
+            'traffic_plan': traffic_plan_list,
+            'breakdowns': {
+                'router': {'simple_plan': {}},
+                'segmentation': {'raw_items_serialized': seg_items_serial, 'density': seg_density},
+            }
+        }
+        full_prev = _build_full_preview_from_plan(plan_like, seed)
+        # Annotate & enforce enumerated host roles (Server, Workstation, PC) in preview
+        # Full preview already receives normalized roles from planning layer
         # Attempt scenario name
         scenario_name = None
         try:
@@ -2557,6 +2500,61 @@ def _plan_summary_from_full_preview(full_prev: dict) -> dict:
         'full_preview_seed': full_prev.get('seed'),
     }
     return summary
+
+# --- Unified Preview Helpers (ensure modal JSON preview == full page preview) ---
+def _derive_routing_policies(routing_items):
+    """Derive R2R and R2S policies from routing items (first item wins)."""
+    r2r_policy_plan = None
+    r2s_policy_plan = None
+    try:
+        first_r2r = next((ri for ri in (routing_items or []) if getattr(ri,'r2r_mode',None)), None)  # type: ignore
+        if first_r2r:
+            m = getattr(first_r2r, 'r2r_mode', '')
+            if m == 'Exact' and getattr(first_r2r, 'r2r_edges', 0) > 0:
+                r2r_policy_plan = { 'mode': 'Exact', 'target_degree': int(getattr(first_r2r,'r2r_edges',0)) }
+            elif m:
+                r2r_policy_plan = { 'mode': m }
+        first_r2s = next((ri for ri in (routing_items or []) if getattr(ri,'r2s_mode',None)), None)  # type: ignore
+        if first_r2s:
+            m2 = getattr(first_r2s, 'r2s_mode', '')
+            if m2 == 'Exact' and getattr(first_r2s, 'r2s_edges', 0) > 0:
+                r2s_policy_plan = { 'mode': 'Exact', 'target_per_router': int(getattr(first_r2s,'r2s_edges',0)) }
+            elif m2:
+                r2s_policy_plan = { 'mode': m2 }
+    except Exception:
+        pass
+    return r2r_policy_plan, r2s_policy_plan
+
+def _build_full_preview_from_plan(plan: dict, seed, r2s_hosts_min_list=None, r2s_hosts_max_list=None):
+    """Single source of truth to invoke build_full_preview using a compute_full_plan result."""
+    from core_topo_gen.planning.full_preview import build_full_preview  # lazy import
+    role_counts = plan['role_counts']
+    prelim_router_count = plan['routers_planned']
+    routing_items = plan.get('routing_items') or []
+    service_plan = plan.get('service_plan') or {}
+    vplan = plan.get('vulnerability_plan') or {}
+    seg_items_serial = plan.get('breakdowns', {}).get('segmentation', {}).get('raw_items_serialized') or []
+    seg_density = plan.get('breakdowns', {}).get('segmentation', {}).get('density')
+    r2r_policy_plan, r2s_policy_plan = _derive_routing_policies(routing_items)
+    fp = build_full_preview(
+        role_counts=role_counts,
+        routers_planned=prelim_router_count,
+        services_plan=service_plan,
+        vulnerabilities_plan=vplan,
+        r2r_policy=r2r_policy_plan,
+        r2s_policy=r2s_policy_plan,
+        routing_items=routing_items,
+        routing_plan=plan.get('breakdowns', {}).get('router', {}).get('simple_plan', {}),
+        segmentation_density=seg_density,
+        segmentation_items=seg_items_serial,
+        traffic_plan=plan.get('traffic_plan'),
+        seed=seed,
+        ip4_prefix='10.0.0.0/24',
+        r2s_hosts_min_list=r2s_hosts_min_list,
+        r2s_hosts_max_list=r2s_hosts_max_list,
+    )
+    fp['router_plan'] = plan.get('breakdowns', {}).get('router', {})
+    return fp
 
 @app.route('/api/plan/approve_full_preview', methods=['POST'])
 def api_plan_approve_full_preview():
@@ -2610,6 +2608,118 @@ def api_plan_approve_full_preview():
     except Exception as e:
         app.logger.exception('[plan.approve_full_preview] error: %s', e)
         return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.route('/api/open_scripts', methods=['GET'])
+def api_open_scripts():
+    """Return a listing of traffic or segmentation script directory contents.
+
+    Query params: kind=traffic|segmentation
+    """
+    kind = request.args.get('kind','traffic').lower()
+    scope = request.args.get('scope','runtime').lower()  # runtime|preview
+    if kind not in ('traffic','segmentation'):
+        return jsonify({'ok': False, 'error': 'invalid kind'}), 400
+    if scope == 'preview':
+        # Look for latest preview dir (deterministic naming core-topo-preview-*)
+        import tempfile, glob
+        base = tempfile.gettempdir()
+        pattern = 'core-topo-preview-traffic-*' if kind=='traffic' else 'core-topo-preview-seg-*'
+        candidates = sorted(glob.glob(os.path.join(base, pattern)), key=lambda p: os.path.getmtime(p), reverse=True)
+        path = candidates[0] if candidates else None
+        if not path:
+            return jsonify({'ok': False, 'error': 'no preview dir found for kind', 'pattern': pattern}), 404
+    else:
+        path = '/tmp/traffic' if kind == 'traffic' else '/tmp/segmentation'
+    if not os.path.isdir(path):
+        return jsonify({'ok': False, 'error': 'directory does not exist', 'path': path}), 404
+    files = []
+    try:
+        for name in sorted(os.listdir(path)):
+            fp = os.path.join(path, name)
+            if not os.path.isfile(fp):
+                continue
+            try:
+                sz = os.path.getsize(fp)
+            except Exception:
+                sz = 0
+            files.append({'file': name, 'size': sz})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({'ok': True, 'kind': kind, 'path': path, 'files': files})
+
+@app.route('/api/open_script_file', methods=['GET'])
+def api_open_script_file():
+    """Return (truncated) contents of a requested script file.
+
+    Query params: kind=traffic|segmentation, scope=runtime|preview, file=<filename>
+    """
+    kind = request.args.get('kind','traffic').lower()
+    scope = request.args.get('scope','runtime').lower()
+    fname = request.args.get('file') or ''
+    if kind not in ('traffic','segmentation'):
+        return jsonify({'ok': False, 'error': 'invalid kind'}), 400
+    if not fname or '/' in fname or '..' in fname:
+        return jsonify({'ok': False, 'error': 'invalid filename'}), 400
+    if scope == 'preview':
+        import tempfile, glob
+        base = tempfile.gettempdir()
+        pattern = 'core-topo-preview-traffic-*' if kind=='traffic' else 'core-topo-preview-seg-*'
+        candidates = sorted(glob.glob(os.path.join(base, pattern)), key=lambda p: os.path.getmtime(p), reverse=True)
+        path = candidates[0] if candidates else None
+    else:
+        path = '/tmp/traffic' if kind == 'traffic' else '/tmp/segmentation'
+    if not path or not os.path.isdir(path):
+        return jsonify({'ok': False, 'error': 'dir not found', 'path': path}), 404
+    fp = os.path.join(path, fname)
+    if not os.path.isfile(fp):
+        return jsonify({'ok': False, 'error': 'file not found', 'file': fname}), 404
+    try:
+        with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read(8000)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({'ok': True, 'file': fname, 'path': path, 'content': content, 'truncated': len(content)==8000})
+
+@app.route('/api/download_scripts', methods=['GET'])
+def api_download_scripts():
+    """Download a zip of segmentation or traffic scripts (preview or runtime).
+
+    Query: kind=traffic|segmentation scope=runtime|preview
+    """
+    kind = request.args.get('kind','traffic').lower()
+    scope = request.args.get('scope','runtime').lower()
+    if kind not in ('traffic','segmentation'):
+        return jsonify({'ok': False, 'error': 'invalid kind'}), 400
+    if scope not in ('runtime','preview'):
+        return jsonify({'ok': False, 'error': 'invalid scope'}), 400
+    # Resolve directory
+    if scope == 'runtime':
+        base_dir = '/tmp/traffic' if kind=='traffic' else '/tmp/segmentation'
+    else:
+        import tempfile, glob
+        pattern = 'core-topo-preview-traffic-*' if kind=='traffic' else 'core-topo-preview-seg-*'
+        cands = sorted(glob.glob(os.path.join(tempfile.gettempdir(), pattern)), key=lambda p: os.path.getmtime(p), reverse=True)
+        base_dir = cands[0] if cands else None
+    if not base_dir or not os.path.isdir(base_dir):
+        return jsonify({'ok': False, 'error': 'directory not found'}), 404
+    import io, zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for root, _dirs, files in os.walk(base_dir):
+            for f in files:
+                fp = os.path.join(root, f)
+                # avoid huge non-script artifacts except summary json
+                if not (f.endswith('.py') or f.endswith('.json')):
+                    continue
+                arc = os.path.relpath(fp, base_dir)
+                try:
+                    zf.write(fp, arc)
+                except Exception:
+                    continue
+    buf.seek(0)
+    from flask import send_file as _send_file
+    filename = f"{kind}_{scope}_scripts.zip"
+    return _send_file(buf, mimetype='application/zip', as_attachment=True, download_name=filename)
 
 
 @app.route('/api/plan/approve', methods=['POST'])
@@ -3140,7 +3250,16 @@ def run_cli_async():
     log_path = os.path.join(out_dir, f'cli-{run_id}.log')
     env = os.environ.copy(); env["PYTHONUNBUFFERED"] = "1"
     # Redirect output directly to log file for easy tailing
-    log_f = open(log_path, 'w', encoding='utf-8')
+    # Open log file in line-buffered mode so subprocess logging (stdout+stderr) flushes promptly for UI streaming
+    try:
+        log_f = open(log_path, 'w', encoding='utf-8', buffering=1)
+    except Exception:
+        # Fallback to default buffering if line buffering not available
+        log_f = open(log_path, 'w', encoding='utf-8')
+    try:
+        app.logger.debug("[async] Opened CLI log (line-buffered) at %s", log_path)
+    except Exception:
+        pass
     app.logger.info("[async] Starting CLI; log: %s", log_path)
     # derive core host/port (best-effort) from synchronous parse
     core_host = '127.0.0.1'
@@ -4104,8 +4223,18 @@ def stream_logs(run_id: str):
     log_path = meta.get('log_path')
 
     def generate():
-        # Tail the log file as it is written
+        # 1) Send existing backlog first for immediate context
         last_pos = 0
+        try:
+            with open(log_path, 'r', encoding='utf-8', errors='ignore') as f_init:
+                backlog = f_init.read()
+                last_pos = f_init.tell()
+            if backlog:
+                for line in backlog.splitlines():
+                    yield f"data: {line}\n\n"
+        except FileNotFoundError:
+            pass
+        # 2) Tail incremental additions
         while True:
             try:
                 with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:

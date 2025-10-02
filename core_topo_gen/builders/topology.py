@@ -8,6 +8,7 @@ from core.api.grpc.wrappers import NodeType, Position, Interface
 
 from ..types import NodeInfo, ServiceInfo, RoutingInfo
 from ..utils.allocators import UniqueAllocator, SubnetAllocator, make_subnet_allocator
+from ..planning.router_host_plan import plan_router_counts  # new pure-planning helper
 from ..utils.grpc_helpers import safe_create_session
 from ..utils.services import (
     map_role_to_node_type,
@@ -843,48 +844,19 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             pass
 
     total_hosts = sum(role_counts.values())
-    # Density-derived routers use only the base host pool (exclude additive Count rows) as per updated semantics
-    effective_base = max(0, int(base_host_pool or 0))
-    # Support count-only routers: compute count allocations up front
+    # Use shared pure-planning helper for router counts
+    _plan_stats = plan_router_counts(role_counts, routing_density, routing_items, base_host_pool, approved_plan)
+    router_count = _plan_stats['router_count']
+    density_router_count = _plan_stats['density_router_count']
+    count_router_count = _plan_stats['count_router_count']
+    effective_base = _plan_stats['effective_base']
     try:
-        count_router_count = sum(int(getattr(ri, 'abs_count', 0) or 0) for ri in (routing_items or []))
+        logger.debug(
+            "Router planning (shared helper): base=%s rd_raw=%.4f rd_clamped=%.4f weight_based=%s count_based=%s final=%s total_hosts=%s override=%s", 
+            _plan_stats['effective_base'], _plan_stats['rd_raw'], _plan_stats['rd_clamped'], _plan_stats['weight_based'], count_router_count, router_count, _plan_stats['total_hosts'], _plan_stats['preview_router_override']
+        )
     except Exception:
-        count_router_count = 0
-
-    # Determine routers from routing_density. Backward compatibility: if routing_density > 1 treat value
-    # as an absolute desired router count (pre-existing tests used integers like 5). If 0 < routing_density <= 1,
-    # treat as fractional density of effective_base. Always additive with explicit abs_count rows (capped by hosts).
-    density_router_count = 0
-    density_router_count_effective = 0
-    abs_density_component = 0
-    frac_density_component = 0
-    if routing_density and routing_density > 0 and effective_base >= 0:
-        try:
-            rd = float(routing_density)
-        except Exception:
-            rd = 0.0
-        if rd > 1.0:  # absolute count interpretation
-            abs_density_component = int(rd)
-        else:
-            d = max(0.0, min(1.0, rd))
-            desired = effective_base * d
-            import math as _math
-            frac_density_component = int(_math.floor(desired + 1e-9))
-        density_router_count = abs_density_component + frac_density_component
-        # Cap density-derived portion to effective_base (can't exceed host pool for density dimension)
-        density_router_count = max(0, min(effective_base, density_router_count))
-        density_router_count_effective = density_router_count
-        try:
-            logger.debug(
-                "Router density computation: base=%s rd=%.4f abs_part=%s frac_part=%s allocated=%s", 
-                effective_base, rd, abs_density_component, frac_density_component, density_router_count
-            )
-        except Exception:
-            pass
-
-    # Additive total (density-derived + explicit count-based) with final cap at total host count
-    router_count = min(total_hosts, density_router_count + count_router_count)
-
+        pass
     # If no routers requested (no density, no counts) OR no hosts, fall back to simple star topology (no routers)
     if router_count <= 0 or total_hosts == 0:
         logger.info("No routers created: routing density=%s, count_router_count=%s, total_hosts=%s", routing_density, count_router_count, total_hosts)
@@ -925,14 +897,14 @@ def build_segmented_topology(core: client.CoreGrpcClient,
     routers: List[NodeInfo] = []
     # Store stats for later reporting (attached to session to avoid changing return signature)
     try:
-        setattr(session, "topo_stats", {
-            "routers_density_count": density_router_count_effective if 'density_router_count_effective' in locals() else density_router_count,
-            "routers_count_count": count_router_count,
-            "routers_total_planned": router_count,
-        })
+            setattr(session, "topo_stats", {
+                "routers_density_count": density_router_count,
+                "routers_count_count": count_router_count,
+                "routers_total_planned": router_count,
+            })
     except Exception:
         pass
-    logger.debug("Router planning: density=%s density_raw=%s count_count=%s final=%s total_hosts=%s", routing_density, density_router_count, count_router_count, router_count, total_hosts)
+    logger.debug("Router planning: density=%s weight_based=%s count_based=%s final=%s total_hosts=%s", routing_density, density_router_count, count_router_count, router_count, total_hosts)
     router_nodes: Dict[int, object] = {}
     router_objs: List[object] = []
     host_nodes_by_id: Dict[int, object] = {}
@@ -1936,8 +1908,17 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                         r_if = Interface(id=r_ifid, name=r_base, ip4=r_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
                         sw_if = Interface(id=0, name=f"rsw{seq}-r{rid}", ip4=sw_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
                         safe_add_link(session, sw_node, r, iface1=sw_if, iface2=r_if)
-                        # Host LAN /28
-                        lan_net2 = subnet_alloc.next_random_subnet(28)
+                        # Host LAN dynamic sizing (/30+/28+/27... with 25% headroom over (hosts + 2 infra))
+                        def _lan_prefix_for_hosts(count: int, reserve: int = 2, cap: int = 24) -> int:
+                            needed = int((count + reserve) * 1.25 + 0.9999)
+                            for p in range(30, cap + 1):  # /30 smallest up to /24
+                                size = 1 << (32 - p)
+                                usable = size - 2
+                                if usable >= needed:
+                                    return p
+                            return cap
+                        lan_pref = _lan_prefix_for_hosts(2)  # this segment always two hosts (h_a, h_b)
+                        lan_net2 = subnet_alloc.next_random_subnet(lan_pref)
                         lan2_hosts = list(lan_net2.hosts())
                         if len(lan2_hosts) < 3:  # need gateway + 2 hosts
                             try:
@@ -2195,10 +2176,13 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                 #   Allow when base policy (connectivity mode) is 'Max'.
                 #   Allow limited (degree-budgeted) augmentation for 'Uniform'.
                 #   Disallow for ('Min','Exact','Random','NonUniform','Injected') to preserve preview edges.
-                allow_mesh = base_policy in ('Max',)
+                #   Additionally: if no base_policy metadata exists (tests / legacy) honor explicit router_mesh_style.
+                # If router_mesh_style explicitly provided (tests / legacy), honor it regardless of base_policy.
+                explicit_style = bool(router_mesh_style)
+                allow_mesh = (base_policy in ('Max',)) or explicit_style
                 allow_uniform = base_policy == 'Uniform'
                 if not allow_mesh and not allow_uniform:
-                    continue  # skip enrichment
+                    continue
                 style = (router_mesh_style or "full").lower()
                 ordered = list(group_nodes)
                 # Budget: do not exceed target_degree (if specified) by more than +1 when adding protocol links
@@ -2232,7 +2216,12 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                         remaining_budget -= 1
                 elif style == 'tree':
                     # Tree style: ensure no extra edges beyond existing spanning tree -> no candidate pairs
-                    candidate_pairs = []
+                    # Build simple chain if none exist yet
+                    if explicit_style and not any(k[0] in {r.id for r in ordered} and k[1] in {r.id for r in ordered} for k in existing_router_links):
+                        for i in range(len(ordered)-1):
+                            candidate_pairs.append((ordered[i], ordered[i+1]))
+                    else:
+                        candidate_pairs = []
                 else:
                     # Instead of full mesh, shuffle all potential pairs and apply budget
                     for i in range(len(ordered)):
@@ -2243,6 +2232,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                     if not allow_mesh and allow_uniform and target_degree > 0:
                         # Filter to pairs where at least one endpoint below target_degree
                         candidate_pairs = [p for p in candidate_pairs if (current_degrees[p[0].id] < target_degree or current_degrees[p[1].id] < target_degree)]
+                logger.debug("[mesh-debug] proto=%s style=%s allow_mesh=%s base_policy=%s candidates=%d existing_r2r=%d", proto, style, allow_mesh, base_policy, len(candidate_pairs), len(existing_router_links))
                 for a, b in candidate_pairs:
                     key = (min(a.id, b.id), max(a.id, b.id))
                     if key in existing_router_links:
@@ -2449,6 +2439,29 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                     continue
             if counts:
                 topo_stats['router_host_counts'] = counts
+        # Attach R2S grouping preview if not already attached (reuse shared helper)
+        if not hasattr(session, 'r2s_grouping_preview'):
+            try:
+                from ..planning.router_host_plan import plan_r2s_grouping  # local import to avoid cycles
+                # Build minimal host list for helper
+                _hosts_for_group = hosts if 'hosts' in locals() else []  # type: ignore
+                # host_router_map is defined earlier in segmented path; if missing, synthesize round-robin
+                if 'host_router_map' not in locals() or not isinstance(host_router_map, dict):
+                    synth_map: Dict[int,int] = {}
+                    seq = 0
+                    for h in _hosts_for_group:
+                        seq += 1
+                        if router_count > 0:
+                            synth_map[h.node_id] = ((seq-1) % router_count) + 1
+                    host_router_map_local = synth_map
+                else:
+                    host_router_map_local = host_router_map  # type: ignore
+                grouping_seed = GLOBAL_RANDOM_SEED if GLOBAL_RANDOM_SEED is not None else random.randint(1,2**31-1)
+                grouping_out = plan_r2s_grouping(router_count, host_router_map_local, _hosts_for_group, routing_items, None, grouping_seed, ip4_prefix=ip4_prefix, ip_mode=ip_mode, ip_region=ip_region)  # type: ignore
+                setattr(session, 'r2s_grouping_preview', grouping_out.get('grouping_preview'))
+                setattr(session, 'r2s_policy_preview', grouping_out.get('computed_r2s_policy'))
+            except Exception:
+                pass
         setattr(session, 'topo_stats', topo_stats)
     except Exception:
         pass

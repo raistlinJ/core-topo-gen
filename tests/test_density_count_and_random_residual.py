@@ -1,5 +1,5 @@
 import os, tempfile, xml.etree.ElementTree as ET
-from core_topo_gen.parsers.xml_parser import parse_node_info
+from core_topo_gen.parsers.node_info import parse_node_info
 
 def build_xml(weight_rows, count_for_density=10, counts=None):
     counts = counts or []
