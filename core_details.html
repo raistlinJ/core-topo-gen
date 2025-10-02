@@ -29,121 +29,11 @@
         <div class="d-flex flex-column flex-sm-row align-items-sm-center gap-2">
           <div class="btn-group btn-group-sm">
             <a class="btn btn-outline-secondary" href="{{ url_for('download_report') }}?path={{ xml_path | urlencode }}">Download XML</a>
-            <button class="btn btn-outline-primary" id="createPlanBtn" type="button" data-xml="{{ xml_path }}" title="Compute a plan (no build)">Create Plan</button>
-            <button class="btn btn-outline-success d-none" id="approvePlanBtn" type="button" title="Approve the last computed plan">Approve Plan</button>
+            <button class="btn btn-outline-primary" id="createPlanBtn" type="button" data-xml="{{ xml_path }}" title="Show Full Preview JSON">Full Preview</button>
           </div>
-          <form id="runPlanForm" action="{{ url_for('run_with_plan') }}" method="POST" class="d-flex align-items-center gap-2">
-            <input type="hidden" name="xml_path" value="{{ xml_path }}">
-            <input type="hidden" name="plan_path" id="approvedPlanPathInput" value="{{ approved_plan_path or '' }}">
-            <div class="form-check form-check-inline mb-0">
-              <input class="form-check-input" type="checkbox" value="on" id="strictPlanChk" name="strict_plan">
-              <label class="form-check-label small" for="strictPlanChk" title="Abort build on any plan drift">Strict</label>
-            </div>
-            <button class="btn btn-outline-warning btn-sm {% if not approved_plan_path %}d-none{% endif %}" id="runWithPlanBtn" type="submit" {% if not approved_plan_path %}disabled{% endif %} title="Run CORE build using approved plan">Run With Plan</button>
-          </form>
-          <div id="approvedPlanStatus" class="small {% if approved_plan_path %}text-success{% else %}text-muted{% endif %}">
-            {% if approved_plan_path %}
-              <span class="me-1">Approved plan ready</span>
-              <button type="button" class="btn btn-link btn-sm p-0 align-baseline" id="viewApprovedPlanBtn">view</button>
-              <button type="button" class="btn btn-link btn-sm text-danger p-0 ms-2 align-baseline" id="deleteApprovedPlanBtn" title="Delete approved plan">delete</button>
-            {% else %}
-              No approved plan
-            {% endif %}
-          </div>
+          <div class="small text-muted">Legacy plan approval workflow removed; use Full Preview + Run.</div>
         </div>
-      {% endif %}
-    </div>
-
-    {% if xml_path %}
-      <div class="mb-2">
-        {% if valid %}
-          <span class="badge text-bg-success">VALID</span>
-        {% else %}
-          <span class="badge text-bg-danger">INVALID</span>
-        {% endif %}
-      </div>
-
-      {% if not valid %}
-        <div class="alert alert-danger" role="alert" style="white-space: pre-wrap;">{{ errors }}</div>
-      {% endif %}
-
-      {% if summary %}
-      <div class="card mb-3">
-        <div class="card-header"><strong>Summary</strong></div>
-        <div class="card-body">
-          <ul class="mb-0">
-            <li>Nodes: {{ summary.nodes_count or summary.devices_count or 0 }}</li>
-            {% if summary.switches_count is defined %}
-            <li>Switches: {{ summary.switches_count }}{% if summary.switches and summary.switches|length>0 %} ({{ summary.switches|join(', ') }}){% endif %}</li>
-            {% endif %}
-            <li>Networks: {{ summary.networks_count or 0 }}</li>
-            <li>Links (count): {{ summary.links_count or 0 }}{% if summary.links_sample is defined %} (showing sample: {{ summary.links_sample or 0 }}){% endif %}</li>
-            <li>Services (total occurrences): {{ summary.services_count or 0 }}</li>
-            {% if summary.file_size_bytes %}
-            <li>File size: {{ summary.file_size_bytes }} bytes</li>
-            {% endif %}
-            {% if summary.router_degree_stats %}
-            <li>Router Degrees: min {{ summary.router_degree_stats.min }}, avg {{ summary.router_degree_stats.avg }}, max {{ summary.router_degree_stats.max }}</li>
-            {% endif %}
-            {% if summary.routing_edges_policies and summary.routing_edges_policies|length > 0 %}
-            <li>Connectivity Policies: {{ summary.routing_edges_policies|length }} routing item(s)
-              <details class="mt-1">
-                <summary class="small">Show items</summary>
-                <div class="small mt-1" style="max-height:180px;overflow:auto;">
-                  {% for pol in summary.routing_edges_policies %}
-                    <div class="mb-1">
-                      <strong>{{ pol.protocol or 'Protocol' }}</strong>:
-                      R2R=<span class="text-nowrap">{{ pol.r2r_mode or 'Random' }}{% if pol.edges is not none %}({{ pol.edges }}){% endif %}</span>
-                      {% if pol.r2s_mode or pol.r2s_edges %}
-                        &middot; R2S=<span class="text-nowrap">{{ pol.r2s_mode or 'Random' }}{% if pol.r2s_edges is not none %}({{ pol.r2s_edges }}){% endif %}</span>
-                      {% endif %}
-                    </div>
-                  {% endfor %}
-                </div>
-              </details>
-            </li>
-            {% endif %}
-          </ul>
-        </div>
-      </div>
-
-
-      <!-- Topology Graph Card (auto-generated from summary.nodes / linked_nodes). Render even if invalid to aid debugging -->
-      {# Render the graph card if we have any indication of topology data: nodes, switches, switch_nodes, or links_detail #}
-      {% if summary and ( (summary.nodes and summary.nodes|length > 0) or (summary.switch_nodes and summary.switch_nodes|length > 0) or (summary.links_detail and summary.links_detail|length > 0) ) %}
-      <div class="card mb-3" id="topologyGraphCard">
-        <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
-          <div class="d-flex align-items-center gap-2">
-            <strong>Graph View</strong>
-            <div class="btn-group btn-group-sm" role="group">
-              <button type="button" class="btn btn-outline-secondary" id="graphResetBtn" title="Reset zoom & layout">Reset</button>
-              <button type="button" class="btn btn-outline-secondary" id="graphClusterBtn" title="Cluster by type">Cluster: Off</button>
-            </div>
-            <div class="btn-group btn-group-sm" role="group">
-              <button type="button" class="btn btn-outline-secondary" id="graphExportSvgBtn" title="Download SVG">SVG</button>
-              <button type="button" class="btn btn-outline-secondary" id="graphExportPngBtn" title="Download PNG">PNG</button>
-            </div>
-          </div>
-          <div class="small text-muted" id="graphStats"></div>
-        </div>
-        <div class="card-body p-2">
-          <div id="topologyGraph" style="width:100%; height:460px; position:relative; border:1px solid #e0e0e0; border-radius:4px; background:#fafafa; overflow:hidden;">
-            <div class="position-absolute top-50 start-50 translate-middle text-muted" id="graphLoading">Rendering graph...</div>
-            <div class="position-absolute top-50 start-50 translate-middle text-muted d-none" id="graphNoData" style="max-width:70%; text-align:center;">
-              <div class="mb-2">No device nodes were parsed from this XML.</div>
-              <div class="small text-muted">If you expected a topology graph, the parser may have classified nodes differently or the XML structure is missing the <code>devices</code>/<code>nodes</code> section. Links detected: <span id="graphNoDataLinksCount">0</span>.</div>
-            </div>
-            <div class="position-absolute top-0 end-0 m-2 p-2 bg-white border rounded shadow-sm small" id="graphLegend" style="max-width:220px;">
-              <div class="fw-semibold mb-1">Legend</div>
-              <div id="graphLegendItems" class="d-flex flex-wrap gap-2"></div>
-              <div class="mt-1 text-muted" style="font-size:0.7rem;">Circle size = services count</div>
-            </div>
-            <div id="graphMiniMap" class="position-absolute bg-white border rounded shadow-sm" style="bottom:8px; right:8px; width:160px; height:120px; overflow:hidden; cursor:grab;">
-              <svg width="160" height="120"></svg>
-            </div>
-            <div id="graphTooltip" class="graph-tooltip hidden"></div>
-          </div>
-          <div class="form-text mt-1">Drag nodes to reposition (they’ll stay pinned), scroll or pinch to zoom, and drag the background to pan. Hover highlights neighbors. Use Reset to clear zoom & unpin positions; Cluster groups by type; SVG/PNG export the view.</div>
+      <!-- Removed legacy approval script block -->
           {% if summary.__invalid %}
             <div class="alert alert-warning mt-2 py-1 px-2 mb-0" style="font-size:0.75rem;">XML did not fully validate; graph derived from best-effort parse.</div>
           {% endif %}
@@ -251,29 +141,6 @@
 {% block extra_scripts %}
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 <script src="{{ url_for('static', filename='core_graph.js') }}"></script>
-<div class="modal fade" id="planModal" tabindex="-1" aria-labelledby="planModalLabel" aria-hidden="true">
-  <div class="modal-dialog modal-lg modal-dialog-scrollable">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h5 class="modal-title" id="planModalLabel">Plan Preview</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-      </div>
-      <div class="modal-body">
-        <div id="planLoading" class="text-muted">Computing plan...</div>
-        <pre id="planJson" class="small bg-light p-2 border rounded d-none" style="max-height:420px; overflow:auto; font-size:0.7rem;"></pre>
-        <div id="planViolationsWrap" class="mt-2 d-none">
-          <div class="alert alert-warning py-2 mb-0"><strong>Violations Detected</strong>
-            <ul id="planViolationsList" class="mb-0 small"></ul>
-          </div>
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-        <button type="button" class="btn btn-success d-none" id="modalApproveBtn">Approve Plan</button>
-      </div>
-    </div>
-  </div>
-</div>
 {% if summary and (summary.nodes or summary.switches or summary.switch_nodes) %}
   {% set base_nodes = summary.nodes or [] %}
   {% set extra_switch_nodes = [] %}
@@ -418,10 +285,6 @@
     const delApprovedBtn = document.getElementById('deleteApprovedPlanBtn');
     let currentPlanPath = null; // preview path
     let approvedPlanPath = approvedInput?.value || null;
-    function showModal(){
-      const mEl = document.getElementById('planModal');
-      if (!mEl) return; (new bootstrap.Modal(mEl)).show();
-    }
     function hydrateApprovedState(){
       if(!approvedPlanPath){ return; }
       if(runBtn){ runBtn.classList.remove('d-none'); runBtn.disabled=false; }
@@ -438,7 +301,7 @@
       planViolWrap.classList.add('d-none');
       modalApproveBtn.classList.add('d-none');
       planLoadingEl.textContent = 'Computing plan...';
-      showModal();
+  // Modal removed; legacy preview display suppressed
       fetch('/api/plan/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ xml_path: xml }) })
         .then(r => r.json())
         .then(data => {
@@ -473,7 +336,7 @@
     function wireApprovedPlanButtons(){
       const vBtn = document.getElementById('viewApprovedPlanBtn');
       const dBtn = document.getElementById('deleteApprovedPlanBtn');
-      if(vBtn){ vBtn.onclick = ()=>{ if(!approvedPlanPath){ return; } fetch('/api/plan/status?xml_path='+encodeURIComponent(createBtn.getAttribute('data-xml'))).then(r=>r.json()).then(d=>{ if(d.plan_summary){ planJsonEl.textContent = JSON.stringify(d.plan_summary,null,2); planJsonEl.classList.remove('d-none'); planViolWrap.classList.add('d-none'); planLoadingEl.classList.add('d-none'); showModal(); } else { alert('No plan summary available'); } }); } }
+  if(vBtn){ vBtn.onclick = ()=>{ /* legacy approved plan view removed */ } }
       if(dBtn){ dBtn.onclick = ()=>{ if(!approvedPlanPath) return; if(!confirm('Delete approved plan?')) return; fetch('/api/plan/delete', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ plan_path: approvedPlanPath }) }).then(r=>r.json()).then(resp=>{ if(resp.ok){ approvedPlanPath=null; approvedInput.value=''; runBtn.classList.add('d-none'); runBtn.disabled=true; approvedStatus.classList.remove('text-success'); approvedStatus.classList.add('text-muted'); approvedStatus.textContent='No approved plan'; } else { alert('Delete failed: '+(resp.error||'')); } }); } }
     }
     wireApprovedPlanButtons();

@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format loosely follows Keep a Changelog and semantic versioning (when practical).
 
+## [Unreleased]
+### Removed / Deprecated
+- Approval workflow (approved plan JSON, `/api/plan/approve*` endpoints, CLI flags `--approve-plan` / `--use-plan`).
+- R2R/R2S edge and host/switch injection from stored full preview; builds now always derive topology directly from current scenario + seed.
+- Plan drift detection and strict plan enforcement options.
+
+### Changed
+- Report no longer renders the "Plan Summary (Phased Build)" section; retained optional drift lines under a neutral "Planning Drift" heading if metadata includes them.
+- Simplified CLI: always performs a fresh plan; seeds are the sole reproducibility mechanism.
+
+### Added
+
+### Migration Notes
+Remove any automation persisting an approved plan JSON. Replace with deterministic seeds captured from the preview. Switch any calls to removed endpoints to `/api/plan/preview_full` and execute builds without supplying historical plan artifacts.
+
 ## [0.3.0] - 2025-09-26
 ### Added
 

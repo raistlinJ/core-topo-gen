@@ -23,16 +23,15 @@ def test_plan_router_counts_count_only():
     assert stats['density_router_count'] == 0
 
 
-def test_plan_router_counts_preview_override():
+def test_plan_router_counts_preview_override_removed():
     rc = {'Server': 5}
     class R: pass
-    # Count-only single router declared, preview wants 2
     r1 = R(); r1.abs_count = 1; r1.factor = 0.0
-    approved = {'full_preview': {'routers': [{}, {}]}}
-    stats = plan_router_counts(rc, routing_density=0.5, routing_items=[r1], base_host_pool=5, approved_preview=approved)
-    # No weight-based items, so override should elevate to 2 (but not exceed hosts)
-    assert stats['router_count'] == 2
-    assert stats['preview_router_override'] == 2
+    stats = plan_router_counts(rc, routing_density=0.5, routing_items=[r1], base_host_pool=5)
+    # With approval removed, router count should remain the declared count (1)
+    assert stats['router_count'] == 1
+    # preview_router_override field removed; ensure no unexpected fields appear
+    assert 'preview_router_override' not in stats
 
 
 def test_plan_router_counts_zero_hosts():

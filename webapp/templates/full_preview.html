@@ -512,20 +512,6 @@
   setTimeout(()=>{ applySegmentationRowStyling(); applyTrafficRowStyling(); }, 0);
   }
   if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
-  // Approve preview
-  document.getElementById('approvePreviewBtn')?.addEventListener('click', async ()=>{
-    const statusEl = document.getElementById('approveStatus');
-    statusEl.textContent='Approving...';
-    try {
-      const res = await fetch('/api/plan/approve_full_preview', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ xml_path: '{{ xml_path }}', full_preview: previewData }) });
-      const js = await res.json();
-      if(!js.ok){ statusEl.textContent='Failed: '+(js.error||''); statusEl.classList.add('text-danger'); }
-      else {
-        statusEl.textContent='Approved. Plan: '+js.approved_path;
-        statusEl.classList.remove('text-danger'); statusEl.classList.add('text-success');
-      }
-    } catch(e){ statusEl.textContent='Error: '+e; statusEl.classList.add('text-danger'); }
-  });
   // Export JSON
   document.getElementById('exportJsonBtn')?.addEventListener('click', ()=>{
     try {

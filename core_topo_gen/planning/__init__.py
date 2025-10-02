@@ -2,8 +2,7 @@
 
 Purpose: provide small, focused computation modules that derive counts and
 allocation plans for each scenario section (hosts, routers, services, etc.).
-This allows the CLI, web preview, and phased builders to share consistent
-semantics while enabling fine-grained unit tests.
+This allows the CLI and web full preview to share consistent semantics while enabling fine-grained unit tests.
 """
 
 from .router_plan import compute_router_plan  # noqa: F401

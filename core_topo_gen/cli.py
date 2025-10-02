@@ -14,10 +14,6 @@ from .parsers.services import parse_services
 from .utils.segmentation import apply_preview_segmentation_rules
 from .utils.allocation import compute_role_counts
 from .builders.topology import build_star_from_roles, build_segmented_topology, build_multi_switch_topology
-try:
-    from .builders.topology_phased import build_segmented_topology_phased
-except Exception:  # fallback if phased file missing
-    build_segmented_topology_phased = None
 from .utils.traffic import generate_traffic_scripts
 from .utils.report import write_report
 from .utils.vuln_process import (
@@ -76,11 +72,9 @@ def main():
     ap.add_argument("--verbose", action="store_true", help="Enable debug logging")
     ap.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducible topology randomness")
     ap.add_argument("--preview", action="store_true", help="Parse and plan only; output plan summary JSON and exit 0")
-    ap.add_argument("--approve-plan", action="store_true", help="If set with --preview, also emit an approval hint (no build)")
     ap.add_argument("--preview-full", action="store_true", help="Generate a full dry-run plan (routers, hosts, IPs, services, vulnerabilities, segmentation) without contacting CORE; implies --preview style output")
     ap.add_argument("--plan-output", help="Path to write computed plan JSON (preview or build)")
-    ap.add_argument("--use-plan", help="Path to previously approved plan JSON to drive build (skip recompute)")
-    ap.add_argument("--strict-plan", action="store_true", help="Abort build on any plan drift (default: warn only)")
+    # Preview always recomputes (plan reuse removed)
     ap.add_argument(
         "--router-mesh",
         choices=["full", "ring", "tree"],
@@ -146,15 +140,7 @@ def main():
         except Exception:
             pass
 
-    approved_plan = None
-    if args.use_plan:
-        import json, sys
-        try:
-            with open(args.use_plan, 'r', encoding='utf-8') as pf:
-                approved_plan = json.load(pf)
-        except Exception as e:
-            print(f"ERROR: failed to load plan file {args.use_plan}: {e}", file=sys.stderr)
-            return
+    # Single-pass planning/build
 
     # Unified planning via orchestrator (still parse node_info early for some legacy metadata requirements)
     density_base, weight_items, count_items, services = parse_node_info(args.xml, args.scenario)
@@ -245,28 +231,7 @@ def main():
                 vulnerabilities_plan = vplan
         except Exception:
             pass
-        if approved_plan:
-            from .planning.pool import AllocationPool
-            plan_core = approved_plan.get('plan') if 'plan' in approved_plan else approved_plan
-            pool = AllocationPool(
-                hosts_total=plan_core.get('hosts_total', sum(role_counts.values())),
-                role_counts=role_counts,
-                routers_planned=plan_core.get('routers_planned', prelim_router_count),
-                services_plan=service_plan,
-                routing_plan=routing_plan,
-                r2r_policy=plan_core.get('r2r_policy'),
-                vulnerabilities_plan=plan_core.get('vulnerabilities_plan'),
-            )
-            pool.notes.append('reconstructed_from_use_plan')
-            try:
-                fp = approved_plan.get('full_preview')
-                if fp:
-                    pool.full_preview = fp
-                    pool.notes.append('full_preview_attached')
-            except Exception:
-                pass
-        else:
-            pool = build_initial_pool(role_counts, prelim_router_count, service_plan, routing_plan, router_breakdown=router_plan_breakdown, r2r_policy=r2r_policy_plan, vulnerabilities_plan=vulnerabilities_plan)
+        pool = build_initial_pool(role_counts, prelim_router_count, service_plan, routing_plan, router_breakdown=router_plan_breakdown, r2r_policy=r2r_policy_plan, vulnerabilities_plan=vulnerabilities_plan)
         if args.preview or args.preview_full:
             import json, sys
             summary = pool.summarize()
@@ -332,8 +297,6 @@ def main():
                         json.dump(out, wf, indent=2, sort_keys=True)
                 except Exception as e:
                     print(f"WARN: failed to write plan file {args.plan_output}: {e}", file=sys.stderr)
-            if args.approve_plan:
-                print("-- To proceed, rerun with --use-plan plan.json (after saving) to build the CORE scenario --")
             return
         else:
             if args.plan_output:
@@ -479,92 +442,27 @@ def main():
         pass
     # If any routing item carries abs_count>0, we should build a segmented topology even if density==0
     has_routing_counts = any(getattr(ri, 'abs_count', 0) and int(getattr(ri, 'abs_count', 0)) > 0 for ri in (routing_items or []))
-    phased_mode = bool(approved_plan) and build_segmented_topology_phased is not None
+    # Always build directly from current scenario plan (phased path removed)
     if (routing_density and routing_density > 0) or has_routing_counts:
-        if phased_mode:
-            # Reconstruct AllocationPool skeleton from approved_plan (minimal fields needed)
-            from .planning.pool import AllocationPool
-            from .planning.constraints import enforce_no_drift
-            try:
-                plan_sum = approved_plan.get('plan_summary') or approved_plan  # heuristic
-            except Exception:
-                plan_sum = approved_plan
-            try:
-                routers_planned = int(plan_sum.get('routers_planned') or plan_sum.get('routers_total_planned') or 0)
-            except Exception:
-                routers_planned = 0
-            pool = AllocationPool(
-                hosts_total=sum(role_counts.values()),
-                role_counts=role_counts,
-                routers_planned=routers_planned,
-                services_plan={},
-                routing_plan={},
-                r2r_policy=plan_sum.get('r2r_policy'),
-                vulnerabilities_plan=plan_sum.get('vulnerabilities_plan'),
-            )
-            r2s_ratio = None
-            try:
-                r2s_ratio = float(plan_sum.get('r2s_ratio_used') or plan_sum.get('r2s_policy', {}).get('ratio') or 0.0)
-            except Exception:
-                r2s_ratio = None
-            session, routers, hosts, router_protocols, docker_by_name = build_segmented_topology_phased(
-                core,
-                pool,
-                routing_density=routing_density,
-                routing_items=routing_items,
-                services=services,
-                ip4_prefix=args.prefix,
-                ip_mode=args.ip_mode,
-                ip_region=args.ip_region,
-                layout_density=args.layout_density,
-                docker_slot_plan=docker_slot_plan,
-                router_mesh_style=args.router_mesh,
-                r2s_ratio=r2s_ratio,
-            )
-            service_assignments = {}
-            # Drift enforcement (strict) using pool summary vs plan
-            actual_summary = pool.summarize()
-            drift = enforce_no_drift(plan_sum, actual_summary, strict=args.strict_plan)
-            if drift:
-                import sys, json
-                if args.strict_plan:
-                    logging.error("Plan drift detected (strict): %s", "; ".join(drift))
-                else:
-                    logging.warning("Plan drift detected (non-strict): %s", "; ".join(drift))
-                try:
-                    ts = getattr(session, 'topo_stats', {}) or {}
-                    ts['plan_drift'] = drift
-                    ts['plan_drift_strict'] = args.strict_plan
-                    setattr(session, 'topo_stats', ts)
-                except Exception:
-                    pass
-                if args.strict_plan:
-                    print(json.dumps({"plan_drift": drift, "actual": actual_summary}, indent=2), file=sys.stderr)
-                    return
-        else:
-            session, routers, hosts, service_assignments, router_protocols, docker_by_name = build_segmented_topology(
-                core,
-                role_counts,
-                routing_density=routing_density,
-                routing_items=routing_items,
-                base_host_pool=density_base,
-                services=services,
-                ip4_prefix=args.prefix,
-                ip_mode=args.ip_mode,
-                ip_region=args.ip_region,
-                layout_density=args.layout_density,
-                docker_slot_plan=docker_slot_plan,
-                router_mesh_style=args.router_mesh,
-                approved_plan=approved_plan,
-            )
+        session, routers, hosts, service_assignments, router_protocols, docker_by_name = build_segmented_topology(
+            core,
+            role_counts,
+            routing_density=routing_density,
+            routing_items=routing_items,
+            base_host_pool=density_base,
+            services=services,
+            ip4_prefix=args.prefix,
+            ip_mode=args.ip_mode,
+            ip_region=args.ip_region,
+            layout_density=args.layout_density,
+            docker_slot_plan=docker_slot_plan,
+            router_mesh_style=args.router_mesh,
+        )
         # Merge topo stats if present
         try:
             ts = getattr(session, 'topo_stats', None)
             if isinstance(ts, dict):
                 generation_meta.update(ts)
-                # Embed plan summary if phased
-                if phased_mode:
-                    generation_meta['plan_summary'] = pool.summarize() if 'pool' in locals() else {}
         except Exception:
             pass
     else:
@@ -617,29 +515,7 @@ def main():
                 logging.warning("Failed applying segmentation: %s", e)
         else:
             # Attempt preview injection if present
-            if approved_plan and approved_plan.get('full_preview'):
-                seg_prev = approved_plan['full_preview'].get('segmentation_preview') or {}
-                rules_prev = seg_prev.get('rules') or []
-                # Reuse preview-generated scripts if out_dir present
-                seg_out_dir_prev = seg_prev.get('out_dir')
-                if seg_out_dir_prev and os.path.isdir(seg_out_dir_prev):
-                    try:
-                        from .utils.segmentation import reuse_preview_segmentation
-                        seg_summary = reuse_preview_segmentation(seg_out_dir_prev, runtime_dir="/tmp/segmentation")
-                        logging.info("Reused preview segmentation scripts (%d rules) from %s", len(seg_summary.get('rules', [])), seg_out_dir_prev)
-                        rules_prev = []  # Skip pure rule injection path below since reuse performed
-                    except Exception as e_reuse:
-                        logging.warning("Preview segmentation reuse failed, falling back to rule injection: %s", e_reuse)
-                if rules_prev:
-                    try:
-                        seg_summary = apply_preview_segmentation_rules(session, rules_prev, out_dir="/tmp/segmentation")
-                        logging.info("Injected preview segmentation rules: %d", len(seg_summary.get('rules', [])))
-                    except Exception as e:
-                        logging.warning("Failed injecting preview segmentation rules: %s", e)
-                else:
-                    logging.info("No preview segmentation rules found to inject")
-            else:
-                logging.info("Segmentation disabled or unspecified; skipping")
+            logging.info("Segmentation disabled or unspecified; skipping")
     except Exception as e:
         logging.warning("Segmentation parse/apply error: %s", e)
 

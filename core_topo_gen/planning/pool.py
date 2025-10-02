@@ -21,9 +21,7 @@ class AllocationPool:
     switches_allocated: int = 0
     r2s_ratio_used: float | None = None  # persisted ratio actually applied
     notes: List[str] = field(default_factory=list)
-    # Optional full preview blob (if approved plan included one). Used for
-    # deterministic injection (e.g., precomputed R2R edges) to achieve
-    # zero-drift builds.
+    # Optional full preview blob (for deterministic previews / reporting only).
     full_preview: Dict[str, Any] | None = None
 
     def consume_hosts(self, n: int) -> bool:

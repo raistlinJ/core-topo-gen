@@ -76,38 +76,15 @@ def write_report(
     lines: List[str] = []
     lines.append(f"# Scenario Report")
     lines.append("")
-    # Plan Summary (phased builder)
+    # Drift notes (legacy phased summary removed)
     try:
-        plan_summary = None
         if metadata:
-            plan_summary = metadata.get('plan_summary') or metadata.get('planSummary')
-        if isinstance(plan_summary, dict) and plan_summary:
-            lines.append("## Plan Summary (Phased Build)")
-            try:
-                # Show key resource alignment
-                lines.append(f"- Hosts planned: {plan_summary.get('hosts_total')} | allocated: {plan_summary.get('hosts_allocated')}")
-                lines.append(f"- Routers planned: {plan_summary.get('routers_planned')} | allocated: {plan_summary.get('routers_allocated')}")
-                if plan_summary.get('r2s_ratio_used') is not None:
-                    lines.append(f"- R2S ratio used: {plan_summary.get('r2s_ratio_used')}")
-                if plan_summary.get('switches_allocated') is not None:
-                    lines.append(f"- Switches allocated: {plan_summary.get('switches_allocated')}")
-                if plan_summary.get('vulnerabilities_plan'):
-                    vt = sum((plan_summary.get('vulnerabilities_plan') or {}).values())
-                    lines.append(f"- Vulnerabilities planned: {vt} | assigned: {plan_summary.get('vulnerabilities_assigned')}")
-                if plan_summary.get('r2r_policy'):
-                    rp = plan_summary.get('r2r_policy') or {}
-                    mode = rp.get('mode') or 'n/a'
-                    tdeg = rp.get('target_degree') or 0
-                    lines.append(f"- R2R policy: mode={mode} target_degree={tdeg}")
-            except Exception:
-                pass
-            # Drift details if present
-            drift = plan_summary.get('plan_drift') or metadata.get('plan_drift') or metadata.get('preview_drift')
+            drift = metadata.get('plan_drift') or metadata.get('preview_drift')
             if drift:
-                lines.append("### Plan / Preview Drift")
+                lines.append("## Planning Drift")
                 for v in drift:
                     lines.append(f"- {v}")
-            lines.append("")
+                lines.append("")
     except Exception:
         pass
     if scenario_name:

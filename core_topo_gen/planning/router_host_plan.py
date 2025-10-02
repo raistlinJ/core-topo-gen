@@ -9,11 +9,9 @@ The builder previously embedded this logic inline. We now expose:
   plan_router_counts(...): returns a dictionary of router planning stats.
 
 Notes:
-  - `base_host_pool` should be the density base (i.e., hosts eligible for density-based
-    router derivation). When not known, callers may pass total hosts; results will still
-    be consistent with current heuristic.
-  - An `approved_preview` (full preview structure) may override router_count when no
-    weight-based routing items exist but a prior preview supplies routers.
+    - `base_host_pool` should be the density base (i.e., hosts eligible for density-based
+        router derivation). When not known, callers may pass total hosts; results will still
+        be consistent with current heuristic.
 """
 from typing import Dict, Any, List, Optional
 import random
@@ -310,7 +308,6 @@ def plan_router_counts(
     routing_density: float,
     routing_items: List[Any],
     base_host_pool: Optional[int],
-    approved_preview: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     total_hosts = sum(int(c) for c in role_counts.values())
     effective_base = max(0, int(base_host_pool or 0))
@@ -336,16 +333,7 @@ def plan_router_counts(
     # Weight-based routers
     import math as _math
     weight_based = int(_math.floor(effective_base * rd_clamped + 1e-9)) if (rd_clamped > 0 and effective_base > 0) else 0
-    preview_router_override = 0
-    if not has_weight_based and approved_preview:
-        try:
-            fp = approved_preview.get('full_preview') or {}
-            preview_router_override = int(len(fp.get('routers') or []))
-        except Exception:
-            preview_router_override = 0
     router_count = min(total_hosts, count_router_count + weight_based)
-    if preview_router_override > 0:
-        router_count = min(total_hosts, preview_router_override)
     return {
         'router_count': router_count,
         'count_router_count': count_router_count,
@@ -356,5 +344,4 @@ def plan_router_counts(
         'has_weight_based': has_weight_based,
         'effective_base': effective_base,
         'total_hosts': total_hosts,
-        'preview_router_override': preview_router_override,
     }

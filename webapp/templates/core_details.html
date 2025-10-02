@@ -29,9 +29,9 @@
         <div class="d-flex flex-column flex-sm-row align-items-sm-center gap-2">
           <div class="btn-group btn-group-sm">
             <a class="btn btn-outline-secondary" href="{{ url_for('download_report') }}?path={{ xml_path | urlencode }}">Download XML</a>
-            <button class="btn btn-outline-primary" id="createPlanBtn" type="button" data-xml="{{ xml_path }}" title="Compute a plan (direct from XML, no persistence)">Create Plan</button>
+            <button class="btn btn-outline-primary" id="createPlanBtn" type="button" data-xml="{{ xml_path }}" title="Show Full Preview JSON">Full Preview</button>
           </div>
-          <div class="small text-muted">Plan approval disabled (plan derived live from XML)</div>
+          <div class="small text-muted">Unified full preview replaces legacy plan approval workflow.</div>
         </div>
       {% endif %}
     </div>
@@ -386,63 +386,13 @@
   </script>
   <script>
   (function(){
-    const createBtn = document.getElementById('createPlanBtn');
-    const approveBtn = document.getElementById('approvePlanBtn');
-    const runBtn = document.getElementById('runWithPlanBtn');
-    const approvedInput = document.getElementById('approvedPlanPathInput');
-    const modalApproveBtn = document.getElementById('modalApproveBtn');
-    const planJsonEl = document.getElementById('planJson');
-    const planLoadingEl = document.getElementById('planLoading');
-    const planViolWrap = document.getElementById('planViolationsWrap');
-    const planViolList = document.getElementById('planViolationsList');
-    const approvedStatus = document.getElementById('approvedPlanStatus');
-    const viewApprovedBtn = document.getElementById('viewApprovedPlanBtn');
-    const delApprovedBtn = document.getElementById('deleteApprovedPlanBtn');
-    let currentPlanPath = null; // preview path
-    let approvedPlanPath = approvedInput?.value || null;
-    function showModal(){
-      const mEl = document.getElementById('planModal');
-      if (!mEl) return; (new bootstrap.Modal(mEl)).show();
-    }
-    function hydrateApprovedState(){
-      if(!approvedPlanPath){ return; }
-      if(runBtn){ runBtn.classList.remove('d-none'); runBtn.disabled=false; }
-    }
-    hydrateApprovedState();
-    function computePlan(){
-      // Legacy plan preview removed; instruct user to use full preview feature.
-      planJsonEl.classList.remove('d-none');
-      planJsonEl.textContent = 'Lightweight plan preview removed. Use Full Preview workflow.';
-      planLoadingEl.classList.add('d-none');
-      planViolWrap.classList.add('d-none');
-      approveBtn.classList.add('d-none');
-      modalApproveBtn.classList.add('d-none');
-      showModal();
-    }
-    function approvePlan(){
-      if(!currentPlanPath) return; approveBtn.disabled=true; modalApproveBtn.disabled=true;
-      fetch('/api/plan/approve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plan_path: currentPlanPath, xml_path: createBtn.getAttribute('data-xml') }) })
-        .then(r=>r.json())
-        .then(data=>{
-          approveBtn.disabled=false; modalApproveBtn.disabled=false;
-          if(!data.ok){ alert('Plan approval failed: ' + (data.error||'')); return; }
-          const approvedPath = data.approved_path; approvedInput.value = approvedPath; runBtn.classList.remove('d-none'); runBtn.disabled=false; approveBtn.classList.add('d-none'); modalApproveBtn.classList.add('d-none');
-          approvedPlanPath = approvedPath;
-          if(approvedStatus){ approvedStatus.classList.remove('text-muted'); approvedStatus.classList.add('text-success'); approvedStatus.innerHTML = '<span class="me-1">Approved plan ready</span><button type="button" class="btn btn-link btn-sm p-0 align-baseline" id="viewApprovedPlanBtn">view</button><button type="button" class="btn btn-link btn-sm text-danger p-0 ms-2 align-baseline" id="deleteApprovedPlanBtn" title="Delete approved plan">delete</button>'; }
-          try { planJsonEl.insertAdjacentHTML('beforebegin','<div class="alert alert-success py-1 mb-2">Plan approved.</div>'); } catch(e){}
-          wireApprovedPlanButtons();
-        }).catch(err=>{ approveBtn.disabled=false; modalApproveBtn.disabled=false; alert('Approve error: '+err); });
-    }
-    function wireApprovedPlanButtons(){
-      const vBtn = document.getElementById('viewApprovedPlanBtn');
-      const dBtn = document.getElementById('deleteApprovedPlanBtn');
-      if(vBtn){ vBtn.onclick = ()=>{ if(!approvedPlanPath){ return; } fetch('/api/plan/status?xml_path='+encodeURIComponent(createBtn.getAttribute('data-xml'))).then(r=>r.json()).then(d=>{ if(d.plan_summary){ planJsonEl.textContent = JSON.stringify(d.plan_summary,null,2); planJsonEl.classList.remove('d-none'); planViolWrap.classList.add('d-none'); planLoadingEl.classList.add('d-none'); showModal(); } else { alert('No plan summary available'); } }); } }
-      if(dBtn){ dBtn.onclick = ()=>{ if(!approvedPlanPath) return; if(!confirm('Delete approved plan?')) return; fetch('/api/plan/delete', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ plan_path: approvedPlanPath }) }).then(r=>r.json()).then(resp=>{ if(resp.ok){ approvedPlanPath=null; approvedInput.value=''; runBtn.classList.add('d-none'); runBtn.disabled=true; approvedStatus.classList.remove('text-success'); approvedStatus.classList.add('text-muted'); approvedStatus.textContent='No approved plan'; } else { alert('Delete failed: '+(resp.error||'')); } }); } }
-    }
-    wireApprovedPlanButtons();
-    createBtn?.addEventListener('click', computePlan);
-    approveBtn?.addEventListener('click', approvePlan);
-    modalApproveBtn?.addEventListener('click', approvePlan);
+    const btn = document.getElementById('createPlanBtn');
+    btn?.addEventListener('click', ()=>{
+      // Redirect user to the unified full preview route
+      const xml = btn.getAttribute('data-xml');
+      if(!xml){ return; }
+      window.location.href = `/full_preview?xml_path=${encodeURIComponent(xml)}`;
+    });
   })();
   </script>
   {% endblock %}

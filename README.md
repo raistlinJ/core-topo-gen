@@ -2,7 +2,7 @@
 
 Generate CORE topologies from XML scenarios via a GUI or CLI. Supports services/routing assignment, segmented or star layouts, optional traffic script generation, and per-router host grouping bounds for switch aggregation.
 
-## Recent Workflow Simplification (2025-09)
+## Recent Workflow Simplification (2025-09/10)
 
 The planning and execution workflow has been streamlined:
 
@@ -10,9 +10,9 @@ The planning and execution workflow has been streamlined:
 - Deterministic runs via an optional seed. Enter a seed before clicking Full Preview (or reuse/copy one from preview history) to reproduce identical role expansions, service/vulnerability assignments, segmentation picks, switch regrouping, and R2R/R2S edge decisions.
 - A new "Run (Seed)" button will launch the asynchronous CLI using the explicit seed input; if the seed input is empty but a preview has been generated, it reuses the preview's seed for bit‑for‑bit reproducibility.
 - Preview history (last 25) with per‑seed diffs lets you compare topology scale changes across edits or random seeds.
-- Removed concepts: plan approval, drift detection, strict plan checkbox, secondary preview buttons, intermediate plan JSON persistence.
+- Removed concepts: plan approval, drift detection mode, strict plan checkbox, secondary preview buttons, intermediate plan JSON persistence.
 
-Upgrade note: If you had automation calling removed endpoints (e.g. `/api/plan/preview`, `/api/plan/approve`, `/api/plan/status`), migrate to `/api/plan/preview_full` and drop approval logic. The backend now returns the full preview payload in a single call. See also the expanded scenario XML schema (`SCENARIO_XML_SCHEMA.md`) and updated XSD (`validation/scenarios.xsd`) which now include connectivity attributes (`r2r_mode`, `r2s_mode`, etc.) and host grouping bounds (`r2s_hosts_min`, `r2s_hosts_max`).
+Upgrade note: Legacy endpoints and flags (`/api/plan/preview`, `/api/plan/approve*`, `/api/plan/status`, `--approve-plan`, `--use-plan`) are removed. Use `/api/plan/preview_full` followed by Run; reproducibility comes from supplying a seed.
 
 ## Prerequisites
 

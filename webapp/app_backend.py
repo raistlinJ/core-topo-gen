@@ -513,7 +513,7 @@ def _append_run_history(entry: dict):
             pass
 
 
-## Removed legacy plan approval / status endpoints; full preview is now the sole planning interface.
+## Full preview is the sole planning interface.
 
 
 
@@ -2269,7 +2269,7 @@ def run_cli():
         return redirect(url_for('index'))
 
 
-# ----------------------- Planning (Preview / Approve / Run) -----------------------
+# ----------------------- Planning (Preview / Run) -----------------------
 
 
 
@@ -2556,58 +2556,6 @@ def _build_full_preview_from_plan(plan: dict, seed, r2s_hosts_min_list=None, r2s
     fp['router_plan'] = plan.get('breakdowns', {}).get('router', {})
     return fp
 
-@app.route('/api/plan/approve_full_preview', methods=['POST'])
-def api_plan_approve_full_preview():
-    """Persist a full preview JSON as an approved plan (without invoking CORE).
-
-    Request JSON: { xml_path: str, full_preview: {...} }
-    Response: { ok, plan_path, approved_path, plan_summary }
-    """
-    try:
-        payload = request.get_json(silent=True) or {}
-        xml_path = payload.get('xml_path')
-        full_prev = payload.get('full_preview') or {}
-        if not xml_path or not full_prev:
-            return jsonify({'ok': False, 'error': 'xml_path or full_preview missing'}), 400
-        xml_path = os.path.abspath(xml_path)
-        if not os.path.exists(xml_path):
-            return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
-        plan_dir = os.path.join(_outputs_dir(), 'plans')
-        approved_dir = os.path.join(plan_dir, 'approved')
-        os.makedirs(plan_dir, exist_ok=True)
-        os.makedirs(approved_dir, exist_ok=True)
-        import time, json as _json
-        ts = int(time.time())
-        seed = full_prev.get('seed') or 'na'
-        plan_filename = f'plan_from_preview_{seed}_{ts}.json'
-        plan_path = os.path.join(plan_dir, plan_filename)
-        approved_path = os.path.join(approved_dir, plan_filename)
-        plan_summary = _plan_summary_from_full_preview(full_prev)
-        plan_obj = { 'plan': plan_summary, 'full_preview': full_prev }
-        try:
-            with open(plan_path, 'w', encoding='utf-8') as pf:
-                _json.dump(plan_obj, pf, indent=2, sort_keys=True)
-            # Copy to approved directly
-            import shutil
-            shutil.copy(plan_path, approved_path)
-        except Exception as e_write:
-            return jsonify({'ok': False, 'error': f'write_failed: {e_write}'}), 500
-        # Run history entry
-        try:
-            _append_run_history({
-                'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
-                'mode': 'preview-approved',
-                'xml_path': xml_path,
-                'plan_path': approved_path,
-                'seed': seed,
-                'scenario_names': None,
-            })
-        except Exception as e_hist:
-            app.logger.warning('[preview-approved] history append failed: %s', e_hist)
-        return jsonify({'ok': True, 'plan_path': plan_path, 'approved_path': approved_path, 'plan_summary': plan_summary})
-    except Exception as e:
-        app.logger.exception('[plan.approve_full_preview] error: %s', e)
-        return jsonify({'ok': False, 'error': str(e)}), 500
 
 @app.route('/api/open_scripts', methods=['GET'])
 def api_open_scripts():
@@ -2720,242 +2668,6 @@ def api_download_scripts():
     from flask import send_file as _send_file
     filename = f"{kind}_{scope}_scripts.zip"
     return _send_file(buf, mimetype='application/zip', as_attachment=True, download_name=filename)
-
-
-@app.route('/api/plan/approve', methods=['POST'])
-def api_plan_approve():
-    """Mark a previously generated plan as approved.
-
-    Request JSON: { plan_path: "/abs/path/plan_x.json", xml_path: "/abs/path/scenarios.xml" }
-    Returns JSON with approved_path (copied) so the original ephemeral path can be discarded later.
-    """
-    try:
-        payload = request.get_json(silent=True) or {}
-        plan_path = payload.get('plan_path') or request.form.get('plan_path')
-        xml_path = payload.get('xml_path') or request.form.get('xml_path')
-        if not plan_path:
-            return jsonify({ 'ok': False, 'error': 'plan_path missing' }), 400
-        plan_path = os.path.abspath(plan_path)
-        if not os.path.exists(plan_path):
-            return jsonify({ 'ok': False, 'error': f'Plan file not found: {plan_path}' }), 404
-        # Security: ensure inside outputs/plans
-        base_plans = os.path.join(_outputs_dir(), 'plans')
-        if not plan_path.startswith(os.path.abspath(base_plans)):
-            return jsonify({ 'ok': False, 'error': 'Refusing to approve plan outside outputs/plans' }), 400
-        approved_dir = os.path.join(base_plans, 'approved')
-        os.makedirs(approved_dir, exist_ok=True)
-        import shutil, json as _json
-        # Derive new filename (retain original timestamp if present)
-        p_name = os.path.basename(plan_path)
-        approved_path = os.path.join(approved_dir, p_name)
-        shutil.copy(plan_path, approved_path)
-        plan_obj = None
-        try:
-            with open(approved_path, 'r', encoding='utf-8') as pf:
-                plan_obj = _json.load(pf)
-        except Exception:
-            plan_obj = None
-        # Merge optional full_preview provided by client (if user generated a richer full preview before approval)
-        try:
-            if isinstance(plan_obj, dict) and 'full_preview' not in plan_obj:
-                fp_client = payload.get('full_preview')
-                if fp_client:
-                    plan_obj['full_preview'] = fp_client
-                    with open(approved_path, 'w', encoding='utf-8') as pfw:
-                        _json.dump(plan_obj, pfw, indent=2, sort_keys=True)
-        except Exception as e_merge:
-            app.logger.warning('[plan.approve] failed merging full_preview: %s', e_merge)
-        _append_run_history({
-            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
-            'mode': 'plan-approved',
-            'xml_path': os.path.abspath(xml_path) if xml_path else None,
-            'plan_path': approved_path,
-            'plan_preview_path': plan_path,
-            'plan_summary': plan_obj.get('plan') if isinstance(plan_obj, dict) else None,
-        })
-        return jsonify({ 'ok': True, 'approved_path': approved_path, 'plan': (plan_obj.get('plan') if isinstance(plan_obj, dict) else None) })
-    except Exception as e:
-        app.logger.exception('[plan.approve] error: %s', e)
-        return jsonify({ 'ok': False, 'error': str(e) }), 500
-
-
-@app.route('/run_with_plan', methods=['POST'])
-def run_with_plan():
-    """Execute a build using an approved plan JSON (phased builder) and provided scenario XML.
-
-    Form fields: xml_path, plan_path, strict_plan (optional 'on')
-    Returns HTML similar to run_cli route (index.html with logs and preview/report info).
-    """
-    xml_path = request.form.get('xml_path')
-    plan_path = request.form.get('plan_path')
-    strict_plan = bool(request.form.get('strict_plan'))
-    if not xml_path or not plan_path:
-        flash('xml_path or plan_path missing')
-        return redirect(url_for('index'))
-    xml_path = os.path.abspath(xml_path)
-    plan_path = os.path.abspath(plan_path)
-    if not os.path.exists(xml_path):
-        flash(f'XML path not found: {xml_path}')
-        return redirect(url_for('index'))
-    if not os.path.exists(plan_path):
-        flash(f'Plan path not found: {plan_path}')
-        return redirect(url_for('index'))
-    # Derive CORE host/port from XML if present
-    core_host = '127.0.0.1'
-    core_port = 50051
-    try:
-        payload = _parse_scenarios_xml(xml_path)
-        ch = payload.get('core', {}).get('host') if isinstance(payload.get('core'), dict) else None
-        cp = payload.get('core', {}).get('port') if isinstance(payload.get('core'), dict) else None
-        if ch: core_host = str(ch)
-        if cp: core_port = int(cp)
-    except Exception:
-        pass
-    # Pre-save existing CORE session (best effort)
-    pre_saved = None
-    try:
-        pre_dir = os.path.join(os.path.dirname(xml_path) or _outputs_dir(), 'core-pre')
-        pre_saved = _grpc_save_current_session_xml(core_host, core_port, pre_dir)
-    except Exception:
-        pre_saved = None
-    repo_root = _get_repo_root()
-    py_exec = _select_python_interpreter()
-    scenario_name = None
-    try:
-        names_for_cli = _scenario_names_from_xml(xml_path)
-        if names_for_cli:
-            scenario_name = names_for_cli[0]
-    except Exception:
-        scenario_name = None
-    args = [py_exec, '-m', 'core_topo_gen.cli', '--xml', xml_path, '--use-plan', plan_path, '--host', core_host, '--port', str(core_port), '--verbose']
-    if scenario_name:
-        args.extend(['--scenario', scenario_name])
-    if strict_plan:
-        args.append('--strict-plan')
-    app.logger.info('[plan.run] Running build with plan: %s', ' '.join(args))
-    proc = subprocess.run(args, cwd=repo_root, check=False, capture_output=True, text=True)
-    logs = (proc.stdout or '') + ('\n' + proc.stderr if proc.stderr else '')
-    report_md = _extract_report_path_from_text(logs) or _find_latest_report_path()
-    if report_md and os.path.exists(report_md):
-        flash('Plan build completed. Report ready.')
-    else:
-        if proc.returncode == 0:
-            flash('Plan build completed (no report found).')
-        else:
-            flash('Plan build finished with errors.')
-    session_id = _extract_session_id_from_text(logs)
-    post_saved = None
-    try:
-        post_dir = os.path.join(os.path.dirname(xml_path), 'core-post')
-        post_saved = _grpc_save_current_session_xml(core_host, core_port, post_dir, session_id=session_id)
-    except Exception:
-        post_saved = None
-    # Run history entry
-    try:
-        _append_run_history({
-            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
-            'mode': 'plan-build',
-            'xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
-            'scenario_xml_path': xml_path,
-            'plan_path': plan_path,
-            'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
-            'pre_xml_path': pre_saved,
-            'post_xml_path': post_saved,
-            'strict_plan': strict_plan,
-            'returncode': proc.returncode,
-            'scenario_names': [scenario_name] if scenario_name else None,
-        })
-    except Exception as e_hist:
-        app.logger.warning('[plan.run] failed appending run history: %s', e_hist)
-    # Prepare payload for template reuse
-    xml_text = ''
-    try:
-        with open(xml_path, 'r', encoding='utf-8', errors='ignore') as f:
-            xml_text = f.read()
-    except Exception:
-        pass
-    payload = _parse_scenarios_xml(xml_path)
-    if 'core' not in payload:
-        payload['core'] = _default_core_dict()
-    payload['result_path'] = report_md if (report_md and os.path.exists(report_md)) else xml_path
-    run_success = (proc.returncode == 0)
-    return render_template('index.html', payload=payload, logs=logs, xml_preview=xml_text, run_success=run_success)
-
-@app.route('/run_with_full_preview', methods=['POST'])
-def run_with_full_preview():
-    """Experimental: build a CORE scenario guided by an approved plan's embedded full_preview.
-
-    This ensures that randomness (seed-resolved) for roles/IP/subnet grouping matches the preview by:
-      - Re-using the plan file via --use-plan (phased builder) for counts and policies
-      - Passing the original seed; builder will still allocate fresh addresses but drift is measured
-    Future optimization could inject explicit subnet/group assignments once builders accept overrides.
-    """
-    xml_path = request.form.get('xml_path')
-    plan_path = request.form.get('plan_path')
-    strict_plan = bool(request.form.get('strict_plan'))
-    if not xml_path or not plan_path:
-        flash('xml_path or plan_path missing (full preview run)')
-        return redirect(url_for('index'))
-    xml_path = os.path.abspath(xml_path)
-    plan_path = os.path.abspath(plan_path)
-    if not os.path.exists(xml_path):
-        flash(f'XML path not found: {xml_path}')
-        return redirect(url_for('index'))
-    if not os.path.exists(plan_path):
-        flash(f'Plan path not found: {plan_path}')
-        return redirect(url_for('index'))
-    # Inspect plan for full_preview seed
-    fp_seed = None
-    full_preview_present = False
-    try:
-        import json as _json
-        with open(plan_path,'r',encoding='utf-8') as f:
-            pobj = _json.load(f)
-        if isinstance(pobj, dict):
-            fp = pobj.get('full_preview') or (pobj.get('plan') and pobj.get('plan').get('full_preview'))
-            if fp and isinstance(fp, dict):
-                fp_seed = fp.get('seed')
-                full_preview_present = True
-    except Exception:
-        fp_seed = None
-    repo_root = _get_repo_root()
-    py_exec = _select_python_interpreter()
-    scenario_name = None
-    try:
-        names_for_cli = _scenario_names_from_xml(xml_path)
-        if names_for_cli:
-            scenario_name = names_for_cli[0]
-    except Exception:
-        scenario_name = None
-    args = [py_exec, '-m', 'core_topo_gen.cli', '--xml', xml_path, '--use-plan', plan_path, '--host', '127.0.0.1', '--port', '50051', '--verbose']
-    if scenario_name:
-        args.extend(['--scenario', scenario_name])
-    if strict_plan:
-        args.append('--strict-plan')
-    if full_preview_present and fp_seed is not None:
-        args.extend(['--seed', str(fp_seed)])
-    else:
-        flash('Full preview seed not found in plan; falling back to plan-only build')
-    app.logger.info('[plan.run_full_preview] Running build with full preview seed: %s', ' '.join(args))
-    proc = subprocess.run(args, cwd=repo_root, check=False, capture_output=True, text=True)
-    logs = (proc.stdout or '') + ('\n' + proc.stderr if proc.stderr else '')
-    report_md = _extract_report_path_from_text(logs) or _find_latest_report_path()
-    if report_md and os.path.exists(report_md):
-        flash('Full preview guided build completed.')
-    else:
-        flash('Full preview build finished (report status unknown).')
-    xml_text = ''
-    try:
-        with open(xml_path,'r',encoding='utf-8',errors='ignore') as xf:
-            xml_text = xf.read()
-    except Exception:
-        pass
-    payload = _parse_scenarios_xml(xml_path)
-    if 'core' not in payload:
-        payload['core'] = _default_core_dict()
-    payload['result_path'] = report_md if (report_md and os.path.exists(report_md)) else xml_path
-    run_success = (proc.returncode == 0)
-    return render_template('index.html', payload=payload, logs=logs, xml_preview=xml_text, run_success=run_success)
 
 @app.route('/download_report')
 def download_report():
@@ -4078,7 +3790,7 @@ def core_details():
             )
     except Exception:
         pass
-    # Plan approval removed; render without approved plan context
+    # Render without legacy approved-plan context
     return render_template('core_details.html', xml_path=xml_path, valid=xml_valid, errors=errors, summary=xml_summary, session=session_info, classification=classification, container_flag=container_flag)
 
 
