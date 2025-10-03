@@ -13,7 +13,7 @@ The implementation is intentionally simpler than the builder logic but keeps
 the same public return contract relied upon by the web UI, CLI and tests.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Any, Optional, Set
 import ipaddress
 import random
@@ -31,6 +31,7 @@ class PreviewNode:
     role: str
     kind: str  # router | host | switch
     ip4: str | None = None
+    r2r_interfaces: Dict[str, str] = field(default_factory=dict)
 
 
 def _stable_shuffle(seq: List[Any], seed: int) -> List[Any]:
@@ -256,27 +257,202 @@ def build_full_preview(
         else:
             r2r_preview = {"mode": "NonUniform", "target_degree": min(routers_planned - 1, 4)}
 
-    # Build simple R2R edges (chain / ring / partial) for preview
+    rng_edges = random.Random(rnd_seed + 103)
+
+    def _chain_edges(node_ids: List[int]) -> List[Tuple[int, int]]:
+        return [(node_ids[i], node_ids[i + 1]) for i in range(len(node_ids) - 1)]
+
+    def _edges_from_degree_sequence(node_ids: List[int], degrees: List[int]) -> Optional[List[Tuple[int, int]]]:
+        if len(node_ids) != len(degrees):
+            return None
+        if any(d < 0 or d > len(node_ids) - 1 for d in degrees):
+            return None
+        if sum(degrees) % 2 != 0:
+            return None
+        work = list(zip(node_ids, degrees))
+        edges: set[Tuple[int, int]] = set()
+        while work:
+            rng_edges.shuffle(work)
+            work.sort(key=lambda x: x[1], reverse=True)
+            node, deg = work[0]
+            if deg == 0:
+                break
+            work = work[1:]
+            if deg > len(work):
+                return None
+            for idx in range(deg):
+                target_node, target_deg = work[idx]
+                if target_node == node:
+                    return None
+                edge = tuple(sorted((node, target_node)))
+                edges.add(edge)
+                work[idx] = (target_node, target_deg - 1)
+                if work[idx][1] < 0:
+                    return None
+        if any(rem_deg > 0 for _, rem_deg in work):
+            return None
+        return sorted(edges)
+
+    def _degree_counts(node_ids: List[int], edges: List[Tuple[int, int]]) -> Dict[int, int]:
+        counts: Dict[int, int] = {nid: 0 for nid in node_ids}
+        for a, b in edges:
+            counts[a] = counts.get(a, 0) + 1
+            counts[b] = counts.get(b, 0) + 1
+        return counts
+
+    def _assign_r2r_link_interfaces(
+        router_nodes: List[PreviewNode],
+        edges: List[Tuple[int, int]],
+        ip4_prefix: str | None,
+        ip_mode: str | None,
+        ip_region: str | None,
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        if not edges or not router_nodes:
+            return [], []
+        router_map: Dict[int, PreviewNode] = {r.node_id: r for r in router_nodes}
+        try:
+            allocator = make_subnet_allocator(ip_mode or 'private', ip4_prefix or '10.224.0.0/11', ip_region or 'all')
+        except Exception:
+            allocator = None
+        fallback_base = int(ipaddress.IPv4Address('10.240.0.0'))
+        fallback_idx = 0
+        link_details: List[Dict[str, Any]] = []
+        subnets: List[str] = []
+        for edge_idx, (a, b) in enumerate(edges, start=1):
+            subnet_obj = None
+            if allocator is not None:
+                try:
+                    subnet_obj = allocator.next_subnet(30)
+                except Exception:
+                    subnet_obj = None
+            if subnet_obj is None:
+                try:
+                    base_addr = ipaddress.IPv4Address(fallback_base + (fallback_idx * 4))
+                    subnet_obj = ipaddress.ip_network((base_addr, 30), strict=False)
+                    fallback_idx += 1
+                except Exception:
+                    subnet_obj = ipaddress.ip_network('10.254.0.0/30', strict=False)
+            hosts = list(subnet_obj.hosts())
+            ip_a = f"{hosts[0]}/{subnet_obj.prefixlen}" if len(hosts) >= 1 else None
+            ip_b = f"{hosts[1]}/{subnet_obj.prefixlen}" if len(hosts) >= 2 else None
+            ra = router_map.get(a)
+            rb = router_map.get(b)
+            if ra is not None:
+                if ip_a:
+                    ra.r2r_interfaces[str(b)] = ip_a
+            if rb is not None:
+                if ip_b:
+                    rb.r2r_interfaces[str(a)] = ip_b
+            detail = {
+                'edge_id': edge_idx,
+                'routers': [
+                    {'id': a, 'ip': ip_a},
+                    {'id': b, 'ip': ip_b},
+                ],
+                'subnet': str(subnet_obj),
+            }
+            link_details.append(detail)
+            subnets.append(str(subnet_obj))
+        return link_details, subnets
+
+    # Build R2R edges according to mode semantics
     r2r_edges: List[Tuple[int, int]] = []
+    r2r_links_detail: List[Dict[str, Any]] = []
+    r2r_subnets: List[str] = []
     if routers_planned > 1:
-        mode_rr = r2r_preview.get('mode')
-        ids = [r.node_id for r in router_nodes]
-        if mode_rr == 'Min':
-            for a, b in zip(ids, ids[1:]):
-                r2r_edges.append((a, b))
-        elif mode_rr == 'Uniform':
-            for a, b in zip(ids, ids[1:]):
-                r2r_edges.append((a, b))
-            if len(ids) > 2:
-                r2r_edges.append((ids[-1], ids[0]))
-        else:  # NonUniform/Other -> minimal spanning chain
-            for a, b in zip(ids, ids[1:]):
-                r2r_edges.append((a, b))
-    r2r_degree: Dict[int, int] = {}
-    for a, b in r2r_edges:
-        r2r_degree[a] = r2r_degree.get(a, 0) + 1
-        r2r_degree[b] = r2r_degree.get(b, 0) + 1
-    if r2r_degree:
+        node_ids = [r.node_id for r in router_nodes]
+        mode_rr = (r2r_preview.get('mode') or '').strip().lower()
+        if mode_rr == 'min':
+            r2r_edges = _chain_edges(node_ids)
+        elif mode_rr == 'uniform':
+            allowed_degrees = [d for d in range(1, len(node_ids)) if (len(node_ids) * d) % 2 == 0]
+            if allowed_degrees:
+                chosen_degree = rng_edges.choice(allowed_degrees)
+                candidate = _edges_from_degree_sequence(node_ids, [chosen_degree] * len(node_ids))
+                if candidate is not None:
+                    r2r_edges = candidate
+                    r2r_preview['target_degree'] = chosen_degree
+                else:
+                    r2r_edges = _chain_edges(node_ids)
+            else:
+                r2r_edges = _chain_edges(node_ids)
+        elif mode_rr == 'exact':
+            requested = int(r2r_preview.get('target_degree') or r2r_preview.get('target_per_router') or 0)
+            target_degree = max(0, min(requested, len(node_ids) - 1))
+            r2r_preview['target_degree'] = target_degree
+
+            def _ensure_even(seq: List[int]) -> None:
+                if sum(seq) % 2 != 0:
+                    for idx in range(len(seq) - 1, -1, -1):
+                        if seq[idx] > 0:
+                            seq[idx] -= 1
+                            break
+
+            def _attempt_degree_sequence(base_target: int) -> Tuple[Optional[List[Tuple[int, int]]], List[int]]:
+                if base_target <= 0:
+                    return [], [0] * len(node_ids)
+                base_seq = [base_target] * len(node_ids)
+                _ensure_even(base_seq)
+                candidate_edges = _edges_from_degree_sequence(node_ids, base_seq)
+                if candidate_edges is not None:
+                    return candidate_edges, base_seq
+                for reduce_count in range(1, len(node_ids) + 1):
+                    seq_try = [base_target] * len(node_ids)
+                    for offset in range(reduce_count):
+                        idx = len(seq_try) - 1 - offset
+                        if idx < 0:
+                            break
+                        if seq_try[idx] > 0:
+                            seq_try[idx] -= 1
+                    _ensure_even(seq_try)
+                    candidate_edges = _edges_from_degree_sequence(node_ids, seq_try)
+                    if candidate_edges is not None:
+                        return candidate_edges, seq_try
+                return None, base_seq
+
+            edges_exact, _ = _attempt_degree_sequence(target_degree)
+            if edges_exact is not None:
+                r2r_edges = edges_exact
+                realized = _degree_counts(node_ids, r2r_edges)
+                r2r_preview['degree_sequence'] = {str(nid): realized.get(nid, 0) for nid in node_ids}
+            else:
+                r2r_edges = _chain_edges(node_ids)
+        elif mode_rr == 'nonuniform':
+            degree_sequence = list(range(len(node_ids)))
+            rng_edges.shuffle(degree_sequence)
+            degree_sequence = [min(d, len(node_ids) - 1) for d in degree_sequence]
+            if len(set(degree_sequence)) == 1 and len(node_ids) > 1:
+                degree_sequence[0] = min(len(node_ids) - 1, degree_sequence[0] + 1)
+            if sum(degree_sequence) % 2 != 0:
+                adjusted = False
+                for idx, val in enumerate(degree_sequence):
+                    if val < len(node_ids) - 1:
+                        degree_sequence[idx] += 1
+                        adjusted = True
+                        break
+                if not adjusted:
+                    for idx, val in enumerate(degree_sequence):
+                        if val > 0:
+                            degree_sequence[idx] -= 1
+                            break
+            candidate = _edges_from_degree_sequence(node_ids, degree_sequence)
+            if candidate is not None and candidate:
+                r2r_edges = candidate
+                realized = _degree_counts(node_ids, r2r_edges)
+                r2r_preview['degree_sequence'] = {str(k): realized.get(k, 0) for k in node_ids}
+            else:
+                r2r_edges = _chain_edges(node_ids)
+        elif mode_rr == 'none':
+            r2r_edges = []
+        else:
+            r2r_edges = _chain_edges(node_ids)
+        if r2r_edges:
+            r2r_links_detail, r2r_subnets = _assign_r2r_link_interfaces(router_nodes, r2r_edges, ip4_prefix, ip_mode, ip_region)
+    router_ids_for_stats = [r.node_id for r in router_nodes]
+    r2r_degree = _degree_counts(router_ids_for_stats, r2r_edges) if router_nodes else {}
+    if r2r_edges or any(v > 0 for v in r2r_degree.values()):
+        r2r_preview.setdefault('degree_sequence', {str(k): r2r_degree.get(k, 0) for k in router_ids_for_stats})
+    if any(r2r_degree.values()):
         vals = list(r2r_degree.values())
         r2r_stats = {'min': min(vals), 'max': max(vals), 'avg': round(sum(vals) / len(vals), 2)}
     else:
@@ -352,7 +528,12 @@ def build_full_preview(
     router_switch_subnets = grouping_out['router_switch_subnets']
     lan_subnets = grouping_out['lan_subnets']
     ptp_subnets = grouping_out['ptp_subnets']
-    r2r_subnets = grouping_out.get('r2r_subnets', [])
+    grouping_r2r_subnets = grouping_out.get('r2r_subnets', []) or []
+    if grouping_r2r_subnets:
+        if r2r_subnets:
+            r2r_subnets.extend([s for s in grouping_r2r_subnets if s not in r2r_subnets])
+        else:
+            r2r_subnets = list(grouping_r2r_subnets)
     # convert generic switch nodes to PreviewNodes
     switch_nodes = [PreviewNode(node_id=sn['node_id'], name=sn.get('name', f"sw-{sn['node_id']}"), role="Switch", kind="switch") for sn in grouping_out['switch_nodes']]
 
@@ -724,6 +905,7 @@ def build_full_preview(
         'vulnerabilities_preview': vuln_assignments,
         'r2r_policy_preview': r2r_preview,
         'r2r_edges_preview': r2r_edges,
+    'r2r_links_preview': r2r_links_detail,
         'r2r_degree_preview': r2r_degree,
         'r2r_stats_preview': r2r_stats,
         'r2s_policy_preview': computed_r2s_policy,

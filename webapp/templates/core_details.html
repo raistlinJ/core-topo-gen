@@ -233,29 +233,6 @@
 {% block extra_scripts %}
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 <script src="{{ url_for('static', filename='core_graph.js') }}"></script>
-<div class="modal fade" id="planModal" tabindex="-1" aria-labelledby="planModalLabel" aria-hidden="true">
-  <div class="modal-dialog modal-lg modal-dialog-scrollable">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h5 class="modal-title" id="planModalLabel">Plan Preview</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-      </div>
-      <div class="modal-body">
-        <div id="planLoading" class="text-muted">Computing plan...</div>
-        <pre id="planJson" class="small bg-light p-2 border rounded d-none" style="max-height:420px; overflow:auto; font-size:0.7rem;"></pre>
-        <div id="planViolationsWrap" class="mt-2 d-none">
-          <div class="alert alert-warning py-2 mb-0"><strong>Violations Detected</strong>
-            <ul id="planViolationsList" class="mb-0 small"></ul>
-          </div>
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-        <button type="button" class="btn btn-success d-none" id="modalApproveBtn">Approve Plan</button>
-      </div>
-    </div>
-  </div>
-</div>
 {% if summary and (summary.nodes or summary.switches or summary.switch_nodes) %}
   {% set base_nodes = summary.nodes or [] %}
   {% set extra_switch_nodes = [] %}

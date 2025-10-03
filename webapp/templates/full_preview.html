@@ -3,6 +3,54 @@
 {% block active_page %}{% set active_page = 'scenarios' %}{% endblock %}
 {% block content %}
 <div class="container-fluid mt-3">
+  {% macro render_r2r_interfaces(router_id, links) -%}
+    {% set ns = namespace(items=[]) %}
+    {% for link in links or [] %}
+      {% set routers = link.routers or [] %}
+      {% if routers|length == 2 %}
+        {% set a = routers[0] %}
+        {% set b = routers[1] %}
+        {% if a.id == router_id %}
+          {% set neighbor = b.id %}
+          {% set ip = a.ip or '-' %}
+        {% elif b.id == router_id %}
+          {% set neighbor = a.id %}
+          {% set ip = b.ip or '-' %}
+        {% else %}
+          {% set neighbor = None %}
+        {% endif %}
+        {% if neighbor is not none %}
+          {% set label = 'r' ~ neighbor %}
+          {% if link.subnet %}
+            {% set entry = label ~ ': ' ~ ip ~ ' [' ~ link.subnet ~ ']' %}
+          {% else %}
+            {% set entry = label ~ ': ' ~ ip %}
+          {% endif %}
+          {% set ns.items = ns.items + [entry] %}
+        {% endif %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.items|join('; ') if ns.items else '-' }}
+  {%- endmacro %}
+
+  {% macro render_router_switch_links(router_id, switches) -%}
+    {% set ns = namespace(items=[]) %}
+    {% for sw in switches or [] %}
+      {% if sw.router_id == router_id %}
+        {% set label = 'sw-' ~ sw.switch_id %}
+        {% if sw.router_ip and sw.rsw_subnet %}
+          {% set entry = label ~ ': ' ~ sw.router_ip ~ ' [' ~ sw.rsw_subnet ~ ']' %}
+        {% elif sw.router_ip %}
+          {% set entry = label ~ ': ' ~ sw.router_ip %}
+        {% else %}
+          {% set entry = label %}
+        {% endif %}
+        {% set ns.items = ns.items + [entry] %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.items|join('; ') if ns.items else '-' }}
+  {%- endmacro %}
+
   <div class="d-flex align-items-center mb-2 gap-2">
     <h2 class="me-auto mb-0">Full Preview {{ scenario or '' }}</h2>
     <button id="executeRunBtn" class="btn btn-sm btn-warning" title="Execute this scenario now (invokes CLI)">Execute</button>
@@ -18,14 +66,12 @@
   </div>
   <p class="text-muted">Current Seed: <strong>{{ seed }}</strong> | XML: {{ xml_path }}</p>
   <div class="mb-3">
-    <button id="approvePreviewBtn" class="btn btn-sm btn-primary me-2">Approve as Plan</button>
     <button id="exportJsonBtn" class="btn btn-sm btn-outline-secondary me-2">Export JSON</button>
     <button id="exportPngBtn" class="btn btn-sm btn-outline-secondary me-2">Export Graph PNG</button>
     <div class="btn-group btn-group-sm" role="group">
-      <button class="btn btn-sm btn-outline-success" id="openTrafficBtn" type="button" title="List generated traffic scripts (preview/runtime)">Traffic Scripts</button>
-      <button class="btn btn-sm btn-outline-danger" id="openSegBtn" type="button" title="List segmentation scripts">Segmentation Scripts</button>
+      <button class="btn btn-sm btn-outline-success" id="openTrafficBtn" type="button" title="List generated traffic + segmentation scripts">Traffic/Segmentation Scripts</button>
     </div>
-    <span id="approveStatus" class="ms-3 small text-muted"></span>
+    <!-- Approval workflow removed; button/status span deleted -->
   </div>
   <div class="row">
     <div class="col-md-4">
@@ -62,6 +108,7 @@
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-routers" type="button">Routers</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-hosts" type="button">Hosts</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-switches" type="button">Switches</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-interfaces" type="button">Interfaces</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-seg" type="button">Segmentation</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-traffic" type="button">Traffic</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-node-sections" type="button">Node Sections</button></li>
@@ -79,8 +126,8 @@
           </div>
         </div>
         <div class="tab-pane fade" id="fp-routers">
-          <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>IP</th></tr></thead><tbody>
-          {% for r in full_preview.routers %}<tr><td>{{ r.node_id }}</td><td>{{ r.name }}</td><td>{{ r.ip4 }}</td></tr>{% endfor %}
+          <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Primary IP</th><th>R2R Interfaces</th><th>Switch Links</th></tr></thead><tbody>
+          {% for r in full_preview.routers %}<tr><td>{{ r.node_id }}</td><td>{{ r.name }}</td><td>{{ r.ip4 or '-' }}</td><td>{{ render_r2r_interfaces(r.node_id, full_preview.r2r_links_preview) }}</td><td>{{ render_router_switch_links(r.node_id, full_preview.switches_detail) }}</td></tr>{% endfor %}
           </tbody></table>
         </div>
         <div class="tab-pane fade" id="fp-hosts">
@@ -94,25 +141,99 @@
           {% for sw in full_preview.switches_detail %}<tr><td>{{ sw.switch_id }}</td><td>sw-{{ sw.switch_id }}</td><td>{{ sw.router_id }}</td><td>{{ sw.hosts|join(',') }}</td><td>{{ sw.rsw_subnet }}</td><td>{{ sw.lan_subnet }}</td></tr>{% endfor %}
           </tbody></table>
         </div>
+        <div class="tab-pane fade" id="fp-interfaces">
+          <div class="row g-3">
+            <div class="col-12">
+              <h6 class="mb-2">Router-to-Router Links</h6>
+              {% set r2r_links = full_preview.r2r_links_preview or [] %}
+              {% if r2r_links %}
+              <div class="table-responsive" style="max-height:240px;overflow:auto;">
+                <table class="table table-sm table-bordered small align-middle">
+                  <thead class="table-light"><tr><th>#</th><th>Router A</th><th>Router A IP</th><th>Router B</th><th>Router B IP</th><th>Subnet</th></tr></thead>
+                  <tbody>
+                  {% for link in r2r_links %}
+                    {% set routers = link.routers or [] %}
+                    {% set ra = routers[0] if routers|length > 0 else {} %}
+                    {% set rb = routers[1] if routers|length > 1 else {} %}
+                    {% set ra_obj = (full_preview.routers|selectattr('node_id','equalto', ra.id)|first) %}
+                    {% set rb_obj = (full_preview.routers|selectattr('node_id','equalto', rb.id)|first) %}
+                    {% set ra_label = ra_obj.name if ra_obj else 'r' ~ (ra.id or '-') %}
+                    {% set rb_label = rb_obj.name if rb_obj else 'r' ~ (rb.id or '-') %}
+                    <tr>
+                      <td>{{ link.edge_id }}</td>
+                      <td>{{ ra_label }}</td>
+                      <td>{{ ra.ip or '-' }}</td>
+                      <td>{{ rb_label }}</td>
+                      <td>{{ rb.ip or '-' }}</td>
+                      <td>{{ link.subnet or '-' }}</td>
+                    </tr>
+                  {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              {% else %}<div class="small text-muted fst-italic">(no router-to-router links)</div>{% endif %}
+            </div>
+            <div class="col-12">
+              <h6 class="mb-2">Router-to-Switch Links</h6>
+              {% set sw_detail = full_preview.switches_detail or [] %}
+              {% if sw_detail %}
+              <div class="table-responsive" style="max-height:220px;overflow:auto;">
+                <table class="table table-sm table-bordered small align-middle">
+                  <thead class="table-light"><tr><th>Router</th><th>Switch</th><th>Router IP</th><th>Switch IP</th><th>R/S Subnet</th><th>LAN Subnet</th></tr></thead>
+                  <tbody>
+                  {% for sw in sw_detail %}
+                    {% set router_obj = (full_preview.routers|selectattr('node_id','equalto', sw.router_id)|first) %}
+                    {% set router_label = router_obj.name if router_obj else 'r' ~ (sw.router_id or '-') %}
+                    <tr>
+                      <td>{{ router_label }}</td>
+                      <td>sw-{{ sw.switch_id }}</td>
+                      <td>{{ sw.router_ip or '-' }}</td>
+                      <td>{{ sw.switch_ip or '-' }}</td>
+                      <td>{{ sw.rsw_subnet or '-' }}</td>
+                      <td>{{ sw.lan_subnet or '-' }}</td>
+                    </tr>
+                  {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              {% else %}<div class="small text-muted fst-italic">(no router-to-switch links)</div>{% endif %}
+            </div>
+            <div class="col-12">
+              <h6 class="mb-2">Switch Host Interfaces</h6>
+              {% if sw_detail %}
+              <div class="table-responsive" style="max-height:220px;overflow:auto;">
+                <table class="table table-sm table-bordered small align-middle">
+                  <thead class="table-light"><tr><th>Switch</th><th>Host ID</th><th>Host IP</th><th>LAN Subnet</th></tr></thead>
+                  <tbody>
+                  {% for sw in sw_detail %}
+                    {% set host_ips = (sw.host_if_ips or {})|dictsort(case_sensitive=False) %}
+                    {% if host_ips %}
+                      {% for hid, hip in host_ips %}
+                        <tr>
+                          <td>sw-{{ sw.switch_id }}</td>
+                          <td>{{ hid }}</td>
+                          <td>{{ hip or '-' }}</td>
+                          <td>{{ sw.lan_subnet or '-' }}</td>
+                        </tr>
+                      {% endfor %}
+                    {% else %}
+                      <tr>
+                        <td>sw-{{ sw.switch_id }}</td>
+                        <td class="text-muted" colspan="2">(no host interfaces)</td>
+                        <td>{{ sw.lan_subnet or '-' }}</td>
+                      </tr>
+                    {% endif %}
+                  {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              {% else %}<div class="small text-muted fst-italic">(no switch host assignments)</div>{% endif %}
+            </div>
+          </div>
+        </div>
         <div class="tab-pane fade" id="fp-seg">
           {% set seg_prev = full_preview.segmentation_preview %}
-          <div class="d-flex gap-2 mb-2">
-            <div class="btn-group btn-group-sm" role="group">
-              <button type="button" class="btn btn-outline-secondary" id="segListPreviewBtn">Preview Scripts</button>
-              <button type="button" class="btn btn-outline-secondary" id="segListRuntimeBtn">Runtime Scripts</button>
-            </div>
-            <div class="btn-group btn-group-sm" role="group">
-              <button type="button" class="btn btn-outline-secondary" id="trafficListPreviewBtn">Traffic Preview Scripts</button>
-              <button type="button" class="btn btn-outline-secondary" id="trafficListRuntimeBtn">Traffic Runtime Scripts</button>
-            </div>
-            <div class="btn-group btn-group-sm" role="group">
-              <button type="button" class="btn btn-outline-primary" id="dlSegRuntimeBtn" title="Download runtime segmentation scripts zip">DL Seg Runtime</button>
-              <button type="button" class="btn btn-outline-primary" id="dlSegPreviewBtn" title="Download preview segmentation scripts zip">DL Seg Preview</button>
-              <button type="button" class="btn btn-outline-success" id="dlTrafficRuntimeBtn" title="Download runtime traffic scripts zip">DL Traffic Runtime</button>
-              <button type="button" class="btn btn-outline-success" id="dlTrafficPreviewBtn" title="Download preview traffic scripts zip">DL Traffic Preview</button>
-            </div>
-            <span id="segScriptStatus" class="small text-muted"></span>
-          </div>
+          <!-- Segmentation action buttons removed per request; only rules table remains -->
           {% if seg_prev and seg_prev.rules %}
           <div class="table-responsive" style="max-height:300px;overflow:auto;">
             <table class="table table-sm table-bordered small align-middle" id="segRulesTable">
@@ -140,6 +261,37 @@
           {% else %}
             <div class="small text-muted fst-italic">(no segmentation rules)</div>
           {% endif %}
+          <!-- Unified Scripts Listing Modal (segmentation + traffic) -->
+          <div class="modal fade" id="scriptsListingModal" tabindex="-1" aria-labelledby="scriptsListingModalLabel" aria-hidden="true">
+            <div class="modal-dialog modal-lg modal-dialog-scrollable">
+              <div class="modal-content">
+                <div class="modal-header">
+                  <h5 class="modal-title" id="scriptsListingModalLabel">Scripts</h5>
+                  <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                  <div class="d-flex flex-wrap gap-2 mb-2">
+                    <div class="btn-group btn-group-sm" role="group">
+                      <button type="button" class="btn btn-outline-secondary" data-kind="segmentation" data-scope="preview">Segmentation</button>
+                    </div>
+                    <div class="btn-group btn-group-sm" role="group">
+                      <button type="button" class="btn btn-outline-success" data-kind="traffic" data-scope="preview">Traffic</button>
+                    </div>
+                    <span id="scriptsListingStatus" class="small text-muted align-self-center"></span>
+                  </div>
+                  <div class="table-responsive" style="max-height:55vh;">
+                    <table class="table table-sm table-hover small align-middle mb-0" id="scriptsListingTable">
+                      <thead class="table-light"><tr><th style="width:55%;">File</th><th style="width:15%;" class="text-end">Size (bytes)</th><th style="width:30%;">Actions</th></tr></thead>
+                      <tbody><tr><td colspan="3" class="text-muted fst-italic">Select a scope above to load scripts.</td></tr></tbody>
+                    </table>
+                  </div>
+                </div>
+                <div class="modal-footer">
+                  <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+              </div>
+            </div>
+          </div>
           <div id="segScriptModal" class="modal" tabindex="-1">
             <div class="modal-dialog modal-lg modal-dialog-scrollable">
               <div class="modal-content">
@@ -161,7 +313,7 @@
         <div class="tab-pane fade" id="fp-node-sections">
           <div class="table-responsive small">
             <table class="table table-sm table-bordered mb-0" id="nodeSectionsTable"><thead><tr>
-              <th>Node ID</th><th>Name</th><th>Type</th><th>Services</th><th>Vulns</th><th>Seg Rules</th><th>Traffic S</th><th>Traffic R</th>
+              <th>Node ID</th><th>Name</th><th>Type</th><th>Primary IP</th><th>Interfaces</th><th>Services</th><th>Vulns</th><th>Seg Rules</th><th>Traffic S</th><th>Traffic R</th>
             </tr></thead><tbody></tbody></table>
           </div>
         </div>
@@ -302,7 +454,8 @@
       const tbody = document.querySelector('#nodeSectionsTable tbody');
       if(tbody){
   const allNodes = [...(previewData.routers||[]).map(r=>({...r, _type:'router'})), ...(previewData.hosts||[]).map(h=>({...h, _type:'host'})), ...(previewData.switches_detail||[]).map(s=>({...s, node_id:s.switch_id, name:'sw-'+s.switch_id, _type:'switch'}))];
-  if(!allNodes.length){ tbody.innerHTML = '<tr><td colspan="8" class="text-muted fst-italic">(no nodes)</td></tr>'; return; }
+  if(!allNodes.length){ tbody.innerHTML = '<tr><td colspan="10" class="text-muted fst-italic">(no nodes)</td></tr>'; return; }
+        const switchesDetail = previewData.switches_detail || [];
         const rowsHtml = allNodes.map(n=>{
           const nid = n.node_id;
           const svc = (servicesByNode[nid]||[]).join(',');
@@ -310,9 +463,36 @@
           const segC = segCountByNode[nid]||0;
           const ts = trafficSend[nid]||0;
           const tr = trafficRecv[nid]||0;
-          return `<tr><td>${nid}</td><td>${n.name||('node-'+nid)}</td><td>${n._type}</td><td>${svc}</td><td>${vul}</td><td>${segC}</td><td>${ts}</td><td>${tr}</td></tr>`;
+          let primaryIp = n.ip4 || '';
+          if(!primaryIp && n.switch_ip) primaryIp = n.switch_ip;
+          if(!primaryIp && n.router_ip) primaryIp = n.router_ip;
+          let ifaceParts = [];
+          if(n._type === 'router'){
+            const r2rInterfaces = n.r2r_interfaces || {};
+            Object.keys(r2rInterfaces).sort((a,b)=> Number(a) - Number(b)).forEach(nb=>{
+              ifaceParts.push(`r${nb}:${r2rInterfaces[nb]}`);
+            });
+            switchesDetail.filter(sw => sw.router_id === nid).forEach(sw=>{
+              ifaceParts.push(`sw-${sw.switch_id}:${sw.router_ip || '-'}`);
+            });
+          } else if(n._type === 'switch'){
+            if(typeof n.router_id !== 'undefined'){
+              ifaceParts.push(`router:${n.router_id}→${n.router_ip || '-'}`);
+            }
+            if(n.switch_ip){ ifaceParts.push(`uplink:${n.switch_ip}`); }
+            const hostIf = n.host_if_ips || {};
+            Object.keys(hostIf).sort((a,b)=> Number(a) - Number(b)).forEach(hid=>{
+              ifaceParts.push(`h${hid}:${hostIf[hid]}`);
+            });
+          } else if(n._type === 'host'){
+            const routerForHost = hostRouterMap[nid] ?? hostRouterMap[String(nid)];
+            if(routerForHost){ ifaceParts.push(`router:${routerForHost}`); }
+          }
+          const ifaceStr = ifaceParts.length ? ifaceParts.join('; ') : '-';
+          const primaryIpStr = primaryIp || '-';
+          return `<tr><td>${nid}</td><td>${n.name||('node-'+nid)}</td><td>${n._type}</td><td>${primaryIpStr}</td><td>${ifaceStr}</td><td>${svc}</td><td>${vul}</td><td>${segC}</td><td>${ts}</td><td>${tr}</td></tr>`;
         }).join('');
-        tbody.innerHTML = rowsHtml || '<tr><td colspan="8" class="text-muted fst-italic">(none)</td></tr>';
+        tbody.innerHTML = rowsHtml || '<tr><td colspan="10" class="text-muted fst-italic">(none)</td></tr>';
       }
     } catch(e) { console.warn('node section table build failed', e); }
   // Node labels removed per request
@@ -337,46 +517,82 @@
   } // END buildGraph
   // Invoke graph build after definitions
   buildGraph();
-  function listScripts(kind){
-    fetch(`/api/open_scripts?kind=${kind}`).then(r=>r.json()).then(d=>{
-      if(!d.ok){ alert(`Failed: ${d.error||'unknown error'}`); return; }
-      const lines = d.files.slice(0,50).map(f=>`${f.file} (${f.size} bytes)`).join('\n');
-      const more = d.files.length>50? `\n... (${d.files.length-50} more)` : '';
-      alert(`${kind} scripts in ${d.path}:\n` + (lines||'(none)') + more);
-    }).catch(e=> alert('Error listing scripts: '+e));
+  // Unified scripts listing modal logic
+  function openScriptsModal(initialKind){
+    const modalEl = document.getElementById('scriptsListingModal');
+    if(!modalEl) return;
+    // Ensure modal is a direct body child to avoid stacking/overflow clipping inside tab panes
+    if(!modalEl.__appendedToBody){
+      document.body.appendChild(modalEl);
+      modalEl.__appendedToBody = true;
+    }
+    if(window.bootstrap){
+      const m = (window.bootstrap.Modal.getOrCreateInstance
+        ? window.bootstrap.Modal.getOrCreateInstance(modalEl)
+        : new bootstrap.Modal(modalEl));
+      m.show();
+    } else { modalEl.style.display='block'; }
+    const targetKind = initialKind || 'traffic';
+    const firstBtn = modalEl.querySelector(`button[data-kind='${targetKind}'][data-scope='preview']`) || modalEl.querySelector('button[data-kind]');
+    if(firstBtn){ loadScriptsListing(firstBtn.getAttribute('data-kind'), firstBtn.getAttribute('data-scope')); }
   }
-  function listScriptsScoped(kind, scope){
+  function loadScriptsListing(kind, scope){
+    if(window.__SCRIPTS_LISTING_IN_FLIGHT__) return;
+    window.__SCRIPTS_LISTING_IN_FLIGHT__ = true;
+    const status = document.getElementById('scriptsListingStatus');
+    const tbody = document.querySelector('#scriptsListingTable tbody');
+    status.textContent = `Loading ${scope} ${kind} scripts...`;
+    tbody.innerHTML = `<tr><td colspan="3" class="text-muted fst-italic">Loading...</td></tr>`;
     fetch(`/api/open_scripts?kind=${kind}&scope=${scope}`).then(r=>r.json()).then(d=>{
-      const statusEl = document.getElementById('segScriptStatus');
-      if(!d.ok){ statusEl.textContent = `List failed (${scope} ${kind}): ${d.error||'error'}`; statusEl.classList.add('text-danger'); return; }
-      statusEl.classList.remove('text-danger');
-      statusEl.textContent = `${scope} ${kind} scripts: ${d.files.length}`;
-      if(d.files.length===0){ return; }
-      // Build a quick alert style list (future: table/modal). Limit 60.
-      const lines = d.files.slice(0,60).map(f=>`${f.file} (${f.size} bytes)`).join('\n');
-      console.log(`${scope} ${kind} scripts in ${d.path}:\n` + lines);
-    }).catch(e=>{ const statusEl = document.getElementById('segScriptStatus'); statusEl.textContent='Error listing scripts: '+e; statusEl.classList.add('text-danger'); });
+      if(!d.ok){ status.textContent = `Failed: ${d.error||'error'}`; tbody.innerHTML = '<tr><td colspan="3" class="text-danger">Error loading scripts</td></tr>'; return; }
+      status.textContent = `${d.files.length} file(s)`;
+      if(d.files.length===0){ tbody.innerHTML = '<tr><td colspan="3" class="text-muted fst-italic">(none)</td></tr>'; return; }
+      const rows = d.files.slice(0,500).map(f=>{
+        const safe = f.file.replace(/"/g,'&quot;');
+        return `<tr><td class="small"><code>${safe}</code></td><td class="text-end small">${f.size}</td><td class="small"><div class="btn-group btn-group-sm" role="group"><button type="button" class="btn btn-outline-primary" data-action="view" data-file="${safe}" data-kind="${kind}" data-scope="${scope}">View</button></div></td></tr>`;
+      }).join('');
+      tbody.innerHTML = rows;
+    }).catch(e=>{ status.textContent = 'Error'; tbody.innerHTML = `<tr><td colspan="3" class="text-danger">${e}</td></tr>`; })
+      .finally(()=>{ setTimeout(()=>{ window.__SCRIPTS_LISTING_IN_FLIGHT__ = false; }, 120); });
   }
+  document.getElementById('scriptsListingModal')?.addEventListener('click', (e)=>{
+    const btn = e.target.closest('button[data-kind][data-scope]');
+    if(btn && !btn.dataset.action){
+      loadScriptsListing(btn.getAttribute('data-kind'), btn.getAttribute('data-scope'));
+      return;
+    }
+    const actionBtn = e.target.closest('button[data-action="view"]');
+    if(actionBtn){
+      const file = actionBtn.getAttribute('data-file');
+      const kind = actionBtn.getAttribute('data-kind');
+      const scope = actionBtn.getAttribute('data-scope');
+      viewScript(kind, scope, file);
+    }
+  });
   function viewScript(kind, scope, file){
     fetch(`/api/open_script_file?kind=${kind}&scope=${scope}&file=${encodeURIComponent(file)}`).then(r=>r.json()).then(d=>{
       if(!d.ok){ alert('Failed to load script: '+(d.error||'')); return; }
       const pre = document.getElementById('segScriptContent');
       pre.textContent = d.content || '(no content)';
       const modalEl = document.getElementById('segScriptModal');
+      if(!modalEl.__appendedToBody){
+        document.body.appendChild(modalEl);
+        modalEl.__appendedToBody = true;
+      }
       if(window.bootstrap){
-        // Reuse or create a single instance to avoid stacking backdrops
+        // Reuse or create a single instance to avoid stacking backdrops; guard against double show within 200ms
+        const now = Date.now();
+        if(modalEl.__lastShowTs && (now - modalEl.__lastShowTs) < 200){
+          return; // prevent rapid double triggering
+        }
+        modalEl.__lastShowTs = now;
         const m = (window.bootstrap.Modal.getOrCreateInstance
           ? window.bootstrap.Modal.getOrCreateInstance(modalEl)
           : new bootstrap.Modal(modalEl));
-        // One-time attach hidden handler to clean stray backdrops
         if(!modalEl.__attachedBackdropCleaner){
           modalEl.addEventListener('hidden.bs.modal', ()=>{
-            // Remove all but the last backdrop if multiples somehow remained
             const backs = document.querySelectorAll('.modal-backdrop');
-            if(backs.length > 1){
-              backs.forEach((b,i)=>{ if(i < backs.length-1) b.remove(); });
-            }
-            // Safety: ensure body classes/style restored
+            if(backs.length > 1){ backs.forEach((b,i)=>{ if(i < backs.length-1) b.remove(); }); }
             document.body.classList.remove('modal-open');
             document.body.style.removeProperty('padding-right');
           });
@@ -397,20 +613,7 @@
       }
     }).catch(e=> alert('Error fetching script: '+e));
   }
-  document.getElementById('openTrafficBtn')?.addEventListener('click', ()=> listScripts('traffic'));
-  document.getElementById('openSegBtn')?.addEventListener('click', ()=> listScripts('segmentation'));
-  document.getElementById('segListPreviewBtn')?.addEventListener('click', ()=> listScriptsScoped('segmentation','preview'));
-  document.getElementById('segListRuntimeBtn')?.addEventListener('click', ()=> listScriptsScoped('segmentation','runtime'));
-  document.getElementById('trafficListPreviewBtn')?.addEventListener('click', ()=> listScriptsScoped('traffic','preview'));
-  document.getElementById('trafficListRuntimeBtn')?.addEventListener('click', ()=> listScriptsScoped('traffic','runtime'));
-  function dl(kind, scope){
-    const url = `/api/download_scripts?kind=${kind}&scope=${scope}`;
-    const a = document.createElement('a'); a.href = url; a.download = `${kind}_${scope}_scripts.zip`; document.body.appendChild(a); a.click(); a.remove();
-  }
-  document.getElementById('dlSegRuntimeBtn')?.addEventListener('click', ()=> dl('segmentation','runtime'));
-  document.getElementById('dlSegPreviewBtn')?.addEventListener('click', ()=> dl('segmentation','preview'));
-  document.getElementById('dlTrafficRuntimeBtn')?.addEventListener('click', ()=> dl('traffic','runtime'));
-  document.getElementById('dlTrafficPreviewBtn')?.addEventListener('click', ()=> dl('traffic','preview'));
+  document.getElementById('openTrafficBtn')?.addEventListener('click', ()=> openScriptsModal('traffic'));
   // Delegate view script buttons
   document.getElementById('fp-seg')?.addEventListener('click', (e)=>{
     const btn = e.target.closest('.view-script-btn');
@@ -427,9 +630,7 @@
     const table = document.getElementById('segRulesTable');
     if(!table) return;
     const rows = table.querySelectorAll('tbody tr');
-    const limit = 25;
-    let hiddenCt = 0;
-    rows.forEach((tr, idx)=>{
+    rows.forEach((tr)=>{
       const cells = tr.children;
       if(cells.length < 3) return;
       const typeCell = cells[2];
@@ -443,32 +644,7 @@
       else if(ruleType === 'dnat') badgeClass = 'bg-primary';
       else if(ruleType === 'custom') badgeClass = 'bg-purple';
       typeCell.innerHTML = `<span class="badge ${badgeClass} text-dark" style="min-width:70px;display:inline-block;">${typeCell.textContent.trim()||'-'}</span>`;
-      if(idx >= limit){
-        tr.classList.add('d-none','seg-extra-row');
-        hiddenCt++;
-      }
     });
-    if(hiddenCt>0){
-      const toggleBtn = document.createElement('button');
-      toggleBtn.type='button';
-      toggleBtn.className='btn btn-sm btn-outline-secondary mt-1';
-      toggleBtn.id='segShowMoreBtn';
-      toggleBtn.textContent=`Show ${hiddenCt} more rules`; 
-      table.parentElement.insertBefore(toggleBtn, table);
-      toggleBtn.addEventListener('click', ()=>{
-        const hidden = table.querySelectorAll('tbody tr.seg-extra-row');
-        const collapsed = toggleBtn.getAttribute('data-collapsed') !== 'false';
-        if(collapsed){
-          hidden.forEach(r=> r.classList.remove('d-none'));
-          toggleBtn.textContent='Collapse rules';
-          toggleBtn.setAttribute('data-collapsed','false');
-        } else {
-          hidden.forEach(r=> r.classList.add('d-none'));
-          toggleBtn.textContent=`Show ${hiddenCt} more rules`;
-          toggleBtn.setAttribute('data-collapsed','true');
-        }
-      });
-    }
   }
   function applyTrafficRowStyling(){
     const table = document.getElementById('trafficFlowsTable');

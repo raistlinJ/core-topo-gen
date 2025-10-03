@@ -844,7 +844,48 @@ function showFullPreviewModal(full){
     try { setJson('fpTrafficPlan', full.traffic_summary || full.traffic_plan || {}); } catch(e){}
     // Tables
     function tableHtml(arr, cols){ if(!arr||!arr.length) return '<div class="text-muted small">(none)</div>'; const head='<thead><tr>'+cols.map(c=>`<th>${c}</th>`).join('')+'</tr></thead>'; const body='<tbody>'+arr.map(o=>'<tr>'+cols.map(c=>`<td>${(o[c]!==undefined&&o[c]!==null)? (Array.isArray(o[c])? o[c].join(','): o[c]): ''}</td>`).join('')+'</tr>').join('')+'</tbody>'; return `<div class="table-responsive"><table class="table table-sm table-bordered mb-0">${head}${body}</table></div>`; }
-    const routersWrap = document.getElementById('fpRoutersWrap'); if(routersWrap) routersWrap.innerHTML = tableHtml(full.routers,['node_id','name','ip4']);
+    function summarizeRouterInterfaces(full){
+        const routers = full.routers || [];
+        if(!routers.length) return [];
+        const r2rLinks = full.r2r_links_preview || [];
+        const switches = full.switches_detail || [];
+        const r2rMap = {};
+        r2rLinks.forEach(link => {
+            const routersList = link.routers || [];
+            if(routersList.length < 2) return;
+            const subnet = link.subnet || '';
+            const [ra, rb] = routersList;
+            const entryA = `r${rb.id ?? '?'}: ${(ra.ip || '-')}${subnet ? ` [${subnet}]` : ''}`;
+            const entryB = `r${ra.id ?? '?'}: ${(rb.ip || '-')}${subnet ? ` [${subnet}]` : ''}`;
+            if(ra && ra.id !== undefined){
+                const listA = r2rMap[ra.id] || (r2rMap[ra.id] = []);
+                listA.push(entryA);
+            }
+            if(rb && rb.id !== undefined){
+                const listB = r2rMap[rb.id] || (r2rMap[rb.id] = []);
+                listB.push(entryB);
+            }
+        });
+        const switchMap = {};
+        switches.forEach(sw => {
+            if(sw.router_id === undefined) return;
+            const label = `sw-${sw.switch_id ?? '?'}: ${(sw.router_ip || '-')}${sw.rsw_subnet ? ` [${sw.rsw_subnet}]` : ''}`;
+            const list = switchMap[sw.router_id] || (switchMap[sw.router_id] = []);
+            list.push(label);
+        });
+        return routers.map(r => {
+            const r2rList = (r2rMap[r.node_id] || []).slice().sort();
+            const swList = (switchMap[r.node_id] || []).slice().sort();
+            return {
+                'ID': r.node_id,
+                'Name': r.name || `r${r.node_id}`,
+                'Primary IP': r.ip4 || '-',
+                'R2R Interfaces': r2rList.length ? r2rList.join('; ') : '-',
+                'Switch Links': swList.length ? swList.join('; ') : '-',
+            };
+        });
+    }
+    const routersWrap = document.getElementById('fpRoutersWrap'); if(routersWrap) routersWrap.innerHTML = tableHtml(summarizeRouterInterfaces(full),['ID','Name','Primary IP','R2R Interfaces','Switch Links']);
     const hostsWrap = document.getElementById('fpHostsWrap'); if(hostsWrap) hostsWrap.innerHTML = tableHtml(full.hosts,['node_id','name','role','ip4']);
     const switchesWrap = document.getElementById('fpSwitchesWrap'); if(switchesWrap) switchesWrap.innerHTML = tableHtml(full.switches_detail,['switch_id','router_id','hosts','rsw_subnet','lan_subnet']);
     // Graph
