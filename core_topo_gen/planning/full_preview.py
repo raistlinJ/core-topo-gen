@@ -19,6 +19,8 @@ import ipaddress
 import random
 import os
 import tempfile
+
+from .layout_positions import compute_clustered_layout
 from ..utils.allocators import UniqueAllocator, make_subnet_allocator  # runtime-like allocators
 from .router_host_plan import plan_router_counts, plan_r2s_grouping  # reuse builder's router count & grouping logic
 from .node_plan import _normalize_role_name  # internal normalization helper
@@ -790,6 +792,20 @@ def build_full_preview(
                 'final_dir_hint': '/tmp/traffic',
                 'note': 'Preview scripts will be copied to runtime dir for reuse (unified preview/runtime).'
             }
+            try:
+                import json as _json
+                summary_path = os.path.join(preview_dir, 'traffic_summary.json')
+                with open(summary_path, 'r', encoding='utf-8') as _tf:
+                    _preview_summary = _json.load(_tf) or {}
+                flows_with_scripts = _preview_summary.get('flows') or []
+                if flows_with_scripts:
+                    traffic_scripts_preview['preview_flows'] = flows_with_scripts[:250]
+                    traffic_summary = {
+                        'flows': flows_with_scripts,
+                        'count': len(flows_with_scripts)
+                    }
+            except Exception:
+                pass
             # Predicted allow rules (dry-run) for preview purposes
             host_ip_map = {h.node_id: h.ip4.split('/')[0] for h in host_nodes if h.ip4}
             try:
@@ -895,30 +911,34 @@ def build_full_preview(
     except Exception:
         pass
 
-    return {
-        'routers': [r.__dict__ for r in router_nodes],
-        'hosts': [h.__dict__ for h in host_nodes],
-        'switches': [s.__dict__ for s in switch_nodes],
+    routers_payload = [r.__dict__ for r in router_nodes]
+    hosts_payload = [h.__dict__ for h in host_nodes]
+    switches_payload = [s.__dict__ for s in switch_nodes]
+
+    preview = {
+        'routers': routers_payload,
+        'hosts': hosts_payload,
+        'switches': switches_payload,
         'switches_detail': switches_detail,
         'host_router_map': host_router_map,
         'services_preview': service_assignments,
         'vulnerabilities_preview': vuln_assignments,
         'r2r_policy_preview': r2r_preview,
         'r2r_edges_preview': r2r_edges,
-    'r2r_links_preview': r2r_links_detail,
+        'r2r_links_preview': r2r_links_detail,
         'r2r_degree_preview': r2r_degree,
         'r2r_stats_preview': r2r_stats,
         'r2s_policy_preview': computed_r2s_policy,
         'segmentation_preview': seg_preview,
         'segmentation_rules_preview': segmentation_rules_preview,
-    'segmentation_items_resolved': segmentation_items or [],
-    'traffic_plan': traffic_plan,
-    'traffic_summary': traffic_summary,
-    'traffic_scripts_preview': traffic_scripts_preview,
+        'segmentation_items_resolved': segmentation_items or [],
+        'traffic_plan': traffic_plan,
+        'traffic_summary': traffic_summary,
+        'traffic_scripts_preview': traffic_scripts_preview,
         'ptp_subnets': ptp_subnets,
         'router_switch_subnets': router_switch_subnets,
         'lan_subnets': lan_subnets,
-    'r2r_subnets': r2r_subnets,
+        'r2r_subnets': r2r_subnets,
         'routing_plan': routing_plan,
         'services_plan': services_plan,
         'vulnerabilities_plan': vulnerabilities_plan,
@@ -931,3 +951,17 @@ def build_full_preview(
         'ip_allocation_mode': ip_alloc_mode,
         'router_plan_stats': router_plan_stats,
     }
+
+    layout_input = {
+        'routers': routers_payload,
+        'hosts': hosts_payload,
+        'switches': switches_payload,
+        'switches_detail': switches_detail,
+        'host_router_map': host_router_map,
+    }
+    try:
+        preview['layout_positions'] = compute_clustered_layout(layout_input, max_dim=2000)
+    except Exception as layout_err:
+        preview['layout_positions'] = {'error': str(layout_err)}
+
+    return preview

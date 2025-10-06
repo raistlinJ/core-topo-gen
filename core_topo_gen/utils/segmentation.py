@@ -294,21 +294,26 @@ def plan_and_apply_segmentation(
     except Exception:
         ds = 0.0
     abs_slots_total = 0
+    has_weight_items = False
     try:
         for it in (items or []):
-            c = getattr(it, "abs_count", 0) or 0
-            if c > 0:
-                abs_slots_total += int(c)
+            factor_val = getattr(it, "factor", 0) or 0
+            count_val = getattr(it, "abs_count", 0) or 0
+            if count_val > 0:
+                abs_slots_total += int(count_val)
+            if factor_val > 0 and count_val <= 0:
+                has_weight_items = True
     except Exception:
         abs_slots_total = 0
 
     # Compute density-based slots (weight-based)
     density_slots = 0
-    if ds >= 1:
-        density_slots = max(1, int(round(ds)))
-    elif ds > 0:
-        d = max(0.0, min(1.0, ds))
-        density_slots = max(1, min(base, int(round(base * d))))
+    if has_weight_items:
+        if ds >= 1:
+            density_slots = max(1, int(round(ds)))
+        elif ds > 0:
+            d = max(0.0, min(1.0, ds))
+            density_slots = max(1, min(base, int(round(base * d))))
     # If no explicit counts and density <= 0, nothing to plan
     if abs_slots_total <= 0 and density_slots <= 0:
         return summary
@@ -382,6 +387,27 @@ def plan_and_apply_segmentation(
             return None
         return None
 
+    ROUTER_WEIGHT = 8
+    HOST_WEIGHT = 1
+    MAX_FIREWALL_RULES_PER_NODE = 3
+
+    def _weighted_select(router_list: List[NodeInfo], host_list: List[NodeInfo]) -> Tuple[Optional[NodeInfo], bool]:
+        if router_list and host_list:
+            total = ROUTER_WEIGHT * len(router_list) + HOST_WEIGHT * len(host_list)
+            pick = random.uniform(0, total)
+            if pick < ROUTER_WEIGHT * len(router_list):
+                return random.choice(router_list), True
+            return random.choice(host_list), False
+        if router_list:
+            return random.choice(router_list), True
+        if host_list:
+            return random.choice(host_list), False
+        return None, False
+
+    def _select_node(router_candidates: List[NodeInfo],
+                     host_candidates: List[NodeInfo]) -> Tuple[Optional[NodeInfo], bool]:
+        return _weighted_select(router_candidates, host_candidates)
+
     for idx in range(slots):
         if idx < len(svc_sequence):
             try:
@@ -410,45 +436,42 @@ def plan_and_apply_segmentation(
                 logger.debug("No eligible router for NAT (avoiding NAT+Firewall overlap); skipping slot")
                 continue
         elif svc.upper() == "CUSTOM":
-            # Custom can go on routers or hosts; prefer unused nodes
-            if routers:
-                avail = [r for r in routers if r.node_id not in used_nodes]
-                if avail:
-                    node = random.choice(avail)
-                    on_router = True
-                    logger.debug("Segmentation slot %d: CUSTOM on router %s", idx + 1, node.node_id)
+            router_primary = [r for r in (routers or []) if r.node_id not in used_nodes]
+            host_primary: List[NodeInfo] = []
+            if include_hosts and hosts:
+                host_primary = [h for h in hosts if h.node_id not in used_nodes]
+            node, on_router = _select_node(router_primary, host_primary)
             if node is None:
-                if include_hosts and hosts:
-                    avail = [h for h in hosts if h.node_id not in used_nodes]
-                    node = random.choice(avail if avail else hosts)
-                    on_router = False
-                    logger.debug("Segmentation slot %d: CUSTOM on host %s", idx + 1, node.node_id)
-                else:
-                    # fallback to routers only if not including hosts
-                    if routers:
-                        node = random.choice(routers)
-                        on_router = True
-                        logger.debug("Segmentation slot %d: CUSTOM fallback on router %s", idx + 1, node.node_id)
-                    else:
-                        logger.debug("No eligible nodes for CUSTOM; skipping slot")
-                        continue
+                logger.debug("No eligible nodes for CUSTOM; skipping slot")
+                continue
+            try:
+                logger.debug(
+                    "Segmentation slot %d: CUSTOM on %s %s",
+                    idx + 1,
+                    "router" if on_router else "host",
+                    node.node_id,
+                )
+            except Exception:
+                pass
         else:
             # Firewall: avoid nodes with NAT
-            if routers:
-                candidates = [r for r in routers if r.node_id not in nat_nodes_taken]
-                unused = [r for r in candidates if r.node_id not in used_nodes]
-                pick_from = unused or candidates
-                if pick_from:
-                    node = random.choice(pick_from)
-                    on_router = True
-                    logger.debug("Segmentation slot %d: Firewall on router %s", idx + 1, node.node_id)
-            if node is None and include_hosts:
-                candidates = [h for h in hosts if h.node_id not in nat_nodes_taken]
-                unused = [h for h in candidates if h.node_id not in used_nodes]
-                pick_from = unused or candidates or hosts
-                node = random.choice(pick_from)
-                on_router = False
-                logger.debug("Segmentation slot %d: Firewall on host %s", idx + 1, node.node_id)
+            router_primary = [r for r in (routers or []) if r.node_id not in nat_nodes_taken and r.node_id not in used_nodes]
+            host_primary: List[NodeInfo] = []
+            if include_hosts and hosts:
+                host_primary = [h for h in hosts if h.node_id not in used_nodes]
+            node, on_router = _select_node(router_primary, host_primary)
+            if node is None:
+                logger.debug("Segmentation slot %d: no eligible nodes for %s; skipping slot", idx + 1, svc)
+                continue
+            try:
+                logger.debug(
+                    "Segmentation slot %d: Firewall on %s %s",
+                    idx + 1,
+                    "router" if on_router else "host",
+                    node.node_id,
+                )
+            except Exception:
+                pass
 
         # Build commands/script via plugin or defaults
         if svc.upper() == "CUSTOM":
@@ -506,6 +529,13 @@ print('[segmentation] applied', len(cmds), 'commands')
                 logger.debug("Segmentation: wrote custom script %s for node %s", script_name, node.node_id)
             except Exception as e:
                 logger.debug("Failed to write custom policy script for node %s: %s", node.node_id, e)
+            summary["rules"].append({
+                "node_id": node.node_id,
+                "service": "CUSTOM",
+                "rule": rule,
+                "script": script_path,
+            })
+            used_nodes.add(node.node_id)
         else:
             # NAT: set up basic SNAT on router from an internal subnet to an external subnet
             if svc.upper() == "NAT":
@@ -697,12 +727,6 @@ print('[segmentation] applied', len(cmds), 'commands')
                 # Skip the rest of the loop for NAT
                 continue
 
-            # Default rule construction for Firewall selection
-            rule_type = random.choices(
-                ["subnet_block", "host_block", "protect_internal"], weights=[5, 3, 2]
-            )[0]
-            # Build commands list; will be executed by a generated Python script
-            cmd_list: List[str] = []
             chain_fw = "FORWARD" if on_router else "INPUT"
 
             # Basic overlap avoidance using coverage from earlier in this run
@@ -714,225 +738,242 @@ print('[segmentation] applied', len(cmds), 'commands')
                 except Exception:
                     return False
 
-            if rule_type == "subnet_block" and len(nets) >= 2:
-                # For host-level rule ensure the host's own subnet is target
-                if not on_router:
-                    host_subnet = _node_primary_subnet(node) or random.choice(nets)
-                    # Pick another subnet distinct from host_subnet as source (blocked inbound)
-                    candidates = [n for n in nets if n != host_subnet]
-                    if not candidates:
-                        rule = {"type": "none", "svc": svc, "node": node.node_id}
-                    else:
-                        src_net = random.choice(candidates)
-                        dst_net = host_subnet
-                        if src_net in fw_index[int(node.node_id)]["subnet_block_input"]:
+            rule_iterations = random.randint(1, MAX_FIREWALL_RULES_PER_NODE)
+            for _ in range(rule_iterations):
+                rule_type = random.choices(
+                    ["subnet_block", "host_block", "protect_internal"], weights=[5, 3, 2]
+                )[0]
+                # Build commands list; will be executed by a generated Python script
+                cmd_list: List[str] = []
+
+                if rule_type == "subnet_block" and len(nets) >= 2:
+                    # For host-level rule ensure the host's own subnet is target
+                    if not on_router:
+                        host_subnet = _node_primary_subnet(node) or random.choice(nets)
+                        # Pick another subnet distinct from host_subnet as source (blocked inbound)
+                        candidates = [n for n in nets if n != host_subnet]
+                        if not candidates:
                             rule = {"type": "none", "svc": svc, "node": node.node_id}
                         else:
-                            cmd_list.append(f"iptables -A INPUT -s {src_net} -j DROP")
-                            rule = {"type": "subnet_block", "svc": svc, "node": node.node_id, "src": src_net, "dst": dst_net}
-                            fw_index[int(node.node_id)]["subnet_block_input"].add(src_net)
-                else:
-                    # Router-level pick two distinct subnets; prefer one containing router IP as dst
-                    r_sub = _node_primary_subnet(node) or random.choice(nets)
-                    others = [n for n in nets if n != r_sub]
-                    if not others:
-                        rule = {"type": "none", "svc": svc, "node": node.node_id}
-                    else:
-                        src_net = random.choice(others)
-                        dst_net = r_sub
-                        if dst_net in fw_index[int(node.node_id)]["protect_internal"]:
-                            try:
-                                logger.debug("Skip subnet_block on node %s: covered by protect_internal %s", node.node_id, dst_net)
-                            except Exception:
-                                pass
-                            rule = {"type": "none", "svc": svc, "node": node.node_id}
-                        else:
-                            key_pair = (src_net, dst_net)
-                            if key_pair in fw_index[int(node.node_id)]["subnet_block_forward"]:
+                            src_net = random.choice(candidates)
+                            dst_net = host_subnet
+                            if src_net in fw_index[int(node.node_id)]["subnet_block_input"]:
                                 rule = {"type": "none", "svc": svc, "node": node.node_id}
                             else:
-                                cmd_list.append(f"iptables -A FORWARD -s {src_net} -d {dst_net} -j DROP")
+                                cmd_list.append(f"iptables -A INPUT -s {src_net} -j DROP")
                                 rule = {"type": "subnet_block", "svc": svc, "node": node.node_id, "src": src_net, "dst": dst_net}
-                                fw_index[int(node.node_id)]["subnet_block_forward"].add(key_pair)
-            elif rule_type == "host_block" and len(hosts) >= 2:
-                chain = "FORWARD" if on_router else "INPUT"
-                idx_key = "host_block_forward" if on_router else "host_block_input"
-                if on_router:
-                    a, b = random.sample(hosts, 2)
-                    a_ip = a.ip4.split("/")[0]
-                    b_ip = b.ip4.split("/")[0]
-                else:
-                    # Ensure destination is this host
-                    this_ip = (node.ip4 or '').split('/')[0]
-                    # Pick a different host as source
-                    others = [h for h in hosts if h.node_id != node.node_id]
-                    if not others:
-                        rule = {"type": "none", "svc": svc, "node": node.node_id}
-                        a_ip = b_ip = this_ip  # dummy
+                                fw_index[int(node.node_id)]["subnet_block_input"].add(src_net)
                     else:
-                        a = random.choice(others)
-                        a_ip = a.ip4.split('/')[0]
-                        b_ip = this_ip
-                key_pair = (a_ip, b_ip)
-                if key_pair in fw_index[int(node.node_id)][idx_key]:
-                    rule = {"type": "none", "svc": svc, "node": node.node_id}
-                else:
-                    cmd_list.append(f"iptables -A {chain} -s {a_ip} -d {b_ip} -j DROP")
-                    rule = {"type": "host_block", "svc": svc, "node": node.node_id, "src": a_ip, "dst": b_ip}
-                    fw_index[int(node.node_id)][idx_key].add(key_pair)
-            else:
-                # protect_internal: pick one subnet, block from all others to it
-                if nets:
-                    internal = random.choice(nets)
-                    # Only one protect_internal per internal subnet per node
-                    if internal in fw_index[int(node.node_id)]["protect_internal"]:
-                        rule = {"type": "none", "svc": svc, "node": node.node_id}
-                    else:
-                        if on_router:
-                            cmd_list.append(f"iptables -A FORWARD ! -s {internal} -d {internal} -j DROP")
+                        # Router-level pick two distinct subnets; prefer one containing router IP as dst
+                        r_sub = _node_primary_subnet(node) or random.choice(nets)
+                        others = [n for n in nets if n != r_sub]
+                        if not others:
+                            rule = {"type": "none", "svc": svc, "node": node.node_id}
                         else:
-                            cmd_list.append(f"iptables -A INPUT ! -s {internal} -j DROP")
-                        rule = {"type": "protect_internal", "svc": svc, "node": node.node_id, "subnet": internal}
-                        fw_index[int(node.node_id)]["protect_internal"].add(internal)
+                            src_net = random.choice(others)
+                            dst_net = r_sub
+                            if dst_net in fw_index[int(node.node_id)]["protect_internal"]:
+                                try:
+                                    logger.debug("Skip subnet_block on node %s: covered by protect_internal %s", node.node_id, dst_net)
+                                except Exception:
+                                    pass
+                                rule = {"type": "none", "svc": svc, "node": node.node_id}
+                            else:
+                                key_pair = (src_net, dst_net)
+                                if key_pair in fw_index[int(node.node_id)]["subnet_block_forward"]:
+                                    rule = {"type": "none", "svc": svc, "node": node.node_id}
+                                else:
+                                    cmd_list.append(f"iptables -A FORWARD -s {src_net} -d {dst_net} -j DROP")
+                                    rule = {"type": "subnet_block", "svc": svc, "node": node.node_id, "src": src_net, "dst": dst_net}
+                                    fw_index[int(node.node_id)]["subnet_block_forward"].add(key_pair)
+                elif rule_type == "host_block" and len(hosts) >= 2:
+                    chain = "FORWARD" if on_router else "INPUT"
+                    idx_key = "host_block_forward" if on_router else "host_block_input"
+                    if on_router:
+                        a, b = random.sample(hosts, 2)
+                        a_ip = a.ip4.split("/")[0]
+                        b_ip = b.ip4.split("/")[0]
+                    else:
+                        # Ensure destination is this host
+                        this_ip = (node.ip4 or '').split('/')[0]
+                        # Pick a different host as source
+                        others = [h for h in hosts if h.node_id != node.node_id]
+                        if not others:
+                            rule = {"type": "none", "svc": svc, "node": node.node_id}
+                            a_ip = b_ip = this_ip  # dummy
+                        else:
+                            a = random.choice(others)
+                            a_ip = a.ip4.split('/')[0]
+                            b_ip = this_ip
+                    key_pair = (a_ip, b_ip)
+                    if key_pair in fw_index[int(node.node_id)][idx_key]:
+                        rule = {"type": "none", "svc": svc, "node": node.node_id}
+                    else:
+                        cmd_list.append(f"iptables -A {chain} -s {a_ip} -d {b_ip} -j DROP")
+                        rule = {"type": "host_block", "svc": svc, "node": node.node_id, "src": a_ip, "dst": b_ip}
+                        fw_index[int(node.node_id)][idx_key].add(key_pair)
                 else:
-                    rule = {"type": "none", "svc": svc, "node": node.node_id}
+                    # protect_internal: pick one subnet, block from all others to it
+                    if nets:
+                        internal = random.choice(nets)
+                        # Only one protect_internal per internal subnet per node
+                        if internal in fw_index[int(node.node_id)]["protect_internal"]:
+                            rule = {"type": "none", "svc": svc, "node": node.node_id}
+                        else:
+                            if on_router:
+                                cmd_list.append(f"iptables -A FORWARD ! -s {internal} -d {internal} -j DROP")
+                            else:
+                                cmd_list.append(f"iptables -A INPUT ! -s {internal} -j DROP")
+                            rule = {"type": "protect_internal", "svc": svc, "node": node.node_id, "subnet": internal}
+                            fw_index[int(node.node_id)]["protect_internal"].add(internal)
+                    else:
+                        rule = {"type": "none", "svc": svc, "node": node.node_id}
 
-            # Write Python script as /tmp/segmentation/<type>_<nodeID>_<number>.py
-            rtype = rule.get("type", "rule")
-            key = (node.node_id, rtype)
-            cnt = counters.get(key, 1)
-            counters[key] = cnt + 1
-            script_name = f"seg_{rtype}_{node.node_id}_{cnt}.py"
-            script_path = os.path.join(out_dir, script_name)
-            # Make firewall scripts idempotent and enforce default deny on relevant chain
-            py_lines = [
-                "#!/usr/bin/env python3",
-                "import subprocess, shlex",
-                "def run(cmd: str):",
-                "    try:",
-                "        subprocess.check_call(shlex.split(cmd))",
-                "    except Exception:",
-                "        pass",
-                "def build_check(cmd: str) -> str:",
-                "    tokens = shlex.split(cmd)",
-                "    out = []",
-                "    i = 0",
-                "    while i < len(tokens):",
-                "        t = tokens[i]",
-                "        if t == 'iptables':",
-                "            out.append(t)",
-                "        elif t == '-A' or t == '-I':",
-                "            out.append('-C')",
-                "            if i + 1 < len(tokens):",
-                "                out.append(tokens[i+1])",
-                "                i += 1",
-                "                if t == '-I' and i + 1 < len(tokens) and tokens[i+1].isdigit():",
-                "                    i += 1",
-                "        else:",
-                "            out.append(t)",
-                "        i += 1",
-                "    return ' '.join(out)",
-                "def ensure_rule(cmd: str):",
-                "    check_cmd = build_check(cmd)",
-                "    try:",
-                "        subprocess.check_call(shlex.split(check_cmd))",
-                "        return False",
-                "    except Exception:",
-                "        pass",
-                "    try:",
-                "        subprocess.check_call(shlex.split(cmd))",
-                "        return True",
-                "    except Exception:",
-                "        return False",
-            ]
-            # Set default deny and stateful accept for the chain in use
-            if chain_fw in ("FORWARD", "INPUT"):
-                py_lines += [
-                    f"run('iptables -P {chain_fw} DROP')",
-                    f"ensure_rule('iptables -A {chain_fw} -m state --state ESTABLISHED,RELATED -j ACCEPT')",
+                # Write Python script as /tmp/segmentation/<type>_<nodeID>_<number>.py
+                rtype = rule.get("type", "rule")
+                key = (node.node_id, rtype)
+                cnt = counters.get(key, 1)
+                counters[key] = cnt + 1
+                script_name = f"seg_{rtype}_{node.node_id}_{cnt}.py"
+                script_path = os.path.join(out_dir, script_name)
+                # Make firewall scripts idempotent and enforce default deny on relevant chain
+                py_lines = [
+                    "#!/usr/bin/env python3",
+                    "import subprocess, shlex",
+                    "def run(cmd: str):",
+                    "    try:",
+                    "        subprocess.check_call(shlex.split(cmd))",
+                    "    except Exception:",
+                    "        pass",
+                    "def build_check(cmd: str) -> str:",
+                    "    tokens = shlex.split(cmd)",
+                    "    out = []",
+                    "    i = 0",
+                    "    while i < len(tokens):",
+                    "        t = tokens[i]",
+                    "        if t == 'iptables':",
+                    "            out.append(t)",
+                    "        elif t == '-A' or t == '-I':",
+                    "            out.append('-C')",
+                    "            if i + 1 < len(tokens):",
+                    "                out.append(tokens[i+1])",
+                    "                i += 1",
+                    "                if t == '-I' and i + 1 < len(tokens) and tokens[i+1].isdigit():",
+                    "                    i += 1",
+                    "        else:",
+                    "            out.append(t)",
+                    "        i += 1",
+                    "    return ' '.join(out)",
+                    "def ensure_rule(cmd: str):",
+                    "    check_cmd = build_check(cmd)",
+                    "    try:",
+                    "        subprocess.check_call(shlex.split(check_cmd))",
+                    "        return False",
+                    "    except Exception:",
+                    "        pass",
+                    "    try:",
+                    "        subprocess.check_call(shlex.split(cmd))",
+                    "        return True",
+                    "    except Exception:",
+                    "        return False",
                 ]
-            # For host-level firewall rules, opportunistically open a few common service ports so internal nodes have reachable services.
-            allow_services: List[int] = []
-            if not on_router and chain_fw == "INPUT":
-                service_port_candidates = [22, 53, 80, 443, 8080]
-                # Deterministic selection based on node id for stable previews / runs
-                try:
-                    seed_val = int(getattr(node, 'node_id', 0)) * 9973 + 17
-                except Exception:
-                    seed_val = 17
-                rng = random.Random(seed_val)
-                try:
-                    k = 1 + (seed_val % 3)  # 1..3 stable count
-                except Exception:
-                    k = 1
-                # Shuffle deterministically then take first k
-                shuffled = list(service_port_candidates)
-                rng.shuffle(shuffled)
-                allow_services = shuffled[:k]
-                for p in allow_services:
-                    proto = "udp" if p == 53 else "tcp"
-                    # Insert at head using -I so it has precedence over later DROP rules
-                    py_lines.append(f"ensure_rule('iptables -I INPUT 1 -p {proto} --dport {p} -j ACCEPT')")
-            py_lines += [
-                "rules = [",
-            ]
-            for c in cmd_list:
-                py_lines.append(f"    \"{c}\",")
-            py_lines += [
-                "]",
-                "applied = 0",
-                "for cmd in rules:",
-                "    if ensure_rule(cmd):",
-                "        applied += 1",
-                f"print('[segmentation-{chain_fw.lower()}] applied', applied, 'new rules (idempotent), default {chain_fw} policy set to DROP')",
-            ]
-            try:
-                with open(script_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(py_lines) + "\n")
-                os.chmod(script_path, 0o755)
-                logger.debug("Segmentation: wrote %s for node %s", script_name, node.node_id)
-            except Exception as e:
-                logger.debug("Failed to write policy script for node %s: %s", node.node_id, e)
-
-        # Ensure the chosen service is enabled only on routers; hosts should not be assigned the Segmentation service
-        try:
-            # Enable Segmentation only on routers by default; if include_hosts is True, allow hosts too
-            if svc.upper() != "CUSTOM" and (on_router or include_hosts):
-                to_enable = SERVICE_ENABLE_MAP.get(svc, svc)
-                ok = ensure_service(session, node.node_id, to_enable)
-                if not ok:
-                    logger.warning("Unable to add segmentation service %s on node %s", to_enable, node.node_id)
-                else:
-                    logger.info("Segmentation: enabled %s on node %s", to_enable, node.node_id)
-        except Exception as e:
-            logger.warning("Error enabling segmentation service on node %s: %s", node.node_id, e)
-
-        # Record non-NAT/CUSTOM rule for this node
-        if (rule.get("type") or "") not in ("none",):
-            # Annotate default-deny chain for allow logic to recognize
-            try:
+                # Set default deny and stateful accept for the chain in use
                 if chain_fw in ("FORWARD", "INPUT"):
-                    rule["default_deny"] = True
-                    rule["chain"] = chain_fw
-                if not on_router and 'allow_services' not in rule and 'allow_services' in locals() and allow_services:
-                    # Expose list of opportunistic open service ports for reporting
-                    rule['allow_services'] = allow_services
-            except Exception:
-                pass
-        summary["rules"].append({
-            "node_id": node.node_id,
-            "service": (SERVICE_ENABLE_MAP.get(svc, svc) if svc.upper() != "CUSTOM" else "CUSTOM"),
-            "rule": rule,
-            "script": script_path,
-        })
-        used_nodes.add(node.node_id)
-        # Mark firewall nodes to avoid mixing with NAT later in the same run
-        rtype_l = (rule.get("type") or "").lower()
-        if rtype_l in ("subnet_block", "host_block", "protect_internal"):
-            try:
-                fw_nodes_taken.add(int(node.node_id))
-            except Exception:
-                pass
+                    py_lines += [
+                        f"run('iptables -P {chain_fw} DROP')",
+                        f"ensure_rule('iptables -A {chain_fw} -m state --state ESTABLISHED,RELATED -j ACCEPT')",
+                    ]
+                # For host-level firewall rules, opportunistically open a few common service ports so internal nodes have reachable services.
+                allow_services: List[int] = []
+                if not on_router and chain_fw == "INPUT":
+                    service_port_candidates = [22, 53, 80, 443, 8080]
+                    # Deterministic selection based on node id for stable previews / runs
+                    try:
+                        seed_val = int(getattr(node, 'node_id', 0)) * 9973 + 17
+                    except Exception:
+                        seed_val = 17
+                    rng = random.Random(seed_val + cnt)
+                    try:
+                        k = 1 + (seed_val % 3)  # 1..3 stable count
+                    except Exception:
+                        k = 1
+                    # Shuffle deterministically then take first k
+                    shuffled = list(service_port_candidates)
+                    rng.shuffle(shuffled)
+                    allow_services = shuffled[:k]
+                    for p in allow_services:
+                        proto = "udp" if p == 53 else "tcp"
+                        # Insert at head using -I so it has precedence over later DROP rules
+                        py_lines.append(f"ensure_rule('iptables -I INPUT 1 -p {proto} --dport {p} -j ACCEPT')")
+                py_lines += [
+                    "rules = [",
+                ]
+                for c in cmd_list:
+                    py_lines.append(f"    \"{c}\",")
+                py_lines += [
+                    "]",
+                    "applied = 0",
+                    "for cmd in rules:",
+                    "    if ensure_rule(cmd):",
+                    "        applied += 1",
+                    f"print('[segmentation-{chain_fw.lower()}] applied', applied, 'new rules (idempotent), default {chain_fw} policy set to DROP')",
+                ]
+                try:
+                    with open(script_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(py_lines) + "\n")
+                    os.chmod(script_path, 0o755)
+                    logger.debug("Segmentation: wrote %s for node %s", script_name, node.node_id)
+                except Exception as e:
+                    logger.debug("Failed to write policy script for node %s: %s", node.node_id, e)
+
+                # Ensure the chosen service is enabled only on routers; hosts should not be assigned the Segmentation service
+                try:
+                    # Enable Segmentation only on routers by default; if include_hosts is True, allow hosts too
+                    if svc.upper() != "CUSTOM" and (on_router or include_hosts):
+                        to_enable = SERVICE_ENABLE_MAP.get(svc, svc)
+                        ok = ensure_service(session, node.node_id, to_enable)
+                        if not ok:
+                            logger.warning("Unable to add segmentation service %s on node %s", to_enable, node.node_id)
+                        else:
+                            logger.info("Segmentation: enabled %s on node %s", to_enable, node.node_id)
+                except Exception as e:
+                    logger.warning("Error enabling segmentation service on node %s: %s", node.node_id, e)
+
+                # Record non-NAT/CUSTOM rule for this node
+                if (rule.get("type") or "") not in ("none",):
+                    # Annotate default-deny chain for allow logic to recognize
+                    try:
+                        if chain_fw in ("FORWARD", "INPUT"):
+                            rule["default_deny"] = True
+                            rule["chain"] = chain_fw
+                        if not on_router and 'allow_services' not in rule and 'allow_services' in locals() and allow_services:
+                            # Expose list of opportunistic open service ports for reporting
+                            rule['allow_services'] = allow_services
+                    except Exception:
+                        pass
+                summary["rules"].append({
+                    "node_id": node.node_id,
+                    "service": (SERVICE_ENABLE_MAP.get(svc, svc) if svc.upper() != "CUSTOM" else "CUSTOM"),
+                    "rule": rule,
+                    "script": script_path,
+                })
+                used_nodes.add(node.node_id)
+                # Mark firewall nodes to avoid mixing with NAT later in the same run
+                rtype_l = (rule.get("type") or "").lower()
+                if rtype_l in ("subnet_block", "host_block", "protect_internal"):
+                    try:
+                        fw_nodes_taken.add(int(node.node_id))
+                    except Exception:
+                        pass
+                # Ensure we record default-deny + allow services even if rule type 'none'
+                if (rule.get("type") or "").lower() == "none":
+                    try:
+                        rule["default_deny"] = True
+                        rule["chain"] = chain_fw
+                    except Exception:
+                        pass
+                # Reset allow_services for next iteration without leaking previous values
+                allow_services = []
 
     # Summary logging similar to traffic
     try:

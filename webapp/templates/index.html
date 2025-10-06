@@ -175,7 +175,7 @@
                     <div id="runProgressStatus">Starting…</div>
                     <div id="runProgressMeta"></div>
                 </div>
-                <div class="progress mb-3" role="progressbar" aria-label="Progress" aria-valuemin="0" aria-valuemax="100">
+                <div class="progress mb-2">
                     <div class="progress-bar progress-bar-striped progress-bar-animated" id="runProgressBar" style="width: 100%">Working…</div>
                 </div>
                 <div class="border rounded" style="max-height: 260px; overflow: auto;">
@@ -187,7 +187,7 @@
             </div>
         </div>
     </div>
-    </div>
+</div>
 {% set xml_preview_enabled = True %}
 {% set xml_preview_text = xml_preview %}
 {% include 'partials/dock.html' %}
@@ -355,7 +355,11 @@ function appendLog(line, level){
     // Fallback: create a very small inline buffer if dock not initialized yet.
     try {
         const pre = document.getElementById('logsPre') || document.getElementById('runProgressLog');
-        if(pre){ pre.textContent += `[${new Date().toISOString()}] ${lvl} ${line}\n`; }
+        if(pre){
+            const text = `[${new Date().toISOString()}] ${lvl} ${line}\n`;
+            if(typeof pre.append === 'function'){ pre.append(text); }
+            else { pre.appendChild(document.createTextNode(text)); }
+        }
     } catch(e){}
 }
 if(!window.logInfo) window.logInfo = (m)=>appendLog(m,'INFO');
@@ -431,6 +435,157 @@ function saveFullPreviewHistory(){
     try { localStorage.setItem('coretg_full_preview_history', JSON.stringify(previewState.fullPreviewHistory.slice(-25))); } catch(e){}
 }
 loadFullPreviewHistory();
+
+// Run progress modal state (hoisted early to avoid TDZ issues)
+let runProgressModalInst = null;
+let runProgressEvtSrc = null;
+let runProgressRunId = null;
+
+function setupPreviewModalExecute(modalEl, modalInstance){
+    if(!modalEl) return;
+    const execBtn = modalEl.querySelector('#previewModalExecuteBtn');
+    if(!execBtn) return;
+    if(execBtn.dataset.enhanced === '1') return;
+    execBtn.dataset.enhanced = '1';
+    execBtn.addEventListener('click', async () => {
+        if(execBtn.disabled) return;
+        execBtn.disabled = true;
+        execBtn.classList.add('disabled');
+        const forceHideModal = () => {
+            try { modalInstance?.hide(); } catch(e){}
+            if(modalEl){
+                modalEl.classList.remove('show');
+                modalEl.setAttribute('aria-hidden','true');
+                modalEl.style.display = 'none';
+            }
+            // Remove any lingering backdrop only if no other modals remain visible
+            const openModals = document.querySelectorAll('.modal.show');
+            if(openModals.length === 0){
+                document.querySelectorAll('.modal-backdrop').forEach(b => {
+                    try { b.remove(); } catch(e){}
+                });
+                document.body.classList.remove('modal-open');
+                document.body.style.removeProperty('paddingRight');
+                document.body.style.removeProperty('overflow');
+            }
+        };
+        const restoreModal = () => {
+            try {
+                if(modalInstance){
+                    modalInstance.show();
+                } else if(modalEl){
+                    modalEl.style.display = 'block';
+                    modalEl.classList.add('show');
+                    document.body.classList.add('modal-open');
+                }
+            } catch(e){}
+        };
+        const waitForPaint = async () => {
+            await new Promise(resolve => requestAnimationFrame(() => resolve()));
+        };
+        try {
+            if(!window.confirm('Execute this scenario now? This will start a CORE session.')){
+                return;
+            }
+            forceHideModal();
+            await waitForPaint();
+            await new Promise(resolve => setTimeout(resolve, 0));
+            openRunProgress('Running CLI…');
+            try {
+                const statusEl = document.getElementById('runProgressStatus');
+                if(statusEl) statusEl.textContent = 'Starting…';
+                const metaEl = document.getElementById('runProgressMeta');
+                if(metaEl) metaEl.textContent = '';
+                const bar = document.getElementById('runProgressBar');
+                if(bar){
+                    bar.classList.add('progress-bar-animated');
+                    bar.textContent = 'Working…';
+                }
+            } catch(e){}
+            try {
+                const showBtn = document.getElementById('dockShowBtn');
+                if(showBtn && !showBtn.classList.contains('d-none')) showBtn.click();
+            } catch(e){}
+
+            const setRunning = () => {
+                try {
+                    const statusEl = document.getElementById('runProgressStatus');
+                    if(statusEl) statusEl.textContent = 'Running…';
+                    const metaEl = document.getElementById('runProgressMeta');
+                    if(metaEl) metaEl.textContent = 'Streaming logs…';
+                    const bar = document.getElementById('runProgressBar');
+                    if(bar){
+                        bar.classList.add('progress-bar-animated');
+                        bar.textContent = 'Working…';
+                    }
+                } catch(e){}
+            };
+            const setFinished = (data) => {
+                try {
+                    const statusEl = document.getElementById('runProgressStatus');
+                    if(statusEl) statusEl.textContent = (data?.returncode === 0) ? 'Scenario started' : 'Finished with errors';
+                    const metaEl = document.getElementById('runProgressMeta');
+                    if(metaEl) metaEl.textContent = (data?.returncode === 0) ? 'Completed' : 'Finished';
+                    const bar = document.getElementById('runProgressBar');
+                    if(bar){
+                        bar.classList.remove('progress-bar-animated');
+                        bar.textContent = (data?.returncode === 0) ? 'Done' : 'Error';
+                    }
+                } catch(e){}
+            };
+            const setFailedToStart = (msg) => {
+                try {
+                    const statusEl = document.getElementById('runProgressStatus');
+                    if(statusEl) statusEl.textContent = 'Failed to start';
+                    const metaEl = document.getElementById('runProgressMeta');
+                    if(metaEl) metaEl.textContent = msg || '';
+                    const bar = document.getElementById('runProgressBar');
+                    if(bar){
+                        bar.classList.remove('progress-bar-animated');
+                        bar.textContent = 'Error';
+                    }
+                } catch(e){}
+            };
+
+            let launchFailed = false;
+            const result = await runSyncWithModal({
+                showProgressModal: false,
+                skipConfirm: true,
+                onTick: (data) => {
+                    if(data && !data.done){
+                        setRunning();
+                    }
+                },
+                onComplete: (data) => {
+                    setFinished(data);
+                    try {
+                        if(data?.returncode === 0){
+                            setTimeout(()=>{ window.location.href = "{{ url_for('reports_page') }}"; }, 500);
+                        }
+                    } catch(e){}
+                },
+                onError: () => {
+                    setFailedToStart('Unable to launch CLI');
+                    launchFailed = true;
+                },
+            });
+            if(result === false){
+                if(!launchFailed){
+                    closeRunProgress();
+                    restoreModal();
+                }
+                return;
+            }
+        } catch(err){
+            console.error('Preview execute failed', err);
+            closeRunProgress();
+            restoreModal();
+        } finally {
+            execBtn.disabled = false;
+            execBtn.classList.remove('disabled');
+        }
+    });
+}
 
 function updatePlanButtons(){
     const previewBtn = document.getElementById('planPreviewBtn');
@@ -905,6 +1060,7 @@ function showFullPreviewModal(full){
         form.target='_blank';
         const inXml = document.createElement('input'); inXml.type='hidden'; inXml.name='xml_path'; inXml.value=xmlPath; form.appendChild(inXml);
         if(scen){ const inSc = document.createElement('input'); inSc.type='hidden'; inSc.name='scenario'; inSc.value=scen; form.appendChild(inSc); }
+        if(full && full.seed){ const inSeed=document.createElement('input'); inSeed.type='hidden'; inSeed.name='seed'; inSeed.value=full.seed; form.appendChild(inSeed); }
         document.body.appendChild(form);
         form.submit();
         setTimeout(()=>{ try { form.remove(); } catch(e){} }, 1000);
@@ -928,17 +1084,147 @@ function buildFullPreviewModalGraph(full){
         currentTransform = ev.transform; zoomLayer.attr('transform', currentTransform);
     });
     svg.call(zoom).on('dblclick.zoom', null);
-    const nodes=[]; const links=[];
-    (full.routers||[]).forEach(r=>nodes.push({id:r.node_id, label:r.name, type:'router'}));
-    (full.hosts||[]).forEach(hn=>nodes.push({id:hn.node_id, label:hn.name, type:'host'}));
-    (full.switches_detail||[]).forEach(sw=>nodes.push({id:sw.switch_id, label:'sw-'+sw.switch_id, type:'switch'}));
-    (full.r2r_edges_preview||[]).forEach(e=>links.push({source:e[0], target:e[1], kind:'r2r'}));
-    (full.switches_detail||[]).forEach(sw=>{ (sw.hosts||[]).forEach(hid=>links.push({source:sw.switch_id, target:hid, kind:'sw-host'})); links.push({source:sw.router_id, target:sw.switch_id, kind:'r-sw'}); });
-    const hr = full.host_router_map || {}; Object.entries(hr).forEach(([hid,rid])=>{ const hIdNum=parseInt(hid,10); if(!links.find(l=>l.kind==='sw-host' && l.target===hIdNum)){ links.push({source:rid, target:hIdNum, kind:'r-host'}); }});
-    const sim = d3.forceSimulation(nodes).force('link', d3.forceLink(links).id(d=>d.id).distance(l=> l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40))).force('charge', d3.forceManyBody().strength(-220)).force('center', d3.forceCenter(w/2,h/2));
-    const link = zoomLayer.selectAll('line').data(links).enter().append('line').attr('stroke', l=> l.kind==='r2r'? '#0d6efd': (l.kind==='r-sw'? '#198754':'#999')).attr('stroke-width', l=> l.kind==='r2r'? 2:1.2).attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null).attr('opacity', .9);
-    const node = zoomLayer.selectAll('g').data(nodes).enter().append('g').call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
-    node.append('circle').attr('r', d=> d.type==='router'? 11: (d.type==='switch'? 8:5)).attr('fill', d=> d.type==='router'? '#ff7043': (d.type==='switch'? '#17a2b8': '#ffc107')).attr('stroke','#333').attr('stroke-width',1.1);
+        const nodes=[];
+        const linkDescriptors=[];
+        (full.routers||[]).forEach(r=>nodes.push({id:r.node_id, label:r.name, type:'router'}));
+        (full.hosts||[]).forEach(hn=>nodes.push({id:hn.node_id, label:hn.name, type:'host'}));
+        (full.switches_detail||[]).forEach(sw=>nodes.push({id:sw.switch_id, label:'sw-'+sw.switch_id, type:'switch'}));
+        (full.r2r_edges_preview||[]).forEach(e=>linkDescriptors.push({sourceId:e[0], targetId:e[1], kind:'r2r'}));
+        (full.switches_detail||[]).forEach(sw=>{ (sw.hosts||[]).forEach(hid=>linkDescriptors.push({sourceId:sw.switch_id, targetId:hid, kind:'sw-host'})); linkDescriptors.push({sourceId:sw.router_id, targetId:sw.switch_id, kind:'r-sw'}); });
+        const hr = full.host_router_map || {}; Object.entries(hr).forEach(([hid,rid])=>{ const hIdNum=parseInt(hid,10); if(!linkDescriptors.find(l=>l.kind==='sw-host' && l.targetId===hIdNum)){ linkDescriptors.push({sourceId:rid, targetId:hIdNum, kind:'r-host'}); }});
+
+        const nodeById = new Map(nodes.map(n => [n.id, n]));
+        const layoutPositions = full.layout_positions;
+        const layoutMaps = (layoutPositions && !layoutPositions.error && typeof layoutPositions === 'object')
+            ? {
+                    routers: layoutPositions.routers || {},
+                    switches: layoutPositions.switches || {},
+                    hosts: layoutPositions.hosts || {},
+                }
+            : null;
+        function layoutCoordForNode(node){
+            if(!layoutMaps) return null;
+            let table = null;
+            if(node.type==='router') table = layoutMaps.routers;
+            else if(node.type==='switch') table = layoutMaps.switches;
+            else table = layoutMaps.hosts;
+            if(!table) return null;
+            const key = String(node.id);
+            const raw = table[key] || table[node.id];
+            if(!raw) return null;
+            const x = Number(raw.x);
+            const y = Number(raw.y);
+            if(Number.isFinite(x) && Number.isFinite(y)) return {x, y};
+            return null;
+        }
+        const layoutCoords = [];
+        if(layoutMaps){
+            nodes.forEach(n=>{
+                const pos = layoutCoordForNode(n);
+                if(pos){
+                    n._layout = pos;
+                    layoutCoords.push(pos);
+                }
+            });
+        }
+        const margin = 40;
+        const innerWidth = Math.max(w - margin*2, 200);
+        const innerHeight = Math.max(h - margin*2, 200);
+        let usingLayout = layoutCoords.length > 0;
+        const originalPositions = new Map();
+        function applyRowJitter(list){
+            const buckets = new Map();
+            list.forEach(node=>{
+                if(!Number.isFinite(node.y)) return;
+                const base = node._layout ? node._layout.y : node.y;
+                if(!Number.isFinite(base)) return;
+                const key = Math.round(base * 1000);
+                const bucket = buckets.get(key);
+                if(bucket){
+                    bucket.push(node);
+                } else {
+                    buckets.set(key, [node]);
+                }
+            });
+            buckets.forEach(group=>{
+                if(group.length <= 1) return;
+                group.sort((a,b)=> String(a.id).localeCompare(String(b.id)));
+                const mid = (group.length - 1) / 2;
+                const spacing = 8;
+                group.forEach((node, idx)=>{
+                    node.y += (idx - mid) * spacing;
+                });
+            });
+        }
+        let applyPositionUpdate = null;
+        if(usingLayout){
+            let minX = layoutCoords[0].x, maxX = layoutCoords[0].x;
+            let minY = layoutCoords[0].y, maxY = layoutCoords[0].y;
+            layoutCoords.forEach(c=>{ if(c.x<minX) minX=c.x; if(c.x>maxX) maxX=c.x; if(c.y<minY) minY=c.y; if(c.y>maxY) maxY=c.y; });
+            const spanX = Math.max(1, maxX - minX);
+            const spanY = Math.max(1, maxY - minY);
+            let scale = Math.min(innerWidth/spanX, innerHeight/spanY);
+            if(!Number.isFinite(scale) || scale <= 0){
+                usingLayout = false;
+            } else {
+                const offsetX = margin + (innerWidth - spanX * scale) / 2 - minX * scale;
+                const offsetY = margin + (innerHeight - spanY * scale) / 2 - minY * scale;
+                nodes.forEach(n=>{
+                    if(n._layout){
+                        n.x = offsetX + n._layout.x * scale;
+                        n.y = offsetY + n._layout.y * scale;
+                    } else {
+                        n.x = w/2 + Math.random()*40 - 20;
+                        n.y = h/2 + Math.random()*40 - 20;
+                    }
+                });
+                applyRowJitter(nodes);
+                originalPositions.clear();
+                nodes.forEach(n=>{
+                    if(Number.isFinite(n.x) && Number.isFinite(n.y)){
+                        originalPositions.set(n.id, { x: n.x, y: n.y });
+                    }
+                });
+            }
+        }
+        const link = zoomLayer.selectAll('line').data(linkDescriptors).enter().append('line').attr('stroke', l=> l.kind==='r2r'? '#0d6efd': (l.kind==='r-sw'? '#198754':'#999')).attr('stroke-width', l=> l.kind==='r2r'? 2:1.2).attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null).attr('opacity', .9);
+        const node = zoomLayer.selectAll('g').data(nodes).enter().append('g');
+        node.append('circle').attr('r', d=> d.type==='router'? 11: (d.type==='switch'? 8:5)).attr('fill', d=> d.type==='router'? '#ff7043': (d.type==='switch'? '#17a2b8': '#ffc107')).attr('stroke','#333').attr('stroke-width',1.1);
+        let sim = null;
+        if(usingLayout){
+            const updateStatic = () => {
+                link
+                    .attr('x1', d=> (nodeById.get(d.sourceId)?.x) ?? 0)
+                    .attr('y1', d=> (nodeById.get(d.sourceId)?.y) ?? 0)
+                    .attr('x2', d=> (nodeById.get(d.targetId)?.x) ?? 0)
+                    .attr('y2', d=> (nodeById.get(d.targetId)?.y) ?? 0);
+                node.attr('transform', d=>`translate(${d.x||0},${d.y||0})`);
+            };
+            updateStatic();
+            applyPositionUpdate = updateStatic;
+            const staticDrag = d3.drag()
+                .on('start', (event)=>{
+                    try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
+                })
+                .on('drag', (event, d)=>{
+                    d.x = event.x;
+                    d.y = event.y;
+                    updateStatic();
+                })
+                .on('end', (event)=>{
+                    try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
+                });
+            node.call(staticDrag);
+        } else {
+            const simLinks = linkDescriptors.map(l=>({...l, source:l.sourceId, target:l.targetId}));
+            sim = d3.forceSimulation(nodes).force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40))).force('charge', d3.forceManyBody().strength(-220)).force('center', d3.forceCenter(w/2,h/2));
+            link.data(simLinks, d=>`${d.source}-${d.target}`);
+            sim.on('tick', ()=>{
+                link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y).attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
+                node.attr('transform', d=>`translate(${d.x},${d.y})`);
+            });
+            node.call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
+        }
     // Legend
     const legend = svg.append('g').attr('class','legend').attr('transform','translate(8,8)');
     const legendItems = [
@@ -961,12 +1247,35 @@ function buildFullPreviewModalGraph(full){
     const tSend = {}; const tRecv = {};
     try { (traffic.flows || traffic || []).forEach(f=>{ const s=f.src_id??f.src; const d=f.dst_id??f.dst; if(s!==undefined) tSend[s]=(tSend[s]||0)+1; if(d!==undefined) tRecv[d]=(tRecv[d]||0)+1; }); } catch(e){}
     // Tooltip functionality removed per request
-    sim.on('tick', ()=>{ link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y).attr('x2', d=>d.target.x).attr('y2', d=>d.target.y); node.attr('transform', d=>`translate(${d.x},${d.y})`); });
-    function dragstarted(event,d){ if(!event.active) sim.alphaTarget(.3).restart(); d.fx=d.x; d.fy=d.y; }
+    if(sim){
+        sim.on('tick', ()=>{
+            link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y).attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
+            node.attr('transform', d=>`translate(${d.x},${d.y})`);
+        });
+    }
+    function dragstarted(event,d){ if(sim && !event.active) sim.alphaTarget(.3).restart(); d.fx=d.x; d.fy=d.y; }
     function dragged(event,d){ d.fx=event.x; d.fy=event.y; }
-    function dragended(event,d){ if(!event.active) sim.alphaTarget(0); }
+    function dragended(event,d){ if(sim && !event.active) sim.alphaTarget(0); }
     document.getElementById('fpGraphLoading')?.remove();
-    document.getElementById('fpGraphResetBtn')?.addEventListener('click', ()=>{ sim.alpha(1).restart(); nodes.forEach(n=>{ n.fx=null; n.fy=null; }); svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity); });
+    const resetBtn = document.getElementById('fpGraphResetBtn');
+    if(resetBtn){
+        resetBtn.addEventListener('click', ()=>{
+            if(sim){
+                sim.alpha(1).restart();
+                nodes.forEach(n=>{ n.fx=null; n.fy=null; });
+            } else if(applyPositionUpdate){
+                nodes.forEach(n => {
+                    const orig = originalPositions.get(n.id);
+                    if(orig){
+                        n.x = orig.x;
+                        n.y = orig.y;
+                    }
+                });
+                applyPositionUpdate();
+            }
+            svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity);
+        });
+    }
     // Removed zoom hint tooltip
     svg.on('mousedown', ()=> svg.style('cursor','grabbing'));
     window.addEventListener('mouseup', ()=> svg.style('cursor','grab'));
@@ -999,36 +1308,130 @@ function buildNodeSectionsTable(full){
 // Execute button in Full Preview modal
 document.addEventListener('DOMContentLoaded', ()=>{
     const execBtn = document.getElementById('fpExecuteBtn');
-    if(execBtn){
+    if(execBtn && !execBtn.dataset.boundExecute){
+        execBtn.dataset.boundExecute = '1';
+        let executing = false;
+        const originalLabel = execBtn.textContent;
+        const modalEl = document.getElementById('fullPreviewModal');
+        const resolveModalInstance = () => {
+            if(!modalEl || !window.bootstrap) return null;
+            try {
+                return bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl);
+            } catch(e){
+                console.error('Failed to resolve full preview modal instance', e);
+                return null;
+            }
+        };
         execBtn.addEventListener('click', async ()=>{
+            if(executing) return;
             if(!state.result_path || !state.result_path.endsWith('.xml')){
-                alert('Save XML before executing.'); return;
+                alert('Save XML before executing.');
+                return;
             }
             if(!window.confirm('Execute this scenario now? This will start a CORE session.')) return;
+            const modalInstance = resolveModalInstance();
+            const forceHideModal = () => {
+                try { modalInstance?.hide(); } catch(e){}
+                if(modalEl){
+                    modalEl.classList.remove('show');
+                    modalEl.setAttribute('aria-hidden','true');
+                    modalEl.style.display = 'none';
+                }
+                const openModals = document.querySelectorAll('.modal.show');
+                if(openModals.length === 0){
+                    document.querySelectorAll('.modal-backdrop').forEach(b => { try { b.remove(); } catch(e){} });
+                    document.body.classList.remove('modal-open');
+                    document.body.style.removeProperty('paddingRight');
+                    document.body.style.removeProperty('overflow');
+                }
+            };
+            const restoreModal = () => {
+                try {
+                    if(modalInstance){
+                        modalInstance.show();
+                    } else if(modalEl){
+                        modalEl.style.display = 'block';
+                        modalEl.classList.add('show');
+                        document.body.classList.add('modal-open');
+                    }
+                } catch(e){}
+            };
+            const waitForPaint = async () => {
+                await new Promise(resolve => requestAnimationFrame(() => resolve()));
+            };
+            executing = true;
+            execBtn.disabled = true;
+            execBtn.classList.add('disabled');
+            if(originalLabel){ execBtn.textContent = 'Executing…'; }
+            let runStarted = false;
             try {
+                forceHideModal();
+                await waitForPaint();
+                openRunProgress('Executing scenario…');
+                try {
+                    document.getElementById('runProgressStatus').textContent = 'Starting…';
+                    document.getElementById('runProgressMeta').textContent = '';
+                    const bar = document.getElementById('runProgressBar');
+                    if(bar){ bar.classList.add('progress-bar-animated'); bar.textContent = 'Working…'; }
+                } catch(e){}
                 // Ensure dock visible
                 try { const showBtn=document.getElementById('dockShowBtn'); if(showBtn && !showBtn.classList.contains('d-none')) showBtn.click(); } catch(e){}
                 appendLog('--- Execute (Full Preview) start: '+state.result_path+' ---','info');
                 const form = new FormData(); form.append('xml_path', state.result_path);
                 const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
-                if(!res.ok){ appendLog('Failed to start execution (HTTP '+res.status+')','error'); return; }
+                if(!res.ok){
+                    appendLog('Failed to start execution (HTTP '+res.status+')','error');
+                    try {
+                        const statusEl = document.getElementById('runProgressStatus');
+                        if(statusEl) statusEl.textContent = 'Failed to start';
+                        const metaEl = document.getElementById('runProgressMeta');
+                        if(metaEl) metaEl.textContent = 'HTTP '+res.status;
+                        const bar = document.getElementById('runProgressBar');
+                        if(bar) bar.classList.remove('progress-bar-animated');
+                    } catch(e){}
+                    closeRunProgress();
+                    restoreModal();
+                    return;
+                }
                 const dataInit = await res.json();
                 const run_id = dataInit.run_id;
-                if(!run_id){ appendLog('Execution start response missing run_id','error'); return; }
+                if(!run_id){
+                    appendLog('Execution start response missing run_id','error');
+                    try {
+                        const statusEl = document.getElementById('runProgressStatus');
+                        if(statusEl) statusEl.textContent = 'Failed to start';
+                        const metaEl = document.getElementById('runProgressMeta');
+                        if(metaEl) metaEl.textContent = 'Missing run id';
+                        const bar = document.getElementById('runProgressBar');
+                        if(bar) bar.classList.remove('progress-bar-animated');
+                    } catch(e){}
+                    closeRunProgress();
+                    restoreModal();
+                    return;
+                }
+                runStarted = true;
                 appendLog('Run ID: '+run_id,'info');
-                // Stream logs directly into dock log buffer
-                const evt = new EventSource('/stream/' + run_id);
-                evt.onmessage = ev => {
+                try {
+                    const statusEl = document.getElementById('runProgressStatus');
+                    if(statusEl) statusEl.textContent = 'Running…';
+                    const metaEl = document.getElementById('runProgressMeta');
+                    if(metaEl) metaEl.textContent = 'Streaming logs…';
+                } catch(e){}
+                runProgressRunId = run_id;
+                try { if(runProgressEvtSrc) runProgressEvtSrc.close(); } catch(e){}
+                runProgressEvtSrc = new EventSource('/stream/' + run_id);
+                runProgressEvtSrc.onmessage = ev => {
                     if(ev && typeof ev.data === 'string') {
-                        // Prefer dock logging; fall back to legacy runProgressLogLine if present
                         try {
-                            if(window.logLine){ window.logLine('INFO', ev.data); }
-                            else if(typeof runProgressLogLine === 'function'){ runProgressLogLine(ev.data); }
-                            else { appendLog(ev.data, 'INFO'); }
+                            runProgressLogLine(ev.data);
                         } catch(e) { /* swallow */ }
                     }
                 };
-                evt.addEventListener('end', ()=>{ try{ evt.close(); }catch(e){} appendLog('Execution stream ended','info'); });
+                runProgressEvtSrc.addEventListener('end', ()=>{
+                    try { runProgressEvtSrc?.close(); } catch(e){}
+                    runProgressEvtSrc = null;
+                    runProgressLogLine('Execution stream ended');
+                });
                 // Poll status until done
                 (async function poll(){
                     try {
@@ -1036,15 +1439,49 @@ document.addEventListener('DOMContentLoaded', ()=>{
                         if(!r.ok){ setTimeout(poll, 1200); return; }
                         const st = await r.json();
                         if(!st.done){ setTimeout(poll, 1000); return; }
+                        try {
+                            const metaEl = document.getElementById('runProgressMeta');
+                            if(metaEl) metaEl.textContent = st.returncode===0 ? 'Completed' : 'Finished';
+                            const bar = document.getElementById('runProgressBar');
+                            if(bar){ bar.classList.remove('progress-bar-animated'); bar.textContent = st.returncode===0 ? 'Done' : 'Error'; }
+                        } catch(e){}
                         if(st.returncode===0){
                             appendLog('Execution complete: success; redirecting to Reports','info');
+                            try {
+                                const statusEl = document.getElementById('runProgressStatus');
+                                if(statusEl) statusEl.textContent = 'Scenario started';
+                            } catch(e){}
                             setTimeout(()=>{ window.location.href = "{{ url_for('reports_page') }}"; }, 700);
                         } else {
                             appendLog('Execution finished with errors (code '+st.returncode+')','error');
+                            try {
+                                const statusEl = document.getElementById('runProgressStatus');
+                                if(statusEl) statusEl.textContent = 'Finished with errors';
+                            } catch(e){}
                         }
                     } catch(e){ setTimeout(poll, 1500); }
                 })();
-            } catch(e){ appendLog('Execution exception: '+e,'error'); }
+            } catch(e){
+                appendLog('Execution exception: '+e,'error');
+                try {
+                    const statusEl = document.getElementById('runProgressStatus');
+                    if(statusEl) statusEl.textContent = 'Exception starting run';
+                    const metaEl = document.getElementById('runProgressMeta');
+                    if(metaEl) metaEl.textContent = '';
+                    const bar = document.getElementById('runProgressBar');
+                    if(bar) bar.classList.remove('progress-bar-animated');
+                } catch(_){}
+                if(!runStarted){
+                    closeRunProgress();
+                    restoreModal();
+                }
+            }
+            finally {
+                execBtn.disabled = false;
+                execBtn.classList.remove('disabled');
+                if(originalLabel){ execBtn.textContent = originalLabel; }
+                executing = false;
+            }
         });
     }
 });
@@ -1348,31 +1785,7 @@ function renderMain() {
     const hostSummaryHtml = `<span class=\"badge rounded-pill ${hostBadgeClass} host-total-badge\" data-bs-toggle=\"tooltip\" title=\"${allocTip.replace(/"/g,'&quot;')}\">Hosts: ${niWeightRows.length ? (niBase + ' + ' + niAdd + ' = ' + niTotal) : (niAdd)}</span>`;
     const densityBaseHtml = `<div class=\"d-flex align-items-center gap-1\" title=\"Base host pool used only for weight-based density calculations; Count rows are additive beyond this.\"><label class=\"form-label mb-0\">Count for Density</label><input type=\"number\" min=\"0\" max=\"5000\" step=\"1\" class=\"form-control form-control-sm\" style=\"width:120px\" value=\"${densityCountVal}\" data-scen-idx=\"${activeIdx}\" data-field=\"scenario_density_count\" /></div>`;
     const headerRow = document.createElement('div');
-    headerRow.className = 'mb-3 d-flex flex-wrap gap-3 align-items-center';
-    headerRow.innerHTML = `
-        <div class=\"d-flex align-items-center gap-2\">
-            <strong>Scenario:</strong>
-            <input class=\"form-control form-control-sm\" style=\"width:260px\" value=\"${scen.name}\" data-scen-idx=\"${activeIdx}\" data-field=\"name\" />
-        </div>
-        <div class=\"d-flex align-items-center gap-2 flex-wrap\">
-            ${densityBaseHtml}
-            ${hostSummaryHtml}
-        </div>
-        <div class=\"ms-auto d-flex gap-2\">
-            <button type=\"button\" class=\"btn btn-sm btn-outline-secondary\" data-action=\"preview-plan\">Export Preview</button>
-            <button type=\"button\" class=\"btn btn-sm btn-outline-danger\" data-action=\"remove-scenario\" data-scen-idx=\"${activeIdx}\">Remove</button>
-        </div>`;
-    root.appendChild(headerRow);
-
-    // Section cards (Node Information first)
-    const secNames = ['Node Information','Routing','Services','Traffic','Events','Vulnerabilities','Segmentation'];
-    // Compute base host pool (non-router/docker). Routers/Docker added later should not change this base count.
-    const baseNodeSec = scen.sections['Node Information'] || { items: [] };
-    const baseNodeItems = baseNodeSec.items || [];
-    const baseNodeRows = baseNodeItems.map(it => ({ metric: (it.v_metric || (it.selected==='Specific'?'Count':'Weight')), it }));
-    const baseWeightRows = baseNodeRows.filter(r => r.metric === 'Weight');
-    const baseCountRows = baseNodeRows.filter(r => r.metric === 'Count');
-    const baseCountSum = baseCountRows.reduce((a,r)=> a + (parseInt(r.it.v_count,10)||0), 0);
+    const secNames = Object.keys(scen.sections || {});
     // Base host pool for density-driven (weight) allocations comes from scenario.density_count
     const baseHostPool = (scen.density_count !== undefined && scen.density_count !== null && scen.density_count !== '' ? (parseInt(scen.density_count,10)||0) : 10);
     secNames.forEach(name => {
@@ -2105,12 +2518,24 @@ function wireHandlers() {
             const totalVulns = vExplicit + vDerived;
             const rowsHtml = allocTable.length ? allocTable.map(r => `<tr><td>${r.label}</td><td>${r.weight.toFixed(3)}</td><td>${r.percent.toFixed(1)}%</td><td>${r.alloc}</td></tr>`).join('') : '<tr><td colspan="4" class="text-muted">No weight allocation</td></tr>';
             const modalHtml = `
-<div class=\"modal fade\" id=\"previewModal\" tabindex=\"-1\" aria-hidden=\"true\">\n  <div class=\"modal-dialog modal-lg modal-dialog-scrollable\">\n    <div class=\"modal-content\">\n      <div class=\"modal-header\">\n        <h5 class=\"modal-title\">Plan Preview: ${scen.name}</h5>\n        <button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\" aria-label=\"Close\"></button>\n      </div>\n      <div class=\"modal-body\">\n        <div class=\"row mb-3\">\n          <div class=\"col-md-4\"><div class=\"card card-body p-2\"><small class=\"text-muted\">Hosts Total</small><div class=\"fs-5\">${totalHosts}</div><div class=\"small text-muted\">Base ${base} + Add ${addHosts}</div></div></div>\n          <div class=\"col-md-4\"><div class=\"card card-body p-2\"><small class=\"text-muted\">Routers</small><div class=\"fs-5\">${totalRouters}</div><div class=\"small text-muted\">Explicit ${rExplicit} + Derived ${rDerived}</div></div></div>\n          <div class=\"col-md-4\"><div class=\"card card-body p-2\"><small class=\"text-muted\">Vulns</small><div class=\"fs-5\">${totalVulns}</div><div class=\"small text-muted\">Explicit ${vExplicit} + Derived ${vDerived}</div></div></div>\n        </div>\n        <h6>Host Weight Allocation</h6>\n        <div class=\"table-responsive\">\n          <table class=\"table table-sm\">\n            <thead><tr><th>Row</th><th>Weight</th><th>%</th><th>Alloc</th></tr></thead>\n            <tbody>${rowsHtml}</tbody>\n          </table>\n        </div>\n      </div>\n      <div class=\"modal-footer\">\n        <button type=\"button\" class=\"btn btn-sm btn-outline-secondary\" data-bs-dismiss=\"modal\">Close</button>\n      </div>\n    </div>\n  </div>\n</div>`;
+<div class=\"modal fade\" id=\"previewModal\" tabindex=\"-1\" aria-hidden=\"true\">\n  <div class=\"modal-dialog modal-lg modal-dialog-scrollable\">\n    <div class=\"modal-content\">\n      <div class=\"modal-header\">\n        <h5 class=\"modal-title\">Plan Preview: ${scen.name}</h5>\n        <button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\" aria-label=\"Close\"></button>\n      </div>\n      <div class=\"modal-body\">\n        <div class=\"progress mb-3 d-none\" id=\"previewExecuteProgress\">\n          <div class=\"progress-bar progress-bar-striped progress-bar-animated\" id=\"previewExecuteProgressBar\" style=\"width:100%\">Running…</div>\n        </div>\n        <div class=\"row mb-3\">\n          <div class=\"col-md-4\"><div class=\"card card-body p-2\"><small class=\"text-muted\">Hosts Total</small><div class=\"fs-5\">${totalHosts}</div><div class=\"small text-muted\">Base ${base} + Add ${addHosts}</div></div></div>\n          <div class=\"col-md-4\"><div class=\"card card-body p-2\"><small class=\"text-muted\">Routers</small><div class=\"fs-5\">${totalRouters}</div><div class=\"small text-muted\">Explicit ${rExplicit} + Derived ${rDerived}</div></div></div>\n          <div class=\"col-md-4\"><div class=\"card card-body p-2\"><small class=\"text-muted\">Vulns</small><div class=\"fs-5\">${totalVulns}</div><div class=\"small text-muted\">Explicit ${vExplicit} + Derived ${vDerived}</div></div></div>\n        </div>\n        <h6>Host Weight Allocation</h6>\n        <div class=\"table-responsive\">\n          <table class=\"table table-sm\">\n            <thead><tr><th>Row</th><th>Weight</th><th>%</th><th>Alloc</th></tr></thead>\n            <tbody>${rowsHtml}</tbody>\n          </table>\n        </div>\n      </div>\n      <div class=\"modal-footer\">\n        <button type=\"button\" class=\"btn btn-sm btn-warning\" id=\"previewModalExecuteBtn\">Execute</button>\n        <button type=\"button\" class=\"btn btn-sm btn-outline-secondary\" data-bs-dismiss=\"modal\">Close</button>\n      </div>\n    </div>\n  </div>\n</div>`;
             let container = document.getElementById('previewModalContainer');
             if (!container) { container = document.createElement('div'); container.id = 'previewModalContainer'; document.body.appendChild(container); }
             container.innerHTML = modalHtml;
-            if (window.bootstrap) { try { new bootstrap.Modal(document.getElementById('previewModal')).show(); } catch(e) { alert('Bootstrap modal failed; see console'); console.error(e); } }
-            else { alert('Bootstrap not loaded.'); }
+            const modalEl = container.querySelector('#previewModal');
+            let modalInstance = null;
+            if (window.bootstrap) {
+                try {
+                    modalInstance = new bootstrap.Modal(modalEl);
+                } catch(e) {
+                    alert('Bootstrap modal failed; see console');
+                    console.error(e);
+                }
+            } else {
+                alert('Bootstrap not loaded.');
+            }
+            setupPreviewModalExecute(modalEl, modalInstance);
+            try { modalInstance?.show(); } catch(e) {}
         };
     }
     // Initialize popovers & tooltips (Bootstrap 5)
@@ -2757,9 +3182,6 @@ async function pollRunStatus(runId) {
     }
 
 // --- Run CLI via modal (async under the hood) ---
-let runProgressModalInst = null;
-let runProgressEvtSrc = null;
-let runProgressRunId = null;
 function ensureRunProgressModal(){
     if(!runProgressModalInst){
         const el = document.getElementById('runProgressModal');
@@ -2778,18 +3200,26 @@ function runProgressLogLine(s){
         else if(/\bWARN(ING)?\b/.test(line)) lvl='WARN';
         else if(/\bDEBUG\b/.test(line)) lvl='DEBUG';
     } catch(e){}
+    try {
+        const text = line + '\n';
+        if(typeof pre.append === 'function'){ pre.append(text); }
+        else { pre.appendChild(document.createTextNode(text)); }
+    } catch(e){}
     appendLog(line, lvl);
     pre.parentElement?.scrollTo({ top: pre.parentElement.scrollHeight });
 }
 function openRunProgress(title){
+    const modalEl = document.getElementById('runProgressModal');
     ensureRunProgressModal();
     try {
         if(title) document.querySelector('#runProgressModal .modal-title').textContent = title;
         document.getElementById('runProgressStatus').textContent = 'Starting…';
         document.getElementById('runProgressMeta').textContent = '';
         document.getElementById('runProgressBar').classList.add('progress-bar-animated');
+        const logEl = document.getElementById('runProgressLog');
+        if(logEl) logEl.textContent = '';
     // Do NOT clear persistent log buffer; just re-render existing lines
-    renderDockLog();
+    if(typeof renderDockLog === 'function'){ renderDockLog(); }
         // Reset footer buttons to default state
         const hideBtn = document.getElementById('runProgressHideBtn');
         if (hideBtn) {
@@ -2798,15 +3228,56 @@ function openRunProgress(title){
         }
         runProgressModalInst?.show();
     } catch(e){}
+    try {
+        if(modalEl && !modalEl.classList.contains('show')){
+            modalEl.style.display = 'block';
+            modalEl.removeAttribute('aria-hidden');
+            modalEl.classList.add('show');
+            if(!document.body.classList.contains('modal-open')){
+                document.body.classList.add('modal-open');
+                document.body.style.removeProperty('paddingRight');
+                document.body.style.removeProperty('overflow');
+            }
+            if(!document.querySelector('.modal-backdrop')){
+                const backdrop = document.createElement('div');
+                backdrop.className = 'modal-backdrop fade show';
+                document.body.appendChild(backdrop);
+            }
+        }
+    } catch(e){}
 }
 function closeRunProgress(){
     try { if(runProgressEvtSrc) runProgressEvtSrc.close(); } catch(e){}
     runProgressEvtSrc = null;
     runProgressRunId = null;
     try { runProgressModalInst?.hide(); } catch(e){}
+    try {
+        const modalEl = document.getElementById('runProgressModal');
+        if(modalEl){
+            modalEl.classList.remove('show');
+            modalEl.style.removeProperty('display');
+            modalEl.setAttribute('aria-hidden','true');
+        }
+        const openModals = document.querySelectorAll('.modal.show');
+        if(openModals.length === 0){
+            document.querySelectorAll('.modal-backdrop').forEach(b => {
+                try { b.remove(); } catch(_e){}
+            });
+            document.body.classList.remove('modal-open');
+            document.body.style.removeProperty('paddingRight');
+            document.body.style.removeProperty('overflow');
+        }
+    } catch(e){}
 }
-async function runSyncWithModal(ev){
-    if(ev) ev.preventDefault();
+async function runSyncWithModal(arg){
+    let opts = {};
+    if(arg && typeof arg === 'object' && typeof arg.preventDefault === 'function'){
+        arg.preventDefault();
+    } else if(arg && typeof arg === 'object'){
+        opts = arg;
+    }
+    const showProgressModal = opts.showProgressModal !== false;
+    const skipConfirm = opts.skipConfirm === true;
     // Validate saved XML
     let rp = state.result_path || '';
     if (!rp.endsWith('.xml')) {
@@ -2820,8 +3291,10 @@ async function runSyncWithModal(ev){
         } catch(e){ logError('Exception during auto-save; aborting run'); return false; }
     }
     const confirmMsg = 'This will generate a CORE scenario and attempt to start it. Proceed?';
-    if (!window.confirm(confirmMsg)) { logInfo('Run CLI cancelled by user at confirmation'); return false; }
-    openRunProgress('Running CLI…');
+    if (!skipConfirm && !window.confirm(confirmMsg)) { logInfo('Run CLI cancelled by user at confirmation'); return false; }
+    if(showProgressModal){
+        openRunProgress('Running CLI…');
+    }
     try {
         // Ensure dock is visible
         try {
@@ -2830,9 +3303,39 @@ async function runSyncWithModal(ev){
         } catch(e){}
         const form = new FormData(); form.append('xml_path', rp);
         const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
-        if(!res.ok){ runProgressLogLine('Failed to start CLI'); return false; }
-        const { run_id } = await res.json();
+        if(!res.ok){
+            runProgressLogLine('Failed to start CLI');
+            if(showProgressModal){
+                try {
+                    const statusEl = document.getElementById('runProgressStatus');
+                    if(statusEl) statusEl.textContent = 'Failed to start';
+                    const metaEl = document.getElementById('runProgressMeta');
+                    if(metaEl) metaEl.textContent = 'HTTP ' + res.status;
+                    const bar = document.getElementById('runProgressBar');
+                    if(bar){ bar.classList.remove('progress-bar-animated'); bar.textContent = 'Error'; }
+                } catch(e){}
+            }
+            try { opts.onError?.(new Error('Failed to start CLI')); } catch(e){}
+            return false;
+        }
+        const dataInit = await res.json();
+        const run_id = dataInit?.run_id;
         runProgressRunId = run_id;
+        if(!run_id){
+            runProgressLogLine('Execution start response missing run_id');
+            if(showProgressModal){
+                try {
+                    const statusEl = document.getElementById('runProgressStatus');
+                    if(statusEl) statusEl.textContent = 'Failed to start';
+                    const metaEl = document.getElementById('runProgressMeta');
+                    if(metaEl) metaEl.textContent = 'Missing run id';
+                    const bar = document.getElementById('runProgressBar');
+                    if(bar){ bar.classList.remove('progress-bar-animated'); bar.textContent = 'Error'; }
+                } catch(e){}
+            }
+            try { opts.onError?.(new Error('Missing run id')); } catch(e){}
+            return false;
+        }
         // No Cancel button in modal; runs cannot be cancelled here
         // Start SSE stream into modal
         try { if(runProgressEvtSrc) runProgressEvtSrc.close(); } catch(e){}
@@ -2840,30 +3343,42 @@ async function runSyncWithModal(ev){
         runProgressEvtSrc.onmessage = (ev)=>{ runProgressLogLine(ev.data||''); };
         runProgressEvtSrc.addEventListener('end', ()=>{ try { runProgressEvtSrc.close(); } catch(e){} logInfo('Run (modal) ended'); });
         // Poll for completion and update meta
-        (async function poll(){
-            try{
-                const r = await fetch('/run_status/' + run_id);
-                if(!r.ok){ setTimeout(poll, 1200); return; }
-                const data = await r.json();
-                if(data.report_path || data.xml_path){
-                    state.result_path = data.report_path || data.xml_path;
-                    persistEditorState();
-                }
-                const metaEl = document.getElementById('runProgressMeta');
-                if(metaEl){ metaEl.textContent = data.done ? (data.returncode===0 ? 'Completed' : 'Failed') : 'Running…'; }
-                if(!data.done){ setTimeout(poll, 1000); return; }
-                document.getElementById('runProgressStatus').textContent = (data.returncode===0) ? 'Scenario started' : 'Finished with errors';
-                document.getElementById('runProgressBar').classList.remove('progress-bar-animated');
-                // If successful, redirect to Reports page
-                try {
-                    if (data.returncode === 0) {
-                        setTimeout(() => { window.location.href = "{{ url_for('reports_page') }}"; }, 500);
+        return await new Promise((resolve) => {
+            (async function poll(){
+                try{
+                    const r = await fetch('/run_status/' + run_id);
+                    if(!r.ok){ setTimeout(poll, 1200); return; }
+                    const data = await r.json();
+                    if(data.report_path || data.xml_path){
+                        state.result_path = data.report_path || data.xml_path;
+                        persistEditorState();
                     }
-                } catch(e){}
-            } catch(e){ setTimeout(poll, 1500); }
-        })();
-    } catch(e){ runProgressLogLine('Exception starting CLI'); }
-    return false; // prevent default form submit
+                    if(showProgressModal){
+                        const metaEl = document.getElementById('runProgressMeta');
+                        if(metaEl){ metaEl.textContent = data.done ? (data.returncode===0 ? 'Completed' : 'Failed') : 'Running…'; }
+                    } else {
+                        try { opts.onTick?.(data); } catch(e){}
+                    }
+                    if(!data.done){ setTimeout(poll, 1000); return; }
+                    if(showProgressModal){
+                        document.getElementById('runProgressStatus').textContent = (data.returncode===0) ? 'Scenario started' : 'Finished with errors';
+                        document.getElementById('runProgressBar').classList.remove('progress-bar-animated');
+                    }
+                    try { opts.onComplete?.(data); } catch(e){}
+                    try {
+                        if (data.returncode === 0) {
+                            setTimeout(() => { window.location.href = "{{ url_for('reports_page') }}"; }, 500);
+                        }
+                    } catch(e){}
+                    resolve(data);
+                } catch(e){ setTimeout(poll, 1500); }
+            })();
+        });
+    } catch(e){
+        runProgressLogLine('Exception starting CLI');
+        try { if(!showProgressModal) opts.onError?.(e); } catch(_){}
+        throw e;
+    }
 }
 
 // Run deterministically with a seed (preview seed or input)

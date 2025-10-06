@@ -53,7 +53,7 @@
 
   <div class="d-flex align-items-center mb-2 gap-2">
     <h2 class="me-auto mb-0">Full Preview {{ scenario or '' }}</h2>
-    <button id="executeRunBtn" class="btn btn-sm btn-warning" title="Execute this scenario now (invokes CLI)">Execute</button>
+  <button id="executeRunBtn" class="btn btn-sm btn-warning" title="Execute this scenario now (invokes CLI)" data-preview-plan="{{ preview_plan_path or '' }}">Execute</button>
     <form method="post" action="/plan/full_preview_page" class="d-flex align-items-center" id="rerollForm">
       <input type="hidden" name="xml_path" value="{{ xml_path }}" />
       {% if scenario %}<input type="hidden" name="scenario" value="{{ scenario }}" />{% endif %}
@@ -68,9 +68,6 @@
   <div class="mb-3">
     <button id="exportJsonBtn" class="btn btn-sm btn-outline-secondary me-2">Export JSON</button>
     <button id="exportPngBtn" class="btn btn-sm btn-outline-secondary me-2">Export Graph PNG</button>
-    <div class="btn-group btn-group-sm" role="group">
-      <button class="btn btn-sm btn-outline-success" id="openTrafficBtn" type="button" title="List generated traffic + segmentation scripts">Traffic/Segmentation Scripts</button>
-    </div>
     <!-- Approval workflow removed; button/status span deleted -->
   </div>
   <div class="row">
@@ -114,9 +111,9 @@
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-node-sections" type="button">Node Sections</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-json" type="button">Raw JSON</button></li>
       </ul>
-      <div class="tab-content border border-top-0 p-2" id="fpTabsContent" style="min-height:480px;">
+      <div class="tab-content border border-top-0 p-2" id="fpTabsContent" style="min-height:680px;">
         <div class="tab-pane fade show active position-relative" id="fp-graph">
-          <div id="previewGraph" style="height:440px; position:relative; background:#fafafa; border:1px solid #e0e0e0; border-radius:4px; overflow:hidden;"></div>
+          <div id="previewGraph" style="height:640px; position:relative; background:#fafafa; border:1px solid #e0e0e0; border-radius:4px; overflow:hidden;"></div>
           <div id="graphZoomControls" class="position-absolute" style="top:6px; right:8px; z-index:10;">
             <div class="btn-group btn-group-sm shadow-sm" role="group" aria-label="Zoom controls">
               <button type="button" class="btn btn-outline-secondary" id="zoomInBtn" title="Zoom In">+</button>
@@ -323,7 +320,7 @@
           {% if flows %}
           <div class="table-responsive" style="max-height:440px;overflow:auto;">
             <table class="table table-sm table-striped small" id="trafficFlowsTable">
-              <thead><tr><th>#</th><th>Src ID</th><th>Dst ID</th><th>Pattern</th><th>Rate (kbps)</th><th>Proto</th></tr></thead>
+              <thead><tr><th>#</th><th>Src ID</th><th>Dst ID</th><th>Pattern</th><th>Rate (kbps)</th><th>Proto</th><th>Script</th></tr></thead>
               <tbody>
               {% for f in flows %}
                 <tr>
@@ -333,6 +330,16 @@
                   <td>{{ f.pattern or '-' }}</td>
                   <td>{{ f.rate_kbps or f.rate or '-' }}</td>
                   <td>{{ f.protocol or f.kind or 'tcp' }}</td>
+                  <td>
+                    {% set sender = f.sender_script %}
+                    {% set receiver = f.receiver_script %}
+                    {% if sender or receiver %}
+                      <div class="d-flex gap-1 flex-wrap">
+                        {% if sender %}{% set send_name = sender.split('/')[-1] %}<button class="btn btn-sm btn-outline-primary py-0 px-1 view-script-btn" data-kind="traffic" data-file="{{ send_name }}" data-role="sender">Sender</button>{% endif %}
+                        {% if receiver %}{% set recv_name = receiver.split('/')[-1] %}<button class="btn btn-sm btn-outline-secondary py-0 px-1 view-script-btn" data-kind="traffic" data-file="{{ recv_name }}" data-role="receiver">Receiver</button>{% endif %}
+                      </div>
+                    {% else %}-{% endif %}
+                  </td>
                 </tr>
               {% endfor %}
               </tbody>
@@ -348,7 +355,32 @@
       </div>
     </div>
   </div>
- </div>
+</div>
+<div class="modal fade" id="executeProgressModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Executing scenario…</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex justify-content-between align-items-center mb-2 small text-muted">
+          <div id="executeProgressStatus">Starting…</div>
+          <div id="executeProgressMeta"></div>
+        </div>
+        <div class="progress mb-3" role="progressbar" aria-label="Progress" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-bar progress-bar-striped progress-bar-animated" id="executeProgressBar" style="width: 100%;">Working…</div>
+        </div>
+        <div class="border rounded" style="max-height: 260px; overflow: auto;">
+          <pre class="m-0 p-2 small" id="executeProgressLog" style="white-space: pre-wrap;"></pre>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" id="executeProgressHideBtn" data-bs-dismiss="modal">Hide</button>
+      </div>
+    </div>
+  </div>
+</div>
 {% block extra_scripts %}
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 <script id="fpDataJson" type="application/json">{{ full_preview | tojson }}</script>
@@ -386,41 +418,199 @@
     });
     svg.call(zoom).on('dblclick.zoom', null);
     const nodes = [];
-    const links = [];
-    const routerIds = new Set();
-  (previewData.routers||[]).forEach(r=>{ nodes.push({id:r.node_id, label:r.name, type:'router'}); routerIds.add(r.node_id); });
-  (previewData.hosts||[]).forEach(h=>{ nodes.push({id:h.node_id, label:h.name, type:'host'}); });
-  (previewData.switches_detail||[]).forEach(sw=>{ nodes.push({id:sw.switch_id, label:'sw-'+sw.switch_id, type:'switch'}); });
-    // R2R edges
-  (previewData.r2r_edges_preview||[]).forEach(e=>{ links.push({source:e[0], target:e[1], kind:'r2r'}); });
-    // Host -> Router (fallback if no switch) or Host -> Switch
-  const hostRouterMap = previewData.host_router_map || {};
-  (previewData.switches_detail||[]).forEach(sw=>{
-      (sw.hosts||[]).forEach(hid=>{ links.push({source:sw.switch_id, target:hid, kind:'sw-host'}); });
-      links.push({source:sw.router_id, target:sw.switch_id, kind:'r-sw'});
+    const linkDescriptors = [];
+    (previewData.routers||[]).forEach(r=>{ nodes.push({id:r.node_id, label:r.name, type:'router'}); });
+    (previewData.hosts||[]).forEach(h=>{ nodes.push({id:h.node_id, label:h.name, type:'host'}); });
+    (previewData.switches_detail||[]).forEach(sw=>{ nodes.push({id:sw.switch_id, label:'sw-'+sw.switch_id, type:'switch'}); });
+    (previewData.r2r_edges_preview||[]).forEach(e=>{ linkDescriptors.push({sourceId:e[0], targetId:e[1], kind:'r2r'}); });
+    const hostRouterMap = previewData.host_router_map || {};
+    (previewData.switches_detail||[]).forEach(sw=>{
+      (sw.hosts||[]).forEach(hid=>{ linkDescriptors.push({sourceId:sw.switch_id, targetId:hid, kind:'sw-host'}); });
+      linkDescriptors.push({sourceId:sw.router_id, targetId:sw.switch_id, kind:'r-sw'});
     });
     Object.entries(hostRouterMap).forEach(([hid,rid])=>{
       const hIdNum = parseInt(hid,10);
-      // Only add direct link if host not already attached via switch
-      if(!links.find(l=>l.kind==='sw-host' && l.target===hIdNum)){
-        links.push({source:rid, target:hIdNum, kind:'r-host'});
+      if(!linkDescriptors.find(l=>l.kind==='sw-host' && l.targetId===hIdNum)){
+        linkDescriptors.push({sourceId:rid, targetId:hIdNum, kind:'r-host'});
       }
     });
-    const sim = d3.forceSimulation(nodes)
-      .force('link', d3.forceLink(links).id(d=>d.id).distance(l=> l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40)))
-      .force('charge', d3.forceManyBody().strength(-200))
-      .force('center', d3.forceCenter(width/2, height/2));
-    const link = container.selectAll('line').data(links).enter().append('line')
+
+    const nodeById = new Map(nodes.map(n => [n.id, n]));
+    const layoutPositions = previewData.layout_positions;
+    const layoutMaps = (layoutPositions && !layoutPositions.error && typeof layoutPositions === 'object')
+      ? {
+          routers: layoutPositions.routers || {},
+          switches: layoutPositions.switches || {},
+          hosts: layoutPositions.hosts || {},
+        }
+      : null;
+
+    function layoutCoordForNode(node){
+      if(!layoutMaps) return null;
+      let table = null;
+      if(node.type === 'router') table = layoutMaps.routers;
+      else if(node.type === 'switch') table = layoutMaps.switches;
+      else table = layoutMaps.hosts;
+      if(!table) return null;
+      const key = String(node.id);
+      const raw = table[key] || table[node.id];
+      if(!raw) return null;
+      const x = Number(raw.x);
+      const y = Number(raw.y);
+      if(Number.isFinite(x) && Number.isFinite(y)) return {x, y};
+      return null;
+    }
+
+    const layoutCoords = [];
+    if(layoutMaps){
+      nodes.forEach(n => {
+        const pos = layoutCoordForNode(n);
+        if(pos){
+          n._layout = pos;
+          layoutCoords.push(pos);
+        }
+      });
+    }
+
+    const margin = 40;
+    const innerWidth = Math.max(width - margin * 2, 200);
+    const innerHeight = Math.max(height - margin * 2, 200);
+    let usingLayout = layoutCoords.length > 0;
+    const staticOriginalPositions = new Map();
+    let resetStaticPositions = null;
+    function applyRowJitter(list){
+      const buckets = new Map();
+      list.forEach(node => {
+        if(!Number.isFinite(node.y)) return;
+        const base = node._layout ? node._layout.y : node.y;
+        if(!Number.isFinite(base)) return;
+        const key = Math.round(base * 1000);
+        const bucket = buckets.get(key);
+        if(bucket){
+          bucket.push(node);
+        } else {
+          buckets.set(key, [node]);
+        }
+      });
+      buckets.forEach(group => {
+        if(group.length <= 1) return;
+        group.sort((a,b)=> String(a.id).localeCompare(String(b.id)));
+        const mid = (group.length - 1) / 2;
+        const spacing = 8;
+        group.forEach((node, idx)=>{
+          node.y += (idx - mid) * spacing;
+        });
+      });
+    }
+    let scale = 1;
+    let offsetX = margin;
+    let offsetY = margin;
+    if(usingLayout){
+      let minX = layoutCoords[0].x;
+      let maxX = layoutCoords[0].x;
+      let minY = layoutCoords[0].y;
+      let maxY = layoutCoords[0].y;
+      for(const coord of layoutCoords){
+        if(coord.x < minX) minX = coord.x;
+        if(coord.x > maxX) maxX = coord.x;
+        if(coord.y < minY) minY = coord.y;
+        if(coord.y > maxY) maxY = coord.y;
+      }
+      const spanX = Math.max(1, maxX - minX);
+      const spanY = Math.max(1, maxY - minY);
+      scale = Math.min(innerWidth / spanX, innerHeight / spanY);
+      if(!Number.isFinite(scale) || scale <= 0){
+        scale = 1;
+        usingLayout = false;
+      } else {
+        offsetX = margin + (innerWidth - spanX * scale) / 2 - minX * scale;
+        offsetY = margin + (innerHeight - spanY * scale) / 2 - minY * scale;
+        nodes.forEach(n => {
+          if(n._layout){
+            n.x = offsetX + n._layout.x * scale;
+            n.y = offsetY + n._layout.y * scale;
+          } else {
+            n.x = width / 2 + Math.random() * 40 - 20;
+            n.y = height / 2 + Math.random() * 40 - 20;
+          }
+        });
+        applyRowJitter(nodes);
+        staticOriginalPositions.clear();
+        nodes.forEach(n => {
+          if(Number.isFinite(n.x) && Number.isFinite(n.y)){
+            staticOriginalPositions.set(n.id, { x: n.x, y: n.y });
+          }
+        });
+      }
+    }
+
+    const link = container.selectAll('line').data(linkDescriptors).enter().append('line')
       .attr('stroke', l=> l.kind==='r2r'? '#007bff' : (l.kind==='r-sw'? '#28a745' : '#999'))
       .attr('stroke-width', l=> l.kind==='r2r'? 2 : 1.2)
       .attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null)
       .attr('opacity', 0.85);
-    const node = container.selectAll('g.node').data(nodes).enter().append('g').attr('class','node')
-      .call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
+    const node = container.selectAll('g.node').data(nodes).enter().append('g').attr('class','node');
     node.append('circle')
       .attr('r', d=> d.type==='router'? 10 : (d.type==='switch'? 7 : 5))
       .attr('fill', d=> d.type==='router'? '#ff5722' : (d.type==='switch'? '#17a2b8' : '#ffc107'))
       .attr('stroke', '#333').attr('stroke-width', 1);
+
+    let sim = null;
+    if(usingLayout){
+      const invertToLayout = (event) => {
+        const point = currentTransform.invert([event.x, event.y]);
+        return { x: point[0], y: point[1] };
+      };
+      const updateStatic = () => {
+        link
+          .attr('x1', d=> (nodeById.get(d.sourceId)?.x) ?? 0)
+          .attr('y1', d=> (nodeById.get(d.sourceId)?.y) ?? 0)
+          .attr('x2', d=> (nodeById.get(d.targetId)?.x) ?? 0)
+          .attr('y2', d=> (nodeById.get(d.targetId)?.y) ?? 0);
+        node.attr('transform', d=>`translate(${d.x||0},${d.y||0})`);
+      };
+      updateStatic();
+      resetStaticPositions = () => {
+        nodes.forEach(n => {
+          const orig = staticOriginalPositions.get(n.id);
+          if(orig){
+            n.x = orig.x;
+            n.y = orig.y;
+          }
+        });
+        updateStatic();
+      };
+      const staticDrag = d3.drag()
+        .on('start', (event)=>{
+          try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
+        })
+        .on('drag', (event, d)=>{
+          const { x, y } = invertToLayout(event);
+          d.x = x;
+          d.y = y;
+          updateStatic();
+        })
+        .on('end', (event)=>{
+          try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
+        });
+      node.call(staticDrag);
+    } else {
+      const simLinks = linkDescriptors.map(l => ({...l, source: l.sourceId, target: l.targetId}));
+      sim = d3.forceSimulation(nodes)
+        .force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40)))
+        .force('charge', d3.forceManyBody().strength(-200))
+        .force('center', d3.forceCenter(width/2, height/2));
+      link.data(simLinks, d=>`${d.source}-${d.target}`);
+      sim.on('tick', ()=>{
+        link
+          .attr('x1', d=>d.source.x)
+          .attr('y1', d=>d.source.y)
+          .attr('x2', d=>d.target.x)
+          .attr('y2', d=>d.target.y);
+        node.attr('transform', d=>`translate(${d.x},${d.y})`);
+      });
+      node.call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
+    }
     // Build quick lookup structures for tooltips
   const servicesByNode = previewData.services_preview || {}; // { node_id: [service,...] }
   const vulnsRaw = previewData.vulnerabilities_preview || {}; // legacy __density_pool__ removed in planner
@@ -496,20 +686,21 @@
       }
     } catch(e) { console.warn('node section table build failed', e); }
   // Node labels removed per request
-    sim.on('tick', ()=>{
-      link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y).attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
-      node.attr('transform', d=>'translate('+d.x+','+d.y+')');
-    });
-    function dragstarted(event,d){ if(!event.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; }
-    function dragged(event,d){ d.fx=event.x; d.fy=event.y; }
-    function dragended(event,d){ if(!event.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }
+  function dragstarted(event,d){ if(sim && !event.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; }
+  function dragged(event,d){ d.fx=event.x; d.fy=event.y; }
+  function dragended(event,d){ if(sim && !event.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }
     // Wire zoom control buttons
     const zoomInBtn = document.getElementById('zoomInBtn');
     const zoomOutBtn = document.getElementById('zoomOutBtn');
     const zoomResetBtn = document.getElementById('zoomResetBtn');
     if(zoomInBtn){ zoomInBtn.onclick = ()=> svg.transition().duration(200).call(zoom.scaleBy, 1.2); }
     if(zoomOutBtn){ zoomOutBtn.onclick = ()=> svg.transition().duration(200).call(zoom.scaleBy, 1/1.2); }
-    if(zoomResetBtn){ zoomResetBtn.onclick = ()=> svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity); }
+    if(zoomResetBtn){
+      zoomResetBtn.onclick = ()=>{
+        svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity);
+        if(resetStaticPositions) resetStaticPositions();
+      };
+    }
     // Improve grab cursor feedback
     svg.on('mousedown', ()=> svg.style('cursor','grabbing'));
     window.addEventListener('mouseup', ()=> svg.style('cursor','grab'));
@@ -613,17 +804,21 @@
       }
     }).catch(e=> alert('Error fetching script: '+e));
   }
-  document.getElementById('openTrafficBtn')?.addEventListener('click', ()=> openScriptsModal('traffic'));
-  // Delegate view script buttons
-  document.getElementById('fp-seg')?.addEventListener('click', (e)=>{
-    const btn = e.target.closest('.view-script-btn');
-    if(!btn) return;
-    const file = btn.getAttribute('data-file');
-    const kind = btn.getAttribute('data-kind') || 'segmentation';
-    // Determine if script path looks preview or runtime; heuristic: name starts with 'seg_' and not in /tmp yet -> prefer preview
-    // For simplicity let user choose preview first
-    viewScript(kind, 'preview', file);
-  });
+  function attachScriptDelegation(containerId, fallbackKind){
+    const el = document.getElementById(containerId);
+    if(!el) return;
+    el.addEventListener('click', (e)=>{
+      const btn = e.target.closest('.view-script-btn');
+      if(!btn) return;
+      const file = btn.getAttribute('data-file');
+      if(!file) return;
+      const kind = btn.getAttribute('data-kind') || fallbackKind || 'segmentation';
+      const scope = btn.getAttribute('data-scope') || 'preview';
+      viewScript(kind, scope, file);
+    });
+  }
+  attachScriptDelegation('fp-seg', 'segmentation');
+  attachScriptDelegation('fp-traffic', 'traffic');
 
   // --------- Color-coded badges & collapsible tables ---------
   function applySegmentationRowStyling(){
@@ -724,40 +919,142 @@
       img.src = 'data:image/svg+xml;base64,'+btoa(unescape(encodeURIComponent(svgStr)));
     } catch(e){ console.error('Export PNG failed', e); }
   });
-  // Execute: start CLI run for provided xml_path
-  document.getElementById('executeRunBtn')?.addEventListener('click', async ()=>{
-    const confirmMsg = 'Execute scenario now? This will invoke the CLI and start a CORE session.';
-    if(!window.confirm(confirmMsg)) return;
-    try {
-  const form = new FormData(); form.append('xml_path', '{{ xml_path }}');
-      const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
-      if(!res.ok){ alert('Failed to start execution'); return; }
-      const { run_id } = await res.json();
-      // Open a basic popup / window with streaming logs (reuse existing /stream endpoint)
-      const logWin = window.open('', '_blank');
-      if(logWin){
-        logWin.document.write('<pre id="log" style="font:11px monospace;white-space:pre-wrap;">Starting...\n</pre>');
-      }
-      const evt = new EventSource('/stream/' + run_id);
-      evt.onmessage = (ev)=>{ if(logWin && !logWin.closed){ logWin.document.getElementById('log').textContent += (ev.data||'') + '\n'; } };
-      evt.addEventListener('end', ()=>{ try { evt.close(); } catch(e){} });
-      // Poll status until done then redirect user to reports page
-      (async function poll(){
-        try {
-          const r = await fetch('/run_status/' + run_id);
-          if(!r.ok){ setTimeout(poll, 1200); return; }
-          const data = await r.json();
-          if(!data.done){ setTimeout(poll, 1000); return; }
-          if(data.returncode===0){
-            if(logWin && !logWin.closed){ logWin.document.getElementById('log').textContent += '\nRun complete. Redirecting to Reports...'; }
-            setTimeout(()=>{ window.location.href = "{{ url_for('reports_page') }}"; }, 500);
-          } else {
-            if(logWin && !logWin.closed){ logWin.document.getElementById('log').textContent += '\nRun finished with errors (code '+data.returncode+').'; }
-          }
-        } catch(e){ setTimeout(poll, 1500); }
-      })();
-    } catch(e){ alert('Exception starting execution: '+e); }
+
+  let executeProgressModalInst = null;
+  let executeProgressEvtSrc = null;
+  let executeProgressRunId = null;
+
+  function ensureExecuteProgressModal(){
+    const modalEl = document.getElementById('executeProgressModal');
+    if(!modalEl) return null;
+    if(!executeProgressModalInst && window.bootstrap){
+      executeProgressModalInst = new bootstrap.Modal(modalEl, { backdrop: 'static', keyboard: false });
+    }
+    return executeProgressModalInst;
+  }
+
+  function setExecuteProgressUI(opts){
+    const { status, meta, barText, animate } = opts || {};
+    const statusEl = document.getElementById('executeProgressStatus');
+    if(statusEl !== null && status !== undefined){ statusEl.textContent = status; }
+    const metaEl = document.getElementById('executeProgressMeta');
+    if(metaEl !== null && meta !== undefined){ metaEl.textContent = meta; }
+    const bar = document.getElementById('executeProgressBar');
+    if(bar){
+      if(barText !== undefined){ bar.textContent = barText; }
+      if(animate === true){ bar.classList.add('progress-bar-animated','progress-bar-striped'); }
+      else if(animate === false){ bar.classList.remove('progress-bar-animated','progress-bar-striped'); }
+    }
+  }
+
+  function openExecuteProgress(title){
+    const inst = ensureExecuteProgressModal();
+    const modalEl = document.getElementById('executeProgressModal');
+    if(modalEl && title){
+      const titleEl = modalEl.querySelector('.modal-title');
+      if(titleEl) titleEl.textContent = title;
+    }
+    setExecuteProgressUI({ status: 'Starting…', meta: '', barText: 'Working…', animate: true });
+    const logEl = document.getElementById('executeProgressLog');
+    if(logEl) logEl.textContent = '';
+    try { inst?.show(); } catch(e){}
+  }
+
+  function appendExecuteProgressLog(line){
+    const logEl = document.getElementById('executeProgressLog');
+    if(!logEl) return;
+    const text = (line === undefined || line === null) ? '' : String(line);
+    logEl.textContent += text + '\n';
+    logEl.parentElement?.scrollTo({ top: logEl.parentElement.scrollHeight, behavior: 'auto' });
+  }
+
+  function cleanupExecuteProgress(){
+    if(executeProgressEvtSrc){
+      try { executeProgressEvtSrc.close(); } catch(e){}
+    }
+    executeProgressEvtSrc = null;
+    executeProgressRunId = null;
+  }
+
+  document.getElementById('executeProgressModal')?.addEventListener('hidden.bs.modal', ()=>{
+    cleanupExecuteProgress();
   });
+
+  // Execute: start CLI run for provided xml_path
+  const executeRunBtn = document.getElementById('executeRunBtn');
+  if(executeRunBtn && !executeRunBtn.dataset.boundExecute){
+    executeRunBtn.dataset.boundExecute = '1';
+    let executing = false;
+    const originalLabel = executeRunBtn.textContent;
+    executeRunBtn.addEventListener('click', async ()=>{
+      if(executing) return;
+      const confirmMsg = 'Execute scenario now? This will invoke the CLI and start a CORE session.';
+      if(!window.confirm(confirmMsg)) return;
+      executing = true;
+      executeRunBtn.disabled = true;
+      if(originalLabel){ executeRunBtn.textContent = 'Executing…'; }
+      try {
+        openExecuteProgress('Executing scenario…');
+        appendExecuteProgressLog('Submitting run for {{ xml_path }}');
+        cleanupExecuteProgress();
+        const form = new FormData(); form.append('xml_path', '{{ xml_path }}');
+        const planPath = executeRunBtn.getAttribute('data-preview-plan');
+        if(planPath){ form.append('preview_plan', planPath); }
+        const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+        if(!res.ok){
+          appendExecuteProgressLog('Failed to start execution (HTTP '+res.status+')');
+          setExecuteProgressUI({ status: 'Failed to start', meta: 'HTTP '+res.status, barText: 'Error', animate: false });
+          return;
+        }
+        const initData = await res.json();
+        const run_id = initData?.run_id;
+        if(!run_id){
+          appendExecuteProgressLog('Execution start response missing run_id');
+          setExecuteProgressUI({ status: 'Failed to start', meta: 'Missing run id', barText: 'Error', animate: false });
+          return;
+        }
+        appendExecuteProgressLog('Run ID: '+run_id);
+        setExecuteProgressUI({ status: 'Running…', meta: 'Streaming logs…', barText: 'Working…', animate: true });
+        executeProgressRunId = run_id;
+        executeProgressEvtSrc = new EventSource('/stream/' + run_id);
+        executeProgressEvtSrc.onmessage = (ev)=>{
+          if(ev && typeof ev.data === 'string'){
+            appendExecuteProgressLog(ev.data);
+          }
+        };
+        executeProgressEvtSrc.addEventListener('end', ()=>{
+          appendExecuteProgressLog('Execution stream ended');
+          cleanupExecuteProgress();
+        });
+        (async function poll(){
+          try {
+            const r = await fetch('/run_status/' + run_id);
+            if(!r.ok){ setTimeout(poll, 1200); return; }
+            const data = await r.json();
+            if(!data.done){ setTimeout(poll, 1000); return; }
+            cleanupExecuteProgress();
+            if(data.returncode===0){
+              appendExecuteProgressLog('Execution complete: success; redirecting to Reports');
+              setExecuteProgressUI({ status: 'Scenario started', meta: 'Completed', barText: 'Done', animate: false });
+              setTimeout(()=>{ window.location.href = "{{ url_for('reports_page') }}"; }, 700);
+            } else {
+              appendExecuteProgressLog('Execution finished with errors (code '+data.returncode+')');
+              setExecuteProgressUI({ status: 'Finished with errors', meta: 'Code '+data.returncode, barText: 'Error', animate: false });
+            }
+          } catch(e){ setTimeout(poll, 1500); }
+        })();
+      } catch(e){
+        appendExecuteProgressLog('Exception starting execution: '+e);
+        setExecuteProgressUI({ status: 'Exception starting run', meta: '', barText: 'Error', animate: false });
+        cleanupExecuteProgress();
+      }
+      finally {
+        executeRunBtn.disabled = false;
+        if(originalLabel){ executeRunBtn.textContent = originalLabel; }
+        executing = false;
+      }
+    });
+  }
 })();
 </script>
 {% endblock %} {# end extra_scripts #}

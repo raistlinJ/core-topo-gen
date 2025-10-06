@@ -1,8 +1,10 @@
 from __future__ import annotations
 from typing import Dict, List, Optional, Tuple, Set, Any
+from collections import defaultdict
 import math
 import random
 import logging
+import ipaddress
 from core.api.grpc import client
 from core.api.grpc.wrappers import NodeType, Position, Interface
 
@@ -818,6 +820,558 @@ def _grid_positions(count: int, cols: Optional[int] = None, cell_w: int = 800, c
     return positions
 
 
+def _ensure_router_iface_name(router_iface_names: Dict[int, Set[str]], router_id: int, base: str) -> str:
+    names = router_iface_names.setdefault(router_id, set())
+    if base not in names:
+        names.add(base)
+        return base
+    idx = 1
+    while True:
+        candidate = f"{base}-{idx}"
+        if candidate not in names:
+            names.add(candidate)
+            return candidate
+        idx += 1
+
+
+def _try_build_segmented_topology_from_preview(
+    core: client.CoreGrpcClient,
+    services: Optional[List[ServiceInfo]],
+    routing_items: List[RoutingInfo],
+    ip4_prefix: str,
+    ip_mode: str,
+    ip_region: str,
+    layout_density: str,
+    preview_plan: Dict[str, Any],
+) -> Optional[Tuple[Any, List[NodeInfo], List[NodeInfo], Dict[int, List[str]], Dict[int, List[str]], Dict[str, Dict[str, str]]]]:
+    """Attempt to realize the provided preview plan exactly. Returns None on failure."""
+
+    routers_data = preview_plan.get('routers') or []
+    hosts_data = preview_plan.get('hosts') or []
+    switches_detail = preview_plan.get('switches_detail') or []
+    if not routers_data or not hosts_data:
+        logger.debug("[preview] missing routers or hosts in preview payload; skipping preview realization")
+        return None
+
+    layout_positions = preview_plan.get('layout_positions') or {}
+
+    def _layout_coord(layout_map: Any, node_id: int) -> Optional[Tuple[int, int]]:
+        if not isinstance(layout_map, dict):
+            return None
+        raw = layout_map.get(str(node_id)) if str(node_id) in layout_map else layout_map.get(node_id)
+        if not isinstance(raw, dict):
+            return None
+        try:
+            x = int(float(raw.get('x')))
+            y = int(float(raw.get('y')))
+            return (x, y)
+        except Exception:
+            return None
+
+    router_layout_map = layout_positions.get('routers') if isinstance(layout_positions, dict) else {}
+    host_layout_map = layout_positions.get('hosts') if isinstance(layout_positions, dict) else {}
+    switch_layout_map = layout_positions.get('switches') if isinstance(layout_positions, dict) else {}
+
+    try:
+        mac_alloc = UniqueAllocator(ip4_prefix)
+    except Exception as exc:
+        logger.warning("[preview] failed to init MAC allocator (%s); skipping preview realization", exc)
+        return None
+    try:
+        subnet_alloc = make_subnet_allocator(ip_mode, ip4_prefix, ip_region)
+    except Exception as exc:
+        logger.warning("[preview] failed to init subnet allocator (%s); skipping preview realization", exc)
+        return None
+
+    session = safe_create_session(core)
+    existing_links, safe_add_link, link_counters = _make_safe_link_tracker()
+    if DIAG_ENABLED:
+        try:
+            al = getattr(session, 'add_link', None)
+            logger.info("[diag.session.preview] session=%r has_add_link=%s add_link_type=%s", session, bool(al), type(al))
+        except Exception:
+            pass
+
+    if layout_density == "compact":
+        cell_w, cell_h = 600, 450
+        host_radius_mean = 140
+        host_radius_jitter = 40
+    elif layout_density == "spacious":
+        cell_w, cell_h = 1000, 750
+        host_radius_mean = 260
+        host_radius_jitter = 80
+    else:
+        cell_w, cell_h = 900, 650
+        host_radius_mean = 220
+        host_radius_jitter = 60
+
+    router_grid_positions = _grid_positions(len(routers_data), cell_w=cell_w, cell_h=cell_h, jitter=50)
+    router_index_order = sorted(routers_data, key=lambda r: r.get('node_id', 0))
+    router_index_map: Dict[int, int] = {}
+    router_coord_map: Dict[int, Tuple[int, int]] = {}
+
+    router_objs: List[Any] = []
+    router_nodes: Dict[int, Any] = {}
+    routers_info: List[NodeInfo] = []
+    router_iface_names: Dict[int, Set[str]] = {}
+    router_next_ifid: Dict[int, int] = defaultdict(int)
+
+    for idx, rdata in enumerate(router_index_order):
+        try:
+            rid = int(rdata.get('node_id', idx + 1))
+        except Exception:
+            rid = idx + 1
+        router_index_map[rid] = idx
+        name = str(rdata.get('name') or f"router-{idx+1}")
+        layout_coord = _layout_coord(router_layout_map, rid)
+        if layout_coord:
+            x, y = layout_coord
+        elif router_grid_positions:
+            x, y = router_grid_positions[idx % len(router_grid_positions)]
+        else:
+            x, y = (500 + idx * 120, 400)
+        router_coord_map[rid] = (x, y)
+        logger.info("[preview] add_router id=%s name=%s pos=(%s,%s)", rid, name, x, y)
+        node = session.add_node(rid, _type=_router_node_type(), position=Position(x=x, y=y), name=name)
+        mark_node_as_router(node, session)
+        try:
+            setattr(node, "model", "router")
+        except Exception:
+            pass
+        router_iface_names[rid] = set()
+        services_for_router = ["IPForward", "zebra"]
+        set_node_services(session, rid, services_for_router, node_obj=node)
+        routers_info.append(NodeInfo(node_id=rid, ip4=str(rdata.get('ip4') or ""), role="Router"))
+        router_objs.append(node)
+        router_nodes[rid] = node
+
+    host_router_map_preview: Dict[int, int] = {}
+    try:
+        hrm_raw = preview_plan.get('host_router_map') or {}
+        for key, val in hrm_raw.items():
+            try:
+                host_router_map_preview[int(key)] = int(val)
+            except Exception:
+                continue
+    except Exception:
+        host_router_map_preview = {}
+
+    host_nodes_by_id: Dict[int, Any] = {}
+    host_data_by_id: Dict[int, Dict[str, Any]] = {}
+    host_next_ifid: Dict[int, int] = defaultdict(int)
+    host_primary_ips: Dict[int, str] = {}
+    hosts_info: List[NodeInfo] = []
+    default_host_ids: Set[int] = set()
+
+    sorted_hosts = sorted(hosts_data, key=lambda h: h.get('node_id', 0))
+    for idx, hdata in enumerate(sorted_hosts):
+        try:
+            hid = int(hdata.get('node_id', idx + len(router_objs) + 1))
+        except Exception:
+            hid = idx + len(router_objs) + 1
+        host_data_by_id[hid] = hdata
+        role = hdata.get('role') or "Host"
+        node_type = map_role_to_node_type(role)
+        router_id = host_router_map_preview.get(hid)
+        layout_coord = _layout_coord(host_layout_map, hid)
+        if layout_coord:
+            x, y = layout_coord
+        else:
+            if router_id in router_coord_map:
+                base_x, base_y = router_coord_map[router_id]
+            elif router_grid_positions:
+                base_x, base_y = router_grid_positions[idx % len(router_grid_positions)]
+            else:
+                base_x, base_y = (500 + idx * 35, 500)
+            angle = (idx % 12) * (math.pi / 6.0)
+            radius = max(60, int(random.gauss(host_radius_mean, host_radius_jitter)))
+            x = int(base_x + radius * math.cos(angle))
+            y = int(base_y + radius * math.sin(angle))
+        name = str(hdata.get('name') or f"host-{hid}")
+        logger.info("[preview] add_host id=%s name=%s type=%s pos=(%s,%s)", hid, name, _type_desc(node_type), x, y)
+        host_node = session.add_node(hid, _type=node_type, position=Position(x=x, y=y), name=name)
+        try:
+            if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
+                setattr(host_node, "model", "docker")
+            elif node_type == NodeType.SWITCH:
+                setattr(host_node, "model", "switch")
+            elif node_type == NodeType.DEFAULT:
+                setattr(host_node, "model", "PC")
+        except Exception:
+            pass
+        host_nodes_by_id[hid] = host_node
+        host_next_ifid[hid] = 0
+        if node_type == NodeType.DEFAULT:
+            default_host_ids.add(hid)
+        ip_hint = str(hdata.get('ip4') or "")
+        if node_type == NodeType.DEFAULT:
+            hosts_info.append(NodeInfo(node_id=hid, ip4=ip_hint, role=role))
+
+    switches_preview = preview_plan.get('switches') or []
+    switch_name_map = {}
+    for sval in switches_preview:
+        try:
+            switch_name_map[int(sval.get('node_id'))] = sval.get('name')
+        except Exception:
+            continue
+
+    switch_nodes: Dict[int, Any] = {}
+    for idx, detail in enumerate(switches_detail):
+        try:
+            sid = int(detail.get('switch_id'))
+        except Exception:
+            continue
+        if sid in switch_nodes:
+            continue
+        router_id = int(detail.get('router_id') or 0)
+        layout_coord = _layout_coord(switch_layout_map, sid)
+        if layout_coord:
+            sx, sy = layout_coord
+        else:
+            if router_id in router_coord_map:
+                base_x, base_y = router_coord_map[router_id]
+            elif router_grid_positions:
+                base_x, base_y = router_grid_positions[idx % len(router_grid_positions)]
+            else:
+                base_x, base_y = (600 + idx * 40, 600)
+            sx = base_x + 120 + (idx % 3) * 40
+            sy = base_y + 60 + (idx % 5) * 35
+        switch_name = switch_name_map.get(sid) or f"rsw-{router_id}-{idx+1}"
+        logger.info("[preview] add_switch id=%s name=%s pos=(%s,%s)", sid, switch_name, sx, sy)
+        sw_node = session.add_node(sid, _type=NodeType.SWITCH, position=Position(x=sx, y=sy), name=switch_name)
+        try:
+            setattr(sw_node, "model", "switch")
+        except Exception:
+            pass
+        switch_nodes[sid] = sw_node
+
+    def _normalize_host_if_ips(raw: Any) -> Dict[int, str]:
+        out: Dict[int, str] = {}
+        if not isinstance(raw, dict):
+            return out
+        for k, v in raw.items():
+            try:
+                out[int(k)] = str(v)
+            except Exception:
+                continue
+        return out
+
+    hosts_attached: Set[int] = set()
+    host_switch_assignment: Dict[int, int] = {}
+
+    for detail in switches_detail:
+        try:
+            sid = int(detail.get('switch_id'))
+            router_id = int(detail.get('router_id'))
+        except Exception:
+            continue
+        sw_node = switch_nodes.get(sid)
+        router_node = router_nodes.get(router_id)
+        if not sw_node or not router_node:
+            continue
+
+        rsw_subnet = detail.get('rsw_subnet')
+        lan_subnet = detail.get('lan_subnet')
+        router_ip = detail.get('router_ip')
+        switch_ip = detail.get('switch_ip')
+        try:
+            rsw_net = ipaddress.ip_network(rsw_subnet, strict=False) if rsw_subnet else None
+        except Exception:
+            rsw_net = None
+        try:
+            lan_net = ipaddress.ip_network(lan_subnet, strict=False) if lan_subnet else None
+        except Exception:
+            lan_net = None
+        rsw_hosts = list(rsw_net.hosts()) if rsw_net else []
+        lan_hosts = list(lan_net.hosts()) if lan_net else []
+        if (not router_ip or '/' not in str(router_ip)) and rsw_hosts:
+            router_ip = f"{rsw_hosts[0]}/{rsw_net.prefixlen}"
+        if (not switch_ip or '/' not in str(switch_ip)) and len(rsw_hosts) >= 2:
+            switch_ip = f"{rsw_hosts[1]}/{rsw_net.prefixlen}"
+
+        if router_ip and '/' in router_ip:
+            r_ip_val, r_mask = router_ip.split('/', 1)
+            r_mask_int = int(r_mask)
+        else:
+            r_ip_val = router_ip or None
+            r_mask_int = rsw_net.prefixlen if rsw_net else 30
+
+        if switch_ip and '/' in switch_ip:
+            s_ip_val, s_mask = switch_ip.split('/', 1)
+            s_mask_int = int(s_mask)
+        else:
+            s_ip_val = switch_ip or None
+            s_mask_int = rsw_net.prefixlen if rsw_net else r_mask_int
+
+        r_ifid = router_next_ifid[router_id]
+        router_next_ifid[router_id] += 1
+        base_name = f"r{router_id}-rsw{sid}"
+        r_iface_name = _ensure_router_iface_name(router_iface_names, router_id, base_name)
+        r_iface = Interface(id=r_ifid, name=r_iface_name, ip4=r_ip_val, ip4_mask=r_mask_int, mac=mac_alloc.next_mac())
+        sw_iface = Interface(id=0, name=f"{getattr(sw_node, 'name', f'rsw-{sid}')}-r{router_id}", ip4=s_ip_val, ip4_mask=s_mask_int, mac=mac_alloc.next_mac())
+        safe_add_link(session, router_node, sw_node, iface1=r_iface, iface2=sw_iface)
+        link_counters['attempts'] += 1
+        link_counters['success'] += 1
+
+        host_if_ips = _normalize_host_if_ips(detail.get('host_if_ips'))
+        host_list_raw = detail.get('hosts') or []
+        host_list: List[int] = []
+        seen_local: Set[int] = set()
+        for h in host_list_raw:
+            try:
+                hid_val = int(h)
+            except Exception:
+                continue
+            if hid_val in seen_local:
+                continue
+            seen_local.add(hid_val)
+            host_list.append(hid_val)
+        for index, hid in enumerate(host_list):
+            host_node = host_nodes_by_id.get(hid)
+            if not host_node:
+                continue
+            previous_sid = host_switch_assignment.get(hid)
+            if previous_sid is not None:
+                if previous_sid != sid:
+                    logger.warning("[preview] host %s already attached to switch %s; skipping duplicate attachment to switch %s", hid, previous_sid, sid)
+                else:
+                    logger.debug("[preview] host %s already attached to switch %s; skipping duplicate entry", hid, sid)
+                continue
+            ip_str = host_if_ips.get(hid)
+            if not ip_str and lan_hosts:
+                assign_idx = min(index + 1, len(lan_hosts) - 1)
+                try:
+                    ip_str = f"{lan_hosts[assign_idx]}/{lan_net.prefixlen}"
+                except Exception:
+                    ip_str = None
+            if ip_str and '/' in ip_str:
+                hip_val, hip_mask = ip_str.split('/', 1)
+                hip_mask_int = int(hip_mask)
+            else:
+                hip_val = None if not ip_str else str(ip_str)
+                hip_mask_int = lan_net.prefixlen if lan_net else 24
+            iface_id = host_next_ifid[hid]
+            host_iface = Interface(id=iface_id, name=f"eth{iface_id}", ip4=hip_val, ip4_mask=hip_mask_int, mac=mac_alloc.next_mac())
+            gateway_ip = str(lan_hosts[0]) if lan_hosts else None
+            sw_host_iface = Interface(id=index + 1, name=f"{getattr(sw_node, 'name', 'rsw')}-h{hid}", ip4=gateway_ip, ip4_mask=(lan_net.prefixlen if lan_net else hip_mask_int), mac=mac_alloc.next_mac())
+            if safe_add_link(session, host_node, sw_node, iface1=host_iface, iface2=sw_host_iface):
+                host_next_ifid[hid] += 1
+                link_counters['attempts'] += 1
+                link_counters['success'] += 1
+                hosts_attached.add(hid)
+                host_switch_assignment[hid] = sid
+                if hip_val:
+                    host_primary_ips[hid] = f"{hip_val}/{hip_mask_int}"
+            else:
+                logger.warning("[preview] failed to link host %s to switch %s; host may remain unattached", hid, sid)
+
+    for hid, rid in host_router_map_preview.items():
+        if hid in hosts_attached:
+            continue
+        host_node = host_nodes_by_id.get(hid)
+        router_node = router_nodes.get(rid)
+        if not host_node or not router_node:
+            continue
+        hdata = host_data_by_id.get(hid, {})
+        ip_hint = str(hdata.get('ip4') or "")
+        hip_val = None
+        hip_mask_int = 24
+        router_ip_val = None
+        if ip_hint and '/' in ip_hint:
+            try:
+                iface = ipaddress.ip_interface(ip_hint)
+                hip_val = str(iface.ip)
+                hip_mask_int = iface.network.prefixlen
+                hosts_in_net = list(iface.network.hosts())
+                if hosts_in_net:
+                    router_ip_val = str(hosts_in_net[0]) if str(hosts_in_net[0]) != hip_val else (str(hosts_in_net[1]) if len(hosts_in_net) > 1 else None)
+            except Exception:
+                hip_val = None
+        if hip_val is None:
+            lan_net = subnet_alloc.next_random_subnet(24)
+            lan_hosts = list(lan_net.hosts())
+            hip_val = str(lan_hosts[1]) if len(lan_hosts) > 1 else None
+            router_ip_val = str(lan_hosts[0]) if lan_hosts else None
+            hip_mask_int = lan_net.prefixlen
+        iface_id = host_next_ifid[hid]
+        host_next_ifid[hid] += 1
+        host_iface = Interface(id=iface_id, name=f"eth{iface_id}", ip4=hip_val, ip4_mask=hip_mask_int, mac=mac_alloc.next_mac())
+        r_ifid = router_next_ifid[rid]
+        router_next_ifid[rid] += 1
+        base_name = f"r{rid}-h{hid}"
+        r_iface_name = _ensure_router_iface_name(router_iface_names, rid, base_name)
+        router_iface = Interface(id=r_ifid, name=r_iface_name, ip4=router_ip_val, ip4_mask=hip_mask_int, mac=mac_alloc.next_mac())
+        safe_add_link(session, host_node, router_node, iface1=host_iface, iface2=router_iface)
+        link_counters['attempts'] += 1
+        link_counters['success'] += 1
+        hosts_attached.add(hid)
+        if hip_val:
+            host_primary_ips[hid] = f"{hip_val}/{hip_mask_int}"
+
+    router_protocols: Dict[int, List[str]] = defaultdict(list)
+    proto_sources = preview_plan.get('r2s_grouping_preview') or []
+    for entry in proto_sources:
+        try:
+            rid = int(entry.get('router_id'))
+        except Exception:
+            continue
+        proto = entry.get('protocol')
+        if rid and proto:
+            router_protocols[rid].append(proto)
+
+    r2r_links_preview = preview_plan.get('r2r_links_preview') or []
+    if not r2r_links_preview:
+        edges_preview = preview_plan.get('r2r_edges_preview') or []
+        for edge in edges_preview:
+            if not isinstance(edge, (list, tuple)) or len(edge) != 2:
+                continue
+            r2r_links_preview.append({'routers': [{'id': edge[0]}, {'id': edge[1]}]})
+
+    for link_entry in r2r_links_preview:
+        routers_descr = link_entry.get('routers') or []
+        if len(routers_descr) != 2:
+            continue
+        try:
+            a_id = int(routers_descr[0].get('id'))
+            b_id = int(routers_descr[1].get('id'))
+        except Exception:
+            continue
+        a_node = router_nodes.get(a_id)
+        b_node = router_nodes.get(b_id)
+        if not a_node or not b_node:
+            continue
+        subnet_str = link_entry.get('subnet')
+        try:
+            subnet_obj = ipaddress.ip_network(subnet_str, strict=False) if subnet_str else None
+        except Exception:
+            subnet_obj = None
+        if subnet_obj:
+            hosts_in_net = list(subnet_obj.hosts())
+        else:
+            subnet_obj = subnet_alloc.next_random_subnet(30)
+            hosts_in_net = list(subnet_obj.hosts())
+        a_ip_entry = routers_descr[0].get('ip')
+        b_ip_entry = routers_descr[1].get('ip')
+        if not a_ip_entry and hosts_in_net:
+            a_ip_entry = f"{hosts_in_net[0]}/{subnet_obj.prefixlen}"
+        if not b_ip_entry and len(hosts_in_net) >= 2:
+            b_ip_entry = f"{hosts_in_net[1]}/{subnet_obj.prefixlen}"
+        if a_ip_entry and '/' in a_ip_entry:
+            a_ip, a_mask = a_ip_entry.split('/', 1)
+            a_mask_int = int(a_mask)
+        else:
+            a_ip = a_ip_entry or None
+            a_mask_int = subnet_obj.prefixlen
+        if b_ip_entry and '/' in b_ip_entry:
+            b_ip, b_mask = b_ip_entry.split('/', 1)
+            b_mask_int = int(b_mask)
+        else:
+            b_ip = b_ip_entry or None
+            b_mask_int = subnet_obj.prefixlen
+        a_ifid = router_next_ifid[a_id]
+        router_next_ifid[a_id] += 1
+        b_ifid = router_next_ifid[b_id]
+        router_next_ifid[b_id] += 1
+        a_iface_name = _ensure_router_iface_name(router_iface_names, a_id, f"r{a_id}-proto-{b_id}")
+        b_iface_name = _ensure_router_iface_name(router_iface_names, b_id, f"r{b_id}-proto-{a_id}")
+        a_iface = Interface(id=a_ifid, name=a_iface_name, ip4=a_ip, ip4_mask=a_mask_int, mac=mac_alloc.next_mac())
+        b_iface = Interface(id=b_ifid, name=b_iface_name, ip4=b_ip, ip4_mask=b_mask_int, mac=mac_alloc.next_mac())
+        safe_add_link(session, a_node, b_node, iface1=a_iface, iface2=b_iface)
+        link_counters['attempts'] += 1
+        link_counters['success'] += 1
+
+    for rid, protos in router_protocols.items():
+        node = router_nodes.get(rid)
+        if not node:
+            continue
+        merged = ["IPForward", "zebra"]
+        for proto in protos:
+            if proto and proto not in merged:
+                merged.append(proto)
+        set_node_services(session, rid, merged, node_obj=node)
+        try:
+            setattr(node, "routing_protocol", protos[-1])
+        except Exception:
+            pass
+
+    for hid in default_host_ids:
+        node = host_nodes_by_id.get(hid)
+        if not node:
+            continue
+        try:
+            ensure_service(session, hid, "DefaultRoute", node_obj=node)
+        except Exception:
+            pass
+
+    host_service_assignments: Dict[int, List[str]] = {}
+    services_preview = preview_plan.get('services_preview') or {}
+    for key, svc_list in services_preview.items():
+        try:
+            hid = int(key)
+        except Exception:
+            continue
+        node = host_nodes_by_id.get(hid)
+        if not node:
+            continue
+        assigned: List[str] = []
+        for svc in svc_list or []:
+            if not svc:
+                continue
+            try:
+                ensure_service(session, hid, svc, node_obj=node)
+                assigned.append(svc)
+            except Exception as exc:
+                logger.debug("[preview] failed to assign service %s to host %s: %s", svc, hid, exc)
+        if assigned:
+            host_service_assignments[hid] = assigned
+
+    hosts_info_map = {ni.node_id: ni for ni in hosts_info}
+    for hid, primary in host_primary_ips.items():
+        info = hosts_info_map.get(hid)
+        if info:
+            info.ip4 = primary
+
+    topo_stats: Dict[str, Any] = {}
+    try:
+        topo_stats.update({
+            'routers_total_planned': len(router_objs),
+            'preview_realized': True,
+        })
+        policy = preview_plan.get('r2r_policy_preview')
+        if policy:
+            topo_stats['router_edges_policy'] = policy
+        degrees = preview_plan.get('r2r_degree_preview')
+        if degrees:
+            try:
+                topo_stats['router_degrees'] = {int(k): int(v) for k, v in degrees.items()}
+            except Exception:
+                topo_stats['router_degrees'] = degrees
+        r2s_policy = preview_plan.get('r2s_policy_preview')
+        if r2s_policy:
+            topo_stats['r2s_policy'] = r2s_policy
+        host_counts: Dict[int, int] = defaultdict(int)
+        for hid, rid in host_router_map_preview.items():
+            host_counts[rid] += 1
+        if host_counts:
+            topo_stats['router_host_counts'] = dict(host_counts)
+        router_plan_stats = preview_plan.get('router_plan_stats')
+        if isinstance(router_plan_stats, dict):
+            topo_stats['router_plan_stats'] = router_plan_stats
+        setattr(session, 'topo_stats', topo_stats)
+    except Exception:
+        pass
+    try:
+        if preview_plan.get('r2s_grouping_preview'):
+            setattr(session, 'r2s_grouping_preview', preview_plan.get('r2s_grouping_preview'))
+    except Exception:
+        pass
+
+    docker_by_name: Dict[str, Dict[str, str]] = {}
+    logger.info("[preview] topology realized from persisted preview: routers=%d hosts=%d switches=%d", len(router_objs), len(host_nodes_by_id), len(switch_nodes))
+
+    return session, routers_info, [ni for ni in hosts_info], {k: v for k, v in host_service_assignments.items()}, {k: v for k, v in router_protocols.items()}, docker_by_name
+
+
 def build_segmented_topology(core: client.CoreGrpcClient,
                              role_counts: Dict[str, int],
                              routing_density: float,
@@ -829,7 +1383,22 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                              ip_region: str = "all",
                              layout_density: str = "normal",
                              docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None,
-                             router_mesh_style: str = "full"):
+                             router_mesh_style: str = "full",
+                             preview_plan: Optional[Dict[str, Any]] = None):
+    if preview_plan:
+        preview_result = _try_build_segmented_topology_from_preview(
+            core=core,
+            services=services,
+            routing_items=routing_items,
+            ip4_prefix=ip4_prefix,
+            ip_mode=ip_mode,
+            ip_region=ip_region,
+            layout_density=layout_density,
+            preview_plan=preview_plan,
+        )
+        if preview_result is not None:
+            return preview_result
+
     logger.info("Creating CORE session and building segmented topology with routers (randomized placement)")
     mac_alloc = UniqueAllocator(ip4_prefix)
     subnet_alloc = make_subnet_allocator(ip_mode, ip4_prefix, ip_region)
@@ -843,9 +1412,28 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             pass
 
     total_hosts = sum(role_counts.values())
+    if preview_plan:
+        try:
+            hosts_preview = preview_plan.get('hosts') or []
+            if isinstance(hosts_preview, list):
+                preview_host_total = len(hosts_preview)
+                if preview_host_total and preview_host_total != total_hosts:
+                    logger.info("[preview] overriding host total from %s to %s", total_hosts, preview_host_total)
+                    total_hosts = preview_host_total
+        except Exception:
+            pass
     # Use shared pure-planning helper for router counts
     _plan_stats = plan_router_counts(role_counts, routing_density, routing_items, base_host_pool)
     router_count = _plan_stats['router_count']
+    if preview_plan:
+        try:
+            preview_router_override = len(preview_plan.get('routers') or [])
+        except Exception:
+            preview_router_override = 0
+        if preview_router_override > 0 and preview_router_override != router_count:
+            logger.info("[preview] overriding router count from %s to %s", router_count, preview_router_override)
+            router_count = preview_router_override
+            _plan_stats['preview_router_override'] = preview_router_override
     density_router_count = _plan_stats['density_router_count']
     count_router_count = _plan_stats['count_router_count']
     effective_base = _plan_stats['effective_base']
@@ -915,24 +1503,6 @@ def build_segmented_topology(core: client.CoreGrpcClient,
 
     # place routers on a spacious grid for easier viewing
     r_positions = _grid_positions(router_count, cell_w=cell_w, cell_h=cell_h, jitter=50)
-    # Pre-compute user service names (unique, preserving order of appearance)
-    user_service_names: list[str] = []
-    if services:
-        seen_usvc = set()
-        for svc in services:
-            nm = getattr(svc, 'name', None) or getattr(svc, 'Name', None)
-            if not nm:
-                continue
-            nm_str = str(nm).strip()
-            if not nm_str:
-                continue
-            # Skip core mandatory services if user redundantly included them
-            if nm_str in ("IPForward", "zebra"):
-                continue
-            if nm_str not in seen_usvc:
-                seen_usvc.add(nm_str)
-                user_service_names.append(nm_str)
-
     for i in range(router_count):
         x, y = r_positions[i]
         node_id = i + 1
@@ -947,8 +1517,8 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             pass
         # initialize iface name set for router
         router_iface_names[node.id] = set()
-        # Always include mandatory services first, then append user-defined extras
-        merged_services = ["IPForward", "zebra"] + user_service_names
+        # Always include mandatory router services
+        merged_services = ["IPForward", "zebra"]
         set_node_services(session, node.id, merged_services, node_obj=node)
         routers.append(NodeInfo(node_id=node.id, ip4="", role="Router"))
         router_nodes[node.id] = node
@@ -1889,10 +2459,10 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             if i < len(expanded_protocols):
                 proto = expanded_protocols[i]
                 router_protocols[rid].append(proto)
-                # IMPORTANT: earlier during router creation we applied mandatory services + user_service_names.
-                # This later protocol-assignment pass was overwriting that set and dropping user-defined services.
-                # Merge mandatory + user services again here before adding the protocol-specific service so they persist.
-                base = ["IPForward", "zebra"] + user_service_names
+                # IMPORTANT: earlier during router creation we applied mandatory router services (IPForward + zebra).
+                # This protocol-assignment pass overwrites the router service set, so ensure the mandatory services remain
+                # present before appending protocol-specific daemons.
+                base = ["IPForward", "zebra"]
                 proto_list = base + [proto] if proto else base
                 set_node_services(session, rid, proto_list, node_obj=rnode)
                 try:

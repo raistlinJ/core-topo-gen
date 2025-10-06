@@ -10,6 +10,7 @@ import time
 import uuid
 import threading
 from typing import Dict, Any
+from collections import defaultdict
 import subprocess
 import sys
 import re
@@ -1817,6 +1818,50 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
 
         # Adjacency from links
         adj: Dict[str, set] = { (d.get('id') or ''): set() for d in devices }
+        interface_store: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+
+        def record_interface(node_ref, iface_el):
+            if not node_ref or iface_el is None:
+                return
+            try:
+                attrs_iface = dict(iface_el.attrib or {})
+            except Exception:
+                attrs_iface = {}
+            name_raw = (attrs_iface.get('name') or attrs_iface.get('id') or '').strip()
+            mac = (attrs_iface.get('mac') or '').strip()
+            ip4 = (attrs_iface.get('ip4') or attrs_iface.get('ipv4') or '').strip()
+            ip4_mask = (attrs_iface.get('ip4_mask') or attrs_iface.get('ipv4_mask') or '').strip()
+            ip6 = (attrs_iface.get('ip6') or attrs_iface.get('ipv6') or '').strip()
+            ip6_mask = (attrs_iface.get('ip6_mask') or attrs_iface.get('ipv6_mask') or '').strip()
+            if not any([name_raw, mac, ip4, ip6]):
+                # Ignore empty interfaces to avoid noise
+                return
+            node_key = str(node_ref)
+            stable_key = '|'.join([
+                name_raw.lower(),
+                ip4,
+                ip6,
+            ])
+            existing = interface_store[node_key].get(stable_key)
+            if existing:
+                if mac and not existing.get('mac'):
+                    existing['mac'] = mac
+                if ip4_mask and not existing.get('ipv4_mask'):
+                    existing['ipv4_mask'] = ip4_mask
+                if ip6_mask and not existing.get('ipv6_mask'):
+                    existing['ipv6_mask'] = ip6_mask
+                if name_raw and not existing.get('name'):
+                    existing['name'] = name_raw
+                return
+            interface_store[node_key][stable_key] = {
+                'name': name_raw or None,
+                'mac': mac or None,
+                'ipv4': ip4 or None,
+                'ipv4_mask': ip4_mask or None,
+                'ipv6': ip6 or None,
+                'ipv6_mask': ip6_mask or None,
+            }
+
         for link in links:
             n1 = link.get('node1') or link.get('node1_id')
             n2 = link.get('node2') or link.get('node2_id')
@@ -1827,17 +1872,43 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
             if n1 and n2:
                 adj.setdefault(n1, set()).add(n2)
                 adj.setdefault(n2, set()).add(n1)
+            try:
+                for child in list(link):
+                    tag_local = local(getattr(child, 'tag', ''))
+                    target_node = None
+                    if tag_local in ('iface1', 'interface1'):
+                        target_node = n1
+                    elif tag_local in ('iface2', 'interface2'):
+                        target_node = n2
+                    elif tag_local in ('iface', 'interface'):
+                        target_node = child.get('node') or child.get('node_id') or child.get('device') or n2
+                    else:
+                        continue
+                    record_interface(target_node, child)
+            except Exception:
+                continue
 
         # Compose nodes list with linked names
         nodes = []
         for d in devices:
             did = d.get('id') or ''
+            iface_entries = []
+            try:
+                raw_ifaces = interface_store.get(did, {})
+                for entry in raw_ifaces.values():
+                    cleaned = {k: v for k, v in entry.items() if v not in (None, '')}
+                    if cleaned:
+                        iface_entries.append(cleaned)
+            except Exception:
+                iface_entries = []
+            iface_entries.sort(key=lambda e: ((e.get('name') or '').lower(), e.get('ipv4') or '', e.get('ipv6') or ''))
             node = {
                 'id': did,
                 'name': d.get('name') or did,
                 'type': d.get('type') or '',
                 'services': id_to_services.get(did, []),
                 'linked_nodes': sorted([id_to_name.get(x, x) for x in adj.get(did, set())], key=lambda x: x.lower()),
+                'interfaces': iface_entries,
             }
             nodes.append(node)
 
@@ -1857,7 +1928,17 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
                 # Avoid duplicates by id OR name against existing device switches
                 if any((sw_id == s.get('id')) or (sw_name == s.get('name')) for s in switches):
                     continue
-                extra_switch = {'id': sw_id, 'name': sw_name, 'type': 'switch', 'services': [], 'linked_nodes': []}
+                iface_entries = []
+                try:
+                    raw_ifaces = interface_store.get(sw_id, {})
+                    for entry in raw_ifaces.values():
+                        cleaned = {k: v for k, v in entry.items() if v not in (None, '')}
+                        if cleaned:
+                            iface_entries.append(cleaned)
+                except Exception:
+                    iface_entries = []
+                iface_entries.sort(key=lambda e: ((e.get('name') or '').lower(), e.get('ipv4') or '', e.get('ipv6') or ''))
+                extra_switch = {'id': sw_id, 'name': sw_name, 'type': 'switch', 'services': [], 'linked_nodes': [], 'interfaces': iface_entries}
                 switches.append(extra_switch)
                 extra_switch_nodes.append(extra_switch)
                 # Allow link resolution to map id->name for network-derived switches
@@ -2340,132 +2421,82 @@ def plan_full_preview_page():
         if not os.path.exists(xml_path):
             flash(f'XML not found: {xml_path}')
             return redirect(url_for('index'))
-        from core_topo_gen.parsers.node_info import parse_node_info
-        from core_topo_gen.parsers.routing import parse_routing_info
-        from core_topo_gen.parsers.services import parse_services
-        from core_topo_gen.parsers.vulnerabilities import parse_vulnerabilities_info
-        from core_topo_gen.parsers.segmentation import parse_segmentation_info
-        try:
-            from core_topo_gen.parsers.traffic import parse_traffic_info
-            from core_topo_gen.planning.traffic_plan import compute_traffic_plan, TrafficItem
-        except Exception:
-            parse_traffic_info = None
-            compute_traffic_plan = None
-        density_base, weight_items, count_items, services_list = parse_node_info(xml_path, scenario)
-        role_counts: dict[str,int] = {}
-        for r,c in count_items:
-            role_counts[r] = role_counts.get(r,0)+int(c)
-        # Re-introduce weight-based expansion
-        try:
-            if weight_items and (density_base or 0) > 0:
-                base_total = int(density_base)
-                total_f = sum(f for _, f in weight_items) or 0.0
-                if total_f > 0:
-                    for role, f in weight_items:
-                        alloc = int(round((f/total_f) * base_total))
-                        if alloc > 0:
-                            role_counts[role] = role_counts.get(role,0)+alloc
-        except Exception:
-            pass
-        # Node role normalization is handled centrally in compute_node_plan now; no further sanitation here
-        routing_density, routing_items = parse_routing_info(xml_path, scenario)
-        prelim_router_count = 0
-        try:
-            host_total_for_density = sum(role_counts.values())
-            if routing_density and routing_density>0 and host_total_for_density>0:
-                prelim_router_count = max(1, int(round(routing_density * host_total_for_density)))
-            for ri in routing_items:
-                abs_c = int(getattr(ri,'abs_count',0) or 0)
-                if abs_c>0:
-                    prelim_router_count = max(prelim_router_count, abs_c)
-        except Exception:
-            pass
-        service_plan = {s.name: (s.abs_count if s.abs_count>0 else int(round(s.density * (density_base or 0)))) for s in services_list}
-        vuln_density, vuln_items = parse_vulnerabilities_info(xml_path, scenario)
-        vplan: dict[str,int] = {}
-        try:
-            import math as _math
-            density_target = int(_math.floor((vuln_density or 0.0) * (density_base or 0) + 1e-9))
-        except Exception:
-            density_target = 0
-        for it in (vuln_items or []):
-            if (it.get('v_metric')=='Count'):
-                try: c=int(it.get('v_count') or 0)
-                except Exception: c=0
-                if c>0:
-                    name = it.get('selected') or 'Item'
-                    vplan[name]=vplan.get(name,0)+c
-    # Deprecated: previously inserted '__density_pool__' placeholder. Now vulnerabilities plan resolves Random allocations directly.
-    # if density_target>0: vplan['__density_pool__']=density_target
-        seg_density, seg_items = parse_segmentation_info(xml_path, scenario)
+        from core_topo_gen.planning.orchestrator import compute_full_plan
+        from core_topo_gen.planning.plan_cache import hash_xml_file, try_get_cached_plan, save_plan_to_cache
 
-        # Traffic plan (optional)
-        traffic_plan_list = None
-        if parse_traffic_info and compute_traffic_plan:
+        plan = None
+        xml_hash = None
+        try:
+            xml_hash = hash_xml_file(xml_path)
+            plan = try_get_cached_plan(xml_hash, scenario, seed)
+            if plan:
+                app.logger.debug('[plan.full_preview_page] using cached plan (%s, scenario=%s, seed=%s)', (xml_hash or '')[:12], scenario, seed)
+        except Exception as cache_err:
             try:
-                _tdensity, titems = parse_traffic_info(xml_path, scenario)
-                t_specs: list[TrafficItem] = []
-                for it in (titems or []):
-                    try:
-                        pattern = it.get('pattern') if hasattr(it,'get') else 'continuous'
-                        rate = it.get('rate_kbps') if hasattr(it,'get') else None
-                        factor_raw = it.get('factor') if hasattr(it,'get') else 1.0
-                        try:
-                            factor = float(factor_raw or 0.0)
-                        except Exception:
-                            factor = 0.0
-                        t_specs.append(TrafficItem(pattern=pattern or 'continuous', rate_kbps=rate, factor=factor))
-                    except Exception:
-                        continue
-                if t_specs:
-                    traffic_plan_list, _tbreak = compute_traffic_plan(t_specs)
+                app.logger.debug('[plan.full_preview_page] cache lookup failed: %s', cache_err)
             except Exception:
-                traffic_plan_list = None
-        seg_items_serial = [{"selected": (it.name or 'Random'), "factor": it.factor} for it in seg_items]
-        # build full preview (with optional seed)
-        try:
-            from core_topo_gen.planning.full_preview import build_full_preview
-        except ModuleNotFoundError:
-            _ensure_full_preview_module()
-            from core_topo_gen.planning.full_preview import build_full_preview
-        # Derive r2s policy (Exact etc.) for preview page as well
-        r2s_policy_plan = None
-        try:
-            first_r2s = next((ri for ri in routing_items if getattr(ri,'r2s_mode',None)), None)  # type: ignore
-            if first_r2s:
-                m2 = getattr(first_r2s, 'r2s_mode', '')
-                if m2 == 'Exact' and getattr(first_r2s, 'r2s_edges', 0) > 0:
-                    r2s_policy_plan = { 'mode': 'Exact', 'target_per_router': int(getattr(first_r2s,'r2s_edges',0)) }
-                elif m2:
-                    r2s_policy_plan = { 'mode': m2 }
-        except Exception:
-            pass
-        # Reconstruct plan-like structure for unified helper
-        plan_like = {
-            'role_counts': role_counts,
-            'routers_planned': prelim_router_count,
-            'routing_items': routing_items,
-            'service_plan': service_plan,
-            'vulnerability_plan': vplan,
-            'traffic_plan': traffic_plan_list,
-            'breakdowns': {
-                'router': {'simple_plan': {}},
-                'segmentation': {'raw_items_serialized': seg_items_serial, 'density': seg_density},
-            }
-        }
-        full_prev = _build_full_preview_from_plan(plan_like, seed)
+                pass
+            plan = None
+        if not plan:
+            plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
+            try:
+                if xml_hash is None:
+                    xml_hash = hash_xml_file(xml_path)
+                save_plan_to_cache(xml_hash, scenario, seed, plan)
+            except Exception as cache_save_err:
+                try:
+                    app.logger.debug('[plan.full_preview_page] cache save failed: %s', cache_save_err)
+                except Exception:
+                    pass
+        full_prev = _build_full_preview_from_plan(plan, seed)
         # Annotate & enforce enumerated host roles (Server, Workstation, PC) in preview
         # Full preview already receives normalized roles from planning layer
         # Attempt scenario name
-        scenario_name = None
+        scenario_name = scenario or None
+        if not scenario_name:
+            try:
+                names_for_cli = _scenario_names_from_xml(xml_path)
+                if names_for_cli: scenario_name = names_for_cli[0]
+            except Exception:
+                pass
+        # Persist preview payload for downstream execution wiring
+        preview_plan_path = None
         try:
-            names_for_cli = _scenario_names_from_xml(xml_path)
-            if names_for_cli: scenario_name = names_for_cli[0]
-        except Exception: pass
+            import json as _json
+            plans_dir = os.path.join(_outputs_dir(), 'plans')
+            os.makedirs(plans_dir, exist_ok=True)
+            seed_tag = full_prev.get('seed') or 'preview'
+            unique_tag = f"{seed_tag}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+            preview_plan_path = os.path.join(plans_dir, f"plan_from_preview_{unique_tag}.json")
+            plan_payload = {
+                'full_preview': full_prev,
+                'metadata': {
+                    'xml_path': xml_path,
+                    'scenario': scenario_name,
+                    'seed': full_prev.get('seed'),
+                    'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
+                },
+            }
+            with open(preview_plan_path, 'w', encoding='utf-8') as pf:
+                _json.dump(plan_payload, pf, indent=2, sort_keys=True)
+        except Exception as plan_err:
+            preview_plan_path = None
+            try:
+                app.logger.warning('[plan.full_preview_page] failed to persist preview plan: %s', plan_err)
+            except Exception:
+                pass
         # Provide JSON string for embedding (stringify smaller subset for safety)
         import json as _json
         preview_json_str = _json.dumps(full_prev, indent=2)
-        return render_template('full_preview.html', full_preview=full_prev, preview_json=preview_json_str, xml_path=xml_path, scenario=scenario_name, seed=full_prev.get('seed'))
+        return render_template(
+            'full_preview.html',
+            full_preview=full_prev,
+            preview_json=preview_json_str,
+            xml_path=xml_path,
+            scenario=scenario_name,
+            seed=full_prev.get('seed'),
+            preview_plan_path=preview_plan_path,
+        )
     except Exception as e:
         app.logger.exception('[plan.full_preview_page] error: %s', e)
         flash(f'Full preview page error: {e}')
@@ -2527,7 +2558,13 @@ def _derive_routing_policies(routing_items):
 
 def _build_full_preview_from_plan(plan: dict, seed, r2s_hosts_min_list=None, r2s_hosts_max_list=None):
     """Single source of truth to invoke build_full_preview using a compute_full_plan result."""
-    from core_topo_gen.planning.full_preview import build_full_preview  # lazy import
+    try:
+        from core_topo_gen.planning.full_preview import build_full_preview  # lazy import
+    except ModuleNotFoundError:
+        if _ensure_full_preview_module():
+            from core_topo_gen.planning.full_preview import build_full_preview  # type: ignore
+        else:
+            raise
     role_counts = plan['role_counts']
     prelim_router_count = plan['routers_planned']
     routing_items = plan.get('routing_items') or []
@@ -2927,6 +2964,7 @@ def reports_delete():
 def run_cli_async():
     seed = None
     xml_path = None
+    preview_plan_path = None
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
         xml_path = request.form.get('xml_path')
@@ -2934,6 +2972,7 @@ def run_cli_async():
         if raw_seed:
             try: seed = int(raw_seed)
             except Exception: seed = None
+        preview_plan_path = request.form.get('preview_plan') or preview_plan_path
     if not xml_path:
         try:
             j = request.get_json(silent=True) or {}
@@ -2941,6 +2980,8 @@ def run_cli_async():
             if 'seed' in j:
                 try: seed = int(j.get('seed'))
                 except Exception: seed = None
+            if 'preview_plan' in j and not preview_plan_path:
+                preview_plan_path = j.get('preview_plan')
         except Exception:
             pass
     if not xml_path:
@@ -2956,6 +2997,19 @@ def run_cli_async():
             pass
     if not os.path.exists(xml_path):
         return jsonify({"error": f"XML path not found: {xml_path}"}), 400
+    preview_plan_path = (preview_plan_path or '').strip() or None
+    if preview_plan_path:
+        try:
+            preview_plan_path = os.path.abspath(preview_plan_path)
+            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
+            if os.path.commonpath([preview_plan_path, plans_dir]) != plans_dir:
+                app.logger.warning('[async] preview plan outside allowed directory: %s', preview_plan_path)
+                preview_plan_path = None
+            elif not os.path.exists(preview_plan_path):
+                app.logger.warning('[async] preview plan path missing: %s', preview_plan_path)
+                preview_plan_path = None
+        except Exception:
+            preview_plan_path = None
     # Skip schema validation: format differs from CORE XML
     run_id = str(uuid.uuid4())
     out_dir = os.path.dirname(xml_path)
@@ -3006,6 +3060,8 @@ def run_cli_async():
         args.extend(['--seed', str(seed)])
     if active_scenario_name:
         args.extend(['--scenario', active_scenario_name])
+    if preview_plan_path:
+        args.extend(['--preview-plan', preview_plan_path])
     proc = subprocess.Popen(args, cwd=repo_root, stdout=log_f, stderr=subprocess.STDOUT, env=env)
     RUNS[run_id] = {
         'proc': proc,
@@ -3020,6 +3076,7 @@ def run_cli_async():
         'scenario_names': scen_names,
         'post_xml_path': None,
         'history_added': False,
+        'preview_plan_path': preview_plan_path,
     }
     # Start a background finalizer so history is appended even if the UI does not poll /run_status
     def _wait_and_finalize_async(run_id_local: str):
@@ -3083,6 +3140,7 @@ def run_cli_async():
                     'returncode': rc,
                     'run_id': run_id_local,
                     'scenario_names': meta.get('scenario_names') or [],
+                    'preview_plan_path': meta.get('preview_plan_path'),
                 })
                 meta['history_added'] = True
             except Exception as e_final:
@@ -3178,6 +3236,7 @@ def run_status(run_id: str):
                         'returncode': rc,
                         'run_id': run_id,
                         'scenario_names': meta.get('scenario_names') or [],
+                        'preview_plan_path': meta.get('preview_plan_path'),
                     })
                 except Exception as e_hist:
                     try:

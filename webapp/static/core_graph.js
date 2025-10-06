@@ -129,12 +129,29 @@
     function showTooltip(d, x, y){
       if(!tooltipEl) return;
       const svcList = (d.services||[]);
+      const ifaceList = Array.isArray(d.interfaces) ? d.interfaces : [];
       const lines = [];
       lines.push(`<strong>${(d.name||'')} (${d.id})</strong>`);
       if(svcList.length){
         svcList.forEach(s => lines.push(s));
       } else {
         lines.push('<em>No Services</em>');
+      }
+      if(ifaceList.length){
+        lines.push('<span class="text-muted">Interfaces</span>');
+        ifaceList.slice(0, 4).forEach(iface => {
+          const parts = [];
+          if(iface.name){ parts.push(iface.name); }
+          if(iface.mac){ parts.push(iface.mac); }
+          const addrParts = [];
+          if(iface.ipv4){ addrParts.push(`${iface.ipv4}${iface.ipv4_mask ? '/' + iface.ipv4_mask : ''}`); }
+          if(iface.ipv6){ addrParts.push(`${iface.ipv6}${iface.ipv6_mask ? '/' + iface.ipv6_mask : ''}`); }
+          if(addrParts.length){ parts.push(addrParts.join(' | ')); }
+          if(parts.length){ lines.push(parts.join(' • ')); }
+        });
+        if(ifaceList.length > 4){
+          lines.push(`(+${ifaceList.length - 4} more)`);
+        }
       }
       tooltipEl.innerHTML = lines.join('<br>');
       tooltipEl.classList.remove('hidden');

@@ -1,8 +1,10 @@
 from __future__ import annotations
 import argparse
+import json
 import logging
 import random
 import os
+from typing import Any, Dict, Tuple
 from core.api.grpc import client
 from .parsers.node_info import parse_node_info
 from .parsers.routing import parse_routing_info
@@ -49,6 +51,17 @@ except ModuleNotFoundError:
         pass
 
 
+def _load_preview_plan(path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    with open(path, 'r', encoding='utf-8') as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Preview plan at {path} is not a JSON object")
+    full_preview = payload.get('full_preview')
+    if not isinstance(full_preview, dict):
+        raise ValueError(f"Preview plan at {path} is missing a 'full_preview' object")
+    return payload, full_preview
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--xml", required=True, help="Path to XML scenario file")
@@ -74,6 +87,7 @@ def main():
     ap.add_argument("--preview", action="store_true", help="Parse and plan only; output plan summary JSON and exit 0")
     ap.add_argument("--preview-full", action="store_true", help="Generate a full dry-run plan (routers, hosts, IPs, services, vulnerabilities, segmentation) without contacting CORE; implies --preview style output")
     ap.add_argument("--plan-output", help="Path to write computed plan JSON (preview or build)")
+    ap.add_argument("--preview-plan", help="Path to a persisted full preview JSON to reuse during build")
     # Preview always recomputes (plan reuse removed)
     ap.add_argument(
         "--router-mesh",
@@ -126,6 +140,27 @@ def main():
         help="Include host nodes as candidates for segmentation placement (default: routers only)",
     )
     args = ap.parse_args()
+
+    preview_payload: Dict[str, Any] | None = None
+    preview_full: Dict[str, Any] | None = None
+    preview_plan_path: str | None = None
+    if args.preview_plan:
+        preview_plan_path = os.path.abspath(args.preview_plan)
+        try:
+            preview_payload, preview_full = _load_preview_plan(preview_plan_path)
+            logging.getLogger(__name__).info("Loaded preview plan from %s", preview_plan_path)
+        except Exception as e:
+            logging.getLogger(__name__).error("Failed loading preview plan %s: %s", preview_plan_path, e)
+            raise SystemExit(1)
+        if args.seed is None:
+            try:
+                seed_candidate = preview_payload.get('metadata', {}).get('seed') if isinstance(preview_payload, dict) else None
+            except Exception:
+                seed_candidate = None
+            if seed_candidate is None and isinstance(preview_full, dict):
+                seed_candidate = preview_full.get('seed')
+            if isinstance(seed_candidate, int):
+                args.seed = seed_candidate
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -199,10 +234,34 @@ def main():
         except Exception:
             pass
 
+    preview_router_count: int | None = None
+    if preview_full:
+        try:
+            hosts_preview = preview_full.get('hosts') or []
+            if isinstance(hosts_preview, list):
+                preview_role_counts: Dict[str, int] = {}
+                for h in hosts_preview:
+                    role = (h.get('role') if isinstance(h, dict) else None) or 'Host'
+                    preview_role_counts[role] = preview_role_counts.get(role, 0) + 1
+                if preview_role_counts:
+                    role_counts = preview_role_counts
+                    effective_total = sum(preview_role_counts.values())
+        except Exception as e_rc:
+            logging.getLogger(__name__).warning("Preview plan role expansion failed: %s", e_rc)
+        try:
+            routers_preview = preview_full.get('routers') or []
+            if isinstance(routers_preview, list):
+                preview_router_count = len(routers_preview)
+        except Exception:
+            preview_router_count = None
+
     # Orchestrator full plan (centralized)
     from .planning.orchestrator import compute_full_plan
     orchestrated_plan = compute_full_plan(args.xml, scenario=args.scenario, seed=args.seed, include_breakdowns=True)
     prelim_router_count = orchestrated_plan['routers_planned']
+    if preview_router_count is not None and preview_router_count > 0:
+        prelim_router_count = preview_router_count
+        orchestrated_plan['routers_planned'] = preview_router_count
     service_plan = orchestrated_plan.get('service_plan') or {}
     vulnerabilities_plan = orchestrated_plan.get('vulnerability_plan')
     routing_plan = orchestrated_plan.get('breakdowns', {}).get('router', {}).get('simple_plan', {})
@@ -232,6 +291,11 @@ def main():
         except Exception:
             pass
         pool = build_initial_pool(role_counts, prelim_router_count, service_plan, routing_plan, router_breakdown=router_plan_breakdown, r2r_policy=r2r_policy_plan, vulnerabilities_plan=vulnerabilities_plan)
+        if preview_full:
+            try:
+                pool.full_preview = preview_full
+            except Exception:
+                pass
         if args.preview or args.preview_full:
             import json, sys
             summary = pool.summarize()
@@ -253,39 +317,42 @@ def main():
             if args.preview_full:
                 try:
                     from .planning.full_preview import build_full_preview
-                    # Derive r2s policy summary (mirror earlier plan pass) for preview fidelity
-                    r2s_policy_plan = None
-                    try:
-                        first_r2s = next((ri for ri in routing_items if getattr(ri,'r2s_mode',None)), None)
-                        if first_r2s:
-                            m2_raw = getattr(first_r2s, 'r2s_mode', '') or ''
-                            m2 = m2_raw.strip()
-                            m2_norm = m2.lower()
-                            edges_raw = getattr(first_r2s,'r2s_edges',0)
-                            try: edges_val = int(edges_raw)
-                            except Exception: edges_val = 0
-                            if m2_norm == 'exact' and edges_val > 0:
-                                r2s_policy_plan = { 'mode': 'Exact', 'target_per_router': edges_val }
-                            elif m2:
-                                r2s_policy_plan = { 'mode': m2 }
-                    except Exception:
-                        pass
-                    full_prev = build_full_preview(
-                        role_counts=role_counts,
-                        routers_planned=prelim_router_count,
-                        services_plan=service_plan,
-                        vulnerabilities_plan=vulnerabilities_plan,
-                        r2r_policy=r2r_policy_plan,
-                        r2s_policy=r2s_policy_plan,
-                        routing_items=routing_items,
-                        routing_plan=routing_plan,
-                        segmentation_density=orchestrated_plan.get('breakdowns', {}).get('segmentation', {}).get('density'),
-                        segmentation_items=orchestrated_plan.get('breakdowns', {}).get('segmentation', {}).get('raw_items_serialized'),
-                        seed=args.seed,
-                        ip4_prefix=args.prefix,
-                        ip_mode=args.ip_mode,
-                        ip_region=args.ip_region,
-                    )
+                    if preview_full:
+                        full_prev = preview_full
+                    else:
+                        # Derive r2s policy summary (mirror earlier plan pass) for preview fidelity
+                        r2s_policy_plan = None
+                        try:
+                            first_r2s = next((ri for ri in routing_items if getattr(ri,'r2s_mode',None)), None)
+                            if first_r2s:
+                                m2_raw = getattr(first_r2s, 'r2s_mode', '') or ''
+                                m2 = m2_raw.strip()
+                                m2_norm = m2.lower()
+                                edges_raw = getattr(first_r2s,'r2s_edges',0)
+                                try: edges_val = int(edges_raw)
+                                except Exception: edges_val = 0
+                                if m2_norm == 'exact' and edges_val > 0:
+                                    r2s_policy_plan = { 'mode': 'Exact', 'target_per_router': edges_val }
+                                elif m2:
+                                    r2s_policy_plan = { 'mode': m2 }
+                        except Exception:
+                            pass
+                        full_prev = build_full_preview(
+                            role_counts=role_counts,
+                            routers_planned=prelim_router_count,
+                            services_plan=service_plan,
+                            vulnerabilities_plan=vulnerabilities_plan,
+                            r2r_policy=r2r_policy_plan,
+                            r2s_policy=r2s_policy_plan,
+                            routing_items=routing_items,
+                            routing_plan=routing_plan,
+                            segmentation_density=orchestrated_plan.get('breakdowns', {}).get('segmentation', {}).get('density'),
+                            segmentation_items=orchestrated_plan.get('breakdowns', {}).get('segmentation', {}).get('raw_items_serialized'),
+                            seed=args.seed,
+                            ip4_prefix=args.prefix,
+                            ip_mode=args.ip_mode,
+                            ip_region=args.ip_region,
+                        )
                     full_prev['router_plan'] = router_plan_breakdown
                     out['full_preview'] = full_prev
                 except Exception as e:
@@ -336,6 +403,14 @@ def main():
         "weight_rows": {r: f for r, f in weight_items},
         "role_counts": role_counts,
     }
+    if preview_plan_path:
+        generation_meta['preview_plan_path'] = preview_plan_path
+        if preview_full:
+            try:
+                generation_meta['preview_router_count'] = len(preview_full.get('routers') or [])
+                generation_meta['preview_host_total'] = len(preview_full.get('hosts') or [])
+            except Exception:
+                pass
     # Merge in planning metadata namespaced to avoid collision
     try:
         if planning_meta:
@@ -457,6 +532,7 @@ def main():
             layout_density=args.layout_density,
             docker_slot_plan=docker_slot_plan,
             router_mesh_style=args.router_mesh,
+            preview_plan=preview_full,
         )
         # Merge topo stats if present
         try:

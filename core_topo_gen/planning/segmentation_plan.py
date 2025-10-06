@@ -39,11 +39,12 @@ def compute_segmentation_plan(seg_density: float, seg_items: List[SegmentationIt
             expanded.append(it)
 
     d = max(0.0, min(1.0, float(seg_density or 0.0)))
-    raw_slots = d * (base_host_pool or 0)
-    total_slots = int(_math.floor(raw_slots + 1e-9))
+    has_weight_items = any((getattr(it, 'factor', 0.0) or 0.0) > 0 and (getattr(it, 'abs_count', 0) or 0) <= 0 for it in seg_items)
+    raw_slots = d * (base_host_pool or 0) if has_weight_items else 0.0
+    total_slots = int(_math.floor(raw_slots + 1e-9)) if has_weight_items else 0
     factors_sum = sum(it.factor for it in expanded) or 0.0
     plan: Dict[str,int] = {}
-    if total_slots > 0 and factors_sum > 0:
+    if total_slots > 0 and factors_sum > 0 and has_weight_items:
         provisional = []
         residual = total_slots
         for it in expanded:
@@ -64,6 +65,7 @@ def compute_segmentation_plan(seg_density: float, seg_items: List[SegmentationIt
         'density': d,
         'raw_slots': raw_slots,
         'slots': total_slots,
+        'weight_items_present': has_weight_items,
         # Backward-compatible original items list
         'items': original_items_repr,
         # New expanded representation actually used for allocation
