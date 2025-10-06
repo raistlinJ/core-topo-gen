@@ -277,14 +277,20 @@ def main():
             vuln_items: list[VulnerabilityItem] = []
             for it in (vuln_items_xml or []):
                 name = (it.get('selected') or '').strip() or 'Item'
-                vm = (it.get('v_metric') or '').strip()
+                vm_raw = (it.get('v_metric') or '').strip()
+                vm = vm_raw or ('Count' if (it.get('selected') or '').strip() == 'Specific' and (it.get('v_count') or '').strip() else 'Weight')
                 abs_count = 0
-                if vm == 'Count':
+                if vm.lower() == 'count':
                     try:
                         abs_count = int(it.get('v_count') or 0)
                     except Exception:
                         abs_count = 0
-                vuln_items.append(VulnerabilityItem(name=name, density=vuln_density, abs_count=abs_count))
+                try:
+                    factor_val = float(it.get('factor') or 0.0)
+                except Exception:
+                    factor_val = 0.0
+                kind = (it.get('selected') or name)
+                vuln_items.append(VulnerabilityItem(name=name, density=vuln_density, abs_count=abs_count, kind=kind, factor=factor_val, metric=vm))
             vplan, vbreak = compute_vulnerability_plan(base_total, vuln_density, vuln_items)
             if vplan:
                 vulnerabilities_plan = vplan
@@ -511,7 +517,7 @@ def main():
 
     # Log DOCKER availability in this CORE wrapper
     try:
-        from core.api.grpc.wrappers import NodeType as _NT
+        from core.api.grpc.wrappers import NodeType as _NT  # type: ignore
         logging.info("CORE Docker node type available: %s", hasattr(_NT, 'DOCKER'))
     except Exception:
         pass

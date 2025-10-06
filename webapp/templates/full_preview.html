@@ -88,6 +88,7 @@
   <pre class="small bg-light p-2">{{ full_preview.services_preview | tojson(indent=2) }}</pre>
   <h6>Vulnerabilities Preview</h6>
   {% set vuln_prev = full_preview.vulnerabilities_preview or {} %}
+    {% set vuln_by_node = full_preview.vulnerabilities_by_node or {} %}
   {% if vuln_prev %}
   <pre class="small bg-light p-2">{
 {% set first = True %}
@@ -98,12 +99,17 @@
 {% if first %}"_note": "(none)"{% endif %}
 }</pre>
   {% else %}<div class="small text-muted fst-italic">(none)</div>{% endif %}
+  {% if vuln_by_node %}
+  <h6>Vulnerabilities by Host</h6>
+  <pre class="small bg-light p-2">{{ vuln_by_node | tojson(indent=2) }}</pre>
+  {% endif %}
     </div>
     <div class="col-md-8">
       <ul class="nav nav-tabs" id="fpTabs" role="tablist">
         <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#fp-graph" type="button">Graph</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-routers" type="button">Routers</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-hosts" type="button">Hosts</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-vulnerabilities" type="button">Vulnerabilities</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-switches" type="button">Switches</button></li>
     <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-interfaces" type="button">Interfaces</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-seg" type="button">Segmentation</button></li>
@@ -122,23 +128,81 @@
             </div>
           </div>
         </div>
-        <div class="tab-pane fade" id="fp-routers">
+  <div class="tab-pane fade" id="fp-routers">
           <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Primary IP</th><th>R2R Interfaces</th><th>Switch Links</th></tr></thead><tbody>
           {% for r in full_preview.routers %}<tr><td>{{ r.node_id }}</td><td>{{ r.name }}</td><td>{{ r.ip4 or '-' }}</td><td>{{ render_r2r_interfaces(r.node_id, full_preview.r2r_links_preview) }}</td><td>{{ render_router_switch_links(r.node_id, full_preview.switches_detail) }}</td></tr>{% endfor %}
           </tbody></table>
         </div>
-        <div class="tab-pane fade" id="fp-hosts">
-          <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Role</th><th>IP</th><th>Router</th></tr></thead><tbody>
+  <div class="tab-pane fade" id="fp-hosts">
+          <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Role</th><th>IP</th><th>Router</th><th>Vulnerabilities</th></tr></thead><tbody>
           {% set hr = full_preview.host_router_map or {} %}
-          {% for h in full_preview.hosts %}<tr><td>{{ h.node_id }}</td><td>{{ h.name }}</td><td>{{ h.role }}</td><td>{{ h.ip4 }}</td><td>{{ hr[h.node_id|string] or hr[h.node_id] }}</td></tr>{% endfor %}
+          {% for h in full_preview.hosts %}{% set vulns = h.vulnerabilities or [] %}<tr><td>{{ h.node_id }}</td><td>{{ h.name }}</td><td>{{ h.role }}</td><td>{{ h.ip4 }}</td><td>{{ hr[h.node_id|string] or hr[h.node_id] }}</td><td>{{ vulns|join(', ') if vulns else '-' }}</td></tr>{% endfor %}
           </tbody></table>
         </div>
-        <div class="tab-pane fade" id="fp-switches">
+  <div class="tab-pane fade" id="fp-vulnerabilities">
+          {% set vuln_plan = full_preview.vulnerabilities_preview or {} %}
+          {% set vuln_assign = full_preview.vulnerabilities_by_node or {} %}
+          <div class="row g-3">
+            <div class="col-md-4">
+              <h6 class="mb-2">Planned Counts</h6>
+              {% set plan_ns = namespace(has_rows=False) %}
+              <div class="table-responsive" style="max-height:220px;overflow:auto;">
+                <table class="table table-sm table-striped small align-middle">
+                  <thead class="table-light"><tr><th>Vulnerability</th><th class="text-end">Count</th></tr></thead>
+                  <tbody>
+                  {% for v_name, v_count in vuln_plan.items() %}
+                    {% if v_name != '__density_pool__' %}
+                      {% set plan_ns.has_rows = True %}
+                      <tr><td>{{ v_name }}</td><td class="text-end">{{ v_count }}</td></tr>
+                    {% endif %}
+                  {% endfor %}
+                  {% if not plan_ns.has_rows %}
+                    <tr><td colspan="2" class="text-muted fst-italic text-center">(no planned vulnerabilities)</td></tr>
+                  {% endif %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div class="col-md-8">
+              <h6 class="mb-2">Assignments by Host</h6>
+              {% set sorted_assign = vuln_assign|dictsort %}
+              {% if sorted_assign %}
+              <div class="table-responsive" style="max-height:220px;overflow:auto;">
+                <table class="table table-sm table-striped small align-middle">
+                  <thead class="table-light"><tr><th>Host ID</th><th>Name</th><th>Role</th><th>Vulnerabilities</th></tr></thead>
+                  <tbody>
+                  {% set assign_ns = namespace(has_rows=False) %}
+                  {% for node_id_str, vulns in sorted_assign %}
+                    {% if vulns %}
+                      {% set assign_ns.has_rows = True %}
+                      {% set node_id = node_id_str|int %}
+                      {% set host = (full_preview.hosts | selectattr('node_id','equalto', node_id) | first) %}
+                      <tr>
+                        <td>{{ node_id }}</td>
+                        <td>{{ host.name if host else 'Host ' ~ node_id }}</td>
+                        <td>{{ host.role if host and host.role else 'host' }}</td>
+                        <td>{{ vulns|join(', ') }}</td>
+                      </tr>
+                    {% endif %}
+                  {% endfor %}
+                  {% if not assign_ns.has_rows %}
+                    <tr><td colspan="4" class="text-muted fst-italic text-center">(no host vulnerabilities assigned)</td></tr>
+                  {% endif %}
+                  </tbody>
+                </table>
+              </div>
+              {% else %}
+                <div class="small text-muted fst-italic">(no host vulnerabilities assigned)</div>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+  <div class="tab-pane fade" id="fp-switches">
           <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Router</th><th>Hosts</th><th>R/S Subnet</th><th>LAN Subnet</th></tr></thead><tbody>
           {% for sw in full_preview.switches_detail %}<tr><td>{{ sw.switch_id }}</td><td>sw-{{ sw.switch_id }}</td><td>{{ sw.router_id }}</td><td>{{ sw.hosts|join(',') }}</td><td>{{ sw.rsw_subnet }}</td><td>{{ sw.lan_subnet }}</td></tr>{% endfor %}
           </tbody></table>
         </div>
-        <div class="tab-pane fade" id="fp-interfaces">
+  <div class="tab-pane fade" id="fp-interfaces">
           <div class="row g-3">
             <div class="col-12">
               <h6 class="mb-2">Router-to-Router Links</h6>
@@ -228,28 +292,37 @@
             </div>
           </div>
         </div>
-        <div class="tab-pane fade" id="fp-seg">
+  <div class="tab-pane fade" id="fp-seg">
           {% set seg_prev = full_preview.segmentation_preview %}
+          {% set seg_artifacts = segmentation_artifacts or (display_artifacts.segmentation if display_artifacts else None) %}
+          {% set seg_rows = seg_artifacts.table_rows if seg_artifacts and seg_artifacts.table_rows else [] %}
+          {% set seg_json = seg_artifacts.json if seg_artifacts else None %}
           <!-- Segmentation action buttons removed per request; only rules table remains -->
-          {% if seg_prev and seg_prev.rules %}
-          <div class="table-responsive" style="max-height:300px;overflow:auto;">
+          {% if seg_rows %}
+          <div class="table-responsive" style="max-height:320px;overflow:auto;">
             <table class="table table-sm table-bordered small align-middle" id="segRulesTable">
-              <thead><tr><th>#</th><th>Node</th><th>Type</th><th>Src</th><th>Dst</th><th>Subnet</th><th>Internal</th><th>External</th><th>Proto</th><th>Port</th><th>Script</th></tr></thead>
+              <thead><tr><th>#</th><th>Node</th><th>Type</th><th>Summary</th><th>Src</th><th>Dst</th><th>Subnet</th><th>Internal</th><th>External</th><th>Proto</th><th>Port</th><th>Script</th></tr></thead>
               <tbody>
-              {% for r in seg_prev.rules %}
-                {% set rule = r.rule or r %}
+              {% for row in seg_rows %}
+                {% set script_name = row.script_name %}
+                {% if not script_name and row.script_path %}{% set script_name = row.script_path.rsplit('/', 1)[-1] %}{% endif %}
                 <tr>
                   <td>{{ loop.index }}</td>
-                  <td>{{ r.node_id }}</td>
-                  <td>{{ rule.type or rule.get('type') }}</td>
-                  <td>{{ rule.get('src') or '-' }}</td>
-                  <td>{{ rule.get('dst') or '-' }}</td>
-                  <td>{{ rule.get('subnet') or '-' }}</td>
-                  <td>{{ rule.get('internal') or '-' }}</td>
-                  <td>{{ rule.get('external') or '-' }}</td>
-                  <td>{{ rule.get('proto') or '-' }}</td>
-                  <td>{{ rule.get('port') or '-' }}</td>
-                  <td>{% if r.script %}{% set scr = r.script.split('/')[-1] %}<button class="btn btn-sm btn-outline-primary py-0 px-1 view-script-btn" data-file="{{ scr }}" data-kind="segmentation">View</button>{% else %}-{% endif %}</td>
+                  <td>{{ row.node_id if row.node_id is not none else '-' }}</td>
+                  <td>{{ row.type or '-' }}</td>
+                  <td>{{ row.summary or '-' }}</td>
+                  <td>{{ row.src or '-' }}</td>
+                  <td>{{ row.dst or '-' }}</td>
+                  <td>{{ row.subnet or '-' }}</td>
+                  <td>{{ row.internal or '-' }}</td>
+                  <td>{{ row.external or '-' }}</td>
+                  <td>{{ row.proto or '-' }}</td>
+                  <td>{{ row.port if row.port is not none else '-' }}</td>
+                  <td>
+                    {% if script_name %}
+                      <button class="btn btn-sm btn-outline-primary py-0 px-1 view-script-btn" data-file="{{ script_name }}" data-kind="segmentation" title="{{ row.script_path or script_name }}">View</button>
+                    {% else %}-{% endif %}
+                  </td>
                 </tr>
               {% endfor %}
               </tbody>
@@ -257,6 +330,19 @@
           </div>
           {% else %}
             <div class="small text-muted fst-italic">(no segmentation rules)</div>
+          {% endif %}
+          {% if seg_json %}
+          <div class="mt-2">
+            {% if seg_json.types_summary %}
+            <div class="small mb-1">
+              {% for t, count in seg_json.types_summary.items() %}
+                <span class="badge text-bg-light border me-1">{{ t }}: {{ count }}</span>
+              {% endfor %}
+            </div>
+            {% endif %}
+            <h6 class="small text-uppercase text-muted mb-1">Segmentation Summary</h6>
+            <pre class="small bg-light p-2" style="max-height:220px;overflow:auto;">{{ seg_json | tojson(indent=2) }}</pre>
+          </div>
           {% endif %}
           <!-- Unified Scripts Listing Modal (segmentation + traffic) -->
           <div class="modal fade" id="scriptsListingModal" tabindex="-1" aria-labelledby="scriptsListingModalLabel" aria-hidden="true">
@@ -307,14 +393,14 @@
           <div class="small text-muted">Scripts Hash (SHA-256): <code>{{ seg_prev.scripts_hash_sha256 }}</code></div>
           {% endif %}
         </div>
-        <div class="tab-pane fade" id="fp-node-sections">
+  <div class="tab-pane fade" id="fp-node-sections">
           <div class="table-responsive small">
             <table class="table table-sm table-bordered mb-0" id="nodeSectionsTable"><thead><tr>
               <th>Node ID</th><th>Name</th><th>Type</th><th>Primary IP</th><th>Interfaces</th><th>Services</th><th>Vulns</th><th>Seg Rules</th><th>Traffic S</th><th>Traffic R</th>
             </tr></thead><tbody></tbody></table>
           </div>
         </div>
-        <div class="tab-pane fade" id="fp-traffic">
+  <div class="tab-pane fade" id="fp-traffic">
           {% set tsummary = full_preview.traffic_summary or {} %}
           {% set flows = tsummary.flows or [] %}
           {% if flows %}
@@ -349,7 +435,7 @@
             <div class="small text-muted fst-italic">(no traffic flows)</div>
           {% endif %}
         </div>
-        <div class="tab-pane fade" id="fp-json">
+  <div class="tab-pane fade" id="fp-json">
           <pre class="small bg-light p-2" style="max-height:440px;overflow:auto;">{{ preview_json }}</pre>
         </div>
       </div>
@@ -390,7 +476,23 @@
   function init(){
     const dataEl = document.getElementById('fpDataJson');
     try { previewData = JSON.parse(dataEl.textContent); } catch(e) { console.warn('Failed parse preview json', e); previewData = {}; }
+    
     // Simple graph using d3-force (assumes d3 is loaded in base template). Fallback to textual if not.
+    function normalizeVulnerabilitiesByNode(source){
+      const out = {};
+      if(!source) return out;
+      Object.entries(source).forEach(([key, value]) => {
+        if(key === '__density_pool__') return;
+        if(Array.isArray(value)){
+          out[String(key)] = value;
+          const numericKey = Number(key);
+          if(Number.isFinite(numericKey)){
+            out[numericKey] = value;
+          }
+        }
+      });
+      return out;
+    }
     function buildGraph(){
     if(!window.d3){ document.getElementById('previewGraph').textContent='d3 not loaded'; return; }
     const wrap = d3.select('#previewGraph');
@@ -399,6 +501,7 @@
     const svg = wrap.append('svg').attr('width', width).attr('height', height).style('cursor','grab');
     // Legend
     const legend = svg.append('g').attr('class','legend').attr('transform','translate(8,8)');
+    const vulnerabilitiesByNode = normalizeVulnerabilitiesByNode(previewData.vulnerabilities_by_node);
     const legendItems = [
       {label:'Router', color:'#ff5722', r:10},
       {label:'Switch', color:'#17a2b8', r:7},
@@ -419,8 +522,16 @@
     svg.call(zoom).on('dblclick.zoom', null);
     const nodes = [];
     const linkDescriptors = [];
+    const vulnerabilityColor = '#28a745';
     (previewData.routers||[]).forEach(r=>{ nodes.push({id:r.node_id, label:r.name, type:'router'}); });
-    (previewData.hosts||[]).forEach(h=>{ nodes.push({id:h.node_id, label:h.name, type:'host'}); });
+    (previewData.hosts||[]).forEach(h=>{
+      const hostId = h.node_id;
+      const keyStr = String(hostId);
+      const assignment = Array.isArray(h.vulnerabilities) ? h.vulnerabilities : vulnerabilitiesByNode[keyStr] || vulnerabilitiesByNode[hostId] || [];
+      const vulnList = Array.isArray(assignment) ? assignment : [];
+      const hasVuln = vulnList.length > 0;
+      nodes.push({id:hostId, label:h.name, type:'host', hasVuln: hasVuln, vulnerabilities: vulnList});
+    });
     (previewData.switches_detail||[]).forEach(sw=>{ nodes.push({id:sw.switch_id, label:'sw-'+sw.switch_id, type:'switch'}); });
     (previewData.r2r_edges_preview||[]).forEach(e=>{ linkDescriptors.push({sourceId:e[0], targetId:e[1], kind:'r2r'}); });
     const hostRouterMap = previewData.host_router_map || {};
@@ -435,7 +546,6 @@
       }
     });
 
-    const nodeById = new Map(nodes.map(n => [n.id, n]));
     const layoutPositions = previewData.layout_positions;
     const layoutMaps = (layoutPositions && !layoutPositions.error && typeof layoutPositions === 'object')
       ? {
@@ -505,7 +615,7 @@
     let scale = 1;
     let offsetX = margin;
     let offsetY = margin;
-    if(usingLayout){
+    if(usingLayout && layoutCoords.length){
       let minX = layoutCoords[0].x;
       let maxX = layoutCoords[0].x;
       let minY = layoutCoords[0].y;
@@ -525,96 +635,103 @@
       } else {
         offsetX = margin + (innerWidth - spanX * scale) / 2 - minX * scale;
         offsetY = margin + (innerHeight - spanY * scale) / 2 - minY * scale;
-        nodes.forEach(n => {
-          if(n._layout){
-            n.x = offsetX + n._layout.x * scale;
-            n.y = offsetY + n._layout.y * scale;
-          } else {
-            n.x = width / 2 + Math.random() * 40 - 20;
-            n.y = height / 2 + Math.random() * 40 - 20;
-          }
-        });
-        applyRowJitter(nodes);
-        staticOriginalPositions.clear();
-        nodes.forEach(n => {
-          if(Number.isFinite(n.x) && Number.isFinite(n.y)){
-            staticOriginalPositions.set(n.id, { x: n.x, y: n.y });
-          }
-        });
       }
     }
 
-    const link = container.selectAll('line').data(linkDescriptors).enter().append('line')
+    if(usingLayout){
+      nodes.forEach(n => {
+        if(n._layout){
+          n.x = offsetX + n._layout.x * scale;
+          n.y = offsetY + n._layout.y * scale;
+        } else {
+          n.x = width / 2 + Math.random() * 40 - 20;
+          n.y = height / 2 + Math.random() * 40 - 20;
+        }
+      });
+      applyRowJitter(nodes);
+      nodes.forEach(n => {
+        n.layoutX = n.x;
+        n.layoutY = n.y;
+        if(Number.isFinite(n.x) && Number.isFinite(n.y)){
+          staticOriginalPositions.set(n.id, { x: n.x, y: n.y });
+        }
+      });
+    } else {
+      nodes.forEach(n => {
+        n.x = width / 2 + Math.random() * 80 - 40;
+        n.y = height / 2 + Math.random() * 80 - 40;
+        n.layoutX = undefined;
+        n.layoutY = undefined;
+      });
+    }
+
+    const simLinks = linkDescriptors.map(l => ({...l, source: l.sourceId, target: l.targetId}));
+
+    const link = container.selectAll('line').data(simLinks).enter().append('line')
       .attr('stroke', l=> l.kind==='r2r'? '#007bff' : (l.kind==='r-sw'? '#28a745' : '#999'))
       .attr('stroke-width', l=> l.kind==='r2r'? 2 : 1.2)
       .attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null)
       .attr('opacity', 0.85);
     const node = container.selectAll('g.node').data(nodes).enter().append('g').attr('class','node');
+    const hasVulnerableHosts = nodes.some(n => n.type === 'host' && n.hasVuln);
+    if(hasVulnerableHosts){
+      legend.append('g').attr('transform',`translate(0,${legendItems.length*18})`)
+        .call(g=>{
+          g.append('circle').attr('r',5).attr('cx',5).attr('cy',5).attr('fill',vulnerabilityColor).attr('stroke','#333').attr('stroke-width',1);
+          g.append('text').text('Host (vulnerable)').attr('x', 5*2 + 6).attr('y', 5+4).attr('font-size','11px');
+        });
+    }
     node.append('circle')
       .attr('r', d=> d.type==='router'? 10 : (d.type==='switch'? 7 : 5))
-      .attr('fill', d=> d.type==='router'? '#ff5722' : (d.type==='switch'? '#17a2b8' : '#ffc107'))
+      .attr('fill', d=> {
+        if(d.type==='router') return '#ff5722';
+        if(d.type==='switch') return '#17a2b8';
+        return d.hasVuln ? vulnerabilityColor : '#ffc107';
+      })
       .attr('stroke', '#333').attr('stroke-width', 1);
+    const simulation = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40)))
+      .force('charge', d3.forceManyBody().strength(-210))
+      .force('center', d3.forceCenter(width/2, height/2))
+      .force('layoutX', d3.forceX(d => Number.isFinite(d.layoutX) ? d.layoutX : width/2).strength(usingLayout ? 0.18 : 0.04))
+      .force('layoutY', d3.forceY(d => Number.isFinite(d.layoutY) ? d.layoutY : height/2).strength(usingLayout ? 0.18 : 0.04));
 
-    let sim = null;
+    link.data(simLinks, d=>`${d.source}-${d.target}`);
+
+    simulation.on('tick', ()=>{
+      link
+        .attr('x1', d=>d.source.x)
+        .attr('y1', d=>d.source.y)
+        .attr('x2', d=>d.target.x)
+        .attr('y2', d=>d.target.y);
+      node.attr('transform', d=>`translate(${d.x},${d.y})`);
+    });
+
+    node.call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
+
+    let sim = simulation;
+
     if(usingLayout){
-      const invertToLayout = (event) => {
-        const point = currentTransform.invert([event.x, event.y]);
-        return { x: point[0], y: point[1] };
-      };
-      const updateStatic = () => {
-        link
-          .attr('x1', d=> (nodeById.get(d.sourceId)?.x) ?? 0)
-          .attr('y1', d=> (nodeById.get(d.sourceId)?.y) ?? 0)
-          .attr('x2', d=> (nodeById.get(d.targetId)?.x) ?? 0)
-          .attr('y2', d=> (nodeById.get(d.targetId)?.y) ?? 0);
-        node.attr('transform', d=>`translate(${d.x||0},${d.y||0})`);
-      };
-      updateStatic();
       resetStaticPositions = () => {
         nodes.forEach(n => {
           const orig = staticOriginalPositions.get(n.id);
           if(orig){
+            n.layoutX = orig.x;
+            n.layoutY = orig.y;
             n.x = orig.x;
             n.y = orig.y;
+            n.vx = 0;
+            n.vy = 0;
+            n.fx = null;
+            n.fy = null;
           }
         });
-        updateStatic();
+        simulation.alpha(0.55).restart();
       };
-      const staticDrag = d3.drag()
-        .on('start', (event)=>{
-          try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
-        })
-        .on('drag', (event, d)=>{
-          const { x, y } = invertToLayout(event);
-          d.x = x;
-          d.y = y;
-          updateStatic();
-        })
-        .on('end', (event)=>{
-          try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
-        });
-      node.call(staticDrag);
-    } else {
-      const simLinks = linkDescriptors.map(l => ({...l, source: l.sourceId, target: l.targetId}));
-      sim = d3.forceSimulation(nodes)
-        .force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40)))
-        .force('charge', d3.forceManyBody().strength(-200))
-        .force('center', d3.forceCenter(width/2, height/2));
-      link.data(simLinks, d=>`${d.source}-${d.target}`);
-      sim.on('tick', ()=>{
-        link
-          .attr('x1', d=>d.source.x)
-          .attr('y1', d=>d.source.y)
-          .attr('x2', d=>d.target.x)
-          .attr('y2', d=>d.target.y);
-        node.attr('transform', d=>`translate(${d.x},${d.y})`);
-      });
-      node.call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
     }
     // Build quick lookup structures for tooltips
   const servicesByNode = previewData.services_preview || {}; // { node_id: [service,...] }
-  const vulnsRaw = previewData.vulnerabilities_preview || {}; // legacy __density_pool__ removed in planner
-  const vulnsByNode = Object.fromEntries(Object.entries(vulnsRaw).filter(([k,_])=> k !== '__density_pool__'));
+  const vulnsByNode = vulnerabilitiesByNode;
   const segRules = (previewData.segmentation_preview && previewData.segmentation_preview.rules) || []; // rules with node_id
     const segCountByNode = {};
     segRules.forEach(r=>{ const nid = r.node_id; segCountByNode[nid] = (segCountByNode[nid]||0)+1; });
@@ -686,9 +803,33 @@
       }
     } catch(e) { console.warn('node section table build failed', e); }
   // Node labels removed per request
-  function dragstarted(event,d){ if(sim && !event.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; }
-  function dragged(event,d){ d.fx=event.x; d.fy=event.y; }
-  function dragended(event,d){ if(sim && !event.active) sim.alphaTarget(0); d.fx=null; d.fy=null; }
+  function dragstarted(event,d){
+    try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
+    if(sim && !event.active){ sim.alphaTarget(0.35).restart(); }
+    const [sx, sy] = currentTransform.invert([event.x, event.y]);
+    d.fx = sx;
+    d.fy = sy;
+    d.layoutX = sx;
+    d.layoutY = sy;
+  }
+  function dragged(event,d){
+    const [sx, sy] = currentTransform.invert([event.x, event.y]);
+    d.fx = sx;
+    d.fy = sy;
+    d.layoutX = sx;
+    d.layoutY = sy;
+  }
+  function dragended(event,d){
+    if(sim && !event.active){ sim.alphaTarget(0); }
+    d.fx = null;
+    d.fy = null;
+    d.vx = 0;
+    d.vy = 0;
+    if(usingLayout){
+      d.layoutX = d.x;
+      d.layoutY = d.y;
+    }
+  }
     // Wire zoom control buttons
     const zoomInBtn = document.getElementById('zoomInBtn');
     const zoomOutBtn = document.getElementById('zoomOutBtn');

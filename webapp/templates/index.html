@@ -284,7 +284,15 @@
                         </div>
                         <div class="card mb-3">
                             <div class="card-header"><strong>Segmentation Plan</strong></div>
-                            <div class="card-body p-2"><pre class="small mb-0" id="fpSegmentation" style="max-height:220px; overflow:auto;"></pre></div>
+                            <div class="card-body p-2">
+                                <div class="small mb-2" id="fpSegmentationTypes" hidden></div>
+                                <pre class="small mb-0" id="fpSegmentation" style="max-height:220px; overflow:auto;"></pre>
+                                <div class="mt-2" id="fpSegmentationRuntimeWrap" hidden>
+                                    <h6 class="small text-uppercase text-muted mb-1">Runtime Segmentation Summary (segmentation_summary.json)</h6>
+                                    <pre class="small bg-light p-2 mb-0" id="fpSegmentationRuntime" style="max-height:220px; overflow:auto;"></pre>
+                                </div>
+                                <div class="small text-muted mt-2" id="fpSegmentationHash" hidden></div>
+                            </div>
                         </div>
                         <div class="card mb-3">
                             <div class="card-header"><strong>Router Plan</strong></div>
@@ -422,6 +430,143 @@ let previewState = {
     dirty: false,
     coreTested: false
 };
+const FULL_PREVIEW_ARTIFACT_VERSION = 2;
+
+function safeClone(value){
+    if(value === null || typeof value !== 'object') return value;
+    try { return structuredClone(value); }
+    catch(e){
+        try { return JSON.parse(JSON.stringify(value)); }
+        catch(err){ return value; }
+    }
+}
+
+function summarizeSegRule(rule){
+    if(!rule) return '';
+    const type = rule.type || rule.action || '';
+    if(type === 'nat'){
+        const mode = rule.mode ? `${rule.mode} ` : '';
+        const internal = rule.internal || rule.internal_subnet || '';
+        const external = rule.external || rule.external_subnet || '';
+        return `${mode}${internal}${(internal && external)?' -> ':''}${external}`.trim();
+    }
+    if(type === 'host_block'){
+        const src = rule.src || rule.source || '';
+        const dst = rule.dst || rule.destination || '';
+        return `${src} X ${dst}`.trim();
+    }
+    if(type === 'custom'){
+        return rule.description || 'custom';
+    }
+    if(type){
+        const src = rule.src || rule.source;
+        const dst = rule.dst || rule.destination;
+        if(src || dst){
+            return `${type}: ${src || '*'} -> ${dst || '*'}`;
+        }
+        return type;
+    }
+    return '';
+}
+
+function buildSegmentationArtifacts(full){
+    const seg = (full && full.segmentation_preview) || {};
+    const rawRules = Array.isArray(seg.rules) ? seg.rules : [];
+    const meta = safeClone(seg);
+    if(meta && typeof meta === 'object') delete meta.rules;
+    if(!rawRules.length){
+        return {
+            rows: [],
+            tableRows: [],
+            table_rows: [],
+            json: {
+                rules_count: 0,
+                types_summary: {},
+                rules: [],
+                metadata: meta || null
+            }
+        };
+    }
+    const summaries = [];
+    const tableRows = [];
+    const typeCounts = {};
+    for(const rawEntry of rawRules){
+        const entry = safeClone(rawEntry);
+        if(!entry || typeof entry !== 'object') continue;
+        const rule = ('rule' in entry && entry.rule) ? safeClone(entry.rule) : safeClone(entry);
+        if(!rule || typeof rule !== 'object') continue;
+        const nodeId = (entry.node_id !== undefined) ? entry.node_id : (rule.node_id !== undefined ? rule.node_id : null);
+        const typeRaw = (rule.type !== undefined && rule.type !== null) ? rule.type : rule.action;
+        const type = (typeRaw !== undefined && typeRaw !== null) ? String(typeRaw) : null;
+        const summary = summarizeSegRule(rule);
+        const src = (rule.src !== undefined && rule.src !== null) ? rule.src : rule.source;
+        const dst = (rule.dst !== undefined && rule.dst !== null) ? rule.dst : rule.destination;
+        const internal = (rule.internal !== undefined && rule.internal !== null) ? rule.internal : rule.internal_subnet;
+        const external = (rule.external !== undefined && rule.external !== null) ? rule.external : rule.external_subnet;
+        const proto = (rule.proto !== undefined && rule.proto !== null) ? rule.proto : rule.protocol;
+        const port = (rule.port !== undefined) ? rule.port : null;
+        const scriptPath = typeof entry.script === 'string' ? entry.script : (typeof rule.script === 'string' ? rule.script : null);
+        const scriptName = scriptPath ? scriptPath.split('/').pop() : null;
+        const tableRow = {
+            node_id: nodeId,
+            type,
+            summary,
+            src: src ?? null,
+            dst: dst ?? null,
+            subnet: rule.subnet ?? null,
+            internal: internal ?? null,
+            external: external ?? null,
+            proto: proto ?? null,
+            port,
+            script_path: scriptPath || null,
+            script_name: scriptName || null,
+            detail: rule
+        };
+        tableRows.push(tableRow);
+        summaries.push({ node_id: nodeId, type, summary });
+        const key = type || 'unknown';
+        typeCounts[key] = (typeCounts[key] || 0) + 1;
+    }
+    return {
+        rows: summaries,
+        tableRows,
+        table_rows: tableRows,
+        json: {
+            rules_count: tableRows.length,
+            types_summary: typeCounts,
+            rules: tableRows.map(row => ({ node_id: row.node_id, type: row.type, summary: row.summary, detail: safeClone(row.detail) })),
+            metadata: meta || null
+        }
+    };
+}
+
+function buildFullPreviewArtifacts(full){
+    if(!full) return { segmentation: buildSegmentationArtifacts(full) };
+    if(full.__displayArtifactsVersion === FULL_PREVIEW_ARTIFACT_VERSION && full.__displayArtifacts){
+        return full.__displayArtifacts;
+    }
+    let artifacts = null;
+    if(full.display_artifacts_version === FULL_PREVIEW_ARTIFACT_VERSION && full.display_artifacts){
+        artifacts = safeClone(full.display_artifacts);
+    }
+    if(!artifacts || !artifacts.segmentation){
+        artifacts = { segmentation: buildSegmentationArtifacts(full) };
+    } else {
+        const seg = artifacts.segmentation;
+        if(!seg.tableRows || !seg.table_rows || !Array.isArray(seg.rows)){
+            artifacts.segmentation = buildSegmentationArtifacts(full);
+        }
+    }
+    artifacts.__version = FULL_PREVIEW_ARTIFACT_VERSION;
+    try {
+        Object.defineProperty(full, '__displayArtifacts', { value: artifacts, enumerable: false, configurable: true, writable: true });
+        Object.defineProperty(full, '__displayArtifactsVersion', { value: FULL_PREVIEW_ARTIFACT_VERSION, enumerable: false, configurable: true, writable: true });
+    } catch(e){
+        full.__displayArtifacts = artifacts;
+        full.__displayArtifactsVersion = FULL_PREVIEW_ARTIFACT_VERSION;
+    }
+    return artifacts;
+}
 // Core settings: prefer server-provided if present; otherwise restore from persisted
 // ---------------- Plan Workflow State -----------------
 // (Legacy alias cleanup left intentionally blank. Using previewState below.)
@@ -680,6 +825,7 @@ async function computeFullPlanPreview(){
     if(!data.ok){ pre.textContent='Full preview failed: '+(data.error||''); previewState.fullPreview=null; document.getElementById('fullPreviewStructured')?.classList.add('d-none'); }
         else {
             previewState.fullPreview = data.full_preview;
+            buildFullPreviewArtifacts(previewState.fullPreview);
             pre.textContent = JSON.stringify(previewState.fullPreview, null, 2);
             renderFullPreviewStructured();
             // Emit detailed calculation logs into dock
@@ -838,8 +984,9 @@ function renderFullPreviewStructured(){
             contentEl.innerHTML = `<div><div class="mb-2"><strong>Degree Stats:</strong> ${esc(JSON.stringify(full.r2r_stats_preview||{}))}</div><div class="mb-2"><strong>Degrees:</strong> ${esc(degList||'(none)')}</div><div class="mb-2"><strong>Edges (${edges.length}):</strong> ${esc(edgesSample||'(none)')} ${edges.length>200?'...':''}</div><div><strong>Spark:</strong> ${esc(spark)}</div></div>`; return;
         }
         if(id==='seg'){
-            const rules = (full.segmentation_preview && full.segmentation_preview.rules) || [];
-            contentEl.innerHTML = tableFromObjects(rules.map(r=>({ node_id:r.node_id, type:r.rule.type, summary: ruleSummary(r.rule) })), ['node_id','type','summary']);
+            const artifacts = buildFullPreviewArtifacts(full);
+            const segRows = (artifacts && artifacts.segmentation && artifacts.segmentation.rows) || [];
+            contentEl.innerHTML = tableFromObjects(segRows, ['node_id','type','summary']);
             return;
         }
         if(id==='router_bd'){
@@ -867,13 +1014,6 @@ function renderFullPreviewStructured(){
             return;
         }
         contentEl.textContent='Unknown section';
-    }
-    function ruleSummary(rule){
-        if(!rule) return ''; const t = rule.type;
-        if(t==='nat') return `${rule.mode||''} ${rule.internal||''} -> ${rule.external||''}`.trim();
-        if(t==='host_block') return `${rule.src} X ${rule.dst}`;
-        if(t==='custom') return rule.description || 'custom';
-        return t;
     }
     function tableFromObjects(arr, cols){
         if(!arr.length) return '<div class="text-muted fst-italic">(none)</div>';
@@ -948,49 +1088,70 @@ function showFullPreviewModal(full){
     function setJson(id, obj){ const el=document.getElementById(id); if(el) el.textContent = JSON.stringify(obj||{}, null, 2); }
     setJson('fpR2RPolicy', full.r2r_policy_preview);
     setJson('fpR2SPolicy', full.r2s_policy_preview);
-    // Render segmentation plan as filtered/minimal JSON (exclude script paths)
+    // Render segmentation plan using shared artifacts so modal and structured views match
     (function(){
-        const segEl = document.getElementById('fpSegmentation'); if(!segEl) return;
-        const seg = full.segmentation_preview || {};
-        const rulesRaw = seg.rules || [];
-        if(!rulesRaw.length){ segEl.textContent = '(no segmentation plan rules)'; return; }
-        // Normalize rule objects (sometimes nested under r.rule)
-        const cleaned = []; const typeCounts = {};
-        for(const r of rulesRaw){
-            const rule = r.rule || r;
-            const obj = {
-                node_id: r.node_id ?? rule.node_id ?? null,
-                type: rule.type || rule.action || null,
-                src: rule.src || null,
-                dst: rule.dst || null,
-                subnet: rule.subnet || null,
-                proto: rule.proto || rule.protocol || null,
-                port: rule.port || null,
-                action: rule.action || (rule.type && ['allow','dnat'].includes(rule.type)? rule.type : null) || null,
-                internal: rule.internal ?? null,
-                external: rule.external ?? null
-            };
-            // Count types
-            const t = obj.type || 'unknown';
-            typeCounts[t] = (typeCounts[t]||0)+1;
-            cleaned.push(obj);
+        const segEl = document.getElementById('fpSegmentation');
+        if(!segEl) return;
+        const typesEl = document.getElementById('fpSegmentationTypes');
+        const runtimeWrap = document.getElementById('fpSegmentationRuntimeWrap');
+        const runtimeEl = document.getElementById('fpSegmentationRuntime');
+        const hashEl = document.getElementById('fpSegmentationHash');
+        const artifacts = buildFullPreviewArtifacts(full) || {};
+        const segArtifacts = artifacts.segmentation || null;
+        const segJson = segArtifacts && segArtifacts.json;
+        const hasRules = !!(segJson && typeof segJson === 'object' && segJson.rules_count > 0);
+        if(hasRules){
+            try {
+                segEl.textContent = JSON.stringify(segJson, null, 2);
+            } catch(e){
+                segEl.textContent = '[error rendering segmentation plan JSON]';
+            }
+        } else {
+            segEl.textContent = '(no segmentation plan rules)';
         }
-        // Optionally truncate very large rule sets for readability
-        const MAX_RULES_DISPLAY = 400;
-        let truncated = false;
-        let rulesOut = cleaned;
-        if(cleaned.length > MAX_RULES_DISPLAY){
-            rulesOut = cleaned.slice(0, MAX_RULES_DISPLAY);
-            truncated = true;
+        if(typesEl){
+            typesEl.innerHTML = '';
+            const typesSummary = hasRules ? (segJson.types_summary || {}) : {};
+            const entries = Object.entries(typesSummary).filter(([, count]) => count !== undefined && count !== null);
+            if(entries.length){
+                typesEl.hidden = false;
+                entries.forEach(([type, count]) => {
+                    const badge = document.createElement('span');
+                    badge.className = 'badge text-bg-light border me-1';
+                    badge.textContent = `${type}: ${count}`;
+                    typesEl.appendChild(badge);
+                });
+            } else {
+                typesEl.hidden = true;
+            }
         }
-        const minimal = {
-            rules_count: cleaned.length,
-            truncated: truncated || undefined,
-            types_summary: typeCounts,
-            sample_rules: rulesOut
-        };
-        try { segEl.textContent = JSON.stringify(minimal, null, 2); }
-        catch(e){ segEl.textContent = '[error rendering segmentation plan JSON]'; }
+        const segPreview = (full && full.segmentation_preview) || {};
+        const runtimeSummary = segPreview && segPreview.runtime_summary;
+        if(runtimeWrap){
+            if(runtimeSummary){
+                runtimeWrap.hidden = false;
+                if(runtimeEl){
+                    try {
+                        runtimeEl.textContent = JSON.stringify(runtimeSummary, null, 2);
+                    } catch(e){
+                        runtimeEl.textContent = '[error rendering runtime segmentation summary]';
+                    }
+                }
+            } else {
+                runtimeWrap.hidden = true;
+                if(runtimeEl){ runtimeEl.textContent = ''; }
+            }
+        }
+        if(hashEl){
+            const hashVal = segPreview && segPreview.scripts_hash_sha256;
+            if(hashVal){
+                hashEl.hidden = false;
+                hashEl.textContent = `Scripts Hash (SHA-256): ${hashVal}`;
+            } else {
+                hashEl.hidden = true;
+                hashEl.textContent = '';
+            }
+        }
     })();
     // Breakdown plans
     try { setJson('fpRouterPlan', full.router_plan); } catch(e){}
@@ -1072,6 +1233,22 @@ function showFullPreviewModal(full){
 
 // Drift function removed
 
+function normalizeVulnerabilitiesByNode(source){
+    const out = {};
+    if(!source) return out;
+    Object.entries(source).forEach(([key, value])=>{
+        if(key === '__density_pool__') return;
+        if(Array.isArray(value)){
+            out[String(key)] = value;
+            const numericKey = Number(key);
+            if(Number.isFinite(numericKey)){
+                out[numericKey] = value;
+            }
+        }
+    });
+    return out;
+}
+
 function buildFullPreviewModalGraph(full){
     if(!window.d3){ const g=document.getElementById('fpGraphLoading'); if(g) g.textContent='d3 not loaded'; return; }
     const container = d3.select('#fpGraph');
@@ -1084,16 +1261,23 @@ function buildFullPreviewModalGraph(full){
         currentTransform = ev.transform; zoomLayer.attr('transform', currentTransform);
     });
     svg.call(zoom).on('dblclick.zoom', null);
+        const vulnerabilitiesByNode = normalizeVulnerabilitiesByNode(full.vulnerabilities_by_node);
         const nodes=[];
         const linkDescriptors=[];
         (full.routers||[]).forEach(r=>nodes.push({id:r.node_id, label:r.name, type:'router'}));
-        (full.hosts||[]).forEach(hn=>nodes.push({id:hn.node_id, label:hn.name, type:'host'}));
+        (full.hosts||[]).forEach(hn=>{
+            const hostId = hn.node_id;
+            const keyStr = String(hostId);
+            const assignment = Array.isArray(hn.vulnerabilities) ? hn.vulnerabilities : vulnerabilitiesByNode[keyStr] || vulnerabilitiesByNode[hostId] || [];
+            const vulnList = Array.isArray(assignment) ? assignment : [];
+            const hasVuln = vulnList.length > 0;
+            nodes.push({id:hostId, label:hn.name, type:'host', hasVuln: hasVuln, vulnerabilities: vulnList});
+        });
         (full.switches_detail||[]).forEach(sw=>nodes.push({id:sw.switch_id, label:'sw-'+sw.switch_id, type:'switch'}));
         (full.r2r_edges_preview||[]).forEach(e=>linkDescriptors.push({sourceId:e[0], targetId:e[1], kind:'r2r'}));
         (full.switches_detail||[]).forEach(sw=>{ (sw.hosts||[]).forEach(hid=>linkDescriptors.push({sourceId:sw.switch_id, targetId:hid, kind:'sw-host'})); linkDescriptors.push({sourceId:sw.router_id, targetId:sw.switch_id, kind:'r-sw'}); });
         const hr = full.host_router_map || {}; Object.entries(hr).forEach(([hid,rid])=>{ const hIdNum=parseInt(hid,10); if(!linkDescriptors.find(l=>l.kind==='sw-host' && l.targetId===hIdNum)){ linkDescriptors.push({sourceId:rid, targetId:hIdNum, kind:'r-host'}); }});
 
-        const nodeById = new Map(nodes.map(n => [n.id, n]));
         const layoutPositions = full.layout_positions;
         const layoutMaps = (layoutPositions && !layoutPositions.error && typeof layoutPositions === 'object')
             ? {
@@ -1156,74 +1340,99 @@ function buildFullPreviewModalGraph(full){
                 });
             });
         }
-        let applyPositionUpdate = null;
-        if(usingLayout){
+        let scale = 1;
+        let offsetX = margin;
+        let offsetY = margin;
+        if(usingLayout && layoutCoords.length){
             let minX = layoutCoords[0].x, maxX = layoutCoords[0].x;
             let minY = layoutCoords[0].y, maxY = layoutCoords[0].y;
             layoutCoords.forEach(c=>{ if(c.x<minX) minX=c.x; if(c.x>maxX) maxX=c.x; if(c.y<minY) minY=c.y; if(c.y>maxY) maxY=c.y; });
             const spanX = Math.max(1, maxX - minX);
             const spanY = Math.max(1, maxY - minY);
-            let scale = Math.min(innerWidth/spanX, innerHeight/spanY);
+            scale = Math.min(innerWidth/spanX, innerHeight/spanY);
             if(!Number.isFinite(scale) || scale <= 0){
+                scale = 1;
                 usingLayout = false;
             } else {
-                const offsetX = margin + (innerWidth - spanX * scale) / 2 - minX * scale;
-                const offsetY = margin + (innerHeight - spanY * scale) / 2 - minY * scale;
-                nodes.forEach(n=>{
-                    if(n._layout){
-                        n.x = offsetX + n._layout.x * scale;
-                        n.y = offsetY + n._layout.y * scale;
-                    } else {
-                        n.x = w/2 + Math.random()*40 - 20;
-                        n.y = h/2 + Math.random()*40 - 20;
-                    }
-                });
-                applyRowJitter(nodes);
-                originalPositions.clear();
-                nodes.forEach(n=>{
-                    if(Number.isFinite(n.x) && Number.isFinite(n.y)){
-                        originalPositions.set(n.id, { x: n.x, y: n.y });
-                    }
-                });
+                offsetX = margin + (innerWidth - spanX * scale) / 2 - minX * scale;
+                offsetY = margin + (innerHeight - spanY * scale) / 2 - minY * scale;
             }
         }
-        const link = zoomLayer.selectAll('line').data(linkDescriptors).enter().append('line').attr('stroke', l=> l.kind==='r2r'? '#0d6efd': (l.kind==='r-sw'? '#198754':'#999')).attr('stroke-width', l=> l.kind==='r2r'? 2:1.2).attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null).attr('opacity', .9);
-        const node = zoomLayer.selectAll('g').data(nodes).enter().append('g');
-        node.append('circle').attr('r', d=> d.type==='router'? 11: (d.type==='switch'? 8:5)).attr('fill', d=> d.type==='router'? '#ff7043': (d.type==='switch'? '#17a2b8': '#ffc107')).attr('stroke','#333').attr('stroke-width',1.1);
-        let sim = null;
+
         if(usingLayout){
-            const updateStatic = () => {
-                link
-                    .attr('x1', d=> (nodeById.get(d.sourceId)?.x) ?? 0)
-                    .attr('y1', d=> (nodeById.get(d.sourceId)?.y) ?? 0)
-                    .attr('x2', d=> (nodeById.get(d.targetId)?.x) ?? 0)
-                    .attr('y2', d=> (nodeById.get(d.targetId)?.y) ?? 0);
-                node.attr('transform', d=>`translate(${d.x||0},${d.y||0})`);
-            };
-            updateStatic();
-            applyPositionUpdate = updateStatic;
-            const staticDrag = d3.drag()
-                .on('start', (event)=>{
-                    try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
-                })
-                .on('drag', (event, d)=>{
-                    d.x = event.x;
-                    d.y = event.y;
-                    updateStatic();
-                })
-                .on('end', (event)=>{
-                    try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
-                });
-            node.call(staticDrag);
-        } else {
-            const simLinks = linkDescriptors.map(l=>({...l, source:l.sourceId, target:l.targetId}));
-            sim = d3.forceSimulation(nodes).force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40))).force('charge', d3.forceManyBody().strength(-220)).force('center', d3.forceCenter(w/2,h/2));
-            link.data(simLinks, d=>`${d.source}-${d.target}`);
-            sim.on('tick', ()=>{
-                link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y).attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
-                node.attr('transform', d=>`translate(${d.x},${d.y})`);
+            nodes.forEach(n=>{
+                if(n._layout){
+                    n.x = offsetX + n._layout.x * scale;
+                    n.y = offsetY + n._layout.y * scale;
+                } else {
+                    n.x = w/2 + Math.random()*40 - 20;
+                    n.y = h/2 + Math.random()*40 - 20;
+                }
             });
-            node.call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
+            applyRowJitter(nodes);
+            nodes.forEach(n=>{
+                n.layoutX = n.x;
+                n.layoutY = n.y;
+                if(Number.isFinite(n.x) && Number.isFinite(n.y)){
+                    originalPositions.set(n.id, { x: n.x, y: n.y });
+                }
+            });
+        } else {
+            nodes.forEach(n=>{
+                n.x = w/2 + Math.random()*80 - 40;
+                n.y = h/2 + Math.random()*80 - 40;
+                n.layoutX = undefined;
+                n.layoutY = undefined;
+            });
+        }
+
+        const simLinks = linkDescriptors.map(l=>({...l, source:l.sourceId, target:l.targetId}));
+
+        const link = zoomLayer.selectAll('line').data(simLinks).enter().append('line').attr('stroke', l=> l.kind==='r2r'? '#0d6efd': (l.kind==='r-sw'? '#198754':'#999')).attr('stroke-width', l=> l.kind==='r2r'? 2:1.2).attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null).attr('opacity', .9);
+        const node = zoomLayer.selectAll('g').data(nodes).enter().append('g');
+        const vulnerabilityColor = '#28a745';
+        const hasVulnerableHosts = nodes.some(n => n.type === 'host' && n.hasVuln);
+        node.append('circle').attr('r', d=> d.type==='router'? 11: (d.type==='switch'? 8:5)).attr('fill', d=> {
+            if(d.type==='router') return '#ff7043';
+            if(d.type==='switch') return '#17a2b8';
+            return d.hasVuln ? vulnerabilityColor : '#ffc107';
+        }).attr('stroke','#333').attr('stroke-width',1.1);
+        const simulation = d3.forceSimulation(nodes)
+            .force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40)))
+            .force('charge', d3.forceManyBody().strength(-220))
+            .force('center', d3.forceCenter(w/2,h/2))
+            .force('layoutX', d3.forceX(d => Number.isFinite(d.layoutX) ? d.layoutX : w/2).strength(usingLayout ? 0.2 : 0.04))
+            .force('layoutY', d3.forceY(d => Number.isFinite(d.layoutY) ? d.layoutY : h/2).strength(usingLayout ? 0.2 : 0.04));
+
+        link.data(simLinks, d=>`${d.source}-${d.target}`);
+
+        simulation.on('tick', ()=>{
+            link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y).attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
+            node.attr('transform', d=>`translate(${d.x},${d.y})`);
+        });
+
+        node.call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
+
+        let sim = simulation;
+
+        let resetStaticPositions = null;
+        if(usingLayout){
+            resetStaticPositions = () => {
+                nodes.forEach(n => {
+                    const orig = originalPositions.get(n.id);
+                    if(orig){
+                        n.layoutX = orig.x;
+                        n.layoutY = orig.y;
+                        n.x = orig.x;
+                        n.y = orig.y;
+                        n.vx = 0;
+                        n.vy = 0;
+                        n.fx = null;
+                        n.fy = null;
+                    }
+                });
+                simulation.alpha(0.55).restart();
+            };
         }
     // Legend
     const legend = svg.append('g').attr('class','legend').attr('transform','translate(8,8)');
@@ -1237,25 +1446,43 @@ function buildFullPreviewModalGraph(full){
         g.append('circle').attr('r',li.r).attr('cx',li.r).attr('cy',li.r).attr('fill',li.color).attr('stroke','#333').attr('stroke-width',1);
         g.append('text').text(li.label).attr('x', li.r*2 + 6).attr('y', li.r+4).attr('font-size','11px');
     });
+    if(hasVulnerableHosts){
+        const offset = legendItems.length*20;
+        const g=legend.append('g').attr('transform',`translate(0,${offset})`);
+        g.append('circle').attr('r',5).attr('cx',5).attr('cy',5).attr('fill',vulnerabilityColor).attr('stroke','#333').attr('stroke-width',1);
+        g.append('text').text('Host (vulnerable)').attr('x', 5*2 + 6).attr('y', 5+4).attr('font-size','11px');
+    }
     // Node labels removed per request
     // Build section lookups
     const servicesByNode = full.services_preview || {}; // node_id -> [services]
-    const vulnByNode = full.vulnerabilities_preview || {}; // node_id -> [vulns]
+    const vulnByNode = vulnerabilitiesByNode; // node_id -> [vulns]
     const segRules = (full.segmentation_preview && full.segmentation_preview.rules) || [];
     const segCnt = {}; segRules.forEach(r=>{ segCnt[r.node_id] = (segCnt[r.node_id]||0)+1; });
     const traffic = full.traffic_summary || {};
     const tSend = {}; const tRecv = {};
     try { (traffic.flows || traffic || []).forEach(f=>{ const s=f.src_id??f.src; const d=f.dst_id??f.dst; if(s!==undefined) tSend[s]=(tSend[s]||0)+1; if(d!==undefined) tRecv[d]=(tRecv[d]||0)+1; }); } catch(e){}
     // Tooltip functionality removed per request
-    if(sim){
-        sim.on('tick', ()=>{
-            link.attr('x1', d=>d.source.x).attr('y1', d=>d.source.y).attr('x2', d=>d.target.x).attr('y2', d=>d.target.y);
-            node.attr('transform', d=>`translate(${d.x},${d.y})`);
-        });
+    function dragstarted(event,d){
+        try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
+        if(sim && !event.active) sim.alphaTarget(.35).restart();
+        const [sx, sy] = currentTransform.invert([event.x, event.y]);
+        d.fx = sx; d.fy = sy;
+        d.layoutX = sx; d.layoutY = sy;
     }
-    function dragstarted(event,d){ if(sim && !event.active) sim.alphaTarget(.3).restart(); d.fx=d.x; d.fy=d.y; }
-    function dragged(event,d){ d.fx=event.x; d.fy=event.y; }
-    function dragended(event,d){ if(sim && !event.active) sim.alphaTarget(0); }
+    function dragged(event,d){
+        const [sx, sy] = currentTransform.invert([event.x, event.y]);
+        d.fx = sx; d.fy = sy;
+        d.layoutX = sx; d.layoutY = sy;
+    }
+    function dragended(event,d){
+        if(sim && !event.active) sim.alphaTarget(0);
+        d.fx=null; d.fy=null;
+        d.vx = 0; d.vy = 0;
+        if(usingLayout){
+            d.layoutX = d.x;
+            d.layoutY = d.y;
+        }
+    }
     document.getElementById('fpGraphLoading')?.remove();
     const resetBtn = document.getElementById('fpGraphResetBtn');
     if(resetBtn){
@@ -1263,15 +1490,9 @@ function buildFullPreviewModalGraph(full){
             if(sim){
                 sim.alpha(1).restart();
                 nodes.forEach(n=>{ n.fx=null; n.fy=null; });
-            } else if(applyPositionUpdate){
-                nodes.forEach(n => {
-                    const orig = originalPositions.get(n.id);
-                    if(orig){
-                        n.x = orig.x;
-                        n.y = orig.y;
-                    }
-                });
-                applyPositionUpdate();
+            }
+            if(resetStaticPositions){
+                resetStaticPositions();
             }
             svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity);
         });
@@ -1285,7 +1506,7 @@ function buildFullPreviewModalGraph(full){
 function buildNodeSectionsTable(full){
     const wrap = document.getElementById('fpNodeSectionsWrap'); if(!wrap) return;
     const servicesByNode = full.services_preview || {};
-    const vulnByNode = full.vulnerabilities_preview || {};
+    const vulnByNode = normalizeVulnerabilitiesByNode(full.vulnerabilities_by_node);
     const segRules = (full.segmentation_preview && full.segmentation_preview.rules) || [];
     const segCnt = {}; segRules.forEach(r=>{ segCnt[r.node_id]=(segCnt[r.node_id]||0)+1; });
     const traffic = full.traffic_summary || {};
@@ -1782,10 +2003,20 @@ function renderMain() {
     }
     const hostBadgeClass = (niWeightRows.length && niBase === 0 && niAdd > 0) ? 'text-bg-warning' : 'text-bg-primary';
     // Simplified host summary: remove ΣW badge, allocation popover, and auto-scale functionality
-    const hostSummaryHtml = `<span class=\"badge rounded-pill ${hostBadgeClass} host-total-badge\" data-bs-toggle=\"tooltip\" title=\"${allocTip.replace(/"/g,'&quot;')}\">Hosts: ${niWeightRows.length ? (niBase + ' + ' + niAdd + ' = ' + niTotal) : (niAdd)}</span>`;
+    const hostSummaryHtml = `<span class=\"badge rounded-pill ${hostBadgeClass} host-total-badge ms-2\" data-bs-toggle=\"tooltip\" title=\"${allocTip.replace(/"/g,'&quot;')}\">Hosts: ${niWeightRows.length ? (niBase + ' + ' + niAdd + ' = ' + niTotal) : (niAdd)}</span>`;
     const densityBaseHtml = `<div class=\"d-flex align-items-center gap-1\" title=\"Base host pool used only for weight-based density calculations; Count rows are additive beyond this.\"><label class=\"form-label mb-0\">Count for Density</label><input type=\"number\" min=\"0\" max=\"5000\" step=\"1\" class=\"form-control form-control-sm\" style=\"width:120px\" value=\"${densityCountVal}\" data-scen-idx=\"${activeIdx}\" data-field=\"scenario_density_count\" /></div>`;
     const headerRow = document.createElement('div');
-    const secNames = Object.keys(scen.sections || {});
+    const rawSectionNames = Object.keys(scen.sections || {});
+    const filteredSectionNames = rawSectionNames.filter(name => name !== 'Notes');
+    const secNames = [];
+    if (filteredSectionNames.includes('Node Information')) {
+        secNames.push('Node Information');
+    }
+    filteredSectionNames.forEach(name => {
+        if (name !== 'Node Information') {
+            secNames.push(name);
+        }
+    });
     // Base host pool for density-driven (weight) allocations comes from scenario.density_count
     const baseHostPool = (scen.density_count !== undefined && scen.density_count !== null && scen.density_count !== '' ? (parseInt(scen.density_count,10)||0) : 10);
     secNames.forEach(name => {
@@ -1807,7 +2038,7 @@ function renderMain() {
             return acc + (metric === 'Count' ? (parseInt(it.v_count) || 0) : 0);
         }, 0)) : 0;
     const hasWeightRows = hasNodes ? hasWeightRowsPre : false;
-    const totalNodeCount = hasNodes ? extraNodeCount : 0;
+    const totalNodeCount = hasNodes ? (extraNodeCount + (hasWeightRowsPre ? niBase : 0)) : 0;
     const totalNodesLabel = hasNodes ? (totalNodeCount === 1 ? 'Total Node' : 'Total Nodes') : '';
     // Define totalPlanned (was previously referenced but never declared, causing a ReferenceError that prevented section rendering)
     const totalPlanned = hasNodes ? totalNodeCount : 0;
@@ -1832,19 +2063,23 @@ function renderMain() {
         // Compute planned badges (hosts / routers / vulns) for this section
         let hostBadge = '';
         if (name === 'Node Information') {
-            const basePart = hasWeightRows ? (parseInt(nodesVal) || 0) : 0;
+            const basePart = hasWeightRows ? niBase : 0;
             const additivePart = extraNodeCount;
-            const title = hasWeightRows
-                ? 'Hosts total = Base (Total Nodes) allocated across weight rows + additive Count rows'
-                : 'Hosts total = Sum of Count rows (no weight rows present)';
-            if ((basePart + additivePart) > 0) {
-                if (hasWeightRows) {
-                    hostBadge = `<span class=\"badge rounded-pill text-bg-primary ms-2\" title=\"${title.replace(/"/g,'&quot;')}\">Hosts: ${basePart} + ${additivePart} = ${totalNodeCount}</span>`;
-                } else {
-                    hostBadge = `<span class=\"badge rounded-pill text-bg-primary ms-2\" title=\"${title.replace(/"/g,'&quot;')}\">Hosts: ${additivePart}</span>`;
-                }
+            const totalPlannedHosts = basePart + additivePart;
+            if (hasWeightRows || additivePart > 0) {
+                const display = hasWeightRows ? `${basePart} + ${additivePart} = ${totalPlannedHosts}` : `${additivePart}`;
+                hostBadge = `<span class=\"badge rounded-pill text-bg-primary ms-2 host-total-badge\" data-bs-toggle=\"tooltip\" title=\"${allocTip.replace(/"/g,'&quot;')}\">Hosts: ${display}</span>`;
             }
         }
+        const hostSummaryBlock = (name === 'Node Information' && (niBase > 0 || niAdd > 0 || hasWeightRows))
+            ? `<div class="d-flex align-items-center gap-2">${hostSummaryHtml}</div>`
+            : '';
+        const nodeMetaHtml = (name === 'Node Information')
+            ? `<div class="d-flex flex-wrap align-items-center justify-content-between gap-3 mb-3">
+                    ${densityBaseHtml}
+                    ${hostSummaryBlock}
+               </div>`
+            : '';
         let routingBadge = '';
         if (name === 'Routing') {
             const rItems = sec.items || [];
@@ -1876,15 +2111,16 @@ function renderMain() {
         }
     const badgeSpan = hostBadge + routingBadge + vulnBadge;
         card.innerHTML = `
-            <div class=\"card-header d-flex align-items-center gap-2\">
+            <div class="card-header d-flex align-items-center gap-2">
                 ${iconHtml}
                 <strong>${name}</strong>${badgeSpan}
-                <div class=\"ms-auto d-flex gap-2\">
-                    <button class=\"btn btn-sm btn-outline-primary\" data-action=\"add-item\" data-scen-idx=\"${activeIdx}\" data-sec=\"${name}\">Add</button>
-                    <button class=\"btn btn-sm btn-outline-secondary\" type=\"button\" data-action=\"toggle-collapse\" data-target=\"#${collapseId}\">${collapsed ? 'Expand' : 'Collapse'}</button>
+                <div class="ms-auto d-flex gap-2">
+                    <button class="btn btn-sm btn-outline-primary" data-action="add-item" data-scen-idx="${activeIdx}" data-sec="${name}">Add</button>
+                    <button class="btn btn-sm btn-outline-secondary" type="button" data-action="toggle-collapse" data-target="#${collapseId}">${collapsed ? 'Expand' : 'Collapse'}</button>
                 </div>
             </div>
-            <div id=\"${collapseId}\" class=\"card-body\" style=\"display:${collapsed ? 'none':'block'};\">
+            <div id="${collapseId}" class="card-body" style="display:${collapsed ? 'none':'block'};">
+                ${nodeMetaHtml}
                                 <div class="table-responsive">
                                                                                 <table class="table table-sm align-middle">
                                                                                         <thead>

@@ -34,6 +34,7 @@ class PreviewNode:
     kind: str  # router | host | switch
     ip4: str | None = None
     r2r_interfaces: Dict[str, str] = field(default_factory=dict)
+    vulnerabilities: List[str] = field(default_factory=list)
 
 
 def _stable_shuffle(seq: List[Any], seed: int) -> List[Any]:
@@ -209,42 +210,54 @@ def build_full_preview(
                 rid = 0
             host_router_map[host_id] = rid
             host_nodes.append(PreviewNode(node_id=host_id, name=f"h{idx+1}", role=role, kind="host"))
+    host_map: Dict[int, PreviewNode] = {h.node_id: h for h in host_nodes}
 
     # ---- Runtime-like IP assignment (using allocators similar to topology.py) ----
     # We mimic the builder behavior more closely by using UniqueAllocator which rolls to the next
     # contiguous block when exhausted. Subnet allocation (make_subnet_allocator) is reserved for
     # switch / LAN preview later; here we focus on per-node primary IPs.
     ip_alloc_mode = 'runtime_like'
+    assigned_ips: Set[str] = set()
     try:
         uniq_alloc = UniqueAllocator(ip4_prefix)
     except Exception:
-        # Fallback to legacy simple list approach if allocator fails
         uniq_alloc = None
-    if uniq_alloc:
-        # Assign router primary IPs only (hosts will be assigned from LAN subnets after grouping)
-        for rn in router_nodes:
+    fallback_ip_iter = None
+    fallback_prefixlen = None
+
+    def _alloc_ip_from_pool() -> Optional[str]:
+        nonlocal uniq_alloc, fallback_ip_iter, fallback_prefixlen
+        while True:
+            if uniq_alloc is not None:
+                try:
+                    ip, mask = uniq_alloc.next_ip()
+                    if ip not in assigned_ips:
+                        assigned_ips.add(ip)
+                        return f"{ip}/{mask}"
+                except Exception:
+                    uniq_alloc = None
+            if fallback_ip_iter is None:
+                try:
+                    base_net = ipaddress.ip_network(ip4_prefix or '10.0.0.0/24', strict=False)
+                except Exception:
+                    base_net = ipaddress.ip_network('10.0.0.0/24', strict=False)
+                fallback_ip_iter = iter(base_net.hosts())
+                fallback_prefixlen = base_net.prefixlen
             try:
-                ip, mask = uniq_alloc.next_ip()
-                rn.ip4 = f"{ip}/{mask}"
-            except Exception:
-                break
-    else:
-        try:
-            net = ipaddress.ip_network(ip4_prefix, strict=False)
-            all_ips = [str(h) for h in net.hosts()]
-        except Exception:
-            all_ips = []
-        ip_iter = iter(all_ips)
-        for rn in router_nodes:
-            try:
-                rn.ip4 = next(ip_iter) + "/24"
+                addr = next(fallback_ip_iter)
             except StopIteration:
-                break
-        for hn in host_nodes:
-            try:
-                hn.ip4 = next(ip_iter) + "/24"
-            except StopIteration:
-                break
+                return None
+            raw = str(addr)
+            if raw in assigned_ips:
+                continue
+            assigned_ips.add(raw)
+            return f"{raw}/{fallback_prefixlen}"
+
+    for rn in router_nodes:
+        alloc_ip = _alloc_ip_from_pool()
+        if not alloc_ip:
+            break
+        rn.ip4 = alloc_ip
 
     # ---- R2R Policy Preview ----
     if r2r_policy:
@@ -541,40 +554,92 @@ def build_full_preview(
 
     # Override host IPs using LAN subnets for realistic per-LAN addressing
     try:
-        host_map = {h.node_id: h for h in host_nodes}
         router_map = {r.node_id: r for r in router_nodes}
         for swd in switches_detail:
             lan_sub = swd.get('lan_subnet')
-            hosts_ids = swd.get('hosts') or []
-            if not lan_sub or not hosts_ids:
+            host_ids_raw = swd.get('hosts') or []
+            if not lan_sub or not host_ids_raw:
                 continue
             try:
                 lan_net = ipaddress.ip_network(lan_sub, strict=False)
                 lan_hosts = list(lan_net.hosts())
             except Exception:
                 continue
-            # Reserve first host address (index 0) for switch/gateway; assign from index 1 upward
-            for idx_h, hid in enumerate(sorted(hosts_ids)):
-                if idx_h + 1 < len(lan_hosts):
-                    ip_addr = lan_hosts[idx_h + 1]
-                    h = host_map.get(hid)
-                    if h:
-                        h.ip4 = f"{ip_addr}/{lan_net.prefixlen}"
-                    # Also record into switches_detail host_if_ips for completeness
-                    swd.setdefault('host_if_ips', {})[hid] = f"{ip_addr}/{lan_net.prefixlen}"
+            sorted_host_ids = sorted(int(h) for h in host_ids_raw)
+            existing_host_ips_raw = swd.get('host_if_ips') or {}
+            normalized_host_ips: Dict[int, str] = {}
+            for hid_key, cidr in existing_host_ips_raw.items():
+                try:
+                    hid_int = int(hid_key)
+                except Exception:
+                    continue
+                if not cidr:
+                    continue
+                normalized_host_ips[hid_int] = cidr
+                ip_only = str(cidr).split('/')
+                if ip_only:
+                    assigned_ips.add(ip_only[0])
+                host_obj = host_map.get(hid_int)
+                if host_obj:
+                    if host_obj.ip4:
+                        prev_ip = host_obj.ip4.split('/')
+                        if prev_ip:
+                            assigned_ips.discard(prev_ip[0])
+                    host_obj.ip4 = cidr
+            swd['host_if_ips'] = normalized_host_ips
+            reserve_for_infra = 2
+            while reserve_for_infra > 0 and (len(lan_hosts) - reserve_for_infra) < len(sorted_host_ids):
+                reserve_for_infra -= 1
+            for idx_h, hid in enumerate(sorted_host_ids):
+                host_obj = host_map.get(hid)
+                if hid in normalized_host_ips and normalized_host_ips[hid]:
+                    continue
+                ip_slot_index = reserve_for_infra + idx_h if reserve_for_infra >= 0 else idx_h
+                cidr_val: Optional[str] = None
+                if 0 <= ip_slot_index < len(lan_hosts):
+                    ip_addr = lan_hosts[ip_slot_index]
+                    cidr_val = f"{ip_addr}/{lan_net.prefixlen}"
+                else:
+                    cidr_val = _alloc_ip_from_pool()
+                if not cidr_val:
+                    continue
+                if host_obj:
+                    if host_obj.ip4:
+                        prev_ip = host_obj.ip4.split('/')
+                        if prev_ip:
+                            assigned_ips.discard(prev_ip[0])
+                    host_obj.ip4 = cidr_val
+                normalized_host_ips[hid] = cidr_val
+                ip_only = cidr_val.split('/')
+                if ip_only:
+                    assigned_ips.add(ip_only[0])
             # Apply router/switch link IPs if provided
-            r_ip = swd.get('router_ip'); s_ip = swd.get('switch_ip')
+            r_ip = swd.get('router_ip')
             try:
                 if r_ip:
                     rid = int(swd.get('router_id'))
                     rnode = router_map.get(rid)
-                    if rnode and (not rnode.ip4 or rnode.ip4.split('/')[0].startswith('10.')):
+                    if rnode:
+                        if rnode.ip4:
+                            prev_ip = rnode.ip4.split('/')
+                            if prev_ip:
+                                assigned_ips.discard(prev_ip[0])
                         rnode.ip4 = r_ip
+                        ip_only = r_ip.split('/')
+                        if ip_only:
+                            assigned_ips.add(ip_only[0])
             except Exception:
                 pass
         ip_alloc_mode = 'lan_subnet'
     except Exception:
         pass
+
+    for host in host_nodes:
+        if host.ip4:
+            continue
+        fallback_ip = _alloc_ip_from_pool()
+        if fallback_ip:
+            host.ip4 = fallback_ip
 
     # Host group bounds summary from routing_items
     try:
@@ -612,6 +677,9 @@ def build_full_preview(
                 break
             hid = ordered[idx % len(ordered)]
             vuln_assignments.setdefault(hid, []).append(vname)
+    for h in host_nodes:
+        node_vulns = vuln_assignments.get(h.node_id) or []
+        h.vulnerabilities = list(node_vulns)
 
     # ---- Traffic Materialization (resolve abstract items to concrete flows) ----
     traffic_summary: Dict[str, Any] = {}
@@ -923,6 +991,7 @@ def build_full_preview(
         'host_router_map': host_router_map,
         'services_preview': service_assignments,
         'vulnerabilities_preview': vuln_assignments,
+        'vulnerabilities_by_node': {str(n.node_id): n.vulnerabilities for n in host_nodes if n.vulnerabilities},
         'r2r_policy_preview': r2r_preview,
         'r2r_edges_preview': r2r_edges,
         'r2r_links_preview': r2r_links_detail,

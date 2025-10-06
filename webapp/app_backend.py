@@ -29,6 +29,8 @@ from pathlib import Path
 
 ALLOWED_EXTENSIONS = {'xml'}
 
+FULL_PREVIEW_ARTIFACT_VERSION = 2
+
 """Flask web backend for core-topo-gen.
 
 Augmented to guarantee the in-repo version of core_topo_gen is imported
@@ -613,43 +615,81 @@ def _safe_add_to_zip(zf: zipfile.ZipFile, abs_path: str, arcname: str) -> None:
     except Exception:
         pass
 
-def _gather_scripts_into_zip(zf: zipfile.ZipFile) -> int:
+def _gather_scripts_into_zip(zf: zipfile.ZipFile, scenario_dir: str | None = None) -> int:
     """Collect generated traffic and segmentation artifacts into the provided zip file.
 
-    Returns the count of files added.
+    This now walks both persistent output directories and the runtime `/tmp`
+    locations used by the CLI so that *all* generated scripts and supporting
+    files (JSON summaries, helper assets, custom plugin payloads, etc.) are
+    included in the bundle. Returns the count of files added.
     """
     added = 0
-    # Traffic
+    seen: set[str] = set()
+
+    def _collect(label: str, dir_candidates: list[str]) -> None:
+        nonlocal added
+        for base in dir_candidates:
+            if not base:
+                continue
+            try:
+                base_abs = os.path.abspath(base)
+            except Exception:
+                base_abs = base
+            if not base_abs or not os.path.isdir(base_abs):
+                continue
+            for root, dirs, files in os.walk(base_abs):
+                # Skip hidden directories to avoid noise like .cache/.DS_Store
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                for fname in files:
+                    if fname.startswith('.'):
+                        continue
+                    try:
+                        path = os.path.join(root, fname)
+                        if not os.path.isfile(path) or os.path.islink(path):
+                            continue
+                        rel = os.path.relpath(path, base_abs)
+                        # Defensive: ignore paths that navigate upwards
+                        if rel.startswith('..'):
+                            continue
+                        rel = rel.replace('\\', '/')
+                        arcname = f"{label}/{rel}".lstrip('/')
+                        key = arcname.lower()
+                        if key in seen:
+                            continue
+                        _safe_add_to_zip(zf, path, arcname)
+                        seen.add(key)
+                        added += 1
+                    except Exception:
+                        continue
+
+    traffic_dirs = []
     try:
-        tdir = _traffic_dir()
-        if os.path.isdir(tdir):
-            # include summary first
-            sp = os.path.join(tdir, "traffic_summary.json")
-            if os.path.exists(sp):
-                _safe_add_to_zip(zf, sp, os.path.join("traffic", "traffic_summary.json")); added += 1
-            for name in os.listdir(tdir):
-                if not name.startswith("traffic_"):
-                    continue
-                ap = os.path.join(tdir, name)
-                if os.path.isfile(ap):
-                    _safe_add_to_zip(zf, ap, os.path.join("traffic", name)); added += 1
+        traffic_dirs.append(_traffic_dir())
     except Exception:
         pass
-    # Segmentation
+    # Runtime traffic scripts live under /tmp/traffic by default
+    traffic_dirs.extend(filter(None, [
+        os.path.join(_outputs_dir(), 'traffic'),
+        '/tmp/traffic',
+        os.path.join(scenario_dir, 'traffic') if scenario_dir else None,
+    ]))
+    # Preserve order but drop duplicates
+    traffic_dirs = list(dict.fromkeys(traffic_dirs))
+
+    segmentation_dirs = []
     try:
-        sdir = _segmentation_dir()
-        if os.path.isdir(sdir):
-            sp = os.path.join(sdir, "segmentation_summary.json")
-            if os.path.exists(sp):
-                _safe_add_to_zip(zf, sp, os.path.join("segmentation", "segmentation_summary.json")); added += 1
-            for name in os.listdir(sdir):
-                if not (name.startswith("seg_") and name.endswith(".py")):
-                    continue
-                ap = os.path.join(sdir, name)
-                if os.path.isfile(ap):
-                    _safe_add_to_zip(zf, ap, os.path.join("segmentation", name)); added += 1
+        segmentation_dirs.append(_segmentation_dir())
     except Exception:
         pass
+    segmentation_dirs.extend(filter(None, [
+        os.path.join(_outputs_dir(), 'segmentation'),
+        '/tmp/segmentation',
+        os.path.join(scenario_dir, 'segmentation') if scenario_dir else None,
+    ]))
+    segmentation_dirs = list(dict.fromkeys(segmentation_dirs))
+
+    _collect('traffic', traffic_dirs)
+    _collect('segmentation', segmentation_dirs)
     return added
 
 def _normalize_core_device_types(xml_path: str) -> None:
@@ -792,6 +832,7 @@ def _build_full_scenario_archive(out_dir: str, scenario_xml_path: str | None, re
         if run_id:
             stem = f"{stem}-{run_id[:8]}"
         zip_path = os.path.join(out_dir, f"full_scenario_{stem}.zip")
+        scenario_dir = os.path.dirname(os.path.abspath(scenario_xml_path)) if scenario_xml_path else None
         with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
             # Add top-level artifacts if present
             if scenario_xml_path and os.path.exists(scenario_xml_path):
@@ -803,7 +844,7 @@ def _build_full_scenario_archive(out_dir: str, scenario_xml_path: str | None, re
             if post_xml_path and os.path.exists(post_xml_path):
                 _safe_add_to_zip(zf, post_xml_path, os.path.join("core-session", os.path.basename(post_xml_path)))
             # Add generated scripts and summaries
-            _gather_scripts_into_zip(zf)
+            _gather_scripts_into_zip(zf, scenario_dir)
         return zip_path if os.path.exists(zip_path) else None
     except Exception:
         return None
@@ -1114,6 +1155,40 @@ def docker_cleanup():
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
+def _find_latest_session_xml(base_dir: str, stem: str | None = None) -> str | None:
+    """Best-effort helper to locate the newest session XML written previously.
+
+    If `stem` is provided, prefer files beginning with that stem; otherwise
+    return the most recent .xml file under the directory.
+    """
+    try:
+        if not base_dir or not os.path.isdir(base_dir):
+            return None
+        candidates: list[tuple[float, str]] = []
+        for name in os.listdir(base_dir):
+            if not name.lower().endswith('.xml'):
+                continue
+            if stem:
+                prefix = f"{stem}-"
+                if not name.startswith(prefix):
+                    continue
+            path = os.path.join(base_dir, name)
+            try:
+                st = os.stat(path)
+                candidates.append((st.st_mtime, path))
+            except Exception:
+                continue
+        if not candidates and stem:
+            # If no stem-specific match, allow fallback to any latest XML
+            return _find_latest_session_xml(base_dir, stem=None)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+    except Exception:
+        return None
+
+
 def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_id: str | None = None) -> str | None:
     """Attempt to connect to CORE daemon via gRPC and save the active session XML.
 
@@ -1144,6 +1219,17 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
     except Exception:
         pass
     # Pick first running/defined session if any; API lacks direct 'current' concept here.
+    def _unique_path(base_path: str) -> str:
+        if not os.path.exists(base_path):
+            return base_path
+        root, ext = os.path.splitext(base_path)
+        counter = 2
+        while True:
+            candidate = f"{root}-{counter}{ext}"
+            if not os.path.exists(candidate):
+                return candidate
+            counter += 1
+
     try:
         app.logger.debug("Connecting to CORE gRPC at %s (requested session_id=%s)", address, session_id)
         client = CoreGrpcClient(address=address)
@@ -1175,10 +1261,62 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
             if session_id is None:
                 app.logger.warning("Selected CORE session has no id; aborting save_xml")
                 return None
+            session_meta = target
+            try:
+                meta_detail = client.get_session(session_id)
+                if meta_detail is not None:
+                    session_meta = meta_detail
+            except Exception as e:
+                app.logger.debug("get_session(%s) lookup failed: %s", session_id, e)
+            try:
+                client.open_session(session_id)
+            except Exception as e:
+                app.logger.debug("open_session(%s) failed or not required: %s", session_id, e)
+            existing_candidates: list[str] = []
+
+            def _add_candidate_path(path_candidate: str | None) -> None:
+                if not path_candidate:
+                    return
+                try:
+                    abs_path = os.path.abspath(path_candidate)
+                except Exception:
+                    return
+                if not os.path.exists(abs_path):
+                    return
+                existing_candidates.append(abs_path)
+
+            _add_candidate_path(getattr(session_meta, 'file', None))
+            _add_candidate_path(getattr(target, 'file', None))
+            for attr in ('dir', 'path', 'directory'):
+                dir_candidate = getattr(session_meta, attr, None) or getattr(target, attr, None)
+                if not dir_candidate or not os.path.isdir(dir_candidate):
+                    continue
+                try:
+                    for entry in os.listdir(dir_candidate):
+                        if entry.lower().endswith('.xml'):
+                            _add_candidate_path(os.path.join(dir_candidate, entry))
+                except Exception:
+                    continue
+            seen_candidates: set[str] = set()
+            filtered_candidates: list[str] = []
+            for cand in existing_candidates:
+                if cand in seen_candidates:
+                    continue
+                seen_candidates.add(cand)
+                filtered_candidates.append(cand)
+            def _candidate_priority(path: str) -> tuple[int, float, str]:
+                base = os.path.basename(path).lower()
+                priority = 0 if 'session-deployed' in base else 1
+                try:
+                    mtime = -os.stat(path).st_mtime
+                except Exception:
+                    mtime = 0.0
+                return (priority, mtime, base)
+            filtered_candidates.sort(key=_candidate_priority)
             # Derive a friendly stem from the original scenario XML if available
             stem = None
             try:
-                orig_file = getattr(target, 'file', None)
+                orig_file = getattr(session_meta, 'file', None)
                 if orig_file and os.path.exists(orig_file):
                     # Try to parse scenario names from the original XML
                     names = _scenario_names_from_xml(orig_file)
@@ -1188,14 +1326,64 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
                 stem = None
             if not stem:
                 stem = f"core-session-{session_id}"
+            for candidate_path in filtered_candidates:
+                try:
+                    suffix = ''
+                    base_name = os.path.basename(candidate_path).lower()
+                    if 'session-deployed' in base_name and not stem.lower().startswith('session-deployed'):
+                        suffix = '-session-deployed'
+                    copy_dest = os.path.join(base_sessions_dir, f"{stem}-{ts}{suffix}.xml")
+                    copy_dest = _unique_path(copy_dest)
+                    shutil.copy2(candidate_path, copy_dest)
+                    try:
+                        _normalize_core_device_types(copy_dest)
+                    except Exception as norm_err:
+                        app.logger.debug("core xml type normalization skipped for copied candidate %s: %s", copy_dest, norm_err)
+                    try:
+                        size = os.stat(copy_dest).st_size
+                    except Exception:
+                        size = -1
+                    app.logger.info("Copied CORE session XML from %s to %s (%s bytes)", candidate_path, copy_dest, size if size >= 0 else '?')
+                    return copy_dest
+                except Exception as copy_err:
+                    app.logger.debug("Failed copying session XML candidate %s: %s", candidate_path, copy_err)
+                    continue
             # Always store under outputs/core-sessions so CORE page can find it
             out_path = os.path.join(base_sessions_dir, f"{stem}-{ts}.xml")
+            # Attempt save with small retries to handle transient timing issues
+            save_errors: list[Exception] = []
+            session_id_arg = session_id
             try:
-                app.logger.info("Invoking save_xml(session_id=%s) -> %s", session_id, out_path)
-                client.save_xml(session_id=session_id, file_path=out_path)
-            except Exception as e:
-                app.logger.warning("save_xml failed for session %s at %s: %s", session_id, address, e)
-                return None
+                session_id_arg = int(session_id)  # type: ignore[assignment]
+            except Exception:
+                session_id_arg = session_id
+            for attempt in range(3):
+                try:
+                    app.logger.info("Invoking save_xml(session_id=%s) -> %s (attempt %d)", session_id, out_path, attempt + 1)
+                    client.save_xml(session_id=session_id_arg, file_path=out_path)
+                    break
+                except Exception as e:
+                    save_errors.append(e)
+                    if attempt < 2:
+                        try:
+                            time.sleep(0.5 * (attempt + 1))
+                        except Exception:
+                            pass
+                        continue
+                    app.logger.warning("save_xml final failure for session %s at %s: %s", session_id, address, e)
+            else:
+                # Loop exhausted without break
+                last = save_errors[-1] if save_errors else None
+                if last:
+                    app.logger.warning("save_xml could not persist session XML: %s", last)
+            if not os.path.exists(out_path):
+                for _ in range(3):
+                    try:
+                        time.sleep(0.2)
+                    except Exception:
+                        break
+                    if os.path.exists(out_path):
+                        break
             if os.path.exists(out_path):
                 # Validate that it's a CORE XML and not our editor format
                 try:
@@ -1221,6 +1409,15 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
                         os.remove(out_path)
                     except Exception:
                         pass
+            # Fallback: try to locate an existing session XML from previous saves
+            fallback = _find_latest_session_xml(base_sessions_dir, stem)
+            if fallback and os.path.exists(fallback):
+                try:
+                    size = os.stat(fallback).st_size
+                except Exception:
+                    size = -1
+                app.logger.info("Using existing CORE session XML fallback for session_id=%s: %s (%s bytes)", session_id, fallback, size if size >= 0 else '?')
+                return fallback
             return None
         finally:
             try:
@@ -1971,7 +2168,7 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
                 'name': id_to_name.get(did, did),
                 'type': id_to_type.get(did, ''),
                 'services': id_to_services.get(did, []),
-                'linked_nodes': sorted([id_to_name.get(x, x) for x in adj.get(did, set())], key=lambda x: x.lower()),
+                'linked_nodes': [],
                 'interfaces': iface_entries,
             })
 
@@ -2010,52 +2207,89 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
         except Exception:
             pass
 
+        valid_ids: set[str] = {n['id'] for n in nodes}
+        valid_ids.update(sw['id'] for sw in extra_switch_nodes)
+        adj_clean: Dict[str, set[str]] = {}
+        for nid, neighbors in adj.items():
+            if nid not in valid_ids:
+                continue
+            adj_clean[nid] = {nbr for nbr in neighbors if nbr in valid_ids}
+        for sw in extra_switch_nodes:
+            adj_clean.setdefault(sw['id'], set())
+
+        def _prune_neighbors(node_id: str, node_type: str) -> None:
+            if node_type in ('router', 'switch'):
+                return
+            current_neighbors = sorted(adj_clean.get(node_id, set()), key=lambda vid: id_to_name.get(vid, vid).lower())
+            routers = [vid for vid in current_neighbors if (id_to_type.get(vid, '').lower() == 'router')]
+            switches_local = [vid for vid in current_neighbors if (id_to_type.get(vid, '').lower() == 'switch')]
+
+            def _trim_group(group: list[str]) -> None:
+                if len(group) <= 1:
+                    return
+                keep = group[0]
+                for extra in group[1:]:
+                    adj_clean.get(node_id, set()).discard(extra)
+                    if extra in adj_clean:
+                        adj_clean[extra].discard(node_id)
+
+            _trim_group(routers)
+            _trim_group(switches_local)
+
+        for node in nodes:
+            _prune_neighbors(node['id'], (node.get('type') or '').lower())
+        for sw in extra_switch_nodes:
+            _prune_neighbors(sw['id'], (sw.get('type') or '').lower())
+
+        def _neighbor_names(node_id: str) -> list[str]:
+            neighbors = sorted(adj_clean.get(node_id, set()), key=lambda vid: id_to_name.get(vid, vid).lower())
+            return [id_to_name.get(vid, vid) for vid in neighbors]
+
+        filtered_nodes: list[dict] = []
+        for node in nodes:
+            nid = node['id']
+            linked = adj_clean.get(nid, set())
+            if linked or (node.get('interfaces') and len(node.get('interfaces')) > 0) or (node.get('type') or '').lower() in ('router', 'switch'):
+                node['linked_nodes'] = _neighbor_names(nid)
+                filtered_nodes.append(node)
+        nodes = filtered_nodes
+
+        filtered_extra_switch_nodes: list[dict] = []
+        for sw in extra_switch_nodes:
+            nid = sw['id']
+            linked = adj_clean.get(nid, set())
+            if linked:
+                sw['linked_nodes'] = _neighbor_names(nid)
+                filtered_extra_switch_nodes.append(sw)
+        extra_switch_nodes = filtered_extra_switch_nodes
+
+        valid_ids = {n['id'] for n in nodes}
+        valid_ids.update(sw['id'] for sw in extra_switch_nodes)
+        adj_clean = {nid: {nbr for nbr in neighbors if nbr in valid_ids} for nid, neighbors in adj_clean.items() if nid in valid_ids}
+
+        switches = [n for n in nodes if (n.get('type') or '').lower() == 'switch']
+
         link_details: list[dict] = []
         seen_pairs: set[tuple[str, str]] = set()
-        for link in links:
-            n1 = normalize_ref(link.get('node1') or link.get('node1_id'))
-            n2 = normalize_ref(link.get('node2') or link.get('node2_id'))
-            if not (n1 and n2):
-                try:
-                    if not n1 and hasattr(link, 'find'):
-                        iface1 = link.find('.//iface1')
-                        if iface1 is not None:
-                            n1 = normalize_ref(iface1.get('node') or iface1.get('device') or iface1.get('node_id'))
-                    if not n2 and hasattr(link, 'find'):
-                        iface2 = link.find('.//iface2')
-                        if iface2 is not None:
-                            n2 = normalize_ref(iface2.get('node') or iface2.get('device') or iface2.get('node_id'))
-                except Exception:
-                    pass
-            if not (n1 and n2):
-                continue
-            ordered = tuple(sorted([n1, n2]))
-            if ordered in seen_pairs:
-                continue
-            seen_pairs.add(ordered)
-            link_details.append({
-                'node1': n1,
-                'node2': n2,
-                'node1_name': id_to_name.get(n1, n1),
-                'node2_name': id_to_name.get(n2, n2),
-            })
-
-        if extra_switch_nodes and link_details:
-            neighbors: Dict[str, set[str]] = {sw['id']: set() for sw in extra_switch_nodes}
-            for ld in link_details:
-                a = ld.get('node1')
-                b = ld.get('node2')
-                if a in neighbors and b:
-                    neighbors[a].add(b)
-                if b in neighbors and a:
-                    neighbors[b].add(a)
-            for sw in extra_switch_nodes:
-                sw['linked_nodes'] = [id_to_name.get(x, x) for x in sorted(neighbors.get(sw['id'], set()))]
+        for src, neighbors in adj_clean.items():
+            for dst in neighbors:
+                if src == dst or dst not in valid_ids:
+                    continue
+                ordered = tuple(sorted((src, dst)))
+                if ordered in seen_pairs:
+                    continue
+                seen_pairs.add(ordered)
+                link_details.append({
+                    'node1': ordered[0],
+                    'node2': ordered[1],
+                    'node1_name': id_to_name.get(ordered[0], ordered[0]),
+                    'node2_name': id_to_name.get(ordered[1], ordered[1]),
+                })
 
         info.update({
-            'nodes_count': len(devices),
+            'nodes_count': len(nodes),
             'networks_count': len(networks),
-            'links_count': len(links),
+            'links_count': len(link_details),
             'services_count': len(services),
             'nodes': nodes,
             'switches_count': len(switches),
@@ -2066,7 +2300,7 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
         })
         info['devices'] = [attrs(d, 'id', 'name', 'type', 'class', 'image') for d in devices[:50]]
         info['networks'] = [attrs(n, 'id', 'name', 'type', 'model', 'mobility') for n in networks[:50]]
-        info['links_sample'] = len(links[:100])
+        info['links_sample'] = len(link_details)
 
         try:
             st = os.stat(xml_path)
@@ -2076,7 +2310,7 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
 
         try:
             router_ids = [normalize_ref(dev.get('id')) for dev in devices if (dev.get('type') or '').lower().find('router') >= 0]
-            degs = {rid: len(adj.get(rid, set())) for rid in router_ids if rid}
+            degs = {rid: len(adj_clean.get(rid, set())) for rid in router_ids if rid}
             if degs:
                 vals = list(degs.values())
                 info['router_degree_stats'] = {
@@ -2375,11 +2609,13 @@ def run_cli():
         except Exception as e_bundle:
             app.logger.exception("[sync] failed building full scenario bundle: %s", e_bundle)
         try:
+            session_xml_path = post_saved if (post_saved and os.path.exists(post_saved)) else None
             _append_run_history({
                 'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
                 'mode': 'sync',
-                'xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
-                'post_xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
+                'xml_path': xml_path,
+                'post_xml_path': session_xml_path,
+                'session_xml_path': session_xml_path,
                 'scenario_xml_path': xml_path,
                 'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
                 'pre_xml_path': pre_saved if 'pre_saved' in locals() else None,
@@ -2495,6 +2731,21 @@ def plan_full_preview_page():
                 except Exception:
                     pass
         full_prev = _build_full_preview_from_plan(plan, seed)
+        display_artifacts = full_prev.get('display_artifacts')
+        if not display_artifacts:
+            try:
+                display_artifacts = _attach_display_artifacts(full_prev)
+            except Exception:
+                display_artifacts = {
+                    'segmentation': {
+                        'rows': [],
+                        'table_rows': [],
+                        'tableRows': [],
+                        'json': {'rules_count': 0, 'types_summary': {}, 'rules': [], 'metadata': None},
+                    },
+                    '__version': FULL_PREVIEW_ARTIFACT_VERSION,
+                }
+        segmentation_artifacts = (display_artifacts or {}).get('segmentation')
         # Annotate & enforce enumerated host roles (Server, Workstation, PC) in preview
         # Full preview already receives normalized roles from planning layer
         # Attempt scenario name
@@ -2533,7 +2784,7 @@ def plan_full_preview_page():
                 pass
         # Provide JSON string for embedding (stringify smaller subset for safety)
         import json as _json
-        preview_json_str = _json.dumps(full_prev, indent=2)
+        preview_json_str = _json.dumps(full_prev, indent=2, default=str)
         return render_template(
             'full_preview.html',
             full_preview=full_prev,
@@ -2542,6 +2793,8 @@ def plan_full_preview_page():
             scenario=scenario_name,
             seed=full_prev.get('seed'),
             preview_plan_path=preview_plan_path,
+            display_artifacts=display_artifacts,
+            segmentation_artifacts=segmentation_artifacts,
         )
     except Exception as e:
         app.logger.exception('[plan.full_preview_page] error: %s', e)
@@ -2602,6 +2855,150 @@ def _derive_routing_policies(routing_items):
         pass
     return r2r_policy_plan, r2s_policy_plan
 
+def _json_ready(value):
+    """Convert nested objects into JSON-friendly primitives (recursively)."""
+    if isinstance(value, dict):
+        return {k: _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, '__dict__'):
+        try:
+            return {k: _json_ready(v) for k, v in vars(value).items() if not k.startswith('_')}
+        except Exception:
+            pass
+    try:
+        return str(value)
+    except Exception:
+        return repr(value)
+
+
+def _summarize_seg_rule(rule_dict: dict) -> str:
+    if not isinstance(rule_dict, dict):
+        return ''
+    type_raw = rule_dict.get('type') or rule_dict.get('action') or ''
+    type_str = str(type_raw).strip()
+    if not type_str:
+        return ''
+    lower = type_str.lower()
+    if lower == 'nat':
+        mode = str(rule_dict.get('mode')).strip() if rule_dict.get('mode') not in (None, '') else ''
+        internal = rule_dict.get('internal') or rule_dict.get('internal_subnet') or ''
+        external = rule_dict.get('external') or rule_dict.get('external_subnet') or ''
+        parts = []
+        if mode:
+            parts.append(mode)
+        if internal:
+            parts.append(str(internal))
+        summary = ' '.join(parts)
+        if internal and external:
+            summary = f"{summary} -> {external}" if summary else f"{internal} -> {external}"
+        elif external:
+            summary = f"{summary} {external}".strip()
+        return summary.strip()
+    if lower == 'host_block':
+        src = rule_dict.get('src') or rule_dict.get('source') or ''
+        dst = rule_dict.get('dst') or rule_dict.get('destination') or ''
+        return f"{src} X {dst}".strip()
+    if lower == 'custom':
+        desc = rule_dict.get('description') or rule_dict.get('summary') or ''
+        desc_str = str(desc).strip()
+        return desc_str or 'custom'
+    src = rule_dict.get('src') or rule_dict.get('source')
+    dst = rule_dict.get('dst') or rule_dict.get('destination')
+    if src or dst:
+        return f"{type_str}: {src or '*'} -> {dst or '*'}"
+    return type_str
+
+
+def _build_segmentation_display_artifacts(full_preview: dict) -> dict:
+    seg_preview = {}
+    try:
+        seg_preview = _json_ready((full_preview or {}).get('segmentation_preview') or {})
+    except Exception:
+        seg_preview = {}
+    raw_rules = []
+    if isinstance(seg_preview, dict):
+        raw_rules = seg_preview.get('rules') or []
+    if not isinstance(raw_rules, list):
+        raw_rules = []
+    entries = []
+    type_counts = {}
+    for raw_entry in raw_rules:
+        entry = _json_ready(raw_entry)
+        if not isinstance(entry, dict):
+            continue
+        rule_dict = entry.get('rule')
+        if rule_dict is None:
+            rule_dict = entry
+        rule_dict = _json_ready(rule_dict)
+        if not isinstance(rule_dict, dict):
+            continue
+        node_id = entry.get('node_id', rule_dict.get('node_id'))
+        rule_type = rule_dict.get('type') or rule_dict.get('action')
+        rule_type_str = str(rule_type) if rule_type not in (None, '') else None
+        summary = _summarize_seg_rule(rule_dict)
+        script_path = entry.get('script') or rule_dict.get('script')
+        if not isinstance(script_path, str):
+            script_path = None
+        script_name = os.path.basename(script_path) if script_path else None
+        table_row = {
+            'node_id': node_id,
+            'type': rule_type_str,
+            'summary': summary,
+            'src': rule_dict.get('src') or rule_dict.get('source'),
+            'dst': rule_dict.get('dst') or rule_dict.get('destination'),
+            'subnet': rule_dict.get('subnet'),
+            'internal': rule_dict.get('internal') or rule_dict.get('internal_subnet'),
+            'external': rule_dict.get('external') or rule_dict.get('external_subnet'),
+            'proto': rule_dict.get('proto') or rule_dict.get('protocol'),
+            'port': rule_dict.get('port'),
+            'script_path': script_path,
+            'script_name': script_name,
+            'detail': rule_dict,
+        }
+        entries.append(table_row)
+        key = rule_type_str or 'unknown'
+        type_counts[key] = type_counts.get(key, 0) + 1
+    metadata = None
+    if isinstance(seg_preview, dict):
+        metadata = {k: v for k, v in seg_preview.items() if k != 'rules'}
+        if not metadata:
+            metadata = None
+    result = {
+        'rows': [{'node_id': e['node_id'], 'type': e['type'], 'summary': e['summary']} for e in entries],
+        'table_rows': entries,
+        'tableRows': entries,
+        'json': {
+            'rules_count': len(entries),
+            'types_summary': type_counts,
+            'rules': [
+                {
+                    'node_id': e['node_id'],
+                    'type': e['type'],
+                    'summary': e['summary'],
+                    'detail': e['detail'],
+                }
+                for e in entries
+            ],
+            'metadata': metadata,
+        },
+    }
+    return result
+
+
+def _attach_display_artifacts(full_preview: dict) -> dict:
+    artifacts = {
+        'segmentation': _build_segmentation_display_artifacts(full_preview),
+        '__version': FULL_PREVIEW_ARTIFACT_VERSION,
+    }
+    if isinstance(full_preview, dict):
+        full_preview['display_artifacts'] = artifacts
+        full_preview['display_artifacts_version'] = FULL_PREVIEW_ARTIFACT_VERSION
+    return artifacts
+
+
 def _build_full_preview_from_plan(plan: dict, seed, r2s_hosts_min_list=None, r2s_hosts_max_list=None):
     """Single source of truth to invoke build_full_preview using a compute_full_plan result."""
     try:
@@ -2637,6 +3034,10 @@ def _build_full_preview_from_plan(plan: dict, seed, r2s_hosts_min_list=None, r2s
         r2s_hosts_max_list=r2s_hosts_max_list,
     )
     fp['router_plan'] = plan.get('breakdowns', {}).get('router', {})
+    try:
+        _attach_display_artifacts(fp)
+    except Exception:
+        pass
     return fp
 
 
@@ -2896,6 +3297,10 @@ def reports_page():
             # Prefer names parsed from the Scenario Editor XML, fall back to session xml if missing
             src_xml = e.get('scenario_xml_path') or e.get('xml_path')
             e['scenario_names'] = _scenario_names_from_xml(src_xml)
+        # Normalize session xml pointer for UI compatibility
+        session_xml = e.get('session_xml_path') or e.get('post_xml_path')
+        if session_xml:
+            e['session_xml_path'] = session_xml
         # Hardening: ensure scenario_names is always a list
         sn = e.get('scenario_names')
         if not isinstance(sn, list):
@@ -2930,6 +3335,9 @@ def reports_data():
         if 'scenario_names' not in e:
             src_xml = e.get('scenario_xml_path') or e.get('xml_path')
             e['scenario_names'] = _scenario_names_from_xml(src_xml)
+        session_xml = e.get('session_xml_path') or e.get('post_xml_path')
+        if session_xml:
+            e['session_xml_path'] = session_xml
         # Hardening: normalize scenario_names to list
         sn = e.get('scenario_names')
         if not isinstance(sn, list):
@@ -3173,11 +3581,13 @@ def run_cli_async():
                     single_xml = None
                 bundle_xml = single_xml or xml_path_local
                 full_bundle = _build_full_scenario_archive(os.path.dirname(bundle_xml or ''), bundle_xml, (report_md if (report_md and os.path.exists(report_md)) else None), meta.get('pre_xml_path'), post_saved, run_id=run_id_local)
+                session_xml_path = post_saved if (post_saved and os.path.exists(post_saved)) else None
                 _append_run_history({
                     'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
                     'mode': 'async',
-                    'xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
-                    'post_xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
+                    'xml_path': xml_path_local,
+                    'post_xml_path': session_xml_path,
+                    'session_xml_path': session_xml_path,
                     'scenario_xml_path': xml_path_local,
                     'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
                     'pre_xml_path': meta.get('pre_xml_path'),
@@ -3268,12 +3678,13 @@ def run_status(run_id: str):
                         single_xml = None
                     bundle_xml = single_xml or xml_path_local
                     full_bundle = _build_full_scenario_archive(os.path.dirname(bundle_xml or ''), bundle_xml, (report_md if (report_md and os.path.exists(report_md)) else None), meta.get('pre_xml_path'), post_saved, run_id=run_id)
+                    session_xml_path = post_saved if (post_saved and os.path.exists(post_saved)) else None
                     _append_run_history({
                         'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
                         'mode': 'async',
-                        # Only record session xml if we actually pulled it via gRPC
-                        'xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
-                        'post_xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
+                        'xml_path': xml_path_local,
+                        'post_xml_path': session_xml_path,
+                        'session_xml_path': session_xml_path,
                         'scenario_xml_path': xml_path_local,
                         'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
                         'pre_xml_path': meta.get('pre_xml_path'),

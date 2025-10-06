@@ -69,14 +69,20 @@ def compute_full_plan(
     vuln_items: List[VulnerabilityItem] = []
     for it in (vuln_items_xml or []):
         name = (it.get('selected') or 'Item') if hasattr(it, 'get') else 'Item'
-        vm = it.get('v_metric') if hasattr(it, 'get') else ''
+        vm_raw = (it.get('v_metric') if hasattr(it, 'get') else '') or ''
+        vm = vm_raw.strip() or ('Count' if ((it.get('selected') or '').strip() == 'Specific' and (it.get('v_count') or '').strip()) else 'Weight')
         abs_c = 0
-        if vm == 'Count':
+        if vm.lower() == 'count':
             try:
                 abs_c = int(it.get('v_count') or 0)
             except Exception:
                 abs_c = 0
-        vuln_items.append(VulnerabilityItem(name=name, density=vuln_density, abs_count=abs_c))
+        try:
+            factor_val = float((it.get('factor') or 0.0)) if hasattr(it, 'get') else 0.0
+        except Exception:
+            factor_val = 0.0
+        kind = (it.get('selected') or name) if hasattr(it, 'get') else name
+        vuln_items.append(VulnerabilityItem(name=name, density=vuln_density, abs_count=abs_c, kind=kind, factor=factor_val, metric=vm))
     vulnerability_plan, vuln_breakdown = compute_vulnerability_plan(density_base, vuln_density, vuln_items)
 
     # --- Segmentation ---
