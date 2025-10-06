@@ -53,6 +53,7 @@
         <div class="card-header"><strong>Summary</strong></div>
         <div class="card-body">
           <ul class="mb-0">
+            <li>File classification: {{ classification|default('unknown')|title }}</li>
             <li>Nodes: {{ summary.nodes_count or summary.devices_count or 0 }}</li>
             {% if summary.switches_count is defined %}
             <li>Switches: {{ summary.switches_count }}{% if summary.switches and summary.switches|length>0 %} ({{ summary.switches|join(', ') }}){% endif %}</li>

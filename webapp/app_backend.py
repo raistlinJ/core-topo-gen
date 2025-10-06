@@ -234,54 +234,36 @@ def diag_modules():
         out['planning_import_error'] = str(e)
 
 def _current_user() -> dict | None:
-    u = session.get('user')
-    if not u:
-        return None
-    return { 'username': u.get('username'), 'role': u.get('role') }
+    user = session.get('user')
+    if isinstance(user, dict) and user.get('username'):
+        return user
+    return None
 
 
-@app.context_processor
-def _inject_user():
-    return { 'current_user': _current_user() }
-
-
-def _path_exempt_from_auth(path: str) -> bool:
-    if path in ('/login', '/logout', '/healthz', '/save_xml_api'):
-        return True
-    if path.startswith('/static/'):
-        return True
-    return False
+def _set_current_user(user: dict | None) -> None:
+    if user:
+        session['user'] = {
+            'username': user.get('username'),
+            'role': user.get('role', 'user')
+        }
+    else:
+        session.pop('user', None)
 
 
 @app.before_request
-def _require_login():
+def _inject_current_user() -> None:
     try:
         g.current_user = _current_user()
-        if _path_exempt_from_auth(request.path):
-            return None
-        if g.current_user is None:
-            # Prefer redirect for normal browser navigation; return JSON for XHR/API
-            if request.method in ('GET', 'HEAD'):
-                return redirect(url_for('login', next=request.url))
-            is_xhr = request.headers.get('X-Requested-With') == 'XMLHttpRequest'
-            prefers_json = False
-            try:
-                if request.accept_mimetypes:
-                    best = request.accept_mimetypes.best_match(['application/json', 'text/html'])
-                    prefers_json = (best == 'application/json')
-            except Exception:
-                prefers_json = False
-            if is_xhr or prefers_json:
-                return jsonify({ 'error': 'unauthorized' }), 401
-            return redirect(url_for('login', next=request.url))
-        return None
     except Exception:
-        return None
+        g.current_user = None
 
 
 def _require_admin() -> bool:
-    u = _current_user()
-    return bool(u and u.get('role') == 'admin')
+    user = _current_user()
+    if user and (user.get('role') == 'admin'):
+        return True
+    flash('Admin privileges required')
+    return False
 
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -290,25 +272,23 @@ def login():
         return render_template('login.html')
     username = (request.form.get('username') or '').strip()
     password = request.form.get('password') or ''
+    if not username or not password:
+        flash('Username and password required')
+        return render_template('login.html', error=True), 400
     db = _load_users()
-    user = None
-    for u in db.get('users', []):
-        if u.get('username') == username:
-            user = u; break
-    if not user or not check_password_hash(user.get('password_hash', ''), password):
-        flash('Invalid username or password')
-        return redirect(url_for('login'))
-    session['user'] = { 'username': user.get('username'), 'role': user.get('role') }
-    nxt = request.args.get('next')
-    return redirect(nxt or url_for('index'))
+    users = db.get('users', [])
+    user = next((u for u in users if u.get('username') == username), None)
+    if user and check_password_hash(user.get('password_hash', ''), password):
+        _set_current_user({'username': user.get('username'), 'role': user.get('role', 'user')})
+        session.permanent = True
+        return redirect(url_for('index'))
+    flash('Invalid username or password')
+    return render_template('login.html', error=True), 401
 
 
 @app.route('/logout', methods=['POST', 'GET'])
 def logout():
-    try:
-        session.pop('user', None)
-    except Exception:
-        pass
+    _set_current_user(None)
     return redirect(url_for('login'))
 
 
@@ -318,28 +298,30 @@ def users_page():
         return redirect(url_for('index'))
     db = _load_users()
     users = db.get('users', [])
-    return render_template('users.html', users=users)
+    return render_template('users.html', users=users, self_change=False)
 
 
-@app.route('/users/create', methods=['POST'])
+@app.route('/users', methods=['POST'])
 def users_create():
     if not _require_admin():
-        return redirect(url_for('users_page'))
+        return redirect(url_for('index'))
     username = (request.form.get('username') or '').strip()
-    password = request.form.get('password') or ''
+    password = (request.form.get('password') or '').strip()
     role = (request.form.get('role') or 'user').strip() or 'user'
     if not username or not password:
-        flash('Username and password are required')
+        flash('Username and password required')
         return redirect(url_for('users_page'))
     db = _load_users()
-    if any(u.get('username') == username for u in db.get('users', [])):
-        flash('User already exists')
+    users = db.get('users', [])
+    if any(u.get('username') == username for u in users):
+        flash('Username already exists')
         return redirect(url_for('users_page'))
-    db.setdefault('users', []).append({
+    users.append({
         'username': username,
         'password_hash': generate_password_hash(password),
-        'role': 'admin' if role == 'admin' else 'user',
+        'role': role
     })
+    db['users'] = users
     _save_users(db)
     flash('User created')
     return redirect(url_for('users_page'))
@@ -349,10 +331,13 @@ def users_create():
 def users_delete(username: str):
     if not _require_admin():
         return redirect(url_for('users_page'))
+    username = (username or '').strip()
+    if not username:
+        flash('Invalid username')
+        return redirect(url_for('users_page'))
     cur = _current_user()
     db = _load_users()
     users = db.get('users', [])
-    # Prevent removing self and ensure at least one admin remains
     remain = [u for u in users if u.get('username') != username]
     if cur and username == cur.get('username'):
         flash('Cannot delete your own account')
@@ -1742,101 +1727,125 @@ def _validate_core_xml(xml_path: str):
 
 
 def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
-    """Extract basic details from a CORE scenario XML for a summary view.
-
-    Robust to namespaces and minor structural variations.
-    """
+    """Extract a topology summary from a CORE session/scenario XML."""
     info: Dict[str, Any] = {}
     try:
         tree = LET.parse(xml_path)
         root = tree.getroot()
 
-        # helpers
         def attrs(el, *names):
             return {n: el.get(n) for n in names if el.get(n) is not None}
 
         def local(tag: str) -> str:
-            # strip namespace if present
-            if tag is None:
+            if not tag:
                 return ''
             if '}' in tag:
                 return tag.split('}', 1)[1]
             return tag
 
         def iter_by_local(el, lname: str):
+            lname = lname.lower()
             for e in el.iter():
-                if local(getattr(e, 'tag', '')) == lname:
+                if local(getattr(e, 'tag', '')).lower() == lname:
                     yield e
 
-        devices = list(iter_by_local(root, 'device'))
+        # Combine device/node representations (session exports sometimes use <node>)
+        candidates = list(iter_by_local(root, 'device')) + list(iter_by_local(root, 'node'))
+        devices: list[Any] = []
+        seen_ids: set[str] = set()
+        for cand in candidates:
+            ident = cand.get('id') or cand.get('name')
+            key = str(ident).strip() if ident is not None else ''
+            if key and key in seen_ids:
+                continue
+            if key:
+                seen_ids.add(key)
+            devices.append(cand)
+
         networks = list(iter_by_local(root, 'network'))
-        # Attempt to also locate any scenario-editor style sections (if this XML is from editor not CORE export)
+        links = list(iter_by_local(root, 'link'))
+        services = list(iter_by_local(root, 'service'))
+
         routing_edge_policies: list[dict] = []
         try:
             for sec in root.findall('.//section'):
-                if (sec.get('name') or '').strip() == 'Routing':
-                    for it in sec.findall('./item'):
-                        em = it.get('r2r_mode')
-                        r2s_mode = it.get('r2s_mode')
-                        ev = it.get('r2r_edges') or it.get('edges')
-                        r2s_ev = it.get('r2s_edges')
-                        if em or ev:
-                            rec = {
-                                'r2r_mode': em or '',
-                                'r2r_edges': int(ev) if (ev and ev.isdigit()) else None,
-                                'r2s_mode': (r2s_mode or ''),
-                                'r2s_edges': (int(r2s_ev) if (r2s_ev and r2s_ev.isdigit()) else None),
-                                'protocol': it.get('selected')
-                            }
-                            routing_edge_policies.append(rec)
+                if (sec.get('name') or '').strip() != 'Routing':
+                    continue
+                for item in sec.findall('./item'):
+                    r2r_edges = item.get('r2r_edges') or item.get('edges')
+                    r2s_edges = item.get('r2s_edges')
+                    if any([item.get('r2r_mode'), r2r_edges, item.get('r2s_mode'), r2s_edges]):
+                        routing_edge_policies.append({
+                            'r2r_mode': item.get('r2r_mode') or '',
+                            'r2r_edges': int(r2r_edges) if (r2r_edges and r2r_edges.isdigit()) else None,
+                            'r2s_mode': item.get('r2s_mode') or '',
+                            'r2s_edges': int(r2s_edges) if (r2s_edges and r2s_edges.isdigit()) else None,
+                            'protocol': item.get('selected') or '',
+                        })
         except Exception:
             routing_edge_policies = []
-        # Prefer <links> parent if available, else collect all <link> elements anywhere
-        links_parent = None
-        for e in root.iter():
-            if local(getattr(e, 'tag', '')) == 'links':
-                links_parent = e
-                break
-        links = []
-        if links_parent is not None:
-            links = [e for e in links_parent if local(getattr(e, 'tag', '')) == 'link']
-        else:
-            links = list(iter_by_local(root, 'link'))
-        services = list(iter_by_local(root, 'service'))
 
-        # Build maps for easy lookup
-        id_to_name: Dict[str, str] = {}
-        id_to_type: Dict[str, str] = {}
-        id_to_services: Dict[str, list] = {}
-        for d in devices:
-            did = d.get('id') or ''
-            id_to_name[did] = d.get('name') or did
-            id_to_type[did] = d.get('type') or ''
-            # services within this device
-            svcs = [s.get('name') for s in d.findall('./services/service') if s.get('name')]
-            id_to_services[did] = svcs
-
-        # Adjacency from links
-        adj: Dict[str, set] = { (d.get('id') or ''): set() for d in devices }
         interface_store: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
 
-        def record_interface(node_ref, iface_el):
-            if not node_ref or iface_el is None:
+        def record_interface(node_ref: Any, iface_el: Any) -> None:
+            node_key = str(node_ref or '').strip()
+            if not node_key or iface_el is None:
                 return
             try:
-                attrs_iface = dict(iface_el.attrib or {})
+                attrs_iface = dict(getattr(iface_el, 'attrib', {}) or {})
             except Exception:
                 attrs_iface = {}
             name_raw = (attrs_iface.get('name') or attrs_iface.get('id') or '').strip()
+            if not name_raw:
+                name_el = iface_el.find('./name') if hasattr(iface_el, 'find') else None
+                if name_el is not None and getattr(name_el, 'text', None):
+                    name_raw = name_el.text.strip()
             mac = (attrs_iface.get('mac') or '').strip()
+            if not mac and hasattr(iface_el, 'find'):
+                mac_el = iface_el.find('./mac')
+                if mac_el is not None and getattr(mac_el, 'text', None):
+                    mac = mac_el.text.strip()
             ip4 = (attrs_iface.get('ip4') or attrs_iface.get('ipv4') or '').strip()
             ip4_mask = (attrs_iface.get('ip4_mask') or attrs_iface.get('ipv4_mask') or '').strip()
             ip6 = (attrs_iface.get('ip6') or attrs_iface.get('ipv6') or '').strip()
             ip6_mask = (attrs_iface.get('ip6_mask') or attrs_iface.get('ipv6_mask') or '').strip()
+            try:
+                for addr in iface_el.findall('.//addr'):
+                    addr_type = (addr.get('type') or addr.get('family') or '').lower()
+                    addr_val = (addr.get('address') or addr.get('ip') or (addr.text or '')).strip()
+                    mask_val = (addr.get('mask') or addr.get('prefix') or addr.get('netmask') or '').strip()
+                    if not addr_val:
+                        continue
+                    if '6' in addr_type:
+                        if not ip6:
+                            ip6 = addr_val
+                        if not ip6_mask:
+                            ip6_mask = mask_val
+                    else:
+                        if not ip4:
+                            ip4 = addr_val
+                        if not ip4_mask:
+                            ip4_mask = mask_val
+                for addr in iface_el.findall('.//address'):
+                    addr_val = (addr.get('value') or addr.get('address') or (addr.text or '')).strip()
+                    mask_val = (addr.get('mask') or addr.get('prefix') or '').strip()
+                    addr_type = (addr.get('type') or '').lower()
+                    if not addr_val:
+                        continue
+                    if '6' in addr_type:
+                        if not ip6:
+                            ip6 = addr_val
+                        if not ip6_mask:
+                            ip6_mask = mask_val
+                    else:
+                        if not ip4:
+                            ip4 = addr_val
+                        if not ip4_mask:
+                            ip4_mask = mask_val
+            except Exception:
+                pass
             if not any([name_raw, mac, ip4, ip6]):
-                # Ignore empty interfaces to avoid noise
                 return
-            node_key = str(node_ref)
             stable_key = '|'.join([
                 name_raw.lower(),
                 ip4,
@@ -1862,127 +1871,186 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
                 'ipv6_mask': ip6_mask or None,
             }
 
+        id_to_name: Dict[str, str] = {}
+        id_to_type: Dict[str, str] = {}
+        id_to_services: Dict[str, list] = {}
+
+        def coerce_device_id(raw_id: Any, fallback_index: int) -> str:
+            value = str(raw_id).strip() if raw_id is not None else ''
+            if value:
+                return value
+            return f"device_{fallback_index}"
+
+        for idx, dev in enumerate(devices, start=1):
+            did = coerce_device_id(dev.get('id') or dev.get('name'), idx)
+            name_val = (dev.get('name') or '').strip()
+            if not name_val and hasattr(dev, 'find'):
+                name_el = dev.find('./name')
+                if name_el is not None and getattr(name_el, 'text', None):
+                    name_val = name_el.text.strip()
+            type_val = (dev.get('type') or '').strip()
+            if not type_val and hasattr(dev, 'find'):
+                type_el = dev.find('./type') or dev.find('./model') or dev.find('./icon')
+                if type_el is not None and getattr(type_el, 'text', None):
+                    type_val = type_el.text.strip()
+            id_to_name[did] = name_val or did
+            id_to_type[did] = type_val or ''
+
+            services_found: set[str] = set()
+            try:
+                for svc in dev.findall('./services/service'):
+                    nm = (svc.get('name') or (svc.text or '')).strip()
+                    if nm:
+                        services_found.add(nm)
+                for svc in dev.findall('./service'):
+                    nm = (svc.get('name') or (svc.text or '')).strip()
+                    if nm:
+                        services_found.add(nm)
+            except Exception:
+                pass
+            id_to_services[did] = sorted(services_found)
+
+            try:
+                for iface in dev.findall('.//interface'):
+                    record_interface(did, iface)
+                for iface in dev.findall('.//iface'):
+                    record_interface(did, iface)
+            except Exception:
+                pass
+
+        adj: Dict[str, set[str]] = defaultdict(set)
+
+        def normalize_ref(value: Any) -> str:
+            return str(value).strip() if value is not None else ''
+
         for link in links:
-            n1 = link.get('node1') or link.get('node1_id')
-            n2 = link.get('node2') or link.get('node2_id')
-            if not (n1 and n2):
-                # attempt best-effort inference: check child iface elements for node refs
-                n1 = n1 or (link.find('.//iface1') or {}).get('node') if hasattr(link, 'find') else n1
-                n2 = n2 or (link.find('.//iface2') or {}).get('node') if hasattr(link, 'find') else n2
+            n1 = normalize_ref(link.get('node1') or link.get('node1_id'))
+            n2 = normalize_ref(link.get('node2') or link.get('node2_id'))
+            if not n1 or not n2:
+                try:
+                    if not n1 and hasattr(link, 'find'):
+                        iface1 = link.find('.//iface1')
+                        if iface1 is not None:
+                            n1 = normalize_ref(iface1.get('node') or iface1.get('device') or iface1.get('node_id'))
+                    if not n2 and hasattr(link, 'find'):
+                        iface2 = link.find('.//iface2')
+                        if iface2 is not None:
+                            n2 = normalize_ref(iface2.get('node') or iface2.get('device') or iface2.get('node_id'))
+                except Exception:
+                    pass
             if n1 and n2:
-                adj.setdefault(n1, set()).add(n2)
-                adj.setdefault(n2, set()).add(n1)
+                adj[n1].add(n2)
+                adj[n2].add(n1)
             try:
                 for child in list(link):
-                    tag_local = local(getattr(child, 'tag', ''))
-                    target_node = None
-                    if tag_local in ('iface1', 'interface1'):
-                        target_node = n1
-                    elif tag_local in ('iface2', 'interface2'):
-                        target_node = n2
-                    elif tag_local in ('iface', 'interface'):
-                        target_node = child.get('node') or child.get('node_id') or child.get('device') or n2
-                    else:
-                        continue
-                    record_interface(target_node, child)
+                    tag = local(getattr(child, 'tag', '')).lower()
+                    target = None
+                    if tag in ('iface1', 'interface1'):
+                        target = n1
+                    elif tag in ('iface2', 'interface2'):
+                        target = n2
+                    elif tag in ('iface', 'interface'):
+                        target = normalize_ref(child.get('node') or child.get('node_id') or child.get('device')) or n2
+                    if target:
+                        record_interface(target, child)
             except Exception:
                 continue
 
-        # Compose nodes list with linked names
-        nodes = []
-        for d in devices:
-            did = d.get('id') or ''
+        nodes: list[dict] = []
+        for idx, dev in enumerate(devices, start=1):
+            did = coerce_device_id(dev.get('id') or dev.get('name'), idx)
+            raw_ifaces = interface_store.get(did, {})
             iface_entries = []
-            try:
-                raw_ifaces = interface_store.get(did, {})
+            for entry in raw_ifaces.values():
+                cleaned = {k: v for k, v in entry.items() if v not in (None, '')}
+                if cleaned:
+                    iface_entries.append(cleaned)
+            iface_entries.sort(key=lambda e: ((e.get('name') or '').lower(), e.get('ipv4') or '', e.get('ipv6') or ''))
+            nodes.append({
+                'id': did,
+                'name': id_to_name.get(did, did),
+                'type': id_to_type.get(did, ''),
+                'services': id_to_services.get(did, []),
+                'linked_nodes': sorted([id_to_name.get(x, x) for x in adj.get(did, set())], key=lambda x: x.lower()),
+                'interfaces': iface_entries,
+            })
+
+        switches = [n for n in nodes if (n.get('type') or '').lower() == 'switch']
+        extra_switch_nodes: list[dict] = []
+        try:
+            for net in networks:
+                ntype = (net.get('type') or '').lower()
+                if 'switch' not in ntype:
+                    continue
+                sw_id = normalize_ref(net.get('id') or net.get('name'))
+                if not sw_id:
+                    continue
+                sw_name = (net.get('name') or sw_id).strip() or sw_id
+                if any(sw_id == sw.get('id') or sw_name == sw.get('name') for sw in switches):
+                    continue
+                raw_ifaces = interface_store.get(sw_id, {})
+                iface_entries = []
                 for entry in raw_ifaces.values():
                     cleaned = {k: v for k, v in entry.items() if v not in (None, '')}
                     if cleaned:
                         iface_entries.append(cleaned)
-            except Exception:
-                iface_entries = []
-            iface_entries.sort(key=lambda e: ((e.get('name') or '').lower(), e.get('ipv4') or '', e.get('ipv6') or ''))
-            node = {
-                'id': did,
-                'name': d.get('name') or did,
-                'type': d.get('type') or '',
-                'services': id_to_services.get(did, []),
-                'linked_nodes': sorted([id_to_name.get(x, x) for x in adj.get(did, set())], key=lambda x: x.lower()),
-                'interfaces': iface_entries,
-            }
-            nodes.append(node)
-
-        # Identify switch nodes explicitly for downstream UI (graph coloring, counts)
-        switches = [n for n in nodes if (n.get('type') or '').lower() == 'switch']
-        # Also treat network elements with 'SWITCH' in their type attribute as switches (not all networks are devices)
-        extra_switch_nodes = []  # network-derived switches not already in device nodes
-        try:
-            for net in networks:
-                ntype = (net.get('type') or '')
-                if 'switch' not in ntype.lower():
-                    continue
-                sw_id = net.get('id') or (net.get('name') or '')
-                sw_name = net.get('name') or sw_id
-                if not sw_id:
-                    continue
-                # Avoid duplicates by id OR name against existing device switches
-                if any((sw_id == s.get('id')) or (sw_name == s.get('name')) for s in switches):
-                    continue
-                iface_entries = []
-                try:
-                    raw_ifaces = interface_store.get(sw_id, {})
-                    for entry in raw_ifaces.values():
-                        cleaned = {k: v for k, v in entry.items() if v not in (None, '')}
-                        if cleaned:
-                            iface_entries.append(cleaned)
-                except Exception:
-                    iface_entries = []
                 iface_entries.sort(key=lambda e: ((e.get('name') or '').lower(), e.get('ipv4') or '', e.get('ipv6') or ''))
-                extra_switch = {'id': sw_id, 'name': sw_name, 'type': 'switch', 'services': [], 'linked_nodes': [], 'interfaces': iface_entries}
+                extra_switch = {
+                    'id': sw_id,
+                    'name': sw_name,
+                    'type': 'switch',
+                    'services': [],
+                    'linked_nodes': [],
+                    'interfaces': iface_entries,
+                }
                 switches.append(extra_switch)
                 extra_switch_nodes.append(extra_switch)
-                # Allow link resolution to map id->name for network-derived switches
                 id_to_name.setdefault(sw_id, sw_name)
                 id_to_type.setdefault(sw_id, 'switch')
         except Exception:
             pass
 
-        # Build explicit link details (ids and names). Avoid duplicates (undirected)
-        link_details = []
-        seen_pairs = set()
+        link_details: list[dict] = []
+        seen_pairs: set[tuple[str, str]] = set()
         for link in links:
-            n1 = link.get('node1') or link.get('node1_id')
-            n2 = link.get('node2') or link.get('node2_id')
+            n1 = normalize_ref(link.get('node1') or link.get('node1_id'))
+            n2 = normalize_ref(link.get('node2') or link.get('node2_id'))
             if not (n1 and n2):
-                # attempt iface child inference again (defensive)
                 try:
-                    if not n1:
+                    if not n1 and hasattr(link, 'find'):
                         iface1 = link.find('.//iface1')
                         if iface1 is not None:
-                            n1 = iface1.get('node')
-                    if not n2:
+                            n1 = normalize_ref(iface1.get('node') or iface1.get('device') or iface1.get('node_id'))
+                    if not n2 and hasattr(link, 'find'):
                         iface2 = link.find('.//iface2')
                         if iface2 is not None:
-                            n2 = iface2.get('node')
+                            n2 = normalize_ref(iface2.get('node') or iface2.get('device') or iface2.get('node_id'))
                 except Exception:
                     pass
             if not (n1 and n2):
                 continue
-            # normalize order to prevent duplicates
-            a, b = sorted([n1, n2])
-            key = f"{a}__{b}"
-            if key in seen_pairs:
+            ordered = tuple(sorted([n1, n2]))
+            if ordered in seen_pairs:
                 continue
-            seen_pairs.add(key)
+            seen_pairs.add(ordered)
             link_details.append({
                 'node1': n1,
                 'node2': n2,
                 'node1_name': id_to_name.get(n1, n1),
-                'node2_name': id_to_name.get(n2, n2)
+                'node2_name': id_to_name.get(n2, n2),
             })
 
-        # Build adjacency for any extra network-derived switches from explicit link_details (after they are computed)
-        # (We delay population of their linked_nodes until link_details creation below.)
+        if extra_switch_nodes and link_details:
+            neighbors: Dict[str, set[str]] = {sw['id']: set() for sw in extra_switch_nodes}
+            for ld in link_details:
+                a = ld.get('node1')
+                b = ld.get('node2')
+                if a in neighbors and b:
+                    neighbors[a].add(b)
+                if b in neighbors and a:
+                    neighbors[b].add(a)
+            for sw in extra_switch_nodes:
+                sw['linked_nodes'] = [id_to_name.get(x, x) for x in sorted(neighbors.get(sw['id'], set()))]
 
         info.update({
             'nodes_count': len(devices),
@@ -1991,57 +2059,35 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
             'services_count': len(services),
             'nodes': nodes,
             'switches_count': len(switches),
-            # lightweight list of switch identifiers (names) for quick UI access
-            'switches': [s['name'] for s in switches],
-            # expose any additional network-derived switch nodes not already in nodes list
+            'switches': [sw['name'] for sw in switches],
             'switch_nodes': extra_switch_nodes,
-            # explicit link detail list (ids & human names)
             'links_detail': link_details,
             'routing_edges_policies': routing_edge_policies,
         })
-        # legacy fields kept for compatibility with any current UI that may still reference them
         info['devices'] = [attrs(d, 'id', 'name', 'type', 'class', 'image') for d in devices[:50]]
         info['networks'] = [attrs(n, 'id', 'name', 'type', 'model', 'mobility') for n in networks[:50]]
         info['links_sample'] = len(links[:100])
 
-        # Populate linked_nodes for extra network-derived switches using link_details (if present)
-        if extra_switch_nodes and link_details:
-            # map from switch id to set of neighbor ids
-            sw_neighbors = {sw['id']: set() for sw in extra_switch_nodes}
-            for ld in link_details:
-                a = ld.get('node1')
-                b = ld.get('node2')
-                if not a or not b:
-                    continue
-                if a in sw_neighbors and b != a:
-                    sw_neighbors[a].add(b)
-                if b in sw_neighbors and a != b:
-                    sw_neighbors[b].add(a)
-            # Translate neighbor ids to names for readability
-            for sw in extra_switch_nodes:
-                nid = sw['id']
-                neigh_ids = sorted(sw_neighbors.get(nid, set()))
-                sw['linked_nodes'] = [id_to_name.get(x, x) for x in neigh_ids]
-        # filesize
         try:
             st = os.stat(xml_path)
             info['file_size_bytes'] = st.st_size
         except Exception:
             pass
-        # Compute router degree statistics (devices with type containing 'ROUTER')
+
         try:
-            router_ids = [d.get('id') for d in devices if (d.get('type') or '').lower().find('router') >= 0]
-            degs = {rid: len(adj.get(rid, [])) for rid in router_ids if rid}
+            router_ids = [normalize_ref(dev.get('id')) for dev in devices if (dev.get('type') or '').lower().find('router') >= 0]
+            degs = {rid: len(adj.get(rid, set())) for rid in router_ids if rid}
             if degs:
                 vals = list(degs.values())
                 info['router_degree_stats'] = {
                     'min': min(vals),
                     'max': max(vals),
-                    'avg': round(sum(vals)/len(vals), 2),
-                    'per_router': degs
+                    'avg': round(sum(vals) / len(vals), 2),
+                    'per_router': degs,
                 }
         except Exception:
             pass
+
         return info
     except Exception as e:
         return {'error': str(e)}
@@ -3803,17 +3849,24 @@ def core_details():
                     container_flag = True
                     if classification != 'scenario':
                         classification = 'session'
-            if not sid and classification == 'session':
-                errors = 'Provided XML appears to be a CORE session export (contains <container> or <session> root); scenario tools may not apply.'
             ok, errs = _validate_core_xml(xml_path)
-            xml_valid = bool(ok)
-            if not xml_valid and errs and not errors:
-                errors = errs
+            if ok:
+                xml_valid = True
+            else:
+                if classification == 'session':
+                    xml_valid = True
+                    # Suppress schema errors for session exports; treat as advisory only.
+                else:
+                    xml_valid = False
+                    if errs and not errors:
+                        errors = errs
             # Always attempt analysis so graph can render even for invalid/session XML; mark summary with invalid flag
             try:
                 xml_summary = _analyze_core_xml(xml_path)
                 if xml_summary is None:
                     xml_summary = {}
+                if classification == 'session':
+                    xml_summary['__session_export'] = True
                 if not xml_valid:
                     xml_summary['__invalid'] = True
             except Exception:
@@ -3850,7 +3903,16 @@ def core_details():
     except Exception:
         pass
     # Render without legacy approved-plan context
-    return render_template('core_details.html', xml_path=xml_path, valid=xml_valid, errors=errors, summary=xml_summary, session=session_info, classification=classification, container_flag=container_flag)
+    return render_template(
+        'core_details.html',
+        xml_path=xml_path,
+        valid=xml_valid,
+        errors=errors,
+        summary=xml_summary,
+        session=session_info,
+        classification=classification,
+        container_flag=container_flag,
+    )
 
 
 @app.route('/admin/cleanup_pycore', methods=['POST'])
