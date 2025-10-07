@@ -80,13 +80,32 @@
   <li>R2R Edges: {{ (full_preview.r2r_edges_preview or [])|length }}</li>
   <li>Seg Rules: {{ (full_preview.segmentation_preview.rules or [])|length if full_preview.segmentation_preview and full_preview.segmentation_preview.rules else 0 }}</li>
       </ul>
-      <h6>R2R Policy</h6>
-      <pre class="small bg-light p-2">{{ full_preview.r2r_policy_preview | tojson(indent=2) }}</pre>
-      <h6>R2S Policy</h6>
-      <pre class="small bg-light p-2">{{ full_preview.r2s_policy_preview | tojson(indent=2) }}</pre>
-  <h6>Services Preview</h6>
-  <pre class="small bg-light p-2">{{ full_preview.services_preview | tojson(indent=2) }}</pre>
-  <h6>Vulnerabilities Preview</h6>
+      <div class="d-flex justify-content-between align-items-center mb-1">
+        <h6 class="mb-0">R2R Policy</h6>
+        <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-side-r2r" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+      </div>
+      <div id="fp-side-r2r" class="collapse">
+        <pre class="small bg-light p-2">{{ full_preview.r2r_policy_preview | tojson(indent=2) }}</pre>
+      </div>
+      <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
+        <h6 class="mb-0">R2S Policy</h6>
+        <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-side-r2s" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+      </div>
+      <div id="fp-side-r2s" class="collapse">
+        <pre class="small bg-light p-2">{{ full_preview.r2s_policy_preview | tojson(indent=2) }}</pre>
+      </div>
+  <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
+    <h6 class="mb-0">Services Preview</h6>
+    <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-side-services" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+  </div>
+  <div id="fp-side-services" class="collapse">
+    <pre class="small bg-light p-2">{{ full_preview.services_preview | tojson(indent=2) }}</pre>
+  </div>
+  <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
+    <h6 class="mb-0">Vulnerabilities Preview</h6>
+    <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-side-vuln" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+  </div>
+  <div id="fp-side-vuln" class="collapse">
   {% set vuln_prev = full_preview.vulnerabilities_preview or {} %}
     {% set vuln_by_node = full_preview.vulnerabilities_by_node or {} %}
   {% if vuln_prev %}
@@ -99,9 +118,15 @@
 {% if first %}"_note": "(none)"{% endif %}
 }</pre>
   {% else %}<div class="small text-muted fst-italic">(none)</div>{% endif %}
+  </div>
   {% if vuln_by_node %}
-  <h6>Vulnerabilities by Host</h6>
-  <pre class="small bg-light p-2">{{ vuln_by_node | tojson(indent=2) }}</pre>
+  <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
+    <h6 class="mb-0">Vulnerabilities by Host</h6>
+    <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-side-vuln-host" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+  </div>
+  <div id="fp-side-vuln-host" class="collapse">
+    <pre class="small bg-light p-2">{{ vuln_by_node | tojson(indent=2) }}</pre>
+  </div>
   {% endif %}
     </div>
     <div class="col-md-8">
@@ -129,17 +154,34 @@
           </div>
         </div>
   <div class="tab-pane fade" id="fp-routers">
-          <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Primary IP</th><th>R2R Interfaces</th><th>Switch Links</th></tr></thead><tbody>
-          {% for r in full_preview.routers %}<tr><td>{{ r.node_id }}</td><td>{{ r.name }}</td><td>{{ r.ip4 or '-' }}</td><td>{{ render_r2r_interfaces(r.node_id, full_preview.r2r_links_preview) }}</td><td>{{ render_router_switch_links(r.node_id, full_preview.switches_detail) }}</td></tr>{% endfor %}
-          </tbody></table>
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="mb-0">Routers</h6>
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-routers-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+          </div>
+          <div id="fp-routers-body" class="collapse">
+            <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Primary IP</th><th>R2R Interfaces</th><th>Switch Links</th></tr></thead><tbody>
+            {% for r in full_preview.routers %}<tr><td>{{ r.node_id }}</td><td>{{ r.name }}</td><td>{{ r.ip4 or '-' }}</td><td>{{ render_r2r_interfaces(r.node_id, full_preview.r2r_links_preview) }}</td><td>{{ render_router_switch_links(r.node_id, full_preview.switches_detail) }}</td></tr>{% endfor %}
+            </tbody></table>
+          </div>
         </div>
   <div class="tab-pane fade" id="fp-hosts">
-          <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Role</th><th>IP</th><th>Router</th><th>Vulnerabilities</th></tr></thead><tbody>
-          {% set hr = full_preview.host_router_map or {} %}
-          {% for h in full_preview.hosts %}{% set vulns = h.vulnerabilities or [] %}<tr><td>{{ h.node_id }}</td><td>{{ h.name }}</td><td>{{ h.role }}</td><td>{{ h.ip4 }}</td><td>{{ hr[h.node_id|string] or hr[h.node_id] }}</td><td>{{ vulns|join(', ') if vulns else '-' }}</td></tr>{% endfor %}
-          </tbody></table>
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="mb-0">Hosts</h6>
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-hosts-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+          </div>
+          <div id="fp-hosts-body" class="collapse">
+            <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Role</th><th>IP</th><th>Router</th><th>Vulnerabilities</th></tr></thead><tbody>
+            {% set hr = full_preview.host_router_map or {} %}
+            {% for h in full_preview.hosts %}{% set vulns = h.vulnerabilities or [] %}<tr><td>{{ h.node_id }}</td><td>{{ h.name }}</td><td>{{ h.role }}</td><td>{{ h.ip4 }}</td><td>{{ hr[h.node_id|string] or hr[h.node_id] }}</td><td>{{ vulns|join(', ') if vulns else '-' }}</td></tr>{% endfor %}
+            </tbody></table>
+          </div>
         </div>
   <div class="tab-pane fade" id="fp-vulnerabilities">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="mb-0">Vulnerabilities</h6>
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-vuln-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+          </div>
+          <div id="fp-vuln-body" class="collapse">
           {% set vuln_plan = full_preview.vulnerabilities_preview or {} %}
           {% set vuln_assign = full_preview.vulnerabilities_by_node or {} %}
           <div class="row g-3">
@@ -196,13 +238,25 @@
               {% endif %}
             </div>
           </div>
+          </div>
         </div>
   <div class="tab-pane fade" id="fp-switches">
-          <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Router</th><th>Hosts</th><th>R/S Subnet</th><th>LAN Subnet</th></tr></thead><tbody>
-          {% for sw in full_preview.switches_detail %}<tr><td>{{ sw.switch_id }}</td><td>sw-{{ sw.switch_id }}</td><td>{{ sw.router_id }}</td><td>{{ sw.hosts|join(',') }}</td><td>{{ sw.rsw_subnet }}</td><td>{{ sw.lan_subnet }}</td></tr>{% endfor %}
-          </tbody></table>
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="mb-0">Switches</h6>
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-switches-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+          </div>
+          <div id="fp-switches-body" class="collapse">
+            <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Router</th><th>Hosts</th><th>R/S Subnet</th><th>LAN Subnet</th></tr></thead><tbody>
+            {% for sw in full_preview.switches_detail %}<tr><td>{{ sw.switch_id }}</td><td>sw-{{ sw.switch_id }}</td><td>{{ sw.router_id }}</td><td>{{ sw.hosts|join(',') }}</td><td>{{ sw.rsw_subnet }}</td><td>{{ sw.lan_subnet }}</td></tr>{% endfor %}
+            </tbody></table>
+          </div>
         </div>
   <div class="tab-pane fade" id="fp-interfaces">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="mb-0">Interfaces</h6>
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-interfaces-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+          </div>
+          <div id="fp-interfaces-body" class="collapse">
           <div class="row g-3">
             <div class="col-12">
               <h6 class="mb-2">Router-to-Router Links</h6>
@@ -291,8 +345,14 @@
               {% else %}<div class="small text-muted fst-italic">(no switch host assignments)</div>{% endif %}
             </div>
           </div>
+          </div>
         </div>
   <div class="tab-pane fade" id="fp-seg">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="mb-0">Segmentation</h6>
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-seg-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+          </div>
+          <div id="fp-seg-body" class="collapse">
           {% set seg_prev = full_preview.segmentation_preview %}
           {% set seg_artifacts = segmentation_artifacts or (display_artifacts.segmentation if display_artifacts else None) %}
           {% set seg_rows = seg_artifacts.table_rows if seg_artifacts and seg_artifacts.table_rows else [] %}
@@ -392,15 +452,27 @@
           {% if seg_prev and seg_prev.scripts_hash_sha256 %}
           <div class="small text-muted">Scripts Hash (SHA-256): <code>{{ seg_prev.scripts_hash_sha256 }}</code></div>
           {% endif %}
+          </div>
         </div>
   <div class="tab-pane fade" id="fp-node-sections">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="mb-0">Node Sections</h6>
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-node-sections-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+          </div>
+          <div id="fp-node-sections-body" class="collapse">
           <div class="table-responsive small">
             <table class="table table-sm table-bordered mb-0" id="nodeSectionsTable"><thead><tr>
               <th>Node ID</th><th>Name</th><th>Type</th><th>Primary IP</th><th>Interfaces</th><th>Services</th><th>Vulns</th><th>Seg Rules</th><th>Traffic S</th><th>Traffic R</th>
             </tr></thead><tbody></tbody></table>
           </div>
+          </div>
         </div>
   <div class="tab-pane fade" id="fp-traffic">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="mb-0">Traffic</h6>
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-traffic-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+          </div>
+          <div id="fp-traffic-body" class="collapse">
           {% set tsummary = full_preview.traffic_summary or {} %}
           {% set flows = tsummary.flows or [] %}
           {% if flows %}
@@ -434,9 +506,16 @@
           {% else %}
             <div class="small text-muted fst-italic">(no traffic flows)</div>
           {% endif %}
+          </div>
         </div>
   <div class="tab-pane fade" id="fp-json">
-          <pre class="small bg-light p-2" style="max-height:440px;overflow:auto;">{{ preview_json }}</pre>
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="mb-0">Raw JSON</h6>
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-json-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+          </div>
+          <div id="fp-json-body" class="collapse">
+            <pre class="small bg-light p-2" style="max-height:440px;overflow:auto;">{{ preview_json }}</pre>
+          </div>
         </div>
       </div>
     </div>
@@ -492,6 +571,49 @@
         }
       });
       return out;
+    }
+    function setupPreviewCollapsers(){
+      const toggles = document.querySelectorAll('[data-preview-collapse]');
+      toggles.forEach(btn => {
+        if(btn.dataset.collapserBound) return;
+        const targetId = btn.getAttribute('data-preview-collapse');
+        const target = document.getElementById(targetId);
+        if(!target) return;
+        btn.dataset.collapserBound = '1';
+        const collapseLabel = btn.dataset.labelCollapse || 'Collapse';
+        const expandLabel = btn.dataset.labelExpand || 'Expand';
+        const hasBootstrap = !!(window.bootstrap && bootstrap.Collapse);
+        if(hasBootstrap){
+          const instance = bootstrap.Collapse.getOrCreateInstance(target, { toggle: false });
+          const updateLabel = () => {
+            btn.textContent = target.classList.contains('show') ? collapseLabel : expandLabel;
+          };
+          updateLabel();
+          btn.addEventListener('click', ev => {
+            ev.preventDefault();
+            if(target.classList.contains('show')){
+              instance.hide();
+            } else {
+              instance.show();
+            }
+          });
+          target.addEventListener('shown.bs.collapse', updateLabel);
+          target.addEventListener('hidden.bs.collapse', updateLabel);
+        } else {
+          if(!target.classList.contains('d-none')){
+            target.classList.add('d-none');
+          }
+          const updateLabel = () => {
+            btn.textContent = target.classList.contains('d-none') ? expandLabel : collapseLabel;
+          };
+          updateLabel();
+          btn.addEventListener('click', ev => {
+            ev.preventDefault();
+            target.classList.toggle('d-none');
+            updateLabel();
+          });
+        }
+      });
     }
     function buildGraph(){
     if(!window.d3){ document.getElementById('previewGraph').textContent='d3 not loaded'; return; }
@@ -570,7 +692,6 @@
       if(Number.isFinite(x) && Number.isFinite(y)) return {x, y};
       return null;
     }
-
     const layoutCoords = [];
     if(layoutMaps){
       nodes.forEach(n => {
@@ -675,20 +796,36 @@
     const node = container.selectAll('g.node').data(nodes).enter().append('g').attr('class','node');
     const hasVulnerableHosts = nodes.some(n => n.type === 'host' && n.hasVuln);
     if(hasVulnerableHosts){
-      legend.append('g').attr('transform',`translate(0,${legendItems.length*18})`)
-        .call(g=>{
-          g.append('circle').attr('r',5).attr('cx',5).attr('cy',5).attr('fill',vulnerabilityColor).attr('stroke','#333').attr('stroke-width',1);
-          g.append('text').text('Host (vulnerable)').attr('x', 5*2 + 6).attr('y', 5+4).attr('font-size','11px');
-        });
+      const vulnLegend = legend.append('g').attr('transform',`translate(0,${legendItems.length*18})`);
+      const vulnLegendSymbol = d3.symbol().type(d3.symbolStar).size(80);
+      vulnLegend.append('path')
+        .attr('d', vulnLegendSymbol)
+        .attr('transform','translate(8,8)')
+        .attr('fill', vulnerabilityColor)
+        .attr('stroke', '#333')
+        .attr('stroke-width', 1);
+      vulnLegend.append('text')
+        .text('Host (vulnerable)')
+        .attr('x', 18)
+        .attr('y', 12)
+        .attr('font-size','11px');
     }
-    node.append('circle')
+    const normalNode = node.filter(d => !(d.type === 'host' && d.hasVuln));
+    normalNode.append('circle')
       .attr('r', d=> d.type==='router'? 10 : (d.type==='switch'? 7 : 5))
       .attr('fill', d=> {
         if(d.type==='router') return '#ff5722';
         if(d.type==='switch') return '#17a2b8';
-        return d.hasVuln ? vulnerabilityColor : '#ffc107';
+        return '#ffc107';
       })
       .attr('stroke', '#333').attr('stroke-width', 1);
+    const vulnNode = node.filter(d => d.type === 'host' && d.hasVuln);
+    const vulnSymbol = d3.symbol().type(d3.symbolStar).size(140);
+    vulnNode.append('path')
+      .attr('d', vulnSymbol)
+      .attr('fill', vulnerabilityColor)
+      .attr('stroke', '#333')
+      .attr('stroke-width', 1);
     const simulation = d3.forceSimulation(nodes)
       .force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40)))
       .force('charge', d3.forceManyBody().strength(-210))
@@ -806,25 +943,14 @@
   function dragstarted(event,d){
     try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
     if(sim && !event.active){ sim.alphaTarget(0.35).restart(); }
-    const [sx, sy] = currentTransform.invert([event.x, event.y]);
-    d.fx = sx;
-    d.fy = sy;
-    d.layoutX = sx;
-    d.layoutY = sy;
+    d.fx = d.x;
+    d.fy = d.y;
   }
-  function dragged(event,d){
-    const [sx, sy] = currentTransform.invert([event.x, event.y]);
-    d.fx = sx;
-    d.fy = sy;
-    d.layoutX = sx;
-    d.layoutY = sy;
-  }
+  function dragged(event,d){ d.fx = event.x; d.fy = event.y; }
   function dragended(event,d){
     if(sim && !event.active){ sim.alphaTarget(0); }
     d.fx = null;
     d.fy = null;
-    d.vx = 0;
-    d.vy = 0;
     if(usingLayout){
       d.layoutX = d.x;
       d.layoutY = d.y;
@@ -849,6 +975,7 @@
   } // END buildGraph
   // Invoke graph build after definitions
   buildGraph();
+  setupPreviewCollapsers();
   // Unified scripts listing modal logic
   function openScriptsModal(initialKind){
     const modalEl = document.getElementById('scriptsListingModal');

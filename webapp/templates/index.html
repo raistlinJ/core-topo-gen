@@ -253,38 +253,62 @@
                             </div>
                         </div>
                         <div class="card mt-3">
-                            <div class="card-header"><strong>Routers</strong></div>
-                            <div class="card-body p-2" id="fpRoutersWrap"><div class="text-muted small">No data</div></div>
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>Routers</strong>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpRoutersWrap" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                            </div>
+                            <div class="card-body collapse p-2" id="fpRoutersWrap"><div class="text-muted small">No data</div></div>
                         </div>
                         <div class="card mt-3">
-                            <div class="card-header"><strong>Hosts</strong></div>
-                            <div class="card-body p-2" id="fpHostsWrap"><div class="text-muted small">No data</div></div>
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>Hosts</strong>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpHostsWrap" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                            </div>
+                            <div class="card-body collapse p-2" id="fpHostsWrap"><div class="text-muted small">No data</div></div>
                         </div>
                         <div class="card mt-3">
-                            <div class="card-header"><strong>Switches</strong></div>
-                            <div class="card-body p-2" id="fpSwitchesWrap"><div class="text-muted small">No data</div></div>
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>Switches</strong>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpSwitchesWrap" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                            </div>
+                            <div class="card-body collapse p-2" id="fpSwitchesWrap"><div class="text-muted small">No data</div></div>
                         </div>
                         <div class="card mt-3">
-                            <div class="card-header"><strong>Node Sections</strong></div>
-                            <div class="card-body p-2" style="max-height:240px;overflow:auto;" id="fpNodeSectionsWrap"><div class="text-muted small">No data</div></div>
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>Node Sections</strong>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpNodeSectionsWrap" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                            </div>
+                            <div class="card-body collapse p-2" style="max-height:240px;overflow:auto;" id="fpNodeSectionsWrap"><div class="text-muted small">No data</div></div>
                         </div>
                     </div>
                     <div class="col-lg-4">
                         <div class="card mb-3">
-                            <div class="card-header"><strong>Counts</strong></div>
-                            <div class="card-body p-2" id="fpCounts"></div>
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>Counts</strong>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpCounts" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                            </div>
+                            <div class="card-body collapse p-2" id="fpCounts"></div>
                         </div>
                         <div class="card mb-3">
-                            <div class="card-header"><strong>R2R Policy</strong></div>
-                            <div class="card-body p-2"><pre class="small mb-0" id="fpR2RPolicy" style="max-height:160px; overflow:auto;"></pre></div>
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>R2R Policy</strong>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpR2RPolicyBody" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                            </div>
+                            <div class="card-body collapse p-2" id="fpR2RPolicyBody"><pre class="small mb-0" id="fpR2RPolicy" style="max-height:160px; overflow:auto;"></pre></div>
                         </div>
                         <div class="card mb-3">
-                            <div class="card-header"><strong>R2S Policy</strong></div>
-                            <div class="card-body p-2"><pre class="small mb-0" id="fpR2SPolicy" style="max-height:160px; overflow:auto;"></pre></div>
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>R2S Policy</strong>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpR2SPolicyBody" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                            </div>
+                            <div class="card-body collapse p-2" id="fpR2SPolicyBody"><pre class="small mb-0" id="fpR2SPolicy" style="max-height:160px; overflow:auto;"></pre></div>
                         </div>
                         <div class="card mb-3">
-                            <div class="card-header"><strong>Segmentation Plan</strong></div>
-                            <div class="card-body p-2">
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>Segmentation Plan</strong>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpSegmentationCardBody" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                            </div>
+                            <div class="card-body collapse p-2" id="fpSegmentationCardBody">
                                 <div class="small mb-2" id="fpSegmentationTypes" hidden></div>
                                 <pre class="small mb-0" id="fpSegmentation" style="max-height:220px; overflow:auto;"></pre>
                                 <div class="mt-2" id="fpSegmentationRuntimeWrap" hidden>
@@ -295,20 +319,32 @@
                             </div>
                         </div>
                         <div class="card mb-3">
-                            <div class="card-header"><strong>Router Plan</strong></div>
-                            <div class="card-body p-2"><pre class="small mb-0" id="fpRouterPlan" style="max-height:160px; overflow:auto;"></pre></div>
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>Router Plan</strong>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpRouterPlanBody" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                            </div>
+                            <div class="card-body collapse p-2" id="fpRouterPlanBody"><pre class="small mb-0" id="fpRouterPlan" style="max-height:160px; overflow:auto;"></pre></div>
                         </div>
                         <div class="card mb-3">
-                            <div class="card-header"><strong>Services Plan</strong></div>
-                            <div class="card-body p-2"><pre class="small mb-0" id="fpServicesPlan" style="max-height:160px; overflow:auto;"></pre></div>
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>Services Plan</strong>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpServicesPlanBody" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                            </div>
+                            <div class="card-body collapse p-2" id="fpServicesPlanBody"><pre class="small mb-0" id="fpServicesPlan" style="max-height:160px; overflow:auto;"></pre></div>
                         </div>
                         <div class="card mb-3">
-                            <div class="card-header"><strong>Vulnerabilities Plan</strong></div>
-                            <div class="card-body p-2"><pre class="small mb-0" id="fpVulnPlan" style="max-height:160px; overflow:auto;"></pre></div>
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>Vulnerabilities Plan</strong>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpVulnPlanBody" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                            </div>
+                            <div class="card-body collapse p-2" id="fpVulnPlanBody"><pre class="small mb-0" id="fpVulnPlan" style="max-height:160px; overflow:auto;"></pre></div>
                         </div>
                         <div class="card mb-3">
-                            <div class="card-header"><strong>Traffic Plan</strong></div>
-                            <div class="card-body p-2"><pre class="small mb-0" id="fpTrafficPlan" style="max-height:160px; overflow:auto;"></pre></div>
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>Traffic Plan</strong>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpTrafficPlanBody" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                            </div>
+                            <div class="card-body collapse p-2" id="fpTrafficPlanBody"><pre class="small mb-0" id="fpTrafficPlan" style="max-height:160px; overflow:auto;"></pre></div>
                         </div>
                         <!-- Removed History, Role Distribution, Service Distribution cards -->
                         <!-- Drift card removed (no approved plan concept) -->
@@ -352,6 +388,52 @@ const payloadDataEl = document.getElementById('payload-data');
 window.VULN_CATALOG = window.VULN_CATALOG || { types: [], vectors: [], items: [] };
 // Prevent TDZ: define catalog early on window
 window.VULN_CATALOG = window.VULN_CATALOG || { types: [], vectors: [], items: [] };
+function setupPreviewCollapsers(){
+    const toggles = document.querySelectorAll('[data-preview-collapse]');
+    toggles.forEach(btn => {
+        if(btn.dataset.collapserBound) return;
+        const targetId = btn.getAttribute('data-preview-collapse');
+        const target = document.getElementById(targetId);
+        if(!target) return;
+        btn.dataset.collapserBound = '1';
+        const collapseLabel = btn.dataset.labelCollapse || 'Collapse';
+        const expandLabel = btn.dataset.labelExpand || 'Expand';
+        const hasBootstrap = !!(window.bootstrap && bootstrap.Collapse);
+        if(hasBootstrap){
+            const instance = bootstrap.Collapse.getOrCreateInstance(target, { toggle: false });
+            const updateLabel = () => {
+                btn.textContent = target.classList.contains('show') ? collapseLabel : expandLabel;
+            };
+            updateLabel();
+            btn.addEventListener('click', ev => {
+                ev.preventDefault();
+                if(target.classList.contains('show')){
+                    instance.hide();
+                } else {
+                    instance.show();
+                }
+            });
+            target.addEventListener('shown.bs.collapse', updateLabel);
+            target.addEventListener('hidden.bs.collapse', updateLabel);
+        } else {
+            if(!target.classList.contains('d-none')){
+                target.classList.add('d-none');
+            }
+            const updateLabel = () => {
+                btn.textContent = target.classList.contains('d-none') ? expandLabel : collapseLabel;
+            };
+            updateLabel();
+            btn.addEventListener('click', ev => {
+                ev.preventDefault();
+                target.classList.toggle('d-none');
+                updateLabel();
+            });
+        }
+    });
+}
+window.setupPreviewCollapsers = setupPreviewCollapsers;
+if(document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', () => setupPreviewCollapsers()); }
+else { setupPreviewCollapsers(); }
 // ---------------- Unified Logging Bridge -----------------
 // Forward all app/UI logs into dock log system (defined in partial 'dock.html').
 // We DO NOT override existing dock log functions if already present.
@@ -1206,6 +1288,7 @@ function showFullPreviewModal(full){
     const switchesWrap = document.getElementById('fpSwitchesWrap'); if(switchesWrap) switchesWrap.innerHTML = tableHtml(full.switches_detail,['switch_id','router_id','hosts','rsw_subnet','lan_subnet']);
     // Graph
     buildFullPreviewModalGraph(full);
+    setupPreviewCollapsers();
     try { buildNodeSectionsTable(full); } catch(e){ console.warn('Node sections table failed', e); }
         // Removed history, role distribution, service distribution
     // Approval & drift removed
@@ -1392,11 +1475,23 @@ function buildFullPreviewModalGraph(full){
         const node = zoomLayer.selectAll('g').data(nodes).enter().append('g');
         const vulnerabilityColor = '#28a745';
         const hasVulnerableHosts = nodes.some(n => n.type === 'host' && n.hasVuln);
-        node.append('circle').attr('r', d=> d.type==='router'? 11: (d.type==='switch'? 8:5)).attr('fill', d=> {
-            if(d.type==='router') return '#ff7043';
-            if(d.type==='switch') return '#17a2b8';
-            return d.hasVuln ? vulnerabilityColor : '#ffc107';
-        }).attr('stroke','#333').attr('stroke-width',1.1);
+        const normalNode = node.filter(d => !(d.type === 'host' && d.hasVuln));
+        normalNode.append('circle')
+            .attr('r', d=> d.type==='router'? 11: (d.type==='switch'? 8:5))
+            .attr('fill', d=> {
+                if(d.type==='router') return '#ff7043';
+                if(d.type==='switch') return '#17a2b8';
+                return '#ffc107';
+            })
+            .attr('stroke','#333')
+            .attr('stroke-width',1.1);
+        const vulnNode = node.filter(d => d.type === 'host' && d.hasVuln);
+        const vulnSymbol = d3.symbol().type(d3.symbolStar).size(170);
+        vulnNode.append('path')
+            .attr('d', vulnSymbol)
+            .attr('fill', vulnerabilityColor)
+            .attr('stroke', '#333')
+            .attr('stroke-width', 1.1);
         const simulation = d3.forceSimulation(nodes)
             .force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40)))
             .force('charge', d3.forceManyBody().strength(-220))
@@ -1449,8 +1544,14 @@ function buildFullPreviewModalGraph(full){
     if(hasVulnerableHosts){
         const offset = legendItems.length*20;
         const g=legend.append('g').attr('transform',`translate(0,${offset})`);
-        g.append('circle').attr('r',5).attr('cx',5).attr('cy',5).attr('fill',vulnerabilityColor).attr('stroke','#333').attr('stroke-width',1);
-        g.append('text').text('Host (vulnerable)').attr('x', 5*2 + 6).attr('y', 5+4).attr('font-size','11px');
+        const vulnLegendSymbol = d3.symbol().type(d3.symbolStar).size(80);
+        g.append('path')
+            .attr('d', vulnLegendSymbol)
+            .attr('transform','translate(8,8)')
+            .attr('fill', vulnerabilityColor)
+            .attr('stroke','#333')
+            .attr('stroke-width',1);
+        g.append('text').text('Host (vulnerable)').attr('x', 20).attr('y', 12).attr('font-size','11px');
     }
     // Node labels removed per request
     // Build section lookups
@@ -1465,19 +1566,12 @@ function buildFullPreviewModalGraph(full){
     function dragstarted(event,d){
         try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
         if(sim && !event.active) sim.alphaTarget(.35).restart();
-        const [sx, sy] = currentTransform.invert([event.x, event.y]);
-        d.fx = sx; d.fy = sy;
-        d.layoutX = sx; d.layoutY = sy;
+        d.fx=d.x; d.fy=d.y;
     }
-    function dragged(event,d){
-        const [sx, sy] = currentTransform.invert([event.x, event.y]);
-        d.fx = sx; d.fy = sy;
-        d.layoutX = sx; d.layoutY = sy;
-    }
+    function dragged(event,d){ d.fx=event.x; d.fy=event.y; }
     function dragended(event,d){
         if(sim && !event.active) sim.alphaTarget(0);
         d.fx=null; d.fy=null;
-        d.vx = 0; d.vy = 0;
         if(usingLayout){
             d.layoutX = d.x;
             d.layoutY = d.y;
