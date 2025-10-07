@@ -78,3 +78,39 @@ def test_no_empty_r2s_switches(monkeypatch):
         if (not has_host) and only_r_or_sw:
             empty_switches.append(sw)
     assert not empty_switches, f"Orphan R2S switches still present: {empty_switches}"
+
+
+def test_nonuniform_respects_host_bounds(monkeypatch):
+    ritems = [RoutingInfo(protocol='OSPFv2', factor=0.0, abs_count=2, r2s_mode='NonUniform', r2s_edges=4, r2s_hosts_min=3, r2s_hosts_max=5)]
+    role_counts = {'workstation': 24}
+    sess = FakeSession(); _patch(monkeypatch, sess)
+    random.seed(12345)
+    topo_mod.build_segmented_topology(DummyClient(), role_counts=role_counts, routing_density=0.6, routing_items=ritems, base_host_pool=sum(role_counts.values()), services=None)
+
+    host_models = {'pc', 'docker', 'host', 'default'}
+    switch_host_counts = {}
+    for nid, node in sess.nodes.items():
+        name = getattr(node, 'name', '') or ''
+        if not name.startswith('rsw-'):
+            continue
+        neighbors = [lk[0] if lk[1] == nid else lk[1] for lk in sess.links if nid in lk]
+        hosts_attached = [sess.nodes.get(nb) for nb in neighbors if getattr(sess.nodes.get(nb), 'model', '').lower() in host_models]
+        if hosts_attached:
+            switch_host_counts[nid] = len(hosts_attached)
+
+    assert switch_host_counts, "Expected at least one non-uniform R2S switch to be created"
+    for count in switch_host_counts.values():
+        assert 3 <= count <= 5, f"Switch host count {count} outside bounds"
+
+    topo_stats = getattr(sess, 'topo_stats', {}) or {}
+    policy = topo_stats.get('r2s_policy', {}) if isinstance(topo_stats, dict) else {}
+    bounds = policy.get('host_group_bounds', {}) if isinstance(policy, dict) else {}
+    if bounds:
+        assert bounds.get('requested_min') == 3
+        assert bounds.get('requested_max') == 5
+        applied_min = bounds.get('applied_min')
+        applied_max = bounds.get('applied_max')
+        if applied_min is not None:
+            assert applied_min >= 3
+        if applied_max is not None:
+            assert applied_max <= 5

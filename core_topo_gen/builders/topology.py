@@ -2056,6 +2056,33 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                     if any_hosts:
                         r2s_ratio = 1
         if router_count > 0 and (r2s_mode in ('Exact','Uniform','Min','NonUniform','Random') or r2s_ratio > 0):
+            effective_r2s_min: Optional[int] = None
+            effective_r2s_max: Optional[int] = None
+            if routing_items:
+                try:
+                    mins: List[int] = []
+                    maxs: List[int] = []
+                    for _ri in routing_items:
+                        try:
+                            v_min = int(getattr(_ri, 'r2s_hosts_min', 0) or 0)
+                        except Exception:
+                            v_min = 0
+                        if v_min > 0:
+                            mins.append(v_min)
+                        try:
+                            v_max = int(getattr(_ri, 'r2s_hosts_max', 0) or 0)
+                        except Exception:
+                            v_max = 0
+                        if v_max > 0:
+                            maxs.append(v_max)
+                    if mins:
+                        effective_r2s_min = max(1, min(mins))
+                    if maxs:
+                        effective_r2s_max = max(maxs)
+                    if effective_r2s_min is not None and effective_r2s_max is not None and effective_r2s_max < effective_r2s_min:
+                        effective_r2s_max = effective_r2s_min
+                except Exception:
+                    pass
             # Build host list map per router
             router_host_ids: Dict[int, List[int]] = {r.id: [] for r in router_objs}
             for hid, rid in host_router_map.items():
@@ -2063,7 +2090,18 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                     router_host_ids[rid].append(hid)
             r2s_counts: Dict[int, int] = {r.id: 0 for r in router_objs}
             rehomed_hosts: List[int] = []
+            r2s_switch_host_counts: Dict[int, List[int]] = {r.id: [] for r in router_objs}
             r2s_seq: Dict[int, int] = {r.id: 0 for r in router_objs}
+            def _ratio_to_int(val) -> int:
+                try:
+                    v = float(val)
+                except Exception:
+                    return 0
+                if v <= 0:
+                    return 0
+                if v < 1.0:
+                    return 1
+                return int(round(v))
 
             def _remove_link(a_id: int, b_id: int):
                 key = tuple(sorted((a_id, b_id)))
@@ -2171,34 +2209,79 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                             pass
                     r2s_counts[rid] += 1
                     rehomed_hosts.extend(host_ids)
+                    try:
+                        r2s_switch_host_counts[rid].append(len(host_ids))
+                    except Exception:
+                        pass
                     continue  # move to next router (skip pair-based logic)
                 # Determine target switches based on mode
+                group_sizes: List[int] = []
                 if r2s_mode == 'Exact' and r2s_ratio > 0:
-                    max_switches = min(r2s_ratio, len(host_ids)//2)
+                    ratio_int = _ratio_to_int(r2s_ratio)
+                    max_pairs = len(host_ids) // 2
+                    if ratio_int > 0 and max_pairs > 0:
+                        group_sizes = [2] * min(ratio_int, max_pairs)
                 elif r2s_mode == 'Min':
-                    max_switches = 1 if len(host_ids) >= 2 else 0
+                    if len(host_ids) >= 2:
+                        group_sizes = [2]
                 elif r2s_mode == 'Uniform':
                     import math as _math
                     max_switches = min(len(host_ids)//2, max(1, int(_math.ceil(len(host_ids)/4))))
+                    group_sizes = [2] * max_switches
                 elif r2s_mode == 'NonUniform':
-                    import math as _math
-                    max_switches = random.randint(0, max(0, int(_math.ceil(len(host_ids)/3))))
+                    min_hosts = effective_r2s_min if effective_r2s_min is not None else 2
+                    max_hosts = effective_r2s_max if effective_r2s_max is not None else max(min_hosts, 4)
+                    try:
+                        min_hosts = max(1, int(min_hosts))
+                    except Exception:
+                        min_hosts = 1
+                    try:
+                        max_hosts = max(int(max_hosts), min_hosts)
+                    except Exception:
+                        max_hosts = max(min_hosts, 2)
+                    available = len(host_ids)
+                    if available >= min_hosts:
+                        possible_groups = available // min_hosts
+                        if possible_groups > 0:
+                            desired = _ratio_to_int(r2s_ratio) if r2s_ratio > 0 else random.randint(0, possible_groups)
+                            desired = min(desired, possible_groups)
+                            if desired <= 0 and r2s_ratio <= 0:
+                                desired = 0
+                            if desired > 0:
+                                remaining = available
+                                for idx_grp in range(desired):
+                                    groups_left = desired - idx_grp - 1
+                                    min_required_for_rest = min_hosts * groups_left
+                                    upper_bound = remaining - min_required_for_rest
+                                    if groups_left == 0:
+                                        upper_bound = remaining
+                                    upper_bound = max(min_hosts, min(max_hosts, upper_bound))
+                                    lower_bound = min_hosts
+                                    if upper_bound < lower_bound:
+                                        break
+                                    size = random.randint(lower_bound, upper_bound)
+                                    if size <= 0:
+                                        break
+                                    group_sizes.append(size)
+                                    remaining -= size
+                                    if remaining < min_hosts:
+                                        break
                 elif r2s_mode == 'Random':
-                    if random.random() < 0.5:
-                        max_switches = min(len(host_ids)//2, 1)
-                    else:
-                        max_switches = 0
+                    if random.random() < 0.5 and len(host_ids) >= 2:
+                        group_sizes = [2]
                 else:  # ratio fallback
-                    max_switches = min(r2s_ratio, len(host_ids)//2)
-                if max_switches <= 0:
+                    ratio_int = _ratio_to_int(r2s_ratio)
+                    max_pairs = len(host_ids) // 2
+                    if ratio_int > 0 and max_pairs > 0:
+                        group_sizes = [2] * min(ratio_int, max_pairs)
+                if not group_sizes:
                     continue
-                for _ in range(max_switches):
-                    if len(host_ids) < 2:
+                for group_size in group_sizes:
+                    if len(host_ids) < group_size:
                         break
-                    h_a = host_ids.pop()
-                    h_b = host_ids.pop()
+                    group_hosts = [host_ids.pop() for _ in range(group_size)]
                     # Remove direct or LAN links (LAN unlikely here because deferred) for these hosts
-                    for h_sel in (h_a, h_b):
+                    for h_sel in group_hosts:
                         if host_direct_link.get(h_sel):
                             _remove_link(h_sel, rid)
                         lan_sw_id = lan_switch_by_router.get(rid)
@@ -2244,10 +2327,11 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                             if usable >= needed:
                                 return p
                         return cap
-                    lan_pref = _lan_prefix_for_hosts(2)  # this segment always two hosts (h_a, h_b)
+                    lan_pref = _lan_prefix_for_hosts(len(group_hosts))
                     lan_net2 = subnet_alloc.next_random_subnet(lan_pref)
                     lan2_hosts = list(lan_net2.hosts())
-                    if len(lan2_hosts) < 3:  # need gateway + 2 hosts
+                    needed_ips = len(group_hosts) + 1
+                    if len(lan2_hosts) < needed_ips:
                         try:
                             if hasattr(session, 'delete_link'): session.delete_link(node1_id=sw_node.id, node2_id=rid)  # type: ignore
                         except Exception: pass
@@ -2255,7 +2339,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                             if hasattr(session, 'delete_node'): session.delete_node(sw_node.id)  # type: ignore
                         except Exception: pass
                         continue
-                    for idx_h, h_sel in enumerate([h_a, h_b]):
+                    for idx_h, h_sel in enumerate(group_hosts):
                         try:
                             h_obj = host_nodes_by_id.get(h_sel)
                             if not h_obj: continue
@@ -2268,7 +2352,11 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                         except Exception:
                             pass
                     r2s_counts[rid] += 1
-                    rehomed_hosts.extend([h_a, h_b])
+                    rehomed_hosts.extend(group_hosts)
+                    try:
+                        r2s_switch_host_counts[rid].append(len(group_hosts))
+                    except Exception:
+                        pass
             # Persist stats
             try:
                 topo_stats = getattr(session, 'topo_stats', {}) or {}
@@ -2298,6 +2386,19 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                     'host_pairs_possible': total_pairs_possible,
                     'saturation': saturation,
                 }
+                if any(r2s_switch_host_counts.values()):
+                    try:
+                        topo_stats['r2s_policy']['switch_host_counts'] = {rid: counts for rid, counts in r2s_switch_host_counts.items() if counts}
+                    except Exception:
+                        pass
+                applied_counts = [cnt for cnts in r2s_switch_host_counts.values() for cnt in cnts]
+                if applied_counts or effective_r2s_min is not None or effective_r2s_max is not None:
+                    topo_stats['r2s_policy']['host_group_bounds'] = {
+                        'requested_min': effective_r2s_min,
+                        'requested_max': effective_r2s_max,
+                        'applied_min': min(applied_counts) if applied_counts else None,
+                        'applied_max': max(applied_counts) if applied_counts else None,
+                    }
                 if r2s_counts:
                     topo_stats['r2s_policy']['display_min_count'] = rs_stats['min']
                     topo_stats['r2s_policy']['display_max_count'] = rs_stats['max']
