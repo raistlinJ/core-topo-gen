@@ -1346,20 +1346,109 @@ function buildFullPreviewModalGraph(full){
     svg.call(zoom).on('dblclick.zoom', null);
         const vulnerabilitiesByNode = normalizeVulnerabilitiesByNode(full.vulnerabilities_by_node);
         const nodes=[];
-        const linkDescriptors=[];
-        (full.routers||[]).forEach(r=>nodes.push({id:r.node_id, label:r.name, type:'router'}));
+        const nodeById = new Map();
+        const addNode = (node)=>{
+            if(node==null || node.id===undefined || node.id===null) return;
+            const key = String(node.id);
+            if(nodeById.has(key)){
+                Object.assign(nodeById.get(key), node);
+                return;
+            }
+            nodeById.set(key, node);
+            nodes.push(node);
+        };
+        (full.routers||[]).forEach(r=>{
+            if(r==null || r.node_id===undefined || r.node_id===null) return;
+            addNode({id:r.node_id, label:r.name, type:'router'});
+        });
         (full.hosts||[]).forEach(hn=>{
+            if(hn==null) return;
             const hostId = hn.node_id;
+            if(hostId===undefined || hostId===null) return;
             const keyStr = String(hostId);
             const assignment = Array.isArray(hn.vulnerabilities) ? hn.vulnerabilities : vulnerabilitiesByNode[keyStr] || vulnerabilitiesByNode[hostId] || [];
             const vulnList = Array.isArray(assignment) ? assignment : [];
             const hasVuln = vulnList.length > 0;
-            nodes.push({id:hostId, label:hn.name, type:'host', hasVuln: hasVuln, vulnerabilities: vulnList});
+            addNode({id:hostId, label:hn.name, type:'host', hasVuln: hasVuln, vulnerabilities: vulnList});
         });
-        (full.switches_detail||[]).forEach(sw=>nodes.push({id:sw.switch_id, label:'sw-'+sw.switch_id, type:'switch'}));
-        (full.r2r_edges_preview||[]).forEach(e=>linkDescriptors.push({sourceId:e[0], targetId:e[1], kind:'r2r'}));
-        (full.switches_detail||[]).forEach(sw=>{ (sw.hosts||[]).forEach(hid=>linkDescriptors.push({sourceId:sw.switch_id, targetId:hid, kind:'sw-host'})); linkDescriptors.push({sourceId:sw.router_id, targetId:sw.switch_id, kind:'r-sw'}); });
-        const hr = full.host_router_map || {}; Object.entries(hr).forEach(([hid,rid])=>{ const hIdNum=parseInt(hid,10); if(!linkDescriptors.find(l=>l.kind==='sw-host' && l.targetId===hIdNum)){ linkDescriptors.push({sourceId:rid, targetId:hIdNum, kind:'r-host'}); }});
+        (full.switches_detail||[]).forEach(sw=>{
+            if(sw==null) return;
+            const switchId = sw.switch_id;
+            if(switchId===undefined || switchId===null) return;
+            addNode({id:switchId, label:'sw-'+switchId, type:'switch'});
+        });
+        const linkDescriptors=[];
+        (full.r2r_edges_preview||[]).forEach(e=>{
+            if(!Array.isArray(e) || e.length<2) return;
+            const [a,b] = e;
+            if(a===undefined || a===null || b===undefined || b===null) return;
+            linkDescriptors.push({sourceId:a, targetId:b, kind:'r2r'});
+        });
+        (full.switches_detail||[]).forEach(sw=>{
+            if(sw==null) return;
+            const switchId = sw.switch_id;
+            const routerId = sw.router_id;
+            if(switchId===undefined || switchId===null || routerId===undefined || routerId===null) return;
+            (sw.hosts||[]).forEach(hid=>{
+                if(hid===undefined || hid===null) return;
+                linkDescriptors.push({sourceId:switchId, targetId:hid, kind:'sw-host'});
+            });
+            linkDescriptors.push({sourceId:routerId, targetId:switchId, kind:'r-sw'});
+        });
+        const hr = full.host_router_map || {};
+        Object.entries(hr).forEach(([hid,rid])=>{
+            if(hid===undefined || hid===null) return;
+            const hIdNum = Number.isFinite(Number(hid)) ? Number(hid) : parseInt(hid, 10);
+            const hostId = Number.isFinite(hIdNum) ? hIdNum : hid;
+            if(hostId===undefined || hostId===null) return;
+            const hasSwitchLink = linkDescriptors.find(l=>l.kind==='sw-host' && String(l.targetId)===String(hostId));
+            if(hasSwitchLink) return;
+            const routerCandidate = (typeof rid === 'number' && Number.isFinite(rid)) ? rid : parseInt(rid,10);
+            const routerId = Number.isFinite(routerCandidate) ? routerCandidate : rid;
+            if(routerId===undefined || routerId===null) return;
+            linkDescriptors.push({sourceId:routerId, targetId:hostId, kind:'r-host'});
+        });
+
+        const ensureNodeForLink = (id, role)=>{
+            if(id===undefined || id===null || (typeof id==='number' && Number.isNaN(id))) return;
+            const key = String(id);
+            if(nodeById.has(key)) return;
+            const type = role==='router'? 'router' : role==='switch'? 'switch' : 'host';
+            const labelBase = role==='router'? `router-${key}` : role==='switch'? `sw-${key}` : `host-${key}`;
+            const fallback = { id, label: labelBase, type };
+            if(type==='host'){
+                fallback.hasVuln = false;
+                fallback.vulnerabilities = [];
+            }
+            addNode(fallback);
+        };
+        linkDescriptors.forEach(link=>{
+            if(!link) return;
+            if(link.kind==='r2r'){
+                ensureNodeForLink(link.sourceId, 'router');
+                ensureNodeForLink(link.targetId, 'router');
+            } else if(link.kind==='r-sw'){
+                ensureNodeForLink(link.sourceId, 'router');
+                ensureNodeForLink(link.targetId, 'switch');
+            } else if(link.kind==='sw-host'){
+                ensureNodeForLink(link.sourceId, 'switch');
+                ensureNodeForLink(link.targetId, 'host');
+            } else if(link.kind==='r-host'){
+                ensureNodeForLink(link.sourceId, 'router');
+                ensureNodeForLink(link.targetId, 'host');
+            }
+        });
+
+        const filteredLinks = linkDescriptors.filter(link=>{
+            if(!link) return false;
+            return nodeById.has(String(link.sourceId)) && nodeById.has(String(link.targetId));
+        });
+        if(nodes.length === 0){
+            svg.remove();
+            container.append('div').attr('class','text-muted small p-2').text('No nodes to display');
+            document.getElementById('fpGraphLoading')?.remove();
+            return;
+        }
 
         const layoutPositions = full.layout_positions;
         const layoutMaps = (layoutPositions && !layoutPositions.error && typeof layoutPositions === 'object')
@@ -1469,9 +1558,9 @@ function buildFullPreviewModalGraph(full){
             });
         }
 
-        const simLinks = linkDescriptors.map(l=>({...l, source:l.sourceId, target:l.targetId}));
+    const simLinks = filteredLinks.map(l=>({...l, source:l.sourceId, target:l.targetId}));
 
-        const link = zoomLayer.selectAll('line').data(simLinks).enter().append('line').attr('stroke', l=> l.kind==='r2r'? '#0d6efd': (l.kind==='r-sw'? '#198754':'#999')).attr('stroke-width', l=> l.kind==='r2r'? 2:1.2).attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null).attr('opacity', .9);
+    const link = zoomLayer.selectAll('line').data(simLinks).enter().append('line').attr('stroke', l=> l.kind==='r2r'? '#0d6efd': (l.kind==='r-sw'? '#198754':'#999')).attr('stroke-width', l=> l.kind==='r2r'? 2:1.2).attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null).attr('opacity', .9);
         const node = zoomLayer.selectAll('g').data(nodes).enter().append('g');
         const vulnerabilityColor = '#28a745';
         const hasVulnerableHosts = nodes.some(n => n.type === 'host' && n.hasVuln);
