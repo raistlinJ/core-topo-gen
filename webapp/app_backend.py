@@ -11,6 +11,7 @@ import uuid
 import threading
 from typing import Dict, Any
 from collections import defaultdict
+from types import SimpleNamespace
 import subprocess
 import sys
 import re
@@ -258,6 +259,53 @@ def _inject_current_user() -> None:
         g.current_user = _current_user()
     except Exception:
         g.current_user = None
+
+
+@app.context_processor
+def _inject_template_user() -> dict:
+    try:
+        user = _current_user()
+        if user:
+            return {
+                'current_user': SimpleNamespace(
+                    username=user.get('username'),
+                    role=user.get('role', 'user'),
+                    is_authenticated=True,
+                )
+            }
+    except Exception:
+        pass
+    return {
+        'current_user': SimpleNamespace(
+            username=None,
+            role=None,
+            is_authenticated=False,
+        )
+    }
+
+
+_LOGIN_EXEMPT_ENDPOINTS = {
+    'login',
+    'static',
+    'healthz',
+}
+
+
+@app.before_request
+def _require_login_redirect() -> None | Response:
+    try:
+        endpoint = request.endpoint or ''
+        if not endpoint:
+            return None
+        if endpoint.startswith('static'):
+            return None
+        if endpoint in _LOGIN_EXEMPT_ENDPOINTS:
+            return None
+        if _current_user() is None:
+            return redirect(url_for('login'))
+    except Exception:
+        return None
+    return None
 
 
 def _require_admin() -> bool:

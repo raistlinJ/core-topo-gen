@@ -354,6 +354,8 @@ def build_star_from_roles(core: client.CoreGrpcClient,
     host_slot_idx = 0
     docker_by_name: Dict[str, Dict[str, str]] = {}
     created_docker = 0
+    docker_slots_used: Set[str] = set()
+    docker_slots_used: Set[str] = set()
     for idx, role in enumerate(expanded_roles):
         theta = (2 * math.pi * idx) / max(total_hosts, 1)
         x = int(cx + radius * math.cos(theta))
@@ -372,6 +374,7 @@ def build_star_from_roles(core: client.CoreGrpcClient,
                         node_type = getattr(NodeType, "DOCKER")
                         docker_by_name[node_name] = docker_slot_plan[slot_key]
                         created_docker += 1
+                        docker_slots_used.add(slot_key)
                     else:
                         logger.warning("NodeType.DOCKER not available in this CORE build; cannot create docker nodes even though a slot plan exists")
             except Exception:
@@ -440,6 +443,13 @@ def build_star_from_roles(core: client.CoreGrpcClient,
             sw_ifid += 1
             safe_add_link(session, node, switch, iface1=dev_iface, iface2=sw_iface)
             logger.debug("Link device %s <-> switch (dev ifid=%d, sw ifid=%d)", node.id, dev_ifid, sw_ifid-1)
+
+    if docker_slot_plan:
+        missing_slots = set(docker_slot_plan.keys()) - docker_slots_used
+        if missing_slots:
+            raise RuntimeError(
+                f"Unable to provision Docker nodes for vulnerability assignments: {sorted(missing_slots)}"
+            )
 
     service_assignments: Dict[int, List[str]] = {}
     if created_docker:
@@ -1953,6 +1963,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                             node_type = getattr(NodeType, "DOCKER")
                             docker_by_name[name] = docker_slot_plan[slot_key]
                             created_docker += 1
+                            docker_slots_used.add(slot_key)
                         else:
                             logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan on segmented (single-host)")
                 except Exception:
@@ -2054,6 +2065,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                                 node_type = getattr(NodeType, "DOCKER")
                                 docker_by_name[name] = docker_slot_plan[slot_key]
                                 created_docker += 1
+                                docker_slots_used.add(slot_key)
                             else:
                                 logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan on segmented (multi-host deferred)")
                     except Exception:
@@ -2098,6 +2110,14 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                         ensure_service(session, host.id, "DefaultRoute", node_obj=host)
                     except Exception:
                         pass
+
+    if docker_slot_plan:
+        missing_slots = set(docker_slot_plan.keys()) - docker_slots_used
+        if missing_slots:
+            raise RuntimeError(
+                "Unable to provision Docker nodes for vulnerability assignments: "
+                + ", ".join(sorted(missing_slots))
+            )
 
     # --- R-to-S (router-to-switch) ratio policy application (secondary pass) ---
     try:

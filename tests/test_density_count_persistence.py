@@ -2,8 +2,14 @@ import json, os
 from webapp.app_backend import app
 
 
+def _login(client):
+    resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
+    assert resp.status_code in (302, 303)
+
+
 def test_density_count_persists_roundtrip(tmp_path, monkeypatch):
     client = app.test_client()
+    _login(client)
     from webapp import app_backend as backend
 
     def fake_outputs_dir():
@@ -56,6 +62,7 @@ def test_density_count_persists_roundtrip(tmp_path, monkeypatch):
 
 def test_default_density_count_is_10_when_absent(tmp_path, monkeypatch):
     client = app.test_client()
+    _login(client)
     from webapp import app_backend as backend
 
     def fake_outputs_dir():

@@ -25,7 +25,7 @@
           <div class="d-flex align-items-center gap-4 flex-wrap justify-content-end">
             {% block header_right_extra %}{% endblock %}
             <div class="d-flex align-items-center gap-3">
-              {% if current_user %}
+              {% if current_user.is_authenticated %}
                 <span class="small text-white-50">{{ current_user.username }}</span>
                 <a class="btn btn-sm btn-outline-light" href="{{ url_for('me_password') }}">Password</a>
                 <form action="{{ url_for('logout') }}" method="post" class="d-inline">

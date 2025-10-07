@@ -3,8 +3,14 @@ import os
 from webapp.app_backend import app
 
 
+def _login(client):
+    resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
+    assert resp.status_code in (302, 303)
+
+
 def test_save_xml_api_writes_file(tmp_path, monkeypatch):
     client = app.test_client()
+    _login(client)
     # Ensure outputs dir is under tmp to avoid polluting repo
     outdir = tmp_path / 'outputs'
     outdir.mkdir(parents=True, exist_ok=True)
