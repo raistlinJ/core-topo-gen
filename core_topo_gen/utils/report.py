@@ -273,6 +273,9 @@ def write_report(
             lines.append("## Router-to-Switch Connectivity")
             mode = r2s.get('mode')
             tgt = r2s.get('target_per_router') or r2s.get('target')
+            req_mode = r2s.get('mode_requested')
+            if req_mode and req_mode != mode:
+                lines.append(f"- Requested mode: {req_mode}")
             if mode == 'Exact' and tgt is not None:
                 lines.append(f"- Policy: Exact (target switches per router={tgt})")
             else:

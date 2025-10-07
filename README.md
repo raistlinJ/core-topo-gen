@@ -317,7 +317,8 @@ Implications:
 * Provides a fast way to collapse all access hosts under a single distribution/aggregation layer per router (common campus style) without hand-tuning per-switch counts.
 * Deterministic: given a seed and unchanged XML, the same switch IDs, LAN subnet prefixes, and host interface assignments repeat.
 * Metrics: In the preview JSON the field `r2s_policy_preview` will include:
-	* `mode: "Exact"`
+	* `mode` (`Exact`, `NonUniform`, `Min`, etc. — reflects the applied policy in the builder)
+	* `mode_requested` (`Exact`, `Uniform`, `Min`, `NonUniform`, `Random`, or `ratio` depending on routing item input)
 	* `target_per_router` (the declared or derived target, often 1 here)
 	* `target_per_router_effective` when the system derived a fallback (e.g. default from 0 to 1)
 	* `counts` mapping router_id -> created switch count (all 1's for routers with hosts under aggregated behavior)

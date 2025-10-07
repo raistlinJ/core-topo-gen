@@ -1,0 +1,29 @@
+<Scenarios>
+  <Scenario name="Scenario 1" density_count="30" scenario_total_nodes="56" base_nodes="0">
+    <ScenarioEditor>
+      <BaseScenario filepath=""/>
+      <section name="Node Information" density_count="30" base_nodes="30" additive_nodes="0" combined_nodes="30" weight_rows="1" count_rows="0" weight_sum="1.000" normalized_weight_sum="1.000">
+        <item selected="Random" factor="1.000"/>
+      </section>
+      <section name="Routing" density="0.800" explicit_count="0" derived_count="24" total_planned="24" weight_rows="1" count_rows="0" weight_sum="1.000">
+        <item selected="RIP" factor="1.000" r2r_mode="Min" r2s_mode="NonUniform" r2s_hosts_min="1" r2s_hosts_max="2" v_metric="Weight"/>
+      </section>
+      <section name="Services" density="0.500" explicit_count="0" weight_rows="0" count_rows="0" weight_sum="0.000"/>
+      <section name="Traffic" density="0.700" explicit_count="0" weight_rows="1" count_rows="0" weight_sum="1.000">
+        <item selected="Random" factor="1.000" pattern="continuous" rate_kbps="64.0" period_s="1.0" jitter_pct="10.0" content_type="Random" v_metric="Weight"/>
+      </section>
+      <section name="Events" density="0.500"/>
+      <section name="Vulnerabilities" density="0.500" explicit_count="2" derived_count="0" total_planned="2" weight_rows="0" count_rows="2" weight_sum="0.000">
+        <item selected="Specific" factor="1.000" v_name="mysql" v_path="https://github.com/vulhub/vulhub/tree/master/mysql/CVE-2012-2122" v_metric="Count" v_count="1"/>
+        <item selected="Specific" factor="1.000" v_name="couchdb" v_path="https://github.com/vulhub/vulhub/tree/master/couchdb/CVE-2022-24706" v_metric="Count" v_count="1"/>
+      </section>
+      <section name="Segmentation" density="0.500" explicit_count="0" weight_rows="2" count_rows="0" weight_sum="1.000">
+        <item selected="Firewall" factor="0.500" v_metric="Weight"/>
+        <item selected="NAT" factor="0.500" v_metric="Weight"/>
+      </section>
+      <section name="Notes">
+        <notes/>
+      </section>
+    </ScenarioEditor>
+  </Scenario>
+</Scenarios>

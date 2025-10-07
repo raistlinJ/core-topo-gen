@@ -2018,211 +2018,106 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                     except Exception:
                         pass
 
-        # --- R-to-S (router-to-switch) ratio policy application (secondary pass) ---
-        try:
-            r2s_ratio = 0
-            r2s_mode = 'ratio'
-            if routing_items and router_count > 0:
-                modes_present = [ri.r2s_mode for ri in routing_items if getattr(ri,'r2s_mode',None)]
-                if any(m == 'Exact' for m in modes_present):
-                    r2s_mode = 'Exact'
-                elif 'Uniform' in modes_present:
-                    r2s_mode = 'Uniform'
-                elif 'Min' in modes_present:
-                    r2s_mode = 'Min'
-                elif 'NonUniform' in modes_present:
-                    r2s_mode = 'NonUniform'
-                elif 'Random' in modes_present:
-                    r2s_mode = 'Random'
-                ratios = []
-                for ri in routing_items:
+    # --- R-to-S (router-to-switch) ratio policy application (secondary pass) ---
+    try:
+        r2s_ratio = 0
+        r2s_mode = 'ratio'
+        if routing_items and router_count > 0:
+            modes_present = [ri.r2s_mode for ri in routing_items if getattr(ri,'r2s_mode',None)]
+            if any(m == 'Exact' for m in modes_present):
+                r2s_mode = 'Exact'
+            elif 'Uniform' in modes_present:
+                r2s_mode = 'Uniform'
+            elif 'Min' in modes_present:
+                r2s_mode = 'Min'
+            elif 'NonUniform' in modes_present:
+                r2s_mode = 'NonUniform'
+            elif 'Random' in modes_present:
+                r2s_mode = 'Random'
+            ratios = []
+            for ri in routing_items:
+                try:
+                    val = int(getattr(ri, 'r2s_edges', 0) or 0)
+                    if val > 0:
+                        ratios.append(val)
+                except Exception:
+                    pass
+            # For Exact we take the FIRST positive value (user intent) rather than max to preserve exact=1 semantics
+            if r2s_mode == 'Exact':
+                r2s_ratio = ratios[0] if ratios else 0
+            else:
+                r2s_ratio = max(ratios) if ratios else 0
+                # If Exact mode chosen but ratio ended up zero while hosts exist, default to 1 (aggregated intent)
+                if r2s_mode == 'Exact' and r2s_ratio == 0:
                     try:
-                        val = int(getattr(ri, 'r2s_edges', 0) or 0)
-                        if val > 0:
-                            ratios.append(val)
+                        any_hosts = any(len(v) > 0 for v in host_router_map.values())
                     except Exception:
-                        pass
-                # For Exact we take the FIRST positive value (user intent) rather than max to preserve exact=1 semantics
-                if r2s_mode == 'Exact':
-                    r2s_ratio = ratios[0] if ratios else 0
-                else:
-                    r2s_ratio = max(ratios) if ratios else 0
-                    # If Exact mode chosen but ratio ended up zero while hosts exist, default to 1 (aggregated intent)
-                    if r2s_mode == 'Exact' and r2s_ratio == 0:
-                        try:
-                            any_hosts = any(len(v) > 0 for v in host_router_map.values())
-                        except Exception:
-                            any_hosts = False
-                        if any_hosts:
-                            r2s_ratio = 1
-            if router_count > 0 and (r2s_mode in ('Exact','Uniform','Min','NonUniform','Random') or r2s_ratio > 0):
-                # Build host list map per router
-                router_host_ids: Dict[int, List[int]] = {r.id: [] for r in router_objs}
-                for hid, rid in host_router_map.items():
-                    if rid in router_host_ids:
-                        router_host_ids[rid].append(hid)
-                r2s_counts: Dict[int, int] = {r.id: 0 for r in router_objs}
-                rehomed_hosts: List[int] = []
-                r2s_seq: Dict[int, int] = {r.id: 0 for r in router_objs}
+                        any_hosts = False
+                    if any_hosts:
+                        r2s_ratio = 1
+        if router_count > 0 and (r2s_mode in ('Exact','Uniform','Min','NonUniform','Random') or r2s_ratio > 0):
+            # Build host list map per router
+            router_host_ids: Dict[int, List[int]] = {r.id: [] for r in router_objs}
+            for hid, rid in host_router_map.items():
+                if rid in router_host_ids:
+                    router_host_ids[rid].append(hid)
+            r2s_counts: Dict[int, int] = {r.id: 0 for r in router_objs}
+            rehomed_hosts: List[int] = []
+            r2s_seq: Dict[int, int] = {r.id: 0 for r in router_objs}
 
-                def _remove_link(a_id: int, b_id: int):
-                    key = tuple(sorted((a_id, b_id)))
-                    try:
-                        if hasattr(session, 'delete_link'):
-                            session.delete_link(node1_id=key[0], node2_id=key[1])  # type: ignore
-                    except Exception:
-                        pass
-                    try:
-                        if hasattr(session, 'links') and isinstance(session.links, list):
-                            new_links = []
-                            for lk in session.links:
-                                try:
-                                    n1 = getattr(lk, 'node1_id', getattr(lk, 'node1', None))
-                                    n2 = getattr(lk, 'node2_id', getattr(lk, 'node2', None))
-                                except Exception:
-                                    n1 = n2 = None
-                                if n1 is None or n2 is None:
-                                    new_links.append(lk); continue
-                                pair = tuple(sorted((n1, n2)))
-                                if pair == key:
-                                    continue
-                                new_links.append(lk)
-                            session.links = new_links
-                    except Exception:
-                        pass
+            def _remove_link(a_id: int, b_id: int):
+                key = tuple(sorted((a_id, b_id)))
+                try:
+                    if hasattr(session, 'delete_link'):
+                        session.delete_link(node1_id=key[0], node2_id=key[1])  # type: ignore
+                except Exception:
+                    pass
+                try:
+                    if hasattr(session, 'links') and isinstance(session.links, list):
+                        new_links = []
+                        for lk in session.links:
+                            try:
+                                n1 = getattr(lk, 'node1_id', getattr(lk, 'node1', None))
+                                n2 = getattr(lk, 'node2_id', getattr(lk, 'node2', None))
+                            except Exception:
+                                n1 = n2 = None
+                            if n1 is None or n2 is None:
+                                new_links.append(lk); continue
+                            pair = tuple(sorted((n1, n2)))
+                            if pair == key:
+                                continue
+                            new_links.append(lk)
+                        session.links = new_links
+                except Exception:
+                    pass
 
-                for r in router_objs:
-                    rid = r.id
-                    host_ids = list(router_host_ids.get(rid, []))
-                    random.shuffle(host_ids)
-                    # Aggregated Exact semantics: if Exact mode with single target (r2s_ratio==1), create one switch and attach ALL hosts
-                    if r2s_mode == 'Exact' and r2s_ratio == 1 and host_ids:
-                        # Remove any existing direct / LAN links for these hosts
-                        for h_sel in host_ids:
-                            if host_direct_link.get(h_sel):
-                                _remove_link(h_sel, rid)
-                            lan_sw_id = lan_switch_by_router.get(rid)
-                            if lan_sw_id:
-                                _remove_link(h_sel, lan_sw_id)
-                            host_direct_link[h_sel] = False
-                        sx = r_positions[rid-1][0] + random.randint(50, 100)
-                        sy = r_positions[rid-1][1] + random.randint(50, 100)
-                        r2s_seq[rid] = r2s_seq.get(rid, 0) + 1
-                        seq = r2s_seq[rid]
-                        logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, f"rsw-{rid}-{seq}", _type_desc(NodeType.SWITCH), sx, sy)
-                        sw_node = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=Position(x=sx, y=sy), name=f"rsw-{rid}-{seq}")
-                        try: setattr(sw_node, 'model', 'switch')
-                        except Exception: pass
-                        node_id_counter += 1
-                        # Router-switch /30
-                        seg_net = subnet_alloc.next_random_subnet(30)
-                        seg_hosts = list(seg_net.hosts())
-                        if len(seg_hosts) >= 2:
-                            r_ip = str(seg_hosts[0]); sw_ip = str(seg_hosts[1])
-                            r_ifid = router_next_ifid.get(rid, 0); router_next_ifid[rid] = r_ifid + 1
-                            r_base = f"r{rid}-rsw{seq}-if{r_ifid}"
-                            nameset = router_iface_names.setdefault(rid, set())
-                            if r_base in nameset:
-                                sidx = 1
-                                while f"{r_base}-{sidx}" in nameset: sidx += 1
-                                r_base = f"{r_base}-{sidx}"
-                            nameset.add(r_base)
-                            r_if = Interface(id=r_ifid, name=r_base, ip4=r_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
-                            sw_if = Interface(id=0, name=f"rsw{seq}-r{rid}", ip4=sw_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
-                            safe_add_link(session, sw_node, r, iface1=sw_if, iface2=r_if)
-                        # Host LAN: choose subnet large enough for all hosts + switch ip
-                        import math as _math
-                        needed = len(host_ids) + 1  # switch + hosts
-                        # find prefix so that usable hosts (2^(32-prefix)-2) >= needed
-                        for host_bits in range(1, 17):  # up to /15 (2^(17) hosts) safety
-                            total = 2 ** host_bits
-                            if total - 2 >= needed:
-                                prefix = 32 - host_bits
-                                break
-                        else:
-                            prefix = 16
-                        try:
-                            lan_net2 = subnet_alloc.next_random_subnet(prefix)
-                        except Exception:
-                            lan_net2 = ipaddress.ip_network(f"10.253.{rid}.0/{prefix}", strict=False)
-                        lan2_hosts = list(lan_net2.hosts())
-                        if len(lan2_hosts) < (len(host_ids) + 1):
-                            # Fallback widen to /16 if insufficient
-                            try:
-                                lan_net2 = subnet_alloc.next_random_subnet(16)
-                                lan2_hosts = list(lan_net2.hosts())
-                            except Exception:
-                                lan_net2 = ipaddress.ip_network(f"10.252.{rid}.0/16", strict=False)
-                                lan2_hosts = list(lan_net2.hosts())
-                        gateway_ip = str(lan2_hosts[0]) if lan2_hosts else None
-                        # Attach each host
-                        for h_index, h_sel in enumerate(host_ids):
-                            try:
-                                h_obj = host_nodes_by_id.get(h_sel)
-                                if not h_obj: continue
-                                hip = str(lan2_hosts[h_index + 1]) if h_index + 1 < len(lan2_hosts) else None
-                                if not hip: break
-                                next_if = host_next_ifid.get(h_sel, 1)
-                                h_if = Interface(id=next_if, name=f"eth{next_if}", ip4=hip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
-                                host_next_ifid[h_sel] = next_if + 1
-                                sw_l_if = Interface(id=h_index+1, name=f"rsw{seq}-h{h_sel}-if{h_index+1}", ip4=gateway_ip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
-                                safe_add_link(session, h_obj, sw_node, iface1=h_if, iface2=sw_l_if)
-                            except Exception:
-                                pass
-                        r2s_counts[rid] += 1
-                        rehomed_hosts.extend(host_ids)
-                        continue  # move to next router (skip pair-based logic)
-                    # Determine target switches based on mode
-                    if r2s_mode == 'Exact' and r2s_ratio > 0:
-                        max_switches = min(r2s_ratio, len(host_ids)//2)
-                    elif r2s_mode == 'Min':
-                        max_switches = 1 if len(host_ids) >= 2 else 0
-                    elif r2s_mode == 'Uniform':
-                        import math as _math
-                        max_switches = min(len(host_ids)//2, max(1, int(_math.ceil(len(host_ids)/4))))
-                    elif r2s_mode == 'NonUniform':
-                        import math as _math
-                        max_switches = random.randint(0, max(0, int(_math.ceil(len(host_ids)/3))))
-                    elif r2s_mode == 'Random':
-                        if random.random() < 0.5:
-                            max_switches = min(len(host_ids)//2, 1)
-                        else:
-                            max_switches = 0
-                    else:  # ratio fallback
-                        max_switches = min(r2s_ratio, len(host_ids)//2)
-                    if max_switches <= 0:
-                        continue
-                    for _ in range(max_switches):
-                        if len(host_ids) < 2:
-                            break
-                        h_a = host_ids.pop()
-                        h_b = host_ids.pop()
-                        # Remove direct or LAN links (LAN unlikely here because deferred) for these hosts
-                        for h_sel in (h_a, h_b):
-                            if host_direct_link.get(h_sel):
-                                _remove_link(h_sel, rid)
-                            lan_sw_id = lan_switch_by_router.get(rid)
-                            if lan_sw_id:
-                                _remove_link(h_sel, lan_sw_id)
-                            host_direct_link[h_sel] = False
-                        # Create switch
-                        sx = r_positions[rid-1][0] + random.randint(50, 100)
-                        sy = r_positions[rid-1][1] + random.randint(50, 100)
-                        r2s_seq[rid] = r2s_seq.get(rid, 0) + 1
-                        seq = r2s_seq[rid]
-                        logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, f"rsw-{rid}-{seq}", _type_desc(NodeType.SWITCH), sx, sy)
-                        sw_node = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=Position(x=sx, y=sy), name=f"rsw-{rid}-{seq}")
-                        try: setattr(sw_node, 'model', 'switch')
-                        except Exception: pass
-                        node_id_counter += 1
-                        # Router-switch /30
-                        seg_net = subnet_alloc.next_random_subnet(30)
-                        seg_hosts = list(seg_net.hosts())
-                        if len(seg_hosts) < 2:
-                            try:
-                                if hasattr(session, 'delete_node'): session.delete_node(sw_node.id)  # type: ignore
-                            except Exception: pass
-                            continue
+            for r in router_objs:
+                rid = r.id
+                host_ids = list(router_host_ids.get(rid, []))
+                random.shuffle(host_ids)
+                # Aggregated Exact semantics: if Exact mode with single target (r2s_ratio==1), create one switch and attach ALL hosts
+                if r2s_mode == 'Exact' and r2s_ratio == 1 and host_ids:
+                    # Remove any existing direct / LAN links for these hosts
+                    for h_sel in host_ids:
+                        if host_direct_link.get(h_sel):
+                            _remove_link(h_sel, rid)
+                        lan_sw_id = lan_switch_by_router.get(rid)
+                        if lan_sw_id:
+                            _remove_link(h_sel, lan_sw_id)
+                        host_direct_link[h_sel] = False
+                    sx = r_positions[rid-1][0] + random.randint(50, 100)
+                    sy = r_positions[rid-1][1] + random.randint(50, 100)
+                    r2s_seq[rid] = r2s_seq.get(rid, 0) + 1
+                    seq = r2s_seq[rid]
+                    logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, f"rsw-{rid}-{seq}", _type_desc(NodeType.SWITCH), sx, sy)
+                    sw_node = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=Position(x=sx, y=sy), name=f"rsw-{rid}-{seq}")
+                    try: setattr(sw_node, 'model', 'switch')
+                    except Exception: pass
+                    node_id_counter += 1
+                    # Router-switch /30
+                    seg_net = subnet_alloc.next_random_subnet(30)
+                    seg_hosts = list(seg_net.hosts())
+                    if len(seg_hosts) >= 2:
                         r_ip = str(seg_hosts[0]); sw_ip = str(seg_hosts[1])
                         r_ifid = router_next_ifid.get(rid, 0); router_next_ifid[rid] = r_ifid + 1
                         r_base = f"r{rid}-rsw{seq}-if{r_ifid}"
@@ -2235,73 +2130,182 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                         r_if = Interface(id=r_ifid, name=r_base, ip4=r_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
                         sw_if = Interface(id=0, name=f"rsw{seq}-r{rid}", ip4=sw_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
                         safe_add_link(session, sw_node, r, iface1=sw_if, iface2=r_if)
-                        # Host LAN dynamic sizing (/30+/28+/27... with 25% headroom over (hosts + 2 infra))
-                        def _lan_prefix_for_hosts(count: int, reserve: int = 2, cap: int = 24) -> int:
-                            needed = int((count + reserve) * 1.25 + 0.9999)
-                            for p in range(30, cap + 1):  # /30 smallest up to /24
-                                size = 1 << (32 - p)
-                                usable = size - 2
-                                if usable >= needed:
-                                    return p
-                            return cap
-                        lan_pref = _lan_prefix_for_hosts(2)  # this segment always two hosts (h_a, h_b)
-                        lan_net2 = subnet_alloc.next_random_subnet(lan_pref)
-                        lan2_hosts = list(lan_net2.hosts())
-                        if len(lan2_hosts) < 3:  # need gateway + 2 hosts
-                            try:
-                                if hasattr(session, 'delete_link'): session.delete_link(node1_id=sw_node.id, node2_id=rid)  # type: ignore
-                            except Exception: pass
-                            try:
-                                if hasattr(session, 'delete_node'): session.delete_node(sw_node.id)  # type: ignore
-                            except Exception: pass
-                            continue
-                        for idx_h, h_sel in enumerate([h_a, h_b]):
-                            try:
-                                h_obj = host_nodes_by_id.get(h_sel)
-                                if not h_obj: continue
-                                hip = str(lan2_hosts[idx_h+1])
-                                next_if = host_next_ifid.get(h_sel, 1)
-                                h_if = Interface(id=next_if, name=f"eth{next_if}", ip4=hip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
-                                host_next_ifid[h_sel] = next_if + 1
-                                sw_l_if = Interface(id=idx_h+1, name=f"rsw{seq}-h{h_sel}-if{idx_h+1}", ip4=str(lan2_hosts[0]), ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
-                                safe_add_link(session, h_obj, sw_node, iface1=h_if, iface2=sw_l_if)
-                            except Exception:
-                                pass
-                        r2s_counts[rid] += 1
-                        rehomed_hosts.extend([h_a, h_b])
-                # Persist stats
-                try:
-                    topo_stats = getattr(session, 'topo_stats', {}) or {}
-                    rs_stats = _int_list_stats(list(r2s_counts.values())) if r2s_counts else {"min":0,"max":0,"avg":0.0,"std":0.0,"gini":0.0}
-                    # Adopt unified Exact semantics: target switches per router (integer/float accepted)
-                    # Compute saturation: how many pairs of hosts were available vs consumed for switch regrouping.
+                    # Host LAN: choose subnet large enough for all hosts + switch ip
+                    import math as _math
+                    needed = len(host_ids) + 1  # switch + hosts
+                    # find prefix so that usable hosts (2^(32-prefix)-2) >= needed
+                    for host_bits in range(1, 17):  # up to /15 (2^(17) hosts) safety
+                        total = 2 ** host_bits
+                        if total - 2 >= needed:
+                            prefix = 32 - host_bits
+                            break
+                    else:
+                        prefix = 16
                     try:
-                        total_pairs_possible = sum(len(v)//2 for v in router_host_ids.values())
+                        lan_net2 = subnet_alloc.next_random_subnet(prefix)
                     except Exception:
-                        total_pairs_possible = 0
-                    host_pairs_consumed = len(rehomed_hosts)//2
-                    saturation = 0.0
-                    if total_pairs_possible > 0:
-                        saturation = round(host_pairs_consumed / total_pairs_possible, 3)
-                    topo_stats['r2s_policy'] = {
-                        'mode': 'Exact',
-                        'target_per_router': float(r2s_ratio),
-                        'target': float(r2s_ratio),  # backward compat
-                        'counts': r2s_counts,
-                        'count_min': rs_stats['min'], 'count_max': rs_stats['max'], 'count_avg': rs_stats['avg'], 'count_std': rs_stats['std'], 'count_gini': rs_stats['gini'],
-                        'rehomed_hosts': rehomed_hosts,
-                        'host_pairs_consumed': host_pairs_consumed,
-                        'host_pairs_possible': total_pairs_possible,
-                        'saturation': saturation,
-                    }
-                    if r2s_counts:
-                        topo_stats['r2s_policy']['display_min_count'] = rs_stats['min']
-                        topo_stats['r2s_policy']['display_max_count'] = rs_stats['max']
-                    setattr(session, 'topo_stats', topo_stats)
+                        lan_net2 = ipaddress.ip_network(f"10.253.{rid}.0/{prefix}", strict=False)
+                    lan2_hosts = list(lan_net2.hosts())
+                    if len(lan2_hosts) < (len(host_ids) + 1):
+                        # Fallback widen to /16 if insufficient
+                        try:
+                            lan_net2 = subnet_alloc.next_random_subnet(16)
+                            lan2_hosts = list(lan_net2.hosts())
+                        except Exception:
+                            lan_net2 = ipaddress.ip_network(f"10.252.{rid}.0/16", strict=False)
+                            lan2_hosts = list(lan_net2.hosts())
+                    gateway_ip = str(lan2_hosts[0]) if lan2_hosts else None
+                    # Attach each host
+                    for h_index, h_sel in enumerate(host_ids):
+                        try:
+                            h_obj = host_nodes_by_id.get(h_sel)
+                            if not h_obj: continue
+                            hip = str(lan2_hosts[h_index + 1]) if h_index + 1 < len(lan2_hosts) else None
+                            if not hip: break
+                            next_if = host_next_ifid.get(h_sel, 1)
+                            h_if = Interface(id=next_if, name=f"eth{next_if}", ip4=hip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                            host_next_ifid[h_sel] = next_if + 1
+                            sw_l_if = Interface(id=h_index+1, name=f"rsw{seq}-h{h_sel}-if{h_index+1}", ip4=gateway_ip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                            safe_add_link(session, h_obj, sw_node, iface1=h_if, iface2=sw_l_if)
+                        except Exception:
+                            pass
+                    r2s_counts[rid] += 1
+                    rehomed_hosts.extend(host_ids)
+                    continue  # move to next router (skip pair-based logic)
+                # Determine target switches based on mode
+                if r2s_mode == 'Exact' and r2s_ratio > 0:
+                    max_switches = min(r2s_ratio, len(host_ids)//2)
+                elif r2s_mode == 'Min':
+                    max_switches = 1 if len(host_ids) >= 2 else 0
+                elif r2s_mode == 'Uniform':
+                    import math as _math
+                    max_switches = min(len(host_ids)//2, max(1, int(_math.ceil(len(host_ids)/4))))
+                elif r2s_mode == 'NonUniform':
+                    import math as _math
+                    max_switches = random.randint(0, max(0, int(_math.ceil(len(host_ids)/3))))
+                elif r2s_mode == 'Random':
+                    if random.random() < 0.5:
+                        max_switches = min(len(host_ids)//2, 1)
+                    else:
+                        max_switches = 0
+                else:  # ratio fallback
+                    max_switches = min(r2s_ratio, len(host_ids)//2)
+                if max_switches <= 0:
+                    continue
+                for _ in range(max_switches):
+                    if len(host_ids) < 2:
+                        break
+                    h_a = host_ids.pop()
+                    h_b = host_ids.pop()
+                    # Remove direct or LAN links (LAN unlikely here because deferred) for these hosts
+                    for h_sel in (h_a, h_b):
+                        if host_direct_link.get(h_sel):
+                            _remove_link(h_sel, rid)
+                        lan_sw_id = lan_switch_by_router.get(rid)
+                        if lan_sw_id:
+                            _remove_link(h_sel, lan_sw_id)
+                        host_direct_link[h_sel] = False
+                    # Create switch
+                    sx = r_positions[rid-1][0] + random.randint(50, 100)
+                    sy = r_positions[rid-1][1] + random.randint(50, 100)
+                    r2s_seq[rid] = r2s_seq.get(rid, 0) + 1
+                    seq = r2s_seq[rid]
+                    logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, f"rsw-{rid}-{seq}", _type_desc(NodeType.SWITCH), sx, sy)
+                    sw_node = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=Position(x=sx, y=sy), name=f"rsw-{rid}-{seq}")
+                    try: setattr(sw_node, 'model', 'switch')
+                    except Exception: pass
+                    node_id_counter += 1
+                    # Router-switch /30
+                    seg_net = subnet_alloc.next_random_subnet(30)
+                    seg_hosts = list(seg_net.hosts())
+                    if len(seg_hosts) < 2:
+                        try:
+                            if hasattr(session, 'delete_node'): session.delete_node(sw_node.id)  # type: ignore
+                        except Exception: pass
+                        continue
+                    r_ip = str(seg_hosts[0]); sw_ip = str(seg_hosts[1])
+                    r_ifid = router_next_ifid.get(rid, 0); router_next_ifid[rid] = r_ifid + 1
+                    r_base = f"r{rid}-rsw{seq}-if{r_ifid}"
+                    nameset = router_iface_names.setdefault(rid, set())
+                    if r_base in nameset:
+                        sidx = 1
+                        while f"{r_base}-{sidx}" in nameset: sidx += 1
+                        r_base = f"{r_base}-{sidx}"
+                    nameset.add(r_base)
+                    r_if = Interface(id=r_ifid, name=r_base, ip4=r_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
+                    sw_if = Interface(id=0, name=f"rsw{seq}-r{rid}", ip4=sw_ip, ip4_mask=seg_net.prefixlen, mac=mac_alloc.next_mac())
+                    safe_add_link(session, sw_node, r, iface1=sw_if, iface2=r_if)
+                    # Host LAN dynamic sizing (/30+/28+/27... with 25% headroom over (hosts + 2 infra))
+                    def _lan_prefix_for_hosts(count: int, reserve: int = 2, cap: int = 24) -> int:
+                        needed = int((count + reserve) * 1.25 + 0.9999)
+                        for p in range(30, cap + 1):  # /30 smallest up to /24
+                            size = 1 << (32 - p)
+                            usable = size - 2
+                            if usable >= needed:
+                                return p
+                        return cap
+                    lan_pref = _lan_prefix_for_hosts(2)  # this segment always two hosts (h_a, h_b)
+                    lan_net2 = subnet_alloc.next_random_subnet(lan_pref)
+                    lan2_hosts = list(lan_net2.hosts())
+                    if len(lan2_hosts) < 3:  # need gateway + 2 hosts
+                        try:
+                            if hasattr(session, 'delete_link'): session.delete_link(node1_id=sw_node.id, node2_id=rid)  # type: ignore
+                        except Exception: pass
+                        try:
+                            if hasattr(session, 'delete_node'): session.delete_node(sw_node.id)  # type: ignore
+                        except Exception: pass
+                        continue
+                    for idx_h, h_sel in enumerate([h_a, h_b]):
+                        try:
+                            h_obj = host_nodes_by_id.get(h_sel)
+                            if not h_obj: continue
+                            hip = str(lan2_hosts[idx_h+1])
+                            next_if = host_next_ifid.get(h_sel, 1)
+                            h_if = Interface(id=next_if, name=f"eth{next_if}", ip4=hip, ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                            host_next_ifid[h_sel] = next_if + 1
+                            sw_l_if = Interface(id=idx_h+1, name=f"rsw{seq}-h{h_sel}-if{idx_h+1}", ip4=str(lan2_hosts[0]), ip4_mask=lan_net2.prefixlen, mac=mac_alloc.next_mac())
+                            safe_add_link(session, h_obj, sw_node, iface1=h_if, iface2=sw_l_if)
+                        except Exception:
+                            pass
+                    r2s_counts[rid] += 1
+                    rehomed_hosts.extend([h_a, h_b])
+            # Persist stats
+            try:
+                topo_stats = getattr(session, 'topo_stats', {}) or {}
+                rs_stats = _int_list_stats(list(r2s_counts.values())) if r2s_counts else {"min":0,"max":0,"avg":0.0,"std":0.0,"gini":0.0}
+                # Adopt unified Exact semantics: target switches per router (integer/float accepted)
+                # Compute saturation: how many pairs of hosts were available vs consumed for switch regrouping.
+                try:
+                    total_pairs_possible = sum(len(v)//2 for v in router_host_ids.values())
                 except Exception:
-                    pass
-        except Exception:
-            logger.exception("R-to-S ratio policy application failed")
+                    total_pairs_possible = 0
+                host_pairs_consumed = len(rehomed_hosts)//2
+                saturation = 0.0
+                if total_pairs_possible > 0:
+                    saturation = round(host_pairs_consumed / total_pairs_possible, 3)
+                applied_mode = r2s_mode
+                if applied_mode not in ('Exact', 'Uniform', 'Min', 'NonUniform', 'Random'):
+                    applied_mode = 'Ratio' if r2s_ratio > 0 else 'Off'
+                topo_stats['r2s_policy'] = {
+                    'mode': applied_mode,
+                    'mode_requested': r2s_mode,
+                    'target_per_router': float(r2s_ratio),
+                    'target': float(r2s_ratio),  # backward compat
+                    'counts': r2s_counts,
+                    'count_min': rs_stats['min'], 'count_max': rs_stats['max'], 'count_avg': rs_stats['avg'], 'count_std': rs_stats['std'], 'count_gini': rs_stats['gini'],
+                    'rehomed_hosts': rehomed_hosts,
+                    'host_pairs_consumed': host_pairs_consumed,
+                    'host_pairs_possible': total_pairs_possible,
+                    'saturation': saturation,
+                }
+                if r2s_counts:
+                    topo_stats['r2s_policy']['display_min_count'] = rs_stats['min']
+                    topo_stats['r2s_policy']['display_max_count'] = rs_stats['max']
+                setattr(session, 'topo_stats', topo_stats)
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("R-to-S ratio policy application failed")
 
     # Post-pass cleanup: ensure no host remains connected to both an original LAN switch (lan-*) and a rehome switch (rsw-*).
     try:
