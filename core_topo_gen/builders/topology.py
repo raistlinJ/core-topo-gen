@@ -820,6 +820,66 @@ def _grid_positions(count: int, cols: Optional[int] = None, cell_w: int = 800, c
     return positions
 
 
+def _random_int_partition(total: int, parts: int, min_each: int = 0) -> List[int]:
+    """Randomly partition an integer total into `parts` buckets.
+
+    Ensures each bucket is at least min_each (clamped when infeasible) and that
+    the returned list sums to `total`. Remaining units are distributed based on
+    random weights with deterministic ordering by fractional remainder so that
+    callers can rely on seeded pseudo-randomness.
+    """
+    if parts <= 0:
+        return []
+    min_each = max(0, min_each)
+    if total <= 0:
+        return [0 for _ in range(parts)]
+    if min_each * parts > total:
+        min_each = 0
+    counts = [min_each] * parts
+    remaining = total - min_each * parts
+    if remaining <= 0:
+        return counts
+    weights = [random.random() + 0.01 for _ in range(parts)]
+    sum_w = sum(weights)
+    fractional: List[Tuple[float, int]] = []
+    for idx, w in enumerate(weights):
+        exact = (remaining * w) / sum_w if sum_w > 0 else 0.0
+        floor_val = int(math.floor(exact))
+        counts[idx] += floor_val
+        fractional.append((exact - floor_val, idx))
+    current = sum(counts)
+    if current < total:
+        fractional.sort(key=lambda t: t[0], reverse=True)
+        idx_cycle = 0
+        while current < total and idx_cycle < len(fractional):
+            _, idx = fractional[idx_cycle]
+            counts[idx] += 1
+            current += 1
+            idx_cycle += 1
+        while current < total:
+            idx = random.randrange(parts)
+            counts[idx] += 1
+            current += 1
+    elif current > total:
+        fractional.sort(key=lambda t: t[0])
+        idx_cycle = 0
+        while current > total and idx_cycle < len(fractional):
+            _, idx = fractional[idx_cycle]
+            if counts[idx] > min_each:
+                counts[idx] -= 1
+                current -= 1
+            idx_cycle += 1
+        while current > total:
+            idx = random.randrange(parts)
+            if counts[idx] > min_each:
+                counts[idx] -= 1
+                current -= 1
+            else:
+                break
+    random.shuffle(counts)
+    return counts
+
+
 def _ensure_router_iface_name(router_iface_names: Dict[int, Set[str]], router_id: int, base: str) -> str:
     names = router_iface_names.setdefault(router_id, set())
     if base not in names:
@@ -1842,11 +1902,22 @@ def build_segmented_topology(core: client.CoreGrpcClient,
     for role, count in role_counts.items():
         expanded_roles.extend([role] * count)
 
-    # Shuffle roles for variety, then assign round-robin to balance across routers
     random.shuffle(expanded_roles)
-    buckets: List[List[str]] = [[] for _ in range(router_count)]
-    for idx, role in enumerate(expanded_roles):
-        buckets[idx % router_count].append(role)
+    min_each = 1 if router_count > 0 and len(expanded_roles) >= router_count else 0
+    counts = _random_int_partition(len(expanded_roles), router_count, min_each=min_each)
+    buckets: List[List[str]] = []
+    cursor = 0
+    for c in counts:
+        if c <= 0:
+            buckets.append([])
+            continue
+        next_cursor = min(len(expanded_roles), cursor + c)
+        buckets.append(expanded_roles[cursor:next_cursor])
+        cursor = next_cursor
+    if len(buckets) < router_count:
+        buckets.extend([[] for _ in range(router_count - len(buckets))])
+    if cursor < len(expanded_roles) and buckets:
+        buckets[-1].extend(expanded_roles[cursor:])
 
     hosts: List[NodeInfo] = []
     # Track mapping host->router and whether currently directly connected (True) or will later be regrouped
@@ -1865,11 +1936,12 @@ def build_segmented_topology(core: client.CoreGrpcClient,
             continue
         if len(roles) == 1:
             role = roles[0]
-            # offset around router
-            theta = 0.0
-            r = max(60, int(random.gauss(host_radius_mean, host_radius_jitter)))
-            x = int(rx + r * math.cos(theta))
-            y = int(ry + r * math.sin(theta))
+            theta = random.random() * math.tau
+            radius_center = host_radius_mean + random.uniform(-host_radius_jitter * 0.3, host_radius_jitter * 0.3)
+            radius_sigma = max(15, host_radius_jitter * random.uniform(0.5, 0.9))
+            r = max(60, int(random.gauss(radius_center, radius_sigma)))
+            x = int(rx + r * math.cos(theta) + random.uniform(-20, 20))
+            y = int(ry + r * math.sin(theta) + random.uniform(-20, 20))
             node_type = map_role_to_node_type(role)
             name = f"{role.lower()}-{ridx+1}-1"
             if node_type == NodeType.DEFAULT:
@@ -1957,11 +2029,20 @@ def build_segmented_topology(core: client.CoreGrpcClient,
                     pass
         else:
             # Multi-host group: create hosts directly (temporarily) off the router; we'll regroup after R2S.
+            roles = list(roles)
+            random.shuffle(roles)
+            base_angle = random.random() * math.tau
+            angle_step = math.tau / max(len(roles), 1)
+            angle_jitter = math.tau / max(len(roles) * 6, 18)
+            angles = [base_angle + angle_step * idx + random.uniform(-angle_jitter, angle_jitter) for idx in range(len(roles))]
+            random.shuffle(angles)
             for j, role in enumerate(roles):
-                theta = (2 * math.pi * j) / len(roles)
-                r = max(80, int(random.gauss(host_radius_mean + 10 * math.sqrt(len(roles)), host_radius_jitter)))
-                x = int(rx + r * math.cos(theta))
-                y = int(ry + r * math.sin(theta))
+                theta = angles[j % len(angles)] if angles else random.random() * math.tau
+                radius_center = host_radius_mean + 10 * math.sqrt(len(roles)) + random.uniform(-host_radius_jitter * 0.2, host_radius_jitter * 0.2)
+                radius_sigma = max(25, host_radius_jitter * random.uniform(0.5, 1.1))
+                r = max(80, int(random.gauss(radius_center, radius_sigma)))
+                x = int(rx + r * math.cos(theta) + random.uniform(-30, 30))
+                y = int(ry + r * math.sin(theta) + random.uniform(-30, 30))
                 node_type = map_role_to_node_type(role)
                 name = f"{role.lower()}-{ridx+1}-{j+1}"
                 if node_type == NodeType.DEFAULT:
