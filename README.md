@@ -288,6 +288,16 @@ The front‑end does not persist previews server‑side; history is stored local
 
 Experimental structural metadata (Services / Traffic / Segmentation): the XML builder also emits `explicit_count`, `weight_rows`, `count_rows`, and `weight_sum` for these sections to support future additive extensions and analytical tooling.
 
+To inspect generated traffic or segmentation scripts without leaving the UI, use:
+
+```
+GET /api/open_scripts?kind=traffic&scope=runtime
+GET /api/open_script_file?kind=traffic&scope=runtime&file=traffic_run.py
+GET /api/download_scripts?kind=segmentation&scope=preview
+```
+
+These endpoints surface the files written under `/tmp/traffic` or `/tmp/segmentation` (runtime runs) and the latest temporary preview directories, returning JSON listings, truncated file content, or a ZIP archive suitable for reuse.
+
 Schema documentation: see `SCENARIO_XML_SCHEMA.md` for a human-readable summary and examples; machine validation via `validation/scenarios.xsd`.
 
 ## Router Connectivity & Switch Aggregation Policies

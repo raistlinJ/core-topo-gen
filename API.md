@@ -150,6 +150,29 @@ Scenario editor & runs
     - Host grouping bounds supplied in the XML via `r2s_hosts_min` / `r2s_hosts_max` (NonUniform R2S) appear under `r2s_policy_preview.per_router_bounds` and in each grouping entry.
     - Exact aggregation (`r2s_mode=Exact` & `r2s_edges=1`) produces one switch per router with all its hosts; bounds are ignored for this mode.
 
+
+Script inspection & downloads
+
+- GET `/api/open_scripts`
+  - Query params:
+    - `kind` (`traffic`|`segmentation`, default `traffic`)
+    - `scope` (`runtime`|`preview`, default `runtime`)
+  - Returns JSON `{ ok, kind, path, files }` listing available generated scripts.
+  - Runtime scope targets `/tmp/traffic` or `/tmp/segmentation`. Preview scope resolves the most recent `core-topo-preview-*` temp directory.
+
+- GET `/api/open_script_file`
+  - Query params:
+    - `kind` (`traffic`|`segmentation`)
+    - `scope` (`runtime`|`preview`)
+    - `file` (filename within the selected directory)
+  - Returns JSON `{ ok, file, path, content, truncated }` with up to 8KB of script content for quick inspection.
+
+- GET `/api/download_scripts`
+  - Query params:
+    - `kind` (`traffic`|`segmentation`)
+    - `scope` (`runtime`|`preview`)
+  - Streams a ZIP download containing the filtered `.py` and `.json` artifacts for the requested scope.
+
 CORE management
 
 - GET `/core`
