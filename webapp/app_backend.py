@@ -149,6 +149,17 @@ def _reports_dir() -> str:
     os.makedirs(d, exist_ok=True)
     return d
 
+
+def _derive_default_seed(xml_hash: str) -> int:
+    try:
+        seed_val = int(xml_hash[:12], 16)
+        seed_val %= (2**31 - 1)
+        if seed_val <= 0:
+            seed_val = 97531
+        return seed_val
+    except Exception:
+        return 1357911
+
 # Additional helper dirs (stubs restored after accidental removal)
 def _traffic_dir() -> str:
     d = os.path.join(_outputs_dir(), 'traffic')
@@ -2721,6 +2732,8 @@ def api_plan_preview_full():
                 save_plan_to_cache(xml_hash, scenario, seed, plan)
             except Exception as ce:
                 app.logger.debug('[plan.preview_full] cache save failed: %s', ce)
+        if seed is None:
+            seed = plan.get('seed') or _derive_default_seed(xml_hash)
         full_prev = _build_full_preview_from_plan(plan, seed, r2s_hosts_min_list, r2s_hosts_max_list)
         return jsonify({'ok': True, 'full_preview': full_prev, 'plan': plan, 'breakdowns': plan.get('breakdowns')})
     except Exception as e:
@@ -2778,7 +2791,9 @@ def plan_full_preview_page():
                     app.logger.debug('[plan.full_preview_page] cache save failed: %s', cache_save_err)
                 except Exception:
                     pass
-        full_prev = _build_full_preview_from_plan(plan, seed)
+        if seed is None:
+            seed = plan.get('seed') or _derive_default_seed(xml_hash or hash_xml_file(xml_path))
+        full_prev = _build_full_preview_from_plan(plan, seed, [], [])
         display_artifacts = full_prev.get('display_artifacts')
         if not display_artifacts:
             try:

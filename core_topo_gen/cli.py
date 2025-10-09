@@ -5,7 +5,14 @@ import logging
 import random
 import os
 from typing import Any, Dict, Tuple
-from core.api.grpc import client
+
+try:  # pragma: no cover - exercised indirectly via CLI subprocess tests
+    from core.api.grpc import client  # type: ignore
+    CORE_GRPC_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover - fallback path executed in CI without CORE
+    client = None  # type: ignore
+    CORE_GRPC_AVAILABLE = False
+from .types import NodeInfo
 from .parsers.node_info import parse_node_info
 from .parsers.routing import parse_routing_info
 from .parsers.traffic import parse_traffic_info
@@ -60,6 +67,179 @@ def _load_preview_plan(path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if not isinstance(full_preview, dict):
         raise ValueError(f"Preview plan at {path} is missing a 'full_preview' object")
     return payload, full_preview
+
+
+def _run_offline_report(
+    args: argparse.Namespace,
+    role_counts: Dict[str, int],
+    routing_items,
+    services,
+    orchestrated_plan: Dict[str, Any],
+    generation_meta: Dict[str, Any],
+) -> int:
+    """Generate a scenario report without requiring the CORE gRPC library."""
+
+    logging.warning(
+        "core.api.grpc not available; running topology generation in offline report-only mode"
+    )
+
+    from ipaddress import ip_network
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    report_dir = os.path.join(repo_root, "reports")
+    os.makedirs(report_dir, exist_ok=True)
+
+    network = None
+    prefix = getattr(args, "prefix", "10.0.0.0/24")
+    try:
+        network = ip_network(prefix, strict=False)
+    except Exception:
+        network = ip_network("10.0.0.0/24", strict=False)
+
+    def _next_ip(seq):
+        try:
+            value = next(seq)
+        except StopIteration:
+            return "0.0.0.0/0"
+        return f"{value}/{network.prefixlen}"
+
+    ip_iter = iter(network.hosts())
+    hosts = []
+    node_id = 1
+    # Stable iteration order for deterministic reports
+    for role, count in sorted(role_counts.items()):
+        for _ in range(max(0, count)):
+            hosts.append(NodeInfo(node_id=node_id, ip4=_next_ip(ip_iter), role=role))
+            node_id += 1
+
+    planned_router_count = orchestrated_plan.get('routers_planned')
+    if planned_router_count is None:
+        try:
+            planned_router_count = orchestrated_plan.get('breakdowns', {}).get('router', {}).get('final_router_count')
+        except Exception:
+            planned_router_count = None
+    if planned_router_count is None:
+        planned_router_count = 0
+    routers = []
+    router_protocols: Dict[int, list[str]] = {}
+    if planned_router_count:
+        item_protocols = [ri.protocol for ri in (routing_items or []) if getattr(ri, 'protocol', None)]
+        if not item_protocols:
+            item_protocols = ['Router']
+        for idx in range(int(planned_router_count)):
+            proto = item_protocols[idx % len(item_protocols)]
+            routers.append(NodeInfo(node_id=node_id, ip4=_next_ip(ip_iter), role="Router"))
+            router_protocols[node_id] = [proto]
+            node_id += 1
+
+    switches = [1] if hosts or routers else []
+    service_assignments: Dict[int, list[str]] = {}
+
+    # Reuse existing helpers to parse additional configuration for the report
+    routing_cfg = {
+        "density": None,
+        "items": [{"protocol": getattr(ri, 'protocol', None), "factor": getattr(ri, 'factor', 0.0)} for ri in (routing_items or [])],
+    }
+    try:
+        routing_density, _ = parse_routing_info(args.xml, args.scenario)
+        routing_cfg["density"] = routing_density
+    except Exception:
+        pass
+
+    traffic_density = None
+    traffic_items = []
+    try:
+        traffic_density, traffic_items = parse_traffic_info(args.xml, args.scenario)
+    except Exception:
+        traffic_density = None
+        traffic_items = []
+    traffic_cfg = {
+        "density": traffic_density,
+        "items": [{
+            "kind": getattr(i, 'kind', ''),
+            "factor": getattr(i, 'factor', 0.0),
+            "pattern": getattr(i, 'pattern', ''),
+            "rate_kbps": getattr(i, 'rate_kbps', 0.0),
+            "period_s": getattr(i, 'period_s', 0.0),
+            "jitter_pct": getattr(i, 'jitter_pct', 0.0),
+            "content_type": getattr(i, 'content_type', ''),
+        } for i in (traffic_items or [])],
+    }
+
+    services_cfg = [
+        {"name": getattr(s, 'name', ''), "factor": getattr(s, 'factor', 0.0), "density": getattr(s, 'density', 0.0)}
+        for s in (services or [])
+    ]
+
+    try:
+        vuln_density, vuln_items = parse_vulnerabilities_info(args.xml, args.scenario)
+    except Exception:
+        vuln_density, vuln_items = None, []
+    vulnerabilities_cfg = {"density": vuln_density, "items": vuln_items or []}
+
+    try:
+        seg_density, seg_items = parse_segmentation_info(args.xml, args.scenario)
+    except Exception:
+        seg_density, seg_items = None, []
+    segmentation_cfg = {
+        "density": seg_density,
+        "items": [
+            {"name": getattr(i, 'name', ''), "factor": getattr(i, 'factor', 0.0)}
+            for i in (seg_items or [])
+        ] if seg_items else [],
+    }
+
+    # Attach XML metadata for the report summary (consistent with main path)
+    try:
+        xml_path_meta = os.path.abspath(args.xml)
+        generation_meta.setdefault('xml_path', xml_path_meta)
+        if 'xml_schema_classification' not in generation_meta:
+            import xml.etree.ElementTree as _ET
+            rt = _ET.parse(xml_path_meta).getroot()
+            tagl = rt.tag.lower()
+            if 'scenarios' in tagl:
+                generation_meta['xml_schema_classification'] = 'scenario'
+            elif 'scenarioeditor' in tagl:
+                generation_meta['xml_schema_classification'] = 'editor'
+            elif 'scenario' in tagl:
+                generation_meta['xml_schema_classification'] = 'session'
+            else:
+                generation_meta['xml_schema_classification'] = 'unknown'
+            if rt.find('.//container') is not None:
+                generation_meta['xml_container_flag'] = True
+    except Exception:
+        pass
+
+    from datetime import datetime as _dt
+
+    report_dir = os.path.join(repo_root, "reports")
+    os.makedirs(report_dir, exist_ok=True)
+    report_path = os.path.join(report_dir, f"scenario_report_{_dt.now().strftime('%Y%m%d-%H%M%S-%f')}.md")
+
+    write_report(
+        report_path,
+        args.scenario,
+        routers=routers,
+        router_protocols=router_protocols,
+        switches=switches,
+        hosts=hosts,
+        service_assignments=service_assignments,
+        traffic_summary_path=None,
+        segmentation_summary_path=None,
+        metadata=generation_meta,
+        routing_cfg=routing_cfg,
+        traffic_cfg=traffic_cfg,
+        services_cfg=services_cfg,
+        segmentation_cfg=segmentation_cfg,
+        vulnerabilities_cfg=vulnerabilities_cfg,
+    )
+
+    logging.info("Scenario report written to %s", report_path)
+    try:
+        print(f"Scenario report written to {report_path}", flush=True)
+    except Exception:
+        pass
+    return 0
 
 
 def main():
@@ -382,16 +562,6 @@ def main():
     except Exception:
         pass
 
-    core = client.CoreGrpcClient(address=f"{args.host}:{args.port}")
-    # Wrap with a logging proxy to trace all gRPC calls
-    try:
-        from .utils.grpc_logging import wrap_core_client
-        core = wrap_core_client(core, logging.getLogger("core_topo_gen.grpc"))
-    except Exception:
-        pass
-    logging.info("[grpc] CoreGrpcClient.connect() -> %s:%s", args.host, args.port)
-    core.connect()
-
     scenario_name = args.scenario
     generation_meta = {
         "host": args.host,
@@ -452,6 +622,26 @@ def main():
                 })
     except Exception:
         pass
+
+    if not CORE_GRPC_AVAILABLE:
+        return _run_offline_report(
+            args,
+            role_counts,
+            routing_items,
+            services,
+            orchestrated_plan,
+            generation_meta,
+        )
+
+    core = client.CoreGrpcClient(address=f"{args.host}:{args.port}")
+    # Wrap with a logging proxy to trace all gRPC calls
+    try:
+        from .utils.grpc_logging import wrap_core_client
+        core = wrap_core_client(core, logging.getLogger("core_topo_gen.grpc"))
+    except Exception:
+        pass
+    logging.info("[grpc] CoreGrpcClient.connect() -> %s:%s", args.host, args.port)
+    core.connect()
     # Pre-parse vulnerabilities to plan docker-compose assignments mapped to host slots (reuse orchestrator raw)
     docker_slot_plan: dict | None = None
     try:

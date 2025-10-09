@@ -118,9 +118,6 @@ Popular options:
 ## Additional documentation
 - [API.md](./API.md) – REST endpoints exposed by the Web UI backend
 - [SCENARIO_XML_SCHEMA.md](./SCENARIO_XML_SCHEMA.md) – Schema walkthrough and examples
-- [MIGRATION.md](./MIGRATION.md) – Notes on breaking changes and upgrade paths
-- [CHANGELOG.md](./CHANGELOG.md) – Release notes and key fixes
-- [TODO.md](./TODO.md) – Active backlog items
 
 ## Contributing
 Pull requests and issue reports are welcome! Please run the relevant pytest targets (`pytest -q`) before submitting changes and keep documentation up to date when behaviour changes.

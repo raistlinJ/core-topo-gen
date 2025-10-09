@@ -5,8 +5,44 @@ import math
 import random
 import logging
 import ipaddress
-from core.api.grpc import client
-from core.api.grpc.wrappers import NodeType, Position, Interface
+
+try:  # pragma: no cover - offline mode exercised via CLI tests
+    from core.api.grpc import client  # type: ignore
+    from core.api.grpc.wrappers import NodeType, Position, Interface  # type: ignore
+    CORE_GRPC_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover
+    CORE_GRPC_AVAILABLE = False
+
+    class _DummyCoreClient:
+        def __init__(self, *_, **__):  # noqa: D401 - minimal placeholder
+            raise RuntimeError("core.api.grpc is not installed; CORE operations are unavailable")
+
+    import types as _types
+    client = _types.SimpleNamespace(CoreGrpcClient=_DummyCoreClient)  # type: ignore[attr-defined]
+
+    class _NodeTypeValue:
+        def __init__(self, name: str):
+            self.name = name
+
+        def __repr__(self) -> str:  # pragma: no cover - debug aid
+            return self.name
+
+    class NodeType:  # type: ignore
+        DEFAULT = _NodeTypeValue("DEFAULT")
+        SWITCH = _NodeTypeValue("SWITCH")
+        ROUTER = _NodeTypeValue("ROUTER")
+        DOCKER = _NodeTypeValue("DOCKER")
+
+    class Position:  # type: ignore
+        def __init__(self, x: int = 0, y: int = 0, z: int = 0):
+            self.x = x
+            self.y = y
+            self.z = z
+
+    class Interface:  # type: ignore
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
 
 from ..types import NodeInfo, ServiceInfo, RoutingInfo
 from ..utils.allocators import UniqueAllocator, SubnetAllocator, make_subnet_allocator
@@ -310,7 +346,7 @@ def _router_node_type():
     return NodeType.DEFAULT
 
 
-def build_star_from_roles(core: client.CoreGrpcClient,
+def build_star_from_roles(core,
                           role_counts: Dict[str, int],
                           services: Optional[List[ServiceInfo]] = None,
                           ip4_prefix: str = "10.0.0.0/24",
@@ -516,7 +552,7 @@ def build_star_from_roles(core: client.CoreGrpcClient,
     return session, switch, node_infos, service_assignments, docker_by_name
 
 
-def build_multi_switch_topology(core: client.CoreGrpcClient,
+def build_multi_switch_topology(core,
                                 role_counts: Dict[str, int],
                                 services: Optional[List[ServiceInfo]] = None,
                                 ip4_prefix: str = "10.0.0.0/24",
@@ -905,7 +941,7 @@ def _ensure_router_iface_name(router_iface_names: Dict[int, Set[str]], router_id
 
 
 def _try_build_segmented_topology_from_preview(
-    core: client.CoreGrpcClient,
+    core,
     services: Optional[List[ServiceInfo]],
     routing_items: List[RoutingInfo],
     ip4_prefix: str,
@@ -1442,7 +1478,7 @@ def _try_build_segmented_topology_from_preview(
     return session, routers_info, [ni for ni in hosts_info], {k: v for k, v in host_service_assignments.items()}, {k: v for k, v in router_protocols.items()}, docker_by_name
 
 
-def build_segmented_topology(core: client.CoreGrpcClient,
+def build_segmented_topology(core,
                              role_counts: Dict[str, int],
                              routing_density: float,
                              routing_items: List[RoutingInfo],
