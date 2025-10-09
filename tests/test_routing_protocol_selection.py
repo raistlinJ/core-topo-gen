@@ -1,6 +1,6 @@
 import os, tempfile
 import xml.etree.ElementTree as ET
-from core_topo_gen.parsers.xml_parser import parse_routing_info
+from core_topo_gen.parsers.routing import parse_routing_info
 
 XML_TMPL = """<Scenarios><Scenario name='p'><ScenarioEditor>
   <section name='Node Information'>

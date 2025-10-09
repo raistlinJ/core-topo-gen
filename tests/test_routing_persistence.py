@@ -1,7 +1,7 @@
 import textwrap
 import tempfile
 import os
-from core_topo_gen.parsers.xml_parser import parse_routing_info
+from core_topo_gen.parsers.routing import parse_routing_info
 
 XML = textwrap.dedent(
     """<Scenarios>

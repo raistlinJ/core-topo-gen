@@ -60,6 +60,15 @@ def write_report(
     seg_rules: List[dict] = []
     if segmentation_summary_path and os.path.exists(segmentation_summary_path):
         seg_rules = _read_segmentation_summary(segmentation_summary_path)
+    # Allow verification (optional)
+    allow_verify: Dict[str, object] | None = None
+    try:
+        av_path = "/tmp/segmentation/allow_verification.json"
+        if os.path.exists(av_path):
+            with open(av_path, 'r', encoding='utf-8') as avf:
+                allow_verify = json.load(avf)
+    except Exception:
+        allow_verify = None
 
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     total_nodes = len(routers) + len(hosts) + len(switches)
@@ -67,38 +76,15 @@ def write_report(
     lines: List[str] = []
     lines.append(f"# Scenario Report")
     lines.append("")
-    # Plan Summary (phased builder)
+    # Drift notes (legacy phased summary removed)
     try:
-        plan_summary = None
         if metadata:
-            plan_summary = metadata.get('plan_summary') or metadata.get('planSummary')
-        if isinstance(plan_summary, dict) and plan_summary:
-            lines.append("## Plan Summary (Phased Build)")
-            try:
-                # Show key resource alignment
-                lines.append(f"- Hosts planned: {plan_summary.get('hosts_total')} | allocated: {plan_summary.get('hosts_allocated')}")
-                lines.append(f"- Routers planned: {plan_summary.get('routers_planned')} | allocated: {plan_summary.get('routers_allocated')}")
-                if plan_summary.get('r2s_ratio_used') is not None:
-                    lines.append(f"- R2S ratio used: {plan_summary.get('r2s_ratio_used')}")
-                if plan_summary.get('switches_allocated') is not None:
-                    lines.append(f"- Switches allocated: {plan_summary.get('switches_allocated')}")
-                if plan_summary.get('vulnerabilities_plan'):
-                    vt = sum((plan_summary.get('vulnerabilities_plan') or {}).values())
-                    lines.append(f"- Vulnerabilities planned: {vt} | assigned: {plan_summary.get('vulnerabilities_assigned')}")
-                if plan_summary.get('r2r_policy'):
-                    rp = plan_summary.get('r2r_policy') or {}
-                    mode = rp.get('mode') or 'n/a'
-                    tdeg = rp.get('target_degree') or 0
-                    lines.append(f"- R2R policy: mode={mode} target_degree={tdeg}")
-            except Exception:
-                pass
-            # Drift details if present
-            drift = plan_summary.get('plan_drift') or metadata.get('plan_drift') or metadata.get('preview_drift')
+            drift = metadata.get('plan_drift') or metadata.get('preview_drift')
             if drift:
-                lines.append("### Plan / Preview Drift")
+                lines.append("## Planning Drift")
                 for v in drift:
                     lines.append(f"- {v}")
-            lines.append("")
+                lines.append("")
     except Exception:
         pass
     if scenario_name:
@@ -136,6 +122,9 @@ def write_report(
     lines.append(f"- Routers: {len(routers)}  |  Switches: {len(switches)}  |  Hosts: {len(hosts)}")
     lines.append(f"- Traffic flows: {len(flows)}")
     lines.append(f"- Segmentation rules: {len(seg_rules)}")
+    if allow_verify:
+        bc = allow_verify.get('blocked_count') or 0
+        lines.append(f"- Flow verification blocked: {bc} (see allow_verification.json)")
     try:
         if metadata and metadata.get('segmentation_preview_rules') and not seg_rules:
             lines.append(f"- Segmentation (preview injected): {len(metadata.get('segmentation_preview_rules') or [])}")
@@ -284,6 +273,9 @@ def write_report(
             lines.append("## Router-to-Switch Connectivity")
             mode = r2s.get('mode')
             tgt = r2s.get('target_per_router') or r2s.get('target')
+            req_mode = r2s.get('mode_requested')
+            if req_mode and req_mode != mode:
+                lines.append(f"- Requested mode: {req_mode}")
             if mode == 'Exact' and tgt is not None:
                 lines.append(f"- Policy: Exact (target switches per router={tgt})")
             else:
@@ -510,6 +502,20 @@ def write_report(
                 )
             )
         lines.append("")
+        # Insert flow verification detail right after segmentation rules if available
+        if allow_verify:
+            lines.append("### Flow Allow Verification")
+            lines.append(f"- Total flows examined: {allow_verify.get('flows_total')}")
+            lines.append(f"- Blocked after allow synthesis: {allow_verify.get('blocked_count')}")
+            b_list = allow_verify.get('blocked') or []
+            if b_list:
+                lines.append("| Proto | Dst IP | Port |")
+                lines.append("| --- | --- | ---: |")
+                for b in b_list[:25]:  # cap display
+                    lines.append(f"| {b.get('proto','').upper()} | {b.get('dst_ip','')} | {b.get('dst_port','')} |")
+                if len(b_list) > 25:
+                    lines.append(f"(truncated {len(b_list)-25} more)")
+            lines.append("")
 
     # Optional Details section (extra info grouped at end)
     if any([metadata, routing_cfg, traffic_cfg, services_cfg, segmentation_cfg, vulnerabilities_cfg]):

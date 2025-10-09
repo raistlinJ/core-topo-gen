@@ -13,24 +13,10 @@
 </head>
 <body class="bg-light">
   <div class="container py-5">
-    <nav class="navbar navbar-expand bg-light border rounded shadow-sm mb-4 px-2 py-1">
-      <ul class="navbar-nav me-auto mb-0 small">
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('index') }}">Scenarios</a></li>
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('data_sources_page') }}">Vulnerability Sources</a></li>
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('reports_page') }}">Reports</a></li>
-  <li class="nav-item"><a class="nav-link core-link" href="{{ url_for('core_page') }}"><i class="bi bi-diagram-3-fill"></i> CORE</a></li>
-      </ul>
-      {% if current_user and current_user.role == 'admin' %}
-      <div class="d-flex align-items-center gap-2">
-        <div class="dropdown">
-          <button class="btn btn-sm btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">Settings</button>
-          <ul class="dropdown-menu dropdown-menu-end">
-            <li><a class="dropdown-item" href="{{ url_for('users_page') }}">Users</a></li>
-          </ul>
-        </div>
-      </div>
-      {% endif %}
-    </nav>
+    <div class="text-center mb-4">
+      <h1 class="fw-bold text-primary">CORE TopoGen</h1>
+      <p class="text-muted mb-0">Sign in to manage scenarios and reports.</p>
+    </div>
     <div class="row justify-content-center">
       <div class="col-md-4">
         <div class="card shadow-sm">
@@ -55,9 +41,7 @@
               <button type="submit" class="btn btn-primary w-100">Sign In</button>
             </form>
           </div>
-          <div class="card-footer small text-muted">
-            If this is your first run, a default admin user was created. Check server logs for the generated password, or set ADMIN_PASSWORD.
-          </div>
+          <!-- Footer removed per request -->
         </div>
       </div>
     </div>

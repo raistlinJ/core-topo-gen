@@ -1,3 +1,35 @@
+### /api/plan/preview_full (POST)
+Returns unified full preview (routers, hosts, IP allocations, segmentation placeholder) without building a CORE session.
+
+Request JSON:
+{
+  "xml_path": "/abs/path/to/scenarios.xml",
+  "scenario": "Optional Scenario Name",
+  "seed": 1234
+}
+
+Response JSON:
+{
+  "ok": true,
+  "full_preview": { ... },
+  "plan": {  # orchestrator root with role_counts, routers_planned, service_plan, vulnerability_plan, segmentation_plan, traffic_plan
+    "role_counts": {"Workstation": 12, ...},
+    "routers_planned": 3,
+    ...
+  },
+  "breakdowns": {  # per-section breakdowns
+    "node": { ... },
+    "router": {"has_weight_based_items": true, ...},
+    "services": { ... },
+    "vulnerabilities": { ... },
+    "segmentation": { ... },
+    "traffic": { ... }
+  }
+}
+
+Notes:
+- Plans are cached on disk (outputs/plan_cache.json) keyed by (xml_hash, scenario, seed). Set TOPO_PLAN_CACHE_PATH to override location.
+- Router count, service allocations, vulnerability density pool, and segmentation item serialization are single-sourced from the orchestrator.
 # HTTP API Reference (Flask)
 
 This document describes the HTTP endpoints exposed by the Web GUI backend (`webapp/app_backend.py`). Use these for automation and integrations.
@@ -117,6 +149,29 @@ Scenario editor & runs
     - If `seed` omitted, a random seed is generated and returned so clients can rerun with identical topology decisions.
     - Host grouping bounds supplied in the XML via `r2s_hosts_min` / `r2s_hosts_max` (NonUniform R2S) appear under `r2s_policy_preview.per_router_bounds` and in each grouping entry.
     - Exact aggregation (`r2s_mode=Exact` & `r2s_edges=1`) produces one switch per router with all its hosts; bounds are ignored for this mode.
+
+
+Script inspection & downloads
+
+- GET `/api/open_scripts`
+  - Query params:
+    - `kind` (`traffic`|`segmentation`, default `traffic`)
+    - `scope` (`runtime`|`preview`, default `runtime`)
+  - Returns JSON `{ ok, kind, path, files }` listing available generated scripts.
+  - Runtime scope targets `/tmp/traffic` or `/tmp/segmentation`. Preview scope resolves the most recent `core-topo-preview-*` temp directory.
+
+- GET `/api/open_script_file`
+  - Query params:
+    - `kind` (`traffic`|`segmentation`)
+    - `scope` (`runtime`|`preview`)
+    - `file` (filename within the selected directory)
+  - Returns JSON `{ ok, file, path, content, truncated }` with up to 8KB of script content for quick inspection.
+
+- GET `/api/download_scripts`
+  - Query params:
+    - `kind` (`traffic`|`segmentation`)
+    - `scope` (`runtime`|`preview`)
+  - Streams a ZIP download containing the filtered `.py` and `.json` artifacts for the requested scope.
 
 CORE management
 
@@ -317,10 +372,11 @@ Optional section attributes written by the Web UI for additive planning round-tr
 
 Parsing helper (server-side or external tooling):
 ```python
-from core_topo_gen.parsers.xml_parser import parse_planning_metadata
+from core_topo_gen.parsers.planning_metadata import parse_planning_metadata
 meta = parse_planning_metadata('outputs/scenarios-123/scenarios.xml', 'Scenario 1')
 print(meta['node_info']['combined_nodes'])
 ```
+Note: the legacy `core_topo_gen.parsers.xml_parser` module was removed (2025-10); import the specific section module instead.
 Fallback: If attributes are absent (legacy XML), parsing gracefully recomputes approximate values from existing elements.
 
 Experimental (Services / Traffic / Segmentation):

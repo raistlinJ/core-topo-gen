@@ -15,6 +15,9 @@ def _call_create_session(core: Any, session_id: Optional[int] = None) -> Any:
     Tries different keyword names across CORE client versions, falling back to no-arg.
     Returns the created session object or raises the exception from the client.
     """
+    # Some test stubs only expose add_session(); support that.
+    if not hasattr(core, 'create_session') and hasattr(core, 'add_session'):
+        return core.add_session()
     if session_id is None:
         return core.create_session()
     # Try known kwarg names first; fall back to no-arg if unsupported
@@ -102,4 +105,7 @@ def safe_create_session(core: Any, max_attempts: int = 5) -> Any:
     if last_err is not None:
         raise last_err
     # Should not reach here; fallback to no-arg call
+    # Final fallback: if create_session missing but add_session present (test stubs)
+    if hasattr(core, 'add_session'):
+        return core.add_session()
     return core.create_session()

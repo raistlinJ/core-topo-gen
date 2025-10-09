@@ -48,6 +48,7 @@
     const zoomBehavior = d3.zoom().scaleExtent([0.15,6]).on('zoom', ev=> { g.attr('transform', ev.transform); updateMiniMapViewport(ev.transform); });
     svg.call(zoomBehavior);
 
+    const vulnerabilityColor = '#28a745';
     const typeColor = d3.scaleOrdinal()
       .domain(['router','switch','hub','wlan','host','pc','server'])
       .range(['#d9534f','#f0ad4e','#5bc0de','#5cb85c','#0275d8','#6610f2','#6f42c1']);
@@ -92,7 +93,16 @@
       .attr('x', d => -(70 + Math.min(100, (d.services||[]).length * 8)) / 2)
       .attr('y', d => -(36 + Math.min(24, (d.services||[]).length * 1.2)) / 2)
       .attr('rx',6).attr('ry',6)
-      .attr('fill', d => typeColor((d.type||'').toLowerCase()))
+      .attr('fill', d => {
+        const t = (d.type||'').toLowerCase();
+        const vulnList = Array.isArray(d.vulnerabilities) ? d.vulnerabilities
+          : (d.metadata && Array.isArray(d.metadata.vulnerabilities) ? d.metadata.vulnerabilities : []);
+        const hasVuln = (Array.isArray(vulnList) && vulnList.length > 0) || !!d.hasVuln;
+        if(hasVuln && (t === 'host' || t === 'pc' || t === 'server')){
+          return vulnerabilityColor;
+        }
+        return typeColor(t);
+      })
       .attr('stroke','#222')
       .attr('stroke-width',1.2)
       .on('click', (ev,d)=>{
@@ -129,12 +139,29 @@
     function showTooltip(d, x, y){
       if(!tooltipEl) return;
       const svcList = (d.services||[]);
+      const ifaceList = Array.isArray(d.interfaces) ? d.interfaces : [];
       const lines = [];
       lines.push(`<strong>${(d.name||'')} (${d.id})</strong>`);
       if(svcList.length){
         svcList.forEach(s => lines.push(s));
       } else {
         lines.push('<em>No Services</em>');
+      }
+      if(ifaceList.length){
+        lines.push('<span class="text-muted">Interfaces</span>');
+        ifaceList.slice(0, 4).forEach(iface => {
+          const parts = [];
+          if(iface.name){ parts.push(iface.name); }
+          if(iface.mac){ parts.push(iface.mac); }
+          const addrParts = [];
+          if(iface.ipv4){ addrParts.push(`${iface.ipv4}${iface.ipv4_mask ? '/' + iface.ipv4_mask : ''}`); }
+          if(iface.ipv6){ addrParts.push(`${iface.ipv6}${iface.ipv6_mask ? '/' + iface.ipv6_mask : ''}`); }
+          if(addrParts.length){ parts.push(addrParts.join(' | ')); }
+          if(parts.length){ lines.push(parts.join(' • ')); }
+        });
+        if(ifaceList.length > 4){
+          lines.push(`(+${ifaceList.length - 4} more)`);
+        }
       }
       tooltipEl.innerHTML = lines.join('<br>');
       tooltipEl.classList.remove('hidden');
@@ -180,7 +207,14 @@
       const degreePerType = new Map();
       links.forEach(l=>{ const inc=(idx)=>{ const t=(nodes[idx].type||'').toLowerCase(); if(!t) return; const s=degreePerType.get(t)||0; degreePerType.set(t,s+1); }; inc(l.source.index??l.source); inc(l.target.index??l.target); });
       const types = Array.from(new Set(nodes.map(n => (n.type||'').toLowerCase()))).filter(Boolean).sort();
-      legendEl.innerHTML = types.map(t => {
+      const hasVulnerableHosts = nodes.some(n => {
+        const t = (n.type||'').toLowerCase();
+        if(!(t === 'host' || t === 'pc' || t === 'server')) return false;
+        const vulnList = Array.isArray(n.vulnerabilities) ? n.vulnerabilities
+          : (n.metadata && Array.isArray(n.metadata.vulnerabilities) ? n.metadata.vulnerabilities : []);
+        return (Array.isArray(vulnList) && vulnList.length > 0) || !!n.hasVuln;
+      });
+      let legendHtml = types.map(t => {
         const nodeCount = nodes.filter(n => (n.type||'').toLowerCase()===t).length;
         const deg = degreePerType.get(t)||0;
         const isSwitch = t === 'switch';
@@ -189,6 +223,11 @@
           : `display:inline-block;width:12px;height:12px;border:1px solid #222;background:${typeColor(t)}`;
         return `<span class="d-flex align-items-center gap-1"><span style="${swatchStyle}"></span>${t}<span class="text-muted" style="font-size:.65rem;">(nodes:${nodeCount}, links:${deg})</span></span>`;
       }).join(' ');
+      if(hasVulnerableHosts){
+        const vulnSwatch = `<span class="d-flex align-items-center gap-1"><span style="display:inline-block;width:12px;height:12px;border:1px solid #222;background:${vulnerabilityColor}"></span>host (vulnerable)</span>`;
+        legendHtml = legendHtml ? `${legendHtml} ${vulnSwatch}` : vulnSwatch;
+      }
+      legendEl.innerHTML = legendHtml;
     }
 
   simulation.on('tick', () => { updatePositions(); });

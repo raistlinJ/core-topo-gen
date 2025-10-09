@@ -29,9 +29,8 @@
         <div class="d-flex flex-column flex-sm-row align-items-sm-center gap-2">
           <div class="btn-group btn-group-sm">
             <a class="btn btn-outline-secondary" href="{{ url_for('download_report') }}?path={{ xml_path | urlencode }}">Download XML</a>
-            <button class="btn btn-outline-primary" id="createPlanBtn" type="button" data-xml="{{ xml_path }}" title="Compute a plan (direct from XML, no persistence)">Create Plan</button>
           </div>
-          <div class="small text-muted">Plan approval disabled (plan derived live from XML)</div>
+          <div class="small text-muted">Generate Full Previews from the Scenarios page.</div>
         </div>
       {% endif %}
     </div>
@@ -54,6 +53,7 @@
         <div class="card-header"><strong>Summary</strong></div>
         <div class="card-body">
           <ul class="mb-0">
+            <li>File classification: {{ classification|default('unknown')|title }}</li>
             <li>Nodes: {{ summary.nodes_count or summary.devices_count or 0 }}</li>
             {% if summary.switches_count is defined %}
             <li>Switches: {{ summary.switches_count }}{% if summary.switches and summary.switches|length>0 %} ({{ summary.switches|join(', ') }}){% endif %}</li>
@@ -153,7 +153,11 @@
         {% if summary.nodes and summary.nodes|length > 0 %}
           {% for node in summary.nodes %}
             {% set nid = 'node' ~ loop.index %}
-            {% set searchtext = (node.name ~ ' ' ~ node.id ~ ' ' ~ (node.type or '') ~ ' ' ~ (node.services|join(' ')) ~ ' ' ~ (node.linked_nodes|join(' '))) %}
+            {% set iface_ns = namespace(val='') %}
+            {% for iface in node.interfaces or [] %}
+              {% set iface_ns.val = iface_ns.val ~ ' ' ~ (iface.name or '') ~ ' ' ~ (iface.mac or '') ~ ' ' ~ (iface.ipv4 or '') ~ ' ' ~ (iface.ipv6 or '') %}
+            {% endfor %}
+            {% set searchtext = (node.name ~ ' ' ~ node.id ~ ' ' ~ (node.type or '') ~ ' ' ~ (node.services|join(' ')) ~ ' ' ~ (node.linked_nodes|join(' ')) ~ ' ' ~ iface_ns.val) %}
             <div class="accordion-item" data-search="{{ searchtext|lower|e }}" data-node-id="{{ node.id }}">
               <h2 class="accordion-header" id="heading-{{ nid }}">
                 <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapse-{{ nid }}" aria-expanded="false" aria-controls="collapse-{{ nid }}">
@@ -163,13 +167,13 @@
               <div id="collapse-{{ nid }}" class="accordion-collapse collapse" aria-labelledby="heading-{{ nid }}">
                 <div class="accordion-body">
                   <div class="row g-3">
-                    <div class="col-md-3">
+                    <div class="col-lg-3 col-md-6">
                       <div class="card h-100" data-card="type">
                         <div class="card-header"><strong>Node Type</strong></div>
                         <div class="card-body" data-role="node-type"><span class="badge bg-secondary">{{ node.type or 'N/A' }}</span></div>
                       </div>
                     </div>
-                    <div class="col-md-5">
+                    <div class="col-lg-3 col-md-6">
                       <div class="card h-100" data-card="linked">
                         <div class="card-header"><strong>Linked Nodes</strong></div>
                         <div class="card-body">
@@ -185,7 +189,7 @@
                         </div>
                       </div>
                     </div>
-                    <div class="col-md-4">
+                    <div class="col-lg-3 col-md-6">
                       <div class="card h-100" data-card="services">
                         <div class="card-header"><strong>Services</strong></div>
                         <div class="card-body" data-role="service-badges">
@@ -195,6 +199,27 @@
                                 <span class="badge text-bg-info service-item">{{ s }}</span>
                               {% endfor %}
                             </div>
+                          {% else %}
+                            <em>None</em>
+                          {% endif %}
+                        </div>
+                      </div>
+                    </div>
+                    <div class="col-lg-3 col-md-6">
+                      <div class="card h-100" data-card="addresses">
+                        <div class="card-header"><strong>Addresses</strong></div>
+                        <div class="card-body" data-role="addresses-list">
+                          {% if node.interfaces and node.interfaces|length > 0 %}
+                            <ul class="list-unstyled mb-0">
+                              {% for iface in node.interfaces %}
+                                <li class="address-item mb-2">
+                                  <div class="small fw-semibold">{{ iface.name or 'iface ' ~ loop.index }}</div>
+                                  {% if iface.mac %}<div class="small text-muted">{{ iface.mac }}</div>{% endif %}
+                                  {% if iface.ipv4 %}<div class="small">IPv4: {{ iface.ipv4 }}{% if iface.ipv4_mask %}/{{ iface.ipv4_mask }}{% endif %}</div>{% endif %}
+                                  {% if iface.ipv6 %}<div class="small">IPv6: {{ iface.ipv6 }}{% if iface.ipv6_mask %}/{{ iface.ipv6_mask }}{% endif %}</div>{% endif %}
+                                </li>
+                              {% endfor %}
+                            </ul>
                           {% else %}
                             <em>None</em>
                           {% endif %}
@@ -233,29 +258,6 @@
 {% block extra_scripts %}
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 <script src="{{ url_for('static', filename='core_graph.js') }}"></script>
-<div class="modal fade" id="planModal" tabindex="-1" aria-labelledby="planModalLabel" aria-hidden="true">
-  <div class="modal-dialog modal-lg modal-dialog-scrollable">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h5 class="modal-title" id="planModalLabel">Plan Preview</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
-      </div>
-      <div class="modal-body">
-        <div id="planLoading" class="text-muted">Computing plan...</div>
-        <pre id="planJson" class="small bg-light p-2 border rounded d-none" style="max-height:420px; overflow:auto; font-size:0.7rem;"></pre>
-        <div id="planViolationsWrap" class="mt-2 d-none">
-          <div class="alert alert-warning py-2 mb-0"><strong>Violations Detected</strong>
-            <ul id="planViolationsList" class="mb-0 small"></ul>
-          </div>
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-        <button type="button" class="btn btn-success d-none" id="modalApproveBtn">Approve Plan</button>
-      </div>
-    </div>
-  </div>
-</div>
 {% if summary and (summary.nodes or summary.switches or summary.switch_nodes) %}
   {% set base_nodes = summary.nodes or [] %}
   {% set extra_switch_nodes = [] %}
@@ -331,6 +333,7 @@
         const typeText = (item.querySelector('[data-role="node-type"]')?.textContent || '').toLowerCase();
         const linkedList = item.querySelector('[data-role="linked-nodes-list"]');
         const serviceWrap = item.querySelector('[data-role="service-badges"]');
+        const addrList = item.querySelector('[data-role="addresses-list"]');
         let match = false;
         if (q === '') { match = true; }
         else if (headerText.includes(q) || typeText.includes(q)) { match = true; }
@@ -345,6 +348,11 @@
               if (((b.textContent || '').toLowerCase()).includes(q)) { match = true; break; }
             }
           }
+          if (!match && addrList) {
+            for (const li of Array.from(addrList.querySelectorAll('.address-item'))) {
+              if (((li.textContent || '').toLowerCase()).includes(q)) { match = true; break; }
+            }
+          }
         }
         if (match) {
           item.classList.remove('d-none');
@@ -354,6 +362,9 @@
           const svcCard = item.querySelector('[data-card="services"]');
           if (svcCard) svcCard.classList.remove('d-none');
           if (serviceWrap) Array.from(serviceWrap.querySelectorAll('.service-item')).forEach(b => b.classList.remove('d-none'));
+          const addrCard = item.querySelector('[data-card="addresses"]');
+          if (addrCard) addrCard.classList.remove('d-none');
+          if (addrList) Array.from(addrList.querySelectorAll('.address-item')).forEach(li => li.classList.remove('d-none'));
           shown += 1;
         } else {
           item.classList.add('d-none');
@@ -382,67 +393,6 @@
     expandAllBtn?.addEventListener('click', expandAll);
     collapseAllBtn?.addEventListener('click', collapseAll);
     applyFilter();
-  })();
-  </script>
-  <script>
-  (function(){
-    const createBtn = document.getElementById('createPlanBtn');
-    const approveBtn = document.getElementById('approvePlanBtn');
-    const runBtn = document.getElementById('runWithPlanBtn');
-    const approvedInput = document.getElementById('approvedPlanPathInput');
-    const modalApproveBtn = document.getElementById('modalApproveBtn');
-    const planJsonEl = document.getElementById('planJson');
-    const planLoadingEl = document.getElementById('planLoading');
-    const planViolWrap = document.getElementById('planViolationsWrap');
-    const planViolList = document.getElementById('planViolationsList');
-    const approvedStatus = document.getElementById('approvedPlanStatus');
-    const viewApprovedBtn = document.getElementById('viewApprovedPlanBtn');
-    const delApprovedBtn = document.getElementById('deleteApprovedPlanBtn');
-    let currentPlanPath = null; // preview path
-    let approvedPlanPath = approvedInput?.value || null;
-    function showModal(){
-      const mEl = document.getElementById('planModal');
-      if (!mEl) return; (new bootstrap.Modal(mEl)).show();
-    }
-    function hydrateApprovedState(){
-      if(!approvedPlanPath){ return; }
-      if(runBtn){ runBtn.classList.remove('d-none'); runBtn.disabled=false; }
-    }
-    hydrateApprovedState();
-    function computePlan(){
-      // Legacy plan preview removed; instruct user to use full preview feature.
-      planJsonEl.classList.remove('d-none');
-      planJsonEl.textContent = 'Lightweight plan preview removed. Use Full Preview workflow.';
-      planLoadingEl.classList.add('d-none');
-      planViolWrap.classList.add('d-none');
-      approveBtn.classList.add('d-none');
-      modalApproveBtn.classList.add('d-none');
-      showModal();
-    }
-    function approvePlan(){
-      if(!currentPlanPath) return; approveBtn.disabled=true; modalApproveBtn.disabled=true;
-      fetch('/api/plan/approve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ plan_path: currentPlanPath, xml_path: createBtn.getAttribute('data-xml') }) })
-        .then(r=>r.json())
-        .then(data=>{
-          approveBtn.disabled=false; modalApproveBtn.disabled=false;
-          if(!data.ok){ alert('Plan approval failed: ' + (data.error||'')); return; }
-          const approvedPath = data.approved_path; approvedInput.value = approvedPath; runBtn.classList.remove('d-none'); runBtn.disabled=false; approveBtn.classList.add('d-none'); modalApproveBtn.classList.add('d-none');
-          approvedPlanPath = approvedPath;
-          if(approvedStatus){ approvedStatus.classList.remove('text-muted'); approvedStatus.classList.add('text-success'); approvedStatus.innerHTML = '<span class="me-1">Approved plan ready</span><button type="button" class="btn btn-link btn-sm p-0 align-baseline" id="viewApprovedPlanBtn">view</button><button type="button" class="btn btn-link btn-sm text-danger p-0 ms-2 align-baseline" id="deleteApprovedPlanBtn" title="Delete approved plan">delete</button>'; }
-          try { planJsonEl.insertAdjacentHTML('beforebegin','<div class="alert alert-success py-1 mb-2">Plan approved.</div>'); } catch(e){}
-          wireApprovedPlanButtons();
-        }).catch(err=>{ approveBtn.disabled=false; modalApproveBtn.disabled=false; alert('Approve error: '+err); });
-    }
-    function wireApprovedPlanButtons(){
-      const vBtn = document.getElementById('viewApprovedPlanBtn');
-      const dBtn = document.getElementById('deleteApprovedPlanBtn');
-      if(vBtn){ vBtn.onclick = ()=>{ if(!approvedPlanPath){ return; } fetch('/api/plan/status?xml_path='+encodeURIComponent(createBtn.getAttribute('data-xml'))).then(r=>r.json()).then(d=>{ if(d.plan_summary){ planJsonEl.textContent = JSON.stringify(d.plan_summary,null,2); planJsonEl.classList.remove('d-none'); planViolWrap.classList.add('d-none'); planLoadingEl.classList.add('d-none'); showModal(); } else { alert('No plan summary available'); } }); } }
-      if(dBtn){ dBtn.onclick = ()=>{ if(!approvedPlanPath) return; if(!confirm('Delete approved plan?')) return; fetch('/api/plan/delete', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ plan_path: approvedPlanPath }) }).then(r=>r.json()).then(resp=>{ if(resp.ok){ approvedPlanPath=null; approvedInput.value=''; runBtn.classList.add('d-none'); runBtn.disabled=true; approvedStatus.classList.remove('text-success'); approvedStatus.classList.add('text-muted'); approvedStatus.textContent='No approved plan'; } else { alert('Delete failed: '+(resp.error||'')); } }); } }
-    }
-    wireApprovedPlanButtons();
-    createBtn?.addEventListener('click', computePlan);
-    approveBtn?.addEventListener('click', approvePlan);
-    modalApproveBtn?.addEventListener('click', approvePlan);
   })();
   </script>
   {% endblock %}

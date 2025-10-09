@@ -10,6 +10,8 @@ import time
 import uuid
 import threading
 from typing import Dict, Any
+from collections import defaultdict
+from types import SimpleNamespace
 import subprocess
 import sys
 import re
@@ -27,6 +29,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from pathlib import Path
 
 ALLOWED_EXTENSIONS = {'xml'}
+
+FULL_PREVIEW_ARTIFACT_VERSION = 2
 
 """Flask web backend for core-topo-gen.
 
@@ -233,54 +237,83 @@ def diag_modules():
         out['planning_import_error'] = str(e)
 
 def _current_user() -> dict | None:
-    u = session.get('user')
-    if not u:
-        return None
-    return { 'username': u.get('username'), 'role': u.get('role') }
+    user = session.get('user')
+    if isinstance(user, dict) and user.get('username'):
+        return user
+    return None
 
 
-@app.context_processor
-def _inject_user():
-    return { 'current_user': _current_user() }
-
-
-def _path_exempt_from_auth(path: str) -> bool:
-    if path in ('/login', '/logout', '/healthz', '/save_xml_api'):
-        return True
-    if path.startswith('/static/'):
-        return True
-    return False
+def _set_current_user(user: dict | None) -> None:
+    if user:
+        session['user'] = {
+            'username': user.get('username'),
+            'role': user.get('role', 'user')
+        }
+    else:
+        session.pop('user', None)
 
 
 @app.before_request
-def _require_login():
+def _inject_current_user() -> None:
     try:
         g.current_user = _current_user()
-        if _path_exempt_from_auth(request.path):
+    except Exception:
+        g.current_user = None
+
+
+@app.context_processor
+def _inject_template_user() -> dict:
+    try:
+        user = _current_user()
+        if user:
+            return {
+                'current_user': SimpleNamespace(
+                    username=user.get('username'),
+                    role=user.get('role', 'user'),
+                    is_authenticated=True,
+                )
+            }
+    except Exception:
+        pass
+    return {
+        'current_user': SimpleNamespace(
+            username=None,
+            role=None,
+            is_authenticated=False,
+        )
+    }
+
+
+_LOGIN_EXEMPT_ENDPOINTS = {
+    'login',
+    'static',
+    'healthz',
+}
+
+
+@app.before_request
+def _require_login_redirect() -> None | Response:
+    try:
+        endpoint = request.endpoint or ''
+        if not endpoint:
             return None
-        if g.current_user is None:
-            # Prefer redirect for normal browser navigation; return JSON for XHR/API
-            if request.method in ('GET', 'HEAD'):
-                return redirect(url_for('login', next=request.url))
-            is_xhr = request.headers.get('X-Requested-With') == 'XMLHttpRequest'
-            prefers_json = False
-            try:
-                if request.accept_mimetypes:
-                    best = request.accept_mimetypes.best_match(['application/json', 'text/html'])
-                    prefers_json = (best == 'application/json')
-            except Exception:
-                prefers_json = False
-            if is_xhr or prefers_json:
-                return jsonify({ 'error': 'unauthorized' }), 401
-            return redirect(url_for('login', next=request.url))
-        return None
+        if endpoint.startswith('static'):
+            return None
+        if endpoint in _LOGIN_EXEMPT_ENDPOINTS:
+            return None
+        if _current_user() is None:
+            return redirect(url_for('login'))
     except Exception:
         return None
+    return None
 
 
 def _require_admin() -> bool:
-    u = _current_user()
-    return bool(u and u.get('role') == 'admin')
+    user = _current_user()
+    if user and (user.get('role') == 'admin'):
+        return True
+    flash('Admin privileges required')
+    return False
 
 
 @app.route('/login', methods=['GET', 'POST'])
@@ -289,25 +322,23 @@ def login():
         return render_template('login.html')
     username = (request.form.get('username') or '').strip()
     password = request.form.get('password') or ''
+    if not username or not password:
+        flash('Username and password required')
+        return render_template('login.html', error=True), 400
     db = _load_users()
-    user = None
-    for u in db.get('users', []):
-        if u.get('username') == username:
-            user = u; break
-    if not user or not check_password_hash(user.get('password_hash', ''), password):
-        flash('Invalid username or password')
-        return redirect(url_for('login'))
-    session['user'] = { 'username': user.get('username'), 'role': user.get('role') }
-    nxt = request.args.get('next')
-    return redirect(nxt or url_for('index'))
+    users = db.get('users', [])
+    user = next((u for u in users if u.get('username') == username), None)
+    if user and check_password_hash(user.get('password_hash', ''), password):
+        _set_current_user({'username': user.get('username'), 'role': user.get('role', 'user')})
+        session.permanent = True
+        return redirect(url_for('index'))
+    flash('Invalid username or password')
+    return render_template('login.html', error=True), 401
 
 
 @app.route('/logout', methods=['POST', 'GET'])
 def logout():
-    try:
-        session.pop('user', None)
-    except Exception:
-        pass
+    _set_current_user(None)
     return redirect(url_for('login'))
 
 
@@ -317,28 +348,30 @@ def users_page():
         return redirect(url_for('index'))
     db = _load_users()
     users = db.get('users', [])
-    return render_template('users.html', users=users)
+    return render_template('users.html', users=users, self_change=False)
 
 
-@app.route('/users/create', methods=['POST'])
+@app.route('/users', methods=['POST'])
 def users_create():
     if not _require_admin():
-        return redirect(url_for('users_page'))
+        return redirect(url_for('index'))
     username = (request.form.get('username') or '').strip()
-    password = request.form.get('password') or ''
+    password = (request.form.get('password') or '').strip()
     role = (request.form.get('role') or 'user').strip() or 'user'
     if not username or not password:
-        flash('Username and password are required')
+        flash('Username and password required')
         return redirect(url_for('users_page'))
     db = _load_users()
-    if any(u.get('username') == username for u in db.get('users', [])):
-        flash('User already exists')
+    users = db.get('users', [])
+    if any(u.get('username') == username for u in users):
+        flash('Username already exists')
         return redirect(url_for('users_page'))
-    db.setdefault('users', []).append({
+    users.append({
         'username': username,
         'password_hash': generate_password_hash(password),
-        'role': 'admin' if role == 'admin' else 'user',
+        'role': role
     })
+    db['users'] = users
     _save_users(db)
     flash('User created')
     return redirect(url_for('users_page'))
@@ -348,10 +381,13 @@ def users_create():
 def users_delete(username: str):
     if not _require_admin():
         return redirect(url_for('users_page'))
+    username = (username or '').strip()
+    if not username:
+        flash('Invalid username')
+        return redirect(url_for('users_page'))
     cur = _current_user()
     db = _load_users()
     users = db.get('users', [])
-    # Prevent removing self and ensure at least one admin remains
     remain = [u for u in users if u.get('username') != username]
     if cur and username == cur.get('username'):
         flash('Cannot delete your own account')
@@ -513,7 +549,7 @@ def _append_run_history(entry: dict):
             pass
 
 
-## Removed legacy plan approval / status endpoints; full preview is now the sole planning interface.
+## Full preview is the sole planning interface.
 
 
 
@@ -627,43 +663,81 @@ def _safe_add_to_zip(zf: zipfile.ZipFile, abs_path: str, arcname: str) -> None:
     except Exception:
         pass
 
-def _gather_scripts_into_zip(zf: zipfile.ZipFile) -> int:
+def _gather_scripts_into_zip(zf: zipfile.ZipFile, scenario_dir: str | None = None) -> int:
     """Collect generated traffic and segmentation artifacts into the provided zip file.
 
-    Returns the count of files added.
+    This now walks both persistent output directories and the runtime `/tmp`
+    locations used by the CLI so that *all* generated scripts and supporting
+    files (JSON summaries, helper assets, custom plugin payloads, etc.) are
+    included in the bundle. Returns the count of files added.
     """
     added = 0
-    # Traffic
+    seen: set[str] = set()
+
+    def _collect(label: str, dir_candidates: list[str]) -> None:
+        nonlocal added
+        for base in dir_candidates:
+            if not base:
+                continue
+            try:
+                base_abs = os.path.abspath(base)
+            except Exception:
+                base_abs = base
+            if not base_abs or not os.path.isdir(base_abs):
+                continue
+            for root, dirs, files in os.walk(base_abs):
+                # Skip hidden directories to avoid noise like .cache/.DS_Store
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                for fname in files:
+                    if fname.startswith('.'):
+                        continue
+                    try:
+                        path = os.path.join(root, fname)
+                        if not os.path.isfile(path) or os.path.islink(path):
+                            continue
+                        rel = os.path.relpath(path, base_abs)
+                        # Defensive: ignore paths that navigate upwards
+                        if rel.startswith('..'):
+                            continue
+                        rel = rel.replace('\\', '/')
+                        arcname = f"{label}/{rel}".lstrip('/')
+                        key = arcname.lower()
+                        if key in seen:
+                            continue
+                        _safe_add_to_zip(zf, path, arcname)
+                        seen.add(key)
+                        added += 1
+                    except Exception:
+                        continue
+
+    traffic_dirs = []
     try:
-        tdir = _traffic_dir()
-        if os.path.isdir(tdir):
-            # include summary first
-            sp = os.path.join(tdir, "traffic_summary.json")
-            if os.path.exists(sp):
-                _safe_add_to_zip(zf, sp, os.path.join("traffic", "traffic_summary.json")); added += 1
-            for name in os.listdir(tdir):
-                if not name.startswith("traffic_"):
-                    continue
-                ap = os.path.join(tdir, name)
-                if os.path.isfile(ap):
-                    _safe_add_to_zip(zf, ap, os.path.join("traffic", name)); added += 1
+        traffic_dirs.append(_traffic_dir())
     except Exception:
         pass
-    # Segmentation
+    # Runtime traffic scripts live under /tmp/traffic by default
+    traffic_dirs.extend(filter(None, [
+        os.path.join(_outputs_dir(), 'traffic'),
+        '/tmp/traffic',
+        os.path.join(scenario_dir, 'traffic') if scenario_dir else None,
+    ]))
+    # Preserve order but drop duplicates
+    traffic_dirs = list(dict.fromkeys(traffic_dirs))
+
+    segmentation_dirs = []
     try:
-        sdir = _segmentation_dir()
-        if os.path.isdir(sdir):
-            sp = os.path.join(sdir, "segmentation_summary.json")
-            if os.path.exists(sp):
-                _safe_add_to_zip(zf, sp, os.path.join("segmentation", "segmentation_summary.json")); added += 1
-            for name in os.listdir(sdir):
-                if not (name.startswith("seg_") and name.endswith(".py")):
-                    continue
-                ap = os.path.join(sdir, name)
-                if os.path.isfile(ap):
-                    _safe_add_to_zip(zf, ap, os.path.join("segmentation", name)); added += 1
+        segmentation_dirs.append(_segmentation_dir())
     except Exception:
         pass
+    segmentation_dirs.extend(filter(None, [
+        os.path.join(_outputs_dir(), 'segmentation'),
+        '/tmp/segmentation',
+        os.path.join(scenario_dir, 'segmentation') if scenario_dir else None,
+    ]))
+    segmentation_dirs = list(dict.fromkeys(segmentation_dirs))
+
+    _collect('traffic', traffic_dirs)
+    _collect('segmentation', segmentation_dirs)
     return added
 
 def _normalize_core_device_types(xml_path: str) -> None:
@@ -806,6 +880,7 @@ def _build_full_scenario_archive(out_dir: str, scenario_xml_path: str | None, re
         if run_id:
             stem = f"{stem}-{run_id[:8]}"
         zip_path = os.path.join(out_dir, f"full_scenario_{stem}.zip")
+        scenario_dir = os.path.dirname(os.path.abspath(scenario_xml_path)) if scenario_xml_path else None
         with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
             # Add top-level artifacts if present
             if scenario_xml_path and os.path.exists(scenario_xml_path):
@@ -817,7 +892,7 @@ def _build_full_scenario_archive(out_dir: str, scenario_xml_path: str | None, re
             if post_xml_path and os.path.exists(post_xml_path):
                 _safe_add_to_zip(zf, post_xml_path, os.path.join("core-session", os.path.basename(post_xml_path)))
             # Add generated scripts and summaries
-            _gather_scripts_into_zip(zf)
+            _gather_scripts_into_zip(zf, scenario_dir)
         return zip_path if os.path.exists(zip_path) else None
     except Exception:
         return None
@@ -1128,6 +1203,40 @@ def docker_cleanup():
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
+def _find_latest_session_xml(base_dir: str, stem: str | None = None) -> str | None:
+    """Best-effort helper to locate the newest session XML written previously.
+
+    If `stem` is provided, prefer files beginning with that stem; otherwise
+    return the most recent .xml file under the directory.
+    """
+    try:
+        if not base_dir or not os.path.isdir(base_dir):
+            return None
+        candidates: list[tuple[float, str]] = []
+        for name in os.listdir(base_dir):
+            if not name.lower().endswith('.xml'):
+                continue
+            if stem:
+                prefix = f"{stem}-"
+                if not name.startswith(prefix):
+                    continue
+            path = os.path.join(base_dir, name)
+            try:
+                st = os.stat(path)
+                candidates.append((st.st_mtime, path))
+            except Exception:
+                continue
+        if not candidates and stem:
+            # If no stem-specific match, allow fallback to any latest XML
+            return _find_latest_session_xml(base_dir, stem=None)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+    except Exception:
+        return None
+
+
 def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_id: str | None = None) -> str | None:
     """Attempt to connect to CORE daemon via gRPC and save the active session XML.
 
@@ -1158,6 +1267,17 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
     except Exception:
         pass
     # Pick first running/defined session if any; API lacks direct 'current' concept here.
+    def _unique_path(base_path: str) -> str:
+        if not os.path.exists(base_path):
+            return base_path
+        root, ext = os.path.splitext(base_path)
+        counter = 2
+        while True:
+            candidate = f"{root}-{counter}{ext}"
+            if not os.path.exists(candidate):
+                return candidate
+            counter += 1
+
     try:
         app.logger.debug("Connecting to CORE gRPC at %s (requested session_id=%s)", address, session_id)
         client = CoreGrpcClient(address=address)
@@ -1189,10 +1309,62 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
             if session_id is None:
                 app.logger.warning("Selected CORE session has no id; aborting save_xml")
                 return None
+            session_meta = target
+            try:
+                meta_detail = client.get_session(session_id)
+                if meta_detail is not None:
+                    session_meta = meta_detail
+            except Exception as e:
+                app.logger.debug("get_session(%s) lookup failed: %s", session_id, e)
+            try:
+                client.open_session(session_id)
+            except Exception as e:
+                app.logger.debug("open_session(%s) failed or not required: %s", session_id, e)
+            existing_candidates: list[str] = []
+
+            def _add_candidate_path(path_candidate: str | None) -> None:
+                if not path_candidate:
+                    return
+                try:
+                    abs_path = os.path.abspath(path_candidate)
+                except Exception:
+                    return
+                if not os.path.exists(abs_path):
+                    return
+                existing_candidates.append(abs_path)
+
+            _add_candidate_path(getattr(session_meta, 'file', None))
+            _add_candidate_path(getattr(target, 'file', None))
+            for attr in ('dir', 'path', 'directory'):
+                dir_candidate = getattr(session_meta, attr, None) or getattr(target, attr, None)
+                if not dir_candidate or not os.path.isdir(dir_candidate):
+                    continue
+                try:
+                    for entry in os.listdir(dir_candidate):
+                        if entry.lower().endswith('.xml'):
+                            _add_candidate_path(os.path.join(dir_candidate, entry))
+                except Exception:
+                    continue
+            seen_candidates: set[str] = set()
+            filtered_candidates: list[str] = []
+            for cand in existing_candidates:
+                if cand in seen_candidates:
+                    continue
+                seen_candidates.add(cand)
+                filtered_candidates.append(cand)
+            def _candidate_priority(path: str) -> tuple[int, float, str]:
+                base = os.path.basename(path).lower()
+                priority = 0 if 'session-deployed' in base else 1
+                try:
+                    mtime = -os.stat(path).st_mtime
+                except Exception:
+                    mtime = 0.0
+                return (priority, mtime, base)
+            filtered_candidates.sort(key=_candidate_priority)
             # Derive a friendly stem from the original scenario XML if available
             stem = None
             try:
-                orig_file = getattr(target, 'file', None)
+                orig_file = getattr(session_meta, 'file', None)
                 if orig_file and os.path.exists(orig_file):
                     # Try to parse scenario names from the original XML
                     names = _scenario_names_from_xml(orig_file)
@@ -1202,14 +1374,64 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
                 stem = None
             if not stem:
                 stem = f"core-session-{session_id}"
+            for candidate_path in filtered_candidates:
+                try:
+                    suffix = ''
+                    base_name = os.path.basename(candidate_path).lower()
+                    if 'session-deployed' in base_name and not stem.lower().startswith('session-deployed'):
+                        suffix = '-session-deployed'
+                    copy_dest = os.path.join(base_sessions_dir, f"{stem}-{ts}{suffix}.xml")
+                    copy_dest = _unique_path(copy_dest)
+                    shutil.copy2(candidate_path, copy_dest)
+                    try:
+                        _normalize_core_device_types(copy_dest)
+                    except Exception as norm_err:
+                        app.logger.debug("core xml type normalization skipped for copied candidate %s: %s", copy_dest, norm_err)
+                    try:
+                        size = os.stat(copy_dest).st_size
+                    except Exception:
+                        size = -1
+                    app.logger.info("Copied CORE session XML from %s to %s (%s bytes)", candidate_path, copy_dest, size if size >= 0 else '?')
+                    return copy_dest
+                except Exception as copy_err:
+                    app.logger.debug("Failed copying session XML candidate %s: %s", candidate_path, copy_err)
+                    continue
             # Always store under outputs/core-sessions so CORE page can find it
             out_path = os.path.join(base_sessions_dir, f"{stem}-{ts}.xml")
+            # Attempt save with small retries to handle transient timing issues
+            save_errors: list[Exception] = []
+            session_id_arg = session_id
             try:
-                app.logger.info("Invoking save_xml(session_id=%s) -> %s", session_id, out_path)
-                client.save_xml(session_id=session_id, file_path=out_path)
-            except Exception as e:
-                app.logger.warning("save_xml failed for session %s at %s: %s", session_id, address, e)
-                return None
+                session_id_arg = int(session_id)  # type: ignore[assignment]
+            except Exception:
+                session_id_arg = session_id
+            for attempt in range(3):
+                try:
+                    app.logger.info("Invoking save_xml(session_id=%s) -> %s (attempt %d)", session_id, out_path, attempt + 1)
+                    client.save_xml(session_id=session_id_arg, file_path=out_path)
+                    break
+                except Exception as e:
+                    save_errors.append(e)
+                    if attempt < 2:
+                        try:
+                            time.sleep(0.5 * (attempt + 1))
+                        except Exception:
+                            pass
+                        continue
+                    app.logger.warning("save_xml final failure for session %s at %s: %s", session_id, address, e)
+            else:
+                # Loop exhausted without break
+                last = save_errors[-1] if save_errors else None
+                if last:
+                    app.logger.warning("save_xml could not persist session XML: %s", last)
+            if not os.path.exists(out_path):
+                for _ in range(3):
+                    try:
+                        time.sleep(0.2)
+                    except Exception:
+                        break
+                    if os.path.exists(out_path):
+                        break
             if os.path.exists(out_path):
                 # Validate that it's a CORE XML and not our editor format
                 try:
@@ -1235,6 +1457,15 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
                         os.remove(out_path)
                     except Exception:
                         pass
+            # Fallback: try to locate an existing session XML from previous saves
+            fallback = _find_latest_session_xml(base_sessions_dir, stem)
+            if fallback and os.path.exists(fallback):
+                try:
+                    size = os.stat(fallback).st_size
+                except Exception:
+                    size = -1
+                app.logger.info("Using existing CORE session XML fallback for session_id=%s: %s (%s bytes)", session_id, fallback, size if size >= 0 else '?')
+                return fallback
             return None
         finally:
             try:
@@ -1741,226 +1972,404 @@ def _validate_core_xml(xml_path: str):
 
 
 def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
-    """Extract basic details from a CORE scenario XML for a summary view.
-
-    Robust to namespaces and minor structural variations.
-    """
+    """Extract a topology summary from a CORE session/scenario XML."""
     info: Dict[str, Any] = {}
     try:
         tree = LET.parse(xml_path)
         root = tree.getroot()
 
-        # helpers
         def attrs(el, *names):
             return {n: el.get(n) for n in names if el.get(n) is not None}
 
         def local(tag: str) -> str:
-            # strip namespace if present
-            if tag is None:
+            if not tag:
                 return ''
             if '}' in tag:
                 return tag.split('}', 1)[1]
             return tag
 
         def iter_by_local(el, lname: str):
+            lname = lname.lower()
             for e in el.iter():
-                if local(getattr(e, 'tag', '')) == lname:
+                if local(getattr(e, 'tag', '')).lower() == lname:
                     yield e
 
-        devices = list(iter_by_local(root, 'device'))
+        # Combine device/node representations (session exports sometimes use <node>)
+        candidates = list(iter_by_local(root, 'device')) + list(iter_by_local(root, 'node'))
+        devices: list[Any] = []
+        seen_ids: set[str] = set()
+        for cand in candidates:
+            ident = cand.get('id') or cand.get('name')
+            key = str(ident).strip() if ident is not None else ''
+            if key and key in seen_ids:
+                continue
+            if key:
+                seen_ids.add(key)
+            devices.append(cand)
+
         networks = list(iter_by_local(root, 'network'))
-        # Attempt to also locate any scenario-editor style sections (if this XML is from editor not CORE export)
+        links = list(iter_by_local(root, 'link'))
+        services = list(iter_by_local(root, 'service'))
+
         routing_edge_policies: list[dict] = []
         try:
             for sec in root.findall('.//section'):
-                if (sec.get('name') or '').strip() == 'Routing':
-                    for it in sec.findall('./item'):
-                        em = it.get('r2r_mode')
-                        r2s_mode = it.get('r2s_mode')
-                        ev = it.get('r2r_edges') or it.get('edges')
-                        r2s_ev = it.get('r2s_edges')
-                        if em or ev:
-                            rec = {
-                                'r2r_mode': em or '',
-                                'r2r_edges': int(ev) if (ev and ev.isdigit()) else None,
-                                'r2s_mode': (r2s_mode or ''),
-                                'r2s_edges': (int(r2s_ev) if (r2s_ev and r2s_ev.isdigit()) else None),
-                                'protocol': it.get('selected')
-                            }
-                            routing_edge_policies.append(rec)
+                if (sec.get('name') or '').strip() != 'Routing':
+                    continue
+                for item in sec.findall('./item'):
+                    r2r_edges = item.get('r2r_edges') or item.get('edges')
+                    r2s_edges = item.get('r2s_edges')
+                    if any([item.get('r2r_mode'), r2r_edges, item.get('r2s_mode'), r2s_edges]):
+                        routing_edge_policies.append({
+                            'r2r_mode': item.get('r2r_mode') or '',
+                            'r2r_edges': int(r2r_edges) if (r2r_edges and r2r_edges.isdigit()) else None,
+                            'r2s_mode': item.get('r2s_mode') or '',
+                            'r2s_edges': int(r2s_edges) if (r2s_edges and r2s_edges.isdigit()) else None,
+                            'protocol': item.get('selected') or '',
+                        })
         except Exception:
             routing_edge_policies = []
-        # Prefer <links> parent if available, else collect all <link> elements anywhere
-        links_parent = None
-        for e in root.iter():
-            if local(getattr(e, 'tag', '')) == 'links':
-                links_parent = e
-                break
-        links = []
-        if links_parent is not None:
-            links = [e for e in links_parent if local(getattr(e, 'tag', '')) == 'link']
-        else:
-            links = list(iter_by_local(root, 'link'))
-        services = list(iter_by_local(root, 'service'))
 
-        # Build maps for easy lookup
+        interface_store: Dict[str, Dict[str, Dict[str, Any]]] = defaultdict(dict)
+
+        def record_interface(node_ref: Any, iface_el: Any) -> None:
+            node_key = str(node_ref or '').strip()
+            if not node_key or iface_el is None:
+                return
+            try:
+                attrs_iface = dict(getattr(iface_el, 'attrib', {}) or {})
+            except Exception:
+                attrs_iface = {}
+            name_raw = (attrs_iface.get('name') or attrs_iface.get('id') or '').strip()
+            if not name_raw:
+                name_el = iface_el.find('./name') if hasattr(iface_el, 'find') else None
+                if name_el is not None and getattr(name_el, 'text', None):
+                    name_raw = name_el.text.strip()
+            mac = (attrs_iface.get('mac') or '').strip()
+            if not mac and hasattr(iface_el, 'find'):
+                mac_el = iface_el.find('./mac')
+                if mac_el is not None and getattr(mac_el, 'text', None):
+                    mac = mac_el.text.strip()
+            ip4 = (attrs_iface.get('ip4') or attrs_iface.get('ipv4') or '').strip()
+            ip4_mask = (attrs_iface.get('ip4_mask') or attrs_iface.get('ipv4_mask') or '').strip()
+            ip6 = (attrs_iface.get('ip6') or attrs_iface.get('ipv6') or '').strip()
+            ip6_mask = (attrs_iface.get('ip6_mask') or attrs_iface.get('ipv6_mask') or '').strip()
+            try:
+                for addr in iface_el.findall('.//addr'):
+                    addr_type = (addr.get('type') or addr.get('family') or '').lower()
+                    addr_val = (addr.get('address') or addr.get('ip') or (addr.text or '')).strip()
+                    mask_val = (addr.get('mask') or addr.get('prefix') or addr.get('netmask') or '').strip()
+                    if not addr_val:
+                        continue
+                    if '6' in addr_type:
+                        if not ip6:
+                            ip6 = addr_val
+                        if not ip6_mask:
+                            ip6_mask = mask_val
+                    else:
+                        if not ip4:
+                            ip4 = addr_val
+                        if not ip4_mask:
+                            ip4_mask = mask_val
+                for addr in iface_el.findall('.//address'):
+                    addr_val = (addr.get('value') or addr.get('address') or (addr.text or '')).strip()
+                    mask_val = (addr.get('mask') or addr.get('prefix') or '').strip()
+                    addr_type = (addr.get('type') or '').lower()
+                    if not addr_val:
+                        continue
+                    if '6' in addr_type:
+                        if not ip6:
+                            ip6 = addr_val
+                        if not ip6_mask:
+                            ip6_mask = mask_val
+                    else:
+                        if not ip4:
+                            ip4 = addr_val
+                        if not ip4_mask:
+                            ip4_mask = mask_val
+            except Exception:
+                pass
+            if not any([name_raw, mac, ip4, ip6]):
+                return
+            stable_key = '|'.join([
+                name_raw.lower(),
+                ip4,
+                ip6,
+            ])
+            existing = interface_store[node_key].get(stable_key)
+            if existing:
+                if mac and not existing.get('mac'):
+                    existing['mac'] = mac
+                if ip4_mask and not existing.get('ipv4_mask'):
+                    existing['ipv4_mask'] = ip4_mask
+                if ip6_mask and not existing.get('ipv6_mask'):
+                    existing['ipv6_mask'] = ip6_mask
+                if name_raw and not existing.get('name'):
+                    existing['name'] = name_raw
+                return
+            interface_store[node_key][stable_key] = {
+                'name': name_raw or None,
+                'mac': mac or None,
+                'ipv4': ip4 or None,
+                'ipv4_mask': ip4_mask or None,
+                'ipv6': ip6 or None,
+                'ipv6_mask': ip6_mask or None,
+            }
+
         id_to_name: Dict[str, str] = {}
         id_to_type: Dict[str, str] = {}
         id_to_services: Dict[str, list] = {}
-        for d in devices:
-            did = d.get('id') or ''
-            id_to_name[did] = d.get('name') or did
-            id_to_type[did] = d.get('type') or ''
-            # services within this device
-            svcs = [s.get('name') for s in d.findall('./services/service') if s.get('name')]
-            id_to_services[did] = svcs
 
-        # Adjacency from links
-        adj: Dict[str, set] = { (d.get('id') or ''): set() for d in devices }
+        def coerce_device_id(raw_id: Any, fallback_index: int) -> str:
+            value = str(raw_id).strip() if raw_id is not None else ''
+            if value:
+                return value
+            return f"device_{fallback_index}"
+
+        for idx, dev in enumerate(devices, start=1):
+            did = coerce_device_id(dev.get('id') or dev.get('name'), idx)
+            name_val = (dev.get('name') or '').strip()
+            if not name_val and hasattr(dev, 'find'):
+                name_el = dev.find('./name')
+                if name_el is not None and getattr(name_el, 'text', None):
+                    name_val = name_el.text.strip()
+            type_val = (dev.get('type') or '').strip()
+            if not type_val and hasattr(dev, 'find'):
+                type_el = dev.find('./type') or dev.find('./model') or dev.find('./icon')
+                if type_el is not None and getattr(type_el, 'text', None):
+                    type_val = type_el.text.strip()
+            id_to_name[did] = name_val or did
+            id_to_type[did] = type_val or ''
+
+            services_found: set[str] = set()
+            try:
+                for svc in dev.findall('./services/service'):
+                    nm = (svc.get('name') or (svc.text or '')).strip()
+                    if nm:
+                        services_found.add(nm)
+                for svc in dev.findall('./service'):
+                    nm = (svc.get('name') or (svc.text or '')).strip()
+                    if nm:
+                        services_found.add(nm)
+            except Exception:
+                pass
+            id_to_services[did] = sorted(services_found)
+
+            try:
+                for iface in dev.findall('.//interface'):
+                    record_interface(did, iface)
+                for iface in dev.findall('.//iface'):
+                    record_interface(did, iface)
+            except Exception:
+                pass
+
+        adj: Dict[str, set[str]] = defaultdict(set)
+
+        def normalize_ref(value: Any) -> str:
+            return str(value).strip() if value is not None else ''
+
         for link in links:
-            n1 = link.get('node1') or link.get('node1_id')
-            n2 = link.get('node2') or link.get('node2_id')
-            if not (n1 and n2):
-                # attempt best-effort inference: check child iface elements for node refs
-                n1 = n1 or (link.find('.//iface1') or {}).get('node') if hasattr(link, 'find') else n1
-                n2 = n2 or (link.find('.//iface2') or {}).get('node') if hasattr(link, 'find') else n2
+            n1 = normalize_ref(link.get('node1') or link.get('node1_id'))
+            n2 = normalize_ref(link.get('node2') or link.get('node2_id'))
+            if not n1 or not n2:
+                try:
+                    if not n1 and hasattr(link, 'find'):
+                        iface1 = link.find('.//iface1')
+                        if iface1 is not None:
+                            n1 = normalize_ref(iface1.get('node') or iface1.get('device') or iface1.get('node_id'))
+                    if not n2 and hasattr(link, 'find'):
+                        iface2 = link.find('.//iface2')
+                        if iface2 is not None:
+                            n2 = normalize_ref(iface2.get('node') or iface2.get('device') or iface2.get('node_id'))
+                except Exception:
+                    pass
             if n1 and n2:
-                adj.setdefault(n1, set()).add(n2)
-                adj.setdefault(n2, set()).add(n1)
+                adj[n1].add(n2)
+                adj[n2].add(n1)
+            try:
+                for child in list(link):
+                    tag = local(getattr(child, 'tag', '')).lower()
+                    target = None
+                    if tag in ('iface1', 'interface1'):
+                        target = n1
+                    elif tag in ('iface2', 'interface2'):
+                        target = n2
+                    elif tag in ('iface', 'interface'):
+                        target = normalize_ref(child.get('node') or child.get('node_id') or child.get('device')) or n2
+                    if target:
+                        record_interface(target, child)
+            except Exception:
+                continue
 
-        # Compose nodes list with linked names
-        nodes = []
-        for d in devices:
-            did = d.get('id') or ''
-            node = {
+        nodes: list[dict] = []
+        for idx, dev in enumerate(devices, start=1):
+            did = coerce_device_id(dev.get('id') or dev.get('name'), idx)
+            raw_ifaces = interface_store.get(did, {})
+            iface_entries = []
+            for entry in raw_ifaces.values():
+                cleaned = {k: v for k, v in entry.items() if v not in (None, '')}
+                if cleaned:
+                    iface_entries.append(cleaned)
+            iface_entries.sort(key=lambda e: ((e.get('name') or '').lower(), e.get('ipv4') or '', e.get('ipv6') or ''))
+            nodes.append({
                 'id': did,
-                'name': d.get('name') or did,
-                'type': d.get('type') or '',
+                'name': id_to_name.get(did, did),
+                'type': id_to_type.get(did, ''),
                 'services': id_to_services.get(did, []),
-                'linked_nodes': sorted([id_to_name.get(x, x) for x in adj.get(did, set())], key=lambda x: x.lower()),
-            }
-            nodes.append(node)
+                'linked_nodes': [],
+                'interfaces': iface_entries,
+            })
 
-        # Identify switch nodes explicitly for downstream UI (graph coloring, counts)
         switches = [n for n in nodes if (n.get('type') or '').lower() == 'switch']
-        # Also treat network elements with 'SWITCH' in their type attribute as switches (not all networks are devices)
-        extra_switch_nodes = []  # network-derived switches not already in device nodes
+        extra_switch_nodes: list[dict] = []
         try:
             for net in networks:
-                ntype = (net.get('type') or '')
-                if 'switch' not in ntype.lower():
+                ntype = (net.get('type') or '').lower()
+                if 'switch' not in ntype:
                     continue
-                sw_id = net.get('id') or (net.get('name') or '')
-                sw_name = net.get('name') or sw_id
+                sw_id = normalize_ref(net.get('id') or net.get('name'))
                 if not sw_id:
                     continue
-                # Avoid duplicates by id OR name against existing device switches
-                if any((sw_id == s.get('id')) or (sw_name == s.get('name')) for s in switches):
+                sw_name = (net.get('name') or sw_id).strip() or sw_id
+                if any(sw_id == sw.get('id') or sw_name == sw.get('name') for sw in switches):
                     continue
-                extra_switch = {'id': sw_id, 'name': sw_name, 'type': 'switch', 'services': [], 'linked_nodes': []}
+                raw_ifaces = interface_store.get(sw_id, {})
+                iface_entries = []
+                for entry in raw_ifaces.values():
+                    cleaned = {k: v for k, v in entry.items() if v not in (None, '')}
+                    if cleaned:
+                        iface_entries.append(cleaned)
+                iface_entries.sort(key=lambda e: ((e.get('name') or '').lower(), e.get('ipv4') or '', e.get('ipv6') or ''))
+                extra_switch = {
+                    'id': sw_id,
+                    'name': sw_name,
+                    'type': 'switch',
+                    'services': [],
+                    'linked_nodes': [],
+                    'interfaces': iface_entries,
+                }
                 switches.append(extra_switch)
                 extra_switch_nodes.append(extra_switch)
-                # Allow link resolution to map id->name for network-derived switches
                 id_to_name.setdefault(sw_id, sw_name)
                 id_to_type.setdefault(sw_id, 'switch')
         except Exception:
             pass
 
-        # Build explicit link details (ids and names). Avoid duplicates (undirected)
-        link_details = []
-        seen_pairs = set()
-        for link in links:
-            n1 = link.get('node1') or link.get('node1_id')
-            n2 = link.get('node2') or link.get('node2_id')
-            if not (n1 and n2):
-                # attempt iface child inference again (defensive)
-                try:
-                    if not n1:
-                        iface1 = link.find('.//iface1')
-                        if iface1 is not None:
-                            n1 = iface1.get('node')
-                    if not n2:
-                        iface2 = link.find('.//iface2')
-                        if iface2 is not None:
-                            n2 = iface2.get('node')
-                except Exception:
-                    pass
-            if not (n1 and n2):
+        valid_ids: set[str] = {n['id'] for n in nodes}
+        valid_ids.update(sw['id'] for sw in extra_switch_nodes)
+        adj_clean: Dict[str, set[str]] = {}
+        for nid, neighbors in adj.items():
+            if nid not in valid_ids:
                 continue
-            # normalize order to prevent duplicates
-            a, b = sorted([n1, n2])
-            key = f"{a}__{b}"
-            if key in seen_pairs:
-                continue
-            seen_pairs.add(key)
-            link_details.append({
-                'node1': n1,
-                'node2': n2,
-                'node1_name': id_to_name.get(n1, n1),
-                'node2_name': id_to_name.get(n2, n2)
-            })
+            adj_clean[nid] = {nbr for nbr in neighbors if nbr in valid_ids}
+        for sw in extra_switch_nodes:
+            adj_clean.setdefault(sw['id'], set())
 
-        # Build adjacency for any extra network-derived switches from explicit link_details (after they are computed)
-        # (We delay population of their linked_nodes until link_details creation below.)
+        def _prune_neighbors(node_id: str, node_type: str) -> None:
+            if node_type in ('router', 'switch'):
+                return
+            current_neighbors = sorted(adj_clean.get(node_id, set()), key=lambda vid: id_to_name.get(vid, vid).lower())
+            routers = [vid for vid in current_neighbors if (id_to_type.get(vid, '').lower() == 'router')]
+            switches_local = [vid for vid in current_neighbors if (id_to_type.get(vid, '').lower() == 'switch')]
+
+            def _trim_group(group: list[str]) -> None:
+                if len(group) <= 1:
+                    return
+                keep = group[0]
+                for extra in group[1:]:
+                    adj_clean.get(node_id, set()).discard(extra)
+                    if extra in adj_clean:
+                        adj_clean[extra].discard(node_id)
+
+            _trim_group(routers)
+            _trim_group(switches_local)
+
+        for node in nodes:
+            _prune_neighbors(node['id'], (node.get('type') or '').lower())
+        for sw in extra_switch_nodes:
+            _prune_neighbors(sw['id'], (sw.get('type') or '').lower())
+
+        def _neighbor_names(node_id: str) -> list[str]:
+            neighbors = sorted(adj_clean.get(node_id, set()), key=lambda vid: id_to_name.get(vid, vid).lower())
+            return [id_to_name.get(vid, vid) for vid in neighbors]
+
+        filtered_nodes: list[dict] = []
+        for node in nodes:
+            nid = node['id']
+            linked = adj_clean.get(nid, set())
+            if linked or (node.get('interfaces') and len(node.get('interfaces')) > 0) or (node.get('type') or '').lower() in ('router', 'switch'):
+                node['linked_nodes'] = _neighbor_names(nid)
+                filtered_nodes.append(node)
+        nodes = filtered_nodes
+
+        filtered_extra_switch_nodes: list[dict] = []
+        for sw in extra_switch_nodes:
+            nid = sw['id']
+            linked = adj_clean.get(nid, set())
+            if linked:
+                sw['linked_nodes'] = _neighbor_names(nid)
+                filtered_extra_switch_nodes.append(sw)
+        extra_switch_nodes = filtered_extra_switch_nodes
+
+        valid_ids = {n['id'] for n in nodes}
+        valid_ids.update(sw['id'] for sw in extra_switch_nodes)
+        adj_clean = {nid: {nbr for nbr in neighbors if nbr in valid_ids} for nid, neighbors in adj_clean.items() if nid in valid_ids}
+
+        switches = [n for n in nodes if (n.get('type') or '').lower() == 'switch']
+
+        link_details: list[dict] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for src, neighbors in adj_clean.items():
+            for dst in neighbors:
+                if src == dst or dst not in valid_ids:
+                    continue
+                ordered = tuple(sorted((src, dst)))
+                if ordered in seen_pairs:
+                    continue
+                seen_pairs.add(ordered)
+                link_details.append({
+                    'node1': ordered[0],
+                    'node2': ordered[1],
+                    'node1_name': id_to_name.get(ordered[0], ordered[0]),
+                    'node2_name': id_to_name.get(ordered[1], ordered[1]),
+                })
 
         info.update({
-            'nodes_count': len(devices),
+            'nodes_count': len(nodes),
             'networks_count': len(networks),
-            'links_count': len(links),
+            'links_count': len(link_details),
             'services_count': len(services),
             'nodes': nodes,
             'switches_count': len(switches),
-            # lightweight list of switch identifiers (names) for quick UI access
-            'switches': [s['name'] for s in switches],
-            # expose any additional network-derived switch nodes not already in nodes list
+            'switches': [sw['name'] for sw in switches],
             'switch_nodes': extra_switch_nodes,
-            # explicit link detail list (ids & human names)
             'links_detail': link_details,
             'routing_edges_policies': routing_edge_policies,
         })
-        # legacy fields kept for compatibility with any current UI that may still reference them
         info['devices'] = [attrs(d, 'id', 'name', 'type', 'class', 'image') for d in devices[:50]]
         info['networks'] = [attrs(n, 'id', 'name', 'type', 'model', 'mobility') for n in networks[:50]]
-        info['links_sample'] = len(links[:100])
+        info['links_sample'] = len(link_details)
 
-        # Populate linked_nodes for extra network-derived switches using link_details (if present)
-        if extra_switch_nodes and link_details:
-            # map from switch id to set of neighbor ids
-            sw_neighbors = {sw['id']: set() for sw in extra_switch_nodes}
-            for ld in link_details:
-                a = ld.get('node1')
-                b = ld.get('node2')
-                if not a or not b:
-                    continue
-                if a in sw_neighbors and b != a:
-                    sw_neighbors[a].add(b)
-                if b in sw_neighbors and a != b:
-                    sw_neighbors[b].add(a)
-            # Translate neighbor ids to names for readability
-            for sw in extra_switch_nodes:
-                nid = sw['id']
-                neigh_ids = sorted(sw_neighbors.get(nid, set()))
-                sw['linked_nodes'] = [id_to_name.get(x, x) for x in neigh_ids]
-        # filesize
         try:
             st = os.stat(xml_path)
             info['file_size_bytes'] = st.st_size
         except Exception:
             pass
-        # Compute router degree statistics (devices with type containing 'ROUTER')
+
         try:
-            router_ids = [d.get('id') for d in devices if (d.get('type') or '').lower().find('router') >= 0]
-            degs = {rid: len(adj.get(rid, [])) for rid in router_ids if rid}
+            router_ids = [normalize_ref(dev.get('id')) for dev in devices if (dev.get('type') or '').lower().find('router') >= 0]
+            degs = {rid: len(adj_clean.get(rid, set())) for rid in router_ids if rid}
             if degs:
                 vals = list(degs.values())
                 info['router_degree_stats'] = {
                     'min': min(vals),
                     'max': max(vals),
-                    'avg': round(sum(vals)/len(vals), 2),
-                    'per_router': degs
+                    'avg': round(sum(vals) / len(vals), 2),
+                    'per_router': degs,
                 }
         except Exception:
             pass
+
         return info
     except Exception as e:
         return {'error': str(e)}
@@ -2248,11 +2657,13 @@ def run_cli():
         except Exception as e_bundle:
             app.logger.exception("[sync] failed building full scenario bundle: %s", e_bundle)
         try:
+            session_xml_path = post_saved if (post_saved and os.path.exists(post_saved)) else None
             _append_run_history({
                 'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
                 'mode': 'sync',
-                'xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
-                'post_xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
+                'xml_path': xml_path,
+                'post_xml_path': session_xml_path,
+                'session_xml_path': session_xml_path,
                 'scenario_xml_path': xml_path,
                 'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
                 'pre_xml_path': pre_saved if 'pre_saved' in locals() else None,
@@ -2269,7 +2680,7 @@ def run_cli():
         return redirect(url_for('index'))
 
 
-# ----------------------- Planning (Preview / Approve / Run) -----------------------
+# ----------------------- Planning (Preview / Run) -----------------------
 
 
 
@@ -2298,114 +2709,20 @@ def api_plan_preview_full():
         xml_path = os.path.abspath(xml_path)
         if not os.path.exists(xml_path):
             return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
-        from core_topo_gen.parsers.xml_parser import parse_node_info, parse_routing_info, parse_services, parse_vulnerabilities_info, parse_segmentation_info
-        density_base, weight_items, count_items, services_list = parse_node_info(xml_path, scenario)
-        role_counts: dict[str,int] = {}
-        for r, c in count_items:
-            role_counts[r] = role_counts.get(r, 0) + int(c)
-        # Re-introduce weight-based expansion so preview reflects factor-based host planning
-        try:
-            if weight_items and (density_base or 0) > 0:
-                base_total = int(density_base)
-                # Normalize factors to sum to 1.0 then allocate
-                total_f = sum(f for _, f in weight_items) or 0.0
-                if total_f > 0:
-                    for role, f in weight_items:
-                        alloc = int(round((f/total_f) * base_total))
-                        if alloc > 0:
-                            role_counts[role] = role_counts.get(role, 0) + alloc
-        except Exception:
-            pass
-        routing_density, routing_items = parse_routing_info(xml_path, scenario)
-        prelim_router_count = 0
-        try:
-            host_total_for_density = sum(role_counts.values())
-            if routing_density and routing_density > 0 and host_total_for_density > 0:
-                prelim_router_count = max(1, int(round(routing_density * host_total_for_density)))
-            # Count-based router items can independently raise the router count
-            for ri in routing_items:
-                abs_c = int(getattr(ri, 'abs_count', 0) or 0)
-                if abs_c > 0:
-                    prelim_router_count = max(prelim_router_count, abs_c)
-        except Exception:
-            pass
-        service_plan = {s.name: (s.abs_count if s.abs_count > 0 else int(round(s.density * (density_base or 0)))) for s in services_list}
-        vuln_density, vuln_items = parse_vulnerabilities_info(xml_path, scenario)
-        vplan: dict[str,int] = {}
-        try:
-            import math as _math
-            density_target = int(_math.floor((vuln_density or 0.0) * (density_base or 0) + 1e-9))
-        except Exception:
-            density_target = 0
-        for it in (vuln_items or []):
-            if (it.get('v_metric') == 'Count'):
-                try:
-                    c = int(it.get('v_count') or 0)
-                except Exception:
-                    c = 0
-                if c>0:
-                    name = it.get('selected') or 'Item'
-                    vplan[name] = vplan.get(name,0)+c
-        if density_target>0:
-            vplan['__density_pool__'] = density_target
-        seg_density, seg_items = parse_segmentation_info(xml_path, scenario)
-        seg_items_serial = [{"selected": (it.name or 'Random'), "factor": it.factor} for it in seg_items]
-        try:
-            from core_topo_gen.planning.full_preview import build_full_preview  # type: ignore
-        except ModuleNotFoundError as _e1:
-            app.logger.warning('[plan.preview_full] initial import failed: %s; retrying ensure', _e1)
-            ensure_ok = False
+        from core_topo_gen.planning.orchestrator import compute_full_plan
+        from core_topo_gen.planning.plan_cache import hash_xml_file, try_get_cached_plan, save_plan_to_cache
+        xml_hash = hash_xml_file(xml_path)
+        plan = try_get_cached_plan(xml_hash, scenario, seed)
+        if plan:
+            app.logger.debug('[plan.preview_full] using cached plan (%s, scenario=%s, seed=%s)', xml_hash[:12], scenario, seed)
+        else:
+            plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
             try:
-                ensure_ok = _ensure_full_preview_module()
-            except Exception as _e2:
-                app.logger.error('[plan.preview_full] ensure_full_preview_module raised: %s', _e2)
-            try:
-                from core_topo_gen.planning.full_preview import build_full_preview  # type: ignore
-            except Exception as _e3:
-                # Log sys.path and package file locations for diagnostics
-                try:
-                    import core_topo_gen as _ctg, inspect
-                    app.logger.error('[plan.preview_full] final import failed; core_topo_gen file=%s sys.path[0]=%s ensure_ok=%s', getattr(_ctg,'__file__',None), sys.path[0], ensure_ok)
-                except Exception:
-                    pass
-                raise _e3
-        # Derive R2R and R2S policies (parallel to CLI derivation) from first eligible routing items
-        r2r_policy_plan = None
-        r2s_policy_plan = None
-        try:
-            first_r2r = next((ri for ri in routing_items if getattr(ri,'r2r_mode',None)), None)  # type: ignore
-            if first_r2r:
-                m = getattr(first_r2r, 'r2r_mode', '')
-                if m == 'Exact' and getattr(first_r2r, 'r2r_edges', 0) > 0:
-                    r2r_policy_plan = { 'mode': 'Exact', 'target_degree': int(getattr(first_r2r,'r2r_edges',0)) }
-                elif m:
-                    r2r_policy_plan = { 'mode': m }
-            first_r2s = next((ri for ri in routing_items if getattr(ri,'r2s_mode',None)), None)  # type: ignore
-            if first_r2s:
-                m2 = getattr(first_r2s, 'r2s_mode', '')
-                if m2 == 'Exact' and getattr(first_r2s, 'r2s_edges', 0) > 0:
-                    r2s_policy_plan = { 'mode': 'Exact', 'target_per_router': int(getattr(first_r2s,'r2s_edges',0)) }
-                elif m2:
-                    r2s_policy_plan = { 'mode': m2 }
-        except Exception:
-            pass
-        full_prev = build_full_preview(
-            role_counts=role_counts,
-            routers_planned=prelim_router_count,
-            services_plan=service_plan,
-            vulnerabilities_plan=vplan,
-            r2r_policy=r2r_policy_plan,
-            r2s_policy=r2s_policy_plan,
-            routing_items=routing_items,  # allow builder to self-derive if explicit policy absent
-            routing_plan={},
-            segmentation_density=seg_density,
-            segmentation_items=seg_items_serial,
-            seed=seed,
-            ip4_prefix='10.0.0.0/24',
-            r2s_hosts_min_list=r2s_hosts_min_list,
-            r2s_hosts_max_list=r2s_hosts_max_list,
-        )
-        return jsonify({'ok': True, 'full_preview': full_prev})
+                save_plan_to_cache(xml_hash, scenario, seed, plan)
+            except Exception as ce:
+                app.logger.debug('[plan.preview_full] cache save failed: %s', ce)
+        full_prev = _build_full_preview_from_plan(plan, seed, r2s_hosts_min_list, r2s_hosts_max_list)
+        return jsonify({'ok': True, 'full_preview': full_prev, 'plan': plan, 'breakdowns': plan.get('breakdowns')})
     except Exception as e:
         app.logger.exception('[plan.preview_full] error: %s', e)
         return jsonify({'ok': False, 'error': str(e) }), 500
@@ -2434,95 +2751,99 @@ def plan_full_preview_page():
         if not os.path.exists(xml_path):
             flash(f'XML not found: {xml_path}')
             return redirect(url_for('index'))
-        from core_topo_gen.parsers.xml_parser import parse_node_info, parse_routing_info, parse_services, parse_vulnerabilities_info, parse_segmentation_info
-        density_base, weight_items, count_items, services_list = parse_node_info(xml_path, scenario)
-        role_counts: dict[str,int] = {}
-        for r,c in count_items:
-            role_counts[r] = role_counts.get(r,0)+int(c)
-        # Re-introduce weight-based expansion
+        from core_topo_gen.planning.orchestrator import compute_full_plan
+        from core_topo_gen.planning.plan_cache import hash_xml_file, try_get_cached_plan, save_plan_to_cache
+
+        plan = None
+        xml_hash = None
         try:
-            if weight_items and (density_base or 0) > 0:
-                base_total = int(density_base)
-                total_f = sum(f for _, f in weight_items) or 0.0
-                if total_f > 0:
-                    for role, f in weight_items:
-                        alloc = int(round((f/total_f) * base_total))
-                        if alloc > 0:
-                            role_counts[role] = role_counts.get(role,0)+alloc
-        except Exception:
-            pass
-        routing_density, routing_items = parse_routing_info(xml_path, scenario)
-        prelim_router_count = 0
-        try:
-            host_total_for_density = sum(role_counts.values())
-            if routing_density and routing_density>0 and host_total_for_density>0:
-                prelim_router_count = max(1, int(round(routing_density * host_total_for_density)))
-            for ri in routing_items:
-                abs_c = int(getattr(ri,'abs_count',0) or 0)
-                if abs_c>0:
-                    prelim_router_count = max(prelim_router_count, abs_c)
-        except Exception:
-            pass
-        service_plan = {s.name: (s.abs_count if s.abs_count>0 else int(round(s.density * (density_base or 0)))) for s in services_list}
-        vuln_density, vuln_items = parse_vulnerabilities_info(xml_path, scenario)
-        vplan: dict[str,int] = {}
-        try:
-            import math as _math
-            density_target = int(_math.floor((vuln_density or 0.0) * (density_base or 0) + 1e-9))
-        except Exception:
-            density_target = 0
-        for it in (vuln_items or []):
-            if (it.get('v_metric')=='Count'):
-                try: c=int(it.get('v_count') or 0)
-                except Exception: c=0
-                if c>0:
-                    name = it.get('selected') or 'Item'
-                    vplan[name]=vplan.get(name,0)+c
-        if density_target>0: vplan['__density_pool__']=density_target
-        seg_density, seg_items = parse_segmentation_info(xml_path, scenario)
-        seg_items_serial = [{"selected": (it.name or 'Random'), "factor": it.factor} for it in seg_items]
-        # build full preview (with optional seed)
-        try:
-            from core_topo_gen.planning.full_preview import build_full_preview
-        except ModuleNotFoundError:
-            _ensure_full_preview_module()
-            from core_topo_gen.planning.full_preview import build_full_preview
-        # Derive r2s policy (Exact etc.) for preview page as well
-        r2s_policy_plan = None
-        try:
-            first_r2s = next((ri for ri in routing_items if getattr(ri,'r2s_mode',None)), None)  # type: ignore
-            if first_r2s:
-                m2 = getattr(first_r2s, 'r2s_mode', '')
-                if m2 == 'Exact' and getattr(first_r2s, 'r2s_edges', 0) > 0:
-                    r2s_policy_plan = { 'mode': 'Exact', 'target_per_router': int(getattr(first_r2s,'r2s_edges',0)) }
-                elif m2:
-                    r2s_policy_plan = { 'mode': m2 }
-        except Exception:
-            pass
-        full_prev = build_full_preview(
-            role_counts=role_counts,
-            routers_planned=prelim_router_count,
-            services_plan=service_plan,
-            vulnerabilities_plan=vplan,
-            r2r_policy=None,
-            r2s_policy=r2s_policy_plan,
-            routing_items=routing_items,  # pass through for auto-derive
-            routing_plan={},
-            segmentation_density=seg_density,
-            segmentation_items=seg_items_serial,
-            seed=seed,
-            ip4_prefix='10.0.0.0/24',
-        )
+            xml_hash = hash_xml_file(xml_path)
+            plan = try_get_cached_plan(xml_hash, scenario, seed)
+            if plan:
+                app.logger.debug('[plan.full_preview_page] using cached plan (%s, scenario=%s, seed=%s)', (xml_hash or '')[:12], scenario, seed)
+        except Exception as cache_err:
+            try:
+                app.logger.debug('[plan.full_preview_page] cache lookup failed: %s', cache_err)
+            except Exception:
+                pass
+            plan = None
+        if not plan:
+            plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
+            try:
+                if xml_hash is None:
+                    xml_hash = hash_xml_file(xml_path)
+                save_plan_to_cache(xml_hash, scenario, seed, plan)
+            except Exception as cache_save_err:
+                try:
+                    app.logger.debug('[plan.full_preview_page] cache save failed: %s', cache_save_err)
+                except Exception:
+                    pass
+        full_prev = _build_full_preview_from_plan(plan, seed)
+        display_artifacts = full_prev.get('display_artifacts')
+        if not display_artifacts:
+            try:
+                display_artifacts = _attach_display_artifacts(full_prev)
+            except Exception:
+                display_artifacts = {
+                    'segmentation': {
+                        'rows': [],
+                        'table_rows': [],
+                        'tableRows': [],
+                        'json': {'rules_count': 0, 'types_summary': {}, 'rules': [], 'metadata': None},
+                    },
+                    '__version': FULL_PREVIEW_ARTIFACT_VERSION,
+                }
+        segmentation_artifacts = (display_artifacts or {}).get('segmentation')
+        # Annotate & enforce enumerated host roles (Server, Workstation, PC) in preview
+        # Full preview already receives normalized roles from planning layer
         # Attempt scenario name
-        scenario_name = None
+        scenario_name = scenario or None
+        if not scenario_name:
+            try:
+                names_for_cli = _scenario_names_from_xml(xml_path)
+                if names_for_cli: scenario_name = names_for_cli[0]
+            except Exception:
+                pass
+        # Persist preview payload for downstream execution wiring
+        preview_plan_path = None
         try:
-            names_for_cli = _scenario_names_from_xml(xml_path)
-            if names_for_cli: scenario_name = names_for_cli[0]
-        except Exception: pass
+            import json as _json
+            plans_dir = os.path.join(_outputs_dir(), 'plans')
+            os.makedirs(plans_dir, exist_ok=True)
+            seed_tag = full_prev.get('seed') or 'preview'
+            unique_tag = f"{seed_tag}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+            preview_plan_path = os.path.join(plans_dir, f"plan_from_preview_{unique_tag}.json")
+            plan_payload = {
+                'full_preview': full_prev,
+                'metadata': {
+                    'xml_path': xml_path,
+                    'scenario': scenario_name,
+                    'seed': full_prev.get('seed'),
+                    'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
+                },
+            }
+            with open(preview_plan_path, 'w', encoding='utf-8') as pf:
+                _json.dump(plan_payload, pf, indent=2, sort_keys=True)
+        except Exception as plan_err:
+            preview_plan_path = None
+            try:
+                app.logger.warning('[plan.full_preview_page] failed to persist preview plan: %s', plan_err)
+            except Exception:
+                pass
         # Provide JSON string for embedding (stringify smaller subset for safety)
         import json as _json
-        preview_json_str = _json.dumps(full_prev, indent=2)
-        return render_template('full_preview.html', full_preview=full_prev, preview_json=preview_json_str, xml_path=xml_path, scenario=scenario_name, seed=full_prev.get('seed'))
+        preview_json_str = _json.dumps(full_prev, indent=2, default=str)
+        return render_template(
+            'full_preview.html',
+            full_preview=full_prev,
+            preview_json=preview_json_str,
+            xml_path=xml_path,
+            scenario=scenario_name,
+            seed=full_prev.get('seed'),
+            preview_plan_path=preview_plan_path,
+            display_artifacts=display_artifacts,
+            segmentation_artifacts=segmentation_artifacts,
+        )
     except Exception as e:
         app.logger.exception('[plan.full_preview_page] error: %s', e)
         flash(f'Full preview page error: {e}')
@@ -2558,294 +2879,327 @@ def _plan_summary_from_full_preview(full_prev: dict) -> dict:
     }
     return summary
 
-@app.route('/api/plan/approve_full_preview', methods=['POST'])
-def api_plan_approve_full_preview():
-    """Persist a full preview JSON as an approved plan (without invoking CORE).
-
-    Request JSON: { xml_path: str, full_preview: {...} }
-    Response: { ok, plan_path, approved_path, plan_summary }
-    """
+# --- Unified Preview Helpers (ensure modal JSON preview == full page preview) ---
+def _derive_routing_policies(routing_items):
+    """Derive R2R and R2S policies from routing items (first item wins)."""
+    r2r_policy_plan = None
+    r2s_policy_plan = None
     try:
-        payload = request.get_json(silent=True) or {}
-        xml_path = payload.get('xml_path')
-        full_prev = payload.get('full_preview') or {}
-        if not xml_path or not full_prev:
-            return jsonify({'ok': False, 'error': 'xml_path or full_preview missing'}), 400
-        xml_path = os.path.abspath(xml_path)
-        if not os.path.exists(xml_path):
-            return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
-        plan_dir = os.path.join(_outputs_dir(), 'plans')
-        approved_dir = os.path.join(plan_dir, 'approved')
-        os.makedirs(plan_dir, exist_ok=True)
-        os.makedirs(approved_dir, exist_ok=True)
-        import time, json as _json
-        ts = int(time.time())
-        seed = full_prev.get('seed') or 'na'
-        plan_filename = f'plan_from_preview_{seed}_{ts}.json'
-        plan_path = os.path.join(plan_dir, plan_filename)
-        approved_path = os.path.join(approved_dir, plan_filename)
-        plan_summary = _plan_summary_from_full_preview(full_prev)
-        plan_obj = { 'plan': plan_summary, 'full_preview': full_prev }
-        try:
-            with open(plan_path, 'w', encoding='utf-8') as pf:
-                _json.dump(plan_obj, pf, indent=2, sort_keys=True)
-            # Copy to approved directly
-            import shutil
-            shutil.copy(plan_path, approved_path)
-        except Exception as e_write:
-            return jsonify({'ok': False, 'error': f'write_failed: {e_write}'}), 500
-        # Run history entry
-        try:
-            _append_run_history({
-                'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
-                'mode': 'preview-approved',
-                'xml_path': xml_path,
-                'plan_path': approved_path,
-                'seed': seed,
-                'scenario_names': None,
-            })
-        except Exception as e_hist:
-            app.logger.warning('[preview-approved] history append failed: %s', e_hist)
-        return jsonify({'ok': True, 'plan_path': plan_path, 'approved_path': approved_path, 'plan_summary': plan_summary})
-    except Exception as e:
-        app.logger.exception('[plan.approve_full_preview] error: %s', e)
-        return jsonify({'ok': False, 'error': str(e)}), 500
+        first_r2r = next((ri for ri in (routing_items or []) if getattr(ri,'r2r_mode',None)), None)  # type: ignore
+        if first_r2r:
+            m = getattr(first_r2r, 'r2r_mode', '')
+            if m == 'Exact' and getattr(first_r2r, 'r2r_edges', 0) > 0:
+                r2r_policy_plan = { 'mode': 'Exact', 'target_degree': int(getattr(first_r2r,'r2r_edges',0)) }
+            elif m:
+                r2r_policy_plan = { 'mode': m }
+        first_r2s = next((ri for ri in (routing_items or []) if getattr(ri,'r2s_mode',None)), None)  # type: ignore
+        if first_r2s:
+            m2 = getattr(first_r2s, 'r2s_mode', '')
+            if m2 == 'Exact' and getattr(first_r2s, 'r2s_edges', 0) > 0:
+                r2s_policy_plan = { 'mode': 'Exact', 'target_per_router': int(getattr(first_r2s,'r2s_edges',0)) }
+            elif m2:
+                r2s_policy_plan = { 'mode': m2 }
+    except Exception:
+        pass
+    return r2r_policy_plan, r2s_policy_plan
 
-
-@app.route('/api/plan/approve', methods=['POST'])
-def api_plan_approve():
-    """Mark a previously generated plan as approved.
-
-    Request JSON: { plan_path: "/abs/path/plan_x.json", xml_path: "/abs/path/scenarios.xml" }
-    Returns JSON with approved_path (copied) so the original ephemeral path can be discarded later.
-    """
-    try:
-        payload = request.get_json(silent=True) or {}
-        plan_path = payload.get('plan_path') or request.form.get('plan_path')
-        xml_path = payload.get('xml_path') or request.form.get('xml_path')
-        if not plan_path:
-            return jsonify({ 'ok': False, 'error': 'plan_path missing' }), 400
-        plan_path = os.path.abspath(plan_path)
-        if not os.path.exists(plan_path):
-            return jsonify({ 'ok': False, 'error': f'Plan file not found: {plan_path}' }), 404
-        # Security: ensure inside outputs/plans
-        base_plans = os.path.join(_outputs_dir(), 'plans')
-        if not plan_path.startswith(os.path.abspath(base_plans)):
-            return jsonify({ 'ok': False, 'error': 'Refusing to approve plan outside outputs/plans' }), 400
-        approved_dir = os.path.join(base_plans, 'approved')
-        os.makedirs(approved_dir, exist_ok=True)
-        import shutil, json as _json
-        # Derive new filename (retain original timestamp if present)
-        p_name = os.path.basename(plan_path)
-        approved_path = os.path.join(approved_dir, p_name)
-        shutil.copy(plan_path, approved_path)
-        plan_obj = None
+def _json_ready(value):
+    """Convert nested objects into JSON-friendly primitives (recursively)."""
+    if isinstance(value, dict):
+        return {k: _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, '__dict__'):
         try:
-            with open(approved_path, 'r', encoding='utf-8') as pf:
-                plan_obj = _json.load(pf)
+            return {k: _json_ready(v) for k, v in vars(value).items() if not k.startswith('_')}
         except Exception:
-            plan_obj = None
-        # Merge optional full_preview provided by client (if user generated a richer full preview before approval)
-        try:
-            if isinstance(plan_obj, dict) and 'full_preview' not in plan_obj:
-                fp_client = payload.get('full_preview')
-                if fp_client:
-                    plan_obj['full_preview'] = fp_client
-                    with open(approved_path, 'w', encoding='utf-8') as pfw:
-                        _json.dump(plan_obj, pfw, indent=2, sort_keys=True)
-        except Exception as e_merge:
-            app.logger.warning('[plan.approve] failed merging full_preview: %s', e_merge)
-        _append_run_history({
-            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
-            'mode': 'plan-approved',
-            'xml_path': os.path.abspath(xml_path) if xml_path else None,
-            'plan_path': approved_path,
-            'plan_preview_path': plan_path,
-            'plan_summary': plan_obj.get('plan') if isinstance(plan_obj, dict) else None,
-        })
-        return jsonify({ 'ok': True, 'approved_path': approved_path, 'plan': (plan_obj.get('plan') if isinstance(plan_obj, dict) else None) })
-    except Exception as e:
-        app.logger.exception('[plan.approve] error: %s', e)
-        return jsonify({ 'ok': False, 'error': str(e) }), 500
+            pass
+    try:
+        return str(value)
+    except Exception:
+        return repr(value)
 
 
-@app.route('/run_with_plan', methods=['POST'])
-def run_with_plan():
-    """Execute a build using an approved plan JSON (phased builder) and provided scenario XML.
+def _summarize_seg_rule(rule_dict: dict) -> str:
+    if not isinstance(rule_dict, dict):
+        return ''
+    type_raw = rule_dict.get('type') or rule_dict.get('action') or ''
+    type_str = str(type_raw).strip()
+    if not type_str:
+        return ''
+    lower = type_str.lower()
+    if lower == 'nat':
+        mode = str(rule_dict.get('mode')).strip() if rule_dict.get('mode') not in (None, '') else ''
+        internal = rule_dict.get('internal') or rule_dict.get('internal_subnet') or ''
+        external = rule_dict.get('external') or rule_dict.get('external_subnet') or ''
+        parts = []
+        if mode:
+            parts.append(mode)
+        if internal:
+            parts.append(str(internal))
+        summary = ' '.join(parts)
+        if internal and external:
+            summary = f"{summary} -> {external}" if summary else f"{internal} -> {external}"
+        elif external:
+            summary = f"{summary} {external}".strip()
+        return summary.strip()
+    if lower == 'host_block':
+        src = rule_dict.get('src') or rule_dict.get('source') or ''
+        dst = rule_dict.get('dst') or rule_dict.get('destination') or ''
+        return f"{src} X {dst}".strip()
+    if lower == 'custom':
+        desc = rule_dict.get('description') or rule_dict.get('summary') or ''
+        desc_str = str(desc).strip()
+        return desc_str or 'custom'
+    src = rule_dict.get('src') or rule_dict.get('source')
+    dst = rule_dict.get('dst') or rule_dict.get('destination')
+    if src or dst:
+        return f"{type_str}: {src or '*'} -> {dst or '*'}"
+    return type_str
 
-    Form fields: xml_path, plan_path, strict_plan (optional 'on')
-    Returns HTML similar to run_cli route (index.html with logs and preview/report info).
-    """
-    xml_path = request.form.get('xml_path')
-    plan_path = request.form.get('plan_path')
-    strict_plan = bool(request.form.get('strict_plan'))
-    if not xml_path or not plan_path:
-        flash('xml_path or plan_path missing')
-        return redirect(url_for('index'))
-    xml_path = os.path.abspath(xml_path)
-    plan_path = os.path.abspath(plan_path)
-    if not os.path.exists(xml_path):
-        flash(f'XML path not found: {xml_path}')
-        return redirect(url_for('index'))
-    if not os.path.exists(plan_path):
-        flash(f'Plan path not found: {plan_path}')
-        return redirect(url_for('index'))
-    # Derive CORE host/port from XML if present
-    core_host = '127.0.0.1'
-    core_port = 50051
+
+def _build_segmentation_display_artifacts(full_preview: dict) -> dict:
+    seg_preview = {}
     try:
-        payload = _parse_scenarios_xml(xml_path)
-        ch = payload.get('core', {}).get('host') if isinstance(payload.get('core'), dict) else None
-        cp = payload.get('core', {}).get('port') if isinstance(payload.get('core'), dict) else None
-        if ch: core_host = str(ch)
-        if cp: core_port = int(cp)
+        seg_preview = _json_ready((full_preview or {}).get('segmentation_preview') or {})
     except Exception:
-        pass
-    # Pre-save existing CORE session (best effort)
-    pre_saved = None
+        seg_preview = {}
+    raw_rules = []
+    if isinstance(seg_preview, dict):
+        raw_rules = seg_preview.get('rules') or []
+    if not isinstance(raw_rules, list):
+        raw_rules = []
+    entries = []
+    type_counts = {}
+    for raw_entry in raw_rules:
+        entry = _json_ready(raw_entry)
+        if not isinstance(entry, dict):
+            continue
+        rule_dict = entry.get('rule')
+        if rule_dict is None:
+            rule_dict = entry
+        rule_dict = _json_ready(rule_dict)
+        if not isinstance(rule_dict, dict):
+            continue
+        node_id = entry.get('node_id', rule_dict.get('node_id'))
+        rule_type = rule_dict.get('type') or rule_dict.get('action')
+        rule_type_str = str(rule_type) if rule_type not in (None, '') else None
+        summary = _summarize_seg_rule(rule_dict)
+        script_path = entry.get('script') or rule_dict.get('script')
+        if not isinstance(script_path, str):
+            script_path = None
+        script_name = os.path.basename(script_path) if script_path else None
+        table_row = {
+            'node_id': node_id,
+            'type': rule_type_str,
+            'summary': summary,
+            'src': rule_dict.get('src') or rule_dict.get('source'),
+            'dst': rule_dict.get('dst') or rule_dict.get('destination'),
+            'subnet': rule_dict.get('subnet'),
+            'internal': rule_dict.get('internal') or rule_dict.get('internal_subnet'),
+            'external': rule_dict.get('external') or rule_dict.get('external_subnet'),
+            'proto': rule_dict.get('proto') or rule_dict.get('protocol'),
+            'port': rule_dict.get('port'),
+            'script_path': script_path,
+            'script_name': script_name,
+            'detail': rule_dict,
+        }
+        entries.append(table_row)
+        key = rule_type_str or 'unknown'
+        type_counts[key] = type_counts.get(key, 0) + 1
+    metadata = None
+    if isinstance(seg_preview, dict):
+        metadata = {k: v for k, v in seg_preview.items() if k != 'rules'}
+        if not metadata:
+            metadata = None
+    result = {
+        'rows': [{'node_id': e['node_id'], 'type': e['type'], 'summary': e['summary']} for e in entries],
+        'table_rows': entries,
+        'tableRows': entries,
+        'json': {
+            'rules_count': len(entries),
+            'types_summary': type_counts,
+            'rules': [
+                {
+                    'node_id': e['node_id'],
+                    'type': e['type'],
+                    'summary': e['summary'],
+                    'detail': e['detail'],
+                }
+                for e in entries
+            ],
+            'metadata': metadata,
+        },
+    }
+    return result
+
+
+def _attach_display_artifacts(full_preview: dict) -> dict:
+    artifacts = {
+        'segmentation': _build_segmentation_display_artifacts(full_preview),
+        '__version': FULL_PREVIEW_ARTIFACT_VERSION,
+    }
+    if isinstance(full_preview, dict):
+        full_preview['display_artifacts'] = artifacts
+        full_preview['display_artifacts_version'] = FULL_PREVIEW_ARTIFACT_VERSION
+    return artifacts
+
+
+def _build_full_preview_from_plan(plan: dict, seed, r2s_hosts_min_list=None, r2s_hosts_max_list=None):
+    """Single source of truth to invoke build_full_preview using a compute_full_plan result."""
     try:
-        pre_dir = os.path.join(os.path.dirname(xml_path) or _outputs_dir(), 'core-pre')
-        pre_saved = _grpc_save_current_session_xml(core_host, core_port, pre_dir)
-    except Exception:
-        pre_saved = None
-    repo_root = _get_repo_root()
-    py_exec = _select_python_interpreter()
-    scenario_name = None
-    try:
-        names_for_cli = _scenario_names_from_xml(xml_path)
-        if names_for_cli:
-            scenario_name = names_for_cli[0]
-    except Exception:
-        scenario_name = None
-    args = [py_exec, '-m', 'core_topo_gen.cli', '--xml', xml_path, '--use-plan', plan_path, '--host', core_host, '--port', str(core_port), '--verbose']
-    if scenario_name:
-        args.extend(['--scenario', scenario_name])
-    if strict_plan:
-        args.append('--strict-plan')
-    app.logger.info('[plan.run] Running build with plan: %s', ' '.join(args))
-    proc = subprocess.run(args, cwd=repo_root, check=False, capture_output=True, text=True)
-    logs = (proc.stdout or '') + ('\n' + proc.stderr if proc.stderr else '')
-    report_md = _extract_report_path_from_text(logs) or _find_latest_report_path()
-    if report_md and os.path.exists(report_md):
-        flash('Plan build completed. Report ready.')
-    else:
-        if proc.returncode == 0:
-            flash('Plan build completed (no report found).')
+        from core_topo_gen.planning.full_preview import build_full_preview  # lazy import
+    except ModuleNotFoundError:
+        if _ensure_full_preview_module():
+            from core_topo_gen.planning.full_preview import build_full_preview  # type: ignore
         else:
-            flash('Plan build finished with errors.')
-    session_id = _extract_session_id_from_text(logs)
-    post_saved = None
+            raise
+    role_counts = plan['role_counts']
+    prelim_router_count = plan['routers_planned']
+    routing_items = plan.get('routing_items') or []
+    service_plan = plan.get('service_plan') or {}
+    vplan = plan.get('vulnerability_plan') or {}
+    seg_items_serial = plan.get('breakdowns', {}).get('segmentation', {}).get('raw_items_serialized') or []
+    seg_density = plan.get('breakdowns', {}).get('segmentation', {}).get('density')
+    r2r_policy_plan, r2s_policy_plan = _derive_routing_policies(routing_items)
+    fp = build_full_preview(
+        role_counts=role_counts,
+        routers_planned=prelim_router_count,
+        services_plan=service_plan,
+        vulnerabilities_plan=vplan,
+        r2r_policy=r2r_policy_plan,
+        r2s_policy=r2s_policy_plan,
+        routing_items=routing_items,
+        routing_plan=plan.get('breakdowns', {}).get('router', {}).get('simple_plan', {}),
+        segmentation_density=seg_density,
+        segmentation_items=seg_items_serial,
+        traffic_plan=plan.get('traffic_plan'),
+        seed=seed,
+        ip4_prefix='10.0.0.0/24',
+        r2s_hosts_min_list=r2s_hosts_min_list,
+        r2s_hosts_max_list=r2s_hosts_max_list,
+    )
+    fp['router_plan'] = plan.get('breakdowns', {}).get('router', {})
     try:
-        post_dir = os.path.join(os.path.dirname(xml_path), 'core-post')
-        post_saved = _grpc_save_current_session_xml(core_host, core_port, post_dir, session_id=session_id)
-    except Exception:
-        post_saved = None
-    # Run history entry
-    try:
-        _append_run_history({
-            'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
-            'mode': 'plan-build',
-            'xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
-            'scenario_xml_path': xml_path,
-            'plan_path': plan_path,
-            'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
-            'pre_xml_path': pre_saved,
-            'post_xml_path': post_saved,
-            'strict_plan': strict_plan,
-            'returncode': proc.returncode,
-            'scenario_names': [scenario_name] if scenario_name else None,
-        })
-    except Exception as e_hist:
-        app.logger.warning('[plan.run] failed appending run history: %s', e_hist)
-    # Prepare payload for template reuse
-    xml_text = ''
-    try:
-        with open(xml_path, 'r', encoding='utf-8', errors='ignore') as f:
-            xml_text = f.read()
+        _attach_display_artifacts(fp)
     except Exception:
         pass
-    payload = _parse_scenarios_xml(xml_path)
-    if 'core' not in payload:
-        payload['core'] = _default_core_dict()
-    payload['result_path'] = report_md if (report_md and os.path.exists(report_md)) else xml_path
-    run_success = (proc.returncode == 0)
-    return render_template('index.html', payload=payload, logs=logs, xml_preview=xml_text, run_success=run_success)
+    return fp
 
-@app.route('/run_with_full_preview', methods=['POST'])
-def run_with_full_preview():
-    """Experimental: build a CORE scenario guided by an approved plan's embedded full_preview.
 
-    This ensures that randomness (seed-resolved) for roles/IP/subnet grouping matches the preview by:
-      - Re-using the plan file via --use-plan (phased builder) for counts and policies
-      - Passing the original seed; builder will still allocate fresh addresses but drift is measured
-    Future optimization could inject explicit subnet/group assignments once builders accept overrides.
+@app.route('/api/open_scripts', methods=['GET'])
+def api_open_scripts():
+    """Return a listing of traffic or segmentation script directory contents.
+
+    Query params: kind=traffic|segmentation
     """
-    xml_path = request.form.get('xml_path')
-    plan_path = request.form.get('plan_path')
-    strict_plan = bool(request.form.get('strict_plan'))
-    if not xml_path or not plan_path:
-        flash('xml_path or plan_path missing (full preview run)')
-        return redirect(url_for('index'))
-    xml_path = os.path.abspath(xml_path)
-    plan_path = os.path.abspath(plan_path)
-    if not os.path.exists(xml_path):
-        flash(f'XML path not found: {xml_path}')
-        return redirect(url_for('index'))
-    if not os.path.exists(plan_path):
-        flash(f'Plan path not found: {plan_path}')
-        return redirect(url_for('index'))
-    # Inspect plan for full_preview seed
-    fp_seed = None
-    full_preview_present = False
-    try:
-        import json as _json
-        with open(plan_path,'r',encoding='utf-8') as f:
-            pobj = _json.load(f)
-        if isinstance(pobj, dict):
-            fp = pobj.get('full_preview') or (pobj.get('plan') and pobj.get('plan').get('full_preview'))
-            if fp and isinstance(fp, dict):
-                fp_seed = fp.get('seed')
-                full_preview_present = True
-    except Exception:
-        fp_seed = None
-    repo_root = _get_repo_root()
-    py_exec = _select_python_interpreter()
-    scenario_name = None
-    try:
-        names_for_cli = _scenario_names_from_xml(xml_path)
-        if names_for_cli:
-            scenario_name = names_for_cli[0]
-    except Exception:
-        scenario_name = None
-    args = [py_exec, '-m', 'core_topo_gen.cli', '--xml', xml_path, '--use-plan', plan_path, '--host', '127.0.0.1', '--port', '50051', '--verbose']
-    if scenario_name:
-        args.extend(['--scenario', scenario_name])
-    if strict_plan:
-        args.append('--strict-plan')
-    if full_preview_present and fp_seed is not None:
-        args.extend(['--seed', str(fp_seed)])
+    kind = request.args.get('kind','traffic').lower()
+    scope = request.args.get('scope','runtime').lower()  # runtime|preview
+    if kind not in ('traffic','segmentation'):
+        return jsonify({'ok': False, 'error': 'invalid kind'}), 400
+    if scope == 'preview':
+        # Look for latest preview dir (deterministic naming core-topo-preview-*)
+        import tempfile, glob
+        base = tempfile.gettempdir()
+        pattern = 'core-topo-preview-traffic-*' if kind=='traffic' else 'core-topo-preview-seg-*'
+        candidates = sorted(glob.glob(os.path.join(base, pattern)), key=lambda p: os.path.getmtime(p), reverse=True)
+        path = candidates[0] if candidates else None
+        if not path:
+            return jsonify({'ok': False, 'error': 'no preview dir found for kind', 'pattern': pattern}), 404
     else:
-        flash('Full preview seed not found in plan; falling back to plan-only build')
-    app.logger.info('[plan.run_full_preview] Running build with full preview seed: %s', ' '.join(args))
-    proc = subprocess.run(args, cwd=repo_root, check=False, capture_output=True, text=True)
-    logs = (proc.stdout or '') + ('\n' + proc.stderr if proc.stderr else '')
-    report_md = _extract_report_path_from_text(logs) or _find_latest_report_path()
-    if report_md and os.path.exists(report_md):
-        flash('Full preview guided build completed.')
-    else:
-        flash('Full preview build finished (report status unknown).')
-    xml_text = ''
+        path = '/tmp/traffic' if kind == 'traffic' else '/tmp/segmentation'
+    if not os.path.isdir(path):
+        return jsonify({'ok': False, 'error': 'directory does not exist', 'path': path}), 404
+    files = []
     try:
-        with open(xml_path,'r',encoding='utf-8',errors='ignore') as xf:
-            xml_text = xf.read()
-    except Exception:
-        pass
-    payload = _parse_scenarios_xml(xml_path)
-    if 'core' not in payload:
-        payload['core'] = _default_core_dict()
-    payload['result_path'] = report_md if (report_md and os.path.exists(report_md)) else xml_path
-    run_success = (proc.returncode == 0)
-    return render_template('index.html', payload=payload, logs=logs, xml_preview=xml_text, run_success=run_success)
+        for name in sorted(os.listdir(path)):
+            fp = os.path.join(path, name)
+            if not os.path.isfile(fp):
+                continue
+            try:
+                sz = os.path.getsize(fp)
+            except Exception:
+                sz = 0
+            files.append({'file': name, 'size': sz})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({'ok': True, 'kind': kind, 'path': path, 'files': files})
+
+@app.route('/api/open_script_file', methods=['GET'])
+def api_open_script_file():
+    """Return (truncated) contents of a requested script file.
+
+    Query params: kind=traffic|segmentation, scope=runtime|preview, file=<filename>
+    """
+    kind = request.args.get('kind','traffic').lower()
+    scope = request.args.get('scope','runtime').lower()
+    fname = request.args.get('file') or ''
+    if kind not in ('traffic','segmentation'):
+        return jsonify({'ok': False, 'error': 'invalid kind'}), 400
+    if not fname or '/' in fname or '..' in fname:
+        return jsonify({'ok': False, 'error': 'invalid filename'}), 400
+    if scope == 'preview':
+        import tempfile, glob
+        base = tempfile.gettempdir()
+        pattern = 'core-topo-preview-traffic-*' if kind=='traffic' else 'core-topo-preview-seg-*'
+        candidates = sorted(glob.glob(os.path.join(base, pattern)), key=lambda p: os.path.getmtime(p), reverse=True)
+        path = candidates[0] if candidates else None
+    else:
+        path = '/tmp/traffic' if kind == 'traffic' else '/tmp/segmentation'
+    if not path or not os.path.isdir(path):
+        return jsonify({'ok': False, 'error': 'dir not found', 'path': path}), 404
+    fp = os.path.join(path, fname)
+    if not os.path.isfile(fp):
+        return jsonify({'ok': False, 'error': 'file not found', 'file': fname}), 404
+    try:
+        with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read(8000)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({'ok': True, 'file': fname, 'path': path, 'content': content, 'truncated': len(content)==8000})
+
+@app.route('/api/download_scripts', methods=['GET'])
+def api_download_scripts():
+    """Download a zip of segmentation or traffic scripts (preview or runtime).
+
+    Query: kind=traffic|segmentation scope=runtime|preview
+    """
+    kind = request.args.get('kind','traffic').lower()
+    scope = request.args.get('scope','runtime').lower()
+    if kind not in ('traffic','segmentation'):
+        return jsonify({'ok': False, 'error': 'invalid kind'}), 400
+    if scope not in ('runtime','preview'):
+        return jsonify({'ok': False, 'error': 'invalid scope'}), 400
+    # Resolve directory
+    if scope == 'runtime':
+        base_dir = '/tmp/traffic' if kind=='traffic' else '/tmp/segmentation'
+    else:
+        import tempfile, glob
+        pattern = 'core-topo-preview-traffic-*' if kind=='traffic' else 'core-topo-preview-seg-*'
+        cands = sorted(glob.glob(os.path.join(tempfile.gettempdir(), pattern)), key=lambda p: os.path.getmtime(p), reverse=True)
+        base_dir = cands[0] if cands else None
+    if not base_dir or not os.path.isdir(base_dir):
+        return jsonify({'ok': False, 'error': 'directory not found'}), 404
+    import io, zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for root, _dirs, files in os.walk(base_dir):
+            for f in files:
+                fp = os.path.join(root, f)
+                # avoid huge non-script artifacts except summary json
+                if not (f.endswith('.py') or f.endswith('.json')):
+                    continue
+                arc = os.path.relpath(fp, base_dir)
+                try:
+                    zf.write(fp, arc)
+                except Exception:
+                    continue
+    buf.seek(0)
+    from flask import send_file as _send_file
+    filename = f"{kind}_{scope}_scripts.zip"
+    return _send_file(buf, mimetype='application/zip', as_attachment=True, download_name=filename)
 
 @app.route('/download_report')
 def download_report():
@@ -2991,6 +3345,10 @@ def reports_page():
             # Prefer names parsed from the Scenario Editor XML, fall back to session xml if missing
             src_xml = e.get('scenario_xml_path') or e.get('xml_path')
             e['scenario_names'] = _scenario_names_from_xml(src_xml)
+        # Normalize session xml pointer for UI compatibility
+        session_xml = e.get('session_xml_path') or e.get('post_xml_path')
+        if session_xml:
+            e['session_xml_path'] = session_xml
         # Hardening: ensure scenario_names is always a list
         sn = e.get('scenario_names')
         if not isinstance(sn, list):
@@ -3025,6 +3383,9 @@ def reports_data():
         if 'scenario_names' not in e:
             src_xml = e.get('scenario_xml_path') or e.get('xml_path')
             e['scenario_names'] = _scenario_names_from_xml(src_xml)
+        session_xml = e.get('session_xml_path') or e.get('post_xml_path')
+        if session_xml:
+            e['session_xml_path'] = session_xml
         # Hardening: normalize scenario_names to list
         sn = e.get('scenario_names')
         if not isinstance(sn, list):
@@ -3105,6 +3466,7 @@ def reports_delete():
 def run_cli_async():
     seed = None
     xml_path = None
+    preview_plan_path = None
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
         xml_path = request.form.get('xml_path')
@@ -3112,6 +3474,7 @@ def run_cli_async():
         if raw_seed:
             try: seed = int(raw_seed)
             except Exception: seed = None
+        preview_plan_path = request.form.get('preview_plan') or preview_plan_path
     if not xml_path:
         try:
             j = request.get_json(silent=True) or {}
@@ -3119,6 +3482,8 @@ def run_cli_async():
             if 'seed' in j:
                 try: seed = int(j.get('seed'))
                 except Exception: seed = None
+            if 'preview_plan' in j and not preview_plan_path:
+                preview_plan_path = j.get('preview_plan')
         except Exception:
             pass
     if not xml_path:
@@ -3134,13 +3499,35 @@ def run_cli_async():
             pass
     if not os.path.exists(xml_path):
         return jsonify({"error": f"XML path not found: {xml_path}"}), 400
+    preview_plan_path = (preview_plan_path or '').strip() or None
+    if preview_plan_path:
+        try:
+            preview_plan_path = os.path.abspath(preview_plan_path)
+            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
+            if os.path.commonpath([preview_plan_path, plans_dir]) != plans_dir:
+                app.logger.warning('[async] preview plan outside allowed directory: %s', preview_plan_path)
+                preview_plan_path = None
+            elif not os.path.exists(preview_plan_path):
+                app.logger.warning('[async] preview plan path missing: %s', preview_plan_path)
+                preview_plan_path = None
+        except Exception:
+            preview_plan_path = None
     # Skip schema validation: format differs from CORE XML
     run_id = str(uuid.uuid4())
     out_dir = os.path.dirname(xml_path)
     log_path = os.path.join(out_dir, f'cli-{run_id}.log')
     env = os.environ.copy(); env["PYTHONUNBUFFERED"] = "1"
     # Redirect output directly to log file for easy tailing
-    log_f = open(log_path, 'w', encoding='utf-8')
+    # Open log file in line-buffered mode so subprocess logging (stdout+stderr) flushes promptly for UI streaming
+    try:
+        log_f = open(log_path, 'w', encoding='utf-8', buffering=1)
+    except Exception:
+        # Fallback to default buffering if line buffering not available
+        log_f = open(log_path, 'w', encoding='utf-8')
+    try:
+        app.logger.debug("[async] Opened CLI log (line-buffered) at %s", log_path)
+    except Exception:
+        pass
     app.logger.info("[async] Starting CLI; log: %s", log_path)
     # derive core host/port (best-effort) from synchronous parse
     core_host = '127.0.0.1'
@@ -3175,6 +3562,8 @@ def run_cli_async():
         args.extend(['--seed', str(seed)])
     if active_scenario_name:
         args.extend(['--scenario', active_scenario_name])
+    if preview_plan_path:
+        args.extend(['--preview-plan', preview_plan_path])
     proc = subprocess.Popen(args, cwd=repo_root, stdout=log_f, stderr=subprocess.STDOUT, env=env)
     RUNS[run_id] = {
         'proc': proc,
@@ -3189,6 +3578,7 @@ def run_cli_async():
         'scenario_names': scen_names,
         'post_xml_path': None,
         'history_added': False,
+        'preview_plan_path': preview_plan_path,
     }
     # Start a background finalizer so history is appended even if the UI does not poll /run_status
     def _wait_and_finalize_async(run_id_local: str):
@@ -3239,11 +3629,13 @@ def run_cli_async():
                     single_xml = None
                 bundle_xml = single_xml or xml_path_local
                 full_bundle = _build_full_scenario_archive(os.path.dirname(bundle_xml or ''), bundle_xml, (report_md if (report_md and os.path.exists(report_md)) else None), meta.get('pre_xml_path'), post_saved, run_id=run_id_local)
+                session_xml_path = post_saved if (post_saved and os.path.exists(post_saved)) else None
                 _append_run_history({
                     'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
                     'mode': 'async',
-                    'xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
-                    'post_xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
+                    'xml_path': xml_path_local,
+                    'post_xml_path': session_xml_path,
+                    'session_xml_path': session_xml_path,
                     'scenario_xml_path': xml_path_local,
                     'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
                     'pre_xml_path': meta.get('pre_xml_path'),
@@ -3252,6 +3644,7 @@ def run_cli_async():
                     'returncode': rc,
                     'run_id': run_id_local,
                     'scenario_names': meta.get('scenario_names') or [],
+                    'preview_plan_path': meta.get('preview_plan_path'),
                 })
                 meta['history_added'] = True
             except Exception as e_final:
@@ -3333,12 +3726,13 @@ def run_status(run_id: str):
                         single_xml = None
                     bundle_xml = single_xml or xml_path_local
                     full_bundle = _build_full_scenario_archive(os.path.dirname(bundle_xml or ''), bundle_xml, (report_md if (report_md and os.path.exists(report_md)) else None), meta.get('pre_xml_path'), post_saved, run_id=run_id)
+                    session_xml_path = post_saved if (post_saved and os.path.exists(post_saved)) else None
                     _append_run_history({
                         'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
                         'mode': 'async',
-                        # Only record session xml if we actually pulled it via gRPC
-                        'xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
-                        'post_xml_path': post_saved if (post_saved and os.path.exists(post_saved)) else None,
+                        'xml_path': xml_path_local,
+                        'post_xml_path': session_xml_path,
+                        'session_xml_path': session_xml_path,
                         'scenario_xml_path': xml_path_local,
                         'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
                         'pre_xml_path': meta.get('pre_xml_path'),
@@ -3347,6 +3741,7 @@ def run_status(run_id: str):
                         'returncode': rc,
                         'run_id': run_id,
                         'scenario_names': meta.get('scenario_names') or [],
+                        'preview_plan_path': meta.get('preview_plan_path'),
                     })
                 except Exception as e_hist:
                     try:
@@ -3913,17 +4308,24 @@ def core_details():
                     container_flag = True
                     if classification != 'scenario':
                         classification = 'session'
-            if not sid and classification == 'session':
-                errors = 'Provided XML appears to be a CORE session export (contains <container> or <session> root); scenario tools may not apply.'
             ok, errs = _validate_core_xml(xml_path)
-            xml_valid = bool(ok)
-            if not xml_valid and errs and not errors:
-                errors = errs
+            if ok:
+                xml_valid = True
+            else:
+                if classification == 'session':
+                    xml_valid = True
+                    # Suppress schema errors for session exports; treat as advisory only.
+                else:
+                    xml_valid = False
+                    if errs and not errors:
+                        errors = errs
             # Always attempt analysis so graph can render even for invalid/session XML; mark summary with invalid flag
             try:
                 xml_summary = _analyze_core_xml(xml_path)
                 if xml_summary is None:
                     xml_summary = {}
+                if classification == 'session':
+                    xml_summary['__session_export'] = True
                 if not xml_valid:
                     xml_summary['__invalid'] = True
             except Exception:
@@ -3959,8 +4361,17 @@ def core_details():
             )
     except Exception:
         pass
-    # Plan approval removed; render without approved plan context
-    return render_template('core_details.html', xml_path=xml_path, valid=xml_valid, errors=errors, summary=xml_summary, session=session_info, classification=classification, container_flag=container_flag)
+    # Render without legacy approved-plan context
+    return render_template(
+        'core_details.html',
+        xml_path=xml_path,
+        valid=xml_valid,
+        errors=errors,
+        summary=xml_summary,
+        session=session_info,
+        classification=classification,
+        container_flag=container_flag,
+    )
 
 
 @app.route('/admin/cleanup_pycore', methods=['POST'])
@@ -4104,8 +4515,18 @@ def stream_logs(run_id: str):
     log_path = meta.get('log_path')
 
     def generate():
-        # Tail the log file as it is written
+        # 1) Send existing backlog first for immediate context
         last_pos = 0
+        try:
+            with open(log_path, 'r', encoding='utf-8', errors='ignore') as f_init:
+                backlog = f_init.read()
+                last_pos = f_init.tell()
+            if backlog:
+                for line in backlog.splitlines():
+                    yield f"data: {line}\n\n"
+        except FileNotFoundError:
+            pass
+        # 2) Tail incremental additions
         while True:
             try:
                 with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:

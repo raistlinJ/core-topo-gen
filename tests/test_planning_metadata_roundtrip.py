@@ -1,6 +1,9 @@
 import os
 import xml.etree.ElementTree as ET
-from core_topo_gen.parsers.xml_parser import parse_planning_metadata, parse_node_info, parse_routing_info, parse_vulnerabilities_info
+from core_topo_gen.parsers.planning_metadata import parse_planning_metadata
+from core_topo_gen.parsers.node_info import parse_node_info
+from core_topo_gen.parsers.routing import parse_routing_info
+from core_topo_gen.parsers.vulnerabilities import parse_vulnerabilities_info
 
 
 def build_minimal_xml(tmp_path):

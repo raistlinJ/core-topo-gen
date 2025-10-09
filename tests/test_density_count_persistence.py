@@ -2,8 +2,14 @@ import json, os
 from webapp.app_backend import app
 
 
+def _login(client):
+    resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
+    assert resp.status_code in (302, 303)
+
+
 def test_density_count_persists_roundtrip(tmp_path, monkeypatch):
     client = app.test_client()
+    _login(client)
     from webapp import app_backend as backend
 
     def fake_outputs_dir():
@@ -46,7 +52,7 @@ def test_density_count_persists_roundtrip(tmp_path, monkeypatch):
     assert 'density_count="17"' in txt
 
     # Parse using core_topo_gen parser
-    from core_topo_gen.parsers.xml_parser import parse_node_info
+    from core_topo_gen.parsers.node_info import parse_node_info
     density_base, weight_items, count_items, services = parse_node_info(xml_path, 'ScenarioPersist')
     assert density_base == 17
     assert weight_items == []
@@ -56,6 +62,7 @@ def test_density_count_persists_roundtrip(tmp_path, monkeypatch):
 
 def test_default_density_count_is_10_when_absent(tmp_path, monkeypatch):
     client = app.test_client()
+    _login(client)
     from webapp import app_backend as backend
 
     def fake_outputs_dir():
@@ -82,7 +89,7 @@ def test_default_density_count_is_10_when_absent(tmp_path, monkeypatch):
     xml_path = out['result_path']
     assert os.path.exists(xml_path)
 
-    from core_topo_gen.parsers.xml_parser import parse_node_info
+    from core_topo_gen.parsers.node_info import parse_node_info
     density_base, *_ = parse_node_info(xml_path, 'ScenarioDefault')
     # No scenario-level or section-level density_count provided -> parser should fall back to default 10
     assert density_base == 10
