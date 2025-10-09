@@ -37,6 +37,7 @@
           <label class="form-check-label small" for="logFilterRegex" title="Interpret filter as RegExp">Regex</label>
         </div>
         <button class="btn btn-sm btn-outline-secondary ms-1" id="logFilterClearBtn" type="button" title="Clear filter">✕</button>
+        <button class="btn btn-sm btn-outline-secondary ms-2" id="logFollowToggle" type="button" title="Toggle auto-scroll">Follow On</button>
         <button class="btn btn-sm btn-outline-danger ms-2" id="clearLogsBtn" type="button" title="Clear log buffer">Clear</button>
       </div>
     </li>
@@ -64,6 +65,7 @@
   const DOCK_HEIGHT_KEY = 'coretg_dock_height_px';
   const DOCK_HIDDEN_KEY = 'coretg_dock_hidden';
   const DOCK_ACTIVE_TAB_KEY = 'coretg_dock_active_tab';
+  const LOG_FOLLOW_KEY = 'coretg_log_follow';
   let currentLogLevel = LOG_LEVELS.INFO;
   // Preload any existing buffer immediately so the UI isn't blank between load and init()
   let logBuffer = [];
@@ -76,12 +78,33 @@
   let filterRegexObj = null;
   const LOG_FILTER_TEXT_KEY = 'coretg_log_filter_text';
   const LOG_FILTER_REGEX_KEY = 'coretg_log_filter_regex';
+  function scrollLogsToBottom(primaryEl){
+    const preEl = primaryEl || document.getElementById('logsPre');
+    if(!preEl) return;
+    const paneEl = preEl.closest('.tab-pane');
+    const targets = [preEl, paneEl].filter(Boolean);
+    const doScroll = () => {
+      targets.forEach(el => {
+        if(typeof el.scrollTo === 'function'){
+          el.scrollTo({ top: el.scrollHeight, behavior: 'auto' });
+        } else {
+          el.scrollTop = el.scrollHeight;
+        }
+      });
+    };
+    if(typeof requestAnimationFrame === 'function'){
+      requestAnimationFrame(() => requestAnimationFrame(doScroll));
+    } else {
+      doScroll();
+    }
+  }
   function compileFilter(){ filterRegexObj=null; if(!filterText) return; if(filterIsRegex){ let pattern=filterText; let flags='i'; const m=filterText.match(/^\/(.*)\/(\w*)$/); if(m){ pattern=m[1]; flags=m[2]||'i'; } try{ filterRegexObj=new RegExp(pattern, flags);}catch(e){ filterRegexObj=null; } } }
   function passFilter(line){ if(!filterText) return true; if(filterIsRegex){ if(!filterRegexObj) return true; return filterRegexObj.test(line); } return line.toLowerCase().includes(filterText.toLowerCase()); }
-  function renderLogs(){ const el=document.getElementById('logsPre'); if(!el) return; const filtered = logBuffer.filter(r => (r.levelValue||20) >= currentLogLevel).filter(r=>passFilter(r.line)).map(r => r.line); const text = filtered.join('\n'); if(typeof el.replaceChildren === 'function'){ const frag=document.createDocumentFragment(); if(text){ frag.append(text + '\n'); } el.replaceChildren(frag); } else { el.textContent = text + (filtered.length ? '\n' : ''); } el.scrollTop = el.scrollHeight; }
+  let followLogs = true;
+  function renderLogs(){ const el=document.getElementById('logsPre'); if(!el) return; const filtered = logBuffer.filter(r => (r.levelValue||20) >= currentLogLevel).filter(r=>passFilter(r.line)).map(r => r.line); const text = filtered.join('\n'); if(typeof el.replaceChildren === 'function'){ const frag=document.createDocumentFragment(); if(text){ frag.append(text + '\n'); } el.replaceChildren(frag); } else { el.textContent = text + (filtered.length ? '\n' : ''); } if(followLogs){ scrollLogsToBottom(el); const progEl=document.getElementById('runProgressLog'); if(progEl){ scrollLogsToBottom(progEl); } } }
   function persistLogs(){ try{ localStorage.setItem(LOG_STORE_KEY, JSON.stringify(logBuffer)); }catch(e){} }
   function isFilterActive(){ return !!filterText; }
-  function logLine(level, msg){ const ts=new Date().toISOString(); const lvlVal = LOG_LEVELS[level] ?? LOG_LEVELS.INFO; const line = `[${ts}] ${level.padEnd(5)} ${msg}`; logBuffer.push({ level, levelValue: lvlVal, line }); if(logBuffer.length>5000){ logBuffer.splice(0, logBuffer.length-5000); } persistLogs(); if(lvlVal >= currentLogLevel){ if(isFilterActive()){ renderLogs(); } else { if(passFilter(line)){ const el=document.getElementById('logsPre'); if(el){ const text = line + '\n'; if(typeof el.append === 'function'){ el.append(text); } else { el.appendChild(document.createTextNode(text)); } el.scrollTop = el.scrollHeight; } } } } }
+  function logLine(level, msg){ const ts=new Date().toISOString(); const lvlVal = LOG_LEVELS[level] ?? LOG_LEVELS.INFO; const line = `[${ts}] ${level.padEnd(5)} ${msg}`; logBuffer.push({ level, levelValue: lvlVal, line }); if(logBuffer.length>5000){ logBuffer.splice(0, logBuffer.length-5000); } persistLogs(); if(lvlVal >= currentLogLevel){ if(isFilterActive()){ renderLogs(); } else { if(passFilter(line)){ const el=document.getElementById('logsPre'); if(el){ const text = line + '\n'; if(typeof el.append === 'function'){ el.append(text); } else { el.appendChild(document.createTextNode(text)); } if(followLogs){ scrollLogsToBottom(el); const progEl=document.getElementById('runProgressLog'); if(progEl){ scrollLogsToBottom(progEl); } } } } } } }
   function logDebug(m){ logLine('DEBUG', m); }
   function logInfo(m){ logLine('INFO', m); }
   function logWarn(m){ logLine('WARN', m); }
@@ -99,7 +122,7 @@
     const onUp = () => { resizing=false; document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); document.removeEventListener('touchmove', onMove); document.removeEventListener('touchend', onUp); };
     grip.addEventListener('mousedown', (e)=>{resizing=true; startY=e.clientY; startH=dock.offsetHeight; document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp);});
     grip.addEventListener('touchstart', (e)=>{resizing=true; startY=e.touches[0].clientY; startH=dock.offsetHeight; document.addEventListener('touchmove', onMove); document.addEventListener('touchend', onUp);}, {passive:true});
-    const applyHidden = (hidden) => { if(hidden){ dock.classList.add('d-none'); showBtn.classList.remove('d-none'); setBodyPad(12);} else { dock.classList.remove('d-none'); showBtn.classList.add('d-none'); applyHeight(parseInt(localStorage.getItem(DOCK_HEIGHT_KEY) || String(initialH), 10)); } try{ localStorage.setItem(DOCK_HIDDEN_KEY, hidden?'1':'0'); }catch(e){} };
+  const applyHidden = (hidden) => { if(hidden){ dock.classList.add('d-none'); showBtn.classList.remove('d-none'); setBodyPad(12);} else { dock.classList.remove('d-none'); showBtn.classList.add('d-none'); applyHeight(parseInt(localStorage.getItem(DOCK_HEIGHT_KEY) || String(initialH), 10)); if(followLogs){ if(typeof requestAnimationFrame === 'function'){ requestAnimationFrame(renderLogs); } else { renderLogs(); } } } try{ localStorage.setItem(DOCK_HIDDEN_KEY, hidden?'1':'0'); }catch(e){} };
     const savedHidden = localStorage.getItem(DOCK_HIDDEN_KEY); applyHidden(savedHidden ? savedHidden==='1' : true);
     hideBtn.addEventListener('click', () => applyHidden(true)); showBtn.addEventListener('click', () => applyHidden(false));
     // Tab persistence
@@ -112,12 +135,17 @@
   }
   function init(){
     setupDock();
+    try { const savedFollow = localStorage.getItem(LOG_FOLLOW_KEY); if(savedFollow !== null){ followLogs = savedFollow !== '0'; } } catch(e){}
     try { const raw = localStorage.getItem(LOG_STORE_KEY); if(raw){ const arr = JSON.parse(raw); if(Array.isArray(arr)){ logBuffer = arr; if(window._coretg_logBuffer) window._coretg_logBuffer = logBuffer; } } } catch(e){}
     try { const savedLvl = localStorage.getItem('coretg_log_level'); if(savedLvl && LOG_LEVELS[savedLvl] !== undefined){ currentLogLevel = LOG_LEVELS[savedLvl]; const sel=document.getElementById('logLevelFilter'); if(sel) sel.value=savedLvl; } } catch(e){}
   // If we preloaded, paint them before applying filters/level to avoid flash of empty
   renderLogs();
     const sel = document.getElementById('logLevelFilter'); sel?.addEventListener('change', () => { const v=sel.value; if(LOG_LEVELS[v]!==undefined){ currentLogLevel=LOG_LEVELS[v]; try{ localStorage.setItem('coretg_log_level', v); }catch(e){} renderLogs(); }});
-    document.getElementById('clearLogsBtn')?.addEventListener('click', () => { try { localStorage.setItem(LOG_STORE_KEY, JSON.stringify([])); } catch(e){} logBuffer = []; if(window._coretg_logBuffer) window._coretg_logBuffer = logBuffer; renderLogs(); });
+  const followBtn = document.getElementById('logFollowToggle');
+  function updateFollowBtn(){ if(!followBtn) return; followBtn.classList.toggle('btn-primary', followLogs); followBtn.classList.toggle('btn-outline-secondary', !followLogs); followBtn.textContent = followLogs ? 'Follow On' : 'Follow Off'; followBtn.setAttribute('aria-pressed', followLogs ? 'true' : 'false'); }
+  updateFollowBtn();
+  followBtn?.addEventListener('click', ()=>{ followLogs = !followLogs; updateFollowBtn(); try{ localStorage.setItem(LOG_FOLLOW_KEY, followLogs ? '1' : '0'); }catch(e){} if(followLogs){ renderLogs(); } });
+  document.getElementById('clearLogsBtn')?.addEventListener('click', () => { try { localStorage.setItem(LOG_STORE_KEY, JSON.stringify([])); } catch(e){} logBuffer = []; if(window._coretg_logBuffer) window._coretg_logBuffer = logBuffer; renderLogs(); });
     // Restore filter state
     try { const ft = localStorage.getItem(LOG_FILTER_TEXT_KEY); if(ft){ filterText=ft; const inp=document.getElementById('logFilterInput'); if(inp) inp.value=filterText; } } catch(e){}
     try { const fr = localStorage.getItem(LOG_FILTER_REGEX_KEY); if(fr==='1'){ filterIsRegex=true; const cb=document.getElementById('logFilterRegex'); if(cb) cb.checked=true; } } catch(e){}

@@ -2060,6 +2060,12 @@ function renderSidebar() {
     ensureScenarioIds();
     const list = document.getElementById('scenarioList');
     list.innerHTML = '';
+    const escapeHtml = (value) => (value ?? '').toString()
+        .replace(/&/g,'&amp;')
+        .replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;')
+        .replace(/'/g,'&#39;');
     state.scenarios.forEach((scen, idx) => {
         const sid = scen._sid;
         const a = document.createElement('a');
@@ -2068,9 +2074,10 @@ function renderSidebar() {
         // Build inner HTML with checkbox
         const isChecked = selectedScenarioIds.has(sid);
         const name = scen.name || `Scenario ${idx+1}`;
+        const safeName = escapeHtml(name);
         a.innerHTML = `<div class="d-flex align-items-center">
             <input type="checkbox" class="form-check-input me-2 scenario-select" data-sid="${sid}" ${isChecked? 'checked':''} onclick="event.stopPropagation(); toggleScenarioSelection('${sid}', this.checked);" />
-            <span class="flex-grow-1 text-truncate" title="${name.replace(/"/g,'&quot;')}">${name}</span>
+            <span class="flex-grow-1 text-truncate" title="${safeName}">${safeName}</span>
         </div>`;
         a.onclick = (e) => { e.preventDefault(); activeIdx = idx; persistEditorState(); render(); };
         list.appendChild(a);
@@ -2106,6 +2113,22 @@ function renderMain() {
     root.innerHTML = '';
     if (!state.scenarios.length) { return; }
     const scen = state.scenarios[activeIdx] || state.scenarios[0];
+    const escapeHtml = (value) => (value ?? '').toString()
+        .replace(/&/g,'&amp;')
+        .replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;')
+        .replace(/'/g,'&#39;');
+    const safeScenarioName = escapeHtml(scen?.name || '');
+    const defaultScenarioName = escapeHtml(`Scenario ${activeIdx + 1}`);
+    const metaCard = document.createElement('div');
+    metaCard.className = 'card mb-3';
+    metaCard.innerHTML = `
+        <div class="card-body">
+            <label class="form-label mb-1 small text-muted" for="scenarioNameInput_${activeIdx}">Scenario name</label>
+            <input type="text" class="form-control" id="scenarioNameInput_${activeIdx}" data-field="name" data-scen-idx="${activeIdx}" value="${safeScenarioName}" placeholder="${defaultScenarioName}">
+        </div>`;
+    root.appendChild(metaCard);
     // --- Host density normalization for Node Information ---
     try {
         const ni = scen.sections && scen.sections['Node Information'];
@@ -2707,7 +2730,7 @@ function wireHandlers() {
         const sec = el.getAttribute('data-sec');
         const field = el.getAttribute('data-field');
         const iidx = el.getAttribute('data-item-idx');
-        const handler = () => {
+        const handler = (ev) => {
             if (field === 'scenario_base_hosts') { return; }
             if (sec) {
                 if (iidx !== null) {
@@ -2807,7 +2830,20 @@ function wireHandlers() {
                     }
                 }
             } else {
-                if (field === 'name') state.scenarios[sidx].name = el.value;
+                if (field === 'name') {
+                    const raw = el.value ?? '';
+                    if (ev?.type === 'change') {
+                        const trimmed = raw.trim();
+                        const finalName = trimmed || `Scenario ${sidx + 1}`;
+                        state.scenarios[sidx].name = finalName;
+                        if (el.value !== finalName) {
+                            el.value = finalName;
+                        }
+                        try { logInfo(`Scenario renamed to ${finalName}`); } catch(_) {}
+                    } else {
+                        state.scenarios[sidx].name = raw;
+                    }
+                }
                 if (field === 'base-file') state.scenarios[sidx].base.filepath = el.value;
                 if (field === 'notes') state.scenarios[sidx].notes = el.value;
                 if(field === 'notes'){
@@ -2821,6 +2857,9 @@ function wireHandlers() {
                         }
                     } catch(e){}
                 }
+            }
+            if (field === 'name') {
+                renderSidebar();
             }
             // keep hidden for submit
             document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
