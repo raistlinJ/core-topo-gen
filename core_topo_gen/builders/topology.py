@@ -354,7 +354,7 @@ def build_star_from_roles(core: client.CoreGrpcClient,
     host_slot_idx = 0
     docker_by_name: Dict[str, Dict[str, str]] = {}
     created_docker = 0
-    docker_slots_used: Set[str] = set()
+
     docker_slots_used: Set[str] = set()
     for idx, role in enumerate(expanded_roles):
         theta = (2 * math.pi * idx) / max(total_hosts, 1)
@@ -1937,6 +1937,7 @@ def build_segmented_topology(core: client.CoreGrpcClient,
     lan_switch_by_router: Dict[int, int] = {}
     node_id_counter = router_count + 1
     host_slot_idx = 0
+    docker_slots_used: Set[str] = set()
     docker_by_name: Dict[str, Dict[str, str]] = {}
     created_docker = 0
     for ridx, roles in enumerate(buckets):
