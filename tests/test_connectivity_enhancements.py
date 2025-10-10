@@ -81,13 +81,21 @@ def test_nonuniform_gini(monkeypatch):
     sess, routers, hosts, *_ = _build({'workstation':10}, ritems, monkeypatch)
     degs = _degrees(sess, routers)
     vals = list(degs.values())
-    if len(vals) > 1:
-        # Compute gini replicate
-        v = sorted(vals); n=len(v); sm=sum(v)
-        if sm>0:
-            cum = sum((i+1)*x for i,x in enumerate(v))
-            gini = (2*cum)/(n*sm) - (n+1)/n
-            assert gini >= 0
+    assert len(vals) >= 2
+    spread = max(vals) - min(vals)
+    if len(vals) >= 5:
+        assert spread >= 2, f"Expected substantial degree spread for NonUniform mode, got {vals}"
+    elif len(vals) >= 3:
+        assert spread >= 1, f"Expected some degree spread for NonUniform mode, got {vals}"
+    # Compute gini replicate to ensure variance is meaningful.
+    v = sorted(vals)
+    n = len(v)
+    sm = sum(v)
+    if sm > 0 and n > 1:
+        cum = sum((i + 1) * x for i, x in enumerate(v))
+        gini = (2 * cum) / (n * sm) - (n + 1) / n
+        if n >= 4:
+            assert gini >= 0.18, f"NonUniform gini too low: {gini} from degrees {vals}"
     topo_stats = getattr(sess, 'topo_stats', {})
     rep = topo_stats.get('router_edges_policy') or {}
     assert rep.get('mode') in ('NonUniform','Random','Min','Exact','Uniform')

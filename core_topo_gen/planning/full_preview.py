@@ -19,6 +19,7 @@ import ipaddress
 import random
 import os
 import tempfile
+import math
 
 from .layout_positions import compute_clustered_layout
 from ..utils.allocators import UniqueAllocator, make_subnet_allocator  # runtime-like allocators
@@ -433,30 +434,105 @@ def build_full_preview(
             else:
                 r2r_edges = _chain_edges(node_ids)
         elif mode_rr == 'nonuniform':
-            degree_sequence = list(range(len(node_ids)))
-            rng_edges.shuffle(degree_sequence)
-            degree_sequence = [min(d, len(node_ids) - 1) for d in degree_sequence]
-            if len(set(degree_sequence)) == 1 and len(node_ids) > 1:
-                degree_sequence[0] = min(len(node_ids) - 1, degree_sequence[0] + 1)
-            if sum(degree_sequence) % 2 != 0:
-                adjusted = False
-                for idx, val in enumerate(degree_sequence):
-                    if val < len(node_ids) - 1:
-                        degree_sequence[idx] += 1
-                        adjusted = True
-                        break
-                if not adjusted:
-                    for idx, val in enumerate(degree_sequence):
-                        if val > 0:
-                            degree_sequence[idx] -= 1
-                            break
-            candidate = _edges_from_degree_sequence(node_ids, degree_sequence)
-            if candidate is not None and candidate:
-                r2r_edges = candidate
-                realized = _degree_counts(node_ids, r2r_edges)
-                r2r_preview['degree_sequence'] = {str(k): realized.get(k, 0) for k in node_ids}
-            else:
-                r2r_edges = _chain_edges(node_ids)
+            edges_set: Set[Tuple[int, int]] = set()
+            degrees = {nid: 0 for nid in node_ids}
+            order_ids = list(node_ids)
+            rng_edges.shuffle(order_ids)
+
+            def _try_add_edge(a_id: int, b_id: int) -> bool:
+                if a_id == b_id:
+                    return False
+                key = tuple(sorted((a_id, b_id)))
+                if key in edges_set:
+                    return False
+                edges_set.add(key)
+                r2r_edges.append(key)
+                degrees[a_id] += 1
+                degrees[b_id] += 1
+                return True
+
+            in_tree = {order_ids[0]}
+            remaining = set(order_ids[1:])
+            while remaining:
+                a_id = rng_edges.choice(list(in_tree))
+                b_id = rng_edges.choice(list(remaining))
+                if _try_add_edge(a_id, b_id):
+                    in_tree.add(b_id)
+                    remaining.remove(b_id)
+
+            hub_pool = list(node_ids)
+            if len(hub_pool) > 1:
+                max_hubs = int(round(max(2.0, math.sqrt(len(node_ids)))))
+                max_hubs = max(2, max_hubs)
+                hub_count = min(max_hubs, len(node_ids) - 1)
+                if hub_count <= 0:
+                    hub_count = 1
+                rng_edges.shuffle(hub_pool)
+                hub_ids = hub_pool[:hub_count]
+                if not hub_ids:
+                    hub_ids = [hub_pool[0]]
+                primary_hub = hub_ids[0]
+                secondary_hubs = hub_ids[1:]
+                periphery_ids = [rid for rid in node_ids if rid not in hub_ids]
+                nonhub_cap = 2 if len(node_ids) >= 5 else max(2, len(node_ids) // 2)
+
+                def _eligible_target(hub_id: int, cand_id: int) -> bool:
+                    if hub_id == cand_id:
+                        return False
+                    key = tuple(sorted((hub_id, cand_id)))
+                    if key in edges_set:
+                        return False
+                    if cand_id in hub_ids:
+                        return True
+                    if hub_id == primary_hub:
+                        return degrees[cand_id] < (nonhub_cap + 1)
+                    return degrees[cand_id] < nonhub_cap
+
+                for idx, a_id in enumerate(hub_ids):
+                    for b_id in hub_ids[idx + 1:]:
+                        _try_add_edge(a_id, b_id)
+
+                for per_id in periphery_ids:
+                    if _eligible_target(primary_hub, per_id):
+                        _try_add_edge(primary_hub, per_id)
+                    if secondary_hubs and rng_edges.random() < 0.2:
+                        hub_choice = rng_edges.choice(secondary_hubs)
+                        if _eligible_target(hub_choice, per_id):
+                            _try_add_edge(hub_choice, per_id)
+
+                def _degree_span() -> int:
+                    vals = list(degrees.values())
+                    if not vals:
+                        return 0
+                    return max(vals) - min(vals)
+
+                def _gini(values: List[int]) -> float:
+                    vals = [int(v) for v in values if v >= 0]
+                    n = len(vals)
+                    if n <= 1:
+                        return 0.0
+                    total = sum(vals)
+                    if total <= 0:
+                        return 0.0
+                    sorted_vals = sorted(vals)
+                    cum = 0
+                    for idx, val in enumerate(sorted_vals, start=1):
+                        cum += idx * val
+                    return (2 * cum) / (n * total) - (n + 1) / n
+
+                variance_target = 2 if len(node_ids) >= 5 else 1
+                current_span = _degree_span()
+                current_gini = _gini(list(degrees.values()))
+
+                if secondary_hubs and (current_span < variance_target or (len(node_ids) >= 5 and current_gini < 0.15)):
+                    for hub_id in secondary_hubs:
+                        if rng_edges.random() < 0.5 and _eligible_target(primary_hub, hub_id):
+                            _try_add_edge(primary_hub, hub_id)
+                    current_span = _degree_span()
+                    current_gini = _gini(list(degrees.values()))
+
+                if degrees:
+                    r2r_preview['degree_sequence'] = {str(k): degrees.get(k, 0) for k in node_ids}
         elif mode_rr == 'none':
             r2r_edges = []
         else:

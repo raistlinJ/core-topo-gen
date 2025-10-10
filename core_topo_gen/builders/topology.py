@@ -1777,6 +1777,8 @@ def build_segmented_topology(core,
                 target_degree = None  # will derive heuristic later
         elif 'NonUniform' in modes_present:
             connectivity_mode = 'NonUniform'
+            if router_mesh_style == 'full':
+                router_mesh_style = ''
         elif 'Max' in modes_present:
             connectivity_mode = 'Max'
         else:
@@ -1866,7 +1868,7 @@ def build_segmented_topology(core,
                         if add_router_link(a_obj, b_obj, prefix=30, label="u-bal"):
                             degrees[a_id]+=1; degrees[b_id]+=1
         elif connectivity_mode == 'NonUniform':
-            # Start with a random spanning tree (like Random) then add a random number of extra edges favoring hubs.
+            # Build a biased hub-and-spoke style overlay with dense hub links and sparse periphery connections.
             order = list(range(router_count))
             random.shuffle(order)
             in_tree = {order[0]}; remaining = set(order[1:])
@@ -1875,45 +1877,100 @@ def build_segmented_topology(core,
                 b_idx = random.choice(list(remaining))
                 add_router_link(router_objs[a_idx], router_objs[b_idx], prefix=30, label="base")
                 in_tree.add(b_idx); remaining.remove(b_idx)
-            # Compute degrees
             degrees: Dict[int, int] = {r.id: 0 for r in router_objs}
             for a_id, b_id in existing_router_links:
                 degrees[a_id] += 1; degrees[b_id] += 1
-            # Decide extra edge budget: between ~ n/3 and ~ n (bounded by remaining possible pairs)
-            max_possible = (router_count * (router_count - 1) // 2) - len(existing_router_links)
-            extra_target = min(max_possible, max(0, random.randint(router_count//3, router_count)))
-            attempts = 0; max_attempts = router_count * router_count
-            # Prefer connecting lower-degree nodes to higher-degree nodes to create heterogeneity
             router_id_list = [r.id for r in router_objs]
-            while extra_target > 0 and attempts < max_attempts:
-                attempts += 1
-                # pick one low-degree and one high-degree (if available)
-                sorted_ids = sorted(router_id_list, key=lambda rid: degrees[rid])
-                low_candidates = sorted_ids[: max(1, min(3, len(sorted_ids)))]
-                high_candidates = sorted_ids[-max(1, min(5, len(sorted_ids))):]
-                a_id = random.choice(low_candidates)
-                b_id = random.choice(high_candidates)
+
+            def _try_add_edge(a_id: int, b_id: int, label: str) -> bool:
                 if a_id == b_id:
-                    continue
-                a_obj = router_nodes.get(a_id); b_obj = router_nodes.get(b_id)
+                    return False
+                key = (min(a_id, b_id), max(a_id, b_id))
+                if key in existing_router_links:
+                    return False
+                a_obj = router_nodes.get(a_id)
+                b_obj = router_nodes.get(b_id)
                 if not a_obj or not b_obj:
-                    continue
-                if add_router_link(a_obj, b_obj, prefix=30, label="nu"):
-                    degrees[a_id] += 1; degrees[b_id] += 1; extra_target -= 1
-            # Ensure non-uniformity (variance) – if degrees ended uniform, add one extra edge if possible
-            if len(set(degrees.values())) == 1:
-                possible = []
-                ids = list(degrees.keys())
-                for i in range(len(ids)):
-                    for j in range(i+1,len(ids)):
-                        key = (min(ids[i], ids[j]), max(ids[i], ids[j]))
-                        if key not in existing_router_links:
-                            possible.append((ids[i], ids[j]))
-                if possible:
-                    a_id,b_id = random.choice(possible)
-                    a_obj = router_nodes.get(a_id); b_obj = router_nodes.get(b_id)
-                    if a_obj and b_obj:
-                        add_router_link(a_obj, b_obj, prefix=30, label="nu-var")
+                    return False
+                if add_router_link(a_obj, b_obj, prefix=30, label=label):
+                    degrees[a_id] += 1
+                    degrees[b_id] += 1
+                    return True
+                return False
+
+            if len(router_id_list) > 1:
+                hub_pool = list(router_id_list)
+                max_hubs = int(round(max(2.0, math.sqrt(router_count))))
+                max_hubs = max(2, max_hubs)
+                hub_count = min(max_hubs, router_count - 1)
+                if hub_count <= 0:
+                    hub_count = 1
+                random.shuffle(hub_pool)
+                hub_ids = hub_pool[:hub_count]
+                if not hub_ids:
+                    hub_ids = [hub_pool[0]]
+                primary_hub = hub_ids[0]
+                secondary_hubs = hub_ids[1:]
+                periphery_ids = [rid for rid in router_id_list if rid not in hub_ids]
+                nonhub_cap = 2 if router_count >= 5 else max(2, router_count // 2)
+
+                def _eligible_target(hub_id: int, cand_id: int) -> bool:
+                    if hub_id == cand_id:
+                        return False
+                    key = (min(hub_id, cand_id), max(hub_id, cand_id))
+                    if key in existing_router_links:
+                        return False
+                    if cand_id in hub_ids:
+                        return True
+                    if hub_id == primary_hub:
+                        return degrees[cand_id] < (nonhub_cap + 1)
+                    return degrees[cand_id] < nonhub_cap
+
+                # Step 1: build a dense hub clique to create heavy hitters.
+                for idx, a_id in enumerate(hub_ids):
+                    for b_id in hub_ids[idx + 1:]:
+                        _try_add_edge(a_id, b_id, label="nu-hub")
+
+                # Step 2: connect periphery nodes primarily to the dominant hub (and occasionally to secondaries).
+                for per_id in periphery_ids:
+                    if _eligible_target(primary_hub, per_id):
+                        _try_add_edge(primary_hub, per_id, label="nu-pri")
+                    if secondary_hubs and random.random() < 0.2:
+                        hub_choice = random.choice(secondary_hubs)
+                        if _eligible_target(hub_choice, per_id):
+                            _try_add_edge(hub_choice, per_id, label="nu-sec")
+
+                def _degree_span() -> int:
+                    vals = list(degrees.values())
+                    if not vals:
+                        return 0
+                    return max(vals) - min(vals)
+
+                def _gini(values: List[int]) -> float:
+                    vals = [int(v) for v in values if v >= 0]
+                    n = len(vals)
+                    if n <= 1:
+                        return 0.0
+                    total = sum(vals)
+                    if total <= 0:
+                        return 0.0
+                    sorted_vals = sorted(vals)
+                    cum = 0
+                    for idx, val in enumerate(sorted_vals, start=1):
+                        cum += idx * val
+                    return (2 * cum) / (n * total) - (n + 1) / n
+
+                variance_target = 2 if router_count >= 5 else 1
+                current_span = _degree_span()
+                current_gini = _gini(list(degrees.values()))
+
+                # Step 3: if spread is still low, add a few more primary-to-hub edges without touching periphery caps.
+                if secondary_hubs and (current_span < variance_target or (router_count >= 5 and current_gini < 0.15)):
+                    for hub_id in secondary_hubs:
+                        if random.random() < 0.5 and _eligible_target(primary_hub, hub_id):
+                            _try_add_edge(primary_hub, hub_id, label="nu-boost")
+                    current_span = _degree_span()
+                    current_gini = _gini(list(degrees.values()))
         elif connectivity_mode == 'Max':
             # Full mesh (legacy 'Max' -> still supported for backward compatibility)
             for i in range(router_count):
