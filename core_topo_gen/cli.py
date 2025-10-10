@@ -446,6 +446,33 @@ def main():
     vulnerabilities_plan = orchestrated_plan.get('vulnerability_plan')
     routing_plan = orchestrated_plan.get('breakdowns', {}).get('router', {}).get('simple_plan', {})
     router_plan_breakdown = orchestrated_plan.get('breakdowns', {}).get('router', {})
+    seg_breakdown = orchestrated_plan.get('breakdowns', {}).get('segmentation', {}) if orchestrated_plan else {}
+    seg_density_plan = seg_breakdown.get('density') if isinstance(seg_breakdown, dict) else None
+    seg_items_serialized = seg_breakdown.get('raw_items_serialized') if isinstance(seg_breakdown, dict) else None
+    traffic_plan_preview = orchestrated_plan.get('traffic_plan') if isinstance(orchestrated_plan, dict) else None
+    if preview_full is None:
+        try:
+            preview_full = build_full_preview(
+                role_counts=role_counts,
+                routers_planned=prelim_router_count,
+                services_plan=service_plan,
+                vulnerabilities_plan=vulnerabilities_plan,
+                r2r_policy=r2r_policy_plan,
+                r2s_policy=r2s_policy_plan,
+                routing_items=routing_items,
+                routing_plan=routing_plan,
+                segmentation_density=seg_density_plan,
+                segmentation_items=seg_items_serialized,
+                traffic_plan=traffic_plan_preview,
+                seed=args.seed,
+                ip4_prefix=args.prefix,
+                ip_mode=args.ip_mode,
+                ip_region=args.ip_region,
+            )
+        except Exception as auto_prev_exc:
+            logging.getLogger(__name__).warning("Failed to generate automatic full preview: %s", auto_prev_exc)
+    if preview_full and isinstance(router_plan_breakdown, dict):
+        preview_full.setdefault('router_plan', router_plan_breakdown)
     try:
         from .planning.plan_builder import build_initial_pool
         from .planning.constraints import validate_pool_final
@@ -579,14 +606,14 @@ def main():
         "weight_rows": {r: f for r, f in weight_items},
         "role_counts": role_counts,
     }
+    if preview_full:
+        try:
+            generation_meta['preview_router_count'] = len(preview_full.get('routers') or [])
+            generation_meta['preview_host_total'] = len(preview_full.get('hosts') or [])
+        except Exception:
+            pass
     if preview_plan_path:
         generation_meta['preview_plan_path'] = preview_plan_path
-        if preview_full:
-            try:
-                generation_meta['preview_router_count'] = len(preview_full.get('routers') or [])
-                generation_meta['preview_host_total'] = len(preview_full.get('hosts') or [])
-            except Exception:
-                pass
     # Merge in planning metadata namespaced to avoid collision
     try:
         if planning_meta:
