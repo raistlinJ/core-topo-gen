@@ -9,7 +9,7 @@ import datetime
 import time
 import uuid
 import threading
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from collections import defaultdict
 from types import SimpleNamespace
 import subprocess
@@ -184,6 +184,89 @@ def _users_db_path() -> str:
     base = os.path.join(_outputs_dir(), 'users')
     os.makedirs(base, exist_ok=True)
     return os.path.join(base, 'users.json')
+
+
+def _base_upload_state_path() -> str:
+    return os.path.join(_outputs_dir(), 'base_upload.json')
+
+
+def _sanitize_base_upload_meta(meta: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(meta, dict):
+        return None
+    out: Dict[str, Any] = {}
+    path = meta.get('path') or meta.get('filepath')
+    if isinstance(path, str) and path:
+        out['path'] = path
+    display = meta.get('display_name') or meta.get('name')
+    if isinstance(display, str) and display:
+        out['display_name'] = display
+    if 'valid' in meta:
+        out['valid'] = bool(meta.get('valid'))
+    if 'exists' in meta:
+        out['exists'] = bool(meta.get('exists'))
+    if not out.get('path'):
+        return None
+    return out
+
+
+def _load_base_upload_state() -> Optional[Dict[str, Any]]:
+    path = _base_upload_state_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return _sanitize_base_upload_meta(data)
+    except Exception:
+        return None
+
+
+def _save_base_upload_state(meta: Dict[str, Any]) -> None:
+    clean = _sanitize_base_upload_meta(meta)
+    if not clean:
+        return
+    clean = dict(clean)
+    clean['updated_at'] = datetime.datetime.utcnow().isoformat() + 'Z'
+    try:
+        with open(_base_upload_state_path(), 'w', encoding='utf-8') as f:
+            json.dump(clean, f, indent=2)
+    except Exception:
+        pass
+
+
+def _clear_base_upload_state() -> None:
+    path = _base_upload_state_path()
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _hydrate_base_upload_from_disk(payload: Dict[str, Any]) -> None:
+    if payload.get('base_upload'):
+        return
+    meta = _load_base_upload_state()
+    if not meta:
+        return
+    meta = dict(meta)
+    path = meta.get('path') or ''
+    exists = bool(path) and os.path.exists(path)
+    meta['exists'] = exists
+    if path and exists:
+        ok, _errs = _validate_core_xml(path)
+        meta['valid'] = bool(ok)
+        if 'display_name' not in meta or not meta['display_name']:
+            meta['display_name'] = os.path.basename(path)
+    payload['base_upload'] = meta
+    scen_list = payload.get('scenarios') or []
+    if scen_list and isinstance(scen_list[0], dict):
+        base_section = scen_list[0].setdefault('base', {})
+        if path and not base_section.get('filepath'):
+            base_section['filepath'] = path
+        display = meta.get('display_name')
+        if display and not base_section.get('display_name'):
+            base_section['display_name'] = display
 
 def _load_users() -> dict:
     p = _users_db_path()
@@ -1500,7 +1583,16 @@ def _attach_base_upload(payload: Dict[str, Any]):
         if not base_path or not os.path.exists(base_path):
             return
         ok, _errs = _validate_core_xml(base_path)
-        payload['base_upload'] = { 'path': base_path, 'valid': bool(ok) }
+        display_name = os.path.basename(base_path)
+        payload['base_upload'] = {
+            'path': base_path,
+            'valid': bool(ok),
+            'display_name': display_name,
+        }
+        try:
+            scen_list[0].setdefault('base', {})['display_name'] = display_name
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -2391,6 +2483,9 @@ def index():
     payload = _default_scenarios_payload()
     # Reconstruct base_upload if base filepath already present
     _attach_base_upload(payload)
+    _hydrate_base_upload_from_disk(payload)
+    if payload.get('base_upload'):
+        _save_base_upload_state(payload['base_upload'])
     return render_template('index.html', payload=payload, logs="", xml_preview="")
 
 
@@ -2414,6 +2509,9 @@ def load_xml():
             payload["core"] = _default_core_dict()
         payload["result_path"] = filepath
         _attach_base_upload(payload)
+        _hydrate_base_upload_from_disk(payload)
+        if payload.get('base_upload'):
+            _save_base_upload_state(payload['base_upload'])
         xml_text = ""
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
@@ -2488,6 +2586,9 @@ def save_xml():
         except Exception:
             payload = {"scenarios": data.get("scenarios", []), "result_path": out_path, "core": _default_core_dict()}
         _attach_base_upload(payload)
+        _hydrate_base_upload_from_disk(payload)
+        if payload.get('base_upload'):
+            _save_base_upload_state(payload['base_upload'])
         return render_template('index.html', payload=payload, logs="", xml_preview=xml_text)
     except Exception as e:
         flash(f'Failed to save XML: {e}')
@@ -3095,6 +3196,7 @@ def _build_full_preview_from_plan(plan: dict, seed, r2s_hosts_min_list=None, r2s
         ip4_prefix='10.0.0.0/24',
         r2s_hosts_min_list=r2s_hosts_min_list,
         r2s_hosts_max_list=r2s_hosts_max_list,
+        base_scenario=plan.get('base_scenario'),
     )
     fp['router_plan'] = plan.get('breakdowns', {}).get('router', {})
     try:
@@ -3804,7 +3906,12 @@ def upload_base():
     f.save(saved_path)
     ok, errs = _validate_core_xml(saved_path)
     payload = _default_scenarios_payload()
-    payload['base_upload'] = { 'path': saved_path, 'valid': bool(ok) }
+    payload['base_upload'] = {
+        'path': saved_path,
+        'valid': bool(ok),
+        'display_name': filename,
+        'exists': True,
+    }
     if not ok:
         flash('Base scenario XML is INVALID. See details link for errors.')
     else:
@@ -3812,9 +3919,12 @@ def upload_base():
         try:
             # set the base scenario file path on the first scenario for convenience
             payload['scenarios'][0]['base']['filepath'] = saved_path
+            payload['scenarios'][0]['base']['display_name'] = filename
         except Exception:
             pass
     _attach_base_upload(payload)
+    if payload.get('base_upload'):
+        _save_base_upload_state(payload['base_upload'])
     return render_template('index.html', payload=payload, logs=(errs if not ok else ''), xml_preview='')
 
 @app.route('/remove_base', methods=['POST'])
@@ -3834,10 +3944,12 @@ def remove_base():
         # Clear the base filepath of first scenario
         try:
             if payload['scenarios'] and isinstance(payload['scenarios'][0], dict):
-                payload['scenarios'][0].get('base', {}).update({'filepath': ''})
+                payload['scenarios'][0].setdefault('base', {}).update({'filepath': '', 'display_name': ''})
         except Exception:
             pass
         flash('Base scenario removed.')
+        _clear_base_upload_state()
+        payload.pop('base_upload', None)
         # Do not attach base upload (cleared)
         return render_template('index.html', payload=payload, logs='', xml_preview='')
     except Exception as e:

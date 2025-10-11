@@ -468,6 +468,7 @@ def main():
                 ip4_prefix=args.prefix,
                 ip_mode=args.ip_mode,
                 ip_region=args.ip_region,
+                base_scenario=orchestrated_plan.get('base_scenario'),
             )
         except Exception as auto_prev_exc:
             logging.getLogger(__name__).warning("Failed to generate automatic full preview: %s", auto_prev_exc)
@@ -565,6 +566,7 @@ def main():
                             ip4_prefix=args.prefix,
                             ip_mode=args.ip_mode,
                             ip_region=args.ip_region,
+                            base_scenario=orchestrated_plan.get('base_scenario'),
                         )
                     full_prev['router_plan'] = router_plan_breakdown
                     out['full_preview'] = full_prev

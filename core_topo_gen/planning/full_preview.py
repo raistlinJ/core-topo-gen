@@ -19,6 +19,7 @@ import ipaddress
 import random
 import os
 import tempfile
+import xml.etree.ElementTree as ET
 import math
 
 from .layout_positions import compute_clustered_layout
@@ -36,6 +37,8 @@ class PreviewNode:
     ip4: str | None = None
     r2r_interfaces: Dict[str, str] = field(default_factory=dict)
     vulnerabilities: List[str] = field(default_factory=list)
+    is_base_bridge: bool = False
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 def _stable_shuffle(seq: List[Any], seed: int) -> List[Any]:
@@ -51,6 +54,241 @@ def _expand_roles(role_counts: Dict[str, int]) -> List[str]:
         out.extend([r] * int(c))
     return out
 
+
+BASE_TARGET_TYPES = {
+    'router', 'prouter', 'mdr', 'switch', 'lanswitch'
+}
+
+BASE_HOST_TYPES = {
+    'host', 'pc', 'server', 'workstation', 'client', 'desktop', 'lxc', 'xterm',
+    'generic', 'terminal', 'laptop'
+}
+
+BASE_INFRA_TYPES = {
+    'network', 'lan', 'wan', 'wireless', 'wirelesslan', 'wireless-lan', 'wlan',
+    'hub', 'rj45', 'ethernet', 'tap', 'bridge', 'link', 'wifi', 'wirelessap',
+    'radio', 'rf', 'pointtopoint', 'p2p'
+}
+
+BASE_CLUSTER_ALLOWED_TYPES = BASE_TARGET_TYPES.union(BASE_HOST_TYPES).union(BASE_INFRA_TYPES)
+
+
+def _parse_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _position_from_element(element: Optional[ET.Element]) -> Optional[Dict[str, float]]:
+    if element is None:
+        return None
+    x = _parse_float(element.get('x'))
+    y = _parse_float(element.get('y'))
+    if x is None or y is None:
+        return None
+    return {'x': x, 'y': y}
+
+
+def _extract_base_graph(root: ET.Element) -> Tuple[Dict[str, Dict[str, Any]], List[Tuple[str, str]]]:
+    nodes: Dict[str, Dict[str, Any]] = {}
+    edges: List[Tuple[str, str]] = []
+
+    def _register_node(node_id: Any, name: Any, node_type: Any, position: Optional[Dict[str, float]]):
+        if node_id is None:
+            return
+        node_id_str = str(node_id).strip()
+        if not node_id_str:
+            return
+        node_type_norm = (str(node_type).strip().lower()) if node_type is not None else ''
+        name_str = str(name).strip() if name is not None else ''
+        existing = nodes.get(node_id_str)
+        if existing:
+            if name_str and not existing.get('name'):
+                existing['name'] = name_str
+            if node_type_norm and not existing.get('type'):
+                existing['type'] = node_type_norm
+            if position and not existing.get('position'):
+                existing['position'] = position
+            return
+        nodes[node_id_str] = {
+            'id': node_id_str,
+            'name': name_str or node_id_str,
+            'type': node_type_norm or 'unknown',
+            'position': position,
+        }
+
+    def _register_edge(a: Any, b: Any):
+        if a is None or b is None:
+            return
+        a_str = str(a).strip()
+        b_str = str(b).strip()
+        if not a_str or not b_str or a_str == b_str:
+            return
+        edges.append((a_str, b_str))
+
+    for node in root.findall('.//node'):
+        node_id = node.get('id') or node.findtext('id')
+        node_type = node.get('type') or node.get('model')
+        name = node.get('name') or node.findtext('name')
+        pos = _position_from_element(node.find('position'))
+        _register_node(node_id, name, node_type, pos)
+
+    for device in root.findall('.//device'):
+        node_id = device.get('id')
+        node_type = device.get('type')
+        name = device.get('name')
+        pos = _position_from_element(device.find('position'))
+        _register_node(node_id, name, node_type, pos)
+
+    for network in root.findall('.//network'):
+        node_id = network.get('id')
+        node_type = network.get('type') or 'network'
+        name = network.get('name')
+        pos = _position_from_element(network.find('position'))
+        _register_node(node_id, name, node_type, pos)
+
+    for link in root.findall('.//link'):
+        node1 = link.get('node1') or link.get('node1_id') or link.get('src')
+        node2 = link.get('node2') or link.get('node2_id') or link.get('dst')
+        _register_edge(node1, node2)
+
+    return nodes, edges
+
+
+def _parse_base_candidates(base_path: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    if not base_path or not os.path.exists(base_path):
+        return candidates
+    try:
+        tree = ET.parse(base_path)
+        root = tree.getroot()
+    except Exception:
+        return candidates
+    nodes_map, edges = _extract_base_graph(root)
+    if not nodes_map:
+        return candidates
+
+    adjacency: Dict[str, Set[str]] = {}
+    for node_id in nodes_map:
+        adjacency[node_id] = set()
+    for a, b in edges:
+        if a in nodes_map and b in nodes_map:
+            adjacency.setdefault(a, set()).add(b)
+            adjacency.setdefault(b, set()).add(a)
+
+    for node_id, node in nodes_map.items():
+        node_type = (node.get('type') or '').strip().lower()
+        if node_type not in BASE_TARGET_TYPES:
+            continue
+        candidate = dict(node)
+        visited: Set[str] = set()
+        queue: List[str] = []
+        if node_id:
+            visited.add(node_id)
+            queue.append(node_id)
+        while queue:
+            current = queue.pop(0)
+            for neighbor in adjacency.get(current, set()):
+                if neighbor in visited:
+                    continue
+                neighbor_type = (nodes_map.get(neighbor, {}).get('type') or '').strip().lower()
+                if neighbor_type and neighbor_type not in BASE_CLUSTER_ALLOWED_TYPES:
+                    nodes_map.setdefault(neighbor, {})['type'] = 'unknown'
+                elif not neighbor_type:
+                    nodes_map.setdefault(neighbor, {})['type'] = 'unknown'
+                visited.add(neighbor)
+                queue.append(neighbor)
+        if visited:
+            cluster_nodes = [dict(nodes_map[n]) for n in visited if n in nodes_map]
+            cluster_edges_set: Set[Tuple[str, str]] = set()
+            for edge_a, edge_b in edges:
+                if edge_a in visited and edge_b in visited:
+                    ordered = tuple(sorted((edge_a, edge_b)))
+                    cluster_edges_set.add(ordered)
+            candidate['cluster'] = {
+                'root_id': node_id,
+                'nodes': cluster_nodes,
+                'edges': [list(edge) for edge in sorted(cluster_edges_set)],
+            }
+        candidates.append(candidate)
+    return candidates
+
+
+def _attach_base_bridge(
+    base_scenario: Optional[Dict[str, Any]],
+    router_nodes: List[PreviewNode],
+    r2r_edges: List[Tuple[int, int]],
+    seed: int,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(base_scenario, dict):
+        return None
+    resolved_path = (base_scenario.get('filepath') or '').strip()
+    if not resolved_path:
+        # fall back to raw path if provided
+        resolved_path = (base_scenario.get('filepath_raw') or '').strip()
+    if not resolved_path:
+        return None
+    info: Dict[str, Any] = {
+        'filepath': resolved_path,
+        'filepath_raw': base_scenario.get('filepath_raw', resolved_path),
+    }
+    exists = os.path.exists(resolved_path)
+    info['exists'] = exists
+    if not exists:
+        info['attached'] = False
+        info['reason'] = 'missing-file'
+        return info
+    candidates = _parse_base_candidates(resolved_path)
+    info['candidate_count'] = len(candidates)
+    if not candidates:
+        info['attached'] = False
+        info['reason'] = 'no-target'
+        return info
+    rng = random.Random(seed + 811)
+    target = rng.choice(candidates)
+    peer_candidates = [r.node_id for r in router_nodes]
+    if not peer_candidates:
+        info['attached'] = False
+        info['reason'] = 'no-router-available'
+        return info
+    peer_router_id = rng.choice(peer_candidates)
+    peer_router = None
+    for node in router_nodes:
+        if node.node_id == peer_router_id:
+            peer_router = node
+            break
+    if peer_router is None:
+        info['attached'] = False
+        info['reason'] = 'peer-router-missing'
+        return info
+
+    info['attached'] = True
+    target_copy = dict(target)
+    info['target'] = target_copy
+    if target.get('cluster'):
+        info['target_cluster'] = target['cluster']
+        target_copy['cluster'] = target['cluster']
+    if target.get('position'):
+        info['target_position'] = target['position']
+
+    peer_router.is_base_bridge = True
+    peer_router.metadata['base_target'] = dict(target)
+    peer_router.metadata.setdefault('base_bridge_targets', [])
+    peer_router.metadata['base_bridge_targets'].append(dict(target))
+    peer_router.metadata['base_filepath'] = resolved_path
+    if target.get('cluster'):
+        peer_router.metadata['base_target_cluster'] = target['cluster']
+
+    info['bridge_router_id'] = peer_router.node_id
+    info['bridge_router_name'] = peer_router.name
+    info['internal_peer_router_id'] = peer_router.node_id
+    info['internal_peer_router_name'] = peer_router.name
+    info['existing_router_bridge'] = True
+    info['bridge_router_ip4'] = peer_router.ip4
+    return info
 
 def _preview_services(service_plan: Dict[str, int], host_ids: List[int], seed: int) -> Dict[int, List[str]]:
     if not service_plan:
@@ -116,6 +354,7 @@ def build_full_preview(
     ip_region: str | None = None,
     r2s_hosts_min_list: Optional[List[int]] = None,
     r2s_hosts_max_list: Optional[List[int]] = None,
+    base_scenario: Optional[Dict[str, Any]] = None,
 ):
     """Return a topology preview dictionary.
 
@@ -537,17 +776,10 @@ def build_full_preview(
             r2r_edges = []
         else:
             r2r_edges = _chain_edges(node_ids)
-        if r2r_edges:
-            r2r_links_detail, r2r_subnets = _assign_r2r_link_interfaces(router_nodes, r2r_edges, ip4_prefix, ip_mode, ip_region)
-    router_ids_for_stats = [r.node_id for r in router_nodes]
-    r2r_degree = _degree_counts(router_ids_for_stats, r2r_edges) if router_nodes else {}
-    if r2r_edges or any(v > 0 for v in r2r_degree.values()):
-        r2r_preview.setdefault('degree_sequence', {str(k): r2r_degree.get(k, 0) for k in router_ids_for_stats})
-    if any(r2r_degree.values()):
-        vals = list(r2r_degree.values())
-        r2r_stats = {'min': min(vals), 'max': max(vals), 'avg': round(sum(vals) / len(vals), 2)}
-    else:
-        r2r_stats = {}
+    r2r_links_detail: List[Dict[str, Any]] = []
+    r2r_subnets: List[str] = []
+    r2r_degree: Dict[int, int] = {}
+    r2r_stats: Dict[str, Any] = {}
 
     # ---- Helper: assign routing items to routers to derive per-router bounds ----
     def _assign_items_to_routers(items: Optional[List[Any]], count: int) -> List[Optional[Any]]:
@@ -581,6 +813,28 @@ def build_full_preview(
     router_switch_subnets: List[str] = []
     lan_subnets: List[str] = []
     ptp_subnets: List[str] = []  # keep key for backward compatibility
+
+    base_bridge_info: Optional[Dict[str, Any]] = None
+    if base_scenario:
+        base_bridge_info = _attach_base_bridge(
+            base_scenario,
+            router_nodes,
+            r2r_edges,
+            rnd_seed,
+        )
+    # recompute router stats + interfaces post bridge
+    router_ids_for_stats = [r.node_id for r in router_nodes]
+    if r2r_edges:
+        for router in router_nodes:
+            router.r2r_interfaces.clear()
+        r2r_links_detail, r2r_subnets = _assign_r2r_link_interfaces(router_nodes, r2r_edges, ip4_prefix, ip_mode, ip_region)
+    if router_nodes:
+        r2r_degree = _degree_counts(router_ids_for_stats, r2r_edges)
+        if r2r_edges or any(v > 0 for v in r2r_degree.values()):
+            r2r_preview['degree_sequence'] = {str(k): r2r_degree.get(k, 0) for k in router_ids_for_stats}
+        if any(r2r_degree.values()):
+            vals = list(r2r_degree.values())
+            r2r_stats = {'min': min(vals), 'max': max(vals), 'avg': round(sum(vals) / len(vals), 2)}
 
     # Host grouping per router (deterministic): collect hosts by rid
     hosts_by_router: Dict[int, List[int]] = {r.node_id: [] for r in router_nodes}
@@ -1087,6 +1341,8 @@ def build_full_preview(
         'routing_plan': routing_plan,
         'services_plan': services_plan,
         'vulnerabilities_plan': vulnerabilities_plan,
+    'base_scenario_reference': base_scenario,
+    'base_bridge_preview': base_bridge_info,
         'role_counts': dict(role_counts),
         'seed': seed,
         'seed_generated': seed_generated,

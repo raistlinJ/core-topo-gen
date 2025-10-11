@@ -51,18 +51,15 @@
                     <div class="card mb-3" id="baseCoreScenarioCard">
                         <div class="card-header d-flex justify-content-between align-items-center">
                             <strong>Base CORE Scenario</strong>
-                            <div class="d-flex align-items-center gap-2">
-                                {% if payload.base_upload %}
-                                    {% if payload.base_upload.valid %}
-                                        <span class="badge text-bg-success">VALID</span>
-                                    {% else %}
-                                        <span class="badge text-bg-danger">INVALID</span>
-                                    {% endif %}
-                                    <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('core_details') }}?path={{ payload.base_upload.path | urlencode }}" target="_blank">Details</a>
-                                    <form action="{{ url_for('remove_base') }}" method="post" class="d-inline" onsubmit="saveScrollBeforeNav(); document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });">
-                                        <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
-                                    </form>
-                                {% endif %}
+                            <div class="d-flex align-items-center gap-2" id="baseScenarioControls">
+                                {% set has_base = payload.base_upload is defined and payload.base_upload %}
+                                <span id="baseValidityBadge" class="badge {% if not has_base %}d-none{% else %}{% if payload.base_upload.valid %}text-bg-success{% else %}text-bg-danger{% endif %}{% endif %}">
+                                    {% if has_base %}{% if payload.base_upload.valid %}VALID{% else %}INVALID{% endif %}{% else %}VALID{% endif %}
+                                </span>
+                                <a id="baseDetailsLink" class="btn btn-sm btn-outline-secondary {% if not has_base %}d-none{% endif %}" href="{% if has_base %}{{ url_for('core_details') }}?path={{ payload.base_upload.path | urlencode }}{% else %}#{% endif %}" target="_blank" data-base-url="{{ url_for('core_details') }}?path=">Details</a>
+                                <form action="{{ url_for('remove_base') }}" method="post" class="d-inline {% if not has_base %}d-none{% endif %}" id="baseRemoveForm" onsubmit="saveScrollBeforeNav(); document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });">
+                                    <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
+                                </form>
                             </div>
                         </div>
                         <div class="card-body">
@@ -491,6 +488,62 @@ function defaultScenario(name) {
     };
 }
 
+function normalizeBaseUpload(meta) {
+    if (!meta || typeof meta !== 'object') return null;
+    const safe = {};
+    if (typeof meta.path === 'string') safe.path = meta.path;
+    if (typeof meta.display_name === 'string') safe.display_name = meta.display_name;
+    if (Object.prototype.hasOwnProperty.call(meta, 'valid')) safe.valid = !!meta.valid;
+    return Object.keys(safe).length ? safe : null;
+}
+
+const ROUTER_NODE_TYPES = new Set(['router', 'prouter', 'mdr', 'core-router', 'gateway']);
+const SWITCH_NODE_TYPES = new Set(['switch', 'lanswitch', 'l3switch', 'bridge', 'core-switch']);
+const HOST_NODE_TYPES = new Set(['host', 'pc', 'server', 'workstation', 'client', 'desktop', 'lxc', 'xterm', 'generic', 'terminal', 'laptop']);
+const NETWORK_NODE_TYPES = new Set(['network', 'lan', 'wan', 'wireless', 'wirelesslan', 'wlan']);
+const HUB_NODE_TYPES = new Set(['hub', 'rj45', 'ethernet', 'tap']);
+
+const NODE_TYPE_STYLE_PRESETS = {
+    router: { label: 'Router', color: '#ff7043', radius: 11 },
+    switch: { label: 'Switch', color: '#17a2b8', radius: 8 },
+    host: { label: 'Host', color: '#ffc107', radius: 5 },
+    network: { label: 'Network', color: '#6c757d', radius: 7 },
+    hub: { label: 'Hub', color: '#7952b3', radius: 6 },
+    rj45: { label: 'RJ45', color: '#20c997', radius: 6 },
+    wlan: { label: 'WLAN', color: '#0dcaf0', radius: 6 },
+    tap: { label: 'TAP', color: '#6f42c1', radius: 6 },
+};
+
+function canonicalNodeType(raw) {
+    if (raw === null || raw === undefined) return 'host';
+    const key = String(raw).trim().toLowerCase();
+    if (!key) return 'host';
+    if (ROUTER_NODE_TYPES.has(key)) return 'router';
+    if (SWITCH_NODE_TYPES.has(key)) return 'switch';
+    if (NETWORK_NODE_TYPES.has(key)) return 'network';
+    if (HUB_NODE_TYPES.has(key)) return 'hub';
+    if (HOST_NODE_TYPES.has(key)) return 'host';
+    return key;
+}
+
+function formatNodeTypeLabel(key) {
+    if (!key) return 'Node';
+    return key.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function nodeStyleForType(rawType) {
+    const key = canonicalNodeType(rawType);
+    const preset = NODE_TYPE_STYLE_PRESETS[key];
+    if (preset) {
+        return { ...preset };
+    }
+    return {
+        label: formatNodeTypeLabel(key),
+        color: '#adb5bd',
+        radius: 6,
+    };
+}
+
 // Restore persisted editor state (scenarios and last saved xml) and active index from localStorage
 let persistedState = null;
 try { persistedState = JSON.parse(localStorage.getItem('coretg_editor_state') || 'null'); } catch(e){ persistedState = null; }
@@ -500,10 +553,63 @@ try { const v = parseInt(localStorage.getItem('coretg_active_idx')||'0',10); if(
 let state = initialPayload ?? { scenarios: [ defaultScenario('Scenario 1') ], result_path: null };
 // If server provided a concrete result_path (save/load/run), prefer server scenarios; else, restore from localStorage if available
 const serverHasResult = !!(initialPayload && initialPayload.result_path);
+const serverScenarioBases = Array.isArray(initialPayload?.scenarios)
+    ? initialPayload.scenarios.map(s => {
+        if (!s || typeof s !== 'object' || !s.base || typeof s.base !== 'object') return undefined;
+        const meta = {};
+        if (typeof s.base.filepath === 'string') meta.filepath = s.base.filepath;
+        if (typeof s.base.display_name === 'string') meta.display_name = s.base.display_name;
+        return Object.keys(meta).length ? meta : undefined;
+    })
+    : [];
 if (!serverHasResult && persistedState && Array.isArray(persistedState.scenarios) && persistedState.scenarios.length) {
     state.scenarios = persistedState.scenarios;
     if (persistedState.result_path) state.result_path = persistedState.result_path;
+    if (serverScenarioBases.length) {
+        serverScenarioBases.forEach((serverMeta, idx) => {
+            if (!serverMeta) return;
+            if (!state.scenarios[idx]) return;
+            const scen = state.scenarios[idx];
+            if (!scen.base || typeof scen.base !== 'object') scen.base = {};
+            scen.base.filepath = (serverMeta.filepath || '');
+            if ('display_name' in serverMeta) {
+                scen.base.display_name = serverMeta.display_name;
+            } else if (scen.base.display_name) {
+                delete scen.base.display_name;
+            }
+        });
+    }
 }
+const serverBaseUpload = normalizeBaseUpload(initialPayload?.base_upload);
+const persistedBaseUpload = normalizeBaseUpload(persistedState?.base_upload);
+if (!serverHasResult && persistedBaseUpload && (!state.base_upload || !state.base_upload.path)) {
+    if (state.scenarios?.[0] && state.scenarios[0].base && (state.scenarios[0].base.filepath || state.scenarios[0].base.display_name)) {
+        state.base_upload = { ...persistedBaseUpload };
+    }
+}
+if (serverBaseUpload) {
+    state.base_upload = { ...serverBaseUpload };
+}
+if (state.base_upload && state.scenarios?.[0]) {
+    const scenBase = (typeof state.scenarios[0].base === 'object' && state.scenarios[0].base) ? state.scenarios[0].base : (state.scenarios[0].base = {});
+    if (!scenBase.filepath && state.base_upload.path) {
+        scenBase.filepath = state.base_upload.path;
+    }
+    if (!scenBase.display_name) {
+        if (state.base_upload.display_name) scenBase.display_name = state.base_upload.display_name;
+        else if (scenBase.filepath) scenBase.display_name = scenBase.filepath.split(/[/\\]/).pop() || '';
+    }
+}
+if (state.base_upload) {
+    if (!state.base_upload.display_name) {
+        const fallback = state.scenarios?.[0]?.base?.display_name || (state.base_upload.path ? state.base_upload.path.split(/[/\\]/).pop() : '');
+        if (fallback) state.base_upload.display_name = fallback;
+    }
+    if (!state.base_upload.path && state.scenarios?.[0]?.base?.filepath) {
+        state.base_upload.path = state.scenarios[0].base.filepath;
+    }
+}
+
 // Preview workflow state (in-memory only; persisted history handled separately)
 let previewState = {
     fullPreview: null,
@@ -1347,19 +1453,74 @@ function buildFullPreviewModalGraph(full){
         const vulnerabilitiesByNode = normalizeVulnerabilitiesByNode(full.vulnerabilities_by_node);
         const nodes=[];
         const nodeById = new Map();
+        const baseCluster = full.base_bridge_preview && full.base_bridge_preview.attached ? (full.base_bridge_preview.target_cluster || null) : null;
+        const baseClusterNodeMap = new Map();
+        const baseBridgeInfo = full.base_bridge_preview && full.base_bridge_preview.attached ? full.base_bridge_preview : null;
+        const legend = svg.append('g').attr('class','legend').attr('transform','translate(8,8)');
+        let legendOffset = 0;
+        const legendTypesSeen = new Set();
+        let legendSpacingAdded = false;
+
+        const ensureLegendEntry = (canonicalType) => {
+            if(!canonicalType || legendTypesSeen.has(canonicalType)) return;
+            legendTypesSeen.add(canonicalType);
+            const style = nodeStyleForType(canonicalType);
+            const radius = Math.max(4, Math.min((style.radius ?? 6), 12));
+            const entry = legend.append('g').attr('transform', `translate(0,${legendOffset})`);
+            entry.append('circle')
+                .attr('r', radius)
+                .attr('cx', radius)
+                .attr('cy', radius)
+                .attr('fill', style.color)
+                .attr('stroke', '#333')
+                .attr('stroke-width', 1);
+            entry.append('text')
+                .text(style.label)
+                .attr('x', radius * 2 + 6)
+                .attr('y', radius + 4)
+                .attr('font-size', '11px');
+            legendOffset += Math.max(radius * 2 + 6, 20);
+        };
+
+        const registerLegendForNodes = (list) => {
+            if(!Array.isArray(list)) return;
+            list.forEach(node => {
+                if(!node) return;
+                const canonical = canonicalNodeType(node.type ?? node.kind ?? node.role);
+                if(node.type !== canonical) node.type = canonical;
+                ensureLegendEntry(canonical);
+            });
+        };
+
+        const addLegendSpacing = () => {
+            if(!legendSpacingAdded && legendTypesSeen.size > 0){
+                legendOffset += 6;
+                legendSpacingAdded = true;
+            }
+        };
+        function resolveBaseNodeType(meta){
+            if(!meta || typeof meta !== 'object') return 'host';
+            const raw = meta.type ?? meta.model ?? meta.kind ?? meta.role ?? '';
+            return canonicalNodeType(raw);
+        }
         const addNode = (node)=>{
             if(node==null || node.id===undefined || node.id===null) return;
             const key = String(node.id);
+            const canonicalType = canonicalNodeType(node.type ?? node.kind ?? node.role);
+            const normalized = { ...node, type: canonicalType };
             if(nodeById.has(key)){
-                Object.assign(nodeById.get(key), node);
+                Object.assign(nodeById.get(key), normalized);
                 return;
             }
-            nodeById.set(key, node);
-            nodes.push(node);
+            nodeById.set(key, normalized);
+            nodes.push(normalized);
         };
+        const bridgeRouterIdNum = baseBridgeInfo ? Number(baseBridgeInfo.bridge_router_id) : null;
         (full.routers||[]).forEach(r=>{
             if(r==null || r.node_id===undefined || r.node_id===null) return;
-            addNode({id:r.node_id, label:r.name, type:'router'});
+            const routerIdNum = Number(r.node_id);
+            const isBridgeRouter = Number.isFinite(bridgeRouterIdNum) && routerIdNum === bridgeRouterIdNum;
+            addNode({id:r.node_id, label:r.name, type:'router', isBaseBridge: isBridgeRouter});
         });
         (full.hosts||[]).forEach(hn=>{
             if(hn==null) return;
@@ -1377,12 +1538,20 @@ function buildFullPreviewModalGraph(full){
             if(switchId===undefined || switchId===null) return;
             addNode({id:switchId, label:'sw-'+switchId, type:'switch'});
         });
+    const bridgePeerIdNum = baseBridgeInfo ? Number(baseBridgeInfo.internal_peer_router_id) : null;
+        const baseBridgeKeys = new Set();
+        if(Number.isFinite(bridgeRouterIdNum) && Number.isFinite(bridgePeerIdNum)){
+            baseBridgeKeys.add(`${Math.min(bridgeRouterIdNum, bridgePeerIdNum)}-${Math.max(bridgeRouterIdNum, bridgePeerIdNum)}`);
+        }
+
         const linkDescriptors=[];
         (full.r2r_edges_preview||[]).forEach(e=>{
             if(!Array.isArray(e) || e.length<2) return;
             const [a,b] = e;
             if(a===undefined || a===null || b===undefined || b===null) return;
-            linkDescriptors.push({sourceId:a, targetId:b, kind:'r2r'});
+            const key = `${Math.min(Number(a), Number(b))}-${Math.max(Number(a), Number(b))}`;
+            const kind = baseBridgeKeys.has(key) ? 'base-bridge' : 'r2r';
+            linkDescriptors.push({sourceId:a, targetId:b, kind});
         });
         (full.switches_detail||[]).forEach(sw=>{
             if(sw==null) return;
@@ -1443,12 +1612,86 @@ function buildFullPreviewModalGraph(full){
             if(!link) return false;
             return nodeById.has(String(link.sourceId)) && nodeById.has(String(link.targetId));
         });
+
+        if(baseCluster && Array.isArray(baseCluster.nodes)){
+            baseCluster.nodes.forEach((baseNodeMeta, idx)=>{
+                if(!baseNodeMeta) return;
+                const originalId = baseNodeMeta.id !== undefined && baseNodeMeta.id !== null ? String(baseNodeMeta.id) : `base-${idx}`;
+                if(baseClusterNodeMap.has(originalId)) return;
+                const nodeId = `base-cluster-${originalId}`;
+                baseClusterNodeMap.set(originalId, nodeId);
+                const clusterLabel = baseNodeMeta.name || `Base ${originalId}`;
+                const clusterNode = {
+                    id: nodeId,
+                    name: clusterLabel,
+                    label: clusterLabel,
+                    type: resolveBaseNodeType(baseNodeMeta),
+                    isBaseCluster: true,
+                    isBase: true,
+                    baseOriginal: baseNodeMeta,
+                };
+                if(baseNodeMeta.position && Number.isFinite(Number(baseNodeMeta.position.x)) && Number.isFinite(Number(baseNodeMeta.position.y))){
+                    clusterNode._layout = { x: Number(baseNodeMeta.position.x), y: Number(baseNodeMeta.position.y) };
+                }
+                addNode(clusterNode);
+            });
+        }
+        let baseAnchorId = null;
+        const baseTargetMeta = full.base_bridge_preview && full.base_bridge_preview.attached ? (full.base_bridge_preview.target || null) : null;
+        if(baseClusterNodeMap.size > 0){
+            const targetKey = baseTargetMeta && baseTargetMeta.id !== undefined && baseTargetMeta.id !== null ? String(baseTargetMeta.id) : null;
+            if(targetKey && baseClusterNodeMap.has(targetKey)){
+                baseAnchorId = baseClusterNodeMap.get(targetKey);
+            } else {
+                baseAnchorId = baseClusterNodeMap.values().next().value;
+            }
+        } else if(baseTargetMeta){
+            baseAnchorId = `base-target-${baseTargetMeta.id || 'base'}`;
+            if(!nodeById.has(baseAnchorId)){
+                const anchorLabel = baseTargetMeta.name || 'Base Scenario';
+                const anchorNode = {
+                    id: baseAnchorId,
+                    name: anchorLabel,
+                    label: anchorLabel,
+                    type: resolveBaseNodeType(baseTargetMeta),
+                    isBaseExternal: true,
+                    isBase: true,
+                    baseTarget: baseTargetMeta,
+                };
+                if(baseTargetMeta.position && Number.isFinite(Number(baseTargetMeta.position.x)) && Number.isFinite(Number(baseTargetMeta.position.y))){
+                    anchorNode._layout = { x: Number(baseTargetMeta.position.x), y: Number(baseTargetMeta.position.y) };
+                }
+                addNode(anchorNode);
+            }
+        }
+        if(baseCluster && Array.isArray(baseCluster.edges)){
+            baseCluster.edges.forEach(edge=>{
+                if(!Array.isArray(edge) || edge.length < 2) return;
+                const aRaw = edge[0];
+                const bRaw = edge[1];
+                const keyA = aRaw !== undefined && aRaw !== null ? String(aRaw) : null;
+                const keyB = bRaw !== undefined && bRaw !== null ? String(bRaw) : null;
+                if(!keyA || !keyB) return;
+                const mappedA = baseClusterNodeMap.get(keyA);
+                const mappedB = baseClusterNodeMap.get(keyB);
+                if(!mappedA || !mappedB) return;
+                filteredLinks.push({ sourceId: mappedA, targetId: mappedB, kind: 'base-cluster' });
+            });
+        }
+        const bridgeRouterId = baseBridgeInfo ? baseBridgeInfo.bridge_router_id : null;
+        if(baseAnchorId && bridgeRouterId !== null){
+            filteredLinks.push({ sourceId: bridgeRouterId, targetId: baseAnchorId, kind: 'base-external' });
+        }
+
         if(nodes.length === 0){
             svg.remove();
             container.append('div').attr('class','text-muted small p-2').text('No nodes to display');
             document.getElementById('fpGraphLoading')?.remove();
             return;
         }
+
+        registerLegendForNodes(nodes);
+        addLegendSpacing();
 
         const layoutPositions = full.layout_positions;
         const layoutMaps = (layoutPositions && !layoutPositions.error && typeof layoutPositions === 'object')
@@ -1463,6 +1706,10 @@ function buildFullPreviewModalGraph(full){
             let table = null;
             if(node.type==='router') table = layoutMaps.routers;
             else if(node.type==='switch') table = layoutMaps.switches;
+            else if(node.isBase){
+                if(node._layout) return node._layout;
+                return null;
+            }
             else table = layoutMaps.hosts;
             if(!table) return null;
             const key = String(node.id);
@@ -1476,7 +1723,10 @@ function buildFullPreviewModalGraph(full){
         const layoutCoords = [];
         if(layoutMaps){
             nodes.forEach(n=>{
-                const pos = layoutCoordForNode(n);
+                let pos = layoutCoordForNode(n);
+                if(!pos && n.isBase && n._layout){
+                    pos = n._layout;
+                }
                 if(pos){
                     n._layout = pos;
                     layoutCoords.push(pos);
@@ -1488,10 +1738,11 @@ function buildFullPreviewModalGraph(full){
         const innerHeight = Math.max(h - margin*2, 200);
         let usingLayout = layoutCoords.length > 0;
         const originalPositions = new Map();
-        function applyRowJitter(list){
+    function applyRowJitter(list){
             const buckets = new Map();
             list.forEach(node=>{
                 if(!Number.isFinite(node.y)) return;
+        if(node.isBase) return;
                 const base = node._layout ? node._layout.y : node.y;
                 if(!Number.isFinite(base)) return;
                 const key = Math.round(base * 1000);
@@ -1558,22 +1809,35 @@ function buildFullPreviewModalGraph(full){
             });
         }
 
-    const simLinks = filteredLinks.map(l=>({...l, source:l.sourceId, target:l.targetId}));
+        const simLinks = filteredLinks.map(l=>({...l, source:l.sourceId, target:l.targetId}));
 
-    const link = zoomLayer.selectAll('line').data(simLinks).enter().append('line').attr('stroke', l=> l.kind==='r2r'? '#0d6efd': (l.kind==='r-sw'? '#198754':'#999')).attr('stroke-width', l=> l.kind==='r2r'? 2:1.2).attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null).attr('opacity', .9);
+        const link = zoomLayer.selectAll('line').data(simLinks).enter().append('line')
+            .attr('stroke', l=> {
+                if(l.kind === 'base-bridge' || l.kind === 'base-external' || l.kind === 'base-cluster') return '#6f42c1';
+                if(l.kind==='r2r') return '#0d6efd';
+                return (l.kind==='r-sw'? '#198754':'#999');
+            })
+            .attr('stroke-width', l=> {
+                if(l.kind === 'base-cluster') return 3;
+                if(l.kind === 'base-bridge' || l.kind === 'base-external') return 4;
+                return l.kind==='r2r'? 2:1.2;
+            })
+            .attr('stroke-linecap', l=> (l.kind === 'base-bridge' || l.kind === 'base-external' || l.kind === 'base-cluster') ? 'round' : null)
+            .attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null)
+            .attr('opacity', .9);
         const node = zoomLayer.selectAll('g').data(nodes).enter().append('g');
         const vulnerabilityColor = '#28a745';
         const hasVulnerableHosts = nodes.some(n => n.type === 'host' && n.hasVuln);
         const normalNode = node.filter(d => !(d.type === 'host' && d.hasVuln));
         normalNode.append('circle')
-            .attr('r', d=> d.type==='router'? 11: (d.type==='switch'? 8:5))
-            .attr('fill', d=> {
-                if(d.type==='router') return '#ff7043';
-                if(d.type==='switch') return '#17a2b8';
-                return '#ffc107';
+            .attr('r', d=> {
+                const style = nodeStyleForType(d.type);
+                const radius = Number(style.radius);
+                return Number.isFinite(radius) ? radius : 6;
             })
-            .attr('stroke','#333')
-            .attr('stroke-width',1.1);
+            .attr('fill', d=> nodeStyleForType(d.type).color)
+            .attr('stroke', d=> (d.isBase || d.isBaseBridge) ? '#6f42c1' : '#333')
+            .attr('stroke-width', d=> (d.isBaseBridge ? 3 : d.isBase ? 2 : 1.1));
         const vulnNode = node.filter(d => d.type === 'host' && d.hasVuln);
         const vulnSymbol = d3.symbol().type(d3.symbolStar).size(170);
         vulnNode.append('path')
@@ -1582,8 +1846,12 @@ function buildFullPreviewModalGraph(full){
             .attr('stroke', '#333')
             .attr('stroke-width', 1.1);
         const simulation = d3.forceSimulation(nodes)
-            .force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40)))
-            .force('charge', d3.forceManyBody().strength(-220))
+            .force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> {
+                if(l.kind === 'base-cluster') return 60;
+                if(l.kind === 'base-bridge' || l.kind === 'base-external') return 95;
+                return l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40);
+            }).strength(l => l.kind === 'base-cluster' ? 0.9 : (l.kind === 'base-bridge' || l.kind === 'base-external' ? 0.7 : 0.6)))
+            .force('charge', d3.forceManyBody().strength(d => d.isBase ? -160 : -220))
             .force('center', d3.forceCenter(w/2,h/2))
             .force('layoutX', d3.forceX(d => Number.isFinite(d.layoutX) ? d.layoutX : w/2).strength(usingLayout ? 0.2 : 0.04))
             .force('layoutY', d3.forceY(d => Number.isFinite(d.layoutY) ? d.layoutY : h/2).strength(usingLayout ? 0.2 : 0.04));
@@ -1619,20 +1887,15 @@ function buildFullPreviewModalGraph(full){
             };
         }
     // Legend
-    const legend = svg.append('g').attr('class','legend').attr('transform','translate(8,8)');
-    const legendItems = [
-        {label:'Router', color:'#ff7043', r:11},
-        {label:'Switch', color:'#17a2b8', r:8},
-        {label:'Host', color:'#ffc107', r:5},
-    ];
-    legendItems.forEach((li,i)=>{
-        const g=legend.append('g').attr('transform',`translate(0,${i*20})`);
-        g.append('circle').attr('r',li.r).attr('cx',li.r).attr('cy',li.r).attr('fill',li.color).attr('stroke','#333').attr('stroke-width',1);
-        g.append('text').text(li.label).attr('x', li.r*2 + 6).attr('y', li.r+4).attr('font-size','11px');
-    });
+    const hasBaseBridge = baseBridgeInfo && baseBridgeInfo.attached;
+    if(hasBaseBridge){
+        const g=legend.append('g').attr('transform',`translate(0,${legendOffset})`);
+        g.append('line').attr('x1',0).attr('y1',8).attr('x2',24).attr('y2',8).attr('stroke','#6f42c1').attr('stroke-width',4).attr('stroke-linecap','round');
+        g.append('text').text('Bridge to Base Scenario').attr('x',28).attr('y',12).attr('font-size','11px');
+        legendOffset += 20;
+    }
     if(hasVulnerableHosts){
-        const offset = legendItems.length*20;
-        const g=legend.append('g').attr('transform',`translate(0,${offset})`);
+        const g=legend.append('g').attr('transform',`translate(0,${legendOffset})`);
         const vulnLegendSymbol = d3.symbol().type(d3.symbolStar).size(80);
         g.append('path')
             .attr('d', vulnLegendSymbol)
@@ -1641,6 +1904,7 @@ function buildFullPreviewModalGraph(full){
             .attr('stroke','#333')
             .attr('stroke-width',1);
         g.append('text').text('Host (vulnerable)').attr('x', 20).attr('y', 12).attr('font-size','11px');
+        legendOffset += 20;
     }
     // Node labels removed per request
     // Build section lookups
@@ -1945,13 +2209,18 @@ let activeIdx = Math.min(Math.max(0, persistedActiveIdx), (state.scenarios.lengt
 
 function persistEditorState(){
     try {
+        const baseUploadMeta = normalizeBaseUpload(state.base_upload) || (state.scenarios?.[0]?.base?.filepath || state.scenarios?.[0]?.base?.display_name ? {
+            path: state.scenarios?.[0]?.base?.filepath || '',
+            display_name: state.scenarios?.[0]?.base?.display_name || (state.scenarios?.[0]?.base?.filepath ? state.scenarios[0].base.filepath.split(/[/\\]/).pop() || '' : '')
+        } : null);
         localStorage.setItem('coretg_editor_state', JSON.stringify({
             scenarios: state.scenarios,
             result_path: state.result_path || null,
             core: state.core || null,
             core_ok: !!state.core_ok,
             core_tested_host: state.core_tested_host || null,
-            core_tested_port: state.core_tested_port || null
+            core_tested_port: state.core_tested_port || null,
+            base_upload: baseUploadMeta
         }));
         localStorage.setItem('coretg_active_idx', String(activeIdx||0));
     } catch(e){}
@@ -1983,13 +2252,47 @@ function render() {
         if (rp && rp.endsWith('.xml')) { dlBtn.removeAttribute('disabled'); dlBtn.classList.remove('pe-none'); dlBtn.setAttribute('title',''); }
         else { dlBtn.setAttribute('disabled','disabled'); dlBtn.classList.add('pe-none'); dlBtn.setAttribute('title','Save XML first'); }
     }
-    // Sync Base Scenario File input with active scenario
+    // Sync Base Scenario UI with persisted metadata (independent of active scenario)
+    const scen0 = state.scenarios?.[0] || {};
+    const scen0Base = (typeof scen0.base === 'object' && scen0.base) ? scen0.base : {};
+    const metaBase = (state.base_upload && typeof state.base_upload === 'object') ? state.base_upload : (initialPayload?.base_upload && typeof initialPayload.base_upload === 'object' ? initialPayload.base_upload : {});
+    const basePath = metaBase.path || scen0Base.filepath || '';
+    const baseDisplayName = metaBase.display_name || scen0Base.display_name || (basePath ? basePath.split(/[/\\]/).pop() : '');
+    const baseValid = typeof metaBase.valid === 'boolean' ? metaBase.valid : true;
+
     const baseIn = document.getElementById('baseFileInput');
-    if (baseIn && state.scenarios.length) {
-        const full = state.scenarios[activeIdx]?.base?.filepath || '';
-        const baseName = full.split(/[/\\]/).pop();
-        if (baseIn.value !== baseName) baseIn.value = baseName;
-        // Read-only display: no input handler needed to modify state
+    if (baseIn) {
+        const current = baseIn.value || '';
+        const target = baseDisplayName || '';
+        if (current !== target) baseIn.value = target;
+    }
+    const baseBadge = document.getElementById('baseValidityBadge');
+    if (baseBadge) {
+        if (basePath) {
+            baseBadge.textContent = baseValid ? 'VALID' : 'INVALID';
+            baseBadge.classList.remove('d-none', 'text-bg-success', 'text-bg-danger');
+            baseBadge.classList.add(baseValid ? 'text-bg-success' : 'text-bg-danger');
+        } else {
+            baseBadge.classList.add('d-none');
+            baseBadge.classList.remove('text-bg-success', 'text-bg-danger');
+        }
+    }
+    const baseDetailsLink = document.getElementById('baseDetailsLink');
+    if (baseDetailsLink) {
+        if (basePath) {
+            const baseUrl = baseDetailsLink.dataset.baseUrl || baseDetailsLink.getAttribute('href') || '';
+            if (baseUrl) {
+                baseDetailsLink.href = `${baseUrl}${encodeURIComponent(basePath)}`;
+            }
+            baseDetailsLink.classList.remove('d-none');
+        } else {
+            baseDetailsLink.classList.add('d-none');
+        }
+    }
+    const baseRemoveForm = document.getElementById('baseRemoveForm');
+    if (baseRemoveForm) {
+        if (basePath) baseRemoveForm.classList.remove('d-none');
+        else baseRemoveForm.classList.add('d-none');
     }
 }
 

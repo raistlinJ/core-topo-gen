@@ -14,6 +14,7 @@ from .vulnerability_plan import compute_vulnerability_plan, VulnerabilityItem
 from .segmentation_plan import compute_segmentation_plan, SegmentationItem
 from .traffic_plan import compute_traffic_plan, TrafficItem
 
+from ..parsers.base import parse_base_reference
 from ..parsers.node_info import parse_node_info
 from ..parsers.routing import parse_routing_info
 from ..parsers.services import parse_services
@@ -131,6 +132,12 @@ def compute_full_plan(
         'vulnerability_items_raw': vuln_items_xml,
         'segmentation_items_raw': seg_items,
     }
+    try:
+        base_ref = parse_base_reference(xml_path, scenario)
+        if base_ref:
+            plan['base_scenario'] = base_ref
+    except Exception:
+        pass
     if include_breakdowns:
         plan['breakdowns'] = {
             'node': node_breakdown,
