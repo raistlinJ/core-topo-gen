@@ -576,8 +576,10 @@
   const ROUTER_NODE_TYPES = new Set(['router', 'prouter', 'mdr', 'core-router', 'gateway']);
   const SWITCH_NODE_TYPES = new Set(['switch', 'lanswitch', 'l3switch', 'bridge', 'core-switch']);
   const HOST_NODE_TYPES = new Set(['host', 'pc', 'server', 'workstation', 'client', 'desktop', 'lxc', 'xterm', 'generic', 'terminal', 'laptop']);
-  const NETWORK_NODE_TYPES = new Set(['network', 'lan', 'wan', 'wireless', 'wirelesslan', 'wlan']);
-  const HUB_NODE_TYPES = new Set(['hub', 'rj45', 'ethernet', 'tap']);
+  const NETWORK_NODE_TYPES = new Set(['network', 'lan', 'wan']);
+  const WIRELESS_NODE_TYPES = new Set(['wireless', 'wirelesslan', 'wireless-lan', 'wlan', 'wifi']);
+  const RJ45_NODE_TYPES = new Set(['rj45']);
+  const HUB_NODE_TYPES = new Set(['hub', 'ethernet', 'tap']);
 
     const NODE_TYPE_STYLE_PRESETS = {
       router: { label: 'Router', color: '#ff7043', radius: 11 },
@@ -585,7 +587,8 @@
       host: { label: 'Host', color: '#ffc107', radius: 5 },
       network: { label: 'Network', color: '#6c757d', radius: 7 },
       hub: { label: 'Hub', color: '#7952b3', radius: 6 },
-      rj45: { label: 'RJ45', color: '#20c997', radius: 6 },
+      rj45: { label: 'RJ45', color: '#20c997', radius: 6, shape: 'square' },
+      wireless: { label: 'Wireless', color: '#0dcaf0', radius: 6 },
       wlan: { label: 'WLAN', color: '#0dcaf0', radius: 6 },
       tap: { label: 'TAP', color: '#6f42c1', radius: 6 },
     };
@@ -596,9 +599,11 @@
       if(!key) return 'host';
       if(ROUTER_NODE_TYPES.has(key)) return 'router';
       if(SWITCH_NODE_TYPES.has(key)) return 'switch';
-  if(NETWORK_NODE_TYPES.has(key)) return 'network';
-  if(HUB_NODE_TYPES.has(key)) return 'hub';
-  if(HOST_NODE_TYPES.has(key)) return 'host';
+      if(RJ45_NODE_TYPES.has(key)) return 'rj45';
+      if(WIRELESS_NODE_TYPES.has(key)) return 'wireless';
+      if(NETWORK_NODE_TYPES.has(key)) return 'network';
+      if(HUB_NODE_TYPES.has(key)) return 'hub';
+      if(HOST_NODE_TYPES.has(key)) return 'host';
       return key;
     }
 
@@ -611,12 +616,15 @@
       const key = canonicalNodeType(rawType);
       const preset = NODE_TYPE_STYLE_PRESETS[key];
       if(preset){
-        return { ...preset };
+        const radius = Number.isFinite(preset.radius) ? preset.radius : 6;
+        const shape = preset.shape || 'circle';
+        return { ...preset, radius, shape };
       }
       return {
         label: formatNodeTypeLabel(key),
         color: '#adb5bd',
         radius: 6,
+        shape: 'circle',
       };
     }
     function setupPreviewCollapsers(){
@@ -688,13 +696,25 @@
       const style = nodeStyleForType(canonicalType);
       const radius = Math.max(4, Math.min((style.radius ?? 6), 12));
       const entry = legend.append('g').attr('transform',`translate(0,${legendOffset})`);
-      entry.append('circle')
-        .attr('r', radius)
-        .attr('cx', radius)
-        .attr('cy', radius)
-        .attr('fill', style.color)
-        .attr('stroke','#333')
-        .attr('stroke-width',1);
+      if(style.shape === 'square'){
+        const side = radius * 2;
+        entry.append('rect')
+          .attr('x', 0)
+          .attr('y', 0)
+          .attr('width', side)
+          .attr('height', side)
+          .attr('fill', style.color)
+          .attr('stroke','#333')
+          .attr('stroke-width',1);
+      } else {
+        entry.append('circle')
+          .attr('r', radius)
+          .attr('cx', radius)
+          .attr('cy', radius)
+          .attr('fill', style.color)
+          .attr('stroke','#333')
+          .attr('stroke-width',1);
+      }
       entry.append('text')
         .text(style.label)
         .attr('x', radius * 2 + 6)
@@ -1025,15 +1045,30 @@
       legendOffset += 20;
     }
     const normalNode = node.filter(d => !(d.type === 'host' && d.hasVuln));
-    normalNode.append('circle')
-      .attr('r', d=> {
-        const style = nodeStyleForType(d.type);
-        const radius = Number(style.radius);
-        return Number.isFinite(radius) ? radius : 6;
-      })
-      .attr('fill', d=> nodeStyleForType(d.type).color)
-      .attr('stroke', d=> (d.isBase || d.isBaseBridge) ? '#6f42c1' : '#333')
-      .attr('stroke-width', d=> d.isBase ? 2 : (d.isBaseBridge ? 3 : 1));
+    normalNode.each(function(d){
+      const nodeGroup = d3.select(this);
+      const style = nodeStyleForType(d.type);
+      if(style.shape === 'square'){
+        const side = (Number.isFinite(style.radius) ? style.radius : 6) * 2;
+        nodeGroup.append('rect')
+          .attr('x', -side / 2)
+          .attr('y', -side / 2)
+          .attr('width', side)
+          .attr('height', side)
+          .attr('rx', 2)
+          .attr('ry', 2)
+          .attr('fill', style.color)
+          .attr('stroke', (d.isBase || d.isBaseBridge) ? '#6f42c1' : '#333')
+          .attr('stroke-width', d.isBaseBridge ? 3 : d.isBase ? 2 : 1.1);
+      } else {
+        const radius = Number.isFinite(style.radius) ? style.radius : 6;
+        nodeGroup.append('circle')
+          .attr('r', radius)
+          .attr('fill', style.color)
+          .attr('stroke', (d.isBase || d.isBaseBridge) ? '#6f42c1' : '#333')
+          .attr('stroke-width', d.isBaseBridge ? 3 : d.isBase ? 2 : 1.1);
+      }
+    });
     const vulnNode = node.filter(d => d.type === 'host' && d.hasVuln);
     const vulnSymbol = d3.symbol().type(d3.symbolStar).size(140);
     vulnNode.append('path')
