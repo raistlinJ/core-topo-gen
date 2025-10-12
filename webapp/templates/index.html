@@ -1891,6 +1891,8 @@ function buildFullPreviewModalGraph(full){
             .force('layoutX', d3.forceX(d => Number.isFinite(d.layoutX) ? d.layoutX : w/2).strength(usingLayout ? 0.2 : 0.04))
             .force('layoutY', d3.forceY(d => Number.isFinite(d.layoutY) ? d.layoutY : h/2).strength(usingLayout ? 0.2 : 0.04));
 
+        simulation.alpha(1).alphaTarget(0.03).restart();
+
         link.data(simLinks, d=>`${d.source}-${d.target}`);
 
         simulation.on('tick', ()=>{
@@ -1958,12 +1960,10 @@ function buildFullPreviewModalGraph(full){
     }
     function dragged(event,d){ d.fx=event.x; d.fy=event.y; }
     function dragended(event,d){
-        if(sim && !event.active) sim.alphaTarget(0);
-        d.fx=null; d.fy=null;
-        if(usingLayout){
-            d.layoutX = d.x;
-            d.layoutY = d.y;
-        }
+        if(sim && !event.active) sim.alphaTarget(0.03);
+        d.fx=d.x; d.fy=d.y;
+        d.layoutX = d.x;
+        d.layoutY = d.y;
     }
     document.getElementById('fpGraphLoading')?.remove();
     const resetBtn = document.getElementById('fpGraphResetBtn');
