@@ -54,6 +54,7 @@
                 <th>Full Scenario</th>
                 <th>Scenario XML</th>
                 <th>Report</th>
+                <th>Summary</th>
                 <th>Session XML</th>
                 <th>RC</th>
                 <th style="white-space:nowrap;">Run ID</th>
@@ -69,6 +70,7 @@
                 <td>{% if r.full_scenario_path %}<a href="{{ url_for('download_report', path=r.full_scenario_path) }}">bundle</a>{% else %}-{% endif %}</td>
                 <td>{% if r.scenario_xml_path %}<a href="{{ url_for('download_report', path=r.scenario_xml_path) }}">scenario</a>{% else %}<span class="text-muted">n/a</span>{% endif %}</td>
                 <td>{% if r.report_path %}<a href="{{ url_for('download_report', path=r.report_path) }}">report</a>{% else %}<span class="text-muted">n/a</span>{% endif %}</td>
+                <td>{% if r.summary_path %}<a href="{{ url_for('download_report', path=r.summary_path) }}">summary</a>{% else %}<span class="text-muted">n/a</span>{% endif %}</td>
                 {% set session_path = r.session_xml_path or r.post_xml_path %}
                 <td>{% if session_path %}<a href="{{ url_for('download_report', path=session_path) }}">session</a>{% else %}<span class="text-muted">n/a</span>{% endif %}</td>
                 <td>{{ r.returncode }}</td>
@@ -114,7 +116,7 @@ function updateHeader(){
 function escapeHtml(str){ return (str||'').replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
 function buildRow(r){
   const scenNames = (r.scenario_names||[]).join(', ');
-  const rid = (r.run_id||'') || [r.timestamp||'', (r.scenario_xml_path||r.xml_path||''), (r.report_path||''), (r.full_scenario_path||'')].join('|');
+  const rid = (r.run_id||'') || [r.timestamp||'', (r.scenario_xml_path||r.xml_path||''), (r.report_path||''), (r.summary_path||''), (r.full_scenario_path||'')].join('|');
   const sessionPath = r.session_xml_path || r.post_xml_path;
   return `<tr data-scenarios="${(r.scenario_names||[]).join('||')}">
     <td style="text-align:center;"><input type="checkbox" class="row-select" data-run-id="${rid}"></td>
@@ -123,7 +125,8 @@ function buildRow(r){
     <td>${escapeHtml(r.mode||'')}</td>
   <td>${r.full_scenario_path?`<a href='/download_report?path=${encodeURIComponent(r.full_scenario_path)}'>bundle</a>`:'-'}</td>
     <td>${r.scenario_xml_path?`<a href='/download_report?path=${encodeURIComponent(r.scenario_xml_path)}'>scenario</a>`:'<span class=\"text-muted\">n/a</span>'}</td>
-    <td>${r.report_path?`<a href='/download_report?path=${encodeURIComponent(r.report_path)}'>report</a>`:'<span class=\"text-muted\">n/a</span>'}</td>
+  <td>${r.report_path?`<a href='/download_report?path=${encodeURIComponent(r.report_path)}'>report</a>`:'<span class=\"text-muted\">n/a</span>'}</td>
+  <td>${r.summary_path?`<a href='/download_report?path=${encodeURIComponent(r.summary_path)}'>summary</a>`:'<span class=\"text-muted\">n/a</span>'}</td>
   <td>${sessionPath?`<a href='/download_report?path=${encodeURIComponent(sessionPath)}'>session</a>`:'<span class=\"text-muted\">n/a</span>'}</td>
     <td>${r.returncode ?? ''}</td>
     <td>${escapeHtml(r.run_id||'-')}</td>

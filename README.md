@@ -26,7 +26,7 @@ Generate reproducible CORE network topologies from scenario XML files using a ri
 - **Deterministic previews** – optional RNG seed locks in host expansion, router placement, connectivity, services, segmentation, and vulnerability assignment.
 - **Live log dock** – stream run output, filter by level or text/regex, and toggle auto-follow for long runs.
 - **Rich topology policies** – per-routing-item R2R meshes, R2S aggregation, host grouping bounds, and switch re-homing.
-- **Artifacts on disk** – traffic scripts, segmentation rules, docker-compose definitions, and Markdown reports are written to predictable locations for inspection.
+- **Artifacts on disk** – traffic scripts, segmentation rules, docker-compose definitions, Markdown reports, and JSON summaries are written to predictable locations for inspection.
 
 ## Screenshots
 
@@ -62,7 +62,7 @@ Popular options:
 - `--scenario NAME` pick a specific scenario entry
 - `--host / --port` override the CORE gRPC endpoint (defaults `127.0.0.1:50051`)
 - `--layout-density {compact|normal|spacious}` adjust map spacing
-- `--seg-include-hosts`, `--nat-mode`, `--dnat-prob` fine-tune segmentation
+- `--seg-include-hosts`, `--seg-allow-docker-ports`, `--nat-mode`, `--dnat-prob` fine-tune segmentation
 - `--traffic-pattern`, `--traffic-rate`, `--traffic-content` override traffic defaults
 
 ## Full Preview workflow
@@ -87,12 +87,12 @@ Popular options:
 
 ### Traffic, segmentation, and services
 - Traffic scripts land in `/tmp/traffic` (with companion services) and respect overrides for pattern, rate, jitter, and content hints.
-- Segmentation scripts land in `/tmp/segmentation` alongside a `segmentation_summary.json`; NAT mode, DNAT probability, and host inclusion are configurable.
+- Segmentation scripts land in `/tmp/segmentation` alongside a `segmentation_summary.json`; NAT mode, DNAT probability, host inclusion, and docker port allowances are configurable.
 - Docker vulnerabilities attach per-node docker-compose files in `/tmp/vulns`, with metadata embedded into CORE nodes.
 - Custom traffic plugins can register via `core_topo_gen.plugins.traffic.register()` for bespoke sender/receiver code.
 
 ### Reports & artifacts
-- Markdown reports (`./reports/scenario_report_<timestamp>.md`) enumerate topology stats, planning metadata, segmentation results, and runtime artefacts.
+- Markdown reports (`./reports/scenario_report_<timestamp>.md`) enumerate topology stats, planning metadata, segmentation results, and runtime artefacts. Each run also emits a JSON summary alongside the Markdown file (`scenario_report_<timestamp>.json`) plus per-run connectivity CSVs when router degree data is available.
 - Run history is persisted in `outputs/run_history.json` for the Reports page.
 - Safe deletion keeps reports while purging associated outputs under `outputs/` when scenarios are removed via the GUI.
 

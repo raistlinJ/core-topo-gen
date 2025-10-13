@@ -216,7 +216,7 @@ def _run_offline_report(
     os.makedirs(report_dir, exist_ok=True)
     report_path = os.path.join(report_dir, f"scenario_report_{_dt.now().strftime('%Y%m%d-%H%M%S-%f')}.md")
 
-    write_report(
+    report_path, summary_path = write_report(
         report_path,
         args.scenario,
         routers=routers,
@@ -239,6 +239,12 @@ def _run_offline_report(
         print(f"Scenario report written to {report_path}", flush=True)
     except Exception:
         pass
+    if summary_path:
+        logging.info("Scenario summary written to %s", summary_path)
+        try:
+            print(f"Scenario summary written to {summary_path}", flush=True)
+        except Exception:
+            pass
     return 0
 
 
@@ -318,6 +324,11 @@ def main():
         "--seg-include-hosts",
         action="store_true",
         help="Include host nodes as candidates for segmentation placement (default: routers only)",
+    )
+    ap.add_argument(
+        "--seg-allow-docker-ports",
+        action="store_true",
+        help="Allow docker-compose container ports through host INPUT chains when segmentation enforces default-deny",
     )
     args = ap.parse_args()
 
@@ -810,6 +821,8 @@ def main():
                     seg_items,
                     nat_mode=str(getattr(args, 'nat_mode', 'SNAT')).upper(),
                     include_hosts=bool(getattr(args, 'seg_include_hosts', False)),
+                    allow_docker_ports=bool(getattr(args, 'seg_allow_docker_ports', False)),
+                    docker_nodes=docker_by_name if isinstance(docker_by_name, dict) else None,
                 )
                 logging.info("Applied segmentation rules: %d", len(seg_summary.get("rules", [])))
             except Exception as e:
@@ -1103,7 +1116,7 @@ def main():
                         pass
             except Exception:
                 pass
-            write_report(
+            report_path, summary_path = write_report(
                 report_path,
                 scenario_name,
                 routers=routers,
@@ -1141,7 +1154,7 @@ def main():
                         pass
             except Exception:
                 pass
-            write_report(
+            report_path, summary_path = write_report(
                 report_path,
                 scenario_name,
                 routers=[],
@@ -1164,6 +1177,12 @@ def main():
             print(f"Scenario report written to {report_path}", flush=True)
         except Exception:
             pass
+        if summary_path:
+            logging.info("Scenario summary written to %s", summary_path)
+            try:
+                print(f"Scenario summary written to {summary_path}", flush=True)
+            except Exception:
+                pass
     except Exception as e:
         logging.exception("Failed to write scenario report: %s", e)
 

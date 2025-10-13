@@ -2,7 +2,9 @@ from __future__ import annotations
 import os
 import json
 import time
-from typing import Dict, List, Optional
+import logging
+from dataclasses import asdict, is_dataclass
+from typing import Any, Dict, List, Optional
 from ..types import NodeInfo
 
 
@@ -29,6 +31,27 @@ def _read_segmentation_summary(path: str) -> List[dict]:
     except Exception:
         pass
     return []
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if is_dataclass(value):
+        try:
+            return _json_safe(asdict(value))
+        except Exception:
+            return str(value)
+    try:
+        attrs = vars(value)
+    except Exception:
+        attrs = None
+    if isinstance(attrs, dict):
+        return _json_safe({k: v for k, v in attrs.items() if not k.startswith("_")})
+    return str(value)
 
 
 def write_report(
@@ -644,7 +667,60 @@ def write_report(
                     ))
             lines.append("")
 
+    summary_counts = {
+        "total_nodes": total_nodes,
+        "routers": len(routers),
+        "switches": len(switches),
+        "hosts": len(hosts),
+        "traffic_flows": len(flows),
+        "segmentation_rules": len(seg_rules),
+    }
+    summary_candidate = os.path.splitext(out_path)[0] + ".json"
+    summary_payload = {
+        "report_path": out_path,
+        "summary_path": summary_candidate,
+        "scenario_name": scenario_name,
+        "generated": ts,
+        "counts": summary_counts,
+        "routers": [asdict(r) for r in routers],
+        "router_protocols": {str(k): list(v or []) for k, v in (router_protocols or {}).items()},
+        "switches": list(switches),
+        "hosts": [asdict(h) for h in hosts],
+        "service_assignments": {str(k): list(v or []) for k, v in (service_assignments or {}).items()},
+        "traffic": {
+            "summary_path": traffic_summary_path if traffic_summary_path and os.path.exists(str(traffic_summary_path)) else None,
+            "flows_total": len(flows),
+        },
+        "segmentation": {
+            "summary_path": segmentation_summary_path if segmentation_summary_path and os.path.exists(str(segmentation_summary_path)) else None,
+            "rules_total": len(seg_rules),
+        },
+        "metadata": _json_safe(metadata) if metadata is not None else None,
+        "routing_cfg": _json_safe(routing_cfg) if routing_cfg is not None else None,
+        "traffic_cfg": _json_safe(traffic_cfg) if traffic_cfg is not None else None,
+        "services_cfg": _json_safe(services_cfg) if services_cfg is not None else None,
+        "segmentation_cfg": _json_safe(segmentation_cfg) if segmentation_cfg is not None else None,
+        "vulnerabilities_cfg": _json_safe(vulnerabilities_cfg) if vulnerabilities_cfg is not None else None,
+    }
+    if flows:
+        summary_payload["traffic"]["flows"] = flows
+    if seg_rules:
+        summary_payload["segmentation"]["rules"] = seg_rules
+    if allow_verify:
+        summary_payload["segmentation"]["allow_verification"] = allow_verify
+
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    summary_path: Optional[str] = None
+    try:
+        summary_path = summary_candidate
+        with open(summary_path, "w", encoding="utf-8") as jf:
+            json.dump(_json_safe(summary_payload), jf, indent=2, sort_keys=True)
+    except Exception:
+        logging.exception("Failed to write scenario summary JSON")
+        summary_path = None
+    else:
+        logging.info("Scenario summary written to %s", summary_path)
+
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines).strip() + "\n")
-    return out_path
+    return out_path, summary_path

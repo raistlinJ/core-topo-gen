@@ -50,8 +50,8 @@
 
     const vulnerabilityColor = '#28a745';
     const typeColor = d3.scaleOrdinal()
-      .domain(['router','switch','hub','wlan','host','pc','server'])
-      .range(['#d9534f','#f0ad4e','#5bc0de','#5cb85c','#0275d8','#6610f2','#6f42c1']);
+      .domain(['router','switch','hub','wlan','host','pc','server','docker'])
+      .range(['#d9534f','#f0ad4e','#5bc0de','#5cb85c','#0275d8','#6610f2','#6f42c1','#9c27b0']);
 
     const linkCounts = new Array(nodes.length).fill(0); links.forEach(l => { linkCounts[l.source]++; linkCounts[l.target]++; });
 

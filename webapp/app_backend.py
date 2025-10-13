@@ -734,6 +734,62 @@ def _find_latest_report_path(since_ts: float | None = None) -> str | None:
     except Exception:
         return None
 
+
+def _derive_summary_from_report(report_path: str | None) -> str | None:
+    try:
+        if not report_path:
+            return None
+        candidate = os.path.splitext(report_path)[0] + '.json'
+        if os.path.exists(candidate):
+            return candidate
+    except Exception:
+        pass
+    return None
+
+
+def _extract_summary_path_from_text(text: str) -> str | None:
+    """Parse CLI output to extract a generated JSON summary path."""
+    if not text:
+        return None
+    try:
+        m = re.search(r"Scenario summary written to\s+(.+)", text)
+        if m:
+            path = m.group(1).strip().rstrip(' .')
+            if not os.path.isabs(path):
+                repo_root = _get_repo_root()
+                path = os.path.abspath(os.path.join(repo_root, path))
+            if os.path.exists(path):
+                return path
+    except Exception:
+        pass
+    return None
+
+
+def _find_latest_summary_path(since_ts: float | None = None) -> str | None:
+    try:
+        report_dir = _reports_dir()
+        if not os.path.isdir(report_dir):
+            return None
+        cands = []
+        for name in os.listdir(report_dir):
+            if not name.endswith('.json'):
+                continue
+            if not name.startswith('scenario_report_'):
+                continue
+            p = os.path.join(report_dir, name)
+            try:
+                st = os.stat(p)
+                if since_ts is None or st.st_mtime >= max(0.0, float(since_ts) - 5.0):
+                    cands.append((st.st_mtime, p))
+            except Exception:
+                continue
+        if not cands:
+            return None
+        cands.sort(key=lambda x: x[0], reverse=True)
+        return cands[0][1]
+    except Exception:
+        return None
+
 def _extract_session_id_from_text(text: str) -> str | None:
     """Parse CLI logs for the session id marker emitted by core_topo_gen.cli.
 
@@ -963,7 +1019,7 @@ def _write_single_scenario_xml(src_xml_path: str, scenario_name: str | None, out
     except Exception:
         return None
 
-def _build_full_scenario_archive(out_dir: str, scenario_xml_path: str | None, report_path: str | None, pre_xml_path: str | None, post_xml_path: str | None, run_id: str | None = None) -> str | None:
+def _build_full_scenario_archive(out_dir: str, scenario_xml_path: str | None, report_path: str | None, pre_xml_path: str | None, post_xml_path: str | None, *, summary_path: str | None = None, run_id: str | None = None) -> str | None:
     """Create a zip bundle that includes the scenario XML, pre/post session XML, report, and any generated scripts.
 
     Returns the path to the created zip, or None on failure.
@@ -981,6 +1037,11 @@ def _build_full_scenario_archive(out_dir: str, scenario_xml_path: str | None, re
                 _safe_add_to_zip(zf, scenario_xml_path, "scenario.xml")
             if report_path and os.path.exists(report_path):
                 _safe_add_to_zip(zf, report_path, os.path.join("report", os.path.basename(report_path)))
+            if summary_path and os.path.exists(summary_path):
+                _safe_add_to_zip(zf, summary_path, os.path.join("report", os.path.basename(summary_path)))
+            csv_candidate = f"{report_path}.connectivity.csv" if report_path else None
+            if csv_candidate and os.path.exists(csv_candidate):
+                _safe_add_to_zip(zf, csv_candidate, os.path.join("report", os.path.basename(csv_candidate)))
             if pre_xml_path and os.path.exists(pre_xml_path):
                 _safe_add_to_zip(zf, pre_xml_path, os.path.join("core-session", os.path.basename(pre_xml_path)))
             if post_xml_path and os.path.exists(post_xml_path):
@@ -2713,6 +2774,15 @@ def run_cli():
         report_md = _extract_report_path_from_text(logs) or _find_latest_report_path()
         if report_md:
             app.logger.info("[sync] Detected report path: %s", report_md)
+        summary_json = _extract_summary_path_from_text(logs)
+        if not summary_json:
+            summary_json = _derive_summary_from_report(report_md)
+        if not summary_json and not report_md:
+            summary_json = _find_latest_summary_path()
+        if summary_json and not os.path.exists(summary_json):
+            summary_json = None
+        if summary_json:
+            app.logger.info("[sync] Detected summary path: %s", summary_json)
         # Try to capture the exact session id from logs for precise post-run save
         session_id = _extract_session_id_from_text(logs)
         if session_id:
@@ -2765,7 +2835,15 @@ def run_cli():
                 single_scen_xml = None
             bundle_xml = single_scen_xml or xml_path
             app.logger.info("[sync] Building full scenario archive (xml=%s, report=%s, pre=%s, post=%s)", bundle_xml, report_md, (pre_saved if 'pre_saved' in locals() else None), post_saved)
-            full_bundle_path = _build_full_scenario_archive(os.path.dirname(bundle_xml), bundle_xml, (report_md if (report_md and os.path.exists(report_md)) else None), (pre_saved if 'pre_saved' in locals() else None), post_saved, run_id=None)
+            full_bundle_path = _build_full_scenario_archive(
+                os.path.dirname(bundle_xml),
+                bundle_xml,
+                (report_md if (report_md and os.path.exists(report_md)) else None),
+                (pre_saved if 'pre_saved' in locals() else None),
+                post_saved,
+                summary_path=summary_json,
+                run_id=None,
+            )
         except Exception as e_bundle:
             app.logger.exception("[sync] failed building full scenario bundle: %s", e_bundle)
         try:
@@ -2778,6 +2856,7 @@ def run_cli():
                 'session_xml_path': session_xml_path,
                 'scenario_xml_path': xml_path,
                 'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
+                'summary_path': summary_json if (summary_json and os.path.exists(summary_json)) else None,
                 'pre_xml_path': pre_saved if 'pre_saved' in locals() else None,
                 'full_scenario_path': full_bundle_path,
                 'single_scenario_xml_path': single_scen_xml,
@@ -3466,6 +3545,10 @@ def reports_page():
         session_xml = e.get('session_xml_path') or e.get('post_xml_path')
         if session_xml:
             e['session_xml_path'] = session_xml
+        if not e.get('summary_path'):
+            derived_summary = _derive_summary_from_report(e.get('report_path'))
+            if derived_summary:
+                e['summary_path'] = derived_summary
         # Hardening: ensure scenario_names is always a list
         sn = e.get('scenario_names')
         if not isinstance(sn, list):
@@ -3503,6 +3586,10 @@ def reports_data():
         session_xml = e.get('session_xml_path') or e.get('post_xml_path')
         if session_xml:
             e['session_xml_path'] = session_xml
+        if not e.get('summary_path'):
+            derived_summary = _derive_summary_from_report(e.get('report_path'))
+            if derived_summary:
+                e['summary_path'] = derived_summary
         # Hardening: normalize scenario_names to list
         sn = e.get('scenario_names')
         if not isinstance(sn, list):
@@ -3696,6 +3783,7 @@ def run_cli_async():
         'post_xml_path': None,
         'history_added': False,
         'preview_plan_path': preview_plan_path,
+        'summary_path': None,
     }
     # Start a background finalizer so history is appended even if the UI does not poll /run_status
     def _wait_and_finalize_async(run_id_local: str):
@@ -3726,6 +3814,16 @@ def run_cli_async():
                     report_md = _find_latest_report_path()
                 if report_md:
                     app.logger.info("[async-finalizer] Detected report path: %s", report_md)
+                summary_json = _extract_summary_path_from_text(txt)
+                if not summary_json:
+                    summary_json = _derive_summary_from_report(report_md)
+                if not summary_json and not report_md:
+                    summary_json = _find_latest_summary_path()
+                if summary_json and not os.path.exists(summary_json):
+                    summary_json = None
+                if summary_json:
+                    meta['summary_path'] = summary_json
+                    app.logger.info("[async-finalizer] Detected summary path: %s", summary_json)
                 # Best-effort: capture post-run CORE session XML
                 post_saved = None
                 try:
@@ -3745,7 +3843,17 @@ def run_cli_async():
                 except Exception:
                     single_xml = None
                 bundle_xml = single_xml or xml_path_local
-                full_bundle = _build_full_scenario_archive(os.path.dirname(bundle_xml or ''), bundle_xml, (report_md if (report_md and os.path.exists(report_md)) else None), meta.get('pre_xml_path'), post_saved, run_id=run_id_local)
+                full_bundle = _build_full_scenario_archive(
+                    os.path.dirname(bundle_xml or ''),
+                    bundle_xml,
+                    (report_md if (report_md and os.path.exists(report_md)) else None),
+                    meta.get('pre_xml_path'),
+                    post_saved,
+                    summary_path=summary_json,
+                    run_id=run_id_local,
+                )
+                if full_bundle:
+                    meta['full_scenario_path'] = full_bundle
                 session_xml_path = post_saved if (post_saved and os.path.exists(post_saved)) else None
                 _append_run_history({
                     'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
@@ -3755,6 +3863,7 @@ def run_cli_async():
                     'session_xml_path': session_xml_path,
                     'scenario_xml_path': xml_path_local,
                     'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
+                    'summary_path': summary_json if (summary_json and os.path.exists(summary_json)) else None,
                     'pre_xml_path': meta.get('pre_xml_path'),
                     'full_scenario_path': full_bundle,
                     'single_scenario_xml_path': single_xml,
@@ -3822,6 +3931,16 @@ def run_status(run_id: str):
                         report_md = _find_latest_report_path()
                     if report_md:
                         app.logger.info("[async] Detected report path: %s", report_md)
+                    summary_json = _extract_summary_path_from_text(txt)
+                    if not summary_json:
+                        summary_json = _derive_summary_from_report(report_md)
+                    if not summary_json and not report_md:
+                        summary_json = _find_latest_summary_path()
+                    if summary_json and not os.path.exists(summary_json):
+                        summary_json = None
+                    if summary_json:
+                        meta['summary_path'] = summary_json
+                        app.logger.info("[async] Detected summary path: %s", summary_json)
                     # Best-effort: capture post-run CORE session XML
                     post_saved = None
                     try:
@@ -3842,7 +3961,17 @@ def run_status(run_id: str):
                     except Exception:
                         single_xml = None
                     bundle_xml = single_xml or xml_path_local
-                    full_bundle = _build_full_scenario_archive(os.path.dirname(bundle_xml or ''), bundle_xml, (report_md if (report_md and os.path.exists(report_md)) else None), meta.get('pre_xml_path'), post_saved, run_id=run_id)
+                    full_bundle = _build_full_scenario_archive(
+                        os.path.dirname(bundle_xml or ''),
+                        bundle_xml,
+                        (report_md if (report_md and os.path.exists(report_md)) else None),
+                        meta.get('pre_xml_path'),
+                        post_saved,
+                        summary_path=summary_json,
+                        run_id=run_id,
+                    )
+                    if full_bundle:
+                        meta['full_scenario_path'] = full_bundle
                     session_xml_path = post_saved if (post_saved and os.path.exists(post_saved)) else None
                     _append_run_history({
                         'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
@@ -3852,6 +3981,7 @@ def run_status(run_id: str):
                         'session_xml_path': session_xml_path,
                         'scenario_xml_path': xml_path_local,
                         'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
+                        'summary_path': summary_json if (summary_json and os.path.exists(summary_json)) else None,
                         'pre_xml_path': meta.get('pre_xml_path'),
                         'full_scenario_path': full_bundle,
                         'single_scenario_xml_path': single_xml,
@@ -3872,6 +4002,7 @@ def run_status(run_id: str):
     out_dir = os.path.dirname(xml_path)
     # Determine report path (attempt to parse log each time so UI can link it without refresh)
     report_md = None
+    txt = ''
     try:
         lp = meta.get('log_path')
         if lp and os.path.exists(lp):
@@ -3880,10 +4011,22 @@ def run_status(run_id: str):
             report_md = _extract_report_path_from_text(txt)
     except Exception:
         report_md = None
+    summary_json = _extract_summary_path_from_text(txt)
+    if not summary_json:
+        summary_json = _derive_summary_from_report(report_md)
+    if not summary_json:
+        summary_json = meta.get('summary_path')
+    if not summary_json and not report_md:
+        summary_json = _find_latest_summary_path()
+    if summary_json and not os.path.exists(summary_json):
+        summary_json = None
+    if summary_json:
+        meta['summary_path'] = summary_json
     return jsonify({
         'done': bool(meta.get('done')),
         'returncode': meta.get('returncode'),
         'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
+        'summary_path': summary_json if (summary_json and os.path.exists(summary_json)) else None,
         'xml_path': (meta.get('post_xml_path') if meta.get('post_xml_path') and os.path.exists(meta.get('post_xml_path')) else None),
         'log_path': meta.get('log_path'),
         'scenario_xml_path': xml_path,

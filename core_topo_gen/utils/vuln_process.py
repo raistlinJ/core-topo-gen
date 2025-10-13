@@ -17,6 +17,8 @@ except Exception:  # pragma: no cover - optional dependency handled at runtime
 
 logger = logging.getLogger(__name__)
 
+_COMPOSE_PORT_CACHE: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
+
 
 def _read_csv(path: str) -> List[Dict[str, str]]:
 	rows: List[Dict[str, str]] = []
@@ -736,6 +738,141 @@ def _set_container_name_one_service(compose_obj: dict, container_name: str, pref
 		return compose_obj
 	except Exception:
 		return compose_obj
+
+
+def _parse_compose_ports_entry(entry: object) -> List[Tuple[str, int]]:
+	"""Convert a docker-compose ports entry into one or more (protocol, port) tuples."""
+	results: List[Tuple[str, int]] = []
+	try:
+		if isinstance(entry, int):
+			if entry > 0:
+				results.append(("tcp", int(entry)))
+			return results
+		if isinstance(entry, str):
+			text = entry.strip()
+			if not text:
+				return results
+			if '#' in text:
+				text = text.split('#', 1)[0].strip()
+			if not text:
+				return results
+			if text.startswith('{'):
+				return results
+			proto = 'tcp'
+			if ':' in text:
+				parts = text.split(':')
+				text = parts[-1].strip()
+			if '/' in text:
+				value, proto_part = text.split('/', 1)
+				text = value.strip()
+				proto = (proto_part or 'tcp').strip().lower() or 'tcp'
+			else:
+				proto = 'tcp'
+			port = int(text)
+			if port > 0:
+				results.append((proto, port))
+			return results
+		if isinstance(entry, dict):
+			proto = str(entry.get('protocol') or entry.get('mode') or 'tcp').strip().lower() or 'tcp'
+			for key in ('target', 'container_port', 'port'):
+				value = entry.get(key)
+				if value in (None, ''):
+					continue
+				text = str(value).strip()
+				if '/' in text:
+					text = text.split('/', 1)[0].strip()
+				try:
+					port = int(text)
+				except Exception:
+					continue
+				if port > 0:
+					results.append((proto, port))
+					break
+	except Exception:
+		return []
+	return results
+
+
+def extract_compose_ports(rec: Dict[str, str], out_base: str = "/tmp/vulns", compose_name: str = 'docker-compose.yml') -> List[Dict[str, object]]:
+	"""Best-effort extraction of container ports for a docker-compose vulnerability record."""
+	if not rec:
+		return []
+	name_key = (rec.get('Name') or rec.get('name') or '').strip()
+	path_key = (rec.get('Path') or rec.get('path') or '').strip()
+	cache_key = (name_key, path_key)
+	if cache_key in _COMPOSE_PORT_CACHE:
+		return list(_COMPOSE_PORT_CACHE[cache_key])
+
+	ports: List[Dict[str, object]] = []
+	compose_path = rec.get('compose_path')
+	if compose_path and not os.path.isabs(compose_path):
+		compose_path = os.path.abspath(compose_path)
+	if not compose_path or not os.path.exists(compose_path):
+		safe = _safe_name(name_key or 'vuln') or 'vuln'
+		base_dir = os.path.join(out_base, safe)
+		os.makedirs(base_dir, exist_ok=True)
+		if path_key and os.path.exists(path_key):
+			compose_path = path_key
+		else:
+			candidates = _compose_candidates(base_dir)
+			if candidates:
+				compose_path = candidates[0]
+			else:
+				raw_url = _guess_compose_raw_url(path_key, compose_name=compose_name)
+				if raw_url:
+					dest = os.path.join(base_dir, compose_name)
+					if _download_to(raw_url, dest):
+						compose_path = dest
+				elif path_key:
+					dest = os.path.join(base_dir, compose_name)
+					if _download_to(path_key, dest):
+						compose_path = dest
+	if not compose_path or not os.path.exists(compose_path):
+		logger.debug("extract_compose_ports: compose file unavailable for %s (path=%s)", cache_key, compose_path)
+		_COMPOSE_PORT_CACHE[cache_key] = ports
+		return []
+
+	if yaml is None:
+		logger.debug("extract_compose_ports: PyYAML unavailable; skipping port extraction for %s", cache_key)
+		_COMPOSE_PORT_CACHE[cache_key] = ports
+		return []
+
+	try:
+		with open(compose_path, 'r', encoding='utf-8') as f:
+			compose_obj = yaml.safe_load(f) or {}
+	except Exception as exc:
+		logger.debug("extract_compose_ports: failed to parse %s: %s", compose_path, exc)
+		_COMPOSE_PORT_CACHE[cache_key] = ports
+		return []
+
+	services = compose_obj.get('services') if isinstance(compose_obj, dict) else None
+	if not isinstance(services, dict):
+		_COMPOSE_PORT_CACHE[cache_key] = ports
+		return []
+	seen: Set[Tuple[str, int]] = set()
+	for svc_name, svc_body in services.items():
+		if not isinstance(svc_body, dict):
+			continue
+		ports_field = svc_body.get('ports')
+		if not ports_field:
+			continue
+		if not isinstance(ports_field, list):
+			ports_field = [ports_field]
+		for entry in ports_field:
+			for proto, port in _parse_compose_ports_entry(entry):
+				key = (proto, port)
+				if key in seen:
+					continue
+				seen.add(key)
+				ports.append({"protocol": proto, "port": port, "service": svc_name})
+
+	_COMPOSE_PORT_CACHE[cache_key] = ports
+	if ports and 'compose_ports' not in rec:
+		try:
+			rec['compose_ports'] = list(ports)
+		except Exception:
+			pass
+	return list(ports)
 
 
 def prepare_compose_for_nodes(selected: List[Dict[str, str]], node_names: List[str], out_base: str = "/tmp/vulns", compose_name: str = 'docker-compose.yml') -> List[str]:

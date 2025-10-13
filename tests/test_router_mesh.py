@@ -1,3 +1,4 @@
+import os
 import random
 import types
 
@@ -135,8 +136,10 @@ def test_report_vulnerability_summary(monkeypatch, tmp_path):
             {"selected": "Specific", "v_metric": "Count", "v_count": 1, "v_name": "B"},
         ],
     }
-    write_report(str(out), "test-scenario", routers=[], router_protocols={}, switches=[], hosts=[], vulnerabilities_cfg=vulnerabilities_cfg)
+    report_path, summary_path = write_report(str(out), "test-scenario", routers=[], router_protocols={}, switches=[], hosts=[], vulnerabilities_cfg=vulnerabilities_cfg)
     txt = out.read_text(encoding="utf-8")
     assert "Vulnerabilities assigned:" in txt
     # 2 + 1 = 3
     assert "Vulnerabilities assigned: 3" in txt
+    assert os.path.exists(report_path)
+    assert summary_path is not None and os.path.exists(summary_path)

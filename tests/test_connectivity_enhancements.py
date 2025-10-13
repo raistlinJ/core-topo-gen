@@ -131,7 +131,9 @@ def test_report_metrics_present(monkeypatch, tmp_path):
     from core_topo_gen.utils.report import write_report
     out = tmp_path / 'rep.md'
     topo_stats = getattr(sess, 'topo_stats', {})
-    write_report(str(out), 'scen', routers=routers, router_protocols={}, hosts=hosts, metadata=topo_stats)
+    report_path, summary_path = write_report(str(out), 'scen', routers=routers, router_protocols={}, hosts=hosts, metadata=topo_stats)
     txt = out.read_text()
     assert 'Degree stats:' in txt
     assert 'Router-to-Switch Connectivity' in txt
+    assert os.path.exists(report_path)
+    assert summary_path is not None and os.path.exists(summary_path)

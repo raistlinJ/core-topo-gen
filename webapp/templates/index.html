@@ -96,18 +96,19 @@
                             <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#coreAdvancedCollapse" aria-expanded="false" aria-controls="coreAdvancedCollapse">Advanced</button>
                         </div>
                         <div class="card-body">
-                            <div class="row g-2 align-items-end mb-1">
-                                <div class="col-auto">
-                                    <label for="coreHost" class="form-label mb-0">IP</label>
-                                    <input type="text" class="form-control" id="coreHost" placeholder="localhost" value="{{ (payload.core.host if payload.core else 'localhost') | e }}">
-                                </div>
-                                <div class="col-auto">
-                                    <label for="corePort" class="form-label mb-0">Port</label>
-                                    <input type="number" class="form-control" id="corePort" placeholder="50051" value="{{ (payload.core.port if payload.core else 50051) }}">
-                                </div>
-                            </div>
+                            <div class="small text-muted">Defaults to localhost:50051. Adjust connection details in Advanced if needed.</div>
                             <div class="collapse" id="coreAdvancedCollapse">
                                 <hr class="my-2"/>
+                                <div class="row g-2 align-items-end mb-2">
+                                    <div class="col-auto">
+                                        <label for="coreHost" class="form-label mb-0">IP</label>
+                                        <input type="text" class="form-control" id="coreHost" placeholder="localhost" value="{{ (payload.core.host if payload.core else 'localhost') | e }}">
+                                    </div>
+                                    <div class="col-auto">
+                                        <label for="corePort" class="form-label mb-0">Port</label>
+                                        <input type="number" class="form-control" id="corePort" placeholder="50051" value="{{ (payload.core.port if payload.core else 50051) }}">
+                                    </div>
+                                </div>
                                 <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
                                     <button class="btn btn-sm btn-outline-secondary" type="button" id="testCoreBtn">Test CORE Connection</button>
                                     <span id="coreStatus" class="small text-muted">Not tested </span>
@@ -172,6 +173,7 @@
                     <div id="runProgressStatus">Starting…</div>
                     <div id="runProgressMeta"></div>
                 </div>
+                <div id="runProgressModeHint" class="mb-2 fw-bold text-warning d-none"></div>
                 <div class="progress mb-2">
                     <div class="progress-bar progress-bar-striped progress-bar-animated" id="runProgressBar" style="width: 100%">Working…</div>
                 </div>
@@ -825,13 +827,20 @@ function setupPreviewModalExecute(modalEl, modalInstance){
             await new Promise(resolve => requestAnimationFrame(() => resolve()));
         };
         try {
-            if(!window.confirm('Execute this scenario now? This will start a CORE session.')){
+            const execInfo = detectLocalEmulation();
+            const confirmMsg = execInfo.shouldFake
+                ? 'Execute this scenario now?\n\nCORE not connected; will run with fake local emulation. Proceed?'
+                : 'Execute this scenario now? This will start a CORE session.';
+            if(!window.confirm(confirmMsg)){
+                execBtn.disabled = false;
+                execBtn.classList.remove('disabled');
                 return;
             }
             forceHideModal();
             await waitForPaint();
             await new Promise(resolve => setTimeout(resolve, 0));
             openRunProgress('Running CLI…');
+            maybeShowLocalEmulationHint();
             try {
                 const statusEl = document.getElementById('runProgressStatus');
                 if(statusEl) statusEl.textContent = 'Starting…';
@@ -2031,7 +2040,11 @@ document.addEventListener('DOMContentLoaded', ()=>{
                 alert('Save XML before executing.');
                 return;
             }
-            if(!window.confirm('Execute this scenario now? This will start a CORE session.')) return;
+            const execInfo = detectLocalEmulation();
+            const confirmMsg = execInfo.shouldFake
+                ? 'Execute this scenario now?\n\nCORE not connected; will run with fake local emulation. Proceed?'
+                : 'Execute this scenario now? This will start a CORE session.';
+            if(!window.confirm(confirmMsg)) return;
             const modalInstance = resolveModalInstance();
             const forceHideModal = () => {
                 try { modalInstance?.hide(); } catch(e){}
@@ -2071,6 +2084,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
                 forceHideModal();
                 await waitForPaint();
                 openRunProgress('Executing scenario…');
+                maybeShowLocalEmulationHint();
                 try {
                     document.getElementById('runProgressStatus').textContent = 'Starting…';
                     document.getElementById('runProgressMeta').textContent = '';
@@ -4004,6 +4018,72 @@ function runProgressLogLine(s){
     appendLog(line, lvl);
     pre.parentElement?.scrollTo({ top: pre.parentElement.scrollHeight });
 }
+function detectLocalEmulation(){
+    const normalizeHost = (raw) => {
+        if(raw === null || raw === undefined) return '';
+        let h = String(raw).trim().toLowerCase();
+        if(!h) return '';
+        if(h.startsWith('[') && h.endsWith(']')){
+            h = h.slice(1, -1);
+        }
+        if(h.startsWith('::ffff:') && /^::ffff:\d+\.\d+\.\d+\.\d+$/.test(h)){
+            h = h.replace('::ffff:', '');
+        }
+        return h;
+    };
+    try {
+        const hostRaw = (state?.core && state.core.host !== undefined) ? state.core.host : (initialPayload?.core?.host ?? 'localhost');
+        let hostStr = (typeof hostRaw === 'string' && hostRaw.trim()) ? hostRaw.trim() : String(hostRaw ?? 'localhost');
+        if(!hostStr) hostStr = 'localhost';
+        const normHost = normalizeHost(hostStr);
+        const isLoopback = !normHost || normHost === 'localhost' || normHost === '::1' || normHost === '0:0:0:0:0:0:0:1' || /^127(?:\.\d{1,3}){3}$/.test(normHost);
+        const portRaw = (state?.core && state.core.port !== undefined) ? state.core.port : (initialPayload?.core?.port ?? 50051);
+        const portNum = parseInt(portRaw, 10);
+        const port = Number.isFinite(portNum) && portNum > 0 ? portNum : 50051;
+        const testedHostRaw = (state?.core_tested_host !== undefined && state.core_tested_host !== null)
+            ? state.core_tested_host
+            : (initialPayload?.core_tested_host ?? null);
+        const testedPortRaw = (state?.core_tested_port !== undefined && state.core_tested_port !== null)
+            ? state.core_tested_port
+            : (initialPayload?.core_tested_port ?? null);
+        const normTestedHost = normalizeHost(testedHostRaw);
+        const testedPortNum = parseInt(testedPortRaw ?? '', 10);
+        const testedPort = Number.isFinite(testedPortNum) && testedPortNum > 0 ? testedPortNum : port;
+        const testedMatches = !!normTestedHost && normTestedHost === normHost && testedPort === port;
+        const hasVerifiedCore = !!state?.core_ok && testedMatches;
+        const shouldFake = isLoopback && !hasVerifiedCore;
+        return {
+            shouldFake,
+            isLoopback: !!isLoopback,
+            verified: hasVerifiedCore,
+            host: hostStr,
+            port
+        };
+    } catch(e){
+        return { shouldFake: false, isLoopback: false, verified: false, host: 'localhost', port: 50051 };
+    }
+}
+function setRunProgressModeHint(message){
+    const hintEl = document.getElementById('runProgressModeHint');
+    if(!hintEl) return;
+    if(message){
+        hintEl.textContent = message;
+        hintEl.classList.remove('d-none');
+    } else {
+        hintEl.textContent = '';
+        hintEl.classList.add('d-none');
+    }
+}
+function maybeShowLocalEmulationHint(){
+    const info = detectLocalEmulation();
+    if(info.shouldFake){
+        setRunProgressModeHint(`LOCAL EMULATION • NO CONNECTED CORE SESSION`);
+    } else if(info.verified){
+        setRunProgressModeHint(`CONNECTED • CORE ${info.host}:${info.port}`);
+    } else {
+        setRunProgressModeHint('');
+    }
+}
 function openRunProgress(title){
     const modalEl = document.getElementById('runProgressModal');
     ensureRunProgressModal();
@@ -4012,6 +4092,7 @@ function openRunProgress(title){
         document.getElementById('runProgressStatus').textContent = 'Starting…';
         document.getElementById('runProgressMeta').textContent = '';
         document.getElementById('runProgressBar').classList.add('progress-bar-animated');
+        setRunProgressModeHint('');
         const logEl = document.getElementById('runProgressLog');
         if(logEl) logEl.textContent = '';
     // Do NOT clear persistent log buffer; just re-render existing lines
@@ -4086,10 +4167,14 @@ async function runSyncWithModal(arg){
             if (!rp.endsWith('.xml')) { logWarn('Save did not produce an XML path; aborting run'); return false; }
         } catch(e){ logError('Exception during auto-save; aborting run'); return false; }
     }
-    const confirmMsg = 'This will generate a CORE scenario and attempt to start it. Proceed?';
+    const execInfo = detectLocalEmulation();
+    const confirmMsg = execInfo.shouldFake
+        ? 'CORE not connected; will run with fake local emulation. Proceed?'
+        : 'This will generate a CORE scenario and attempt to start it. Proceed?';
     if (!skipConfirm && !window.confirm(confirmMsg)) { logInfo('Run CLI cancelled by user at confirmation'); return false; }
     if(showProgressModal){
         openRunProgress('Running CLI…');
+        maybeShowLocalEmulationHint();
     }
     try {
         // Ensure dock is visible
@@ -4201,9 +4286,13 @@ async function runWithSeedBuild(){
         alert('Enter a seed or generate a Full Preview (which records a seed) first.');
         return;
     }
-    const confirmMsg = `Run CLI with seed=${seedVal}? This will start a CORE session.`;
+    const execInfo = detectLocalEmulation();
+    const confirmMsg = execInfo.shouldFake
+        ? `CORE not connected; will run with fake local emulation (seed=${seedVal}). Proceed?`
+        : `Run CLI with seed=${seedVal}? This will start a CORE session.`;
     if(!window.confirm(confirmMsg)) return;
     openRunProgress('Running CLI (seed='+seedVal+')…');
+    maybeShowLocalEmulationHint();
     try {
         // Show dock logs
         try { const showBtn=document.getElementById('dockShowBtn'); if(showBtn && !showBtn.classList.contains('d-none')) showBtn.click(); } catch(e){}

@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 from core_topo_gen.utils.report import write_report
 
 
@@ -30,7 +31,7 @@ def test_report_includes_segmentation(tmp_path):
     # Minimal inputs
     scenario_name = "test-scenario"
 
-    result_path = write_report(
+    report_path, summary_path = write_report(
         str(out_md),
         scenario_name,
         routers=[],
@@ -47,7 +48,8 @@ def test_report_includes_segmentation(tmp_path):
         segmentation_cfg={"density": 0.5, "items": [{"name": "Firewall", "factor": 1.0}]},
     )
 
-    assert os.path.exists(result_path)
+    assert os.path.exists(report_path)
+    assert summary_path is not None and os.path.exists(summary_path)
     content = out_md.read_text(encoding="utf-8")
     # Summary counts
     assert "Segmentation rules: 2" in content
@@ -58,3 +60,7 @@ def test_report_includes_segmentation(tmp_path):
     # Details section
     assert "### Segmentation config" in content
     assert "Density: 0.5" in content
+
+    summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+    assert summary.get("counts", {}).get("segmentation_rules") == 2
+    assert summary.get("segmentation", {}).get("rules_total") == 2

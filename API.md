@@ -96,6 +96,7 @@ Scenario editor & runs
   - Starts a CLI run and waits for completion; renders `index.html` with logs.
   - Side effects:
     - Writes a Markdown report under `./reports/`.
+    - Writes a JSON summary next to the Markdown report (`scenario_report_<ts>.json`) with counts, metadata, and segmentation/traffic tallies.
     - If planning metadata attributes are present in the XML, they are merged into the report under a "Planning Metadata (from XML)" section with namespaced keys (`plan_*`).
     - Connectivity metrics (router degree distribution, aggregation switch stats) appended when routers are generated.
     - Attempts to capture pre- and post-run CORE session XML into `outputs/core-sessions/`.
@@ -331,6 +332,7 @@ The CLI supports the following arguments. The Web endpoints currently forward on
   - `--nat-mode` (`SNAT|MASQUERADE`, default `SNAT`): NAT mode for routers
   - `--dnat-prob` (float 0..1, default `0.0`): probability of DNAT (port-forward) on routers
   - `--seg-include-hosts` (flag): include host nodes as candidates for segmentation placement
+  - `--seg-allow-docker-ports` (flag): ensure host INPUT chains allow docker-compose container ports when segmentation sets default deny rules
 
 Important
 - The web backend derives CORE `host`/`port` from the saved editor XML’s `core` section when present; otherwise defaults apply.

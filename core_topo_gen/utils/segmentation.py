@@ -3,11 +3,12 @@ import os
 import ipaddress
 import random
 import logging
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 import shutil
 from ..types import NodeInfo, SegmentationInfo
 from .services import ensure_service
 from ..plugins import segmentation as seg_plugins
+from .vuln_process import extract_compose_ports
 
 logger = logging.getLogger(__name__)
 
@@ -212,10 +213,14 @@ def plan_and_apply_segmentation(
     nat_mode: str = "SNAT",
     out_dir: str = "/tmp/segmentation",
     include_hosts: bool = False,
+    allow_docker_ports: bool = False,
+    docker_nodes: Optional[Dict[str, Dict[str, object]]] = None,
 ) -> Dict[str, object]:
     """
     Create a number of segmentation "slots" based on density and assign selected services by factor.
     Adds and configures chosen services on nodes. Generates simple iptables scripts to enforce policies.
+    When allow_docker_ports is True, host-level firewall scripts automatically add INPUT accept rules
+    for container ports defined by docker-compose records associated with the host (best-effort).
 
     Returns a summary dictionary with planned rules per node.
     """
@@ -223,6 +228,74 @@ def plan_and_apply_segmentation(
     if not hosts:
         return summary
     os.makedirs(out_dir, exist_ok=True)
+
+    docker_nodes = docker_nodes or {}
+    allow_docker_ports = bool(allow_docker_ports) and bool(docker_nodes)
+    node_name_cache: Dict[int, Optional[str]] = {}
+    node_port_cache: Dict[int, List[Tuple[str, int]]] = {}
+    compose_port_cache: Dict[str, List[Tuple[str, int]]] = {}
+
+    def _lookup_node_name(node_id: int) -> Optional[str]:
+        if node_id in node_name_cache:
+            return node_name_cache[node_id]
+        name: Optional[str] = None
+        if session is not None and hasattr(session, "get_node"):
+            try:
+                node_obj = session.get_node(node_id)
+                if node_obj is not None:
+                    name = getattr(node_obj, "name", None) or getattr(node_obj, "label", None)
+            except Exception:
+                name = None
+        node_name_cache[node_id] = name
+        return name
+
+    def _docker_ports_for_node(node_id: int) -> List[Tuple[str, int]]:
+        if not allow_docker_ports:
+            return []
+        if node_id in node_port_cache:
+            return node_port_cache[node_id]
+        node_name = _lookup_node_name(node_id)
+        ports: List[Tuple[str, int]] = []
+        if node_name:
+            rec = docker_nodes.get(node_name)
+            if rec:
+                existing = rec.get("compose_ports")
+                entries: List[Dict[str, object]] = []
+                if isinstance(existing, list) and existing and isinstance(existing[0], dict):
+                    entries = existing  # type: ignore[assignment]
+                if not entries:
+                    try:
+                        entries = extract_compose_ports(rec, out_base="/tmp/vulns")
+                    except Exception:
+                        entries = []
+                key = None
+                try:
+                    key = f"{node_name}::{rec.get('Path', '')}"
+                except Exception:
+                    key = None
+                if key and key in compose_port_cache:
+                    ports = compose_port_cache[key]
+                else:
+                    seen_pairs: Set[Tuple[str, int]] = set()
+                    for entry in entries or []:
+                        if not isinstance(entry, dict):
+                            continue
+                        proto = str(entry.get("protocol", "tcp")).strip().lower() or "tcp"
+                        try:
+                            port_val = int(entry.get("port"))
+                        except Exception:
+                            continue
+                        if port_val <= 0:
+                            continue
+                        pair = (proto, port_val)
+                        if pair in seen_pairs:
+                            continue
+                        seen_pairs.add(pair)
+                        ports.append(pair)
+                    if key:
+                        compose_port_cache[key] = ports
+        node_port_cache[node_id] = ports
+        return ports
 
     # Track existing NAT rules to avoid duplicates across runs and within this call
     # Key: (node_id, internal_cidr, external_cidr, mode, egress_ip)
@@ -885,6 +958,27 @@ print('[segmentation] applied', len(cmds), 'commands')
                     ]
                 # For host-level firewall rules, opportunistically open a few common service ports so internal nodes have reachable services.
                 allow_services: List[int] = []
+                docker_ports_opened: List[Tuple[str, int]] = []
+                docker_ports_seen: Set[Tuple[str, int]] = set()
+                inserted_accept_rules: Set[Tuple[str, int]] = set()
+
+                def _add_accept_rule(proto: str, port: int) -> Tuple[bool, Optional[Tuple[str, int]]]:
+                    try:
+                        port_val = int(port)
+                    except Exception:
+                        return False, None
+                    proto_norm = (proto or "tcp").strip().lower() or "tcp"
+                    if port_val <= 0 or chain_fw != "INPUT":
+                        return False, (proto_norm, port_val)
+                    key = (proto_norm, port_val)
+                    if key in inserted_accept_rules:
+                        return False, key
+                    inserted_accept_rules.add(key)
+                    py_lines.append(
+                        f"ensure_rule('iptables -I INPUT 1 -p {proto_norm} --dport {port_val} -j ACCEPT')"
+                    )
+                    return True, key
+
                 if not on_router and chain_fw == "INPUT":
                     service_port_candidates = [22, 53, 80, 443, 8080]
                     # Deterministic selection based on node id for stable previews / runs
@@ -897,14 +991,25 @@ print('[segmentation] applied', len(cmds), 'commands')
                         k = 1 + (seed_val % 3)  # 1..3 stable count
                     except Exception:
                         k = 1
-                    # Shuffle deterministically then take first k
                     shuffled = list(service_port_candidates)
                     rng.shuffle(shuffled)
                     allow_services = shuffled[:k]
                     for p in allow_services:
                         proto = "udp" if p == 53 else "tcp"
-                        # Insert at head using -I so it has precedence over later DROP rules
-                        py_lines.append(f"ensure_rule('iptables -I INPUT 1 -p {proto} --dport {p} -j ACCEPT')")
+                        _add_accept_rule(proto, p)
+                    for proto, port in _docker_ports_for_node(node.node_id):
+                        added, key = _add_accept_rule(proto, port)
+                        target = key
+                        if target is None:
+                            try:
+                                proto_norm = (proto or "tcp").strip().lower() or "tcp"
+                                port_val = int(port)
+                                target = (proto_norm, port_val)
+                            except Exception:
+                                target = None
+                        if target and target not in docker_ports_seen:
+                            docker_ports_seen.add(target)
+                            docker_ports_opened.append(target)
                 py_lines += [
                     "rules = [",
                 ]
@@ -949,8 +1054,22 @@ print('[segmentation] applied', len(cmds), 'commands')
                         if not on_router and 'allow_services' not in rule and 'allow_services' in locals() and allow_services:
                             # Expose list of opportunistic open service ports for reporting
                             rule['allow_services'] = allow_services
+                        if docker_ports_opened:
+                            rule['docker_ports_allowed'] = [
+                                {"protocol": proto, "port": port}
+                                for proto, port in docker_ports_opened
+                            ]
                     except Exception:
                         pass
+                else:
+                    if docker_ports_opened:
+                        try:
+                            rule['docker_ports_allowed'] = [
+                                {"protocol": proto, "port": port}
+                                for proto, port in docker_ports_opened
+                            ]
+                        except Exception:
+                            pass
                 summary["rules"].append({
                     "node_id": node.node_id,
                     "service": (SERVICE_ENABLE_MAP.get(svc, svc) if svc.upper() != "CUSTOM" else "CUSTOM"),
