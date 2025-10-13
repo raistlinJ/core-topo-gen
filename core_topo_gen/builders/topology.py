@@ -296,7 +296,61 @@ def _make_safe_link_tracker():
             return False
     return existing, safe_add, counters
 
-def _apply_docker_compose_meta(node, rec):
+
+def _log_add_node_result(session_obj, node_obj, requested_id, node_type, name, position=None):
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    try:
+        session_type = type(session_obj).__name__
+    except Exception:
+        session_type = str(type(session_obj))
+    try:
+        actual_id = getattr(node_obj, 'id', None)
+    except Exception:
+        actual_id = None
+    pos_desc = None
+    if position is not None:
+        try:
+            pos_desc = (getattr(position, 'x', None), getattr(position, 'y', None))
+        except Exception:
+            try:
+                pos_desc = (position[0], position[1]) if isinstance(position, (tuple, list)) else position
+            except Exception:
+                pos_desc = None
+    try:
+        attr_type = getattr(node_obj, "type", None)
+    except Exception:
+        attr_type = None
+    try:
+        attr_image = getattr(node_obj, "image", None)
+    except Exception:
+        attr_image = None
+    try:
+        attr_compose = getattr(node_obj, "compose", None)
+    except Exception:
+        attr_compose = None
+    try:
+        attr_compose_name = getattr(node_obj, "compose_name", None)
+    except Exception:
+        attr_compose_name = None
+    try:
+        logger.info(
+            "[grpc.call] session.add_node name=%s requested_id=%s actual_id=%s type=%s session_type=%s position=%s attr_type=%s attr_image=%s compose=%s compose_name=%s",
+            name,
+            requested_id,
+            actual_id,
+            _type_desc(node_type) if node_type is not None else None,
+            session_type,
+            pos_desc,
+            attr_type,
+            attr_image,
+            attr_compose,
+            attr_compose_name,
+        )
+    except Exception:
+        pass
+
+def _apply_docker_compose_meta(node, rec, session=None):
     """Attach docker compose metadata if available (best-effort, non-fatal)."""
     try:
         if not node:
@@ -304,15 +358,79 @@ def _apply_docker_compose_meta(node, rec):
         n = getattr(node, 'name', None)
         if not n:
             return
-        compose_path = f"/tmp/vulns/docker-compose-{n}.yml"
+        compose_path = None
+        try:
+            if rec:
+                compose_path = rec.get('compose_path')
+                logger.info(
+                    "[vuln-node] metadata lookup node=%s compose_path=%s record_keys=%s",
+                    n,
+                    compose_path,
+                    sorted(rec.keys()),
+                )
+                try:
+                    startup = rec.get('Startup') or rec.get('startup')
+                    if startup:
+                        logger.info("[vuln-node] node=%s record startup=%s", n, startup)
+                except Exception:
+                    pass
+                try:
+                    command = rec.get('Command') or rec.get('command')
+                    if command:
+                        logger.info("[vuln-node] node=%s record command=%s", n, command)
+                except Exception:
+                    pass
+        except Exception:
+            compose_path = None
+        if not compose_path:
+            compose_path = f"/tmp/vulns/docker-compose-{n}.yml"
+            logger.warning(
+                "[vuln-node] node=%s compose_path missing in record; falling back to %s",
+                n,
+                compose_path,
+            )
+        path_exists = False
+        path_size = None
+        try:
+            path_exists = os.path.exists(compose_path)
+            if path_exists:
+                path_size = os.path.getsize(compose_path)
+        except Exception:
+            path_exists = False
+        if not path_exists:
+            logger.warning(
+                "[vuln-node] node=%s compose file not found at %s (CORE may fall back to default docker behavior)",
+                n,
+                compose_path,
+            )
+        else:
+            logger.info(
+                "[vuln-node] node=%s compose file ready path=%s size=%s bytes",
+                n,
+                compose_path,
+                path_size,
+            )
         vname = None
         try:
             if rec:
                 vname = rec.get('Name') or rec.get('name') or rec.get('Title') or rec.get('title')
         except Exception:
             vname = None
+        if not vname:
+            try:
+                vname = n
+            except Exception:
+                vname = None
+        try:
+            logger.debug("[vuln-node] node=%s existing compose attr=%s", n, getattr(node, 'compose', None))
+        except Exception:
+            pass
         try:
             setattr(node, 'compose', compose_path)
+        except Exception:
+            pass
+        try:
+            setattr(node, 'image', "")
         except Exception:
             pass
         if vname:
@@ -321,8 +439,25 @@ def _apply_docker_compose_meta(node, rec):
             except Exception:
                 pass
         try:
+            logger.debug(
+                "[vuln-node] node=%s after attribute set compose=%s compose_name=%s",
+                n,
+                getattr(node, 'compose', None),
+                getattr(node, 'compose_name', None),
+            )
+        except Exception:
+            pass
+        try:
             options = getattr(node, 'options', None)
             if options is not None:
+                try:
+                    logger.debug(
+                        "[vuln-node] node=%s existing options before compose update=%s",
+                        n,
+                        vars(options) if hasattr(options, '__dict__') else options,
+                    )
+                except Exception:
+                    pass
                 try:
                     setattr(options, 'compose', compose_path)
                 except Exception:
@@ -332,8 +467,96 @@ def _apply_docker_compose_meta(node, rec):
                         setattr(options, 'compose_name', str(vname))
                     except Exception:
                         pass
+                try:
+                    setattr(options, 'type', "")
+                except Exception:
+                    pass
+                try:
+                    setattr(options, 'image', "")
+                except Exception:
+                    pass
+                try:
+                    logger.debug(
+                        "[vuln-node] node=%s options after compose update=%s",
+                        n,
+                        vars(options) if hasattr(options, '__dict__') else options,
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
+        if session is not None:
+            image_hint = None
+            try:
+                if rec:
+                    image_hint = rec.get('Image') or rec.get('image') or rec.get('DockerImage')
+            except Exception:
+                image_hint = None
+            try:
+                logger.info(
+                    "[vuln-node] node=%s compose=%s compose_name=%s image=%s exists=%s size=%s session_edit=%s",
+                    getattr(node, 'name', None),
+                    compose_path,
+                    vname,
+                    image_hint,
+                    path_exists,
+                    path_size,
+                    hasattr(session, 'edit_node'),
+                )
+            except Exception:
+                pass
+            try:
+                options_obj = getattr(node, 'options', None)
+            except Exception:
+                options_obj = None
+            if options_obj is None:
+                options_obj = SimpleNamespace()
+                try:
+                    setattr(node, 'options', options_obj)
+                except Exception:
+                    pass
+            else:
+                try:
+                    logger.debug(
+                        "[vuln-node] node=%s options namespace pre-edit=%s",
+                        n,
+                        vars(options_obj) if hasattr(options_obj, '__dict__') else options_obj,
+                    )
+                except Exception:
+                    pass
+            try:
+                setattr(options_obj, 'compose', compose_path)
+            except Exception:
+                pass
+            if vname:
+                try:
+                    setattr(options_obj, 'compose_name', str(vname))
+                except Exception:
+                    pass
+            try:
+                setattr(options_obj, 'type', "")
+            except Exception:
+                pass
+            try:
+                setattr(options_obj, 'image', "")
+            except Exception:
+                pass
+            try:
+                if hasattr(session, 'edit_node'):
+                    logger.debug(
+                        "[vuln-node] edit_node id=%s compose=%s compose_name=%s options=%s",
+                        node.id,
+                        getattr(options_obj, 'compose', None),
+                        getattr(options_obj, 'compose_name', None),
+                        vars(options_obj) if hasattr(options_obj, '__dict__') else options_obj,
+                    )
+                    resp = session.edit_node(node.id, options=options_obj)
+                    try:
+                        logger.debug("[vuln-node] edit_node response node=%s resp=%s", n, resp)
+                    except Exception:
+                        pass
+            except Exception:
+                logger.debug('Failed to push compose options via edit_node for node %s', getattr(node, 'name', None))
     except Exception:
         logger.debug('Failed to set docker compose metadata for node %s', getattr(node, 'name', None))
 
@@ -370,7 +593,9 @@ def build_star_from_roles(core,
     # to avoid accidental duplicate link attempts that can trigger interface rename collisions in CORE.
     existing_links, safe_add_link, link_counters = _make_safe_link_tracker()
     logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", 1, "switch", _type_desc(NodeType.SWITCH), cx, cy)
-    switch = session.add_node(1, _type=NodeType.SWITCH, position=Position(x=cx, y=cy))
+    switch_pos = Position(x=cx, y=cy)
+    switch = session.add_node(1, _type=NodeType.SWITCH, position=switch_pos)
+    _log_add_node_result(session, switch, 1, NodeType.SWITCH, "switch", position=switch_pos)
     try:
         setattr(switch, "model", "switch")
     except Exception:
@@ -417,7 +642,8 @@ def build_star_from_roles(core,
             except Exception:
                 pass
         logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id, node_name, _type_desc(node_type), x, y)
-        node = session.add_node(node_id, _type=node_type, position=Position(x=x, y=y), name=node_name)
+        node_position = Position(x=x, y=y)
+        node = session.add_node(node_id, _type=node_type, position=node_position, name=node_name)
         # set model for better XML typing
         try:
             if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
@@ -435,7 +661,17 @@ def build_star_from_roles(core,
         try:
             if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
                 rec = docker_by_name.get(node_name)
-                _apply_docker_compose_meta(node, rec)
+                try:
+                    if rec:
+                        logger.info(
+                            "[vuln-node] created docker node id=%s name=%s from record keys=%s",
+                            getattr(node, "id", node_id),
+                            node_name,
+                            sorted(rec.keys()),
+                        )
+                except Exception:
+                    pass
+                _apply_docker_compose_meta(node, rec, session=session)
                 # Explicitly ensure DefaultRoute is NOT present on docker nodes
                 try:
                     present = has_service(session, node.id, "DefaultRoute", node_obj=node)
@@ -456,6 +692,8 @@ def build_star_from_roles(core,
                         pass
         except Exception:
             pass
+
+        _log_add_node_result(session, node, node_id, node_type, node_name, position=node_position)
 
         if node_type == NodeType.DEFAULT:
             host_ip, host_mask = mac_alloc.next_ip()
@@ -580,7 +818,9 @@ def build_multi_switch_topology(core,
 
     cx, cy = 800, 800
     logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", 1, "agg-sw", _type_desc(NodeType.SWITCH), cx, cy)
-    agg = session.add_node(1, _type=NodeType.SWITCH, position=Position(x=cx, y=cy), name="agg-sw")
+    agg_position = Position(x=cx, y=cy)
+    agg = session.add_node(1, _type=NodeType.SWITCH, position=agg_position, name="agg-sw")
+    _log_add_node_result(session, agg, 1, NodeType.SWITCH, "agg-sw", position=agg_position)
     try:
         setattr(agg, "model", "switch")
     except Exception:
@@ -603,7 +843,9 @@ def build_multi_switch_topology(core,
         y = int(cy + radius * math.sin(theta))
         node_id = i + 2
         logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id, f"sw-{i+1}", _type_desc(NodeType.SWITCH), x, y)
-        sw = session.add_node(node_id, _type=NodeType.SWITCH, position=Position(x=x, y=y), name=f"sw-{i+1}")
+        sw_position = Position(x=x, y=y)
+        sw = session.add_node(node_id, _type=NodeType.SWITCH, position=sw_position, name=f"sw-{i+1}")
+        _log_add_node_result(session, sw, node_id, NodeType.SWITCH, f"sw-{i+1}", position=sw_position)
         switch_ids.append(sw.id)
         # link access switch to aggregation with explicit interfaces for clarity in saved XML
         try:
@@ -671,7 +913,8 @@ def build_multi_switch_topology(core,
             except Exception:
                 pass
         logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", next_id, name, _type_desc(node_type), x, y)
-        node = session.add_node(next_id, _type=node_type, position=Position(x=x, y=y), name=name)
+        node_position = Position(x=x, y=y)
+        node = session.add_node(next_id, _type=node_type, position=node_position, name=name)
         try:
             if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
                 setattr(node, "model", "docker")
@@ -681,14 +924,24 @@ def build_multi_switch_topology(core,
                 setattr(node, "model", "PC")
         except Exception:
             pass
-        nodes_by_id[node.id] = node
-        next_id += 1
+
+        actual_node_id = getattr(node, "id", next_id)
 
         # If this is a DOCKER node, attach compose/compose_name metadata now
         try:
             if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
                 rec = docker_by_name.get(name)
-                _apply_docker_compose_meta(node, rec)
+                try:
+                    if rec:
+                        logger.info(
+                            "[vuln-node] created docker node id=%s name=%s from record keys=%s",
+                            actual_node_id,
+                            name,
+                            sorted(rec.keys()),
+                        )
+                except Exception:
+                    pass
+                _apply_docker_compose_meta(node, rec, session=session)
                 # Explicitly ensure DefaultRoute is NOT present on docker nodes
                 present = False
                 try:
@@ -710,6 +963,10 @@ def build_multi_switch_topology(core,
                         pass
         except Exception:
             pass
+
+        _log_add_node_result(session, node, next_id, node_type, name, position=node_position)
+        nodes_by_id[node.id] = node
+        next_id += 1
 
         if node_type == NodeType.DEFAULT:
             # Allocate a unique /24 LAN and assign the first host IP
@@ -1047,7 +1304,10 @@ def _try_build_segmented_topology_from_preview(
             x, y = (500 + idx * 120, 400)
         router_coord_map[rid] = (x, y)
         logger.info("[preview] add_router id=%s name=%s pos=(%s,%s)", rid, name, x, y)
-        node = session.add_node(rid, _type=_router_node_type(), position=Position(x=x, y=y), name=name)
+        router_position = Position(x=x, y=y)
+        rtype = _router_node_type()
+        node = session.add_node(rid, _type=rtype, position=router_position, name=name)
+        _log_add_node_result(session, node, rid, rtype, name, position=router_position)
         mark_node_as_router(node, session)
         try:
             setattr(node, "model", "router")
@@ -1104,7 +1364,9 @@ def _try_build_segmented_topology_from_preview(
             y = int(base_y + radius * math.sin(angle))
         name = str(hdata.get('name') or f"host-{hid}")
         logger.info("[preview] add_host id=%s name=%s type=%s pos=(%s,%s)", hid, name, _type_desc(node_type), x, y)
-        host_node = session.add_node(hid, _type=node_type, position=Position(x=x, y=y), name=name)
+        host_position = Position(x=x, y=y)
+        host_node = session.add_node(hid, _type=node_type, position=host_position, name=name)
+        _log_add_node_result(session, host_node, hid, node_type, name, position=host_position)
         try:
             if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
                 setattr(host_node, "model", "docker")
@@ -1153,7 +1415,9 @@ def _try_build_segmented_topology_from_preview(
             sy = base_y + 60 + (idx % 5) * 35
         switch_name = switch_name_map.get(sid) or f"rsw-{router_id}-{idx+1}"
         logger.info("[preview] add_switch id=%s name=%s pos=(%s,%s)", sid, switch_name, sx, sy)
-        sw_node = session.add_node(sid, _type=NodeType.SWITCH, position=Position(x=sx, y=sy), name=switch_name)
+        sw_position = Position(x=sx, y=sy)
+        sw_node = session.add_node(sid, _type=NodeType.SWITCH, position=sw_position, name=switch_name)
+        _log_add_node_result(session, sw_node, sid, NodeType.SWITCH, switch_name, position=sw_position)
         try:
             setattr(sw_node, "model", "switch")
         except Exception:
@@ -1656,7 +1920,9 @@ def build_segmented_topology(core,
         node_id = i + 1
         rtype = _router_node_type()
         logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id, f"router-{i+1}", _type_desc(rtype), x, y)
-        node = session.add_node(node_id, _type=rtype, position=Position(x=x, y=y), name=f"router-{i+1}")
+        router_position = Position(x=x, y=y)
+        node = session.add_node(node_id, _type=rtype, position=router_position, name=f"router-{i+1}")
+        _log_add_node_result(session, node, node_id, rtype, f"router-{i+1}", position=router_position)
         logger.debug("Added router id=%s at (%s,%s)", node.id, x, y)
         mark_node_as_router(node, session)
         try:
@@ -2105,7 +2371,8 @@ def build_segmented_topology(core,
                 except Exception:
                     pass
             logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, name, _type_desc(node_type), x, y)
-            host = session.add_node(node_id_counter, _type=node_type, position=Position(x=x, y=y), name=name)
+            host_position = Position(x=x, y=y)
+            host = session.add_node(node_id_counter, _type=node_type, position=host_position, name=name)
             try:
                 if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
                     setattr(host, "model", "docker")
@@ -2116,14 +2383,24 @@ def build_segmented_topology(core,
             except Exception:
                 pass
             logger.debug("Added host id=%s name=%s type=%s at (%s,%s)", host.id, name, node_type, x, y)
-            node_id_counter += 1
+            actual_host_id = getattr(host, "id", node_id_counter)
             host_nodes_by_id[host.id] = host
             host_next_ifid[host.id] = 1  # eth0 consumed
             # Apply DOCKER compose metadata when applicable
             try:
                 if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
                     rec = docker_by_name.get(name)
-                    _apply_docker_compose_meta(host, rec)
+                    try:
+                        if rec:
+                            logger.info(
+                                "[vuln-node] created docker node id=%s name=%s from record keys=%s",
+                                actual_host_id,
+                                name,
+                                sorted(rec.keys()),
+                            )
+                    except Exception:
+                        pass
+                    _apply_docker_compose_meta(host, rec, session=session)
                     # Explicitly ensure DefaultRoute is NOT present on docker nodes
                     present = False
                     try:
@@ -2145,6 +2422,8 @@ def build_segmented_topology(core,
                             pass
             except Exception:
                 pass
+            _log_add_node_result(session, host, node_id_counter, node_type, name, position=host_position)
+            node_id_counter += 1
             # Allocate a unique /24 LAN
             lan_net = subnet_alloc.next_random_subnet(24)
             lan_hosts = list(lan_net.hosts())
@@ -2207,7 +2486,8 @@ def build_segmented_topology(core,
                     except Exception:
                         pass
                 logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, name, _type_desc(node_type), x, y)
-                host = session.add_node(node_id_counter, _type=node_type, position=Position(x=x, y=y), name=name)
+                host_position = Position(x=x, y=y)
+                host = session.add_node(node_id_counter, _type=node_type, position=host_position, name=name)
                 try:
                     if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
                         setattr(host, "model", "docker")
@@ -2217,7 +2497,7 @@ def build_segmented_topology(core,
                         setattr(host, "model", "PC")
                 except Exception:
                     pass
-                node_id_counter += 1
+                actual_host_id = getattr(host, "id", node_id_counter)
                 host_nodes_by_id[host.id] = host
                 host_next_ifid[host.id] = 1
                 # Addressing: allocate per-host /24 directly to router (direct link) for now
@@ -2246,6 +2526,45 @@ def build_segmented_topology(core,
                         ensure_service(session, host.id, "DefaultRoute", node_obj=host)
                     except Exception:
                         pass
+
+                # If this is a DOCKER node, attach compose/compose_name metadata now
+                try:
+                    if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
+                        rec = docker_by_name.get(name)
+                        try:
+                            if rec:
+                                logger.info(
+                                    "[vuln-node] created docker node id=%s name=%s from record keys=%s",
+                                    actual_host_id,
+                                    name,
+                                    sorted(rec.keys()),
+                                )
+                        except Exception:
+                            pass
+                        _apply_docker_compose_meta(host, rec, session=session)
+                        present = False
+                        try:
+                            present = has_service(session, host.id, "DefaultRoute", node_obj=host)
+                        except Exception:
+                            present = False
+                        if present:
+                            try:
+                                logger.info("Removing DefaultRoute from DOCKER node %s (id=%s)", getattr(host, "name", host.id), host.id)
+                            except Exception:
+                                pass
+                            ok = remove_service(session, host.id, "DefaultRoute", node_obj=host)
+                            try:
+                                if ok:
+                                    logger.info("Removed DefaultRoute from DOCKER node %s (id=%s)", getattr(host, "name", host.id), host.id)
+                                else:
+                                    logger.info("DefaultRoute not present or could not remove on DOCKER node %s (id=%s)", getattr(host, "name", host.id), host.id)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                _log_add_node_result(session, host, node_id_counter, node_type, name, position=host_position)
+                node_id_counter += 1
 
     if docker_slot_plan:
         missing_slots = set(docker_slot_plan.keys()) - docker_slots_used
@@ -2373,7 +2692,9 @@ def build_segmented_topology(core,
                 sy = int(base_y + 40 + (offset_idx * 20))
                 name = switch_name_map.get(switch_id) or detail.get('name') or f"rsw-{router_id}-{offset_idx}"
                 logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", switch_id, name, _type_desc(NodeType.SWITCH), sx, sy)
-                sw_node = session.add_node(switch_id, _type=NodeType.SWITCH, position=Position(x=sx, y=sy), name=name)
+                sw_position = Position(x=sx, y=sy)
+                sw_node = session.add_node(switch_id, _type=NodeType.SWITCH, position=sw_position, name=name)
+                _log_add_node_result(session, sw_node, switch_id, NodeType.SWITCH, name, position=sw_position)
                 try:
                     setattr(sw_node, 'model', 'switch')
                 except Exception:
@@ -2636,7 +2957,9 @@ def build_segmented_topology(core,
                         rx = r_positions[rid-1][0]; ry = r_positions[rid-1][1]
                     sx = int(rx + random.randint(30, 70)); sy = int(ry + random.randint(30, 70))
                     logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, f"lan-{rid}", _type_desc(NodeType.SWITCH), sx, sy)
-                    lan_sw = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=Position(x=sx, y=sy), name=f"lan-{rid}")
+                    lan_position = Position(x=sx, y=sy)
+                    lan_sw = session.add_node(node_id_counter, _type=NodeType.SWITCH, position=lan_position, name=f"lan-{rid}")
+                    _log_add_node_result(session, lan_sw, node_id_counter, NodeType.SWITCH, f"lan-{rid}", position=lan_position)
                     try: setattr(lan_sw, 'model', 'switch')
                     except Exception: pass
                     node_id_counter += 1

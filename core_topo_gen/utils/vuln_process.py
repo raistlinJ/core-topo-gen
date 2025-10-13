@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 import os
 import csv
 import json
@@ -12,6 +13,9 @@ try:
 	import yaml  # type: ignore
 except Exception:  # pragma: no cover - optional dependency handled at runtime
 	yaml = None  # type: ignore
+
+
+logger = logging.getLogger(__name__)
 
 
 def _read_csv(path: str) -> List[Dict[str, str]]:
@@ -415,6 +419,15 @@ def assign_compose_to_nodes(node_names: List[str], density: float, items_cfg: Li
 				if not pth or not _images_pulled_for_compose(pth):
 					continue
 			assigned[nn] = rec
+			try:
+				logger.info(
+					"[vuln-assign] count allocation node=%s name=%s path=%s",
+					nn,
+					rec.get('Name'),
+					rec.get('Path'),
+				)
+			except Exception:
+				pass
 
 	# 2) Allocate Weight items up to density_target (independent of how many count nodes consumed)
 	if density_target <= 0 or not weight_items or not nodes_pool:
@@ -501,6 +514,15 @@ def assign_compose_to_nodes(node_names: List[str], density: float, items_cfg: Li
 		for nn in take_nodes:
 			rec = rng.choice(pool)
 			assigned[nn] = rec
+			try:
+				logger.info(
+					"[vuln-assign] weight allocation node=%s name=%s path=%s",
+					nn,
+					rec.get('Name'),
+					rec.get('Path'),
+				)
+			except Exception:
+				pass
 
 	return assigned
 
@@ -581,6 +603,109 @@ def _download_to(path: str, dest_path: str, timeout: float = 30.0) -> bool:
 		return False
 
 
+def _strip_port_mapping_value(port_value: str) -> str:
+	"""Return only the container-side port component from a port mapping string."""
+	text = str(port_value).strip()
+	if ':' not in text:
+		return text
+	parts = text.split(':')
+	if not parts:
+		return text
+	container_segment = parts[-1].strip()
+	return container_segment or text
+
+
+def _prune_service_ports(service: Dict[str, object]) -> None:
+	"""Update a docker-compose service entry to drop published host ports."""
+	if not isinstance(service, dict):
+		return
+	ports = service.get('ports')
+	if not ports or not isinstance(ports, list):
+		return
+	changed = False
+	new_ports: List[object] = []
+	for entry in ports:
+		if isinstance(entry, str):
+			value = entry.strip()
+			if ':' in value and not value.startswith('{'):
+				new_value = _strip_port_mapping_value(value)
+				if new_value != value:
+					changed = True
+					new_ports.append(new_value)
+				continue
+		elif isinstance(entry, dict):
+			entry_copy = dict(entry)
+			removed = False
+			if 'published' in entry_copy:
+				entry_copy.pop('published', None)
+				removed = True
+			if 'host_ip' in entry_copy:
+				entry_copy.pop('host_ip', None)
+				removed = True
+			if removed:
+				changed = True
+			new_ports.append(entry_copy)
+			continue
+		new_ports.append(entry)
+	if changed:
+		service['ports'] = new_ports
+
+
+def _strip_port_mappings_from_text(text: str) -> str:
+	"""Best-effort removal of host->container port mappings in compose YAML text."""
+	lines = text.splitlines()
+	result: List[str] = []
+	in_ports = False
+	ports_indent: Optional[int] = None
+	for line in lines:
+		stripped = line.lstrip()
+		indent = len(line) - len(stripped)
+		if in_ports:
+			if stripped and indent <= (ports_indent or 0) and not stripped.startswith('-'):
+				in_ports = False
+			if not in_ports:
+				pass
+			else:
+				if stripped.startswith('-'):
+					raw_entry = stripped[1:].strip()
+					body = raw_entry
+					comment = ''
+					if '#' in raw_entry:
+						hash_index = raw_entry.find('#')
+						body = raw_entry[:hash_index].rstrip()
+						comment = raw_entry[hash_index:].strip()
+					if body and not body.startswith('{'):
+						quote_char = ''
+						closing_quote = ''
+						content = body
+						if len(body) >= 2 and body[0] in ("'", '"') and body[-1] == body[0]:
+							quote_char = body[0]
+							closing_quote = body[-1]
+							content = body[1:-1]
+						if ':' in content and ' ' not in content.split(':', 1)[0]:
+							new_content = _strip_port_mapping_value(content)
+							if quote_char:
+								body = f"{quote_char}{new_content}{closing_quote}"
+							else:
+								body = new_content
+							line = f"{' ' * indent}- {body}"
+							if comment:
+								line = f"{line} {comment}"
+							result.append(line)
+							continue
+				if stripped.startswith('published:') or stripped.startswith('host_ip:'):
+					continue
+		if not in_ports and stripped.startswith('ports:'):
+			in_ports = True
+			ports_indent = indent
+			result.append(line)
+			continue
+		result.append(line)
+	if text.endswith('\n'):
+		return '\n'.join(result) + '\n'
+	return '\n'.join(result)
+
+
 def _set_container_name_one_service(compose_obj: dict, container_name: str, prefer_service: Optional[str] = None) -> dict:
 	"""Set container_name on one service in the compose file.
 
@@ -643,11 +768,29 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 		vtype = (rec.get('Type') or '').strip().lower()
 		if vtype != 'docker-compose':
 			continue
+		try:
+			logger.info(
+				"[vuln] preparing docker-compose for node=%s name=%s path=%s",
+				node_name,
+				rec.get('Name'),
+				rec.get('Path'),
+			)
+		except Exception:
+			pass
 		key = ((rec.get('Name') or '').strip(), (rec.get('Path') or '').strip())
 		base_compose_obj: Optional[dict]
 		src_path: Optional[str]
 		if key in cache:
 			base_compose_obj, src_path = cache[key]
+			try:
+				logger.debug(
+					"[vuln] compose cache hit key=%s src=%s has_yaml=%s",
+					key,
+					src_path,
+					base_compose_obj is not None,
+				)
+			except Exception:
+				pass
 		else:
 			safe = _safe_name(key[0] or 'vuln') or 'vuln'
 			base_dir = os.path.join(out_base, safe)
@@ -656,33 +799,51 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			src_path = os.path.join(base_dir, compose_name)
 			ok = False
 			if raw_url:
+				logger.info("[vuln] fetching compose url=%s dest=%s", raw_url, src_path)
 				ok = _download_to(raw_url, src_path)
 			if not ok and key[1] and os.path.exists(key[1]):
+				logger.info("[vuln] copying compose from local path=%s dest=%s", key[1], src_path)
 				ok = _download_to(key[1], src_path)
 			if not ok:
 				cache[key] = (None, None)
+				try:
+					logger.warning("[vuln] unable to retrieve compose for key=%s", key)
+				except Exception:
+					pass
 				continue
 			base_compose_obj = None
 			if yaml is not None:
 				try:
 					with open(src_path, 'r', encoding='utf-8') as f:
 						base_compose_obj = yaml.safe_load(f) or {}
+					logger.debug(
+						"[vuln] parsed compose yaml key=%s services=%s",
+						key,
+						list((base_compose_obj.get('services') or {}).keys()),
+					)
 				except Exception:
+					logger.exception("[vuln] yaml parse error for compose path=%s", src_path)
 					base_compose_obj = None
 			cache[key] = (base_compose_obj, src_path)
 		out_path = os.path.join(out_base, f"docker-compose-{node_name}.yml")
+		wrote = False
 		if base_compose_obj is not None and yaml is not None:
 			prefer = key[0]
 			obj = _set_container_name_one_service(dict(base_compose_obj), node_name, prefer_service=prefer)
 			try:
 				with open(out_path, 'w', encoding='utf-8') as f:
 					yaml.safe_dump(obj, f, sort_keys=False)
-				created.append(out_path)
+				services_keys = list((obj.get('services') or {}).keys()) if isinstance(obj, dict) else []
+				logger.info("[vuln] wrote compose yaml node=%s services=%s dest=%s", node_name, services_keys, out_path)
+				wrote = True
 			except Exception:
-				pass
+				logger.exception("[vuln] failed writing compose yaml for node=%s", node_name)
 		elif src_path and os.path.exists(src_path):
 			try:
 				shutil.copy2(src_path, out_path)
+			except Exception:
+				logger.exception("[vuln] failed copying compose for node=%s", node_name)
+			else:
 				try:
 					with open(out_path, 'r', encoding='utf-8', errors='ignore') as f:
 						txt = f.read()
@@ -691,58 +852,30 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						txt = _re.sub(r'container_name\s*:\s*[^\n]+', f'container_name: {node_name}', txt, count=1)
 					else:
 						txt = txt.rstrip() + f"\n\n# injected container_name\ncontainer_name: {node_name}\n"
+					text_sanitized = _strip_port_mappings_from_text(txt)
+					logger.debug(
+						"[vuln] sanitized compose text node=%s original_len=%s new_len=%s",
+						node_name,
+						len(txt),
+						len(text_sanitized),
+					)
 					with open(out_path, 'w', encoding='utf-8') as f2:
-						f2.write(txt)
+						f2.write(text_sanitized)
 				except Exception:
-					pass
-				created.append(out_path)
+					logger.exception("[vuln] failed sanitizing compose text for node=%s", node_name)
+				wrote = True
+		if wrote:
+			created.append(out_path)
+			try:
+				rec['compose_path'] = out_path
+				logger.info("[vuln] compose file ready for node=%s compose=%s", node_name, out_path)
 			except Exception:
 				pass
-	return created
-    # (Removed leftover code from earlier version of prepare_compose_for_nodes)
-	if not ok and picked.get('Path') and os.path.exists(picked['Path']):
-		ok = _download_to(picked['Path'], compose_src_path)
-	if not ok:
-		return created
-	# Load YAML if available
-	base_compose_obj: Optional[dict] = None
-	if yaml is not None:
-		try:
-			with open(compose_src_path, 'r', encoding='utf-8') as f:
-				base_compose_obj = yaml.safe_load(f) or {}
-		except Exception:
-			base_compose_obj = None
-	# For each node, write customized compose
-	for node in node_names:
-		out_path = os.path.join(out_base, f"docker-compose-{node}.yml")
-		try:
-			if base_compose_obj is not None and yaml is not None:
-				# try to match service by vulnerability Name when possible
-				prefer = (picked.get('Name') or '').strip()
-				obj = _set_container_name_one_service(dict(base_compose_obj), node, prefer_service=prefer)
-				with open(out_path, 'w', encoding='utf-8') as f:
-					yaml.safe_dump(obj, f, sort_keys=False)
-				created.append(out_path)
-			else:
-				# Fallback: copy as-is, and if it already has container_name, naive replace first occurrence
-				shutil.copy2(compose_src_path, out_path)
-				try:
-					txt = ''
-					with open(out_path, 'r', encoding='utf-8', errors='ignore') as f:
-						txt = f.read()
-					if 'container_name:' in txt:
-						txt = re.sub(r'container_name\s*:\s*[^\n]+', f'container_name: {node}', txt, count=1)
-					else:
-						# append at end of file under a note
-						txt = txt.rstrip() + f"\n\n# injected by core_topo_gen: per-node container name\n# NOTE: unable to reliably place within services via fallback path\n# Please adjust manually if needed.\ncontainer_name: {node}\n"
-					with open(out_path, 'w', encoding='utf-8') as f:
-						f.write(txt)
-					created.append(out_path)
-				except Exception:
-					# keep the raw copy even if edit fails
-					created.append(out_path)
-		except Exception:
-			continue
+		else:
+			try:
+				logger.warning("[vuln] compose not generated for node=%s", node_name)
+			except Exception:
+				pass
 	return created
 
 
