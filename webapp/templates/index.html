@@ -6,88 +6,35 @@
     body { padding-bottom: 42vh; }
     .pulse-change { animation: pulseHighlight .9s ease-in-out; }
     @keyframes pulseHighlight { 0% { box-shadow:0 0 0 0 rgba(13,110,253,.7); transform:scale(1);} 40% { box-shadow:0 0 0 6px rgba(13,110,253,.0); transform:scale(1.03);} 100% { box-shadow:0 0 0 0 rgba(13,110,253,0); transform:scale(1); } }
-    .popover { max-width: 420px; }
-    .host-total-badge + .badge, .host-total-badge + button { margin-left: .25rem; }
-    /* Hide H/S bounds by default; JS adds .hs-show to display them */
-    .hs-bounds-wrapper { display: none; }
-    .hs-bounds-wrapper.hs-show { display: flex; }
-</style>
-{% endblock %}
-<!-- hs-bounds-wrapper styles moved into style block above -->
-{% block content %}
-    <div class="row">
-        <div class="col-md-3 mb-3">
-                <div class="card shadow-sm h-100 d-flex flex-column">
-                            <div class="card-header d-flex justify-content-between align-items-center">
-                                <span class="fw-bold">Scenarios</span>
-                                <div class="btn-toolbar gap-2 align-items-center">
-                                    <button type="button" class="btn btn-sm btn-outline-secondary" id="importBtn" title="Import scenarios XML">Import</button>
-                                    <button type="button" class="btn btn-sm btn-outline-info" id="exportBtn" title="Export last saved XML">Export</button>
-                                    <div class="btn-group" role="group" aria-label="Bulk scenario actions">
-                                        <button type="button" class="btn btn-sm btn-outline-secondary" id="selectAllScenariosBtn" title="Select all (or clear if all selected)">All</button>
-                                        <button type="button" class="btn btn-sm btn-outline-danger" id="deleteSelectedScenariosBtn" title="Delete selected scenarios" disabled>Delete</button>
-                                    </div>
-                                </div>
-                            </div>
-                    <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="scenarioList" style="min-height:0;"></div>
-                    <form id="hiddenLoadForm" class="d-none" action="{{ url_for('load_xml') }}" method="post" enctype="multipart/form-data">
-                        <input type="file" name="scenarios_xml" id="hiddenLoadInput" accept=".xml">
-                    </form>
-                    <div class="card-footer" style="position: sticky; bottom: 0; background: #fff; z-index: 1;">
-                        <button type="button" class="btn btn-sm btn-primary w-100" id="appendScenarioBtn">New Scenario</button>
-                    </div>
+        card.innerHTML = `
+            <div class="card-header d-flex align-items-center gap-2">
+                ${iconHtml}
+                <strong>${name}</strong>${badgeSpan}
+                <div class="ms-auto d-flex gap-2">
+                    ${refreshBtnHtml}
+                    <button class="btn btn-sm btn-outline-primary" data-action="add-item" data-scen-idx="${activeIdx}" data-sec="${name}">${addBtnLabel}</button>
+                    <button class="btn btn-sm btn-outline-secondary" type="button" data-action="toggle-collapse" data-target="#${collapseId}">${collapsed ? 'Expand' : 'Collapse'}</button>
                 </div>
             </div>
-    <div class="col-md-9">
-
-            <div class="card shadow mt-3">
-                <div class="card-body">
-                    {% with messages = get_flashed_messages() %}
-                        {% if messages %}
-                            <div class="alert alert-info">{{ messages[0] }}</div>
-                        {% endif %}
-                    {% endwith %}
-
-                    <div class="card mb-3" id="baseCoreScenarioCard">
-                        <div class="card-header d-flex justify-content-between align-items-center">
-                            <strong>Base CORE Scenario</strong>
-                            <div class="d-flex align-items-center gap-2" id="baseScenarioControls">
-                                {% set has_base = payload.base_upload is defined and payload.base_upload %}
-                                <span id="baseValidityBadge" class="badge {% if not has_base %}d-none{% else %}{% if payload.base_upload.valid %}text-bg-success{% else %}text-bg-danger{% endif %}{% endif %}">
-                                    {% if has_base %}{% if payload.base_upload.valid %}VALID{% else %}INVALID{% endif %}{% else %}VALID{% endif %}
-                                </span>
-                                <a id="baseDetailsLink" class="btn btn-sm btn-outline-secondary {% if not has_base %}d-none{% endif %}" href="{% if has_base %}{{ url_for('core_details') }}?path={{ payload.base_upload.path | urlencode }}{% else %}#{% endif %}" target="_blank" data-base-url="{{ url_for('core_details') }}?path=">Details</a>
-                                <form action="{{ url_for('remove_base') }}" method="post" class="d-inline {% if not has_base %}d-none{% endif %}" id="baseRemoveForm" onsubmit="saveScrollBeforeNav(); document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });">
-                                    <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
-                                </form>
-                            </div>
-                        </div>
-                        <div class="card-body">
-                            <div class="mb-3">
-                                <label class="form-label d-flex align-items-center justify-content-between">
-                                    <span>Base Scenario File</span>
-                                </label>
-                                <input class="form-control" id="baseFileInput" readonly>
-                                <div class="form-text">Shows the uploaded file name; full path is stored internally.</div>
-                            </div>
-                            <form class="d-flex gap-2" action="{{ url_for('upload_base') }}" method="post" enctype="multipart/form-data" onsubmit="saveScrollBeforeNav()">
-                                <input type="file" class="form-control" name="base_xml" accept=".xml" required>
-                                <button type="submit" class="btn btn-primary">{% if payload.base_upload %}Update{% else %}Upload{% endif %}</button>
-                            </form>
-                            {% if payload.base_upload and not payload.base_upload.valid and logs %}
-                                <div class="alert alert-danger mt-3 mb-0" style="white-space: pre-wrap;">{{ logs }}</div>
-                            {% endif %}
-                        </div>
-                    </div>
-
-                    <form id="editorForm" action="{{ url_for('save_xml') }}" method="post">
-                        <input type="hidden" name="scenarios_json" id="scenarios_json">
-                        <input type="hidden" name="active_index" id="active_index" value="0">
-                        <div id="editorRoot"></div>
-                        <div class="d-flex gap-2 mt-3">
-                            <button type="submit" class="btn btn-success">Save XML</button>
-                            <button type="button" class="btn btn-outline-info" id="downloadXmlBtn" disabled title="Save XML first">Download XML</button>
-                        </div>
+            <div id="${collapseId}" class="card-body" style="display:${collapsed ? 'none':'block'};">
+                ${nodeMetaHtml}
+                ${hitlInfoHtml}
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        ${tableHeadHtml}
+                        <tbody>
+                            ${tableBodyHtml}
+                        </tbody>
+                    </table>
+                </div>
+                ${warningHtml}
+                ${name==='Routing' ? `
+                <div id="routingEdgesWarnings" class="alert alert-warning py-2 px-3 small mt-3 d-none"></div>
+                <div class="d-flex flex-wrap align-items-center gap-3 mt-3 small" id="routingEdgesSummary" style="display:none;">
+                        <div><strong>Policy:</strong> <span data-role="edges-policy">(pending)</span></div>
+                </div>
+                ` : ''}
+            </div>`;
                     </form>
 
                     <div class="card mt-3" id="coreConnectionCard">
@@ -461,6 +408,10 @@ try {
 } catch (e) {
     initialPayload = null;
 }
+let hitlAdaptors = Array.isArray(initialPayload?.hitl_adaptors)
+    ? Array.from(new Set(initialPayload.hitl_adaptors.filter(val => typeof val === 'string' && val.trim()).map(val => val.trim()))).sort()
+    : [];
+let hitlAdaptorsFetchedAt = hitlAdaptors.length ? Date.now() : null;
 // If server provides a fresh result_path (e.g., after Save XML), reflect it in localStorage early
 try {
     if (initialPayload && initialPayload.result_path) {
@@ -484,10 +435,27 @@ function defaultScenario(name) {
             'Traffic': { density: 0.5, items: [] },
             'Events': { density: 0.5, items: [] },
             'Vulnerabilities': { density: 0.5, items: [] },
-            'Segmentation': { density: 0.5, items: [] }
+            'Segmentation': { density: 0.5, items: [] },
+            'HITL': { items: [] }
         },
         notes: ''
     };
+}
+
+function ensureHitlSection(scen) {
+    if (!scen || typeof scen !== 'object') return;
+    if (!scen.sections || typeof scen.sections !== 'object') scen.sections = {};
+    const hitlSec = scen.sections['HITL'];
+    if (!hitlSec || typeof hitlSec !== 'object') {
+        scen.sections['HITL'] = { items: [] };
+        return;
+    }
+    if (!Array.isArray(hitlSec.items)) hitlSec.items = [];
+}
+
+function ensureHitlSections(list) {
+    if (!Array.isArray(list)) return;
+    list.forEach(ensureHitlSection);
 }
 
 function normalizeBaseUpload(meta) {
@@ -561,6 +529,7 @@ let persistedActiveIdx = 0;
 try { const v = parseInt(localStorage.getItem('coretg_active_idx')||'0',10); if(!isNaN(v)) persistedActiveIdx = v; } catch(e){}
 // Base state is from server payload or default
 let state = initialPayload ?? { scenarios: [ defaultScenario('Scenario 1') ], result_path: null };
+ensureHitlSections(state.scenarios);
 // If server provided a concrete result_path (save/load/run), prefer server scenarios; else, restore from localStorage if available
 const serverHasResult = !!(initialPayload && initialPayload.result_path);
 const serverScenarioBases = Array.isArray(initialPayload?.scenarios)
@@ -574,6 +543,7 @@ const serverScenarioBases = Array.isArray(initialPayload?.scenarios)
     : [];
 if (!serverHasResult && persistedState && Array.isArray(persistedState.scenarios) && persistedState.scenarios.length) {
     state.scenarios = persistedState.scenarios;
+    ensureHitlSections(state.scenarios);
     if (persistedState.result_path) state.result_path = persistedState.result_path;
     if (serverScenarioBases.length) {
         serverScenarioBases.forEach((serverMeta, idx) => {
@@ -629,6 +599,65 @@ let previewState = {
     coreTested: false
 };
 const FULL_PREVIEW_ARTIFACT_VERSION = 2;
+
+function normalizeHitlAdaptorList(list){
+    if(!Array.isArray(list)) return [];
+    return Array.from(new Set(list.filter(val => typeof val === 'string' && val.trim()).map(val => val.trim()))).sort();
+}
+
+async function refreshHitlAdaptors(opts){
+    const options = opts || {};
+    const btn = options.button;
+    const quiet = !!options.quiet;
+    const originalLabel = btn ? btn.textContent : '';
+    try {
+        if(btn){
+            btn.disabled = true;
+            btn.classList.add('disabled');
+            btn.textContent = 'Refreshing…';
+        }
+        const res = await fetch('/api/hitl/adaptors');
+        if(!res.ok) throw new Error('HTTP '+res.status);
+        const data = await res.json();
+        const list = Array.isArray(data?.adaptors) ? data.adaptors : (Array.isArray(data) ? data : []);
+        hitlAdaptors = normalizeHitlAdaptorList(list);
+        hitlAdaptorsFetchedAt = hitlAdaptors.length ? Date.now() : null;
+        logInfo(`HITL adaptors refreshed (${hitlAdaptors.length})`);
+        if(!quiet && typeof showToast === 'function'){
+            showToast('HITL adaptor list updated');
+        }
+    } catch(err) {
+        logWarn('Failed to refresh HITL adaptors: ' + err);
+        if(!quiet && typeof showToast === 'function'){
+            showToast('Failed to refresh HITL adaptors');
+        }
+    } finally {
+        if(btn){
+            btn.disabled = false;
+            btn.classList.remove('disabled');
+            if(originalLabel) btn.textContent = originalLabel;
+        }
+        renderMain();
+    }
+}
+
+function formatHitlSummary(){
+    if(!hitlAdaptors.length) return 'No adaptors detected yet. Refresh to discover available interfaces.';
+    return hitlAdaptors.join(', ');
+}
+
+function renderHitlRows(sidx, secName, items){
+    if(!Array.isArray(items) || !items.length){
+        return `<tr><td colspan="4" class="text-muted fst-italic">No adaptors selected.</td></tr>`;
+    }
+    return items.map((it, iidx) => renderItemRow(sidx, secName, iidx, it)).join('');
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    if(!hitlAdaptors.length){
+        refreshHitlAdaptors({ quiet: true });
+    }
+});
 
 function safeClone(value){
     if(value === null || typeof value !== 'object') return value;
@@ -2285,7 +2314,8 @@ const dropdownsBySection = {
     'Traffic': ['Random','TCP','UDP','CUSTOM'],
     'Events': ['Script Path'],
     'Vulnerabilities': ['Category','Specific','Random'],
-    'Segmentation': ['Random','Firewall','NAT','CUSTOM']
+    'Segmentation': ['Random','Firewall','NAT','CUSTOM'],
+    'HITL': []
 };
 
 function render() {
@@ -2465,6 +2495,7 @@ function renderMain() {
     root.innerHTML = '';
     if (!state.scenarios.length) { return; }
     const scen = state.scenarios[activeIdx] || state.scenarios[0];
+    ensureHitlSection(scen);
     const escapeHtml = (value) => (value ?? '').toString()
         .replace(/&/g,'&amp;')
         .replace(/</g,'&lt;')
@@ -2578,18 +2609,27 @@ function renderMain() {
     // Base host pool for density-driven (weight) allocations comes from scenario.density_count
     const baseHostPool = (scen.density_count !== undefined && scen.density_count !== null && scen.density_count !== '' ? (parseInt(scen.density_count,10)||0) : 10);
     secNames.forEach(name => {
-        const sec = scen.sections[name] || { items: [] };
+        if (!scen.sections[name]) {
+            scen.sections[name] = { items: [] };
+        }
+        let sec = scen.sections[name];
+        if (!sec || typeof sec !== 'object') {
+            sec = { items: [] };
+            scen.sections[name] = sec;
+        }
+        if (!Array.isArray(sec.items)) sec.items = [];
+        const isHitl = (name === 'HITL');
     const hasNodes = (name === 'Node Information');
         const itemCount = (sec.items || []).length;
         // Determine if any weight rows exist in this section (used for Node Information behavior)
         const hasWeightRowsPre = hasNodes ? ((sec.items || []).some(it => ((it.v_metric || (it.selected==='Specific'? 'Count' : 'Weight')) === 'Weight'))) : false;
         // Always ensure density has a sensible default value
-        if (!hasNodes) {
+        if (!hasNodes && !isHitl) {
             if (sec.density === undefined || sec.density === null || isNaN(sec.density)) {
                 sec.density = 0.5;
             }
         }
-        const densVal = sec.density;
+        const densVal = isHitl ? 0 : sec.density;
         const nodesVal = '';
         const extraNodeCount = hasNodes ? ((sec.items || []).reduce((acc, it) => {
             const metric = it.v_metric || (it.selected==='Specific'?'Count':'Weight');
@@ -2604,7 +2644,9 @@ function renderMain() {
         // - Always expand Node Information (primary planning surface)
         // - Other sections start collapsed only if empty
         let collapsed;
-        if (name === 'Node Information') collapsed = false; else collapsed = (itemCount === 0);
+        if (name === 'Node Information') collapsed = false;
+        else if (isHitl) collapsed = false;
+        else collapsed = (itemCount === 0);
         // Override with persisted state if present
         const collapseKey = `${activeIdx}::${name}`;
         if (collapseState.hasOwnProperty(collapseKey)) {
@@ -2668,6 +2710,85 @@ function renderMain() {
             if (total > 0) vulnBadge = `<span class=\"badge rounded-pill text-bg-info ms-2\" title=\"Vulnerability assignments additive: Count rows + (Density * Base Hosts). Density clipped to 1.0 when fractional.\">Vulns: ${total}</span>`;
         }
     const badgeSpan = hostBadge + routingBadge + vulnBadge;
+        const refreshBtnHtml = isHitl
+            ? `<button class="btn btn-sm btn-outline-secondary" type="button" data-action="refresh-hitl">Refresh</button>`
+            : '';
+        const addBtnLabel = isHitl ? 'Add adaptor' : 'Add';
+        const hitlInfoHtml = isHitl
+            ? `<div class="alert alert-info py-2 px-3 mb-3 small">
+                    <div class="fw-semibold mb-1">Available adaptors</div>
+                    <div>${formatHitlSummary()}</div>
+                    ${hitlAdaptorsFetchedAt ? `<div class="text-muted mt-1">Last updated: ${new Date(hitlAdaptorsFetchedAt).toLocaleString()}</div>` : ''}
+               </div>`
+            : '';
+        const tableHeadHtml = isHitl
+            ? `<thead>
+                    <tr>
+                        <th style="width:260px">Adaptor</th>
+                        <th>Alias</th>
+                        <th style="width:200px">Notes</th>
+                        <th style="width:80px"></th>
+                    </tr>
+               </thead>`
+            : `<thead>
+                    <tr>
+                        <th style="width:280px"></th>
+                        <th></th>
+                        <th style="width:160px"></th>
+                        <th style="width:80px"></th>
+                    </tr>
+               </thead>`;
+        const tableBodyHtml = (() => {
+            if (isHitl) {
+                return renderHitlRows(activeIdx, name, sec.items);
+            }
+            const items = sec.items || [];
+            const rowsByMetric = items.map((it, iidx) => ({ it, iidx, metric: (it.v_metric || (name==='Vulnerabilities' && (it.selected||'Category')==='Specific' ? 'Count' : 'Weight')) }));
+            const weights = rowsByMetric.filter(x => x.metric === 'Weight');
+            const counts = rowsByMetric.filter(x => x.metric === 'Count');
+            if (name === 'Node Information' && weights.length === 0) {
+                const secRef = state.scenarios[activeIdx].sections[name];
+                if (secRef && secRef.total_nodes) { secRef.total_nodes = 0; }
+            }
+            const parts = [];
+            const showWeightHeader = (weights.length > 0);
+            if (showWeightHeader) {
+                const densCtrl = (
+                    name === 'Node Information'
+                        ? `<div class="d-flex align-items-center justify-content-end gap-2 small text-muted"><span>Density</span><input disabled class="form-control form-control-sm" style="width:80px" value="1.0"></div>`
+                        : (name === 'Routing'
+                            ? `<div class="d-flex align-items-center justify-content-end gap-2">
+                                    <span>Density</span>
+                                    <input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm" style="width:120px" placeholder="e.g., 0.25" value="${densVal}" data-scen-idx="${activeIdx}" data-sec="${name}" data-field="density">
+                               </div>`
+                            : (() => {
+                                const tooltip = (name === 'Services')
+                                    ? 'Services: per-item Count overrides density; assigns exactly that many hosts the selected service.'
+                                    : (name === 'Traffic')
+                                        ? 'Traffic: per-item Count overrides density; creates exactly that many sender/receiver pairs.'
+                                        : (name === 'Segmentation')
+                                            ? 'Segmentation: per-item Count overrides density; plans exactly that many slots (NAT prioritized).'
+                                            : '';
+                                let info = '';
+                                return '<div class="d-flex align-items-center justify-content-end gap-2">'
+                                    + '<span>Density</span>'
+                                    + info
+                                    + '<input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm" style="width:100px" value="' + densVal + '" data-scen-idx="' + activeIdx + '" data-sec="' + name + '" data-field="density">'
+                                + '</div>';
+                            })()
+                        )
+                );
+                parts.push(`<tr class="table-light"><td colspan="2"><strong>Weight-based</strong></td><td class="text-end">${densCtrl}</td><td></td></tr>`);
+                if (weights.length) { parts.push(weights.map(x => renderItemRow(activeIdx, name, x.iidx, x.it)).join('')); }
+            }
+            if (counts.length) {
+                const countHdr = (name === 'Node Information') ? 'Count-based' : 'Count-based';
+                parts.push(`<tr class="table-light"><td colspan="4"><strong>${countHdr}</strong></td></tr>`);
+                parts.push(counts.map(x => renderItemRow(activeIdx, name, x.iidx, x.it)).join(''));
+            }
+            return parts.join('');
+        })();
+        const warningHtml = isHitl ? '' : `<div class="text-danger small mt-1 section-warning" data-scen-idx="${activeIdx}" data-sec="${name}" style="display:none">Weights must sum to 1.000</div>`;
         card.innerHTML = `
             <div class="card-header d-flex align-items-center gap-2">
                 ${iconHtml}
@@ -2817,6 +2938,43 @@ function updateHsBoundsVisibility(){
 
 // renderSections was deprecated and removed; rendering is handled in renderMain()
 function renderItemRow(sidx, secName, iidx, it) {
+    if (secName === 'HITL') {
+        const esc = (value) => (value ?? '').toString()
+            .replace(/&/g,'&amp;')
+            .replace(/</g,'&lt;')
+            .replace(/>/g,'&gt;')
+            .replace(/"/g,'&quot;')
+            .replace(/'/g,'&#39;');
+        const adaptorSelected = it.adaptor || '';
+        const aliasVal = it.alias || '';
+        const notesVal = it.notes || '';
+        const available = hitlAdaptors.slice();
+        let optionsHtml = '<option value="">Select adaptor</option>';
+        available.forEach(name => {
+            const safe = esc(name);
+            optionsHtml += `<option value="${safe}" ${name===adaptorSelected?'selected':''}>${safe}</option>`;
+        });
+        if (adaptorSelected && !available.includes(adaptorSelected)) {
+            const safe = esc(adaptorSelected);
+            optionsHtml += `<option value="${safe}" selected>${safe} (missing)</option>`;
+        }
+        const disabledAttr = available.length ? '' : 'disabled';
+        const adaptorSelect = `<select class="form-select form-select-sm" ${disabledAttr} data-field="hitl_adaptor" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${optionsHtml}</select>`;
+        const aliasInput = `<input type="text" class="form-control form-control-sm" placeholder="Optional alias" value="${esc(aliasVal)}" data-field="hitl_alias" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">`;
+        const notesInput = `<input type="text" class="form-control form-control-sm" placeholder="Notes (e.g., purpose)" value="${esc(notesVal)}" data-field="hitl_notes" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">`;
+        const missingNotice = (!available.length)
+            ? '<div class="small text-muted mt-1">Refresh adaptor list to populate options.</div>'
+            : (adaptorSelected && !available.includes(adaptorSelected))
+                ? '<div class="small text-danger mt-1">Adaptor no longer detected on host.</div>'
+                : '';
+        return `
+        <tr>
+            <td>${adaptorSelect}${missingNotice}</td>
+            <td>${aliasInput}</td>
+            <td>${notesInput}</td>
+            <td><button type="button" class="btn btn-sm btn-outline-danger" data-action="remove-item" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">Remove</button></td>
+        </tr>`;
+    }
     // Build Selected options and current weight
     const weight = ((parseFloat(it.factor) || 0).toFixed(3));
     let opts = '';
@@ -3109,11 +3267,17 @@ function wireHandlers() {
                         if (field === 'edges' || field === 'r2s_edges') {
                             setTimeout(validateRoutingEdges, 20);
                         }
-                    } else if (['pattern','content_type','selected','script_path','v_type','v_vector','v_name','v_path','v_count','v_metric','r2r_mode','r2s_mode'].includes(field)) {
+                    } else if (['pattern','content_type','selected','script_path','v_type','v_vector','v_name','v_path','v_count','v_metric','r2r_mode','r2s_mode','hitl_adaptor','hitl_alias','hitl_notes'].includes(field)) {
                         const prev = item[field];
                         if (field === 'v_count') {
                             const n = parseInt(el.value, 10) || 1;
                             item[field] = n;
+                        } else if (field === 'hitl_adaptor') {
+                            item.adaptor = el.value || '';
+                        } else if (field === 'hitl_alias') {
+                            item.alias = el.value || '';
+                        } else if (field === 'hitl_notes') {
+                            item.notes = el.value || '';
                         } else {
                             item[field] = el.value;
                         }
@@ -3229,18 +3393,18 @@ function wireHandlers() {
             const sec = btn.getAttribute('data-sec');
             const iidx = parseInt(btn.getAttribute('data-item-idx'));
             state.scenarios[sidx].sections[sec].items.splice(iidx,1);
-                        logInfo(`Removed item ${iidx} from ${sec}`);
-              redistributeEven(sidx, sec);
-              // Auto-clear total_nodes if Node Information loses its last weight-based row
-              if (sec === 'Node Information') {
-                  const secRef = state.scenarios[sidx].sections[sec];
-                  const hasWeight = (secRef.items || []).some(it => (it.v_metric || 'Weight') === 'Weight');
-                  if (!hasWeight && secRef.total_nodes) { secRef.total_nodes = 0; }
-              }
-              // Re-render to refresh totals and labels
-                            renderMain();
-                            persistEditorState();
-                            try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
+            logInfo(`Removed item ${iidx} from ${sec}`);
+            if (sec !== 'HITL') {
+                redistributeEven(sidx, sec);
+                if (sec === 'Node Information') {
+                    const secRef = state.scenarios[sidx].sections[sec];
+                    const hasWeight = (secRef.items || []).some(it => (it.v_metric || 'Weight') === 'Weight');
+                    if (!hasWeight && secRef.total_nodes) { secRef.total_nodes = 0; }
+                }
+            }
+            renderMain();
+            persistEditorState();
+            try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
         };
     });
     document.querySelectorAll('[data-action="add-item"]').forEach(btn => {
@@ -3250,6 +3414,15 @@ function wireHandlers() {
             // Default selection logic: for Routing we prefer the first concrete protocol (not Random) so
             // routers don't silently become 'Random' unless user explicitly chooses it. Other sections
             // still start at 'Random' (or specialized default) as before.
+            if (sec === 'HITL') {
+                const item = { adaptor: '', alias: '', notes: '' };
+                state.scenarios[sidx].sections[sec].items.push(item);
+                logInfo(`Added item to ${sec}`);
+                renderMain();
+                persistEditorState();
+                try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
+                return;
+            }
             let defaultSelected = 'Random';
             if (sec === 'Routing') {
                 try {
@@ -3288,6 +3461,9 @@ function wireHandlers() {
             try { localStorage.setItem('sectionCollapseState', JSON.stringify(collapseState)); } catch(e) {}
             logDebug(`Section toggle ${targetSel} -> ${visible ? 'collapsed':'expanded'}`);
         };
+    });
+    document.querySelectorAll('[data-action="refresh-hitl"]').forEach(btn => {
+        btn.onclick = () => refreshHitlAdaptors({ button: btn });
     });
     // Export preview handler
     const previewBtn = document.querySelector('[data-action="preview-plan"]');

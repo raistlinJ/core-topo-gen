@@ -1236,19 +1236,110 @@ def _default_scenarios_payload():
     # Single default scenario with empty sections mirroring PyQt structure
     sections = [
         "Node Information", "Routing", "Services", "Traffic",
-        "Events", "Vulnerabilities", "Segmentation"
+        "Events", "Vulnerabilities", "Segmentation", "HITL"
     ]
     scen = {
         "name": "Scenario 1",
         "base": {"filepath": ""},
         "sections": {name: {
-            "density": 0.5 if name != "Node Information" else None,
+            "density": 0.5 if name not in ("Node Information", "HITL") else None,
             "total_nodes": 1 if name == "Node Information" else None,
             "items": []
         } for name in sections},
         "notes": ""
     }
     return {"scenarios": [scen], "result_path": None, "core": _default_core_dict()}
+
+
+def _list_local_hitl_adaptors() -> list[str]:
+    names: set[str] = set()
+    try:
+        import socket
+        if hasattr(socket, 'if_nameindex'):
+            for _idx, name in socket.if_nameindex():  # type: ignore[attr-defined]
+                if name:
+                    names.add(name)
+    except Exception:
+        pass
+    if not names:
+        try:
+            import psutil  # type: ignore
+            for name in getattr(psutil, 'net_if_addrs', lambda: {})().keys():
+                if name:
+                    names.add(name)
+        except Exception:
+            pass
+    if not names:
+        try:
+            sys_class = Path('/sys/class/net')
+            if sys_class.exists():
+                for child in sys_class.iterdir():
+                    if child.is_dir():
+                        names.add(child.name)
+        except Exception:
+            pass
+    if not names and os.name == 'nt':
+        try:
+            proc = subprocess.run(['ipconfig', '/all'], capture_output=True, text=True, timeout=5)
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.lower().endswith('adapter:'):
+                        adapter_name = line[:-1].strip()
+                        if adapter_name:
+                            names.add(adapter_name)
+        except Exception:
+            pass
+    return sorted({n.strip() for n in names if isinstance(n, str) and n.strip()})
+
+
+def _ensure_hitl_sections(payload: Dict[str, Any]) -> None:
+    scenarios = payload.get('scenarios')
+    if not isinstance(scenarios, list):
+        return
+    for scen in scenarios:
+        if not isinstance(scen, dict):
+            continue
+        sections = scen.setdefault('sections', {})
+        if not isinstance(sections, dict):
+            sections = {}
+            scen['sections'] = sections
+        hitl = sections.get('HITL')
+        if not isinstance(hitl, dict):
+            hitl = {'items': []}
+            sections['HITL'] = hitl
+        if not isinstance(hitl.get('items'), list):
+            hitl['items'] = []
+        for key in ('density', 'total_nodes'):
+            if key in hitl:
+                hitl.pop(key, None)
+
+
+def _prepare_payload_for_index(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        _ensure_hitl_sections(payload)
+    except Exception:
+        pass
+    try:
+        payload['hitl_adaptors'] = _list_local_hitl_adaptors()
+    except Exception:
+        payload['hitl_adaptors'] = []
+    return payload
+
+
+@app.route('/api/hitl/adaptors', methods=['GET'])
+def api_hitl_adaptors():
+    try:
+        adaptors = _list_local_hitl_adaptors()
+        return jsonify({'adaptors': adaptors, 'count': len(adaptors)})
+    except Exception as exc:
+        try:
+            app.logger.exception('[hitl] adaptor enumeration failed: %s', exc)
+        except Exception:
+            pass
+        return jsonify({'adaptors': [], 'error': str(exc)}), 500
 
 
 # ---------------- Docker (per-node) status & cleanup ----------------
@@ -2547,6 +2638,7 @@ def index():
     _hydrate_base_upload_from_disk(payload)
     if payload.get('base_upload'):
         _save_base_upload_state(payload['base_upload'])
+    payload = _prepare_payload_for_index(payload)
     return render_template('index.html', payload=payload, logs="", xml_preview="")
 
 
@@ -2579,6 +2671,7 @@ def load_xml():
                 xml_text = f.read()
         except Exception:
             xml_text = ""
+        payload = _prepare_payload_for_index(payload)
         return render_template('index.html', payload=payload, logs="", xml_preview=xml_text)
     except Exception as e:
         flash(f'Failed to parse XML: {e}')
@@ -2650,6 +2743,7 @@ def save_xml():
         _hydrate_base_upload_from_disk(payload)
         if payload.get('base_upload'):
             _save_base_upload_state(payload['base_upload'])
+        payload = _prepare_payload_for_index(payload)
         return render_template('index.html', payload=payload, logs="", xml_preview=xml_text)
     except Exception as e:
         flash(f'Failed to save XML: {e}')
@@ -2865,6 +2959,7 @@ def run_cli():
             })
         except Exception as e_hist:
             app.logger.exception("[sync] failed appending run history: %s", e_hist)
+        payload = _prepare_payload_for_index(payload)
         return render_template('index.html', payload=payload, logs=logs, xml_preview=xml_text, run_success=run_success)
     except Exception as e:
         flash(f'Error running core-topo-gen: {e}')
@@ -4068,6 +4163,7 @@ def upload_base():
     _attach_base_upload(payload)
     if payload.get('base_upload'):
         _save_base_upload_state(payload['base_upload'])
+    payload = _prepare_payload_for_index(payload)
     return render_template('index.html', payload=payload, logs=(errs if not ok else ''), xml_preview='')
 
 @app.route('/remove_base', methods=['POST'])
@@ -4094,6 +4190,7 @@ def remove_base():
         _clear_base_upload_state()
         payload.pop('base_upload', None)
         # Do not attach base upload (cleared)
+        payload = _prepare_payload_for_index(payload)
         return render_template('index.html', payload=payload, logs='', xml_preview='')
     except Exception as e:
         flash(f'Failed to remove base: {e}')
