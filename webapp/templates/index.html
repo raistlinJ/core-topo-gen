@@ -16,25 +16,59 @@
                     <button class="btn btn-sm btn-outline-secondary" type="button" data-action="toggle-collapse" data-target="#${collapseId}">${collapsed ? 'Expand' : 'Collapse'}</button>
                 </div>
             </div>
-            <div id="${collapseId}" class="card-body" style="display:${collapsed ? 'none':'block'};">
-                ${nodeMetaHtml}
-                ${hitlInfoHtml}
-                <div class="table-responsive">
-                    <table class="table table-sm align-middle">
-                        ${tableHeadHtml}
-                        <tbody>
-                            ${tableBodyHtml}
-                        </tbody>
-                    </table>
-                </div>
-                ${warningHtml}
-                ${name==='Routing' ? `
-                <div id="routingEdgesWarnings" class="alert alert-warning py-2 px-3 small mt-3 d-none"></div>
-                <div class="d-flex flex-wrap align-items-center gap-3 mt-3 small" id="routingEdgesSummary" style="display:none;">
-                        <div><strong>Policy:</strong> <span data-role="edges-policy">(pending)</span></div>
-                </div>
-                ` : ''}
-            </div>`;
+    <div class="col-md-9">
+
+            <div class="card shadow mt-3">
+                <div class="card-body">
+                    {% with messages = get_flashed_messages() %}
+                        {% if messages %}
+                            <div class="alert alert-info">{{ messages[0] }}</div>
+                        {% endif %}
+                    {% endwith %}
+
+                    <div class="card mb-3" id="baseCoreScenarioCard">
+                        <div class="card-header d-flex justify-content-between align-items-center">
+                            <strong>Base CORE Scenario</strong>
+                            <div class="d-flex align-items-center gap-2">
+                                <button class="btn btn-sm btn-outline-secondary" type="button" id="baseScenarioCollapseBtn" data-action="toggle-collapse" data-target="#collapse-base-core-scenario" aria-controls="collapse-base-core-scenario" aria-expanded="true">Collapse</button>
+                                <div class="d-flex align-items-center gap-2" id="baseScenarioControls">
+                                    {% set has_base = payload.base_upload is defined and payload.base_upload %}
+                                    <span id="baseValidityBadge" class="badge {% if not has_base %}d-none{% else %}{% if payload.base_upload.valid %}text-bg-success{% else %}text-bg-danger{% endif %}{% endif %}">
+                                        {% if has_base %}{% if payload.base_upload.valid %}VALID{% else %}INVALID{% endif %}{% else %}VALID{% endif %}
+                                    </span>
+                                    <a id="baseDetailsLink" class="btn btn-sm btn-outline-secondary {% if not has_base %}d-none{% endif %}" href="{% if has_base %}{{ url_for('core_details') }}?path={{ payload.base_upload.path | urlencode }}{% else %}#{% endif %}" target="_blank" data-base-url="{{ url_for('core_details') }}?path=">Details</a>
+                                    <form action="{{ url_for('remove_base') }}" method="post" class="d-inline {% if not has_base %}d-none{% endif %}" id="baseRemoveForm" onsubmit="saveScrollBeforeNav(); document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });">
+                                        <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
+                                    </form>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card-body" id="collapse-base-core-scenario">
+                            <div class="mb-3">
+                                <label class="form-label d-flex align-items-center justify-content-between">
+                                    <span>Base Scenario File</span>
+                                </label>
+                                <input class="form-control" id="baseFileInput" readonly>
+                                <div class="form-text">Shows the uploaded file name; full path is stored internally.</div>
+                            </div>
+                            <form class="d-flex gap-2" action="{{ url_for('upload_base') }}" method="post" enctype="multipart/form-data" onsubmit="saveScrollBeforeNav()">
+                                <input type="file" class="form-control" name="base_xml" accept=".xml" required>
+                                <button type="submit" class="btn btn-primary">{% if payload.base_upload %}Update{% else %}Upload{% endif %}</button>
+                            </form>
+                            {% if payload.base_upload and not payload.base_upload.valid and logs %}
+                                <div class="alert alert-danger mt-3 mb-0" style="white-space: pre-wrap;">{{ logs }}</div>
+                            {% endif %}
+                        </div>
+                    </div>
+
+                    <form id="editorForm" action="{{ url_for('save_xml') }}" method="post">
+                        <input type="hidden" name="scenarios_json" id="scenarios_json">
+                        <input type="hidden" name="active_index" id="active_index" value="0">
+                        <div id="editorRoot"></div>
+                        <div class="d-flex gap-2 mt-3">
+                            <button type="submit" class="btn btn-success">Save XML</button>
+                            <button type="button" class="btn btn-outline-info" id="downloadXmlBtn" disabled title="Save XML first">Download XML</button>
+                        </div>
                     </form>
 
                     <div class="card mt-3" id="coreConnectionCard">
@@ -237,6 +271,16 @@
                         </div>
                         <div class="card mb-3">
                             <div class="card-header d-flex justify-content-between align-items-center">
+                                <strong>HITL Interfaces</strong>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpHitlCardBody" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                            </div>
+                            <div class="card-body collapse p-2" id="fpHitlCardBody">
+                                <div class="small mb-2" id="fpHitlSummary">HITL disabled.</div>
+                                <div id="fpHitlWrap" class="text-muted small">(none)</div>
+                            </div>
+                        </div>
+                        <div class="card mb-3">
+                            <div class="card-header d-flex justify-content-between align-items-center">
                                 <strong>R2R Policy</strong>
                                 <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fpR2RPolicyBody" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
                             </div>
@@ -426,6 +470,7 @@ function defaultScenario(name) {
     return {
         name: name || `Scenario ${document.querySelectorAll('.scenario-card').length + 1}`,
         base: { filepath: '' },
+        hitl: { enabled: false, interfaces: [] },
         density_count: 10,
         sections: {
             // Default: one Count-based row; weight-based nodes/density start at 0
@@ -442,20 +487,572 @@ function defaultScenario(name) {
     };
 }
 
-function ensureHitlSection(scen) {
-    if (!scen || typeof scen !== 'object') return;
-    if (!scen.sections || typeof scen.sections !== 'object') scen.sections = {};
-    const hitlSec = scen.sections['HITL'];
-    if (!hitlSec || typeof hitlSec !== 'object') {
-        scen.sections['HITL'] = { items: [] };
-        return;
-    }
-    if (!Array.isArray(hitlSec.items)) hitlSec.items = [];
+const HITL_ATTACHMENT_CHOICES = [
+    { value: 'existing_router', label: 'Existing Router' },
+    { value: 'existing_switch', label: 'Existing Switch' },
+    { value: 'new_router', label: 'New Router' },
+    { value: 'new_switch', label: 'New Switch' },
+];
+
+const HITL_ATTACHMENT_ALLOWED = new Set(HITL_ATTACHMENT_CHOICES.map(opt => opt.value));
+const DEFAULT_HITL_ATTACHMENT = 'existing_router';
+
+function normalizeHitlAttachment(value) {
+    if (value === null || value === undefined) return DEFAULT_HITL_ATTACHMENT;
+    let normalized = String(value).trim().toLowerCase();
+    if (!normalized) return DEFAULT_HITL_ATTACHMENT;
+    normalized = normalized.replace(/[\s-]+/g, '_');
+    return HITL_ATTACHMENT_ALLOWED.has(normalized) ? normalized : DEFAULT_HITL_ATTACHMENT;
 }
 
-function ensureHitlSections(list) {
-    if (!Array.isArray(list)) return;
-    list.forEach(ensureHitlSection);
+function prettyHitlAttachment(value) {
+    const normalized = normalizeHitlAttachment(value);
+    const match = HITL_ATTACHMENT_CHOICES.find(opt => opt.value === normalized);
+    return match ? match.label : 'Existing Router';
+}
+
+function hitlAttachmentAttemptOrder(preference) {
+    const normalized = normalizeHitlAttachment(preference);
+    switch (normalized) {
+        case 'existing_router':
+            return ['existing_router', 'existing_switch', 'new_switch', 'new_router'];
+        case 'existing_switch':
+            return ['existing_switch', 'existing_router', 'new_switch', 'new_router'];
+        case 'new_router':
+            return ['new_router', 'existing_router', 'existing_switch', 'new_switch'];
+        case 'new_switch':
+        default:
+            return ['new_switch', 'existing_switch', 'existing_router', 'new_router'];
+    }
+}
+
+function ensureHitlStateForScenario(scen) {
+    if (!scen || typeof scen !== 'object') return { enabled: false, interfaces: [] };
+    if (!scen.hitl || typeof scen.hitl !== 'object') {
+        scen.hitl = { enabled: false, interfaces: [] };
+    }
+    const normalizeAddrList = (value) => {
+        if (Array.isArray(value)) {
+            return value.map(v => (v ?? '').toString().trim()).filter(Boolean);
+        }
+        if (typeof value === 'string') {
+            return value.split(',').map(v => v.trim()).filter(Boolean);
+        }
+        return [];
+    };
+    if (!Array.isArray(scen.hitl.interfaces)) {
+        const raw = scen.hitl.interfaces;
+        if (typeof raw === 'string' && raw.trim()) {
+            scen.hitl.interfaces = [{ name: raw.trim() }];
+        } else if (raw && typeof raw === 'object' && raw.name) {
+            scen.hitl.interfaces = [{ ...raw }];
+        } else {
+            scen.hitl.interfaces = [];
+        }
+    }
+    scen.hitl.interfaces = scen.hitl.interfaces.map(entry => {
+        if (!entry) return null;
+        if (typeof entry === 'string') {
+            const name = entry.trim();
+            return name ? { name } : null;
+        }
+        if (typeof entry !== 'object') return null;
+        const clone = { ...entry };
+        if (!clone.name && clone.interface) clone.name = clone.interface;
+        if (!clone.name && clone.iface) clone.name = clone.iface;
+        if (!clone.name || typeof clone.name !== 'string' || !clone.name.trim()) {
+            return null;
+        }
+        clone.name = clone.name.trim();
+        if (clone.alias && !clone.description) clone.description = clone.alias;
+        if (clone.display && !clone.description) clone.description = clone.display;
+        if (clone.summary && !clone.description) clone.description = clone.summary;
+        if (clone.ipv4 !== undefined) clone.ipv4 = normalizeAddrList(clone.ipv4);
+        if (clone.ipv6 !== undefined) clone.ipv6 = normalizeAddrList(clone.ipv6);
+        clone.attachment = normalizeHitlAttachment(clone.attachment);
+        return clone;
+    }).filter(Boolean);
+    scen.hitl.enabled = !!scen.hitl.enabled;
+    return scen.hitl;
+}
+
+const HITL_PREVIEW_CACHE = new WeakMap();
+
+function makeDeterministicRng(seed) {
+    let h1 = 0xdeadbeef ^ seed.length;
+    let h2 = 0x41c6ce57 ^ seed.length;
+    for (let i = 0; i < seed.length; i++) {
+        const ch = seed.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761);
+        h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    let idx = 0;
+    return () => {
+        idx += 0x9e3779b9;
+        let h = idx;
+        h = Math.imul(h ^ (h >>> 15), 2246822519);
+        h ^= h1;
+        h = Math.imul(h ^ (h >>> 13), 3266489917);
+        h ^= h2;
+        h = Math.imul(h ^ (h >>> 16), 668265263);
+        return ((h >>> 0) / 4294967296);
+    };
+}
+
+function deriveHitlPreviewArtifacts(full) {
+    if (!full || typeof full !== 'object') return null;
+    if (HITL_PREVIEW_CACHE.has(full)) {
+        return HITL_PREVIEW_CACHE.get(full) || null;
+    }
+    const scenario = Array.isArray(state?.scenarios) ? state.scenarios[activeIdx] : null;
+    if (!scenario) {
+        HITL_PREVIEW_CACHE.set(full, null);
+        return null;
+    }
+    const hitlState = ensureHitlStateForScenario(scenario);
+    if (!hitlState.enabled) {
+        HITL_PREVIEW_CACHE.set(full, null);
+        return null;
+    }
+    const rawInterfaces = (hitlState.interfaces || []).filter(entry => entry && typeof entry === 'object' && entry.name);
+    if (!rawInterfaces.length) {
+        HITL_PREVIEW_CACHE.set(full, null);
+        return null;
+    }
+    const normalizeList = (value) => {
+        if (Array.isArray(value)) {
+            return value.map(v => (v ?? '').toString().trim()).filter(Boolean);
+        }
+        if (typeof value === 'string') {
+            return value.split(',').map(v => v.trim()).filter(Boolean);
+        }
+        return [];
+    };
+    const interfaces = rawInterfaces.map((entry, idx) => {
+        const clone = { ...entry };
+        clone.name = (clone.name || '').toString();
+        clone.alias = clone.alias ?? clone.description ?? clone.display;
+        clone.ipv4 = normalizeList(clone.ipv4);
+        clone.ipv6 = normalizeList(clone.ipv6);
+        clone.attachment = normalizeHitlAttachment(clone.attachment);
+        return clone;
+    });
+    const normalizeName = (raw, idx) => {
+        let base = (raw || `iface-${idx}`).toString().trim().toLowerCase();
+        base = base.replace(/[^a-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+        if (!base) base = `iface-${idx}`;
+        if (base.length > 48) base = base.slice(0, 48);
+        return base;
+    };
+    const hitlRouters = Array.isArray(full.routers)
+        ? full.routers.filter(r => r && r.metadata && r.metadata.hitl_preview)
+        : [];
+    const hitlRouterKeyMap = new Map();
+    const usedHitlRouterIds = new Set();
+    const normalizeRouterKey = (value) => {
+        if (value === undefined || value === null) return null;
+        const str = String(value).trim();
+        if (!str) return null;
+        return str.toLowerCase();
+    };
+    const registerHitlRouterKey = (key, router) => {
+        const normalizedKey = normalizeRouterKey(key);
+        if (!normalizedKey) return;
+        if (!hitlRouterKeyMap.has(normalizedKey)) {
+            hitlRouterKeyMap.set(normalizedKey, router);
+        }
+    };
+    hitlRouters.forEach(router => {
+        if (!router) return;
+        const meta = router.metadata || {};
+        registerHitlRouterKey(router.node_id ?? router.id, router);
+        registerHitlRouterKey(meta.hitl_slug, router);
+        registerHitlRouterKey(meta.slug, router);
+        if (meta.hitl_interface_name) {
+            registerHitlRouterKey(meta.hitl_interface_name, router);
+            registerHitlRouterKey(normalizeName(meta.hitl_interface_name, meta.ordinal ?? 0), router);
+        }
+        if (typeof meta.ordinal === 'number') {
+            registerHitlRouterKey(`ordinal:${meta.ordinal}`, router);
+        }
+    });
+    const findExistingHitlRouter = (iface, idx) => {
+        if (!iface) return null;
+        const candidates = [];
+        if (iface.slug) candidates.push(iface.slug);
+        if (iface.name) {
+            candidates.push(iface.name);
+            candidates.push(normalizeName(iface.name, idx));
+        }
+        if (iface.alias) candidates.push(iface.alias);
+        if (typeof idx === 'number') candidates.push(`ordinal:${idx}`);
+        if (typeof iface.ordinal === 'number') candidates.push(`ordinal:${iface.ordinal}`);
+        for (const key of candidates) {
+            const normalized = normalizeRouterKey(key);
+            if (!normalized) continue;
+            const router = hitlRouterKeyMap.get(normalized);
+            if (!router) continue;
+            const routerId = router.node_id ?? router.id;
+            if (routerId === undefined || routerId === null) continue;
+            if (usedHitlRouterIds.has(routerId)) continue;
+            return router;
+        }
+        return null;
+    };
+    const hitlSwitchDetails = Array.isArray(full.switches_detail)
+        ? full.switches_detail.filter(detail => detail && detail.metadata && detail.metadata.hitl_preview)
+        : [];
+    const hitlSwitchKeyMap = new Map();
+    const usedHitlSwitchIds = new Set();
+    const normalizeSwitchKey = (value) => {
+        if (value === undefined || value === null) return null;
+        const str = String(value).trim();
+        if (!str) return null;
+        return str.toLowerCase();
+    };
+    const registerHitlSwitchKey = (key, detail) => {
+        const normalizedKey = normalizeSwitchKey(key);
+        if (!normalizedKey) return;
+        if (!hitlSwitchKeyMap.has(normalizedKey)) {
+            hitlSwitchKeyMap.set(normalizedKey, detail);
+        }
+    };
+    hitlSwitchDetails.forEach(detail => {
+        if (!detail) return;
+        const meta = detail.metadata || {};
+        registerHitlSwitchKey(detail.switch_id ?? detail.id, detail);
+        registerHitlSwitchKey(meta.hitl_slug, detail);
+        registerHitlSwitchKey(meta.slug, detail);
+        if (meta.hitl_interface_name) {
+            registerHitlSwitchKey(meta.hitl_interface_name, detail);
+            registerHitlSwitchKey(normalizeName(meta.hitl_interface_name, meta.ordinal ?? 0), detail);
+        }
+        if (typeof meta.ordinal === 'number') {
+            registerHitlSwitchKey(`ordinal:${meta.ordinal}`, detail);
+        }
+    });
+    const findExistingHitlSwitch = (iface, idx) => {
+        if (!iface) return null;
+        const candidates = [];
+        if (iface.slug) candidates.push(iface.slug);
+        if (iface.name) {
+            candidates.push(iface.name);
+            candidates.push(normalizeName(iface.name, idx));
+        }
+        if (iface.alias) candidates.push(iface.alias);
+        if (typeof idx === 'number') candidates.push(`ordinal:${idx}`);
+        if (typeof iface.ordinal === 'number') candidates.push(`ordinal:${iface.ordinal}`);
+        for (const key of candidates) {
+            const normalized = normalizeSwitchKey(key);
+            if (!normalized) continue;
+            const detail = hitlSwitchKeyMap.get(normalized);
+            if (!detail) continue;
+            const switchId = detail.switch_id ?? detail.id;
+            if (switchId === undefined || switchId === null) continue;
+            if (usedHitlSwitchIds.has(switchId)) continue;
+            return detail;
+        }
+        return null;
+    };
+    const existingIds = new Set();
+    const noteExisting = val => {
+        if (val === undefined || val === null) return;
+        existingIds.add(String(val));
+    };
+    (full.routers || []).forEach(r => noteExisting(r?.node_id ?? r?.id));
+    (full.hosts || []).forEach(h => noteExisting(h?.node_id ?? h?.id));
+    (full.switches_detail || []).forEach(sw => noteExisting(sw?.switch_id ?? sw?.id));
+    const basePreview = full.base_bridge_preview || {};
+    noteExisting(basePreview?.bridge_router_id);
+    noteExisting(basePreview?.internal_peer_router_id);
+    const routerPeers = Array.isArray(full.routers)
+        ? full.routers.filter(r => r && r.node_id !== undefined && r.node_id !== null)
+        : [];
+    routerPeers.sort((a, b) => {
+        const aid = Number(a?.node_id ?? a?.id ?? 0);
+        const bid = Number(b?.node_id ?? b?.id ?? 0);
+        return aid - bid;
+    });
+    const hostPeers = Array.isArray(full.hosts)
+        ? full.hosts.filter(h => h && h.node_id !== undefined && h.node_id !== null)
+        : [];
+    hostPeers.sort((a, b) => {
+        const aid = Number(a?.node_id ?? a?.id ?? 0);
+        const bid = Number(b?.node_id ?? b?.id ?? 0);
+        return aid - bid;
+    });
+    const existingSubnets = Array.isArray(full.switches_detail)
+        ? full.switches_detail.filter(sw => sw && sw.switch_id !== undefined && sw.switch_id !== null).sort((a, b) => {
+            const aid = Number(a?.switch_id ?? a?.id ?? 0);
+            const bid = Number(b?.switch_id ?? b?.id ?? 0);
+            return aid - bid;
+        })
+        : [];
+    const scenarioName = (scenario && typeof scenario.name === 'string') ? scenario.name : '';
+    const scenarioSeed = scenarioName && scenarioName.trim() ? scenarioName.trim() : '__preview__';
+    const nodes = [];
+    const links = [];
+    const addedHitlUplinkPairs = new Set();
+    const makeUniqueId = (base) => {
+        let candidate = base;
+        let suffix = 2;
+        while (existingIds.has(String(candidate))) {
+            candidate = `${base}-${suffix}`;
+            suffix += 1;
+        }
+        existingIds.add(String(candidate));
+        return candidate;
+    };
+    interfaces.forEach((iface, idx) => {
+        const baseName = normalizeName(iface.name, idx);
+        const attachmentPref = normalizeHitlAttachment(iface.attachment);
+    const isNewSwitchAttachment = attachmentPref === 'new_switch';
+        const nodeId = makeUniqueId(`hitl-${baseName}`);
+        const alias = iface.alias;
+        const labelParts = [];
+        if (iface.name) labelParts.push(iface.name);
+        if (alias && alias !== iface.name) {
+            labelParts.push(alias);
+        } else if (iface.mac) {
+            labelParts.push(iface.mac);
+        }
+        const nodeLabel = labelParts.filter(Boolean).join(' · ') || iface.name || `HITL ${idx + 1}`;
+        const hitlNode = {
+            id: nodeId,
+            type: 'rj45',
+            label: nodeLabel,
+            name: nodeLabel,
+            isHitl: true,
+            hitlInterface: iface,
+            attachment: attachmentPref,
+        };
+        if (!isNewSwitchAttachment && Array.isArray(iface.ipv4) && iface.ipv4.length) {
+            hitlNode.ip4 = iface.ipv4[0];
+        }
+        nodes.push(hitlNode);
+        const rng = makeDeterministicRng(`${scenarioSeed}|${iface.name}|${idx}|${interfaces.length}`);
+        const attempts = hitlAttachmentAttemptOrder(attachmentPref);
+        let targetId = null;
+        let assignment = null;
+        let linkKind = 'hitl-peer';
+        let uplinkRouterId = null;
+        const pickRouterPeer = () => {
+            if (!routerPeers.length) return null;
+            const peer = routerPeers[Math.floor(rng() * routerPeers.length)];
+            const peerId = peer?.node_id ?? peer?.id;
+            return (peerId !== undefined && peerId !== null) ? peerId : null;
+        };
+        const pickSwitchPeer = () => {
+            if (!existingSubnets.length) return null;
+            const subnet = existingSubnets[Math.floor(rng() * existingSubnets.length)];
+            const candidateId = subnet?.switch_id ?? subnet?.id;
+            return (candidateId !== undefined && candidateId !== null) ? candidateId : null;
+        };
+        const createNewRouter = () => {
+            const routerId = makeUniqueId(`hitl-router-${baseName}`);
+            const routerLabel = `HITL Router ${idx + 1}`;
+            const routerNode = {
+                id: routerId,
+                node_id: routerId,
+                type: 'router',
+                label: routerLabel,
+                name: routerLabel,
+                isHitlRouter: true,
+                hitlInterface: iface,
+                attachment: attachmentPref,
+            };
+            const routerCandidates = routerPeers.length ? routerPeers.slice() : [];
+            if (routerCandidates.length) {
+                const chosen = routerCandidates[Math.floor(rng() * routerCandidates.length) % routerCandidates.length];
+                const chosenId = chosen?.node_id ?? chosen?.id;
+                if (chosenId !== undefined && chosenId !== null) {
+                    uplinkRouterId = chosenId;
+                    routerNode.uplinkRouterId = chosenId;
+                    noteExisting(chosenId);
+                    links.push({ sourceId: routerId, targetId: chosenId, kind: 'hitl-router-uplink', attachment: attachmentPref, assignment: 'uplink_router' });
+                }
+            }
+            nodes.push(routerNode);
+            routerPeers.push({ node_id: routerId, id: routerId, name: routerLabel, type: 'router', isHitlRouter: true });
+            noteExisting(routerId);
+            return routerId;
+        };
+        const createNewSwitch = () => {
+            const switchId = makeUniqueId(`hitl-switch-${baseName}`);
+            const switchLabel = `HITL Switch ${idx + 1}`;
+            const switchNode = {
+                id: switchId,
+                switch_id: switchId,
+                type: 'switch',
+                label: switchLabel,
+                name: switchLabel,
+                isHitlSwitch: true,
+                hitlInterface: iface,
+                attachment: attachmentPref,
+            };
+            const routerCandidates = routerPeers.length ? routerPeers.slice() : [];
+            if (routerCandidates.length) {
+                const chosen = routerCandidates[Math.floor(rng() * routerCandidates.length) % routerCandidates.length];
+                const chosenId = chosen?.node_id ?? chosen?.id;
+                if (chosenId !== undefined && chosenId !== null) {
+                    uplinkRouterId = chosenId;
+                    switchNode.uplinkRouterId = chosenId;
+                    noteExisting(chosenId);
+                    links.push({ sourceId: switchId, targetId: chosenId, kind: 'hitl-switch-uplink', attachment: attachmentPref, assignment: 'uplink_switch' });
+                }
+            }
+            nodes.push(switchNode);
+            existingSubnets.push({ switch_id: switchId, id: switchId, name: switchLabel, isHitlSwitch: true });
+            noteExisting(switchId);
+            return switchId;
+        };
+        for (const attempt of attempts) {
+            if (attempt === 'existing_router') {
+                const candidate = pickRouterPeer();
+                if (candidate !== null) {
+                    targetId = candidate;
+                    assignment = 'existing_router';
+                    linkKind = 'hitl-router';
+                    noteExisting(candidate);
+                    uplinkRouterId = candidate;
+                    break;
+                }
+            } else if (attempt === 'existing_switch') {
+                const candidate = pickSwitchPeer();
+                if (candidate !== null) {
+                    targetId = candidate;
+                    assignment = 'existing_switch';
+                    linkKind = 'hitl-switch';
+                    noteExisting(candidate);
+                    break;
+                }
+            } else if (attempt === 'new_router') {
+                const matchedRouter = findExistingHitlRouter(iface, idx);
+                if (matchedRouter) {
+                    const matchedId = matchedRouter.node_id ?? matchedRouter.id;
+                    if (matchedId !== undefined && matchedId !== null) {
+                        usedHitlRouterIds.add(matchedId);
+                        targetId = matchedId;
+                        assignment = 'new_router';
+                        linkKind = 'hitl-router';
+                        noteExisting(matchedId);
+                        const meta = matchedRouter.metadata || {};
+                        const peerCandidate = meta.peer_router_node_id ?? meta.hitl_peer_router_id ?? meta.peer_router ?? meta.peer_router_id ?? null;
+                        if (peerCandidate !== undefined && peerCandidate !== null) {
+                            uplinkRouterId = peerCandidate;
+                            noteExisting(peerCandidate);
+                        }
+                        hitlNode.matchedRouterId = matchedId;
+                        hitlNode.matchedRouterMetadata = meta;
+                        break;
+                    }
+                }
+                const newRouterId = createNewRouter();
+                if (newRouterId !== null) {
+                    targetId = newRouterId;
+                    assignment = 'new_router';
+                    linkKind = 'hitl-router';
+                    break;
+                }
+            } else if (attempt === 'new_switch') {
+                const matchedSwitch = findExistingHitlSwitch(iface, idx);
+                if (matchedSwitch) {
+                    const matchedId = matchedSwitch.switch_id ?? matchedSwitch.id;
+                    if (matchedId !== undefined && matchedId !== null) {
+                        usedHitlSwitchIds.add(matchedId);
+                        targetId = matchedId;
+                        assignment = 'new_switch';
+                        linkKind = 'hitl-switch';
+                        noteExisting(matchedId);
+                        const meta = matchedSwitch.metadata || {};
+                        const peerCandidate = matchedSwitch.router_id ?? meta.peer_router_node_id ?? meta.target_router_id ?? null;
+                        if (peerCandidate !== undefined && peerCandidate !== null) {
+                            uplinkRouterId = peerCandidate;
+                            noteExisting(peerCandidate);
+                        }
+                        hitlNode.matchedSwitchId = matchedId;
+                        hitlNode.matchedSwitchDetail = matchedSwitch;
+                        break;
+                    }
+                }
+                const newSwitchId = createNewSwitch();
+                if (newSwitchId !== null) {
+                    targetId = newSwitchId;
+                    assignment = 'new_switch';
+                    linkKind = 'hitl-switch';
+                    break;
+                }
+            }
+        }
+        if (targetId === null) {
+            const fallbackRouter = pickRouterPeer();
+            if (fallbackRouter !== null) {
+                targetId = fallbackRouter;
+                assignment = assignment ?? 'existing_router';
+                linkKind = 'hitl-router';
+                noteExisting(fallbackRouter);
+                uplinkRouterId = fallbackRouter;
+            }
+        }
+        if (targetId === null && hostPeers.length) {
+            const peer = hostPeers[Math.floor(rng() * hostPeers.length)];
+            const peerId = peer?.node_id ?? peer?.id;
+            if (peerId !== undefined && peerId !== null) {
+                targetId = peerId;
+                assignment = assignment ?? 'existing_host';
+                linkKind = 'hitl-host';
+                noteExisting(peerId);
+            }
+        }
+        if (targetId === null) {
+            const networkId = makeUniqueId(`hitl-net-${baseName}`);
+            const networkLabel = `HITL Network ${idx + 1}`;
+            nodes.push({
+                id: networkId,
+                type: 'network',
+                label: networkLabel,
+                name: networkLabel,
+                isHitlNetwork: true,
+                hitlInterface: iface,
+                attachment: attachmentPref,
+            });
+            targetId = networkId;
+            assignment = assignment ?? 'network';
+            linkKind = 'hitl-network';
+        }
+        if (targetId !== null) {
+            hitlNode.peerNodeId = targetId;
+            hitlNode.assignment = assignment || attachmentPref;
+            if (uplinkRouterId !== null) {
+                hitlNode.uplinkRouterId = uplinkRouterId;
+            }
+            const assignmentType = assignment || attachmentPref;
+            links.push({ sourceId: nodeId, targetId, kind: linkKind, attachment: attachmentPref, assignment: assignmentType });
+            if (uplinkRouterId !== null && uplinkRouterId !== targetId) {
+                let highlightKind = null;
+                let highlightAssignment = 'uplink_router';
+                if (assignmentType === 'new_router') {
+                    highlightKind = 'hitl-router-uplink';
+                    highlightAssignment = 'uplink_router';
+                } else if (assignmentType === 'new_switch') {
+                    highlightKind = 'hitl-switch-uplink';
+                    highlightAssignment = 'uplink_switch';
+                }
+                if (highlightKind) {
+                    const pairKey = [String(targetId), String(uplinkRouterId)].sort().join('--');
+                    if (!addedHitlUplinkPairs.has(pairKey)) {
+                        addedHitlUplinkPairs.add(pairKey);
+                        links.push({ sourceId: targetId, targetId: uplinkRouterId, kind: highlightKind, attachment: attachmentPref, assignment: highlightAssignment });
+                    }
+                }
+            }
+        }
+    });
+    const result = nodes.length ? { nodes, links, interfaces, hitlState } : null;
+    HITL_PREVIEW_CACHE.set(full, result);
+    return result;
 }
 
 function normalizeBaseUpload(meta) {
@@ -529,7 +1126,15 @@ let persistedActiveIdx = 0;
 try { const v = parseInt(localStorage.getItem('coretg_active_idx')||'0',10); if(!isNaN(v)) persistedActiveIdx = v; } catch(e){}
 // Base state is from server payload or default
 let state = initialPayload ?? { scenarios: [ defaultScenario('Scenario 1') ], result_path: null };
-ensureHitlSections(state.scenarios);
+if (!Array.isArray(state.host_interfaces)) {
+    if (Array.isArray(initialPayload?.host_interfaces)) {
+        state.host_interfaces = initialPayload.host_interfaces;
+    } else if (Array.isArray(persistedState?.host_interfaces)) {
+        state.host_interfaces = persistedState.host_interfaces;
+    } else {
+        state.host_interfaces = [];
+    }
+}
 // If server provided a concrete result_path (save/load/run), prefer server scenarios; else, restore from localStorage if available
 const serverHasResult = !!(initialPayload && initialPayload.result_path);
 const serverScenarioBases = Array.isArray(initialPayload?.scenarios)
@@ -589,6 +1194,8 @@ if (state.base_upload) {
         state.base_upload.path = state.scenarios[0].base.filepath;
     }
 }
+
+(state.scenarios || []).forEach(ensureHitlStateForScenario);
 
 // Preview workflow state (in-memory only; persisted history handled separately)
 let previewState = {
@@ -1156,6 +1763,7 @@ function renderFullPreviewStructured(){
         { id:'hosts', label:`Hosts (${(full.hosts||[]).length})` },
         { id:'switches', label:`Switches (${(full.switches||[]).length})` },
         { id:'subnets', label:'Subnets' },
+        { id:'hitl', label:`HITL (${(full.hitl_interfaces||[]).length})` },
         { id:'r2r', label:`R2R Edges (${(full.r2r_edges_preview||[]).length})` },
         { id:'seg', label:`Seg Rules (${(full.segmentation_preview && full.segmentation_preview.rules ? full.segmentation_preview.rules.length : 0)})` },
         { id:'services_bd', label:'Services Plan' },
@@ -1188,6 +1796,8 @@ function renderFullPreviewStructured(){
                 ['P2P /30', (full.ptp_subnets||[]).length],
                 ['Router-Sw /30', (full.router_switch_subnets||[]).length],
                 ['LAN /28', (full.lan_subnets||[]).length],
+                ['HITL Enabled', full.hitl_enabled ? 'yes' : 'no'],
+                ['HITL Interfaces', (full.hitl_interfaces||[]).length],
                 // Seed removed from UI summary
             ];
             contentEl.innerHTML = '<div class="row g-2">' + stats.map(s=>`<div class="col-auto"><span class="badge text-bg-secondary">${esc(s[0])}: ${esc(s[1]??'-')}</span></div>`).join('') + '</div>';
@@ -1208,6 +1818,23 @@ function renderFullPreviewStructured(){
             const rs = (full.router_switch_subnets||[]).map(s=>`<li>${esc(s)}</li>`).join('');
             const lan = (full.lan_subnets||[]).map(s=>`<li>${esc(s)}</li>`).join('');
             contentEl.innerHTML = `<div class="row small g-3"><div class="col"><h6 class="fw-bold">Host P2P (/30)</h6><ul class="mb-0">${p2p||'<li>(none)</li>'}</ul></div><div class="col"><h6 class="fw-bold">Router-Switch (/30)</h6><ul class="mb-0">${rs||'<li>(none)</li>'}</ul></div><div class="col"><h6 class="fw-bold">LAN (/28)</h6><ul class="mb-0">${lan||'<li>(none)</li>'}</ul></div></div>`; return;
+        }
+        if(id==='hitl'){
+            const enabled = !!full.hitl_enabled;
+            const scenarioKey = full.hitl_scenario_key || '';
+            const hitlRows = Array.isArray(full.hitl_interfaces) ? full.hitl_interfaces.map(iface => ({
+                'Name': iface?.name || '-',
+                'Attachment': prettyHitlAttachment(iface?.attachment),
+                'Preview Router': (iface?.preview_router && iface.preview_router.name) || '-',
+                'RJ45 IPv4': iface?.rj45_ip4 || ((Array.isArray(iface?.ipv4) && iface.ipv4.find(v=>v)) || '-') ,
+                'New Router IPv4': iface?.new_router_ip4 || '-',
+                'Existing Router IPv4': iface?.existing_router_ip4 || '-',
+                'Link Network': iface?.link_network_cidr || iface?.link_network || '-',
+                'IPv4 List': Array.isArray(iface?.ipv4) ? iface.ipv4.join(', ') : '-',
+            })) : [];
+            const summary = `<div class="mb-2 small">HITL is <strong>${enabled ? 'enabled' : 'disabled'}</strong>${scenarioKey ? ` (scenario key: ${esc(scenarioKey)})` : ''}.</div>`;
+            contentEl.innerHTML = summary + tableFromObjects(hitlRows, ['Name','Attachment','Preview Router','RJ45 IPv4','New Router IPv4','Existing Router IPv4','Link Network','IPv4 List']);
+            return;
         }
         if(id==='r2r'){
             const edges = full.r2r_edges_preview || [];
@@ -1292,7 +1919,9 @@ function buildPreviewDiff(a,b){
         ['Hosts', (a.hosts||[]).length, (b.hosts||[]).length],
         ['Switches', (a.switches||[]).length, (b.switches||[]).length],
         ['R2R Edges', (a.r2r_edges_preview||[]).length, (b.r2r_edges_preview||[]).length],
-        ['Seg Rules', (a.segmentation_preview && a.segmentation_preview.rules ? a.segmentation_preview.rules.length : 0), (b.segmentation_preview && b.segmentation_preview.rules ? b.segmentation_preview.rules.length : 0)]
+        ['Seg Rules', (a.segmentation_preview && a.segmentation_preview.rules ? a.segmentation_preview.rules.length : 0), (b.segmentation_preview && b.segmentation_preview.rules ? b.segmentation_preview.rules.length : 0)],
+        ['HITL Enabled', a.hitl_enabled ? 1 : 0, b.hitl_enabled ? 1 : 0],
+        ['HITL Interfaces', (a.hitl_interfaces||[]).length, (b.hitl_interfaces||[]).length]
     ];
     function esc(x){ return (''+x).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
     const rows = metrics.map(m => { const delta = m[2]-m[1]; const cls = delta===0?'text-secondary':(delta>0?'text-success':'text-danger'); return `<tr><td>${esc(m[0])}</td><td>${esc(m[1])}</td><td>${esc(m[2])}</td><td class="${cls}">${delta>0?'+':''}${esc(delta)}</td></tr>`; }).join('');
@@ -1316,6 +1945,7 @@ function showFullPreviewModal(full){
         ['P2P /30',(full.ptp_subnets||[]).length],
         ['R-Sw /30',(full.router_switch_subnets||[]).length],
         ['LAN /28',(full.lan_subnets||[]).length],
+        ['HITL Interfaces',(full.hitl_interfaces||[]).length]
     ];
     countsEl.innerHTML = '<div class="row g-1">' + stats.map(s=>`<div class="col-auto"><span class="badge text-bg-secondary">${s[0]}: ${s[1]}</span></div>`).join('') + '</div>';
     // Policies & segmentation
@@ -1438,6 +2068,25 @@ function showFullPreviewModal(full){
     const routersWrap = document.getElementById('fpRoutersWrap'); if(routersWrap) routersWrap.innerHTML = tableHtml(summarizeRouterInterfaces(full),['ID','Name','Primary IP','R2R Interfaces','Switch Links']);
     const hostsWrap = document.getElementById('fpHostsWrap'); if(hostsWrap) hostsWrap.innerHTML = tableHtml(full.hosts,['node_id','name','role','ip4']);
     const switchesWrap = document.getElementById('fpSwitchesWrap'); if(switchesWrap) switchesWrap.innerHTML = tableHtml(full.switches_detail,['switch_id','router_id','hosts','rsw_subnet','lan_subnet']);
+    (function(){
+        const summaryEl = document.getElementById('fpHitlSummary');
+        const wrapEl = document.getElementById('fpHitlWrap');
+        if(!wrapEl || !summaryEl) return;
+        const enabled = !!full.hitl_enabled;
+        const scenarioKey = full.hitl_scenario_key || '';
+        summaryEl.innerHTML = `HITL is <strong>${enabled ? 'enabled' : 'disabled'}</strong>${scenarioKey ? ` (scenario key: ${scenarioKey})` : ''}.`;
+        const rows = Array.isArray(full.hitl_interfaces) ? full.hitl_interfaces.map(iface => ({
+            'Name': iface?.name || '-',
+            'Attachment': prettyHitlAttachment(iface?.attachment),
+            'Preview Router': (iface?.preview_router && iface.preview_router.name) || '-',
+            'RJ45 IPv4': iface?.rj45_ip4 || ((Array.isArray(iface?.ipv4) && iface.ipv4.find(v=>v)) || '-') ,
+            'New Router IPv4': iface?.new_router_ip4 || '-',
+            'Existing Router IPv4': iface?.existing_router_ip4 || '-',
+            'Link Network': iface?.link_network_cidr || iface?.link_network || '-',
+            'IPv4 List': Array.isArray(iface?.ipv4) ? iface.ipv4.join(', ') : '-',
+        })) : [];
+        wrapEl.innerHTML = tableHtml(rows,['Name','Attachment','Preview Router','RJ45 IPv4','New Router IPv4','Existing Router IPv4','Link Network','IPv4 List']);
+    })();
     // Graph
     buildFullPreviewModalGraph(full);
     setupPreviewCollapsers();
@@ -1497,8 +2146,9 @@ function buildFullPreviewModalGraph(full){
     });
     svg.call(zoom).on('dblclick.zoom', null);
         const vulnerabilitiesByNode = normalizeVulnerabilitiesByNode(full.vulnerabilities_by_node);
-        const nodes=[];
-        const nodeById = new Map();
+    const nodes=[];
+    const nodeById = new Map();
+    const hitlPreview = deriveHitlPreviewArtifacts(full);
         const baseCluster = full.base_bridge_preview && full.base_bridge_preview.attached ? (full.base_bridge_preview.target_cluster || null) : null;
         const baseClusterNodeMap = new Map();
         const baseBridgeInfo = full.base_bridge_preview && full.base_bridge_preview.attached ? full.base_bridge_preview : null;
@@ -1666,10 +2316,31 @@ function buildFullPreviewModalGraph(full){
             }
         });
 
+        if(hitlPreview && Array.isArray(hitlPreview.nodes)){
+            hitlPreview.nodes.forEach(node=>{
+                if(!node) return;
+                addNode(node);
+            });
+        }
+
         const filteredLinks = linkDescriptors.filter(link=>{
             if(!link) return false;
             return nodeById.has(String(link.sourceId)) && nodeById.has(String(link.targetId));
         });
+
+        if(hitlPreview && Array.isArray(hitlPreview.links)){
+            hitlPreview.links.forEach(link=>{
+                if(!link) return;
+                if(!nodeById.has(String(link.sourceId)) || !nodeById.has(String(link.targetId))) return;
+                filteredLinks.push({
+                    sourceId: link.sourceId,
+                    targetId: link.targetId,
+                    kind: link.kind || 'hitl',
+                    attachment: link.attachment || null,
+                    assignment: link.assignment || null,
+                });
+            });
+        }
 
         if(baseCluster && Array.isArray(baseCluster.nodes)){
             baseCluster.nodes.forEach((baseNodeMeta, idx)=>{
@@ -1867,21 +2538,28 @@ function buildFullPreviewModalGraph(full){
             });
         }
 
-        const simLinks = filteredLinks.map(l=>({...l, source:l.sourceId, target:l.targetId}));
+    const simLinks = filteredLinks.map(l=>({...l, source:l.sourceId, target:l.targetId}));
 
+        const isHitlLink = (kind) => typeof kind === 'string' && kind.startsWith('hitl');
         const link = zoomLayer.selectAll('line').data(simLinks).enter().append('line')
             .attr('stroke', l=> {
                 if(l.kind === 'base-bridge' || l.kind === 'base-external' || l.kind === 'base-cluster') return '#6f42c1';
                 if(l.kind==='r2r') return '#0d6efd';
+                if(isHitlLink(l.kind)) return '#20c997';
                 return (l.kind==='r-sw'? '#198754':'#999');
             })
             .attr('stroke-width', l=> {
                 if(l.kind === 'base-cluster') return 3;
                 if(l.kind === 'base-bridge' || l.kind === 'base-external') return 4;
+                if(isHitlLink(l.kind)) return 2.4;
                 return l.kind==='r2r'? 2:1.2;
             })
             .attr('stroke-linecap', l=> (l.kind === 'base-bridge' || l.kind === 'base-external' || l.kind === 'base-cluster') ? 'round' : null)
-            .attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null)
+            .attr('stroke-dasharray', l=> {
+                if(l.kind==='r-host') return '3,3';
+                if(isHitlLink(l.kind)) return '5,4';
+                return null;
+            })
             .attr('opacity', .9);
         const node = zoomLayer.selectAll('g').data(nodes).enter().append('g');
         const vulnerabilityColor = '#28a745';
@@ -2033,17 +2711,59 @@ function buildNodeSectionsTable(full){
     const tSend = {}; const tRecv = {};
     try { (traffic.flows || traffic || []).forEach(f=>{ const s=f.src_id??f.src; const d=f.dst_id??f.dst; if(s!==undefined) tSend[s]=(tSend[s]||0)+1; if(d!==undefined) tRecv[d]=(tRecv[d]||0)+1; }); } catch(e){}
     const all = [];
-    (full.routers||[]).forEach(r=> all.push({id:r.node_id, name:r.name, type:'router'}));
-    (full.hosts||[]).forEach(h=> all.push({id:h.node_id, name:h.name, type:h.role||'host'}));
-    (full.switches_detail||[]).forEach(sw=> all.push({id:sw.switch_id, name:'sw-'+sw.switch_id, type:'switch'}));
+    const seenIds = new Set();
+    const pushNode = (entry) => {
+        if(!entry || entry.id === undefined || entry.id === null) return;
+        const key = String(entry.id);
+        if(seenIds.has(key)) return;
+        seenIds.add(key);
+        all.push(entry);
+    };
+    (full.routers||[]).forEach(r=> pushNode({id:r.node_id, name:r.name, type:'router'}));
+    (full.hosts||[]).forEach(h=> pushNode({id:h.node_id, name:h.name, type:h.role||'host'}));
+    (full.switches_detail||[]).forEach(sw=> pushNode({id:sw.switch_id, name:'sw-'+sw.switch_id, type:'switch'}));
+    const hitlPreview = deriveHitlPreviewArtifacts(full);
+    if(hitlPreview && Array.isArray(hitlPreview.nodes)){
+        hitlPreview.nodes.forEach(node=>{
+            if(!node) return;
+            const canonical = canonicalNodeType(node.type || (node.isHitl ? 'rj45' : node.isHitlNetwork ? 'network' : 'host'));
+            pushNode({
+                id: node.id,
+                name: node.label || node.name || String(node.id),
+                type: canonical,
+                hitlAttachment: node.attachment || (node.hitlInterface && node.hitlInterface.attachment) || null,
+                hitlAssignment: node.assignment || null,
+                hitlPeer: node.peerNodeId || null,
+            });
+        });
+    }
     if(!all.length){ wrap.innerHTML='<div class="text-muted small">No nodes</div>'; return; }
     const rows = all.map(n=>{
         const svc=(servicesByNode[n.id]||[]).join(',');
         const vul=(vulnByNode[n.id]||[]).join(',');
         const sc=segCnt[n.id]||0; const ts=tSend[n.id]||0; const tr=tRecv[n.id]||0;
-        return `<tr><td>${n.id}</td><td>${n.name}</td><td>${n.type}</td><td>${svc}</td><td>${vul}</td><td>${sc}</td><td>${ts}</td><td>${tr}</td></tr>`;
+        let attachmentDisplay = '-';
+        if(n.hitlAttachment){
+            const baseLabel = prettyHitlAttachment(n.hitlAttachment);
+            let assignmentLabel = '';
+            if(n.hitlAssignment){
+                if(HITL_ATTACHMENT_ALLOWED.has(n.hitlAssignment)){
+                    assignmentLabel = prettyHitlAttachment(n.hitlAssignment);
+                } else if(n.hitlAssignment === 'existing_host'){
+                    assignmentLabel = 'Existing Host';
+                } else if(n.hitlAssignment === 'network'){
+                    assignmentLabel = 'Isolated Network';
+                } else {
+                    assignmentLabel = n.hitlAssignment.replace(/_/g, ' ');
+                }
+            }
+            attachmentDisplay = assignmentLabel && assignmentLabel !== baseLabel
+                ? `${baseLabel} → ${assignmentLabel}`
+                : baseLabel;
+        }
+        return `<tr><td>${n.id}</td><td>${n.name ?? '-'}</td><td>${n.type || '-'}</td><td>${attachmentDisplay}</td><td>${svc}</td><td>${vul}</td><td>${sc}</td><td>${ts}</td><td>${tr}</td></tr>`;
     }).join('');
-    wrap.innerHTML = `<div class='table-responsive'><table class='table table-sm table-bordered mb-0'><thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Services</th><th>Vulns</th><th>Seg Rules</th><th>Traffic S</th><th>Traffic R</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    wrap.innerHTML = `<div class='table-responsive'><table class='table table-sm table-bordered mb-0'><thead><tr><th>ID</th><th>Name</th><th>Type</th><th>HITL Attachment</th><th>Services</th><th>Vulns</th><th>Seg Rules</th><th>Traffic S</th><th>Traffic R</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 // Execute button in Full Preview modal
@@ -2298,7 +3018,8 @@ function persistEditorState(){
             core_ok: !!state.core_ok,
             core_tested_host: state.core_tested_host || null,
             core_tested_port: state.core_tested_port || null,
-            base_upload: baseUploadMeta
+            base_upload: baseUploadMeta,
+            host_interfaces: Array.isArray(state.host_interfaces) ? state.host_interfaces : []
         }));
         localStorage.setItem('coretg_active_idx', String(activeIdx||0));
     } catch(e){}
@@ -2493,6 +3214,18 @@ function renderSidebar() {
 function renderMain() {
     const root = document.getElementById('editorRoot');
     root.innerHTML = '';
+    // Load persisted collapse state (per scenario + section)
+    let collapseState = {};
+    try { collapseState = JSON.parse(localStorage.getItem('sectionCollapseState') || '{}'); } catch(e) { collapseState = {}; }
+    const baseCollapseTarget = document.getElementById('collapse-base-core-scenario');
+    const baseCollapseBtn = document.getElementById('baseScenarioCollapseBtn');
+    if (baseCollapseTarget && baseCollapseBtn) {
+        const baseCollapseKey = `global::base core scenario`;
+        const baseCollapsed = collapseState.hasOwnProperty(baseCollapseKey) ? !!collapseState[baseCollapseKey] : false;
+        baseCollapseTarget.style.display = baseCollapsed ? 'none' : 'block';
+        baseCollapseBtn.textContent = baseCollapsed ? 'Expand' : 'Collapse';
+        baseCollapseBtn.setAttribute('aria-expanded', baseCollapsed ? 'false' : 'true');
+    }
     if (!state.scenarios.length) { return; }
     const scen = state.scenarios[activeIdx] || state.scenarios[0];
     ensureHitlSection(scen);
@@ -2506,12 +3239,123 @@ function renderMain() {
     const defaultScenarioName = escapeHtml(`Scenario ${activeIdx + 1}`);
     const metaCard = document.createElement('div');
     metaCard.className = 'card mb-3';
+    const metaCollapseId = `collapse-scenario-meta-${activeIdx}`;
+    const metaCollapseKey = `${activeIdx}::scenario meta ${activeIdx}`;
+    const metaCollapsed = collapseState.hasOwnProperty(metaCollapseKey) ? !!collapseState[metaCollapseKey] : false;
     metaCard.innerHTML = `
-        <div class="card-body">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <strong>Scenario Name</strong>
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-action="toggle-collapse" data-target="#${metaCollapseId}" aria-controls="${metaCollapseId}" aria-expanded="${metaCollapsed ? 'false' : 'true'}">${metaCollapsed ? 'Expand' : 'Collapse'}</button>
+        </div>
+        <div class="card-body" id="${metaCollapseId}" style="display:${metaCollapsed ? 'none' : 'block'};">
             <label class="form-label mb-1 small text-muted" for="scenarioNameInput_${activeIdx}">Scenario name</label>
             <input type="text" class="form-control" id="scenarioNameInput_${activeIdx}" data-field="name" data-scen-idx="${activeIdx}" value="${safeScenarioName}" placeholder="${defaultScenarioName}">
         </div>`;
     root.appendChild(metaCard);
+
+    const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+    const hitl = ensureHitlStateForScenario(scen);
+    const hostLookup = new Map(hostInterfaces.filter(it => it && typeof it === 'object').map(it => [it.name, it]));
+    const describeIface = (iface) => {
+        if (!iface || typeof iface !== 'object') return '';
+        const parts = [];
+        if (Array.isArray(iface.ipv4) && iface.ipv4.length) {
+            parts.push(iface.ipv4.filter(Boolean).join(', '));
+        }
+        if ((!parts.length) && Array.isArray(iface.ipv6) && iface.ipv6.length) {
+            parts.push(iface.ipv6.filter(Boolean)[0]);
+        }
+        if (iface.mac) parts.push(`MAC ${iface.mac}`);
+        if (iface.mtu) parts.push(`MTU ${iface.mtu}`);
+        if (iface.speed) parts.push(`${iface.speed} Mbps`);
+        return parts.join(' • ');
+    };
+    const selectedNames = new Set((hitl.interfaces || []).map(entry => entry.name));
+    const availableInterfaces = hostInterfaces.filter(iface => iface && !selectedNames.has(iface.name));
+    const availableOptionsHtml = availableInterfaces.length
+        ? availableInterfaces.map(iface => {
+            const summary = describeIface(iface);
+            const label = summary ? `${iface.name} — ${summary}` : iface.name;
+            return `<option value="${escapeHtml(iface.name)}">${escapeHtml(label)}</option>`;
+        }).join('')
+        : '<option disabled value="">All discovered interfaces selected</option>';
+    const selectedInterfacesHtml = (hitl.interfaces && hitl.interfaces.length)
+        ? hitl.interfaces.map((iface, ifaceIdx) => {
+            const safeName = escapeHtml(iface.name || 'interface');
+            const hostInfo = hostLookup.get(iface.name);
+            const summary = describeIface(hostInfo || iface);
+            const missingBadge = hostInfo ? '' : '<span class="badge rounded-pill text-bg-warning">Not detected</span>';
+            const summaryHtml = summary ? escapeHtml(summary) : 'No address information available';
+            const attachmentValue = normalizeHitlAttachment(iface.attachment);
+            const attachmentLabel = escapeHtml(prettyHitlAttachment(attachmentValue));
+            const optionsMarkup = HITL_ATTACHMENT_CHOICES.map(opt => `<option value="${opt.value}" ${opt.value === attachmentValue ? 'selected' : ''}>${escapeHtml(opt.label)}</option>`).join('');
+            return `<div class="border rounded p-2 mb-2 d-flex justify-content-between align-items-start gap-2 flex-wrap">
+                        <div class="flex-grow-1">
+                            <div class="fw-semibold d-flex align-items-center gap-2 flex-wrap">${safeName}${missingBadge}<span class="badge rounded-pill text-bg-secondary">${attachmentLabel}</span></div>
+                            <div class="small text-muted">${summaryHtml}</div>
+                            <div class="mt-2">
+                                <label class="form-label small mb-1" for="hitlAttach_${activeIdx}_${ifaceIdx}">Attach to</label>
+                                <select class="form-select form-select-sm" id="hitlAttach_${activeIdx}_${ifaceIdx}" data-hitl-attach data-scen-idx="${activeIdx}" data-iface-index="${ifaceIdx}">
+                                    ${optionsMarkup}
+                                </select>
+                                <div class="form-text">New nodes are created deterministically when requested.</div>
+                            </div>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-outline-danger" data-hitl-remove data-scen-idx="${activeIdx}" data-iface="${safeName}">Remove</button>
+                    </div>`;
+        }).join('')
+        : '<div class="text-muted small">No interfaces selected.</div>';
+    const availableSize = Math.min(8, Math.max(4, hostInterfaces.length || 4));
+    const hitlCard = document.createElement('div');
+    hitlCard.className = 'card mb-3';
+    const hitlCollapseId = `collapse-hardware-in-the-loop-${activeIdx}`;
+    const hitlCollapseKey = `${activeIdx}::hardware in the loop ${activeIdx}`;
+    const hitlCollapsed = collapseState.hasOwnProperty(hitlCollapseKey) ? !!collapseState[hitlCollapseKey] : false;
+    const hitlBody = hostInterfaces.length
+        ? `
+            <div class="row g-3">
+                <div class="col-md-6">
+                    <label class="form-label">Available interfaces</label>
+                    <select class="form-select" multiple size="${availableSize}" data-hitl-available data-scen-idx="${activeIdx}" id="hitlAvailable_${activeIdx}">
+                        ${availableOptionsHtml}
+                    </select>
+                    <div class="d-flex flex-wrap gap-2 mt-2">
+                        <button type="button" class="btn btn-sm btn-outline-primary" data-hitl-add data-scen-idx="${activeIdx}" ${availableInterfaces.length ? '' : 'disabled'}>Add selected</button>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" data-hitl-refresh data-scen-idx="${activeIdx}">Refresh list</button>
+                    </div>
+                    <div class="form-text">Use ⌘/Ctrl to multi-select before adding.</div>
+                </div>
+                <div class="col-md-6">
+                    <label class="form-label">Selected interfaces</label>
+                    <div id="hitlSelected_${activeIdx}">
+                        ${selectedInterfacesHtml}
+                    </div>
+                </div>
+            </div>`
+        : `
+            <div class="alert alert-warning mb-0">
+                Unable to enumerate host interfaces. Ensure psutil is installed on the server and retry.
+                <div class="mt-2">
+                    <button type="button" class="btn btn-sm btn-outline-secondary" data-hitl-refresh data-scen-idx="${activeIdx}">Retry enumeration</button>
+                </div>
+            </div>`;
+    hitlCard.innerHTML = `
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <strong>Hardware in the Loop</strong>
+            <div class="d-flex align-items-center gap-2">
+                <div class="form-check form-switch m-0">
+                    <input class="form-check-input" type="checkbox" id="hitlToggle_${activeIdx}" data-hitl-toggle data-scen-idx="${activeIdx}" ${hitl.enabled ? 'checked' : ''}>
+                    <label class="form-check-label small" for="hitlToggle_${activeIdx}">Enable</label>
+                </div>
+                <button class="btn btn-sm btn-outline-secondary" type="button" data-action="toggle-collapse" data-target="#${hitlCollapseId}" aria-controls="${hitlCollapseId}" aria-expanded="${hitlCollapsed ? 'false' : 'true'}">${hitlCollapsed ? 'Expand' : 'Collapse'}</button>
+            </div>
+        </div>
+        <div class="card-body" id="${hitlCollapseId}" style="display:${hitlCollapsed ? 'none' : 'block'};">
+            ${hitlBody}
+            <div class="small text-muted mt-3" data-hitl-status="${activeIdx}"></div>
+        </div>`;
+    root.appendChild(hitlCard);
+
     // --- Host density normalization for Node Information ---
     try {
         const ni = scen.sections && scen.sections['Node Information'];
@@ -2554,9 +3398,7 @@ function renderMain() {
             }
         }
     } catch(e) { console.warn('Normalization error', e); }
-    // Load persisted section collapse state (per scenario + section)
-    let collapseState = {};
-    try { collapseState = JSON.parse(localStorage.getItem('sectionCollapseState') || '{}'); } catch(e) { collapseState = {}; }
+    // collapseState persists per scenario + section (loaded above)
     // No auto-insertion of Count rows for Node Information; totals should only include user-added Count rows
     // Scenario header with Count for Density (base host pool) restored
     const niSec = scen.sections['Node Information'] || { items: [] };
@@ -3455,15 +4297,130 @@ function wireHandlers() {
             const visible = target.style.display !== 'none';
             target.style.display = visible ? 'none' : 'block';
             btn.textContent = visible ? 'Expand' : 'Collapse';
+            btn.setAttribute('aria-expanded', visible ? 'false' : 'true');
             const secName = targetSel.replace('#collapse-','').replace(/-/g,' ');
-            const collapseKey = `${activeIdx}::${secName}`;
+            let collapseKey = `${activeIdx}::${secName}`;
+            if (secName === 'base core scenario') {
+                collapseKey = `global::${secName}`;
+            }
             collapseState[collapseKey] = visible; // store collapsed state (true means now collapsed)
             try { localStorage.setItem('sectionCollapseState', JSON.stringify(collapseState)); } catch(e) {}
             logDebug(`Section toggle ${targetSel} -> ${visible ? 'collapsed':'expanded'}`);
         };
     });
-    document.querySelectorAll('[data-action="refresh-hitl"]').forEach(btn => {
-        btn.onclick = () => refreshHitlAdaptors({ button: btn });
+    document.querySelectorAll('[data-hitl-toggle]').forEach(toggle => {
+        toggle.addEventListener('change', () => {
+            const sidx = parseInt(toggle.getAttribute('data-scen-idx'));
+            if (isNaN(sidx) || !state.scenarios[sidx]) return;
+            const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
+            hitlState.enabled = !!toggle.checked;
+            logInfo(`HITL ${hitlState.enabled ? 'enabled' : 'disabled'} for scenario ${state.scenarios[sidx].name || sidx + 1}`);
+            persistEditorState();
+            const hidden = document.getElementById('scenarios_json');
+            if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+        });
+    });
+    document.querySelectorAll('[data-hitl-add]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+            if (isNaN(sidx) || !state.scenarios[sidx]) return;
+            const select = document.getElementById(`hitlAvailable_${sidx}`);
+            if (!select) return;
+            const chosen = Array.from(select.selectedOptions || []);
+            if (!chosen.length) {
+                try { showToast('Select one or more interfaces to add', { autohide: true, delay: 2000 }); } catch(e) {}
+                return;
+            }
+            const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
+            const catalog = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+            let added = 0;
+            chosen.forEach(opt => {
+                const name = (opt.value || opt.textContent || '').trim();
+                if (!name) return;
+                if (hitlState.interfaces.some(entry => entry.name === name)) return;
+                const hostInfo = catalog.find(entry => entry && entry.name === name);
+                const newEntry = { name, attachment: 'existing_router' };
+                if (hostInfo) {
+                    if (Array.isArray(hostInfo.ipv4)) newEntry.ipv4 = hostInfo.ipv4;
+                    if (Array.isArray(hostInfo.ipv6)) newEntry.ipv6 = hostInfo.ipv6;
+                    if (hostInfo.mac) newEntry.mac = hostInfo.mac;
+                }
+                hitlState.interfaces.push(newEntry);
+                added += 1;
+            });
+            if (!added) {
+                try { showToast('Interfaces already selected', { autohide: true, delay: 2000 }); } catch(e) {}
+                return;
+            }
+            hitlState.enabled = true;
+            logInfo(`Added ${added} HITL interface${added > 1 ? 's' : ''}`);
+            persistEditorState();
+            const hidden = document.getElementById('scenarios_json');
+            if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+            renderMain();
+        });
+    });
+    document.querySelectorAll('[data-hitl-attach]').forEach(select => {
+        select.addEventListener('change', () => {
+            const sidx = parseInt(select.getAttribute('data-scen-idx'));
+            const ifaceIdx = parseInt(select.getAttribute('data-iface-index'));
+            if (isNaN(sidx) || isNaN(ifaceIdx) || !state.scenarios[sidx]) return;
+            const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
+            if (!Array.isArray(hitlState.interfaces) || !hitlState.interfaces[ifaceIdx]) return;
+            const newValue = normalizeHitlAttachment(select.value);
+            hitlState.interfaces[ifaceIdx].attachment = newValue;
+            logInfo(`Updated HITL attachment for ${hitlState.interfaces[ifaceIdx].name || 'interface'} → ${newValue}`);
+            persistEditorState();
+            const hidden = document.getElementById('scenarios_json');
+            if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+            renderMain();
+        });
+    });
+    document.querySelectorAll('[data-hitl-remove]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+            const ifaceName = btn.getAttribute('data-iface');
+            if (isNaN(sidx) || !state.scenarios[sidx] || !ifaceName) return;
+            const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
+            const idx = hitlState.interfaces.findIndex(entry => entry.name === ifaceName);
+            if (idx === -1) return;
+            hitlState.interfaces.splice(idx, 1);
+            logInfo(`Removed HITL interface ${ifaceName}`);
+            persistEditorState();
+            const hidden = document.getElementById('scenarios_json');
+            if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+            renderMain();
+        });
+    });
+    document.querySelectorAll('[data-hitl-refresh]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+            const statusEl = document.querySelector(`[data-hitl-status="${sidx}"]`);
+            const setStatus = (message, isError = false) => {
+                if (!statusEl) return;
+                statusEl.textContent = message;
+                statusEl.classList.toggle('text-danger', !!isError);
+            };
+            btn.disabled = true;
+            setStatus('Refreshing interface list…');
+            try {
+                const resp = await fetch('/api/host_interfaces');
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+                const interfaces = Array.isArray(data.interfaces) ? data.interfaces : [];
+                state.host_interfaces = interfaces;
+                persistEditorState();
+                const hidden = document.getElementById('scenarios_json');
+                if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+                renderMain();
+                try { showToast('Host interfaces refreshed', { autohide: true, delay: 2000 }); } catch(e) {}
+            } catch (err) {
+                logError(`Failed to refresh host interfaces: ${err}`);
+                setStatus('Refresh failed. Check server logs.', true);
+            } finally {
+                btn.disabled = false;
+            }
+        });
     });
     // Export preview handler
     const previewBtn = document.querySelector('[data-action="preview-plan"]');
