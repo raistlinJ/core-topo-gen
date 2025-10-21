@@ -151,3 +151,5 @@ server.pid
 Untitled.txt
 
 data_sources/
+
+.conda-py311/

@@ -12,6 +12,15 @@ BACKEND_PATTERN?=$(REPO_ROOT)/webapp/app_backend.py
 # Additional fuzzy patterns (space separated) to match different launch styles
 BACKEND_ALT_PATTERNS?="webapp/app_backend.py" "python webapp/app_backend.py" "flask run" "gunicorn" 
 
+# Optional override for the host web UI interpreter.
+# Usage: `make host-web PYTHON=/path/to/python` or `make host-web WEBUI_PY=/path/to/python`
+ifeq ($(origin WEBUI_PY), undefined)
+ifneq ($(origin PYTHON), undefined)
+WEBUI_PY := $(PYTHON)
+endif
+endif
+export WEBUI_PY
+
 # Generate self-signed certs if missing
 .dev-certs:
 	@CERT_SANS="$(CERT_SANS)" CERT_SUBJECT="$(CERT_SUBJECT)" CERT_DAYS="$(CERT_DAYS)" bash scripts/dev_gen_certs.sh >/dev/null
@@ -31,7 +40,11 @@ up: dev-certs
 PROXY?=nginx
 
 host-web: dev-certs
-	@echo "Starting host Web UI (interpreter via WEBUI_PY or core-python/python3)..."
+	@if [ -n "$(WEBUI_PY)" ]; then \
+		echo "Starting host Web UI (WEBUI_PY=$(WEBUI_PY))..."; \
+	else \
+		echo "Starting host Web UI (interpreter via WEBUI_PY or core-python/python3)..."; \
+	fi
 	@bash scripts/run_host_webui.sh & \
 	  sleep 2; \
 	  echo "Launching $(PROXY) proxy..."; \

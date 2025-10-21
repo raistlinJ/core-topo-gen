@@ -72,13 +72,16 @@
   </div>
   <div class="row">
     <div class="col-md-4">
-      <h5>Overview</h5>
-      <ul class="list-unstyled small">
+    {% set hitl_cfg = hitl_config or {} %}
+    <h5>Overview</h5>
+    <ul class="list-unstyled small">
   <li>Routers: {{ (full_preview.routers or [])|length }}</li>
   <li>Hosts: {{ (full_preview.hosts or [])|length }}</li>
   <li>Switches: {{ (full_preview.switches or [])|length }}</li>
   <li>R2R Edges: {{ (full_preview.r2r_edges_preview or [])|length }}</li>
   <li>Seg Rules: {{ (full_preview.segmentation_preview.rules or [])|length if full_preview.segmentation_preview and full_preview.segmentation_preview.rules else 0 }}</li>
+  <li>HITL: {{ 'Enabled' if hitl_cfg.get('enabled') else 'Disabled' }}</li>
+  <li>HITL Interfaces: {{ (hitl_cfg.get('interfaces') or [])|length }}</li>
       </ul>
       <div class="d-flex justify-content-between align-items-center mb-1">
         <h6 class="mb-0">R2R Policy</h6>
@@ -344,6 +347,45 @@
               </div>
               {% else %}<div class="small text-muted fst-italic">(no switch host assignments)</div>{% endif %}
             </div>
+            <div class="col-12">
+              <h6 class="mb-2">HITL Interfaces</h6>
+              {% set hitl_ifaces = hitl_cfg.get('interfaces') or [] %}
+              {% if hitl_ifaces %}
+              <div class="small mb-2">HITL is <strong>{{ 'enabled' if hitl_cfg.get('enabled') else 'disabled' }}</strong>{% if hitl_cfg.get('scenario_key') %} (scenario key: {{ hitl_cfg.get('scenario_key') }}){% endif %}.</div>
+              <div class="table-responsive" style="max-height:240px;overflow:auto;">
+                <table class="table table-sm table-bordered small align-middle">
+                  <thead class="table-light">
+                    <tr>
+                      <th>Name</th>
+                      <th>Attachment</th>
+                      <th>Preview Router</th>
+                      <th>RJ45 IPv4</th>
+                      <th>New Router IPv4</th>
+                      <th>Existing Router IPv4</th>
+                      <th>Link Network</th>
+                      <th>IPv4 List</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for iface in hitl_ifaces %}
+                    <tr>
+                      <td>{{ iface.get('name') or '-' }}</td>
+                      <td>{{ (iface.get('attachment') or '')|replace('_', ' ')|title }}</td>
+                      <td>{{ iface.get('preview_router', {}).get('name') or '-' }}</td>
+                      <td>{{ iface.get('rj45_ip4') or '-' }}</td>
+                      <td>{{ iface.get('new_router_ip4') or '-' }}</td>
+                      <td>{{ iface.get('existing_router_ip4') or '-' }}</td>
+                      <td>{{ iface.get('link_network_cidr') or iface.get('link_network') or '-' }}</td>
+                      <td>{{ iface.get('ipv4')|join(', ') if iface.get('ipv4') else '-' }}</td>
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+              {% else %}
+                <div class="small text-muted fst-italic">(no HITL interfaces declared)</div>
+              {% endif %}
+            </div>
           </div>
           </div>
         </div>
@@ -549,13 +591,54 @@
 {% block extra_scripts %}
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 <script id="fpDataJson" type="application/json">{{ full_preview | tojson }}</script>
+<script id="fpHitlConfigJson" type="application/json">{{ hitl_config | tojson }}</script>
+<script id="fpScenarioMetaJson" type="application/json">{{ {'scenario': scenario, 'xml_basename': xml_basename} | tojson }}</script>
 <script>
 (function(){
   let previewData = {};
   function init(){
     const dataEl = document.getElementById('fpDataJson');
     try { previewData = JSON.parse(dataEl.textContent); } catch(e) { console.warn('Failed parse preview json', e); previewData = {}; }
-    
+
+    let hitlConfig = { enabled: false, interfaces: [] };
+    const hitlEl = document.getElementById('fpHitlConfigJson');
+    if(hitlEl){
+      try {
+        const parsed = JSON.parse(hitlEl.textContent || 'null');
+        if(parsed && typeof parsed === 'object'){
+          hitlConfig = parsed;
+        }
+      } catch(e){
+        console.warn('Failed parse HITL config json', e);
+      }
+    }
+    if(!hitlConfig || typeof hitlConfig !== 'object'){
+      hitlConfig = { enabled: false, interfaces: [] };
+    }
+    if(!Array.isArray(hitlConfig.interfaces)){
+      hitlConfig.interfaces = [];
+    }
+    let scenarioMeta = { scenario: null, xml_basename: '' };
+    const scenarioMetaEl = document.getElementById('fpScenarioMetaJson');
+    if(scenarioMetaEl){
+      try {
+        const parsedMeta = JSON.parse(scenarioMetaEl.textContent || 'null');
+        if(parsedMeta && typeof parsedMeta === 'object'){
+          scenarioMeta = parsedMeta;
+        }
+      } catch(e){
+        console.warn('Failed parse scenario meta json', e);
+      }
+    }
+    const scenarioNameRaw = typeof scenarioMeta.scenario === 'string' ? scenarioMeta.scenario : null;
+    const xmlBaseNameRaw = typeof scenarioMeta.xml_basename === 'string' ? scenarioMeta.xml_basename : '';
+    const scenarioKey = (hitlConfig && typeof hitlConfig.scenario_key === 'string' && hitlConfig.scenario_key.trim())
+      ? hitlConfig.scenario_key.trim()
+      : ((scenarioNameRaw && scenarioNameRaw.trim())
+          ? scenarioNameRaw.trim()
+          : (xmlBaseNameRaw || '__default__'));
+    hitlConfig.scenario_key = scenarioKey;
+
     // Simple graph using d3-force (assumes d3 is loaded in base template). Fallback to textual if not.
     function normalizeVulnerabilitiesByNode(source){
       const out = {};
@@ -627,6 +710,399 @@
         shape: 'circle',
       };
     }
+
+    function makeDeterministicRng(seed){
+      const input = typeof seed === 'string' ? seed : String(seed ?? '');
+      let h1 = 0xdeadbeef ^ input.length;
+      let h2 = 0x41c6ce57 ^ input.length;
+      for(let i = 0; i < input.length; i++){
+        const ch = input.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761);
+        h2 = Math.imul(h2 ^ ch, 1597334677);
+      }
+      h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+      h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+      let idx = 0;
+      return () => {
+        idx += 0x9e3779b9;
+        let h = idx;
+        h = Math.imul(h ^ (h >>> 15), 2246822519);
+        h ^= h1;
+        h = Math.imul(h ^ (h >>> 13), 3266489917);
+        h ^= h2;
+        h = Math.imul(h ^ (h >>> 16), 668265263);
+        return ((h >>> 0) / 4294967296);
+      };
+    }
+
+    const HITL_ATTACHMENT_ALLOWED = new Set(['existing_router', 'existing_switch', 'new_router', 'new_switch']);
+    const DEFAULT_HITL_ATTACHMENT = 'existing_router';
+
+    function normalizeHitlAttachment(value){
+      if(value === null || value === undefined) return DEFAULT_HITL_ATTACHMENT;
+      let normalized = String(value).trim().toLowerCase();
+      if(!normalized) return DEFAULT_HITL_ATTACHMENT;
+      normalized = normalized.replace(/[\s-]+/g, '_');
+      return HITL_ATTACHMENT_ALLOWED.has(normalized) ? normalized : DEFAULT_HITL_ATTACHMENT;
+    }
+
+    function attachmentAttemptOrder(pref){
+      const normalized = normalizeHitlAttachment(pref);
+      if(normalized === 'existing_router'){
+        return ['existing_router', 'existing_switch', 'new_switch', 'new_router'];
+      }
+      if(normalized === 'existing_switch'){
+        return ['existing_switch', 'existing_router', 'new_switch', 'new_router'];
+      }
+      if(normalized === 'new_router'){
+        return ['new_router', 'existing_router', 'existing_switch', 'new_switch'];
+      }
+      return ['new_switch', 'existing_switch', 'existing_router', 'new_router'];
+    }
+
+    function deriveStandaloneHitlArtifacts(preview, hitlCfg, scenarioKeySeed){
+      if(!preview || typeof preview !== 'object') return null;
+      if(!hitlCfg || typeof hitlCfg !== 'object' || !hitlCfg.enabled) return null;
+      const rawInterfaces = Array.isArray(hitlCfg.interfaces) ? hitlCfg.interfaces : [];
+      const sanitized = rawInterfaces.map((entry, idx) => {
+        if(!entry || typeof entry !== 'object') return null;
+        const name = String(entry.name || '').trim();
+        if(!name) return null;
+        const normalized = { name };
+        const alias = entry.alias ?? entry.description ?? entry.display;
+        if(typeof alias === 'string' && alias.trim()){
+          normalized.alias = alias.trim();
+        }
+        if(typeof entry.mac === 'string'){
+          const macVal = entry.mac.trim();
+          if(macVal) normalized.mac = macVal;
+        }
+        const normalizeList = (value) => {
+          if(Array.isArray(value)){
+            return value.map(v => String(v || '').trim()).filter(Boolean);
+          }
+          if(typeof value === 'string'){
+            return value.split(',').map(v => v.trim()).filter(Boolean);
+          }
+          return [];
+        };
+        const ipv4List = normalizeList(entry.ipv4);
+        if(ipv4List.length) normalized.ipv4 = ipv4List;
+        const ipv6List = normalizeList(entry.ipv6);
+        if(ipv6List.length) normalized.ipv6 = ipv6List;
+        normalized.attachment = normalizeHitlAttachment(entry.attachment);
+        if(Number.isFinite(Number(entry.ordinal))){
+          normalized.ordinal = Number(entry.ordinal);
+        }
+        if(Number.isFinite(Number(entry.interface_count))){
+          normalized.interfaceCount = Number(entry.interface_count);
+        }
+        const previewRouter = entry.preview_router;
+        if(previewRouter && typeof previewRouter === 'object'){
+          const routerNodeId = previewRouter.node_id ?? previewRouter.id ?? null;
+          if(routerNodeId !== null && routerNodeId !== undefined){
+            normalized.previewRouter = {
+              nodeId: routerNodeId,
+              name: previewRouter.name || null,
+            };
+            if(previewRouter.metadata && typeof previewRouter.metadata === 'object'){
+              const metaRouterId = previewRouter.metadata.target_router_id ?? previewRouter.metadata.peer_router_node_id ?? null;
+              if(metaRouterId !== null && metaRouterId !== undefined){
+                normalized.targetRouterId = metaRouterId;
+              }
+            }
+          }
+        }
+        const previewSwitch = entry.preview_switch;
+        if(previewSwitch && typeof previewSwitch === 'object'){
+          const switchNodeId = previewSwitch.node_id ?? previewSwitch.switch_id ?? null;
+          if(switchNodeId !== null && switchNodeId !== undefined){
+            normalized.previewSwitch = {
+              nodeId: switchNodeId,
+              name: previewSwitch.name || null,
+              routerId: null,
+            };
+            if(previewSwitch.metadata && typeof previewSwitch.metadata === 'object'){
+              const metaRouterId = previewSwitch.metadata.target_router_id ?? previewSwitch.metadata.peer_router_node_id ?? null;
+              if(metaRouterId !== null && metaRouterId !== undefined){
+                normalized.targetRouterId = normalized.targetRouterId ?? metaRouterId;
+                normalized.previewSwitch.routerId = metaRouterId;
+              }
+            }
+          }
+        }
+        const explicitTarget = entry.target_router_id ?? entry.peer_router_node_id;
+        if(explicitTarget !== null && explicitTarget !== undefined){
+          normalized.targetRouterId = normalized.targetRouterId ?? explicitTarget;
+        }
+        return normalized;
+      }).filter(Boolean);
+      if(!sanitized.length) return null;
+
+      const normalizeName = (raw, idx) => {
+        let base = (raw || `iface-${idx}`).toString().trim().toLowerCase();
+        base = base.replace(/[^a-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+        if(!base) base = `iface-${idx}`;
+        if(base.length > 48) base = base.slice(0, 48);
+        return base;
+      };
+
+      const existingIds = new Set();
+      const noteExisting = (val) => {
+        if(val === undefined || val === null) return;
+        existingIds.add(String(val));
+      };
+
+      const routers = Array.isArray(preview.routers) ? preview.routers : [];
+      const hosts = Array.isArray(preview.hosts) ? preview.hosts : [];
+      const switches = Array.isArray(preview.switches_detail) ? preview.switches_detail : [];
+      routers.forEach(r => noteExisting(r?.node_id ?? r?.id));
+      hosts.forEach(h => noteExisting(h?.node_id ?? h?.id));
+      switches.forEach(sw => noteExisting(sw?.switch_id ?? sw?.id));
+      const basePreview = preview.base_bridge_preview || {};
+      noteExisting(basePreview?.bridge_router_id);
+      noteExisting(basePreview?.internal_peer_router_id);
+
+      const routerPeers = routers.filter(r => r && r.node_id !== undefined && r.node_id !== null).slice().sort((a, b) => {
+        const aid = Number(a?.node_id ?? a?.id ?? 0);
+        const bid = Number(b?.node_id ?? b?.id ?? 0);
+        return aid - bid;
+      });
+      const hostPeers = hosts.filter(h => h && h.node_id !== undefined && h.node_id !== null).slice().sort((a, b) => {
+        const aid = Number(a?.node_id ?? a?.id ?? 0);
+        const bid = Number(b?.node_id ?? b?.id ?? 0);
+        return aid - bid;
+      });
+
+      const existingSubnets = switches.filter(sw => sw && sw.switch_id !== undefined && sw.switch_id !== null).slice().sort((a, b) => {
+        const aid = Number(a?.switch_id ?? a?.id ?? 0);
+        const bid = Number(b?.switch_id ?? b?.id ?? 0);
+        return aid - bid;
+      });
+
+      const scenarioSeed = typeof scenarioKeySeed === 'string' && scenarioKeySeed ? scenarioKeySeed : '__default__';
+
+      const resultNodes = [];
+      const resultLinks = [];
+
+      const makeUniqueId = (base) => {
+        let candidate = base;
+        let suffix = 2;
+        while(existingIds.has(String(candidate))){
+          candidate = `${base}-${suffix}`;
+          suffix += 1;
+        }
+        existingIds.add(String(candidate));
+        return candidate;
+      };
+
+      sanitized.forEach((iface, idx) => {
+        const baseName = normalizeName(iface.name, idx);
+        const attachmentPref = normalizeHitlAttachment(iface.attachment);
+        const nodeId = makeUniqueId(`hitl-${baseName}`);
+        const alias = iface.alias;
+        const labelParts = [];
+        if(iface.name) labelParts.push(iface.name);
+        if(alias && alias !== iface.name){
+          labelParts.push(alias);
+        } else if(iface.mac){
+          labelParts.push(iface.mac);
+        }
+        const nodeLabel = labelParts.filter(Boolean).join(' · ') || iface.name || `HITL ${idx + 1}`;
+        const hitlNode = {
+          id: nodeId,
+          type: 'rj45',
+          label: nodeLabel,
+          name: nodeLabel,
+          isHitl: true,
+          hitlInterface: iface,
+          attachment: attachmentPref,
+        };
+        if(Array.isArray(iface.ipv4) && iface.ipv4.length){
+          hitlNode.ip4 = iface.ipv4[0];
+        }
+        resultNodes.push(hitlNode);
+        const rng = makeDeterministicRng(`${scenarioSeed}|${iface.name}|${idx}|${sanitized.length}`);
+        const attempts = attachmentAttemptOrder(attachmentPref);
+        let targetId = null;
+        let assignment = null;
+        let linkKind = 'hitl-peer';
+        let uplinkRouterId = (iface.targetRouterId !== undefined && iface.targetRouterId !== null)
+          ? iface.targetRouterId
+          : null;
+        const pickRouterPeer = () => {
+          if(!routerPeers.length) return null;
+          const peer = routerPeers[Math.floor(rng() * routerPeers.length)];
+          const peerId = peer?.node_id ?? peer?.id;
+          return (peerId !== undefined && peerId !== null) ? peerId : null;
+        };
+        const pickSwitchPeer = () => {
+          if(!existingSubnets.length) return null;
+          const subnet = existingSubnets[Math.floor(rng() * existingSubnets.length)];
+          const candidateId = subnet?.switch_id ?? subnet?.id;
+          return (candidateId !== undefined && candidateId !== null) ? candidateId : null;
+        };
+        const createNewRouter = () => {
+          const routerId = makeUniqueId(`hitl-router-${baseName}`);
+          const routerLabel = `HITL Router ${idx + 1}`;
+          const routerNode = {
+            id: routerId,
+            node_id: routerId,
+            type: 'router',
+            label: routerLabel,
+            name: routerLabel,
+            isHitlRouter: true,
+            attachment: attachmentPref,
+            hitlInterface: iface,
+          };
+          const routerCandidates = routerPeers.length ? routerPeers.slice() : [];
+          if(routerCandidates.length){
+            const chosen = routerCandidates[Math.floor(rng() * routerCandidates.length) % routerCandidates.length];
+            const chosenId = chosen?.node_id ?? chosen?.id;
+            if(chosenId !== undefined && chosenId !== null){
+              uplinkRouterId = chosenId;
+              routerNode.uplinkRouterId = chosenId;
+              noteExisting(chosenId);
+              resultLinks.push({ sourceId: routerId, targetId: chosenId, kind: 'hitl-router-uplink', attachment: attachmentPref, assignment: 'uplink_router' });
+            }
+          }
+          resultNodes.push(routerNode);
+          routerPeers.push({ node_id: routerId, id: routerId, name: routerLabel, type: 'router', isHitlRouter: true });
+          noteExisting(routerId);
+          return routerId;
+        };
+        const createNewSwitch = () => {
+          const previewSwitchMeta = iface.previewSwitch;
+          if(previewSwitchMeta && previewSwitchMeta.nodeId !== null && previewSwitchMeta.nodeId !== undefined){
+            const existingSwitchId = previewSwitchMeta.nodeId;
+            noteExisting(existingSwitchId);
+            if(!existingSubnets.some(sw => (sw?.switch_id ?? sw?.id) === existingSwitchId)){
+              existingSubnets.push({ switch_id: existingSwitchId, id: existingSwitchId, name: previewSwitchMeta.name || `sw-${existingSwitchId}`, isHitlSwitch: true });
+            }
+            const hintedRouterId = iface.targetRouterId ?? previewSwitchMeta.routerId ?? null;
+            if(hintedRouterId !== null && hintedRouterId !== undefined){
+              uplinkRouterId = hintedRouterId;
+            }
+            return existingSwitchId;
+          }
+          const switchId = makeUniqueId(`hitl-switch-${baseName}`);
+          const switchLabel = `HITL Switch ${idx + 1}`;
+          const switchNode = {
+            id: switchId,
+            switch_id: switchId,
+            type: 'switch',
+            label: switchLabel,
+            name: switchLabel,
+            isHitlSwitch: true,
+            hitlInterface: iface,
+            attachment: attachmentPref,
+          };
+          const routerCandidates = routerPeers.length ? routerPeers.slice() : [];
+          if(routerCandidates.length){
+            const chosen = routerCandidates[Math.floor(rng() * routerCandidates.length) % routerCandidates.length];
+            const chosenId = chosen?.node_id ?? chosen?.id;
+            if(chosenId !== undefined && chosenId !== null){
+              uplinkRouterId = chosenId;
+              switchNode.uplinkRouterId = chosenId;
+              noteExisting(chosenId);
+              resultLinks.push({ sourceId: switchId, targetId: chosenId, kind: 'hitl-switch-uplink', attachment: attachmentPref, assignment: 'uplink_switch' });
+            }
+          }
+          resultNodes.push(switchNode);
+          existingSubnets.push({ switch_id: switchId, id: switchId, name: switchLabel, isHitlSwitch: true });
+          noteExisting(switchId);
+          return switchId;
+        };
+        for(const attempt of attempts){
+          if(attempt === 'existing_router'){
+            const candidate = pickRouterPeer();
+            if(candidate !== null){
+              targetId = candidate;
+              assignment = 'existing_router';
+              linkKind = 'hitl-router';
+              noteExisting(candidate);
+              uplinkRouterId = candidate;
+              break;
+            }
+          } else if(attempt === 'existing_switch'){
+            const candidate = pickSwitchPeer();
+            if(candidate !== null){
+              targetId = candidate;
+              assignment = 'existing_switch';
+              linkKind = 'hitl-switch';
+              noteExisting(candidate);
+              break;
+            }
+          } else if(attempt === 'new_router'){
+            const newRouterId = createNewRouter();
+            if(newRouterId !== null){
+              targetId = newRouterId;
+              assignment = 'new_router';
+              linkKind = 'hitl-router';
+              break;
+            }
+          } else if(attempt === 'new_switch'){
+            const newSwitchId = createNewSwitch();
+            if(newSwitchId !== null){
+              targetId = newSwitchId;
+              assignment = 'new_switch';
+              linkKind = 'hitl-switch';
+              break;
+            }
+          }
+        }
+        if(targetId === null){
+          const fallbackRouter = pickRouterPeer();
+          if(fallbackRouter !== null){
+            targetId = fallbackRouter;
+            assignment = assignment ?? 'existing_router';
+            linkKind = 'hitl-router';
+            noteExisting(fallbackRouter);
+            uplinkRouterId = fallbackRouter;
+          }
+        }
+        if(targetId === null && hostPeers.length){
+          const peer = hostPeers[Math.floor(rng() * hostPeers.length)];
+          const peerId = peer?.node_id ?? peer?.id;
+          if(peerId !== undefined && peerId !== null){
+            targetId = peerId;
+            assignment = assignment ?? 'existing_host';
+            linkKind = 'hitl-host';
+            noteExisting(peerId);
+          }
+        }
+        if(targetId === null){
+          const networkId = makeUniqueId(`hitl-net-${baseName}`);
+          const networkLabel = `HITL Network ${idx + 1}`;
+          const networkNode = {
+            id: networkId,
+            type: 'network',
+            label: networkLabel,
+            name: networkLabel,
+            isHitlNetwork: true,
+            hitlInterface: iface,
+            attachment: attachmentPref,
+          };
+          resultNodes.push(networkNode);
+          targetId = networkId;
+          assignment = assignment ?? 'network';
+          linkKind = 'hitl-network';
+        }
+        if(targetId !== null){
+          hitlNode.peerNodeId = targetId;
+          hitlNode.assignment = assignment || attachmentPref;
+          if(uplinkRouterId !== null){
+            hitlNode.uplinkRouterId = uplinkRouterId;
+          }
+          resultLinks.push({ sourceId: nodeId, targetId, kind: linkKind, attachment: attachmentPref, assignment: assignment || attachmentPref });
+        }
+      });
+
+      return resultNodes.length ? { nodes: resultNodes, links: resultLinks, interfaces: sanitized, hitlState: hitlCfg } : null;
+    }
+
+    const hitlPreviewArtifacts = deriveStandaloneHitlArtifacts(previewData, hitlConfig, scenarioKey);
+
     function setupPreviewCollapsers(){
       const toggles = document.querySelectorAll('[data-preview-collapse]');
       toggles.forEach(btn => {
@@ -861,6 +1337,23 @@
       }
     });
 
+    if(hitlPreviewArtifacts && Array.isArray(hitlPreviewArtifacts.nodes)){
+      hitlPreviewArtifacts.nodes.forEach(node => {
+        if(!node) return;
+        nodes.push({ ...node });
+      });
+    }
+
+    if(hitlPreviewArtifacts && Array.isArray(hitlPreviewArtifacts.links)){
+      hitlPreviewArtifacts.links.forEach(link => {
+        if(!link) return;
+        const sourceId = link.sourceId ?? link.source ?? null;
+        const targetId = link.targetId ?? link.target ?? null;
+        if(sourceId === null || targetId === null) return;
+        linkDescriptors.push({ sourceId, targetId, kind: link.kind || 'hitl' });
+      });
+    }
+
     if(!nodes.length){
       svg.remove();
       wrap.append('div').attr('class','text-muted small p-2').text('No nodes to display');
@@ -1016,15 +1509,21 @@
       .attr('stroke', l=> {
         if(l.kind === 'base-bridge' || l.kind === 'base-external' || l.kind === 'base-cluster') return '#6f42c1';
         if(l.kind === 'r2r') return '#007bff';
+        if(l.kind === 'hitl' || l.kind === 'hitl-peer' || l.kind === 'hitl-network') return '#20c997';
         return (l.kind === 'r-sw' ? '#28a745' : '#999');
       })
       .attr('stroke-width', l=> {
         if(l.kind === 'base-cluster') return 3;
         if(l.kind === 'base-bridge' || l.kind === 'base-external') return 4;
+        if(l.kind === 'hitl' || l.kind === 'hitl-peer' || l.kind === 'hitl-network') return 2.4;
         return l.kind === 'r2r' ? 2 : 1.2;
       })
       .attr('stroke-linecap', l=> (l.kind === 'base-bridge' || l.kind === 'base-external' || l.kind === 'base-cluster') ? 'round' : null)
-      .attr('stroke-dasharray', l=> l.kind==='r-host'? '3,3': null)
+      .attr('stroke-dasharray', l=> {
+        if(l.kind === 'r-host') return '3,3';
+        if(l.kind === 'hitl-network') return '4,2';
+        return null;
+      })
       .attr('opacity', 0.85);
     const node = container.selectAll('g.node').data(nodes).enter().append('g').attr('class','node');
     const hasVulnerableHosts = nodes.some(n => n.type === 'host' && n.hasVuln);
@@ -1080,8 +1579,15 @@
       .force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> {
         if(l.kind === 'base-cluster') return 60;
         if(l.kind === 'base-bridge' || l.kind === 'base-external') return 95;
+        if(l.kind === 'hitl' || l.kind === 'hitl-peer') return 70;
+        if(l.kind === 'hitl-network') return 55;
         return l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40);
-      }).strength(l => l.kind === 'base-cluster' ? 0.9 : (l.kind === 'base-bridge' || l.kind === 'base-external' ? 0.7 : 0.6)))
+      }).strength(l => {
+        if(l.kind === 'base-cluster') return 0.9;
+        if(l.kind === 'base-bridge' || l.kind === 'base-external') return 0.7;
+        if(l.kind === 'hitl' || l.kind === 'hitl-peer' || l.kind === 'hitl-network') return 0.6;
+        return 0.6;
+      }))
       .force('charge', d3.forceManyBody().strength(d => d.type === 'base' ? -160 : -210))
       .force('center', d3.forceCenter(width/2, height/2))
       .force('layoutX', d3.forceX(d => Number.isFinite(d.layoutX) ? d.layoutX : width/2).strength(usingLayout ? 0.18 : 0.04))
@@ -1158,7 +1664,26 @@
     try {
       const tbody = document.querySelector('#nodeSectionsTable tbody');
       if(tbody){
-  const allNodes = [...(previewData.routers||[]).map(r=>({...r, _type:'router'})), ...(previewData.hosts||[]).map(h=>({...h, _type:'host'})), ...(previewData.switches_detail||[]).map(s=>({...s, node_id:s.switch_id, name:'sw-'+s.switch_id, _type:'switch'}))];
+  const hitlNodesForTable = (hitlPreviewArtifacts && Array.isArray(hitlPreviewArtifacts.nodes))
+    ? hitlPreviewArtifacts.nodes.filter(Boolean).map(node => {
+        const iface = node.hitlInterface || null;
+        const primaryIpv4 = iface && Array.isArray(iface.ipv4) && iface.ipv4.length ? iface.ipv4[0]
+          : (typeof iface?.ipv4 === 'string' ? iface.ipv4 : (node.ip4 || ''));
+        return {
+          node_id: node.id,
+          name: node.label || node.name || String(node.id),
+          _type: node.isHitl ? 'rj45' : (node.isHitlNetwork ? 'network' : canonicalNodeType(node.type)),
+          role: node.isHitl ? 'hitl' : (node.isHitlNetwork ? 'network' : (node.type || 'node')),
+          hitlInterface: iface,
+          hitlAttachment: node.attachment || (iface && iface.attachment) || DEFAULT_HITL_ATTACHMENT,
+          hitlAssignment: node.assignment || null,
+          hitlUplinkRouterId: node.uplinkRouterId || null,
+          ip4: primaryIpv4,
+          isHitlNetwork: !!node.isHitlNetwork,
+        };
+      })
+    : [];
+  const allNodes = [...(previewData.routers||[]).map(r=>({...r, _type:'router'})), ...(previewData.hosts||[]).map(h=>({...h, _type:'host'})), ...(previewData.switches_detail||[]).map(s=>({...s, node_id:s.switch_id, name:'sw-'+s.switch_id, _type:'switch'})), ...hitlNodesForTable];
   if(!allNodes.length){ tbody.innerHTML = '<tr><td colspan="10" class="text-muted fst-italic">(no nodes)</td></tr>'; return; }
         const switchesDetail = previewData.switches_detail || [];
         const rowsHtml = allNodes.map(n=>{
@@ -1180,6 +1705,9 @@
             switchesDetail.filter(sw => sw.router_id === nid).forEach(sw=>{
               ifaceParts.push(`sw-${sw.switch_id}:${sw.router_ip || '-'}`);
             });
+            if(n.hitlUplinkRouterId){
+              ifaceParts.push(`uplink-router:${n.hitlUplinkRouterId}`);
+            }
           } else if(n._type === 'switch'){
             if(typeof n.router_id !== 'undefined'){
               ifaceParts.push(`router:${n.router_id}→${n.router_ip || '-'}`);
@@ -1189,9 +1717,25 @@
             Object.keys(hostIf).sort((a,b)=> Number(a) - Number(b)).forEach(hid=>{
               ifaceParts.push(`h${hid}:${hostIf[hid]}`);
             });
+            if(n.hitlUplinkRouterId){
+              ifaceParts.push(`uplink-router:${n.hitlUplinkRouterId}`);
+            }
           } else if(n._type === 'host'){
             const routerForHost = hostRouterMap[nid] ?? hostRouterMap[String(nid)];
             if(routerForHost){ ifaceParts.push(`router:${routerForHost}`); }
+          } else if(n._type === 'rj45'){
+            const hi = n.hitlInterface || {};
+            if(hi && typeof hi === 'object'){
+              if(hi.name && hi.name !== n.name){ ifaceParts.push(`iface:${hi.name}`); }
+              if(hi.mac){ ifaceParts.push(`mac:${hi.mac}`); }
+              if(Array.isArray(hi.ipv4) && hi.ipv4.length){ ifaceParts.push(`ipv4:${hi.ipv4.join(',')}`); }
+              if(Array.isArray(hi.ipv6) && hi.ipv6.length){ ifaceParts.push(`ipv6:${hi.ipv6.join(',')}`); }
+            }
+            if(n.hitlAttachment){ ifaceParts.push(`attach:${n.hitlAttachment}`); }
+            if(n.hitlAssignment && n.hitlAssignment !== n.hitlAttachment){ ifaceParts.push(`assigned:${n.hitlAssignment}`); }
+            if(n.hitlUplinkRouterId){ ifaceParts.push(`uplink-router:${n.hitlUplinkRouterId}`); }
+          } else if(n._type === 'network' && n.isHitlNetwork){
+            ifaceParts.push('RJ45 isolated network');
           }
           const ifaceStr = ifaceParts.length ? ifaceParts.join('; ') : '-';
           const primaryIpStr = primaryIp || '-';

@@ -33,6 +33,7 @@ except ModuleNotFoundError:  # pragma: no cover
         SWITCH = _NodeTypeValue("SWITCH")
         ROUTER = _NodeTypeValue("ROUTER")
         DOCKER = _NodeTypeValue("DOCKER")
+        RJ45 = _NodeTypeValue("RJ45")
 
     class Position:  # type: ignore
         def __init__(self, x: int = 0, y: int = 0, z: int = 0):

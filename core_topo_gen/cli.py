@@ -20,6 +20,7 @@ from .parsers.segmentation import parse_segmentation_info
 from .parsers.vulnerabilities import parse_vulnerabilities_info
 from .parsers.planning_metadata import parse_planning_metadata
 from .parsers.services import parse_services
+from .parsers.hitl import parse_hitl_info
 from .utils.segmentation import apply_preview_segmentation_rules
 from .utils.allocation import compute_role_counts
 from .builders.topology import build_star_from_roles, build_segmented_topology, build_multi_switch_topology
@@ -34,6 +35,7 @@ from .utils.vuln_process import (
     prepare_compose_for_assignments,
 )
 from .utils.services import ensure_service
+from .utils.hitl import attach_hitl_rj45_nodes
 
 # Ensure planning.full_preview is importable even if an older installed core_topo_gen shadows repo version
 try:  # pragma: no cover
@@ -376,6 +378,17 @@ def main():
         planning_meta = parse_planning_metadata(args.xml, args.scenario) or {}
     except Exception:
         planning_meta = {}
+    try:
+        hitl_config = parse_hitl_info(args.xml, args.scenario) or {"enabled": False, "interfaces": []}
+    except Exception:
+        hitl_config = {"enabled": False, "interfaces": []}
+    scenario_key = args.scenario
+    if not scenario_key:
+        try:
+            scenario_key = os.path.splitext(os.path.basename(args.xml))[0]
+        except Exception:
+            scenario_key = "__default__"
+    hitl_config.setdefault("scenario_key", scenario_key)
     # First allocate weight-based roles across density base
     base_total = density_base
     if args.max_nodes is not None and args.max_nodes > 0:
@@ -449,6 +462,10 @@ def main():
     # Orchestrator full plan (centralized)
     from .planning.orchestrator import compute_full_plan
     orchestrated_plan = compute_full_plan(args.xml, scenario=args.scenario, seed=args.seed, include_breakdowns=True)
+    if not args.scenario and isinstance(orchestrated_plan, dict):
+        derived_key = orchestrated_plan.get("scenario_name") or orchestrated_plan.get("scenario_key")
+        if derived_key:
+            hitl_config["scenario_key"] = derived_key
     prelim_router_count = orchestrated_plan['routers_planned']
     if preview_router_count is not None and preview_router_count > 0:
         prelim_router_count = preview_router_count
@@ -618,6 +635,8 @@ def main():
         "count_rows_breakdown": {r: c for r, c in count_items},
         "weight_rows": {r: f for r, f in weight_items},
         "role_counts": role_counts,
+        "hitl_enabled": bool(hitl_config.get("enabled")),
+        "hitl_interface_count": len(hitl_config.get("interfaces") or []),
     }
     if preview_full:
         try:
@@ -801,6 +820,18 @@ def main():
             logging.info("No docker nodes created by topology builders (either no assignments or NodeType.DOCKER unavailable)")
     except Exception:
         pass
+
+    try:
+        hitl_summary = attach_hitl_rj45_nodes(session, routers, hosts, hitl_config)
+        generation_meta["hitl_attachment"] = hitl_summary
+        if hitl_summary.get("interfaces"):
+            logging.info(
+                "HITL: attached %d RJ45 node(s) to session", len(hitl_summary.get("interfaces", []))
+            )
+        elif hitl_summary.get("enabled"):
+            logging.info("HITL: enabled but no RJ45 nodes created (see hitl_attachment metadata)")
+    except Exception as exc:
+        logging.warning("HITL attachment failed: %s", exc)
 
     # Parse segmentation config OR fallback to preview segmentation if available
     seg_summary = None

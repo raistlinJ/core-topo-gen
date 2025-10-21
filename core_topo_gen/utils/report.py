@@ -378,6 +378,66 @@ def write_report(
                 lines.append(f"- Vulnerabilities planned (additive): target={vden_t} count_items={vcnt_t} total_est={vadd} assigned={vassn}")
     except Exception:
         pass
+    try:
+        hitl_meta = None
+        if metadata and isinstance(metadata, dict):
+            hitl_meta = metadata.get("hitl_attachment")
+        if isinstance(hitl_meta, dict) and (hitl_meta.get("enabled") or hitl_meta.get("interfaces")):
+            interfaces = hitl_meta.get("interfaces") or []
+            created_candidates = [entry for entry in interfaces if isinstance(entry, dict) and entry.get("created", True) is not False]
+            total_requested = len([entry for entry in interfaces if isinstance(entry, dict)]) or len(interfaces)
+            if lines and lines[-1] != "":
+                lines.append("")
+            lines.append("## Hardware-in-the-Loop Attachments")
+            lines.append(f"- Enabled: {'yes' if hitl_meta.get('enabled') else 'no'}")
+            lines.append(f"- Session enablerj45 option set: {'yes' if hitl_meta.get('session_option_enabled') else 'no'}")
+            if interfaces:
+                lines.append(f"- RJ45 nodes created: {len(created_candidates)} of {total_requested}")
+            created_router_nodes = hitl_meta.get("created_router_nodes") or []
+            if created_router_nodes:
+                router_list = ", ".join(str(x) for x in created_router_nodes)
+                lines.append(f"- New router nodes: {len(created_router_nodes)} (ids: {router_list})")
+            created_network_nodes = hitl_meta.get("created_network_nodes") or []
+            if created_network_nodes:
+                network_list = ", ".join(str(x) for x in created_network_nodes)
+                lines.append(f"- New network nodes: {len(created_network_nodes)} (ids: {network_list})")
+            if interfaces:
+                lines.append("")
+                lines.append("| Interface | Preference | Assignment | RJ45 Node | Peer Node | Status | Uplink Router |")
+                lines.append("| --- | --- | --- | ---: | ---: | --- | ---: |")
+                for entry in interfaces:
+                    if not isinstance(entry, dict):
+                        continue
+                    name = entry.get("name") or entry.get("normalized_name") or "-"
+                    preference = entry.get("attachment") or "-"
+                    assignment = entry.get("assignment") or "-"
+                    rj_node = entry.get("rj45_node_id")
+                    peer_node = entry.get("peer_node_id") or entry.get("target_node_id")
+                    uplink_node = entry.get("uplink_router_node_id")
+                    status: str
+                    if entry.get("created", True) is False:
+                        reason = str(entry.get("reason") or "failed").replace("|", "/").replace("\n", " ")
+                        status = f"failed: {reason}"
+                    else:
+                        status = "linked" if entry.get("linked") else "created"
+                        if uplink_node is not None and entry.get("uplink_linked") is False:
+                            status = f"{status} (uplink pending)"
+                    def _fmt(value: Any) -> str:
+                        if value is None:
+                            return "-"
+                        return str(value)
+                    lines.append("| {iface} | {pref} | {assign} | {rj} | {peer} | {status} | {uplink} |".format(
+                        iface=str(name).replace("|", "/"),
+                        pref=str(preference).replace("|", "/"),
+                        assign=str(assignment).replace("|", "/"),
+                        rj=_fmt(rj_node),
+                        peer=_fmt(peer_node),
+                        status=status,
+                        uplink=_fmt(uplink_node),
+                    ))
+                lines.append("")
+    except Exception:
+        pass
     lines.append("")
 
     # Dedicated Planning Stats section consolidating additive semantics (optional clarity)
