@@ -276,8 +276,27 @@ def _enrich_hitl_interfaces_with_ips(hitl_cfg: Dict[str, Any]) -> None:
         iface['ordinal'] = idx
         iface['interface_count'] = total_interfaces
         ip_info: Optional[Dict[str, Any]] = None
-        if attachment in {'new_router', 'existing_router'}:
+        if attachment in {'new_router', 'existing_router', 'new_switch'}:
             ip_info = predict_hitl_link_ips(scenario_key, iface.get('name'), idx)
+        if attachment in {'new_router', 'existing_router'} and ip_info:
+            iface['link_network'] = ip_info.get('network')
+            iface['link_network_cidr'] = ip_info.get('network_cidr') or ip_info.get('network')
+            iface['prefix_len'] = ip_info.get('prefix_len')
+            iface['netmask'] = ip_info.get('netmask')
+            iface['existing_router_ip4'] = ip_info.get('existing_router_ip4')
+            iface['new_router_ip4'] = ip_info.get('new_router_ip4')
+            iface['rj45_ip4'] = ip_info.get('rj45_ip4')
+            ipv4_current = iface.get('ipv4') if isinstance(iface.get('ipv4'), list) else []
+            rj45_ip = iface.get('rj45_ip4')
+            if rj45_ip:
+                ordered = [rj45_ip] + [ip for ip in ipv4_current if ip != rj45_ip]
+                iface['ipv4'] = ordered
+        if attachment == 'new_switch':
+            preview_switch = _build_hitl_preview_switch(scenario_key, iface, slug, idx)
+            preview_metadata = preview_switch.setdefault('metadata', {})
+            preview_metadata['scenario_key'] = scenario_key
+            preview_metadata['ordinal'] = idx
+            preview_metadata['interface_count'] = total_interfaces
             if ip_info:
                 iface['link_network'] = ip_info.get('network')
                 iface['link_network_cidr'] = ip_info.get('network_cidr') or ip_info.get('network')
@@ -286,17 +305,16 @@ def _enrich_hitl_interfaces_with_ips(hitl_cfg: Dict[str, Any]) -> None:
                 iface['existing_router_ip4'] = ip_info.get('existing_router_ip4')
                 iface['new_router_ip4'] = ip_info.get('new_router_ip4')
                 iface['rj45_ip4'] = ip_info.get('rj45_ip4')
-                ipv4_current = iface.get('ipv4') if isinstance(iface.get('ipv4'), list) else []
-                rj45_ip = iface.get('rj45_ip4')
-                if rj45_ip:
-                    ordered = [rj45_ip] + [ip for ip in ipv4_current if ip != rj45_ip]
-                    iface['ipv4'] = ordered
-        if attachment == 'new_switch':
-            preview_switch = _build_hitl_preview_switch(scenario_key, iface, slug, idx)
-            preview_metadata = preview_switch.setdefault('metadata', {})
-            preview_metadata['scenario_key'] = scenario_key
-            preview_metadata['ordinal'] = idx
-            preview_metadata['interface_count'] = total_interfaces
+                iface['router_ip4'] = ip_info.get('existing_router_ip4')
+                iface['switch_ip4'] = ip_info.get('new_router_ip4')
+                preview_metadata.update({
+                    'link_network': iface.get('link_network_cidr') or iface.get('link_network'),
+                    'router_ip4': iface.get('router_ip4'),
+                    'switch_ip4': iface.get('switch_ip4'),
+                    'rj45_ip4': iface.get('rj45_ip4'),
+                    'prefix_len': iface.get('prefix_len'),
+                    'netmask': iface.get('netmask'),
+                })
             iface['preview_switch'] = preview_switch
             preview_switches.append(preview_switch)
             continue
@@ -773,10 +791,40 @@ def _merge_hitl_preview_with_full_preview(full_preview: Dict[str, Any], hitl_cfg
             else:
                 metadata['target_router_id'] = metadata.get('target_router_id') or peer_router_id
                 iface['target_router_id'] = iface.get('target_router_id') or peer_router_id
+            link_network = (
+                iface.get('link_network_cidr')
+                or metadata.get('link_network')
+                or iface.get('link_network')
+            )
+            router_ip4 = (
+                iface.get('router_ip4')
+                or iface.get('existing_router_ip4')
+                or metadata.get('router_ip4')
+                or metadata.get('existing_router_ip4')
+            )
+            switch_ip4 = (
+                iface.get('switch_ip4')
+                or iface.get('new_router_ip4')
+                or metadata.get('switch_ip4')
+                or metadata.get('new_router_ip4')
+            )
+            rj45_ip4 = iface.get('rj45_ip4') or metadata.get('rj45_ip4')
             if switch_id in existing_switch_ids:
                 existing_detail = existing_switches_map.get(switch_id)
                 if isinstance(existing_detail, dict):
                     existing_detail.setdefault('metadata', {}).update(metadata)
+                    if link_network and not existing_detail.get('rsw_subnet'):
+                        existing_detail['rsw_subnet'] = link_network
+                    if router_ip4 and not existing_detail.get('router_ip'):
+                        existing_detail['router_ip'] = router_ip4
+                    if switch_ip4 and not existing_detail.get('switch_ip'):
+                        existing_detail['switch_ip'] = switch_ip4
+                    if rj45_ip4:
+                        existing_detail.setdefault('host_if_ips', {})['rj45'] = rj45_ip4
+                    if link_network:
+                        rs_list = full_preview.setdefault('router_switch_subnets', [])
+                        if link_network not in rs_list:
+                            rs_list.append(link_network)
                 continue
             hosts_placeholder = []
             iface_hosts = iface.get('hosts') or metadata.get('hosts')
@@ -786,18 +834,24 @@ def _merge_hitl_preview_with_full_preview(full_preview: Dict[str, Any], hitl_cfg
                 'switch_id': switch_id,
                 'router_id': peer_router_id,
                 'hosts': hosts_placeholder,
-                'rsw_subnet': None,
+                'rsw_subnet': link_network,
                 'lan_subnet': None,
-                'router_ip': None,
-                'switch_ip': None,
+                'router_ip': router_ip4,
+                'switch_ip': switch_ip4,
                 'host_if_ips': {},
                 'hitl_preview': True,
                 'metadata': metadata,
             }
+            if rj45_ip4:
+                detail_entry['host_if_ips']['rj45'] = rj45_ip4
             switches_list.append(detail_entry)
             existing_switch_ids.add(switch_id)
             existing_switches_map[switch_id] = detail_entry
             added_switch_ids.append(switch_id)
+            if link_network:
+                rs_list = full_preview.setdefault('router_switch_subnets', [])
+                if link_network not in rs_list:
+                    rs_list.append(link_network)
         if added_switch_ids:
             full_preview['hitl_switch_ids'] = sorted({*(full_preview.get('hitl_switch_ids') or []), *added_switch_ids})
 
@@ -1114,7 +1168,7 @@ def _save_base_upload_state(meta: Dict[str, Any]) -> None:
     if not clean:
         return
     clean = dict(clean)
-    clean['updated_at'] = datetime.datetime.utcnow().isoformat() + 'Z'
+    clean['updated_at'] = datetime.datetime.now(datetime.UTC).isoformat()
     try:
         with open(_base_upload_state_path(), 'w', encoding='utf-8') as f:
             json.dump(clean, f, indent=2)
@@ -2143,6 +2197,171 @@ def _default_scenarios_payload():
         "core": _default_core_dict(),
         "host_interfaces": _enumerate_host_interfaces(),
     }
+
+
+def _prepare_payload_for_index(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize payload data before rendering the index page."""
+    if not isinstance(payload, dict):
+        payload = {}
+    else:
+        payload = dict(payload)
+
+    defaults = _default_scenarios_payload()
+
+    # --- Core connection defaults ---
+    core_meta = payload.get('core')
+    if not isinstance(core_meta, dict):
+        core_meta = {}
+    core_defaults = defaults['core']
+    core_host = core_meta.get('host') or core_defaults['host']
+    core_port = core_meta.get('port', core_defaults['port'])
+    try:
+        core_port = int(core_port)
+    except Exception:
+        core_port = core_defaults['port']
+    payload['core'] = {'host': core_host, 'port': core_port}
+
+    # --- Scenarios ---
+    scenarios_raw = payload.get('scenarios')
+    if not isinstance(scenarios_raw, list) or not scenarios_raw:
+        scenarios_raw = defaults['scenarios']
+
+    required_sections = {
+        'Node Information': {'density': None, 'total_nodes': None},
+        'Routing': {'density': 0.5},
+        'Services': {'density': 0.5},
+        'Traffic': {'density': 0.5},
+        'Events': {'density': 0.5},
+        'Vulnerabilities': {'density': 0.5},
+        'Segmentation': {'density': 0.5},
+        'HITL': {},
+    }
+
+    normalized_scenarios: List[Dict[str, Any]] = []
+    for idx, scen in enumerate(scenarios_raw, start=1):
+        if not isinstance(scen, dict):
+            continue
+        scen_norm = dict(scen)
+        scen_norm['name'] = scen_norm.get('name') or f"Scenario {idx}"
+
+        base_meta = scen_norm.get('base')
+        if not isinstance(base_meta, dict):
+            base_meta = {}
+        base_meta = dict(base_meta)
+        filepath = base_meta.get('filepath')
+        if not isinstance(filepath, str):
+            filepath = '' if filepath is None else str(filepath)
+        base_meta['filepath'] = filepath
+        if filepath and not base_meta.get('display_name'):
+            base_meta['display_name'] = os.path.basename(filepath)
+        scen_norm['base'] = base_meta
+
+        if 'density_count' not in scen_norm:
+            scen_norm['density_count'] = 10
+
+        sections_meta = scen_norm.get('sections')
+        if not isinstance(sections_meta, dict):
+            sections_meta = {}
+        sections_out: Dict[str, Any] = {}
+        for section_name, defaults_map in required_sections.items():
+            sec_val = sections_meta.get(section_name)
+            if isinstance(sec_val, dict):
+                sec_norm = dict(sec_val)
+            else:
+                sec_norm = {}
+            items = sec_norm.get('items')
+            if isinstance(items, list):
+                sec_norm['items'] = [item for item in items if isinstance(item, dict)]
+            else:
+                sec_norm['items'] = []
+            for key, val in defaults_map.items():
+                sec_norm.setdefault(key, val)
+            sections_out[section_name] = sec_norm
+        for extra_name, extra_val in sections_meta.items():
+            if extra_name not in sections_out:
+                sections_out[extra_name] = extra_val
+        scen_norm['sections'] = sections_out
+
+        hitl_meta = scen_norm.get('hitl')
+        if isinstance(hitl_meta, dict):
+            hitl_norm = dict(hitl_meta)
+        else:
+            hitl_norm = {}
+        hitl_norm['enabled'] = bool(hitl_norm.get('enabled'))
+        interfaces_raw = hitl_norm.get('interfaces')
+        interfaces_norm: List[Dict[str, Any]] = []
+        if isinstance(interfaces_raw, list):
+            for iface in interfaces_raw:
+                if not isinstance(iface, dict):
+                    continue
+                iface_norm = dict(iface)
+                name = iface_norm.get('name')
+                if not isinstance(name, str):
+                    name = '' if name is None else str(name)
+                name = name.strip()
+                if not name:
+                    continue
+                iface_norm['name'] = name
+                iface_norm['attachment'] = _normalize_hitl_attachment(iface_norm.get('attachment'))
+                for addr_key in ('ipv4', 'ipv6'):
+                    vals = iface_norm.get(addr_key)
+                    if isinstance(vals, list):
+                        iface_norm[addr_key] = [str(v).strip() for v in vals if v is not None and str(v).strip()]
+                interfaces_norm.append(iface_norm)
+        hitl_norm['interfaces'] = interfaces_norm
+        scen_norm['hitl'] = hitl_norm
+
+        normalized_scenarios.append(scen_norm)
+
+    if not normalized_scenarios:
+        normalized_scenarios = defaults['scenarios']
+    payload['scenarios'] = normalized_scenarios
+
+    # --- Base upload metadata ---
+    base_upload = payload.get('base_upload')
+    if isinstance(base_upload, dict):
+        base_norm = dict(base_upload)
+        path = base_norm.get('path')
+        if isinstance(path, str):
+            base_norm['path'] = path
+            base_norm.setdefault('display_name', os.path.basename(path) if path else '')
+        else:
+            base_norm['path'] = ''
+        if 'valid' in base_norm:
+            base_norm['valid'] = bool(base_norm['valid'])
+        payload['base_upload'] = base_norm
+
+    # --- Host interfaces ---
+    host_ifaces = payload.get('host_interfaces')
+    if not isinstance(host_ifaces, list):
+        host_ifaces = []
+    sanitized_ifaces: List[Dict[str, Any]] = []
+    adaptor_names: set[str] = set()
+    for iface in host_ifaces:
+        if not isinstance(iface, dict):
+            continue
+        entry = dict(iface)
+        name = entry.get('name')
+        if isinstance(name, str):
+            name = name.strip()
+        elif name is not None:
+            name = str(name)
+        else:
+            name = ''
+        entry['name'] = name
+        if name:
+            adaptor_names.add(name)
+        for arr_key in ('ipv4', 'ipv6', 'flags'):
+            vals = entry.get(arr_key)
+            if isinstance(vals, list):
+                entry[arr_key] = [v for v in vals if v not in (None, '')]
+        sanitized_ifaces.append(entry)
+    payload['host_interfaces'] = sanitized_ifaces
+    payload['hitl_adaptors'] = sorted(adaptor_names)
+
+    payload.setdefault('result_path', defaults['result_path'])
+
+    return payload
 
 
 # Hardware in the Loop utilities

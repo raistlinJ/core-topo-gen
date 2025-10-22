@@ -1,6 +1,21 @@
 {% extends 'layout.html' %}
 {% block title %}Full Preview{% endblock %}
 {% block active_page %}{% set active_page = 'scenarios' %}{% endblock %}
+{% block extra_head %}
+<style>
+  #previewGraph svg { cursor: grab; }
+  #previewGraph svg:active { cursor: grabbing; }
+  .form-switch.form-switch-sm .form-check-input {
+    height: 1rem;
+    width: 2rem;
+    transform: scale(0.85);
+    margin-top: 0.15rem;
+  }
+  .form-switch.form-switch-sm .form-check-label {
+    padding-left: .35rem;
+  }
+</style>
+{% endblock %}
 {% block content %}
 <div class="container-fluid mt-3">
   {% macro render_r2r_interfaces(router_id, links) -%}
@@ -149,10 +164,16 @@
         <div class="tab-pane fade show active position-relative" id="fp-graph">
           <div id="previewGraph" style="height:640px; position:relative; background:#fafafa; border:1px solid #e0e0e0; border-radius:4px; overflow:hidden;"></div>
           <div id="graphZoomControls" class="position-absolute" style="top:6px; right:8px; z-index:10;">
-            <div class="btn-group btn-group-sm shadow-sm" role="group" aria-label="Zoom controls">
-              <button type="button" class="btn btn-outline-secondary" id="zoomInBtn" title="Zoom In">+</button>
-              <button type="button" class="btn btn-outline-secondary" id="zoomOutBtn" title="Zoom Out">−</button>
-              <button type="button" class="btn btn-outline-secondary" id="zoomResetBtn" title="Reset View">Reset</button>
+            <div class="d-flex flex-column align-items-end gap-2">
+              <div class="form-check form-switch form-switch-sm mb-0 shadow-sm bg-white px-2 py-1 rounded" id="graphLabelsToggleWrap">
+                <input class="form-check-input" type="checkbox" role="switch" id="graphLabelsToggle">
+                <label class="form-check-label small" for="graphLabelsToggle">Show labels</label>
+              </div>
+              <div class="btn-group btn-group-sm shadow-sm" role="group" aria-label="Zoom controls">
+                <button type="button" class="btn btn-outline-secondary" id="zoomInBtn" title="Zoom In">+</button>
+                <button type="button" class="btn btn-outline-secondary" id="zoomOutBtn" title="Zoom Out">−</button>
+                <button type="button" class="btn btn-outline-secondary" id="zoomResetBtn" title="Reset View">Reset</button>
+              </div>
             </div>
           </div>
         </div>
@@ -746,8 +767,156 @@
       return HITL_ATTACHMENT_ALLOWED.has(normalized) ? normalized : DEFAULT_HITL_ATTACHMENT;
     }
 
-    function attachmentAttemptOrder(pref){
-      const normalized = normalizeHitlAttachment(pref);
+    function intToIpv4(value){
+      const num = (Number(value) >>> 0);
+      const part1 = (num >>> 24) & 0xff;
+      const part2 = (num >>> 16) & 0xff;
+      const part3 = (num >>> 8) & 0xff;
+      const part4 = num & 0xff;
+      return `${part1}.${part2}.${part3}.${part4}`;
+    }
+
+    function slugifyHitlName(rawValue, fallback){
+      let value = '';
+      if(typeof rawValue === 'string'){
+        value = rawValue.trim().toLowerCase();
+      } else if(rawValue !== null && rawValue !== undefined){
+        value = String(rawValue).trim().toLowerCase();
+      }
+      if(!value){
+        value = (fallback || '').toString().trim().toLowerCase();
+      }
+      const cleaned = [];
+      for(const ch of value){
+        if(/^[a-z0-9]$/.test(ch)){
+          cleaned.push(ch);
+        } else if(ch === '-' || ch === '_'){
+          cleaned.push(ch);
+        } else {
+          cleaned.push('-');
+        }
+      }
+      let slug = cleaned.join('').replace(/^[-_]+|[-_]+$/g, '');
+      if(!slug){
+        slug = ((fallback || '').toString().trim().toLowerCase()).replace(/^[-_]+|[-_]+$/g, '') || 'iface';
+      }
+      if(slug.length > 48) slug = slug.slice(0, 48);
+      return slug;
+    }
+
+    function computeHitlPreviewLinkIps(scenarioKey, ifaceName, ordinal, prefixLen = 29){
+      try {
+        const sanitizedPrefix = Number.isFinite(prefixLen) ? Math.min(Math.max(Math.trunc(prefixLen), 0), 32) : 29;
+        const baseNetworkInt = (10 << 24) | (254 << 16);
+        const addressSpaceSize = 1 << 16;
+        const hostBlock = sanitizedPrefix >= 32 ? 1 : (1 << Math.max(0, 32 - sanitizedPrefix));
+        if(hostBlock < 8){
+          return null;
+        }
+        const subnetSpan = Math.max(0, sanitizedPrefix - 16);
+        const totalSubnets = Math.max(1, Math.pow(2, subnetSpan));
+        const seed = `${scenarioKey || '__default__'}|${ifaceName || ordinal}|${ordinal}|hitl-link`;
+        const rng = makeDeterministicRng(seed);
+        const subnetIndex = Math.floor(rng() * totalSubnets) % totalSubnets;
+        let networkAddressInt = (baseNetworkInt + (subnetIndex * hostBlock)) >>> 0;
+        const maxAddressInt = (baseNetworkInt + addressSpaceSize - 1) >>> 0;
+        if(networkAddressInt > maxAddressInt){
+          networkAddressInt = (baseNetworkInt + (networkAddressInt % addressSpaceSize)) >>> 0;
+        }
+        let broadcastInt = (networkAddressInt + hostBlock - 1) >>> 0;
+        if(broadcastInt > maxAddressInt){
+          broadcastInt = (baseNetworkInt + (broadcastInt % addressSpaceSize)) >>> 0;
+        }
+        const firstHost = (networkAddressInt + 1) >>> 0;
+        const secondHost = (networkAddressInt + 2) >>> 0;
+        const thirdHost = (networkAddressInt + 3) >>> 0;
+        if(thirdHost >= broadcastInt){
+          return null;
+        }
+        const netmaskInt = sanitizedPrefix === 0 ? 0 : ((0xffffffff << (32 - sanitizedPrefix)) >>> 0);
+        return {
+          network: intToIpv4(networkAddressInt),
+          network_cidr: `${intToIpv4(networkAddressInt)}/${sanitizedPrefix}`,
+          prefix_len: sanitizedPrefix,
+          netmask: intToIpv4(netmaskInt),
+          broadcast_ip4: intToIpv4(broadcastInt),
+          existing_router_ip4: intToIpv4(firstHost),
+          new_router_ip4: intToIpv4(secondHost),
+          rj45_ip4: intToIpv4(thirdHost),
+        };
+      } catch(err){
+        console.warn('HITL: failed to compute preview link IPs', err);
+        return null;
+      }
+    }
+
+    function deriveHitlLinkMeta(iface, ordinal, totalCount, scenarioKey){
+      if(!iface || typeof iface !== 'object'){
+        return {};
+      }
+      const previewRouter = iface.preview_router || iface.previewRouter || null;
+      const previewMetadata = (previewRouter && previewRouter.metadata) || {};
+      const result = {
+        network: iface.link_network || iface.linkNetwork || null,
+        networkCidr: iface.link_network_cidr || iface.linkNetworkCidr || null,
+        prefixLen: Number.isFinite(iface.prefix_len) ? Number(iface.prefix_len) : null,
+        netmask: iface.netmask || null,
+        existingRouterIp4: iface.existing_router_ip4 || null,
+        newRouterIp4: iface.new_router_ip4 || null,
+        rj45Ip4: iface.rj45_ip4 || null,
+        broadcastIp4: iface.broadcast_ip4 || null,
+      };
+      if(!result.network && previewMetadata.link_network) result.network = previewMetadata.link_network;
+      if(!result.networkCidr && previewMetadata.link_network) result.networkCidr = previewMetadata.link_network;
+      if(!result.prefixLen && Number.isFinite(previewMetadata.prefix_len)) result.prefixLen = Number(previewMetadata.prefix_len);
+      if(!result.netmask && previewMetadata.netmask) result.netmask = previewMetadata.netmask;
+      if(!result.existingRouterIp4 && previewMetadata.existing_router_ip4) result.existingRouterIp4 = previewMetadata.existing_router_ip4;
+      if(!result.newRouterIp4 && previewMetadata.new_router_ip4) result.newRouterIp4 = previewMetadata.new_router_ip4;
+      if(!result.rj45Ip4 && previewMetadata.rj45_ip4) result.rj45Ip4 = previewMetadata.rj45_ip4;
+      if(!result.broadcastIp4 && previewMetadata.broadcast_ip4) result.broadcastIp4 = previewMetadata.broadcast_ip4;
+      if(previewRouter && typeof previewRouter.ip4 === 'string' && !result.newRouterIp4){
+        result.newRouterIp4 = previewRouter.ip4;
+      }
+      if(result.newRouterIp4 && typeof result.newRouterIp4 === 'string' && result.newRouterIp4.includes('/')){
+        const parts = result.newRouterIp4.split('/', 2);
+        result.newRouterIp4 = parts[0];
+        if(!result.prefixLen && parts[1]){
+          const parsed = parseInt(parts[1], 10);
+          if(!Number.isNaN(parsed)){
+            result.prefixLen = parsed;
+          }
+        }
+      }
+      if(!result.networkCidr && result.network && Number.isFinite(result.prefixLen)){
+        result.networkCidr = `${result.network}/${result.prefixLen}`;
+      }
+      const needsFallback = !result.networkCidr || !result.newRouterIp4 || !result.rj45Ip4 || !result.existingRouterIp4;
+      if(needsFallback){
+        const fallback = computeHitlPreviewLinkIps(scenarioKey, iface.name || `iface-${ordinal + 1}`, ordinal, result.prefixLen || 29);
+        if(fallback){
+          result.network = result.network || fallback.network;
+          result.networkCidr = result.networkCidr || fallback.network_cidr || fallback.network;
+          result.prefixLen = result.prefixLen || fallback.prefix_len;
+          result.netmask = result.netmask || fallback.netmask;
+          result.existingRouterIp4 = result.existingRouterIp4 || fallback.existing_router_ip4;
+          result.newRouterIp4 = result.newRouterIp4 || fallback.new_router_ip4;
+          result.rj45Ip4 = result.rj45Ip4 || fallback.rj45_ip4;
+          result.broadcastIp4 = result.broadcastIp4 || fallback.broadcast_ip4;
+        }
+      }
+      if(result.network && Number.isFinite(result.prefixLen) && !result.netmask){
+        const prefix = Math.min(Math.max(Number(result.prefixLen), 0), 32);
+        const maskInt = prefix === 0 ? 0 : ((0xffffffff << (32 - prefix)) >>> 0);
+        result.netmask = intToIpv4(maskInt);
+      }
+      if(result.network && Number.isFinite(result.prefixLen) && !result.networkCidr){
+        result.networkCidr = `${result.network}/${result.prefixLen}`;
+      }
+      return result;
+    }
+
+    function hitlAttachmentAttemptOrder(preference){
+      const normalized = normalizeHitlAttachment(preference);
       if(normalized === 'existing_router'){
         return ['existing_router', 'existing_switch', 'new_switch', 'new_router'];
       }
@@ -764,80 +933,59 @@
       if(!preview || typeof preview !== 'object') return null;
       if(!hitlCfg || typeof hitlCfg !== 'object' || !hitlCfg.enabled) return null;
       const rawInterfaces = Array.isArray(hitlCfg.interfaces) ? hitlCfg.interfaces : [];
-      const sanitized = rawInterfaces.map((entry, idx) => {
-        if(!entry || typeof entry !== 'object') return null;
-        const name = String(entry.name || '').trim();
-        if(!name) return null;
-        const normalized = { name };
-        const alias = entry.alias ?? entry.description ?? entry.display;
-        if(typeof alias === 'string' && alias.trim()){
-          normalized.alias = alias.trim();
+      const totalInterfaces = rawInterfaces.length;
+      const scenarioSeed = (typeof scenarioKeySeed === 'string' && scenarioKeySeed.trim())
+        ? scenarioKeySeed.trim()
+        : ((preview && preview.seed !== undefined && preview.seed !== null) ? String(preview.seed) : '__standalone__');
+      const hitlScenarioKey = (typeof hitlCfg.scenario_key === 'string' && hitlCfg.scenario_key.trim())
+        ? hitlCfg.scenario_key.trim()
+        : scenarioSeed;
+
+      const normalizeList = (value) => {
+        if(Array.isArray(value)){
+          return value.map(v => (v ?? '').toString().trim()).filter(Boolean);
         }
-        if(typeof entry.mac === 'string'){
-          const macVal = entry.mac.trim();
-          if(macVal) normalized.mac = macVal;
+        if(typeof value === 'string'){
+          return value.split(',').map(v => v.trim()).filter(Boolean);
         }
-        const normalizeList = (value) => {
-          if(Array.isArray(value)){
-            return value.map(v => String(v || '').trim()).filter(Boolean);
+        return [];
+      };
+
+      const interfaces = rawInterfaces
+        .map((entry, idx) => {
+          if(!entry || typeof entry !== 'object' || !entry.name) return null;
+          const clone = { ...entry };
+          clone.name = (clone.name || '').toString();
+          clone.alias = clone.alias ?? clone.description ?? clone.display;
+          clone.ipv4 = normalizeList(clone.ipv4);
+          clone.ipv6 = normalizeList(clone.ipv6);
+          clone.attachment = normalizeHitlAttachment(clone.attachment);
+          const fallbackSlug = `iface-${idx + 1}`;
+          const slug = slugifyHitlName(clone.name, fallbackSlug);
+          clone.slug = slug;
+          clone.ordinal = idx;
+          const linkMeta = deriveHitlLinkMeta(clone, idx, totalInterfaces, hitlScenarioKey) || {};
+          clone.hitl_link_meta = linkMeta;
+          if(linkMeta.rj45Ip4 && !clone.rj45_ip4){
+            clone.rj45_ip4 = linkMeta.rj45Ip4;
           }
-          if(typeof value === 'string'){
-            return value.split(',').map(v => v.trim()).filter(Boolean);
+          if(linkMeta.newRouterIp4 && !clone.new_router_ip4){
+            clone.new_router_ip4 = linkMeta.newRouterIp4;
           }
-          return [];
-        };
-        const ipv4List = normalizeList(entry.ipv4);
-        if(ipv4List.length) normalized.ipv4 = ipv4List;
-        const ipv6List = normalizeList(entry.ipv6);
-        if(ipv6List.length) normalized.ipv6 = ipv6List;
-        normalized.attachment = normalizeHitlAttachment(entry.attachment);
-        if(Number.isFinite(Number(entry.ordinal))){
-          normalized.ordinal = Number(entry.ordinal);
-        }
-        if(Number.isFinite(Number(entry.interface_count))){
-          normalized.interfaceCount = Number(entry.interface_count);
-        }
-        const previewRouter = entry.preview_router;
-        if(previewRouter && typeof previewRouter === 'object'){
-          const routerNodeId = previewRouter.node_id ?? previewRouter.id ?? null;
-          if(routerNodeId !== null && routerNodeId !== undefined){
-            normalized.previewRouter = {
-              nodeId: routerNodeId,
-              name: previewRouter.name || null,
-            };
-            if(previewRouter.metadata && typeof previewRouter.metadata === 'object'){
-              const metaRouterId = previewRouter.metadata.target_router_id ?? previewRouter.metadata.peer_router_node_id ?? null;
-              if(metaRouterId !== null && metaRouterId !== undefined){
-                normalized.targetRouterId = metaRouterId;
-              }
-            }
+          if(linkMeta.existingRouterIp4 && !clone.existing_router_ip4){
+            clone.existing_router_ip4 = linkMeta.existingRouterIp4;
           }
-        }
-        const previewSwitch = entry.preview_switch;
-        if(previewSwitch && typeof previewSwitch === 'object'){
-          const switchNodeId = previewSwitch.node_id ?? previewSwitch.switch_id ?? null;
-          if(switchNodeId !== null && switchNodeId !== undefined){
-            normalized.previewSwitch = {
-              nodeId: switchNodeId,
-              name: previewSwitch.name || null,
-              routerId: null,
-            };
-            if(previewSwitch.metadata && typeof previewSwitch.metadata === 'object'){
-              const metaRouterId = previewSwitch.metadata.target_router_id ?? previewSwitch.metadata.peer_router_node_id ?? null;
-              if(metaRouterId !== null && metaRouterId !== undefined){
-                normalized.targetRouterId = normalized.targetRouterId ?? metaRouterId;
-                normalized.previewSwitch.routerId = metaRouterId;
-              }
-            }
+          if(linkMeta.networkCidr && !clone.link_network_cidr){
+            clone.link_network_cidr = linkMeta.networkCidr;
           }
-        }
-        const explicitTarget = entry.target_router_id ?? entry.peer_router_node_id;
-        if(explicitTarget !== null && explicitTarget !== undefined){
-          normalized.targetRouterId = normalized.targetRouterId ?? explicitTarget;
-        }
-        return normalized;
-      }).filter(Boolean);
-      if(!sanitized.length) return null;
+          if(linkMeta.netmask && !clone.netmask){
+            clone.netmask = linkMeta.netmask;
+          }
+          return clone;
+        })
+        .filter(Boolean);
+
+      if(!interfaces.length) return null;
 
       const normalizeName = (raw, idx) => {
         let base = (raw || `iface-${idx}`).toString().trim().toLowerCase();
@@ -863,27 +1011,92 @@
       noteExisting(basePreview?.bridge_router_id);
       noteExisting(basePreview?.internal_peer_router_id);
 
-      const routerPeers = routers.filter(r => r && r.node_id !== undefined && r.node_id !== null).slice().sort((a, b) => {
-        const aid = Number(a?.node_id ?? a?.id ?? 0);
-        const bid = Number(b?.node_id ?? b?.id ?? 0);
-        return aid - bid;
+      const routerPeers = routers
+        .filter(r => r && r.node_id !== undefined && r.node_id !== null)
+        .slice()
+        .sort((a, b) => {
+          const aid = Number(a?.node_id ?? a?.id ?? 0);
+          const bid = Number(b?.node_id ?? b?.id ?? 0);
+          return aid - bid;
+        });
+      const routerPeerMap = new Map();
+      routerPeers.forEach(peer => {
+        const peerId = peer?.node_id ?? peer?.id;
+        if(peerId !== undefined && peerId !== null){
+          routerPeerMap.set(String(peerId), peer);
+        }
       });
-      const hostPeers = hosts.filter(h => h && h.node_id !== undefined && h.node_id !== null).slice().sort((a, b) => {
-        const aid = Number(a?.node_id ?? a?.id ?? 0);
-        const bid = Number(b?.node_id ?? b?.id ?? 0);
-        return aid - bid;
-      });
-
-      const existingSubnets = switches.filter(sw => sw && sw.switch_id !== undefined && sw.switch_id !== null).slice().sort((a, b) => {
-        const aid = Number(a?.switch_id ?? a?.id ?? 0);
-        const bid = Number(b?.switch_id ?? b?.id ?? 0);
-        return aid - bid;
-      });
-
-      const scenarioSeed = typeof scenarioKeySeed === 'string' && scenarioKeySeed ? scenarioKeySeed : '__default__';
+      const hostPeers = hosts
+        .filter(h => h && h.node_id !== undefined && h.node_id !== null)
+        .slice()
+        .sort((a, b) => {
+          const aid = Number(a?.node_id ?? a?.id ?? 0);
+          const bid = Number(b?.node_id ?? b?.id ?? 0);
+          return aid - bid;
+        });
+      const existingSubnets = switches
+        .filter(sw => sw && sw.switch_id !== undefined && sw.switch_id !== null)
+        .slice()
+        .sort((a, b) => {
+          const aid = Number(a?.switch_id ?? a?.id ?? 0);
+          const bid = Number(b?.switch_id ?? b?.id ?? 0);
+          return aid - bid;
+        });
 
       const resultNodes = [];
       const resultLinks = [];
+      const includedRouterNodeIds = new Set();
+      const includedSwitchNodeIds = new Set();
+      const routerOverlayMap = new Map();
+      const switchOverlayMap = new Map();
+      const routerSwitchInterfaceMap = new Map();
+
+      const registerRouterOverlayNode = (node) => {
+        if(!node) return;
+        const key = String(node.id ?? node.node_id);
+        if(!key) return;
+        routerOverlayMap.set(key, node);
+      };
+
+      const getOrCreateRouterOverlayNode = (routerId, fallbackLabel = null) => {
+        if(routerId === null || routerId === undefined) return null;
+        const key = String(routerId);
+        if(routerOverlayMap.has(key)){
+          return routerOverlayMap.get(key);
+        }
+        let node = resultNodes.find(existing => String(existing.id ?? existing.node_id) === key);
+        if(!node){
+          const basePeer = routerPeerMap.get(key);
+          const label = fallbackLabel || basePeer?.name || `Router ${routerId}`;
+          node = {
+            id: routerId,
+            node_id: routerId,
+            type: 'router',
+            label,
+            name: label,
+            isHitlRouter: true,
+          };
+          resultNodes.push(node);
+          includedRouterNodeIds.add(routerId);
+        }
+        registerRouterOverlayNode(node);
+        return node;
+      };
+
+      const registerSwitchOverlayNode = (node) => {
+        if(!node) return;
+        const key = String(node.switch_id ?? node.id);
+        if(!key) return;
+        switchOverlayMap.set(key, node);
+      };
+
+      const registerRouterSwitchInterface = (routerId, entry) => {
+        if(routerId === null || routerId === undefined) return;
+        const key = String(routerId);
+        const list = routerSwitchInterfaceMap.get(key) || [];
+        list.push(entry);
+        routerSwitchInterfaceMap.set(key, list);
+      };
 
       const makeUniqueId = (base) => {
         let candidate = base;
@@ -896,7 +1109,7 @@
         return candidate;
       };
 
-      sanitized.forEach((iface, idx) => {
+      interfaces.forEach((iface, idx) => {
         const baseName = normalizeName(iface.name, idx);
         const attachmentPref = normalizeHitlAttachment(iface.attachment);
         const nodeId = makeUniqueId(`hitl-${baseName}`);
@@ -909,6 +1122,7 @@
           labelParts.push(iface.mac);
         }
         const nodeLabel = labelParts.filter(Boolean).join(' · ') || iface.name || `HITL ${idx + 1}`;
+        const linkMeta = iface.hitl_link_meta || deriveHitlLinkMeta(iface, idx, totalInterfaces, hitlScenarioKey) || {};
         const hitlNode = {
           id: nodeId,
           type: 'rj45',
@@ -917,102 +1131,315 @@
           isHitl: true,
           hitlInterface: iface,
           attachment: attachmentPref,
+          hitlLinkMeta: linkMeta,
         };
-        if(Array.isArray(iface.ipv4) && iface.ipv4.length){
+        if(linkMeta && linkMeta.rj45Ip4){
+          hitlNode.ip4 = linkMeta.rj45Ip4;
+        } else if(Array.isArray(iface.ipv4) && iface.ipv4.length){
           hitlNode.ip4 = iface.ipv4[0];
         }
+        if(linkMeta && (linkMeta.networkCidr || linkMeta.network)){
+          hitlNode.linkNetwork = linkMeta.networkCidr || linkMeta.network;
+        }
+        if(linkMeta && Number.isFinite(linkMeta.prefixLen)){
+          hitlNode.prefixLen = Number(linkMeta.prefixLen);
+        }
+        if(linkMeta && linkMeta.newRouterIp4){
+          hitlNode.peerRouterIp4 = linkMeta.newRouterIp4;
+        }
+        if(linkMeta && linkMeta.existingRouterIp4){
+          hitlNode.existingRouterIp4 = linkMeta.existingRouterIp4;
+        }
+        if(linkMeta && linkMeta.netmask){
+          hitlNode.netmask = linkMeta.netmask;
+        }
+        if(linkMeta && linkMeta.broadcastIp4){
+          hitlNode.broadcastIp4 = linkMeta.broadcastIp4;
+        }
         resultNodes.push(hitlNode);
-        const rng = makeDeterministicRng(`${scenarioSeed}|${iface.name}|${idx}|${sanitized.length}`);
-        const attempts = attachmentAttemptOrder(attachmentPref);
+
+        const rng = makeDeterministicRng(`${scenarioSeed}|${iface.name}|${idx}|${interfaces.length}`);
+        const attempts = hitlAttachmentAttemptOrder(attachmentPref);
         let targetId = null;
         let assignment = null;
         let linkKind = 'hitl-peer';
-        let uplinkRouterId = (iface.targetRouterId !== undefined && iface.targetRouterId !== null)
-          ? iface.targetRouterId
-          : null;
+        let uplinkRouterId = null;
+
         const pickRouterPeer = () => {
           if(!routerPeers.length) return null;
-          const peer = routerPeers[Math.floor(rng() * routerPeers.length)];
+          const peer = routerPeers[Math.floor(rng() * routerPeers.length) % routerPeers.length];
           const peerId = peer?.node_id ?? peer?.id;
           return (peerId !== undefined && peerId !== null) ? peerId : null;
         };
+
         const pickSwitchPeer = () => {
           if(!existingSubnets.length) return null;
-          const subnet = existingSubnets[Math.floor(rng() * existingSubnets.length)];
+          const subnet = existingSubnets[Math.floor(rng() * existingSubnets.length) % existingSubnets.length];
           const candidateId = subnet?.switch_id ?? subnet?.id;
           return (candidateId !== undefined && candidateId !== null) ? candidateId : null;
         };
+
         const createNewRouter = () => {
-          const routerId = makeUniqueId(`hitl-router-${baseName}`);
-          const routerLabel = `HITL Router ${idx + 1}`;
-          const routerNode = {
-            id: routerId,
-            node_id: routerId,
-            type: 'router',
-            label: routerLabel,
-            name: routerLabel,
-            isHitlRouter: true,
-            attachment: attachmentPref,
-            hitlInterface: iface,
+          const previewRouterMeta = iface.preview_router || iface.previewRouter || null;
+          const matchPreviewRouter = () => {
+            if(previewRouterMeta && (previewRouterMeta.node_id ?? previewRouterMeta.nodeId ?? previewRouterMeta.id) !== undefined){
+              return previewRouterMeta;
+            }
+            return routerPeers.find(peer => {
+              if(!peer) return false;
+              const meta = peer.metadata || peer.meta || peer.details || null;
+              if(!meta || meta.hitl_preview !== true) return false;
+              if(iface.slug && typeof meta.hitl_slug === 'string' && meta.hitl_slug === iface.slug) return true;
+              const ifaceNameLower = (iface.name || '').toString().trim().toLowerCase();
+              if(ifaceNameLower && typeof meta.hitl_interface_name === 'string' && meta.hitl_interface_name.trim().toLowerCase() === ifaceNameLower){
+                return true;
+              }
+              if(Number.isFinite(meta.ordinal) && meta.ordinal === idx) return true;
+              return false;
+            }) || null;
           };
-          const routerCandidates = routerPeers.length ? routerPeers.slice() : [];
-          if(routerCandidates.length){
-            const chosen = routerCandidates[Math.floor(rng() * routerCandidates.length) % routerCandidates.length];
-            const chosenId = chosen?.node_id ?? chosen?.id;
-            if(chosenId !== undefined && chosenId !== null){
-              uplinkRouterId = chosenId;
-              routerNode.uplinkRouterId = chosenId;
-              noteExisting(chosenId);
-              resultLinks.push({ sourceId: routerId, targetId: chosenId, kind: 'hitl-router-uplink', attachment: attachmentPref, assignment: 'uplink_router' });
+
+          const previewRouter = matchPreviewRouter();
+          if(previewRouter){
+            const routerId = previewRouter.node_id ?? previewRouter.nodeId ?? previewRouter.id;
+            if(routerId !== undefined && routerId !== null){
+              noteExisting(routerId);
+              const routerLabel = previewRouter.name || `HITL Router ${idx + 1}`;
+              const meta = previewRouter.metadata || previewRouter.meta || {};
+              if(meta && meta.uplink_router_node_id !== undefined && meta.uplink_router_node_id !== null){
+                uplinkRouterId = meta.uplink_router_node_id;
+              } else if(meta && meta.uplinkRouterId !== undefined && meta.uplinkRouterId !== null){
+                uplinkRouterId = meta.uplinkRouterId;
+              }
+              const prefixCandidate = Number.isFinite(linkMeta?.prefixLen) ? Number(linkMeta.prefixLen) : (Number.isFinite(meta?.prefix_len) ? Number(meta.prefix_len) : null);
+              const routerNode = getOrCreateRouterOverlayNode(routerId, routerLabel);
+              if(routerNode){
+                const assignIfMissing = (key, value) => {
+                  if(value === undefined || value === null) return;
+                  if(routerNode[key] === undefined || routerNode[key] === null){
+                    routerNode[key] = value;
+                  }
+                };
+                assignIfMissing('label', routerLabel);
+                assignIfMissing('name', routerLabel);
+                routerNode.isHitlRouter = true;
+                routerNode.attachment = routerNode.attachment || attachmentPref;
+                routerNode.previewRouter = routerNode.previewRouter || previewRouter;
+                routerNode.hitlInterface = routerNode.hitlInterface || iface;
+                if(linkMeta && !routerNode.hitlLinkMeta){
+                  routerNode.hitlLinkMeta = linkMeta;
+                }
+                if(meta && meta.new_router_ip4){
+                  const value = prefixCandidate && !String(meta.new_router_ip4).includes('/')
+                    ? `${meta.new_router_ip4}/${prefixCandidate}`
+                    : meta.new_router_ip4;
+                  assignIfMissing('ip4', value);
+                } else if(linkMeta && linkMeta.newRouterIp4){
+                  const value = prefixCandidate && !String(linkMeta.newRouterIp4).includes('/')
+                    ? `${linkMeta.newRouterIp4}/${prefixCandidate}`
+                    : linkMeta.newRouterIp4;
+                  assignIfMissing('ip4', value);
+                } else if(typeof previewRouter.ip4 === 'string'){
+                  assignIfMissing('ip4', previewRouter.ip4);
+                }
+                if(meta && meta.existing_router_ip4){
+                  assignIfMissing('peerRouterIp4', meta.existing_router_ip4);
+                } else if(linkMeta && linkMeta.existingRouterIp4){
+                  assignIfMissing('peerRouterIp4', linkMeta.existingRouterIp4);
+                }
+                if(linkMeta && (linkMeta.networkCidr || linkMeta.network)){
+                  assignIfMissing('linkNetwork', linkMeta.networkCidr || linkMeta.network);
+                } else if(meta && meta.link_network){
+                  assignIfMissing('linkNetwork', meta.link_network);
+                }
+                if(Number.isFinite(prefixCandidate)){
+                  assignIfMissing('prefixLen', prefixCandidate);
+                }
+                if(uplinkRouterId !== null && (routerNode.uplinkRouterId === undefined || routerNode.uplinkRouterId === null)){
+                  routerNode.uplinkRouterId = uplinkRouterId;
+                }
+                registerRouterOverlayNode(routerNode);
+              }
+              if(!routerPeers.some(peer => String(peer?.node_id ?? peer?.id) === String(routerId))){
+                routerPeers.push(previewRouter);
+              }
+              routerPeerMap.set(String(routerId), previewRouter);
+              return routerId;
             }
           }
-          resultNodes.push(routerNode);
+
+          const routerId = makeUniqueId(`hitl-router-${baseName}`);
+          const routerLabel = `HITL Router ${idx + 1}`;
+          const routerNode = getOrCreateRouterOverlayNode(routerId, routerLabel);
+          if(routerNode){
+            const assignIfMissing = (key, value) => {
+              if(value === undefined || value === null) return;
+              if(routerNode[key] === undefined || routerNode[key] === null){
+                routerNode[key] = value;
+              }
+            };
+            assignIfMissing('label', routerLabel);
+            assignIfMissing('name', routerLabel);
+            routerNode.isHitlRouter = true;
+            routerNode.hitlInterface = routerNode.hitlInterface || iface;
+            routerNode.attachment = routerNode.attachment || attachmentPref;
+            if(linkMeta && !routerNode.hitlLinkMeta){
+              routerNode.hitlLinkMeta = linkMeta;
+            }
+            if(linkMeta && linkMeta.newRouterIp4){
+              const withPrefix = Number.isFinite(linkMeta.prefixLen) && !String(linkMeta.newRouterIp4).includes('/')
+                ? `${linkMeta.newRouterIp4}/${linkMeta.prefixLen}`
+                : linkMeta.newRouterIp4;
+              assignIfMissing('ip4', withPrefix);
+            }
+            if(linkMeta && (linkMeta.networkCidr || linkMeta.network)){
+              assignIfMissing('linkNetwork', linkMeta.networkCidr || linkMeta.network);
+            }
+            if(linkMeta && Number.isFinite(linkMeta.prefixLen)){
+              assignIfMissing('prefixLen', Number(linkMeta.prefixLen));
+            }
+            if(linkMeta && linkMeta.existingRouterIp4){
+              assignIfMissing('peerRouterIp4', linkMeta.existingRouterIp4);
+            }
+            const routerCandidates = routerPeers.length ? routerPeers.slice() : [];
+            if(routerCandidates.length){
+              const chosen = routerCandidates[Math.floor(rng() * routerCandidates.length) % routerCandidates.length];
+              const chosenId = chosen?.node_id ?? chosen?.id;
+              if(chosenId !== undefined && chosenId !== null){
+                uplinkRouterId = chosenId;
+                assignIfMissing('uplinkRouterId', chosenId);
+                noteExisting(chosenId);
+                resultLinks.push({ sourceId: routerId, targetId: chosenId, kind: 'hitl-router-uplink', attachment: attachmentPref, assignment: 'uplink_router', linkMeta });
+              }
+            }
+            registerRouterOverlayNode(routerNode);
+          }
           routerPeers.push({ node_id: routerId, id: routerId, name: routerLabel, type: 'router', isHitlRouter: true });
+          routerPeerMap.set(String(routerId), { node_id: routerId, id: routerId, name: routerLabel, type: 'router', isHitlRouter: true });
           noteExisting(routerId);
           return routerId;
         };
+
         const createNewSwitch = () => {
-          const previewSwitchMeta = iface.previewSwitch;
-          if(previewSwitchMeta && previewSwitchMeta.nodeId !== null && previewSwitchMeta.nodeId !== undefined){
-            const existingSwitchId = previewSwitchMeta.nodeId;
-            noteExisting(existingSwitchId);
-            if(!existingSubnets.some(sw => (sw?.switch_id ?? sw?.id) === existingSwitchId)){
-              existingSubnets.push({ switch_id: existingSwitchId, id: existingSwitchId, name: previewSwitchMeta.name || `sw-${existingSwitchId}`, isHitlSwitch: true });
+          const previewSwitchMetaRaw = iface.preview_switch || iface.previewSwitch || null;
+          const previewSwitchId = previewSwitchMetaRaw && (previewSwitchMetaRaw.node_id ?? previewSwitchMetaRaw.nodeId ?? previewSwitchMetaRaw.id);
+          if(previewSwitchMetaRaw && previewSwitchId !== undefined && previewSwitchId !== null){
+            const switchId = previewSwitchId;
+            const switchLabel = previewSwitchMetaRaw.name || `HITL Switch ${idx + 1}`;
+            noteExisting(switchId);
+            let switchNode = switchOverlayMap.get(String(switchId));
+            if(!switchNode){
+              switchNode = {
+                id: switchId,
+                switch_id: switchId,
+                type: 'switch',
+                label: switchLabel,
+                name: switchLabel,
+                isHitlSwitch: true,
+                hitlInterface: iface,
+                attachment: attachmentPref,
+                previewSwitch: previewSwitchMetaRaw,
+              };
+              resultNodes.push(switchNode);
+              includedSwitchNodeIds.add(switchId);
+              registerSwitchOverlayNode(switchNode);
+            } else {
+              if(!switchNode.label) switchNode.label = switchLabel;
+              if(!switchNode.name) switchNode.name = switchLabel;
+              switchNode.isHitlSwitch = true;
+              switchNode.hitlInterface = switchNode.hitlInterface || iface;
+              switchNode.attachment = switchNode.attachment || attachmentPref;
+              switchNode.previewSwitch = switchNode.previewSwitch || previewSwitchMetaRaw;
+              registerSwitchOverlayNode(switchNode);
             }
-            const hintedRouterId = iface.targetRouterId ?? previewSwitchMeta.routerId ?? null;
+            if(linkMeta && !switchNode.hitlLinkMeta){
+              switchNode.hitlLinkMeta = linkMeta;
+            }
+            if(!existingSubnets.some(sw => String(sw?.switch_id ?? sw?.id) === String(switchId))){
+              existingSubnets.push({ switch_id: switchId, id: switchId, name: switchLabel, isHitlSwitch: true });
+            }
+            const hintedRouterId = iface.targetRouterId ?? previewSwitchMetaRaw.router_id ?? previewSwitchMetaRaw.routerId ?? null;
             if(hintedRouterId !== null && hintedRouterId !== undefined){
               uplinkRouterId = hintedRouterId;
+              if(switchNode.router_id === undefined || switchNode.router_id === null){
+                switchNode.router_id = hintedRouterId;
+              }
+              if(switchNode.uplinkRouterId === undefined || switchNode.uplinkRouterId === null){
+                switchNode.uplinkRouterId = hintedRouterId;
+              }
             }
-            return existingSwitchId;
+            return switchId;
           }
+
           const switchId = makeUniqueId(`hitl-switch-${baseName}`);
           const switchLabel = `HITL Switch ${idx + 1}`;
-          const switchNode = {
-            id: switchId,
-            switch_id: switchId,
-            type: 'switch',
-            label: switchLabel,
-            name: switchLabel,
-            isHitlSwitch: true,
-            hitlInterface: iface,
-            attachment: attachmentPref,
+          let switchNode = switchOverlayMap.get(String(switchId));
+          if(!switchNode){
+            switchNode = {
+              id: switchId,
+              switch_id: switchId,
+              type: 'switch',
+              label: switchLabel,
+              name: switchLabel,
+              isHitlSwitch: true,
+              hitlInterface: iface,
+              attachment: attachmentPref,
+            };
+            resultNodes.push(switchNode);
+            includedSwitchNodeIds.add(switchId);
+          } else {
+            if(!switchNode.label) switchNode.label = switchLabel;
+            if(!switchNode.name) switchNode.name = switchLabel;
+            switchNode.isHitlSwitch = true;
+            switchNode.hitlInterface = switchNode.hitlInterface || iface;
+            switchNode.attachment = switchNode.attachment || attachmentPref;
+          }
+          registerSwitchOverlayNode(switchNode);
+          const assignSwitchIfMissing = (key, value) => {
+            if(value === undefined || value === null) return;
+            if(switchNode[key] === undefined || switchNode[key] === null){
+              switchNode[key] = value;
+            }
           };
+          if(linkMeta){
+            switchNode.hitlLinkMeta = switchNode.hitlLinkMeta || linkMeta;
+            assignSwitchIfMissing('switch_ip', linkMeta.rj45Ip4 || null);
+            assignSwitchIfMissing('router_ip', linkMeta.newRouterIp4 || null);
+            assignSwitchIfMissing('link_network_cidr', linkMeta.networkCidr || null);
+            assignSwitchIfMissing('link_network', linkMeta.network || null);
+          }
+          let routerLinkEstablished = false;
           const routerCandidates = routerPeers.length ? routerPeers.slice() : [];
           if(routerCandidates.length){
             const chosen = routerCandidates[Math.floor(rng() * routerCandidates.length) % routerCandidates.length];
             const chosenId = chosen?.node_id ?? chosen?.id;
             if(chosenId !== undefined && chosenId !== null){
               uplinkRouterId = chosenId;
-              switchNode.uplinkRouterId = chosenId;
+              assignSwitchIfMissing('router_id', chosenId);
+              switchNode.uplinkRouterId = switchNode.uplinkRouterId ?? chosenId;
               noteExisting(chosenId);
               resultLinks.push({ sourceId: switchId, targetId: chosenId, kind: 'hitl-switch-uplink', attachment: attachmentPref, assignment: 'uplink_switch' });
+              routerLinkEstablished = true;
             }
           }
-          resultNodes.push(switchNode);
-          existingSubnets.push({ switch_id: switchId, id: switchId, name: switchLabel, isHitlSwitch: true });
+          if(!routerLinkEstablished){
+            const fallbackRouterId = createNewRouter();
+            if(fallbackRouterId !== null && fallbackRouterId !== undefined){
+              uplinkRouterId = fallbackRouterId;
+              assignSwitchIfMissing('router_id', fallbackRouterId);
+              switchNode.uplinkRouterId = fallbackRouterId;
+              noteExisting(fallbackRouterId);
+              resultLinks.push({ sourceId: switchId, targetId: fallbackRouterId, kind: 'hitl-switch-uplink', attachment: attachmentPref, assignment: 'uplink_switch' });
+              routerLinkEstablished = true;
+            }
+          }
+          if(!existingSubnets.some(sw => String(sw?.switch_id ?? sw?.id) === String(switchId))){
+            existingSubnets.push({ switch_id: switchId, id: switchId, name: switchLabel, isHitlSwitch: true });
+          }
           noteExisting(switchId);
           return switchId;
         };
+
         for(const attempt of attempts){
           if(attempt === 'existing_router'){
             const candidate = pickRouterPeer();
@@ -1051,6 +1478,7 @@
             }
           }
         }
+
         if(targetId === null){
           const fallbackRouter = pickRouterPeer();
           if(fallbackRouter !== null){
@@ -1061,8 +1489,9 @@
             uplinkRouterId = fallbackRouter;
           }
         }
+
         if(targetId === null && hostPeers.length){
-          const peer = hostPeers[Math.floor(rng() * hostPeers.length)];
+          const peer = hostPeers[Math.floor(rng() * hostPeers.length) % hostPeers.length];
           const peerId = peer?.node_id ?? peer?.id;
           if(peerId !== undefined && peerId !== null){
             targetId = peerId;
@@ -1071,10 +1500,11 @@
             noteExisting(peerId);
           }
         }
+
         if(targetId === null){
           const networkId = makeUniqueId(`hitl-net-${baseName}`);
           const networkLabel = `HITL Network ${idx + 1}`;
-          const networkNode = {
+          resultNodes.push({
             id: networkId,
             type: 'network',
             label: networkLabel,
@@ -1082,23 +1512,78 @@
             isHitlNetwork: true,
             hitlInterface: iface,
             attachment: attachmentPref,
-          };
-          resultNodes.push(networkNode);
+          });
           targetId = networkId;
           assignment = assignment ?? 'network';
           linkKind = 'hitl-network';
         }
+
         if(targetId !== null){
           hitlNode.peerNodeId = targetId;
           hitlNode.assignment = assignment || attachmentPref;
           if(uplinkRouterId !== null){
             hitlNode.uplinkRouterId = uplinkRouterId;
           }
-          resultLinks.push({ sourceId: nodeId, targetId, kind: linkKind, attachment: attachmentPref, assignment: assignment || attachmentPref });
+          resultLinks.push({
+            sourceId: nodeId,
+            targetId,
+            kind: linkKind,
+            attachment: attachmentPref,
+            assignment: assignment || attachmentPref,
+            linkMeta,
+          });
+        }
+
+        if(assignment === 'new_switch' && uplinkRouterId !== null){
+          const switchKey = String(targetId);
+          const overlaySwitch = switchOverlayMap.get(switchKey);
+          if(overlaySwitch){
+            if(overlaySwitch.router_id === undefined || overlaySwitch.router_id === null){
+              overlaySwitch.router_id = uplinkRouterId;
+            }
+            if(overlaySwitch.uplinkRouterId === undefined || overlaySwitch.uplinkRouterId === null){
+              overlaySwitch.uplinkRouterId = uplinkRouterId;
+            }
+            if(linkMeta && !overlaySwitch.hitlLinkMeta){
+              overlaySwitch.hitlLinkMeta = linkMeta;
+            }
+            if(linkMeta && linkMeta.newRouterIp4 && !overlaySwitch.router_ip){
+              overlaySwitch.router_ip = linkMeta.newRouterIp4;
+            }
+            if(linkMeta && linkMeta.rj45Ip4 && !overlaySwitch.switch_ip){
+              overlaySwitch.switch_ip = linkMeta.rj45Ip4;
+            }
+            if(linkMeta && linkMeta.networkCidr && !overlaySwitch.link_network_cidr){
+              overlaySwitch.link_network_cidr = linkMeta.networkCidr;
+            }
+            if(linkMeta && linkMeta.network && !overlaySwitch.link_network){
+              overlaySwitch.link_network = linkMeta.network;
+            }
+            registerSwitchOverlayNode(overlaySwitch);
+          }
+          const routerNode = getOrCreateRouterOverlayNode(uplinkRouterId);
+          if(routerNode){
+            const switchLabel = overlaySwitch?.label || overlaySwitch?.name || `HITL Switch ${targetId}`;
+            registerRouterSwitchInterface(uplinkRouterId, {
+              switch_id: targetId,
+              switch_label: switchLabel,
+              router_ip: overlaySwitch?.router_ip || linkMeta?.newRouterIp4 || null,
+              switch_ip: overlaySwitch?.switch_ip || linkMeta?.rj45Ip4 || null,
+              network: linkMeta?.network || null,
+              network_cidr: linkMeta?.networkCidr || null,
+            });
+          }
         }
       });
 
-      return resultNodes.length ? { nodes: resultNodes, links: resultLinks, interfaces: sanitized, hitlState: hitlCfg } : null;
+      routerSwitchInterfaceMap.forEach((entries, key) => {
+        const routerNode = getOrCreateRouterOverlayNode(key);
+        if(routerNode){
+          routerNode.hitlSwitchInterfaces = entries;
+        }
+      });
+
+      return resultNodes.length ? { nodes: resultNodes, links: resultLinks, interfaces } : null;
     }
 
     const hitlPreviewArtifacts = deriveStandaloneHitlArtifacts(previewData, hitlConfig, scenarioKey);
@@ -1119,6 +1604,11 @@
           const updateLabel = () => {
             btn.textContent = target.classList.contains('show') ? collapseLabel : expandLabel;
           };
+          target.addEventListener('shown.bs.collapse', updateLabel);
+          target.addEventListener('hidden.bs.collapse', updateLabel);
+          if(!target.classList.contains('show')){
+            instance.show();
+          }
           updateLabel();
           btn.addEventListener('click', ev => {
             ev.preventDefault();
@@ -1128,15 +1618,11 @@
               instance.show();
             }
           });
-          target.addEventListener('shown.bs.collapse', updateLabel);
-          target.addEventListener('hidden.bs.collapse', updateLabel);
         } else {
-          if(!target.classList.contains('d-none')){
-            target.classList.add('d-none');
-          }
           const updateLabel = () => {
             btn.textContent = target.classList.contains('d-none') ? expandLabel : collapseLabel;
           };
+          target.classList.remove('d-none');
           updateLabel();
           btn.addEventListener('click', ev => {
             ev.preventDefault();
@@ -1146,7 +1632,12 @@
         }
       });
     }
-    function buildGraph(){
+    function buildGraph(options){
+    const labelToggle = document.getElementById('graphLabelsToggle');
+    const shouldShowLabels = !!(labelToggle && labelToggle.checked);
+    if(labelToggle){
+      labelToggle.dataset.graphLabelsState = shouldShowLabels ? 'on' : 'off';
+    }
     if(!window.d3){ document.getElementById('previewGraph').textContent='d3 not loaded'; return; }
     const wrap = d3.select('#previewGraph');
     wrap.selectAll('*').remove();
@@ -1340,6 +1831,75 @@
     if(hitlPreviewArtifacts && Array.isArray(hitlPreviewArtifacts.nodes)){
       hitlPreviewArtifacts.nodes.forEach(node => {
         if(!node) return;
+        const sourceId = node.id ?? node.node_id ?? null;
+        if(sourceId !== null){
+          const existingIndex = nodes.findIndex(existing => String(existing.id) === String(sourceId));
+          if(existingIndex !== -1){
+            const existing = nodes[existingIndex];
+            const mergeFieldWhenMissing = (key) => {
+              if(node[key] !== undefined && node[key] !== null && (existing[key] === undefined || existing[key] === null)){
+                existing[key] = node[key];
+              }
+            };
+            mergeFieldWhenMissing('type');
+            mergeFieldWhenMissing('label');
+            mergeFieldWhenMissing('name');
+            mergeFieldWhenMissing('ip4');
+            mergeFieldWhenMissing('linkNetwork');
+            mergeFieldWhenMissing('prefixLen');
+            mergeFieldWhenMissing('netmask');
+            mergeFieldWhenMissing('peerRouterIp4');
+            mergeFieldWhenMissing('existingRouterIp4');
+            mergeFieldWhenMissing('broadcastIp4');
+            mergeFieldWhenMissing('attachment');
+            mergeFieldWhenMissing('assignment');
+            mergeFieldWhenMissing('hitlAttachment');
+            mergeFieldWhenMissing('hitlAssignment');
+            mergeFieldWhenMissing('hitlUplinkRouterId');
+            mergeFieldWhenMissing('uplinkRouterId');
+            if(node.hitlInterface && !existing.hitlInterface){
+              existing.hitlInterface = node.hitlInterface;
+            }
+            if(node.hitlLinkMeta && !existing.hitlLinkMeta){
+              existing.hitlLinkMeta = node.hitlLinkMeta;
+            }
+            if(Array.isArray(node.hitlSwitchInterfaces) && node.hitlSwitchInterfaces.length){
+              if(!Array.isArray(existing.hitlSwitchInterfaces)){
+                existing.hitlSwitchInterfaces = node.hitlSwitchInterfaces.slice();
+              } else {
+                const seenKeys = new Set(existing.hitlSwitchInterfaces.map(entry => {
+                  if(!entry) return '';
+                  return entry.switch_id !== undefined && entry.switch_id !== null ? String(entry.switch_id) : JSON.stringify(entry);
+                }));
+                node.hitlSwitchInterfaces.forEach(entry => {
+                  if(!entry) return;
+                  const key = entry.switch_id !== undefined && entry.switch_id !== null ? String(entry.switch_id) : JSON.stringify(entry);
+                  if(!seenKeys.has(key)){
+                    existing.hitlSwitchInterfaces.push(entry);
+                    seenKeys.add(key);
+                  }
+                });
+              }
+            }
+            if(node.isHitlRouter){
+              existing.isHitlRouter = true;
+            }
+            if(node.isHitl){
+              existing.isHitl = true;
+            }
+            if(node.hitlAttachment && !existing.hitlAttachment){
+              existing.hitlAttachment = node.hitlAttachment;
+            }
+            if(node.hitlAssignment && !existing.hitlAssignment){
+              existing.hitlAssignment = node.hitlAssignment;
+            }
+            if(node.hitlUplinkRouterId && !existing.hitlUplinkRouterId){
+              existing.hitlUplinkRouterId = node.hitlUplinkRouterId;
+            }
+            existing._hasHitlOverlay = true;
+            return;
+          }
+        }
         nodes.push({ ...node });
       });
     }
@@ -1525,7 +2085,7 @@
         return null;
       })
       .attr('opacity', 0.85);
-    const node = container.selectAll('g.node').data(nodes).enter().append('g').attr('class','node');
+  const node = container.selectAll('g.node').data(nodes).enter().append('g').attr('class','node');
     const hasVulnerableHosts = nodes.some(n => n.type === 'host' && n.hasVuln);
     if(hasVulnerableHosts){
       const vulnLegend = legend.append('g').attr('transform',`translate(0,${legendOffset})`);
@@ -1575,6 +2135,35 @@
       .attr('fill', vulnerabilityColor)
       .attr('stroke', '#333')
       .attr('stroke-width', 1);
+    const labelGroups = node.append('g').attr('class','node-label-wrapper').style('display', shouldShowLabels ? null : 'none');
+
+    const computeLabelWidth = (d) => {
+      const text = d.label || d.name || String(d.id);
+      return Math.max(24, (String(text).length * 6 + 6));
+    };
+
+    labelGroups.append('rect')
+      .attr('class','node-label-bg')
+      .attr('x', d => -computeLabelWidth(d) / 2)
+      .attr('y', 10)
+      .attr('width', d => computeLabelWidth(d))
+      .attr('height', 16)
+      .attr('rx', 3)
+      .attr('ry', 3)
+      .attr('fill', '#fff')
+      .attr('stroke', '#bbb')
+      .attr('stroke-width', 0.8)
+      .attr('opacity', 0.88);
+
+    labelGroups.append('text')
+      .attr('class','node-label-text')
+      .attr('text-anchor','middle')
+      .attr('x', 0)
+      .attr('y', 21)
+      .attr('font-size','10px')
+      .attr('fill','#212529')
+      .text(d => d.label || d.name || String(d.id));
+
     const simulation = d3.forceSimulation(nodes)
       .force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> {
         if(l.kind === 'base-cluster') return 60;
@@ -1679,6 +2268,13 @@
           hitlAssignment: node.assignment || null,
           hitlUplinkRouterId: node.uplinkRouterId || null,
           ip4: primaryIpv4,
+          router_id: node.router_id ?? node.uplinkRouterId ?? null,
+          router_ip: node.router_ip ?? node.peerRouterIp4 ?? (node.hitlLinkMeta ? node.hitlLinkMeta.newRouterIp4 : null),
+          switch_ip: node.switch_ip ?? (node.hitlLinkMeta ? node.hitlLinkMeta.rj45Ip4 : null),
+          link_network_cidr: node.link_network_cidr ?? (node.hitlLinkMeta ? node.hitlLinkMeta.networkCidr : null),
+          link_network: node.link_network ?? (node.hitlLinkMeta ? node.hitlLinkMeta.network : null),
+          hitlSwitchInterfaces: Array.isArray(node.hitlSwitchInterfaces) ? node.hitlSwitchInterfaces.slice() : null,
+          hitlLinkMeta: node.hitlLinkMeta || null,
           isHitlNetwork: !!node.isHitlNetwork,
         };
       })
@@ -1705,14 +2301,25 @@
             switchesDetail.filter(sw => sw.router_id === nid).forEach(sw=>{
               ifaceParts.push(`sw-${sw.switch_id}:${sw.router_ip || '-'}`);
             });
+            if(Array.isArray(n.hitlSwitchInterfaces)){
+              n.hitlSwitchInterfaces.forEach(entry => {
+                if(!entry) return;
+                const label = entry.switch_label || (entry.switch_id !== undefined ? `sw-${entry.switch_id}` : 'hitl-switch');
+                const routerIp = entry.router_ip || entry.switch_ip || '-';
+                const networkInfo = entry.network_cidr || entry.network || '';
+                const value = networkInfo ? `${routerIp} (${networkInfo})` : routerIp;
+                ifaceParts.push(`hitl-sw:${label}:${value}`);
+              });
+            }
             if(n.hitlUplinkRouterId){
               ifaceParts.push(`uplink-router:${n.hitlUplinkRouterId}`);
             }
           } else if(n._type === 'switch'){
-            if(typeof n.router_id !== 'undefined'){
+            if(n.router_id !== undefined && n.router_id !== null){
               ifaceParts.push(`router:${n.router_id}→${n.router_ip || '-'}`);
             }
             if(n.switch_ip){ ifaceParts.push(`uplink:${n.switch_ip}`); }
+            if(n.link_network_cidr){ ifaceParts.push(`lan:${n.link_network_cidr}`); }
             const hostIf = n.host_if_ips || {};
             Object.keys(hostIf).sort((a,b)=> Number(a) - Number(b)).forEach(hid=>{
               ifaceParts.push(`h${hid}:${hostIf[hid]}`);
@@ -1744,7 +2351,7 @@
         tbody.innerHTML = rowsHtml || '<tr><td colspan="10" class="text-muted fst-italic">(none)</td></tr>';
       }
     } catch(e) { console.warn('node section table build failed', e); }
-  // Node labels removed per request
+  // Node labels rendered conditionally via toggle
   function dragstarted(event,d){
     try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
     if(sim && !event.active){ sim.alphaTarget(0.35).restart(); }
@@ -1775,9 +2382,49 @@
     svg.on('mousedown', ()=> svg.style('cursor','grabbing'));
     window.addEventListener('mouseup', ()=> svg.style('cursor','grab'));
   // Close buildGraph function before invoking it
+  wrap.node().dataset.showLabels = shouldShowLabels ? 'on' : 'off';
+  wrap.selectAll('.node-label-wrapper').style('display', shouldShowLabels ? null : 'none');
+  try { sessionStorage.setItem('coretg_graph_labels_state', shouldShowLabels ? 'on' : 'off'); } catch(e){}
+
+    wrap.node().dispatchEvent(new CustomEvent('coretg-graph-ready', {
+      bubbles: true,
+      detail: { target: '#previewGraph', showLabels: shouldShowLabels, svg: svg.node() }
+    }));
   } // END buildGraph
   // Invoke graph build after definitions
+  const labelToggleEl = document.getElementById('graphLabelsToggle');
+  const wrapNode = document.getElementById('previewGraph');
+  const storageKey = 'coretg_fp_labels_state';
+  if(labelToggleEl && !labelToggleEl.dataset.bound){
+    labelToggleEl.dataset.bound = '1';
+    labelToggleEl.addEventListener('change', ()=>{
+      const show = !!labelToggleEl.checked;
+      labelToggleEl.dataset.graphLabelsState = show ? 'on' : 'off';
+      if(wrapNode){
+        wrapNode.dataset.showLabels = show ? 'on' : 'off';
+        d3.select(wrapNode).selectAll('.node-label-wrapper').style('display', show ? null : 'none');
+      }
+      try { sessionStorage.setItem(storageKey, show ? 'on' : 'off'); } catch(e){}
+    });
+  }
+  const savedLabelState = sessionStorage.getItem(storageKey) || labelToggleEl?.dataset.graphLabelsState;
+  if(labelToggleEl && savedLabelState){
+    labelToggleEl.checked = savedLabelState === 'on';
+  }
   buildGraph();
+
+  wrapNode?.addEventListener('coretg-graph-ready', (ev)=>{
+    const show = ev.detail?.showLabels ?? (labelToggleEl ? labelToggleEl.checked : false);
+    if(labelToggleEl){
+      labelToggleEl.checked = show;
+      labelToggleEl.dataset.graphLabelsState = show ? 'on' : 'off';
+      try { sessionStorage.setItem(storageKey, show ? 'on' : 'off'); } catch(e){}
+    }
+    if(wrapNode){
+      wrapNode.dataset.showLabels = show ? 'on' : 'off';
+      d3.select(wrapNode).selectAll('.node-label-wrapper').style('display', show ? null : 'none');
+    }
+  });
   setupPreviewCollapsers();
   // Unified scripts listing modal logic
   function openScriptsModal(initialKind){

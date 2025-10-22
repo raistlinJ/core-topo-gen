@@ -254,15 +254,28 @@ def _compute_hitl_link_ips(
         hosts = list(network.hosts())
         if len(hosts) < 3:
             return None
+        rng = _make_deterministic_rng(f"{scenario_key or '__default__'}|{iface_name or ordinal}|{ordinal}|ips")
+        available = hosts[:]
+        selected_hosts: List[ipaddress.IPv4Address] = []
+        for _ in range(3):
+            if not available:
+                break
+            try:
+                choice_idx = int(rng() * len(available)) % len(available)
+            except Exception:
+                choice_idx = 0
+            selected_hosts.append(available.pop(choice_idx))
+        if len(selected_hosts) < 3:
+            return None
         return {
             "network": str(network.network_address),
             "network_cidr": f"{network.network_address}/{prefix_len}",
             "prefix_len": prefix_len,
             "netmask": str(network.netmask),
             "broadcast_ip4": str(network.broadcast_address),
-            "existing_router_ip4": str(hosts[0]),
-            "new_router_ip4": str(hosts[1]),
-            "rj45_ip4": str(hosts[2]),
+            "existing_router_ip4": str(selected_hosts[0]),
+            "new_router_ip4": str(selected_hosts[1]),
+            "rj45_ip4": str(selected_hosts[2]),
         }
     except Exception:
         return None

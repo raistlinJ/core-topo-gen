@@ -280,8 +280,14 @@ def test_hitl_preview_switch_added_to_full_preview() -> None:
     assert detail is not None, 'expected detail for preview switch'
     assert detail.get('router_id') == 201
     assert detail.get('hitl_preview') is True
-    assert detail.get('router_ip') is None
-    assert detail.get('switch_ip') is None
+    router_ip = detail.get('router_ip')
+    switch_ip = detail.get('switch_ip')
+    assert router_ip, 'router_ip should be populated for HITL switch link'
+    assert switch_ip, 'switch_ip should be populated for HITL switch link'
+    meta = detail.get('metadata') or {}
+    if meta:
+        assert meta.get('router_ip4') == router_ip
+        assert meta.get('switch_ip4') == switch_ip
     assert full_preview.get('hitl_switch_ids') and preview_switch['node_id'] in full_preview['hitl_switch_ids']
 
 
