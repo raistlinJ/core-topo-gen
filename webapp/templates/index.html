@@ -511,7 +511,6 @@ const HITL_ATTACHMENT_CHOICES = [
     { value: 'existing_router', label: 'Existing Router' },
     { value: 'existing_switch', label: 'Existing Switch' },
     { value: 'new_router', label: 'New Router' },
-    { value: 'new_switch', label: 'New Switch' },
 ];
 
 const HITL_ATTACHMENT_ALLOWED = new Set(HITL_ATTACHMENT_CHOICES.map(opt => opt.value));
@@ -535,14 +534,12 @@ function hitlAttachmentAttemptOrder(preference) {
     const normalized = normalizeHitlAttachment(preference);
     switch (normalized) {
         case 'existing_router':
-            return ['existing_router', 'existing_switch', 'new_switch', 'new_router'];
+            return ['existing_router', 'existing_switch', 'new_router'];
         case 'existing_switch':
-            return ['existing_switch', 'existing_router', 'new_switch', 'new_router'];
+            return ['existing_switch', 'existing_router', 'new_router'];
         case 'new_router':
-            return ['new_router', 'existing_router', 'existing_switch', 'new_switch'];
-        case 'new_switch':
         default:
-            return ['new_switch', 'existing_switch', 'existing_router', 'new_router'];
+            return ['new_router', 'existing_router', 'existing_switch'];
     }
 }
 
@@ -1446,14 +1443,6 @@ function deriveHitlPreviewArtifacts(full) {
                     linkKind = 'hitl-router';
                     break;
                 }
-            } else if (attempt === 'new_switch') {
-                const newSwitchId = createNewSwitch();
-                if (newSwitchId !== null) {
-                    targetId = newSwitchId;
-                    assignment = 'new_switch';
-                    linkKind = 'hitl-switch';
-                    break;
-                }
             }
         }
         if (targetId === null) {
@@ -1506,46 +1495,6 @@ function deriveHitlPreviewArtifacts(full) {
                 assignment: assignment || attachmentPref,
                 linkMeta,
             });
-        }
-        if (assignment === 'new_switch' && uplinkRouterId !== null) {
-            const switchKey = String(targetId);
-            const overlaySwitch = switchOverlayMap.get(switchKey);
-            if (overlaySwitch) {
-                if (overlaySwitch.router_id === undefined || overlaySwitch.router_id === null) {
-                    overlaySwitch.router_id = uplinkRouterId;
-                }
-                if (overlaySwitch.uplinkRouterId === undefined || overlaySwitch.uplinkRouterId === null) {
-                    overlaySwitch.uplinkRouterId = uplinkRouterId;
-                }
-                if (linkMeta && !overlaySwitch.hitlLinkMeta) {
-                    overlaySwitch.hitlLinkMeta = linkMeta;
-                }
-                if (linkMeta && linkMeta.newRouterIp4 && !overlaySwitch.router_ip) {
-                    overlaySwitch.router_ip = linkMeta.newRouterIp4;
-                }
-                if (linkMeta && linkMeta.rj45Ip4 && !overlaySwitch.switch_ip) {
-                    overlaySwitch.switch_ip = linkMeta.rj45Ip4;
-                }
-                if (linkMeta && linkMeta.networkCidr && !overlaySwitch.link_network_cidr) {
-                    overlaySwitch.link_network_cidr = linkMeta.networkCidr;
-                }
-                if (linkMeta && linkMeta.network && !overlaySwitch.link_network) {
-                    overlaySwitch.link_network = linkMeta.network;
-                }
-                registerSwitchOverlayNode(overlaySwitch);
-            }
-            const routerNode = getOrCreateRouterOverlayNode(uplinkRouterId);
-            if (routerNode) {
-                const switchLabel = overlaySwitch?.label || overlaySwitch?.name || `HITL Switch ${targetId}`;
-                registerRouterSwitchInterface(uplinkRouterId, {
-                    switch_id: targetId,
-                    switch_label: switchLabel,
-                    router_ip: overlaySwitch?.router_ip || linkMeta?.newRouterIp4 || null,
-                    switch_ip: overlaySwitch?.switch_ip || linkMeta?.rj45Ip4 || null,
-                    network: linkMeta?.network || null,
-                    network_cidr: linkMeta?.networkCidr || null,
-                });
-            }
         }
     });
     routerSwitchInterfaceMap.forEach((entries, key) => {
@@ -3785,14 +3734,30 @@ function renderMain() {
         .replace(/'/g,'&#39;');
     const safeScenarioName = escapeHtml(scen?.name || '');
     const defaultScenarioName = escapeHtml(`Scenario ${activeIdx + 1}`);
+    const existingMetaCard = document.getElementById('scenarioMetaCard');
+    if (existingMetaCard && existingMetaCard.parentNode) {
+        existingMetaCard.parentNode.removeChild(existingMetaCard);
+    }
+
     const metaCard = document.createElement('div');
+    metaCard.id = 'scenarioMetaCard';
     metaCard.className = 'card mb-3';
     metaCard.innerHTML = `
         <div class="card-body">
             <label class="form-label mb-1 small text-muted" for="scenarioNameInput_${activeIdx}">Scenario name</label>
             <input type="text" class="form-control" id="scenarioNameInput_${activeIdx}" data-field="name" data-scen-idx="${activeIdx}" value="${safeScenarioName}" placeholder="${defaultScenarioName}">
         </div>`;
-    root.appendChild(metaCard);
+    const baseScenarioCard = document.getElementById('baseCoreScenarioCard');
+    if (baseScenarioCard && baseScenarioCard.parentNode) {
+        baseScenarioCard.parentNode.insertBefore(metaCard, baseScenarioCard);
+    } else {
+        root.appendChild(metaCard);
+    }
+
+    const existingHitlCard = document.getElementById('scenarioHitlCard');
+    if (existingHitlCard && existingHitlCard.parentNode) {
+        existingHitlCard.parentNode.removeChild(existingHitlCard);
+    }
 
     const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
     const hitl = ensureHitlStateForScenario(scen);
@@ -3848,6 +3813,7 @@ function renderMain() {
         : '<div class="text-muted small">No interfaces selected.</div>';
     const availableSize = Math.min(8, Math.max(4, hostInterfaces.length || 4));
     const hitlCard = document.createElement('div');
+    hitlCard.id = 'scenarioHitlCard';
     hitlCard.className = 'card mb-3';
     const hitlBody = hostInterfaces.length
         ? `
@@ -3889,7 +3855,11 @@ function renderMain() {
             ${hitlBody}
             <div class="small text-muted mt-3" data-hitl-status="${activeIdx}"></div>
         </div>`;
-    root.appendChild(hitlCard);
+    if (baseScenarioCard && baseScenarioCard.parentNode) {
+        baseScenarioCard.parentNode.insertBefore(hitlCard, baseScenarioCard);
+    } else {
+        root.appendChild(hitlCard);
+    }
 
     // --- Host density normalization for Node Information ---
     try {
@@ -3975,7 +3945,7 @@ function renderMain() {
     const densityBaseHtml = `<div class=\"d-flex align-items-center gap-1\" title=\"Base host pool used only for weight-based density calculations; Count rows are additive beyond this.\"><label class=\"form-label mb-0\">Count for Density</label><input type=\"number\" min=\"0\" max=\"5000\" step=\"1\" class=\"form-control form-control-sm\" style=\"width:120px\" value=\"${densityCountVal}\" data-scen-idx=\"${activeIdx}\" data-field=\"scenario_density_count\" /></div>`;
     const headerRow = document.createElement('div');
     const rawSectionNames = Object.keys(scen.sections || {});
-    const filteredSectionNames = rawSectionNames.filter(name => name !== 'Notes');
+    const filteredSectionNames = rawSectionNames.filter(name => name !== 'Notes' && name !== 'Events' && name !== 'HITL');
     const secNames = [];
     if (filteredSectionNames.includes('Node Information')) {
         secNames.push('Node Information');

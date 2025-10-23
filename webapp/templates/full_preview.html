@@ -849,7 +849,7 @@
       };
     }
 
-    const HITL_ATTACHMENT_ALLOWED = new Set(['existing_router', 'existing_switch', 'new_router', 'new_switch']);
+  const HITL_ATTACHMENT_ALLOWED = new Set(['existing_router', 'existing_switch', 'new_router']);
     const DEFAULT_HITL_ATTACHMENT = 'existing_router';
 
     function normalizeHitlAttachment(value){
@@ -1022,15 +1022,12 @@
     function hitlAttachmentAttemptOrder(preference){
       const normalized = normalizeHitlAttachment(preference);
       if(normalized === 'existing_router'){
-        return ['existing_router', 'existing_switch', 'new_switch', 'new_router'];
+        return ['existing_router', 'existing_switch', 'new_router'];
       }
       if(normalized === 'existing_switch'){
-        return ['existing_switch', 'existing_router', 'new_switch', 'new_router'];
+        return ['existing_switch', 'existing_router', 'new_router'];
       }
-      if(normalized === 'new_router'){
-        return ['new_router', 'existing_router', 'existing_switch', 'new_switch'];
-      }
-      return ['new_switch', 'existing_switch', 'existing_router', 'new_router'];
+      return ['new_router', 'existing_router', 'existing_switch'];
     }
 
     function deriveStandaloneHitlArtifacts(preview, hitlCfg, scenarioKeySeed){
@@ -1610,14 +1607,6 @@
               linkKind = 'hitl-router';
               break;
             }
-          } else if(attempt === 'new_switch'){
-            const newSwitchId = createNewSwitch();
-            if(newSwitchId !== null){
-              targetId = newSwitchId;
-              assignment = 'new_switch';
-              linkKind = 'hitl-switch';
-              break;
-            }
           }
         }
 
@@ -1676,46 +1665,6 @@
           });
         }
 
-        if(assignment === 'new_switch' && uplinkRouterId !== null){
-          const switchKey = String(targetId);
-          const overlaySwitch = switchOverlayMap.get(switchKey);
-          if(overlaySwitch){
-            if(overlaySwitch.router_id === undefined || overlaySwitch.router_id === null){
-              overlaySwitch.router_id = uplinkRouterId;
-            }
-            if(overlaySwitch.uplinkRouterId === undefined || overlaySwitch.uplinkRouterId === null){
-              overlaySwitch.uplinkRouterId = uplinkRouterId;
-            }
-            if(linkMeta && !overlaySwitch.hitlLinkMeta){
-              overlaySwitch.hitlLinkMeta = linkMeta;
-            }
-            if(linkMeta && linkMeta.newRouterIp4 && !overlaySwitch.router_ip){
-              overlaySwitch.router_ip = linkMeta.newRouterIp4;
-            }
-            if(linkMeta && linkMeta.rj45Ip4 && !overlaySwitch.switch_ip){
-              overlaySwitch.switch_ip = linkMeta.rj45Ip4;
-            }
-            if(linkMeta && linkMeta.networkCidr && !overlaySwitch.link_network_cidr){
-              overlaySwitch.link_network_cidr = linkMeta.networkCidr;
-            }
-            if(linkMeta && linkMeta.network && !overlaySwitch.link_network){
-              overlaySwitch.link_network = linkMeta.network;
-            }
-            registerSwitchOverlayNode(overlaySwitch);
-          }
-          const routerNode = getOrCreateRouterOverlayNode(uplinkRouterId);
-          if(routerNode){
-            const switchLabel = overlaySwitch?.label || overlaySwitch?.name || `HITL Switch ${targetId}`;
-            registerRouterSwitchInterface(uplinkRouterId, {
-              switch_id: targetId,
-              switch_label: switchLabel,
-              router_ip: overlaySwitch?.router_ip || linkMeta?.newRouterIp4 || null,
-              switch_ip: overlaySwitch?.switch_ip || linkMeta?.rj45Ip4 || null,
-              network: linkMeta?.network || null,
-              network_cidr: linkMeta?.networkCidr || null,
-            });
-          }
-        }
       });
 
       routerSwitchInterfaceMap.forEach((entries, key) => {

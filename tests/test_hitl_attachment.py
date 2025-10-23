@@ -133,31 +133,6 @@ def test_attach_hitl_rj45_nodes_creates_link_and_option() -> None:
     assert session.session_options["enablerj45"] == "1"
 
 
-def test_attach_hitl_rj45_nodes_creates_standalone_network_when_needed() -> None:
-    session = StubSession()
-    routers: list[NodeInfo] = []
-    hosts: list[NodeInfo] = []
-    hitl_config = {
-        "enabled": True,
-        "interfaces": [
-            {"name": "usb0", "attachment": "new_switch"},
-        ],
-        "scenario_key": "Standalone",
-    }
-
-    summary = attach_hitl_rj45_nodes(session, routers, hosts, hitl_config)
-
-    assert summary["interfaces"]
-    entry = summary["interfaces"][0]
-    assert entry["assignment"] == "network"
-    assert entry["attachment"] == "new_switch"
-    assert entry["linked"] is True
-    network_id = entry.get("network_node_id")
-    assert network_id in summary.get("created_network_nodes", [])
-    # Ensure link exists between RJ45 node and created network
-    rj_id = entry["rj45_node_id"]
-    assert any({rj_id, network_id} == {link[0], link[1]} for link in session.links)
-
 def test_hitl_preview_router_added_to_full_preview(monkeypatch) -> None:
     from webapp import app_backend as backend
 
@@ -235,7 +210,7 @@ def test_hitl_preview_router_added_to_full_preview(monkeypatch) -> None:
     assert degree_preview.get(hitl_node_id) == 1
 
 
-def test_hitl_preview_switch_added_to_full_preview() -> None:
+def test_hitl_config_normalizes_new_switch_attachment() -> None:
     from webapp import app_backend as backend
 
     hitl_cfg = backend._sanitize_hitl_config(
@@ -249,46 +224,9 @@ def test_hitl_preview_switch_added_to_full_preview() -> None:
         'switch_scenario',
     )
 
-    preview_switches = hitl_cfg.get('preview_switches') or []
-    assert preview_switches, 'expected preview switches in sanitized HITL config'
-    preview_switch = preview_switches[0]
-    assert preview_switch['metadata'].get('hitl_attachment') == 'new_switch'
-
-    full_preview = {
-        'routers': [
-            {
-                'node_id': 201,
-                'name': 'r1',
-                'role': 'router',
-                'kind': 'router',
-                'ip4': '10.0.0.1/24',
-                'r2r_interfaces': {},
-                'vulnerabilities': [],
-                'is_base_bridge': False,
-                'metadata': {},
-            }
-        ],
-        'switches_detail': [],
-        'r2r_edges_preview': [],
-    }
-
-    backend._merge_hitl_preview_with_full_preview(full_preview, hitl_cfg)
-
-    switches_detail = full_preview.get('switches_detail') or []
-    assert switches_detail, 'expected HITL switch detail entry'
-    detail = next((sd for sd in switches_detail if sd.get('switch_id') == preview_switch['node_id']), None)
-    assert detail is not None, 'expected detail for preview switch'
-    assert detail.get('router_id') == 201
-    assert detail.get('hitl_preview') is True
-    router_ip = detail.get('router_ip')
-    switch_ip = detail.get('switch_ip')
-    assert router_ip, 'router_ip should be populated for HITL switch link'
-    assert switch_ip, 'switch_ip should be populated for HITL switch link'
-    meta = detail.get('metadata') or {}
-    if meta:
-        assert meta.get('router_ip4') == router_ip
-        assert meta.get('switch_ip4') == switch_ip
-    assert full_preview.get('hitl_switch_ids') and preview_switch['node_id'] in full_preview['hitl_switch_ids']
+    iface_entry = hitl_cfg['interfaces'][0]
+    assert iface_entry['attachment'] == 'existing_router'
+    assert not hitl_cfg.get('preview_switches')
 
 
 def test_hitl_existing_router_attachment_populates_router_interfaces(monkeypatch) -> None:
@@ -402,40 +340,6 @@ def test_attach_hitl_rj45_nodes_can_attach_to_switch(monkeypatch) -> None:
     assert entry["linked"] is True
     assert session.links
 
-
-def test_attach_hitl_rj45_nodes_reuses_created_switch_for_existing_preference(monkeypatch) -> None:
-    session = StubSession()
-    routers: list[NodeInfo] = []
-    hosts: list[NodeInfo] = []
-    hitl_config = {
-        "enabled": True,
-        "interfaces": [
-            {"name": "usb0", "attachment": "new_switch"},
-            {"name": "usb1", "attachment": "existing_switch"},
-        ],
-        "scenario_key": "SwitchReuse",
-    }
-
-    def _fixed_rng(seed: str):
-        def _next() -> float:
-            return 0.0
-
-        return _next
-
-    monkeypatch.setattr(hitl_mod, "_make_deterministic_rng", _fixed_rng)
-
-    summary = attach_hitl_rj45_nodes(session, routers, hosts, hitl_config)
-
-    first, second = summary["interfaces"]
-    assert first["attachment"] == "new_switch"
-    assert first["assignment"] == "network"
-    assert second["attachment"] == "existing_switch"
-    assert second["assignment"] == "switch"
-    assert "network_node_id" in first
-    assert first["network_node_id"] == second["target_node_id"]
-    created_switch_id = first["network_node_id"]
-    assert created_switch_id in session.nodes
-    assert any({second["rj45_node_id"], created_switch_id} == {link[0], link[1]} for link in session.links)
 
 
 def test_attach_hitl_rj45_nodes_assigns_ipv4_for_new_router(monkeypatch) -> None:

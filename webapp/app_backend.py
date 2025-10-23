@@ -40,7 +40,6 @@ _HITL_ATTACHMENT_ALLOWED = {
     "existing_router",
     "existing_switch",
     "new_router",
-    "new_switch",
 }
 
 _DEFAULT_HITL_ATTACHMENT = "existing_router"
@@ -67,10 +66,6 @@ def _normalize_hitl_attachment(raw_value: Any) -> str:
             "new_router": "new_router",
             "new router": "new_router",
             "router_new": "new_router",
-            "newswitch": "new_switch",
-            "new_switch": "new_switch",
-            "new switch": "new_switch",
-            "switch_new": "new_switch",
         }
         if normalized in synonyms:
             return synonyms[normalized]
@@ -103,12 +98,6 @@ def _stable_hitl_preview_router_id(scenario_key: str, slug: str, idx: int) -> in
     key = f"hitl-router|{scenario_key or '__default__'}|{slug}|{idx}"
     digest = hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()
     return 700_000 + (int(digest[:10], 16) % 200_000)
-
-
-def _stable_hitl_preview_switch_id(scenario_key: str, slug: str, idx: int) -> int:
-    key = f"hitl-switch|{scenario_key or '__default__'}|{slug}|{idx}"
-    digest = hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()
-    return 500_000 + (int(digest[:10], 16) % 150_000)
 
 
 def _build_hitl_preview_router(
@@ -153,36 +142,6 @@ def _build_hitl_preview_router(
         'metadata': metadata,
     }
     return preview_router
-
-
-def _build_hitl_preview_switch(
-    scenario_key: str,
-    iface: Dict[str, Any],
-    slug: str,
-    ordinal: int,
-) -> Dict[str, Any]:
-    node_id = _stable_hitl_preview_switch_id(scenario_key, slug, ordinal)
-    metadata = {
-        'hitl_preview': True,
-        'hitl_interface_name': iface.get('name'),
-        'hitl_attachment': iface.get('attachment'),
-        'hitl_slug': slug,
-        'scenario_key': scenario_key,
-        'ordinal': ordinal,
-        'interface_count': iface.get('interface_count'),
-    }
-    preview_switch = {
-        'node_id': node_id,
-        'name': f"hitl-switch-{slug}",
-        'role': 'Switch',
-        'kind': 'switch',
-        'ip4': None,
-        'r2r_interfaces': {},
-        'vulnerabilities': [],
-        'is_base_bridge': False,
-        'metadata': metadata,
-    }
-    return preview_switch
 
 
 def _sanitize_hitl_config(hitl_config: Any, scenario_name: Optional[str], xml_basename: Optional[str]) -> Dict[str, Any]:
@@ -264,7 +223,6 @@ def _enrich_hitl_interfaces_with_ips(hitl_cfg: Dict[str, Any]) -> None:
     interfaces = hitl_cfg.get('interfaces') or []
     scenario_key = hitl_cfg.get('scenario_key') or '__default__'
     preview_routers: List[Dict[str, Any]] = []
-    preview_switches: List[Dict[str, Any]] = []
     total_interfaces = len(interfaces)
     for idx, iface in enumerate(list(interfaces)):
         if not isinstance(iface, dict):
@@ -276,7 +234,7 @@ def _enrich_hitl_interfaces_with_ips(hitl_cfg: Dict[str, Any]) -> None:
         iface['ordinal'] = idx
         iface['interface_count'] = total_interfaces
         ip_info: Optional[Dict[str, Any]] = None
-        if attachment in {'new_router', 'existing_router', 'new_switch'}:
+        if attachment in {'new_router', 'existing_router'}:
             ip_info = predict_hitl_link_ips(scenario_key, iface.get('name'), idx)
         if attachment in {'new_router', 'existing_router'} and ip_info:
             iface['link_network'] = ip_info.get('network')
@@ -291,33 +249,6 @@ def _enrich_hitl_interfaces_with_ips(hitl_cfg: Dict[str, Any]) -> None:
             if rj45_ip:
                 ordered = [rj45_ip] + [ip for ip in ipv4_current if ip != rj45_ip]
                 iface['ipv4'] = ordered
-        if attachment == 'new_switch':
-            preview_switch = _build_hitl_preview_switch(scenario_key, iface, slug, idx)
-            preview_metadata = preview_switch.setdefault('metadata', {})
-            preview_metadata['scenario_key'] = scenario_key
-            preview_metadata['ordinal'] = idx
-            preview_metadata['interface_count'] = total_interfaces
-            if ip_info:
-                iface['link_network'] = ip_info.get('network')
-                iface['link_network_cidr'] = ip_info.get('network_cidr') or ip_info.get('network')
-                iface['prefix_len'] = ip_info.get('prefix_len')
-                iface['netmask'] = ip_info.get('netmask')
-                iface['existing_router_ip4'] = ip_info.get('existing_router_ip4')
-                iface['new_router_ip4'] = ip_info.get('new_router_ip4')
-                iface['rj45_ip4'] = ip_info.get('rj45_ip4')
-                iface['router_ip4'] = ip_info.get('existing_router_ip4')
-                iface['switch_ip4'] = ip_info.get('new_router_ip4')
-                preview_metadata.update({
-                    'link_network': iface.get('link_network_cidr') or iface.get('link_network'),
-                    'router_ip4': iface.get('router_ip4'),
-                    'switch_ip4': iface.get('switch_ip4'),
-                    'rj45_ip4': iface.get('rj45_ip4'),
-                    'prefix_len': iface.get('prefix_len'),
-                    'netmask': iface.get('netmask'),
-                })
-            iface['preview_switch'] = preview_switch
-            preview_switches.append(preview_switch)
-            continue
         if attachment != 'new_router':
             continue
         if not ip_info:
@@ -331,8 +262,6 @@ def _enrich_hitl_interfaces_with_ips(hitl_cfg: Dict[str, Any]) -> None:
         preview_routers.append(preview_router)
     if preview_routers:
         hitl_cfg['preview_routers'] = preview_routers
-    if preview_switches:
-        hitl_cfg['preview_switches'] = preview_switches
 
 
 def _deterministic_hitl_peer_index(
@@ -679,7 +608,6 @@ def _merge_hitl_preview_with_full_preview(full_preview: Dict[str, Any], hitl_cfg
     if not isinstance(full_preview, dict) or not isinstance(hitl_cfg, dict):
         return
     preview_routers = hitl_cfg.get('preview_routers') or []
-    preview_switches = hitl_cfg.get('preview_switches') or []
     routers_list = full_preview.get('routers')
     if not isinstance(routers_list, list):
         routers_list = []
@@ -742,118 +670,6 @@ def _merge_hitl_preview_with_full_preview(full_preview: Dict[str, Any], hitl_cfg
         full_preview['hitl_router_count'] = len([nid for nid in hitl_router_ids if nid is not None])
     _wire_hitl_preview_routers(full_preview, hitl_cfg)
     _augment_hitl_existing_router_interfaces(full_preview, hitl_cfg)
-    if preview_switches:
-        base_router_ids = [entry.get('node_id') for entry in routers_list if isinstance(entry, dict) and not (entry.get('metadata', {}) or {}).get('hitl_preview') and entry.get('node_id') is not None]
-        scenario_key = hitl_cfg.get('scenario_key') or '__default__'
-        switches_list = full_preview.get('switches_detail')
-        if not isinstance(switches_list, list):
-            switches_list = []
-            full_preview['switches_detail'] = switches_list
-        existing_switch_ids = {
-            detail.get('switch_id')
-            for detail in switches_list
-            if isinstance(detail, dict) and detail.get('switch_id') is not None
-        }
-        existing_switches_map = {detail.get('switch_id'): detail for detail in switches_list if isinstance(detail, dict)}
-        added_switch_ids = []
-        for iface in hitl_cfg.get('interfaces') or []:
-            if not isinstance(iface, dict):
-                continue
-            if _normalize_hitl_attachment(iface.get('attachment')) != 'new_switch':
-                continue
-            preview_switch = iface.get('preview_switch')
-            if not isinstance(preview_switch, dict):
-                continue
-            switch_id = preview_switch.get('node_id')
-            if switch_id is None:
-                continue
-            metadata = preview_switch.get('metadata') or {}
-            peer_router_id = iface.get('peer_router_node_id') or metadata.get('peer_router_node_id')
-            if peer_router_id is None:
-                if base_router_ids:
-                    iface_name = iface.get('name') or metadata.get('hitl_interface_name') or iface.get('slug') or f"iface-{iface.get('ordinal', 0)}"
-                    ordinal = iface.get('ordinal') if isinstance(iface.get('ordinal'), int) else metadata.get('ordinal') or 0
-                    total_count = iface.get('interface_count') if isinstance(iface.get('interface_count'), int) else metadata.get('interface_count') or len(base_router_ids)
-                    peer_index = _deterministic_hitl_peer_index(
-                        scenario_key,
-                        str(iface_name),
-                        int(ordinal),
-                        int(total_count or len(base_router_ids) or 1),
-                        len(base_router_ids),
-                    ) or 0
-                    peer_router_id = base_router_ids[peer_index % len(base_router_ids)]
-                    metadata['peer_router_node_id'] = peer_router_id
-                    iface['peer_router_node_id'] = peer_router_id
-                    metadata['target_router_id'] = peer_router_id
-                    iface['target_router_id'] = peer_router_id
-                else:
-                    continue
-            else:
-                metadata['target_router_id'] = metadata.get('target_router_id') or peer_router_id
-                iface['target_router_id'] = iface.get('target_router_id') or peer_router_id
-            link_network = (
-                iface.get('link_network_cidr')
-                or metadata.get('link_network')
-                or iface.get('link_network')
-            )
-            router_ip4 = (
-                iface.get('router_ip4')
-                or iface.get('existing_router_ip4')
-                or metadata.get('router_ip4')
-                or metadata.get('existing_router_ip4')
-            )
-            switch_ip4 = (
-                iface.get('switch_ip4')
-                or iface.get('new_router_ip4')
-                or metadata.get('switch_ip4')
-                or metadata.get('new_router_ip4')
-            )
-            rj45_ip4 = iface.get('rj45_ip4') or metadata.get('rj45_ip4')
-            if switch_id in existing_switch_ids:
-                existing_detail = existing_switches_map.get(switch_id)
-                if isinstance(existing_detail, dict):
-                    existing_detail.setdefault('metadata', {}).update(metadata)
-                    if link_network and not existing_detail.get('rsw_subnet'):
-                        existing_detail['rsw_subnet'] = link_network
-                    if router_ip4 and not existing_detail.get('router_ip'):
-                        existing_detail['router_ip'] = router_ip4
-                    if switch_ip4 and not existing_detail.get('switch_ip'):
-                        existing_detail['switch_ip'] = switch_ip4
-                    if rj45_ip4:
-                        existing_detail.setdefault('host_if_ips', {})['rj45'] = rj45_ip4
-                    if link_network:
-                        rs_list = full_preview.setdefault('router_switch_subnets', [])
-                        if link_network not in rs_list:
-                            rs_list.append(link_network)
-                continue
-            hosts_placeholder = []
-            iface_hosts = iface.get('hosts') or metadata.get('hosts')
-            if isinstance(iface_hosts, list):
-                hosts_placeholder = [host for host in iface_hosts if host is not None]
-            detail_entry = {
-                'switch_id': switch_id,
-                'router_id': peer_router_id,
-                'hosts': hosts_placeholder,
-                'rsw_subnet': link_network,
-                'lan_subnet': None,
-                'router_ip': router_ip4,
-                'switch_ip': switch_ip4,
-                'host_if_ips': {},
-                'hitl_preview': True,
-                'metadata': metadata,
-            }
-            if rj45_ip4:
-                detail_entry['host_if_ips']['rj45'] = rj45_ip4
-            switches_list.append(detail_entry)
-            existing_switch_ids.add(switch_id)
-            existing_switches_map[switch_id] = detail_entry
-            added_switch_ids.append(switch_id)
-            if link_network:
-                rs_list = full_preview.setdefault('router_switch_subnets', [])
-                if link_network not in rs_list:
-                    rs_list.append(link_network)
-        if added_switch_ids:
-            full_preview['hitl_switch_ids'] = sorted({*(full_preview.get('hitl_switch_ids') or []), *added_switch_ids})
 
 """Flask web backend for core-topo-gen.
 
