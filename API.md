@@ -77,6 +77,15 @@ Scenario editor & runs
   - Response: renders `index.html` with updated payload.
   - Planning metadata: The saved XML includes optional additive planning attributes (see README "Additive Planning Semantics & XML Metadata"). These appear on section tags for lossless round-trip (e.g. `base_nodes`, `combined_nodes`, `explicit_count`, `derived_count`, `total_planned`). Clients can rely on them when re-importing instead of recomputing derived values.
 
+- POST `/save_xml_api`
+  - JSON body: `{ "scenarios": [...], "active_index"?: int }` (same structure as the editor payload).
+  - Response JSON: `{ "ok": true, "result_path": "/abs/path/Scenario.xml" }` on success.
+  - On malformed payloads: returns `400` with `{ "ok": false, "error": "..." }`; unexpected failures return `500`.
+
+- GET `/api/host_interfaces`
+  - Returns JSON `{ "interfaces": [...] }` where each interface includes `name`, `mac`, `ipv4`, `ipv6`, `mtu`, `speed`, `flags`, and `is_up` metadata.
+  - Requires `psutil`; when the module is unavailable the list is empty and a warning is logged.
+
 - POST `/upload_base`
   - Multipart form with `base_xml` (file, CORE `.xml`). Validates against CORE schema and attaches to the first scenario as the base topology.
   - Response: redirects to `/` with flash message.
@@ -129,11 +138,12 @@ Scenario editor & runs
   - Each history entry includes: `timestamp`, `mode`, `returncode`, `scenario_xml_path`, `report_path`, `pre_xml_path`, `post_xml_path`, `full_scenario_path`, `run_id` (async), and parsed `scenario_names`.
 
 - GET `/download_report?path=<path>`
-- GET `/planning_meta`
-  - Query params: `path` (XML path absolute or repo-relative), `scenario` (optional).
-  - Returns parsed planning metadata JSON as produced by `parse_planning_metadata`. Useful for tooling that needs counts without running a full CLI build.
-
   - Streams a report or artifact file. `path` can be absolute or repo-relative.
+
+- POST `/reports/delete`
+  - JSON body: `{ "run_ids": ["..."] }` to remove run history entries by id (or composite fallback id).
+  - Deletes associated artifacts under `outputs/` when paths match; reports stored in `./reports/` are preserved.
+  - Response JSON: `{ "deleted": number }`.
 
 - POST `/api/plan/preview_full`
   - JSON body: `{ "xml_path": "/abs/path/scenarios.xml", "scenario": "Scenario 1"?, "seed": 12345? }`
@@ -173,6 +183,17 @@ Script inspection & downloads
     - `kind` (`traffic`|`segmentation`)
     - `scope` (`runtime`|`preview`)
   - Streams a ZIP download containing the filtered `.py` and `.json` artifacts for the requested scope.
+
+Docker helpers
+
+- GET `/docker/status`
+  - Returns JSON `{ "items": [{ "name", "compose", "exists", "pulled", "container_exists", "running" }], "timestamp": int }` describing each node assignment tracked under `outputs/vulns`.
+  - Uses Docker CLI to inspect container state and cached compose files; missing compose files are reported with `exists=False`.
+
+- POST `/docker/cleanup`
+  - JSON body (optional): `{ "names": ["node1", ...] }`. When omitted, all tracked assignment names are targeted.
+  - Stops and removes Docker containers with `docker stop` / `docker rm` for each name.
+  - Response JSON: `{ "ok": true, "results": [{ "name", "stopped", "removed" }] }`; errors return `{ "ok": false, "error": "..." }` with HTTP 500.
 
 CORE management
 
@@ -216,6 +237,15 @@ CORE management
 - POST `/test_core`
   - Either JSON body or form fields with: `host` (string), `port` (int).
   - Response JSON: `{ ok: boolean, error?: string }`.
+
+Diagnostics & maintenance
+
+- GET `/diag/modules`
+  - Returns diagnostic information about which `core_topo_gen` modules are imported (file paths, errors) to help troubleshoot environment issues.
+
+- POST `/admin/cleanup_pycore`
+  - Removes stale `/tmp/pycore.*` directories that do not map to active CORE sessions.
+  - Response JSON: `{ "ok": true, "removed": ["..."], "kept": ["..."], "active_session_ids": [int, ...] }`; failures return `{ "ok": false, "error": "..." }`.
 
 Data sources & Vulnerability catalog
 
@@ -282,8 +312,9 @@ Users
 - GET `/users`
   - Renders users page (admin only).
 
-- POST `/users/create`
+- POST `/users`
   - Form fields: `username` (string), `password` (string), `role` (`user|admin`, default `user`).
+  - Fails with a flash error when the username already exists.
 - POST `/users/delete/<username>`
   - Path param: `username` (string). Admin-only.
 - POST `/users/password/<username>`
