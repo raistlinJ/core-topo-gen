@@ -3671,7 +3671,7 @@ def save_xml():
                 xml_text = f.read()
         except Exception:
             xml_text = ""
-        flash(f'Scenarios saved as {os.path.basename(out_path)}. You can download or run the CLI.')
+        flash(f'Scenarios saved as {os.path.basename(out_path)}')
         # Re-parse the saved XML to ensure the UI reflects exactly what was persisted
         try:
             payload = _parse_scenarios_xml(out_path)

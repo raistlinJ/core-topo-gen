@@ -69,9 +69,10 @@
                                 <form action="{{ url_for('remove_base') }}" method="post" class="d-inline {% if not has_base %}d-none{% endif %}" id="baseRemoveForm" onsubmit="saveScrollBeforeNav(); document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios });">
                                     <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
                                 </form>
+                                <button class="btn btn-sm btn-outline-secondary" type="button" id="baseCoreCollapseBtn" data-preview-collapse="baseCoreScenarioBody" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
                             </div>
                         </div>
-                        <div class="card-body">
+                        <div class="card-body collapse show" id="baseCoreScenarioBody">
                             <div class="mb-3">
                                 <label class="form-label d-flex align-items-center justify-content-between">
                                     <span>Base Scenario File</span>
@@ -3804,7 +3805,6 @@ function renderMain() {
                                 <select class="form-select form-select-sm" id="hitlAttach_${activeIdx}_${ifaceIdx}" data-hitl-attach data-scen-idx="${activeIdx}" data-iface-index="${ifaceIdx}">
                                     ${optionsMarkup}
                                 </select>
-                                <div class="form-text">New nodes are created deterministically when requested.</div>
                             </div>
                         </div>
                         <button type="button" class="btn btn-sm btn-outline-danger" data-hitl-remove data-scen-idx="${activeIdx}" data-iface="${safeName}">Remove</button>
@@ -3815,6 +3815,8 @@ function renderMain() {
     const hitlCard = document.createElement('div');
     hitlCard.id = 'scenarioHitlCard';
     hitlCard.className = 'card mb-3';
+    const hitlCollapseId = `hitlCardBody_${activeIdx}`;
+    const hitlCollapseBtnId = `hitlCollapseBtn_${activeIdx}`;
     const hitlBody = hostInterfaces.length
         ? `
             <div class="row g-3">
@@ -3846,12 +3848,15 @@ function renderMain() {
     hitlCard.innerHTML = `
         <div class="card-header d-flex justify-content-between align-items-center">
             <strong>Hardware in the Loop</strong>
-            <div class="form-check form-switch m-0">
-                <input class="form-check-input" type="checkbox" id="hitlToggle_${activeIdx}" data-hitl-toggle data-scen-idx="${activeIdx}" ${hitl.enabled ? 'checked' : ''}>
-                <label class="form-check-label small" for="hitlToggle_${activeIdx}">Enable</label>
+            <div class="d-flex align-items-center gap-2">
+                <div class="form-check form-switch m-0">
+                    <input class="form-check-input" type="checkbox" id="hitlToggle_${activeIdx}" data-hitl-toggle data-scen-idx="${activeIdx}" ${hitl.enabled ? 'checked' : ''}>
+                    <label class="form-check-label small" for="hitlToggle_${activeIdx}">Enable</label>
+                </div>
+                <button class="btn btn-sm btn-outline-secondary" type="button" id="${hitlCollapseBtnId}" data-preview-collapse="${hitlCollapseId}" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
             </div>
         </div>
-        <div class="card-body">
+        <div class="card-body collapse show" id="${hitlCollapseId}">
             ${hitlBody}
             <div class="small text-muted mt-3" data-hitl-status="${activeIdx}"></div>
         </div>`;
@@ -3859,6 +3864,10 @@ function renderMain() {
         baseScenarioCard.parentNode.insertBefore(hitlCard, baseScenarioCard);
     } else {
         root.appendChild(hitlCard);
+    }
+
+    if (typeof setupPreviewCollapsers === 'function') {
+        setupPreviewCollapsers();
     }
 
     // --- Host density normalization for Node Information ---
