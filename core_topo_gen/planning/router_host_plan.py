@@ -16,6 +16,7 @@ Notes:
 from typing import Dict, Any, List, Optional
 import random
 import ipaddress
+import math
 from ..utils.allocators import make_subnet_allocator
 
 def _expand_roles(role_counts: Dict[str, int]) -> List[str]:
@@ -36,6 +37,68 @@ def plan_host_router_mapping(role_counts: Dict[str,int], routers_planned: int) -
             rid = 0
         host_router_map[host_id] = rid
     return host_router_map
+
+def _distribute_exact_groups(
+    host_ids: List[int],
+    groups_desired: int,
+    min_hosts: Optional[int],
+    max_hosts: Optional[int],
+) -> List[List[int]]:
+    """Split host_ids into exactly groups_desired buckets.
+
+    The distribution attempts to respect provided bounds when feasible. When
+    bounds cannot be satisfied (insufficient hosts, inconsistent min/max), the
+    method relaxes toward evenly sized groups while still returning the exact
+    number of buckets. Remaining hosts are allocated round-robin. Empty buckets
+    are allowed when there are fewer hosts than requested groups."""
+
+    groups_desired = max(1, int(groups_desired))
+    groups: List[List[int]] = [[] for _ in range(groups_desired)]
+    if not host_ids:
+        return groups
+
+    host_queue = list(host_ids)
+    eff_min = min_hosts if (isinstance(min_hosts, int) and min_hosts > 0) else 1
+    eff_max = max_hosts if (isinstance(max_hosts, int) and max_hosts > 0) else None
+    if eff_max is not None and eff_max < eff_min:
+        eff_max = eff_min
+
+    total_hosts = len(host_queue)
+    if total_hosts < groups_desired * eff_min:
+        # Relax minimum bound while keeping at least one host per bucket when possible
+        if total_hosts >= groups_desired:
+            eff_min = 1
+        else:
+            eff_min = 0
+
+    # Seed each group with the relaxed minimum requirement
+    for idx in range(groups_desired):
+        if not host_queue:
+            break
+        take = min(eff_min, len(host_queue)) if eff_min > 0 else 0
+        if take > 0:
+            groups[idx].extend(host_queue[:take])
+            del host_queue[:take]
+
+    # Evenly distribute remaining hosts while honoring max bounds where possible
+    if host_queue:
+        g_idx = 0
+        safety = 0
+        while host_queue and safety < groups_desired * 8:
+            group = groups[g_idx % groups_desired]
+            if eff_max is not None and len(group) >= eff_max:
+                g_idx += 1
+                safety += 1
+                continue
+            group.append(host_queue.pop(0))
+            g_idx += 1
+            safety += 1
+        # If hosts remain because every bucket is saturated by max bounds, append remainder to last bucket
+        if host_queue:
+            groups[-1].extend(host_queue)
+
+    return groups
+
 
 def plan_r2s_grouping(
     routers_planned: int,
@@ -63,8 +126,14 @@ def plan_r2s_grouping(
     # Adopt policy
     target_per_router = (r2s_policy or {}).get('target_per_router') if r2s_policy else None
     mode_rs = (r2s_policy or {}).get('mode') if r2s_policy else None
-    if not mode_rs:
-        mode_rs = 'ratio'
+    mode_rs = mode_rs if mode_rs else 'ratio'
+    mode_lower = str(mode_rs).strip().lower()
+    effective_mode = mode_lower
+    derived_effective_target: Optional[int] = None
+    if effective_mode == 'min':
+        target_per_router = 1
+        derived_effective_target = 1
+        effective_mode = 'exact'
     # Assign routing items to routers (simple round-robin with abs_count expansions)
     def _assign_items(items: Optional[List[Any]], count: int):
         if not items or count<=0:
@@ -97,9 +166,8 @@ def plan_r2s_grouping(
     ptp_subnets: List[str] = []
     r2r_subnets: List[str] = []  # /30 subnets for router<->router links (preview purpose)
     next_switch_id = routers_planned + total_hosts + 1
-    derived_effective_target = None
     # Derive target if Exact but unspecified
-    if str(mode_rs).lower()=='exact' and (target_per_router is None):
+    if effective_mode == 'exact' and (target_per_router is None):
         for it in (routing_items or []):
             try:
                 ev = int(getattr(it,'r2s_edges',0) or 0)
@@ -168,93 +236,111 @@ def plan_r2s_grouping(
         except Exception as e:
             raise RuntimeError(f"Failed to allocate R2S group subnets for router {router_id}: {e}")
 
-    for rid, host_list in hosts_by_router.items():
-        host_list_sorted = sorted(host_list)
-        r2s_host_pairs_possible[rid] = len(host_list_sorted)//2
-        # bounds
+    router_meta: Dict[int, Dict[str, Any]] = {}
+    for rid in sorted(hosts_by_router.keys()):
+        host_list_sorted = sorted(hosts_by_router[rid])
+        r2s_host_pairs_possible[rid] = len(host_list_sorted) // 2
         bounds_item = None
-        if item_assignment and 0 <= (rid-1) < len(item_assignment):
-            bounds_item = item_assignment[rid-1]
-        hmin_r = None; hmax_r=None; proto_name=None
+        if item_assignment and 0 <= (rid - 1) < len(item_assignment):
+            bounds_item = item_assignment[rid - 1]
+        hmin_r = None
+        hmax_r = None
+        proto_name = None
         if bounds_item is not None:
             try:
-                hmin_r = int(getattr(bounds_item,'r2s_hosts_min',0)) or None
-                hmax_r = int(getattr(bounds_item,'r2s_hosts_max',0)) or None
-                proto_name = getattr(bounds_item,'protocol',None)
+                hmin_r = int(getattr(bounds_item, 'r2s_hosts_min', 0)) or None
+                hmax_r = int(getattr(bounds_item, 'r2s_hosts_max', 0)) or None
+                proto_name = getattr(bounds_item, 'protocol', None)
             except Exception:
                 pass
         per_router_bounds[rid] = {'min': hmin_r, 'max': hmax_r}
-        if str(mode_rs).lower() == 'exact' and int(float(target_per_router or 0)) == 1:
-            if not host_list_sorted:
-                r2s_host_pairs_used[rid]=0; r2s_unmet[rid]=0
-                grouping_preview.append({'router_id': rid,'protocol': proto_name,'bounds': {'min':hmin_r,'max':hmax_r},'host_ids': host_list_sorted,'groups': [],'group_sizes': []})
+        router_meta[rid] = {
+            'host_ids': host_list_sorted,
+            'hmin': hmin_r,
+            'hmax': hmax_r,
+            'proto': proto_name,
+        }
+
+    def _assign_nonuniform_targets(meta: Dict[int, Dict[str, Any]]) -> Dict[int, int]:
+        assignments: Dict[int, int] = {}
+        candidates: List[Dict[str, Any]] = []
+        for rid, info in meta.items():
+            host_ids = info.get('host_ids') or []
+            host_count = len(host_ids)
+            if host_count < 2:
                 continue
-            rsw_subnet, lan_subnet = _next_group_subnets(rid, 0, host_count=len(host_list_sorted))
-            router_switch_subnets.append(rsw_subnet); lan_subnets.append(lan_subnet)
-            switch_nodes.append({'node_id': next_switch_id, 'name': f"rsw-{rid}-1"})
-            host_if_ips: Dict[int,str] = {}
-            # Assign host IPs within LAN
-            try:
-                lan_net = ipaddress.ip_network(lan_subnet, strict=False)
-                lan_hosts = list(lan_net.hosts())
-            except Exception:
-                lan_hosts = []
-            for idx_h, h_id in enumerate(host_list_sorted):
-                if idx_h + 2 < len(lan_hosts):  # reserve first host for switch mgmt? second for router gateway? start after
-                    host_if_ips[h_id] = str(lan_hosts[idx_h+2]) + f"/{lan_net.prefixlen if lan_hosts else 28}"
-            # Assign router/switch interface IPs inside rsw_subnet (/30)
-            router_ip = None; switch_ip = None
-            try:
-                rsw_net = ipaddress.ip_network(rsw_subnet, strict=False)
-                rsw_hosts = list(rsw_net.hosts())
-                if len(rsw_hosts) >= 2:
-                    router_ip = f"{rsw_hosts[0]}/{rsw_net.prefixlen}"
-                    switch_ip = f"{rsw_hosts[1]}/{rsw_net.prefixlen}"
-            except Exception:
-                pass
-            switches_detail.append({'switch_id': next_switch_id,'router_id': rid,'hosts': host_list_sorted,'rsw_subnet': rsw_subnet,'lan_subnet': lan_subnet,'router_ip': router_ip,'switch_ip': switch_ip,'host_if_ips': host_if_ips})
-            next_switch_id += 1
-            r2s_counts[rid]=1
-            r2s_host_pairs_used[rid] = len(host_list_sorted)//2
-            r2s_unmet[rid] = max(0,int(float(target_per_router))-1)
-            grouping_preview.append({'router_id': rid,'protocol': proto_name,'bounds': {'min':hmin_r,'max':hmax_r},'host_ids': host_list_sorted,'groups': [host_list_sorted],'group_sizes':[len(host_list_sorted)]})
-        else:
-            if len(host_list_sorted) < 2:
-                r2s_host_pairs_used[rid]=0
-                grouping_preview.append({'router_id': rid,'protocol': proto_name,'bounds': {'min':hmin_r,'max':hmax_r},'host_ids': host_list_sorted,'groups': [],'group_sizes': []})
+            hmin_raw = info.get('hmin')
+            eff_min = hmin_raw if (isinstance(hmin_raw, int) and hmin_raw > 0) else 2
+            if eff_min <= 0:
+                eff_min = 1
+            hmax_raw = info.get('hmax')
+            eff_max = hmax_raw if (isinstance(hmax_raw, int) and hmax_raw > 0) else None
+            if eff_max is not None and eff_max < eff_min:
+                eff_max = eff_min
+            min_groups = 1
+            if eff_max is not None and eff_max > 0:
+                min_groups = max(1, math.ceil(host_count / eff_max))
+            if eff_min > host_count:
+                max_groups = 1
+            else:
+                max_groups = host_count if eff_min <= 1 else max(1, host_count // eff_min)
+            if max_groups < 1:
+                max_groups = 1
+            if max_groups < min_groups:
+                max_groups = min_groups
+            range_values = list(range(min_groups, max_groups + 1))
+            if not range_values:
                 continue
-            rnd_local = random.Random(seed + 7000 + rid)
-            lo = hmin_r if (hmin_r and hmin_r>0) else 2
-            hi = hmax_r if (hmax_r and hmax_r>0 and (not hmin_r or hmax_r>=hmin_r)) else 4
-            if lo>hi: lo=hi
-            remaining = list(host_list_sorted)
-            groups: List[List[int]] = []
-            while remaining:
-                if len(remaining) <= hi and len(remaining) >= lo:
-                    groups.append(list(remaining)); remaining.clear(); break
-                if len(remaining) < lo:
-                    if groups:
-                        groups[-1].extend(remaining)
-                    else:
-                        groups.append(list(remaining))
-                    remaining.clear(); break
-                sizes = list(range(lo, min(hi, len(remaining)) + 1))
-                weights = [1.0/(s**1.15) for s in sizes]
-                tot = sum(weights)
-                pick = rnd_local.random()*tot; acc=0.0; chosen=sizes[0]
-                for s,w in zip(sizes,weights):
-                    acc += w
-                    if pick <= acc:
-                        chosen=s; break
-                if chosen > len(remaining):
-                    chosen = len(remaining)
-                groups.append(remaining[:chosen])
-                remaining = remaining[chosen:]
-            for gi, group in enumerate(groups):
-                rsw_subnet, lan_subnet = _next_group_subnets(rid, gi, host_count=len(group))
-                router_switch_subnets.append(rsw_subnet); lan_subnets.append(lan_subnet)
-                # Assign router/switch interface IPs inside rsw_subnet
-                router_ip = None; switch_ip = None
+            candidates.append({
+                'rid': rid,
+                'range': range_values,
+                'flex': len(range_values),
+                'host_count': host_count,
+            })
+        candidates.sort(key=lambda entry: (entry['flex'], -entry['host_count'], entry['rid']))
+        used: set[int] = set()
+        for entry in candidates:
+            choice = next((val for val in entry['range'] if val not in used), None)
+            if choice is None:
+                choice = entry['range'][0]
+            assignments[entry['rid']] = choice
+            used.add(choice)
+        return assignments
+
+    nonuniform_targets: Dict[int, int] = {}
+    if effective_mode == 'nonuniform':
+        nonuniform_targets = _assign_nonuniform_targets(router_meta)
+
+    for rid in sorted(hosts_by_router.keys()):
+        meta = router_meta.get(rid, {})
+        host_list_sorted = meta.get('host_ids', [])
+        hmin_r = meta.get('hmin')
+        hmax_r = meta.get('hmax')
+        proto_name = meta.get('proto')
+        bounds_info = per_router_bounds.get(rid, {'min': hmin_r, 'max': hmax_r})
+        if effective_mode == 'exact':
+            desired_targets = max(1, int(float(target_per_router or 0)))
+            if desired_targets == 1:
+                if not host_list_sorted:
+                    r2s_host_pairs_used[rid] = 0
+                    r2s_unmet[rid] = 0
+                    grouping_preview.append({'router_id': rid, 'protocol': proto_name, 'bounds': bounds_info, 'host_ids': host_list_sorted, 'groups': [], 'group_sizes': []})
+                    continue
+                rsw_subnet, lan_subnet = _next_group_subnets(rid, 0, host_count=len(host_list_sorted))
+                router_switch_subnets.append(rsw_subnet)
+                lan_subnets.append(lan_subnet)
+                switch_nodes.append({'node_id': next_switch_id, 'name': f"rsw-{rid}-1"})
+                host_if_ips: Dict[int, str] = {}
+                try:
+                    lan_net = ipaddress.ip_network(lan_subnet, strict=False)
+                    lan_hosts = list(lan_net.hosts())
+                except Exception:
+                    lan_hosts = []
+                for idx_h, h_id in enumerate(host_list_sorted):
+                    if lan_hosts and idx_h + 2 < len(lan_hosts):
+                        host_if_ips[h_id] = str(lan_hosts[idx_h + 2]) + f"/{lan_net.prefixlen if lan_hosts else 28}"
+                router_ip = None
+                switch_ip = None
                 try:
                     rsw_net = ipaddress.ip_network(rsw_subnet, strict=False)
                     rsw_hosts = list(rsw_net.hosts())
@@ -263,15 +349,105 @@ def plan_r2s_grouping(
                         switch_ip = f"{rsw_hosts[1]}/{rsw_net.prefixlen}"
                 except Exception:
                     pass
-                switches_detail.append({'switch_id': next_switch_id,'router_id': rid,'hosts': list(group),'rsw_subnet': rsw_subnet,'lan_subnet': lan_subnet,'router_ip': router_ip,'switch_ip': switch_ip,'host_if_ips': {}})
+                switches_detail.append({'switch_id': next_switch_id, 'router_id': rid, 'hosts': host_list_sorted, 'rsw_subnet': rsw_subnet, 'lan_subnet': lan_subnet, 'router_ip': router_ip, 'switch_ip': switch_ip, 'host_if_ips': host_if_ips})
+                next_switch_id += 1
+                r2s_counts[rid] = 1
+                r2s_host_pairs_used[rid] = len(host_list_sorted) // 2
+                r2s_unmet[rid] = max(0, int(float(target_per_router)) - 1)
+                grouping_preview.append({'router_id': rid, 'protocol': proto_name, 'bounds': bounds_info, 'host_ids': host_list_sorted, 'groups': [host_list_sorted], 'group_sizes': [len(host_list_sorted)]})
+                continue
+
+            groups = _distribute_exact_groups(host_list_sorted, desired_targets, hmin_r, hmax_r)
+            for gi, group in enumerate(groups):
+                rsw_subnet, lan_subnet = _next_group_subnets(rid, gi, host_count=len(group))
+                router_switch_subnets.append(rsw_subnet)
+                lan_subnets.append(lan_subnet)
+                router_ip = None
+                switch_ip = None
+                try:
+                    rsw_net = ipaddress.ip_network(rsw_subnet, strict=False)
+                    rsw_hosts = list(rsw_net.hosts())
+                    if len(rsw_hosts) >= 2:
+                        router_ip = f"{rsw_hosts[0]}/{rsw_net.prefixlen}"
+                        switch_ip = f"{rsw_hosts[1]}/{rsw_net.prefixlen}"
+                except Exception:
+                    pass
+                switches_detail.append({'switch_id': next_switch_id, 'router_id': rid, 'hosts': list(group), 'rsw_subnet': rsw_subnet, 'lan_subnet': lan_subnet, 'router_ip': router_ip, 'switch_ip': switch_ip, 'host_if_ips': {}})
                 switch_nodes.append({'node_id': next_switch_id, 'name': f"rsw-{rid}-{gi+1}"})
                 next_switch_id += 1
             r2s_counts[rid] = len(groups)
-            r2s_host_pairs_used[rid] = sum(len(g)//2 for g in groups)
-            grouping_preview.append({'router_id': rid,'protocol': proto_name,'bounds': {'min':hmin_r,'max':hmax_r},'host_ids': host_list_sorted,'groups': groups,'group_sizes':[len(g) for g in groups]})
+            r2s_host_pairs_used[rid] = sum(len(g) // 2 for g in groups)
+            grouping_preview.append({'router_id': rid, 'protocol': proto_name, 'bounds': bounds_info, 'host_ids': host_list_sorted, 'groups': groups, 'group_sizes': [len(g) for g in groups]})
+            if len(groups) < desired_targets:
+                r2s_unmet[rid] = desired_targets - len(groups)
+            continue
+
+        if len(host_list_sorted) < 2:
+            r2s_host_pairs_used[rid] = 0
+            grouping_preview.append({'router_id': rid, 'protocol': proto_name, 'bounds': bounds_info, 'host_ids': host_list_sorted, 'groups': [], 'group_sizes': []})
+            continue
+        target_groups = nonuniform_targets.get(rid) if effective_mode == 'nonuniform' else None
+        if target_groups is not None:
+            groups = _distribute_exact_groups(host_list_sorted, target_groups, hmin_r, hmax_r)
+        else:
+            rnd_local = random.Random(seed + 7000 + rid)
+            lo = hmin_r if (hmin_r and hmin_r > 0) else 2
+            hi = hmax_r if (hmax_r and hmax_r > 0 and (not hmin_r or hmax_r >= hmin_r)) else 4
+            if lo > hi:
+                lo = hi
+            remaining = list(host_list_sorted)
+            groups = []
+            while remaining:
+                if len(remaining) <= hi and len(remaining) >= lo:
+                    groups.append(list(remaining))
+                    remaining.clear()
+                    break
+                if len(remaining) < lo:
+                    if groups:
+                        groups[-1].extend(remaining)
+                    else:
+                        groups.append(list(remaining))
+                    remaining.clear()
+                    break
+                sizes = list(range(lo, min(hi, len(remaining)) + 1))
+                weights = [1.0 / (s ** 1.15) for s in sizes]
+                tot = sum(weights)
+                pick = rnd_local.random() * tot
+                acc = 0.0
+                chosen = sizes[0]
+                for s, w in zip(sizes, weights):
+                    acc += w
+                    if pick <= acc:
+                        chosen = s
+                        break
+                if chosen > len(remaining):
+                    chosen = len(remaining)
+                groups.append(remaining[:chosen])
+                remaining = remaining[chosen:]
+        for gi, group in enumerate(groups):
+            rsw_subnet, lan_subnet = _next_group_subnets(rid, gi, host_count=len(group))
+            router_switch_subnets.append(rsw_subnet)
+            lan_subnets.append(lan_subnet)
+            router_ip = None
+            switch_ip = None
+            try:
+                rsw_net = ipaddress.ip_network(rsw_subnet, strict=False)
+                rsw_hosts = list(rsw_net.hosts())
+                if len(rsw_hosts) >= 2:
+                    router_ip = f"{rsw_hosts[0]}/{rsw_net.prefixlen}"
+                    switch_ip = f"{rsw_hosts[1]}/{rsw_net.prefixlen}"
+            except Exception:
+                pass
+            switches_detail.append({'switch_id': next_switch_id, 'router_id': rid, 'hosts': list(group), 'rsw_subnet': rsw_subnet, 'lan_subnet': lan_subnet, 'router_ip': router_ip, 'switch_ip': switch_ip, 'host_if_ips': {}})
+            switch_nodes.append({'node_id': next_switch_id, 'name': f"rsw-{rid}-{gi+1}"})
+            next_switch_id += 1
+        r2s_counts[rid] = len(groups)
+        r2s_host_pairs_used[rid] = sum(len(g) // 2 for g in groups)
+        grouping_preview.append({'router_id': rid, 'protocol': proto_name, 'bounds': bounds_info, 'host_ids': host_list_sorted, 'groups': groups, 'group_sizes': [len(g) for g in groups]})
     # Build policy summary
-    if str(mode_rs).lower()=='exact':
-        computed_r2s_policy = {'mode':'Exact','target_per_router': target_per_router or 1,'counts': r2s_counts}
+    if effective_mode=='exact':
+        policy_mode_label = 'Exact' if mode_lower == 'exact' else mode_rs
+        computed_r2s_policy = {'mode': policy_mode_label,'target_per_router': target_per_router or 1,'counts': r2s_counts}
         if derived_effective_target is not None:
             computed_r2s_policy['target_per_router_effective'] = derived_effective_target
     else:
