@@ -1,420 +1,429 @@
-### /api/plan/preview_full (POST)
-Returns unified full preview (routers, hosts, IP allocations, segmentation placeholder) without building a CORE session.
+# CORE Topology Generator API
 
-Request JSON:
+This guide documents the HTTP surface exposed by the CORE Topology Generator web backend (`webapp/app_backend.py`) and the CLI entry point (`core_topo_gen.cli`). Use it to script scenario management, trigger runs, download artifacts, and integrate with external systems.
+
+## Base Environment
+
+- **Default base URL:** `http://localhost:9090`
+- **Entry modules:**
+	- Web server: `python webapp/app_backend.py`
+	- CLI: `core-python -m core_topo_gen.cli` (fall back to `python -m core_topo_gen.cli` if `core-python` is unavailable)
+- **Artifacts:**
+	- Scenario XML snapshots: `outputs/scenarios-<timestamp>/`
+	- Run history index: `outputs/run_history.json`
+	- Reports: `./reports/scenario_report_<timestamp>.md`
+
+## Authentication
+
+The web UI uses cookie sessions. Script clients must authenticate once and reuse the cookie for subsequent requests.
+
+1. `POST /login`
+	 - Form fields: `username`, `password`
+	 - Success: HTTP 302 redirect to `/` with a `session` cookie.
+	 - Failure: HTTP 200 with an error message rendered in HTML.
+2. `POST /logout`
+	 - Clears the session and redirects to `/`.
+
+**First run:** The app may create a default admin user. Refer to the README for the bootstrap credentials and rotate them immediately.
+
+## Request & Response Conventions
+
+- JSON payloads and responses are UTF-8 encoded.
+- Unless noted, endpoints return `{ "ok": boolean, ... }` or redirect to HTML views.
+- File parameters must be provided using `multipart/form-data`.
+- Absolute paths are recommended (`os.path.abspath`). When a relative path is supplied, the server resolves it against the repo root where possible.
+- Safe-delete operations only touch files under `uploads/` or `outputs/`; reports in `./reports/` are preserved.
+- Planning preview results are cached in `outputs/plan_cache.json`, keyed by `(xml_hash, scenario, seed)`. Override the location with `TOPO_PLAN_CACHE_PATH`.
+
+## Endpoint Groups
+
+- [Health](#health)
+- [Scenario Lifecycle](#scenario-lifecycle)
+- [Planning Preview](#planning-preview)
+- [Run Execution & Reports](#run-execution--reports)
+- [Script Inspection](#script-inspection)
+- [Docker Helpers](#docker-helpers)
+- [CORE Session Management](#core-session-management)
+- [Data Sources & Vulnerability Catalog](#data-sources--vulnerability-catalog)
+- [Diagnostics & Maintenance](#diagnostics--maintenance)
+- [User Administration](#user-administration)
+
+### Health
+
+`GET /healthz`
+
+- Returns plain-text `OK` when the server is running.
+
+### Scenario Lifecycle
+
+`POST /load_xml`
+: Multipart upload (`scenarios_xml` `.xml` file). Loads the file into the editor state and renders the main page.
+
+`POST /save_xml`
+: Form field `scenarios_json` (stringified JSON). Persists the editor payload to `outputs/scenarios-<timestamp>/scenarios.xml` and re-renders the editor. The saved XML includes additive planning attributes (`base_nodes`, `combined_nodes`, `explicit_count`, etc.) for lossless round-tripping.
+
+`POST /save_xml_api`
+: JSON body `{ "scenarios": [...], "active_index"?: int }`. Returns `{ "ok": true, "result_path": ".../scenarios.xml" }` on success or `{ "ok": false, "error": "..." }` with HTTP 400/500 on failure.
+
+`GET /api/host_interfaces`
+: Returns `{ "interfaces": [...] }` describing host NICs (`name`, `mac`, `ipv4`, `ipv6`, `mtu`, `speed`, `flags`, `is_up`). Requires `psutil`; if unavailable, returns an empty list with a warning in logs.
+
+`POST /upload_base`
+: Multipart upload (`base_xml`). Attaches a CORE base topology XML to the active scenario. Redirects to `/`.
+
+`POST /remove_base`
+: Optional `scenarios_json` to retain other edits while clearing the base topology. Renders the updated editor view.
+
+`GET /base_details`
+: Query `path=<abs_xml_path>`. Renders an HTML summary validating the CORE XML.
+
+### Planning Preview
+
+`POST /api/plan/preview_full`
+
+Generates a deterministic planning preview without starting a CORE session.
+
+**Request JSON**
+
+```json
 {
-  "xml_path": "/abs/path/to/scenarios.xml",
-  "scenario": "Optional Scenario Name",
-  "seed": 1234
+	"xml_path": "/abs/path/to/scenarios.xml",
+	"scenario": "Scenario Name",        // optional
+	"seed": 12345                        // optional; random when omitted (returned in response)
 }
+```
 
-Response JSON:
+**Response JSON**
+
+```json
 {
-  "ok": true,
-  "full_preview": { ... },
-  "plan": {  # orchestrator root with role_counts, routers_planned, service_plan, vulnerability_plan, segmentation_plan, traffic_plan
-    "role_counts": {"Workstation": 12, ...},
-    "routers_planned": 3,
-    ...
-  },
-  "breakdowns": {  # per-section breakdowns
-    "node": { ... },
-    "router": {"has_weight_based_items": true, ...},
-    "services": { ... },
-    "vulnerabilities": { ... },
-    "segmentation": { ... },
-    "traffic": { ... }
-  }
+	"ok": true,
+	"full_preview": {
+		"routers": [...],
+		"hosts": [...],
+		"switches": [...],
+		"services_preview": {...},
+		"vulnerabilities_preview": {...},
+		"segmentation_preview": {...},
+		"traffic_preview": {...},
+		"seed": 12345,
+		"seed_generated": false
+	},
+	"plan": {
+		"role_counts": {"Workstation": 12, ...},
+		"routers_planned": 3,
+		"service_plan": {...},
+		"vulnerability_plan": {...},
+		"segmentation_plan": {...},
+		"traffic_plan": {...}
+	},
+	"breakdowns": {
+		"node": {...},
+		"router": {...},
+		"services": {...},
+		"vulnerabilities": {...},
+		"segmentation": {...},
+		"traffic": {...}
+	}
 }
+```
 
-Notes:
-- Plans are cached on disk (outputs/plan_cache.json) keyed by (xml_hash, scenario, seed). Set TOPO_PLAN_CACHE_PATH to override location.
-- Router count, service allocations, vulnerability density pool, and segmentation item serialization are single-sourced from the orchestrator.
-# HTTP API Reference (Flask)
-
-This document describes the HTTP endpoints exposed by the Web GUI backend (`webapp/app_backend.py`). Use these for automation and integrations.
-
-Base URL: http://localhost:9090 (default)
-
-Authentication
-- The Web UI uses cookie-based auth. For scripts/clients, POST to `/login` with `username` and `password` to obtain a session cookie.
-- On first run, a default admin may be created (see README Authentication section). Store and resend cookies in subsequent requests.
-
-Conventions
-- All JSON responses use UTF‑8.
-- File downloads are sent via `/download_report?path=...` and may accept absolute or repo-relative paths. The server resolves common variants.
-- Safe deletes and file operations are scoped under `uploads/` and `outputs/` to avoid accidental removal of arbitrary files.
-
-Planning & Defaults Snapshot
-- Default base host pool (when omitted) is 10; explicit zero requires setting `total_nodes="0"` (or `base_nodes="0"`).
-- Router count formula (builder): `routers = min(total_hosts, density_contribution + sum(abs_count))` where:
-  - If `0 < density <= 1`: `density_contribution = floor(base_host_pool * density)` (base host pool excludes additive Count rows).
-  - If `density > 1`: `density_contribution = int(density)` (legacy absolute form).
-  - `abs_count` gathered from routing items with `v_metric="Count"`.
-- Per-routing-item connectivity shaping: `r2r_mode` (Uniform|NonUniform|Exact|Min|Random) with fallback to global mesh style (`--router-mesh-style` full|ring|tree) when omitted.
-- Host aggregation / rehoming via `r2s_mode` and `r2s_edges` (XML attributes) producing extra layer‑2 switches and balance statistics.
-- Vulnerability assignment lenient mode: downloaded-but-not-pulled catalog entries can still be assigned for planning/report purposes.
-
-Endpoints
-
-- POST `/login`
-  - Form fields: `username`, `password`
-  - Response: 302 redirect (on success) to `/`; or 200 with error message.
-
-- POST `/logout`
-  - Clears session; redirects to `/`.
-
-- GET `/healthz`
-  - Liveness check; returns 200 OK (text).
-
-Scenario editor & runs
-
-- POST `/load_xml`
-  - Multipart form with `scenarios_xml` (file, `.xml`). Loads into the editor state.
-
-- POST `/save_xml`
-  - Form fields: `scenarios_json` (JSON string). Writes to `outputs/scenarios-<ts>/scenarios.xml`.
-  - Response: renders `index.html` with updated payload.
-  - Planning metadata: The saved XML includes optional additive planning attributes (see README "Additive Planning Semantics & XML Metadata"). These appear on section tags for lossless round-trip (e.g. `base_nodes`, `combined_nodes`, `explicit_count`, `derived_count`, `total_planned`). Clients can rely on them when re-importing instead of recomputing derived values.
-
-- POST `/save_xml_api`
-  - JSON body: `{ "scenarios": [...], "active_index"?: int }` (same structure as the editor payload).
-  - Response JSON: `{ "ok": true, "result_path": "/abs/path/Scenario.xml" }` on success.
-  - On malformed payloads: returns `400` with `{ "ok": false, "error": "..." }`; unexpected failures return `500`.
-
-- GET `/api/host_interfaces`
-  - Returns JSON `{ "interfaces": [...] }` where each interface includes `name`, `mac`, `ipv4`, `ipv6`, `mtu`, `speed`, `flags`, and `is_up` metadata.
-  - Requires `psutil`; when the module is unavailable the list is empty and a warning is logged.
-
-- POST `/upload_base`
-  - Multipart form with `base_xml` (file, CORE `.xml`). Validates against CORE schema and attaches to the first scenario as the base topology.
-  - Response: redirects to `/` with flash message.
-
-- POST `/remove_base`
-  - Optional form field: `scenarios_json` (JSON string) to preserve other edits while clearing the base XML from the first scenario.
-  - Response: renders `index.html` with base cleared.
-
-- GET `/base_details`
-  - Query: `path` (absolute path to a CORE XML).
-  - Response: details HTML (validity and summary) for the provided base XML.
-
-- POST `/run_cli` (synchronous)
-  - Form fields: `xml_path` (absolute path to the editor-saved XML).
-  - Internally forwarded CLI args: `--xml`, `--host`, `--port`, `--verbose`.
-  - CORE host/port are derived from the saved editor payload `core.host`/`core.port` when available; otherwise defaults are used.
-  - Starts a CLI run and waits for completion; renders `index.html` with logs.
-  - Side effects:
-    - Writes a Markdown report under `./reports/`.
-    - Writes a JSON summary next to the Markdown report (`scenario_report_<ts>.json`) with counts, metadata, and segmentation/traffic tallies.
-    - If planning metadata attributes are present in the XML, they are merged into the report under a "Planning Metadata (from XML)" section with namespaced keys (`plan_*`).
-    - Connectivity metrics (router degree distribution, aggregation switch stats) appended when routers are generated.
-    - Attempts to capture pre- and post-run CORE session XML into `outputs/core-sessions/`.
-    - Appends an entry to `outputs/run_history.json` (even on failure) with `report_path` if found.
-
-- POST `/run_cli_async` (asynchronous)
-  - Form fields: `xml_path` (absolute path to the editor-saved XML).
-  - Internally forwarded CLI args: `--xml`, `--host`, `--port`, `--verbose`.
-  - CORE host/port are derived from the saved editor payload `core.host`/`core.port` when available; otherwise defaults are used.
-  - Returns JSON: `{ "run_id": "<uuid>" }`.
-  - The process writes logs to `outputs/scenarios-<ts>/cli-<run_id>.log`.
-  - Planning metadata behavior matches synchronous run (merged into report if present).
-
-- GET `/run_status/<run_id>`
-  - Returns JSON with live progress and final artifacts:
-    - `done`: bool
-    - `returncode`: int|null
-    - `report_path`: string|null (abs path when report exists)
-    - `xml_path`: string|null (post-run CORE session XML if captured)
-    - `log_path`: string (path to CLI log file)
-    - `scenario_xml_path`: string
-    - `pre_xml_path`: string|null
-    - `full_scenario_path`: string|null (zip bundle of artifacts)
-
-- GET `/reports`
-  - Renders the Reports page.
-
-- GET `/reports_data`
-  - Returns JSON: `{ history: [...], scenarios: [...] }`.
-  - Each history entry includes: `timestamp`, `mode`, `returncode`, `scenario_xml_path`, `report_path`, `pre_xml_path`, `post_xml_path`, `full_scenario_path`, `run_id` (async), and parsed `scenario_names`.
-
-- GET `/download_report?path=<path>`
-  - Streams a report or artifact file. `path` can be absolute or repo-relative.
-
-- POST `/reports/delete`
-  - JSON body: `{ "run_ids": ["..."] }` to remove run history entries by id (or composite fallback id).
-  - Deletes associated artifacts under `outputs/` when paths match; reports stored in `./reports/` are preserved.
-  - Response JSON: `{ "deleted": number }`.
-
-- POST `/api/plan/preview_full`
-  - JSON body: `{ "xml_path": "/abs/path/scenarios.xml", "scenario": "Scenario 1"?, "seed": 12345? }`
-  - Computes a deterministic full planning preview (no CORE session) including:
-    - Routers / Hosts / Switches (aggregation) with IP samples
-    - `r2r_policy_preview`, `r2r_edges_preview`, degree stats
-    - `r2s_policy_preview` (counts, per-router bounds, host pair saturation)
-    - `r2s_grouping_preview` array (per-router host grouping: groups, group_sizes, bounds)
-    - `services_preview`, `vulnerabilities_preview`
-    - `segmentation_preview` (planned rule names)
-    - `seed` (echo / auto-generated) and `seed_generated` flag
-  - Response: `{ ok: true, full_preview: { ... } }` or `{ ok: false, error }` on failure.
-  - Notes:
-    - If `seed` omitted, a random seed is generated and returned so clients can rerun with identical topology decisions.
-    - Host grouping bounds supplied in the XML via `r2s_hosts_min` / `r2s_hosts_max` (NonUniform R2S) appear under `r2s_policy_preview.per_router_bounds` and in each grouping entry.
-    - Exact aggregation (`r2s_mode=Exact` & `r2s_edges=1`) produces one switch per router with all its hosts; bounds are ignored for this mode.
-
+**Notes**
 
-Script inspection & downloads
-
-- GET `/api/open_scripts`
-  - Query params:
-    - `kind` (`traffic`|`segmentation`, default `traffic`)
-    - `scope` (`runtime`|`preview`, default `runtime`)
-  - Returns JSON `{ ok, kind, path, files }` listing available generated scripts.
-  - Runtime scope targets `/tmp/traffic` or `/tmp/segmentation`. Preview scope resolves the most recent `core-topo-preview-*` temp directory.
+- `seed` is echoed or generated automatically. Store it to reproduce the same topology.
+- `r2s_policy_preview.per_router_bounds` includes min/max bounds when NonUniform host grouping is requested via XML attributes (`r2s_hosts_min`/`r2s_hosts_max`).
+- Exact aggregation (`r2s_mode=Exact` and `r2s_edges=1`) collapses hosts behind a single switch and ignores bounds.
+- Preview responses are cached; purge `outputs/plan_cache.json` to invalidate.
 
-- GET `/api/open_script_file`
-  - Query params:
-    - `kind` (`traffic`|`segmentation`)
-    - `scope` (`runtime`|`preview`)
-    - `file` (filename within the selected directory)
-  - Returns JSON `{ ok, file, path, content, truncated }` with up to 8KB of script content for quick inspection.
+### Run Execution & Reports
 
-- GET `/api/download_scripts`
-  - Query params:
-    - `kind` (`traffic`|`segmentation`)
-    - `scope` (`runtime`|`preview`)
-  - Streams a ZIP download containing the filtered `.py` and `.json` artifacts for the requested scope.
+`POST /run_cli`
+: Form field `xml_path` (absolute path). Runs the CLI synchronously with forwarded args `--xml`, `--host`, `--port`, `--verbose` (values derived from the saved XML when available). Returns the main page with logs. Side effects:
 
-Docker helpers
+- Markdown report written to `./reports/`
+- JSON summary (`scenario_report_<timestamp>.json`) next to the report with counts and metadata
+- Router aggregation metrics appended when routers are generated
+- Pre/post CORE session XML captured under `outputs/core-sessions/` when available
+- Run history appended to `outputs/run_history.json`
 
-- GET `/docker/status`
-  - Returns JSON `{ "items": [{ "name", "compose", "exists", "pulled", "container_exists", "running" }], "timestamp": int }` describing each node assignment tracked under `outputs/vulns`.
-  - Uses Docker CLI to inspect container state and cached compose files; missing compose files are reported with `exists=False`.
+`POST /run_cli_async`
+: Same args as synchronous run. Returns `{ "run_id": "<uuid>" }` immediately and writes logs to `outputs/scenarios-<timestamp>/cli-<run_id>.log`.
 
-- POST `/docker/cleanup`
-  - JSON body (optional): `{ "names": ["node1", ...] }`. When omitted, all tracked assignment names are targeted.
-  - Stops and removes Docker containers with `docker stop` / `docker rm` for each name.
-  - Response JSON: `{ "ok": true, "results": [{ "name", "stopped", "removed" }] }`; errors return `{ "ok": false, "error": "..." }` with HTTP 500.
+`GET /run_status/<run_id>`
+: Polling endpoint returning:
 
-CORE management
+```json
+{
+	"done": false,
+	"returncode": null,
+	"report_path": null,
+	"xml_path": null,
+	"log_path": "outputs/.../cli-<run_id>.log",
+	"scenario_xml_path": "outputs/.../scenarios.xml",
+	"pre_xml_path": null,
+	"full_scenario_path": null
+}
+```
 
-- GET `/core`
-  - Renders the CORE page.
+`GET /stream/<run_id>`
+: Server-Sent Events (SSE) endpoint streaming live CLI log lines for async runs.
 
-- GET `/core/data`
-  - Returns JSON: `{ sessions: [...], xmls: [...] }`
-  - `sessions`: best-effort gRPC info (id, state, nodes, file)
-  - `xmls`: discovered and validated CORE XML files with run/valid status
+`POST /cancel_run/<run_id>`
+: Attempts to terminate a running async job.
 
-- POST `/core/upload`
-  - Multipart form with `xml_file` (file, `.xml`). Validated and placed under `uploads/core/`.
+`GET /reports`
+: Renders the Reports UI.
 
-- POST `/core/start`
-  - Form field: `path` (abs path to a validated XML). Starts a session via gRPC.
+`GET /reports_data`
+: Returns `{ "history": [...], "scenarios": [...] }`, combining run metadata and known scenario files. Each history entry includes `timestamp`, `mode`, `returncode`, `scenario_xml_path`, `report_path`, `pre_xml_path`, `post_xml_path`, `full_scenario_path`, `run_id`, and parsed `scenario_names`.
 
-- POST `/core/stop`
-  - Form field: `session_id`.
+`GET /download_report?path=<path>`
+: Streams a report or artifact file. Accepts absolute or repo-relative paths.
 
-- POST `/core/delete`
-  - Form fields (any):
-    - `session_id` (optional): delete the given CORE session via gRPC.
-    - `path` (optional): delete a CORE XML file if it resides under `uploads/` or `outputs/` (safe delete). Both may be provided.
+`POST /reports/delete`
+: JSON body `{ "run_ids": ["..."] }`. Removes matching run history entries and deletes their artifacts under `outputs/`. Reports in `./reports/` remain untouched. Responds with `{ "deleted": <count> }`.
 
-- GET `/core/details`
-  - Query params:
-    - `path` (abs path to a CORE XML) to analyze; and/or
-    - `session_id` (if provided without a `path`, the server attempts to export the current session XML for analysis).
-  - Response: details HTML.
+`POST /purge_history_for_scenario`
+: JSON body `{ "name": "Scenario" }`. Removes all history entries tied to the scenario name and deletes associated artifacts under `outputs/`. Returns `{ "removed": <count>, "error"?: string }`.
 
-- POST `/core/save_xml`
-  - Form field: `session_id` (int). Saves current session XML via gRPC into `outputs/core-sessions/` and streams the file back as a download.
+**Report path detection:** The backend parses the CLI log line `Scenario report written to ...`. If missing, it falls back to the most recent `./reports/scenario_report_*.md`.
 
-- POST `/core/start_session`
-  - Form field: `session_id` (int). Starts an existing session via gRPC.
+### Script Inspection
 
-- GET `/core/session/<sid>`
-  - Path param: `sid` (int). Convenience view for a specific session’s details.
+`GET /api/open_scripts`
+: Query params `kind=traffic|segmentation` (default `traffic`), `scope=runtime|preview` (default `runtime`). Returns `{ "ok": true, "kind": "traffic", "scope": "runtime", "path": "/tmp/traffic", "files": [...] }`.
 
-- POST `/test_core`
-  - Either JSON body or form fields with: `host` (string), `port` (int).
-  - Response JSON: `{ ok: boolean, error?: string }`.
+`GET /api/open_script_file`
+: Same parameters, plus `file=<filename>`. Returns `{ "content": "...", "truncated": false }` with up to 8KB per request.
 
-Diagnostics & maintenance
+`GET /api/download_scripts`
+: Same parameters, responds with a ZIP archive containing the filtered scripts.
 
-- GET `/diag/modules`
-  - Returns diagnostic information about which `core_topo_gen` modules are imported (file paths, errors) to help troubleshoot environment issues.
+### Docker Helpers
 
-- POST `/admin/cleanup_pycore`
-  - Removes stale `/tmp/pycore.*` directories that do not map to active CORE sessions.
-  - Response JSON: `{ "ok": true, "removed": ["..."], "kept": ["..."], "active_session_ids": [int, ...] }`; failures return `{ "ok": false, "error": "..." }`.
-
-Data sources & Vulnerability catalog
-
-- GET `/data_sources`
-  - Renders the data sources page.
-
-- POST `/data_sources/upload`
-  - Multipart form with `csv_file` (file, `.csv`).
-
-- POST `/data_sources/toggle/<sid>`
-  - Toggle enabled/disabled.
-
-- POST `/data_sources/delete/<sid>`
-  - Delete a data source.
-
-- POST `/data_sources/refresh/<sid>`
-  - Refresh a source (implementation-specific).
-
-- GET `/data_sources/download/<sid>`
-  - Download a CSV.
-
-- GET `/data_sources/export_all`
-  - Download all sources as a CSV bundle.
-
-- GET `/data_sources/edit/<sid>`
-  - Renders an HTML table editor for the CSV with id `sid`.
-
-- POST `/data_sources/save/<sid>`
-  - JSON body: `{ "rows": string[][] }` (entire CSV content). On success, normalizes and saves CSV, then redirects back to the editor.
-  - On invalid payload: returns JSON error with HTTP 400.
-
-- GET `/vuln_catalog`
-  - Renders catalog page.
-
-- POST `/vuln_compose/status`
-  - JSON body: `{ "items": [{ "Name": string, "Path": string, "compose"?: string }] }` (`compose` defaults to `docker-compose.yml`).
-  - Response JSON: `{ items: [{ Name, Path, compose, compose_path, exists: bool, pulled: bool, dir }], log: string[] }`.
-
-- POST `/vuln_compose/download`
-  - JSON body: `{ "items": [{ "Name": string, "Path": string, "compose"?: string }] }`.
-  - Notes: `Path` can be a GitHub URL to a repo, tree, or blob; requires `git` when cloning repos. Non‑GitHub paths are treated as direct download bases for `compose` files.
-  - Response JSON: `{ items: [{ Name, Path, ok: bool, dir: string, message: string, compose?: string }], log: string[] }`.
-
-- POST `/vuln_compose/pull`
-  - JSON body: `{ "items": [{ "Name": string, "Path": string, "compose"?: string }] }`.
-  - Requires Docker CLI available. Performs `docker compose pull` for each item’s compose file.
-  - Response JSON: `{ items: [{ Name, Path, ok: bool, message: string, compose: string }], log: string[] }`.
-
-- POST `/vuln_compose/remove`
-  - JSON body: `{ "items": [{ "Name": string, "Path": string, "compose"?: string }] }`.
-  - Performs `docker compose down --volumes --remove-orphans`, attempts to remove images, and cleans downloaded files/dirs under outputs.
-  - Response JSON: `{ items: [{ Name, Path, ok: bool, message: string, compose: string }], log: string[] }`.
-
-Streaming and cancellation
-
-- GET `/stream/<run_id>`
-  - Server-Sent Events (SSE) stream of live CLI logs for async runs.
-
-- POST `/cancel_run/<run_id>`
-  - Attempts to terminate an async run.
-
-Users
-
-- GET `/users`
-  - Renders users page (admin only).
-
-- POST `/users`
-  - Form fields: `username` (string), `password` (string), `role` (`user|admin`, default `user`).
-  - Fails with a flash error when the username already exists.
-- POST `/users/delete/<username>`
-  - Path param: `username` (string). Admin-only.
-- POST `/users/password/<username>`
-  - Path param: `username` (string). Form field: `password` (new password). Admin-only.
-- GET/POST `/me/password`
-  - Manage users and passwords; admin and self-service flows.
-  - GET: renders HTML. POST form fields: `current_password`, `password`.
-
-Notes
-- Report path detection parses the CLI log line: `Scenario report written to ...`. If missing, the backend falls back to the most recent `reports/scenario_report_*.md`.
-- Artifact deletion is scoped to `outputs/` only when purging run history for a scenario; reports under `./reports/` are not deleted.
-
-- POST `/purge_history_for_scenario`
-  - JSON body: `{ "name": string }` to remove history entries for a given scenario name and delete associated artifacts under `outputs/`.
-  - Response JSON: `{ removed: number, error?: string }`.
-
-CLI run arguments (core_topo_gen.cli)
-
-The CLI supports the following arguments. The Web endpoints currently forward only `--xml`, `--host`, `--port`, and `--verbose`. All other arguments are available when running the CLI directly.
-
-- General/core
-  - `--xml` (string, required): path to XML scenario file
-  - `--scenario` (string): specific scenario name in the XML; defaults to the first
-  - `--host` (string, default `127.0.0.1`): core-daemon gRPC host
-  - `--port` (int, default `50051`): core-daemon gRPC port
-  - `--prefix` (CIDR, default `10.0.0.0/24`): IPv4 prefix for auto-assigned addresses
-  - `--ip-mode` (`private|mixed|public`, default `private`): IP pool selection
-  - `--ip-region` (`all|na|eu|apac|latam|africa|middle-east`, default `all`): region for public pools
-  - `--max-nodes` (int): cap on hosts to create
-  - `--verbose` (flag): enable debug logging
-  - `--seed` (int): RNG seed for reproducible randomness
-  - `--layout-density` (`compact|normal|spacious`, default `normal`): affects node spacing
-    - Additive planning metadata parsing: The CLI automatically detects and parses section-level planning attributes when present (via `parse_planning_metadata`). Resulting keys are merged into generation metadata with a `plan_` prefix and surfaced in scenario reports.
-  - `--router-mesh-style` (`full|ring|tree`, default `full`): fallback mesh style applied to router set when routing items omit `r2r_mode`.
-
-- Traffic overrides (apply to all traffic items if provided)
-  - `--traffic-pattern` (`continuous|burst|periodic|poisson|ramp`)
-  - `--traffic-rate` (float KB/s)
-  - `--traffic-period` (float seconds)
-  - `--traffic-jitter` (float percent 0–100)
-  - `--traffic-content` (`text|photo|audio|video`)
-
-- Segmentation and allow rules
-  - `--allow-src-subnet-prob` (float 0..1, default `0.3`): widen allows to source subnet
-  - `--allow-dst-subnet-prob` (float 0..1, default `0.3`): widen allows to destination subnet
-  - `--nat-mode` (`SNAT|MASQUERADE`, default `SNAT`): NAT mode for routers
-  - `--dnat-prob` (float 0..1, default `0.0`): probability of DNAT (port-forward) on routers
-  - `--seg-include-hosts` (flag): include host nodes as candidates for segmentation placement
-  - `--seg-allow-docker-ports` (flag): ensure host INPUT chains allow docker-compose container ports when segmentation sets default deny rules
-
-Important
-- The web backend derives CORE `host`/`port` from the saved editor XML’s `core` section when present; otherwise defaults apply.
-- If you need to use additional CLI flags via the Web endpoints, extend the backend to accept and forward those parameters.
-
-### Connectivity Attribute Examples (Routing Section XML)
+`GET /docker/status`
+: Enumerates tracked Docker assignments with compose status:
+
+```json
+{
+	"items": [{
+		"name": "node1",
+		"compose": "docker-compose.yml",
+		"exists": true,
+		"pulled": false,
+		"container_exists": false,
+		"running": false
+	}],
+	"timestamp": 1733422330
+}
+```
+
+`POST /docker/cleanup`
+: Optional JSON body `{ "names": ["node1"] }`. Stops and removes containers via `docker stop` / `docker rm`, returning `{ "ok": true, "results": [{ "name": "node1", "stopped": true, "removed": true }] }`.
+
+### CORE Session Management
+
+`GET /core`
+: Renders the CORE session dashboard.
+
+`GET /core/data`
+: Returns `{ "sessions": [...], "xmls": [...] }`. Sessions include gRPC metadata (id, state, node count, backing XML). XML entries list discovered CORE files and their validation status.
+
+`POST /core/upload`
+: Multipart field `xml_file`. Saves validated CORE XML under `uploads/core/`.
+
+`POST /core/start`
+: Form field `path=<abs_xml_path>`. Starts a new CORE session using the provided XML.
+
+`POST /core/stop`
+: Form field `session_id=<int>`.
+
+`POST /core/delete`
+: Form fields:
+	- `session_id` (optional) to delete a running CORE session
+	- `path` (optional) to remove a CORE XML under `uploads/` or `outputs/`
+
+`GET /core/details`
+: Query parameters `path=<abs_xml_path>` and/or `session_id=<int>`. Renders validation results. When only `session_id` is provided, the server exports the current session XML for inspection.
+
+`POST /core/save_xml`
+: Form field `session_id=<int>`. Saves the running session’s XML into `outputs/core-sessions/` and streams it back as a download.
+
+`POST /core/start_session`
+: Form field `session_id=<int>` to start an existing session.
+
+`GET /core/session/<sid>`
+: Convenience view for a single session.
+
+`POST /test_core`
+: Form or JSON body with `host` (string) and `port` (int). Returns `{ "ok": true }` when gRPC connectivity succeeds.
+
+### Data Sources & Vulnerability Catalog
+
+`GET /data_sources`
+: Renders the data sources administration page.
+
+`POST /data_sources/upload`
+: Multipart field `csv_file`. Adds a new data source.
+
+`POST /data_sources/toggle/<sid>`
+: Enables or disables a data source.
+
+`POST /data_sources/delete/<sid>`
+: Removes a data source.
+
+`POST /data_sources/refresh/<sid>`
+: Refreshes a source (implementation-specific).
+
+`GET /data_sources/download/<sid>`
+: Downloads a single source as CSV.
+
+`GET /data_sources/export_all`
+: Downloads all sources in a ZIP or bundled CSV.
+
+`GET /data_sources/edit/<sid>`
+: Renders the inline CSV editor.
+
+`POST /data_sources/save/<sid>`
+: JSON body `{ "rows": [["Header", "Value"], ...] }`. Normalizes and saves the CSV, then redirects back to the editor. Malformed payloads return HTTP 400.
+
+`GET /vuln_catalog`
+: Renders the vulnerability catalog view.
+
+`POST /vuln_compose/status`
+: JSON `{ "items": [{ "Name": "Node1", "Path": "...", "compose"?: "docker-compose.yml" }] }`. Returns `{ "items": [...], "log": [...] }` with compose availability and Docker pull state.
+
+`POST /vuln_compose/download`
+: Same payload. Supports GitHub URLs (cloned via `git`) and direct download paths. Responds with `{ "items": [...], "log": [...] }` summarizing results.
+
+`POST /vuln_compose/pull`
+: Performs `docker compose pull` for each item. Requires Docker CLI access.
+
+`POST /vuln_compose/remove`
+: Runs `docker compose down --volumes --remove-orphans`, removes images, and deletes downloaded directories under `outputs/`.
+
+### Diagnostics & Maintenance
+
+`GET /diag/modules`
+: Returns imported module metadata to help troubleshoot environment issues.
+
+`POST /admin/cleanup_pycore`
+: Removes stale `/tmp/pycore.*` directories. Response `{ "ok": true, "removed": [...], "kept": [...], "active_session_ids": [...] }`.
+
+### User Administration
+
+`GET /users`
+: Admin-only view listing users.
+
+`POST /users`
+: Form fields `username`, `password`, `role` (`user`|`admin`, default `user`). Fails with a flash error if the username already exists.
+
+`POST /users/delete/<username>`
+: Removes the specified user (admin only).
+
+`POST /users/password/<username>`
+: Admin resets another user’s password. Form field `password` (new value).
+
+`GET /me/password`
+: Renders self-service password form.
+
+`POST /me/password`
+: Form fields `current_password`, `password`. Allows users to update their own credential.
+
+## CLI Reference (`core_topo_gen.cli`)
+
+Invoke from the repo root to ensure generated reports land in `./reports/`:
+
+```bash
+core-python -m core_topo_gen.cli --xml /abs/path/scenarios.xml --verbose
+```
+
+### Core Arguments
+
+- `--xml` (required): Scenario XML path.
+- `--scenario`: Scenario name (defaults to the first in the file).
+- `--host`, `--port`: CORE gRPC endpoint (defaults `127.0.0.1:50051`).
+- `--prefix`: IPv4 prefix for auto-assigned addresses (default `10.0.0.0/24`).
+- `--ip-mode`: `private | mixed | public` (default `private`).
+- `--ip-region`: `all | na | eu | apac | latam | africa | middle-east` (default `all`).
+- `--max-nodes`: Hard cap on node creation.
+- `--verbose`: Enables debug logging.
+- `--seed`: RNG seed for deterministic randomness.
+- `--layout-density`: `compact | normal | spacious` (default `normal`).
+- `--router-mesh-style`: `full | ring | tree` (fallback when routing items omit `r2r_mode`).
+
+### Traffic Overrides
+
+- `--traffic-pattern`: `continuous | burst | periodic | poisson | ramp`
+- `--traffic-rate`: Float KB/s
+- `--traffic-period`: Float seconds
+- `--traffic-jitter`: Float percentage (0–100)
+- `--traffic-content`: `text | photo | audio | video`
+
+### Segmentation & Allow Rules
+
+- `--allow-src-subnet-prob`: Float 0–1 (default 0.3)
+- `--allow-dst-subnet-prob`: Float 0–1 (default 0.3)
+- `--nat-mode`: `SNAT | MASQUERADE` (default `SNAT`)
+- `--dnat-prob`: Float 0–1 (default 0.0)
+- `--seg-include-hosts`: Include hosts when deriving segmentation rules.
+- `--seg-allow-docker-ports`: Ensure host INPUT chains allow docker-compose ports when default deny is applied.
+
+### Planning Metadata Integration
+
+- CLI automatically parses additive planning metadata via `parse_planning_metadata`. Detected values are merged into scenario metadata with a `plan_` prefix and appear in reports under **Planning Metadata (from XML)**.
+- CORE host/port defaults are overridden by `core.host` and `core.port` saved in the editor payload when present.
+- Extend the web backend if additional CLI flags must be surfaced to the UI.
+
+## Routing Connectivity Example
 
 ```xml
 <section name="Routing" density="0.5">
-  <!-- Balanced degree distribution among density-derived routers -->
-  <item selected="OSPF" factor="1" r2r_mode="Uniform" />
-  <!-- Absolute router addition (2) with heterogeneous links and host aggregation (target 5 hosts per new switch) -->
-  <item selected="BGP" v_metric="Count" v_count="2" r2r_mode="NonUniform" r2s_mode="aggregate" r2s_edges="5" />
+	<!-- Balanced degree distribution among density-derived routers -->
+	<item selected="OSPF" factor="1" r2r_mode="Uniform" />
+	<!-- Two absolute routers with NonUniform aggregation targeting five hosts per switch -->
+	<item selected="BGP" v_metric="Count" v_count="2" r2r_mode="NonUniform"
+				r2s_mode="aggregate" r2s_edges="5" />
 </section>
 ```
 
-Interpretation:
-- Density 0.5 over a base host pool of 12 hosts -> 6 density routers.
-- 2 BGP count routers => total planned routers = min(total_hosts, 6 + 2).
-- First item influences balanced edge placement; second item contributes NonUniform extra edges and triggers host rehoming behind aggregation switches sized ~5 hosts each.
+- Density `0.5` over 12 base hosts yields 6 density routers.
+- Two `Count` routers bring the total to `min(total_hosts, 6 + 2)`.
+- NonUniform aggregation introduces additional layer-2 switches sized to approximately five hosts each.
 
 ## Planning Metadata Quick Reference
 
-Optional section attributes written by the Web UI for additive planning round-trip:
+The web UI writes additive planning attributes onto section tags to support round-tripping and external tooling.
 
-`<section name="Node Information">`:
-- `base_nodes`: base (density) hosts distributed across weight rows.
-- `additive_nodes`: sum of Count row host additions.
-- `combined_nodes`: total planned hosts (`base_nodes + additive_nodes`).
-- `weight_rows`: number of Weight rows.
-- `count_rows`: number of Count rows.
-- `weight_sum`: raw sum of weight factors.
+### Node Information Section
 
-`<section name="Routing">` / `<section name="Vulnerabilities">`:
-- `explicit_count`: sum of absolute Count/Specific entries.
-- `derived_count`: density-derived amount (rules differ for routers vs vulnerabilities; see README).
+- `base_nodes`: Density-derived hosts.
+- `additive_nodes`: Hosts from Count rows.
+- `combined_nodes`: Total planned hosts (`base_nodes + additive_nodes`).
+- `weight_rows` / `count_rows`: Row counts by type.
+- `weight_sum`: Sum of weight factors.
+
+### Routing & Vulnerabilities Sections
+
+- `explicit_count`: Count-based entries with absolute values.
+- `derived_count`: Density-derived totals.
 - `total_planned`: `explicit_count + derived_count`.
-- `weight_rows`, `count_rows`, `weight_sum`: analogous to Node Information.
+- `weight_rows`, `count_rows`, `weight_sum`: Analogous to Node Information.
 
-Parsing helper (server-side or external tooling):
+### Parsing Helper
+
 ```python
 from core_topo_gen.parsers.planning_metadata import parse_planning_metadata
-meta = parse_planning_metadata('outputs/scenarios-123/scenarios.xml', 'Scenario 1')
-print(meta['node_info']['combined_nodes'])
+
+meta = parse_planning_metadata("outputs/scenarios-123/scenarios.xml", "Scenario 1")
+print(meta["node_info"]["combined_nodes"])
 ```
-Note: the legacy `core_topo_gen.parsers.xml_parser` module was removed (2025-10); import the specific section module instead.
-Fallback: If attributes are absent (legacy XML), parsing gracefully recomputes approximate values from existing elements.
 
-Experimental (Services / Traffic / Segmentation):
+- The legacy `core_topo_gen.parsers.xml_parser` module was removed in 2025-10; import section-specific parsers instead.
+- When attributes are absent (legacy XML), parsing gracefully recomputes approximate values.
 
-The XML builder now also writes structural placeholders for these sections:
-- `explicit_count`, `weight_rows`, `count_rows`, `weight_sum`
+### Experimental Sections (Services / Traffic / Segmentation)
 
-They currently expose raw structure only (no derived_count or total_planned yet); future versions may introduce density-derived semantics similar to Routers/Vulnerabilities.
+- Currently expose structural placeholders (`explicit_count`, `weight_rows`, `count_rows`, `weight_sum`).
+- Derived totals may be added in future releases as semantics mature.
+
