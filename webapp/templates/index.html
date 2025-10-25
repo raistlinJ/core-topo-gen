@@ -90,45 +90,24 @@
                         </div>
                     </div>
 
-                    <form id="editorForm" action="{{ url_for('save_xml') }}" method="post">
-                        <input type="hidden" name="scenarios_json" id="scenarios_json">
-                        <input type="hidden" name="active_index" id="active_index" value="0">
-                        <div id="editorRoot"></div>
-                        <div class="d-flex gap-2 mt-3">
-                            <button type="submit" class="btn btn-success">Save XML</button>
-                            <button type="button" class="btn btn-outline-info" id="downloadXmlBtn" disabled title="Save XML first">Download XML</button>
-                        </div>
-                    </form>
-
-                    <div class="card mt-3" id="coreConnectionCard">
+                    <div class="card mt-3" id="scenarioEditorCard">
                         <div class="card-header d-flex justify-content-between align-items-center">
-                            <strong>CORE Connection</strong>
-                            <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#coreAdvancedCollapse" aria-expanded="false" aria-controls="coreAdvancedCollapse">Advanced</button>
+                            <strong>Scenario Editor</strong>
+                            <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="modal" data-bs-target="#externalIfxModal">External IFX Configuration</button>
                         </div>
                         <div class="card-body">
-                            <div class="small text-muted">Defaults to localhost:50051. Adjust connection details in Advanced if needed.</div>
-                            <div class="collapse" id="coreAdvancedCollapse">
-                                <hr class="my-2"/>
-                                <div class="row g-2 align-items-end mb-2">
-                                    <div class="col-auto">
-                                        <label for="coreHost" class="form-label mb-0">IP</label>
-                                        <input type="text" class="form-control" id="coreHost" placeholder="localhost" value="{{ (payload.core.host if payload.core else 'localhost') | e }}">
-                                    </div>
-                                    <div class="col-auto">
-                                        <label for="corePort" class="form-label mb-0">Port</label>
-                                        <input type="number" class="form-control" id="corePort" placeholder="50051" value="{{ (payload.core.port if payload.core else 50051) }}">
-                                    </div>
+                            <form id="editorForm" action="{{ url_for('save_xml') }}" method="post">
+                                <input type="hidden" name="scenarios_json" id="scenarios_json">
+                                <input type="hidden" name="active_index" id="active_index" value="0">
+                                <div id="editorRoot"></div>
+                                <div class="d-flex gap-2 mt-3">
+                                    <button type="submit" class="btn btn-success">Save XML</button>
+                                    <button type="button" class="btn btn-outline-info" id="downloadXmlBtn" disabled title="Save XML first">Download XML</button>
                                 </div>
-                                <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
-                                    <button class="btn btn-sm btn-outline-secondary" type="button" id="testCoreBtn">Test CORE Connection</button>
-                                    <span id="coreStatus" class="small text-muted">Not tested </span>
-                                </div>
-                                <div class="form-text">Testing is optional; if you skip it the run will still attempt to connect using the provided host and port.</div>
-                            </div>
+                            </form>
                         </div>
                     </div>
 
-                    
 
                     <!-- Planning Workflow card visually removed but retained (d-none) for underlying JS functionality -->
                     <div class="card mt-3 d-none" id="planWorkflowCard">
@@ -199,6 +178,104 @@
 </div>
 {% set xml_preview_enabled = True %}
 {% set xml_preview_text = xml_preview %}
+
+<!-- External IFX Configuration Modal -->
+<div class="modal fade" id="externalIfxModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">External IFX Configuration</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <ul class="nav nav-tabs" id="externalIfxTabs" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="externalIfxCoreTab" data-bs-toggle="tab" data-bs-target="#externalIfxCorePane" type="button" role="tab" aria-controls="externalIfxCorePane" aria-selected="true">CORE</button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="externalIfxHitlTab" data-bs-toggle="tab" data-bs-target="#externalIfxHitlPane" type="button" role="tab" aria-controls="externalIfxHitlPane" aria-selected="false">HITL</button>
+                    </li>
+                </ul>
+                <div class="tab-content pt-3" id="externalIfxTabContent">
+                    <div class="tab-pane fade show active" id="externalIfxCorePane" role="tabpanel" aria-labelledby="externalIfxCoreTab" tabindex="0">
+                        <div class="card mb-3" id="coreConnectionCard">
+                            <div class="card-header">
+                                <strong>CORE Connection</strong>
+                            </div>
+                            <div class="card-body">
+                                <div class="small text-muted mb-3">Defaults to localhost:50051. Update the host or port to target a different CORE daemon.</div>
+                                <div class="row g-2 align-items-end mb-2">
+                                    <div class="col-auto">
+                                        <label for="coreHost" class="form-label mb-0">IP</label>
+                                        <input type="text" class="form-control" id="coreHost" placeholder="localhost" value="{{ (payload.core.host if payload.core else 'localhost') | e }}" />
+                                    </div>
+                                    <div class="col-auto">
+                                        <label for="corePort" class="form-label mb-0">Port</label>
+                                        <input type="number" class="form-control" id="corePort" placeholder="50051" value="{{ (payload.core.port if payload.core else 50051) }}" />
+                                    </div>
+                                </div>
+                                <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+                                    <button class="btn btn-sm btn-outline-secondary" type="button" id="testCoreBtn">Test CORE Connection</button>
+                                    <span id="coreStatus" class="small text-muted">Not tested </span>
+                                </div>
+                                <div class="form-text">Testing is optional; if you skip it the run will still attempt to connect using the provided host and port.</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="tab-pane fade" id="externalIfxHitlPane" role="tabpanel" aria-labelledby="externalIfxHitlTab" tabindex="0">
+                        <div id="externalIfxHitlContainer" class="d-flex flex-column gap-3"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+<!-- Proxmox Assignment Modal -->
+<div class="modal fade" id="proxmoxAssignModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Assign Proxmox Resource</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-info small" id="proxmoxAssignHint" style="display:none;"></div>
+                <form id="proxmoxAssignForm">
+                    <div class="mb-3">
+                        <label for="proxmoxUrl" class="form-label">URL</label>
+                        <input type="url" class="form-control" id="proxmoxUrl" placeholder="https://proxmox.example.local" autocomplete="url" required>
+                        <div class="form-text">Provide the base URL to the Proxmox API (https://host.domain).</div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="proxmoxPort" class="form-label">Port</label>
+                        <input type="number" class="form-control" id="proxmoxPort" placeholder="8006" min="1" max="65535" autocomplete="on" required>
+                    </div>
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" role="switch" id="proxmoxVerifySsl" checked>
+                        <label class="form-check-label" for="proxmoxVerifySsl">Enforce SSL certificate verification</label>
+                        <div class="form-text">Uncheck when connecting to Proxmox with self-signed or invalid certificates.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="proxmoxUsername" class="form-label">Username</label>
+                        <input type="text" class="form-control" id="proxmoxUsername" placeholder="root@pam" autocomplete="username" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="proxmoxPassword" class="form-label">Password</label>
+                        <input type="password" class="form-control" id="proxmoxPassword" placeholder="••••••" autocomplete="current-password" required>
+                    </div>
+                </form>
+                <div class="alert alert-danger d-none" id="proxmoxAssignError"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" id="proxmoxAssignSave">Save</button>
+            </div>
+        </div>
+    </div>
+</div>
 {% include 'partials/dock.html' %}
 
 <!-- Graph libraries for Full Preview Modal -->
@@ -591,7 +668,91 @@ function ensureHitlStateForScenario(scen) {
         return clone;
     }).filter(Boolean);
     scen.hitl.enabled = !!scen.hitl.enabled;
+    if (!scen.hitl.proxmox || typeof scen.hitl.proxmox !== 'object') {
+        scen.hitl.proxmox = {
+            url: '',
+            port: 8006,
+            username: '',
+            verify_ssl: true,
+            secret_id: null,
+            validated: false,
+            last_validated_at: null,
+            last_message: '',
+        };
+    } else {
+        const prox = scen.hitl.proxmox;
+        prox.url = (prox.url ?? '').toString().trim();
+        const parsedPort = parseInt(prox.port, 10);
+        prox.port = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 8006;
+        prox.username = (prox.username ?? '').toString().trim();
+        if ('password' in prox) {
+            delete prox.password;
+        }
+        prox.verify_ssl = prox.verify_ssl === false ? false : true;
+        if (typeof prox.secret_id !== 'string' || !prox.secret_id.trim()) {
+            prox.secret_id = null;
+        }
+        prox.validated = !!prox.validated;
+        prox.last_validated_at = prox.last_validated_at || null;
+        prox.last_message = (prox.last_message ?? '').toString();
+    }
     return scen.hitl;
+}
+
+function updateProxmoxSummary(sidx) {
+    try {
+        const summaryEl = document.querySelector(`[data-proxmox-summary="${sidx}"]`);
+        if (!summaryEl) return;
+        const scenario = state.scenarios?.[sidx];
+        if (!scenario) return;
+        const hitl = ensureHitlStateForScenario(scenario);
+        const prox = hitl.proxmox || { url: '', port: 8006, username: '' };
+        const hasProx = !!(prox.url && prox.username);
+        const port = prox.port ?? 8006;
+        const validated = !!(prox.validated && prox.secret_id);
+        let summaryText = 'No Proxmox resource assigned.';
+        if (hasProx) {
+            if (validated) {
+                summaryText = `Validated ${prox.username} @ ${prox.url}:${port}`;
+            } else {
+                summaryText = `Pending validation for ${prox.username} @ ${prox.url}:${port}`;
+            }
+            const detailParts = [];
+            if (prox.last_message) {
+                detailParts.push(prox.last_message);
+            } else if (validated && prox.last_validated_at) {
+                try {
+                    const dt = new Date(prox.last_validated_at);
+                    if (!Number.isNaN(dt.getTime())) {
+                        detailParts.push(`Last checked ${dt.toLocaleString()}`);
+                    }
+                } catch (e) { /* ignore */ }
+            }
+            detailParts.push(prox.verify_ssl === false ? 'SSL verify off' : 'SSL verify on');
+            if (detailParts.length) {
+                summaryText += ` • ${detailParts.join(' • ')}`;
+            }
+        }
+        summaryEl.textContent = summaryText;
+        summaryEl.classList.remove('text-success', 'text-warning', 'text-muted');
+        if (validated) summaryEl.classList.add('text-success');
+        else if (hasProx) summaryEl.classList.add('text-warning');
+        else summaryEl.classList.add('text-muted');
+
+        const assignBtn = document.querySelector(`[data-proxmox-assign][data-scen-idx="${sidx}"]`);
+        if (assignBtn) {
+            assignBtn.textContent = (validated || prox.secret_id)
+                ? 'Update Proxmox Resource'
+                : 'Assign Proxmox Resource';
+        }
+        const clearBtn = document.querySelector(`[data-proxmox-clear][data-scen-idx="${sidx}"]`);
+        if (clearBtn) {
+            const hasAny = !!(prox.secret_id || hasProx);
+            clearBtn.disabled = !hasAny;
+        }
+    } catch (e) {
+        console.warn('updateProxmoxSummary failed', e);
+    }
 }
 
 const HITL_PREVIEW_CACHE = new WeakMap();
@@ -3762,6 +3923,19 @@ function renderMain() {
 
     const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
     const hitl = ensureHitlStateForScenario(scen);
+    const proxmox = hitl.proxmox || { url: '', port: 8006, username: '', password: '' };
+    const proxValidated = !!(proxmox.validated && proxmox.secret_id);
+    const hasProxmox = !!(proxmox.url && proxmox.username);
+    const proxPort = proxmox.port ?? 8006;
+    const proxSummaryHtml = hasProxmox
+        ? (proxValidated
+            ? `Validated ${escapeHtml(proxmox.username)} @ ${escapeHtml(proxmox.url)}:${escapeHtml(String(proxPort))}`
+            : `Pending validation for ${escapeHtml(proxmox.username)} @ ${escapeHtml(proxmox.url)}:${escapeHtml(String(proxPort))}`)
+        : 'No Proxmox resource assigned.';
+    const proxSummaryClass = proxValidated ? 'text-success' : (hasProxmox ? 'text-warning' : 'text-muted');
+    const proxHasSecret = !!proxmox.secret_id;
+    const proxHasAny = proxHasSecret || hasProxmox;
+    const proxAssignLabel = proxHasSecret ? 'Update Proxmox Resource' : 'Assign Proxmox Resource';
     const hostLookup = new Map(hostInterfaces.filter(it => it && typeof it === 'object').map(it => [it.name, it]));
     const describeIface = (iface) => {
         if (!iface || typeof iface !== 'object') return '';
@@ -3817,7 +3991,7 @@ function renderMain() {
     hitlCard.className = 'card mb-3';
     const hitlCollapseId = `hitlCardBody_${activeIdx}`;
     const hitlCollapseBtnId = `hitlCollapseBtn_${activeIdx}`;
-    const hitlBody = hostInterfaces.length
+    const hitlInterfacesMarkup = hostInterfaces.length
         ? `
             <div class="row g-3">
                 <div class="col-md-6">
@@ -3845,6 +4019,15 @@ function renderMain() {
                     <button type="button" class="btn btn-sm btn-outline-secondary" data-hitl-refresh data-scen-idx="${activeIdx}">Retry enumeration</button>
                 </div>
             </div>`;
+    const hitlBody = `
+        <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
+            <div class="${proxSummaryClass} small" data-proxmox-summary="${activeIdx}">${proxSummaryHtml}</div>
+            <div class="d-flex flex-wrap gap-2">
+                <button type="button" class="btn btn-sm btn-outline-primary" data-proxmox-assign data-scen-idx="${activeIdx}">${proxAssignLabel}</button>
+                <button type="button" class="btn btn-sm btn-outline-danger" data-proxmox-clear data-scen-idx="${activeIdx}" ${proxHasAny ? '' : 'disabled'}>Clear Proxmox Resource</button>
+            </div>
+        </div>
+        ${hitlInterfacesMarkup}`;
     hitlCard.innerHTML = `
         <div class="card-header d-flex justify-content-between align-items-center">
             <strong>Hardware in the Loop</strong>
@@ -3860,7 +4043,10 @@ function renderMain() {
             ${hitlBody}
             <div class="small text-muted mt-3" data-hitl-status="${activeIdx}"></div>
         </div>`;
-    if (baseScenarioCard && baseScenarioCard.parentNode) {
+    const ifxHitlContainer = document.getElementById('externalIfxHitlContainer');
+    if (ifxHitlContainer) {
+        ifxHitlContainer.appendChild(hitlCard);
+    } else if (baseScenarioCard && baseScenarioCard.parentNode) {
         baseScenarioCard.parentNode.insertBefore(hitlCard, baseScenarioCard);
     } else {
         root.appendChild(hitlCard);
@@ -3869,6 +4055,8 @@ function renderMain() {
     if (typeof setupPreviewCollapsers === 'function') {
         setupPreviewCollapsers();
     }
+
+    try { updateProxmoxSummary(activeIdx); } catch (err) { console.warn('Failed to refresh Proxmox summary', err); }
 
     // --- Host density normalization for Node Information ---
     try {
@@ -4792,6 +4980,146 @@ function wireHandlers() {
             }
         });
     });
+    const proxAssignModal = document.getElementById('proxmoxAssignModal');
+    const proxAssignHint = document.getElementById('proxmoxAssignHint');
+    const proxAssignError = document.getElementById('proxmoxAssignError');
+    const proxAssignForm = document.getElementById('proxmoxAssignForm');
+    const proxUrlInput = document.getElementById('proxmoxUrl');
+    const proxPortInput = document.getElementById('proxmoxPort');
+    const proxUserInput = document.getElementById('proxmoxUsername');
+    const proxPassInput = document.getElementById('proxmoxPassword');
+    const proxVerifyInput = document.getElementById('proxmoxVerifySsl');
+    const setProxAssignHint = (message, tone = 'info') => {
+        if (!proxAssignHint) return;
+        proxAssignHint.textContent = message || '';
+        proxAssignHint.style.display = message ? '' : 'none';
+        proxAssignHint.classList.remove('alert-info', 'alert-success', 'alert-danger');
+        const klass = tone === 'success' ? 'alert-success' : tone === 'danger' ? 'alert-danger' : 'alert-info';
+        proxAssignHint.classList.add(klass);
+    };
+    window.setProxAssignHint = setProxAssignHint;
+    document.querySelectorAll('[data-proxmox-assign]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+            if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
+            if (!proxAssignModal || !window.bootstrap) {
+                console.warn('Proxmox modal not available');
+                return;
+            }
+            const scenario = state.scenarios[sidx];
+            const hitlState = ensureHitlStateForScenario(scenario);
+            const prox = hitlState.proxmox || { url: '', port: 8006, username: '' };
+            proxAssignModal.setAttribute('data-scen-idx', String(sidx));
+            const scenName = (scenario?.name || '').trim() || `Scenario ${sidx + 1}`;
+            if (proxAssignError) {
+                proxAssignError.textContent = '';
+                proxAssignError.classList.add('d-none');
+            }
+            if (proxAssignForm) {
+                proxAssignForm.classList.remove('was-validated');
+            }
+            if (proxVerifyInput) {
+                if (typeof prox.verify_ssl === 'boolean') {
+                    proxVerifyInput.checked = prox.verify_ssl;
+                } else if (prox.url) {
+                    proxVerifyInput.checked = /^https:/i.test(prox.url);
+                } else {
+                    proxVerifyInput.checked = true;
+                }
+            }
+            if (proxUrlInput) proxUrlInput.value = prox.url || '';
+            if (proxPortInput) proxPortInput.value = prox.port ?? 8006;
+            if (proxUserInput) proxUserInput.value = prox.username || '';
+            if (proxPassInput) proxPassInput.value = '';
+            if (proxVerifyInput) {
+                if (typeof prox.verify_ssl === 'boolean') {
+                    proxVerifyInput.checked = prox.verify_ssl;
+                } else {
+                    proxVerifyInput.checked = true;
+                }
+            }
+            let validatedStamp = 'a previous run';
+            if (prox.last_validated_at) {
+                try {
+                    const dtTemp = new Date(prox.last_validated_at);
+                    if (!Number.isNaN(dtTemp.getTime())) {
+                        validatedStamp = dtTemp.toLocaleString();
+                    }
+                } catch (err) {
+                    validatedStamp = 'a previous run';
+                }
+            }
+            const msg = prox.validated && prox.secret_id
+                ? `Validated on ${validatedStamp}. Re-enter password to re-validate.`
+                : 'Enter credentials to validate and store securely.';
+            setProxAssignHint(`Assigning Proxmox resource for ${scenName}. ${msg}`, prox.validated && prox.secret_id ? 'success' : 'info');
+            const modalObj = bootstrap.Modal.getInstance(proxAssignModal) || new bootstrap.Modal(proxAssignModal, { backdrop: true, keyboard: true });
+            modalObj.show();
+            setTimeout(() => { try { proxUrlInput?.focus(); } catch(e) {} }, 150);
+        });
+    });
+    document.querySelectorAll('[data-proxmox-clear]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+            if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
+            const scenario = state.scenarios[sidx];
+            const hitlState = ensureHitlStateForScenario(scenario);
+            const prox = hitlState.proxmox || {};
+            const hasAny = !!(prox.secret_id || prox.url || prox.username);
+            if (!hasAny) {
+                try { showToast('No Proxmox credentials to clear', { autohide: true, delay: 2000 }); } catch(e) {}
+                return;
+            }
+            const confirmClear = window.confirm('Clear saved Proxmox credentials for this scenario?');
+            if (!confirmClear) return;
+            const originalLabel = btn.textContent;
+            btn.disabled = true;
+            btn.dataset.busy = 'true';
+            btn.textContent = 'Clearing…';
+            try {
+                const resp = await fetch('/api/proxmox/clear', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({
+                        scenario_index: sidx,
+                        scenario_name: scenario?.name || '',
+                        secret_id: prox.secret_id || null,
+                    }),
+                });
+                let data = null;
+                try { data = await resp.json(); } catch(err) { data = null; }
+                if (!resp.ok || (data && data.success === false)) {
+                    const message = (data && (data.error || data.message)) || `Failed to clear credentials (HTTP ${resp.status})`;
+                    throw new Error(message);
+                }
+                hitlState.proxmox = {
+                    url: '',
+                    port: 8006,
+                    username: '',
+                    verify_ssl: true,
+                    secret_id: null,
+                    validated: false,
+                    last_validated_at: null,
+                    last_message: 'Proxmox credentials cleared.',
+                };
+                persistEditorState();
+                const hidden = document.getElementById('scenarios_json');
+                if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+                updateProxmoxSummary(sidx);
+                try { showToast('Proxmox credentials cleared', { autohide: true, delay: 2500 }); } catch(e) {}
+                logInfo('Cleared Proxmox credentials for scenario');
+            } catch (err) {
+                const message = err instanceof Error ? err.message : 'Failed to clear Proxmox credentials';
+                logError(message);
+                try { showToast(message, { autohide: false }); } catch(e) {}
+            } finally {
+                btn.disabled = false;
+                btn.textContent = originalLabel || 'Clear Proxmox Resource';
+                delete btn.dataset.busy;
+            }
+        });
+    });
     // Export preview handler
     const previewBtn = document.querySelector('[data-action="preview-plan"]');
     if (previewBtn) {
@@ -5041,8 +5369,10 @@ function wireCoreControls() {
         runSync?.removeAttribute('disabled');
         runSync?.classList.remove('pe-none');
         runSyncWrap?.setAttribute('data-bs-title', '');
-        statusEl.classList.remove('text-danger','text-success');
-        statusEl.textContent = 'Not tested (runs allowed)';
+        if (statusEl) {
+            statusEl.classList.remove('text-danger','text-success');
+            statusEl.textContent = 'Not tested (runs allowed)';
+        }
     };
 
     // initialize values
@@ -5052,8 +5382,10 @@ function wireCoreControls() {
     setRunEnabled();
 
     const onEdit = () => {
-    state.core.host = hostEl.value.trim();
-    state.core.port = parseInt(portEl.value || '50051', 10) || 50051;
+    const hostVal = hostEl?.value?.trim() || 'localhost';
+    const portVal = parseInt(portEl?.value || '50051', 10) || 50051;
+    state.core.host = hostVal;
+    state.core.port = portVal;
     state.core_ok = false; // changing values invalidates previous test
         // any edit resets test state
     setRunEnabled();
@@ -5064,36 +5396,44 @@ function wireCoreControls() {
     btn?.addEventListener('click', async () => {
     btn.disabled = true;
     logInfo('Testing CORE connection');
-        statusEl.classList.remove('text-danger', 'text-success');
-        statusEl.textContent = 'Testing...';
+        if (statusEl) {
+            statusEl.classList.remove('text-danger', 'text-success');
+            statusEl.textContent = 'Testing...';
+        }
         try {
             const res = await fetch("{{ url_for('test_core') }}", {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ host: hostEl.value.trim() || 'localhost', port: parseInt(portEl.value || '50051', 10) || 50051 })
+                body: JSON.stringify({ host: hostEl?.value?.trim() || 'localhost', port: parseInt(portEl?.value || '50051', 10) || 50051 })
             });
             const data = await res.json();
             if (data && data.ok) {
                 // persist success and the tested values
                 state.core_ok = true;
-                state.core_tested_host = hostEl.value.trim() || 'localhost';
-                state.core_tested_port = parseInt(portEl.value || '50051', 10) || 50051;
+                state.core_tested_host = hostEl?.value?.trim() || 'localhost';
+                state.core_tested_port = parseInt(portEl?.value || '50051', 10) || 50051;
                 logInfo(`CORE reachable at ${data.host||hostEl.value}:${data.port||portEl.value}`);
-                statusEl.classList.add('text-success');
-                statusEl.textContent = 'CORE reachable (optional)';
+                if (statusEl) {
+                    statusEl.classList.add('text-success');
+                    statusEl.textContent = 'CORE reachable (optional)';
+                }
                 persistEditorState();
             } else {
-                statusEl.classList.remove('text-success');
-                statusEl.classList.add('text-danger');
-                statusEl.textContent = 'Connection failed (run still allowed)' + (data?.error ? `: ${data.error}` : '');
+                if (statusEl) {
+                    statusEl.classList.remove('text-success');
+                    statusEl.classList.add('text-danger');
+                    statusEl.textContent = 'Connection failed (run still allowed)' + (data?.error ? `: ${data.error}` : '');
+                }
                 logWarn(`CORE connection failed: ${data?.error||'unknown'}`);
                 state.core_ok = false;
                 persistEditorState();
             }
         } catch (e) {
-            statusEl.classList.remove('text-success');
-            statusEl.classList.add('text-danger');
-            statusEl.textContent = 'Connection failed (run still allowed)';
+            if (statusEl) {
+                statusEl.classList.remove('text-success');
+                statusEl.classList.add('text-danger');
+                statusEl.textContent = 'Connection failed (run still allowed)';
+            }
             logError('CORE test threw exception');
             state.core_ok = false;
             persistEditorState();
@@ -5170,6 +5510,195 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         try { new bootstrap.Tooltip(el); } catch (e) { /* ignore */ }
     });
+    const proxAssignModal = document.getElementById('proxmoxAssignModal');
+    const proxAssignSave = document.getElementById('proxmoxAssignSave');
+    const proxAssignError = document.getElementById('proxmoxAssignError');
+    const proxAssignHint = document.getElementById('proxmoxAssignHint');
+    const proxAssignForm = document.getElementById('proxmoxAssignForm');
+    const proxUrlInput = document.getElementById('proxmoxUrl');
+    const proxPortInput = document.getElementById('proxmoxPort');
+    const proxUserInput = document.getElementById('proxmoxUsername');
+    const proxPassInput = document.getElementById('proxmoxPassword');
+    const clearProxError = () => {
+        if (!proxAssignError) return;
+        proxAssignError.textContent = '';
+        proxAssignError.classList.add('d-none');
+    };
+    const showProxError = (message) => {
+        if (!proxAssignError) return;
+        proxAssignError.textContent = message;
+        proxAssignError.classList.remove('d-none');
+    };
+    const setProxAssignBusy = (busy) => {
+        if (!proxAssignSave) return;
+        if (!proxAssignSave.dataset.defaultLabel) {
+            proxAssignSave.dataset.defaultLabel = proxAssignSave.innerHTML;
+        }
+        if (busy) {
+            proxAssignSave.disabled = true;
+            proxAssignSave.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Validating…';
+        } else {
+            proxAssignSave.disabled = false;
+            proxAssignSave.innerHTML = proxAssignSave.dataset.defaultLabel;
+        }
+        if (proxAssignForm) {
+            proxAssignForm.querySelectorAll('input').forEach(inp => {
+                if (busy) {
+                    inp.setAttribute('data-prox-disabled-prev', inp.disabled ? '1' : '0');
+                    inp.disabled = true;
+                } else {
+                    const prev = inp.getAttribute('data-prox-disabled-prev');
+                    inp.disabled = prev === '1';
+                    inp.removeAttribute('data-prox-disabled-prev');
+                }
+            });
+        }
+    };
+    const setProxAssignHint = window.setProxAssignHint || ((message, tone = 'info') => {
+        if (!proxAssignHint) return;
+        proxAssignHint.textContent = message || '';
+        proxAssignHint.style.display = message ? '' : 'none';
+        proxAssignHint.classList.remove('alert-info', 'alert-success', 'alert-danger');
+        const klass = tone === 'success' ? 'alert-success' : tone === 'danger' ? 'alert-danger' : 'alert-info';
+        proxAssignHint.classList.add(klass);
+    });
+    if (!window.setProxAssignHint) {
+        window.setProxAssignHint = setProxAssignHint;
+    }
+    proxAssignSave?.addEventListener('click', async () => {
+        if (!proxAssignModal) return;
+        const sidx = parseInt(proxAssignModal.getAttribute('data-scen-idx') || '', 10);
+        if (isNaN(sidx) || !state.scenarios?.[sidx]) {
+            showProxError('Scenario context unavailable.');
+            return;
+        }
+        if (!proxAssignForm) return;
+        if (!proxAssignForm.checkValidity()) {
+            proxAssignForm.reportValidity();
+            return;
+        }
+        clearProxError();
+        const urlVal = (proxUrlInput?.value || '').trim();
+        if (!/^https?:\/\//i.test(urlVal)) {
+            showProxError('URL must start with http:// or https://');
+            proxUrlInput?.focus();
+            return;
+        }
+        const portVal = parseInt(proxPortInput?.value || '8006', 10);
+        if (!Number.isFinite(portVal) || portVal < 1 || portVal > 65535) {
+            showProxError('Port must be between 1 and 65535');
+            proxPortInput?.focus();
+            return;
+        }
+        const userVal = (proxUserInput?.value || '').trim();
+        if (!userVal) {
+            showProxError('Username is required.');
+            proxUserInput?.focus();
+            return;
+        }
+        const passVal = proxPassInput?.value ?? '';
+        if (!passVal) {
+            showProxError('Password is required.');
+            proxPassInput?.focus();
+            return;
+        }
+        const scenario = state.scenarios[sidx];
+        const verifyInput = document.getElementById('proxmoxVerifySsl');
+        const verifySsl = verifyInput ? !!verifyInput.checked : /^https:/i.test(urlVal);
+        setProxAssignBusy(true);
+        setProxAssignHint('Validating credentials with Proxmox…', 'info');
+        let data = null;
+        try {
+            const resp = await fetch('/api/proxmox/validate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({
+                    url: urlVal,
+                    port: portVal,
+                    username: userVal,
+                    password: passVal,
+                    verify_ssl: verifySsl,
+                    scenario_index: sidx,
+                    scenario_name: scenario?.name || '',
+                    timeout: 8.0,
+                }),
+            });
+            try {
+                data = await resp.json();
+            } catch (err) {
+                data = null;
+            }
+            if (!resp.ok || !data || data.success === false) {
+                const errMsg = (data && data.error) ? data.error : `Validation failed (HTTP ${resp.status})`;
+                throw new Error(errMsg);
+            }
+        } catch (err) {
+            const message = err instanceof Error ? err.message : 'Unknown error during validation';
+            showProxError(message);
+            setProxAssignHint('', 'info');
+            setProxAssignBusy(false);
+            return;
+        }
+        try {
+            const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
+            const summary = data?.summary || {};
+            hitlState.proxmox = {
+                ...hitlState.proxmox,
+                url: urlVal,
+                port: summary.port ?? portVal,
+                username: summary.username ?? userVal,
+                verify_ssl: summary.verify_ssl ?? verifySsl,
+                secret_id: data?.secret_id || summary.identifier || hitlState.proxmox?.secret_id || null,
+                validated: true,
+                last_validated_at: summary.stored_at || new Date().toISOString(),
+                last_message: data?.message || 'Credentials validated.',
+            };
+            if ('password' in hitlState.proxmox) {
+                delete hitlState.proxmox.password;
+            }
+            updateProxmoxSummary(sidx);
+            persistEditorState();
+            const hidden = document.getElementById('scenarios_json');
+            if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+            if (proxPassInput) proxPassInput.value = '';
+            setProxAssignHint(data?.message || 'Proxmox credentials validated and stored securely.', 'success');
+            try { showToast(data?.message || 'Proxmox credentials validated', { autohide: true, delay: 2500 }); } catch(e) {}
+            const modalInstance = window.bootstrap ? bootstrap.Modal.getInstance(proxAssignModal) : null;
+            setTimeout(() => { modalInstance?.hide(); }, 400);
+        } catch (err) {
+            const message = err instanceof Error ? err.message : 'Failed to persist Proxmox state locally';
+            showProxError(message);
+            setProxAssignHint('', 'info');
+        } finally {
+            setProxAssignBusy(false);
+        }
+    });
+    if (proxAssignModal && window.bootstrap) {
+        proxAssignModal.addEventListener('hidden.bs.modal', () => {
+            proxAssignModal.removeAttribute('data-scen-idx');
+            clearProxError();
+            setProxAssignHint('', 'info');
+            if (proxPassInput) proxPassInput.value = '';
+            const verifyInput = document.getElementById('proxmoxVerifySsl');
+            if (verifyInput) verifyInput.checked = true;
+        });
+    }
+    const externalIfxModal = document.getElementById('externalIfxModal');
+    if (externalIfxModal) {
+        externalIfxModal.addEventListener('hide.bs.modal', () => {
+            const active = document.activeElement;
+            if (active && externalIfxModal.contains(active) && typeof active.blur === 'function') {
+                active.blur();
+            }
+        });
+        externalIfxModal.addEventListener('hidden.bs.modal', () => {
+            const triggerBtn = document.querySelector('[data-bs-target="\#externalIfxModal"]');
+            if (triggerBtn && typeof triggerBtn.focus === 'function') {
+                triggerBtn.focus();
+            }
+        });
+    }
     // Wire Download XML button
     const dlBtn = document.getElementById('downloadXmlBtn');
     if (dlBtn) {
@@ -5264,7 +5793,11 @@ function ensureVulnModal(){
 async function openVulnPicker(sidx, secName, iidx){
     ensureVulnModal();
     const modalEl = document.getElementById('vulnModal');
-    const modalObj = window.bootstrap ? new bootstrap.Modal(modalEl, { backdrop: true, keyboard: true }) : null;
+    if (!modalEl) {
+        logError('Vulnerability modal element not found');
+        return;
+    }
+    const modalObj = window.bootstrap ? (bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl, { backdrop: true, keyboard: true })) : null;
     const filterInput = modalEl.querySelector('#vulnFilter');
     const filterClearBtn = modalEl.querySelector('#vulnFilterClear');
     const filterMeta = modalEl.querySelector('#vulnFilterMeta');

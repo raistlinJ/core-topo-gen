@@ -16,6 +16,7 @@ import zipfile
 import secrets
 import socket
 import hashlib
+from urllib.parse import urlparse
 
 from pathlib import Path
 from typing import Dict, Any, Optional, List
@@ -31,6 +32,20 @@ import xml.etree.ElementTree as ET
 from flask import Flask, render_template, request, redirect, url_for, flash, send_file, Response, jsonify, session, g
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
+
+try:
+    from proxmoxer import ProxmoxAPI  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    ProxmoxAPI = None  # type: ignore
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    Fernet = None  # type: ignore
+
+    class InvalidToken(Exception):
+        """Fallback InvalidToken if cryptography is unavailable."""
+        pass
 from lxml import etree as LET  # XML validation
 ALLOWED_EXTENSIONS = {'xml'}
 
@@ -936,6 +951,169 @@ def _vuln_base_dir() -> str:
 
 def _vuln_repo_subdir() -> str:
     return 'repo'
+
+
+def _ensure_private_dir(path: str, mode: int = 0o700) -> str:
+    os.makedirs(path, exist_ok=True)
+    if os.name != 'nt':
+        try:
+            os.chmod(path, mode)
+        except Exception:
+            pass
+    return path
+
+
+def _ensure_private_file(path: str, mode: int = 0o600) -> None:
+    if os.name != 'nt':
+        try:
+            os.chmod(path, mode)
+        except Exception:
+            pass
+
+
+def _proxmox_secret_dir() -> str:
+    base = _ensure_private_dir(os.path.join(_outputs_dir(), 'secrets'))
+    prox_dir = os.path.join(base, 'proxmox')
+    return _ensure_private_dir(prox_dir)
+
+
+def _proxmox_secret_key_path() -> str:
+    return os.path.join(_proxmox_secret_dir(), '.key')
+
+
+def _load_or_create_proxmox_key() -> bytes:
+    if Fernet is None:  # pragma: no cover - dependency missing
+        raise RuntimeError('cryptography package is required for secure Proxmox credential storage')
+    env_key = os.environ.get('PROXMOX_SECRET_KEY')
+    if env_key:
+        key_bytes = env_key.encode('utf-8')
+        try:
+            Fernet(key_bytes)
+            return key_bytes
+        except Exception as exc:  # pragma: no cover - misconfigured env
+            logging.getLogger(__name__).warning('Invalid PROXMOX_SECRET_KEY provided: %s', exc)
+    key_path = _proxmox_secret_key_path()
+    if os.path.exists(key_path):
+        try:
+            with open(key_path, 'rb') as fh:
+                key_bytes = fh.read().strip()
+            if key_bytes:
+                Fernet(key_bytes)  # validate
+                return key_bytes
+        except Exception:
+            logging.getLogger(__name__).warning('Existing Proxmox secret key invalid; regenerating')
+    key_bytes = Fernet.generate_key()
+    tmp_path = key_path + '.tmp'
+    with open(tmp_path, 'wb') as fh:
+        fh.write(key_bytes)
+    os.replace(tmp_path, key_path)
+    _ensure_private_file(key_path)
+    return key_bytes
+
+
+def _get_proxmox_cipher():
+    if Fernet is None:  # pragma: no cover - dependency missing
+        raise RuntimeError('cryptography package is required for secure Proxmox credential storage')
+    key = _load_or_create_proxmox_key()
+    return Fernet(key)
+
+
+def _sanitize_proxmox_slug(raw: str, fallback: str = 'scenario') -> str:
+    cleaned = ''.join(ch.lower() if ch.isalnum() else '-' for ch in raw or '')
+    cleaned = re.sub(r'-{2,}', '-', cleaned).strip('-')
+    return cleaned[:48] or fallback
+
+
+def _derive_proxmox_identifier(
+    scenario_name: str,
+    scenario_index: Optional[int],
+    url: str,
+    username: str,
+) -> str:
+    slug = _sanitize_proxmox_slug(scenario_name or '')
+    index_part = f"{scenario_index:02d}-" if isinstance(scenario_index, int) and scenario_index >= 0 else ''
+    fingerprint_src = f"{url}|{username}"
+    fingerprint = hashlib.sha256(fingerprint_src.encode('utf-8', 'ignore')).hexdigest()[:12]
+    return f"{index_part}{slug}-{fingerprint}"
+
+
+def _proxmox_secret_path(identifier: str) -> str:
+    safe = _sanitize_proxmox_slug(identifier, 'proxmox')
+    return os.path.join(_proxmox_secret_dir(), f"{safe}.json")
+
+
+def _save_proxmox_credentials(payload: Dict[str, Any]) -> Dict[str, Any]:
+    cipher = _get_proxmox_cipher()
+    scenario_name = str(payload.get('scenario_name') or '').strip()
+    scenario_index = payload.get('scenario_index')
+    url = str(payload.get('url') or '').strip()
+    username = str(payload.get('username') or '').strip()
+    password = payload.get('password') or ''
+    port = int(payload.get('port') or 8006)
+    verify_ssl = bool(payload.get('verify_ssl', False))
+    identifier = _derive_proxmox_identifier(scenario_name, scenario_index if isinstance(scenario_index, int) else None, url, username)
+    encrypted_password = cipher.encrypt(password.encode('utf-8')).decode('utf-8')
+    record = {
+        'identifier': identifier,
+        'scenario_name': scenario_name,
+        'scenario_index': scenario_index if isinstance(scenario_index, int) else None,
+        'url': url,
+        'port': port,
+        'username': username,
+        'password': encrypted_password,
+        'verify_ssl': verify_ssl,
+        'stored_at': datetime.datetime.now(datetime.UTC).isoformat(),
+    }
+    path = _proxmox_secret_path(identifier)
+    tmp_path = path + '.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as fh:
+        json.dump(record, fh, indent=2)
+    os.replace(tmp_path, path)
+    _ensure_private_file(path)
+    return {
+        'identifier': identifier,
+        'url': url,
+        'port': port,
+        'username': username,
+        'verify_ssl': verify_ssl,
+        'stored_at': record['stored_at'],
+    }
+
+
+def _load_proxmox_credentials(identifier: str) -> Optional[Dict[str, Any]]:
+    path = _proxmox_secret_path(identifier)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        cipher = _get_proxmox_cipher()
+        enc = data.get('password')
+        password = ''
+        if isinstance(enc, str) and enc:
+            try:
+                password = cipher.decrypt(enc.encode('utf-8')).decode('utf-8')
+            except InvalidToken:
+                password = ''
+        data['password_plain'] = password
+        return data
+    except Exception:
+        logging.getLogger(__name__).exception('Failed to load Proxmox credentials for %s', identifier)
+        return None
+
+
+def _delete_proxmox_credentials(identifier: str) -> bool:
+    if not isinstance(identifier, str) or not identifier.strip():
+        return False
+    path = _proxmox_secret_path(identifier)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+    except Exception:
+        logging.getLogger(__name__).exception('Failed to delete Proxmox credentials for %s', identifier)
+        raise
+    return False
 
 # ---------------- User persistence helpers (restored) ----------------
 def _users_db_path() -> str:
@@ -2184,6 +2362,135 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]]) -> Dict[str, A
 @app.route('/api/host_interfaces', methods=['GET'])
 def api_host_interfaces():
     return jsonify({'interfaces': _enumerate_host_interfaces()})
+
+
+@app.route('/api/proxmox/validate', methods=['POST'])
+def api_proxmox_validate():
+    if ProxmoxAPI is None:
+        return jsonify({'success': False, 'error': 'Proxmox integration unavailable: install proxmoxer package'}), 500
+    payload = request.get_json(silent=True) or {}
+    url_raw = str(payload.get('url') or '').strip()
+    if not url_raw:
+        return jsonify({'success': False, 'error': 'URL is required'}), 400
+    parsed = urlparse(url_raw)
+    if parsed.scheme not in {'http', 'https'}:
+        return jsonify({'success': False, 'error': 'URL must start with http:// or https://'}), 400
+    host = parsed.hostname
+    if not host:
+        return jsonify({'success': False, 'error': 'Unable to determine host from URL'}), 400
+    try:
+        port = int(payload.get('port') or (parsed.port or 8006))
+    except Exception:
+        port = parsed.port or 8006
+    if port < 1 or port > 65535:
+        return jsonify({'success': False, 'error': 'Port must be between 1 and 65535'}), 400
+    username = str(payload.get('username') or '').strip()
+    if not username:
+        return jsonify({'success': False, 'error': 'Username is required'}), 400
+    password = payload.get('password')
+    if password is None:
+        password = ''
+    if not isinstance(password, str):
+        password = str(password)
+    if not password:
+        return jsonify({'success': False, 'error': 'Password is required'}), 400
+    verify_ssl = payload.get('verify_ssl')
+    if verify_ssl is None:
+        verify_ssl = (parsed.scheme == 'https')
+    else:
+        verify_ssl = bool(verify_ssl)
+    timeout_val = payload.get('timeout', 5.0)
+    try:
+        timeout = float(timeout_val)
+    except Exception:
+        timeout = 5.0
+    timeout = max(1.0, min(timeout, 30.0))
+    prox_kwargs = {
+        'host': host,
+        'user': username,
+        'password': password,
+        'port': port,
+        'verify_ssl': verify_ssl,
+        'timeout': timeout,
+        'backend': 'https' if parsed.scheme == 'https' else 'http',
+    }
+    try:
+        app.logger.debug('[proxmox] attempting auth for %s@%s:%s (verify_ssl=%s)', username, host, port, verify_ssl)
+    except Exception:
+        pass
+    try:
+        prox = ProxmoxAPI(**prox_kwargs)  # type: ignore[arg-type]
+        prox.version.get()
+    except Exception as exc:
+        try:
+            app.logger.warning('[proxmox] authentication failed: %s', exc)
+        except Exception:
+            pass
+        return jsonify({'success': False, 'error': f'Authentication failed: {exc}'}), 401
+    try:
+        app.logger.info('[proxmox] authentication succeeded for %s@%s:%s', username, host, port)
+    except Exception:
+        pass
+    scenario_index = payload.get('scenario_index')
+    scenario_name = str(payload.get('scenario_name') or '').strip()
+    secret_payload = {
+        'scenario_name': scenario_name,
+        'scenario_index': scenario_index,
+        'url': url_raw,
+        'port': port,
+        'username': username,
+        'password': password,
+        'verify_ssl': verify_ssl,
+    }
+    try:
+        stored_meta = _save_proxmox_credentials(secret_payload)
+    except RuntimeError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+    except Exception as exc:
+        app.logger.exception('[proxmox] failed to persist credentials: %s', exc)
+        return jsonify({'success': False, 'error': 'Credentials validated but could not be stored'}), 500
+    summary = {
+        'url': stored_meta['url'],
+        'port': stored_meta['port'],
+        'username': stored_meta['username'],
+        'verify_ssl': stored_meta['verify_ssl'],
+        'stored_at': stored_meta['stored_at'],
+    }
+    message = f"Validated Proxmox access for {username} at {host}:{port}"
+    return jsonify({
+        'success': True,
+        'message': message,
+        'summary': summary,
+        'secret_id': stored_meta['identifier'],
+        'scenario_index': scenario_index,
+        'scenario_name': scenario_name,
+    })
+
+
+@app.route('/api/proxmox/clear', methods=['POST'])
+def api_proxmox_clear():
+    payload = request.get_json(silent=True) or {}
+    secret_id_raw = payload.get('secret_id')
+    secret_id = secret_id_raw.strip() if isinstance(secret_id_raw, str) else ''
+    scenario_index = payload.get('scenario_index')
+    scenario_name = str(payload.get('scenario_name') or '').strip()
+    removed = False
+    try:
+        if secret_id:
+            removed = _delete_proxmox_credentials(secret_id)
+    except Exception:
+        app.logger.exception('[proxmox] failed to clear credentials for %s (scenario %s)', secret_id or 'unknown', scenario_name or scenario_index)
+        return jsonify({'success': False, 'error': 'Failed to clear stored Proxmox credentials'}), 500
+    try:
+        app.logger.info('[proxmox] cleared credentials request for %s (scenario_index=%s, removed=%s)', scenario_name or 'unnamed', scenario_index, removed)
+    except Exception:
+        pass
+    return jsonify({
+        'success': True,
+        'secret_removed': removed,
+        'scenario_index': scenario_index,
+        'scenario_name': scenario_name,
+    })
 
 # ---------------- Docker (per-node) status & cleanup ----------------
 def _compose_assignments_path() -> str:
