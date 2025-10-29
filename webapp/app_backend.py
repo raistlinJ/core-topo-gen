@@ -484,14 +484,34 @@ def _normalize_run_history_entry(entry: Any) -> Dict[str, Any]:
     return normalized
 
 
+def _require_core_ssh_credentials(core_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize and validate CORE SSH configuration, enforcing credential presence."""
+
+    cfg = _normalize_core_config(core_cfg, include_password=True)
+    # All backend interactions with the CORE daemon **must** traverse an SSH tunnel.
+    # This helper normalizes and validates the credentials up-front so callers do
+    # not accidentally bypass the tunnel when invoking gRPC helpers or CLI flows.
+    username = str(cfg.get('ssh_username') or '').strip()
+    if not username:
+        raise _SSHTunnelError('SSH username is required (SSH tunnel enforced for CORE gRPC)')
+    password_raw = cfg.get('ssh_password')
+    if password_raw is None:
+        password = ''
+    elif isinstance(password_raw, str):
+        password = password_raw.strip()
+    else:
+        password = str(password_raw).strip()
+    if not password:
+        raise _SSHTunnelError('SSH password is required (SSH tunnel enforced for CORE gRPC)')
+    cfg['ssh_username'] = username
+    cfg['ssh_password'] = password
+    return cfg
+
+
 @contextlib.contextmanager
 def _core_connection(core_cfg: Dict[str, Any]) -> Iterator[Tuple[str, int]]:
-    cfg = _normalize_core_config(core_cfg, include_password=True)
+    cfg = _require_core_ssh_credentials(core_cfg)
     logger = getattr(app, 'logger', logging.getLogger(__name__))
-    if not cfg.get('ssh_username'):
-        raise _SSHTunnelError('SSH username is required (SSH tunnel enforced for CORE gRPC)')
-    if not cfg.get('ssh_password'):
-        raise _SSHTunnelError('SSH password is required (SSH tunnel enforced for CORE gRPC)')
     logger.info('Opening CORE SSH tunnel: %s@%s:%s → %s:%s', cfg['ssh_username'], cfg['ssh_host'], cfg['ssh_port'], cfg['host'], cfg['port'])
     with _core_connection_via_ssh(cfg) as forwarded:
         yield forwarded
@@ -5722,6 +5742,11 @@ def run_cli():
         scenario_core_override,
         include_password=True,
     )
+    try:
+        core_cfg = _require_core_ssh_credentials(core_cfg)
+    except _SSHTunnelError as exc:
+        flash(str(exc))
+        return redirect(url_for('index'))
     core_host = core_cfg.get('host', '127.0.0.1')
     try:
         core_port = int(core_cfg.get('port', 50051))
@@ -6894,6 +6919,14 @@ def run_cli_async():
         scenario_core_override if isinstance(scenario_core_override, dict) else None,
         include_password=True,
     )
+    try:
+        core_cfg = _require_core_ssh_credentials(core_cfg)
+    except _SSHTunnelError as exc:
+        try:
+            log_f.close()
+        except Exception:
+            pass
+        return jsonify({"error": str(exc)}), 400
     core_host = core_cfg.get('host', '127.0.0.1')
     try:
         core_port = int(core_cfg.get('port', 50051))
@@ -6910,57 +6943,56 @@ def run_cli_async():
         pre_saved = None
     if pre_saved:
         app.logger.debug("[async] Pre-run session XML saved to %s", pre_saved)
-    # Establish SSH tunnel when required so CLI subprocess can reach CORE
+    # Establish SSH tunnel so CLI subprocess can reach CORE
     conn_host = core_host
     conn_port = core_port
     ssh_tunnel = None
-    if core_cfg.get('ssh_enabled'):
+    try:
+        tunnel = _SshTunnel(
+            ssh_host=str(core_cfg.get('ssh_host') or core_host),
+            ssh_port=int(core_cfg.get('ssh_port') or 22),
+            username=str(core_cfg.get('ssh_username') or ''),
+            password=(core_cfg.get('ssh_password') or None),
+            remote_host=str(core_host),
+            remote_port=int(core_port),
+        )
+        conn_host, conn_port = tunnel.start()
+        ssh_tunnel = tunnel
+        app.logger.info(
+            "[async] SSH tunnel active: %s -> %s",
+            f"{conn_host}:{conn_port}",
+            remote_desc,
+        )
+    except _SSHTunnelError as exc:
         try:
-            tunnel = _SshTunnel(
-                ssh_host=str(core_cfg.get('ssh_host') or core_host),
-                ssh_port=int(core_cfg.get('ssh_port') or 22),
-                username=str(core_cfg.get('ssh_username') or ''),
-                password=(core_cfg.get('ssh_password') or None),
-                remote_host=str(core_host),
-                remote_port=int(core_port),
-            )
-            conn_host, conn_port = tunnel.start()
-            ssh_tunnel = tunnel
-            app.logger.info(
-                "[async] SSH tunnel active: %s -> %s",
-                f"{conn_host}:{conn_port}",
-                remote_desc,
-            )
-        except _SSHTunnelError as exc:
+            app.logger.warning("[async] SSH tunnel setup failed: %s", exc)
+        except Exception:
+            pass
+        try:
+            log_f.close()
+        except Exception:
+            pass
+        if ssh_tunnel:
             try:
-                app.logger.warning("[async] SSH tunnel setup failed: %s", exc)
+                ssh_tunnel.close()
             except Exception:
                 pass
+        return jsonify({"error": f"SSH tunnel failed: {exc}"}), 500
+    except Exception as exc:
+        try:
+            app.logger.exception("[async] Unexpected SSH tunnel failure: %s", exc)
+        except Exception:
+            pass
+        try:
+            log_f.close()
+        except Exception:
+            pass
+        if ssh_tunnel:
             try:
-                log_f.close()
+                ssh_tunnel.close()
             except Exception:
                 pass
-            if ssh_tunnel:
-                try:
-                    ssh_tunnel.close()
-                except Exception:
-                    pass
-            return jsonify({"error": f"SSH tunnel failed: {exc}"}), 500
-        except Exception as exc:
-            try:
-                app.logger.exception("[async] Unexpected SSH tunnel failure: %s", exc)
-            except Exception:
-                pass
-            try:
-                log_f.close()
-            except Exception:
-                pass
-            if ssh_tunnel:
-                try:
-                    ssh_tunnel.close()
-                except Exception:
-                    pass
-            return jsonify({"error": "Failed to establish SSH tunnel"}), 500
+        return jsonify({"error": "Failed to establish SSH tunnel"}), 500
     # Capture scenario names from the editor XML now (CORE post XML will not be parsable by our scenarios parser)
     scen_names = _scenario_names_from_xml(xml_path)
     repo_root = _get_repo_root()

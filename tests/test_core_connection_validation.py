@@ -40,6 +40,29 @@ def _fake_core_connection(_cfg):
     yield '127.0.0.1', 6000
 
 
+def test_require_core_ssh_credentials_requires_username():
+    with pytest.raises(backend._SSHTunnelError) as exc:
+        backend._require_core_ssh_credentials({'host': 'core-host', 'port': 50051, 'ssh_password': 'pw'})
+    assert 'SSH username is required' in str(exc.value)
+
+
+def test_require_core_ssh_credentials_requires_password():
+    with pytest.raises(backend._SSHTunnelError) as exc:
+        backend._require_core_ssh_credentials({'host': 'core-host', 'port': 50051, 'ssh_username': 'core'})
+    assert 'SSH password is required' in str(exc.value)
+
+
+def test_require_core_ssh_credentials_trims_fields():
+    cfg = backend._require_core_ssh_credentials({
+        'host': 'core-host',
+        'port': 50051,
+        'ssh_username': ' core ',
+        'ssh_password': ' pw ',
+    })
+    assert cfg['ssh_username'] == 'core'
+    assert cfg['ssh_password'] == 'pw'
+
+
 def test_test_core_requires_vm_selection(client, monkeypatch):
     monkeypatch.setattr(backend, '_core_connection', _fake_core_connection)
     monkeypatch.setattr(backend.socket, 'socket', _FakeSocket)
@@ -187,3 +210,16 @@ def test_test_core_success_includes_vm_metadata(client, monkeypatch):
     assert 'VM CORE VM' in data['message']
     assert saved_payloads and saved_payloads[0]['vm_key'] == 'pve1::101'
     assert saved_payloads[0]['vmid'] == 101
+
+
+def test_run_cli_async_requires_ssh_credentials(client, tmp_path, monkeypatch):
+    xml_path = tmp_path / 'scenarios.xml'
+    xml_path.write_text('<Scenarios></Scenarios>')
+
+    # Avoid heavy parsing during the test
+    monkeypatch.setattr(backend, '_parse_scenarios_xml', lambda *_args, **_kwargs: {})
+
+    resp = client.post('/run_cli_async', data={'xml_path': str(xml_path)})
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert data['error'].startswith('SSH username is required')
