@@ -66,7 +66,10 @@ The web UI uses cookie sessions. Script clients must authenticate once and reuse
 : JSON body `{ "scenarios": [...], "active_index"?: int }`. Returns `{ "ok": true, "result_path": ".../scenarios.xml" }` on success or `{ "ok": false, "error": "..." }` with HTTP 400/500 on failure.
 
 `GET /api/host_interfaces`
-: Returns `{ "interfaces": [...] }` describing host NICs (`name`, `mac`, `ipv4`, `ipv6`, `mtu`, `speed`, `flags`, `is_up`). Requires `psutil`; if unavailable, returns an empty list with a warning in logs.
+: Returns `{ "interfaces": [...] }` describing host NICs on the web host (`name`, `mac`, `ipv4`, `ipv6`, `mtu`, `speed`, `flags`, `is_up`). Requires `psutil`; if unavailable, returns an empty list with a warning in logs. Primarily a legacy/debug fallback when CORE credentials are not configured.
+
+`POST /api/host_interfaces`
+: JSON body `{ "core_secret_id": "...", "core_vm": { "vm_key": "node::vmid", "vm_name": "...", "vm_node": "...", "vmid": "...", "interfaces": [...] }, "include_down"?: bool }`. Enumerates network interfaces from the selected CORE VM over SSH using stored credentials. Response `{ "success": true, "interfaces": [...], "source": "core_vm", "metadata": { ... }, "fetched_at": "<iso8601>" }` includes Proxmox VM/interface metadata when MAC addresses match the supplied `core_vm.interfaces`. Only physical adapters (those backed by `/sys/class/net/<iface>/device`) are returned. Errors return `{ "success": false, "error": "..." }` with HTTP 4xx/5xx.
 
 `POST /upload_base`
 : Multipart upload (`base_xml`). Attaches a CORE base topology XML to the active scenario. Redirects to `/`.

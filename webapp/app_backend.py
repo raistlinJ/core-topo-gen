@@ -16,10 +16,13 @@ import zipfile
 import secrets
 import socket
 import hashlib
+import socketserver
+import select
+import contextlib
 from urllib.parse import urlparse
 
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple, Iterator
 
 try:
     import psutil  # type: ignore
@@ -39,6 +42,11 @@ except ImportError:  # pragma: no cover - optional dependency
     ProxmoxAPI = None  # type: ignore
 
 try:
+    import paramiko  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    paramiko = None  # type: ignore
+
+try:
     from cryptography.fernet import Fernet, InvalidToken  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     Fernet = None  # type: ignore
@@ -49,15 +57,469 @@ except ImportError:  # pragma: no cover - optional dependency
 from lxml import etree as LET  # XML validation
 ALLOWED_EXTENSIONS = {'xml'}
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+HITL_DISABLE_HOST_ENUM = _env_flag('HITL_DISABLE_HOST_ENUM', False)
+NON_PHYSICAL_INTERFACE_NAMES = {
+    'lo',
+    'lo0',
+    'loopback',
+}
+NON_PHYSICAL_INTERFACE_PREFIXES = (
+    'awdl',
+    'bridge',
+    'br-',
+    'docker',
+    'gif',
+    'ham',
+    'llw',
+    'p2p',
+    'rmnet',
+    'stf',
+    'tap',
+    'tailscale',
+    'tun',
+    'utun',
+    'vboxnet',
+    'veth',
+    'virbr',
+    'vmnet',
+    'wg',
+    'zt',
+)
+NON_PHYSICAL_INTERFACE_SUBSTRINGS = (
+    'tailscale',
+    'tunnel',
+    'zerotier',
+)
+
 FULL_PREVIEW_ARTIFACT_VERSION = 2
 
 _HITL_ATTACHMENT_ALLOWED = {
     "existing_router",
     "existing_switch",
     "new_router",
+    "proxmox_vm",
 }
 
 _DEFAULT_HITL_ATTACHMENT = "existing_router"
+
+_CORE_FIELD_KEYS = (
+    'host',
+    'port',
+    'ssh_enabled',
+    'ssh_host',
+    'ssh_port',
+    'ssh_username',
+    'ssh_password',
+)
+
+
+class _SSHTunnelError(RuntimeError):
+    """Raised when SSH tunneling operations fail."""
+
+
+class _ForwardServer(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def _ensure_paramiko_available() -> None:
+    if paramiko is None:  # pragma: no cover - dependency missing
+        raise RuntimeError('SSH tunneling requires the paramiko package. Install paramiko and retry.')
+
+
+def _make_forward_handler(transport: Any, remote_host: str, remote_port: int):
+    class _ForwardHandler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            logger = getattr(app, 'logger', logging.getLogger(__name__))
+            try:
+                if transport is None or not transport.is_active():
+                    raise _SSHTunnelError('SSH transport is not active')
+                chan = transport.open_channel(
+                    kind='direct-tcpip',
+                    dest_addr=(remote_host, remote_port),
+                    src_addr=self.request.getpeername(),
+                )
+            except Exception as exc:
+                raise _SSHTunnelError(f'Failed to open SSH channel to {remote_host}:{remote_port}: {exc}') from exc
+            if chan is None:
+                raise _SSHTunnelError('SSH channel creation returned None')
+            try:
+                while True:
+                    rlist, _, _ = select.select([self.request, chan], [], [])
+                    if self.request in rlist:
+                        data = self.request.recv(1024)
+                        if not data:
+                            break
+                        chan.sendall(data)
+                    if chan in rlist:
+                        data = chan.recv(1024)
+                        if not data:
+                            break
+                        self.request.sendall(data)
+            finally:
+                try:
+                    chan.close()
+                except Exception:
+                    logger.debug('Failed closing SSH channel', exc_info=True)
+                try:
+                    self.request.close()
+                except Exception:
+                    logger.debug('Failed closing local socket', exc_info=True)
+
+    return _ForwardHandler
+
+
+class _SshTunnel:
+    def __init__(
+        self,
+        *,
+        ssh_host: str,
+        ssh_port: int,
+        username: str,
+        password: str | None,
+        remote_host: str,
+        remote_port: int,
+        timeout: float = 15.0,
+    ) -> None:
+        _ensure_paramiko_available()
+        self.ssh_host = ssh_host
+        self.ssh_port = ssh_port
+        self.username = username
+        self.password = password or ''
+        self.remote_host = remote_host
+        self.remote_port = remote_port
+        self.timeout = max(1.0, float(timeout))
+        self.client: Any | None = None
+        self.transport: Any | None = None
+        self.server: _ForwardServer | None = None
+        self.thread: threading.Thread | None = None
+        self.local_port: int | None = None
+
+    def start(self) -> Tuple[str, int]:
+        logger = getattr(app, 'logger', logging.getLogger(__name__))
+        self.client = paramiko.SSHClient()  # type: ignore[assignment]
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # type: ignore[attr-defined]
+        try:
+            self.client.connect(
+                hostname=self.ssh_host,
+                port=int(self.ssh_port),
+                username=self.username,
+                password=self.password,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=self.timeout,
+                banner_timeout=self.timeout,
+                auth_timeout=self.timeout,
+            )
+        except Exception as exc:
+            raise _SSHTunnelError(f'Failed to establish SSH connection to {self.ssh_host}:{self.ssh_port}: {exc}') from exc
+        self.transport = self.client.get_transport()
+        if self.transport is None or not self.transport.is_active():
+            self.close()
+            raise _SSHTunnelError('SSH transport unavailable after connect')
+        try:
+            self.transport.set_keepalive(30)
+        except Exception:
+            pass
+        handler = _make_forward_handler(self.transport, self.remote_host, self.remote_port)
+        try:
+            self.server = _ForwardServer(('127.0.0.1', 0), handler)
+        except Exception as exc:
+            self.close()
+            raise _SSHTunnelError(f'Failed to create local forwarding server: {exc}') from exc
+        self.local_port = int(self.server.server_address[1])
+        self.thread = threading.Thread(target=self.server.serve_forever, name='core-ssh-forward', daemon=True)
+        self.thread.start()
+        logger.info('Established SSH tunnel %s@%s:%s -> %s:%s (local %s)', self.username, self.ssh_host, self.ssh_port, self.remote_host, self.remote_port, self.local_port)
+        return '127.0.0.1', self.local_port
+
+    def close(self) -> None:
+        logger = getattr(app, 'logger', logging.getLogger(__name__))
+        if self.server:
+            try:
+                self.server.shutdown()
+            except Exception:
+                logger.debug('Tunnel server shutdown failed', exc_info=True)
+            try:
+                self.server.server_close()
+            except Exception:
+                logger.debug('Tunnel server close failed', exc_info=True)
+        self.server = None
+        if self.client:
+            try:
+                self.client.close()
+            except Exception:
+                logger.debug('SSH client close failed', exc_info=True)
+        self.client = None
+        self.transport = None
+        self.thread = None
+        self.local_port = None
+
+
+@contextlib.contextmanager
+def _core_connection_via_ssh(core_cfg: Dict[str, Any]) -> Iterator[Tuple[str, int]]:
+    tunnel: _SshTunnel | None = None
+    try:
+        tunnel = _SshTunnel(
+            ssh_host=str(core_cfg.get('ssh_host') or core_cfg.get('host') or 'localhost'),
+            ssh_port=int(core_cfg.get('ssh_port') or 22),
+            username=str(core_cfg.get('ssh_username') or ''),
+            password=core_cfg.get('ssh_password'),
+            remote_host=str(core_cfg.get('host') or 'localhost'),
+            remote_port=int(core_cfg.get('port') or 50051),
+        )
+        host, port = tunnel.start()
+        yield host, port
+    finally:
+        if tunnel:
+            tunnel.close()
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {'1', 'true', 'yes', 'on', 'y'}
+    return False
+
+
+def _normalize_core_config(raw: Any, *, include_password: bool = True) -> Dict[str, Any]:
+    base = raw if isinstance(raw, dict) else {}
+    nested = base.get('ssh') if isinstance(base.get('ssh'), dict) else {}
+    host = str(base.get('host') or CORE_HOST or 'localhost')
+    try:
+        port = int(base.get('port') if base.get('port') not in (None, '') else CORE_PORT)
+    except Exception:
+        port = CORE_PORT
+    ssh_enabled = True
+    ssh_host = str(base.get('ssh_host') or nested.get('host') or host)
+    try:
+        ssh_port = int(base.get('ssh_port') if base.get('ssh_port') not in (None, '') else (nested.get('port') or 22))
+    except Exception:
+        ssh_port = 22
+    ssh_username = str(base.get('ssh_username') or nested.get('username') or '')
+    ssh_password_val: str | None = None
+    if include_password:
+        pw_source = base.get('ssh_password')
+        if pw_source in (None, '') and isinstance(nested, dict):
+            pw_source = nested.get('password')
+        ssh_password_val = str(pw_source) if pw_source not in (None, '') else ''
+    cfg: Dict[str, Any] = {
+        'host': host,
+        'port': port,
+        'ssh_enabled': ssh_enabled,
+        'ssh_host': ssh_host,
+        'ssh_port': ssh_port,
+        'ssh_username': ssh_username,
+    }
+    if include_password:
+        cfg['ssh_password'] = ssh_password_val or ''
+    return cfg
+
+
+def _extract_optional_core_config(raw: Any, *, include_password: bool = False) -> Dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    candidate = dict(raw)
+
+    def _has_value(val: Any) -> bool:
+        if val is None:
+            return False
+        if isinstance(val, str):
+            return val.strip() != ''
+        return True
+
+    significant_keys = ('host', 'port', 'ssh_host', 'ssh_port', 'ssh_username')
+    has_signal = any(_has_value(candidate.get(key)) for key in significant_keys)
+    if not has_signal:
+        nested = candidate.get('ssh') if isinstance(candidate.get('ssh'), dict) else {}
+        has_signal = any(_has_value(nested.get(key)) for key in ('host', 'port', 'username', 'password'))
+    if include_password and not has_signal:
+        has_signal = _has_value(candidate.get('ssh_password')) or (
+            isinstance(candidate.get('ssh'), dict) and _has_value(candidate['ssh'].get('password'))
+        )
+    if not has_signal:
+        return None
+
+    normalized = _normalize_core_config(candidate, include_password=include_password)
+    extras: Dict[str, Any] = {}
+    for key, value in candidate.items():
+        if key in {'host', 'port', 'ssh_enabled', 'ssh_host', 'ssh_port', 'ssh_username', 'ssh_password', 'ssh'}:
+            continue
+        extras[key] = value
+    if extras:
+        normalized.update(extras)
+    if not include_password:
+        normalized.pop('ssh_password', None)
+    return normalized
+
+
+def _merge_core_configs(*configs: Any, include_password: bool = True) -> Dict[str, Any]:
+    base = _core_backend_defaults(include_password=include_password)
+    merged = dict(base)
+    extras: Dict[str, Any] = {}
+    core_secret_id: Optional[str] = None
+    for cfg in configs:
+        if cfg is None:
+            continue
+        normalized = _extract_optional_core_config(cfg, include_password=include_password)
+        if not normalized:
+            # Password-only override should still apply when include_password requested
+            if include_password and isinstance(cfg, dict) and cfg.get('ssh_password') not in (None, ''):
+                normalized = {'ssh_password': cfg.get('ssh_password')}
+            else:
+                continue
+        for key, value in normalized.items():
+            if key in _CORE_FIELD_KEYS:
+                merged[key] = value
+            elif key == 'core_secret_id' and value not in (None, ''):
+                core_secret_id = str(value)
+                extras['core_secret_id'] = core_secret_id
+            else:
+                extras[key] = value
+    if include_password and (not merged.get('ssh_password')) and core_secret_id:
+        try:
+            secret_record = _load_core_credentials(core_secret_id)
+        except RuntimeError:
+            secret_record = None
+        if secret_record:
+            password_plain = secret_record.get('ssh_password_plain') or secret_record.get('password_plain') or ''
+            if password_plain and not merged.get('ssh_password'):
+                merged['ssh_password'] = password_plain
+            for field in ('host', 'port', 'grpc_host', 'grpc_port', 'ssh_host', 'ssh_port', 'ssh_username'):
+                stored_val = secret_record.get(field)
+                if stored_val in (None, ''):
+                    continue
+                target_field = 'host' if field == 'grpc_host' else 'port' if field == 'grpc_port' else field
+                if target_field in {'host', 'port'}:
+                    if not merged.get(target_field):
+                        merged[target_field] = stored_val
+                else:
+                    if merged.get(target_field) in (None, '', 0):
+                        merged[target_field] = stored_val
+            extras.setdefault('core_secret_id', core_secret_id)
+    merged = _normalize_core_config(merged, include_password=include_password)
+    if extras:
+        merged.update(extras)
+    return merged
+
+
+def _core_backend_defaults(*, include_password: bool = True) -> Dict[str, Any]:
+    env_cfg = {
+        'host': os.environ.get('CORE_HOST', CORE_HOST),
+        'port': os.environ.get('CORE_PORT', CORE_PORT),
+        'ssh_enabled': os.environ.get('CORE_SSH_ENABLED'),
+        'ssh_host': os.environ.get('CORE_SSH_HOST'),
+        'ssh_port': os.environ.get('CORE_SSH_PORT'),
+        'ssh_username': os.environ.get('CORE_SSH_USERNAME'),
+    }
+    if include_password:
+        env_cfg['ssh_password'] = os.environ.get('CORE_SSH_PASSWORD')
+    cfg = _normalize_core_config(env_cfg, include_password=include_password)
+    cfg['ssh_enabled'] = True
+    return cfg
+
+
+def _normalize_history_core_value(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return _normalize_core_config(raw, include_password=False)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return _normalize_core_config({}, include_password=False)
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return _normalize_core_config(parsed, include_password=False)
+        except Exception:
+            pass
+        host_match = re.search(r'([A-Za-z0-9_.-]+)\s*:\s*(\d+)', text)
+        host = host_match.group(1) if host_match else None
+        try:
+            port = int(host_match.group(2)) if host_match else None
+        except Exception:
+            port = None
+        lower = text.lower()
+        data: Dict[str, Any] = {}
+        if host:
+            data['host'] = host
+        if port:
+            data['port'] = port
+        if 'ssh' in lower:
+            disabled_markers = ('disabled', 'off', 'false', '0', 'no')
+            ssh_enabled = not any(marker in lower for marker in disabled_markers)
+            data['ssh_enabled'] = ssh_enabled
+        return _normalize_core_config(data, include_password=False)
+    return _normalize_core_config({}, include_password=False)
+
+
+def _normalize_run_history_entry(entry: Any) -> Dict[str, Any]:
+    if not isinstance(entry, dict):
+        return {}
+    normalized = dict(entry)
+    try:
+        normalized['core'] = _normalize_history_core_value(normalized.get('core'))
+    except Exception:
+        normalized['core'] = _normalize_core_config({}, include_password=False)
+    if 'core_cfg_public' in normalized:
+        try:
+            normalized['core_cfg_public'] = _normalize_history_core_value(normalized.get('core_cfg_public'))
+        except Exception:
+            normalized['core_cfg_public'] = _normalize_core_config({}, include_password=False)
+    if 'scenario_core' in normalized and normalized.get('scenario_core') is not None:
+        try:
+            normalized['scenario_core'] = _normalize_history_core_value(normalized.get('scenario_core'))
+        except Exception:
+            normalized['scenario_core'] = _normalize_core_config({}, include_password=False)
+    return normalized
+
+
+@contextlib.contextmanager
+def _core_connection(core_cfg: Dict[str, Any]) -> Iterator[Tuple[str, int]]:
+    cfg = _normalize_core_config(core_cfg, include_password=True)
+    logger = getattr(app, 'logger', logging.getLogger(__name__))
+    if not cfg.get('ssh_username'):
+        raise _SSHTunnelError('SSH username is required (SSH tunnel enforced for CORE gRPC)')
+    if not cfg.get('ssh_password'):
+        raise _SSHTunnelError('SSH password is required (SSH tunnel enforced for CORE gRPC)')
+    logger.info('Opening CORE SSH tunnel: %s@%s:%s → %s:%s', cfg['ssh_username'], cfg['ssh_host'], cfg['ssh_port'], cfg['host'], cfg['port'])
+    with _core_connection_via_ssh(cfg) as forwarded:
+        yield forwarded
+
+
+@contextlib.contextmanager
+def _open_core_grpc_client(core_cfg: Dict[str, Any]):
+    cfg = _normalize_core_config(core_cfg, include_password=True)
+    try:
+        from core.api.grpc.client import CoreGrpcClient  # type: ignore
+    except Exception as exc:
+        raise ImportError('CORE gRPC client unavailable') from exc
+    with _core_connection(cfg) as (conn_host, conn_port):
+        address = f"{conn_host}:{conn_port}"
+        client = CoreGrpcClient(address=address)
+        try:
+            from core_topo_gen.utils.grpc_logging import wrap_core_client  # type: ignore
+            client = wrap_core_client(client, app.logger)
+        except Exception:
+            pass
+        try:
+            client.connect()
+            yield client
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 def _normalize_hitl_attachment(raw_value: Any) -> str:
@@ -81,6 +543,13 @@ def _normalize_hitl_attachment(raw_value: Any) -> str:
             "new_router": "new_router",
             "new router": "new_router",
             "router_new": "new_router",
+            "proxmox_vm": "proxmox_vm",
+            "proxmoxvm": "proxmox_vm",
+            "proxmox-vm": "proxmox_vm",
+            "proxmox vm": "proxmox_vm",
+            "vm": "proxmox_vm",
+            "external_vm": "proxmox_vm",
+            "externalvm": "proxmox_vm",
         }
         if normalized in synonyms:
             return synonyms[normalized]
@@ -230,6 +699,9 @@ def _sanitize_hitl_config(hitl_config: Any, scenario_name: Optional[str], xml_ba
         'interfaces': sanitized,
         'scenario_key': scenario_key,
     }
+    core_cfg = _extract_optional_core_config(cfg.get('core'), include_password=False)
+    if core_cfg:
+        sanitized_cfg['core'] = core_cfg
     _enrich_hitl_interfaces_with_ips(sanitized_cfg)
     return sanitized_cfg
 
@@ -785,8 +1257,9 @@ except Exception:
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET', 'coretopogenweb')
+_log_level_name = os.environ.get('WEBAPP_LOG_LEVEL', 'INFO').strip().upper()
 try:
-    app.logger.setLevel(logging.DEBUG)
+    app.logger.setLevel(getattr(logging, _log_level_name, logging.INFO))
 except Exception:
     pass
 
@@ -794,6 +1267,10 @@ def _enumerate_host_interfaces(include_down: bool = False) -> List[Dict[str, Any
     """Return host network interfaces available for Hardware-in-the-Loop selection."""
     results: List[Dict[str, Any]] = []
     logger = getattr(app, 'logger', logging.getLogger(__name__))
+    if HITL_DISABLE_HOST_ENUM:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug('[hitl] host interface enumeration skipped (HITL_DISABLE_HOST_ENUM=1)')
+        return results
     if psutil is None:
         logger.warning('[hitl] psutil not available; host interface enumeration skipped')
         try:
@@ -826,6 +1303,18 @@ def _enumerate_host_interfaces(include_down: bool = False) -> List[Dict[str, Any
     skipped_down = 0
     skipped_loopback = 0
     skipped_other = 0
+    def _is_non_physical(ifname: str) -> Optional[str]:
+        name_normalized = ifname.lower()
+        if name_normalized in NON_PHYSICAL_INTERFACE_NAMES:
+            return 'exact'
+        for prefix in NON_PHYSICAL_INTERFACE_PREFIXES:
+            if name_normalized.startswith(prefix):
+                return f'prefix:{prefix}'
+        for needle in NON_PHYSICAL_INTERFACE_SUBSTRINGS:
+            if needle in name_normalized:
+                return f'substr:{needle}'
+        # Treat typical virtual adapters that expose no MAC and no IPv4 address as non-physical
+        return None
 
     for name, addr_list in addrs.items():
         total_seen += 1
@@ -867,6 +1356,12 @@ def _enumerate_host_interfaces(include_down: bool = False) -> List[Dict[str, Any
             logger.debug('[hitl] skipping interface %s: loopback detected', name)
             continue
 
+        non_physical_reason = _is_non_physical(name)
+        if non_physical_reason is not None:
+            skipped_other += 1
+            logger.debug('[hitl] skipping interface %s: marked non-physical (%s)', name, non_physical_reason)
+            continue
+
         entry: Dict[str, Any] = {
             'name': name,
             'display': name,
@@ -887,13 +1382,221 @@ def _enumerate_host_interfaces(include_down: bool = False) -> List[Dict[str, Any
         logger.debug('[hitl] captured interface %s: mac=%s ipv4=%s ipv6=%s is_up=%s',
                      name, mac_addr, ','.join(ipv4) or '-', ','.join(ipv6) or '-', is_up)
 
-    logger.info(
+    logger.debug(
         '[hitl] host interface enumeration complete: total_seen=%d exported=%d skipped_down=%d skipped_loopback=%d skipped_other=%d',
         total_seen,
         len(results),
         skipped_down,
         skipped_loopback,
         skipped_other,
+    )
+
+
+def _normalize_mac_value(value: Any) -> str:
+    if not value:
+        return ''
+    text = str(value).strip().lower()
+    return ''.join(ch for ch in text if ch.isalnum())
+
+
+def _enumerate_core_vm_interfaces_via_ssh(
+    *,
+    ssh_host: str,
+    ssh_port: int,
+    username: str,
+    password: str,
+    prox_interfaces: Optional[List[Dict[str, Any]]] = None,
+    include_down: bool = False,
+    vm_context: Optional[Dict[str, Any]] = None,
+    timeout: float = 10.0,
+) -> List[Dict[str, Any]]:
+    _ensure_paramiko_available()
+    logger = getattr(app, 'logger', logging.getLogger(__name__))
+    client = paramiko.SSHClient()  # type: ignore[assignment]
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # type: ignore[attr-defined]
+    try:
+        client.connect(
+            hostname=ssh_host,
+            port=int(ssh_port),
+            username=username,
+            password=password,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=timeout,
+            banner_timeout=timeout,
+            auth_timeout=timeout,
+        )
+    except Exception as exc:  # pragma: no cover - network dependent
+        raise _SSHTunnelError(f'Failed to establish SSH session to {ssh_host}:{ssh_port}: {exc}') from exc
+    try:
+        physical_ifaces: Optional[set[str]] = None
+        phys_cmd = 'for I in $(ls -1 /sys/class/net 2>/dev/null); do if [ -e "/sys/class/net/$I/device" ]; then printf "%s\n" "$I"; fi; done'
+        try:
+            _, phys_stdout, _ = client.exec_command(phys_cmd, timeout=timeout)
+            phys_data = phys_stdout.read()
+            phys_status = phys_stdout.channel.recv_exit_status() if hasattr(phys_stdout, 'channel') else 0
+            if phys_status == 0:
+                if isinstance(phys_data, bytes):
+                    phys_text = phys_data.decode('utf-8', 'ignore')
+                else:
+                    phys_text = str(phys_data)
+                physical_list = [line.strip() for line in phys_text.splitlines() if line.strip()]
+                if physical_list:
+                    physical_ifaces = {name for name in physical_list if name and not name.lower().startswith('lo')}
+        except Exception:  # pragma: no cover - best effort only
+            app.logger.debug('[hitl] unable to enumerate physical interface set from CORE VM', exc_info=True)
+
+        command = 'LANG=C ip -json address show'
+        try:
+            stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+            stdout_data = stdout.read()
+            stderr_data = stderr.read()
+            exit_status = stdout.channel.recv_exit_status() if hasattr(stdout, 'channel') else 0
+        except Exception as exc:  # pragma: no cover - remote command failure
+            raise RuntimeError(f'Failed to execute "{command}" on CORE VM: {exc}') from exc
+        if isinstance(stdout_data, bytes):
+            stdout_text = stdout_data.decode('utf-8', 'ignore')
+        else:
+            stdout_text = str(stdout_data)
+        if exit_status != 0:
+            err_text = stderr_data.decode('utf-8', 'ignore') if isinstance(stderr_data, bytes) else str(stderr_data)
+            raise RuntimeError(f'CORE VM rejected interface query ({exit_status}): {err_text.strip() or "unknown error"}')
+        try:
+            parsed = json.loads(stdout_text.strip() or '[]')
+        except json.JSONDecodeError as exc:
+            raise RuntimeError('Unable to parse interface data from CORE VM (ip -json output invalid)') from exc
+        if not isinstance(parsed, list):
+            raise RuntimeError('Unexpected interface payload from CORE VM')
+
+        prox_context = vm_context if isinstance(vm_context, dict) else {}
+        prox_map: Dict[str, Dict[str, Any]] = {}
+        if prox_interfaces and isinstance(prox_interfaces, list):
+            for entry in prox_interfaces:
+                if not isinstance(entry, dict):
+                    continue
+                mac_norm = _normalize_mac_value(entry.get('macaddr') or entry.get('mac') or entry.get('hwaddr'))
+                if not mac_norm:
+                    continue
+                prox_info: Dict[str, Any] = {
+                    'id': entry.get('id') or entry.get('interface_id') or entry.get('name') or entry.get('label'),
+                    'macaddr': entry.get('macaddr') or entry.get('mac') or entry.get('hwaddr'),
+                    'bridge': entry.get('bridge'),
+                    'model': entry.get('model'),
+                    'raw': entry,
+                }
+                prox_info.update({
+                    'vm_key': prox_context.get('vm_key'),
+                    'vm_name': prox_context.get('vm_name'),
+                    'vm_node': prox_context.get('vm_node'),
+                    'vmid': prox_context.get('vmid'),
+                })
+                prox_map[mac_norm] = prox_info
+
+        results: List[Dict[str, Any]] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            ifname = item.get('ifname') or item.get('name')
+            if not ifname:
+                continue
+            name_lc = str(ifname).lower()
+            if name_lc.startswith('lo'):
+                continue
+            if physical_ifaces is not None:
+                base_name = str(ifname).split('@', 1)[0]
+                base_name = base_name.split(':', 1)[0]
+                root_name = base_name.split('.', 1)[0]
+                if base_name not in physical_ifaces and root_name not in physical_ifaces:
+                    continue
+            flags = item.get('flags') if isinstance(item.get('flags'), list) else []
+            operstate = str(item.get('operstate') or '').strip().upper()
+            is_up = operstate == 'UP' or 'UP' in [str(flag).upper() for flag in flags]
+            if not include_down and not is_up:
+                continue
+            mac_addr = item.get('address') or item.get('mac')
+            mac_norm = _normalize_mac_value(mac_addr)
+            addr_info = item.get('addr_info') if isinstance(item.get('addr_info'), list) else []
+            ipv4: List[str] = []
+            ipv6: List[str] = []
+            for addr in addr_info:
+                if not isinstance(addr, dict):
+                    continue
+                family = str(addr.get('family') or '').lower()
+                value = addr.get('local') or addr.get('address')
+                if not value:
+                    continue
+                if family == 'inet':
+                    ipv4.append(str(value))
+                elif family == 'inet6':
+                    ipv6.append(str(value).split('%')[0])
+            entry: Dict[str, Any] = {
+                'name': ifname,
+                'display': ifname,
+                'mac': mac_addr,
+                'ipv4': ipv4,
+                'ipv6': ipv6,
+                'mtu': item.get('mtu'),
+                'speed': item.get('link_speed') or None,
+                'is_up': is_up,
+                'flags': flags,
+            }
+            prox_entry = prox_map.get(mac_norm)
+            if prox_entry:
+                entry['proxmox'] = prox_entry
+                bridge_val = prox_entry.get('bridge')
+                if bridge_val:
+                    entry['bridge'] = bridge_val
+            results.append(entry)
+
+        results.sort(key=lambda rec: rec.get('name') or '')
+        logger.info('[hitl] enumerated %d interfaces via CORE VM SSH (host=%s)', len(results), ssh_host)
+        return results
+    finally:
+        try:
+            client.close()
+        except Exception:
+            logger.debug('SSH client close failed after interface enumeration', exc_info=True)
+
+
+def _enumerate_core_vm_interfaces_from_secret(
+    secret_id: str,
+    *,
+    prox_interfaces: Optional[List[Dict[str, Any]]] = None,
+    include_down: bool = False,
+    vm_context: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    if not secret_id:
+        raise ValueError('CORE credential identifier is required')
+    record = _load_core_credentials(secret_id)
+    if not record:
+        raise ValueError('Stored CORE credentials not found')
+    password = record.get('ssh_password_plain') or record.get('password_plain') or ''
+    if not password:
+        raise ValueError('Stored CORE credentials are missing password material')
+    username = str(record.get('ssh_username') or '').strip()
+    if not username:
+        raise ValueError('Stored CORE credentials are missing SSH username')
+    ssh_host = str(record.get('ssh_host') or record.get('host') or '').strip()
+    if not ssh_host:
+        raise ValueError('Stored CORE credentials are missing SSH host')
+    try:
+        ssh_port = int(record.get('ssh_port') or 22)
+    except Exception:
+        ssh_port = 22
+    vm_meta = vm_context if isinstance(vm_context, dict) else {
+        'vm_key': record.get('vm_key'),
+        'vm_name': record.get('vm_name'),
+        'vm_node': record.get('vm_node'),
+        'vmid': record.get('vmid'),
+    }
+    return _enumerate_core_vm_interfaces_via_ssh(
+        ssh_host=ssh_host,
+        ssh_port=ssh_port,
+        username=username,
+        password=password,
+        prox_interfaces=prox_interfaces,
+        include_down=include_down,
+        vm_context=vm_meta,
     )
 
     results.sort(key=lambda item: item['name'])
@@ -971,6 +1674,12 @@ def _ensure_private_file(path: str, mode: int = 0o600) -> None:
             pass
 
 
+def _sanitize_secret_slug(raw: str, fallback: str = 'entry') -> str:
+    cleaned = ''.join(ch.lower() if ch.isalnum() else '-' for ch in (raw or ''))
+    cleaned = re.sub(r'-{2,}', '-', cleaned).strip('-')
+    return cleaned[:48] or fallback
+
+
 def _proxmox_secret_dir() -> str:
     base = _ensure_private_dir(os.path.join(_outputs_dir(), 'secrets'))
     prox_dir = os.path.join(base, 'proxmox')
@@ -1019,9 +1728,7 @@ def _get_proxmox_cipher():
 
 
 def _sanitize_proxmox_slug(raw: str, fallback: str = 'scenario') -> str:
-    cleaned = ''.join(ch.lower() if ch.isalnum() else '-' for ch in raw or '')
-    cleaned = re.sub(r'-{2,}', '-', cleaned).strip('-')
-    return cleaned[:48] or fallback
+    return _sanitize_secret_slug(raw, fallback)
 
 
 def _derive_proxmox_identifier(
@@ -1114,6 +1821,423 @@ def _delete_proxmox_credentials(identifier: str) -> bool:
         logging.getLogger(__name__).exception('Failed to delete Proxmox credentials for %s', identifier)
         raise
     return False
+
+
+def _core_secret_dir() -> str:
+    base = _ensure_private_dir(os.path.join(_outputs_dir(), 'secrets'))
+    core_dir = os.path.join(base, 'core')
+    return _ensure_private_dir(core_dir)
+
+
+def _core_secret_key_path() -> str:
+    return os.path.join(_core_secret_dir(), '.key')
+
+
+def _load_or_create_core_key() -> bytes:
+    if Fernet is None:  # pragma: no cover - dependency missing
+        raise RuntimeError('cryptography package is required for secure CORE credential storage')
+    env_key = os.environ.get('CORE_SECRET_KEY')
+    if env_key:
+        key_bytes = env_key.encode('utf-8')
+        try:
+            Fernet(key_bytes)
+            return key_bytes
+        except Exception as exc:  # pragma: no cover - misconfigured env
+            logging.getLogger(__name__).warning('Invalid CORE_SECRET_KEY provided: %s', exc)
+    key_path = _core_secret_key_path()
+    if os.path.exists(key_path):
+        try:
+            with open(key_path, 'rb') as fh:
+                key_bytes = fh.read().strip()
+            if key_bytes:
+                Fernet(key_bytes)
+                return key_bytes
+        except Exception:
+            logging.getLogger(__name__).warning('Existing CORE secret key invalid; regenerating')
+    key_bytes = Fernet.generate_key()
+    tmp_path = key_path + '.tmp'
+    with open(tmp_path, 'wb') as fh:
+        fh.write(key_bytes)
+    os.replace(tmp_path, key_path)
+    _ensure_private_file(key_path)
+    return key_bytes
+
+
+def _get_core_cipher():
+    if Fernet is None:  # pragma: no cover - dependency missing
+        raise RuntimeError('cryptography package is required for secure CORE credential storage')
+    key = _load_or_create_core_key()
+    return Fernet(key)
+
+
+def _derive_core_identifier(
+    scenario_name: str,
+    scenario_index: Optional[int],
+    host: str,
+    ssh_username: str,
+) -> str:
+    slug = _sanitize_secret_slug(scenario_name or '', 'core')
+    index_part = f"{scenario_index:02d}-" if isinstance(scenario_index, int) and scenario_index >= 0 else ''
+    fingerprint_src = f"{host}|{ssh_username}"
+    fingerprint = hashlib.sha256(fingerprint_src.encode('utf-8', 'ignore')).hexdigest()[:12]
+    return f"{index_part}{slug}-{fingerprint}"
+
+
+def _save_core_credentials(payload: Dict[str, Any]) -> Dict[str, Any]:
+    cipher = _get_core_cipher()
+    scenario_name = str(payload.get('scenario_name') or '').strip()
+    raw_index = payload.get('scenario_index')
+    scenario_index: Optional[int]
+    try:
+        scenario_index = int(raw_index)
+    except Exception:
+        scenario_index = None
+    grpc_host = str(payload.get('grpc_host') or payload.get('host') or '').strip()
+    if not grpc_host:
+        raise ValueError('gRPC host is required to persist CORE credentials')
+    try:
+        grpc_port = int(payload.get('grpc_port') or payload.get('port') or 50051)
+    except Exception:
+        grpc_port = 50051
+    ssh_host = str(payload.get('ssh_host') or grpc_host).strip()
+    try:
+        ssh_port = int(payload.get('ssh_port') or 22)
+    except Exception:
+        ssh_port = 22
+    ssh_username = str(payload.get('ssh_username') or '').strip()
+    ssh_password_raw = payload.get('ssh_password') or ''
+    if not isinstance(ssh_password_raw, str):
+        ssh_password_raw = str(ssh_password_raw)
+    if not ssh_username:
+        raise ValueError('SSH username is required to persist CORE credentials')
+    if not ssh_password_raw:
+        raise ValueError('SSH password is required to persist CORE credentials')
+    ssh_enabled = bool(payload.get('ssh_enabled', True))
+    identifier = _derive_core_identifier(scenario_name, scenario_index, grpc_host or ssh_host, ssh_username)
+    encrypted_password = cipher.encrypt(ssh_password_raw.encode('utf-8')).decode('utf-8')
+    vm_key = str(payload.get('vm_key') or '').strip()
+    vm_name = str(payload.get('vm_name') or '').strip()
+    vm_node = str(payload.get('vm_node') or '').strip()
+    vmid_raw = payload.get('vmid')
+    vmid = ''
+    if isinstance(vmid_raw, (str, int)):
+        vmid = str(vmid_raw).strip()
+    prox_secret_raw = payload.get('proxmox_secret_id') or payload.get('secret_id')
+    prox_secret_id = str(prox_secret_raw).strip() if prox_secret_raw not in (None, '') else None
+    prox_target = None
+    raw_target = payload.get('proxmox_target')
+    if isinstance(raw_target, dict):
+        target_slim: Dict[str, Any] = {}
+        for key in ('node', 'vmid', 'interface_id', 'macaddr', 'bridge', 'model', 'vm_name', 'label'):
+            if key in raw_target:
+                target_slim[key] = raw_target.get(key)
+        prox_target = target_slim or None
+    record = {
+        'identifier': identifier,
+        'scenario_name': scenario_name,
+        'scenario_index': scenario_index,
+        'host': grpc_host,
+        'port': grpc_port,
+        'grpc_host': grpc_host,
+        'grpc_port': grpc_port,
+        'ssh_host': ssh_host,
+        'ssh_port': ssh_port,
+        'ssh_username': ssh_username,
+        'ssh_enabled': ssh_enabled,
+        'password': encrypted_password,
+        'vm_key': vm_key,
+        'vm_name': vm_name,
+        'vm_node': vm_node,
+    'vmid': vmid if vmid else None,
+        'proxmox_secret_id': prox_secret_id,
+        'proxmox_target': prox_target,
+        'stored_at': datetime.datetime.now(datetime.UTC).isoformat(),
+    }
+    path = os.path.join(_core_secret_dir(), f"{identifier}.json")
+    tmp_path = path + '.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as fh:
+        json.dump(record, fh, indent=2)
+    os.replace(tmp_path, path)
+    _ensure_private_file(path)
+    return {
+        'identifier': identifier,
+        'scenario_name': scenario_name,
+        'scenario_index': scenario_index,
+        'host': grpc_host,
+        'port': grpc_port,
+        'grpc_host': grpc_host,
+        'grpc_port': grpc_port,
+        'ssh_host': ssh_host,
+        'ssh_port': ssh_port,
+        'ssh_username': ssh_username,
+        'ssh_enabled': ssh_enabled,
+        'vm_key': vm_key,
+        'vm_name': vm_name,
+        'vm_node': vm_node,
+    'vmid': vmid if vmid else None,
+        'proxmox_secret_id': prox_secret_id,
+        'proxmox_target': prox_target,
+        'stored_at': record['stored_at'],
+    }
+
+
+def _load_core_credentials(identifier: str) -> Optional[Dict[str, Any]]:
+    path = os.path.join(_core_secret_dir(), f"{identifier}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        cipher = _get_core_cipher()
+        encrypted = data.get('password')
+        password_plain = ''
+        if isinstance(encrypted, str) and encrypted:
+            try:
+                password_plain = cipher.decrypt(encrypted.encode('utf-8')).decode('utf-8')
+            except InvalidToken:
+                password_plain = ''
+        data['ssh_password_plain'] = password_plain
+        return data
+    except Exception:
+        logging.getLogger(__name__).exception('Failed to load CORE credentials for %s', identifier)
+        return None
+
+
+def _delete_core_credentials(identifier: str) -> bool:
+    if not isinstance(identifier, str) or not identifier.strip():
+        return False
+    path = os.path.join(_core_secret_dir(), f"{identifier}.json")
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+    except Exception:
+        logging.getLogger(__name__).exception('Failed to delete CORE credentials for %s', identifier)
+        raise
+    return False
+
+
+def _connect_proxmox_from_secret(identifier: str, *, timeout: float = 8.0) -> tuple[Any, Dict[str, Any]]:
+    if ProxmoxAPI is None:  # pragma: no cover - dependency missing
+        raise RuntimeError('Proxmox integration unavailable: install proxmoxer package')
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise ValueError('Proxmox secret identifier is required')
+    record = _load_proxmox_credentials(identifier)
+    if not record:
+        raise ValueError('Stored Proxmox credentials not found')
+    password = record.get('password_plain') or ''
+    if not password:
+        raise ValueError('Stored Proxmox credentials are missing password material')
+    url_raw = str(record.get('url') or '').strip()
+    parsed = urlparse(url_raw) if url_raw else None
+    host = parsed.hostname if parsed and parsed.hostname else url_raw
+    if not host:
+        raise ValueError('Stored Proxmox URL is invalid')
+    try:
+        port = int(record.get('port') or (parsed.port if parsed else 8006) or 8006)
+    except Exception:
+        port = 8006
+    verify_ssl = bool(record.get('verify_ssl', True))
+    backend = 'https'
+    if parsed and parsed.scheme:
+        backend = 'https' if parsed.scheme.lower() == 'https' else 'http'
+    client = ProxmoxAPI(  # type: ignore[call-arg]
+        host=host,
+        user=record.get('username'),
+        password=password,
+        port=port,
+        verify_ssl=verify_ssl,
+        timeout=max(2.0, min(float(timeout), 30.0)),
+        backend=backend,
+    )
+    return client, record
+
+
+def _parse_proxmox_net_config(raw: Any) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    if not isinstance(raw, str) or not raw:
+        return result
+    tokens = [tok.strip() for tok in raw.split(',') if tok.strip()]
+    for idx, token in enumerate(tokens):
+        if '=' not in token:
+            continue
+        key, value = token.split('=', 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if idx == 0 and key in {'virtio', 'e1000', 'rtl8139', 'vmxnet3', 'ne2k_isa', 'i82551'}:
+            result['model'] = key
+            result['macaddr'] = value
+            continue
+        if key == 'macaddr' and 'macaddr' in result:
+            # Keep first mac address discovered from model token
+            continue
+        result[key] = value
+    return result
+
+
+_BRIDGE_NAME_SANITIZER = re.compile(r'[^a-z0-9_-]+')
+
+
+def _normalize_internal_bridge_name(raw: Any) -> str:
+    if raw is None:
+        raise ValueError('Internal bridge name is required')
+    candidate = str(raw).strip().lower()
+    if not candidate:
+        raise ValueError('Internal bridge name is required')
+    candidate = _BRIDGE_NAME_SANITIZER.sub('-', candidate).strip('-_')
+    candidate = re.sub(r'[-_]{2,}', '-', candidate)
+    if not candidate:
+        raise ValueError('Internal bridge name is invalid')
+    if len(candidate) > 10:
+        candidate = candidate[:10].rstrip('-_')
+        if not candidate:
+            raise ValueError('Internal bridge name is invalid')
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]*', candidate):
+        raise ValueError('Internal bridge name may contain only lowercase letters, numbers, hyphen, and underscore, and must start with an alphanumeric character')
+    return candidate
+
+
+def _rewrite_bridge_in_net_config(config_value: str, bridge_name: str) -> tuple[str, bool, Optional[str]]:
+    if not isinstance(config_value, str) or not config_value.strip():
+        raise ValueError('Proxmox network configuration string is required')
+    tokens = [tok.strip() for tok in config_value.split(',') if tok.strip()]
+    previous_bridge: Optional[str] = None
+    updated = False
+    for idx, token in enumerate(tokens):
+        if '=' not in token:
+            continue
+        key, value = token.split('=', 1)
+        if key.strip().lower() == 'bridge':
+            previous_bridge = value.strip()
+            if previous_bridge == bridge_name:
+                return config_value, False, previous_bridge
+            tokens[idx] = f'bridge={bridge_name}'
+            updated = True
+            break
+    if not updated:
+        tokens.append(f'bridge={bridge_name}')
+        updated = True
+    new_config = ','.join(tokens)
+    return new_config, updated, previous_bridge
+
+
+def _parse_proxmox_vm_key(vm_key: str) -> tuple[str, int]:
+    if not isinstance(vm_key, str):
+        raise ValueError('VM key must be a string')
+    parts = vm_key.split('::', 1)
+    if len(parts) != 2:
+        raise ValueError('VM key must be in the format "node::vmid"')
+    node = parts[0].strip()
+    vmid_raw = parts[1].strip()
+    if not node or not vmid_raw:
+        raise ValueError('VM key is missing node or VM ID information')
+    try:
+        vmid = int(vmid_raw)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ValueError(f'VM ID must be an integer (received {vmid_raw!r})') from exc
+    return node, vmid
+
+
+def _ensure_proxmox_bridge(client: Any, node: str, bridge_name: str, *, comment: Optional[str] = None) -> Dict[str, Any]:
+    """Validate that the requested bridge already exists on the target node.
+
+    The HITL workflow now assumes operators have pre-created the internal
+    bridge (for example, ``<username>`` truncated to 10 characters) outside of apply time. We still
+    enumerate the node's network devices so we can return a consistent
+    metadata structure, but we no longer attempt to create or reload the
+    bridge automatically. If the bridge is missing, surface a clear error so
+    users can provision it manually before retrying.
+    """
+
+    try:
+        networks = client.nodes(node).network.get()
+    except Exception as exc:  # pragma: no cover - network enumeration failure
+        raise RuntimeError(f'Failed to enumerate network devices on node {node}: {exc}') from exc
+
+    for entry in networks or []:
+        if not isinstance(entry, dict):
+            continue
+        iface = str(entry.get('iface') or '').strip()
+        if iface == bridge_name:
+            return {
+                'created': False,
+                'already_exists': True,
+                'reload_invoked': False,
+                'reload_ok': True,
+                'reload_error': None,
+            }
+
+    raise RuntimeError(
+        f'Bridge {bridge_name} not found on node {node}. Create the bridge manually before applying HITL mappings.'
+    )
+
+
+def _enumerate_proxmox_vms(identifier: str) -> Dict[str, Any]:
+    client, record = _connect_proxmox_from_secret(identifier)
+    inventory: List[Dict[str, Any]] = []
+    nodes = []
+    try:
+        nodes = client.nodes.get()  # type: ignore[assignment]
+    except Exception as exc:
+        raise RuntimeError(f'Failed to list Proxmox nodes: {exc}') from exc
+    for node in nodes or []:
+        node_name = node.get('node') if isinstance(node, dict) else None
+        if not node_name:
+            continue
+        try:
+            vms = client.nodes(node_name).qemu.get()
+        except Exception as exc:
+            logging.getLogger(__name__).warning('Failed to enumerate VMs for node %s: %s', node_name, exc)
+            continue
+        for vm in vms or []:
+            if not isinstance(vm, dict):
+                continue
+            vmid = vm.get('vmid')
+            if vmid is None:
+                continue
+            template_flag = vm.get('template')
+            if template_flag in (True, 1, '1', 'true', 'TRUE'):
+                continue
+            try:
+                vmid_int = int(vmid)
+            except Exception:
+                vmid_int = vmid
+            vm_name = vm.get('name') or f'VM {vmid_int}'
+            vm_status = vm.get('status')
+            config: Dict[str, Any] = {}
+            try:
+                config = client.nodes(node_name).qemu(vmid_int).config.get()
+            except Exception as exc:
+                logging.getLogger(__name__).warning('Failed to fetch config for VM %s on node %s: %s', vmid_int, node_name, exc)
+            interfaces: List[Dict[str, Any]] = []
+            for key, value in (config or {}).items():
+                if not isinstance(key, str) or not key.lower().startswith('net'):
+                    continue
+                parsed = _parse_proxmox_net_config(value)
+                iface_entry = {
+                    'id': key,
+                    'macaddr': parsed.get('macaddr') or parsed.get('hwaddr') or '',
+                    'bridge': parsed.get('bridge') or '',
+                    'model': parsed.get('model') or parsed.get('modeltype') or '',
+                    'tag': parsed.get('tag') or parsed.get('vlan') or '',
+                    'firewall': parsed.get('firewall') or '',
+                    'raw': value,
+                }
+                interfaces.append(iface_entry)
+            inventory.append({
+                'node': node_name,
+                'vmid': vmid_int,
+                'name': vm_name,
+                'status': vm_status,
+                'interfaces': interfaces,
+            })
+    return {
+        'fetched_at': datetime.datetime.now(datetime.UTC).isoformat(),
+        'url': record.get('url'),
+        'username': record.get('username'),
+        'verify_ssl': record.get('verify_ssl', True),
+        'vms': inventory,
+    }
 
 # ---------------- User persistence helpers (restored) ----------------
 def _users_db_path() -> str:
@@ -1497,7 +2621,7 @@ except Exception:
     CORE_PORT = 50051
 
 def _default_core_dict():
-    return {"host": CORE_HOST, "port": CORE_PORT}
+    return _core_backend_defaults(include_password=False)
 
 
 def _select_python_interpreter() -> str:
@@ -1557,7 +2681,10 @@ def _load_run_history():
     try:
         if os.path.exists(RUN_HISTORY_PATH):
             with open(RUN_HISTORY_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, list):
+                    return [_normalize_run_history_entry(item) for item in data if isinstance(item, dict)]
+                return []
     except Exception:
         pass
     return []
@@ -1577,34 +2704,6 @@ def _append_run_history(entry: dict):
                 os.remove(tmp)
         except Exception:
             pass
-
-
-## Full preview is the sole planning interface.
-
-
-
-def _find_latest_report_path() -> str | None:
-    """Find the most recent scenario_report_*.md under repo_root/reports."""
-    try:
-        base = _reports_dir()
-        if not os.path.isdir(base):
-            return None
-        cands = []
-        for name in os.listdir(base):
-            if not name.startswith('scenario_report_') or not name.endswith('.md'):
-                continue
-            p = os.path.join(base, name)
-            try:
-                st = os.stat(p)
-                cands.append((st.st_mtime, p))
-            except Exception:
-                continue
-        if not cands:
-            return None
-        cands.sort(key=lambda x: x[0], reverse=True)
-        return cands[0][1]
-    except Exception:
-        return None
 
 def _scenario_names_from_xml(xml_path: str) -> list[str]:
     names: list[str] = []
@@ -2177,7 +3276,7 @@ def _default_scenarios_payload():
     scen = {
         "name": "Scenario 1",
         "base": {"filepath": ""},
-        "hitl": {"enabled": False, "interfaces": []},
+        "hitl": {"enabled": False, "interfaces": [], "core": None},
         "sections": {name: {
             "density": 0.5 if name not in ("Node Information", "HITL") else None,
             "total_nodes": 1 if name == "Node Information" else None,
@@ -2203,17 +3302,18 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]]) -> Dict[str, A
     defaults = _default_scenarios_payload()
 
     # --- Core connection defaults ---
-    core_meta = payload.get('core')
-    if not isinstance(core_meta, dict):
-        core_meta = {}
+    core_meta = _normalize_core_config(payload.get('core'), include_password=False)
     core_defaults = defaults['core']
-    core_host = core_meta.get('host') or core_defaults['host']
-    core_port = core_meta.get('port', core_defaults['port'])
-    try:
-        core_port = int(core_port)
-    except Exception:
-        core_port = core_defaults['port']
-    payload['core'] = {'host': core_host, 'port': core_port}
+    if not core_meta.get('host'):
+        core_meta['host'] = core_defaults.get('host')
+    if not core_meta.get('port'):
+        core_meta['port'] = core_defaults.get('port')
+    # Ensure ssh_host defaults to current host to simplify UI when enabling later
+    if not core_meta.get('ssh_host'):
+        core_meta['ssh_host'] = core_meta.get('host') or core_defaults.get('host')
+    if not core_meta.get('ssh_port'):
+        core_meta['ssh_port'] = 22
+    payload['core'] = core_meta
 
     # --- Scenarios ---
     scenarios_raw = payload.get('scenarios')
@@ -2303,6 +3403,7 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]]) -> Dict[str, A
                         iface_norm[addr_key] = [str(v).strip() for v in vals if v is not None and str(v).strip()]
                 interfaces_norm.append(iface_norm)
         hitl_norm['interfaces'] = interfaces_norm
+        hitl_norm['core'] = _extract_optional_core_config(hitl_norm.get('core'), include_password=False)
         scen_norm['hitl'] = hitl_norm
 
         normalized_scenarios.append(scen_norm)
@@ -2359,9 +3460,108 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]]) -> Dict[str, A
 
 
 # Hardware in the Loop utilities
-@app.route('/api/host_interfaces', methods=['GET'])
+@app.route('/api/host_interfaces', methods=['GET', 'POST'])
 def api_host_interfaces():
-    return jsonify({'interfaces': _enumerate_host_interfaces()})
+    if request.method == 'POST':
+        payload = request.get_json(silent=True) or {}
+        secret_id_raw = payload.get('core_secret_id') or payload.get('secret_id')
+        secret_id = secret_id_raw.strip() if isinstance(secret_id_raw, str) else ''
+        include_down = _coerce_bool(payload.get('include_down'))
+        core_vm_payload = payload.get('core_vm') if isinstance(payload.get('core_vm'), dict) else {}
+        prox_interfaces_raw = core_vm_payload.get('interfaces') if isinstance(core_vm_payload, dict) else None
+        prox_interfaces = [entry for entry in prox_interfaces_raw if isinstance(entry, dict)] if isinstance(prox_interfaces_raw, list) else None
+        vm_context = {
+            'vm_key': core_vm_payload.get('vm_key'),
+            'vm_name': core_vm_payload.get('vm_name'),
+            'vm_node': core_vm_payload.get('vm_node'),
+            'vmid': core_vm_payload.get('vmid'),
+        }
+        if not secret_id:
+            return jsonify({'success': False, 'error': 'CORE credentials are required to enumerate interfaces from the CORE VM'}), 400
+        def _fallback_from_proxmox() -> Optional[Dict[str, Any]]:
+            if not prox_interfaces:
+                return None
+            synthesized: List[Dict[str, Any]] = []
+            for idx, vmif in enumerate(prox_interfaces):
+                if not isinstance(vmif, dict):
+                    continue
+                name = str(vmif.get('name') or vmif.get('id') or vmif.get('label') or f'eth{idx}')
+                mac = vmif.get('macaddr') or vmif.get('mac') or vmif.get('hwaddr') or ''
+                entry: Dict[str, Any] = {
+                    'name': name,
+                    'display': name,
+                    'mac': mac,
+                    'ipv4': [],
+                    'ipv6': [],
+                    'mtu': None,
+                    'speed': None,
+                    'is_up': None,
+                    'flags': [],
+                    'proxmox': {
+                        'id': vmif.get('id') or vmif.get('name') or vmif.get('label') or name,
+                        'macaddr': mac,
+                        'bridge': vmif.get('bridge'),
+                        'model': vmif.get('model'),
+                        'raw': vmif,
+                        'vm_key': vm_context.get('vm_key'),
+                        'vm_name': vm_context.get('vm_name'),
+                        'vm_node': vm_context.get('vm_node'),
+                        'vmid': vm_context.get('vmid'),
+                    },
+                }
+                if vmif.get('bridge'):
+                    entry['bridge'] = vmif.get('bridge')
+                synthesized.append(entry)
+            meta = {k: v for k, v in vm_context.items() if v not in (None, '')}
+            return {
+                'success': True,
+                'source': 'proxmox_inventory',
+                'interfaces': synthesized,
+                'metadata': meta,
+                'fetched_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                'note': 'Using Proxmox inventory as a fallback; CORE VM SSH enumeration unavailable.'
+            }
+        try:
+            interfaces = _enumerate_core_vm_interfaces_from_secret(
+                secret_id,
+                prox_interfaces=prox_interfaces,
+                include_down=include_down,
+                vm_context=vm_context,
+            )
+            if (not interfaces) and prox_interfaces:
+                # No interfaces returned from CORE VM; fall back to Proxmox inventory snapshot
+                fb = _fallback_from_proxmox()
+                if fb is not None:
+                    return jsonify(fb)
+        except ValueError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 400
+        except _SSHTunnelError as exc:
+            fb = _fallback_from_proxmox()
+            if fb is not None:
+                return jsonify(fb)
+            return jsonify({'success': False, 'error': str(exc)}), 502
+        except RuntimeError as exc:
+            fb = _fallback_from_proxmox()
+            if fb is not None:
+                return jsonify(fb)
+            return jsonify({'success': False, 'error': str(exc)}), 500
+        except Exception as exc:  # pragma: no cover - defensive logging
+            app.logger.exception('[hitl] unexpected failure retrieving CORE VM interfaces: %s', exc)
+            return jsonify({'success': False, 'error': 'Unexpected error retrieving CORE VM interfaces'}), 500
+        response_data = {
+            'success': True,
+            'source': 'core_vm',
+            'interfaces': interfaces,
+            'metadata': {k: v for k, v in vm_context.items() if v not in (None, '')},
+            'fetched_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+        }
+        return jsonify(response_data)
+    try:
+        interfaces = _enumerate_host_interfaces()
+        return jsonify({'success': True, 'interfaces': interfaces})
+    except Exception as exc:  # pragma: no cover - defensive logging for unexpected psutil errors
+        app.logger.exception('[hitl] failed to enumerate host interfaces via GET: %s', exc)
+        return jsonify({'success': False, 'error': 'Failed to enumerate host interfaces'}), 500
 
 
 @app.route('/api/proxmox/validate', methods=['POST'])
@@ -2392,13 +3592,34 @@ def api_proxmox_validate():
         password = ''
     if not isinstance(password, str):
         password = str(password)
+    verify_ssl_raw = payload.get('verify_ssl')
+    reuse_secret_raw = payload.get('reuse_secret_id')
+    reuse_secret_id = reuse_secret_raw.strip() if isinstance(reuse_secret_raw, str) else ''
+    stored_record: Optional[Dict[str, Any]] = None
+    if not password and reuse_secret_id:
+        stored_record = _load_proxmox_credentials(reuse_secret_id)
+        if not stored_record:
+            return jsonify({'success': False, 'error': 'Stored credentials unavailable. Re-enter the password.'}), 400
+        stored_password = stored_record.get('password_plain') or ''
+        if not stored_password:
+            return jsonify({'success': False, 'error': 'Stored credentials are missing password material. Re-enter the password.'}), 400
+        stored_url = (stored_record.get('url') or '').strip()
+        stored_username = (stored_record.get('username') or '').strip()
+        if stored_url and stored_url != url_raw:
+            return jsonify({'success': False, 'error': 'URL changed since the last validation. Re-enter the password.'}), 400
+        if stored_username and stored_username != username:
+            return jsonify({'success': False, 'error': 'Username changed since the last validation. Re-enter the password.'}), 400
+        password = stored_password
+        if stored_record.get('verify_ssl') is not None and verify_ssl_raw is None:
+            verify_ssl_raw = bool(stored_record.get('verify_ssl'))
+    if not isinstance(password, str):
+        password = str(password)
     if not password:
         return jsonify({'success': False, 'error': 'Password is required'}), 400
-    verify_ssl = payload.get('verify_ssl')
-    if verify_ssl is None:
+    if verify_ssl_raw is None:
         verify_ssl = (parsed.scheme == 'https')
     else:
-        verify_ssl = bool(verify_ssl)
+        verify_ssl = bool(verify_ssl_raw)
     timeout_val = payload.get('timeout', 5.0)
     try:
         timeout = float(timeout_val)
@@ -2491,6 +3712,296 @@ def api_proxmox_clear():
         'scenario_index': scenario_index,
         'scenario_name': scenario_name,
     })
+
+
+@app.route('/api/core/credentials/clear', methods=['POST'])
+def api_core_credentials_clear():
+    payload = request.get_json(silent=True) or {}
+    secret_id_raw = payload.get('core_secret_id') or payload.get('secret_id')
+    secret_id = secret_id_raw.strip() if isinstance(secret_id_raw, str) else ''
+    scenario_index = payload.get('scenario_index')
+    scenario_name = str(payload.get('scenario_name') or '').strip()
+    removed = False
+    try:
+        if secret_id:
+            removed = _delete_core_credentials(secret_id)
+    except Exception:
+        app.logger.exception('[core] failed to clear credentials for %s (scenario %s)', secret_id or 'unknown', scenario_name or scenario_index)
+        return jsonify({'success': False, 'error': 'Failed to clear stored CORE credentials'}), 500
+    try:
+        app.logger.info('[core] cleared credentials request for %s (scenario_index=%s, removed=%s)', scenario_name or 'unnamed', scenario_index, removed)
+    except Exception:
+        pass
+    return jsonify({
+        'success': True,
+        'secret_removed': removed,
+        'scenario_index': scenario_index,
+        'scenario_name': scenario_name,
+    })
+
+
+@app.route('/api/proxmox/vms', methods=['POST'])
+def api_proxmox_vms():
+    payload = request.get_json(silent=True) or {}
+    secret_id_raw = payload.get('secret_id')
+    secret_id = secret_id_raw.strip() if isinstance(secret_id_raw, str) else ''
+    if not secret_id:
+        return jsonify({'success': False, 'error': 'secret_id is required'}), 400
+    try:
+        inventory = _enumerate_proxmox_vms(secret_id)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 502
+    except Exception as exc:  # pragma: no cover - unexpected failure path
+        app.logger.exception('[proxmox] unexpected error fetching VM inventory: %s', exc)
+        return jsonify({'success': False, 'error': 'Failed to fetch Proxmox VM inventory'}), 500
+    return jsonify({'success': True, 'inventory': inventory})
+
+
+@app.route('/api/hitl/apply_bridge', methods=['POST'])
+def api_hitl_apply_bridge():
+    payload = request.get_json(silent=True) or {}
+    bridge_raw = payload.get('bridge_name') or payload.get('internal_bridge') or payload.get('bridge')
+    if bridge_raw in (None, ''):
+        return jsonify({'success': False, 'error': 'Bridge name is required'}), 400
+    try:
+        bridge_name = _normalize_internal_bridge_name(bridge_raw)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+
+    scenario_name = str(payload.get('scenario_name') or payload.get('scenario') or '').strip()
+    scenario_index_raw = payload.get('scenario_index')
+    try:
+        scenario_index = int(scenario_index_raw)
+    except Exception:
+        scenario_index = None
+
+    hitl_payload = payload.get('hitl') or payload.get('scenario_hitl') or payload.get('hitl_config')
+    if not isinstance(hitl_payload, dict):
+        return jsonify({'success': False, 'error': 'HITL configuration is required to apply bridge changes'}), 400
+
+    prox_state = hitl_payload.get('proxmox') or {}
+    secret_id_raw = prox_state.get('secret_id') or prox_state.get('secretId') or prox_state.get('identifier')
+    secret_id = secret_id_raw.strip() if isinstance(secret_id_raw, str) else ''
+    if not secret_id:
+        return jsonify({'success': False, 'error': 'Validate and store Proxmox credentials before applying bridge changes'}), 400
+
+    core_state = hitl_payload.get('core') or {}
+    vm_key_raw = core_state.get('vm_key') or core_state.get('vmKey')
+    vm_key = str(vm_key_raw or '').strip()
+    if not vm_key:
+        return jsonify({'success': False, 'error': 'Select a CORE VM before applying bridge changes'}), 400
+    try:
+        core_node, core_vmid = _parse_proxmox_vm_key(vm_key)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': f'CORE VM selection invalid: {exc}'}), 400
+    core_vm_name = str(core_state.get('vm_name') or core_state.get('vmName') or '').strip()
+
+    interfaces_payload = hitl_payload.get('interfaces')
+    if not isinstance(interfaces_payload, list) or not interfaces_payload:
+        return jsonify({'success': False, 'error': 'Add at least one HITL interface before applying bridge changes'}), 400
+
+    validation_errors: List[str] = []
+    assignments: List[Dict[str, Any]] = []
+    for idx, iface in enumerate(interfaces_payload):
+        if not isinstance(iface, dict):
+            continue
+        iface_name = str(iface.get('name') or f'Interface {idx + 1}').strip() or f'Interface {idx + 1}'
+        prox_target = iface.get('proxmox_target')
+        if not isinstance(prox_target, dict):
+            validation_errors.append(f'{iface_name}: Map the interface to a CORE VM adapter in Step 3.')
+            continue
+        external = iface.get('external_vm')
+        attachment = _normalize_hitl_attachment(iface.get('attachment'))
+        if attachment != 'proxmox_vm':
+            if isinstance(external, dict):
+                attachment = 'proxmox_vm'
+            else:
+                continue
+        core_iface_id = str(prox_target.get('interface_id') or '').strip()
+        if not core_iface_id:
+            validation_errors.append(f'{iface_name}: Select the CORE VM interface to use for HITL connectivity.')
+            continue
+        target_node = str(prox_target.get('node') or '').strip() or core_node
+        try:
+            target_vmid = int(prox_target.get('vmid') or core_vmid)
+        except Exception:
+            validation_errors.append(f'{iface_name}: CORE VM identifier is invalid.')
+            continue
+        if target_node != core_node or target_vmid != core_vmid:
+            validation_errors.append(f'{iface_name}: CORE interface must belong to the selected CORE VM on node {core_node}.')
+            continue
+        if not isinstance(external, dict):
+            validation_errors.append(f'{iface_name}: Select an external Proxmox VM in Step 4.')
+            continue
+        external_vm_key = str(external.get('vm_key') or external.get('vmKey') or '').strip()
+        if not external_vm_key:
+            validation_errors.append(f'{iface_name}: Select an external Proxmox VM in Step 4.')
+            continue
+        try:
+            external_node, external_vmid = _parse_proxmox_vm_key(external_vm_key)
+        except ValueError as exc:
+            validation_errors.append(f'{iface_name}: External VM invalid: {exc}')
+            continue
+        if external_node != core_node:
+            validation_errors.append(f'{iface_name}: External VM must be hosted on node {core_node}.')
+            continue
+        external_iface_id = str(external.get('interface_id') or '').strip()
+        if not external_iface_id:
+            validation_errors.append(f'{iface_name}: Select the external VM interface to connect through the bridge.')
+            continue
+        assignments.append({
+            'name': iface_name,
+            'core': {
+                'node': core_node,
+                'vmid': core_vmid,
+                'vm_name': core_vm_name,
+                'interface_id': core_iface_id,
+            },
+            'external': {
+                'node': external_node,
+                'vmid': external_vmid,
+                'vm_name': str(external.get('vm_name') or '').strip(),
+                'interface_id': external_iface_id,
+            },
+        })
+
+    if validation_errors:
+        message = ' ; '.join(validation_errors[:3])
+        if len(validation_errors) > 3:
+            message += f' (and {len(validation_errors) - 3} more issue(s))'
+        return jsonify({'success': False, 'error': message, 'details': validation_errors}), 400
+    if not assignments:
+        return jsonify({'success': False, 'error': 'No eligible HITL interface mappings found. Map at least one interface to a CORE VM and external VM before applying.'}), 400
+
+    try:
+        client, _record = _connect_proxmox_from_secret(secret_id)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 502
+    except Exception as exc:  # pragma: no cover - defensive logging
+        app.logger.exception('[hitl] unexpected failure connecting to Proxmox: %s', exc)
+        return jsonify({'success': False, 'error': 'Unexpected error connecting to Proxmox'}), 500
+
+    owner_raw = payload.get('bridge_owner') or core_state.get('internal_bridge_owner') or payload.get('username')
+    bridge_owner = str(owner_raw or '').strip()
+    comment_bits = ['core-topo-gen HITL bridge']
+    if scenario_name:
+        comment_bits.append(f'scenario={scenario_name}')
+    if bridge_owner:
+        comment_bits.append(f'owner={bridge_owner}')
+    bridge_comment = ' '.join(comment_bits)
+    try:
+        bridge_meta = _ensure_proxmox_bridge(client, core_node, bridge_name, comment=bridge_comment)
+    except RuntimeError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 502
+
+    vm_config_cache: Dict[tuple[str, int], Dict[str, Any]] = {}
+
+    def _get_vm_config(node: str, vmid: int) -> Dict[str, Any]:
+        key = (node, vmid)
+        if key not in vm_config_cache:
+            try:
+                vm_config_cache[key] = client.nodes(node).qemu(vmid).config.get()
+            except Exception as exc:
+                raise RuntimeError(f'Failed to fetch configuration for VM {vmid} on node {node}: {exc}') from exc
+        return vm_config_cache[key]
+
+    vm_updates: Dict[tuple[str, int], Dict[str, str]] = {}
+    change_details: List[Dict[str, Any]] = []
+    try:
+        for assignment in assignments:
+            for role in ('core', 'external'):
+                vm_info = assignment[role]
+                node = vm_info['node']
+                vmid = vm_info['vmid']
+                interface_id = vm_info['interface_id']
+                vm_name = vm_info.get('vm_name') or ''
+                config = _get_vm_config(node, vmid)
+                net_config = config.get(interface_id)
+                if not isinstance(net_config, str) or not net_config.strip():
+                    raise ValueError(f'{role.title()} VM {vm_name or vmid} is missing Proxmox interface {interface_id}.')
+                new_config, changed, previous_bridge = _rewrite_bridge_in_net_config(net_config, bridge_name)
+                change_details.append({
+                    'role': role,
+                    'scenario_interface': assignment['name'],
+                    'node': node,
+                    'vmid': vmid,
+                    'vm_name': vm_name,
+                    'interface_id': interface_id,
+                    'previous_bridge': previous_bridge,
+                    'new_bridge': bridge_name,
+                    'changed': changed,
+                })
+                if changed:
+                    vm_updates.setdefault((node, vmid), {})[interface_id] = new_config
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 502
+
+    updated_vms: List[Dict[str, Any]] = []
+    for (node, vmid), updates in vm_updates.items():
+        if not updates:
+            continue
+        try:
+            client.nodes(node).qemu(vmid).config.post(**updates)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            app.logger.exception('[hitl] failed updating Proxmox VM config: %s', exc)
+            return jsonify({'success': False, 'error': f'Failed to update Proxmox VM {vmid} on node {node}: {exc}'}), 502
+        updated_vms.append({
+            'node': node,
+            'vmid': vmid,
+            'interfaces': list(updates.keys()),
+        })
+
+    changed_interfaces = sum(1 for change in change_details if change.get('changed'))
+    unchanged_interfaces = len(change_details) - changed_interfaces
+    assignment_count = len(assignments)
+
+    parts = [f'Bridge {bridge_name} applied to {assignment_count} HITL link{"s" if assignment_count != 1 else ""}.']
+    if changed_interfaces:
+        parts.append(f'{changed_interfaces} Proxmox interface{"s" if changed_interfaces != 1 else ""} updated.')
+    if unchanged_interfaces:
+        parts.append(f'{unchanged_interfaces} already on the requested bridge.')
+    message = ' '.join(parts)
+
+    warnings: List[str] = []
+    if bridge_meta.get('created') and not bridge_meta.get('reload_ok'):
+        warnings.append('Bridge created but Proxmox did not confirm network reload; apply pending changes manually if required.')
+
+    response: Dict[str, Any] = {
+        'success': True,
+        'message': message,
+        'bridge_name': bridge_name,
+        'bridge_created': bool(bridge_meta.get('created')),
+        'bridge_already_exists': bool(bridge_meta.get('already_exists')),
+        'bridge_reload_ok': bool(bridge_meta.get('reload_ok')),
+        'bridge_reload_error': bridge_meta.get('reload_error'),
+        'scenario_index': scenario_index,
+        'scenario_name': scenario_name,
+        'assignments': assignment_count,
+        'changed_interfaces': changed_interfaces,
+        'unchanged_interfaces': unchanged_interfaces,
+        'changes': change_details,
+        'updated_vms': updated_vms,
+        'proxmox_node': core_node,
+    }
+    if warnings:
+        response['warnings'] = warnings
+    if bridge_owner:
+        response['bridge_owner'] = bridge_owner
+
+    app.logger.info(
+        '[hitl] applied internal bridge %s on node %s (%d assignment(s), %d interface change(s))',
+        bridge_name,
+        core_node,
+        assignment_count,
+        changed_interfaces,
+    )
+    return jsonify(response)
 
 # ---------------- Docker (per-node) status & cleanup ----------------
 def _compose_assignments_path() -> str:
@@ -2633,7 +4144,7 @@ def _find_latest_session_xml(base_dir: str, stem: str | None = None) -> str | No
         return None
 
 
-def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_id: str | None = None) -> str | None:
+def _grpc_save_current_session_xml_with_config(core_cfg: Dict[str, Any], out_dir: str, session_id: str | None = None) -> str | None:
     """Attempt to connect to CORE daemon via gRPC and save the active session XML.
 
     This uses CoreGrpcClient.save_xml if available. If no active session exists
@@ -2644,12 +4155,13 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
     Falls back to:
         core-session-<session_id>-<timestamp>.xml
     """
+    cfg = _normalize_core_config(core_cfg, include_password=True)
+    remote_desc = f"{cfg.get('host')}:{cfg.get('port')}"
     try:
         from core.api.grpc.client import CoreGrpcClient  # type: ignore
     except Exception:
-        app.logger.debug("gRPC CoreGrpcClient not available; skipping save_xml (host=%s port=%s)", host, port)
+        app.logger.debug("gRPC CoreGrpcClient not available; skipping save_xml (remote=%s)", remote_desc)
         return None
-    address = f"{host}:{port}"
     ts = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')
     # Ensure a centralized session XML directory for discoverability
     base_sessions_dir = os.path.join(_outputs_dir(), 'core-sessions')
@@ -2675,201 +4187,220 @@ def _grpc_save_current_session_xml(host: str, port: int, out_dir: str, session_i
             counter += 1
 
     try:
-        app.logger.debug("Connecting to CORE gRPC at %s (requested session_id=%s)", address, session_id)
-        client = CoreGrpcClient(address=address)
-        try:
-            from core_topo_gen.utils.grpc_logging import wrap_core_client  # type: ignore
-            client = wrap_core_client(client, app.logger)
-        except Exception:
-            pass
-        client.connect()
-        try:
-            sessions = client.get_sessions()
-            if not sessions:
-                app.logger.info("No CORE sessions found at %s; cannot save session XML", address)
-                return None
-            # If a specific session id is requested, select it; otherwise default to first
-            target = None
-            if session_id is not None:
-                for s in sessions:
-                    sid = getattr(s, 'id', None) or getattr(s, 'session_id', None)
-                    if str(sid) == str(session_id):
-                        target = s
-                        break
-                if target is None:
-                    app.logger.warning("Requested session_id=%s not found; defaulting to first session", session_id)
-                    target = sessions[0]
-            else:
-                target = sessions[0]
-            session_id = getattr(target, 'id', None) or getattr(target, 'session_id', None)
-            if session_id is None:
-                app.logger.warning("Selected CORE session has no id; aborting save_xml")
-                return None
-            session_meta = target
+        with _core_connection(cfg) as (conn_host, conn_port):
+            address = f"{conn_host}:{conn_port}"
+            app.logger.debug(
+                "Connecting to CORE gRPC at %s via tunnel (remote=%s, requested session_id=%s)",
+                address,
+                remote_desc,
+                session_id,
+            )
+            client = CoreGrpcClient(address=address)
             try:
-                meta_detail = client.get_session(session_id)
-                if meta_detail is not None:
-                    session_meta = meta_detail
-            except Exception as e:
-                app.logger.debug("get_session(%s) lookup failed: %s", session_id, e)
-            try:
-                client.open_session(session_id)
-            except Exception as e:
-                app.logger.debug("open_session(%s) failed or not required: %s", session_id, e)
-            existing_candidates: list[str] = []
-
-            def _add_candidate_path(path_candidate: str | None) -> None:
-                if not path_candidate:
-                    return
-                try:
-                    abs_path = os.path.abspath(path_candidate)
-                except Exception:
-                    return
-                if not os.path.exists(abs_path):
-                    return
-                existing_candidates.append(abs_path)
-
-            _add_candidate_path(getattr(session_meta, 'file', None))
-            _add_candidate_path(getattr(target, 'file', None))
-            for attr in ('dir', 'path', 'directory'):
-                dir_candidate = getattr(session_meta, attr, None) or getattr(target, attr, None)
-                if not dir_candidate or not os.path.isdir(dir_candidate):
-                    continue
-                try:
-                    for entry in os.listdir(dir_candidate):
-                        if entry.lower().endswith('.xml'):
-                            _add_candidate_path(os.path.join(dir_candidate, entry))
-                except Exception:
-                    continue
-            seen_candidates: set[str] = set()
-            filtered_candidates: list[str] = []
-            for cand in existing_candidates:
-                if cand in seen_candidates:
-                    continue
-                seen_candidates.add(cand)
-                filtered_candidates.append(cand)
-            def _candidate_priority(path: str) -> tuple[int, float, str]:
-                base = os.path.basename(path).lower()
-                priority = 0 if 'session-deployed' in base else 1
-                try:
-                    mtime = -os.stat(path).st_mtime
-                except Exception:
-                    mtime = 0.0
-                return (priority, mtime, base)
-            filtered_candidates.sort(key=_candidate_priority)
-            # Derive a friendly stem from the original scenario XML if available
-            stem = None
-            try:
-                orig_file = getattr(session_meta, 'file', None)
-                if orig_file and os.path.exists(orig_file):
-                    # Try to parse scenario names from the original XML
-                    names = _scenario_names_from_xml(orig_file)
-                    raw = (names[0] if names else os.path.splitext(os.path.basename(orig_file))[0])
-                    stem = secure_filename(raw).strip('_-.') or None
-            except Exception:
-                stem = None
-            if not stem:
-                stem = f"core-session-{session_id}"
-            for candidate_path in filtered_candidates:
-                try:
-                    suffix = ''
-                    base_name = os.path.basename(candidate_path).lower()
-                    if 'session-deployed' in base_name and not stem.lower().startswith('session-deployed'):
-                        suffix = '-session-deployed'
-                    copy_dest = os.path.join(base_sessions_dir, f"{stem}-{ts}{suffix}.xml")
-                    copy_dest = _unique_path(copy_dest)
-                    shutil.copy2(candidate_path, copy_dest)
-                    try:
-                        _normalize_core_device_types(copy_dest)
-                    except Exception as norm_err:
-                        app.logger.debug("core xml type normalization skipped for copied candidate %s: %s", copy_dest, norm_err)
-                    try:
-                        size = os.stat(copy_dest).st_size
-                    except Exception:
-                        size = -1
-                    app.logger.info("Copied CORE session XML from %s to %s (%s bytes)", candidate_path, copy_dest, size if size >= 0 else '?')
-                    return copy_dest
-                except Exception as copy_err:
-                    app.logger.debug("Failed copying session XML candidate %s: %s", candidate_path, copy_err)
-                    continue
-            # Always store under outputs/core-sessions so CORE page can find it
-            out_path = os.path.join(base_sessions_dir, f"{stem}-{ts}.xml")
-            # Attempt save with small retries to handle transient timing issues
-            save_errors: list[Exception] = []
-            session_id_arg = session_id
-            try:
-                session_id_arg = int(session_id)  # type: ignore[assignment]
-            except Exception:
-                session_id_arg = session_id
-            for attempt in range(3):
-                try:
-                    app.logger.info("Invoking save_xml(session_id=%s) -> %s (attempt %d)", session_id, out_path, attempt + 1)
-                    client.save_xml(session_id=session_id_arg, file_path=out_path)
-                    break
-                except Exception as e:
-                    save_errors.append(e)
-                    if attempt < 2:
-                        try:
-                            time.sleep(0.5 * (attempt + 1))
-                        except Exception:
-                            pass
-                        continue
-                    app.logger.warning("save_xml final failure for session %s at %s: %s", session_id, address, e)
-            else:
-                # Loop exhausted without break
-                last = save_errors[-1] if save_errors else None
-                if last:
-                    app.logger.warning("save_xml could not persist session XML: %s", last)
-            if not os.path.exists(out_path):
-                for _ in range(3):
-                    try:
-                        time.sleep(0.2)
-                    except Exception:
-                        break
-                    if os.path.exists(out_path):
-                        break
-            if os.path.exists(out_path):
-                # Validate that it's a CORE XML and not our editor format
-                try:
-                    ok, errs = _validate_core_xml(out_path)
-                except Exception as e:
-                    app.logger.warning("CORE XML validation raised exception for %s: %s", out_path, e)
-                    ok = False
-                if ok:
-                    # Normalize device types: set 'router' if routing services present; 'docker' for docker class; else 'PC'
-                    try:
-                        _normalize_core_device_types(out_path)
-                    except Exception as e:
-                        app.logger.debug("core xml type normalization skipped for %s: %s", out_path, e)
-                    try:
-                        size = os.stat(out_path).st_size
-                    except Exception:
-                        size = -1
-                    app.logger.info("Saved valid CORE session XML (session_id=%s) at %s (%s bytes)", session_id, out_path, size if size >= 0 else '?')
-                    return out_path
-                else:
-                    app.logger.warning("Saved XML failed CORE validation; deleting file %s. Errors: %s", out_path, errs if 'errs' in locals() else '(unknown)')
-                    try:
-                        os.remove(out_path)
-                    except Exception:
-                        pass
-            # Fallback: try to locate an existing session XML from previous saves
-            fallback = _find_latest_session_xml(base_sessions_dir, stem)
-            if fallback and os.path.exists(fallback):
-                try:
-                    size = os.stat(fallback).st_size
-                except Exception:
-                    size = -1
-                app.logger.info("Using existing CORE session XML fallback for session_id=%s: %s (%s bytes)", session_id, fallback, size if size >= 0 else '?')
-                return fallback
-            return None
-        finally:
-            try:
-                client.close()
+                from core_topo_gen.utils.grpc_logging import wrap_core_client  # type: ignore
+                client = wrap_core_client(client, app.logger)
             except Exception:
                 pass
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(contextlib.closing(client))
+                client.connect()
+                sessions = client.get_sessions()
+                if not sessions:
+                    app.logger.info("No CORE sessions found at %s; cannot save session XML", address)
+                    return None
+                # If a specific session id is requested, select it; otherwise default to first
+                target = None
+                if session_id is not None:
+                    for s in sessions:
+                        sid = getattr(s, 'id', None) or getattr(s, 'session_id', None)
+                        if str(sid) == str(session_id):
+                            target = s
+                            break
+                    if target is None:
+                        app.logger.warning("Requested session_id=%s not found; defaulting to first session", session_id)
+                        target = sessions[0]
+                else:
+                    target = sessions[0]
+                session_id = getattr(target, 'id', None) or getattr(target, 'session_id', None)
+                if session_id is None:
+                    app.logger.warning("Selected CORE session has no id; aborting save_xml")
+                    return None
+                session_meta = target
+                try:
+                    meta_detail = client.get_session(session_id)
+                    if meta_detail is not None:
+                        session_meta = meta_detail
+                except Exception as e:
+                    app.logger.debug("get_session(%s) lookup failed: %s", session_id, e)
+                try:
+                    client.open_session(session_id)
+                except Exception as e:
+                    app.logger.debug("open_session(%s) failed or not required: %s", session_id, e)
+                existing_candidates: list[str] = []
+
+                def _add_candidate_path(path_candidate: str | None) -> None:
+                    if not path_candidate:
+                        return
+                    try:
+                        abs_path = os.path.abspath(path_candidate)
+                    except Exception:
+                        return
+                    if not os.path.exists(abs_path):
+                        return
+                    existing_candidates.append(abs_path)
+
+                _add_candidate_path(getattr(session_meta, 'file', None))
+                _add_candidate_path(getattr(target, 'file', None))
+                for attr in ('dir', 'path', 'directory'):
+                    dir_candidate = getattr(session_meta, attr, None) or getattr(target, attr, None)
+                    if not dir_candidate or not os.path.isdir(dir_candidate):
+                        continue
+                    try:
+                        for entry in os.listdir(dir_candidate):
+                            if entry.lower().endswith('.xml'):
+                                _add_candidate_path(os.path.join(dir_candidate, entry))
+                    except Exception:
+                        continue
+                seen_candidates: set[str] = set()
+                filtered_candidates: list[str] = []
+                for cand in existing_candidates:
+                    if cand in seen_candidates:
+                        continue
+                    seen_candidates.add(cand)
+                    filtered_candidates.append(cand)
+
+                def _candidate_priority(path: str) -> tuple[int, float, str]:
+                    base = os.path.basename(path).lower()
+                    priority = 0 if 'session-deployed' in base else 1
+                    try:
+                        mtime = -os.stat(path).st_mtime
+                    except Exception:
+                        mtime = 0.0
+                    return (priority, mtime, base)
+
+                filtered_candidates.sort(key=_candidate_priority)
+                # Derive a friendly stem from the original scenario XML if available
+                stem = None
+                try:
+                    orig_file = getattr(session_meta, 'file', None)
+                    if orig_file and os.path.exists(orig_file):
+                        # Try to parse scenario names from the original XML
+                        names = _scenario_names_from_xml(orig_file)
+                        raw = (names[0] if names else os.path.splitext(os.path.basename(orig_file))[0])
+                        stem = secure_filename(raw).strip('_-.') or None
+                except Exception:
+                    stem = None
+                if not stem:
+                    stem = f"core-session-{session_id}"
+                for candidate_path in filtered_candidates:
+                    try:
+                        suffix = ''
+                        base_name = os.path.basename(candidate_path).lower()
+                        if 'session-deployed' in base_name and not stem.lower().startswith('session-deployed'):
+                            suffix = '-session-deployed'
+                        copy_dest = os.path.join(base_sessions_dir, f"{stem}-{ts}{suffix}.xml")
+                        copy_dest = _unique_path(copy_dest)
+                        shutil.copy2(candidate_path, copy_dest)
+                        try:
+                            _normalize_core_device_types(copy_dest)
+                        except Exception as norm_err:
+                            app.logger.debug("core xml type normalization skipped for copied candidate %s: %s", copy_dest, norm_err)
+                        try:
+                            size = os.stat(copy_dest).st_size
+                        except Exception:
+                            size = -1
+                        app.logger.info("Copied CORE session XML from %s to %s (%s bytes)", candidate_path, copy_dest, size if size >= 0 else '?')
+                        return copy_dest
+                    except Exception as copy_err:
+                        app.logger.debug("Failed copying session XML candidate %s: %s", candidate_path, copy_err)
+                        continue
+                # Always store under outputs/core-sessions so CORE page can find it
+                out_path = os.path.join(base_sessions_dir, f"{stem}-{ts}.xml")
+                # Attempt save with small retries to handle transient timing issues
+                save_errors: list[Exception] = []
+                session_id_arg = session_id
+                try:
+                    session_id_arg = int(session_id)  # type: ignore[assignment]
+                except Exception:
+                    session_id_arg = session_id
+                for attempt in range(3):
+                    try:
+                        app.logger.info("Invoking save_xml(session_id=%s) -> %s (attempt %d)", session_id, out_path, attempt + 1)
+                        client.save_xml(session_id=session_id_arg, file_path=out_path)
+                        break
+                    except Exception as e:
+                        save_errors.append(e)
+                        if attempt < 2:
+                            try:
+                                time.sleep(0.5 * (attempt + 1))
+                            except Exception:
+                                pass
+                            continue
+                        app.logger.warning("save_xml final failure for session %s at %s: %s", session_id, address, e)
+                else:
+                    # Loop exhausted without break
+                    last = save_errors[-1] if save_errors else None
+                    if last:
+                        app.logger.warning("save_xml could not persist session XML: %s", last)
+                if not os.path.exists(out_path):
+                    for _ in range(3):
+                        try:
+                            time.sleep(0.2)
+                        except Exception:
+                            break
+                        if os.path.exists(out_path):
+                            break
+                if os.path.exists(out_path):
+                    # Validate that it's a CORE XML and not our editor format
+                    try:
+                        ok, errs = _validate_core_xml(out_path)
+                    except Exception as e:
+                        app.logger.warning("CORE XML validation raised exception for %s: %s", out_path, e)
+                        ok = False
+                    if ok:
+                        # Normalize device types: set 'router' if routing services present; 'docker' for docker class; else 'PC'
+                        try:
+                            _normalize_core_device_types(out_path)
+                        except Exception as e:
+                            app.logger.debug("core xml type normalization skipped for %s: %s", out_path, e)
+                        try:
+                            size = os.stat(out_path).st_size
+                        except Exception:
+                            size = -1
+                        app.logger.info("Saved valid CORE session XML (session_id=%s) at %s (%s bytes)", session_id, out_path, size if size >= 0 else '?')
+                        return out_path
+                    else:
+                        app.logger.warning("Saved XML failed CORE validation; deleting file %s. Errors: %s", out_path, errs if 'errs' in locals() else '(unknown)')
+                        try:
+                            os.remove(out_path)
+                        except Exception:
+                            pass
+                # Fallback: try to locate an existing session XML from previous saves
+                fallback = _find_latest_session_xml(base_sessions_dir, stem)
+                if fallback and os.path.exists(fallback):
+                    try:
+                        size = os.stat(fallback).st_size
+                    except Exception:
+                        size = -1
+                    app.logger.info("Using existing CORE session XML fallback for session_id=%s: %s (%s bytes)", session_id, fallback, size if size >= 0 else '?')
+                    return fallback
+                return None
+    except _SSHTunnelError as ssh_exc:
+        app.logger.warning("SSH tunnel setup failed while saving CORE XML (remote=%s): %s", remote_desc, ssh_exc)
+        return None
     except Exception:
         return None
+
+def _grpc_save_current_session_xml(core_cfg_or_host: Any, maybe_port: Any, out_dir: str | None = None, session_id: str | None = None) -> str | None:
+    if isinstance(core_cfg_or_host, dict):
+        core_cfg = core_cfg_or_host
+        target_out_dir = maybe_port
+    else:
+        core_cfg = {'host': core_cfg_or_host, 'port': maybe_port}
+        target_out_dir = out_dir
+    if not isinstance(target_out_dir, str) or not target_out_dir:
+        raise ValueError('out_dir is required for _grpc_save_current_session_xml')
+    return _grpc_save_current_session_xml_with_config(core_cfg, target_out_dir, session_id=session_id)
 
 def _attach_base_upload(payload: Dict[str, Any]):
     """Ensure payload['base_upload'] is present if first scenario has a base filepath referencing an existing file.
@@ -2911,6 +4442,20 @@ def _parse_scenarios_xml(path):
             data["scenarios"].append(scen)
             return data
         raise ValueError("Root element must be <Scenarios> or <ScenarioEditor>")
+    core_el = root.find('CoreConnection')
+    if core_el is not None:
+        core_meta = {
+            'host': core_el.get('host'),
+            'port': core_el.get('port'),
+            'ssh_enabled': core_el.get('ssh_enabled'),
+            'ssh_host': core_el.get('ssh_host'),
+            'ssh_port': core_el.get('ssh_port'),
+            'ssh_username': core_el.get('ssh_username'),
+        }
+        data['core'] = _normalize_core_config(core_meta, include_password=False)
+    else:
+        data['core'] = _default_core_dict()
+
     for scen_el in root.findall("Scenario"):
         scen = {"name": scen_el.get("name", "Scenario")}
         # Capture scenario-level density_count attribute if present
@@ -2953,7 +4498,7 @@ def _parse_scenario_editor(se):
     if base is not None:
         scen["base"]["filepath"] = base.get("filepath", "")
     hitl_el = se.find("HardwareInLoop")
-    hitl_info: Dict[str, Any] = {"enabled": False, "interfaces": []}
+    hitl_info: Dict[str, Any] = {"enabled": False, "interfaces": [], "core": None}
     if hitl_el is not None:
         enabled_raw = (hitl_el.get("enabled") or "").strip().lower()
         hitl_info["enabled"] = enabled_raw in ("1", "true", "yes", "on")
@@ -2979,6 +4524,11 @@ def _parse_scenario_editor(se):
                 entry["ipv6"] = [p.strip() for p in ipv6_attr.split(',') if p.strip()]
             interfaces.append(entry)
         hitl_info["interfaces"] = interfaces
+        core_el = hitl_el.find("CoreConnection")
+        if core_el is not None:
+            core_cfg = _extract_optional_core_config(dict(core_el.attrib), include_password=False)
+            if core_cfg:
+                hitl_info["core"] = core_cfg
     scen["hitl"] = hitl_info
     # Sections
     for sec in se.findall("section"):
@@ -3112,6 +4662,14 @@ def _parse_scenario_editor(se):
 
 def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
     root = ET.Element("Scenarios")
+    core_cfg = _normalize_core_config(data_dict.get('core'), include_password=False)
+    core_el = ET.SubElement(root, 'CoreConnection')
+    core_el.set('host', str(core_cfg.get('host') or ''))
+    core_el.set('port', str(core_cfg.get('port') or ''))
+    core_el.set('ssh_enabled', 'true' if core_cfg.get('ssh_enabled') else 'false')
+    core_el.set('ssh_host', str(core_cfg.get('ssh_host') or core_cfg.get('host') or ''))
+    core_el.set('ssh_port', str(core_cfg.get('ssh_port') or ''))
+    core_el.set('ssh_username', str(core_cfg.get('ssh_username') or ''))
     for scen in data_dict.get("scenarios", []):
         scen_el = ET.SubElement(root, "Scenario")
         scen_el.set("name", scen.get("name", "Scenario"))
@@ -3165,9 +4723,25 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
             if "attachment" not in iface:
                 iface["attachment"] = _DEFAULT_HITL_ATTACHMENT
 
-        if hitl and (hitl.get("enabled") or normalized_ifaces):
+        if hitl and (hitl.get("enabled") or normalized_ifaces or hitl.get("core")):
             hitl_el = ET.SubElement(se, "HardwareInLoop")
             hitl_el.set("enabled", "true" if hitl.get("enabled") else "false")
+            hitl_core_cfg = _extract_optional_core_config(hitl.get("core"), include_password=False)
+            if hitl_core_cfg:
+                hitl_core_el = ET.SubElement(hitl_el, "CoreConnection")
+                hitl_core_el.set("host", str(hitl_core_cfg.get("host") or ""))
+                hitl_core_el.set("port", str(hitl_core_cfg.get("port") or ""))
+                hitl_core_el.set("ssh_enabled", "true" if hitl_core_cfg.get("ssh_enabled") else "false")
+                hitl_core_el.set("ssh_host", str(hitl_core_cfg.get("ssh_host") or hitl_core_cfg.get("host") or ""))
+                hitl_core_el.set("ssh_port", str(hitl_core_cfg.get("ssh_port") or ""))
+                hitl_core_el.set("ssh_username", str(hitl_core_cfg.get("ssh_username") or ""))
+                for extra_key, extra_val in hitl_core_cfg.items():
+                    if extra_key in {"host", "port", "ssh_enabled", "ssh_host", "ssh_port", "ssh_username", "ssh_password"}:
+                        continue
+                    try:
+                        hitl_core_el.set(str(extra_key), str(extra_val))
+                    except Exception:
+                        continue
             for iface in normalized_ifaces:
                 name = iface.get("name")
                 if not name:
@@ -3943,7 +5517,15 @@ def save_xml():
             active_index = int(data.get('active_index')) if 'active_index' in data else None
         except Exception:
             active_index = None
-        tree = _build_scenarios_xml({ 'scenarios': data.get('scenarios') })
+        core_meta = None
+        try:
+            core_str = request.form.get('core_json')
+            if core_str:
+                core_meta = json.loads(core_str)
+        except Exception:
+            core_meta = None
+        normalized_core = _normalize_core_config(core_meta, include_password=True) if core_meta else None
+        tree = _build_scenarios_xml({ 'scenarios': data.get('scenarios'), 'core': normalized_core })
         ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
         os.makedirs(out_dir, exist_ok=True)
@@ -3985,8 +5567,10 @@ def save_xml():
             if "core" not in payload:
                 payload["core"] = _default_core_dict()
             payload["result_path"] = out_path
+            if normalized_core:
+                payload['core'] = _normalize_core_config(normalized_core, include_password=False)
         except Exception:
-            payload = {"scenarios": data.get("scenarios", []), "result_path": out_path, "core": _default_core_dict()}
+            payload = {"scenarios": data.get("scenarios", []), "result_path": out_path, "core": _normalize_core_config(normalized_core or {}, include_password=False) if normalized_core else _default_core_dict()}
         payload['host_interfaces'] = _enumerate_host_interfaces()
         _attach_base_upload(payload)
         _hydrate_base_upload_from_disk(payload)
@@ -4004,6 +5588,8 @@ def save_xml_api():
     try:
         data = request.get_json(silent=True) or {}
         scenarios = data.get('scenarios')
+        core_meta = data.get('core')
+        normalized_core = _normalize_core_config(core_meta, include_password=True) if isinstance(core_meta, (dict, list)) or core_meta else None
         active_index = None
         try:
             active_index = int(data.get('active_index')) if 'active_index' in data else None
@@ -4011,7 +5597,7 @@ def save_xml_api():
             active_index = None
         if not isinstance(scenarios, list):
             return jsonify({ 'ok': False, 'error': 'Invalid payload (scenarios list required)' }), 400
-        tree = _build_scenarios_xml({ 'scenarios': scenarios })
+        tree = _build_scenarios_xml({ 'scenarios': scenarios, 'core': normalized_core })
         ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
         os.makedirs(out_dir, exist_ok=True)
@@ -4038,7 +5624,8 @@ def save_xml_api():
                 f.write(pretty)
         except Exception:
             tree.write(out_path, encoding='utf-8', xml_declaration=True)
-        return jsonify({ 'ok': True, 'result_path': out_path })
+        resp_core = _normalize_core_config(normalized_core or core_meta or {}, include_password=False) if (normalized_core or core_meta) else _default_core_dict()
+        return jsonify({ 'ok': True, 'result_path': out_path, 'core': resp_core })
     except Exception as e:
         try:
             app.logger.exception("[save_xml_api] failed: %s", e)
@@ -4069,48 +5656,131 @@ def run_cli():
         flash(f'XML path not found: {xml_path}')
         return redirect(url_for('index'))
     # Skip schema validation: format differs from CORE XML
+    # Determine CORE connection settings (including SSH details) from saved payload and defaults
+    core_override = None
+    try:
+        core_json = request.form.get('core_json')
+        if core_json:
+            core_override = json.loads(core_json)
+    except Exception:
+        core_override = None
+    scenario_core_override = None
+    try:
+        hitl_core_json = request.form.get('hitl_core_json')
+        if hitl_core_json:
+            scenario_core_override = json.loads(hitl_core_json)
+    except Exception:
+        scenario_core_override = None
+    scenario_name_hint = request.form.get('scenario') or request.form.get('scenario_name') or None
+    scenario_index_hint: Optional[int] = None
+    try:
+        raw_index = request.form.get('scenario_index')
+        if raw_index not in (None, ''):
+            scenario_index_hint = int(raw_index)
+    except Exception:
+        scenario_index_hint = None
+    payload_for_core: Dict[str, Any] | None = None
+    try:
+        payload_for_core = _parse_scenarios_xml(xml_path)
+    except Exception:
+        payload_for_core = None
+    scenario_payload: Dict[str, Any] | None = None
+    if payload_for_core:
+        scen_list = payload_for_core.get('scenarios') or []
+        if isinstance(scen_list, list) and scen_list:
+            if scenario_name_hint:
+                for scen_entry in scen_list:
+                    if not isinstance(scen_entry, dict):
+                        continue
+                    if str(scen_entry.get('name') or '').strip() == str(scenario_name_hint).strip():
+                        scenario_payload = scen_entry
+                        break
+            if scenario_payload is None and scenario_index_hint is not None:
+                if 0 <= scenario_index_hint < len(scen_list):
+                    candidate = scen_list[scenario_index_hint]
+                    if isinstance(candidate, dict):
+                        scenario_payload = candidate
+            if scenario_payload is None:
+                for scen_entry in scen_list:
+                    if isinstance(scen_entry, dict):
+                        scenario_payload = scen_entry
+                        break
+    scenario_core_saved = None
+    if scenario_payload and isinstance(scenario_payload.get('hitl'), dict):
+        scenario_core_saved = scenario_payload['hitl'].get('core')
+    global_core_saved = payload_for_core.get('core') if (payload_for_core and isinstance(payload_for_core.get('core'), dict)) else None
+    scenario_core_public: Dict[str, Any] | None = None
+    candidate_scenario_core = scenario_core_override if isinstance(scenario_core_override, dict) else None
+    if not candidate_scenario_core and isinstance(scenario_core_saved, dict):
+        candidate_scenario_core = scenario_core_saved
+    if candidate_scenario_core:
+        scenario_core_public = _extract_optional_core_config(candidate_scenario_core, include_password=False)
+    core_cfg = _merge_core_configs(
+        global_core_saved,
+        scenario_core_saved,
+        core_override,
+        scenario_core_override,
+        include_password=True,
+    )
+    core_host = core_cfg.get('host', '127.0.0.1')
+    try:
+        core_port = int(core_cfg.get('port', 50051))
+    except Exception:
+        core_port = 50051
+    remote_desc = f"{core_host}:{core_port}"
+    app.logger.info("[sync] Preparing CLI run against CORE remote=%s (ssh_enabled=%s), xml=%s", remote_desc, core_cfg.get('ssh_enabled'), xml_path)
     # Run gRPC CLI script (config2scen_core_grpc.py) instead of internal module
     try:
-        # Attempt to parse current scenarios JSON (if present) to extract core host/port overrides
-        core_host = '127.0.0.1'
-        core_port = 50051
+        # Pre-save any existing active CORE session XML (best-effort) using derived config
         try:
-            # attempt to load previously saved payload for core info
-            payload = _parse_scenarios_xml(xml_path)
-            ch = payload.get('core', {}).get('host') if isinstance(payload.get('core'), dict) else None
-            cp = payload.get('core', {}).get('port') if isinstance(payload.get('core'), dict) else None
-            if ch: core_host = str(ch)
-            if cp: core_port = int(cp)
-        except Exception:
-            pass
-        app.logger.info("[sync] Running CLI with CORE %s:%s, xml=%s", core_host, core_port, xml_path)
-        # Pre-save any existing active CORE session XML (best-effort) using derived host/port
-        try:
-            # Save pre-run session XML into a sibling 'core-pre' directory next to scenarios.xml
             pre_dir = os.path.join(os.path.dirname(xml_path) or _outputs_dir(), 'core-pre')
-            pre_saved = _grpc_save_current_session_xml(core_host, core_port, pre_dir)
+            pre_saved = _grpc_save_current_session_xml_with_config(core_cfg, pre_dir)
             if pre_saved:
                 flash(f'Captured current CORE session XML: {os.path.basename(pre_saved)}')
                 app.logger.debug("[sync] Pre-run session XML saved to %s", pre_saved)
         except Exception:
-            pass
+            pre_saved = None
         repo_root = _get_repo_root()
         # Invoke package CLI so it can generate reports under repo_root/reports
         # Resolve python interpreter with fallback logic
         py_exec = _select_python_interpreter()
         app.logger.info("[sync] Using python interpreter: %s", py_exec)
-        # Determine active scenario name (first in the saved editor XML) and pass to CLI
+        # Determine active scenario name (prefer explicit hint, fallback to first in XML)
         active_scenario_name = None
-        try:
-            names_for_cli = _scenario_names_from_xml(xml_path)
-            if names_for_cli:
-                active_scenario_name = names_for_cli[0]
-        except Exception:
-            active_scenario_name = None
-        cli_args = [py_exec, '-m', 'core_topo_gen.cli', '--xml', xml_path, '--host', core_host, '--port', str(core_port), '--verbose']
-        if active_scenario_name:
-            cli_args.extend(['--scenario', active_scenario_name])
-        proc = subprocess.run(cli_args, cwd=repo_root, check=False, capture_output=True, text=True)
+        if scenario_name_hint:
+            active_scenario_name = scenario_name_hint
+        elif scenario_payload and isinstance(scenario_payload.get('name'), str):
+            active_scenario_name = scenario_payload.get('name')
+        if not active_scenario_name:
+            try:
+                names_for_cli = _scenario_names_from_xml(xml_path)
+                if names_for_cli:
+                    active_scenario_name = names_for_cli[0]
+            except Exception:
+                active_scenario_name = None
+        with _core_connection(core_cfg) as (conn_host, conn_port):
+            forwarded_desc = f"{conn_host}:{conn_port}"
+            app.logger.info(
+                "[sync] Running CLI with CORE remote=%s via=%s, xml=%s",
+                remote_desc,
+                forwarded_desc,
+                xml_path,
+            )
+            cli_args = [
+                py_exec,
+                '-m',
+                'core_topo_gen.cli',
+                '--xml',
+                xml_path,
+                '--host',
+                conn_host,
+                '--port',
+                str(conn_port),
+                '--verbose',
+            ]
+            if active_scenario_name:
+                cli_args.extend(['--scenario', active_scenario_name])
+            proc = subprocess.run(cli_args, cwd=repo_root, check=False, capture_output=True, text=True)
         logs = (proc.stdout or '') + ('\n' + proc.stderr if proc.stderr else '')
         app.logger.debug("[sync] CLI return code: %s", proc.returncode)
         # Report path (if generated by CLI): parse logs or fallback to latest under reports/
@@ -4150,15 +5820,24 @@ def run_cli():
         # Best-effort: save the active CORE session XML after run (try even on failures)
         try:
             post_dir = os.path.join(os.path.dirname(xml_path), 'core-post')
-            post_saved = _grpc_save_current_session_xml(core_host, core_port, post_dir, session_id=session_id)
+            post_saved = _grpc_save_current_session_xml_with_config(core_cfg, post_dir, session_id=session_id)
             if post_saved:
                 flash(f'Captured post-run CORE session XML: {os.path.basename(post_saved)}')
                 app.logger.debug("[sync] Post-run session XML saved to %s", post_saved)
         except Exception:
             post_saved = None
-        payload = _parse_scenarios_xml(xml_path)
+        payload = payload_for_core or {}
+        if not payload:
+            try:
+                payload = _parse_scenarios_xml(xml_path)
+            except Exception:
+                payload = {}
         if "core" not in payload:
             payload["core"] = _default_core_dict()
+        try:
+            payload['core'] = _normalize_core_config(core_cfg, include_password=False)
+        except Exception:
+            pass
         _attach_base_upload(payload)
         # Always use absolute xml_path for result_path fallback
         payload["result_path"] = report_md if (report_md and os.path.exists(report_md)) else xml_path
@@ -4191,6 +5870,8 @@ def run_cli():
             app.logger.exception("[sync] failed building full scenario bundle: %s", e_bundle)
         try:
             session_xml_path = post_saved if (post_saved and os.path.exists(post_saved)) else None
+            core_public = dict(core_cfg)
+            core_public.pop('ssh_password', None)
             _append_run_history({
                 'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
                 'mode': 'sync',
@@ -4205,6 +5886,10 @@ def run_cli():
                 'single_scenario_xml_path': single_scen_xml,
                 'returncode': proc.returncode,
                 'scenario_names': scen_names,
+                'scenario_name': active_scenario_name,
+                'core': _normalize_core_config(core_cfg, include_password=False),
+                'core_cfg_public': core_public,
+                'scenario_core': scenario_core_public,
             })
         except Exception as e_hist:
             app.logger.exception("[sync] failed appending run history: %s", e_hist)
@@ -4273,6 +5958,8 @@ def api_plan_preview_full():
             full_prev['hitl_interfaces'] = hitl_config.get('interfaces', [])
             full_prev['hitl_enabled'] = bool(hitl_config.get('enabled'))
             full_prev['hitl_scenario_key'] = hitl_config.get('scenario_key')
+            if hitl_config.get('core'):
+                full_prev['hitl_core'] = hitl_config.get('core')
         except Exception:
             pass
         try:
@@ -4377,6 +6064,8 @@ def plan_full_preview_page():
             full_prev['hitl_interfaces'] = hitl_config.get('interfaces', [])
             full_prev['hitl_enabled'] = bool(hitl_config.get('enabled'))
             full_prev['hitl_scenario_key'] = hitl_config.get('scenario_key')
+            if hitl_config.get('core'):
+                full_prev['hitl_core'] = hitl_config.get('core')
         except Exception:
             pass
         try:
@@ -5052,11 +6741,24 @@ def reports_delete():
         return jsonify({ 'error': 'internal error' }), 500
 
 
+def _close_async_run_tunnel(meta: Dict[str, Any]) -> None:
+    tunnel = meta.pop('ssh_tunnel', None)
+    if tunnel:
+        try:
+            tunnel.close()
+        except Exception:
+            pass
+
+
 @app.route('/run_cli_async', methods=['POST'])
 def run_cli_async():
     seed = None
     xml_path = None
     preview_plan_path = None
+    core_override = None
+    scenario_core_override = None
+    scenario_name_hint = None
+    scenario_index_hint: Optional[int] = None
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
         xml_path = request.form.get('xml_path')
@@ -5065,6 +6767,25 @@ def run_cli_async():
             try: seed = int(raw_seed)
             except Exception: seed = None
         preview_plan_path = request.form.get('preview_plan') or preview_plan_path
+        scenario_name_hint = request.form.get('scenario') or request.form.get('scenario_name') or scenario_name_hint
+        try:
+            raw_index = request.form.get('scenario_index')
+            if raw_index not in (None, ''):
+                scenario_index_hint = int(raw_index)
+        except Exception:
+            scenario_index_hint = scenario_index_hint
+        try:
+            core_json = request.form.get('core_json')
+            if core_json:
+                core_override = json.loads(core_json)
+        except Exception:
+            core_override = None
+        try:
+            hitl_core_json = request.form.get('hitl_core_json')
+            if hitl_core_json:
+                scenario_core_override = json.loads(hitl_core_json)
+        except Exception:
+            scenario_core_override = None
     if not xml_path:
         try:
             j = request.get_json(silent=True) or {}
@@ -5074,6 +6795,17 @@ def run_cli_async():
                 except Exception: seed = None
             if 'preview_plan' in j and not preview_plan_path:
                 preview_plan_path = j.get('preview_plan')
+            if 'core' in j and j.get('core') is not None:
+                core_override = j.get('core')
+            if 'hitl_core' in j and isinstance(j.get('hitl_core'), dict):
+                scenario_core_override = j.get('hitl_core')
+            if 'scenario' in j and j.get('scenario') not in (None, ''):
+                scenario_name_hint = j.get('scenario')
+            if 'scenario_index' in j:
+                try:
+                    scenario_index_hint = int(j.get('scenario_index'))
+                except Exception:
+                    scenario_index_hint = None
         except Exception:
             pass
     if not xml_path:
@@ -5119,26 +6851,116 @@ def run_cli_async():
     except Exception:
         pass
     app.logger.info("[async] Starting CLI; log: %s", log_path)
-    # derive core host/port (best-effort) from synchronous parse
-    core_host = '127.0.0.1'
-    core_port = 50051
+    payload_for_core: Dict[str, Any] | None = None
     try:
-        payload = _parse_scenarios_xml(xml_path)
-        ch = payload.get('core', {}).get('host') if isinstance(payload.get('core'), dict) else None
-        cp = payload.get('core', {}).get('port') if isinstance(payload.get('core'), dict) else None
-        if ch: core_host = str(ch)
-        if cp: core_port = int(cp)
+        payload_for_core = _parse_scenarios_xml(xml_path)
     except Exception:
-        pass
-    # Attempt pre-save of current CORE session xml (best-effort) using derived host/port
+        payload_for_core = None
+    scenario_payload: Dict[str, Any] | None = None
+    if payload_for_core:
+        scen_list = payload_for_core.get('scenarios') or []
+        if isinstance(scen_list, list) and scen_list:
+            if scenario_name_hint:
+                for scen_entry in scen_list:
+                    if not isinstance(scen_entry, dict):
+                        continue
+                    if str(scen_entry.get('name') or '').strip() == str(scenario_name_hint).strip():
+                        scenario_payload = scen_entry
+                        break
+            if scenario_payload is None and scenario_index_hint is not None:
+                if 0 <= scenario_index_hint < len(scen_list):
+                    candidate = scen_list[scenario_index_hint]
+                    if isinstance(candidate, dict):
+                        scenario_payload = candidate
+            if scenario_payload is None:
+                for scen_entry in scen_list:
+                    if isinstance(scen_entry, dict):
+                        scenario_payload = scen_entry
+                        break
+    scenario_core_saved = None
+    if scenario_payload and isinstance(scenario_payload.get('hitl'), dict):
+        scenario_core_saved = scenario_payload['hitl'].get('core')
+    global_core_saved = payload_for_core.get('core') if (payload_for_core and isinstance(payload_for_core.get('core'), dict)) else None
+    scenario_core_public: Dict[str, Any] | None = None
+    candidate_scenario_core = scenario_core_override if isinstance(scenario_core_override, dict) else None
+    if not candidate_scenario_core and isinstance(scenario_core_saved, dict):
+        candidate_scenario_core = scenario_core_saved
+    if candidate_scenario_core:
+        scenario_core_public = _extract_optional_core_config(candidate_scenario_core, include_password=False)
+    core_cfg = _merge_core_configs(
+        global_core_saved,
+        scenario_core_saved,
+        core_override if isinstance(core_override, dict) else None,
+        scenario_core_override if isinstance(scenario_core_override, dict) else None,
+        include_password=True,
+    )
+    core_host = core_cfg.get('host', '127.0.0.1')
+    try:
+        core_port = int(core_cfg.get('port', 50051))
+    except Exception:
+        core_port = 50051
+    remote_desc = f"{core_host}:{core_port}"
+    app.logger.info("[async] CORE remote=%s (ssh_enabled=%s)", remote_desc, core_cfg.get('ssh_enabled'))
+    # Attempt pre-save of current CORE session xml (best-effort) using derived config
     pre_saved = None
     try:
         pre_dir = os.path.join(out_dir or _outputs_dir(), 'core-pre')
-        pre_saved = _grpc_save_current_session_xml(core_host, core_port, pre_dir)
+        pre_saved = _grpc_save_current_session_xml_with_config(core_cfg, pre_dir)
     except Exception:
         pre_saved = None
     if pre_saved:
         app.logger.debug("[async] Pre-run session XML saved to %s", pre_saved)
+    # Establish SSH tunnel when required so CLI subprocess can reach CORE
+    conn_host = core_host
+    conn_port = core_port
+    ssh_tunnel = None
+    if core_cfg.get('ssh_enabled'):
+        try:
+            tunnel = _SshTunnel(
+                ssh_host=str(core_cfg.get('ssh_host') or core_host),
+                ssh_port=int(core_cfg.get('ssh_port') or 22),
+                username=str(core_cfg.get('ssh_username') or ''),
+                password=(core_cfg.get('ssh_password') or None),
+                remote_host=str(core_host),
+                remote_port=int(core_port),
+            )
+            conn_host, conn_port = tunnel.start()
+            ssh_tunnel = tunnel
+            app.logger.info(
+                "[async] SSH tunnel active: %s -> %s",
+                f"{conn_host}:{conn_port}",
+                remote_desc,
+            )
+        except _SSHTunnelError as exc:
+            try:
+                app.logger.warning("[async] SSH tunnel setup failed: %s", exc)
+            except Exception:
+                pass
+            try:
+                log_f.close()
+            except Exception:
+                pass
+            if ssh_tunnel:
+                try:
+                    ssh_tunnel.close()
+                except Exception:
+                    pass
+            return jsonify({"error": f"SSH tunnel failed: {exc}"}), 500
+        except Exception as exc:
+            try:
+                app.logger.exception("[async] Unexpected SSH tunnel failure: %s", exc)
+            except Exception:
+                pass
+            try:
+                log_f.close()
+            except Exception:
+                pass
+            if ssh_tunnel:
+                try:
+                    ssh_tunnel.close()
+                except Exception:
+                    pass
+            return jsonify({"error": "Failed to establish SSH tunnel"}), 500
     # Capture scenario names from the editor XML now (CORE post XML will not be parsable by our scenarios parser)
     scen_names = _scenario_names_from_xml(xml_path)
     repo_root = _get_repo_root()
@@ -5146,15 +6968,47 @@ def run_cli_async():
     py_exec = _select_python_interpreter()
     app.logger.info("[async] Using python interpreter: %s", py_exec)
     # Determine active scenario name and pass to CLI
-    active_scenario_name = scen_names[0] if (scen_names and len(scen_names) > 0) else None
-    args = [py_exec, '-u', '-m', 'core_topo_gen.cli', '--xml', xml_path, '--host', core_host, '--port', str(core_port), '--verbose']
+    active_scenario_name = None
+    if scenario_name_hint:
+        active_scenario_name = scenario_name_hint
+    elif scenario_payload and isinstance(scenario_payload.get('name'), str):
+        active_scenario_name = scenario_payload.get('name')
+    elif scen_names and len(scen_names) > 0:
+        active_scenario_name = scen_names[0]
+    args = [
+        py_exec,
+        '-u',
+        '-m',
+        'core_topo_gen.cli',
+        '--xml',
+        xml_path,
+        '--host',
+        conn_host,
+        '--port',
+        str(conn_port),
+        '--verbose',
+    ]
     if seed is not None:
         args.extend(['--seed', str(seed)])
     if active_scenario_name:
         args.extend(['--scenario', active_scenario_name])
     if preview_plan_path:
         args.extend(['--preview-plan', preview_plan_path])
-    proc = subprocess.Popen(args, cwd=repo_root, stdout=log_f, stderr=subprocess.STDOUT, env=env)
+    try:
+        proc = subprocess.Popen(args, cwd=repo_root, stdout=log_f, stderr=subprocess.STDOUT, env=env)
+    except Exception as exc:
+        try:
+            log_f.close()
+        except Exception:
+            pass
+        if ssh_tunnel:
+            try:
+                ssh_tunnel.close()
+            except Exception:
+                pass
+        return jsonify({"error": f"Failed to launch CLI: {exc}"}), 500
+    core_public = dict(core_cfg)
+    core_public.pop('ssh_password', None)
     RUNS[run_id] = {
         'proc': proc,
         'log_path': log_path,
@@ -5165,7 +7019,14 @@ def run_cli_async():
         'repo_root': repo_root,
         'core_host': core_host,
         'core_port': core_port,
+        'core_cfg': core_cfg,
+        'core_cfg_public': core_public,
+        'forward_host': conn_host,
+        'forward_port': conn_port,
+        'ssh_tunnel': ssh_tunnel,
         'scenario_names': scen_names,
+        'scenario_name': active_scenario_name,
+        'scenario_core': scenario_core_public,
         'post_xml_path': None,
         'history_added': False,
         'preview_plan_path': preview_plan_path,
@@ -5173,6 +7034,7 @@ def run_cli_async():
     }
     # Start a background finalizer so history is appended even if the UI does not poll /run_status
     def _wait_and_finalize_async(run_id_local: str):
+        meta: Dict[str, Any] | None = None
         try:
             meta = RUNS.get(run_id_local)
             if not meta:
@@ -5216,7 +7078,11 @@ def run_cli_async():
                     out_dir = os.path.dirname(xml_path_local or '')
                     post_dir = os.path.join(out_dir, 'core-post') if out_dir else os.path.join(_outputs_dir(), 'core-post')
                     sid = _extract_session_id_from_text(txt)
-                    post_saved = _grpc_save_current_session_xml(meta.get('core_host') or CORE_HOST, int(meta.get('core_port') or CORE_PORT), post_dir, session_id=sid)
+                    cfg_for_post = meta.get('core_cfg') or {
+                        'host': meta.get('core_host') or CORE_HOST,
+                        'port': meta.get('core_port') or CORE_PORT,
+                    }
+                    post_saved = _grpc_save_current_session_xml_with_config(cfg_for_post, post_dir, session_id=sid)
                 except Exception:
                     post_saved = None
                 if post_saved:
@@ -5256,7 +7122,10 @@ def run_cli_async():
                     'returncode': rc,
                     'run_id': run_id_local,
                     'scenario_names': meta.get('scenario_names') or [],
+                    'scenario_name': meta.get('scenario_name'),
                     'preview_plan_path': meta.get('preview_plan_path'),
+                    'core': meta.get('core_cfg_public') or _normalize_core_config(meta.get('core_cfg') or {}, include_password=False),
+                    'scenario_core': meta.get('scenario_core'),
                 })
                 meta['history_added'] = True
             except Exception as e_final:
@@ -5270,6 +7139,9 @@ def run_cli_async():
                 app.logger.exception("[async-finalizer] unexpected error for run %s", run_id_local)
             except Exception:
                 pass
+        finally:
+            if meta:
+                _close_async_run_tunnel(meta)
 
     try:
         t = threading.Thread(target=_wait_and_finalize_async, args=(run_id,), daemon=True)
@@ -5334,7 +7206,11 @@ def run_status(run_id: str):
                         post_dir = os.path.join(out_dir, 'core-post') if out_dir else os.path.join(_outputs_dir(), 'core-post')
                         # Parse session id from logs if available for precise save
                         sid = _extract_session_id_from_text(txt)
-                        post_saved = _grpc_save_current_session_xml(meta.get('core_host') or CORE_HOST, int(meta.get('core_port') or CORE_PORT), post_dir, session_id=sid)
+                        cfg_for_post = meta.get('core_cfg') or {
+                            'host': meta.get('core_host') or CORE_HOST,
+                            'port': meta.get('core_port') or CORE_PORT,
+                        }
+                        post_saved = _grpc_save_current_session_xml_with_config(cfg_for_post, post_dir, session_id=sid)
                     except Exception:
                         post_saved = None
                     if post_saved:
@@ -5374,7 +7250,10 @@ def run_status(run_id: str):
                         'returncode': rc,
                         'run_id': run_id,
                         'scenario_names': meta.get('scenario_names') or [],
+                        'scenario_name': meta.get('scenario_name') or active_scenario_name,
                         'preview_plan_path': meta.get('preview_plan_path'),
+                        'core': meta.get('core_cfg_public') or _normalize_core_config(meta.get('core_cfg') or {}, include_password=False),
+                        'scenario_core': meta.get('scenario_core'),
                     })
                 except Exception as e_hist:
                     try:
@@ -5383,6 +7262,7 @@ def run_status(run_id: str):
                         pass
                 finally:
                     meta['history_added'] = True
+                    _close_async_run_tunnel(meta)
     # Determine report path
     xml_path = meta.get('xml_path', '')
     out_dir = os.path.dirname(xml_path)
@@ -5418,6 +7298,9 @@ def run_status(run_id: str):
         'scenario_xml_path': xml_path,
         'pre_xml_path': meta.get('pre_xml_path'),
         'full_scenario_path': (lambda p: p if (p and os.path.exists(p)) else None)(meta.get('full_scenario_path')),
+        'core': meta.get('core_cfg_public') or _normalize_core_config(meta.get('core_cfg') or {}, include_password=False),
+        'forward_host': meta.get('forward_host'),
+        'forward_port': meta.get('forward_port'),
     })
 
 
@@ -5541,89 +7424,96 @@ def _update_xml_session_mapping(xml_path: str, session_id: int | None) -> None:
         pass
 
 
-def _list_active_core_sessions(host: str, port: int) -> list[dict]:
+def _list_active_core_sessions(host: str, port: int, core_cfg: Optional[Dict[str, Any]] = None) -> list[dict]:
     """Return list of active CORE sessions via gRPC. Best-effort if gRPC missing."""
     items: list[dict] = []
     try:
         from core.api.grpc.client import CoreGrpcClient  # type: ignore
     except Exception:
         return items
-    address = f"{host}:{port}"
+    cfg = _normalize_core_config(core_cfg or {'host': host, 'port': port}, include_password=True)
     try:
-        client = CoreGrpcClient(address=address)
-        try:
-            from core_topo_gen.utils.grpc_logging import wrap_core_client  # type: ignore
-            client = wrap_core_client(client, app.logger)
-        except Exception:
-            pass
-        client.connect()
-        try:
-            sessions = client.get_sessions()
-            for s in sessions:
+        with _core_connection(cfg) as (conn_host, conn_port):
+            address = f"{conn_host}:{conn_port}"
+            client = CoreGrpcClient(address=address)
+            try:
+                from core_topo_gen.utils.grpc_logging import wrap_core_client  # type: ignore
+                client = wrap_core_client(client, app.logger)
+            except Exception:
+                pass
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(contextlib.closing(client))
+                client.connect()
                 try:
-                    sid = getattr(s, 'id', None)
-                    state = getattr(getattr(s, 'state', None), 'name', None) or getattr(s, 'state', None)
-                    file_path = getattr(s, 'file', None)
-                    sess_dir = getattr(s, 'dir', None)
-                    # Fallback: attempt lookup from stored mapping if file_path not provided by gRPC
-                    if (not file_path) and sid is not None:
+                    sessions = client.get_sessions()
+                    for s in sessions:
                         try:
-                            store_map = _load_core_sessions_store()
-                            # reverse lookup: session id -> first path
-                            for pth, stored_sid in store_map.items():
+                            sid = getattr(s, 'id', None)
+                            state = getattr(getattr(s, 'state', None), 'name', None) or getattr(s, 'state', None)
+                            file_path = getattr(s, 'file', None)
+                            sess_dir = getattr(s, 'dir', None)
+                            # Fallback: attempt lookup from stored mapping if file_path not provided by gRPC
+                            if (not file_path) and sid is not None:
                                 try:
-                                    if int(stored_sid) == int(sid):
-                                        file_path = pth
-                                        break
-                                except Exception:
-                                    continue
-                        except Exception:
-                            pass
-                    # Second fallback: scan session directory for xml
-                    if (not file_path) and sess_dir and os.path.isdir(sess_dir):
-                        try:
-                            for fn in os.listdir(sess_dir):
-                                if fn.lower().endswith('.xml'):
-                                    file_path = os.path.join(sess_dir, fn)
-                                    break
-                        except Exception:
-                            pass
-                    # Prefer provided nodes count; if missing or zero, attempt to derive via gRPC
-                    nodes_count = getattr(s, 'nodes', None)
-                    if nodes_count is None or (isinstance(nodes_count, int) and nodes_count == 0):
-                        try:
-                            # Try get_nodes(session_id) -> list
-                            if sid is not None and hasattr(client, 'get_nodes'):
-                                try:
-                                    nlist = client.get_nodes(int(sid))  # type: ignore[attr-defined]
-                                    if nlist is not None:
-                                        # Some clients return dicts or objects; len() is sufficient
-                                        nodes_count = len(nlist)
+                                    store_map = _load_core_sessions_store()
+                                    # reverse lookup: session id -> first path
+                                    for pth, stored_sid in store_map.items():
+                                        try:
+                                            if int(stored_sid) == int(sid):
+                                                file_path = pth
+                                                break
+                                        except Exception:
+                                            continue
                                 except Exception:
                                     pass
-                            # Fallback to fetching session detail if available
-                            if (nodes_count is None or nodes_count == 0) and sid is not None and hasattr(client, 'get_session'):
+                            # Second fallback: scan session directory for xml
+                            if (not file_path) and sess_dir and os.path.isdir(sess_dir):
                                 try:
-                                    sdet = client.get_session(int(sid))  # type: ignore[attr-defined]
-                                    maybe_nodes = getattr(sdet, 'nodes', None)
-                                    if isinstance(maybe_nodes, int):
-                                        nodes_count = maybe_nodes
+                                    for fn in os.listdir(sess_dir):
+                                        if fn.lower().endswith('.xml'):
+                                            file_path = os.path.join(sess_dir, fn)
+                                            break
                                 except Exception:
                                     pass
+                            # Prefer provided nodes count; if missing or zero, attempt to derive via gRPC
+                            nodes_count = getattr(s, 'nodes', None)
+                            if nodes_count is None or (isinstance(nodes_count, int) and nodes_count == 0):
+                                try:
+                                    # Try get_nodes(session_id) -> list
+                                    if sid is not None and hasattr(client, 'get_nodes'):
+                                        try:
+                                            nlist = client.get_nodes(int(sid))  # type: ignore[attr-defined]
+                                            if nlist is not None:
+                                                nodes_count = len(nlist)
+                                        except Exception:
+                                            pass
+                                    # Fallback to fetching session detail if available
+                                    if (nodes_count is None or nodes_count == 0) and sid is not None and hasattr(client, 'get_session'):
+                                        try:
+                                            sdet = client.get_session(int(sid))  # type: ignore[attr-defined]
+                                            maybe_nodes = getattr(sdet, 'nodes', None)
+                                            if isinstance(maybe_nodes, int):
+                                                nodes_count = maybe_nodes
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                            items.append({
+                                'id': sid,
+                                'state': state,
+                                'nodes': nodes_count if nodes_count is not None else None,
+                                'file': file_path,
+                                'dir': sess_dir,
+                            })
                         except Exception:
-                            pass
-                    items.append({
-                        'id': sid,
-                        'state': state,
-                        'nodes': nodes_count if nodes_count is not None else None,
-                        'file': file_path,
-                        'dir': sess_dir,
-                    })
-                except Exception:
-                    continue
-        finally:
-            try: client.close()
-            except Exception: pass
+                            continue
+                finally:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+    except _SSHTunnelError as exc:
+        app.logger.warning('SSH tunnel setup failed while listing CORE sessions: %s', exc)
     except Exception:
         pass
     return items
@@ -5680,11 +7570,11 @@ def _scan_core_xmls(max_count: int = 200) -> list[dict]:
 
 @app.route('/core')
 def core_page():
-    # Determine CORE host/port from defaults
-    host = CORE_HOST
-    port = CORE_PORT
+    core_cfg = _core_backend_defaults(include_password=True)
+    host = core_cfg.get('host', CORE_HOST)
+    port = int(core_cfg.get('port', CORE_PORT))
     # Active sessions via gRPC
-    sessions = _list_active_core_sessions(host, port)
+    sessions = _list_active_core_sessions(host, port, core_cfg)
     # Known XMLs
     xmls = _scan_core_xmls()
     # Map running by file path, with fallback to local store
@@ -5709,9 +7599,10 @@ def core_page():
 
 @app.route('/core/data')
 def core_data():
-    host = CORE_HOST
-    port = CORE_PORT
-    sessions = _list_active_core_sessions(host, port)
+    core_cfg = _core_backend_defaults(include_password=True)
+    host = core_cfg.get('host', CORE_HOST)
+    port = int(core_cfg.get('port', CORE_PORT))
+    sessions = _list_active_core_sessions(host, port, core_cfg)
     xmls = _scan_core_xmls()
     # annotate xmls with running/session_id best-effort mapping, as in core_page
     mapping = _load_core_sessions_store()
@@ -5769,23 +7660,10 @@ def core_start():
     if not ok:
         flash(f'Invalid CORE XML: {errs}')
         return redirect(url_for('core_page'))
-    # Start via gRPC open_xml(start=True)
+    core_cfg = _core_backend_defaults(include_password=True)
+    remote_desc = f"{core_cfg.get('host', CORE_HOST)}:{core_cfg.get('port', CORE_PORT)}"
     try:
-        from core.api.grpc.client import CoreGrpcClient  # type: ignore
-    except Exception:
-        flash('CORE gRPC client not available in this environment.')
-        return redirect(url_for('core_page'))
-    address = f"{CORE_HOST}:{CORE_PORT}"
-    try:
-        client = CoreGrpcClient(address=address)
-        try:
-            from core_topo_gen.utils.grpc_logging import wrap_core_client  # type: ignore
-            client = wrap_core_client(client, app.logger)
-        except Exception:
-            pass
-        client.connect()
-        try:
-            # open_xml requires pathlib.Path
+        with _open_core_grpc_client(core_cfg) as client:
             sid = None
             try:
                 from pathlib import Path as _P
@@ -5798,11 +7676,13 @@ def core_start():
                 flash(f'Failed to open XML: {e}')
                 return redirect(url_for('core_page'))
             if sid is not None:
+                app.logger.info("[core.start] Started session %s via %s", sid, remote_desc)
                 _update_xml_session_mapping(ap, sid)
                 flash(f'Started session {sid}.')
-        finally:
-            try: client.close()
-            except Exception: pass
+    except ImportError:
+        flash('CORE gRPC client not available in this environment.')
+    except _SSHTunnelError as e:
+        flash(f'SSH tunnel error: {e}')
     except Exception as e:
         flash(f'gRPC error: {e}')
     return redirect(url_for('core_page'))
@@ -5819,26 +7699,15 @@ def core_stop():
     except Exception:
         flash('Invalid session id')
         return redirect(url_for('core_page'))
+    core_cfg = _core_backend_defaults(include_password=True)
     try:
-        from core.api.grpc.client import CoreGrpcClient  # type: ignore
-    except Exception:
-        flash('CORE gRPC client not available in this environment.')
-        return redirect(url_for('core_page'))
-    address = f"{CORE_HOST}:{CORE_PORT}"
-    try:
-        client = CoreGrpcClient(address=address)
-        try:
-            from core_topo_gen.utils.grpc_logging import wrap_core_client  # type: ignore
-            client = wrap_core_client(client, app.logger)
-        except Exception:
-            pass
-        client.connect()
-        try:
+        with _open_core_grpc_client(core_cfg) as client:
             client.stop_session(sid_int)
             flash(f'Stopped session {sid_int}.')
-        finally:
-            try: client.close()
-            except Exception: pass
+    except ImportError:
+        flash('CORE gRPC client not available in this environment.')
+    except _SSHTunnelError as e:
+        flash(f'SSH tunnel error: {e}')
     except Exception as e:
         flash(f'gRPC error: {e}')
     return redirect(url_for('core_page'))
@@ -5855,21 +7724,15 @@ def core_start_session():
     except Exception:
         flash('Invalid session id')
         return redirect(url_for('core_page'))
+    core_cfg = _core_backend_defaults(include_password=True)
     try:
-        from core.api.grpc.client import CoreGrpcClient  # type: ignore
-    except Exception:
-        flash('CORE gRPC client not available in this environment.')
-        return redirect(url_for('core_page'))
-    address = f"{CORE_HOST}:{CORE_PORT}"
-    try:
-        client = CoreGrpcClient(address=address)
-        client.connect()
-        try:
+        with _open_core_grpc_client(core_cfg) as client:
             client.start_session(sid_int)
             flash(f'Started session {sid_int}.')
-        finally:
-            try: client.close()
-            except Exception: pass
+    except ImportError:
+        flash('CORE gRPC client not available in this environment.')
+    except _SSHTunnelError as e:
+        flash(f'SSH tunnel error: {e}')
     except Exception as e:
         flash(f'gRPC error: {e}')
     return redirect(url_for('core_page'))
@@ -5883,20 +7746,14 @@ def core_delete():
     if sid:
         try:
             sid_int = int(sid)
-            from core.api.grpc.client import CoreGrpcClient  # type: ignore
-            client = CoreGrpcClient(address=f"{CORE_HOST}:{CORE_PORT}")
-            try:
-                from core_topo_gen.utils.grpc_logging import wrap_core_client  # type: ignore
-                client = wrap_core_client(client, app.logger)
-            except Exception:
-                pass
-            client.connect()
-            try:
+            core_cfg = _core_backend_defaults(include_password=True)
+            with _open_core_grpc_client(core_cfg) as client:
                 client.delete_session(sid_int)
                 flash(f'Deleted session {sid_int}.')
-            finally:
-                try: client.close()
-                except Exception: pass
+        except ImportError:
+            flash('CORE gRPC client not available in this environment.')
+        except _SSHTunnelError as e:
+            flash(f'SSH tunnel error: {e}')
         except Exception as e:
             flash(f'Failed to delete session: {e}')
     if xml_path:
@@ -5923,6 +7780,9 @@ def core_delete():
 
 @app.route('/core/details')
 def core_details():
+    core_cfg = _core_backend_defaults(include_password=True)
+    core_host = core_cfg.get('host', CORE_HOST)
+    core_port = int(core_cfg.get('port', CORE_PORT))
     xml_path = request.args.get('path')
     sid = request.args.get('session_id')
     xml_summary = None
@@ -5935,7 +7795,7 @@ def core_details():
         try:
             out_dir = os.path.join(_outputs_dir(), 'core-sessions')
             os.makedirs(out_dir, exist_ok=True)
-            saved = _grpc_save_current_session_xml(CORE_HOST, CORE_PORT, out_dir, session_id=str(sid))
+            saved = _grpc_save_current_session_xml_with_config(core_cfg, out_dir, session_id=str(sid))
             if saved and os.path.exists(saved):
                 xml_path = saved
         except Exception:
@@ -5996,7 +7856,7 @@ def core_details():
         try:
             sid_int = int(sid)
             # lookup session info via gRPC
-            sessions = _list_active_core_sessions(CORE_HOST, CORE_PORT)
+            sessions = _list_active_core_sessions(core_host, core_port, core_cfg)
             for s in sessions:
                 if int(s.get('id')) == sid_int:
                     session_info = s
@@ -6038,9 +7898,12 @@ def admin_cleanup_pycore():
 
     Returns JSON summary: {removed: [...], kept: [...]}"""
     try:
+        core_cfg = _core_backend_defaults(include_password=True)
+        core_host = core_cfg.get('host', CORE_HOST)
+        core_port = int(core_cfg.get('port', CORE_PORT))
         active_ids = set()
         try:
-            sessions = _list_active_core_sessions(CORE_HOST, CORE_PORT)
+            sessions = _list_active_core_sessions(core_host, core_port, core_cfg)
             for s in sessions:
                 try:
                     active_ids.add(int(s.get('id')))
@@ -6086,8 +7949,13 @@ def core_save_xml():
         sid_int = None
     out_dir = os.path.join(_outputs_dir(), 'core-sessions')
     os.makedirs(out_dir, exist_ok=True)
+    core_cfg = _core_backend_defaults(include_password=True)
     try:
-        saved = _grpc_save_current_session_xml(CORE_HOST, CORE_PORT, out_dir, session_id=str(sid_int) if sid_int is not None else None)
+        saved = _grpc_save_current_session_xml_with_config(
+            core_cfg,
+            out_dir,
+            session_id=str(sid_int) if sid_int is not None else None,
+        )
         if not saved or not os.path.exists(saved):
             return Response('Failed to save session XML', status=500)
         # Stream back as a download so frontend can save via blob
@@ -6103,8 +7971,13 @@ def core_session(sid: int):
     """
     session_info = None
     xml_path = None
+    core_cfg = _core_backend_defaults(include_password=True)
     try:
-        sessions = _list_active_core_sessions(CORE_HOST, CORE_PORT)
+        sessions = _list_active_core_sessions(
+            core_cfg.get('host', CORE_HOST),
+            int(core_cfg.get('port', CORE_PORT)),
+            core_cfg,
+        )
         for s in sessions:
             if int(s.get('id')) == int(sid):
                 session_info = s
@@ -6130,37 +8003,152 @@ def test_core():
         if request.is_json:
             data = request.get_json(silent=True) or {}
         else:
-            data = {"host": request.form.get('host'), "port": request.form.get('port')}
-        host = (data.get('host') or CORE_HOST).strip()
-        try:
-            port = int(data.get('port') or os.environ.get('CORE_PORT', CORE_PORT))
-        except Exception:
-            return jsonify({"ok": False, "error": "Invalid port"}), 200
-        # If inside container and user kept localhost, try environment override or host.docker.internal
-        if host in ('localhost', '127.0.0.1'):
-            env_host = os.environ.get('CORE_HOST')
-            if env_host and env_host not in ('localhost', '127.0.0.1'):
-                host = env_host
-            else:
+            data = {
+                "host": request.form.get('host'),
+                "port": request.form.get('port'),
+                "ssh_enabled": request.form.get('ssh_enabled'),
+                "ssh_host": request.form.get('ssh_host'),
+                "ssh_port": request.form.get('ssh_port'),
+                "ssh_username": request.form.get('ssh_username'),
+                "ssh_password": request.form.get('ssh_password'),
+                "core": request.form.get('core_json'),
+            }
+            try:
+                if isinstance(data.get('core'), str) and data['core']:
+                    data['core'] = json.loads(data['core'])
+            except Exception:
+                data['core'] = None
+        direct_override = {
+            key: data.get(key)
+            for key in ('host', 'port', 'ssh_enabled', 'ssh_host', 'ssh_port', 'ssh_username', 'ssh_password')
+            if data.get(key) not in (None, '')
+        }
+        scenario_core_raw = data.get('hitl_core')
+        if not scenario_core_raw and request.form.get('hitl_core_json'):
+            try:
+                scenario_core_raw = json.loads(request.form.get('hitl_core_json') or '')
+            except Exception:
+                scenario_core_raw = None
+        scenario_core_dict = scenario_core_raw if isinstance(scenario_core_raw, dict) else {}
+        scenario_vm_key = str(scenario_core_dict.get('vm_key') or '').strip()
+        scenario_vm_node = str(scenario_core_dict.get('vm_node') or '').strip()
+        scenario_vm_name = str(scenario_core_dict.get('vm_name') or '').strip()
+        scenario_vm_id_raw = scenario_core_dict.get('vmid') or scenario_core_dict.get('vm_id')
+        scenario_vm_id = str(scenario_vm_id_raw).strip() if isinstance(scenario_vm_id_raw, (str, int)) else ''
+        if not scenario_vm_node and scenario_vm_key and '::' in scenario_vm_key:
+            scenario_vm_node = scenario_vm_key.split('::', 1)[0].strip()
+        cfg = _merge_core_configs(
+            data.get('core') if isinstance(data.get('core'), dict) else None,
+            scenario_core_dict,
+            direct_override if direct_override else None,
+            include_password=True,
+        )
+        if not scenario_vm_key:
+            return jsonify({'ok': False, 'error': 'Select a CORE VM before validating the connection.'}), 400
+        cfg['vm_key'] = scenario_vm_key
+        if scenario_vm_node:
+            cfg['vm_node'] = scenario_vm_node
+        if scenario_vm_name:
+            cfg.setdefault('vm_name', scenario_vm_name)
+        if scenario_vm_id:
+            cfg.setdefault('vmid', scenario_vm_id)
+        core_secret_id = str(cfg.get('core_secret_id') or '').strip()
+        stored_secret = None
+        if core_secret_id:
+            stored_secret = _load_core_credentials(core_secret_id)
+            if not stored_secret:
+                return jsonify({'ok': False, 'error': 'Stored CORE credentials are unavailable. Re-enter the SSH password for the selected CORE VM.'}), 400
+            stored_vm_key = str(stored_secret.get('vm_key') or '').strip()
+            if stored_vm_key and stored_vm_key != scenario_vm_key:
+                stored_vm_name = str(stored_secret.get('vm_name') or stored_secret.get('vm_key') or 'previous VM')
+                mismatch_message = (
+                    f'Stored CORE credentials target {stored_vm_name}, ' \
+                    f'but Step 2 is configured for {scenario_vm_name or scenario_vm_key}. '
+                    'Clear the Step 2 credentials and validate with the selected CORE VM.'
+                )
+                return jsonify({'ok': False, 'error': mismatch_message, 'vm_mismatch': True}), 409
+            stored_vm_node = str(stored_secret.get('vm_node') or '').strip()
+            if stored_vm_node and scenario_vm_node and stored_vm_node != scenario_vm_node:
+                mismatch_message = (
+                    f'Stored CORE credentials reference node {stored_vm_node}, '
+                    f'but the selected CORE VM resides on node {scenario_vm_node}. '
+                    'Clear the Step 2 credentials and validate with the selected CORE VM.'
+                )
+                return jsonify({'ok': False, 'error': mismatch_message, 'vm_mismatch': True}), 409
+        remote_desc = f"{cfg.get('host')}:{cfg.get('port')}"
+        import socket
+        forwarded_host = ''
+        forwarded_port = 0
+        with _core_connection(cfg) as (conn_host, conn_port):
+            forwarded_host = conn_host
+            forwarded_port = int(conn_port)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            try:
+                sock.connect((forwarded_host, forwarded_port))
+            finally:
                 try:
-                    import socket as _s
-                    _s.gethostbyname('host.docker.internal')
-                    host = 'host.docker.internal'
+                    sock.close()
                 except Exception:
                     pass
-        import socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(2.0)
+        scenario_index_raw = data.get('scenario_index')
         try:
-            sock.connect((host, port))
-            sock.close()
-            return jsonify({"ok": True, "host": host, "port": port})
-        except Exception as e:
-            try:
-                sock.close()
-            except Exception:
-                pass
-            return jsonify({"ok": False, "error": str(e)}), 200
+            scenario_index_val = int(scenario_index_raw) if scenario_index_raw not in (None, '') else None
+        except Exception:
+            scenario_index_val = None
+        scenario_name_val = str(data.get('scenario_name') or data.get('scenario') or '').strip()
+        secret_payload = {
+            'scenario_name': scenario_name_val,
+            'scenario_index': scenario_index_val,
+            'grpc_host': cfg.get('host'),
+            'grpc_port': cfg.get('port'),
+            'ssh_host': cfg.get('ssh_host'),
+            'ssh_port': cfg.get('ssh_port'),
+            'ssh_username': cfg.get('ssh_username'),
+            'ssh_password': cfg.get('ssh_password'),
+            'ssh_enabled': cfg.get('ssh_enabled'),
+        }
+        if isinstance(scenario_core_raw, dict):
+            secret_payload.update({
+                'vm_key': scenario_core_raw.get('vm_key'),
+                'vm_name': scenario_core_raw.get('vm_name'),
+                'vm_node': scenario_core_raw.get('vm_node'),
+                'vmid': scenario_core_raw.get('vmid'),
+                'proxmox_secret_id': scenario_core_raw.get('proxmox_secret_id') or scenario_core_raw.get('secret_id'),
+                'proxmox_target': scenario_core_raw.get('proxmox_target') if isinstance(scenario_core_raw.get('proxmox_target'), dict) else None,
+            })
+        try:
+            stored_meta = _save_core_credentials(secret_payload)
+        except RuntimeError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        except Exception as exc:
+            app.logger.exception('[core] failed to persist credentials: %s', exc)
+            return jsonify({"ok": False, "error": 'CORE connection succeeded but credentials could not be stored'}), 500
+        summary_vm_label = stored_meta.get('vm_name') or stored_meta.get('vm_key')
+        if summary_vm_label:
+            summary_message = (
+                f"Validated CORE access for {stored_meta['ssh_username']} @ "
+                f"{stored_meta['ssh_host']}:{stored_meta['ssh_port']} (VM {summary_vm_label})"
+            )
+        else:
+            summary_message = f"Validated CORE access for {stored_meta['ssh_username']} @ {stored_meta['ssh_host']}:{stored_meta['ssh_port']}"
+        return jsonify({
+            "ok": True,
+            "forward_host": forwarded_host,
+            "forward_port": forwarded_port,
+            "remote": remote_desc,
+            "ssh_enabled": bool(cfg.get('ssh_enabled')),
+            "host": cfg.get('host'),
+            "port": int(cfg.get('port', 0)) if cfg.get('port') is not None else None,
+            "core": _normalize_core_config(cfg, include_password=False),
+            "core_secret_id": stored_meta['identifier'],
+            "core_summary": stored_meta,
+            "scenario_index": scenario_index_val,
+            "scenario_name": scenario_name_val,
+            "message": summary_message,
+        })
+    except _SSHTunnelError as e:
+        return jsonify({"ok": False, "error": str(e), "ssh_error": True}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 200
 

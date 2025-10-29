@@ -174,6 +174,45 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HostInterfacesResponse'
+    post:
+      tags:
+        - Scenario Editor
+      summary: Enumerate CORE VM interfaces for HITL configuration via SSH tunnel
+      description: |
+        Enumerates network interfaces on the CORE VM via SSH using stored credentials.
+        Only physical adapters (interfaces with a backing `/sys/class/net/<iface>/device` entry)
+        are returned in the response payload.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HostInterfacesRequest'
+      responses:
+        '200':
+          description: Interfaces enumerated successfully from the CORE VM.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HostInterfacesResponse'
+        '400':
+          description: Missing credentials or invalid payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: SSH tunnel or remote command failure.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Unexpected server error while enumerating interfaces.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /run_cli_async:
     post:
       tags:
@@ -1462,6 +1501,38 @@ components:
         error:
           type: string
           description: Error message when `ok` is false.
+    ProxmoxInterfaceMapping:
+      type: object
+      properties:
+        id:
+          type: string
+          nullable: true
+        macaddr:
+          type: string
+          nullable: true
+        bridge:
+          type: string
+          nullable: true
+        model:
+          type: string
+          nullable: true
+        vm_key:
+          type: string
+          nullable: true
+        vm_name:
+          type: string
+          nullable: true
+        vm_node:
+          type: string
+          nullable: true
+        vmid:
+          type: string
+          nullable: true
+        raw:
+          type: object
+          nullable: true
+          additionalProperties: true
+      additionalProperties: true
     HostInterface:
       type: object
       properties:
@@ -1495,15 +1566,72 @@ components:
             type: string
         is_up:
           type: boolean
+        proxmox:
+          $ref: '#/components/schemas/ProxmoxInterfaceMapping'
+          nullable: true
     HostInterfacesResponse:
       type: object
       properties:
+        success:
+          type: boolean
         interfaces:
           type: array
           items:
             $ref: '#/components/schemas/HostInterface'
+        source:
+          type: string
+          nullable: true
+        metadata:
+          type: object
+          nullable: true
+          additionalProperties: true
+        fetched_at:
+          type: string
+          format: date-time
+          nullable: true
       required:
         - interfaces
+    HostInterfacesRequest:
+      type: object
+      properties:
+        core_secret_id:
+          type: string
+          description: Identifier returned when CORE credentials were stored.
+        include_down:
+          type: boolean
+          description: Include interfaces that are currently DOWN.
+        core_vm:
+          $ref: '#/components/schemas/CoreVmDescriptor'
+        scenario_index:
+          type: integer
+          nullable: true
+        scenario_name:
+          type: string
+          nullable: true
+      required:
+        - core_secret_id
+    CoreVmDescriptor:
+      type: object
+      properties:
+        vm_key:
+          type: string
+          nullable: true
+        vm_name:
+          type: string
+          nullable: true
+        vm_node:
+          type: string
+          nullable: true
+        vmid:
+          type: string
+          nullable: true
+        interfaces:
+          type: array
+          nullable: true
+          items:
+            type: object
+            additionalProperties: true
+      additionalProperties: true
     PlanPreviewRequest:
       type: object
       required:

@@ -27,7 +27,7 @@ Generate reproducible CORE network topologies from scenario XML files using a ri
 - **Live log dock** – stream run output, filter by level or text/regex, and toggle auto-follow for long runs.
 - **Rich topology policies** – per-routing-item R2R meshes, R2S aggregation, host grouping bounds, and switch re-homing.
 - **Artifacts on disk** – traffic scripts, segmentation rules, docker-compose definitions, Markdown reports, and JSON summaries are written to predictable locations for inspection.
-- **Hardware-in-the-Loop friendly** – manage HITL attachments directly in the editor; options are constrained to existing routers/switches or provisioning a new router to keep topologies deterministic.
+- **Hardware-in-the-Loop friendly** – manage HITL attachments directly in the editor, apply Proxmox bridge rewiring from the browser, and keep topologies deterministic by constraining attachments and generated devices.
 
 ## Screenshots
 
@@ -54,7 +54,7 @@ python main.py
 - Visits `http://127.0.0.1:9090` by default (reverse proxy `nginx` compose targets `https://localhost`).
 - First launch seeds an `coreadmin / coreadmin` account; change it immediately under **Profile → Change Password**.
 - Configure TLS reverse proxies with `make host-web`, `make host-web-nginx`, or `make host-web PROXY=envoy`. The helper script `scripts/dev_gen_certs.sh` issues self-signed certificates with SAN support.
-- HITL editor note: the “Attach to” dropdown now offers `Existing Router`, `Existing Switch`, or `New Router`. The legacy `New Switch` choice was removed to prevent hidden switch fan-out; saved scenarios using it are normalized to `Existing Router` during load.
+- HITL editor note: the “Attach to” dropdown now offers `Existing Router`, `Existing Switch`, or `New Router`. The legacy `New Switch` choice was removed to prevent hidden switch fan-out; saved scenarios using it are normalized to `Existing Router` during load. Once Proxmox credentials and VM selections are validated, use **Apply Internal Bridge** to create/update a Proxmox bridge and retarget both the CORE VM and external VM interfaces in one step.
 
 ### Run the CLI
 ```bash
@@ -81,7 +81,7 @@ Popular options:
 - Router and vulnerability planning capture derived vs explicit counts via `explicit_count`, `derived_count`, and `total_planned`.
 - Scenario-level `scenario_total_nodes` summarises planned hosts, routers, and vulnerability targets.
 - Parser helpers expose metadata programmatically: `core_topo_gen.parsers.planning_metadata.parse_planning_metadata()`.
-- Hardware-in-the-Loop plans persist per-scenario preferences (enabled state, interface list, attachment choice). Attachments normalize to `existing_router`, `existing_switch`, or `new_router`; legacy `new_switch` values are coerced to `existing_router` so previews remain deterministic and switch overlays aren’t synthesized implicitly.
+- Hardware-in-the-Loop plans persist per-scenario preferences (enabled state, interface list, attachment choice). Attachments normalize to `existing_router`, `existing_switch`, `new_router`, or `proxmox_vm`; legacy `new_switch` values are coerced to `existing_router` so previews remain deterministic and switch overlays aren’t synthesized implicitly. When interfaces map to Proxmox VMs, the apply flow ensures the selected bridge exists on the node (creating it if needed) and rewrites the CORE/external VM adapters to land on that bridge.
 
 ### Router connectivity & aggregation
 - Per-routing-item `r2r_mode` supports `Exact`, `Uniform`, `NonUniform`, `Min`, `Max`, and legacy meshes tied to `--router-mesh-style`.
