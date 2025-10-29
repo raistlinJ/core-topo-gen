@@ -44,6 +44,8 @@ tags:
     description: Server-sent events and cancellation endpoints.
   - name: UI Pages
     description: HTML-rendering routes that back the web interface.
+  - name: Scenario Sections
+    description: JSON helpers that expose the GUI Scenario Editor sections (node information, routing, services, vulnerabilities, traffic, segmentation).
 security:
   - sessionCookie: []
 paths:
@@ -1482,12 +1484,14 @@ components:
           type: array
           description: Full Scenario Editor payload serialized as JSON objects.
           items:
-            type: object
-            additionalProperties: true
+            $ref: '#/components/schemas/ScenarioEditorScenario'
         active_index:
           type: integer
           minimum: 0
           description: Index of the active scenario in the editor (optional).
+        core:
+          $ref: '#/components/schemas/CoreConnectionConfig'
+          description: Optional CORE daemon connection overrides saved with the scenario editor payload.
     SaveXmlApiResponse:
       type: object
       required:
@@ -1501,6 +1505,548 @@ components:
         error:
           type: string
           description: Error message when `ok` is false.
+    CoreConnectionConfig:
+      type: object
+      description: Connection settings for the CORE gRPC daemon and its SSH tunnel.
+      properties:
+        host:
+          type: string
+          description: CORE gRPC host to connect to after establishing the SSH tunnel.
+        port:
+          type: integer
+          description: CORE gRPC port to connect to after establishing the SSH tunnel.
+        ssh_enabled:
+          type: boolean
+          description: Flag indicating whether the SSH tunnel is required (always true in current UI flows).
+        ssh_host:
+          type: string
+          description: SSH host used to reach the CORE VM.
+        ssh_port:
+          type: integer
+          description: SSH port used to reach the CORE VM.
+        ssh_username:
+          type: string
+          description: SSH username for the CORE VM.
+        ssh_password:
+          type: string
+          nullable: true
+          description: SSH password. The backend strips this value from responses.
+        core_secret_id:
+          type: string
+          nullable: true
+          description: Optional identifier for stored CORE credentials reused across sessions.
+        grpc_host:
+          type: string
+          nullable: true
+          description: Raw gRPC host override captured from user input before normalization.
+        grpc_port:
+          type: integer
+          nullable: true
+          description: Raw gRPC port override captured from user input before normalization.
+      additionalProperties: true
+    ScenarioEditorScenario:
+      type: object
+      description: Single Scenario Editor entry as captured by the web UI.
+      required:
+        - name
+        - sections
+      properties:
+        name:
+          type: string
+          description: Scenario display name.
+        scenario_total_nodes:
+          type: integer
+          nullable: true
+          description: Aggregate node count written by the UI for reporting.
+        density_count:
+          type: integer
+          nullable: true
+          description: Legacy base host pool value retained for backward compatibility.
+        base:
+          $ref: '#/components/schemas/ScenarioBaseReference'
+        hitl:
+          $ref: '#/components/schemas/ScenarioHitlConfig'
+        sections:
+          $ref: '#/components/schemas/ScenarioSections'
+        notes:
+          type: string
+          nullable: true
+          description: Free-form notes that are rendered alongside the generated XML.
+        metadata:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Planner metadata derived from previews (optional, ignored during save).
+      additionalProperties: true
+    ScenarioBaseReference:
+      type: object
+      description: Reference to a base CORE Scenario XML used as a starting point.
+      properties:
+        filepath:
+          type: string
+          description: Absolute or relative path to the base CORE Scenario XML.
+        display_name:
+          type: string
+          nullable: true
+          description: Optional friendly label for the base scenario file.
+      additionalProperties: true
+    ScenarioHitlConfig:
+      type: object
+      description: Human-in-the-loop attachment settings applied when deploying a scenario.
+      properties:
+        enabled:
+          type: boolean
+          description: Whether HITL integration is enabled for this scenario.
+        interfaces:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScenarioHitlInterface'
+        proxmox:
+          $ref: '#/components/schemas/ScenarioHitlProxmoxState'
+        core:
+          type: object
+          nullable: true
+          description: Cached connection summary for the selected CORE VM / Proxmox node.
+          additionalProperties: true
+      additionalProperties: true
+    ScenarioHitlInterface:
+      type: object
+      description: Mapping between a planned network attachment and a physical adapter.
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Local host interface name (e.g., `en0`).
+        description:
+          type: string
+          nullable: true
+          description: Human-readable summary of the adapter.
+        attachment:
+          type: string
+          nullable: true
+          enum: [existing_router, existing_switch, new_router]
+          description: Attachment strategy requested for the adapter.
+        mac:
+          type: string
+          nullable: true
+        ipv4:
+          type: array
+          nullable: true
+          items:
+            type: string
+            format: ipv4
+        ipv6:
+          type: array
+          nullable: true
+          items:
+            type: string
+            format: ipv6
+        proxmox_target:
+          $ref: '#/components/schemas/ScenarioHitlProxmoxTarget'
+        external_vm:
+          type: object
+          nullable: true
+          description: Snapshot of the selected Proxmox VM record when applicable.
+          additionalProperties: true
+      additionalProperties: true
+    ScenarioHitlProxmoxTarget:
+      type: object
+      description: Identifier for a Proxmox VM network interface selected in the HITL modal.
+      properties:
+        node:
+          type: string
+          nullable: true
+          description: Proxmox node name hosting the VM.
+        vmid:
+          type: integer
+          nullable: true
+          description: Proxmox VM identifier.
+        vm_name:
+          type: string
+          nullable: true
+        interface_id:
+          type: string
+          nullable: true
+          description: Selected NIC identifier on the VM (e.g., `net0`).
+        macaddr:
+          type: string
+          nullable: true
+        bridge:
+          type: string
+          nullable: true
+        model:
+          type: string
+          nullable: true
+        label:
+          type: string
+          nullable: true
+          description: Pre-formatted label rendered in the UI dropdown.
+      additionalProperties: true
+    ScenarioHitlProxmoxState:
+      type: object
+      description: Stored Proxmox credential metadata and cached inventory used by the HITL modal.
+      properties:
+        url:
+          type: string
+          nullable: true
+          description: Proxmox API base URL (without scheme defaults to https).
+        port:
+          type: integer
+          nullable: true
+          description: Proxmox API port (defaults to 8006).
+        username:
+          type: string
+          nullable: true
+        secret_id:
+          type: string
+          nullable: true
+          description: Identifier of stored credentials managed by the backend secrets store.
+        verify_ssl:
+          type: boolean
+          nullable: true
+          description: Whether TLS certificates should be verified when calling the Proxmox API.
+        validated:
+          type: boolean
+          nullable: true
+        last_validated_at:
+          type: string
+          format: date-time
+          nullable: true
+        last_message:
+          type: string
+          nullable: true
+        inventory:
+          type: object
+          nullable: true
+          description: Cached VM inventory with interface metadata.
+          additionalProperties: true
+        inventory_error:
+          type: string
+          nullable: true
+      additionalProperties: true
+    ScenarioSections:
+      type: object
+      description: Scenario planning sections shown in the GUI and serialized into XML.
+      properties:
+        'Node Information':
+          $ref: '#/components/schemas/NodeInformationSection'
+        Routing:
+          $ref: '#/components/schemas/RoutingSection'
+        Services:
+          $ref: '#/components/schemas/ServicesSection'
+        Traffic:
+          $ref: '#/components/schemas/TrafficSection'
+        Vulnerabilities:
+          $ref: '#/components/schemas/VulnerabilitiesSection'
+        Segmentation:
+          $ref: '#/components/schemas/SegmentationSection'
+        Events:
+          $ref: '#/components/schemas/EventsSection'
+      additionalProperties: true
+    ScenarioSectionRowBase:
+      type: object
+      description: Common planning row attributes shared across Scenario Editor sections.
+      properties:
+        selected:
+          type: string
+          description: Role, protocol, service, or segmentation label selected in the UI.
+        factor:
+          type: number
+          nullable: true
+          description: Weighting factor applied when `v_metric` is `Weight`.
+        v_metric:
+          type: string
+          nullable: true
+          enum: [Weight, Count]
+          description: Determines whether the row uses proportional weights or absolute counts.
+        v_count:
+          type: number
+          nullable: true
+          description: Absolute amount allocated when `v_metric` is `Count`.
+        notes:
+          type: string
+          nullable: true
+      additionalProperties: true
+    NodeInformationSection:
+      type: object
+      description: Host role planning inputs displayed in the Node Information tab.
+      properties:
+        density:
+          type: number
+          nullable: true
+        total_nodes:
+          type: integer
+          nullable: true
+        base_nodes:
+          type: integer
+          nullable: true
+        additive_nodes:
+          type: integer
+          nullable: true
+        combined_nodes:
+          type: integer
+          nullable: true
+        weight_rows:
+          type: integer
+          nullable: true
+        count_rows:
+          type: integer
+          nullable: true
+        weight_sum:
+          type: number
+          nullable: true
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/NodeInformationRow'
+      required:
+        - items
+      additionalProperties: true
+    NodeInformationRow:
+      allOf:
+        - $ref: '#/components/schemas/ScenarioSectionRowBase'
+        - type: object
+          description: Host role row configuring proportional or count allocations.
+    RoutingSection:
+      type: object
+      description: Routing protocol and connectivity planning inputs.
+      properties:
+        density:
+          type: number
+          nullable: true
+        explicit_count:
+          type: integer
+          nullable: true
+        derived_count:
+          type: integer
+          nullable: true
+        total_planned:
+          type: integer
+          nullable: true
+        weight_rows:
+          type: integer
+          nullable: true
+        count_rows:
+          type: integer
+          nullable: true
+        weight_sum:
+          type: number
+          nullable: true
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RoutingRow'
+      required:
+        - items
+      additionalProperties: true
+    RoutingRow:
+      allOf:
+        - $ref: '#/components/schemas/ScenarioSectionRowBase'
+        - type: object
+          properties:
+            r2r_mode:
+              type: string
+              nullable: true
+              enum: [Uniform, NonUniform, Exact, Min]
+              description: Router-to-router connectivity strategy.
+            r2r_edges:
+              type: integer
+              nullable: true
+              description: Target router degree when `r2r_mode` is `Exact`.
+            r2s_mode:
+              type: string
+              nullable: true
+              enum: [Exact, NonUniform, aggregate, ratio]
+              description: Router-to-switch aggregation style.
+            r2s_edges:
+              type: integer
+              nullable: true
+              description: Switch or host target interpreted according to `r2s_mode`.
+            r2s_hosts_min:
+              type: integer
+              nullable: true
+            r2s_hosts_max:
+              type: integer
+              nullable: true
+          additionalProperties: true
+    ServicesSection:
+      type: object
+      description: Service density and explicit assignments.
+      properties:
+        density:
+          type: number
+          nullable: true
+        weight_rows:
+          type: integer
+          nullable: true
+        count_rows:
+          type: integer
+          nullable: true
+        weight_sum:
+          type: number
+          nullable: true
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServicesRow'
+      required:
+        - items
+      additionalProperties: true
+    ServicesRow:
+      allOf:
+        - $ref: '#/components/schemas/ScenarioSectionRowBase'
+        - type: object
+          description: Service assignment row (selected service name plus weight/count metadata).
+    TrafficSection:
+      type: object
+      description: Traffic generation planning inputs and density controls.
+      properties:
+        density:
+          type: number
+          nullable: true
+        weight_rows:
+          type: integer
+          nullable: true
+        count_rows:
+          type: integer
+          nullable: true
+        weight_sum:
+          type: number
+          nullable: true
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrafficRow'
+      required:
+        - items
+      additionalProperties: true
+    TrafficRow:
+      allOf:
+        - $ref: '#/components/schemas/ScenarioSectionRowBase'
+        - type: object
+          properties:
+            pattern:
+              type: string
+              nullable: true
+              description: Traffic pattern selection (`continuous`, `periodic`, `burst`, `poisson`, `ramp`).
+            rate_kbps:
+              type: number
+              nullable: true
+              description: Payload rate in kilobytes per second.
+            period_s:
+              type: number
+              nullable: true
+              description: Period for periodic traffic patterns (seconds).
+            jitter_pct:
+              type: number
+              nullable: true
+              description: Jitter percentage applied to the generated traffic schedule.
+          additionalProperties: true
+    VulnerabilitiesSection:
+      type: object
+      description: Vulnerability catalog planning inputs.
+      properties:
+        density:
+          type: number
+          nullable: true
+        explicit_count:
+          type: integer
+          nullable: true
+        derived_count:
+          type: integer
+          nullable: true
+        total_planned:
+          type: integer
+          nullable: true
+        weight_rows:
+          type: integer
+          nullable: true
+        count_rows:
+          type: integer
+          nullable: true
+        weight_sum:
+          type: number
+          nullable: true
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/VulnerabilityRow'
+      required:
+        - items
+      additionalProperties: true
+    VulnerabilityRow:
+      allOf:
+        - $ref: '#/components/schemas/ScenarioSectionRowBase'
+        - type: object
+          properties:
+            v_type:
+              type: string
+              nullable: true
+              description: Vulnerability type selection when the row targets catalog categories.
+            v_vector:
+              type: string
+              nullable: true
+              description: CVSS/CWE vector for catalog-driven selections.
+            v_name:
+              type: string
+              nullable: true
+              description: Vulnerability identifier when using an explicit entry.
+            v_path:
+              type: string
+              nullable: true
+              description: Path to a vulnerability provisioning script or profile.
+          additionalProperties: true
+    SegmentationSection:
+      type: object
+      description: Segmentation planning inputs controlling ACL groups.
+      properties:
+        density:
+          type: number
+          nullable: true
+        weight_rows:
+          type: integer
+          nullable: true
+        count_rows:
+          type: integer
+          nullable: true
+        weight_sum:
+          type: number
+          nullable: true
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SegmentationRow'
+      required:
+        - items
+      additionalProperties: true
+    SegmentationRow:
+      allOf:
+        - $ref: '#/components/schemas/ScenarioSectionRowBase'
+        - type: object
+          description: Segmentation row referencing a rule group or ACL template.
+    EventsSection:
+      type: object
+      description: Optional event script triggers captured by the UI.
+      properties:
+        density:
+          type: number
+          nullable: true
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventRow'
+      additionalProperties: true
+    EventRow:
+      allOf:
+        - $ref: '#/components/schemas/ScenarioSectionRowBase'
+        - type: object
+          properties:
+            script_path:
+              type: string
+              nullable: true
+              description: Path to an event script executed manually after deployment.
+          additionalProperties: true
     ProxmoxInterfaceMapping:
       type: object
       properties:

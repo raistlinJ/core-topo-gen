@@ -5933,6 +5933,85 @@ function renderMain() {
         return '';
     })();
     const hostLookup = new Map(hostInterfaces.filter(it => it && typeof it === 'object').map(it => [it.name, it]));
+    const pickFirstNonEmpty = (...candidates) => {
+        for (let idx = 0; idx < candidates.length; idx += 1) {
+            const candidate = candidates[idx];
+            if (candidate === null || candidate === undefined) continue;
+            const text = String(candidate).trim();
+            if (text) return text;
+        }
+        return '';
+    };
+    // Ensure HITL interface entries retain the latest Proxmox adapter metadata discovered
+    // from the host-interface refresh. This feeds the External IFX payload builder so it
+    // can include interface_id when validating adapter selections.
+    const syncHitlProxmoxTargets = () => {
+        if (!hitl || !Array.isArray(hitl.interfaces)) return false;
+        let updated = false;
+        for (let ifaceIdx = 0; ifaceIdx < hitl.interfaces.length; ifaceIdx += 1) {
+            const entry = hitl.interfaces[ifaceIdx];
+            if (!entry || typeof entry !== 'object') continue;
+            const hostInfo = hostLookup.get(entry.name);
+            if (!hostInfo || !hostInfo.proxmox || typeof hostInfo.proxmox !== 'object') continue;
+            const hostProx = hostInfo.proxmox;
+            const rawRecord = hostProx.raw && typeof hostProx.raw === 'object' ? hostProx.raw : null;
+            const interfaceId = pickFirstNonEmpty(
+                hostProx.interface_id,
+                hostProx.id,
+                hostProx.adapter,
+                rawRecord && rawRecord.interface_id,
+                rawRecord && rawRecord.id,
+                rawRecord && rawRecord.adapter,
+                rawRecord && rawRecord.name
+            );
+            if (!interfaceId) continue;
+            const normalizedTarget = {
+                node: pickFirstNonEmpty(hostProx.vm_node, hostProx.node, rawRecord && rawRecord.node),
+                vmid: pickFirstNonEmpty(hostProx.vmid, hostProx.vm_id, rawRecord && rawRecord.vmid, rawRecord && rawRecord.vm_id),
+                interface_id: interfaceId,
+            };
+            const vmName = pickFirstNonEmpty(hostProx.vm_name, rawRecord && rawRecord.vm_name, rawRecord && rawRecord.name);
+            if (vmName) normalizedTarget.vm_name = vmName;
+            const vmKey = pickFirstNonEmpty(hostProx.vm_key, rawRecord && rawRecord.vm_key);
+            if (vmKey) normalizedTarget.vm_key = vmKey;
+            const macaddr = pickFirstNonEmpty(hostProx.macaddr, hostInfo.mac);
+            if (macaddr) normalizedTarget.macaddr = macaddr;
+            const bridge = pickFirstNonEmpty(hostProx.bridge, rawRecord && rawRecord.bridge, hostInfo.bridge);
+            if (bridge) normalizedTarget.bridge = bridge;
+            const model = pickFirstNonEmpty(hostProx.model, rawRecord && rawRecord.model);
+            if (model) normalizedTarget.model = model;
+            const currentTarget = (entry.proxmox_target && typeof entry.proxmox_target === 'object') ? entry.proxmox_target : null;
+            const fieldsToCompare = ['node', 'vmid', 'interface_id', 'vm_name', 'vm_key', 'macaddr', 'bridge', 'model'];
+            let shouldUpdate = !currentTarget;
+            if (!shouldUpdate) {
+                for (let fIdx = 0; fIdx < fieldsToCompare.length; fIdx += 1) {
+                    const field = fieldsToCompare[fIdx];
+                    const existingVal = currentTarget[field] === undefined ? '' : String(currentTarget[field]).trim();
+                    const nextVal = normalizedTarget[field] === undefined ? '' : String(normalizedTarget[field]).trim();
+                    if (existingVal !== nextVal) {
+                        shouldUpdate = true;
+                        break;
+                    }
+                }
+            }
+            if (!shouldUpdate) continue;
+            entry.proxmox_target = normalizedTarget;
+            updated = true;
+        }
+        return updated;
+    };
+    const proxTargetsSynced = syncHitlProxmoxTargets();
+    if (proxTargetsSynced) {
+        try { persistEditorState(); } catch (err) { console.warn('Failed to persist HITL Proxmox mapping state', err); }
+        const hidden = document.getElementById('scenarios_json');
+        if (hidden) {
+            try {
+                hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+            } catch (err) {
+                console.warn('Failed to refresh hidden scenarios_json after Proxmox sync', err);
+            }
+        }
+    }
     const getBridgeName = (iface) => {
         if (!iface || typeof iface !== 'object') return '';
         const direct = iface.bridge || iface.proxmox_bridge;
@@ -8547,6 +8626,34 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         const verifyInput = document.getElementById('proxmoxVerifySsl');
         const verifySsl = verifyInput ? !!verifyInput.checked : /^https:/i.test(urlVal);
+
+        const prevProxState = hitlState.proxmox && typeof hitlState.proxmox === 'object' ? hitlState.proxmox : {};
+        const proxIdentityChanged = (prevProxState.url || '') !== urlVal || (prevProxState.username || '') !== userVal;
+        const needsPendingPersist = !prevProxState.secret_id || proxIdentityChanged || (prevProxState.port ?? 8006) !== portVal || (prevProxState.verify_ssl ?? true) !== verifySsl;
+        if (needsPendingPersist) {
+            const pendingProx = {
+                ...prevProxState,
+                url: urlVal,
+                port: portVal,
+                username: userVal,
+                verify_ssl: verifySsl,
+                validated: false,
+                last_validated_at: proxIdentityChanged ? null : prevProxState.last_validated_at ?? null,
+                last_message: 'Credentials pending validation.',
+            };
+            if (proxIdentityChanged) {
+                pendingProx.inventory = null;
+                pendingProx.inventory_error = null;
+            }
+            hitlState.proxmox = pendingProx;
+            try { persistEditorState(); } catch (err) { console.warn('Failed to persist pending Proxmox state', err); }
+            const hidden = document.getElementById('scenarios_json');
+            if (hidden) {
+                try { hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx }); } catch (err) { console.warn('Failed to sync hidden scenarios_json after pending Proxmox update', err); }
+            }
+            try { updateProxmoxSummary(sidx); } catch (err) { console.warn('Failed to refresh Proxmox summary after pending update', err); }
+        }
+        const reuseSecretId = (!passVal && prox.secret_id && !proxIdentityChanged) ? prox.secret_id : undefined;
         setProxAssignBusy(true);
         setProxAssignHint('Validating credentials with Proxmox…', 'info');
         let data = null;
@@ -8560,7 +8667,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     port: portVal,
                     username: userVal,
                     password: passVal,
-                    reuse_secret_id: !passVal && prox.secret_id ? prox.secret_id : undefined,
+                    reuse_secret_id: reuseSecretId,
                     verify_ssl: verifySsl,
                     scenario_index: sidx,
                     scenario_name: scenario?.name || '',
