@@ -61,7 +61,7 @@ def _normalize_interface_element(element: ET.Element) -> Optional[Dict[str, Any]
 
 def parse_hitl_info(xml_path: str, scenario_name: Optional[str]) -> Dict[str, Any]:
     """Parse Hardware-In-The-Loop configuration from the scenario XML."""
-    result: Dict[str, Any] = {"enabled": False, "interfaces": []}
+    result: Dict[str, Any] = {"enabled": False, "interfaces": [], "core": None}
     if not xml_path or not os.path.exists(xml_path):
         return result
     try:
@@ -94,4 +94,9 @@ def parse_hitl_info(xml_path: str, scenario_name: Optional[str]) -> Dict[str, An
         if normalized:
             interfaces.append(normalized)
     result["interfaces"] = interfaces
+    core_element = hitl_element.find("CoreConnection")
+    if core_element is not None:
+        core_cfg = dict(core_element.attrib)
+        if core_cfg:
+            result["core"] = core_cfg
     return result
