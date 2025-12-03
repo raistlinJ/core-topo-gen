@@ -1,6 +1,7 @@
 from __future__ import annotations
 import logging
 import re
+import shutil
 from typing import Any, Optional
 import time
 import os
@@ -45,6 +46,15 @@ def _extract_pycore_id_from_error(err: BaseException) -> Optional[int]:
     return None
 
 
+def _cleanup_pycore_dir(py_id: int) -> None:
+    try:
+        path = Path(f"/tmp/pycore.{py_id}")
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        logger.debug("Failed to clean stale /tmp/pycore.%s", py_id, exc_info=True)
+
+
 def safe_create_session(core: Any, max_attempts: int = 5) -> Any:
     """Create a CORE session robustly, avoiding 'File exists: /tmp/pycore.N' errors.
 
@@ -76,6 +86,8 @@ def safe_create_session(core: Any, max_attempts: int = 5) -> Any:
     while attempts < max_attempts:
         attempts += 1
         try:
+            if next_try is not None:
+                _cleanup_pycore_dir(int(next_try))
             sess = _call_create_session(core, next_try)
             # Validate that the underlying /tmp/pycore.<id> directory is unique / not pre-existing leftover.
             try:
@@ -96,6 +108,7 @@ def safe_create_session(core: Any, max_attempts: int = 5) -> Any:
             # Detect pycore.N collision and choose a higher id
             py_id = _extract_pycore_id_from_error(e)
             if py_id is not None:
+                _cleanup_pycore_dir(py_id)
                 next_try = py_id + 1
                 logger.info("[grpc] create_session collided with /tmp/pycore.%s; retrying with session_id=%s (attempt %s/%s)", py_id, next_try, attempts, max_attempts)
                 time.sleep(0.2)

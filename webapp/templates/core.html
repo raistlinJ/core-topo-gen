@@ -23,6 +23,10 @@
 {% block extra_head %}
 <style>
   body { padding-bottom: 0; }
+  #coreLayoutRow { min-height: calc(100vh - 200px); }
+  @media (max-width: 992px) {
+    #coreLayoutRow { min-height: 0; }
+  }
   th.actions-col, td.actions-col { white-space: nowrap; }
   th.col-check, td.col-check { width: 2rem; text-align: center; }
   th.filename-col, td.filename-col { width: 100%; }
@@ -55,86 +59,151 @@
 {% endblock %}
 {% block nav_right_extra %}{% endblock %}
 {% block content %}
-<div class="row">
-  <div id="dataLoadingBar" class="d-none"><div class="bar"></div></div>
-  <div class="col-6">
-    <div class="card mb-3">
-      <div class="card-header py-2 d-flex justify-content-between align-items-center">
-        <strong class="mb-0">Active Sessions</strong>
-        <div class="d-flex align-items-center gap-2">
-          <input id="sessionsFilter" class="form-control form-control-sm" type="text" placeholder="Filter..." style="width: 12rem;">
-          <button class="btn btn-sm btn-outline-danger" id="sessionsDeleteBtn" type="button" title="Delete Selected" disabled>
-            <i class="bi bi-trash"></i> Selected
-          </button>
-          <small class="text-muted ms-2">via gRPC</small>
-        </div>
+{% set scenario_filter = request.args.get('scenario', '').strip() if request else '' %}
+{% if scenario_filter %}
+  {% set core_modal_href = url_for('index', core_modal=1, scenario=scenario_filter) %}
+{% else %}
+  {% set core_modal_href = url_for('index', core_modal=1) %}
+{% endif %}
+<div id="dataLoadingBar" class="d-none"><div class="bar"></div></div>
+<div id="coreErrorContainer" class="mb-3">
+  {% if core_errors %}
+  <div class="alert alert-danger" role="alert">
+    <div class="fw-bold">CORE connection issues</div>
+    <ul class="mb-0">
+      {% for err in core_errors %}
+      <li>{{ err }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+</div>
+{% if core_vm_configured and core_vm_summary %}
+<div class="alert alert-success" role="status">
+  <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
+    <div class="flex-grow-1">
+      <div class="d-flex flex-wrap align-items-center gap-2">
+        <span class="fw-bold">CORE VM connected</span>
+        <span>
+          {{ core_vm_summary.label }}{% if core_vm_summary.node %}
+            <span class="text-muted">• Node {{ core_vm_summary.node }}</span>
+          {% endif %}
+        </span>
       </div>
-      <div class="table-responsive" style="max-height:60vh; overflow:auto;">
-        <table class="table table-sm align-middle mb-0" id="sessionsTable">
-          <thead class="table-light">
-            <tr>
-              <th class="col-check"><input type="checkbox" id="sessionsCheckAll"></th>
-              <th class="col-id">ID</th>
-              <th class="col-state">State</th>
-              <th class="col-nodes">Nodes</th>
-              <th class="filename-col">File</th>
-              <th class="actions-col">Actions</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+      <div class="small text-muted">
+        gRPC {{ core_vm_summary.host }}:{{ core_vm_summary.port }} •
+        SSH {{ core_vm_summary.ssh_username or 'unknown' }}@{{ core_vm_summary.ssh_host }}:{{ core_vm_summary.ssh_port }}
+      </div>
+    </div>
+    <a class="btn btn-sm btn-dark" href="{{ core_modal_href }}">Change CORE VM</a>
+  </div>
+</div>
+{% else %}
+<div class="alert alert-warning d-flex flex-wrap justify-content-between align-items-center gap-3" role="status">
+  <span class="fw-semibold">No CORE VM configured</span>
+  <a class="btn btn-sm btn-outline-primary" href="{{ core_modal_href }}">Select CORE VM</a>
+</div>
+{% endif %}
+<div class="row g-3 align-items-stretch" id="coreLayoutRow">
+  <div class="col-12 col-lg-3 d-flex">
+    <div class="card shadow-sm flex-fill d-flex flex-column">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span class="fw-bold">Scenarios</span>
+        <button class="btn btn-sm btn-outline-secondary {% if not active_scenario %}d-none{% endif %}" id="coreScenarioFilterClear" type="button">Clear</button>
+      </div>
+      <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="coreScenarioList" style="min-height:0; max-height:65vh;">
+        {% if scenarios %}
+          {% for s in scenarios %}
+          <button type="button" class="list-group-item list-group-item-action small py-2 {% if active_scenario and active_scenario==s %}active{% endif %}" data-scen-name="{{ s }}">{{ s }}</button>
+          {% endfor %}
+        {% else %}
+          <div class="p-3 text-muted small">No scenarios yet</div>
+        {% endif %}
       </div>
     </div>
   </div>
-  <div class="col-6">
-    <div class="card mb-3">
-      <div class="card-header py-2 d-flex justify-content-between align-items-center">
-        <strong class="mb-0">Saved XML Topologies</strong>
-        <div class="d-flex align-items-center gap-2">
-          <input id="xmlsFilter" class="form-control form-control-sm" type="text" placeholder="Filter..." style="width: 12rem;">
-          <button class="btn btn-sm btn-outline-danger" id="xmlsDeleteBtn" type="button" title="Delete Selected" disabled>
-            <i class="bi bi-trash"></i> Selected
-          </button>
-          <small class="text-muted ms-2">on disk</small>
+  <div class="col-12 col-lg-9">
+    <div class="row g-3">
+      <div class="col-12 col-xl-6">
+        <div class="card mb-3">
+          <div class="card-header py-2 d-flex justify-content-between align-items-center">
+            <strong class="mb-0">Active Sessions</strong>
+            <div class="d-flex align-items-center gap-2">
+              <input id="sessionsFilter" class="form-control form-control-sm" type="text" placeholder="Filter..." style="width: 12rem;">
+              <button class="btn btn-sm btn-outline-danger" id="sessionsDeleteBtn" type="button" title="Delete Selected" disabled>
+                <i class="bi bi-trash"></i> Selected
+              </button>
+              <small class="text-muted ms-2">via gRPC</small>
+            </div>
+          </div>
+          <div class="table-responsive" style="max-height:60vh; overflow:auto;">
+            <table class="table table-sm align-middle mb-0" id="sessionsTable">
+              <thead class="table-light">
+                <tr>
+                  <th class="col-check"><input type="checkbox" id="sessionsCheckAll"></th>
+                  <th class="col-id">ID</th>
+                  <th class="col-state">State</th>
+                  <th class="col-nodes">Nodes</th>
+                  <th class="filename-col">File</th>
+                  <th class="actions-col">Actions</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
         </div>
       </div>
-      <div class="table-responsive" style="max-height:60vh; overflow:auto;">
-        <table class="table table-sm align-middle mb-0" id="xmlsTable">
-          <thead class="table-light">
-            <tr>
-              <th class="col-check"><input type="checkbox" id="xmlsCheckAll"></th>
-              <th class="filename-col">File</th>
-              <th>Valid</th>
-              <th class="actions-col">Actions</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-  <div class="col-12">
-    <div class="card mb-3">
-      <div class="card-header py-2 d-flex justify-content-between align-items-center">
-        <strong class="mb-0">Docker Compose (per-node)</strong>
-        <div class="d-flex gap-2 align-items-center">
-          <button class="btn btn-sm btn-outline-secondary" id="dockerRefreshBtn" type="button">Refresh</button>
-          <button class="btn btn-sm btn-outline-danger" id="dockerCleanupBtn" type="button">Clean Stale Containers</button>
+      <div class="col-12 col-xl-6">
+        <div class="card mb-3">
+          <div class="card-header py-2 d-flex justify-content-between align-items-center">
+            <strong class="mb-0">Saved XML Topologies</strong>
+            <div class="d-flex align-items-center gap-2">
+              <input id="xmlsFilter" class="form-control form-control-sm" type="text" placeholder="Filter..." style="width: 12rem;">
+              <button class="btn btn-sm btn-outline-danger" id="xmlsDeleteBtn" type="button" title="Delete Selected" disabled>
+                <i class="bi bi-trash"></i> Selected
+              </button>
+              <small class="text-muted ms-2">on disk</small>
+            </div>
+          </div>
+          <div class="table-responsive" style="max-height:60vh; overflow:auto;">
+            <table class="table table-sm align-middle mb-0" id="xmlsTable">
+              <thead class="table-light">
+                <tr>
+                  <th class="col-check"><input type="checkbox" id="xmlsCheckAll"></th>
+                  <th class="filename-col">File</th>
+                  <th>Valid</th>
+                  <th class="actions-col">Actions</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
         </div>
       </div>
-      <div class="table-responsive" style="max-height:40vh; overflow:auto;">
-        <table class="table table-sm align-middle mb-0" id="dockerTable">
-          <thead class="table-light">
-            <tr>
-              <th>Name</th>
-              <th>Compose</th>
-              <th>File</th>
-              <th>Images</th>
-              <th>Container</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+      <div class="col-12">
+        <div class="card mb-3">
+          <div class="card-header py-2 d-flex justify-content-between align-items-center">
+            <strong class="mb-0">Docker Compose (per-node)</strong>
+            <div class="d-flex gap-2 align-items-center">
+              <button class="btn btn-sm btn-outline-secondary" id="dockerRefreshBtn" type="button">Refresh</button>
+              <button class="btn btn-sm btn-outline-danger" id="dockerCleanupBtn" type="button">Clean Stale Containers</button>
+            </div>
+          </div>
+          <div class="table-responsive" style="max-height:40vh; overflow:auto;">
+            <table class="table table-sm align-middle mb-0" id="dockerTable">
+              <thead class="table-light">
+                <tr>
+                  <th>Name</th>
+                  <th>Compose</th>
+                  <th>File</th>
+                  <th>Images</th>
+                  <th>Container</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -170,6 +239,14 @@
   let auto = true;
   let timer = null;
   let intervalMs = parseInt(localStorage.getItem('coreRefreshMs') || '5000', 10);
+  const coreDataBaseUrl = "{{ url_for('core_data') }}";
+  let scenarioNamesCache = {{ (scenarios or [])|tojson }};
+  const initialScenarioFilter = {{ (active_scenario or '')|tojson }};
+  let scenarioFilter = initialScenarioFilter || null;
+  const initialCoreErrors = {{ (core_errors or [])|tojson }};
+  const initialGrpcCommand = {{ (core_grpc_command or '')|tojson }};
+  const initialCoreLogs = {{ (core_log_entries or [])|tojson }};
+  let lastGrpcCommand = initialGrpcCommand || null;
   const sessionsTable = document.getElementById('sessionsTable');
   const sessionsTBody = sessionsTable?.querySelector('tbody');
   const xmlsTable = document.getElementById('xmlsTable');
@@ -182,6 +259,8 @@
   const xmlsCheckAll = document.getElementById('xmlsCheckAll');
   const sessionsDeleteBtn = document.getElementById('sessionsDeleteBtn');
   const xmlsDeleteBtn = document.getElementById('xmlsDeleteBtn');
+  const scenarioFilterList = document.getElementById('coreScenarioList');
+  const scenarioClearBtn = document.getElementById('coreScenarioFilterClear');
   let sessionsFilterText = '';
   let xmlsFilterText = '';
   // Persistent selection state (restored across full page reloads)
@@ -213,6 +292,95 @@
       localStorage.setItem(LS_KEYS.masterSessions, sessionsMasterSelectAll ? 'true':'false');
       localStorage.setItem(LS_KEYS.masterXmls, xmlsMasterSelectAll ? 'true':'false');
     } catch(e) {}
+  }
+
+  function dockLog(level, message){
+    const lvl = (level || 'INFO').toString().toUpperCase();
+    const msg = message != null ? String(message) : '';
+    if(typeof window.logLine === 'function'){
+      window.logLine(lvl, msg);
+    } else {
+      try { window.dispatchEvent(new CustomEvent('dock-log', { detail: { level: lvl, message: msg } })); } catch(_e) {}
+    }
+  }
+
+  function buildCoreDataUrl(){
+    if(!scenarioFilter) return coreDataBaseUrl;
+    const sep = coreDataBaseUrl.includes('?') ? '&' : '?';
+    return `${coreDataBaseUrl}${sep}scenario=${encodeURIComponent(scenarioFilter)}`;
+  }
+
+  function updateCoreScenarioQueryParam(){
+    const url = new URL(window.location.href);
+    if(scenarioFilter){
+      url.searchParams.set('scenario', scenarioFilter);
+    } else {
+      url.searchParams.delete('scenario');
+    }
+    window.history.replaceState({}, '', url.toString());
+  }
+
+  function updateCoreScenarioControls(){
+    if(scenarioClearBtn){
+      scenarioClearBtn.classList.toggle('d-none', !scenarioFilter);
+    }
+    if(!scenarioFilterList) return;
+    scenarioFilterList.querySelectorAll('[data-scen-name]').forEach(btn => {
+      const name = btn.getAttribute('data-scen-name');
+      btn.classList.toggle('active', !!scenarioFilter && name === scenarioFilter);
+    });
+  }
+
+  function renderCoreErrors(errs){
+    const container = document.getElementById('coreErrorContainer');
+    if(!container) return;
+    if(!Array.isArray(errs) || errs.length === 0){
+      container.innerHTML = '';
+      return;
+    }
+    const items = errs.map(err => `<li>${esc(err)}</li>`).join('');
+    container.innerHTML = `
+      <div class="alert alert-danger" role="alert">
+        <div class="fw-bold">CORE connection issues</div>
+        <ul class="mb-0">${items}</ul>
+      </div>`;
+  }
+
+  function renderCoreScenarioButtons(){
+    if(!scenarioFilterList) return;
+    scenarioFilterList.innerHTML = '';
+    if(!Array.isArray(scenarioNamesCache) || scenarioNamesCache.length === 0){
+      const empty = document.createElement('div');
+      empty.className = 'p-3 text-muted small';
+      empty.textContent = 'No scenarios yet';
+      scenarioFilterList.appendChild(empty);
+      updateCoreScenarioControls();
+      return;
+    }
+    scenarioNamesCache.forEach(name => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'list-group-item list-group-item-action small py-2 text-start';
+      btn.dataset.scenName = name;
+      btn.textContent = name;
+      if(scenarioFilter && name === scenarioFilter){
+        btn.classList.add('active');
+      }
+      btn.addEventListener('click', async () => {
+        const nextValue = (scenarioFilter === name) ? null : name;
+        await setCoreScenarioFilter(nextValue);
+      });
+      scenarioFilterList.appendChild(btn);
+    });
+    updateCoreScenarioControls();
+  }
+
+  async function setCoreScenarioFilter(value){
+    scenarioFilter = value || null;
+    updateCoreScenarioQueryParam();
+    updateCoreScenarioControls();
+    dockLog('INFO', `[core] Scenario filter set to ${scenarioFilter || 'All'}`);
+    await refresh();
   }
 
   let progressModalInstance = null;
@@ -347,23 +515,58 @@
     const startTs = performance.now();
     setLoading(true);
     try{
-      const res = await fetch("{{ url_for('core_data') }}", { cache:'no-store' });
-      if(!res.ok) return;
+      const dataUrl = buildCoreDataUrl();
+      dockLog('DEBUG', `[core] Refreshing sessions from ${dataUrl}${scenarioFilter ? ` (scenario=${scenarioFilter})` : ''}`);
+      const res = await fetch(dataUrl, { cache:'no-store' });
+      if(!res.ok){
+        dockLog('WARN', `[core] refresh failed (${res.status}) for ${dataUrl}`);
+        return;
+      }
       const data = await res.json();
+      if(Array.isArray(data.logs) && data.logs.length){
+        data.logs.forEach(entry => {
+          if(!entry) return;
+          dockLog(entry.level || 'INFO', entry.message || '');
+        });
+      }
+      if(Array.isArray(data.errors)){
+        renderCoreErrors(data.errors);
+      } else {
+        renderCoreErrors([]);
+      }
+      if(data.grpc_command && data.grpc_command !== lastGrpcCommand){
+        dockLog('INFO', `[core] gRPC command: ${data.grpc_command}`);
+        lastGrpcCommand = data.grpc_command;
+      }
+      const serverScenario = (data.active_scenario || '').trim();
+      if(serverScenario){
+        scenarioFilter = serverScenario;
+      } else if(!serverScenario && scenarioFilter){
+        scenarioFilter = null;
+      }
+      if(Array.isArray(data.scenarios)){
+        scenarioNamesCache = data.scenarios;
+        renderCoreScenarioButtons();
+      } else {
+        updateCoreScenarioControls();
+      }
+      updateCoreScenarioQueryParam();
       if(Array.isArray(data.sessions) && sessionsTBody){
         sessionsTBody.innerHTML = data.sessions.map(buildSessionRow).filter(Boolean).join('\n');
         try { document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => new bootstrap.Tooltip(el)); } catch(e) {}
         bindSelectionHandlers('session');
         // Re-apply master select-all if active AND auto-reapply still allowed
         if (sessionsMasterSelectAll && sessionsAutoReapply) applyMasterSelectAll('session');
+        dockLog('INFO', `[core] Sessions updated (${data.sessions.length} items)`);
       }
       if(Array.isArray(data.xmls) && xmlsTBody){
         xmlsTBody.innerHTML = data.xmls.map(buildXmlRow).filter(Boolean).join('\n');
         bindSelectionHandlers('xml');
         if (xmlsMasterSelectAll && xmlsAutoReapply) applyMasterSelectAll('xml');
+        dockLog('DEBUG', `[core] XML catalog updated (${data.xmls.length} files)`);
       }
       await refreshDocker();
-    }catch(e){ }
+    }catch(e){ dockLog('ERROR', `[core] refresh error: ${e}`); }
     finally {
       const elapsed = performance.now() - startTs;
       const remain = elapsed < minLoadDisplayMs ? (minLoadDisplayMs - elapsed) : 0;
@@ -402,6 +605,13 @@
   }
 
   // Show bar immediately on initial load, then kick first refresh now (not after interval)
+  dockLog('INFO', `[core] CORE page initialized (scenario=${initialScenarioFilter || 'All'})`);
+  if(Array.isArray(initialCoreLogs) && initialCoreLogs.length){
+    initialCoreLogs.forEach(entry => {
+      if(!entry) return;
+      dockLog(entry.level || 'INFO', entry.message || '');
+    });
+  }
   setLoading(true);
   refresh().then(()=> schedule());
   try { bindSelectionHandlers('session'); } catch(e) {}
@@ -412,8 +622,12 @@
   async function refreshDocker(){
     if(!dockerTBody) return;
     try{
+      dockLog('DEBUG', '[core] Refreshing docker status');
       const res = await fetch("/docker/status");
-      if(!res.ok) return;
+      if(!res.ok){
+        dockLog('WARN', `[core] docker refresh failed (${res.status})`);
+        return;
+      }
       const js = await res.json();
       const rows = (js.items||[]).map(it=>{
         const file = badge(!!it.exists, 'yes', 'no');
@@ -430,7 +644,8 @@
         </tr>`;
       });
       dockerTBody.innerHTML = rows.join('\n');
-    }catch(e){ }
+      dockLog('INFO', `[core] Docker table updated (${(js.items||[]).length} nodes)`);
+    }catch(e){ dockLog('ERROR', `[core] docker refresh error: ${e}`); }
   }
   document.getElementById('dockerRefreshBtn')?.addEventListener('click', refreshDocker);
   document.getElementById('dockerCleanupBtn')?.addEventListener('click', async ()=>{
@@ -438,11 +653,25 @@
     openProgress('Cleaning stale containers…', 1);
     try{
       const res = await fetch('/docker/cleanup', { method:'POST' });
-      if(res.ok){ updateProgress(1,1,'Cleanup done'); await refreshDocker(); }
-      else { updateProgress(0,1,'Cleanup failed'); }
-    }catch(e){ updateProgress(0,1,'Cleanup failed'); }
+      if(res.ok){
+        updateProgress(1,1,'Cleanup done');
+        dockLog('INFO', '[core] Docker cleanup completed');
+        await refreshDocker();
+      }
+      else {
+        updateProgress(0,1,'Cleanup failed');
+        dockLog('WARN', `[core] Docker cleanup failed (${res.status})`);
+      }
+    }catch(e){ updateProgress(0,1,'Cleanup failed'); dockLog('ERROR', `[core] Docker cleanup error: ${e}`); }
     finally{ closeProgress(); }
   });
+
+  scenarioClearBtn?.addEventListener('click', async ()=>{ await setCoreScenarioFilter(null); });
+  renderCoreScenarioButtons();
+  renderCoreErrors(initialCoreErrors);
+  if(initialGrpcCommand){
+    dockLog('INFO', `[core] gRPC command: ${initialGrpcCommand}`);
+  }
 
   sessionsFilterInput?.addEventListener('input', ()=>{
     sessionsFilterText = sessionsFilterInput.value.trim().toLowerCase();

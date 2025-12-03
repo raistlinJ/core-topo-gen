@@ -660,6 +660,21 @@
           : (xmlBaseNameRaw || '__default__'));
     hitlConfig.scenario_key = scenarioKey;
 
+    function buildScenarioUrl(basePath){
+      if(!basePath || typeof basePath !== 'string') return basePath;
+      const scen = (typeof scenarioMeta.scenario === 'string' ? scenarioMeta.scenario : '').trim();
+      if(!scen) return basePath;
+      try {
+        const isAbsolute = /^https?:/i.test(basePath);
+        const url = new URL(basePath, window.location.origin);
+        url.searchParams.set('scenario', scen);
+        return isAbsolute ? url.toString() : `${url.pathname}${url.search}${url.hash}`;
+      } catch(e) {
+        const sep = basePath.includes('?') ? '&' : '?';
+        return `${basePath}${sep}scenario=${encodeURIComponent(scen)}`;
+      }
+    }
+
     // Simple graph using d3-force (assumes d3 is loaded in base template). Fallback to textual if not.
     function normalizeVulnerabilitiesByNode(source){
       const out = {};
@@ -2845,7 +2860,8 @@
             if(data.returncode===0){
               appendExecuteProgressLog('Execution complete: success; redirecting to Reports');
               setExecuteProgressUI({ status: 'Scenario started', meta: 'Completed', barText: 'Done', animate: false });
-              setTimeout(()=>{ window.location.href = "{{ url_for('reports_page') }}"; }, 700);
+              const reportsHref = buildScenarioUrl("{{ url_for('reports_page') }}");
+              setTimeout(()=>{ window.location.href = reportsHref; }, 700);
             } else {
               appendExecuteProgressLog('Execution finished with errors (code '+data.returncode+')');
               setExecuteProgressUI({ status: 'Finished with errors', meta: 'Code '+data.returncode, barText: 'Error', animate: false });

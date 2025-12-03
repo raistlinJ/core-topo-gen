@@ -18,6 +18,9 @@
     .btn.core-link .bi { margin-right: .25rem; }
   </style>
 </head>
+{% set nav_scenario = request.args.get('scenario', '').strip() if request else '' %}
+{% set nav_reports_href = url_for('reports_page', scenario=nav_scenario) if nav_scenario else url_for('reports_page') %}
+{% set nav_core_href = url_for('core_page', scenario=nav_scenario) if nav_scenario else url_for('core_page') %}
 <body class="p-3" data-sid="{{ sid }}" data-name="{{ name }}">
   <div class="container-fluid">
     <div class="d-flex align-items-center justify-content-between bg-primary text-white rounded-top shadow-sm px-3 py-2">
@@ -27,8 +30,8 @@
       </div>
       <div class="d-flex align-items-center gap-2 small">
         <a class="btn btn-sm btn-outline-light" href="{{ url_for('data_sources_page') }}">Back</a>
-        <a class="btn btn-sm btn-outline-light" href="{{ url_for('reports_page') }}">Reports</a>
-        <a class="btn btn-sm btn-outline-light core-link" href="{{ url_for('core_page') }}"><i class="bi bi-diagram-3-fill"></i> CORE</a>
+        <a class="btn btn-sm btn-outline-light" href="{{ nav_reports_href }}">Reports</a>
+        <a class="btn btn-sm btn-outline-light core-link" href="{{ nav_core_href }}"><i class="bi bi-diagram-3-fill"></i> CORE</a>
         {% if current_user and current_user.role == 'admin' %}
         <div class="dropdown ms-2">
           <button class="btn btn-sm btn-light dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">

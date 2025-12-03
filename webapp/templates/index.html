@@ -30,35 +30,38 @@
         opacity: 0.6;
         pointer-events: none;
     }
+    .hitl-step-disabled {
+        filter: grayscale(0.3);
+        opacity: 0.85;
+    }
 </style>
 {% endblock %}
 <!-- hs-bounds-wrapper styles moved into style block above -->
 {% block content %}
     <div class="row">
         <div class="col-md-3 mb-3">
-                <div class="card shadow-sm h-100 d-flex flex-column">
-                            <div class="card-header d-flex justify-content-between align-items-center">
-                                <span class="fw-bold">Scenarios</span>
-                                <div class="btn-toolbar gap-2 align-items-center">
-                                    <button type="button" class="btn btn-sm btn-outline-secondary" id="importBtn" title="Import scenarios XML">Import</button>
-                                    <button type="button" class="btn btn-sm btn-outline-info" id="exportBtn" title="Export last saved XML">Export</button>
-                                    <div class="btn-group" role="group" aria-label="Bulk scenario actions">
-                                        <button type="button" class="btn btn-sm btn-outline-secondary" id="selectAllScenariosBtn" title="Select all (or clear if all selected)">All</button>
-                                        <button type="button" class="btn btn-sm btn-outline-danger" id="deleteSelectedScenariosBtn" title="Delete selected scenarios" disabled>Delete</button>
-                                    </div>
-                                </div>
-                            </div>
-                    <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="scenarioList" style="min-height:0;"></div>
-                    <form id="hiddenLoadForm" class="d-none" action="{{ url_for('load_xml') }}" method="post" enctype="multipart/form-data">
-                        <input type="file" name="scenarios_xml" id="hiddenLoadInput" accept=".xml">
-                    </form>
-                    <div class="card-footer" style="position: sticky; bottom: 0; background: #fff; z-index: 1;">
-                        <button type="button" class="btn btn-sm btn-primary w-100" id="appendScenarioBtn">New Scenario</button>
+            <div class="card shadow-sm h-100 d-flex flex-column">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span class="fw-bold">Scenarios</span>
+                    <div class="btn-toolbar gap-2 align-items-center">
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="importBtn" title="Import scenarios XML">Import</button>
+                        <button type="button" class="btn btn-sm btn-outline-info" id="exportBtn" title="Export last saved XML">Export</button>
+                        <div class="btn-group" role="group" aria-label="Bulk scenario actions">
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="selectAllScenariosBtn" title="Select all (or clear if all selected)">All</button>
+                            <button type="button" class="btn btn-sm btn-outline-danger" id="deleteSelectedScenariosBtn" title="Delete selected scenarios" disabled>Delete</button>
+                        </div>
                     </div>
                 </div>
+                <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="scenarioList" style="min-height:0;"></div>
+                <form id="hiddenLoadForm" class="d-none" action="{{ url_for('load_xml') }}" method="post" enctype="multipart/form-data">
+                    <input type="file" name="scenarios_xml" id="hiddenLoadInput" accept=".xml">
+                </form>
+                <div class="card-footer" style="position: sticky; bottom: 0; background: #fff; z-index: 1;">
+                    <button type="button" class="btn btn-sm btn-primary w-100" id="appendScenarioBtn">New Scenario</button>
+                </div>
             </div>
-    <div class="col-md-9">
-
+        </div>
+        <div class="col-md-9">
             <div class="card shadow mt-3">
                 <div class="card-body">
                     {% with messages = get_flashed_messages() %}
@@ -101,15 +104,20 @@
                     </div>
 
                     <div class="card mt-3" id="scenarioEditorCard">
-                        <div class="card-header d-flex justify-content-between align-items-center">
+                        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
                             <strong>Scenario Editor</strong>
-                            <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="modal" data-bs-target="#externalIfxModal">External IFX Configuration</button>
+                            <div class="d-flex flex-wrap align-items-center gap-2">
+                                <div class="btn-group btn-group-sm" role="group" aria-label="HITL setup actions">
+                                    <button class="btn btn-outline-primary" type="button" id="selectCoreVmBtn">Select CORE VM</button>
+                                    <button class="btn btn-primary" type="button" id="configHitlBtn" disabled title="Complete Steps 1 and 2 first.">Config HITL</button>
+                                </div>
+                            </div>
                         </div>
                         <div class="card-body">
                             <form id="editorForm" action="{{ url_for('save_xml') }}" method="post">
                                 <input type="hidden" name="scenarios_json" id="scenarios_json">
                                 <input type="hidden" name="active_index" id="active_index" value="0">
-                                        <input type="hidden" name="core_json" id="core_json">
+                                <input type="hidden" name="core_json" id="core_json">
                                 <div id="editorRoot"></div>
                                 <div class="d-flex gap-2 mt-3">
                                     <button type="submit" class="btn btn-success">Save XML</button>
@@ -119,7 +127,6 @@
                         </div>
                     </div>
 
-
                     <!-- Planning Workflow card visually removed but retained (d-none) for underlying JS functionality -->
                     <div class="card mt-3 d-none" id="planWorkflowCard">
                         <div class="card-header d-flex justify-content-between align-items-center">
@@ -128,8 +135,8 @@
                         </div>
                         <div class="card-body">
                             <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
-                                                                <button class="btn btn-sm btn-outline-primary" type="button" id="planPreviewBtn" title="Generate full preview (routers, IPs, services)" disabled>Full Preview</button>
-                                                                <!-- Run (Seed) workflow removed: deterministic seed input and run button eliminated -->
+                                <button class="btn btn-sm btn-outline-primary" type="button" id="planPreviewBtn" title="Generate full preview (routers, IPs, services)" disabled>Full Preview</button>
+                                <!-- Run (Seed) workflow removed: deterministic seed input and run button eliminated -->
                                 <!-- Single Full Preview button (above) is authoritative; secondary button and strict checkbox removed -->
                             </div>
                             <div class="small text-muted" id="planHint">Save XML and test CORE connection to enable planning.</div>
@@ -157,10 +164,10 @@
                     </form>
                 </div>
             </div>
-            
+
         </div>
     </div>
-<!-- Run Progress Modal -->
+    <!-- Run Progress Modal -->
 <div class="modal fade" id="runProgressModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered modal-lg">
         <div class="modal-content">
@@ -190,22 +197,39 @@
 {% set xml_preview_enabled = True %}
 {% set xml_preview_text = xml_preview %}
 
-<!-- External IFX Configuration Modal -->
+<!-- CORE VM Selection Modal -->
+<div class="modal fade" id="coreVmSelectModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Select CORE VM</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p class="small text-muted">Complete Steps 1 and 2 to choose a Proxmox resource and CORE VM with credentials.</p>
+                <div id="coreVmSelectContainer" class="d-flex flex-column gap-3"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+<!-- Config HITL Modal (Steps 3 & 4) -->
 <div class="modal fade" id="externalIfxModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-lg modal-dialog-scrollable">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title">External IFX Configuration</h5>
+                <h5 class="modal-title">Config HITL</h5>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
-                <p class="small text-muted">Configure hardware-in-the-loop attachments and external interface mappings for each scenario.</p>
+                <p class="small text-muted">Configure Steps 3 &amp; 4: enable HITL interfaces and map participant VMs.</p>
                 <div id="externalIfxBusyNotice" class="alert alert-info small d-none" role="status" aria-live="polite"></div>
                 <div id="externalIfxHitlContainer" class="d-flex flex-column gap-3"></div>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
-                <button type="button" class="btn btn-primary d-none" id="externalIfxApplyBtn">Apply</button>
             </div>
         </div>
     </div>
@@ -241,7 +265,12 @@
                     </div>
                     <div class="mb-3">
                         <label for="proxmoxPassword" class="form-label">Password</label>
-                        <input type="password" class="form-control" id="proxmoxPassword" placeholder="••••••" autocomplete="current-password" required>
+                        <input type="password" class="form-control" id="proxmoxPassword" placeholder="••••••" autocomplete="current-password">
+                    </div>
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" id="proxmoxRememberCreds" checked>
+                        <label class="form-check-label" for="proxmoxRememberCreds">Save credentials after validation</label>
+                        <div class="form-text">Disable to validate against Proxmox without storing secrets in the vault.</div>
                     </div>
                 </form>
                 <div class="alert alert-danger d-none" id="proxmoxAssignError"></div>
@@ -293,6 +322,16 @@
                             </div>
                         </div>
                     </div>
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" id="coreRememberCreds" checked>
+                        <label class="form-check-label" for="coreRememberCreds">Save username &amp; password after validation</label>
+                        <div class="form-text">Disable to require manual entry each time; secrets remain only in the vault.</div>
+                    </div>
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" id="coreAutoStartDaemon">
+                        <label class="form-check-label" for="coreAutoStartDaemon">Auto-start core-daemon if not running</label>
+                        <div class="form-text">Runs 'sudo core-daemon -d' on the CORE VM during connection validation.</div>
+                    </div>
                     <div class="mt-4">
                         <button class="btn btn-link p-0" type="button" data-bs-toggle="collapse" data-bs-target="#coreConnAdvanced" aria-expanded="false" aria-controls="coreConnAdvanced">Advanced</button>
                         <div class="collapse" id="coreConnAdvanced">
@@ -305,6 +344,15 @@
                                 <div class="mb-1">
                                     <label for="coreGrpcPort" class="form-label">gRPC Port</label>
                                     <input type="number" class="form-control" id="coreGrpcPort" min="1" max="65535" data-hitl-core-field="grpc_port" autocomplete="off" required>
+                                </div>
+                                <div class="mb-1">
+                                    <label for="coreVenvBin" class="form-label">Remote CORE venv bin</label>
+                                    <input type="text" class="form-control" id="coreVenvBin" placeholder="/opt/core/venv/bin" data-hitl-core-field="venv_bin" autocomplete="off">
+                                    <div class="form-text">Python commands run over SSH will use this directory (include the <code>/bin</code> path inside the CORE virtualenv).</div>
+                                </div>
+                                <div class="d-flex align-items-center gap-2 mb-1">
+                                    <button type="button" class="btn btn-outline-secondary btn-sm" id="coreTestVenvBtn">Test Venv</button>
+                                    <div id="coreVenvTestStatus" class="form-text mb-0 text-muted">Not tested.</div>
                                 </div>
                             </div>
                         </div>
@@ -349,6 +397,44 @@
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+<!-- Execute Confirm Modal -->
+<div class="modal fade" id="executeConfirmModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Execute Scenario</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p class="mb-3" id="executeConfirmMessage">Execute this scenario now?</p>
+                <div class="alert alert-warning small d-none" id="executeConfirmAlert"></div>
+                <div class="form-check form-switch" id="executePushRepoWrapper">
+                    <input class="form-check-input" type="checkbox" id="executePushRepoToggle" data-hitl-core-field="push_repo" data-scen-idx="-1" autocomplete="off">
+                    <label class="form-check-label" for="executePushRepoToggle">Push repo to CORE VM before runs</label>
+                    <div class="form-text">Enable to upload this repo to the CORE VM before Execute; leave unchecked if the repo already exists on that host.</div>
+                </div>
+                <div class="border rounded p-3 mt-3 bg-body-tertiary d-none" id="executeProgressWrap">
+                    <div class="d-flex align-items-center gap-2">
+                        <div class="spinner-border spinner-border-sm text-primary" role="status" aria-hidden="true" id="executeProgressSpinner"></div>
+                        <div class="flex-grow-1">
+                            <div class="fw-semibold" id="executeProgressStatus">Preparing…</div>
+                            <div class="small text-muted" id="executeProgressMeta"></div>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-outline-secondary d-none" id="executeProgressPopoutBtn">Open run logs</button>
+                    </div>
+                    <div class="progress mt-3" style="height: 12px;">
+                        <div class="progress-bar progress-bar-striped" id="executeProgressBar" role="progressbar" style="width: 0%" aria-valuemin="0" aria-valuemax="100">0%</div>
+                    </div>
+                    <pre class="form-control bg-dark text-white border-0 mt-3 small" id="executeProgressLog" style="height: 190px; overflow:auto; font-family: SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;"></pre>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" id="executeConfirmCancelBtn">Cancel</button>
+                <button type="button" class="btn btn-primary" id="executeConfirmRunBtn">Execute</button>
             </div>
         </div>
     </div>
@@ -531,7 +617,6 @@ const CORETG_USER_ROLE = (currentUserMeta && typeof currentUserMeta.role === 'st
 window.CORETG_USERNAME = CORETG_USERNAME;
 window.CORETG_USER_ROLE = CORETG_USER_ROLE;
 const DEFAULT_INTERNAL_BRIDGE_NAME = 'corebridge';
-
 function computeInternalBridgeName(usernameValue) {
     const base = (usernameValue || window.CORETG_USERNAME || '').toString().trim();
     if (!base) return DEFAULT_INTERNAL_BRIDGE_NAME;
@@ -629,6 +714,9 @@ try {
 } catch (e) {
     initialPayload = null;
 }
+const CORE_DEFAULT_VENV_BIN = (initialPayload && typeof initialPayload.core === 'object' && typeof initialPayload.core.venv_bin === 'string' && initialPayload.core.venv_bin.trim())
+    ? initialPayload.core.venv_bin.trim()
+    : '/opt/core/venv/bin';
 // If server provides a fresh result_path (e.g., after Save XML), reflect it in localStorage early
 try {
     if (initialPayload && initialPayload.result_path) {
@@ -822,6 +910,9 @@ function ensureHitlStateForScenario(scen) {
             last_interfaces_attempt: null,
             interfaces_refresh_inflight: false,
             last_interfaces_error: null,
+            remember_credentials: true,
+            auto_start_daemon: false,
+            push_repo: false,
         };
     } else {
         const core = scen.hitl.core;
@@ -866,6 +957,13 @@ function ensureHitlStateForScenario(scen) {
             core.last_interfaces_error = null;
         }
     }
+    if (typeof scen.hitl.core.remember_credentials !== 'boolean') {
+        scen.hitl.core.remember_credentials = true;
+    }
+    if (typeof scen.hitl.core.auto_start_daemon !== 'boolean') {
+        scen.hitl.core.auto_start_daemon = false;
+    }
+    scen.hitl.core.push_repo = coerceBool(scen.hitl.core.push_repo);
     const coreVmKeyCurrent = (scen.hitl.core?.vm_key ?? '').toString();
     const coreVmNodeCurrent = (scen.hitl.core?.vm_node ?? '').toString().trim();
     if (coreVmKeyCurrent) {
@@ -895,6 +993,7 @@ function ensureHitlStateForScenario(scen) {
             last_message: '',
             inventory: { fetched_at: null, vms: [] },
             inventory_error: null,
+            remember_credentials: true,
         };
     } else {
         const prox = scen.hitl.proxmox;
@@ -956,7 +1055,173 @@ function ensureHitlStateForScenario(scen) {
             }).filter(Boolean);
         }
     }
+    if (typeof scen.hitl.proxmox.remember_credentials !== 'boolean') {
+        scen.hitl.proxmox.remember_credentials = true;
+    }
+    applyDefaultProxmoxFields(scen.hitl.proxmox);
     return scen.hitl;
+}
+
+function shouldRememberProxmox(hitlState) {
+    if (!hitlState || !hitlState.proxmox) return true;
+    return hitlState.proxmox.remember_credentials !== false;
+}
+
+const PROXMOX_DEFAULTS_STORAGE_KEY = 'coretg_proxmox_defaults';
+
+function normalizeProxmoxDefaults(raw) {
+    if (!raw || typeof raw !== 'object') return {};
+    const result = {};
+    if (typeof raw.url === 'string' && raw.url.trim()) {
+        result.url = raw.url.trim();
+    }
+    const portVal = parseInt(raw.port, 10);
+    if (Number.isFinite(portVal) && portVal >= 1 && portVal <= 65535) {
+        result.port = portVal;
+    }
+    if (typeof raw.username === 'string' && raw.username.trim()) {
+        result.username = raw.username.trim();
+    }
+    if (typeof raw.verify_ssl === 'boolean') {
+        result.verify_ssl = raw.verify_ssl;
+    }
+    return result;
+}
+
+function getSavedProxmoxDefaults() {
+    try {
+        const raw = JSON.parse(localStorage.getItem(PROXMOX_DEFAULTS_STORAGE_KEY) || 'null');
+        return normalizeProxmoxDefaults(raw);
+    } catch (err) {
+        return {};
+    }
+}
+
+function persistSavedProxmoxDefaults(partial) {
+    if (!partial || typeof partial !== 'object') return;
+    const current = getSavedProxmoxDefaults();
+    const merged = { ...current };
+    if (typeof partial.url === 'string' && partial.url.trim()) {
+        merged.url = partial.url.trim();
+    }
+    if (partial.port !== undefined) {
+        const portVal = parseInt(partial.port, 10);
+        if (Number.isFinite(portVal) && portVal >= 1 && portVal <= 65535) {
+            merged.port = portVal;
+        }
+    }
+    if (typeof partial.username === 'string' && partial.username.trim()) {
+        merged.username = partial.username.trim();
+    }
+    if (typeof partial.verify_ssl === 'boolean') {
+        merged.verify_ssl = partial.verify_ssl;
+    }
+    const normalized = normalizeProxmoxDefaults(merged);
+    try {
+        localStorage.setItem(PROXMOX_DEFAULTS_STORAGE_KEY, JSON.stringify(normalized));
+    } catch (err) {
+        console.warn('Failed to persist Proxmox defaults', err);
+    }
+}
+
+function applyDefaultProxmoxFields(target) {
+    if (!target || typeof target !== 'object') return;
+    const defaults = getSavedProxmoxDefaults();
+    if (!defaults || Object.keys(defaults).length === 0) return;
+    if (!target.url && defaults.url) {
+        target.url = defaults.url;
+    }
+    if ((!target.port || target.port === 8006) && defaults.port) {
+        target.port = defaults.port;
+    }
+    if (!target.username && defaults.username) {
+        target.username = defaults.username;
+    }
+    if (typeof target.verify_ssl !== 'boolean' && typeof defaults.verify_ssl === 'boolean') {
+        target.verify_ssl = defaults.verify_ssl;
+    }
+}
+
+function shouldRememberCore(hitlState) {
+    if (!hitlState || !hitlState.core) return true;
+    return hitlState.core.remember_credentials !== false;
+}
+
+const proxmoxSecretCache = new Map();
+
+async function fetchStoredProxmoxCredentials(secretId) {
+    if (!secretId) return null;
+    if (proxmoxSecretCache.has(secretId)) {
+        return proxmoxSecretCache.get(secretId);
+    }
+    const resp = await fetch('/api/proxmox/credentials/get', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ secret_id: secretId }),
+    });
+    let data = null;
+    try {
+        data = await resp.json();
+    } catch (err) {
+        data = null;
+    }
+    if (!resp.ok || !data || data.success === false) {
+        const message = (data && data.error) ? data.error : `HTTP ${resp.status}`;
+        throw new Error(message);
+    }
+    const creds = data.credentials || null;
+    proxmoxSecretCache.set(secretId, creds);
+    return creds;
+}
+
+const coreSecretCache = new Map();
+
+async function fetchStoredCoreCredentials(secretId) {
+    if (!secretId) return null;
+    if (coreSecretCache.has(secretId)) {
+        return coreSecretCache.get(secretId);
+    }
+    const resp = await fetch('/api/core/credentials/get', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ core_secret_id: secretId }),
+    });
+    let data = null;
+    try {
+        data = await resp.json();
+    } catch (err) {
+        data = null;
+    }
+    if (!resp.ok || !data || data.success === false) {
+        const message = (data && data.error) ? data.error : `HTTP ${resp.status}`;
+        throw new Error(message);
+    }
+    const creds = data.credentials || null;
+    coreSecretCache.set(secretId, creds);
+    return creds;
+}
+
+function describeConfigHitlGate({ proxValidated, coreHasSecret, coreVmKey }) {
+    if (!proxValidated) return 'Validate Proxmox credentials (Step 1) to continue.';
+    if (!coreVmKey) return 'Select a CORE VM in Step 2 to continue.';
+    if (!coreHasSecret) return 'Store CORE credentials (Step 2) to continue.';
+    return '';
+}
+
+function updateHitlEntryButtons({ hitlAuthReady, proxValidated, coreHasSecret, coreVmKey }) {
+    const configBtn = document.getElementById('configHitlBtn');
+    if (configBtn) {
+        const ready = !!hitlAuthReady;
+        configBtn.disabled = !ready;
+        const hint = ready
+            ? 'Configure HITL interfaces and participant VMs (Steps 3 & 4).'
+            : describeConfigHitlGate({ proxValidated, coreHasSecret, coreVmKey }) || 'Complete Steps 1 and 2 first.';
+        configBtn.setAttribute('title', hint);
+        configBtn.dataset.hitlReady = ready ? '1' : '0';
+        configBtn.dataset.hitlHint = hint;
+    }
 }
 
 function updateProxmoxSummary(sidx) {
@@ -2322,7 +2587,10 @@ function normalizeCoreState(raw, includePassword = true) {
         ssh_host: (typeof serverDefaults.ssh_host === 'string' && serverDefaults.ssh_host.trim()) ? serverDefaults.ssh_host.trim() : '',
         ssh_port: toPositiveInt(serverDefaults.ssh_port, 22),
         ssh_username: (typeof serverDefaults.ssh_username === 'string') ? serverDefaults.ssh_username : '',
+        push_repo: coerceBool(serverDefaults.push_repo),
     };
+    const serverDefaultVenv = (typeof serverDefaults.venv_bin === 'string' && serverDefaults.venv_bin.trim()) ? serverDefaults.venv_bin.trim() : '';
+    const defaultVenvBin = serverDefaultVenv || CORE_DEFAULT_VENV_BIN;
     if (!defaults.ssh_host) defaults.ssh_host = defaults.host;
     const source = (raw && typeof raw === 'object') ? raw : {};
     const out = {
@@ -2332,6 +2600,8 @@ function normalizeCoreState(raw, includePassword = true) {
         ssh_host: defaults.ssh_host,
         ssh_port: defaults.ssh_port,
         ssh_username: defaults.ssh_username,
+        venv_bin: defaultVenvBin,
+        push_repo: defaults.push_repo,
     };
     if ('host' in source && String(source.host).trim()) {
         out.host = String(source.host).trim();
@@ -2360,6 +2630,16 @@ function normalizeCoreState(raw, includePassword = true) {
     if (!out.ssh_port || !Number.isFinite(out.ssh_port)) {
         out.ssh_port = 22;
     }
+    const venvSource = (source.venv_bin ?? source.core_venv_bin);
+    if (typeof venvSource === 'string' && venvSource.trim()) {
+        out.venv_bin = venvSource.trim();
+    }
+    if (!out.venv_bin) {
+        out.venv_bin = defaultVenvBin;
+    }
+    if ('push_repo' in source) {
+        out.push_repo = coerceBool(source.push_repo);
+    }
     return out;
 }
 
@@ -2383,8 +2663,8 @@ function restoreCorePasswordFromSession(coreState) {
 function storeCorePasswordInSession() {
     try {
         const pw = state?.core?.ssh_password ?? '';
-                    if (id) {
-                        const escapedId = (window.CSS && typeof window.CSS.escape === 'function') ? window.CSS.escape(id) : id;
+        if (pw) {
+            sessionStorage.setItem('coretg_core_pw', pw);
         } else {
             sessionStorage.removeItem('coretg_core_pw');
         }
@@ -2395,10 +2675,48 @@ function storeCorePasswordInSession() {
 
 function getCoreConfig(includePassword = true) {
     const normalized = normalizeCoreState(state?.core || {}, includePassword);
+    const { idx: activeIdx } = getActiveScenarioContext();
+    normalized.push_repo = getScenarioPushRepoValue(activeIdx);
     if (!includePassword && 'ssh_password' in normalized) {
         delete normalized.ssh_password;
     }
     return normalized;
+}
+
+function syncGlobalCoreConnection(coreState, testedHost = null, testedPort = null) {
+    if (!coreState || typeof coreState !== 'object') return;
+    const host = (coreState.grpc_host || '').toString().trim() || 'localhost';
+    const portRaw = Number(coreState.grpc_port);
+    const port = Number.isFinite(portRaw) && portRaw > 0 ? Number(portRaw) : 50051;
+    const sshHostCandidate = (coreState.ssh_host || '').toString().trim();
+    const sshHost = sshHostCandidate || host;
+    const sshPortRaw = Number(coreState.ssh_port);
+    const sshPort = Number.isFinite(sshPortRaw) && sshPortRaw > 0 ? Number(sshPortRaw) : 22;
+    const sshUser = (coreState.ssh_username || '').toString();
+    const venvBin = (coreState.venv_bin || '').toString().trim();
+    const pushRepo = coerceBool(coreState.push_repo);
+    const normalized = normalizeCoreState({
+        host,
+        port,
+        ssh_host: sshHost,
+        ssh_port: sshPort,
+        ssh_username: sshUser,
+        venv_bin: venvBin,
+        push_repo: pushRepo,
+        ssh_password: '',
+    }, true);
+    normalized.ssh_password = '';
+    state.core = normalized;
+    state.core_ok = true;
+    const testedPortNumber = Number(testedPort);
+    state.core_tested_host = (testedHost || host || '').toString();
+    state.core_tested_port = Number.isFinite(testedPortNumber) && testedPortNumber > 0 ? Number(testedPortNumber) : port;
+}
+
+function markGlobalCoreDisconnected() {
+    state.core_ok = false;
+    state.core_tested_host = null;
+    state.core_tested_port = null;
 }
 
 function getActiveScenarioContext() {
@@ -2407,6 +2725,34 @@ function getActiveScenarioContext() {
     const scenario = (idx !== null) ? scenarios[idx] : null;
     const name = (scenario && typeof scenario.name === 'string') ? scenario.name.trim() : '';
     return { idx, scenario, name };
+}
+
+function getActiveScenarioName() {
+    return (getActiveScenarioContext().name || '').trim();
+}
+
+function buildScenarioAwareUrl(baseUrl, scenarioName = null) {
+    if (!baseUrl || typeof baseUrl !== 'string') return baseUrl;
+    const sourceName = scenarioName !== null ? scenarioName : getActiveScenarioName();
+    const trimmed = (sourceName || '').trim();
+    if (!trimmed) return baseUrl;
+    try {
+        const isAbsolute = /^https?:/i.test(baseUrl);
+        const url = new URL(baseUrl, window.location.origin);
+        url.searchParams.set('scenario', trimmed);
+        return isAbsolute ? url.toString() : `${url.pathname}${url.search}${url.hash}`;
+    } catch (e) {
+        const sep = baseUrl.includes('?') ? '&' : '?';
+        return `${baseUrl}${sep}scenario=${encodeURIComponent(trimmed)}`;
+    }
+}
+
+function scheduleScenarioRedirect(baseUrl, options = {}) {
+    const delay = Number(options.delay) || 0;
+    const scenarioName = typeof options.scenarioName === 'string' ? options.scenarioName : null;
+    const targetUrl = buildScenarioAwareUrl(baseUrl, scenarioName) || baseUrl;
+    const navigate = () => { window.location.href = targetUrl; };
+    if (delay > 0) { setTimeout(navigate, delay); } else { navigate(); }
 }
 
 function cloneScenarioCoreFromScenario(scenario, includePassword = true) {
@@ -2454,6 +2800,7 @@ function appendScenarioContextToFormData(form, options = {}) {
         form.append('scenario', name);
     }
     if (includeCore) {
+        syncGlobalPushRepoFromScenario(idx);
         const scenarioCore = cloneScenarioCoreFromScenario(scenario, true);
         if (scenarioCore) {
             form.append('hitl_core_json', JSON.stringify(scenarioCore));
@@ -2572,6 +2919,44 @@ if (state.base_upload) {
     if (!state.base_upload.path && state.scenarios?.[0]?.base?.filepath) {
         state.base_upload.path = state.scenarios[0].base.filepath;
     }
+}
+
+function getScenarioByIndex(idx) {
+    const scenarios = Array.isArray(state?.scenarios) ? state.scenarios : [];
+    if (!Number.isInteger(idx) || idx < 0 || idx >= scenarios.length) {
+        return null;
+    }
+    return scenarios[idx];
+}
+
+function getScenarioPushRepoValue(idx = null) {
+    const { idx: activeIdx } = getActiveScenarioContext();
+    const targetIdx = Number.isInteger(idx) ? idx : activeIdx;
+    const scenario = getScenarioByIndex(targetIdx);
+    if (scenario) {
+        const hitlState = ensureHitlStateForScenario(scenario);
+        if (hitlState?.core) {
+            return !!hitlState.core.push_repo;
+        }
+    }
+    return !!(state?.core && coerceBool(state.core.push_repo));
+}
+
+function syncGlobalPushRepoFromScenario(idx = null) {
+    const { idx: activeIdx } = getActiveScenarioContext();
+    const targetIdx = Number.isInteger(idx) ? idx : activeIdx;
+    const scenario = getScenarioByIndex(targetIdx);
+    if (!scenario) {
+        return;
+    }
+    const hitlState = ensureHitlStateForScenario(scenario);
+    if (!hitlState?.core) {
+        return;
+    }
+    if (!state.core) {
+        state.core = {};
+    }
+    state.core.push_repo = !!hitlState.core.push_repo;
 }
 
 (state.scenarios || []).forEach(ensureHitlStateForScenario);
@@ -2761,6 +3146,7 @@ function setupPreviewModalExecute(modalEl, modalInstance){
         if(execBtn.disabled) return;
         execBtn.disabled = true;
         execBtn.classList.add('disabled');
+        let modalHidden = false;
         const forceHideModal = () => {
             try { modalInstance?.hide(); } catch(e){}
             if(modalEl){
@@ -2790,105 +3176,95 @@ function setupPreviewModalExecute(modalEl, modalInstance){
                 }
             } catch(e){}
         };
+        const hideModalForConfirm = async () => {
+            if(modalHidden) return;
+            forceHideModal();
+            modalHidden = true;
+            await new Promise(resolve => requestAnimationFrame(() => resolve()));
+        };
+        const restoreModalIfHidden = () => {
+            if(!modalHidden) return;
+            modalHidden = false;
+            restoreModal();
+        };
         const waitForPaint = async () => {
             await new Promise(resolve => requestAnimationFrame(() => resolve()));
         };
         try {
             const execInfo = detectLocalEmulation();
             const confirmMsg = execInfo.shouldFake
-                ? 'Execute this scenario now?\n\nCORE not connected; will run with fake local emulation. Proceed?'
+                ? 'Execute this scenario now? CORE is not connected, so the run will use fake local emulation.'
                 : 'Execute this scenario now? This will start a CORE session.';
-            if(!window.confirm(confirmMsg)){
+            const { idx: scenarioIdx } = getActiveScenarioContext();
+            await hideModalForConfirm();
+            const confirmResult = await promptExecuteConfirmation({
+                message: confirmMsg,
+                scenarioIndex: scenarioIdx,
+                alertMessage: execInfo.shouldFake ? 'CORE not connected; run will use fake local emulation.' : '',
+                alertTone: execInfo.shouldFake ? 'warning' : 'info',
+                keepOpenOnConfirm: true,
+            });
+            if(!confirmResult?.confirmed){
+                restoreModalIfHidden();
                 execBtn.disabled = false;
                 execBtn.classList.remove('disabled');
                 return;
             }
-            forceHideModal();
             await waitForPaint();
             await new Promise(resolve => setTimeout(resolve, 0));
-            openRunProgress('Running CLI…');
-            maybeShowLocalEmulationHint();
-            try {
-                const statusEl = document.getElementById('runProgressStatus');
-                if(statusEl) statusEl.textContent = 'Starting…';
-                const metaEl = document.getElementById('runProgressMeta');
-                if(metaEl) metaEl.textContent = '';
-                const bar = document.getElementById('runProgressBar');
-                if(bar){
-                    bar.classList.add('progress-bar-animated');
-                    bar.textContent = 'Working…';
-                }
-            } catch(e){}
+            showExecuteProgressPanel(
+                execInfo.shouldFake ? 'Local emulation run' : 'Preparing CORE run…',
+                execInfo.shouldFake ? 'CORE not connected; using fake local emulation.' : `CORE ${execInfo.host}:${execInfo.port}`
+            );
             try {
                 const showBtn = document.getElementById('dockShowBtn');
                 if(showBtn && !showBtn.classList.contains('d-none')) showBtn.click();
             } catch(e){}
 
-            const setRunning = () => {
-                try {
-                    const statusEl = document.getElementById('runProgressStatus');
-                    if(statusEl) statusEl.textContent = 'Running…';
-                    const metaEl = document.getElementById('runProgressMeta');
-                    if(metaEl) metaEl.textContent = 'Streaming logs…';
-                    const bar = document.getElementById('runProgressBar');
-                    if(bar){
-                        bar.classList.add('progress-bar-animated');
-                        bar.textContent = 'Working…';
-                    }
-                } catch(e){}
-            };
-            const setFinished = (data) => {
-                try {
-                    const statusEl = document.getElementById('runProgressStatus');
-                    if(statusEl) statusEl.textContent = (data?.returncode === 0) ? 'Scenario started' : 'Finished with errors';
-                    const metaEl = document.getElementById('runProgressMeta');
-                    if(metaEl) metaEl.textContent = (data?.returncode === 0) ? 'Completed' : 'Finished';
-                    const bar = document.getElementById('runProgressBar');
-                    if(bar){
-                        bar.classList.remove('progress-bar-animated');
-                        bar.textContent = (data?.returncode === 0) ? 'Done' : 'Error';
-                    }
-                } catch(e){}
-            };
-            const setFailedToStart = (msg) => {
-                try {
-                    const statusEl = document.getElementById('runProgressStatus');
-                    if(statusEl) statusEl.textContent = 'Failed to start';
-                    const metaEl = document.getElementById('runProgressMeta');
-                    if(metaEl) metaEl.textContent = msg || '';
-                    const bar = document.getElementById('runProgressBar');
-                    if(bar){
-                        bar.classList.remove('progress-bar-animated');
-                        bar.textContent = 'Error';
-                    }
-                } catch(e){}
-            };
-
             let launchFailed = false;
             const result = await runSyncWithModal({
                 showProgressModal: false,
                 skipConfirm: true,
+                onRunId: (runId) => {
+                    bindExecuteProgressToRun(runId);
+                },
                 onTick: (data) => {
                     if(data && !data.done){
-                        setRunning();
+                        setExecuteProgressStatus('Running CLI…', 'Streaming logs…');
                     }
                 },
                 onComplete: (data) => {
-                    setFinished(data);
+                    if(data?.returncode === 0){
+                        completeExecuteProgressPanel(true, 'Scenario started', 'Redirecting to reports…');
+                        try {
+                            setTimeout(()=>{
+                                if(executeConfirmModalEl && window.bootstrap){
+                                    bootstrap.Modal.getOrCreateInstance(executeConfirmModalEl).hide();
+                                }
+                            }, 200);
+                        } catch(e){}
+                        try {
+                            scheduleScenarioRedirect("{{ url_for('reports_page') }}", { delay: 500 });
+                        } catch(e){}
+                    } else {
+                        completeExecuteProgressPanel(false, 'Finished with errors', 'Check logs for details.');
+                    }
                     try {
-                        if(data?.returncode === 0){
-                            setTimeout(()=>{ window.location.href = "{{ url_for('reports_page') }}"; }, 500);
+                        if(data?.returncode !== 0){
+                            restoreModal();
                         }
                     } catch(e){}
                 },
-                onError: () => {
-                    setFailedToStart('Unable to launch CLI');
+                onError: (err) => {
+                    const detail = (err && err.message) ? err.message : 'Unable to launch CLI';
+                    completeExecuteProgressPanel(false, 'Failed to start', detail);
                     launchFailed = true;
+                    restoreModal();
                 },
             });
             if(result === false){
                 if(!launchFailed){
-                    closeRunProgress();
+                    completeExecuteProgressPanel(false, 'Failed to start', 'Request aborted');
                     restoreModal();
                 }
                 return;
@@ -4227,6 +4603,13 @@ document.addEventListener('DOMContentLoaded', ()=>{
         let executing = false;
         const originalLabel = execBtn.textContent;
         const modalEl = document.getElementById('fullPreviewModal');
+        let modalHidden = false;
+        let allowPreviewRestore = true;
+        if(modalEl && !modalEl.dataset.executeVisibilityBound){
+            modalEl.addEventListener('shown.bs.modal', () => { modalHidden = false; });
+            modalEl.addEventListener('hidden.bs.modal', () => { modalHidden = true; });
+            modalEl.dataset.executeVisibilityBound = '1';
+        }
         const resolveModalInstance = () => {
             if(!modalEl || !window.bootstrap) return null;
             try {
@@ -4244,10 +4627,53 @@ document.addEventListener('DOMContentLoaded', ()=>{
             }
             const execInfo = detectLocalEmulation();
             const confirmMsg = execInfo.shouldFake
-                ? 'Execute this scenario now?\n\nCORE not connected; will run with fake local emulation. Proceed?'
+                ? 'Execute this scenario now? CORE is not connected, so the run will use fake local emulation.'
                 : 'Execute this scenario now? This will start a CORE session.';
-            if(!window.confirm(confirmMsg)) return;
+            const { idx: scenarioIdx } = getActiveScenarioContext();
             const modalInstance = resolveModalInstance();
+            allowPreviewRestore = true;
+            const hideModalForConfirm = async () => {
+                try { modalInstance?.hide(); } catch(e){}
+                if(modalEl){
+                    modalEl.classList.remove('show');
+                    modalEl.setAttribute('aria-hidden','true');
+                    modalEl.style.display = 'none';
+                }
+                const openModals = document.querySelectorAll('.modal.show');
+                if(openModals.length === 0){
+                    document.querySelectorAll('.modal-backdrop').forEach(b => { try { b.remove(); } catch(e){} });
+                    document.body.classList.remove('modal-open');
+                    document.body.style.removeProperty('paddingRight');
+                    document.body.style.removeProperty('overflow');
+                }
+                modalHidden = true;
+                await new Promise(resolve => requestAnimationFrame(() => resolve()));
+            };
+            const restoreModalIfHidden = () => {
+                if(!modalHidden || !allowPreviewRestore) return;
+                modalHidden = false;
+                try {
+                    if(modalInstance){
+                        modalInstance.show();
+                    } else if(modalEl){
+                        modalEl.style.display = 'block';
+                        modalEl.classList.add('show');
+                        document.body.classList.add('modal-open');
+                    }
+                } catch(e){}
+            };
+            await hideModalForConfirm();
+            allowPreviewRestore = false;
+            const confirmResult = await promptExecuteConfirmation({
+                message: confirmMsg,
+                scenarioIndex: scenarioIdx,
+                alertMessage: execInfo.shouldFake ? 'CORE not connected; run will use fake local emulation.' : '',
+                alertTone: execInfo.shouldFake ? 'warning' : 'info',
+                keepOpenOnConfirm: true,
+            });
+            if(!confirmResult?.confirmed){
+                return;
+            }
             const forceHideModal = () => {
                 try { modalInstance?.hide(); } catch(e){}
                 if(modalEl){
@@ -4262,8 +4688,10 @@ document.addEventListener('DOMContentLoaded', ()=>{
                     document.body.style.removeProperty('paddingRight');
                     document.body.style.removeProperty('overflow');
                 }
+                modalHidden = true;
             };
             const restoreModal = () => {
+                if(!allowPreviewRestore) return;
                 try {
                     if(modalInstance){
                         modalInstance.show();
@@ -4273,6 +4701,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
                         document.body.classList.add('modal-open');
                     }
                 } catch(e){}
+                modalHidden = false;
             };
             const waitForPaint = async () => {
                 await new Promise(resolve => requestAnimationFrame(() => resolve()));
@@ -4281,126 +4710,63 @@ document.addEventListener('DOMContentLoaded', ()=>{
             execBtn.disabled = true;
             execBtn.classList.add('disabled');
             if(originalLabel){ execBtn.textContent = 'Executing…'; }
-            let runStarted = false;
+            let launchFailed = false;
             try {
                 forceHideModal();
                 await waitForPaint();
-                openRunProgress('Executing scenario…');
-                maybeShowLocalEmulationHint();
-                try {
-                    document.getElementById('runProgressStatus').textContent = 'Starting…';
-                    document.getElementById('runProgressMeta').textContent = '';
-                    const bar = document.getElementById('runProgressBar');
-                    if(bar){ bar.classList.add('progress-bar-animated'); bar.textContent = 'Working…'; }
-                } catch(e){}
+                showExecuteProgressPanel(
+                    execInfo.shouldFake ? 'Local emulation run' : 'Preparing CORE run…',
+                    execInfo.shouldFake ? 'CORE not connected; using fake local emulation.' : `CORE ${execInfo.host}:${execInfo.port}`
+                );
                 // Ensure dock visible
                 try { const showBtn=document.getElementById('dockShowBtn'); if(showBtn && !showBtn.classList.contains('d-none')) showBtn.click(); } catch(e){}
                 appendLog('--- Execute (Full Preview) start: '+state.result_path+' ---','info');
-                const form = new FormData();
-                form.append('xml_path', state.result_path);
-                appendScenarioContextToFormData(form);
-                try {
-                    form.append('core_json', JSON.stringify(getCoreConfig(true)));
-                } catch (err) {
-                    form.append('core_json', '{}');
-                }
-                const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
-                if(!res.ok){
-                    appendLog('Failed to start execution (HTTP '+res.status+')','error');
-                    try {
-                        const statusEl = document.getElementById('runProgressStatus');
-                        if(statusEl) statusEl.textContent = 'Failed to start';
-                        const metaEl = document.getElementById('runProgressMeta');
-                        if(metaEl) metaEl.textContent = 'HTTP '+res.status;
-                        const bar = document.getElementById('runProgressBar');
-                        if(bar) bar.classList.remove('progress-bar-animated');
-                    } catch(e){}
-                    closeRunProgress();
-                    restoreModal();
-                    return;
-                }
-                const dataInit = await res.json();
-                const run_id = dataInit.run_id;
-                if(!run_id){
-                    appendLog('Execution start response missing run_id','error');
-                    try {
-                        const statusEl = document.getElementById('runProgressStatus');
-                        if(statusEl) statusEl.textContent = 'Failed to start';
-                        const metaEl = document.getElementById('runProgressMeta');
-                        if(metaEl) metaEl.textContent = 'Missing run id';
-                        const bar = document.getElementById('runProgressBar');
-                        if(bar) bar.classList.remove('progress-bar-animated');
-                    } catch(e){}
-                    closeRunProgress();
-                    restoreModal();
-                    return;
-                }
-                runStarted = true;
-                appendLog('Run ID: '+run_id,'info');
-                try {
-                    const statusEl = document.getElementById('runProgressStatus');
-                    if(statusEl) statusEl.textContent = 'Running…';
-                    const metaEl = document.getElementById('runProgressMeta');
-                    if(metaEl) metaEl.textContent = 'Streaming logs…';
-                } catch(e){}
-                runProgressRunId = run_id;
-                try { if(runProgressEvtSrc) runProgressEvtSrc.close(); } catch(e){}
-                runProgressEvtSrc = new EventSource('/stream/' + run_id);
-                runProgressEvtSrc.onmessage = ev => {
-                    if(ev && typeof ev.data === 'string') {
-                        try {
-                            runProgressLogLine(ev.data);
-                        } catch(e) { /* swallow */ }
-                    }
-                };
-                runProgressEvtSrc.addEventListener('end', ()=>{
-                    try { runProgressEvtSrc?.close(); } catch(e){}
-                    runProgressEvtSrc = null;
-                    runProgressLogLine('Execution stream ended');
-                });
-                // Poll status until done
-                (async function poll(){
-                    try {
-                        const r = await fetch('/run_status/' + run_id);
-                        if(!r.ok){ setTimeout(poll, 1200); return; }
-                        const st = await r.json();
-                        if(!st.done){ setTimeout(poll, 1000); return; }
-                        try {
-                            const metaEl = document.getElementById('runProgressMeta');
-                            if(metaEl) metaEl.textContent = st.returncode===0 ? 'Completed' : 'Finished';
-                            const bar = document.getElementById('runProgressBar');
-                            if(bar){ bar.classList.remove('progress-bar-animated'); bar.textContent = st.returncode===0 ? 'Done' : 'Error'; }
-                        } catch(e){}
-                        if(st.returncode===0){
-                            appendLog('Execution complete: success; redirecting to Reports','info');
-                            try {
-                                const statusEl = document.getElementById('runProgressStatus');
-                                if(statusEl) statusEl.textContent = 'Scenario started';
-                            } catch(e){}
-                            setTimeout(()=>{ window.location.href = "{{ url_for('reports_page') }}"; }, 700);
-                        } else {
-                            appendLog('Execution finished with errors (code '+st.returncode+')','error');
-                            try {
-                                const statusEl = document.getElementById('runProgressStatus');
-                                if(statusEl) statusEl.textContent = 'Finished with errors';
-                            } catch(e){}
+                const result = await runSyncWithModal({
+                    showProgressModal: false,
+                    skipConfirm: true,
+                    onRunId: (runId) => {
+                        bindExecuteProgressToRun(runId);
+                        appendLog('Run ID: '+runId,'info');
+                    },
+                    onTick: (data) => {
+                        if(data && !data.done){
+                            setExecuteProgressStatus('Running CLI…', 'Streaming logs…');
                         }
-                    } catch(e){ setTimeout(poll, 1500); }
-                })();
+                    },
+                    onComplete: (data) => {
+                        if(data?.returncode === 0){
+                            completeExecuteProgressPanel(true, 'Scenario started', 'Redirecting to reports…');
+                            try {
+                                setTimeout(()=>{
+                                    if(executeConfirmModalEl && window.bootstrap){
+                                        bootstrap.Modal.getOrCreateInstance(executeConfirmModalEl).hide();
+                                    }
+                                }, 200);
+                            } catch(e){}
+                            scheduleScenarioRedirect("{{ url_for('reports_page') }}", { delay: 600 });
+                        } else {
+                            completeExecuteProgressPanel(false, 'Finished with errors', 'Check logs for details.');
+                            restoreModal();
+                        }
+                    },
+                    onError: (err) => {
+                        launchFailed = true;
+                        const detail = (err && err.message) ? err.message : 'Unable to launch CLI';
+                        completeExecuteProgressPanel(false, 'Failed to start', detail);
+                        restoreModal();
+                    },
+                });
+                if(result === false){
+                    if(!launchFailed){
+                        completeExecuteProgressPanel(false, 'Failed to start', 'Request aborted');
+                        restoreModal();
+                    }
+                    return;
+                }
             } catch(e){
                 appendLog('Execution exception: '+e,'error');
-                try {
-                    const statusEl = document.getElementById('runProgressStatus');
-                    if(statusEl) statusEl.textContent = 'Exception starting run';
-                    const metaEl = document.getElementById('runProgressMeta');
-                    if(metaEl) metaEl.textContent = '';
-                    const bar = document.getElementById('runProgressBar');
-                    if(bar) bar.classList.remove('progress-bar-animated');
-                } catch(_){}
-                if(!runStarted){
-                    closeRunProgress();
-                    restoreModal();
-                }
+                completeExecuteProgressPanel(false, 'Failed to start', 'Unexpected error');
+                restoreModal();
             }
             finally {
                 execBtn.disabled = false;
@@ -5338,7 +5704,13 @@ function handleCoreFieldUpdate(inputEl, { rerender } = { rerender: false }) {
     const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
     const coreState = hitlState.core || (hitlState.core = {});
     let dirty = false;
-    if (field === 'grpc_port' || field === 'ssh_port') {
+    if (inputEl.type === 'checkbox') {
+        const value = !!inputEl.checked;
+        if (coreState[field] !== value) {
+            coreState[field] = value;
+            dirty = true;
+        }
+    } else if (field === 'grpc_port' || field === 'ssh_port') {
         const fallback = field === 'grpc_port' ? 50051 : 22;
         const parsed = parseInt(inputEl.value, 10);
         const sanitized = Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -5346,11 +5718,27 @@ function handleCoreFieldUpdate(inputEl, { rerender } = { rerender: false }) {
             coreState[field] = sanitized;
             dirty = true;
         }
-    } else if (field === 'ssh_host') {
+    } else if (field === 'ssh_host' || field === 'venv_bin' || field === 'ssh_username' || field === 'ssh_password') {
         const value = (inputEl.value || '').trim();
         if ((coreState[field] || '') !== value) {
             coreState[field] = value;
             dirty = true;
+            if (field === 'venv_bin') {
+                coreState.venv_test_status = null;
+                coreState.venv_test_message = null;
+                coreState.venv_test_at = null;
+                coreState.venv_test_python = null;
+                const modalIdxRaw = coreConnectionModal?.getAttribute('data-scen-idx');
+                const modalIdx = modalIdxRaw !== null ? parseInt(modalIdxRaw, 10) : NaN;
+                if (!Number.isNaN(modalIdx) && modalIdx === sidx) {
+                    setCoreVenvStatusDisplay(null, null);
+                }
+            } else if (field in {'ssh_host':1,'ssh_username':1,'ssh_password':1}) {
+                coreState.venv_test_status = null;
+                coreState.venv_test_message = null;
+                coreState.venv_test_at = null;
+                coreState.venv_test_python = null;
+            }
         }
     } else {
         const value = inputEl.value || '';
@@ -5360,6 +5748,10 @@ function handleCoreFieldUpdate(inputEl, { rerender } = { rerender: false }) {
         }
     }
     if (dirty) {
+        if (field === 'push_repo') {
+            if (!state.core) state.core = {};
+            state.core.push_repo = !!coreState[field];
+        }
         coreState.last_tested_status = null;
         coreState.last_tested_message = null;
         coreState.last_tested_at = null;
@@ -5386,6 +5778,8 @@ async function validateCoreConnection(sidx, options = {}) {
         successToastMessage = null,
         closeModalOnSuccess = false,
         suppressToasts = false,
+        rememberCredentials = true,
+        autoStartDaemon = false,
     } = options;
     if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) {
         return { ok: false, message: 'Scenario unavailable' };
@@ -5403,10 +5797,12 @@ async function validateCoreConnection(sidx, options = {}) {
             ssh_port: coreState.ssh_port || 22,
             ssh_username: coreState.ssh_username || '',
             ssh_password: coreState.ssh_password || '',
+                venv_bin: coreState.venv_bin || '',
             ssh_enabled: true,
             core_secret_id: coreState.core_secret_id || null,
             vm_key: vmKey,
             vm_node: vmNode,
+            auto_start_daemon: autoStartDaemon,
         },
     };
     enrichPayloadWithScenarioContext(body, { scenarioIndex: sidx, scenarioOverride: scenario });
@@ -5465,10 +5861,21 @@ async function validateCoreConnection(sidx, options = {}) {
             coreState.last_tested_at = nowIso;
             coreState.last_tested_host = data.host || coreState.grpc_host || '';
             coreState.last_tested_port = data.port || coreState.grpc_port || null;
-            coreState.core_secret_id = data.core_secret_id || (summary && summary.identifier) || null;
-            coreState.validated = !!coreState.core_secret_id;
-            coreState.last_validated_at = (summary && summary.stored_at) || nowIso;
-            coreState.stored_summary = summary;
+            const incomingSecretId = data.core_secret_id || (summary && summary.identifier) || null;
+            if (rememberCredentials) {
+                coreState.core_secret_id = incomingSecretId;
+                coreState.validated = !!incomingSecretId;
+                coreState.last_validated_at = (summary && summary.stored_at) || nowIso;
+                coreState.stored_summary = summary;
+            } else {
+                coreState.core_secret_id = coreState.core_secret_id || null;
+                if (!coreState.core_secret_id) {
+                    coreState.validated = false;
+                    coreState.last_validated_at = null;
+                    coreState.stored_summary = null;
+                }
+            }
+            syncGlobalCoreConnection(coreState, coreState.last_tested_host, coreState.last_tested_port);
             coreState.ssh_password = '';
             persistEditorState();
             const hidden = document.getElementById('scenarios_json');
@@ -5482,14 +5889,14 @@ async function validateCoreConnection(sidx, options = {}) {
             renderMain();
             if (typeof setCoreConnectionHint === 'function') {
                 if (hintOnSuccess) {
-                    setCoreConnectionHint(hintOnSuccess, 'success');
+                    setCoreConnectionHint(hintOnSuccess, rememberCredentials ? 'success' : 'warning');
                 } else if (hintOnStart) {
-                    setCoreConnectionHint('Validation successful.', 'success');
+                    setCoreConnectionHint(rememberCredentials ? 'Validation successful.' : 'Validated without storing credentials. Re-enter password next time.', rememberCredentials ? 'success' : 'warning');
                 }
             }
             if (!suppressToasts) {
                 try {
-                    const toastMessage = successToastMessage || data.message || 'CORE connection verified';
+                    const toastMessage = successToastMessage || data.message || (rememberCredentials ? 'CORE connection verified' : 'CORE verified (not stored)');
                     showToast(toastMessage, { autohide: true, delay: 2500 });
                 } catch (e) {}
             }
@@ -5504,6 +5911,7 @@ async function validateCoreConnection(sidx, options = {}) {
         coreState.last_tested_at = nowIso;
         coreState.last_tested_host = coreState.grpc_host || '';
         coreState.last_tested_port = coreState.grpc_port || null;
+        markGlobalCoreDisconnected();
         persistEditorState();
         const hidden = document.getElementById('scenarios_json');
         if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
@@ -5529,6 +5937,7 @@ async function validateCoreConnection(sidx, options = {}) {
         coreState.last_tested_at = new Date().toISOString();
         coreState.last_tested_host = coreState.grpc_host || '';
         coreState.last_tested_port = coreState.grpc_port || null;
+        markGlobalCoreDisconnected();
         persistEditorState();
         const hidden = document.getElementById('scenarios_json');
         if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
@@ -5552,6 +5961,47 @@ async function validateCoreConnection(sidx, options = {}) {
     }
 }
 
+async function hydrateCoreModalWithSecret(secretId, sidx, { scenarioName = '' } = {}) {
+    if (!secretId || !coreConnectionModal) return;
+    try {
+        const creds = await fetchStoredCoreCredentials(secretId);
+        if (!creds) return;
+        if (!coreConnectionModal || coreConnectionModal.getAttribute('data-scen-idx') !== String(sidx)) {
+            return;
+        }
+        const assignIfEmpty = (inputEl, value) => {
+            if (!inputEl || inputEl.disabled) return;
+            const strValue = value ?? '';
+            if (!inputEl.value && strValue !== undefined && strValue !== null) {
+                inputEl.value = strValue;
+            }
+        };
+        assignIfEmpty(coreModalInputs.grpc_host, creds.grpc_host || creds.host || '');
+        assignIfEmpty(coreModalInputs.grpc_port, creds.grpc_port || creds.port || 50051);
+        assignIfEmpty(coreModalInputs.ssh_host, creds.ssh_host || creds.host || '');
+        assignIfEmpty(coreModalInputs.ssh_port, creds.ssh_port || 22);
+        assignIfEmpty(coreModalInputs.ssh_username, creds.ssh_username || '');
+        assignIfEmpty(coreModalInputs.venv_bin, creds.venv_bin || CORE_DEFAULT_VENV_BIN);
+        if (coreModalInputs.ssh_password && !coreModalInputs.ssh_password.disabled) {
+            coreModalInputs.ssh_password.value = creds.ssh_password || '';
+            if (creds.ssh_password) {
+                coreModalInputs.ssh_password.removeAttribute('placeholder');
+            }
+        }
+        if (typeof setCoreConnectionHint === 'function') {
+            const label = scenarioName
+                ? `Loaded stored CORE credentials for ${scenarioName}.`
+                : 'Loaded stored CORE credentials from the vault.';
+            setCoreConnectionHint(label, creds.ssh_password ? 'success' : 'info');
+        }
+    } catch (err) {
+        console.warn('Failed to load stored CORE credentials', err);
+        if (typeof setCoreConnectionHint === 'function' && coreConnectionModal && coreConnectionModal.getAttribute('data-scen-idx') === String(sidx)) {
+            setCoreConnectionHint('Stored CORE credentials unavailable. Re-enter password to continue.', 'warning');
+        }
+    }
+}
+
 const CORE_MODAL_INPUT_IDS = {
     grpc_host: 'coreGrpcHost',
     grpc_port: 'coreGrpcPort',
@@ -5559,6 +6009,7 @@ const CORE_MODAL_INPUT_IDS = {
     ssh_port: 'coreSshPort',
     ssh_username: 'coreSshUsername',
     ssh_password: 'coreSshPassword',
+    venv_bin: 'coreVenvBin',
 };
 
 function resolveCoreModalReferences() {
@@ -5573,7 +6024,17 @@ function resolveCoreModalReferences() {
     }
     Object.entries(CORE_MODAL_INPUT_IDS).forEach(([field, id]) => {
         if (!coreModalInputs[field]) {
-            coreModalInputs[field] = document.getElementById(id);
+            const inputEl = document.getElementById(id);
+            if (inputEl) {
+                coreModalInputs[field] = inputEl;
+                if (!inputEl.dataset.coreModalInputBound) {
+                    inputEl.addEventListener('input', () => handleCoreModalInputChange(field));
+                    if (inputEl.type === 'checkbox') {
+                        inputEl.addEventListener('change', () => handleCoreModalInputChange(field));
+                    }
+                    inputEl.dataset.coreModalInputBound = '1';
+                }
+            }
         }
     });
 }
@@ -5595,6 +6056,12 @@ async function handleCoreConnectionSave(event) {
     const scenario = state.scenarios[sidx];
     const hitlState = ensureHitlStateForScenario(scenario);
     const coreState = hitlState.core || (hitlState.core = {});
+    const rememberToggle = document.getElementById('coreRememberCreds');
+    const rememberCreds = rememberToggle ? !!rememberToggle.checked : shouldRememberCore(hitlState);
+    coreState.remember_credentials = rememberCreds;
+    const autoStartToggle = document.getElementById('coreAutoStartDaemon');
+    const autoStartDaemon = autoStartToggle ? !!autoStartToggle.checked : !!(coreState.auto_start_daemon);
+    coreState.auto_start_daemon = autoStartDaemon;
     const proxState = hitlState.proxmox || {};
     const prerequisitesMet = !!(proxState.validated && proxState.secret_id && coreState.vm_key);
     if (!prerequisitesMet) {
@@ -5667,8 +6134,10 @@ async function handleCoreConnectionSave(event) {
         hintOnStart: 'Validating CORE connection…',
         hintOnSuccess: 'Connection saved and validated.',
         hintOnFailure: 'Validation failed',
-        successToastMessage: 'CORE connection saved & validated',
+        successToastMessage: rememberCreds ? 'CORE connection saved & validated' : 'CORE connection verified (not stored)',
         closeModalOnSuccess: true,
+        rememberCredentials: rememberCreds,
+        autoStartDaemon: autoStartDaemon,
     });
 }
 
@@ -5681,6 +6150,184 @@ function wireCoreConnectionSaveButton() {
         coreConnectionSaveBtn.addEventListener('click', handleCoreConnectionSave);
         coreConnectionSaveBtn.dataset.coreSaveBound = '1';
     }
+}
+
+function resolveCoreVenvTestElements() {
+    if (!coreTestVenvBtn) {
+        coreTestVenvBtn = document.getElementById('coreTestVenvBtn');
+    }
+    if (!coreVenvTestStatus) {
+        coreVenvTestStatus = document.getElementById('coreVenvTestStatus');
+    }
+}
+
+function setCoreVenvStatusDisplay(status, message) {
+    resolveCoreVenvTestElements();
+    if (!coreVenvTestStatus) {
+        return;
+    }
+    let text = message;
+    if (!text) {
+        if (status === 'success') {
+            text = 'Virtualenv verified.';
+        } else if (status === 'failure') {
+            text = 'Virtualenv test failed.';
+        } else {
+            text = 'Not tested.';
+        }
+    }
+    coreVenvTestStatus.textContent = text;
+    coreVenvTestStatus.classList.remove('text-success', 'text-danger', 'text-muted');
+    if (status === 'success') {
+        coreVenvTestStatus.classList.add('text-success');
+    } else if (status === 'failure') {
+        coreVenvTestStatus.classList.add('text-danger');
+    } else {
+        coreVenvTestStatus.classList.add('text-muted');
+    }
+}
+
+function handleCoreModalInputChange(fieldName) {
+    if (['venv_bin', 'ssh_host', 'ssh_username', 'ssh_password'].includes(fieldName)) {
+        setCoreVenvStatusDisplay(null, null);
+    }
+    updateCoreVenvTestButtonState();
+}
+
+function updateCoreVenvTestButtonState() {
+    resolveCoreModalReferences();
+    resolveCoreVenvTestElements();
+    if (!coreTestVenvBtn) {
+        return;
+    }
+    const venvInput = coreModalInputs.venv_bin;
+    const hostInput = coreModalInputs.ssh_host;
+    const usernameInput = coreModalInputs.ssh_username;
+    const passwordInput = coreModalInputs.ssh_password;
+    const grpcHostInput = coreModalInputs.grpc_host;
+    const inputsDisabled = !!(venvInput && venvInput.disabled);
+    const venvPath = (venvInput && venvInput.value ? venvInput.value.trim() : '');
+    const sshHost = (hostInput && hostInput.value ? hostInput.value.trim() : '')
+        || (grpcHostInput && grpcHostInput.value ? grpcHostInput.value.trim() : '');
+    const sshUsername = (usernameInput && usernameInput.value ? usernameInput.value.trim() : '');
+    const sshPassword = passwordInput ? passwordInput.value || '' : '';
+    const enable = !inputsDisabled && !!(venvPath && sshHost && sshUsername && sshPassword);
+    coreTestVenvBtn.disabled = !enable;
+}
+
+async function handleCoreVenvTest(event) {
+    event?.preventDefault?.();
+    resolveCoreModalReferences();
+    resolveCoreVenvTestElements();
+    if (!coreConnectionModal || !coreModalInputs.venv_bin) {
+        return;
+    }
+    const triggerButton = (event && event.currentTarget instanceof HTMLElement)
+        ? event.currentTarget
+        : coreTestVenvBtn;
+    if (!triggerButton) {
+        return;
+    }
+    const targetIdxRaw = coreConnectionModal.getAttribute('data-scen-idx') || String(activeIdx);
+    const sidx = parseInt(targetIdxRaw, 10);
+    if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) {
+        return;
+    }
+    const scenario = state.scenarios[sidx];
+    const hitlState = ensureHitlStateForScenario(scenario);
+    const coreState = hitlState.core || (hitlState.core = {});
+    const venvPath = (coreModalInputs.venv_bin.value || '').trim();
+    if (!venvPath) {
+        setCoreVenvStatusDisplay('failure', 'Enter a venv bin path to test.');
+        return;
+    }
+    const sshHost = (coreModalInputs.ssh_host?.value || coreState.ssh_host || coreState.grpc_host || '').trim()
+        || (coreModalInputs.grpc_host?.value || '').trim();
+    if (!sshHost) {
+        setCoreVenvStatusDisplay('failure', 'Enter the SSH host before testing the virtualenv.');
+        return;
+    }
+    const sshPortRaw = parseInt(coreModalInputs.ssh_port?.value || '', 10);
+    const sshPort = Number.isFinite(sshPortRaw) && sshPortRaw > 0
+        ? sshPortRaw
+        : (Number(coreState.ssh_port) || 22);
+    const sshUsername = (coreModalInputs.ssh_username?.value || '').trim();
+    if (!sshUsername) {
+        setCoreVenvStatusDisplay('failure', 'Enter the SSH username before testing the virtualenv.');
+        return;
+    }
+    const sshPassword = coreModalInputs.ssh_password?.value || '';
+    if (!sshPassword) {
+        setCoreVenvStatusDisplay('failure', 'Enter the SSH password before testing the virtualenv.');
+        return;
+    }
+    const originalLabel = triggerButton.textContent;
+    triggerButton.disabled = true;
+    triggerButton.textContent = 'Testing…';
+    setCoreVenvStatusDisplay(null, 'Testing virtualenv…');
+    const payload = {
+        venv_bin: venvPath,
+        ssh_host: sshHost,
+        ssh_port: sshPort,
+        ssh_username: sshUsername,
+        ssh_password: sshPassword,
+    };
+    const persistVenvResult = (status, message, extra = {}) => {
+        coreState.venv_test_status = status;
+        coreState.venv_test_message = message;
+        coreState.venv_test_at = new Date().toISOString();
+        coreState.venv_test_python = extra.python || null;
+        persistEditorState();
+    };
+    try {
+        const resp = await fetch('/test_core_venv', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify(payload),
+        });
+        let data = null;
+        try { data = await resp.json(); } catch (err) { data = null; }
+        if (resp.ok && data?.ok) {
+            const msg = data.message || 'Virtualenv verified.';
+            setCoreVenvStatusDisplay('success', msg);
+            persistVenvResult('success', msg, { python: data.python_executable || null });
+            if (typeof showToast === 'function') {
+                try { showToast('CORE venv verified', { autohide: true, delay: 2200 }); } catch (_) {}
+            }
+        } else {
+            const message = (data && data.error) ? data.error : `HTTP ${resp.status}`;
+            setCoreVenvStatusDisplay('failure', message);
+            persistVenvResult('failure', message, { python: null });
+            if (typeof showToast === 'function') {
+                try { showToast(`CORE venv test failed: ${message}`, { autohide: false }); } catch (_) {}
+            }
+        }
+    } catch (err) {
+        const message = err instanceof Error ? err.message : 'Virtualenv test failed.';
+        setCoreVenvStatusDisplay('failure', message);
+        persistVenvResult('failure', message, { python: null });
+        if (typeof showToast === 'function') {
+            try { showToast(message, { autohide: false }); } catch (_) {}
+        }
+    } finally {
+        triggerButton.disabled = false;
+        if (originalLabel !== undefined) {
+            triggerButton.textContent = originalLabel;
+        }
+    }
+}
+
+function wireCoreVenvTestButton() {
+    resolveCoreVenvTestElements();
+    if (!coreTestVenvBtn) {
+        return;
+    }
+    if (!coreTestVenvBtn.dataset.coreVenvBound) {
+        coreTestVenvBtn.addEventListener('click', handleCoreVenvTest);
+        coreTestVenvBtn.dataset.coreVenvBound = '1';
+    }
+    updateCoreVenvTestButtonState();
 }
 
 // --- Scenario multi-select support ---
@@ -5795,6 +6442,56 @@ function renderSidebar() {
     };
     if (selectAllBtn) selectAllBtn.onclick = (e) => { e.preventDefault(); selectAllScenarios(); };
     if (deleteSelectedBtn) deleteSelectedBtn.onclick = (e) => { e.preventDefault(); deleteSelectedScenarios(); };
+    const selectCoreVmBtn = document.getElementById('selectCoreVmBtn');
+    const configHitlBtn = document.getElementById('configHitlBtn');
+    const coreVmSelectModalEl = document.getElementById('coreVmSelectModal');
+    const configHitlModalEl = document.getElementById('externalIfxModal');
+    const openCoreVmSelectModal = () => {
+        if (!coreVmSelectModalEl || !window.bootstrap) return;
+        const modalInstance = bootstrap.Modal.getInstance(coreVmSelectModalEl)
+            || new bootstrap.Modal(coreVmSelectModalEl, { backdrop: true, keyboard: true });
+        modalInstance.show();
+    };
+
+    if (selectCoreVmBtn && !selectCoreVmBtn.dataset.hitlModalBound) {
+        selectCoreVmBtn.addEventListener('click', openCoreVmSelectModal);
+        selectCoreVmBtn.dataset.hitlModalBound = '1';
+    }
+
+    window.openCoreVmSelectModal = openCoreVmSelectModal;
+
+    (() => {
+        try {
+            const url = new URL(window.location.href);
+            if (url.searchParams.get('core_modal') === '1') {
+                setTimeout(openCoreVmSelectModal, 250);
+                url.searchParams.delete('core_modal');
+                const newQuery = url.searchParams.toString();
+                const queryPart = newQuery ? `?${newQuery}` : '';
+                const newUrl = `${url.pathname}${queryPart}${url.hash}`;
+                window.history.replaceState({}, '', newUrl);
+            }
+        } catch (err) {
+            console.warn('Failed to auto-open CORE VM modal', err);
+        }
+    })();
+    if (configHitlBtn && !configHitlBtn.dataset.hitlModalBound) {
+        configHitlBtn.addEventListener('click', () => {
+            if (configHitlBtn.disabled) {
+                const hint = configHitlBtn.getAttribute('title') || 'Complete Steps 1 and 2 first.';
+                if (typeof showToast === 'function') {
+                    showToast(hint, { autohide: true, delay: 2500 });
+                } else if (window.alert) {
+                    window.alert(hint);
+                }
+                return;
+            }
+            if (!configHitlModalEl || !window.bootstrap) return;
+            const modalInstance = bootstrap.Modal.getInstance(configHitlModalEl) || new bootstrap.Modal(configHitlModalEl, { backdrop: true, keyboard: true });
+            modalInstance.show();
+        });
+        configHitlBtn.dataset.hitlModalBound = '1';
+    }
     updateBulkButtonsState();
 }
 
@@ -5831,10 +6528,14 @@ function renderMain() {
         root.appendChild(metaCard);
     }
 
-    const existingHitlCard = document.getElementById('scenarioHitlCard');
-    if (existingHitlCard && existingHitlCard.parentNode) {
-        existingHitlCard.parentNode.removeChild(existingHitlCard);
-    }
+    const removeExistingCard = (cardId) => {
+        const existing = document.getElementById(cardId);
+        if (existing && existing.parentNode) {
+            existing.parentNode.removeChild(existing);
+        }
+    };
+    removeExistingCard('scenarioHitlCoreCard');
+    removeExistingCard('scenarioHitlConfigCard');
 
     const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
     const hitl = ensureHitlStateForScenario(scen);
@@ -5933,87 +6634,7 @@ function renderMain() {
         return '';
     })();
     const hostLookup = new Map(hostInterfaces.filter(it => it && typeof it === 'object').map(it => [it.name, it]));
-    const pickFirstNonEmpty = (...candidates) => {
-        for (let idx = 0; idx < candidates.length; idx += 1) {
-            const candidate = candidates[idx];
-            if (candidate === null || candidate === undefined) continue;
-            const text = String(candidate).trim();
-            if (text) return text;
-        }
-        return '';
-    };
-    // Ensure HITL interface entries retain the latest Proxmox adapter metadata discovered
-    // from the host-interface refresh. This feeds the External IFX payload builder so it
-    // can include interface_id when validating adapter selections.
-    const syncHitlProxmoxTargets = () => {
-        if (!hitl || !Array.isArray(hitl.interfaces)) return false;
-        let updated = false;
-        for (let ifaceIdx = 0; ifaceIdx < hitl.interfaces.length; ifaceIdx += 1) {
-            const entry = hitl.interfaces[ifaceIdx];
-            if (!entry || typeof entry !== 'object') continue;
-            const hostInfo = hostLookup.get(entry.name);
-            if (!hostInfo || !hostInfo.proxmox || typeof hostInfo.proxmox !== 'object') continue;
-            const hostProx = hostInfo.proxmox;
-            const rawRecord = hostProx.raw && typeof hostProx.raw === 'object' ? hostProx.raw : null;
-            const interfaceId = pickFirstNonEmpty(
-                hostProx.interface_id,
-                hostProx.id,
-                hostProx.adapter,
-                rawRecord && rawRecord.interface_id,
-                rawRecord && rawRecord.id,
-                rawRecord && rawRecord.adapter,
-                rawRecord && rawRecord.name
-            );
-            if (!interfaceId) continue;
-            const normalizedTarget = {
-                node: pickFirstNonEmpty(hostProx.vm_node, hostProx.node, rawRecord && rawRecord.node),
-                vmid: pickFirstNonEmpty(hostProx.vmid, hostProx.vm_id, rawRecord && rawRecord.vmid, rawRecord && rawRecord.vm_id),
-                interface_id: interfaceId,
-            };
-            const vmName = pickFirstNonEmpty(hostProx.vm_name, rawRecord && rawRecord.vm_name, rawRecord && rawRecord.name);
-            if (vmName) normalizedTarget.vm_name = vmName;
-            const vmKey = pickFirstNonEmpty(hostProx.vm_key, rawRecord && rawRecord.vm_key);
-            if (vmKey) normalizedTarget.vm_key = vmKey;
-            const macaddr = pickFirstNonEmpty(hostProx.macaddr, hostInfo.mac);
-            if (macaddr) normalizedTarget.macaddr = macaddr;
-            const bridge = pickFirstNonEmpty(hostProx.bridge, rawRecord && rawRecord.bridge, hostInfo.bridge);
-            if (bridge) normalizedTarget.bridge = bridge;
-            const model = pickFirstNonEmpty(hostProx.model, rawRecord && rawRecord.model);
-            if (model) normalizedTarget.model = model;
-            const currentTarget = (entry.proxmox_target && typeof entry.proxmox_target === 'object') ? entry.proxmox_target : null;
-            const fieldsToCompare = ['node', 'vmid', 'interface_id', 'vm_name', 'vm_key', 'macaddr', 'bridge', 'model'];
-            let shouldUpdate = !currentTarget;
-            if (!shouldUpdate) {
-                for (let fIdx = 0; fIdx < fieldsToCompare.length; fIdx += 1) {
-                    const field = fieldsToCompare[fIdx];
-                    const existingVal = currentTarget[field] === undefined ? '' : String(currentTarget[field]).trim();
-                    const nextVal = normalizedTarget[field] === undefined ? '' : String(normalizedTarget[field]).trim();
-                    if (existingVal !== nextVal) {
-                        shouldUpdate = true;
-                        break;
-                    }
-                }
-            }
-            if (!shouldUpdate) continue;
-            entry.proxmox_target = normalizedTarget;
-            updated = true;
-        }
-        return updated;
-    };
-    const proxTargetsSynced = syncHitlProxmoxTargets();
-    if (proxTargetsSynced) {
-        try { persistEditorState(); } catch (err) { console.warn('Failed to persist HITL Proxmox mapping state', err); }
-        const hidden = document.getElementById('scenarios_json');
-        if (hidden) {
-            try {
-                hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
-            } catch (err) {
-                console.warn('Failed to refresh hidden scenarios_json after Proxmox sync', err);
-            }
-        }
-    }
     const getBridgeName = (iface) => {
-        if (!iface || typeof iface !== 'object') return '';
         const direct = iface.bridge || iface.proxmox_bridge;
         if (direct) return String(direct).trim();
         const prox = iface.proxmox && typeof iface.proxmox === 'object' ? iface.proxmox : null;
@@ -6434,9 +7055,6 @@ function renderMain() {
                     </div>`;
         }).join('')
         : '<div class="text-muted small">No interfaces selected.</div>';
-    const hitlCard = document.createElement('div');
-    hitlCard.id = 'scenarioHitlCard';
-    hitlCard.className = 'card mb-3';
     const hitlInterfacesMarkup = hostInterfaces.length
         ? `
             ${interfacesGateNotice}
@@ -6461,14 +7079,16 @@ function renderMain() {
                         ${selectedInterfacesHtml}
                     </div>
                 </div>` : ''}
-            </div>`
+            </div>
+        </div>
+    </div>`
         : `
-            <div class="d-flex flex-column gap-3">
-                ${interfacesEmptyMessage}
-                <div>
-                    <button type="button" class="btn btn-sm btn-outline-secondary" data-hitl-refresh data-scen-idx="${activeIdx}" ${refreshInterfacesDisabledAttr} ${interfacesRefreshBusy ? 'data-refresh-busy="1"' : ''}>${retryButtonLabel}</button>
-                </div>
-            </div>`;
+            ${interfacesGateNotice}
+            ${interfacesEmptyMessage}
+            <div class="d-flex flex-wrap gap-2 mt-3">
+                <button type="button" class="btn btn-sm btn-outline-secondary" data-hitl-refresh data-scen-idx="${activeIdx}" ${refreshInterfacesDisabledAttr} ${interfacesRefreshBusy ? 'data-refresh-busy="1"' : ''}>${retryButtonLabel}</button>
+            </div>
+            ${refreshStatusHtml}`;
 
     let coreVmOptionsMarkup = '';
     if (proxInventory.length) {
@@ -6590,8 +7210,8 @@ function renderMain() {
             </div>`;
     })();
 
-    const hitlBody = `
-        <div class="mb-4">
+    const step1SectionHtml = `
+        <div class="mb-4" data-hitl-step="1">
             <h6 class="mb-2">Step 1 — Proxmox Resource</h6>
             <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
                 <div class="${proxSummaryClass} small" data-proxmox-summary="${activeIdx}">${proxSummaryHtml}</div>
@@ -6603,8 +7223,9 @@ function renderMain() {
                 </div>
             </div>
             <div class="small text-muted mt-2" data-proxmox-inventory-status="${activeIdx}">${proxInventoryStatusHtml}</div>
-        </div>
-        <div class="mb-4">
+        </div>`;
+    const step2SectionHtml = `
+        <div class="mb-4" data-hitl-step="2">
             <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
                 <h6 class="m-0">Step 2 — CORE VM &amp; Credentials</h6>
                 <button type="button" class="btn btn-sm btn-outline-secondary" data-hitl-core-clear data-scen-idx="${activeIdx}" ${(coreVmKey || coreHost || coreUser || coreHasSecret) ? '' : 'disabled'}>Clear CORE Settings</button>
@@ -6637,8 +7258,9 @@ function renderMain() {
                     </div>
                     <div class="small mt-2 ${coreStatusClass}" data-hitl-core-status="${activeIdx}">${coreStatusHtml}</div>
                 ` : ''}
-        </div>
-        <div class="mb-4">
+        </div>`;
+    const step3SectionHtml = `
+        <div class="mb-4" data-hitl-step="3">
             <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
                 <h6 class="m-0">Step 3 — Hardware in the Loop</h6>
                 <div class="form-check form-switch m-0" ${step3ToggleTooltipAttr}>
@@ -6650,8 +7272,9 @@ function renderMain() {
             <fieldset class="hitl-step-fieldset ${step3Disabled ? 'hitl-step-disabled' : ''}" ${step3Disabled ? 'disabled' : ''} data-hitl-step3-body>
                 ${hitlInterfacesMarkup}
             </fieldset>
-        </div>
-        <div>
+        </div>`;
+    const step4SectionHtml = `
+        <div data-hitl-step="4">
             <h6 class="mb-2">Step 4 — CTF Participant VM</h6>
             <div class="form-text mb-2">Choose a VM that will connect a participant to the scenario.</div>
             <fieldset class="hitl-step-fieldset ${step3Disabled ? 'hitl-step-disabled' : ''}" ${step3Disabled ? 'disabled' : ''} data-hitl-step4-body>
@@ -6665,19 +7288,29 @@ function renderMain() {
                     </div>`;
             })()}
         </div>`;
-    hitlCard.innerHTML = `
-        <div class="card-body">
-            ${hitlBody}
-            <div class="small text-muted mt-3" data-hitl-status="${activeIdx}"></div>
-        </div>`;
-    const ifxHitlContainer = document.getElementById('externalIfxHitlContainer');
-    if (ifxHitlContainer) {
-        ifxHitlContainer.appendChild(hitlCard);
-    } else if (baseScenarioCard && baseScenarioCard.parentNode) {
-        baseScenarioCard.parentNode.insertBefore(hitlCard, baseScenarioCard);
-    } else {
-        root.appendChild(hitlCard);
-    }
+    const coreSectionsHtml = `${step1SectionHtml}${step2SectionHtml}`;
+    const hitlSectionsHtml = `${step3SectionHtml}${step4SectionHtml}`;
+    const coreCard = document.createElement('div');
+    coreCard.id = 'scenarioHitlCoreCard';
+    coreCard.className = 'card mb-3';
+    coreCard.innerHTML = `<div class="card-body">${coreSectionsHtml}</div>`;
+    const hitlCard = document.createElement('div');
+    hitlCard.id = 'scenarioHitlConfigCard';
+    hitlCard.className = 'card mb-3';
+    hitlCard.innerHTML = `<div class="card-body">${hitlSectionsHtml}<div class="small text-muted mt-3" data-hitl-status="${activeIdx}"></div></div>`;
+    const mountCardInto = (cardEl, containerId) => {
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = '';
+            container.appendChild(cardEl);
+        } else if (baseScenarioCard && baseScenarioCard.parentNode) {
+            baseScenarioCard.parentNode.insertBefore(cardEl, baseScenarioCard);
+        } else {
+            root.appendChild(cardEl);
+        }
+    };
+    mountCardInto(coreCard, 'coreVmSelectContainer');
+    mountCardInto(hitlCard, 'externalIfxHitlContainer');
 
     if (typeof setupPreviewCollapsers === 'function') {
         setupPreviewCollapsers();
@@ -6688,6 +7321,7 @@ function renderMain() {
     toggleExternalIfxModalBusy(proxInventoryFetchInFlight.size > 0);
 
     updateHitlStatusForScenario(activeIdx);
+    updateHitlEntryButtons({ hitlAuthReady, proxValidated, coreHasSecret, coreVmKey });
     // Prefer previously selected/available interfaces when Steps 1 and 2 are validated.
     // Only consider auto-refresh when explicitly enabled and no prior data exists.
     const shouldAutoRefreshHostIfx = HOST_INTERFACES_AUTO_REFRESH_ENABLED
@@ -6706,9 +7340,16 @@ function renderMain() {
         const proxValidatedForScenario = !!(proxState.validated && proxState.secret_id);
         const hasVmSelection = !!coreState.vm_key;
         const inputsDisabled = !(proxValidatedForScenario && hasVmSelection);
+        const effectiveVenv = (coreState.venv_bin || '').trim() || CORE_DEFAULT_VENV_BIN;
         coreConnectionModal.setAttribute('data-scen-idx', String(sidx));
         if (coreConnectionForm) {
             coreConnectionForm.classList.remove('was-validated');
+        }
+        if (coreRememberInput) {
+            coreRememberInput.checked = shouldRememberCore(hitlState);
+        }
+        if (coreAutoStartInput) {
+            coreAutoStartInput.checked = !!(coreState.auto_start_daemon);
         }
         if (coreModalInputs.grpc_host) {
             coreModalInputs.grpc_host.value = coreState.grpc_host || '';
@@ -6720,6 +7361,11 @@ function renderMain() {
             coreModalInputs.grpc_port.value = port;
             coreModalInputs.grpc_port.disabled = inputsDisabled;
             coreModalInputs.grpc_port.setAttribute('data-scen-idx', String(sidx));
+        }
+        if (coreModalInputs.venv_bin) {
+            coreModalInputs.venv_bin.value = effectiveVenv;
+            coreModalInputs.venv_bin.disabled = inputsDisabled;
+            coreModalInputs.venv_bin.setAttribute('data-scen-idx', String(sidx));
         }
         if (coreModalInputs.ssh_host) {
             coreModalInputs.ssh_host.value = coreState.ssh_host || '';
@@ -6748,6 +7394,9 @@ function renderMain() {
             coreModalInputs.ssh_password.disabled = inputsDisabled;
             coreModalInputs.ssh_password.setAttribute('data-scen-idx', String(sidx));
         }
+        resolveCoreVenvTestElements();
+        setCoreVenvStatusDisplay(coreState.venv_test_status || null, coreState.venv_test_message || null);
+        updateCoreVenvTestButtonState();
         if (typeof setCoreConnectionHint === 'function') {
             if (!hasVmSelection) {
                 setCoreConnectionHint('Select a CORE VM to configure connection details.', 'warning');
@@ -6789,6 +7438,98 @@ function renderMain() {
     });
 
     wireCoreConnectionSaveButton();
+    wireCoreVenvTestButton();
+
+    (function installCoreNavGuard(){
+        const NAV_GUARD_DATA_KEY = 'coreNavGuardInstalled';
+        const navLink = document.getElementById('navCoreLink');
+        if (!navLink || navLink.dataset[NAV_GUARD_DATA_KEY] === '1') {
+            return;
+        }
+        navLink.dataset[NAV_GUARD_DATA_KEY] = '1';
+        const ensureModalHook = () => {
+            resolveCoreModalReferences();
+            const modal = coreConnectionModal;
+            if (modal && !modal.dataset.coreNavAwaitResetHook) {
+                modal.addEventListener('hidden.bs.modal', () => {
+                    window._coreNavAwaitingValidation = null;
+                });
+                modal.dataset.coreNavAwaitResetHook = '1';
+            }
+        };
+        const hasCoreVmSelection = () => {
+            try {
+                const { scenario } = getActiveScenarioContext();
+                if (!scenario) return false;
+                const hitlState = ensureHitlStateForScenario(scenario);
+                const coreState = hitlState.core || {};
+                const vmKey = (coreState.vm_key || '').toString().trim();
+                return vmKey.length > 0;
+            } catch (err) {
+                return false;
+            }
+        };
+        const ensureValidationHook = () => {
+            if (window.__coreNavValidationHookInstalled) {
+                return;
+            }
+            const original = window.validateCoreConnection;
+            if (typeof original !== 'function') {
+                return;
+            }
+            window.validateCoreConnection = async function wrappedValidateCoreConnection(...args) {
+                const result = await original.apply(this, args);
+                if (result && result.ok && window._coreNavAwaitingValidation) {
+                    const target = window._coreNavAwaitingValidation;
+                    window._coreNavAwaitingValidation = null;
+                    window.location.href = target;
+                }
+                return result;
+            };
+            window.__coreNavValidationHookInstalled = true;
+        };
+        const openModalForActiveScenario = () => {
+            const ctx = getActiveScenarioContext();
+            let scenarioIdx = Number.isInteger(ctx.idx) ? ctx.idx : null;
+            if (!Number.isInteger(scenarioIdx) && Number.isInteger(activeIdx)) {
+                scenarioIdx = activeIdx;
+            }
+            ensureModalHook();
+            if (typeof refreshCoreConnectionModal === 'function' && Number.isInteger(scenarioIdx)) {
+                refreshCoreConnectionModal(scenarioIdx);
+            }
+            if (coreConnectionModal && window.bootstrap) {
+                const modalInstance = bootstrap.Modal.getInstance(coreConnectionModal) || new bootstrap.Modal(coreConnectionModal, { backdrop: true, keyboard: true });
+                modalInstance.show();
+                setTimeout(() => {
+                    try {
+                        const primaryInput = coreModalInputs.grpc_host && !coreModalInputs.grpc_host.disabled
+                            ? coreModalInputs.grpc_host
+                            : coreModalInputs.ssh_username;
+                        primaryInput?.focus();
+                        primaryInput?.select?.();
+                    } catch (_) {}
+                }, 150);
+            }
+        };
+        navLink.addEventListener('click', (event) => {
+            if (hasCoreVmSelection()) {
+                return;
+            }
+            event.preventDefault();
+            window._coreNavAwaitingValidation = navLink.href;
+            ensureValidationHook();
+            openModalForActiveScenario();
+            if (typeof setCoreConnectionHint === 'function') {
+                setCoreConnectionHint('Select and validate a CORE VM before opening the CORE page.', 'warning');
+            }
+            try {
+                showToast('Configure a CORE VM before opening the CORE page.', { autohide: true, delay: 3200 });
+            } catch (toastErr) {
+                console.warn('CORE nav guard toast failed', toastErr);
+            }
+        });
+    })();
 
     // --- Host density normalization for Node Information ---
     try {
@@ -6945,7 +7686,7 @@ function renderMain() {
             ? `<div class="d-flex flex-wrap align-items-center justify-content-between gap-3 mb-3">
                     ${densityBaseHtml}
                     ${hostSummaryBlock}
-               </div>`
+                </div>`
             : '';
         let routingBadge = '';
         if (name === 'Routing') {
@@ -8032,6 +8773,7 @@ function wireHandlers() {
     const proxPortInput = document.getElementById('proxmoxPort');
     const proxUserInput = document.getElementById('proxmoxUsername');
     const proxPassInput = document.getElementById('proxmoxPassword');
+    const proxRememberInput = document.getElementById('proxmoxRememberCreds');
     const proxVerifyInput = document.getElementById('proxmoxVerifySsl');
     const setProxAssignHint = (message, tone = 'info') => {
         if (!proxAssignHint) return;
@@ -8042,6 +8784,17 @@ function wireHandlers() {
         proxAssignHint.classList.add(klass);
     };
     window.setProxAssignHint = setProxAssignHint;
+    if (proxRememberInput && !proxRememberInput.dataset.prefBound) {
+        proxRememberInput.addEventListener('change', () => {
+            if (!proxAssignModal) return;
+            const sidx = parseInt(proxAssignModal.getAttribute('data-scen-idx') || '', 10);
+            if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
+            const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
+            hitlState.proxmox.remember_credentials = !!proxRememberInput.checked;
+            persistEditorState();
+        });
+        proxRememberInput.dataset.prefBound = '1';
+    }
     coreConnectionModal = document.getElementById('coreConnectionModal');
     coreConnectionForm = document.getElementById('coreConnectionForm');
     coreConnectionHint = document.getElementById('coreConnectionHint');
@@ -8052,6 +8805,8 @@ function wireHandlers() {
     coreModalInputs.ssh_port = document.getElementById('coreSshPort');
     coreModalInputs.ssh_username = document.getElementById('coreSshUsername');
     coreModalInputs.ssh_password = document.getElementById('coreSshPassword');
+    coreRememberInput = document.getElementById('coreRememberCreds');
+    coreAutoStartInput = document.getElementById('coreAutoStartDaemon');
     setCoreConnectionHint = (message, tone = 'info') => {
         if (!coreConnectionHint) return;
         coreConnectionHint.textContent = message || '';
@@ -8069,8 +8824,30 @@ function wireHandlers() {
     };
     window.setCoreConnectionHint = setCoreConnectionHint;
     wireCoreConnectionSaveButton();
+    if (coreRememberInput && !coreRememberInput.dataset.prefBound) {
+        coreRememberInput.addEventListener('change', () => {
+            if (!coreConnectionModal) return;
+            const sidx = parseInt(coreConnectionModal.getAttribute('data-scen-idx') || '', 10);
+            if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
+            const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
+            hitlState.core.remember_credentials = !!coreRememberInput.checked;
+            persistEditorState();
+        });
+        coreRememberInput.dataset.prefBound = '1';
+    }
+    if (coreAutoStartInput && !coreAutoStartInput.dataset.prefBound) {
+        coreAutoStartInput.addEventListener('change', () => {
+            if (!coreConnectionModal) return;
+            const sidx = parseInt(coreConnectionModal.getAttribute('data-scen-idx') || '', 10);
+            if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
+            const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
+            hitlState.core.auto_start_daemon = !!coreAutoStartInput.checked;
+            persistEditorState();
+        });
+        coreAutoStartInput.dataset.prefBound = '1';
+    }
     document.querySelectorAll('[data-proxmox-assign]').forEach(btn => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', async () => {
             const sidx = parseInt(btn.getAttribute('data-scen-idx'));
             if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
             if (!proxAssignModal || !window.bootstrap) {
@@ -8080,6 +8857,7 @@ function wireHandlers() {
             const scenario = state.scenarios[sidx];
             const hitlState = ensureHitlStateForScenario(scenario);
             const prox = hitlState.proxmox || { url: '', port: 8006, username: '' };
+            const rememberCreds = shouldRememberProxmox(hitlState);
             proxAssignModal.setAttribute('data-scen-idx', String(sidx));
             const scenName = (scenario?.name || '').trim() || `Scenario ${sidx + 1}`;
             if (proxAssignError) {
@@ -8098,16 +8876,22 @@ function wireHandlers() {
                     proxVerifyInput.checked = true;
                 }
             }
-            if (proxUrlInput) proxUrlInput.value = prox.url || '';
-            if (proxPortInput) proxPortInput.value = prox.port ?? 8006;
-            if (proxUserInput) proxUserInput.value = prox.username || '';
+            const savedDefaults = getSavedProxmoxDefaults();
+            const prefillUrl = prox.url || savedDefaults.url || '';
+            const prefillPort = prox.port ?? savedDefaults.port ?? 8006;
+            const prefillUsername = prox.username || savedDefaults.username || '';
+            const prefillVerify = typeof prox.verify_ssl === 'boolean'
+                ? prox.verify_ssl
+                : (typeof savedDefaults.verify_ssl === 'boolean'
+                    ? savedDefaults.verify_ssl
+                    : (prefillUrl ? /^https:/i.test(prefillUrl) : true));
+            if (proxUrlInput) proxUrlInput.value = prefillUrl;
+            if (proxPortInput) proxPortInput.value = prefillPort;
+            if (proxUserInput) proxUserInput.value = prefillUsername;
             if (proxPassInput) proxPassInput.value = '';
-            if (proxVerifyInput) {
-                if (typeof prox.verify_ssl === 'boolean') {
-                    proxVerifyInput.checked = prox.verify_ssl;
-                } else {
-                    proxVerifyInput.checked = true;
-                }
+            if (proxVerifyInput) proxVerifyInput.checked = prefillVerify;
+            if (proxRememberInput) {
+                proxRememberInput.checked = rememberCreds;
             }
             let validatedStamp = 'a previous run';
             if (prox.last_validated_at) {
@@ -8123,7 +8907,9 @@ function wireHandlers() {
             const msg = prox.validated && prox.secret_id
                 ? `Validated on ${validatedStamp}. Re-enter password to re-validate.`
                 : 'Enter credentials to validate and store securely.';
-            setProxAssignHint(`Configure Proxmox resources for ${scenName}. ${msg}`, prox.validated && prox.secret_id ? 'success' : 'info');
+            const baseHintText = `Configure Proxmox resources for ${scenName}. ${msg}`;
+            const baseHintTone = prox.validated && prox.secret_id ? 'success' : 'info';
+            setProxAssignHint(baseHintText, baseHintTone);
             const modalObj = bootstrap.Modal.getInstance(proxAssignModal) || new bootstrap.Modal(proxAssignModal, { backdrop: true, keyboard: true });
             modalObj.show();
             setTimeout(() => {
@@ -8132,6 +8918,41 @@ function wireHandlers() {
                     proxUrlInput?.select?.();
                 } catch(e){}
             }, 150);
+            const secretId = typeof prox.secret_id === 'string' ? prox.secret_id.trim() : '';
+            if (secretId && rememberCreds) {
+                setProxAssignHint(`Restoring saved Proxmox credentials for ${scenName}…`, 'info');
+                try {
+                    const storedCreds = await fetchStoredProxmoxCredentials(secretId);
+                    if (storedCreds) {
+                        if (proxUrlInput && typeof storedCreds.url === 'string') {
+                            proxUrlInput.value = storedCreds.url;
+                        }
+                        if (proxPortInput && storedCreds.port !== undefined && storedCreds.port !== null) {
+                            proxPortInput.value = storedCreds.port;
+                        }
+                        if (proxUserInput && typeof storedCreds.username === 'string') {
+                            proxUserInput.value = storedCreds.username;
+                        }
+                        if (proxPassInput) {
+                            proxPassInput.value = storedCreds.password || '';
+                            proxPassInput.removeAttribute('placeholder');
+                        }
+                        if (proxVerifyInput && typeof storedCreds.verify_ssl === 'boolean') {
+                            proxVerifyInput.checked = storedCreds.verify_ssl;
+                        }
+                        setProxAssignHint(`${baseHintText} Saved credentials loaded.`, 'success');
+                    } else {
+                        setProxAssignHint(`${baseHintText} Stored credentials unavailable; please re-enter`, 'warning');
+                    }
+                } catch (err) {
+                    console.error('Failed to load stored Proxmox credentials', err);
+                    setProxAssignHint(`${baseHintText} Failed to load stored credentials; please re-enter.`, 'warning');
+                    if (proxPassInput) {
+                        proxPassInput.value = '';
+                        proxPassInput.placeholder = 'Enter password';
+                    }
+                }
+            }
         });
     });
     document.querySelectorAll('[data-proxmox-clear]').forEach(btn => {
@@ -8468,6 +9289,10 @@ let coreConnectionModal = null;
 let coreConnectionForm = null;
 let coreConnectionHint = null;
 let coreConnectionSaveBtn = null;
+let coreRememberInput = null;
+let coreAutoStartInput = null;
+let coreTestVenvBtn = null;
+let coreVenvTestStatus = null;
 const coreModalInputs = {
     grpc_host: null,
     grpc_port: null,
@@ -8475,8 +9300,399 @@ const coreModalInputs = {
     ssh_port: null,
     ssh_username: null,
     ssh_password: null,
+    venv_bin: null,
+};
+let executeConfirmModalEl = null;
+let executeConfirmMessageEl = null;
+let executeConfirmAlertEl = null;
+let executeConfirmRunBtn = null;
+let executeConfirmCancelBtn = null;
+let executePushRepoToggle = null;
+let executePushRepoWrapper = null;
+const executeConfirmState = {
+    pending: false,
+    resolve: null,
+    scenarioIndex: null,
+    keepOpenOnConfirm: false,
+};
+let executeProgressWrap = null;
+let executeProgressStatusEl = null;
+let executeProgressMetaEl = null;
+let executeProgressBarEl = null;
+let executeProgressLogEl = null;
+let executeProgressSpinnerEl = null;
+let executeProgressPopoutBtn = null;
+const executeProgressState = {
+    active: false,
+    logLines: [],
+    maxLines: 300,
+    runId: null,
+    heartbeatTimer: null,
+    heartbeatIndex: 0,
 };
 let setCoreConnectionHint = null;
+
+function ensureExecuteConfirmElements() {
+    if (!executeConfirmModalEl) {
+        executeConfirmModalEl = document.getElementById('executeConfirmModal');
+    }
+    if (!executeConfirmMessageEl) {
+        executeConfirmMessageEl = document.getElementById('executeConfirmMessage');
+    }
+    if (!executeConfirmAlertEl) {
+        executeConfirmAlertEl = document.getElementById('executeConfirmAlert');
+    }
+    if (!executeConfirmRunBtn) {
+        executeConfirmRunBtn = document.getElementById('executeConfirmRunBtn');
+    }
+    if (!executeConfirmCancelBtn) {
+        executeConfirmCancelBtn = document.getElementById('executeConfirmCancelBtn');
+    }
+    if (!executePushRepoWrapper) {
+        executePushRepoWrapper = document.getElementById('executePushRepoWrapper');
+    }
+    if (!executePushRepoToggle) {
+        executePushRepoToggle = document.getElementById('executePushRepoToggle');
+    }
+    if (executePushRepoToggle && !executePushRepoToggle.dataset.execBound) {
+        executePushRepoToggle.addEventListener('change', () => handleCoreFieldUpdate(executePushRepoToggle, { rerender: false }));
+        executePushRepoToggle.dataset.execBound = '1';
+    }
+    if (executeConfirmRunBtn && !executeConfirmRunBtn.dataset.execBound) {
+        executeConfirmRunBtn.addEventListener('click', () => {
+            const stayOpen = !!executeConfirmState.keepOpenOnConfirm;
+            settleExecuteConfirm({ confirmed: true, pushRepo: !!executePushRepoToggle?.checked });
+            if (!stayOpen) {
+                try {
+                    if (executeConfirmModalEl && window.bootstrap) {
+                        bootstrap.Modal.getOrCreateInstance(executeConfirmModalEl).hide();
+                    }
+                } catch (err) { /* ignore */ }
+            }
+        });
+        executeConfirmRunBtn.dataset.execBound = '1';
+    }
+    if (executeConfirmCancelBtn && !executeConfirmCancelBtn.dataset.execBound) {
+        executeConfirmCancelBtn.addEventListener('click', () => {
+            settleExecuteConfirm({ confirmed: false, pushRepo: !!executePushRepoToggle?.checked });
+        });
+        executeConfirmCancelBtn.dataset.execBound = '1';
+    }
+    if (executeConfirmModalEl && !executeConfirmModalEl.dataset.execHiddenBound) {
+        executeConfirmModalEl.addEventListener('hidden.bs.modal', () => {
+            settleExecuteConfirm({ confirmed: false, pushRepo: !!executePushRepoToggle?.checked });
+            resetExecuteProgressUI();
+        });
+        executeConfirmModalEl.dataset.execHiddenBound = '1';
+    }
+    if (executeConfirmModalEl && !executeConfirmModalEl.dataset.execShowBound) {
+        executeConfirmModalEl.addEventListener('show.bs.modal', () => {
+            resetExecuteProgressUI();
+        });
+        executeConfirmModalEl.dataset.execShowBound = '1';
+    }
+}
+
+function ensureExecuteProgressElements() {
+    if (!executeProgressWrap) executeProgressWrap = document.getElementById('executeProgressWrap');
+    if (!executeProgressStatusEl) executeProgressStatusEl = document.getElementById('executeProgressStatus');
+    if (!executeProgressMetaEl) executeProgressMetaEl = document.getElementById('executeProgressMeta');
+    if (!executeProgressBarEl) executeProgressBarEl = document.getElementById('executeProgressBar');
+    if (!executeProgressLogEl) executeProgressLogEl = document.getElementById('executeProgressLog');
+    if (!executeProgressSpinnerEl) executeProgressSpinnerEl = document.getElementById('executeProgressSpinner');
+    if (!executeProgressPopoutBtn) executeProgressPopoutBtn = document.getElementById('executeProgressPopoutBtn');
+    if (executeProgressPopoutBtn && !executeProgressPopoutBtn.dataset.execBound) {
+        executeProgressPopoutBtn.addEventListener('click', () => {
+            try {
+                if (executeConfirmModalEl && window.bootstrap) {
+                    bootstrap.Modal.getOrCreateInstance(executeConfirmModalEl).hide();
+                }
+            } catch (err) { /* ignore */ }
+            openRunProgress('Run logs');
+            maybeShowLocalEmulationHint();
+            executeProgressPopoutBtn.classList.add('d-none');
+        });
+        executeProgressPopoutBtn.dataset.execBound = '1';
+    }
+}
+
+function setExecutePushRepoDisabled(disabled) {
+    ensureExecuteConfirmElements();
+    if (executePushRepoToggle) {
+        executePushRepoToggle.disabled = !!disabled;
+    }
+    if (executePushRepoWrapper) {
+        executePushRepoWrapper.classList.toggle('hitl-step-disabled', !!disabled);
+    }
+}
+
+const EXECUTE_PROGRESS_HEARTBEAT_MESSAGES = [
+    'Establishing SSH tunnel to CORE host…',
+    'Validating remote CORE environment…',
+    'Packaging repository for upload…',
+    'Uploading repository; this may take a minute over slower links…',
+    'Syncing XML and preparing remote workspace…',
+];
+const EXECUTE_PROGRESS_HEARTBEAT_INTERVAL_MS = 4500;
+
+function emitExecuteProgressHeartbeatMessage() {
+    if (!executeProgressState.active) return;
+    const idx = Math.min(
+        executeProgressState.heartbeatIndex,
+        EXECUTE_PROGRESS_HEARTBEAT_MESSAGES.length - 1
+    );
+    const msg = EXECUTE_PROGRESS_HEARTBEAT_MESSAGES[idx];
+    appendExecuteProgressLog(`[ui] ${msg}`);
+    setExecuteProgressStatus('Preparing CORE run…', msg);
+    if (executeProgressState.heartbeatIndex < EXECUTE_PROGRESS_HEARTBEAT_MESSAGES.length - 1) {
+        executeProgressState.heartbeatIndex += 1;
+    }
+}
+
+function startExecuteProgressHeartbeat() {
+    stopExecuteProgressHeartbeat();
+    executeProgressState.heartbeatIndex = 0;
+    emitExecuteProgressHeartbeatMessage();
+    executeProgressState.heartbeatTimer = window.setInterval(() => {
+        emitExecuteProgressHeartbeatMessage();
+    }, EXECUTE_PROGRESS_HEARTBEAT_INTERVAL_MS);
+}
+
+function stopExecuteProgressHeartbeat() {
+    if (executeProgressState.heartbeatTimer) {
+        clearInterval(executeProgressState.heartbeatTimer);
+        executeProgressState.heartbeatTimer = null;
+    }
+}
+
+function resetExecuteProgressUI() {
+    ensureExecuteProgressElements();
+    stopExecuteProgressHeartbeat();
+    executeProgressState.active = false;
+    executeProgressState.logLines = [];
+    executeProgressState.runId = null;
+    executeProgressState.heartbeatIndex = 0;
+    if (executeProgressWrap) executeProgressWrap.classList.add('d-none');
+    if (executeProgressStatusEl) executeProgressStatusEl.textContent = '';
+    if (executeProgressMetaEl) executeProgressMetaEl.textContent = '';
+    if (executeProgressBarEl) {
+        executeProgressBarEl.style.width = '0%';
+        executeProgressBarEl.textContent = '0%';
+        executeProgressBarEl.classList.remove('bg-success', 'bg-danger', 'progress-bar-animated');
+        executeProgressBarEl.classList.add('progress-bar-striped');
+    }
+    if (executeProgressLogEl) executeProgressLogEl.textContent = '';
+    if (executeProgressSpinnerEl) executeProgressSpinnerEl.classList.remove('d-none');
+    if (executeProgressPopoutBtn) executeProgressPopoutBtn.classList.add('d-none');
+    setExecutePushRepoDisabled(false);
+    if (executeConfirmRunBtn) {
+        if (!executeConfirmRunBtn.dataset.defaultLabel) {
+            executeConfirmRunBtn.dataset.defaultLabel = executeConfirmRunBtn.textContent || 'Execute';
+        }
+        executeConfirmRunBtn.disabled = false;
+        executeConfirmRunBtn.textContent = executeConfirmRunBtn.dataset.defaultLabel;
+    }
+    if (executeConfirmCancelBtn) {
+        if (!executeConfirmCancelBtn.dataset.cancelLabel) {
+            executeConfirmCancelBtn.dataset.cancelLabel = executeConfirmCancelBtn.textContent || 'Cancel';
+        }
+        executeConfirmCancelBtn.disabled = false;
+        executeConfirmCancelBtn.textContent = executeConfirmCancelBtn.dataset.cancelLabel;
+    }
+}
+
+function showExecuteProgressPanel(status, meta) {
+    ensureExecuteProgressElements();
+    stopExecuteProgressHeartbeat();
+    executeProgressState.active = true;
+    executeProgressState.logLines = [];
+    setExecutePushRepoDisabled(true);
+    if (executeProgressWrap) executeProgressWrap.classList.remove('d-none');
+    if (executeProgressSpinnerEl) executeProgressSpinnerEl.classList.remove('d-none');
+    if (executeProgressBarEl) executeProgressBarEl.classList.add('progress-bar-animated');
+    if (executeConfirmRunBtn) {
+        if (!executeConfirmRunBtn.dataset.defaultLabel) {
+            executeConfirmRunBtn.dataset.defaultLabel = executeConfirmRunBtn.textContent || 'Execute';
+        }
+        executeConfirmRunBtn.disabled = true;
+        executeConfirmRunBtn.textContent = 'Executing…';
+    }
+    if (executeConfirmCancelBtn) {
+        if (!executeConfirmCancelBtn.dataset.cancelLabel) {
+            executeConfirmCancelBtn.dataset.cancelLabel = executeConfirmCancelBtn.textContent || 'Cancel';
+        }
+        executeConfirmCancelBtn.textContent = 'Hide';
+        executeConfirmCancelBtn.disabled = false;
+    }
+    setExecuteProgressStatus(status || 'Preparing run…', meta || '');
+    setExecuteProgressPercent(0, '0%');
+    startExecuteProgressHeartbeat();
+}
+
+function setExecuteProgressStatus(main, meta) {
+    if (!executeProgressState.active) return;
+    if (executeProgressStatusEl && main !== undefined) {
+        executeProgressStatusEl.textContent = main || '';
+    }
+    if (executeProgressMetaEl && meta !== undefined) {
+        executeProgressMetaEl.textContent = meta || '';
+    }
+}
+
+function setExecuteProgressPercent(percent, label) {
+    if (!executeProgressState.active) return;
+    if (!executeProgressBarEl) return;
+    const clamped = Math.max(0, Math.min(100, Number(percent) || 0));
+    executeProgressBarEl.style.width = clamped.toFixed(1).replace(/\.0$/, '') + '%';
+    executeProgressBarEl.textContent = label || clamped.toFixed(0) + '%';
+}
+
+function appendExecuteProgressLog(line) {
+    if (!executeProgressState.active || !executeProgressLogEl) return;
+    const normalized = (line || '').trimEnd();
+    executeProgressState.logLines.push(normalized);
+    if (executeProgressState.logLines.length > executeProgressState.maxLines) {
+        executeProgressState.logLines.shift();
+    }
+    executeProgressLogEl.textContent = executeProgressState.logLines.join('\n');
+    executeProgressLogEl.scrollTop = executeProgressLogEl.scrollHeight;
+}
+
+function bindExecuteProgressToRun(runId) {
+    executeProgressState.runId = runId || null;
+    stopExecuteProgressHeartbeat();
+    if (executeProgressPopoutBtn) executeProgressPopoutBtn.classList.remove('d-none');
+    setExecuteProgressStatus('Running CLI…', 'Streaming logs…');
+}
+
+function completeExecuteProgressPanel(success, message, meta) {
+    if (!executeProgressState.active) return;
+    stopExecuteProgressHeartbeat();
+    if (executeProgressSpinnerEl) executeProgressSpinnerEl.classList.add('d-none');
+    if (executeProgressBarEl) {
+        executeProgressBarEl.classList.remove('progress-bar-striped', 'progress-bar-animated');
+        executeProgressBarEl.classList.remove('bg-danger', 'bg-success');
+        executeProgressBarEl.classList.add(success ? 'bg-success' : 'bg-danger');
+        executeProgressBarEl.style.width = success ? '100%' : executeProgressBarEl.style.width || '100%';
+        executeProgressBarEl.textContent = success ? 'Done' : 'Error';
+    }
+    setExecuteProgressStatus(message || (success ? 'Scenario started' : 'Failed to start'), meta || '');
+    if (executeConfirmCancelBtn) {
+        executeConfirmCancelBtn.textContent = 'Close';
+        executeConfirmCancelBtn.disabled = false;
+    }
+    if (executeConfirmRunBtn) {
+        executeConfirmRunBtn.disabled = true;
+    }
+    setExecutePushRepoDisabled(false);
+}
+
+function handleExecuteProgressLog(line) {
+    if (!executeProgressState.active) return;
+    stopExecuteProgressHeartbeat();
+    appendExecuteProgressLog(line);
+    if (!line) return;
+    if (/\[remote\]\s+Repo upload starting/i.test(line)) {
+        setExecuteProgressStatus('Copying repository…', line.replace('[remote]', '').trim());
+        setExecuteProgressPercent(1, 'Starting…');
+        return;
+    }
+    const repoMatch = /\[remote\]\s+Repo upload\s+(\d+(?:\.\d+)?)%.*\((\d+)\/(\d+)\s*KiB/i.exec(line);
+    if (repoMatch) {
+        const pct = parseFloat(repoMatch[1]) || 0;
+        const cur = repoMatch[2];
+        const total = repoMatch[3];
+        setExecuteProgressStatus('Copying repository…', `${cur} / ${total} KiB`);
+        setExecuteProgressPercent(pct, `${pct.toFixed(1)}%`);
+        return;
+    }
+    if (/\[remote\]\s+Repo upload complete/i.test(line)) {
+        setExecuteProgressStatus('Repository copied', 'Preparing workspace…');
+        setExecuteProgressPercent(100, '100%');
+        return;
+    }
+    if (/\[remote\]\s+Workspace:/i.test(line)) {
+        setExecuteProgressStatus('Remote workspace ready', line.replace('[remote]', '').trim());
+        setExecuteProgressPercent(100, 'Workspace ready');
+        return;
+    }
+}
+
+function settleExecuteConfirm(result) {
+    if (!executeConfirmState.pending) {
+        return;
+    }
+    executeConfirmState.pending = false;
+    executeConfirmState.keepOpenOnConfirm = false;
+    const resolver = executeConfirmState.resolve;
+    executeConfirmState.resolve = null;
+    const scenarioIndex = executeConfirmState.scenarioIndex;
+    executeConfirmState.scenarioIndex = null;
+    if (typeof result !== 'object' || result === null) {
+        resolver?.({ confirmed: false, pushRepo: !!executePushRepoToggle?.checked, scenarioIndex });
+        return;
+    }
+    resolver?.({ ...result, scenarioIndex });
+}
+
+function updateExecuteConfirmAlert(message, tone = 'warning') {
+    if (!executeConfirmAlertEl) {
+        return;
+    }
+    const toneClasses = ['alert-warning', 'alert-info', 'alert-danger', 'alert-success'];
+    executeConfirmAlertEl.classList.remove(...toneClasses);
+    if (!message) {
+        executeConfirmAlertEl.textContent = '';
+        executeConfirmAlertEl.classList.add('d-none');
+        return;
+    }
+    executeConfirmAlertEl.textContent = message;
+    const toneClass = tone === 'danger' ? 'alert-danger'
+        : tone === 'info' ? 'alert-info'
+        : tone === 'success' ? 'alert-success'
+        : 'alert-warning';
+    executeConfirmAlertEl.classList.remove('d-none');
+    executeConfirmAlertEl.classList.add(toneClass);
+}
+
+async function promptExecuteConfirmation(options = {}) {
+    const { idx: activeScenarioIdx } = getActiveScenarioContext();
+    const scenarioIndex = Number.isInteger(options.scenarioIndex) ? options.scenarioIndex : activeScenarioIdx;
+    const message = options.message || 'Execute this scenario now? This will start a CORE session.';
+    const confirmLabel = options.confirmLabel || 'Execute';
+    const alertMessage = options.alertMessage || '';
+    const alertTone = options.alertTone || 'warning';
+    const pushDefault = getScenarioPushRepoValue(scenarioIndex);
+    const keepOpenOnConfirm = !!options.keepOpenOnConfirm;
+    ensureExecuteConfirmElements();
+    if (!executeConfirmModalEl || !window.bootstrap) {
+        const confirmed = window.confirm(message);
+        return { confirmed, pushRepo: pushDefault, scenarioIndex };
+    }
+    executeConfirmState.pending = true;
+    executeConfirmState.scenarioIndex = Number.isInteger(scenarioIndex) ? scenarioIndex : null;
+    executeConfirmState.keepOpenOnConfirm = keepOpenOnConfirm;
+    if (executeConfirmMessageEl) {
+        executeConfirmMessageEl.textContent = message;
+    }
+    updateExecuteConfirmAlert(alertMessage, alertTone);
+    if (executeConfirmRunBtn) {
+        executeConfirmRunBtn.textContent = confirmLabel;
+    }
+    if (executePushRepoToggle) {
+        executePushRepoToggle.checked = !!pushDefault;
+        executePushRepoToggle.setAttribute('data-scen-idx', Number.isInteger(scenarioIndex) ? String(scenarioIndex) : '-1');
+    }
+    if (executePushRepoWrapper) {
+        executePushRepoWrapper.classList.remove('d-none');
+    }
+    resetExecuteProgressUI();
+    const modalInstance = bootstrap.Modal.getOrCreateInstance(executeConfirmModalEl);
+    return new Promise((resolve) => {
+        executeConfirmState.resolve = resolve;
+        modalInstance.show();
+    });
+}
 
 render();
 
@@ -8538,6 +9754,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const proxPortInput = document.getElementById('proxmoxPort');
     const proxUserInput = document.getElementById('proxmoxUsername');
     const proxPassInput = document.getElementById('proxmoxPassword');
+    const proxRememberInput = document.getElementById('proxmoxRememberCreds');
     const clearProxError = () => {
         if (!proxAssignError) return;
         proxAssignError.textContent = '';
@@ -8618,6 +9835,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const scenario = state.scenarios[sidx];
         const hitlState = ensureHitlStateForScenario(scenario);
         const prox = hitlState.proxmox || {};
+        const rememberCreds = proxRememberInput ? !!proxRememberInput.checked : true;
+        hitlState.proxmox.remember_credentials = rememberCreds;
         const passVal = proxPassInput?.value ?? '';
         if (!passVal && !prox.secret_id) {
             showProxError('Password is required.');
@@ -8626,53 +9845,30 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         const verifyInput = document.getElementById('proxmoxVerifySsl');
         const verifySsl = verifyInput ? !!verifyInput.checked : /^https:/i.test(urlVal);
-
-        const prevProxState = hitlState.proxmox && typeof hitlState.proxmox === 'object' ? hitlState.proxmox : {};
-        const proxIdentityChanged = (prevProxState.url || '') !== urlVal || (prevProxState.username || '') !== userVal;
-        const needsPendingPersist = !prevProxState.secret_id || proxIdentityChanged || (prevProxState.port ?? 8006) !== portVal || (prevProxState.verify_ssl ?? true) !== verifySsl;
-        if (needsPendingPersist) {
-            const pendingProx = {
-                ...prevProxState,
-                url: urlVal,
-                port: portVal,
-                username: userVal,
-                verify_ssl: verifySsl,
-                validated: false,
-                last_validated_at: proxIdentityChanged ? null : prevProxState.last_validated_at ?? null,
-                last_message: 'Credentials pending validation.',
-            };
-            if (proxIdentityChanged) {
-                pendingProx.inventory = null;
-                pendingProx.inventory_error = null;
-            }
-            hitlState.proxmox = pendingProx;
-            try { persistEditorState(); } catch (err) { console.warn('Failed to persist pending Proxmox state', err); }
-            const hidden = document.getElementById('scenarios_json');
-            if (hidden) {
-                try { hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx }); } catch (err) { console.warn('Failed to sync hidden scenarios_json after pending Proxmox update', err); }
-            }
-            try { updateProxmoxSummary(sidx); } catch (err) { console.warn('Failed to refresh Proxmox summary after pending update', err); }
-        }
-        const reuseSecretId = (!passVal && prox.secret_id && !proxIdentityChanged) ? prox.secret_id : undefined;
+        persistSavedProxmoxDefaults({ url: urlVal, port: portVal, username: userVal, verify_ssl: verifySsl });
         setProxAssignBusy(true);
         setProxAssignHint('Validating credentials with Proxmox…', 'info');
         let data = null;
+        const requestPayload = {
+            url: urlVal,
+            port: portVal,
+            username: userVal,
+            password: passVal,
+            verify_ssl: verifySsl,
+            scenario_index: sidx,
+            scenario_name: scenario?.name || '',
+            timeout: 8.0,
+            remember_credentials: rememberCreds,
+        };
+        if (rememberCreds && !passVal && prox.secret_id) {
+            requestPayload.reuse_secret_id = prox.secret_id;
+        }
         try {
             const resp = await fetch('/api/proxmox/validate', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 credentials: 'same-origin',
-                body: JSON.stringify({
-                    url: urlVal,
-                    port: portVal,
-                    username: userVal,
-                    password: passVal,
-                    reuse_secret_id: reuseSecretId,
-                    verify_ssl: verifySsl,
-                    scenario_index: sidx,
-                    scenario_name: scenario?.name || '',
-                    timeout: 8.0,
-                }),
+                body: JSON.stringify(requestPayload),
             });
             try {
                 data = await resp.json();
@@ -8692,17 +9888,29 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         try {
             const summary = data?.summary || {};
-            hitlState.proxmox = {
+            const previousSecretId = hitlState.proxmox?.secret_id || null;
+            const nowIso = new Date().toISOString();
+            const updatedProx = {
                 ...hitlState.proxmox,
                 url: urlVal,
                 port: summary.port ?? portVal,
                 username: summary.username ?? userVal,
                 verify_ssl: summary.verify_ssl ?? verifySsl,
-                secret_id: data?.secret_id || summary.identifier || hitlState.proxmox?.secret_id || null,
-                validated: true,
-                last_validated_at: summary.stored_at || new Date().toISOString(),
-                last_message: data?.message || 'Credentials validated.',
+                last_message: data?.message || (rememberCreds ? 'Credentials validated.' : 'Credentials validated (not stored).'),
             };
+            if (rememberCreds) {
+                const newSecretId = data?.secret_id || summary.identifier || null;
+                updatedProx.secret_id = newSecretId;
+                updatedProx.validated = !!newSecretId;
+                updatedProx.last_validated_at = summary.stored_at || nowIso;
+            } else {
+                updatedProx.secret_id = previousSecretId;
+                if (!previousSecretId) {
+                    updatedProx.validated = false;
+                    updatedProx.last_validated_at = null;
+                }
+            }
+            hitlState.proxmox = updatedProx;
             if ('password' in hitlState.proxmox) {
                 delete hitlState.proxmox.password;
             }
@@ -8710,11 +9918,15 @@ document.addEventListener('DOMContentLoaded', () => {
             persistEditorState();
             const hidden = document.getElementById('scenarios_json');
             if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
-            try { showToast('Refreshing Proxmox VM inventory…', { autohide: true, delay: 1500 }); } catch (e) {}
-            await fetchProxmoxInventory(sidx, { force: true });
+            if (rememberCreds && hitlState.proxmox.secret_id) {
+                try { showToast('Refreshing Proxmox VM inventory…', { autohide: true, delay: 1500 }); } catch (e) {}
+                await fetchProxmoxInventory(sidx, { force: true });
+            }
             if (proxPassInput) proxPassInput.value = '';
-            setProxAssignHint(data?.message || 'Proxmox credentials validated and stored securely.', 'success');
-            try { showToast(data?.message || 'Proxmox credentials validated', { autohide: true, delay: 2500 }); } catch(e) {}
+            const successMessage = data?.message || (rememberCreds ? 'Proxmox credentials validated and stored securely.' : 'Credentials validated but not stored. Re-enter credentials when needed.');
+            const successTone = rememberCreds ? 'success' : 'warning';
+            setProxAssignHint(successMessage, successTone);
+            try { showToast(successMessage, { autohide: true, delay: 2500 }); } catch(e) {}
             const modalInstance = window.bootstrap ? bootstrap.Modal.getInstance(proxAssignModal) : null;
             setTimeout(() => { modalInstance?.hide(); }, 400);
         } catch (err) {
@@ -9101,7 +10313,7 @@ async function pollRunStatus(runId) {
             setTimeout(() => pollRunStatus(runId), 1000);
         } else {
             if (data.returncode === 0) {
-                setTimeout(() => { window.location.href = "{{ url_for('reports_page') }}"; }, 500);
+                scheduleScenarioRedirect("{{ url_for('reports_page') }}", { delay: 500 });
             }
         }
     } catch(e) {
@@ -9151,6 +10363,7 @@ function runProgressLogLine(s){
     } catch(e){}
     appendLog(line, lvl);
     pre.parentElement?.scrollTo({ top: pre.parentElement.scrollHeight });
+    handleExecuteProgressLog(line);
 }
 function detectLocalEmulation(){
     const normalizeHost = (raw) => {
@@ -9303,13 +10516,54 @@ async function runSyncWithModal(arg){
     }
     const execInfo = detectLocalEmulation();
     const confirmMsg = execInfo.shouldFake
-        ? 'CORE not connected; will run with fake local emulation. Proceed?'
+        ? 'CORE not connected; this run will use fake local emulation. Proceed?'
         : 'This will generate a CORE scenario and attempt to start it. Proceed?';
-    if (!skipConfirm && !window.confirm(confirmMsg)) { logInfo('Run CLI cancelled by user at confirmation'); return false; }
+    if (!skipConfirm) {
+        const { idx: scenarioIdx } = getActiveScenarioContext();
+        const confirmResult = await promptExecuteConfirmation({
+            message: confirmMsg,
+            scenarioIndex: scenarioIdx,
+            alertMessage: execInfo.shouldFake ? 'CORE not connected; run will use fake local emulation.' : '',
+            alertTone: execInfo.shouldFake ? 'warning' : 'info',
+        });
+        if (!confirmResult?.confirmed) {
+            logInfo('Run CLI cancelled by user at confirmation');
+            return false;
+        }
+    }
     if(showProgressModal){
         openRunProgress('Running CLI…');
         maybeShowLocalEmulationHint();
     }
+    const readErrorMessage = async (response) => {
+        if(!response) return '';
+        try {
+            const ct = response.headers?.get?.('content-type') || '';
+            if(ct && ct.includes('application/json')){
+                const data = await response.json();
+                if(data && typeof data === 'object'){
+                    if(typeof data.error === 'string' && data.error.trim()){
+                        return data.error.trim();
+                    }
+                    return JSON.stringify(data);
+                }
+            }
+        } catch(e) {
+            try {
+                const txt = await response.text();
+                if(txt && txt.trim()) return txt.trim();
+            } catch(_err) {
+                return '';
+            }
+            return '';
+        }
+        try {
+            const txt = await response.text();
+            if(txt && txt.trim()) return txt.trim();
+        } catch(_){}
+        const statusText = response.statusText ? ` ${response.statusText}` : '';
+        return `HTTP ${response.status}${statusText}`.trim();
+    };
     try {
         // Ensure dock is visible
         try {
@@ -9326,23 +10580,28 @@ async function runSyncWithModal(arg){
         }
         const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
         if(!res.ok){
-            runProgressLogLine('Failed to start CLI');
+            const detail = await readErrorMessage(res);
+            const message = detail || `HTTP ${res.status}`;
+            runProgressLogLine('Failed to start CLI' + (detail ? `: ${detail}` : ''));
             if(showProgressModal){
                 try {
                     const statusEl = document.getElementById('runProgressStatus');
                     if(statusEl) statusEl.textContent = 'Failed to start';
                     const metaEl = document.getElementById('runProgressMeta');
-                    if(metaEl) metaEl.textContent = 'HTTP ' + res.status;
+                    if(metaEl) metaEl.textContent = message;
                     const bar = document.getElementById('runProgressBar');
                     if(bar){ bar.classList.remove('progress-bar-animated'); bar.textContent = 'Error'; }
                 } catch(e){}
             }
-            try { opts.onError?.(new Error('Failed to start CLI')); } catch(e){}
+            try { opts.onError?.(new Error(message)); } catch(e){}
             return false;
         }
         const dataInit = await res.json();
         const run_id = dataInit?.run_id;
-        runProgressRunId = run_id;
+        if(run_id){
+            runProgressRunId = run_id;
+            try { opts.onRunId?.(run_id); } catch(e){}
+        }
         if(!run_id){
             runProgressLogLine('Execution start response missing run_id');
             if(showProgressModal){
@@ -9389,7 +10648,7 @@ async function runSyncWithModal(arg){
                     try { opts.onComplete?.(data); } catch(e){}
                     try {
                         if (data.returncode === 0) {
-                            setTimeout(() => { window.location.href = "{{ url_for('reports_page') }}"; }, 500);
+                            scheduleScenarioRedirect("{{ url_for('reports_page') }}", { delay: 500 });
                         }
                     } catch(e){}
                     resolve(data);
@@ -9429,9 +10688,17 @@ async function runWithSeedBuild(){
     }
     const execInfo = detectLocalEmulation();
     const confirmMsg = execInfo.shouldFake
-        ? `CORE not connected; will run with fake local emulation (seed=${seedVal}). Proceed?`
+        ? `CORE not connected; the run will use fake local emulation (seed=${seedVal}). Continue?`
         : `Run CLI with seed=${seedVal}? This will start a CORE session.`;
-    if(!window.confirm(confirmMsg)) return;
+    const { idx: scenarioIdx } = getActiveScenarioContext();
+    const confirmResult = await promptExecuteConfirmation({
+        message: confirmMsg,
+        scenarioIndex: scenarioIdx,
+        alertMessage: execInfo.shouldFake ? `CORE not connected; run will use fake local emulation (seed=${seedVal}).` : '',
+        alertTone: execInfo.shouldFake ? 'warning' : 'info',
+        confirmLabel: 'Run with seed',
+    });
+    if(!confirmResult?.confirmed) return;
     openRunProgress('Running CLI (seed='+seedVal+')…');
     maybeShowLocalEmulationHint();
     try {
@@ -9462,7 +10729,7 @@ async function runWithSeedBuild(){
                 if(!data.done){ setTimeout(poll, 1000); return; }
                 document.getElementById('runProgressStatus').textContent = (data.returncode===0) ? 'Scenario started' : 'Finished with errors';
                 document.getElementById('runProgressBar').classList.remove('progress-bar-animated');
-                if(data.returncode===0){ setTimeout(()=>{ window.location.href = "{{ url_for('reports_page') }}"; }, 600); }
+                if(data.returncode===0){ scheduleScenarioRedirect("{{ url_for('reports_page') }}", { delay: 600 }); }
             } catch(e){ setTimeout(poll, 1500); }
         })();
     } catch(e){ runProgressLogLine('Exception starting seeded run'); }
@@ -9647,7 +10914,7 @@ function showRunSuccessModal(msg){
 }
 document.addEventListener('DOMContentLoaded', () => {
     if (window.runSuccessFlag) {
-        setTimeout(() => { window.location.href = "{{ url_for('reports_page') }}"; }, 300);
+        scheduleScenarioRedirect("{{ url_for('reports_page') }}", { delay: 300 });
     }
 });
 // Capture server-provided flag (injected if present)

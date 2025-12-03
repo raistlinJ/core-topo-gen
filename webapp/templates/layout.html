@@ -46,12 +46,15 @@
             </div>
           </div>
         </div>
+        {% set nav_scenario = request.args.get('scenario', '').strip() if request else '' %}
+        {% set nav_reports_href = url_for('reports_page', scenario=nav_scenario) if nav_scenario else url_for('reports_page') %}
+        {% set nav_core_href = url_for('core_page', scenario=nav_scenario) if nav_scenario else url_for('core_page') %}
         <nav class="navbar navbar-expand bg-light border rounded-bottom shadow-sm mb-3 px-2 py-0">
           <ul class="navbar-nav me-auto mb-0 small">
             <li class="nav-item"><a class="nav-link {% if active_page=='scenarios' %}active{% endif %}" href="{{ url_for('index') }}">Scenarios</a></li>
             <li class="nav-item"><a class="nav-link {% if active_page=='data_sources' %}active{% endif %}" href="{{ url_for('data_sources_page') }}">Vulnerability Sources</a></li>
-            <li class="nav-item"><a class="nav-link {% if active_page=='reports' %}active{% endif %}" href="{{ url_for('reports_page') }}">Reports</a></li>
-            <li class="nav-item"><a class="nav-link core-link {% if active_page=='core' %}active{% endif %}" href="{{ url_for('core_page') }}"><i class="bi bi-diagram-3-fill"></i> CORE</a></li>
+            <li class="nav-item"><a class="nav-link {% if active_page=='reports' %}active{% endif %}" href="{{ nav_reports_href }}">Reports</a></li>
+            <li class="nav-item"><a id="navCoreLink" class="nav-link core-link {% if active_page=='core' %}active{% endif %}" href="{{ nav_core_href }}"><i class="bi bi-diagram-3-fill"></i> CORE</a></li>
           </ul>
           <div class="d-flex align-items-center gap-2" id="navRightExtras">
             {% block nav_right_extra %}{% endblock %}

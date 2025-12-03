@@ -112,6 +112,19 @@
   // Expose globally if not already defined
   if(!window.LOG_LEVELS) window.LOG_LEVELS = LOG_LEVELS;
   if(!window.logLine) { window.logLine = logLine; window.logDebug = logDebug; window.logInfo = logInfo; window.logWarn = logWarn; window.logError = logError; window._coretg_logBuffer = logBuffer; }
+  if(!window.__dockLogListenerAttached){
+    window.addEventListener('dock-log', (ev)=>{
+      try {
+        const detail = ev?.detail || {};
+        const lvl = String(detail.level || 'INFO').toUpperCase();
+        const msg = detail.message != null ? String(detail.message) : '';
+        logLine(LOG_LEVELS[lvl] ? lvl : 'INFO', msg);
+      } catch (err) {
+        logLine('WARN', `dock-log listener error: ${err}`);
+      }
+    });
+    window.__dockLogListenerAttached = true;
+  }
   function setupDock(){
     const dock = document.getElementById('dockPanel'); const grip = document.getElementById('dockGrip'); const hideBtn = document.getElementById('dockHideBtn'); const showBtn = document.getElementById('dockShowBtn'); if(!dock||!grip||!hideBtn||!showBtn) return;
     const setBodyPad = (px) => { document.body.style.paddingBottom = Math.max(px, 0) + 'px'; };

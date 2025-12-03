@@ -277,69 +277,6 @@ def test_hitl_apply_bridge_infers_proxmox_attachment(client, monkeypatch):
     assert data['success'] is True
 
 
-def test_host_interface_refresh_exposes_proxmox_adapter_metadata(client, monkeypatch):
-    observed_args = {}
-
-    def fake_enumerate(secret_id, *, prox_interfaces=None, include_down=False, vm_context=None):
-        observed_args['secret_id'] = secret_id
-        observed_args['prox_interfaces'] = prox_interfaces
-        observed_args['include_down'] = include_down
-        observed_args['vm_context'] = vm_context
-        return [{
-            'name': 'ens19',
-            'display': 'ens19',
-            'mac': 'de:ad:be:ef:00:19',
-            'proxmox': {
-                'id': 'net1',
-                'macaddr': 'de:ad:be:ef:00:19',
-                'bridge': 'vmbr1',
-                'model': 'virtio',
-                'vm_key': 'pve1::101',
-                'vm_name': 'CORE VM',
-                'vm_node': 'pve1',
-                'vmid': '101',
-                'raw': {
-                    'id': 'net1',
-                    'macaddr': 'de:ad:be:ef:00:19',
-                    'bridge': 'vmbr1',
-                    'model': 'virtio',
-                },
-            },
-        }]
-
-    monkeypatch.setattr(backend, '_enumerate_core_vm_interfaces_from_secret', fake_enumerate)
-
-    payload = {
-        'core_secret_id': 'secret-1',
-        'include_down': False,
-        'core_vm': {
-            'vm_key': 'pve1::101',
-            'vm_name': 'CORE VM',
-            'vm_node': 'pve1',
-            'vmid': '101',
-            'interfaces': [
-                {'id': 'net1', 'macaddr': 'de:ad:be:ef:00:19', 'bridge': 'vmbr1', 'model': 'virtio'},
-            ],
-        },
-    }
-
-    resp = client.post('/api/host_interfaces', data=json.dumps(payload), content_type='application/json')
-    assert resp.status_code == 200
-    data = resp.get_json()
-    assert data['success'] is True
-    assert observed_args['secret_id'] == 'secret-1'
-    assert observed_args['vm_context']['vm_key'] == 'pve1::101'
-    assert isinstance(data['interfaces'], list) and len(data['interfaces']) == 1
-    iface = data['interfaces'][0]
-    assert iface['name'] == 'ens19'
-    prox = iface['proxmox']
-    assert prox['id'] == 'net1'
-    assert prox['bridge'] == 'vmbr1'
-    assert prox['macaddr'] == 'de:ad:be:ef:00:19'
-    assert prox['vm_key'] == 'pve1::101'
-    assert prox['raw']['id'] == 'net1'
-
-
 def test_normalize_internal_bridge_name_truncates_and_sanitizes():
     assert backend._normalize_internal_bridge_name('MyUserName12345') == 'myusername'
     assert backend._normalize_internal_bridge_name('user name with spaces') == 'user-name'

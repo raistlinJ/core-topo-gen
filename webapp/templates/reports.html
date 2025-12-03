@@ -20,13 +20,14 @@
       <div class="card mb-3">
         <div class="card-header py-2 d-flex justify-content-between align-items-center">
           <strong class="small mb-0">Scenarios</strong>
-          <button class="btn btn-sm btn-outline-secondary" id="clearScenarioFilter" type="button" title="Clear filter" style="display:none">Clear</button>
+          <button class="btn btn-sm btn-outline-secondary" id="clearScenarioFilter" type="button" title="Clear filter" style="{% if not active_scenario %}display:none{% endif %}">Clear</button>
         </div>
         <div class="list-group list-group-flush sidebar" id="scenarioFilterList">
-          {% for s in scenarios %}
-          <button type="button" class="list-group-item list-group-item-action py-1 px-2 small" data-scen-name="{{ s }}">{{ s }}</button>
-          {% endfor %}
-          {% if not scenarios %}
+          {% if scenarios %}
+            {% for s in scenarios %}
+            <button type="button" class="list-group-item list-group-item-action py-1 px-2 small {% if active_scenario and active_scenario==s %}active{% endif %}" data-scen-name="{{ s }}">{{ s }}</button>
+            {% endfor %}
+          {% else %}
           <div class="p-2 small text-muted">No scenarios yet</div>
           {% endif %}
         </div>
@@ -95,6 +96,12 @@ const tableBody = document.querySelector('#runsTable tbody');
 const runsCheckAll = document.getElementById('runsCheckAll');
 const runsDeleteBtn = document.getElementById('runsDeleteBtn');
 const selectedRunIds = new Set();
+const reportsDataBaseUrl = "{{ url_for('reports_data') }}";
+let scenarioNamesCache = {{ (scenarios or [])|tojson }};
+const initialScenarioFilter = {{ (active_scenario or '')|tojson }};
+let activeScenarioFilter = initialScenarioFilter || null;
+const clearScenarioBtn = document.getElementById('clearScenarioFilter');
+if(clearScenarioBtn){ clearScenarioBtn.style.display = activeScenarioFilter ? 'inline-block':'none'; }
 // Tracks whether user explicitly activated select-all across currently visible rows.
 let masterSelectAllActive = false;
 function getVisibleCheckboxes(){ return tableBody.querySelectorAll('tr:not(.d-none) input.row-select'); }
@@ -143,20 +150,82 @@ function renderRows(history){
   }
   updateHeader();
 }
+function buildReportsDataUrl(){
+  if(!activeScenarioFilter) return reportsDataBaseUrl;
+  const url = new URL(reportsDataBaseUrl, window.location.origin);
+  url.searchParams.set('scenario', activeScenarioFilter);
+  return url.pathname + url.search;
+}
+function updateScenarioQueryParam(){
+  const url = new URL(window.location.href);
+  if(activeScenarioFilter){
+    url.searchParams.set('scenario', activeScenarioFilter);
+  } else {
+    url.searchParams.delete('scenario');
+  }
+  window.history.replaceState({}, '', url.toString());
+}
+function updateScenarioFilterControls(){
+  if(clearScenarioBtn){ clearScenarioBtn.style.display = activeScenarioFilter ? 'inline-block':'none'; }
+  const list = document.getElementById('scenarioFilterList');
+  if(!list) return;
+  list.querySelectorAll('[data-scen-name]').forEach(btn => {
+    const name = btn.getAttribute('data-scen-name');
+    btn.classList.toggle('active', !!activeScenarioFilter && name === activeScenarioFilter);
+  });
+}
+function renderScenarioButtons(){
+  const list = document.getElementById('scenarioFilterList');
+  if(!list) return;
+  list.innerHTML = '';
+  if(!scenarioNamesCache || scenarioNamesCache.length === 0){
+    const empty = document.createElement('div');
+    empty.className = 'p-2 small text-muted';
+    empty.textContent = 'No scenarios yet';
+    list.appendChild(empty);
+    updateScenarioFilterControls();
+    return;
+  }
+  scenarioNamesCache.forEach(name => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'list-group-item list-group-item-action py-1 px-2 small';
+    btn.dataset.scenName = name;
+    btn.textContent = name;
+    if(activeScenarioFilter && name === activeScenarioFilter){ btn.classList.add('active'); }
+    btn.addEventListener('click', async () => {
+      const nextValue = (activeScenarioFilter === name) ? null : name;
+      await setScenarioFilter(nextValue);
+    });
+    list.appendChild(btn);
+  });
+  updateScenarioFilterControls();
+}
+async function setScenarioFilter(value){
+  activeScenarioFilter = value || null;
+  updateScenarioQueryParam();
+  updateScenarioFilterControls();
+  await fetchHistory();
+}
 async function fetchHistory(){
   try {
-    const res = await fetch('/reports_data');
+    const url = buildReportsDataUrl();
+    const res = await fetch(url);
     if(!res.ok) return;
     const data = await res.json();
-    if(Array.isArray(data.history)) renderRows(data.history);
-    // Refresh scenario list if new ones appear
-    const list = document.getElementById('scenarioFilterList');
-    if(list && Array.isArray(data.scenarios)){
-      const existing = new Set(Array.from(list.querySelectorAll('[data-scen-name]')).map(b=>b.getAttribute('data-scen-name')));
-      let added = false;
-      data.scenarios.forEach(n => { if(!existing.has(n)){ added=true; const btn=document.createElement('button'); btn.type='button'; btn.className='list-group-item list-group-item-action py-1 px-2 small'; btn.dataset.scenName=n; btn.textContent=n; list.appendChild(btn);} });
-      if(added) wireScenarioButtons();
+    const serverScenario = (data.active_scenario || '').trim();
+    if(serverScenario){
+      activeScenarioFilter = serverScenario;
+    } else if (!serverScenario && activeScenarioFilter){
+      activeScenarioFilter = null;
     }
+    if(Array.isArray(data.history)) renderRows(data.history);
+    if(Array.isArray(data.scenarios)){
+      scenarioNamesCache = data.scenarios;
+      renderScenarioButtons();
+    }
+    updateScenarioQueryParam();
+    updateScenarioFilterControls();
   } catch(e) {
     // transient errors ignored
   }
@@ -173,7 +242,6 @@ document.getElementById('toggleRefreshBtn').addEventListener('click', () => {
   schedule();
 });
 
-let activeScenarioFilter = null;
 function applyScenarioFilter(){
   const rows = tableBody.querySelectorAll('tr');
   rows.forEach(r => {
@@ -189,21 +257,8 @@ function updateCount(){
   const visible = rows.filter(r=>!r.classList.contains('d-none')).length;
   document.getElementById('runCount').textContent = visible + ' run' + (visible===1?'':'s');
 }
-function wireScenarioButtons(){
-  const list = document.getElementById('scenarioFilterList');
-  list.querySelectorAll('[data-scen-name]').forEach(btn => {
-    btn.onclick = () => {
-      const name = btn.getAttribute('data-scen-name');
-      if(activeScenarioFilter === name){ activeScenarioFilter = null; } else { activeScenarioFilter = name; }
-      list.querySelectorAll('[data-scen-name]').forEach(b=>b.classList.toggle('active', b.getAttribute('data-scen-name')===activeScenarioFilter));
-      document.getElementById('clearScenarioFilter').style.display = activeScenarioFilter? 'inline-block':'none';
-      applyScenarioFilter();
-      updateCount();
-    };
-  });
-}
-document.getElementById('clearScenarioFilter').addEventListener('click', () => { activeScenarioFilter=null; wireScenarioButtons(); applyScenarioFilter(); updateCount(); document.getElementById('clearScenarioFilter').style.display='none'; });
-wireScenarioButtons();
+document.getElementById('clearScenarioFilter').addEventListener('click', async () => { await setScenarioFilter(null); });
+renderScenarioButtons();
 applyScenarioFilter();
 updateCount();
 // Bind row + header selection handlers for initial server-rendered rows

@@ -558,7 +558,6 @@ def main():
             out = {"plan": summary, "violations": violations, "orchestrator_plan": orchestrated_plan}
             if args.preview_full:
                 try:
-                    from .planning.full_preview import build_full_preview
                     if preview_full:
                         full_prev = preview_full
                     else:
