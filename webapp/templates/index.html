@@ -34,6 +34,18 @@
         filter: grayscale(0.3);
         opacity: 0.85;
     }
+    #executeConfirmModal .modal-dialog {
+        max-width: min(960px, 95vw);
+    }
+    #executeConfirmModal .modal-content {
+        min-height: 520px;
+    }
+    #executeProgressWrap .progress {
+        height: 18px;
+    }
+    #executeProgressLog {
+        height: 320px;
+    }
 </style>
 {% endblock %}
 <!-- hs-bounds-wrapper styles moved into style block above -->
@@ -412,11 +424,6 @@
             <div class="modal-body">
                 <p class="mb-3" id="executeConfirmMessage">Execute this scenario now?</p>
                 <div class="alert alert-warning small d-none" id="executeConfirmAlert"></div>
-                <div class="form-check form-switch" id="executePushRepoWrapper">
-                    <input class="form-check-input" type="checkbox" id="executePushRepoToggle" data-hitl-core-field="push_repo" data-scen-idx="-1" autocomplete="off">
-                    <label class="form-check-label" for="executePushRepoToggle">Push repo to CORE VM before runs</label>
-                    <div class="form-text">Enable to upload this repo to the CORE VM before Execute; leave unchecked if the repo already exists on that host.</div>
-                </div>
                 <div class="border rounded p-3 mt-3 bg-body-tertiary d-none" id="executeProgressWrap">
                     <div class="d-flex align-items-center gap-2">
                         <div class="spinner-border spinner-border-sm text-primary" role="status" aria-hidden="true" id="executeProgressSpinner"></div>
@@ -912,7 +919,6 @@ function ensureHitlStateForScenario(scen) {
             last_interfaces_error: null,
             remember_credentials: true,
             auto_start_daemon: false,
-            push_repo: false,
         };
     } else {
         const core = scen.hitl.core;
@@ -963,7 +969,6 @@ function ensureHitlStateForScenario(scen) {
     if (typeof scen.hitl.core.auto_start_daemon !== 'boolean') {
         scen.hitl.core.auto_start_daemon = false;
     }
-    scen.hitl.core.push_repo = coerceBool(scen.hitl.core.push_repo);
     const coreVmKeyCurrent = (scen.hitl.core?.vm_key ?? '').toString();
     const coreVmNodeCurrent = (scen.hitl.core?.vm_node ?? '').toString().trim();
     if (coreVmKeyCurrent) {
@@ -2587,7 +2592,7 @@ function normalizeCoreState(raw, includePassword = true) {
         ssh_host: (typeof serverDefaults.ssh_host === 'string' && serverDefaults.ssh_host.trim()) ? serverDefaults.ssh_host.trim() : '',
         ssh_port: toPositiveInt(serverDefaults.ssh_port, 22),
         ssh_username: (typeof serverDefaults.ssh_username === 'string') ? serverDefaults.ssh_username : '',
-        push_repo: coerceBool(serverDefaults.push_repo),
+        auto_start_daemon: !!serverDefaults.auto_start_daemon,
     };
     const serverDefaultVenv = (typeof serverDefaults.venv_bin === 'string' && serverDefaults.venv_bin.trim()) ? serverDefaults.venv_bin.trim() : '';
     const defaultVenvBin = serverDefaultVenv || CORE_DEFAULT_VENV_BIN;
@@ -2601,7 +2606,7 @@ function normalizeCoreState(raw, includePassword = true) {
         ssh_port: defaults.ssh_port,
         ssh_username: defaults.ssh_username,
         venv_bin: defaultVenvBin,
-        push_repo: defaults.push_repo,
+        auto_start_daemon: defaults.auto_start_daemon,
     };
     if ('host' in source && String(source.host).trim()) {
         out.host = String(source.host).trim();
@@ -2637,9 +2642,7 @@ function normalizeCoreState(raw, includePassword = true) {
     if (!out.venv_bin) {
         out.venv_bin = defaultVenvBin;
     }
-    if ('push_repo' in source) {
-        out.push_repo = coerceBool(source.push_repo);
-    }
+    out.auto_start_daemon = !!(source.auto_start_daemon ?? out.auto_start_daemon);
     return out;
 }
 
@@ -2675,8 +2678,6 @@ function storeCorePasswordInSession() {
 
 function getCoreConfig(includePassword = true) {
     const normalized = normalizeCoreState(state?.core || {}, includePassword);
-    const { idx: activeIdx } = getActiveScenarioContext();
-    normalized.push_repo = getScenarioPushRepoValue(activeIdx);
     if (!includePassword && 'ssh_password' in normalized) {
         delete normalized.ssh_password;
     }
@@ -2694,7 +2695,6 @@ function syncGlobalCoreConnection(coreState, testedHost = null, testedPort = nul
     const sshPort = Number.isFinite(sshPortRaw) && sshPortRaw > 0 ? Number(sshPortRaw) : 22;
     const sshUser = (coreState.ssh_username || '').toString();
     const venvBin = (coreState.venv_bin || '').toString().trim();
-    const pushRepo = coerceBool(coreState.push_repo);
     const normalized = normalizeCoreState({
         host,
         port,
@@ -2702,7 +2702,6 @@ function syncGlobalCoreConnection(coreState, testedHost = null, testedPort = nul
         ssh_port: sshPort,
         ssh_username: sshUser,
         venv_bin: venvBin,
-        push_repo: pushRepo,
         ssh_password: '',
     }, true);
     normalized.ssh_password = '';
@@ -2800,7 +2799,6 @@ function appendScenarioContextToFormData(form, options = {}) {
         form.append('scenario', name);
     }
     if (includeCore) {
-        syncGlobalPushRepoFromScenario(idx);
         const scenarioCore = cloneScenarioCoreFromScenario(scenario, true);
         if (scenarioCore) {
             form.append('hitl_core_json', JSON.stringify(scenarioCore));
@@ -2841,6 +2839,37 @@ function enrichPayloadWithScenarioContext(payload, options = {}) {
         }
     }
     return payload;
+}
+
+function enableAutoStartDaemonPreference() {
+    let changed = false;
+    if (!state.core) {
+        state.core = normalizeCoreState({ auto_start_daemon: true }, true);
+        changed = true;
+    } else if (!state.core.auto_start_daemon) {
+        state.core.auto_start_daemon = true;
+        changed = true;
+    }
+    const { scenario } = getActiveScenarioContext();
+    if (scenario) {
+        const hitlState = ensureHitlStateForScenario(scenario);
+        if (hitlState?.core && hitlState.core.auto_start_daemon !== true) {
+            hitlState.core.auto_start_daemon = true;
+            changed = true;
+        }
+    }
+    if (changed) {
+        try {
+            persistEditorState();
+            const hidden = document.getElementById('scenarios_json');
+            if (hidden) {
+                hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+            }
+        } catch (err) {
+            console.warn('Failed to persist auto-start preference', err);
+        }
+    }
+    return true;
 }
 
 // Restore persisted editor state (scenarios and last saved xml) and active index from localStorage
@@ -2927,36 +2956,6 @@ function getScenarioByIndex(idx) {
         return null;
     }
     return scenarios[idx];
-}
-
-function getScenarioPushRepoValue(idx = null) {
-    const { idx: activeIdx } = getActiveScenarioContext();
-    const targetIdx = Number.isInteger(idx) ? idx : activeIdx;
-    const scenario = getScenarioByIndex(targetIdx);
-    if (scenario) {
-        const hitlState = ensureHitlStateForScenario(scenario);
-        if (hitlState?.core) {
-            return !!hitlState.core.push_repo;
-        }
-    }
-    return !!(state?.core && coerceBool(state.core.push_repo));
-}
-
-function syncGlobalPushRepoFromScenario(idx = null) {
-    const { idx: activeIdx } = getActiveScenarioContext();
-    const targetIdx = Number.isInteger(idx) ? idx : activeIdx;
-    const scenario = getScenarioByIndex(targetIdx);
-    if (!scenario) {
-        return;
-    }
-    const hitlState = ensureHitlStateForScenario(scenario);
-    if (!hitlState?.core) {
-        return;
-    }
-    if (!state.core) {
-        state.core = {};
-    }
-    state.core.push_repo = !!hitlState.core.push_repo;
 }
 
 (state.scenarios || []).forEach(ensureHitlStateForScenario);
@@ -5748,10 +5747,6 @@ function handleCoreFieldUpdate(inputEl, { rerender } = { rerender: false }) {
         }
     }
     if (dirty) {
-        if (field === 'push_repo') {
-            if (!state.core) state.core = {};
-            state.core.push_repo = !!coreState[field];
-        }
         coreState.last_tested_status = null;
         coreState.last_tested_message = null;
         coreState.last_tested_at = null;
@@ -9307,8 +9302,6 @@ let executeConfirmMessageEl = null;
 let executeConfirmAlertEl = null;
 let executeConfirmRunBtn = null;
 let executeConfirmCancelBtn = null;
-let executePushRepoToggle = null;
-let executePushRepoWrapper = null;
 const executeConfirmState = {
     pending: false,
     resolve: null,
@@ -9348,20 +9341,10 @@ function ensureExecuteConfirmElements() {
     if (!executeConfirmCancelBtn) {
         executeConfirmCancelBtn = document.getElementById('executeConfirmCancelBtn');
     }
-    if (!executePushRepoWrapper) {
-        executePushRepoWrapper = document.getElementById('executePushRepoWrapper');
-    }
-    if (!executePushRepoToggle) {
-        executePushRepoToggle = document.getElementById('executePushRepoToggle');
-    }
-    if (executePushRepoToggle && !executePushRepoToggle.dataset.execBound) {
-        executePushRepoToggle.addEventListener('change', () => handleCoreFieldUpdate(executePushRepoToggle, { rerender: false }));
-        executePushRepoToggle.dataset.execBound = '1';
-    }
     if (executeConfirmRunBtn && !executeConfirmRunBtn.dataset.execBound) {
         executeConfirmRunBtn.addEventListener('click', () => {
             const stayOpen = !!executeConfirmState.keepOpenOnConfirm;
-            settleExecuteConfirm({ confirmed: true, pushRepo: !!executePushRepoToggle?.checked });
+            settleExecuteConfirm({ confirmed: true });
             if (!stayOpen) {
                 try {
                     if (executeConfirmModalEl && window.bootstrap) {
@@ -9374,13 +9357,13 @@ function ensureExecuteConfirmElements() {
     }
     if (executeConfirmCancelBtn && !executeConfirmCancelBtn.dataset.execBound) {
         executeConfirmCancelBtn.addEventListener('click', () => {
-            settleExecuteConfirm({ confirmed: false, pushRepo: !!executePushRepoToggle?.checked });
+            settleExecuteConfirm({ confirmed: false });
         });
         executeConfirmCancelBtn.dataset.execBound = '1';
     }
     if (executeConfirmModalEl && !executeConfirmModalEl.dataset.execHiddenBound) {
         executeConfirmModalEl.addEventListener('hidden.bs.modal', () => {
-            settleExecuteConfirm({ confirmed: false, pushRepo: !!executePushRepoToggle?.checked });
+            settleExecuteConfirm({ confirmed: false });
             resetExecuteProgressUI();
         });
         executeConfirmModalEl.dataset.execHiddenBound = '1';
@@ -9416,22 +9399,11 @@ function ensureExecuteProgressElements() {
     }
 }
 
-function setExecutePushRepoDisabled(disabled) {
-    ensureExecuteConfirmElements();
-    if (executePushRepoToggle) {
-        executePushRepoToggle.disabled = !!disabled;
-    }
-    if (executePushRepoWrapper) {
-        executePushRepoWrapper.classList.toggle('hitl-step-disabled', !!disabled);
-    }
-}
-
 const EXECUTE_PROGRESS_HEARTBEAT_MESSAGES = [
     'Establishing SSH tunnel to CORE host…',
     'Validating remote CORE environment…',
-    'Packaging repository for upload…',
-    'Uploading repository; this may take a minute over slower links…',
     'Syncing XML and preparing remote workspace…',
+    'Starting CORE services on remote host…',
 ];
 const EXECUTE_PROGRESS_HEARTBEAT_INTERVAL_MS = 4500;
 
@@ -9484,7 +9456,6 @@ function resetExecuteProgressUI() {
     if (executeProgressLogEl) executeProgressLogEl.textContent = '';
     if (executeProgressSpinnerEl) executeProgressSpinnerEl.classList.remove('d-none');
     if (executeProgressPopoutBtn) executeProgressPopoutBtn.classList.add('d-none');
-    setExecutePushRepoDisabled(false);
     if (executeConfirmRunBtn) {
         if (!executeConfirmRunBtn.dataset.defaultLabel) {
             executeConfirmRunBtn.dataset.defaultLabel = executeConfirmRunBtn.textContent || 'Execute';
@@ -9506,7 +9477,6 @@ function showExecuteProgressPanel(status, meta) {
     stopExecuteProgressHeartbeat();
     executeProgressState.active = true;
     executeProgressState.logLines = [];
-    setExecutePushRepoDisabled(true);
     if (executeProgressWrap) executeProgressWrap.classList.remove('d-none');
     if (executeProgressSpinnerEl) executeProgressSpinnerEl.classList.remove('d-none');
     if (executeProgressBarEl) executeProgressBarEl.classList.add('progress-bar-animated');
@@ -9584,7 +9554,6 @@ function completeExecuteProgressPanel(success, message, meta) {
     if (executeConfirmRunBtn) {
         executeConfirmRunBtn.disabled = true;
     }
-    setExecutePushRepoDisabled(false);
 }
 
 function handleExecuteProgressLog(line) {
@@ -9629,7 +9598,7 @@ function settleExecuteConfirm(result) {
     const scenarioIndex = executeConfirmState.scenarioIndex;
     executeConfirmState.scenarioIndex = null;
     if (typeof result !== 'object' || result === null) {
-        resolver?.({ confirmed: false, pushRepo: !!executePushRepoToggle?.checked, scenarioIndex });
+        resolver?.({ confirmed: false, scenarioIndex });
         return;
     }
     resolver?.({ ...result, scenarioIndex });
@@ -9662,12 +9631,11 @@ async function promptExecuteConfirmation(options = {}) {
     const confirmLabel = options.confirmLabel || 'Execute';
     const alertMessage = options.alertMessage || '';
     const alertTone = options.alertTone || 'warning';
-    const pushDefault = getScenarioPushRepoValue(scenarioIndex);
     const keepOpenOnConfirm = !!options.keepOpenOnConfirm;
     ensureExecuteConfirmElements();
     if (!executeConfirmModalEl || !window.bootstrap) {
         const confirmed = window.confirm(message);
-        return { confirmed, pushRepo: pushDefault, scenarioIndex };
+        return { confirmed, scenarioIndex };
     }
     executeConfirmState.pending = true;
     executeConfirmState.scenarioIndex = Number.isInteger(scenarioIndex) ? scenarioIndex : null;
@@ -9678,13 +9646,6 @@ async function promptExecuteConfirmation(options = {}) {
     updateExecuteConfirmAlert(alertMessage, alertTone);
     if (executeConfirmRunBtn) {
         executeConfirmRunBtn.textContent = confirmLabel;
-    }
-    if (executePushRepoToggle) {
-        executePushRepoToggle.checked = !!pushDefault;
-        executePushRepoToggle.setAttribute('data-scen-idx', Number.isInteger(scenarioIndex) ? String(scenarioIndex) : '-1');
-    }
-    if (executePushRepoWrapper) {
-        executePushRepoWrapper.classList.remove('d-none');
     }
     resetExecuteProgressUI();
     const modalInstance = bootstrap.Modal.getOrCreateInstance(executeConfirmModalEl);
@@ -10189,6 +10150,180 @@ async function openVulnPicker(sidx, secName, iidx){
     } catch(e){}
 }
 
+const RUN_CLI_URL = "{{ url_for('run_cli_async') }}";
+const PUSH_REPO_URL = "{{ url_for('core_push_repo_route') }}";
+
+function buildRunFormData(xmlPath, options = {}) {
+    const form = new FormData();
+    if (xmlPath) {
+        form.append('xml_path', xmlPath);
+    }
+    appendScenarioContextToFormData(form, options);
+    try {
+        form.append('core_json', JSON.stringify(getCoreConfig(true)));
+    } catch (err) {
+        form.append('core_json', '{}');
+    }
+    return form;
+}
+
+async function parseResponseJson(response) {
+    if (!response || typeof response.clone !== 'function') {
+        return null;
+    }
+    try {
+        const text = await response.clone().text();
+        if (!text) {
+            return null;
+        }
+        return JSON.parse(text);
+    } catch (err) {
+        return null;
+    }
+}
+
+async function extractResponseDetail(response) {
+    if (!response) {
+        return '';
+    }
+    const jsonData = await parseResponseJson(response);
+    if (jsonData && typeof jsonData === 'object') {
+        if (typeof jsonData.error === 'string' && jsonData.error.trim()) {
+            return jsonData.error.trim();
+        }
+        try {
+            return JSON.stringify(jsonData);
+        } catch (err) {
+            return '';
+        }
+    }
+    try {
+        const text = await response.clone().text();
+        if (text && text.trim()) {
+            return text.trim();
+        }
+    } catch (err) {
+        return '';
+    }
+    const statusText = response.statusText ? ` ${response.statusText}` : '';
+    return `HTTP ${response.status}${statusText}`.trim();
+}
+
+async function pushRepoToRemote(xmlPath) {
+    const form = buildRunFormData(xmlPath);
+    logInfo('Uploading repository to CORE host…');
+    try {
+        const res = await fetch(PUSH_REPO_URL, { method: 'POST', body: form });
+        if (!res.ok) {
+            const detail = await extractResponseDetail(res);
+            const message = detail ? `Repo upload failed: ${detail}` : `Repo upload failed (HTTP ${res.status})`;
+            logError(message);
+            alert(message);
+            return false;
+        }
+        const data = await parseResponseJson(res);
+        const repoPath = data && typeof data === 'object' ? data.repo_path : null;
+        logInfo(`Repository uploaded${repoPath ? ` to ${repoPath}` : ''}.`);
+        return true;
+    } catch (err) {
+        const message = `Repo upload exception: ${err?.message || err}`;
+        logError(message);
+        alert(message);
+        return false;
+    }
+}
+
+async function handleMissingRepoResponse(response, context = {}) {
+    const info = await parseResponseJson(response);
+    const repoPath = info?.missing_repo || context.repoPath || 'remote CORE workspace';
+    const reason = info?.error || 'Remote repository missing on CORE host.';
+    const canPush = info?.can_push_repo !== false;
+    if (!canPush) {
+        alert(reason);
+        return false;
+    }
+    const message = `${reason}\n\nRemote path: ${repoPath}\n\nUpload the current repository snapshot now?`;
+    const confirmed = window.confirm(message);
+    if (!confirmed) {
+        logInfo('Remote repo upload declined; run aborted.');
+        return false;
+    }
+    const pushed = await pushRepoToRemote(context.xmlPath || info?.xml_path || null);
+    if (!pushed) {
+        return false;
+    }
+    logInfo('Remote repository uploaded; retrying run start.');
+    return true;
+}
+
+async function submitRunCliRequest(buildRequest, options = {}) {
+    const attempts = Math.max(1, options.maxAttempts || 2);
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const request = typeof buildRequest === 'function' ? buildRequest() : null;
+        if (!request || !request.body) {
+            throw new Error('buildRequest must return an object with a body property');
+        }
+        const init = { method: 'POST', body: request.body };
+        if (request.headers) {
+            init.headers = request.headers;
+        }
+        const res = await fetch(RUN_CLI_URL, init);
+        // Handle daemon-missing prompt (backend returns 428 with can_auto_start hint)
+        if (res.status === 428) {
+            const info = await parseResponseJson(res);
+            const canAuto = !!(info && info.can_auto_start);
+            const startCommand = (info && info.start_command) || 'sudo systemctl start core-daemon';
+            const msg = (info && info.error) || 'core-daemon is not running on the CORE host.';
+            const prompt = canAuto
+                ? `${msg}\n\nEnable auto-start (runs "${startCommand}") and retry now?`
+                : `${msg}\n\nAuto-start is unavailable. Start core-daemon on the CORE host, then retry.`;
+            if (typeof runProgressLogLine === 'function') {
+                runProgressLogLine(`Daemon check: ${msg}. Attempted command: ${startCommand}`);
+            } else {
+                logInfo(`Daemon check: ${msg}. Attempted command: ${startCommand}`);
+            }
+            const proceed = canAuto ? window.confirm(prompt) : (alert(prompt), false);
+            if (proceed) {
+                enableAutoStartDaemonPreference();
+                try { logInfo(`Auto-start permission enabled; retrying run launch with ${startCommand}.`); } catch (e) {}
+                // Do not consume an attempt when auto-start was just enabled
+                if (attempt > 0) {
+                    attempt -= 1;
+                } else {
+                    attempt = -1;
+                }
+                continue;
+            }
+            try { logWarn(`Daemon check aborted: ${msg}`); } catch (e) {}
+            return null;
+        }
+        // Handle multiple daemons detected (409 with daemon_conflict)
+        if (res.status === 409) {
+            const info = await parseResponseJson(res);
+            if (info && info.daemon_conflict) {
+                const pids = Array.isArray(info.daemon_pids) ? info.daemon_pids.join(', ') : '';
+                const message = `${info.error || 'Multiple core-daemon processes detected.'}${pids ? `\n\nPIDs: ${pids}` : ''}`;
+                alert(message);
+                return null;
+            }
+        }
+        if (res.status === 409) {
+            const retry = await handleMissingRepoResponse(res, {
+                xmlPath: request.xmlPath || options.xmlPath || null,
+                repoPath: request.repoPath,
+            });
+            if (retry) {
+                continue;
+            }
+            return null;
+        }
+        return res;
+    }
+    logWarn('Exceeded automatic repository sync attempts; aborting run.');
+    alert('Unable to start run until the repository is uploaded to the CORE host.');
+    return null;
+}
+
 
 async function runAsync() {
     let rp = state.result_path || '';
@@ -10204,16 +10339,13 @@ async function runAsync() {
     }
     const confirmMsg = 'This action will generate a new CORE scenario and attempt to start it asynchronously using the daemon connection.\n\nProceed?';
     if (!window.confirm(confirmMsg)) { logInfo('Async run cancelled by user at confirmation'); return; }
-    const form = new FormData();
-    form.append('xml_path', rp);
-    appendScenarioContextToFormData(form);
-    try {
-        form.append('core_json', JSON.stringify(getCoreConfig(true)));
-    } catch (err) {
-        form.append('core_json', '{}');
+    const res = await submitRunCliRequest(() => ({ body: buildRunFormData(rp), xmlPath: rp }));
+    if (!res) { logWarn('Async run aborted before launch'); return; }
+    if (!res.ok) {
+        const detail = await extractResponseDetail(res);
+        alert(detail ? `Failed to start run: ${detail}` : 'Failed to start run');
+        return;
     }
-        const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
-    if (!res.ok) { alert('Failed to start run'); return; }
     const { run_id } = await res.json();
     logInfo(`Async run started id=${run_id}`);
     startLogStream(run_id);
@@ -10535,52 +10667,30 @@ async function runSyncWithModal(arg){
         openRunProgress('Running CLI…');
         maybeShowLocalEmulationHint();
     }
-    const readErrorMessage = async (response) => {
-        if(!response) return '';
-        try {
-            const ct = response.headers?.get?.('content-type') || '';
-            if(ct && ct.includes('application/json')){
-                const data = await response.json();
-                if(data && typeof data === 'object'){
-                    if(typeof data.error === 'string' && data.error.trim()){
-                        return data.error.trim();
-                    }
-                    return JSON.stringify(data);
-                }
-            }
-        } catch(e) {
-            try {
-                const txt = await response.text();
-                if(txt && txt.trim()) return txt.trim();
-            } catch(_err) {
-                return '';
-            }
-            return '';
-        }
-        try {
-            const txt = await response.text();
-            if(txt && txt.trim()) return txt.trim();
-        } catch(_){}
-        const statusText = response.statusText ? ` ${response.statusText}` : '';
-        return `HTTP ${response.status}${statusText}`.trim();
-    };
     try {
         // Ensure dock is visible
         try {
             const showBtn = document.getElementById('dockShowBtn');
             if (showBtn && !showBtn.classList.contains('d-none')) { showBtn.click(); }
         } catch(e){}
-        const form = new FormData();
-        form.append('xml_path', rp);
-        appendScenarioContextToFormData(form);
-        try {
-            form.append('core_json', JSON.stringify(getCoreConfig(true)));
-        } catch (e) {
-            form.append('core_json', '{}');
+        const res = await submitRunCliRequest(() => ({ body: buildRunFormData(rp), xmlPath: rp }));
+        if(!res){
+            runProgressLogLine('Run start aborted.');
+            if(showProgressModal){
+                try {
+                    const statusEl = document.getElementById('runProgressStatus');
+                    if(statusEl) statusEl.textContent = 'Aborted';
+                    const metaEl = document.getElementById('runProgressMeta');
+                    if(metaEl) metaEl.textContent = 'Repository upload required';
+                    const bar = document.getElementById('runProgressBar');
+                    if(bar){ bar.classList.remove('progress-bar-animated'); bar.textContent = 'Aborted'; }
+                } catch(e){}
+            }
+            try { opts.onError?.(new Error('Run aborted before launch')); } catch(e){}
+            return false;
         }
-        const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
         if(!res.ok){
-            const detail = await readErrorMessage(res);
+            const detail = await extractResponseDetail(res);
             const message = detail || `HTTP ${res.status}`;
             runProgressLogLine('Failed to start CLI' + (detail ? `: ${detail}` : ''));
             if(showProgressModal){
@@ -10704,13 +10814,21 @@ async function runWithSeedBuild(){
     try {
         // Show dock logs
         try { const showBtn=document.getElementById('dockShowBtn'); if(showBtn && !showBtn.classList.contains('d-none')) showBtn.click(); } catch(e){}
-        const payload = enrichPayloadWithScenarioContext({ xml_path: rp, seed: seedVal, core: getCoreConfig(true) });
-        const res = await fetch("{{ url_for('run_cli_async') }}", {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-        if(!res.ok){ runProgressLogLine('Failed to start seeded run'); return; }
+        const buildRequest = () => {
+            const payload = enrichPayloadWithScenarioContext({ xml_path: rp, seed: seedVal, core: getCoreConfig(true) });
+            return {
+                body: JSON.stringify(payload),
+                headers: { 'Content-Type': 'application/json' },
+                xmlPath: rp,
+            };
+        };
+        const res = await submitRunCliRequest(buildRequest);
+        if(!res){ runProgressLogLine('Seeded run aborted before launch'); return; }
+        if(!res.ok){
+            const detail = await extractResponseDetail(res);
+            runProgressLogLine('Failed to start seeded run' + (detail ? `: ${detail}` : ''));
+            return;
+        }
         const { run_id } = await res.json();
         runProgressRunId = run_id;
         // Stream logs
