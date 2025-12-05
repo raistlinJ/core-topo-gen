@@ -126,6 +126,7 @@ def test_proxmox_validate_success(client, tmp_path):
         "password": "secret",
         "scenario_index": 0,
         "scenario_name": "Scenario 1",
+        "remember_credentials": True,
     }
     resp = client.post("/api/proxmox/validate", json=payload)
     assert resp.status_code == 200
@@ -138,6 +139,27 @@ def test_proxmox_validate_success(client, tmp_path):
     stored = json.loads(files[0].read_text())
     assert stored["username"] == payload["username"]
     assert stored["port"] == payload["port"]
+
+
+def test_proxmox_validate_without_remember_does_not_store(client, tmp_path):
+    payload = {
+        "url": "https://pve.example.local",
+        "port": 8443,
+        "username": "root@pam",
+        "password": "secret",
+        "scenario_index": 0,
+        "scenario_name": "Scenario 1",
+        "remember_credentials": False,
+    }
+    resp = client.post("/api/proxmox/validate", json=payload)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["success"] is True
+    assert data.get("secret_id") is None
+    saved_path = tmp_path / "outputs" / "secrets" / "proxmox"
+    if saved_path.exists():
+        files = list(saved_path.glob("*.json"))
+        assert not files, "Credentials should not be stored when remember is disabled"
 
 
 def test_proxmox_inventory_requires_secret(client):
@@ -155,6 +177,7 @@ def test_proxmox_inventory_success(client):
         "password": "secret",
         "scenario_index": 0,
         "scenario_name": "Scenario 1",
+        "remember_credentials": True,
     }
     resp = client.post("/api/proxmox/validate", json=validate_payload)
     assert resp.status_code == 200

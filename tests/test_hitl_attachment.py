@@ -281,7 +281,8 @@ def test_hitl_existing_router_attachment_populates_router_interfaces(monkeypatch
     backend._merge_hitl_preview_with_full_preview(full_preview, hitl_cfg)
 
     router_entry = full_preview['routers'][0]
-    hitl_keys = [key for key in router_entry['r2r_interfaces'].keys() if key.startswith('hitl-rj45-')]
+    slug = iface_entry.get('slug') or 'uplink1'
+    hitl_keys = [key for key in router_entry['r2r_interfaces'].keys() if key == slug]
     assert hitl_keys, 'expected HITL RJ45 interface on router'
     peer_key = hitl_keys[0]
     assert router_entry['r2r_interfaces'][peer_key] == '10.254.200.1/29'

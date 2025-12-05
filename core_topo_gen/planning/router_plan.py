@@ -22,8 +22,8 @@ def compute_router_plan(total_hosts: int, base_host_pool: int, routing_density: 
             total_hosts, base_host_pool, (routing_density or 0.0), len(routing_items or [])
         )
     # Expand Random placeholder protocols (weight-based only) before classification.
-    # Web UI enumeration (excluding 'Random'): ["RIP", "RIPv2", "BGP", "OSPFv2", "OSPFv3"]
-    DEFAULT_RANDOM_PROTOCOLS = ["RIP", "RIPv2", "BGP", "OSPFv2", "OSPFv3"]
+    # Web UI enumeration (excluding 'Random'): ["RIP", "RIPNG", "BGP", "OSPFv2", "OSPFv3"]
+    DEFAULT_RANDOM_PROTOCOLS = ["RIP", "RIPNG", "BGP", "OSPFv2", "OSPFv3"]
     expanded_items: List[RoutingInfo] = []
     random_weight_factor = 0.0
     for ri in (routing_items or []):

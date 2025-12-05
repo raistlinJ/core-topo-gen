@@ -36,6 +36,7 @@
   #sessionsTable th.col-id, #sessionsTable td.col-id { width: 5%; white-space: nowrap; text-align: center; overflow: hidden; text-overflow: ellipsis; }
   #sessionsTable th.col-state, #sessionsTable td.col-state { width: 10%; white-space: nowrap; text-align: center; }
   #sessionsTable th.col-nodes, #sessionsTable td.col-nodes { width: 10%; white-space: nowrap; text-align: center; overflow: hidden; text-overflow: ellipsis; }
+  #sessionsTable th.col-scenario, #sessionsTable td.col-scenario { width: 15%; white-space: nowrap; text-align: center; }
   #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 50%; }
   .actions-col .btn { padding: .15rem .3rem; line-height: 1; vertical-align: middle; display: inline-flex; align-items: center; justify-content: center; }
   .actions-col .btn i, .actions-col .btn .bi { font-size: .95em; line-height: 1; display: block; }
@@ -144,6 +145,7 @@
                   <th class="col-id">ID</th>
                   <th class="col-state">State</th>
                   <th class="col-nodes">Nodes</th>
+                  <th class="col-scenario">Scenario</th>
                   <th class="filename-col">File</th>
                   <th class="actions-col">Actions</th>
                 </tr>
@@ -426,9 +428,11 @@
     const baseName = rawFile ? rawFile.split(/[/\\\\]/).pop() : '—';
     const file = esc(baseName);
     const fullFileTitle = esc(rawFile || '');
+    const scenarioRaw = (s.scenario_name || '').toString().trim();
+    const scenarioDisplay = scenarioRaw ? `<span class="badge text-bg-primary">${esc(scenarioRaw)}</span>` : '<span class="text-muted">—</span>';
     const lower = (s.state||'').toString().toLowerCase();
     const hasFile = !!s.file;
-    const rowStr = `${id} ${state} ${nodes} ${file}`.toLowerCase();
+    const rowStr = `${id} ${state} ${nodes} ${scenarioRaw} ${file}`.toLowerCase();
     if (sessionsFilterText && !rowStr.includes(sessionsFilterText)) return '';
     const detailsHref = hasFile
       ? (`{{ url_for('core_details') }}?path=` + encodeURIComponent(s.file))
@@ -473,6 +477,7 @@
       <td class="col-id">${id}</td>
       <td class="col-state">${stateIcon}</td>
       <td class="col-nodes">${nodes}</td>
+      <td class="col-scenario">${scenarioDisplay}</td>
       <td class="filename-col"><div class="filename-scroll" title="${fullFileTitle}">${file}</div></td>
       <td class="actions-col">${actions}</td>
     </tr>`;

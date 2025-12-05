@@ -3,7 +3,7 @@ import logging
 import hashlib
 import ipaddress
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 
 from ..types import NodeInfo
 
@@ -181,6 +181,91 @@ def _next_iface_id(node: Any, cache: Dict[int, int]) -> int:
     next_id = cache[node_id]
     cache[node_id] = next_id + 1
     return next_id
+
+
+def _prefill_iface_cache(session: Any, cache: Dict[int, int]) -> None:
+    if session is None or cache is None:
+        return
+    links_attr = getattr(session, "links", None)
+    if not links_attr:
+        return
+    if isinstance(links_attr, dict):
+        links_iter = list(links_attr.values())
+    elif isinstance(links_attr, Iterable):
+        try:
+            links_iter = list(links_attr)
+        except Exception:
+            links_iter = []
+    else:
+        links_iter = []
+    if not links_iter:
+        return
+
+    def _norm_node(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        try:
+            node_id = getattr(value, "id", None)
+            if node_id is not None:
+                return int(node_id)
+        except Exception:
+            pass
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _norm_iface(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        try:
+            iface_id = getattr(value, "id", None)
+            if iface_id is not None:
+                return int(iface_id)
+        except Exception:
+            pass
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _record(node_value: Any, iface_value: Any) -> None:
+        node_id = _norm_node(node_value)
+        iface_id = _norm_iface(iface_value)
+        if node_id is None or iface_id is None:
+            return
+        next_id = iface_id + 1
+        prev = cache.get(node_id)
+        if prev is None or next_id > prev:
+            cache[node_id] = next_id
+
+    for link in links_iter:
+        try:
+            node1 = getattr(link, "node1_id", None)
+            if node1 is None:
+                node1 = getattr(link, "node1", None)
+            iface1 = getattr(link, "iface1", None)
+            if iface1 is None:
+                iface1 = getattr(link, "iface1_id", None)
+            if iface1 is None:
+                iface1 = getattr(link, "interface1", None)
+            _record(node1, iface1)
+
+            node2 = getattr(link, "node2_id", None)
+            if node2 is None:
+                node2 = getattr(link, "node2", None)
+            iface2 = getattr(link, "iface2", None)
+            if iface2 is None:
+                iface2 = getattr(link, "iface2_id", None)
+            if iface2 is None:
+                iface2 = getattr(link, "interface2", None)
+            _record(node2, iface2)
+        except Exception:
+            continue
 
 
 def _make_position_near(peer: Any, index: int) -> Optional[Position]:
@@ -404,6 +489,10 @@ def _prepare_rj45_options(node: Any, iface_name: str) -> None:
         setattr(node, "interface", iface_name)
     except Exception:
         pass
+    try:
+        setattr(node, "localname", iface_name)
+    except Exception:
+        pass
     options_obj = getattr(node, "options", None)
     if options_obj is None:
         options_obj = SimpleNamespace()
@@ -411,7 +500,7 @@ def _prepare_rj45_options(node: Any, iface_name: str) -> None:
             setattr(node, "options", options_obj)
         except Exception:
             pass
-    for key in ("type", "model", "interface", "device"):
+    for key in ("type", "model", "interface", "device", "localname"):
         try:
             setattr(options_obj, key, "RJ45" if key in {"type", "model"} else iface_name)
         except Exception:
@@ -460,10 +549,20 @@ def attach_hitl_rj45_nodes(
         return summary
     # Determine peers
     router_nodes: List[Any] = []
+    router_node_ids: Set[int] = set()
     for info in routers:
         node = _safe_get_node(session, info.node_id)
         if node:
             router_nodes.append(node)
+            try:
+                rid = _extract_node_id(node, info.node_id)
+            except Exception:
+                rid = info.node_id
+            if rid is not None:
+                try:
+                    router_node_ids.add(int(rid))
+                except Exception:
+                    pass
     host_nodes: List[Any] = []
     for info in hosts:
         node = _safe_get_node(session, info.node_id)
@@ -475,10 +574,12 @@ def attach_hitl_rj45_nodes(
     switch_nodes = _gather_switch_nodes(session)
     existing_ids = _determine_existing_ids(session, routers, hosts)
     iface_id_cache: Dict[int, int] = {}
+    _prefill_iface_cache(session, iface_id_cache)
     summary["session_option_enabled"] = _enable_rj45_option(session)
     created_nodes: List[int] = []
     created_network_nodes: List[int] = []
     created_router_nodes: List[int] = []
+    created_router_id_set: Set[int] = set()
     scenario_key = str(hitl_config.get("scenario_key") or hitl_config.get("scenario_name") or "")
     preference_values: List[str] = []
     for iface_entry in interfaces:
@@ -493,7 +594,7 @@ def attach_hitl_rj45_nodes(
             continue
         raw_name = str(iface_entry.get("name") or f"iface-{idx}")
         clean_name = _normalize_iface_name(raw_name, idx)
-        node_name = f"hitl-{clean_name}"
+        node_name = clean_name
         node_id = _allocate_node_id(existing_ids)
         preference = preference_values[idx] if idx < len(preference_values) else _DEFAULT_ATTACHMENT
         attempt_order = _attachment_attempt_order(preference)
@@ -502,7 +603,7 @@ def attach_hitl_rj45_nodes(
         assignment_kind = "peer"
         uplink_router_id: Optional[int] = None
         uplink_linked: bool = False
-        router_link_ips: Optional[Dict[str, Any]] = None
+        rj_link_ips: Optional[Dict[str, Any]] = None
         rng_seed = f"{scenario_key}|{raw_name}|{idx}|{len(interfaces)}"
         rng = _make_deterministic_rng(rng_seed)
         for attempt in attempt_order:
@@ -526,6 +627,7 @@ def attach_hitl_rj45_nodes(
                     target_node = session.add_node(router_id, _type=router_type, position=router_position, name=router_name)
                     created_nodes.append(router_id)
                     created_router_nodes.append(router_id)
+                    created_router_id_set.add(router_id)
                     assignment_kind = "router"
                     anchor = target_node
                     if router_candidates:
@@ -539,10 +641,10 @@ def attach_hitl_rj45_nodes(
                             f"{clean_name}-uplink",
                         )
                         if link_ips_candidate:
-                            router_link_ips = link_ips_candidate
                             _apply_iface_ip(new_router_iface_obj, link_ips_candidate.get("new_router_ip4"), link_ips_candidate.get("prefix_len"))
                             _apply_iface_ip(peer_router_iface_obj, link_ips_candidate.get("existing_router_ip4"), link_ips_candidate.get("prefix_len"))
                     router_nodes.append(target_node)
+                    router_node_ids.add(router_id)
                     break
                 except Exception as exc:
                     logger.error("HITL: failed to create router %s: %s", router_name, exc)
@@ -635,18 +737,30 @@ def attach_hitl_rj45_nodes(
                 "reason": "no-target",
             })
             continue
+        try:
+            target_node_id = _extract_node_id(target_node, 0)
+        except Exception:
+            target_node_id = None
+        target_is_router = bool(target_node_id is not None and target_node_id in router_node_ids)
+        if target_is_router and rj_link_ips is None:
+            rj_link_seed = f"{raw_name}|router-{target_node_id}|rj45"
+            rj_link_ips = _compute_hitl_link_ips(scenario_key, rj_link_seed, idx + len(interfaces))
         iface_peer_id = _next_iface_id(target_node, iface_id_cache)
         peer_iface_name = f"{getattr(target_node, 'name', 'peer')}-hitl{idx}".lower()
         try:
             peer_iface = Interface(id=iface_peer_id, name=peer_iface_name)
         except Exception:
             peer_iface = None
+        rj_iface_id = _next_iface_id(rj45_node, iface_id_cache)
         try:
-            rj_iface = Interface(id=0, name=f"{clean_name}-uplink")
+            rj_iface = Interface(id=rj_iface_id, name=f"{clean_name}-uplink")
         except Exception:
             rj_iface = None
-        if assignment_kind == "router" and router_link_ips:
-            _apply_iface_ip(rj_iface, router_link_ips.get("rj45_ip4"), router_link_ips.get("prefix_len"))
+        if target_is_router and rj_link_ips:
+            router_ip_key = "new_router_ip4" if (target_node_id in created_router_id_set) else "existing_router_ip4"
+            router_ip_val = rj_link_ips.get(router_ip_key) or rj_link_ips.get("existing_router_ip4") or rj_link_ips.get("new_router_ip4")
+            _apply_iface_ip(peer_iface, router_ip_val, rj_link_ips.get("prefix_len"))
+            _apply_iface_ip(rj_iface, rj_link_ips.get("rj45_ip4"), rj_link_ips.get("prefix_len"))
         linked = _link_nodes(session, rj45_node, target_node, rj_iface, peer_iface)
         created_nodes.append(node_id)
         summary_entry = {
@@ -661,17 +775,19 @@ def attach_hitl_rj45_nodes(
         summary_entry["peer_node_id"] = summary_entry["target_node_id"]
         if linked and peer_iface is not None:
             summary_entry["peer_iface_id"] = getattr(peer_iface, "id", iface_peer_id)
+        if rj_iface is not None:
+            summary_entry["rj45_iface_id"] = getattr(rj_iface, "id", rj_iface_id)
         if network_node is not None:
             summary_entry["network_node_id"] = _extract_node_id(network_node, 0)
         if assignment_kind == "router":
             summary_entry["router_node_id"] = summary_entry["target_node_id"]
-        if router_link_ips:
-            summary_entry["link_network_cidr"] = router_link_ips.get("network_cidr") or router_link_ips.get("network")
-            summary_entry["existing_router_ip4"] = router_link_ips.get("existing_router_ip4")
-            summary_entry["new_router_ip4"] = router_link_ips.get("new_router_ip4")
-            summary_entry["rj45_ip4"] = router_link_ips.get("rj45_ip4")
-            summary_entry["prefix_len"] = router_link_ips.get("prefix_len")
-            summary_entry["netmask"] = router_link_ips.get("netmask")
+        if rj_link_ips:
+            summary_entry["link_network_cidr"] = rj_link_ips.get("network_cidr") or rj_link_ips.get("network")
+            summary_entry["existing_router_ip4"] = rj_link_ips.get("existing_router_ip4")
+            summary_entry["new_router_ip4"] = rj_link_ips.get("new_router_ip4")
+            summary_entry["rj45_ip4"] = rj_link_ips.get("rj45_ip4")
+            summary_entry["prefix_len"] = rj_link_ips.get("prefix_len")
+            summary_entry["netmask"] = rj_link_ips.get("netmask")
         if uplink_router_id is not None:
             summary_entry["uplink_router_node_id"] = uplink_router_id
             summary_entry["uplink_linked"] = uplink_linked

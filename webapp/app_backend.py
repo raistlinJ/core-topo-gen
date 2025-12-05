@@ -476,7 +476,7 @@ def _relay_remote_channel_to_log(channel: Any, log_handle: Any) -> None:
 
 def _exec_ssh_command(client: Any, command: str, *, timeout: float = 120.0) -> tuple[int, str, str]:
     if command:
-        _append_core_ui_log('INFO', f'[ssh.exec] COMMAND START\n{command}')
+        _append_core_ui_log('DEBUG', f'[ssh.exec] COMMAND START\n{command}')
     stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
     try:
         stdout_data = stdout.read()
@@ -500,7 +500,8 @@ def _exec_ssh_command(client: Any, command: str, *, timeout: float = 120.0) -> t
     stderr_tag = 'stderr (empty)' if not stderr_text else f'stderr:\n{stderr_text}'
     log_lines.append(stdout_tag)
     log_lines.append(stderr_tag)
-    _append_core_ui_log('INFO' if exit_code == 0 else 'WARN', '\n'.join(log_lines))
+    log_level = 'WARN' if exit_code != 0 else 'DEBUG'
+    _append_core_ui_log(log_level, '\n'.join(log_lines))
     return exit_code, stdout_text, stderr_text
 
 
@@ -2193,6 +2194,22 @@ def _normalize_hitl_attachment(raw_value: Any) -> str:
     return _DEFAULT_HITL_ATTACHMENT
 
 
+def _normalize_hitl_interface_name(raw_value: Any) -> str:
+    """Strip any legacy hitl- prefix so CORE sees the raw device name."""
+    if isinstance(raw_value, str):
+        candidate = raw_value.strip()
+    elif raw_value is None:
+        candidate = ''
+    else:
+        candidate = str(raw_value).strip()
+    if not candidate:
+        return ''
+    prefix = 'hitl-'
+    if candidate.lower().startswith(prefix):
+        return candidate[len(prefix):]
+    return candidate
+
+
 def _slugify_hitl_name(raw_value: Any, fallback: str) -> str:
     value = ''
     if isinstance(raw_value, str):
@@ -2291,7 +2308,7 @@ def _sanitize_hitl_config(hitl_config: Any, scenario_name: Optional[str], xml_ba
         if entry is None:
             continue
         if isinstance(entry, str):
-            name = entry.strip()
+            name = _normalize_hitl_interface_name(entry)
             if name:
                 sanitized.append({'name': name, 'attachment': _DEFAULT_HITL_ATTACHMENT})
             continue
@@ -2303,9 +2320,10 @@ def _sanitize_hitl_config(hitl_config: Any, scenario_name: Optional[str], xml_ba
             name_candidate = str(name_candidate or '').strip()
         else:
             name_candidate = name_candidate.strip()
-        if not name_candidate:
+        normalized_name = _normalize_hitl_interface_name(name_candidate)
+        if not normalized_name:
             continue
-        clone['name'] = name_candidate
+        clone['name'] = normalized_name
         alias_candidate = clone.get('alias') or clone.get('description') or clone.get('display') or clone.get('summary')
         if isinstance(alias_candidate, str) and alias_candidate.strip():
             clone['alias'] = alias_candidate.strip()
@@ -2680,7 +2698,7 @@ def _augment_hitl_existing_router_interfaces(full_preview: Dict[str, Any], hitl_
         rj45_ip_cidr = _compose_ip_with_prefix(iface.get('rj45_ip4'), prefix_len)
         iface['existing_router_ip4_cidr'] = existing_ip_cidr
         iface['rj45_ip4_cidr'] = rj45_ip_cidr
-        peer_key = f"hitl-rj45-{slug}"
+        peer_key = slug
         iface['hitl_peer_key'] = peer_key
         router_iface_map = router_entry.setdefault('r2r_interfaces', {})
         if existing_ip_cidr:
@@ -4546,17 +4564,41 @@ def _path_matches_scenario(path_value: Any, scenario_norm: str, scenario_paths: 
     return _normalize_scenario_label(base) == scenario_norm
 
 
+def _scenario_label_from_path(
+    path_value: Any,
+    scenario_names: list[str],
+    scenario_paths: dict[str, set[str]],
+) -> str:
+    if not path_value:
+        return ''
+    try:
+        ap = os.path.abspath(str(path_value))
+    except Exception:
+        ap = str(path_value)
+    for norm_key, paths in (scenario_paths or {}).items():
+        if ap in paths:
+            return _resolve_scenario_display(norm_key, scenario_names, norm_key)
+    base = os.path.splitext(os.path.basename(ap))[0]
+    base_norm = _normalize_scenario_label(base)
+    if base_norm:
+        return _resolve_scenario_display(base_norm, scenario_names, base)
+    return ''
+
+
 def _session_ids_for_scenario(mapping: dict, scenario_norm: str, scenario_paths: dict[str, set[str]]) -> set[int]:
     ids: set[int] = set()
     if not scenario_norm:
         return ids
-    for path, sid in (mapping or {}).items():
-        if not _path_matches_scenario(path, scenario_norm, scenario_paths):
+    for path, entry in (mapping or {}).items():
+        sid = _session_store_entry_session_id(entry)
+        if sid is None:
             continue
-        try:
-            ids.add(int(sid))
-        except Exception:
+        stored_norm = _session_store_entry_scenario_norm(entry)
+        if stored_norm and stored_norm == scenario_norm:
+            ids.add(sid)
             continue
+        if _path_matches_scenario(path, scenario_norm, scenario_paths):
+            ids.add(sid)
     return ids
 
 
@@ -4565,10 +4607,11 @@ def _filter_sessions_by_scenario(
     scenario_norm: str,
     scenario_paths: dict[str, set[str]],
     scenario_session_ids: set[int],
-) -> list[dict]:
+) -> tuple[list[dict], bool]:
     if not scenario_norm:
-        return sessions
+        return sessions, True
     filtered: list[dict] = []
+    matched = False
     for session in sessions:
         sid = session.get('id')
         sid_int: Optional[int]
@@ -4576,16 +4619,127 @@ def _filter_sessions_by_scenario(
             sid_int = int(sid) if sid is not None else None
         except Exception:
             sid_int = None
+        label = _normalize_scenario_label(session.get('scenario_name')) if session.get('scenario_name') else ''
+        if label and label == scenario_norm:
+            filtered.append(session)
+            matched = True
+            continue
         if sid_int is not None and sid_int in scenario_session_ids:
             filtered.append(session)
+            matched = True
             continue
         if _path_matches_scenario(session.get('file'), scenario_norm, scenario_paths):
             filtered.append(session)
+            matched = True
             continue
         if _path_matches_scenario(session.get('dir'), scenario_norm, scenario_paths):
             filtered.append(session)
+            matched = True
             continue
-    return filtered
+    return filtered, matched
+
+
+def _xml_matches_scenario(
+    path_value: Any,
+    scenario_norm: str,
+    scenario_paths: dict[str, set[str]],
+    mapping: dict,
+) -> bool:
+    if not scenario_norm:
+        return True
+    if _path_matches_scenario(path_value, scenario_norm, scenario_paths):
+        return True
+    if not path_value:
+        return False
+    try:
+        abs_path = os.path.abspath(str(path_value))
+    except Exception:
+        abs_path = str(path_value)
+    entry = mapping.get(abs_path)
+    if not entry and abs_path:
+        entry = mapping.get(abs_path.rstrip('/'))
+    if not entry:
+        return False
+    stored_norm = _session_store_entry_scenario_norm(entry)
+    return bool(stored_norm and stored_norm == scenario_norm)
+
+
+def _filter_xmls_by_scenario(
+    xmls: list[dict],
+    scenario_norm: str,
+    scenario_paths: dict[str, set[str]],
+    mapping: dict,
+) -> tuple[list[dict], bool]:
+    if not scenario_norm:
+        return xmls, True
+    filtered: list[dict] = []
+    matched = False
+    for entry in xmls:
+        if _xml_matches_scenario(entry.get('path'), scenario_norm, scenario_paths, mapping):
+            filtered.append(entry)
+            matched = True
+    return filtered, matched
+
+
+def _build_session_scenario_labels(
+    mapping: dict,
+    scenario_names: list[str],
+    scenario_paths: dict[str, set[str]],
+) -> dict[int, str]:
+    labels: dict[int, str] = {}
+    for path, entry in (mapping or {}).items():
+        sid = _session_store_entry_session_id(entry)
+        if sid is None:
+            continue
+        label = ''
+        if isinstance(entry, dict):
+            label = str(entry.get('scenario_name') or entry.get('scenario') or '').strip()
+        if not label:
+            norm = _session_store_entry_scenario_norm(entry)
+            if norm:
+                label = _resolve_scenario_display(norm, scenario_names, norm)
+        if not label:
+            label = _scenario_label_from_path(path, scenario_names, scenario_paths)
+        if label:
+            labels[sid] = label
+    return labels
+
+
+def _annotate_sessions_with_scenarios(
+    sessions: list[dict],
+    session_labels: dict[int, str],
+    scenario_norm: str,
+    scenario_names: list[str],
+    scenario_paths: dict[str, set[str]],
+    scenario_query: str = '',
+    scenario_session_ids: Optional[set[int]] = None,
+) -> None:
+    active_display = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query or '') if scenario_norm else ''
+    matched_ids = set(scenario_session_ids or [])
+    for session in sessions:
+        label: Optional[str] = None
+        sid = session.get('id')
+        sid_int: Optional[int]
+        try:
+            sid_int = int(sid) if sid is not None else None
+        except Exception:
+            sid_int = None
+        if sid_int is not None:
+            label = session_labels.get(sid_int)
+        if not label and sid is not None:
+            try:
+                label = session_labels.get(int(str(sid)))
+            except Exception:
+                label = None
+        if not label:
+            candidate_path = session.get('file') or session.get('dir') or ''
+            label = _scenario_label_from_path(candidate_path, scenario_names, scenario_paths)
+        if not label and scenario_norm:
+            if sid_int is not None and sid_int in matched_ids:
+                label = active_display or scenario_query
+            elif _path_matches_scenario(session.get('file'), scenario_norm, scenario_paths) or _path_matches_scenario(session.get('dir'), scenario_norm, scenario_paths):
+                label = active_display or scenario_query
+        session['scenario_name'] = label or ''
 
 
 def _augment_core_config_from_secret(core_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -5707,6 +5861,7 @@ def api_proxmox_validate():
     except Exception:
         timeout = 5.0
     timeout = max(1.0, min(timeout, 30.0))
+    remember_credentials = _coerce_bool(payload.get('remember_credentials'))
     prox_kwargs = {
         'host': host,
         'user': username,
@@ -5744,26 +5899,38 @@ def api_proxmox_validate():
         'password': password,
         'verify_ssl': verify_ssl,
     }
-    try:
-        stored_meta = _save_proxmox_credentials(secret_payload)
-    except RuntimeError as exc:
-        return jsonify({'success': False, 'error': str(exc)}), 500
-    except Exception as exc:
-        app.logger.exception('[proxmox] failed to persist credentials: %s', exc)
-        return jsonify({'success': False, 'error': 'Credentials validated but could not be stored'}), 500
-    summary = {
-        'url': stored_meta['url'],
-        'port': stored_meta['port'],
-        'username': stored_meta['username'],
-        'verify_ssl': stored_meta['verify_ssl'],
-        'stored_at': stored_meta['stored_at'],
-    }
+    summary: Dict[str, Any]
+    secret_identifier: Optional[str] = None
+    if remember_credentials:
+        try:
+            stored_meta = _save_proxmox_credentials(secret_payload)
+        except RuntimeError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 500
+        except Exception as exc:
+            app.logger.exception('[proxmox] failed to persist credentials: %s', exc)
+            return jsonify({'success': False, 'error': 'Credentials validated but could not be stored'}), 500
+        summary = {
+            'url': stored_meta['url'],
+            'port': stored_meta['port'],
+            'username': stored_meta['username'],
+            'verify_ssl': stored_meta['verify_ssl'],
+            'stored_at': stored_meta['stored_at'],
+        }
+        secret_identifier = stored_meta['identifier']
+    else:
+        summary = {
+            'url': url_raw,
+            'port': port,
+            'username': username,
+            'verify_ssl': verify_ssl,
+            'stored_at': datetime.datetime.now(datetime.UTC).isoformat(),
+        }
     message = f"Validated Proxmox access for {username} at {host}:{port}"
     return jsonify({
         'success': True,
         'message': message,
         'summary': summary,
-        'secret_id': stored_meta['identifier'],
+        'secret_id': secret_identifier,
         'scenario_index': scenario_index,
         'scenario_name': scenario_name,
     })
@@ -7811,6 +7978,11 @@ def run_cli():
         session_id = _extract_session_id_from_text(logs)
         if session_id:
             app.logger.info("[sync] Detected CORE session id: %s", session_id)
+            _record_session_mapping(
+                xml_path,
+                session_id,
+                scenario_name=active_scenario_name or scenario_name_hint or None,
+            )
         # Read XML for preview
         xml_text = ""
         try:
@@ -8782,6 +8954,7 @@ def run_cli_async():
     scenario_core_override = None
     scenario_name_hint = None
     scenario_index_hint: Optional[int] = None
+    update_remote_repo = False
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
         xml_path = request.form.get('xml_path')
@@ -8809,6 +8982,8 @@ def run_cli_async():
                 scenario_core_override = json.loads(hitl_core_json)
         except Exception:
             scenario_core_override = None
+        if 'update_remote_repo' in request.form:
+            update_remote_repo = _coerce_bool(request.form.get('update_remote_repo'))
     if not xml_path:
         try:
             j = request.get_json(silent=True) or {}
@@ -8829,6 +9004,8 @@ def run_cli_async():
                     scenario_index_hint = int(j.get('scenario_index'))
                 except Exception:
                     scenario_index_hint = None
+            if 'update_remote_repo' in j:
+                update_remote_repo = _coerce_bool(j.get('update_remote_repo'))
         except Exception:
             pass
     if not xml_path:
@@ -8972,12 +9149,80 @@ def run_cli_async():
             except Exception:
                 pass
             return jsonify({"error": venv_error}), 400
+    if update_remote_repo:
+        try:
+            log_f.write("[remote] Repo upload starting (requested by execute dialog)\n")
+        except Exception:
+            pass
+        try:
+            repo_sync = _push_repo_to_remote(core_cfg, logger=app.logger)
+        except Exception as exc:
+            try:
+                log_f.write(f"[remote] Repo upload failed: {exc}\n")
+            except Exception:
+                pass
+            try:
+                log_f.close()
+            except Exception:
+                pass
+            try:
+                os.remove(log_path)
+            except Exception:
+                pass
+            return jsonify({"error": f"Repo upload failed: {exc}"}), 500
+        else:
+            repo_path = repo_sync.get('repo_path') if isinstance(repo_sync, dict) else None
+            try:
+                detail = f" ({repo_path})" if repo_path else ''
+                log_f.write(f"[remote] Repo upload complete{detail}\n")
+            except Exception:
+                pass
     core_host = core_cfg.get('host', '127.0.0.1')
     try:
         core_port = int(core_cfg.get('port', 50051))
     except Exception:
         core_port = 50051
     remote_desc = f"{core_host}:{core_port}"
+    blocking_sessions: list[dict] = []
+    try:
+        existing_sessions = _list_active_core_sessions(core_host, core_port, core_cfg, errors=[], meta={})
+    except Exception as exc:
+        app.logger.warning('[async] Failed to enumerate existing CORE sessions: %s', exc)
+        existing_sessions = []
+    for entry in existing_sessions:
+        state_raw = str(entry.get('state') or '').strip().lower()
+        if state_raw in {'shutdown'}:
+            continue
+        blocking_sessions.append(entry)
+    if blocking_sessions:
+        count = len(blocking_sessions)
+        message = (
+            f"CORE VM {remote_desc} already has {count} active session(s); finish or stop the running scenario before starting another."
+        )
+        try:
+            log_f.write(f"[remote] {message}\n")
+        except Exception:
+            pass
+        try:
+            log_f.close()
+        except Exception:
+            pass
+        payload = {
+            "error": message,
+            "session_count": count,
+            "core_host": core_host,
+            "core_port": core_port,
+            "active_sessions": [
+                {
+                    "id": entry.get('id'),
+                    "state": entry.get('state'),
+                    "nodes": entry.get('nodes'),
+                    "file": entry.get('file'),
+                }
+                for entry in blocking_sessions[:5]
+            ],
+        }
+        return jsonify(payload), 423
     app.logger.info("[async] CORE remote=%s (ssh_enabled=%s)", remote_desc, core_cfg.get('ssh_enabled'))
     pre_saved = None
     # Establish SSH tunnel so CLI subprocess can reach CORE
@@ -9363,6 +9608,16 @@ def run_cli_async():
                     out_dir = os.path.dirname(xml_path_local or '')
                     post_dir = os.path.join(out_dir, 'core-post') if out_dir else os.path.join(_outputs_dir(), 'core-post')
                     sid = _extract_session_id_from_text(txt)
+                    scenario_label = meta.get('scenario_name') or active_scenario_name
+                    if not scenario_label:
+                        try:
+                            sns_meta = meta.get('scenario_names') or []
+                            if isinstance(sns_meta, list) and sns_meta:
+                                scenario_label = sns_meta[0]
+                        except Exception:
+                            scenario_label = None
+                    if sid:
+                        _record_session_mapping(xml_path_local, sid, scenario_label)
                     cfg_for_post = meta.get('core_cfg') or {
                         'host': meta.get('core_host') or CORE_HOST,
                         'port': meta.get('core_port') or CORE_PORT,
@@ -9500,6 +9755,16 @@ def run_status(run_id: str):
                         post_dir = os.path.join(out_dir, 'core-post') if out_dir else os.path.join(_outputs_dir(), 'core-post')
                         # Parse session id from logs if available for precise save
                         sid = _extract_session_id_from_text(txt)
+                        scenario_label = meta.get('scenario_name') or active_scenario_name
+                        if not scenario_label:
+                            try:
+                                sns_meta = meta.get('scenario_names') or []
+                                if isinstance(sns_meta, list) and sns_meta:
+                                    scenario_label = sns_meta[0]
+                            except Exception:
+                                scenario_label = None
+                        if sid:
+                            _record_session_mapping(xml_path_local, sid, scenario_label)
                         cfg_for_post = meta.get('core_cfg') or {
                             'host': meta.get('core_host') or CORE_HOST,
                             'port': meta.get('core_port') or CORE_PORT,
@@ -9702,6 +9967,29 @@ def _load_core_sessions_store() -> dict:
     return {}
 
 
+def _session_store_entry_session_id(value: Any) -> Optional[int]:
+    candidate: Any
+    if isinstance(value, dict):
+        candidate = value.get('session_id') or value.get('id')
+    else:
+        candidate = value
+    if candidate in (None, ''):
+        return None
+    try:
+        return int(candidate)
+    except Exception:
+        return None
+
+
+def _session_store_entry_scenario_norm(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ''
+    raw = value.get('scenario_norm') or value.get('scenario_name') or value.get('scenario')
+    if not raw:
+        return ''
+    return _normalize_scenario_label(raw)
+
+
 def _save_core_sessions_store(d: dict) -> None:
     try:
         os.makedirs(os.path.dirname(_core_sessions_store_path()), exist_ok=True)
@@ -9713,7 +10001,12 @@ def _save_core_sessions_store(d: dict) -> None:
         pass
 
 
-def _update_xml_session_mapping(xml_path: str, session_id: int | None) -> None:
+def _update_xml_session_mapping(
+    xml_path: str,
+    session_id: int | None,
+    *,
+    scenario_name: Optional[str] = None,
+) -> None:
     try:
         store = _load_core_sessions_store()
         key = os.path.abspath(xml_path)
@@ -9721,10 +10014,31 @@ def _update_xml_session_mapping(xml_path: str, session_id: int | None) -> None:
             if key in store:
                 store.pop(key, None)
         else:
-            store[key] = int(session_id)
+            scenario_label = (scenario_name or '').strip()
+            entry: dict[str, Any] = {'session_id': int(session_id)}
+            scenario_norm = _normalize_scenario_label(scenario_label)
+            if scenario_norm:
+                entry['scenario_norm'] = scenario_norm
+            if scenario_label:
+                entry['scenario_name'] = scenario_label
+            store[key] = entry
         _save_core_sessions_store(store)
     except Exception:
         pass
+
+
+def _record_session_mapping(
+    xml_path: str | None,
+    session_id: Any,
+    scenario_name: Optional[str] = None,
+) -> None:
+    if not xml_path or session_id in (None, ''):
+        return
+    try:
+        sid_int = int(str(session_id).strip())
+    except Exception:
+        return
+    _update_xml_session_mapping(xml_path, sid_int, scenario_name=scenario_name)
 
 
 def _list_active_core_sessions(
@@ -9860,10 +10174,27 @@ def core_page():
     xmls = _scan_core_xmls()
     # Map running by file path, with fallback to local store
     mapping = _load_core_sessions_store()
+    session_label_map = _build_session_scenario_labels(mapping, scenario_names, scenario_paths)
     scenario_session_ids = _session_ids_for_scenario(mapping, scenario_norm, scenario_paths) if scenario_norm else set()
+    _annotate_sessions_with_scenarios(
+        sessions,
+        session_label_map,
+        scenario_norm,
+        scenario_names,
+        scenario_paths,
+        scenario_query,
+        scenario_session_ids,
+    )
     if scenario_norm:
-        sessions = _filter_sessions_by_scenario(sessions, scenario_norm, scenario_paths, scenario_session_ids)
-        xmls = [x for x in xmls if _path_matches_scenario(x.get('path'), scenario_norm, scenario_paths)]
+        filtered_sessions, matched = _filter_sessions_by_scenario(sessions, scenario_norm, scenario_paths, scenario_session_ids)
+        sessions = filtered_sessions
+        if not matched:
+            app.logger.info('[core.page] scenario=%s produced no session matches', scenario_norm)
+        filtered_xmls, xml_matched = _filter_xmls_by_scenario(xmls, scenario_norm, scenario_paths, mapping)
+        if xml_matched:
+            xmls = filtered_xmls
+        else:
+            app.logger.info('[core.page] scenario=%s produced no XML matches; showing all XMLs', scenario_norm)
     file_to_sid: dict[str, int] = {}
     # From gRPC session summaries (file path may be absolute)
     for s in sessions:
@@ -9873,7 +10204,10 @@ def core_page():
             file_to_sid[os.path.abspath(f)] = int(sid)
     # Merge with prior mappings
     for k, v in mapping.items():
-        file_to_sid.setdefault(os.path.abspath(k), int(v))
+        sid = _session_store_entry_session_id(v)
+        if sid is None:
+            continue
+        file_to_sid.setdefault(os.path.abspath(k), sid)
     # Annotate xmls
     for x in xmls:
         sid = file_to_sid.get(x['path'])
@@ -9922,10 +10256,27 @@ def core_data():
     xmls = _scan_core_xmls()
     # annotate xmls with running/session_id best-effort mapping, as in core_page
     mapping = _load_core_sessions_store()
+    session_label_map = _build_session_scenario_labels(mapping, scenario_names, scenario_paths)
     scenario_session_ids = _session_ids_for_scenario(mapping, scenario_norm, scenario_paths) if scenario_norm else set()
+    _annotate_sessions_with_scenarios(
+        sessions,
+        session_label_map,
+        scenario_norm,
+        scenario_names,
+        scenario_paths,
+        scenario_query,
+        scenario_session_ids,
+    )
     if scenario_norm:
-        sessions = _filter_sessions_by_scenario(sessions, scenario_norm, scenario_paths, scenario_session_ids)
-        xmls = [x for x in xmls if _path_matches_scenario(x.get('path'), scenario_norm, scenario_paths)]
+        filtered_sessions, matched = _filter_sessions_by_scenario(sessions, scenario_norm, scenario_paths, scenario_session_ids)
+        sessions = filtered_sessions
+        if not matched:
+            app.logger.info('[core.data] scenario=%s produced no session matches', scenario_norm)
+        filtered_xmls, xml_matched = _filter_xmls_by_scenario(xmls, scenario_norm, scenario_paths, mapping)
+        if xml_matched:
+            xmls = filtered_xmls
+        else:
+            app.logger.info('[core.data] scenario=%s produced no XML matches; showing all XMLs', scenario_norm)
     file_to_sid: dict[str, int] = {}
     for s in sessions:
         f = s.get('file')
@@ -9933,7 +10284,10 @@ def core_data():
         if f and sid is not None:
             file_to_sid[os.path.abspath(f)] = int(sid)
     for k, v in mapping.items():
-        file_to_sid.setdefault(os.path.abspath(k), int(v))
+        sid = _session_store_entry_session_id(v)
+        if sid is None:
+            continue
+        file_to_sid.setdefault(os.path.abspath(k), sid)
     for x in xmls:
         sid = file_to_sid.get(x['path'])
         x['session_id'] = sid
@@ -10093,6 +10447,7 @@ def core_start():
     if not xml_path:
         flash('Missing XML path')
         return redirect(url_for('core_page'))
+    scenario_label = (request.form.get('scenario') or '').strip()
     ap = os.path.abspath(xml_path)
     if not os.path.exists(ap):
         flash('File not found')
@@ -10146,8 +10501,8 @@ def core_start():
         sid_int = int(sid)
     except Exception:
         sid_int = sid
-    app.logger.info('[core.start] Started session %s via %s', sid_int, address)
-    _update_xml_session_mapping(ap, sid_int)
+    app.logger.info('[core.start] Started session %s via %s (scenario=%r)', sid_int, address, scenario_label)
+    _update_xml_session_mapping(ap, sid_int, scenario_name=scenario_label or None)
     flash(f'Started session {sid_int}.')
     return redirect(url_for('core_page'))
 

@@ -1242,7 +1242,7 @@
       interfaces.forEach((iface, idx) => {
         const baseName = normalizeName(iface.name, idx);
         const attachmentPref = normalizeHitlAttachment(iface.attachment);
-        const nodeId = makeUniqueId(`hitl-${baseName}`);
+        const nodeId = makeUniqueId(baseName);
         const alias = iface.alias;
         const labelParts = [];
         if(iface.name) labelParts.push(iface.name);
