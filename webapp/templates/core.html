@@ -73,7 +73,7 @@
 {% endif %}
 <div id="dataLoadingBar" class="d-none"><div class="bar"></div></div>
 <div id="coreErrorContainer" class="mb-3">
-  {% if core_errors %}
+  {% if core_errors and not is_builder_view %}
   <div class="alert alert-danger" role="alert">
     <div class="fw-bold">CORE connection issues</div>
     <ul class="mb-0">
@@ -84,30 +84,70 @@
   </div>
   {% endif %}
 </div>
-{% if core_vm_configured and core_vm_summary %}
+{% set has_core_errors = core_errors|default([])|length > 0 %}
+{% if core_vm_configured and core_vm_summary and not has_core_errors %}
 <div class="alert alert-success" role="status">
   <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
     <div class="flex-grow-1">
       <div class="d-flex flex-wrap align-items-center gap-2">
         <span class="fw-bold">CORE VM connected</span>
         <span>
-          {{ core_vm_summary.label }}{% if core_vm_summary.node %}
-            <span class="text-muted">• Node {{ core_vm_summary.node }}</span>
+          {% if not is_builder_view %}
+            {{ core_vm_summary.label }}{% if core_vm_summary.node %}
+              <span class="text-muted">• Node {{ core_vm_summary.node }}</span>
+            {% endif %}
+          {% else %}
+            CORE VM managed by admin
           {% endif %}
         </span>
       </div>
+      {% if not is_builder_view %}
       <div class="small text-muted">
         gRPC {{ core_vm_summary.host }}:{{ core_vm_summary.port }} •
         SSH {{ core_vm_summary.ssh_username or 'unknown' }}@{{ core_vm_summary.ssh_host }}:{{ core_vm_summary.ssh_port }}
       </div>
+      {% endif %}
     </div>
+    {% if not is_builder_view %}
     <a class="btn btn-sm btn-dark" href="{{ core_modal_href }}">Change CORE VM</a>
+    {% else %}
+    <span class="badge text-bg-secondary">Admin managed</span>
+    {% endif %}
+  </div>
+</div>
+{% elif core_vm_configured and core_vm_summary %}
+<div class="alert alert-warning" role="status">
+  <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
+    <div class="flex-grow-1">
+      <div class="d-flex flex-wrap align-items-center gap-2">
+        <span class="fw-bold">CORE VM assigned, but connection issues detected</span>
+        <span>
+          {% if not is_builder_view %}
+            {{ core_vm_summary.label }}{% if core_vm_summary.node %}
+              <span class="text-muted">• Node {{ core_vm_summary.node }}</span>
+            {% endif %}
+          {% else %}
+            Admin-managed CORE VM
+          {% endif %}
+        </span>
+      </div>
+      <div class="small text-muted">Resolve the errors above and re-validate the CORE connection.</div>
+    </div>
+    {% if not is_builder_view %}
+    <a class="btn btn-sm btn-outline-dark" href="{{ core_modal_href }}">Review CORE VM</a>
+    {% else %}
+    <span class="badge text-bg-secondary">Contact admin</span>
+    {% endif %}
   </div>
 </div>
 {% else %}
 <div class="alert alert-warning d-flex flex-wrap justify-content-between align-items-center gap-3" role="status">
   <span class="fw-semibold">No CORE VM configured</span>
+  {% if not is_builder_view %}
   <a class="btn btn-sm btn-outline-primary" href="{{ core_modal_href }}">Select CORE VM</a>
+  {% else %}
+  <span class="text-muted small">Contact an admin to assign a CORE VM.</span>
+  {% endif %}
 </div>
 {% endif %}
 <div class="row g-3 align-items-stretch" id="coreLayoutRow">

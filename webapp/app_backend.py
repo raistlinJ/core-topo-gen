@@ -27,7 +27,7 @@ import shlex
 import posixpath
 import fnmatch
 import copy
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Iterator, TextIO, Iterable
@@ -4234,6 +4234,46 @@ def _current_user_assigned_scenarios() -> list[str]:
         return list(scenarios)
     return []
 
+
+def _assigned_scenarios_for_user(user: Optional[dict]) -> list[str]:
+    if not user or not isinstance(user, dict):
+        return []
+    username = user.get('username') or ''
+    if not isinstance(username, str):
+        try:
+            username = str(username)
+        except Exception:
+            username = ''
+    username = username.strip()
+    if not username:
+        return []
+    if has_request_context():
+        current = _current_user()
+        if current and current.get('username') == username:
+            return _current_user_assigned_scenarios()
+    db = _load_users()
+    users = db.get('users', []) if isinstance(db, dict) else []
+    for entry in users:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get('username') != username:
+            continue
+        return _normalize_scenario_assignments(entry.get('scenarios'))
+    return []
+
+
+def _builder_allowed_norms(user: Optional[dict] = None) -> Optional[set[str]]:
+    effective_user = user
+    if effective_user is None and has_request_context():
+        effective_user = _current_user()
+    if not effective_user:
+        return None
+    role = _normalize_role_value(effective_user.get('role'))
+    if role != 'builder':
+        return None
+    assigned = _assigned_scenarios_for_user(effective_user)
+    return {norm for norm in assigned if norm}
+
 # Diagnostic endpoint for environment/module troubleshooting
 @app.route('/diag/modules')
 def diag_modules():
@@ -4335,9 +4375,30 @@ def set_ui_view_mode():
     requested = (request.form.get('mode') or '').strip().lower()
     if requested not in _UI_VIEW_ALLOWED:
         requested = _UI_VIEW_DEFAULT
+    role = _normalize_role_value(user.get('role'))
+    if role == 'builder' and requested == 'admin':
+        requested = 'builder'
+    if role not in _ADMIN_VIEW_ROLES:
+        requested = _UI_VIEW_DEFAULT
     session[_UI_VIEW_SESSION_KEY] = requested
     target = request.form.get('next') or request.referrer
-    redirect_target = _resolve_ui_view_redirect_target(target)
+    scenario_hint = ''
+    if target:
+        try:
+            parsed_target = urlparse(target)
+            query_params = parse_qs(parsed_target.query or '')
+            scenario_hint = (query_params.get('scenario', [''])[0] or '').strip()
+        except Exception:
+            scenario_hint = ''
+    if not scenario_hint:
+        try:
+            scenario_hint = (request.form.get('scenario') or request.args.get('scenario') or '').strip()
+        except Exception:
+            scenario_hint = ''
+    if requested == 'participant':
+        redirect_target = url_for('participant_ui_page', scenario=scenario_hint) if scenario_hint else url_for('participant_ui_page')
+    else:
+        redirect_target = _resolve_ui_view_redirect_target(target)
     return redirect(redirect_target)
 
 
@@ -4883,7 +4944,8 @@ def _load_editor_state_snapshot(user: Optional[dict] = None) -> Optional[Dict[st
         with open(path, 'r', encoding='utf-8') as handle:
             data = json.load(handle)
         if isinstance(data, dict):
-            return _scrub_snapshot_transient_errors(data)
+            snapshot = _scrub_snapshot_transient_errors(data)
+            return _sanitize_snapshot_for_user(snapshot, user)
     except Exception:
         pass
     return None
@@ -4901,6 +4963,27 @@ def _scrub_snapshot_transient_errors(snapshot: Dict[str, Any]) -> Dict[str, Any]
             prox_meta = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else None
             if prox_meta:
                 prox_meta.pop('inventory_error', None)
+    return snapshot
+
+
+def _sanitize_snapshot_for_user(snapshot: Dict[str, Any], user: Optional[dict]) -> Dict[str, Any]:
+    allowed_norms = _builder_allowed_norms(user)
+    if allowed_norms is None:
+        snapshot.pop('builder_restricted_scenarios', None)
+        snapshot.pop('builder_assigned_scenarios', None)
+        snapshot.pop('builder_no_assignments', None)
+        return snapshot
+    filtered = _filter_scenarios_by_norms(snapshot.get('scenarios') or [], allowed_norms)
+    snapshot['scenarios'] = filtered
+    if filtered:
+        active_idx = snapshot.get('active_index')
+        if not isinstance(active_idx, int) or active_idx < 0 or active_idx >= len(filtered):
+            snapshot['active_index'] = 0
+    else:
+        snapshot.pop('active_index', None)
+    snapshot['builder_restricted_scenarios'] = True
+    snapshot['builder_assigned_scenarios'] = sorted(allowed_norms)
+    snapshot['builder_no_assignments'] = not bool(allowed_norms)
     return snapshot
 
 def _scenario_names_from_xml(xml_path: str) -> list[str]:
@@ -5245,7 +5328,7 @@ _G_USER_RECORD_SENTINEL = object()
 _G_PARTICIPANT_STATE_SENTINEL = object()
 _UI_VIEW_SESSION_KEY = 'ui_view_mode'
 _UI_VIEW_DEFAULT = 'participant'
-_UI_VIEW_ALLOWED = {'participant', 'admin'}
+_UI_VIEW_ALLOWED = {'participant', 'admin', 'builder'}
 _ADMIN_VIEW_ROLES = {'admin', 'builder'}
 _ALLOWED_USER_ROLES = {'admin', 'builder', 'participant'}
 _ROLE_ALIASES = {'user': 'participant'}
@@ -6566,7 +6649,23 @@ def _default_scenarios_payload():
     }
 
 
-def _prepare_payload_for_index(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _filter_scenarios_by_norms(
+    scenarios: Iterable[Any],
+    allowed_norms: set[str],
+) -> List[Dict[str, Any]]:
+    filtered: List[Dict[str, Any]] = []
+    if not allowed_norms:
+        return filtered
+    for scen in scenarios or []:
+        if not isinstance(scen, dict):
+            continue
+        norm = _normalize_scenario_label(scen.get('name'))
+        if norm and norm in allowed_norms:
+            filtered.append(scen)
+    return filtered
+
+
+def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optional[dict] = None) -> Dict[str, Any]:
     """Normalize payload data before rendering the index page."""
     if not isinstance(payload, dict):
         payload = {}
@@ -6577,6 +6676,7 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]]) -> Dict[str, A
     project_hint = project_hint_raw.strip() if isinstance(project_hint_raw, str) else None
     scenario_hint_raw = payload.get('scenario_query') if isinstance(payload.get('scenario_query'), str) else None
     scenario_hint = scenario_hint_raw.strip() if isinstance(scenario_hint_raw, str) else None
+    allowed_norms = _builder_allowed_norms(user)
 
     defaults = _default_scenarios_payload()
 
@@ -6689,6 +6789,15 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]]) -> Dict[str, A
 
     if not normalized_scenarios:
         normalized_scenarios = defaults['scenarios']
+    if allowed_norms is not None:
+        normalized_scenarios = _filter_scenarios_by_norms(normalized_scenarios, allowed_norms)
+        payload['builder_restricted_scenarios'] = True
+        payload['builder_assigned_scenarios'] = sorted(allowed_norms)
+        payload['builder_no_assignments'] = not bool(allowed_norms)
+    else:
+        payload.pop('builder_restricted_scenarios', None)
+        payload.pop('builder_assigned_scenarios', None)
+        payload.pop('builder_no_assignments', None)
     payload['scenarios'] = normalized_scenarios
 
     # --- Base upload metadata ---
@@ -6735,30 +6844,31 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]]) -> Dict[str, A
 
     payload.setdefault('result_path', defaults['result_path'])
 
-    try:
-        scen_names_for_catalog = [scen.get('name') for scen in normalized_scenarios if isinstance(scen, dict)]
-        participant_hints: Dict[str, str] = {}
-        for scen in normalized_scenarios:
-            if not isinstance(scen, dict):
-                continue
-            name = scen.get('name')
-            norm = _normalize_scenario_label(name)
-            if not norm:
-                continue
-            hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else None
-            participant_url_value = ''
-            if hitl_meta:
-                for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
-                    candidate = hitl_meta.get(key)
-                    normalized = _normalize_participant_proxmox_url(candidate)
-                    if normalized:
-                        participant_url_value = normalized
-                        break
-            if participant_url_value:
-                participant_hints[norm] = participant_url_value
-        _persist_scenario_catalog(scen_names_for_catalog, payload.get('result_path'), participant_urls=participant_hints)
-    except Exception:
-        pass
+    if allowed_norms is None:
+        try:
+            scen_names_for_catalog = [scen.get('name') for scen in normalized_scenarios if isinstance(scen, dict)]
+            participant_hints: Dict[str, str] = {}
+            for scen in normalized_scenarios:
+                if not isinstance(scen, dict):
+                    continue
+                name = scen.get('name')
+                norm = _normalize_scenario_label(name)
+                if not norm:
+                    continue
+                hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else None
+                participant_url_value = ''
+                if hitl_meta:
+                    for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+                        candidate = hitl_meta.get(key)
+                        normalized = _normalize_participant_proxmox_url(candidate)
+                        if normalized:
+                            participant_url_value = normalized
+                            break
+                if participant_url_value:
+                    participant_hints[norm] = participant_url_value
+            _persist_scenario_catalog(scen_names_for_catalog, payload.get('result_path'), participant_urls=participant_hints)
+        except Exception:
+            pass
 
     if project_hint:
         payload['project_key_hint'] = project_hint
@@ -8850,7 +8960,8 @@ def index():
         scenario_query = (request.args.get('scenario') or '').strip()
     except Exception:
         scenario_query = ''
-    if current and _is_participant_role(current.get('role')):
+    view_mode = _current_ui_view_mode()
+    if view_mode == 'participant' or (current and _is_participant_role(current.get('role'))):
         target_args = {'scenario': scenario_query} if scenario_query else {}
         return redirect(url_for('participant_ui_page', **target_args))
     payload = _default_scenarios_payload()
@@ -8860,7 +8971,7 @@ def index():
     payload['host_interfaces'] = _enumerate_host_interfaces()
     if payload.get('base_upload'):
         _save_base_upload_state(payload['base_upload'])
-    payload = _prepare_payload_for_index(payload)
+    payload = _prepare_payload_for_index(payload, user=current)
     if scenario_query:
         payload['scenario_query'] = scenario_query
     if payload.get('result_path') and not payload.get('project_key_hint'):
@@ -8906,7 +9017,7 @@ def load_xml():
                 xml_text = f.read()
         except Exception:
             xml_text = ""
-        payload = _prepare_payload_for_index(payload)
+        payload = _prepare_payload_for_index(payload, user=user)
         snapshot_source = dict(payload)
         snapshot_source['active_index'] = 0
         snapshot_source['project_key_hint'] = payload.get('result_path')
@@ -9022,7 +9133,7 @@ def save_xml():
         _hydrate_base_upload_from_disk(payload)
         if payload.get('base_upload'):
             _save_base_upload_state(payload['base_upload'])
-        payload = _prepare_payload_for_index(payload)
+        payload = _prepare_payload_for_index(payload, user=user)
         if client_project_hint:
             payload['project_key_hint'] = client_project_hint
         if client_scenario_query:
@@ -9151,6 +9262,7 @@ def save_xml_api():
 
 @app.route('/run_cli', methods=['POST'])
 def run_cli():
+    user = _current_user()
     xml_path = request.form.get('xml_path')
     if not xml_path:
         flash('XML path missing. Save XML first.')
@@ -9431,7 +9543,7 @@ def run_cli():
             })
         except Exception as e_hist:
             app.logger.exception("[sync] failed appending run history: %s", e_hist)
-        payload = _prepare_payload_for_index(payload)
+        payload = _prepare_payload_for_index(payload, user=user)
         return render_template('index.html', payload=payload, logs=logs, xml_preview=xml_text, run_success=run_success)
     except Exception as e:
         flash(f'Error running core-topo-gen: {e}')
@@ -11235,6 +11347,7 @@ def run_status(run_id: str):
 
 @app.route('/upload_base', methods=['POST'])
 def upload_base():
+    user = _current_user()
     f = request.files.get('base_xml')
     if not f or f.filename == '':
         flash('No base scenario file selected.')
@@ -11266,12 +11379,13 @@ def upload_base():
     _attach_base_upload(payload)
     if payload.get('base_upload'):
         _save_base_upload_state(payload['base_upload'])
-    payload = _prepare_payload_for_index(payload)
+    payload = _prepare_payload_for_index(payload, user=user)
     return render_template('index.html', payload=payload, logs=(errs if not ok else ''), xml_preview='')
 
 @app.route('/remove_base', methods=['POST'])
 def remove_base():
     """Clear the base scenario file reference from the first scenario."""
+    user = _current_user()
     try:
         payload = _default_scenarios_payload()
         # If scenarios_json posted, honor that to keep user edits
@@ -11293,7 +11407,7 @@ def remove_base():
         _clear_base_upload_state()
         payload.pop('base_upload', None)
         # Do not attach base upload (cleared)
-        payload = _prepare_payload_for_index(payload)
+        payload = _prepare_payload_for_index(payload, user=user)
         return render_template('index.html', payload=payload, logs='', xml_preview='')
     except Exception as e:
         flash(f'Failed to remove base: {e}')

@@ -38,7 +38,7 @@
         max-width: min(960px, 95vw);
     }
     #executeConfirmModal .modal-content {
-        min-height: 520px;
+        min-height: auto;
     }
     #executeProgressWrap .progress {
         height: 18px;
@@ -49,6 +49,7 @@
 </style>
 {% endblock %}
 <!-- hs-bounds-wrapper styles moved into style block above -->
+{% set is_builder_view = (ui_view_mode == 'builder') %}
 {% block content %}
     <div class="row">
         <div class="col-md-3 mb-3">
@@ -56,21 +57,25 @@
                 <div class="card-header d-flex justify-content-between align-items-center">
                     <span class="fw-bold">Scenarios</span>
                     <div class="btn-toolbar gap-2 align-items-center">
+                        {% if not is_builder_view %}
                         <button type="button" class="btn btn-sm btn-outline-secondary" id="importBtn" title="Import scenarios XML">Import</button>
                         <button type="button" class="btn btn-sm btn-outline-info" id="exportBtn" title="Export last saved XML">Export</button>
                         <div class="btn-group" role="group" aria-label="Bulk scenario actions">
                             <button type="button" class="btn btn-sm btn-outline-secondary" id="selectAllScenariosBtn" title="Select all (or clear if all selected)">All</button>
                             <button type="button" class="btn btn-sm btn-outline-danger" id="deleteSelectedScenariosBtn" title="Delete selected scenarios" disabled>Delete</button>
                         </div>
+                        {% endif %}
                     </div>
                 </div>
                 <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="scenarioList" style="min-height:0;"></div>
                 <form id="hiddenLoadForm" class="d-none" action="{{ url_for('load_xml') }}" method="post" enctype="multipart/form-data">
                     <input type="file" name="scenarios_xml" id="hiddenLoadInput" accept=".xml">
                 </form>
+                {% if not is_builder_view %}
                 <div class="card-footer" style="position: sticky; bottom: 0; background: #fff; z-index: 1;">
                     <button type="button" class="btn btn-sm btn-primary w-100" id="appendScenarioBtn">New Scenario</button>
                 </div>
+                {% endif %}
             </div>
         </div>
         <div class="col-md-9">
@@ -87,6 +92,9 @@
                             <strong>Base CORE Scenario</strong>
                             <div class="d-flex align-items-center gap-2" id="baseScenarioControls">
                                 {% set has_base = payload.base_upload is defined and payload.base_upload %}
+                                {% if is_builder_view %}
+                                <a id="baseDetailsLink" class="btn btn-sm btn-outline-secondary {% if not has_base %}d-none{% endif %}" href="{% if has_base %}{{ url_for('core_details') }}?path={{ payload.base_upload.path | urlencode }}{% else %}#{% endif %}" target="_blank" data-base-url="{{ url_for('core_details') }}?path=">Details</a>
+                                {% else %}
                                 <span id="baseValidityBadge" class="badge {% if not has_base %}d-none{% else %}{% if payload.base_upload.valid %}text-bg-success{% else %}text-bg-danger{% endif %}{% endif %}">
                                     {% if has_base %}{% if payload.base_upload.valid %}VALID{% else %}INVALID{% endif %}{% else %}VALID{% endif %}
                                 </span>
@@ -95,9 +103,16 @@
                                     <button type="submit" class="btn btn-sm btn-outline-danger">Remove</button>
                                 </form>
                                 <button class="btn btn-sm btn-outline-secondary" type="button" id="baseCoreCollapseBtn" data-preview-collapse="baseCoreScenarioBody" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+                                {% endif %}
                             </div>
                         </div>
                         <div class="card-body collapse show" id="baseCoreScenarioBody">
+                            {% if is_builder_view %}
+                            <div class="mb-0">
+                                <label class="form-label mb-1">Base Scenario File</label>
+                                <input class="form-control" id="baseFileInput" readonly>
+                            </div>
+                            {% else %}
                             <div class="mb-3">
                                 <label class="form-label d-flex align-items-center justify-content-between">
                                     <span>Base Scenario File</span>
@@ -112,6 +127,7 @@
                             {% if payload.base_upload and not payload.base_upload.valid and logs %}
                                 <div class="alert alert-danger mt-3 mb-0" style="white-space: pre-wrap;">{{ logs }}</div>
                             {% endif %}
+                            {% endif %}
                         </div>
                     </div>
 
@@ -119,10 +135,14 @@
                         <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
                             <strong>Scenario Editor</strong>
                             <div class="d-flex flex-wrap align-items-center gap-2">
+                                {% if not is_builder_view %}
                                 <div class="btn-group btn-group-sm" role="group" aria-label="HITL setup actions">
                                     <button class="btn btn-outline-primary" type="button" id="selectCoreVmBtn">Select CORE VM</button>
                                     <button class="btn btn-primary" type="button" id="configHitlBtn" disabled title="Complete Steps 1 and 2 first.">Config HITL</button>
                                 </div>
+                                {% else %}
+                                <span class="badge text-bg-secondary">HITL settings managed by admin</span>
+                                {% endif %}
                             </div>
                         </div>
                         <div class="card-body">
@@ -640,6 +660,13 @@
 <script>
 // --- BEGIN PAGE JS ---
 const payloadDataEl = document.getElementById('payload-data');
+let initialPayload = null;
+try {
+    initialPayload = JSON.parse(payloadDataEl?.textContent || 'null');
+} catch (err) {
+    console.warn('Failed to parse payload data', err);
+    initialPayload = null;
+}
 const currentUserDataEl = document.getElementById('current-user-meta');
 let currentUserMeta = null;
 try {
@@ -651,6 +678,9 @@ const CORETG_USERNAME = (currentUserMeta && typeof currentUserMeta.username === 
 const CORETG_USER_ROLE = (currentUserMeta && typeof currentUserMeta.role === 'string') ? currentUserMeta.role : '';
 window.CORETG_USERNAME = CORETG_USERNAME;
 window.CORETG_USER_ROLE = CORETG_USER_ROLE;
+const IS_BUILDER_VIEW = (window.CORETG_VIEW_MODE || '') === 'builder';
+const BUILDER_BACKEND_UNAVAILABLE_MESSAGE = 'Backend temporarily unavailable. Please ask an admin.';
+window.IS_BUILDER_VIEW = IS_BUILDER_VIEW;
 const DEFAULT_INTERNAL_BRIDGE_NAME = 'corebridge';
 function computeInternalBridgeName(usernameValue) {
     const base = (usernameValue || window.CORETG_USERNAME || '').toString().trim();
@@ -721,42 +751,18 @@ function setupPreviewCollapsers(){
 window.setupPreviewCollapsers = setupPreviewCollapsers;
 if(document.readyState === 'loading'){ document.addEventListener('DOMContentLoaded', () => setupPreviewCollapsers()); }
 else { setupPreviewCollapsers(); }
-// ---------------- Unified Logging Bridge -----------------
-// Forward all app/UI logs into dock log system (defined in partial 'dock.html').
-// We DO NOT override existing dock log functions if already present.
-function appendLog(line, level){
-    if(!line) return;
-    let lvl = (level||'INFO').toString().toUpperCase();
-    if(!['DEBUG','INFO','WARN','ERROR'].includes(lvl)) lvl='INFO';
-    if(window.logLine){ window.logLine(lvl, line); return; }
-    // Fallback: create a very small inline buffer if dock not initialized yet.
-    try {
-        const pre = document.getElementById('logsPre') || document.getElementById('runProgressLog');
-        if(pre){
-            const text = `[${new Date().toISOString()}] ${lvl} ${line}\n`;
-            if(typeof pre.append === 'function'){ pre.append(text); }
-            else { pre.appendChild(document.createTextNode(text)); }
-        }
-    } catch(e){}
-}
-if(!window.logInfo) window.logInfo = (m)=>appendLog(m,'INFO');
-if(!window.logWarn) window.logWarn = (m)=>appendLog(m,'WARN');
-if(!window.logError) window.logError = (m)=>appendLog(m,'ERROR');
-if(!window.logDebug) window.logDebug = (m)=>appendLog(m,'DEBUG');
-appendLog('UI initialized','INFO');
-try {
-    initialPayload = JSON.parse(payloadDataEl?.textContent || 'null');
-} catch (e) {
-    initialPayload = null;
-}
+const DENSITY_COUNT_MIN = 1;
+const DENSITY_COUNT_MAX = 5000;
+const NODE_COUNT_MIN = 1;
+const NODE_COUNT_MAX = 5000;
+const initialScenarioQuery = (initialPayload && typeof initialPayload.scenario_query === 'string')
+    ? initialPayload.scenario_query.trim()
+    : '';
 const LEGACY_EDITOR_STATE_STORAGE_KEY = 'coretg_editor_state';
 const PROJECT_STATE_STORAGE_KEY = 'coretg_project_state_map_v1';
 const PROJECT_ACTIVE_IDX_STORAGE_KEY = 'coretg_active_idx_map_v1';
 const LAST_PROJECT_KEY_STORAGE_KEY = 'coretg_last_project_key';
 const DEFAULT_PROJECT_KEY = '__default_project__';
-const initialScenarioQuery = (initialPayload && typeof initialPayload.scenario_query === 'string')
-    ? initialPayload.scenario_query.trim()
-    : '';
 
 function readLastProjectKeyFromStorage() {
     try {
@@ -3326,6 +3332,29 @@ function buildScenarioAwareUrl(baseUrl, scenarioName = null) {
     }
 }
 
+function updateActiveScenarioQueryParam() {
+    try {
+        const { name } = getActiveScenarioContext();
+        const trimmed = (name || '').trim();
+        const url = new URL(window.location.href);
+        const current = (url.searchParams.get('scenario') || '').trim();
+        if (trimmed) {
+            if (current === trimmed) {
+                return;
+            }
+            url.searchParams.set('scenario', trimmed);
+        } else {
+            if (!current) {
+                return;
+            }
+            url.searchParams.delete('scenario');
+        }
+        window.history.replaceState({}, '', url.toString());
+    } catch (err) {
+        /* ignore */
+    }
+}
+
 function scheduleScenarioRedirect(baseUrl, options = {}) {
     const delay = Number(options.delay) || 0;
     const scenarioName = typeof options.scenarioName === 'string' ? options.scenarioName : null;
@@ -3946,7 +3975,9 @@ function setupPreviewModalExecute(modalEl, modalInstance){
             await new Promise(resolve => setTimeout(resolve, 0));
             showExecuteProgressPanel(
                 execInfo.shouldFake ? 'Local emulation run' : 'Preparing CORE run…',
-                execInfo.shouldFake ? 'CORE connection unavailable; running locally.' : `CORE ${execInfo.host}:${execInfo.port}`
+                execInfo.shouldFake
+                    ? 'CORE connection unavailable; running locally.'
+                    : (IS_BUILDER_VIEW ? 'Remote CORE backend managed by admin.' : `CORE ${execInfo.host}:${execInfo.port}`)
             );
             try {
                 const showBtn = document.getElementById('dockShowBtn');
@@ -4117,49 +4148,6 @@ async function computeFullPlanPreview(){
             // Emit detailed calculation logs into dock
             try {
                 const fp = previewState.fullPreview || {};
-                const counts = fp.counts || {};
-                const routersPlanned = fp.routers_planned ?? counts.routers ?? 'n/a';
-                const hostsPlanned = counts.hosts_total ?? counts.hosts ?? 'n/a';
-                const switchesPlanned = counts.switches ?? 'n/a';
-                const r2rEdges = (fp.r2r_edges_preview || []).length;
-                let densityInfo = '';
-                if(fp.router_plan && typeof fp.router_plan === 'object'){
-                    const rp = fp.router_plan;
-                    densityInfo = ` density_raw=${rp.density_raw} density_component=${rp.density_component} count_based=${rp.count_based_component} has_weight=${rp.has_weight_based}`;
-                }
-                window.logLine && window.logLine('INFO', `[preview.plan] Routers planned=${routersPlanned} Hosts=${hostsPlanned} Switches=${switchesPlanned} R2R_edges=${r2rEdges}${densityInfo}`);
-                if(fp.routing_items && Array.isArray(fp.routing_items)){
-                    fp.routing_items.forEach((ri, idx)=>{
-                        try {
-                            const proto = ri.protocol || `item${idx}`;
-                            const abs_c = ri.abs_count || 0;
-                            const factor = ri.factor || 0;
-                            window.logLine && window.logLine('INFO', `[preview.plan.item] #${idx} protocol=${proto} abs_count=${abs_c} factor=${factor}`);
-                        } catch(e){}
-                    });
-                }
-                // Services breakdown
-                try {
-                    if(fp.services_plan){
-                        const svcKeys = Object.keys(fp.services_plan);
-                        window.logLine && window.logLine('INFO', `[preview.plan.services] total=${svcKeys.length} entries=${svcKeys.slice(0,10).join(',')}${svcKeys.length>10?'...':''}`);
-                    }
-                } catch(e){}
-                // Vulnerabilities breakdown
-                try {
-                    if(fp.vulnerabilities_plan){
-                        const vp = fp.vulnerabilities_plan;
-                        const totalV = Object.values(vp).reduce((a,b)=> a + (typeof b==='number'? b:0), 0);
-                        window.logLine && window.logLine('INFO', `[preview.plan.vuln] total_items=${Object.keys(vp).length} total_alloc=${totalV}`);
-                    }
-                } catch(e){}
-                // Segmentation breakdown
-                try {
-                    if(fp.segmentation_preview){
-                        const rules = (fp.segmentation_preview.rules||[]).length;
-                        window.logLine && window.logLine('INFO', `[preview.plan.segmentation] rules=${rules}`);
-                    }
-                } catch(e){}
                 // Traffic breakdown
                 try {
                     if(fp.traffic_summary){
@@ -5449,7 +5437,9 @@ document.addEventListener('DOMContentLoaded', ()=>{
                 await waitForPaint();
                 showExecuteProgressPanel(
                     execInfo.shouldFake ? 'Local emulation run' : 'Preparing CORE run…',
-                    execInfo.shouldFake ? 'CORE connection unavailable; running locally.' : `CORE ${execInfo.host}:${execInfo.port}`
+                    execInfo.shouldFake
+                        ? 'CORE connection unavailable; running locally.'
+                        : (IS_BUILDER_VIEW ? 'Remote CORE backend managed by admin.' : `CORE ${execInfo.host}:${execInfo.port}`)
                 );
                 // Ensure dock visible
                 try { const showBtn=document.getElementById('dockShowBtn'); if(showBtn && !showBtn.classList.contains('d-none')) showBtn.click(); } catch(e){}
@@ -6216,6 +6206,7 @@ function updateDownloadButtonState() {
 }
 
 function render() {
+    updateActiveScenarioQueryParam();
     renderSidebar();
     renderMain();
     updateParticipantProxmoxNavLink();
@@ -6698,6 +6689,7 @@ async function handleExternalIfxApply() {
 
 function handleCoreFieldUpdate(inputEl, { rerender } = { rerender: false }) {
     if (!inputEl) return;
+    if (IS_BUILDER_VIEW) return;
     const sidx = parseInt(inputEl.getAttribute('data-scen-idx'));
     if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) return;
     const field = inputEl.getAttribute('data-hitl-core-field');
@@ -6780,6 +6772,12 @@ async function validateCoreConnection(sidx, options = {}) {
     } = options;
     if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) {
         return { ok: false, message: 'Scenario unavailable' };
+    }
+    if (IS_BUILDER_VIEW) {
+        if (!options.suppressToasts && typeof showToast === 'function') {
+            try { showToast('Builder view is read-only. CORE credentials are managed by an admin.', { autohide: true, delay: 3200 }); } catch (_) {}
+        }
+        return { ok: false, message: 'Builder view is read-only' };
     }
     const scenario = state.scenarios[sidx];
     const hitlState = ensureHitlStateForScenario(scenario);
@@ -7039,6 +7037,12 @@ function resolveCoreModalReferences() {
 async function handleCoreConnectionSave(event) {
     event?.preventDefault?.();
     resolveCoreModalReferences();
+    if (IS_BUILDER_VIEW) {
+        if (typeof setCoreConnectionHint === 'function') {
+            setCoreConnectionHint('Builder view is read-only. Ask an admin to update CORE credentials.', 'info');
+        }
+        return;
+    }
     if (!coreConnectionModal || !state?.scenarios?.length) {
         return;
     }
@@ -7197,6 +7201,11 @@ function updateCoreVenvTestButtonState() {
     if (!coreTestVenvBtn) {
         return;
     }
+    if (IS_BUILDER_VIEW) {
+        coreTestVenvBtn.disabled = true;
+        coreTestVenvBtn.title = 'Builder view is read-only';
+        return;
+    }
     const venvInput = coreModalInputs.venv_bin;
     const hostInput = coreModalInputs.ssh_host;
     const usernameInput = coreModalInputs.ssh_username;
@@ -7217,6 +7226,10 @@ async function handleCoreVenvTest(event) {
     resolveCoreModalReferences();
     resolveCoreVenvTestElements();
     if (!coreConnectionModal || !coreModalInputs.venv_bin) {
+        return;
+    }
+    if (IS_BUILDER_VIEW) {
+        setCoreVenvStatusDisplay(null, 'Builder view cannot run remote tests.');
         return;
     }
     const triggerButton = (event && event.currentTarget instanceof HTMLElement)
@@ -7409,8 +7422,9 @@ function renderSidebar() {
         const isChecked = selectedScenarioIds.has(sid);
         const name = scen.name || `Scenario ${idx+1}`;
         const safeName = escapeHtml(name);
+        const checkboxHtml = IS_BUILDER_VIEW ? '' : `<input type="checkbox" class="form-check-input me-2 scenario-select" data-sid="${sid}" ${isChecked? 'checked':''} onclick="event.stopPropagation(); toggleScenarioSelection('${sid}', this.checked);" />`;
         a.innerHTML = `<div class="d-flex align-items-center">
-            <input type="checkbox" class="form-check-input me-2 scenario-select" data-sid="${sid}" ${isChecked? 'checked':''} onclick="event.stopPropagation(); toggleScenarioSelection('${sid}', this.checked);" />
+            ${checkboxHtml}
             <span class="flex-grow-1 text-truncate" title="${safeName}">${safeName}</span>
         </div>`;
         a.onclick = (e) => { e.preventDefault(); activeIdx = idx; persistEditorState(); render(); };
@@ -7423,7 +7437,17 @@ function renderSidebar() {
     const deleteSelectedBtn = document.getElementById('deleteSelectedScenariosBtn');
     const hiddenLoadInput = document.getElementById('hiddenLoadInput');
     const hiddenLoadForm = document.getElementById('hiddenLoadForm');
-    if (appendScenarioBtn) appendScenarioBtn.onclick = (e) => { e.preventDefault(); logInfo('New scenario created'); state.scenarios.push(defaultScenario()); activeIdx = state.scenarios.length - 1; persistEditorState(); try { previewState.dirty = true; updatePlanButtons(); } catch(e){} render(); };
+    if (appendScenarioBtn && !IS_BUILDER_VIEW) {
+        appendScenarioBtn.onclick = (e) => {
+            e.preventDefault();
+            logInfo('New scenario created');
+            state.scenarios.push(defaultScenario());
+            activeIdx = state.scenarios.length - 1;
+            persistEditorState();
+            try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
+            render();
+        };
+    }
     if (importBtn) importBtn.onclick = (e) => { e.preventDefault(); logInfo('Import scenarios clicked'); hiddenLoadInput.click(); };
     if (hiddenLoadInput) hiddenLoadInput.onchange = () => { if (hiddenLoadInput.files && hiddenLoadInput.files.length > 0) { saveScrollBeforeNav(); hiddenLoadForm.submit(); } };
     if (exportBtn) exportBtn.onclick = (e) => {
@@ -7437,41 +7461,56 @@ function renderSidebar() {
         }
         window.location.href = window.location.origin + '/download_report?path=' + encodeURIComponent(rp);
     };
-    if (selectAllBtn) selectAllBtn.onclick = (e) => { e.preventDefault(); selectAllScenarios(); };
-    if (deleteSelectedBtn) deleteSelectedBtn.onclick = (e) => { e.preventDefault(); deleteSelectedScenarios(); };
+    if (selectAllBtn && !IS_BUILDER_VIEW) {
+        selectAllBtn.onclick = (e) => { e.preventDefault(); selectAllScenarios(); };
+    }
+    if (deleteSelectedBtn && !IS_BUILDER_VIEW) {
+        deleteSelectedBtn.onclick = (e) => { e.preventDefault(); deleteSelectedScenarios(); };
+    }
     const selectCoreVmBtn = document.getElementById('selectCoreVmBtn');
     const configHitlBtn = document.getElementById('configHitlBtn');
     const coreVmSelectModalEl = document.getElementById('coreVmSelectModal');
     const configHitlModalEl = document.getElementById('externalIfxModal');
     const openCoreVmSelectModal = () => {
+        if (IS_BUILDER_VIEW) {
+            const msg = 'CORE VM changes require admin access.';
+            if (typeof showToast === 'function') {
+                try { showToast(msg, { autohide: true, delay: 3200 }); } catch (_) {}
+            } else if (window.alert) {
+                window.alert(msg);
+            }
+            return;
+        }
         if (!coreVmSelectModalEl || !window.bootstrap) return;
         const modalInstance = bootstrap.Modal.getInstance(coreVmSelectModalEl)
             || new bootstrap.Modal(coreVmSelectModalEl, { backdrop: true, keyboard: true });
         modalInstance.show();
     };
 
-    if (selectCoreVmBtn && !selectCoreVmBtn.dataset.hitlModalBound) {
+    if (selectCoreVmBtn && !IS_BUILDER_VIEW && !selectCoreVmBtn.dataset.hitlModalBound) {
         selectCoreVmBtn.addEventListener('click', openCoreVmSelectModal);
         selectCoreVmBtn.dataset.hitlModalBound = '1';
     }
 
     window.openCoreVmSelectModal = openCoreVmSelectModal;
 
-    (() => {
-        try {
-            const url = new URL(window.location.href);
-            if (url.searchParams.get('core_modal') === '1') {
-                setTimeout(openCoreVmSelectModal, 250);
-                url.searchParams.delete('core_modal');
-                const newQuery = url.searchParams.toString();
-                const queryPart = newQuery ? `?${newQuery}` : '';
-                const newUrl = `${url.pathname}${queryPart}${url.hash}`;
-                window.history.replaceState({}, '', newUrl);
+    if (!IS_BUILDER_VIEW) {
+        (() => {
+            try {
+                const url = new URL(window.location.href);
+                if (url.searchParams.get('core_modal') === '1') {
+                    setTimeout(openCoreVmSelectModal, 250);
+                    url.searchParams.delete('core_modal');
+                    const newQuery = url.searchParams.toString();
+                    const queryPart = newQuery ? `?${newQuery}` : '';
+                    const newUrl = `${url.pathname}${queryPart}${url.hash}`;
+                    window.history.replaceState({}, '', newUrl);
+                }
+            } catch (err) {
+                console.warn('Failed to auto-open CORE VM modal', err);
             }
-        } catch (err) {
-            console.warn('Failed to auto-open CORE VM modal', err);
-        }
-    })();
+        })();
+    }
     if (configHitlBtn && !configHitlBtn.dataset.hitlModalBound) {
         configHitlBtn.addEventListener('click', () => {
             if (configHitlBtn.disabled) {
@@ -7642,6 +7681,8 @@ function renderMain() {
     const coreVmNode = resolvedCoreVm && resolvedCoreVm.node !== undefined && resolvedCoreVm.node !== null
         ? String(resolvedCoreVm.node).trim()
         : (core.vm_node ? String(core.vm_node).trim() : vmKeyNodePart);
+    const coreVmNameDisplay = IS_BUILDER_VIEW ? '' : coreVmName;
+    const coreVmNodeDisplay = IS_BUILDER_VIEW ? '' : coreVmNode;
     const coreInputsComplete = !!(coreVmKey && coreHost && corePort && coreSshHost && coreSshPort && coreUser && corePasswordAvailable);
     const coreTestSuccess = core.last_tested_status === 'success';
     const coreTestMatches = coreTestSuccess
@@ -8232,30 +8273,40 @@ function renderMain() {
     const testBtnDisabledAttr = coreTestable ? '' : 'disabled';
     const configureBtnDisabledAttr = (!coreVmKey || !proxValidated || proxInventoryBusy) ? 'disabled' : '';
         const coreConnectionSummaryHtml = (() => {
-        const summarizeEndpoint = () => {
-            if (!coreVmKey) return '';
-            const grpcLabel = coreHost ? `${escapeHtml(coreHost)}:${corePort}` : '<span class="text-danger">Not set</span>';
-            const sshHostLabel = coreSshHost ? escapeHtml(coreSshHost) : '<span class="text-danger">Not set</span>';
-            const sshPortLabel = coreSshPort ? String(coreSshPort) : '<span class="text-danger">Not set</span>';
-            const sshUserLabel = coreUser ? escapeHtml(coreUser) : '<span class="text-danger">Not set</span>';
-            const pwdLabel = coreHasSecret
-                ? '<span class="text-success">Stored securely</span>'
-                : (corePasswordRaw ? '<span class="text-success">Provided</span>' : '<span class="text-danger">Not set</span>');
+            if (IS_BUILDER_VIEW) {
+                const summaryBody = coreVmKey
+                    ? '<div class="text-muted small">Connection configured by an administrator.</div>'
+                    : '<div class="text-muted small">No CORE VM assigned yet.</div>';
+                return `
+                    <div class="border rounded p-3 bg-light-subtle">
+                        <h6 class="text-uppercase small mb-2">Connection</h6>
+                        ${summaryBody}
+                    </div>`;
+            }
+            const summarizeEndpoint = () => {
+                if (!coreVmKey) return '';
+                const grpcLabel = coreHost ? `${escapeHtml(coreHost)}:${corePort}` : '<span class="text-danger">Not set</span>';
+                const sshHostLabel = coreSshHost ? escapeHtml(coreSshHost) : '<span class="text-danger">Not set</span>';
+                const sshPortLabel = coreSshPort ? String(coreSshPort) : '<span class="text-danger">Not set</span>';
+                const sshUserLabel = coreUser ? escapeHtml(coreUser) : '<span class="text-danger">Not set</span>';
+                const pwdLabel = coreHasSecret
+                    ? '<span class="text-success">Stored securely</span>'
+                    : (corePasswordRaw ? '<span class="text-success">Provided</span>' : '<span class="text-danger">Not set</span>');
+                return `
+                    <dl class="row small mb-0">
+                        <dt class="col-5 text-muted">gRPC Endpoint</dt><dd class="col-7">${grpcLabel}</dd>
+                        <dt class="col-5 text-muted">SSH Host</dt><dd class="col-7">${sshHostLabel}</dd>
+                        <dt class="col-5 text-muted">SSH Port</dt><dd class="col-7">${sshPortLabel}</dd>
+                        <dt class="col-5 text-muted">SSH Username</dt><dd class="col-7">${sshUserLabel}</dd>
+                        <dt class="col-5 text-muted">Password</dt><dd class="col-7">${pwdLabel}</dd>
+                    </dl>`;
+            };
             return `
-                <dl class="row small mb-0">
-                    <dt class="col-5 text-muted">gRPC Endpoint</dt><dd class="col-7">${grpcLabel}</dd>
-                    <dt class="col-5 text-muted">SSH Host</dt><dd class="col-7">${sshHostLabel}</dd>
-                    <dt class="col-5 text-muted">SSH Port</dt><dd class="col-7">${sshPortLabel}</dd>
-                    <dt class="col-5 text-muted">SSH Username</dt><dd class="col-7">${sshUserLabel}</dd>
-                    <dt class="col-5 text-muted">Password</dt><dd class="col-7">${pwdLabel}</dd>
-                </dl>`;
-        };
-        return `
-            <div class="border rounded p-3 bg-light-subtle">
-                <h6 class="text-uppercase small mb-2">Connection</h6>
-                ${summarizeEndpoint()}
-            </div>`;
-    })();
+                <div class="border rounded p-3 bg-light-subtle">
+                    <h6 class="text-uppercase small mb-2">Connection</h6>
+                    ${summarizeEndpoint()}
+                </div>`;
+        })();
 
     const step1SectionHtml = `
         <div class="mb-4" data-hitl-step="1">
@@ -8271,7 +8322,28 @@ function renderMain() {
             </div>
             <div class="small text-muted mt-2" data-proxmox-inventory-status="${activeIdx}">${proxInventoryStatusHtml}</div>
         </div>`;
-    const step2SectionHtml = `
+    const step2SectionHtml = (() => {
+        if (IS_BUILDER_VIEW) {
+            const builderNotice = '<div class="alert alert-secondary small mb-3">CORE VM selection and credentials are managed by an admin. Contact them to request changes.</div>';
+            const vmSummary = coreVmKey
+                ? '<div class="alert alert-info small mb-0">CORE VM assigned by an administrator.</div>'
+                : '<div class="alert alert-info small mb-0">No CORE VM assigned yet.</div>';
+            return `
+                <div class="mb-4" data-hitl-step="2">
+                    <h6 class="mb-2">Step 2 — CORE VM &amp; Credentials</h6>
+                    ${builderNotice}
+                    <div class="row g-3 align-items-start">
+                        <div class="col-md-6">
+                            ${vmSummary}
+                        </div>
+                        <div class="col-md-6">
+                            <div data-hitl-core-connection="${activeIdx}">${coreConnectionSummaryHtml}</div>
+                        </div>
+                    </div>
+                    <div class="small mt-2 ${coreStatusClass}" data-hitl-core-status="${activeIdx}">${coreStatusHtml}</div>
+                </div>`;
+        }
+        return `
         <div class="mb-4" data-hitl-step="2">
             <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
                 <h6 class="m-0">Step 2 — CORE VM &amp; Credentials</h6>
@@ -8306,6 +8378,7 @@ function renderMain() {
                     <div class="small mt-2 ${coreStatusClass}" data-hitl-core-status="${activeIdx}">${coreStatusHtml}</div>
                 ` : ''}
         </div>`;
+    })();
     const step3SectionHtml = `
         <div class="mb-4" data-hitl-step="3">
             <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
@@ -8406,7 +8479,8 @@ function renderMain() {
         const coreState = hitlState.core || (hitlState.core = {});
         const proxValidatedForScenario = !!(proxState.validated && proxState.secret_id);
         const hasVmSelection = !!coreState.vm_key;
-        const inputsDisabled = !(proxValidatedForScenario && hasVmSelection);
+        const builderLocked = !!IS_BUILDER_VIEW;
+        const inputsDisabled = builderLocked || !(proxValidatedForScenario && hasVmSelection);
         const effectiveVenv = (coreState.venv_bin || '').trim() || CORE_DEFAULT_VENV_BIN;
         coreConnectionModal.setAttribute('data-scen-idx', String(sidx));
         if (coreConnectionForm) {
@@ -8414,9 +8488,11 @@ function renderMain() {
         }
         if (coreRememberInput) {
             coreRememberInput.checked = shouldRememberCore(hitlState);
+            coreRememberInput.disabled = builderLocked || !proxValidatedForScenario;
         }
         if (coreAutoStartInput) {
             coreAutoStartInput.checked = !!(coreState.auto_start_daemon);
+            coreAutoStartInput.disabled = builderLocked || inputsDisabled;
         }
         if (coreModalInputs.grpc_host) {
             coreModalInputs.grpc_host.value = coreState.grpc_host || '';
@@ -8464,8 +8540,14 @@ function renderMain() {
         resolveCoreVenvTestElements();
         setCoreVenvStatusDisplay(coreState.venv_test_status || null, coreState.venv_test_message || null);
         updateCoreVenvTestButtonState();
+        if (coreConnectionSaveBtn) {
+            coreConnectionSaveBtn.disabled = inputsDisabled;
+            coreConnectionSaveBtn.classList.toggle('d-none', builderLocked);
+        }
         if (typeof setCoreConnectionHint === 'function') {
-            if (!hasVmSelection) {
+            if (builderLocked) {
+                setCoreConnectionHint('Builder view is read-only. Contact an admin to change CORE credentials.', 'info');
+            } else if (!hasVmSelection) {
                 setCoreConnectionHint('Select a CORE VM to configure connection details.', 'warning');
             } else if (!proxValidatedForScenario) {
                 setCoreConnectionHint('Validate Proxmox credentials before editing CORE connection details.', 'warning');
@@ -8481,33 +8563,38 @@ function renderMain() {
 
     refreshCoreConnectionModal(activeIdx);
 
-    document.querySelectorAll('[data-hitl-core-configure]').forEach(btn => {
-        btn.onclick = () => {
-            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
-            if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
-            if (!coreConnectionModal || !window.bootstrap) {
-                console.warn('CORE connection modal unavailable');
-                return;
-            }
-            refreshCoreConnectionModal(sidx);
-            const modalInstance = bootstrap.Modal.getInstance(coreConnectionModal) || new bootstrap.Modal(coreConnectionModal, { backdrop: true, keyboard: true });
-            modalInstance.show();
-            setTimeout(() => {
-                try {
-                    const primaryInput = coreModalInputs.grpc_host && !coreModalInputs.grpc_host.disabled
-                        ? coreModalInputs.grpc_host
-                        : coreModalInputs.ssh_username;
-                    primaryInput?.focus();
-                    primaryInput?.select?.();
-                } catch (err) {}
-            }, 150);
-        };
-    });
+    if (!IS_BUILDER_VIEW) {
+        document.querySelectorAll('[data-hitl-core-configure]').forEach(btn => {
+            btn.onclick = () => {
+                const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+                if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
+                if (!coreConnectionModal || !window.bootstrap) {
+                    console.warn('CORE connection modal unavailable');
+                    return;
+                }
+                refreshCoreConnectionModal(sidx);
+                const modalInstance = bootstrap.Modal.getInstance(coreConnectionModal) || new bootstrap.Modal(coreConnectionModal, { backdrop: true, keyboard: true });
+                modalInstance.show();
+                setTimeout(() => {
+                    try {
+                        const primaryInput = coreModalInputs.grpc_host && !coreModalInputs.grpc_host.disabled
+                            ? coreModalInputs.grpc_host
+                            : coreModalInputs.ssh_username;
+                        primaryInput?.focus();
+                        primaryInput?.select?.();
+                    } catch (err) {}
+                }, 150);
+            };
+        });
+    }
 
     wireCoreConnectionSaveButton();
     wireCoreVenvTestButton();
 
     (function installCoreNavGuard(){
+        if (IS_BUILDER_VIEW) {
+            return;
+        }
         const NAV_GUARD_DATA_KEY = 'coreNavGuardInstalled';
         const navLink = document.getElementById('navCoreLink');
         if (!navLink || navLink.dataset[NAV_GUARD_DATA_KEY] === '1') {
@@ -8657,7 +8744,14 @@ function renderMain() {
             if (!isNaN(parsed)) densityCountVal = parsed;
         }
     } catch(e) { densityCountVal = 10; }
-    if (densityCountVal < 0) densityCountVal = 0;
+    densityCountVal = Math.max(DENSITY_COUNT_MIN, Math.min(DENSITY_COUNT_MAX, densityCountVal));
+    scen.density_count = densityCountVal;
+    const densityBounds = resolveDensityBoundsForScenario(scen);
+    densityCountVal = applyDensityBoundsToScenario(scen, densityBounds) ?? densityCountVal;
+    const densityMinEnabled = densityBounds.minEnabled;
+    const densityMaxEnabled = densityBounds.maxEnabled;
+    const densityMinDisplayValue = densityMinEnabled && typeof densityBounds.minValue === 'number' ? densityBounds.minValue : '';
+    const densityMaxDisplayValue = densityMaxEnabled && typeof densityBounds.maxValue === 'number' ? densityBounds.maxValue : '';
     const niBase = densityCountVal;
     const niAdd = niCountRows.reduce((a,it)=> a + (parseInt(it.v_count,10)||0), 0);
     const niTotal = niBase + niAdd;
@@ -8679,7 +8773,60 @@ function renderMain() {
     const hostBadgeClass = (niWeightRows.length && niBase === 0 && niAdd > 0) ? 'text-bg-warning' : 'text-bg-primary';
     // Simplified host summary: remove ΣW badge, allocation popover, and auto-scale functionality
     const hostSummaryHtml = `<span class=\"badge rounded-pill ${hostBadgeClass} host-total-badge ms-2\" data-bs-toggle=\"tooltip\" title=\"${allocTip.replace(/"/g,'&quot;')}\">Hosts: ${niWeightRows.length ? (niBase + ' + ' + niAdd + ' = ' + niTotal) : (niAdd)}</span>`;
-    const densityBaseHtml = `<div class=\"d-flex align-items-center gap-1\" title=\"Base host pool used only for weight-based density calculations; Count rows are additive beyond this.\"><label class=\"form-label mb-0\">Count for Density</label><input type=\"number\" min=\"0\" max=\"5000\" step=\"1\" class=\"form-control form-control-sm\" style=\"width:120px\" value=\"${densityCountVal}\" data-scen-idx=\"${activeIdx}\" data-field=\"scenario_density_count\" /></div>`;
+    const densityBaseTip = 'Base host pool used only for weight-based density calculations; Count rows are additive beyond this.';
+    const densityBaseTipEsc = densityBaseTip.replace(/"/g,'&quot;');
+    const boundsRestrictionTip = IS_BUILDER_VIEW
+        ? 'Restrictions set by the admin.'
+        : 'Set optional Min/Max bounds to guide builder runs.';
+    const densityBoundChipFragments = [];
+    if (!IS_BUILDER_VIEW || densityMinEnabled) {
+        densityBoundChipFragments.push(buildBoundChip({
+            label: 'Min',
+            baseField: 'scenario_density_min',
+            enabled: !!densityMinEnabled,
+            value: densityMinDisplayValue,
+            controlsDisabled: false,
+            min: DENSITY_COUNT_MIN,
+            max: DENSITY_COUNT_MAX,
+            step: 1,
+            width: 110,
+            scenarioIdx: activeIdx,
+            placeholder: 'Min',
+            tooltip: boundsRestrictionTip,
+            readOnly: IS_BUILDER_VIEW,
+        }));
+    }
+    if (!IS_BUILDER_VIEW || densityMaxEnabled) {
+        densityBoundChipFragments.push(buildBoundChip({
+            label: 'Max',
+            baseField: 'scenario_density_max',
+            enabled: !!densityMaxEnabled,
+            value: densityMaxDisplayValue,
+            controlsDisabled: false,
+            min: DENSITY_COUNT_MIN,
+            max: DENSITY_COUNT_MAX,
+            step: 1,
+            width: 110,
+            scenarioIdx: activeIdx,
+            placeholder: 'Max',
+            tooltip: boundsRestrictionTip,
+            readOnly: IS_BUILDER_VIEW,
+        }));
+    }
+    const densityBoundsRow = densityBoundChipFragments.length
+        ? `<div class="d-flex flex-wrap align-items-center gap-2">${densityBoundChipFragments.join('')}</div>`
+        : '';
+    const densityBaseHtml = `
+        <div class=\"d-flex flex-wrap align-items-center gap-3\">
+            <div class=\"d-flex align-items-center gap-1\">
+                <label class=\"form-label mb-0\">Count for Density</label>
+                <button type=\"button\" class=\"btn btn-link btn-sm p-0 text-muted\" tabindex=\"0\" data-bs-toggle=\"tooltip\" data-bs-placement=\"top\" data-bs-title=\"${densityBaseTipEsc}\">
+                    <i class=\"bi bi-info-circle\"></i>
+                </button>
+                <input type=\"number\" min=\"${DENSITY_COUNT_MIN}\" max=\"${DENSITY_COUNT_MAX}\" step=\"1\" class=\"form-control form-control-sm\" style=\"width:120px\" value=\"${densityCountVal}\" data-scen-idx=\"${activeIdx}\" data-field=\"scenario_density_count\" />
+            </div>
+            ${densityBoundsRow}
+        </div>`;
     const headerRow = document.createElement('div');
     const rawSectionNames = Object.keys(scen.sections || {});
     const filteredSectionNames = rawSectionNames.filter(name => name !== 'Notes' && name !== 'Events' && name !== 'HITL');
@@ -8850,8 +8997,56 @@ function renderMain() {
                                                                                     if (weights.length) { parts.push(weights.map(x => renderItemRow(activeIdx, name, x.iidx, x.it)).join('')); }
                                                                                 }
                                                                                 if (counts.length) {
-                                                                                    const countHdr = (name === 'Node Information') ? 'Count-based' : 'Count-based';
-                                                                                    parts.push(`<tr class=\"table-light\"><td colspan=\"4\"><strong>${countHdr}</strong></td></tr>`);
+                                                                                    const countHdr = 'Count-based';
+                                                                                    const secRef = state.scenarios[activeIdx].sections[name];
+                                                                                    const countBounds = resolveSectionCountBounds(secRef, counts);
+                                                                                    const boundChipFragments = [];
+                                                                                    if (!IS_BUILDER_VIEW || countBounds.minEnabled) {
+                                                                                        boundChipFragments.push(buildBoundChip({
+                                                                                            label: 'Min',
+                                                                                            baseField: 'node_count_min',
+                                                                                            enabled: !!countBounds.minEnabled,
+                                                                                            value: countBounds.minValue,
+                                                                                            controlsDisabled: !!countBounds.controlsDisabled,
+                                                                                            min: NODE_COUNT_MIN,
+                                                                                            max: NODE_COUNT_MAX,
+                                                                                            step: 1,
+                                                                                            width: 90,
+                                                                                            scenarioIdx: activeIdx,
+                                                                                            sectionName: name,
+                                                                                            placeholder: 'Min',
+                                                                                            tooltip: boundsRestrictionTip,
+                                                                                            readOnly: IS_BUILDER_VIEW,
+                                                                                        }));
+                                                                                    }
+                                                                                    if (!IS_BUILDER_VIEW || countBounds.maxEnabled) {
+                                                                                        boundChipFragments.push(buildBoundChip({
+                                                                                            label: 'Max',
+                                                                                            baseField: 'node_count_max',
+                                                                                            enabled: !!countBounds.maxEnabled,
+                                                                                            value: countBounds.maxValue,
+                                                                                            controlsDisabled: !!countBounds.controlsDisabled,
+                                                                                            min: NODE_COUNT_MIN,
+                                                                                            max: NODE_COUNT_MAX,
+                                                                                            step: 1,
+                                                                                            width: 90,
+                                                                                            scenarioIdx: activeIdx,
+                                                                                            sectionName: name,
+                                                                                            placeholder: 'Max',
+                                                                                            tooltip: boundsRestrictionTip,
+                                                                                            readOnly: IS_BUILDER_VIEW,
+                                                                                        }));
+                                                                                    }
+                                                                                    const boundsControls = boundChipFragments.length
+                                                                                        ? `<div class="d-flex flex-wrap align-items-center gap-2 node-total-bounds-controls">${boundChipFragments.join('')}</div>`
+                                                                                        : '';
+                                                                                    const countHeaderHtml = `
+                                                                                        <div class="d-flex flex-wrap align-items-center gap-2">
+                                                                                            <strong>${countHdr}</strong>
+                                                                                            ${boundsControls}
+                                                                                        </div>`;
+
+                                                                                    parts.push(`<tr class=\"table-light\"><td colspan=\"4\">${countHeaderHtml}</td></tr>`);
                                                                                     parts.push(counts.map(x => renderItemRow(activeIdx, name, x.iidx, x.it)).join(''));
                                                                                 }
                                                                                 return parts.join('');
@@ -8913,6 +9108,293 @@ function renderMain() {
         // Attach the click handler (fix: previously not wired)
         btn.addEventListener('click', handler);
     });
+}
+
+function clampDensityCountValue(raw) {
+    const parsed = parseInt(raw, 10);
+    if (Number.isNaN(parsed)) return null;
+    return Math.max(DENSITY_COUNT_MIN, Math.min(DENSITY_COUNT_MAX, parsed));
+}
+
+function resolveDensityBoundsForScenario(scen) {
+    const result = {
+        minEnabled: false,
+        maxEnabled: false,
+        minValue: null,
+        maxValue: null,
+    };
+    if (!scen) {
+        return result;
+    }
+    if (scen.density_count_min_enabled) {
+        let minValue = clampDensityCountValue(scen.density_count_min);
+        if (minValue === null) {
+            minValue = clampDensityCountValue(scen.density_count);
+        }
+        if (minValue === null) {
+            minValue = DENSITY_COUNT_MIN;
+        }
+        scen.density_count_min = minValue;
+        result.minEnabled = true;
+        result.minValue = minValue;
+    }
+    if (scen.density_count_max_enabled) {
+        let maxValue = clampDensityCountValue(scen.density_count_max);
+        if (maxValue === null) {
+            maxValue = clampDensityCountValue(scen.density_count);
+        }
+        if (maxValue === null) {
+            maxValue = DENSITY_COUNT_MAX;
+        }
+        scen.density_count_max = maxValue;
+        result.maxEnabled = true;
+        result.maxValue = maxValue;
+    }
+    if (result.minEnabled && result.maxEnabled && (result.minValue ?? 0) > (result.maxValue ?? 0)) {
+        result.maxValue = result.minValue;
+        scen.density_count_max = result.maxValue;
+    }
+    return result;
+}
+
+function applyDensityBoundsToScenario(scen, bounds) {
+    if (!scen) return null;
+    let countValue = clampDensityCountValue(scen.density_count);
+    if (countValue === null) {
+        countValue = DENSITY_COUNT_MIN;
+    }
+    if (bounds?.minEnabled && typeof bounds.minValue === 'number' && countValue < bounds.minValue) {
+        countValue = bounds.minValue;
+    }
+    if (bounds?.maxEnabled && typeof bounds.maxValue === 'number' && countValue > bounds.maxValue) {
+        countValue = bounds.maxValue;
+    }
+    scen.density_count = countValue;
+    return countValue;
+}
+
+function enforceDensityBounds(idx) {
+    if (Number.isNaN(idx) || !state.scenarios?.[idx]) return null;
+    const scen = state.scenarios[idx];
+    const bounds = resolveDensityBoundsForScenario(scen);
+    return applyDensityBoundsToScenario(scen, bounds);
+}
+
+function refreshScenarioStateAfterCountEdit() {
+    renderMain();
+    const hidden = document.getElementById('scenarios_json');
+    if (hidden) {
+        hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+    }
+    persistEditorState();
+    try { previewState.dirty = true; updatePlanButtons(); } catch (e) {}
+}
+
+function clampNodeCountValue(raw) {
+    const parsed = parseInt(raw, 10);
+    if (Number.isNaN(parsed)) return null;
+    return Math.max(NODE_COUNT_MIN, Math.min(NODE_COUNT_MAX, parsed));
+}
+
+function buildBoundChip(options = {}) {
+    const {
+        label = '',
+        baseField = '',
+        enabled = false,
+        value = null,
+        controlsDisabled = false,
+        min = null,
+        max = null,
+        step = 1,
+        width = 90,
+        scenarioIdx = null,
+        sectionName = null,
+        placeholder = '',
+        tooltip = '',
+        tooltipPlacement = 'top',
+        readOnly = false,
+    } = options;
+    if (!baseField) return '';
+    const enableField = `${baseField}_enabled`;
+    const dataAttrs = [];
+    if (Number.isInteger(scenarioIdx)) {
+        dataAttrs.push(`data-scen-idx="${scenarioIdx}"`);
+    }
+    if (sectionName) {
+        dataAttrs.push(`data-sec="${sectionName}"`);
+    }
+    const scopeAttrs = dataAttrs.length ? ` ${dataAttrs.join(' ')}` : '';
+    const checkedAttr = enabled ? 'checked' : '';
+    const isReadOnly = !!readOnly;
+    const checkboxDisabled = (controlsDisabled || isReadOnly) ? 'disabled' : '';
+    const inputDisabled = controlsDisabled ? 'disabled' : (!enabled ? 'disabled' : '');
+    const readonlyAttr = (isReadOnly && !controlsDisabled && enabled) ? 'readonly' : '';
+    const tabindexAttr = isReadOnly ? 'tabindex="-1"' : '';
+    const numericValue = (typeof value === 'number' && !Number.isNaN(value)) ? value : '';
+    const displayValue = (controlsDisabled || !enabled) ? '' : numericValue;
+    const placeholderText = placeholder || label || '';
+    const minAttr = (typeof min === 'number') ? `min="${min}"` : '';
+    const maxAttr = (typeof max === 'number') ? `max="${max}"` : '';
+    const stepAttr = (typeof step === 'number') ? `step="${step}"` : '';
+    const tooltipAttr = tooltip ? ` data-bs-toggle="tooltip" data-bs-placement="${tooltipPlacement}" data-bs-title="${tooltip.replace(/"/g,'&quot;')}"` : '';
+    return `
+        <div class="node-bound-chip border border-secondary-subtle rounded-pill px-2 py-1 bg-body-tertiary d-flex align-items-center gap-2${controlsDisabled ? ' opacity-50' : ''}"${tooltipAttr}>
+            <div class="form-check form-check-inline mb-0">
+                <input class="form-check-input" type="checkbox" data-field="${enableField}"${scopeAttrs} ${checkedAttr} ${checkboxDisabled} />
+                <label class="form-check-label small mb-0">${label}</label>
+            </div>
+            <input type="number" ${minAttr} ${maxAttr} ${stepAttr} class="form-control form-control-sm bg-transparent border-0 shadow-none" style="width:${width}px" value="${displayValue}" data-field="${baseField}"${scopeAttrs} ${inputDisabled} ${readonlyAttr} ${tabindexAttr} placeholder="${placeholderText}">
+        </div>`;
+}
+
+function collectSectionCountRows(section) {
+    if (!section || !Array.isArray(section.items)) return [];
+    const rows = [];
+    section.items.forEach((item, index) => {
+        const metric = item && (item.v_metric || ((item.selected === 'Specific') ? 'Count' : 'Weight'));
+        if (metric === 'Count') {
+            rows.push({ item, index });
+        }
+    });
+    return rows;
+}
+
+function prepareSectionCountRowRefs(section, seedRows) {
+    if (Array.isArray(seedRows) && seedRows.length) {
+        return seedRows
+            .map(entry => {
+                const item = entry.item || entry.it || entry;
+                const idx = (typeof entry.index === 'number') ? entry.index : entry.iidx;
+                if (!item || Number.isNaN(idx)) return null;
+                const metric = item.v_metric || ((item.selected === 'Specific') ? 'Count' : 'Weight');
+                if (metric !== 'Count') return null;
+                return { item, index: idx };
+            })
+            .filter(Boolean);
+    }
+    return collectSectionCountRows(section);
+}
+
+function sumSectionCountRowValues(rowRefs) {
+    if (!Array.isArray(rowRefs)) return 0;
+    return rowRefs.reduce((acc, entry) => {
+        const val = clampNodeCountValue(entry.item?.v_count);
+        return acc + (val === null ? NODE_COUNT_MIN : val);
+    }, 0);
+}
+
+function resolveSectionCountBounds(section, seedRows) {
+    const rowRefs = prepareSectionCountRowRefs(section, seedRows);
+    const rowCount = rowRefs.length;
+    const minFeasible = rowCount * NODE_COUNT_MIN;
+    const result = {
+        minEnabled: false,
+        maxEnabled: false,
+        minValue: null,
+        maxValue: null,
+        rowCount,
+        controlsDisabled: rowCount === 0,
+    };
+    if (!section || !rowCount) {
+        return result;
+    }
+    const currentTotal = sumSectionCountRowValues(rowRefs);
+    if (section.node_count_min_enabled) {
+        let minValue = clampNodeCountValue(section.node_count_min);
+        if (minValue === null) minValue = clampNodeCountValue(currentTotal);
+        if (minValue === null) minValue = minFeasible || NODE_COUNT_MIN;
+        if (minValue < minFeasible) minValue = minFeasible;
+        section.node_count_min = minValue;
+        result.minEnabled = true;
+        result.minValue = minValue;
+    }
+    if (section.node_count_max_enabled) {
+        let maxValue = clampNodeCountValue(section.node_count_max);
+        if (maxValue === null) maxValue = clampNodeCountValue(currentTotal);
+        if (maxValue === null) maxValue = Math.max(minFeasible, currentTotal || NODE_COUNT_MIN);
+        if (result.minEnabled && maxValue < (result.minValue ?? minFeasible)) {
+            maxValue = result.minValue;
+        }
+        if (maxValue < minFeasible) {
+            maxValue = minFeasible;
+        }
+        section.node_count_max = maxValue;
+        result.maxEnabled = true;
+        result.maxValue = maxValue;
+    }
+    return result;
+}
+
+function orderSectionCountRows(rowRefs, preferredIdx) {
+    if (!Array.isArray(rowRefs)) return [];
+    const ordered = [];
+    const preferred = (typeof preferredIdx === 'number') ? rowRefs.find(entry => entry.index === preferredIdx) : null;
+    if (preferred) ordered.push(preferred);
+    rowRefs.forEach(entry => {
+        if (!ordered.includes(entry)) {
+            ordered.push(entry);
+        }
+    });
+    return ordered;
+}
+
+function increaseSectionCountRows(rowRefs, delta, preferredIdx) {
+    if (!Array.isArray(rowRefs) || !rowRefs.length || delta <= 0) return false;
+    const targetList = orderSectionCountRows(rowRefs, preferredIdx);
+    const target = targetList[0];
+    if (!target) return false;
+    let current = clampNodeCountValue(target.item.v_count);
+    if (current === null) current = NODE_COUNT_MIN;
+    target.item.v_count = current + delta;
+    return true;
+}
+
+function decreaseSectionCountRows(section, rowRefs, delta, preferredIdx) {
+    if (!Array.isArray(rowRefs) || !rowRefs.length || delta <= 0) return false;
+    let remaining = delta;
+    let changed = false;
+    const ordered = orderSectionCountRows(rowRefs, preferredIdx);
+    ordered.forEach(entry => {
+        if (remaining <= 0) return;
+        let current = clampNodeCountValue(entry.item.v_count);
+        if (current === null) current = NODE_COUNT_MIN;
+        const reducible = Math.max(0, current - NODE_COUNT_MIN);
+        if (reducible <= 0) return;
+        const take = Math.min(reducible, remaining);
+        entry.item.v_count = current - take;
+        remaining -= take;
+        changed = true;
+    });
+    if (remaining > 0 && section && section.node_count_max_enabled) {
+        section.node_count_max = sumSectionCountRowValues(rowRefs);
+    }
+    return changed;
+}
+
+function enforceSectionCountBoundsForScenario(sidx, secName, preferredIdx = null) {
+    if (Number.isNaN(sidx) || !state.scenarios?.[sidx] || !secName) return false;
+    const scenario = state.scenarios[sidx];
+    const section = scenario.sections?.[secName];
+    if (!section) return false;
+    const rowRefs = collectSectionCountRows(section);
+    if (!rowRefs.length) return false;
+    const bounds = resolveSectionCountBounds(section, rowRefs);
+    let total = sumSectionCountRowValues(rowRefs);
+    let changed = false;
+    if (bounds.minEnabled && typeof bounds.minValue === 'number' && total < bounds.minValue) {
+        const needed = bounds.minValue - total;
+        if (needed > 0) {
+            changed = increaseSectionCountRows(rowRefs, needed, preferredIdx) || changed;
+            total = sumSectionCountRowValues(rowRefs);
+        }
+    }
+    if (bounds.maxEnabled && typeof bounds.maxValue === 'number' && total > bounds.maxValue) {
+        const excess = total - bounds.maxValue;
+        if (excess > 0) {
+            changed = decreaseSectionCountRows(section, rowRefs, excess, preferredIdx) || changed;
+        }
+    }
+    return changed;
 }
 
 function updateHsBoundsVisibility(){
@@ -9138,8 +9620,8 @@ function renderItemRow(sidx, secName, iidx, it) {
         const metric = it.v_metric || 'Weight';
         const metricSel = `<select class="form-select form-select-sm" style="min-width: 140px" data-field="v_metric" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"><option ${metric==='Weight'?'selected':''}>Weight</option><option ${metric==='Count'?'selected':''}>Count</option></select>`;
         if (metric === 'Count') {
-            const count = (parseInt(it.v_count, 10) || 5);
-            return `<div class="d-flex gap-2">${metricSel}<input type="number" min="1" step="1" class="form-control form-control-sm" style="min-width: 120px" value="${count}" data-field="v_count" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></div>`;
+            const count = (parseInt(it.v_count, 10) || NODE_COUNT_MIN);
+            return `<div class="d-flex gap-2">${metricSel}<input type="number" min="${NODE_COUNT_MIN}" max="${NODE_COUNT_MAX}" step="1" class="form-control form-control-sm" style="min-width: 120px" value="${count}" data-field="v_count" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></div>`;
         }
     const isProtectedRandom = (secName === 'Node Information') && ((it.selected||'').toLowerCase()==='random') && it._protected_random;
     const metricDisabled = isProtectedRandom ? 'disabled title="Residual Random row metric locked"' : '';
@@ -9180,29 +9662,86 @@ function wireHandlers() {
     document.querySelectorAll('input[data-field="scenario_density_count"]').forEach(inp => {
         inp.addEventListener('change', () => {
             const idx = parseInt(inp.getAttribute('data-scen-idx'));
-            let val = parseInt(inp.value, 10); if (isNaN(val) || val < 0) val = 0; if (val > 5000) val = 5000;
-            state.scenarios[idx].density_count = val; // store at scenario level; do NOT mutate node rows
-            if (val === '' || val === null) {
-                // If cleared, revert to default 10 in UI but keep undefined so save omits and parser falls back.
-                delete state.scenarios[idx].density_count;
+            if (Number.isNaN(idx) || !state.scenarios?.[idx]) return;
+            let val = clampDensityCountValue(inp.value);
+            if (val === null) {
+                val = DENSITY_COUNT_MIN;
             }
-            renderMain();
+            state.scenarios[idx].density_count = val; // store at scenario level; do NOT mutate node rows
+            enforceDensityBounds(idx);
+            refreshScenarioStateAfterCountEdit();
         });
         // Prevent Enter key from triggering unintended form behavior (like adding a row)
         inp.addEventListener('keydown', (ev) => {
             if (ev.key === 'Enter') { ev.preventDefault(); inp.blur(); }
         });
     });
+    document.querySelectorAll('input[data-field="scenario_density_min_enabled"]').forEach(inp => {
+        inp.addEventListener('change', () => {
+            const idx = parseInt(inp.getAttribute('data-scen-idx'));
+            if (Number.isNaN(idx) || !state.scenarios?.[idx]) return;
+            const scen = state.scenarios[idx];
+            const enabled = !!inp.checked;
+            scen.density_count_min_enabled = enabled;
+            if (enabled && clampDensityCountValue(scen.density_count_min) === null) {
+                const fallback = clampDensityCountValue(scen.density_count);
+                scen.density_count_min = fallback === null ? DENSITY_COUNT_MIN : fallback;
+            }
+            enforceDensityBounds(idx);
+            refreshScenarioStateAfterCountEdit();
+        });
+    });
+    document.querySelectorAll('input[data-field="scenario_density_max_enabled"]').forEach(inp => {
+        inp.addEventListener('change', () => {
+            const idx = parseInt(inp.getAttribute('data-scen-idx'));
+            if (Number.isNaN(idx) || !state.scenarios?.[idx]) return;
+            const scen = state.scenarios[idx];
+            const enabled = !!inp.checked;
+            scen.density_count_max_enabled = enabled;
+            if (enabled && clampDensityCountValue(scen.density_count_max) === null) {
+                const fallback = clampDensityCountValue(scen.density_count);
+                scen.density_count_max = fallback === null ? DENSITY_COUNT_MAX : fallback;
+            }
+            enforceDensityBounds(idx);
+            refreshScenarioStateAfterCountEdit();
+        });
+    });
+    const handleDensityBoundInput = (selector, fieldName, enabledField) => {
+        document.querySelectorAll(selector).forEach(inp => {
+            inp.addEventListener('change', () => {
+                const idx = parseInt(inp.getAttribute('data-scen-idx'));
+                if (Number.isNaN(idx) || !state.scenarios?.[idx]) return;
+                const scen = state.scenarios[idx];
+                let val = clampDensityCountValue(inp.value);
+                if (val === null) {
+                    inp.value = '';
+                    delete scen[fieldName];
+                    scen[enabledField] = false;
+                } else {
+                    scen[fieldName] = val;
+                    scen[enabledField] = true;
+                }
+                enforceDensityBounds(idx);
+                refreshScenarioStateAfterCountEdit();
+            });
+            inp.addEventListener('keydown', (ev) => {
+                if (ev.key === 'Enter') { ev.preventDefault(); inp.blur(); }
+            });
+        });
+    };
+    handleDensityBoundInput('input[data-field="scenario_density_min"]', 'density_count_min', 'density_count_min_enabled');
+    handleDensityBoundInput('input[data-field="scenario_density_max"]', 'density_count_max', 'density_count_max_enabled');
     document.querySelectorAll('[data-field]').forEach(el => {
         const sidx = parseInt(el.getAttribute('data-scen-idx'));
         const sec = el.getAttribute('data-sec');
         const field = el.getAttribute('data-field');
         const iidx = el.getAttribute('data-item-idx');
+        const rowIdx = (iidx !== null && iidx !== undefined) ? parseInt(iidx, 10) : null;
         const handler = (ev) => {
             if (field === 'scenario_base_hosts') { return; }
             if (sec) {
-                if (iidx !== null) {
-                    const item = state.scenarios[sidx].sections[sec].items[parseInt(iidx)];
+                if (rowIdx !== null && !Number.isNaN(rowIdx)) {
+                    const item = state.scenarios[sidx].sections[sec].items[rowIdx];
                     if (['factor','rate_kbps','period_s','jitter_pct','total_nodes','density','r2r_edges','r2s_edges','r2s_hosts_min','r2s_hosts_max'].includes(field)) {
                         item ? (item[field] = parseFloat(el.value)) : state.scenarios[sidx].sections[sec][field] = parseFloat(el.value);
                         if ((field === 'edges' || field === 'r2s_edges') && (isNaN(item[field]) || el.value === '')) {
@@ -9218,7 +9757,7 @@ function wireHandlers() {
                             persistEditorState();
                         }
                         if (field === 'factor') {
-                            adjustWeightsProportionally(sidx, sec, parseInt(iidx));
+                            adjustWeightsProportionally(sidx, sec, rowIdx);
                             updateWeightWarning(sidx, sec);
                             updateWeightInputsDisplay(sidx, sec);
                         }
@@ -9228,8 +9767,14 @@ function wireHandlers() {
                     } else if (['pattern','content_type','selected','script_path','v_type','v_vector','v_name','v_path','v_count','v_metric','r2r_mode','r2s_mode'].includes(field)) {
                         const prev = item[field];
                         if (field === 'v_count') {
-                            const n = parseInt(el.value, 10) || 1;
+                            let n = clampNodeCountValue(el.value);
+                            if (n === null) {
+                                n = NODE_COUNT_MIN;
+                            }
                             item[field] = n;
+                            if (sec) {
+                                enforceSectionCountBoundsForScenario(sidx, sec, rowIdx);
+                            }
                         } else {
                             item[field] = el.value;
                         }
@@ -9259,6 +9804,9 @@ function wireHandlers() {
                             } else {
                                 if (!item.v_metric) item.v_metric = 'Weight';
                             }
+                            if (sec) {
+                                enforceSectionCountBoundsForScenario(sidx, sec, rowIdx);
+                            }
                             // Re-render to show/hide appropriate controls and recalc weight warnings
                             renderMain();
                         } else if (field === 'v_metric') {
@@ -9271,6 +9819,7 @@ function wireHandlers() {
                                 const secRef = state.scenarios[sidx].sections[sec];
                                 const hasWeight = (secRef.items || []).some(it => (it.v_metric || 'Weight') === 'Weight');
                                 if (!hasWeight && secRef.total_nodes) { secRef.total_nodes = 0; }
+                                enforceSectionCountBoundsForScenario(sidx, sec, rowIdx);
                             }
                             updateWeightWarning(sidx, sec);
                             renderMain();
@@ -9282,19 +9831,56 @@ function wireHandlers() {
                         state.scenarios[sidx].sections[sec][field] = el.value;
                     }
                 } else {
+                    const sectionRef = state.scenarios[sidx].sections[sec];
+                    if (!sectionRef) return;
                     if (field === 'density' || field === 'total_nodes') {
                         let v = parseFloat(el.value);
                         if (field === 'density') {
                             if (isNaN(v)) v = 0.0;
                             v = Math.max(0, Math.min(1, v)); // Clamp globally 0..1
                         }
-                        state.scenarios[sidx].sections[sec][field] = v;
+                        sectionRef[field] = v;
                         // keep hidden for submit and update any warnings
                         if (field === 'density') { updateWeightWarning(sidx, sec); }
                         // Ensure Total Nodes label refreshes on total_nodes edits
                         if (field === 'total_nodes') { renderMain(); }
+                    } else if (field === 'node_count_min_enabled' || field === 'node_count_max_enabled') {
+                        if (ev?.type === 'input') return;
+                        const enabled = !!el.checked;
+                        const targetField = field === 'node_count_min_enabled' ? 'node_count_min' : 'node_count_max';
+                        sectionRef[field] = enabled;
+                        if (enabled) {
+                            let fallback = clampNodeCountValue(sectionRef[targetField]);
+                            if (fallback === null) {
+                                const rows = collectSectionCountRows(sectionRef);
+                                const total = sumSectionCountRowValues(rows);
+                                fallback = total > 0 ? total : (rows.length * NODE_COUNT_MIN);
+                            }
+                            if (fallback === null || fallback === undefined) {
+                                fallback = NODE_COUNT_MIN;
+                            }
+                            sectionRef[targetField] = fallback;
+                        }
+                        enforceSectionCountBoundsForScenario(sidx, sec);
+                        refreshScenarioStateAfterCountEdit();
+                        return;
+                    } else if (field === 'node_count_min' || field === 'node_count_max') {
+                        if (ev?.type === 'input') return;
+                        let val = clampNodeCountValue(el.value);
+                        const enabledField = `${field}_enabled`;
+                        if (val === null) {
+                            el.value = '';
+                            delete sectionRef[field];
+                            sectionRef[enabledField] = false;
+                        } else {
+                            sectionRef[field] = val;
+                            sectionRef[enabledField] = true;
+                        }
+                        enforceSectionCountBoundsForScenario(sidx, sec);
+                        refreshScenarioStateAfterCountEdit();
+                        return;
                     } else {
-                        state.scenarios[sidx].sections[sec][field] = el.value;
+                        sectionRef[field] = el.value;
                     }
                 }
             } else {
@@ -9352,6 +9938,7 @@ function wireHandlers() {
                   const secRef = state.scenarios[sidx].sections[sec];
                   const hasWeight = (secRef.items || []).some(it => (it.v_metric || 'Weight') === 'Weight');
                   if (!hasWeight && secRef.total_nodes) { secRef.total_nodes = 0; }
+                  enforceSectionCountBoundsForScenario(sidx, sec);
               }
               // Re-render to refresh totals and labels
                             renderMain();
@@ -9385,6 +9972,10 @@ function wireHandlers() {
             state.scenarios[sidx].sections[sec].items.push(item);
                         logInfo(`Added item to ${sec}`);
               redistributeEven(sidx, sec);
+            if (sec === 'Node Information') {
+                const newIdx = state.scenarios[sidx].sections[sec].items.length - 1;
+                enforceSectionCountBoundsForScenario(sidx, sec, newIdx);
+            }
                             renderMain();
                             persistEditorState();
                             try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
@@ -9761,136 +10352,140 @@ function wireHandlers() {
             }
         });
     });
-    document.querySelectorAll('[data-hitl-core-vm-select]').forEach(select => {
-        select.addEventListener('change', () => {
-            const sidx = parseInt(select.getAttribute('data-scen-idx'));
-            if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
-            const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
-            const coreState = hitlState.core || (hitlState.core = {});
-            const rawValue = select.value || '';
-            const resetCoreSelection = () => {
-                coreState.vm_key = '';
-                coreState.vm_name = '';
-                coreState.vm_node = '';
-                coreState.last_tested_status = null;
-                coreState.last_tested_message = null;
-                coreState.last_tested_at = null;
-                coreState.last_tested_host = null;
-                coreState.last_tested_port = null;
-                coreState.core_secret_id = null;
-                coreState.validated = false;
-                coreState.last_validated_at = null;
-                coreState.stored_summary = null;
-                coreState.internal_bridge = '';
-                coreState.internal_bridge_owner = '';
-                coreState.cached_vm_interface_count = null;
-                coreState.cached_vm_status = null;
-            };
-            if (!rawValue) {
+    if (!IS_BUILDER_VIEW) {
+        document.querySelectorAll('[data-hitl-core-vm-select]').forEach(select => {
+            select.addEventListener('change', () => {
+                const sidx = parseInt(select.getAttribute('data-scen-idx'));
+                if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
+                const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
+                const coreState = hitlState.core || (hitlState.core = {});
+                const rawValue = select.value || '';
+                const resetCoreSelection = () => {
+                    coreState.vm_key = '';
+                    coreState.vm_name = '';
+                    coreState.vm_node = '';
+                    coreState.last_tested_status = null;
+                    coreState.last_tested_message = null;
+                    coreState.last_tested_at = null;
+                    coreState.last_tested_host = null;
+                    coreState.last_tested_port = null;
+                    coreState.core_secret_id = null;
+                    coreState.validated = false;
+                    coreState.last_validated_at = null;
+                    coreState.stored_summary = null;
+                    coreState.internal_bridge = '';
+                    coreState.internal_bridge_owner = '';
+                    coreState.cached_vm_interface_count = null;
+                    coreState.cached_vm_status = null;
+                };
+                if (!rawValue) {
+                    resetCoreSelection();
+                    persistEditorState();
+                    const pwdInput = document.querySelector(`[data-hitl-core-field="ssh_password"][data-scen-idx="${sidx}"]`);
+                    if (pwdInput) pwdInput.removeAttribute('placeholder');
+                    const hidden = document.getElementById('scenarios_json');
+                    if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+                    renderMain();
+                    return;
+                }
+                const proxState = hitlState.proxmox || {};
+                const inventory = proxState.inventory && Array.isArray(proxState.inventory.vms) ? proxState.inventory.vms : [];
+                const selectedVm = inventory.find(vm => `${vm.node ?? ''}::${vm.vmid ?? ''}` === rawValue) || null;
+                const [nodePart, vmidPartRaw] = rawValue.split('::');
                 resetCoreSelection();
+                coreState.vm_key = rawValue;
+                coreState.vm_name = selectedVm && selectedVm.name ? String(selectedVm.name) : '';
+                coreState.vm_node = selectedVm && selectedVm.node !== undefined && selectedVm.node !== null
+                    ? String(selectedVm.node)
+                    : (nodePart || '').trim();
+                if (!coreState.vm_name && coreState.vm_node && vmidPartRaw && vmidPartRaw.trim()) {
+                    coreState.vm_name = `${coreState.vm_node}::${vmidPartRaw.trim()}`;
+                }
+                coreState.cached_vm_interface_count = Array.isArray(selectedVm?.interfaces) ? selectedVm.interfaces.length : null;
+                coreState.cached_vm_status = selectedVm && selectedVm.status ? String(selectedVm.status) : null;
                 persistEditorState();
                 const pwdInput = document.querySelector(`[data-hitl-core-field="ssh_password"][data-scen-idx="${sidx}"]`);
                 if (pwdInput) pwdInput.removeAttribute('placeholder');
                 const hidden = document.getElementById('scenarios_json');
                 if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
                 renderMain();
-                return;
-            }
-            const proxState = hitlState.proxmox || {};
-            const inventory = proxState.inventory && Array.isArray(proxState.inventory.vms) ? proxState.inventory.vms : [];
-            const selectedVm = inventory.find(vm => `${vm.node ?? ''}::${vm.vmid ?? ''}` === rawValue) || null;
-            const [nodePart, vmidPartRaw] = rawValue.split('::');
-            resetCoreSelection();
-            coreState.vm_key = rawValue;
-            coreState.vm_name = selectedVm && selectedVm.name ? String(selectedVm.name) : '';
-            coreState.vm_node = selectedVm && selectedVm.node !== undefined && selectedVm.node !== null
-                ? String(selectedVm.node)
-                : (nodePart || '').trim();
-            if (!coreState.vm_name && coreState.vm_node && vmidPartRaw && vmidPartRaw.trim()) {
-                coreState.vm_name = `${coreState.vm_node}::${vmidPartRaw.trim()}`;
-            }
-            coreState.cached_vm_interface_count = Array.isArray(selectedVm?.interfaces) ? selectedVm.interfaces.length : null;
-            coreState.cached_vm_status = selectedVm && selectedVm.status ? String(selectedVm.status) : null;
-            persistEditorState();
-            const pwdInput = document.querySelector(`[data-hitl-core-field="ssh_password"][data-scen-idx="${sidx}"]`);
-            if (pwdInput) pwdInput.removeAttribute('placeholder');
-            const hidden = document.getElementById('scenarios_json');
-            if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
-            renderMain();
-        });
-    });
-    document.querySelectorAll('[data-hitl-core-field]').forEach(input => {
-        if (input.closest('#coreConnectionModal')) return;
-        input.addEventListener('input', () => handleCoreFieldUpdate(input, { rerender: false }));
-        input.addEventListener('change', () => handleCoreFieldUpdate(input, { rerender: true }));
-    });
-    document.querySelectorAll('[data-hitl-core-test]').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            if (btn.disabled) return;
-            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
-            await validateCoreConnection(sidx, {
-                triggerButton: btn,
-                workingLabel: 'Testing…',
             });
         });
-    });
-    document.querySelectorAll('[data-hitl-core-clear]').forEach(btn => {
-        btn.addEventListener('click', () => {
-            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
-            if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
-            const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
-            const existingSecretId = hitlState.core && typeof hitlState.core.core_secret_id === 'string' ? hitlState.core.core_secret_id : null;
-            if (existingSecretId) {
-                try {
-                    const payload = {
-                        core_secret_id: existingSecretId,
-                        scenario_index: sidx,
-                        scenario_name: state.scenarios?.[sidx]?.name || '',
-                    };
-                    fetch('/api/core/credentials/clear', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        credentials: 'same-origin',
-                        body: JSON.stringify(payload),
-                    }).catch(err => logError(`Failed to clear stored CORE credentials: ${err}`));
-                } catch (err) {
-                    logError(`Exception during CORE credential clear: ${err}`);
-                }
-            }
-            hitlState.core = {
-                vm_key: '',
-                vm_name: '',
-                vm_node: '',
-                grpc_host: '',
-                grpc_port: 50051,
-                ssh_host: '',
-                ssh_port: 22,
-                ssh_username: '',
-                ssh_password: '',
-                core_secret_id: null,
-                validated: false,
-                last_validated_at: null,
-                stored_summary: null,
-                last_tested_at: null,
-                last_tested_status: null,
-                last_tested_message: null,
-                last_tested_host: null,
-                last_tested_port: null,
-                internal_bridge: '',
-                internal_bridge_owner: '',
-                last_interfaces_refresh: null,
-                last_interfaces_attempt: null,
-                interfaces_refresh_inflight: false,
-                last_interfaces_error: null,
-            };
-            persistEditorState();
-            const hidden = document.getElementById('scenarios_json');
-            if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
-            const pwdInput = document.querySelector(`[data-hitl-core-field="ssh_password"][data-scen-idx="${sidx}"]`);
-            if (pwdInput) pwdInput.removeAttribute('placeholder');
-            renderMain();
+    }
+    if (!IS_BUILDER_VIEW) {
+        document.querySelectorAll('[data-hitl-core-field]').forEach(input => {
+            if (input.closest('#coreConnectionModal')) return;
+            input.addEventListener('input', () => handleCoreFieldUpdate(input, { rerender: false }));
+            input.addEventListener('change', () => handleCoreFieldUpdate(input, { rerender: true }));
         });
-    });
+        document.querySelectorAll('[data-hitl-core-test]').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                if (btn.disabled) return;
+                const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+                await validateCoreConnection(sidx, {
+                    triggerButton: btn,
+                    workingLabel: 'Testing…',
+                });
+            });
+        });
+        document.querySelectorAll('[data-hitl-core-clear]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+                if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
+                const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
+                const existingSecretId = hitlState.core && typeof hitlState.core.core_secret_id === 'string' ? hitlState.core.core_secret_id : null;
+                if (existingSecretId) {
+                    try {
+                        const payload = {
+                            core_secret_id: existingSecretId,
+                            scenario_index: sidx,
+                            scenario_name: state.scenarios?.[sidx]?.name || '',
+                        };
+                        fetch('/api/core/credentials/clear', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            credentials: 'same-origin',
+                            body: JSON.stringify(payload),
+                        }).catch(err => logError(`Failed to clear stored CORE credentials: ${err}`));
+                    } catch (err) {
+                        logError(`Exception during CORE credential clear: ${err}`);
+                    }
+                }
+                hitlState.core = {
+                    vm_key: '',
+                    vm_name: '',
+                    vm_node: '',
+                    grpc_host: '',
+                    grpc_port: 50051,
+                    ssh_host: '',
+                    ssh_port: 22,
+                    ssh_username: '',
+                    ssh_password: '',
+                    core_secret_id: null,
+                    validated: false,
+                    last_validated_at: null,
+                    stored_summary: null,
+                    last_tested_at: null,
+                    last_tested_status: null,
+                    last_tested_message: null,
+                    last_tested_host: null,
+                    last_tested_port: null,
+                    internal_bridge: '',
+                    internal_bridge_owner: '',
+                    last_interfaces_refresh: null,
+                    last_interfaces_attempt: null,
+                    interfaces_refresh_inflight: false,
+                    last_interfaces_error: null,
+                };
+                persistEditorState();
+                const hidden = document.getElementById('scenarios_json');
+                if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+                const pwdInput = document.querySelector(`[data-hitl-core-field="ssh_password"][data-scen-idx="${sidx}"]`);
+                if (pwdInput) pwdInput.removeAttribute('placeholder');
+                renderMain();
+            });
+        });
+    }
     document.querySelectorAll('[data-hitl-refresh]').forEach(btn => {
         btn.addEventListener('click', async () => {
             const sidx = parseInt(btn.getAttribute('data-scen-idx'));
@@ -9971,6 +10566,7 @@ function wireHandlers() {
     wireCoreConnectionSaveButton();
     if (coreRememberInput && !coreRememberInput.dataset.prefBound) {
         coreRememberInput.addEventListener('change', () => {
+            if (IS_BUILDER_VIEW) return;
             if (!coreConnectionModal) return;
             const sidx = parseInt(coreConnectionModal.getAttribute('data-scen-idx') || '', 10);
             if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
@@ -9982,6 +10578,7 @@ function wireHandlers() {
     }
     if (coreAutoStartInput && !coreAutoStartInput.dataset.prefBound) {
         coreAutoStartInput.addEventListener('change', () => {
+            if (IS_BUILDER_VIEW) return;
             if (!coreConnectionModal) return;
             const sidx = parseInt(coreConnectionModal.getAttribute('data-scen-idx') || '', 10);
             if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
@@ -10528,16 +11125,17 @@ function isRemoteExecutionSelected() {
 }
 
 function getExecuteConfirmSelections() {
-    return {
-        remoteExecution: isRemoteExecutionSelected(),
-        pushPreference: executeConfirmPushUpdateToggle
+    const remoteExecution = isRemoteExecutionSelected();
+    const pushAllowed = !IS_BUILDER_VIEW;
+    const pushEnabled = pushAllowed && (
+        executeConfirmPushUpdateToggle
             ? !!executeConfirmPushUpdateToggle.checked
-            : getExecuteConfirmUpdateRemotePref(),
-        updateRemote: isRemoteExecutionSelected() && (
-            executeConfirmPushUpdateToggle
-                ? !!executeConfirmPushUpdateToggle.checked
-                : getExecuteConfirmUpdateRemotePref()
-        ),
+            : getExecuteConfirmUpdateRemotePref()
+    );
+    return {
+        remoteExecution,
+        pushPreference: pushAllowed ? pushEnabled : false,
+        updateRemote: remoteExecution && pushAllowed && pushEnabled,
     };
 }
 
@@ -10605,7 +11203,14 @@ function ensureExecuteConfirmElements() {
         executeConfirmPushUpdateHelpEl = document.getElementById('executeConfirmPushUpdateHelp');
     }
     if (executeConfirmRunBtn && !executeConfirmRunBtn.dataset.execBound) {
-        executeConfirmRunBtn.addEventListener('click', () => {
+        executeConfirmRunBtn.addEventListener('click', async () => {
+            if (executeConfirmRunBtn.disabled) {
+                return;
+            }
+            const ready = await ensureBuilderCoreReadyForExecute();
+            if (!ready) {
+                return;
+            }
             const stayOpen = !!executeConfirmState.keepOpenOnConfirm;
             settleExecuteConfirm({ confirmed: true });
             if (!stayOpen) {
@@ -10668,13 +11273,19 @@ function updateExecuteCoreStatus(info = null) {
     const classes = ['text-muted', 'text-success', 'text-warning', 'text-danger'];
     executeCoreStatusEl.classList.remove(...classes);
     if (statusInfo.verified) {
-        executeCoreStatusEl.textContent = `Connected to CORE ${statusInfo.host}:${statusInfo.port}`;
+        executeCoreStatusEl.textContent = IS_BUILDER_VIEW
+            ? 'CORE backend validated and ready.'
+            : `Connected to CORE ${statusInfo.host}:${statusInfo.port}`;
         executeCoreStatusEl.classList.add('text-success');
     } else if (statusInfo.shouldFake) {
-        executeCoreStatusEl.textContent = 'CORE not connected. Runs will fall back to local emulation.';
+        executeCoreStatusEl.textContent = IS_BUILDER_VIEW
+            ? 'Please test the connection. If it fails, contact your administrator.'
+            : 'CORE not connected. Runs will fall back to local emulation.';
         executeCoreStatusEl.classList.add('text-danger');
     } else {
-        executeCoreStatusEl.textContent = 'CORE connection not validated yet. Test before running remotely.';
+        executeCoreStatusEl.textContent = IS_BUILDER_VIEW
+            ? 'CORE backend status unknown. Ask an admin to validate the connection.'
+            : 'CORE connection not validated yet. Test before running remotely.';
         executeCoreStatusEl.classList.add('text-warning');
     }
 }
@@ -10687,36 +11298,57 @@ function refreshExecuteRemoteToggleState() {
     if (executeRemoteTestRow) {
         executeRemoteTestRow.classList.toggle('d-none', !remoteSelected);
     }
+    const hidePushControls = !remoteSelected || IS_BUILDER_VIEW;
     if (executePushUpdateWrap) {
-        executePushUpdateWrap.classList.toggle('d-none', !remoteSelected);
+        executePushUpdateWrap.classList.toggle('d-none', hidePushControls);
     }
     if (executeConfirmPushUpdateToggle) {
-        if (remoteSelected) {
+        if (IS_BUILDER_VIEW) {
+            executeConfirmPushUpdateToggle.checked = false;
+        } else if (remoteSelected) {
             executeConfirmPushUpdateToggle.checked = pushPref;
         }
-        executeConfirmPushUpdateToggle.disabled = !remoteSelected;
+        executeConfirmPushUpdateToggle.disabled = hidePushControls;
     }
     if (executeConfirmPushUpdateHelpEl) {
-        executeConfirmPushUpdateHelpEl.classList.toggle('text-muted', !remoteSelected);
-        executeConfirmPushUpdateHelpEl.textContent = remoteSelected
-            ? 'Sync the current repository snapshot to your CORE VM before execution.'
-            : 'Enable remote execution to push the latest backend before running.';
+        executeConfirmPushUpdateHelpEl.classList.remove('text-success', 'text-warning');
+        if (IS_BUILDER_VIEW) {
+            executeConfirmPushUpdateHelpEl.textContent = 'Repository uploads are managed by an admin.';
+            executeConfirmPushUpdateHelpEl.classList.add('text-muted');
+        } else {
+            executeConfirmPushUpdateHelpEl.classList.toggle('text-muted', !remoteSelected);
+            executeConfirmPushUpdateHelpEl.textContent = remoteSelected
+                ? 'Sync the current repository snapshot to your CORE VM before execution.'
+                : 'Enable remote execution to push the latest backend before running.';
+            if (remoteSelected) {
+                executeConfirmPushUpdateHelpEl.classList.add('text-success');
+            }
+        }
     }
     if (executeConfirmUpdateRemoteHelpEl) {
         executeConfirmUpdateRemoteHelpEl.classList.remove('text-muted', 'text-success', 'text-warning');
         if (remoteSelected) {
+            const hideBuilderNotice = IS_BUILDER_VIEW && !info.verified;
             const remoteMsg = info.verified
-                ? 'Remote execution ready. Runs will target your CORE VM.'
-                : 'Remote execution requires a validated CORE connection. Test before running.';
+                ? (IS_BUILDER_VIEW
+                    ? 'Remote execution ready. Backend managed by an admin.'
+                    : 'Remote execution ready. Runs will target your CORE VM.')
+                : (IS_BUILDER_VIEW
+                    ? ''
+                    : 'Remote execution requires a validated CORE connection. Test before running.');
             executeConfirmUpdateRemoteHelpEl.textContent = remoteMsg;
-            executeConfirmUpdateRemoteHelpEl.classList.add(info.verified ? 'text-success' : 'text-warning');
+            executeConfirmUpdateRemoteHelpEl.classList.toggle('d-none', hideBuilderNotice);
+            if (!hideBuilderNotice) {
+                executeConfirmUpdateRemoteHelpEl.classList.add(info.verified ? 'text-success' : 'text-warning');
+            }
         } else {
             executeConfirmUpdateRemoteHelpEl.textContent = 'Emulation mode runs locally on this workstation.';
+            executeConfirmUpdateRemoteHelpEl.classList.remove('d-none');
             executeConfirmUpdateRemoteHelpEl.classList.add('text-muted');
         }
     }
     if (executeConfirmRunBtn) {
-        const shouldDisable = remoteSelected && !info.verified;
+        const shouldDisable = remoteSelected && !info.verified && !IS_BUILDER_VIEW;
         executeConfirmRunBtn.disabled = shouldDisable;
         if (shouldDisable) {
             executeConfirmRunBtn.setAttribute('title', 'Test the CORE connection to enable remote execution.');
@@ -10752,6 +11384,52 @@ async function handleExecuteCoreTestClick() {
         console.warn('CORE connection test from execute modal failed', err);
     } finally {
         refreshExecuteRemoteToggleState();
+    }
+}
+
+async function ensureBuilderCoreReadyForExecute() {
+    if (!IS_BUILDER_VIEW) {
+        return true;
+    }
+    const scenarioIndex = Number.isInteger(executeConfirmState.scenarioIndex)
+        ? executeConfirmState.scenarioIndex
+        : getActiveScenarioContext().idx;
+    if (!Number.isInteger(scenarioIndex)) {
+        updateExecuteConfirmAlert('Select a scenario before executing.', 'warning');
+        return false;
+    }
+    updateExecuteConfirmAlert('Validating CORE VM before execution…', 'info');
+    try {
+        const result = await validateCoreConnection(scenarioIndex, {
+            triggerButton: executeConfirmRunBtn || undefined,
+            workingLabel: 'Testing CORE…',
+            statusEl: executeCoreStatusEl || undefined,
+            hintOnStart: 'Checking CORE backend availability…',
+            hintOnSuccess: 'CORE backend ready for execution.',
+            hintOnFailure: 'CORE backend unavailable',
+            suppressToasts: true,
+            autoStartDaemon: true,
+        });
+        if (!result?.ok) {
+            handleBuilderBackendUnavailable();
+            return false;
+        }
+        updateExecuteConfirmAlert('', 'info');
+        refreshExecuteRemoteToggleState();
+        return true;
+    } catch (err) {
+        console.warn('Automatic CORE validation failed', err);
+        handleBuilderBackendUnavailable();
+        return false;
+    }
+}
+
+function handleBuilderBackendUnavailable() {
+    updateExecuteConfirmAlert(BUILDER_BACKEND_UNAVAILABLE_MESSAGE, 'danger');
+    if (executeCoreStatusEl) {
+        executeCoreStatusEl.textContent = BUILDER_BACKEND_UNAVAILABLE_MESSAGE;
+        executeCoreStatusEl.classList.remove('text-success', 'text-warning', 'text-muted');
+        executeCoreStatusEl.classList.add('text-danger');
     }
 }
 

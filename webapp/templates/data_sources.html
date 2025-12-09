@@ -15,21 +15,30 @@
 {% endblock %}
 {% block content %}
   {% with messages = get_flashed_messages() %}
-    {% if messages %}
-      <div class="alert alert-info py-2 px-3 mb-3">{{ messages[0] }}</div>
+      {% if messages %}
+        <div class="alert alert-info py-2 px-3 mb-3">{{ messages[0] }}</div>
+      {% endif %}
+    {% endwith %}
+    {% if is_builder_view %}
+    <div class="alert alert-warning py-2 px-3 mb-3">
+      Builder view is read-only for the vulnerability catalog data. You can still review entries, select rows, and run <strong>Check Files</strong> or per-row refresh actions. Contact an administrator for imports, exports, or compose actions.
+    </div>
     {% endif %}
-  {% endwith %}
   <!-- Sub navigation for page sections -->
   <ul class="nav nav-tabs mb-3" id="data-subnav" role="tablist">
+    {% if not is_builder_view %}
     <li class="nav-item" role="presentation">
       <button class="nav-link active" id="subnav-sources" data-bs-toggle="tab" data-bs-target="#tab-sources" type="button" role="tab">Sources</button>
     </li>
+    {% endif %}
     <li class="nav-item" role="presentation">
-      <button class="nav-link" id="subnav-catalog" data-bs-toggle="tab" data-bs-target="#tab-catalog" type="button" role="tab">Vulnerability Catalog</button>
+      <button class="nav-link {% if is_builder_view %}active{% endif %}" id="subnav-catalog" data-bs-toggle="tab" data-bs-target="#tab-catalog" type="button" role="tab">Vulnerability Catalog</button>
     </li>
   </ul>
   <div class="tab-content" id="data-subnav-content">
+    {% if not is_builder_view %}
     <div class="tab-pane fade show active" id="tab-sources" role="tabpanel" aria-labelledby="subnav-sources">
+      {% if not is_builder_view %}
       <form class="card p-3 mb-4" action="{{ url_for('data_sources_upload') }}" method="post" enctype="multipart/form-data">
         <div class="row g-2 align-items-end">
           <div class="col-sm-6">
@@ -44,6 +53,11 @@
           </div>
         </div>
       </form>
+      {% else %}
+      <div class="card p-3 mb-4 bg-light border-0">
+        <div class="text-muted small">Import/Export actions are disabled in builder view.</div>
+      </div>
+      {% endif %}
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center">
           <strong>Sources</strong>
@@ -70,12 +84,16 @@
                 <td>{{ s.rows }}</td>
                 <td><small>{{ s.uploaded }}</small></td>
                 <td>
+                  {% if not is_builder_view %}
                   <div class="d-flex flex-wrap gap-1">
                     <form action="{{ url_for('data_sources_toggle', sid=s.id) }}" method="post" class="d-inline"><button class="btn btn-sm btn-outline-warning" type="submit">{{ 'Disable' if s.enabled else 'Enable' }}</button></form>
                     <form action="{{ url_for('data_sources_refresh', sid=s.id) }}" method="post" class="d-inline"><button class="btn btn-sm btn-outline-info" type="submit">Refresh</button></form>
                     <a class="btn btn-sm btn-outline-primary" href="{{ url_for('data_sources_download', sid=s.id) }}">Download</a>
                     <form action="{{ url_for('data_sources_delete', sid=s.id) }}" method="post" class="d-inline" onsubmit="return confirm('Delete source?')"><button class="btn btn-sm btn-outline-danger" type="submit">Delete</button></form>
                   </div>
+                  {% else %}
+                  <span class="text-muted small">Actions restricted in builder view</span>
+                  {% endif %}
                 </td>
               </tr>
             {% else %}
@@ -86,15 +104,21 @@
         </div>
       </div>
     </div>
-    <div class="tab-pane fade" id="tab-catalog" role="tabpanel" aria-labelledby="subnav-catalog">
+    </div>
+    {% endif %}
+    <div class="tab-pane fade{% if is_builder_view %} show active{% endif %}" id="tab-catalog" role="tabpanel" aria-labelledby="subnav-catalog">
       <div class="card" id="catalog-card">
         <div class="card-header d-flex justify-content-between align-items-center">
           <strong>Vulnerability Catalog [docker-compose only]</strong>
           <div class="d-flex gap-2 align-items-center">
             <button id="btn-check-existence" class="btn btn-sm btn-outline-secondary">Check Files</button>
+            {% if not is_builder_view %}
             <button id="btn-download-selected" class="btn btn-sm btn-outline-primary" disabled>Download Selected</button>
             <button id="btn-pull-selected" class="btn btn-sm btn-outline-success" disabled>Pull Selected</button>
             <button id="btn-remove-selected" class="btn btn-sm btn-outline-danger" disabled>Remove Selected</button>
+            {% else %}
+            <span class="text-muted small">Download / Pull / Remove require admin view</span>
+            {% endif %}
             <span id="catalog-status-spinner" class="ms-2 text-muted small" style="display:none;">
               <span class="spinner-border spinner-border-sm align-text-bottom me-1" role="status" aria-hidden="true"></span>
               Updating <span id="catalog-spin-done">0</span> of <span id="catalog-spin-total">0</span>…
@@ -168,6 +192,7 @@
   {% block extra_scripts %}
   <script>
   (function(){
+    const IS_BUILDER_VIEW = (window.CORETG_VIEW_MODE || '') === 'builder';
     // Hash-based routing for subnav tabs
     let catalogLoaded = false;
     async function ensureCatalogLoaded(){
@@ -178,8 +203,10 @@
     }
     function activateInitialTab(){
       const hash = (window.location.hash || '').toLowerCase();
-      const map = { '#sources': '#tab-sources', '#catalog': '#tab-catalog' };
-      const target = map[hash] || '#tab-sources';
+      const map = { '#catalog': '#tab-catalog' };
+      if(!IS_BUILDER_VIEW){ map['#sources'] = '#tab-sources'; }
+      const defaultTarget = IS_BUILDER_VIEW ? '#tab-catalog' : '#tab-sources';
+      const target = map[hash] || defaultTarget;
       const btn = document.querySelector(`[data-bs-target="${target}"]`);
       if(btn){
         const tab = new bootstrap.Tab(btn);
@@ -300,7 +327,7 @@
             <td>${it.Vector||''}</td>
             <td><small>${it.CVE||'n/a'}</small></td>
             <td><small class="text-break">${it.Path||''}</small></td>
-            <td><input type="text" class="form-control form-control-sm compose-input" value="${cmp}" placeholder="docker-compose.yml"></td>
+            <td>${IS_BUILDER_VIEW ? `<input type="text" class="form-control form-control-sm" value="${cmp}" placeholder="docker-compose.yml" disabled>` : `<input type="text" class="form-control form-control-sm compose-input" value="${cmp}" placeholder="docker-compose.yml">`}</td>
             <td>
               ${isRefreshing ? '<span class="spinner-border spinner-border-sm align-text-bottom me-1" role="status" aria-hidden="true"></span>' : ''}
               <span class="badge bg-${statusBadge}" ${!stKnown? 'data-bs-toggle="tooltip" data-bs-title="'+statusTitle.replace(/\"/g,'&quot;')+'"' : ''}>${statusTxt}</span>
@@ -308,10 +335,11 @@
               ${!isRefreshing ? `<button class="btn btn-xs btn-link text-decoration-none refresh-btn ms-1${isStatusUpdating ? ' disabled opacity-50 pe-none' : ''}" ${isStatusUpdating ? 'disabled' : ''} data-bs-toggle="tooltip" data-bs-title="Refresh this item" aria-label="Refresh"><i class="bi bi-arrow-repeat"></i></button>` : ''}
             </td>
             <td>
+              ${IS_BUILDER_VIEW ? '<span class="text-muted small">Actions unavailable in builder view</span>' : `
               <div class="d-flex gap-1">
                 <button class="btn btn-sm ${canDownload? 'btn-outline-primary': (canPull? 'btn-outline-success' : 'btn-outline-secondary')} act-btn ${disabledAct? 'opacity-50 pe-none' : ''}" ${disabledAct}>${actLabel}</button>
                 ${canRemove ? `<button class="btn btn-sm btn-outline-danger remove-btn ${disabledAct? 'opacity-50 pe-none' : ''}" ${disabledAct}>Remove</button>` : ''}
-              </div>
+              </div>`}
             </td>
           </tr>
         `);
@@ -327,6 +355,7 @@
     }
 
     function updateBatchButtons(){
+      if(IS_BUILDER_VIEW) return;
       // Enable Download if any selected lacking compose file; Pull if any selected downloaded but not pulled
       let anySel = selected.size > 0;
       let anyNeedDl = false, anyNeedPull = false, anyNeedRemove = false;
@@ -592,96 +621,96 @@
       modalObj.show();
     }
     // Track compose name edits
-    TBL.addEventListener('input', (e) => {
-      const inp = e.target.closest('.compose-input');
-      if(!inp) return;
-      const tr = inp.closest('tr');
-      const key = tr.getAttribute('data-key');
-      let val = (inp.value||'').trim();
-      if(!val) val = 'docker-compose.yml';
-      composeName.set(key, val);
-    });
+    if(!IS_BUILDER_VIEW){
+      TBL.addEventListener('input', (e) => {
+        const inp = e.target.closest('.compose-input');
+        if(!inp) return;
+        const tr = inp.closest('tr');
+        const key = tr.getAttribute('data-key');
+        let val = (inp.value||'').trim();
+        if(!val) val = 'docker-compose.yml';
+        composeName.set(key, val);
+      });
+    }
 
-    document.querySelector('#btn-check-existence').addEventListener('click', async () => {
+    document.getElementById('btn-check-existence')?.addEventListener('click', async () => {
       if(isStatusUpdating) return; // prevent concurrent runs
-      // Build items list from current filtered set including compose overrides
       const items = filtered.map(it => ({ Name: it.Name, Path: it.Path, compose: composeName.get(keyOf(it)) || 'docker-compose.yml' }));
-      // Defer to next tick so modal can render immediately
       setTimeout(() => { processStatusWithModal(items); }, 0);
     });
 
     // Event wiring
-  FILTER.addEventListener('input', async () => { applyFilter(); render(); /* No auto-refresh; wait for user to Check Files */ });
-    SEL_ALL.addEventListener('change', () => {
-      if(SEL_ALL.checked){
-        filtered.forEach(it => selected.add(keyOf(it)));
-      } else {
-        selected.clear();
-      }
+    FILTER.addEventListener('input', async () => { applyFilter(); render(); /* No auto-refresh; wait for user to Check Files */ });
+    SEL_ALL?.addEventListener('change', () => {
+      if(SEL_ALL.checked){ filtered.forEach(it => selected.add(keyOf(it))); }
+      else { selected.clear(); }
       render();
     });
     TBL.addEventListener('change', (e) => {
       if(e.target && e.target.classList.contains('row-check')){
         const tr = e.target.closest('tr');
-        const key = tr.getAttribute('data-key');
+        const key = tr?.getAttribute('data-key');
+        if(!key) return;
         if(e.target.checked) selected.add(key); else selected.delete(key);
         updateBatchButtons();
       }
     });
     TBL.addEventListener('click', async (e) => {
-      const btn = e.target.closest('.act-btn');
-      const rbtn = e.target.closest('.refresh-btn');
-      const rmBtn = e.target.closest('.remove-btn');
-      const tr = e.target.closest('tr');
-      if(rbtn && tr){
-        if(isStatusUpdating) return; // block per-row refresh during global update
-        const key = tr.getAttribute('data-key');
+      const refreshBtn = e.target.closest('.refresh-btn');
+      if(refreshBtn){
+        if(isStatusUpdating) return;
+        const tr = refreshBtn.closest('tr');
+        const key = tr?.getAttribute('data-key');
+        if(!key) return;
         const it = filtered.find(x => keyOf(x) === key);
         if(it){ await refreshOne(it); }
         return;
       }
-      if(rmBtn && tr){
-        if(isStatusUpdating) return; // block during global update
-        // Confirm per-row removal
+      if(IS_BUILDER_VIEW) return;
+      const btn = e.target.closest('.act-btn');
+      const rmBtn = e.target.closest('.remove-btn');
+      const tr = e.target.closest('tr');
+      if(!tr) return;
+      if(rmBtn){
+        if(isStatusUpdating) return;
         if(!window.confirm('Remove containers/images and downloaded assets for this item?')) return;
         const key = tr.getAttribute('data-key');
         const it = filtered.find(x => keyOf(x) === key);
         if(it){ const item = { Name: it.Name, Path: it.Path, compose: composeName.get(key) || 'docker-compose.yml' }; setTimeout(() => { processWithModal('remove', [item]); }, 0); }
         return;
       }
-  if(!btn) return;
-  if(isStatusUpdating) return; // block actions during global update
+      if(!btn || isStatusUpdating) return;
       const key = tr.getAttribute('data-key');
       const it = filtered.find(x => keyOf(x) === key);
-  const stKnown = statusMap.has(key);
-  const st = statusMap.get(key) || {exists:false,pulled:false};
+      const stKnown = statusMap.has(key);
+      const st = statusMap.get(key) || {exists:false,pulled:false};
       const item = { Name: it.Name, Path: it.Path, compose: composeName.get(key) || 'docker-compose.yml' };
-      // Defer to next tick so modal can render immediately
-  if(!stKnown){ await refreshOne(it); }
-  else if(!st.exists){ setTimeout(() => { processWithModal('download', [item]); }, 0); }
-  else if(st.exists && !st.pulled){ setTimeout(() => { processWithModal('pull', [item]); }, 0); }
-  else { setTimeout(() => { processWithModal('pull', [item]); }, 0); }
+      if(!stKnown){ await refreshOne(it); }
+      else if(!st.exists){ setTimeout(() => { processWithModal('download', [item]); }, 0); }
+      else if(st.exists && !st.pulled){ setTimeout(() => { processWithModal('pull', [item]); }, 0); }
+      else { setTimeout(() => { processWithModal('pull', [item]); }, 0); }
     });
-    BTN_DL.addEventListener('click', async () => {
-      const items = filtered
-        .filter(it => selected.has(keyOf(it)) && !(statusMap.get(keyOf(it))||{exists:false}).exists)
-        .map(it => ({ Name: it.Name, Path: it.Path, compose: composeName.get(keyOf(it)) || 'docker-compose.yml' }));
-      if(items.length) setTimeout(() => { processWithModal('download', items); }, 0);
-    });
-    BTN_PULL.addEventListener('click', async () => {
-      const items = filtered
-        .filter(it => selected.has(keyOf(it)) && (statusMap.get(keyOf(it))||{exists:false,pulled:false}).exists && !(statusMap.get(keyOf(it))||{pulled:false}).pulled)
-        .map(it => ({ Name: it.Name, Path: it.Path, compose: composeName.get(keyOf(it)) || 'docker-compose.yml' }));
-      if(items.length) setTimeout(() => { processWithModal('pull', items); }, 0);
-    });
-    BTN_REMOVE.addEventListener('click', async () => {
-      // Confirm batch removal
-      if(!window.confirm('Remove containers/images and downloaded assets for all selected items?')) return;
-      const items = filtered
-        .filter(it => selected.has(keyOf(it)) && ((statusMap.get(keyOf(it))||{exists:false,pulled:false}).exists || (statusMap.get(keyOf(it))||{exists:false,pulled:false}).pulled))
-        .map(it => ({ Name: it.Name, Path: it.Path, compose: composeName.get(keyOf(it)) || 'docker-compose.yml' }));
-      if(items.length) setTimeout(() => { processWithModal('remove', items); }, 0);
-    });
+    if(!IS_BUILDER_VIEW){
+      BTN_DL?.addEventListener('click', async () => {
+        const items = filtered
+          .filter(it => selected.has(keyOf(it)) && !(statusMap.get(keyOf(it))||{exists:false}).exists)
+          .map(it => ({ Name: it.Name, Path: it.Path, compose: composeName.get(keyOf(it)) || 'docker-compose.yml' }));
+        if(items.length) setTimeout(() => { processWithModal('download', items); }, 0);
+      });
+      BTN_PULL?.addEventListener('click', async () => {
+        const items = filtered
+          .filter(it => selected.has(keyOf(it)) && (statusMap.get(keyOf(it))||{exists:false,pulled:false}).exists && !(statusMap.get(keyOf(it))||{pulled:false}).pulled)
+          .map(it => ({ Name: it.Name, Path: it.Path, compose: composeName.get(keyOf(it)) || 'docker-compose.yml' }));
+        if(items.length) setTimeout(() => { processWithModal('pull', items); }, 0);
+      });
+      BTN_REMOVE?.addEventListener('click', async () => {
+        if(!window.confirm('Remove containers/images and downloaded assets for all selected items?')) return;
+        const items = filtered
+          .filter(it => selected.has(keyOf(it)) && ((statusMap.get(keyOf(it))||{exists:false,pulled:false}).exists || (statusMap.get(keyOf(it))||{exists:false,pulled:false}).pulled))
+          .map(it => ({ Name: it.Name, Path: it.Path, compose: composeName.get(keyOf(it)) || 'docker-compose.yml' }));
+        if(items.length) setTimeout(() => { processWithModal('remove', items); }, 0);
+      });
+    }
 
   // Dock visibility handled by shared partial; no explicit show/hide here
   // Initial load handled by activateInitialTab; catalog will lazy-load when its tab activates
