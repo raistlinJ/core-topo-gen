@@ -35,9 +35,14 @@
   #sessionsTable th, #sessionsTable td { padding: .3rem .35rem; }
   #sessionsTable th.col-id, #sessionsTable td.col-id { width: 5%; white-space: nowrap; text-align: center; overflow: hidden; text-overflow: ellipsis; }
   #sessionsTable th.col-state, #sessionsTable td.col-state { width: 10%; white-space: nowrap; text-align: center; }
-  #sessionsTable th.col-nodes, #sessionsTable td.col-nodes { width: 10%; white-space: nowrap; text-align: center; overflow: hidden; text-overflow: ellipsis; }
-  #sessionsTable th.col-scenario, #sessionsTable td.col-scenario { width: 15%; white-space: nowrap; text-align: center; }
-  #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 50%; }
+  #sessionsTable th.col-nodes, #sessionsTable td.col-nodes { width: 7%; white-space: nowrap; text-align: center; overflow: hidden; text-overflow: ellipsis; }
+  #sessionsTable th.col-hitl, #sessionsTable td.col-hitl { width: 18%; white-space: nowrap; }
+  #sessionsTable td.col-hitl { font-size: 0.85rem; }
+  #sessionsTable td.col-hitl .hitl-entry { line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #sessionsTable td.col-hitl .hitl-entry-link { color: inherit; text-decoration: none; display: inline-flex; align-items: baseline; gap: .15rem; }
+  #sessionsTable td.col-hitl .hitl-entry-link:hover { text-decoration: underline; }
+  #sessionsTable th.col-scenario, #sessionsTable td.col-scenario { width: 13%; white-space: nowrap; text-align: center; }
+  #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 38%; }
   .actions-col .btn { padding: .15rem .3rem; line-height: 1; vertical-align: middle; display: inline-flex; align-items: center; justify-content: center; }
   .actions-col .btn i, .actions-col .btn .bi { font-size: .95em; line-height: 1; display: block; }
   .actions-col .actions-wrap > a { display: inline-flex; align-items: center; margin-right: 2px; }
@@ -125,7 +130,7 @@
   </div>
   <div class="col-12 col-lg-9">
     <div class="row g-3">
-      <div class="col-12 col-xl-6">
+      <div class="col-12">
         <div class="card mb-3">
           <div class="card-header py-2 d-flex justify-content-between align-items-center">
             <strong class="mb-0">Active Sessions</strong>
@@ -137,7 +142,7 @@
               <small class="text-muted ms-2">via gRPC</small>
             </div>
           </div>
-          <div class="table-responsive" style="max-height:60vh; overflow:auto;">
+          <div class="table-responsive" style="max-height:60vh; overflow-y:auto; overflow-x:auto;">
             <table class="table table-sm align-middle mb-0" id="sessionsTable">
               <thead class="table-light">
                 <tr>
@@ -145,6 +150,7 @@
                   <th class="col-id">ID</th>
                   <th class="col-state">State</th>
                   <th class="col-nodes">Nodes</th>
+                  <th class="col-hitl">HITL</th>
                   <th class="col-scenario">Scenario</th>
                   <th class="filename-col">File</th>
                   <th class="actions-col">Actions</th>
@@ -155,7 +161,7 @@
           </div>
         </div>
       </div>
-      <div class="col-12 col-xl-6">
+      <div class="col-12">
         <div class="card mb-3">
           <div class="card-header py-2 d-flex justify-content-between align-items-center">
             <strong class="mb-0">Saved XML Topologies</strong>
@@ -167,7 +173,7 @@
               <small class="text-muted ms-2">on disk</small>
             </div>
           </div>
-          <div class="table-responsive" style="max-height:60vh; overflow:auto;">
+          <div class="table-responsive" style="max-height:60vh; overflow-y:auto; overflow-x:auto;">
             <table class="table table-sm align-middle mb-0" id="xmlsTable">
               <thead class="table-light">
                 <tr>
@@ -191,7 +197,7 @@
               <button class="btn btn-sm btn-outline-danger" id="dockerCleanupBtn" type="button">Clean Stale Containers</button>
             </div>
           </div>
-          <div class="table-responsive" style="max-height:40vh; overflow:auto;">
+          <div class="table-responsive" style="max-height:40vh; overflow-y:auto; overflow-x:auto;">
             <table class="table table-sm align-middle mb-0" id="dockerTable">
               <thead class="table-light">
                 <tr>
@@ -419,6 +425,24 @@
 
   function esc(s){ return (s||'').toString().replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
 
+  function normalizeParticipantHitlHref(value){
+    if(value === undefined || value === null) return '';
+    let trimmed = String(value).trim();
+    if(!trimmed) return '';
+    if(!/^https?:\/\//i.test(trimmed)){
+      trimmed = `https://${trimmed}`;
+    }
+    try {
+      const parsed = new URL(trimmed);
+      if(parsed.protocol !== 'http:' && parsed.protocol !== 'https:'){
+        return '';
+      }
+      return parsed.toString();
+    } catch(e){
+      return '';
+    }
+  }
+
   function buildSessionRow(s){
     const id = esc(s.id);
     const state = esc(s.state||'');
@@ -430,13 +454,42 @@
     const fullFileTitle = esc(rawFile || '');
     const scenarioRaw = (s.scenario_name || '').toString().trim();
     const scenarioDisplay = scenarioRaw ? `<span class="badge text-bg-primary">${esc(scenarioRaw)}</span>` : '<span class="text-muted">—</span>';
+    const hitlEntries = Array.isArray(s.hitl) ? s.hitl : [];
+    const participantHref = normalizeParticipantHitlHref(s.participant_proxmox_url || '');
+    const participantHrefEsc = participantHref ? esc(participantHref) : '';
+    const hitlFilterText = hitlEntries.map(entry => {
+      const parts = [];
+      if(entry && entry.name) parts.push(entry.name);
+      if(entry && entry.type) parts.push(entry.type);
+      if(entry && Array.isArray(entry.ips)) parts.push(entry.ips.join(' '));
+      return parts.join(' ');
+    }).join(' ');
+    const hitlCell = hitlEntries.length
+        ? `<div class="d-flex flex-column gap-1">${hitlEntries.map(entry => {
+          const name = esc((entry && entry.name) || (entry && entry.type) || 'HITL');
+          const ips = (entry && Array.isArray(entry.ips)) ? entry.ips.filter(ip => !!ip).map(ip => esc(ip)) : [];
+          const ipLabel = ips.length ? ` <span class="text-muted">(${ips.join(', ')})</span>` : ' <span class="text-muted">(no IP)</span>';
+          const inner = participantHrefEsc
+            ? `<a class="hitl-entry-link" href="${participantHrefEsc}" target="_blank" rel="noopener noreferrer" title="Open Participant UI">${name}${ipLabel}</a>`
+            : `${name}${ipLabel}`;
+          return `<div class="hitl-entry">${inner}</div>`;
+        }).join('')}</div>`
+      : '<span class="text-muted">—</span>';
     const lower = (s.state||'').toString().toLowerCase();
     const hasFile = !!s.file;
-    const rowStr = `${id} ${state} ${nodes} ${scenarioRaw} ${file}`.toLowerCase();
+    const rowStr = `${id} ${state} ${nodes} ${scenarioRaw} ${file} ${hitlFilterText}`.toLowerCase();
     if (sessionsFilterText && !rowStr.includes(sessionsFilterText)) return '';
-    const detailsHref = hasFile
-      ? (`{{ url_for('core_details') }}?path=` + encodeURIComponent(s.file))
-      : (`{{ url_for('core_details') }}?session_id=` + encodeURIComponent(String(s.id||'')));
+    const detailsParams = [];
+    if (hasFile && s.file) {
+      detailsParams.push('path=' + encodeURIComponent(s.file));
+    } else {
+      detailsParams.push('session_id=' + encodeURIComponent(String(s.id||'')));
+    }
+    if (scenarioRaw) {
+      detailsParams.push('scenario_name=' + encodeURIComponent(scenarioRaw));
+    }
+    const detailsHrefBase = '{{ url_for('core_details') }}';
+    const detailsHref = detailsParams.length ? `${detailsHrefBase}?${detailsParams.join('&')}` : detailsHrefBase;
     const scenarioHidden = scenarioFilter ? `<input type="hidden" name="scenario" value="${esc(scenarioFilter)}">` : '';
     const stopBtn = `
       <form action="{{ url_for('core_stop') }}" method="post">
@@ -450,6 +503,9 @@
         <input type="hidden" name="session_id" value="${id}">
         <button class="btn btn-sm btn-outline-success" title="Start"><i class="bi bi-play-circle"></i></button>
       </form>`;
+    const participantBtn = participantHrefEsc
+      ? `<a class="btn btn-sm btn-outline-success" href="${participantHrefEsc}" target="_blank" rel="noopener noreferrer" title="Open Participant UI"><i class="bi bi-box-arrow-up-right"></i></a>`
+      : '';
     const stateIcon = (
       lower.includes('run')
         ? `<i class="bi bi-play-circle-fill text-success" data-bs-toggle="tooltip" title="${state}"></i>`
@@ -459,6 +515,7 @@
     );
     const actions = `
       <div class="d-flex align-items-center flex-nowrap actions-wrap">
+        ${participantBtn}
         <a class=\"btn btn-sm btn-outline-info\" href=\"${detailsHref}\" title=\"Details\"><i class=\"bi bi-info-circle\"></i></a>
         ${lower.includes('run') ? stopBtn : (lower.includes('shutdown') ? startBtn : '')}
         <form action=\"{{ url_for('core_delete') }}\" method=\"post\" onsubmit=\"return confirm('Delete session ${id}?')\">
@@ -477,6 +534,7 @@
       <td class="col-id">${id}</td>
       <td class="col-state">${stateIcon}</td>
       <td class="col-nodes">${nodes}</td>
+      <td class="col-hitl">${hitlCell}</td>
       <td class="col-scenario">${scenarioDisplay}</td>
       <td class="filename-col"><div class="filename-scroll" title="${fullFileTitle}">${file}</div></td>
       <td class="actions-col">${actions}</td>
@@ -487,7 +545,7 @@
     const path = esc(x.path);
     const name = esc(x.name);
     const validBadge = x.valid ? '<span class="badge text-bg-success">yes</span>' : '<span class="badge text-bg-danger">no</span>';
-  const detailsHref = `{{ url_for('core_details') }}?path=` + encodeURIComponent(x.path);
+  const detailsHref = '{{ url_for('core_details') }}?path=' + encodeURIComponent(x.path);
     const startDisabled = x.valid ? '' : 'disabled';
     const rowStr = `${name} ${path} ${x.valid? 'yes':'no'}`.toLowerCase();
     if (xmlsFilterText && !rowStr.includes(xmlsFilterText)) return '';

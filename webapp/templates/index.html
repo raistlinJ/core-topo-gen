@@ -130,6 +130,8 @@
                                 <input type="hidden" name="scenarios_json" id="scenarios_json">
                                 <input type="hidden" name="active_index" id="active_index" value="0">
                                 <input type="hidden" name="core_json" id="core_json">
+                                <input type="hidden" name="project_key_hint" id="project_key_hint">
+                                <input type="hidden" name="scenario_query" id="scenario_query_input">
                                 <div id="editorRoot"></div>
                                 <div class="d-flex gap-2 mt-3">
                                     <button type="submit" class="btn btn-success">Save XML</button>
@@ -222,7 +224,8 @@
                 <div id="coreVmSelectContainer" class="d-flex flex-column gap-3"></div>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" id="coreVmModalSaveBtn">Save Scenario</button>
             </div>
         </div>
     </div>
@@ -241,7 +244,8 @@
                 <div id="externalIfxHitlContainer" class="d-flex flex-column gap-3"></div>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" id="externalIfxModalSaveBtn">Save Scenario</button>
             </div>
         </div>
     </div>
@@ -424,10 +428,29 @@
             <div class="modal-body">
                 <p class="mb-3" id="executeConfirmMessage">Execute this scenario now?</p>
                 <div class="alert alert-warning small d-none" id="executeConfirmAlert"></div>
-                <div class="form-check form-switch mb-3" id="executeUpdateRemoteToggleWrap">
-                    <input class="form-check-input" type="checkbox" role="switch" id="executeConfirmUpdateRemoteToggle">
-                    <label class="form-check-label" for="executeConfirmUpdateRemoteToggle">Update remote CORE code before running</label>
-                    <div class="form-text text-muted">Push the current repository snapshot to /tmp/core-topo-gen/ prior to execution.</div>
+                <div class="border rounded-3 p-3 bg-body-tertiary mb-3">
+                    <div class="d-flex flex-wrap align-items-center justify-content-between gap-3">
+                        <div class="flex-grow-1">
+                            <div class="text-uppercase small text-muted fw-semibold">Execution Mode</div>
+                        </div>
+                        <div class="form-check form-switch m-0" id="executeUpdateRemoteToggleWrap">
+                            <input class="form-check-input" type="checkbox" role="switch" id="executeConfirmUpdateRemoteToggle">
+                            <label class="form-check-label fw-semibold" for="executeConfirmUpdateRemoteToggle">Generate on Remote CORE VM</label>
+                        </div>
+                    </div>
+                    <div class="small text-muted mt-2" id="executeConfirmUpdateRemoteHelp">Emulation mode runs locally on this workstation.</div>
+                    <div class="d-flex flex-wrap align-items-center justify-content-between gap-3 mt-3 d-none" id="executeCoreTestRow">
+                        <div class="flex-grow-1">
+                            <div class="text-uppercase small text-muted fw-semibold">Remote CORE Connection</div>
+                            <div class="small text-muted" id="executeCoreStatus">Connection status unknown.</div>
+                        </div>
+                        <button type="button" class="btn btn-outline-primary btn-sm" id="executeCoreTestBtn">Test Connection</button>
+                    </div>
+                    <div class="form-check form-switch mt-3 d-none" id="executePushUpdateToggleWrap">
+                        <input class="form-check-input" type="checkbox" role="switch" id="executeConfirmPushUpdateToggle">
+                        <label class="form-check-label fw-semibold" for="executeConfirmPushUpdateToggle">Push updated backend</label>
+                        <div class="form-text" id="executeConfirmPushUpdateHelp">Sync the current repository snapshot to your CORE VM before execution.</div>
+                    </div>
                 </div>
                 <div class="border rounded p-3 mt-3 bg-body-tertiary d-none" id="executeProgressWrap">
                     <div class="d-flex align-items-center gap-2">
@@ -731,6 +754,18 @@ const PROJECT_STATE_STORAGE_KEY = 'coretg_project_state_map_v1';
 const PROJECT_ACTIVE_IDX_STORAGE_KEY = 'coretg_active_idx_map_v1';
 const LAST_PROJECT_KEY_STORAGE_KEY = 'coretg_last_project_key';
 const DEFAULT_PROJECT_KEY = '__default_project__';
+const initialScenarioQuery = (initialPayload && typeof initialPayload.scenario_query === 'string')
+    ? initialPayload.scenario_query.trim()
+    : '';
+
+function readLastProjectKeyFromStorage() {
+    try {
+        const raw = localStorage.getItem(LAST_PROJECT_KEY_STORAGE_KEY);
+        return raw ? raw.trim() : '';
+    } catch (err) {
+        return '';
+    }
+}
 
 function readJsonFromLocalStorage(key, fallback) {
     try {
@@ -751,56 +786,255 @@ function writeJsonToLocalStorage(key, value) {
 
 function deriveProjectKey(snapshot, fallbackKey = DEFAULT_PROJECT_KEY) {
     if (!snapshot || typeof snapshot !== 'object') return fallbackKey;
-    const tokens = [];
-    const pushToken = (val) => {
-        if (val === null || val === undefined) return;
-        const normalized = String(val).trim();
-        if (normalized) tokens.push(normalized);
+    const candidates = [];
+    const pushCandidate = (val) => {
+        if (typeof val !== 'string') return;
+        const normalized = val.trim();
+        if (normalized) candidates.push(normalized);
     };
-    pushToken(snapshot.result_path || snapshot.resultPath);
+    pushCandidate(snapshot.project_key_hint);
+    pushCandidate(snapshot.scenario_query);
+    pushCandidate(snapshot.result_path || snapshot.resultPath);
+    const resolvedScenarioToken = resolveScenarioQueryHintFromSource(snapshot);
+    if (resolvedScenarioToken) pushCandidate(resolvedScenarioToken);
     const baseUpload = (snapshot.base_upload && typeof snapshot.base_upload === 'object') ? snapshot.base_upload : null;
-    if (baseUpload) pushToken(baseUpload.path);
+    if (baseUpload) pushCandidate(baseUpload.path);
     if (Array.isArray(snapshot.scenarios)) {
-        snapshot.scenarios.forEach(scen => {
-            if (scen && typeof scen === 'object' && scen.base && typeof scen.base === 'object') {
-                pushToken(scen.base.filepath);
+        const basePaths = snapshot.scenarios
+            .map(scen => (scen && typeof scen === 'object' && scen.base && typeof scen.base === 'object') ? scen.base.filepath : '')
+            .filter(val => typeof val === 'string' && val.trim());
+        basePaths.forEach(pushCandidate);
+        if (!basePaths.length) {
+            const scenarioNames = snapshot.scenarios
+                .map(scen => (scen && typeof scen === 'object' && typeof scen.name === 'string') ? scen.name.trim() : '')
+                .filter(Boolean);
+            if (scenarioNames.length) {
+                pushCandidate(`scenarios:${scenarioNames.join('|')}`);
+            }
+        }
+    }
+    return candidates.find(Boolean) || fallbackKey;
+}
+
+function resolveScenarioQueryHintFromSource(source) {
+    if (!source) return '';
+    try {
+        const token = (source.scenario_query || '').trim();
+        if (token) return token;
+        return deriveScenarioSignature(source);
+    } catch (err) {
+        return '';
+    }
+}
+
+function deriveScenarioSignature(source) {
+    const scenarios = Array.isArray(source)
+        ? source
+        : (source && Array.isArray(source.scenarios) ? source.scenarios : []);
+    if (!Array.isArray(scenarios) || !scenarios.length) {
+        return '';
+    }
+    const scenarioNames = scenarios
+        .map(scen => (scen && typeof scen.name === 'string') ? scen.name.trim() : '')
+        .filter(Boolean);
+    if (scenarioNames.length) {
+        return `names:${scenarioNames.join('|')}`;
+    }
+    const basePaths = scenarios
+        .map(scen => {
+            if (!scen || typeof scen !== 'object') return '';
+            const base = scen.base && typeof scen.base === 'object' ? scen.base : null;
+            return base && typeof base.filepath === 'string' ? base.filepath.trim() : '';
+        })
+        .filter(Boolean);
+    if (basePaths.length) {
+        return `base:${basePaths.join('|')}`;
+    }
+    return '';
+}
+
+function scrubScenarioTransientErrors(scenario) {
+    if (!scenario || typeof scenario !== 'object') return;
+    const hitlState = (scenario.hitl && typeof scenario.hitl === 'object') ? scenario.hitl : null;
+    if (!hitlState) return;
+    const prox = (hitlState.proxmox && typeof hitlState.proxmox === 'object') ? hitlState.proxmox : null;
+    if (!prox) return;
+    if (Object.prototype.hasOwnProperty.call(prox, 'inventory_error')) {
+        delete prox.inventory_error;
+    }
+}
+
+function scrubSnapshotTransientErrors(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') return snapshot;
+    const scenarios = Array.isArray(snapshot.scenarios) ? snapshot.scenarios : null;
+    if (scenarios) {
+        scenarios.forEach(scrubScenarioTransientErrors);
+    }
+    return snapshot;
+}
+
+function cloneScenariosForSnapshot(source) {
+    if (!Array.isArray(source)) return [];
+    if (typeof structuredClone === 'function') {
+        try {
+            return structuredClone(source);
+        } catch (err) {
+            // fall through to JSON-based clone
+        }
+    }
+    try {
+        return JSON.parse(JSON.stringify(source));
+    } catch (err) {
+        return source.map(item => {
+            if (!item || typeof item !== 'object') return item;
+            try {
+                return JSON.parse(JSON.stringify(item));
+            } catch (nestedErr) {
+                return { ...item };
             }
         });
     }
-    if (!tokens.length && snapshot.project_key_hint) {
-        pushToken(snapshot.project_key_hint);
-    }
-    return tokens.length ? tokens.join('|') : fallbackKey;
 }
 
 let projectStateMap = readJsonFromLocalStorage(PROJECT_STATE_STORAGE_KEY, {});
 if (!projectStateMap || typeof projectStateMap !== 'object') projectStateMap = {};
 let legacyEditorState = readJsonFromLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, null);
-let currentProjectKey = deriveProjectKey(initialPayload, DEFAULT_PROJECT_KEY);
-if ((!currentProjectKey || currentProjectKey === DEFAULT_PROJECT_KEY) && legacyEditorState) {
-    currentProjectKey = deriveProjectKey(legacyEditorState, DEFAULT_PROJECT_KEY);
-}
+legacyEditorState = scrubSnapshotTransientErrors(legacyEditorState);
+const lastProjectKeyFromStorage = readLastProjectKeyFromStorage();
+const legacyProjectKeyHint = legacyEditorState ? deriveProjectKey(legacyEditorState, DEFAULT_PROJECT_KEY) : '';
 try {
-    if (!currentProjectKey || currentProjectKey === DEFAULT_PROJECT_KEY) {
-        const hintedKeyRaw = localStorage.getItem(LAST_PROJECT_KEY_STORAGE_KEY);
-        const hintedKey = hintedKeyRaw ? hintedKeyRaw.trim() : '';
-        if (hintedKey && projectStateMap[hintedKey]) {
-            currentProjectKey = hintedKey;
-        }
-    }
+    Object.keys(projectStateMap).forEach(key => {
+        const entry = projectStateMap[key];
+        if (!entry || typeof entry !== 'object') return;
+        projectStateMap[key] = scrubSnapshotTransientErrors(entry);
+    });
 } catch (err) {}
-if (!currentProjectKey) currentProjectKey = DEFAULT_PROJECT_KEY;
+let currentProjectKey = deriveProjectKey(initialPayload, DEFAULT_PROJECT_KEY);
+if ((!currentProjectKey || currentProjectKey === DEFAULT_PROJECT_KEY) && legacyProjectKeyHint) {
+    currentProjectKey = legacyProjectKeyHint;
+}
 let activeIdxMap = readJsonFromLocalStorage(PROJECT_ACTIVE_IDX_STORAGE_KEY, {});
 if (!activeIdxMap || typeof activeIdxMap !== 'object') activeIdxMap = {};
+const serverEditorSnapshot = (initialPayload && typeof initialPayload.editor_snapshot === 'object')
+    ? initialPayload.editor_snapshot
+    : null;
+const serverProjectKeyHint = (serverEditorSnapshot && typeof serverEditorSnapshot.project_key_hint === 'string')
+    ? serverEditorSnapshot.project_key_hint.trim()
+    : '';
+const serverScenarioQuery = (serverEditorSnapshot && typeof serverEditorSnapshot.scenario_query === 'string')
+    ? serverEditorSnapshot.scenario_query.trim()
+    : '';
+let serverSnapshotKey = '';
+if (serverEditorSnapshot && typeof serverEditorSnapshot === 'object') {
+    try {
+        const cloned = JSON.parse(JSON.stringify(serverEditorSnapshot));
+        const sanitized = scrubSnapshotTransientErrors(cloned);
+        const candidateKey = deriveProjectKey(
+            sanitized,
+            serverProjectKeyHint || currentProjectKey || DEFAULT_PROJECT_KEY
+        );
+        if (candidateKey) {
+            const existing = projectStateMap[candidateKey];
+            const serverSignature = resolveScenarioQueryHintFromSource(sanitized);
+            const existingSignature = resolveScenarioQueryHintFromSource(existing);
+            const serverResult = (sanitized && typeof sanitized.result_path === 'string')
+                ? sanitized.result_path.trim()
+                : '';
+            const existingResult = (existing && typeof existing.result_path === 'string')
+                ? existing.result_path.trim()
+                : '';
+            const needsSync = !existing
+                || (serverResult && serverResult !== existingResult)
+                || (serverSignature && serverSignature !== existingSignature);
+            if (needsSync) {
+                try {
+                    const localScenarios = existing && Array.isArray(existing.scenarios) ? existing.scenarios : null;
+                    const serverScenarios = Array.isArray(sanitized.scenarios) ? sanitized.scenarios : null;
+                    if (localScenarios && serverScenarios) {
+                        mergePersistedHitlStateIntoScenarios(serverScenarios, localScenarios);
+                    }
+                } catch (mergeErr) {
+                    console.warn('Editor snapshot merge failed; falling back to server snapshot', mergeErr);
+                }
+                projectStateMap[candidateKey] = sanitized;
+                legacyEditorState = sanitized;
+                writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, legacyEditorState);
+                writeJsonToLocalStorage(PROJECT_STATE_STORAGE_KEY, projectStateMap);
+            }
+            serverSnapshotKey = candidateKey;
+        }
+    } catch (err) {
+        console.warn('Unable to sync server snapshot into local cache', err);
+    }
+}
+const derivedInitialSignature =
+    deriveScenarioSignature(initialPayload)
+    || deriveScenarioSignature(serverEditorSnapshot)
+    || deriveScenarioSignature(legacyEditorState)
+    || '';
+let scenarioQueryToken = (initialScenarioQuery || serverScenarioQuery || derivedInitialSignature || '').trim();
+if ((!currentProjectKey || currentProjectKey === DEFAULT_PROJECT_KEY) && serverProjectKeyHint) {
+    currentProjectKey = serverProjectKeyHint;
+}
+if ((!currentProjectKey || currentProjectKey === DEFAULT_PROJECT_KEY) && scenarioQueryToken) {
+    currentProjectKey = `${DEFAULT_PROJECT_KEY}::${scenarioQueryToken.toLowerCase()}`;
+}
+if ((!currentProjectKey || currentProjectKey === DEFAULT_PROJECT_KEY) && serverSnapshotKey) {
+    currentProjectKey = serverSnapshotKey;
+}
+if (!currentProjectKey || !projectStateMap[currentProjectKey]) {
+    if (lastProjectKeyFromStorage && projectStateMap[lastProjectKeyFromStorage]) {
+        currentProjectKey = lastProjectKeyFromStorage;
+    } else if (legacyProjectKeyHint && projectStateMap[legacyProjectKeyHint]) {
+        currentProjectKey = legacyProjectKeyHint;
+    }
+}
+if (!currentProjectKey) currentProjectKey = DEFAULT_PROJECT_KEY;
+const serverResultPath = (initialPayload && typeof initialPayload.result_path === 'string')
+    ? initialPayload.result_path.trim()
+    : '';
+if (serverResultPath) {
+    try {
+        const keyProbe = {
+            project_key_hint: (initialPayload && initialPayload.project_key_hint) || serverResultPath,
+            result_path: serverResultPath,
+        };
+        const serverKeyCandidate = deriveProjectKey(keyProbe, serverResultPath) || serverResultPath;
+        if (serverKeyCandidate && projectStateMap[serverKeyCandidate]) {
+            currentProjectKey = serverKeyCandidate;
+        }
+    } catch (err) {
+        console.warn('Failed to align project key with server result path', err);
+    }
+}
+
+let persistedState = null;
+const keyedStateForCurrentProject = projectStateMap[currentProjectKey];
+if (keyedStateForCurrentProject) {
+    persistedState = keyedStateForCurrentProject;
+}
 const CORE_DEFAULT_VENV_BIN = (initialPayload && typeof initialPayload.core === 'object' && typeof initialPayload.core.venv_bin === 'string' && initialPayload.core.venv_bin.trim())
     ? initialPayload.core.venv_bin.trim()
     : '/opt/core/venv/bin';
+const PARTICIPANT_STATUS_EMPTY_TEXT = 'No Participant UI URL saved yet. Apply one to expose the Participant UI tab during HITL runs.';
+const PARTICIPANT_STATUS_SAVED_TEXT = 'Participant UI link saved. The navigation tab is enabled for this scenario.';
 // If server provides a fresh result_path (e.g., after Save XML), reflect it in localStorage early
 try {
-    if (initialPayload && initialPayload.result_path) {
-        const persisted = { ...(projectStateMap[currentProjectKey] || legacyEditorState || {}) };
-        persisted.result_path = initialPayload.result_path;
-        if (initialPayload.core) persisted.core = initialPayload.core;
+    if (serverResultPath) {
+        const existingSnapshot = projectStateMap[currentProjectKey] || legacyEditorState || {};
+        const persisted = { ...existingSnapshot };
+        const existingCoreSnapshot = (existingSnapshot && existingSnapshot.core)
+            ? normalizeCoreState(existingSnapshot.core, true)
+            : null;
+        persisted.result_path = serverResultPath;
+        if (initialPayload.core) {
+            const serverCoreSnapshot = normalizeCoreState(initialPayload.core, true);
+            persisted.core = existingCoreSnapshot
+                ? mergeCoreSnapshots(serverCoreSnapshot, existingCoreSnapshot)
+                : serverCoreSnapshot;
+        } else if (existingCoreSnapshot) {
+            persisted.core = existingCoreSnapshot;
+        }
         projectStateMap[currentProjectKey] = persisted;
         legacyEditorState = persisted;
         writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, persisted);
@@ -869,6 +1103,25 @@ function prettyHitlAttachment(value) {
     const match = HITL_ATTACHMENT_CHOICES.find(opt => opt.value === normalized);
     return match ? match.label : 'Existing Router';
 }
+
+function normalizeParticipantProxmoxHref(value) {
+    if (value === undefined || value === null) return '';
+    let trimmed = String(value).trim();
+    if (!trimmed) return '';
+    if (!/^https?:\/\//i.test(trimmed)) {
+        trimmed = `https://${trimmed}`;
+    }
+    try {
+        const parsed = new URL(trimmed);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            return '';
+        }
+        return parsed.toString();
+    } catch (err) {
+        return '';
+    }
+}
+
 
 function hitlAttachmentAttemptOrder(preference) {
     const normalized = normalizeHitlAttachment(preference);
@@ -982,6 +1235,8 @@ function ensureHitlStateForScenario(scen) {
         clone.attachment = normalizeHitlAttachment(clone.attachment);
         return clone;
     }).filter(Boolean);
+    const participantUrlRaw = (scen.hitl.participant_proxmox_url ?? '').toString();
+    scen.hitl.participant_proxmox_url = participantUrlRaw.trim();
     scen.hitl.enabled = !!scen.hitl.enabled;
     if (!scen.hitl.core || typeof scen.hitl.core !== 'object') {
         scen.hitl.core = {
@@ -1268,6 +1523,9 @@ function mergePersistedHitlState(targetScenario, persistedScenario) {
             }
         });
     }
+    if (typeof sourceHitl.participant_proxmox_url === 'string') {
+        targetHitl.participant_proxmox_url = sourceHitl.participant_proxmox_url;
+    }
     if (sourceHitl.enabled && !targetHitl.enabled) {
         targetHitl.enabled = true;
     }
@@ -1512,14 +1770,44 @@ function updateProxmoxSummary(sidx) {
         const coreHasSecret = !!coreSecretId;
         const corePasswordRaw = (core.ssh_password || '').toString();
         const corePasswordAvailable = !!corePasswordRaw || coreHasSecret;
-        const selectedVm = (() => {
+        const vmKeyParts = coreVmKey ? coreVmKey.split('::') : [];
+        const vmKeyNodePart = (vmKeyParts[0] || '').trim();
+        const vmKeyIdPart = (vmKeyParts[1] || '').trim();
+        const cachedVmInterfaceCount = Number.isFinite(Number(core.cached_vm_interface_count))
+            ? Number(core.cached_vm_interface_count)
+            : null;
+        const liveSelectedVm = (() => {
             const inventory = hitl.proxmox?.inventory;
             const vms = inventory && Array.isArray(inventory.vms) ? inventory.vms : [];
             return vms.find(vm => `${vm.node ?? ''}::${vm.vmid ?? ''}` === coreVmKey) || null;
         })();
-        const vmInterfaceCount = selectedVm && Array.isArray(selectedVm.interfaces) ? selectedVm.interfaces.length : 0;
-        const coreVmHasInterfaces = !coreVmKey || vmInterfaceCount >= 1;
-        const coreVmSupportsHitl = !coreVmKey || vmInterfaceCount >= 2;
+        const fallbackCoreVm = (!liveSelectedVm && coreVmKey)
+            ? {
+                name: core.vm_name || '',
+                node: core.vm_node || vmKeyNodePart || '',
+                status: core.cached_vm_status || '',
+                vmid: vmKeyIdPart || '',
+                interface_count_hint: cachedVmInterfaceCount,
+            }
+            : null;
+        const resolvedCoreVm = liveSelectedVm
+            ? { ...liveSelectedVm, cached: false }
+            : (fallbackCoreVm ? { ...fallbackCoreVm, cached: true } : null);
+        const resolvedVmInterfaceCount = (() => {
+            if (resolvedCoreVm && Array.isArray(resolvedCoreVm.interfaces)) {
+                return resolvedCoreVm.interfaces.length;
+            }
+            if (resolvedCoreVm && Number.isFinite(resolvedCoreVm.interface_count_hint)) {
+                return Number(resolvedCoreVm.interface_count_hint);
+            }
+            if (cachedVmInterfaceCount !== null) {
+                return cachedVmInterfaceCount;
+            }
+            return null;
+        })();
+        const interfaceCountKnown = resolvedVmInterfaceCount !== null;
+        const coreVmHasInterfaces = !coreVmKey || !interfaceCountKnown || resolvedVmInterfaceCount >= 1;
+        const coreVmSupportsHitl = !coreVmKey || !interfaceCountKnown || resolvedVmInterfaceCount >= 2;
         const coreInputsComplete = !!(coreVmKey && coreHost && corePort && coreSshHost && coreSshPort && coreUser && corePasswordAvailable);
         const coreTestSuccess = core.last_tested_status === 'success';
         const coreTestMatches = coreTestSuccess
@@ -1619,8 +1907,9 @@ function updateProxmoxSummary(sidx) {
             } else if (!coreVmKey) {
                 statusText = 'Select a CORE VM to configure connection details.';
             } else if (!coreVmHasInterfaces) {
-                const plural = vmInterfaceCount === 1 ? '' : 's';
-                statusText = `Selected CORE VM exposes ${vmInterfaceCount || 0} network interface${plural}. Add at least one interface to enable CORE connectivity.`;
+                const count = resolvedVmInterfaceCount || 0;
+                const plural = count === 1 ? '' : 's';
+                statusText = `Selected CORE VM exposes ${count} network interface${plural}. Add at least one interface to enable CORE connectivity.`;
                 className = 'text-danger';
             } else if (!coreInputsComplete) {
                 statusText = 'Enter gRPC and SSH connection details, including credentials.';
@@ -1669,6 +1958,7 @@ function updateProxmoxSummary(sidx) {
         }
         const summaryDetailEl = document.querySelector(`[data-hitl-core-summary="${sidx}"]`);
         if (summaryDetailEl) {
+            const selectedVm = resolvedCoreVm;
             const sanitize = (value) => {
                 return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
             };
@@ -2903,6 +3193,37 @@ function sanitizeCoreForPersist(coreState) {
     return normalizeCoreState(coreState, false);
 }
 
+function mergeCoreSnapshots(primary, secondary) {
+    const merged = { ...(primary || {}) };
+    if (!secondary || typeof secondary !== 'object') {
+        return merged;
+    }
+    Object.keys(secondary).forEach((key) => {
+        const value = secondary[key];
+        if (value === undefined) return;
+        if (typeof value === 'string') {
+            if (!value.trim() && key !== 'ssh_password') return;
+            merged[key] = value;
+            return;
+        }
+        if (typeof value === 'number') {
+            if (!Number.isFinite(value)) return;
+            merged[key] = value;
+            return;
+        }
+        if (typeof value === 'boolean') {
+            merged[key] = value;
+            return;
+        }
+        if (value && typeof value === 'object') {
+            merged[key] = Array.isArray(value) ? value.slice() : { ...value };
+            return;
+        }
+        merged[key] = value;
+    });
+    return merged;
+}
+
 function restoreCorePasswordFromSession(coreState) {
     const cfg = normalizeCoreState(coreState, true);
     try {
@@ -2963,12 +3284,18 @@ function syncGlobalCoreConnection(coreState, testedHost = null, testedPort = nul
     const testedPortNumber = Number(testedPort);
     state.core_tested_host = (testedHost || host || '').toString();
     state.core_tested_port = Number.isFinite(testedPortNumber) && testedPortNumber > 0 ? Number(testedPortNumber) : port;
+    try {
+        refreshExecuteRemoteToggleState();
+    } catch (err) { /* ignore until modal initialized */ }
 }
 
 function markGlobalCoreDisconnected() {
     state.core_ok = false;
     state.core_tested_host = null;
     state.core_tested_port = null;
+    try {
+        refreshExecuteRemoteToggleState();
+    } catch (err) { /* ignore until modal initialized */ }
 }
 
 function getActiveScenarioContext() {
@@ -3142,13 +3469,65 @@ function enableAutoStartDaemonPreference() {
 }
 
 // Restore persisted editor state (scenarios and last saved xml) and active index from localStorage
-let persistedState = projectStateMap[currentProjectKey];
+persistedState = projectStateMap[currentProjectKey];
 if (!persistedState && currentProjectKey !== DEFAULT_PROJECT_KEY) {
     persistedState = projectStateMap[DEFAULT_PROJECT_KEY];
+}
+if (!persistedState && scenarioQueryToken) {
+    try {
+        const matchingKey = Object.keys(projectStateMap || {}).find(key => {
+            const entry = projectStateMap[key];
+            if (!entry || typeof entry !== 'object') return false;
+            const entryScenario = typeof entry.scenario_query === 'string' ? entry.scenario_query.trim() : '';
+            return entryScenario && entryScenario === scenarioQueryToken;
+        });
+        if (matchingKey) {
+            persistedState = projectStateMap[matchingKey];
+            currentProjectKey = matchingKey;
+        }
+    } catch (err) {}
+}
+if (!persistedState) {
+    const signatureFallback = resolveScenarioQueryHintFromSource(serverEditorSnapshot || initialPayload) || scenarioQueryToken;
+    if (signatureFallback) {
+        try {
+            const signatureKey = `${DEFAULT_PROJECT_KEY}::${signatureFallback.toLowerCase()}`;
+            if (projectStateMap[signatureKey]) {
+                currentProjectKey = signatureKey;
+                persistedState = projectStateMap[signatureKey];
+            }
+        } catch (err) {}
+    }
+}
+if (!persistedState) {
+    if (serverEditorSnapshot) {
+        try {
+            persistedState = JSON.parse(JSON.stringify(serverEditorSnapshot));
+        } catch (err) {
+            persistedState = serverEditorSnapshot;
+        }
+    }
+}
+const serverSnapshotHasScenarios = Array.isArray(serverEditorSnapshot?.scenarios) && serverEditorSnapshot.scenarios.length > 0;
+const persistedMissingScenarios = (
+    !persistedState ||
+    !Array.isArray(persistedState.scenarios) ||
+    !persistedState.scenarios.length
+);
+if (persistedMissingScenarios && serverSnapshotHasScenarios) {
+    try {
+        const snapshotClone = JSON.parse(JSON.stringify(serverEditorSnapshot));
+        if (snapshotClone) {
+            persistedState = snapshotClone;
+        }
+    } catch (err) {
+        persistedState = serverEditorSnapshot;
+    }
 }
 if (!persistedState) {
     persistedState = legacyEditorState;
 }
+persistedState = scrubSnapshotTransientErrors(persistedState);
 let persistedActiveIdx = 0;
 const activeIdxCandidateRaw = activeIdxMap[currentProjectKey];
 if (activeIdxCandidateRaw !== undefined) {
@@ -3243,6 +3622,23 @@ function getScenarioByIndex(idx) {
     return scenarios[idx];
 }
 
+function resolveScenarioQueryHint() {
+    try {
+        const token = (scenarioQueryToken || '').trim();
+        if (token) return token;
+        const signature = deriveScenarioSignature(state);
+        if (signature) {
+            scenarioQueryToken = signature;
+            return signature;
+        }
+    } catch (err) {
+        /* ignore */
+    }
+    return (scenarioQueryToken || '').trim();
+}
+
+const resolveScenarioQueryHintFromSnapshot = resolveScenarioQueryHintFromSource;
+
 (state.scenarios || []).forEach(ensureHitlStateForScenario);
 // Clear any stale in-flight flags persisted from a previous session/tab so UI doesn't show a busy state on load
 try {
@@ -3257,6 +3653,59 @@ try {
 } catch (e) { /* ignore */ }
 
 // Preview workflow state (in-memory only; persisted history handled separately)
+let serverSnapshotPendingPayload = null;
+let serverSnapshotTimerId = null;
+let serverSnapshotDisabled = false;
+
+async function transmitEditorSnapshotToServer(payload) {
+    if (!payload || serverSnapshotDisabled) return;
+    try {
+        const resp = await fetch('/api/editor_snapshot', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify(payload),
+        });
+        if (resp.status === 401) {
+            serverSnapshotDisabled = true;
+            return;
+        }
+        if (!resp.ok) {
+            const detail = await resp.text().catch(() => '');
+            throw new Error(detail || `HTTP ${resp.status}`);
+        }
+    } catch (err) {
+        console.warn('Failed to persist editor snapshot on server', err);
+    }
+}
+
+function scheduleServerSnapshotPersist(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') {
+        return;
+    }
+    if (serverSnapshotDisabled) {
+        return;
+    }
+    try {
+        serverSnapshotPendingPayload = JSON.parse(JSON.stringify(snapshot));
+    } catch (err) {
+        console.warn('Unable to serialize editor snapshot for server persistence', err);
+        return;
+    }
+    if (serverSnapshotTimerId) {
+        window.clearTimeout(serverSnapshotTimerId);
+    }
+    serverSnapshotTimerId = window.setTimeout(() => {
+        const payload = serverSnapshotPendingPayload;
+        serverSnapshotPendingPayload = null;
+        serverSnapshotTimerId = null;
+        if (!payload) {
+            return;
+        }
+        transmitEditorSnapshotToServer(payload);
+    }, 900);
+}
+
 let previewState = {
     fullPreview: null,
     fullPreviewHistory: [],
@@ -3476,16 +3925,14 @@ function setupPreviewModalExecute(modalEl, modalInstance){
         };
         try {
             const execInfo = detectLocalEmulation();
-            const confirmMsg = execInfo.shouldFake
-                ? 'Execute this scenario now? CORE is not connected, so the run will use fake local emulation.'
-                : 'Execute this scenario now? This will start a CORE session.';
+            const confirmMsg = 'Execute this scenario now? This will start a CORE session.';
             const { idx: scenarioIdx } = getActiveScenarioContext();
             await hideModalForConfirm();
             const confirmResult = await promptExecuteConfirmation({
                 message: confirmMsg,
                 scenarioIndex: scenarioIdx,
-                alertMessage: execInfo.shouldFake ? 'CORE not connected; run will use fake local emulation.' : '',
-                alertTone: execInfo.shouldFake ? 'warning' : 'info',
+                alertMessage: '',
+                alertTone: 'info',
                 keepOpenOnConfirm: true,
             });
             const updateRemoteRepo = !!confirmResult?.updateRemote;
@@ -3499,7 +3946,7 @@ function setupPreviewModalExecute(modalEl, modalInstance){
             await new Promise(resolve => setTimeout(resolve, 0));
             showExecuteProgressPanel(
                 execInfo.shouldFake ? 'Local emulation run' : 'Preparing CORE run…',
-                execInfo.shouldFake ? 'CORE not connected; using fake local emulation.' : `CORE ${execInfo.host}:${execInfo.port}`
+                execInfo.shouldFake ? 'CORE connection unavailable; running locally.' : `CORE ${execInfo.host}:${execInfo.port}`
             );
             try {
                 const showBtn = document.getElementById('dockShowBtn');
@@ -4913,9 +5360,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
                 return;
             }
             const execInfo = detectLocalEmulation();
-            const confirmMsg = execInfo.shouldFake
-                ? 'Execute this scenario now? CORE is not connected, so the run will use fake local emulation.'
-                : 'Execute this scenario now? This will start a CORE session.';
+            const confirmMsg = 'Execute this scenario now? This will start a CORE session.';
             const { idx: scenarioIdx } = getActiveScenarioContext();
             const modalInstance = resolveModalInstance();
             allowPreviewRestore = true;
@@ -4954,8 +5399,8 @@ document.addEventListener('DOMContentLoaded', ()=>{
             const confirmResult = await promptExecuteConfirmation({
                 message: confirmMsg,
                 scenarioIndex: scenarioIdx,
-                alertMessage: execInfo.shouldFake ? 'CORE not connected; run will use fake local emulation.' : '',
-                alertTone: execInfo.shouldFake ? 'warning' : 'info',
+                alertMessage: '',
+                alertTone: 'info',
                 keepOpenOnConfirm: true,
             });
             const updateRemoteRepo = !!confirmResult?.updateRemote;
@@ -5004,7 +5449,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
                 await waitForPaint();
                 showExecuteProgressPanel(
                     execInfo.shouldFake ? 'Local emulation run' : 'Preparing CORE run…',
-                    execInfo.shouldFake ? 'CORE not connected; using fake local emulation.' : `CORE ${execInfo.host}:${execInfo.port}`
+                    execInfo.shouldFake ? 'CORE connection unavailable; running locally.' : `CORE ${execInfo.host}:${execInfo.port}`
                 );
                 // Ensure dock visible
                 try { const showBtn=document.getElementById('dockShowBtn'); if(showBtn && !showBtn.classList.contains('d-none')) showBtn.click(); } catch(e){}
@@ -5078,58 +5523,206 @@ document.addEventListener('DOMContentLoaded', () => {
 async function autoSaveXml(){
     return new Promise((resolve, reject) => {
         try {
-            // Mirror logic from manual Save XML submission but use fetch
             const scenariosJsonInput = document.getElementById('scenarios_json');
             if(!scenariosJsonInput){ reject('Editor form missing'); return; }
             try { scenariosJsonInput.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx }); } catch(e){ reject('Serialize failed'); return; }
+            const latestCoreConfig = getCoreConfig(true);
             const coreJsonInput = document.getElementById('core_json');
             if (coreJsonInput) {
-                coreJsonInput.value = JSON.stringify(getCoreConfig(true));
+                coreJsonInput.value = JSON.stringify(latestCoreConfig);
             }
-            const formData = new FormData();
-            formData.append('scenarios_json', scenariosJsonInput.value);
-            if (coreJsonInput) {
-                formData.append('core_json', coreJsonInput.value);
-            }
-            fetch('/save_xml', { method:'POST', body: formData })
-                .then(r=>r.text())
-                .then(html => {
-                    // Parse returned HTML for updated payload JSON script tag
-                    try {
-                        const parser = new DOMParser();
-                        const doc = parser.parseFromString(html, 'text/html');
-                        const payloadScript = doc.querySelector('#payload-data');
-                        if(payloadScript){
-                            const newPayload = JSON.parse(payloadScript.textContent || 'null');
-                            if(newPayload){
-                                if (newPayload.core) {
-                                    state.core = normalizeCoreState(newPayload.core, true);
-                                    storeCorePasswordInSession();
+            const scenarioQueryHint = resolveScenarioQueryHint();
+            const projectKeyHint = currentProjectKey || DEFAULT_PROJECT_KEY;
+            const priorPassword = state?.core?.ssh_password || '';
+            const applyCoreUpdate = (corePayload) => {
+                if (!corePayload) return;
+                state.core = normalizeCoreState(corePayload, true);
+                if (priorPassword && !state.core.ssh_password) {
+                    state.core.ssh_password = priorPassword;
+                }
+                storeCorePasswordInSession();
+            };
+            const applyResultPath = (resultPath) => {
+                if (!resultPath) return;
+                const previousProjectKey = currentProjectKey;
+                const previousSnapshot = { ...(projectStateMap[previousProjectKey] || legacyEditorState || {}) };
+                state.result_path = resultPath;
+                try { updateDownloadButtonState(); } catch (err) {}
+                try {
+                    const projectKeyProbe = {
+                        project_key_hint: resultPath,
+                        result_path: resultPath,
+                        scenarios: state.scenarios || [],
+                        base_upload: state.base_upload || null,
+                        scenario_query: resolveScenarioQueryHint() || null,
+                    };
+                    const derivedKey = deriveProjectKey(projectKeyProbe, previousProjectKey || DEFAULT_PROJECT_KEY);
+                    currentProjectKey = derivedKey || previousProjectKey || DEFAULT_PROJECT_KEY;
+                } catch (keyErr) {
+                    console.warn('Failed to derive project key from result_path', keyErr);
+                    if (!currentProjectKey) {
+                        currentProjectKey = previousProjectKey || DEFAULT_PROJECT_KEY;
+                    }
+                }
+                try {
+                    const persisted = { ...previousSnapshot };
+                    persisted.result_path = state.result_path;
+                    persisted.project_key_hint = state.result_path;
+                    projectStateMap[currentProjectKey] = persisted;
+                    legacyEditorState = persisted;
+                    writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, persisted);
+                    writeJsonToLocalStorage(PROJECT_STATE_STORAGE_KEY, projectStateMap);
+                } catch(err) {}
+                // Persist again so the new result_path becomes the active project key
+                persistEditorState();
+            };
+            const finalizeSuccess = () => {
+                previewState.xmlSaved = true;
+                try { updatePlanButtons(); } catch(err) {}
+                resolve();
+            };
+            const legacySave = () => {
+                const formData = new FormData();
+                formData.append('scenarios_json', scenariosJsonInput.value);
+                if (coreJsonInput) {
+                    formData.append('core_json', coreJsonInput.value);
+                }
+                formData.append('project_key_hint', projectKeyHint);
+                formData.append('scenario_query', scenarioQueryHint || '');
+                return fetch('/save_xml', { method:'POST', body: formData, credentials: 'same-origin' })
+                    .then(r=>r.text())
+                    .then(html => {
+                        try {
+                            const parser = new DOMParser();
+                            const doc = parser.parseFromString(html, 'text/html');
+                            const payloadScript = doc.querySelector('#payload-data');
+                            if(payloadScript){
+                                const newPayload = JSON.parse(payloadScript.textContent || 'null');
+                                if(newPayload){
+                                    if (newPayload.core) {
+                                        applyCoreUpdate(newPayload.core);
+                                    }
+                                    if(newPayload.result_path){
+                                        applyResultPath(newPayload.result_path);
+                                        finalizeSuccess();
+                                        return;
+                                    }
                                 }
-                                if(newPayload.result_path){
-                                state.result_path = newPayload.result_path;
-                                try {
-                                    const persisted = { ...(projectStateMap[currentProjectKey] || legacyEditorState || {}) };
-                                    persisted.result_path = state.result_path;
-                                    projectStateMap[currentProjectKey] = persisted;
-                                    legacyEditorState = persisted;
-                                    writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, persisted);
-                                    writeJsonToLocalStorage(PROJECT_STATE_STORAGE_KEY, projectStateMap);
-                                } catch(e){}
-                                previewState.xmlSaved = true;
-                                updatePlanButtons();
-                                resolve();
-                                return;
                             }
-                        }
-                        }
-                        reject('Could not detect saved XML path in response');
-                    } catch(e){ reject(e); }
-                })
-                .catch(err => reject(err));
+                            reject(new Error('Could not detect saved XML path in response'));
+                        } catch(e){ reject(e); }
+                    })
+                    .catch(err => reject(err));
+            };
+            const apiSave = () => {
+                return fetch('/save_xml_api', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({
+                        scenarios: state.scenarios,
+                        active_index: activeIdx,
+                        core: latestCoreConfig,
+                        project_key_hint: projectKeyHint,
+                        scenario_query: scenarioQueryHint,
+                    }),
+                }).then(async resp => {
+                    let data = null;
+                    try { data = await resp.json(); } catch(_) {}
+                    if (!resp.ok || !data || data.ok === false) {
+                        const errMsg = (data && (data.error || data.message)) || `HTTP ${resp.status}`;
+                        throw new Error(errMsg);
+                    }
+                    if (data.core) {
+                        applyCoreUpdate(data.core);
+                    }
+                    if (data.result_path) {
+                        applyResultPath(data.result_path);
+                    }
+                    finalizeSuccess();
+                });
+            };
+            apiSave().catch(err => {
+                console.warn('save_xml_api failed, falling back to legacy save_xml', err);
+                legacySave();
+            });
         } catch(e){ reject(e); }
     });
 }
+
+document.addEventListener('DOMContentLoaded', () => {
+    const bindModalSaveButton = (buttonId, options = {}) => {
+        const btn = document.getElementById(buttonId);
+        if (!btn || btn.dataset.modalSaveBound === '1') return;
+        const busyHtml = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Saving…';
+        const doFallbackSubmit = () => {
+            const editorForm = document.getElementById('editorForm');
+            if (!editorForm) return Promise.reject(new Error('Editor form not found'));
+            return new Promise((resolve) => {
+                try {
+                    if (typeof editorForm.requestSubmit === 'function') {
+                        editorForm.requestSubmit();
+                    } else {
+                        editorForm.submit();
+                    }
+                    resolve();
+                } catch (err) {
+                    console.warn('Fallback submit failed', err);
+                    resolve();
+                }
+            });
+        };
+        const runSave = async () => {
+            if (typeof autoSaveXml === 'function') {
+                await autoSaveXml();
+            } else {
+                await doFallbackSubmit();
+            }
+        };
+        const closeParentModal = () => {
+            try {
+                const modalEl = btn.closest('.modal');
+                if (modalEl && window.bootstrap) {
+                    const instance = window.bootstrap.Modal.getOrCreateInstance(modalEl);
+                    instance.hide();
+                } else if (modalEl) {
+                    modalEl.classList.remove('show');
+                    modalEl.setAttribute('aria-hidden', 'true');
+                    modalEl.style.display = 'none';
+                }
+            } catch (err) {
+                console.warn('Failed to close modal after save', err);
+            }
+        };
+        btn.addEventListener('click', async () => {
+            if (btn.disabled) return;
+            const originalHtml = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = busyHtml;
+            try {
+                await runSave();
+                if (typeof showToast === 'function') {
+                    showToast('Scenario saved.', { autohide: true, delay: 2200 });
+                }
+                closeParentModal();
+            } catch (err) {
+                const message = err && err.message ? err.message : (typeof err === 'string' ? err : 'Save failed');
+                console.warn(`Modal save failed: ${message}`);
+                if (typeof showToast === 'function') {
+                    showToast(`Scenario save failed: ${message}`, { autohide: false });
+                } else {
+                    alert(`Scenario save failed: ${message}`);
+                }
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = originalHtml;
+            }
+        });
+        btn.dataset.modalSaveBound = '1';
+    };
+    bindModalSaveButton('coreVmModalSaveBtn');
+    bindModalSaveButton('externalIfxModalSaveBtn');
+});
 
 state.core = restoreCorePasswordFromSession(state.core);
 if (persistedState && persistedState.core) {
@@ -5157,8 +5750,9 @@ function persistEditorState(){
             display_name: state.scenarios?.[0]?.base?.display_name || (state.scenarios?.[0]?.base?.filepath ? state.scenarios[0].base.filepath.split(/[/\\]/).pop() || '' : '')
         } : null);
         const coreForPersist = sanitizeCoreForPersist(state.core);
+        const scenariosForSnapshot = cloneScenariosForSnapshot(state.scenarios || []);
         const snapshot = {
-            scenarios: state.scenarios,
+            scenarios: scenariosForSnapshot,
             result_path: state.result_path || null,
             core: coreForPersist || null,
             core_ok: !!state.core_ok,
@@ -5170,8 +5764,26 @@ function persistEditorState(){
             host_interfaces_metadata: state.host_interfaces_metadata || null,
             host_interfaces_fetched_at: state.host_interfaces_fetched_at || null,
         };
+        snapshot.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
+        const scenarioSignature = deriveScenarioSignature({ scenarios: scenariosForSnapshot });
+        const trimmedScenarioToken = (scenarioQueryToken || '').trim();
+        const nextScenarioQuery = trimmedScenarioToken || scenarioSignature || '';
+        snapshot.scenario_query = nextScenarioQuery || null;
+        if (!trimmedScenarioToken && nextScenarioQuery) {
+            scenarioQueryToken = nextScenarioQuery;
+        }
+        const stableProjectHint = (() => {
+            if (currentProjectKey && currentProjectKey !== DEFAULT_PROJECT_KEY) return currentProjectKey;
+            if (snapshot.project_key_hint) return snapshot.project_key_hint;
+            if (nextScenarioQuery) return nextScenarioQuery;
+            if (snapshot.result_path) return snapshot.result_path;
+            if (snapshot.base_upload && snapshot.base_upload.path) return snapshot.base_upload.path;
+            return null;
+        })();
+        snapshot.project_key_hint = stableProjectHint;
+        scrubSnapshotTransientErrors(snapshot);
         writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, snapshot);
-        const nextProjectKey = deriveProjectKey(snapshot, DEFAULT_PROJECT_KEY);
+        const nextProjectKey = deriveProjectKey(snapshot, currentProjectKey || DEFAULT_PROJECT_KEY);
         currentProjectKey = nextProjectKey || DEFAULT_PROJECT_KEY;
         projectStateMap[currentProjectKey] = snapshot;
         writeJsonToLocalStorage(PROJECT_STATE_STORAGE_KEY, projectStateMap);
@@ -5180,6 +5792,7 @@ function persistEditorState(){
         try { localStorage.setItem(LAST_PROJECT_KEY_STORAGE_KEY, currentProjectKey); } catch (err) {}
         localStorage.setItem('coretg_active_idx', String(activeIdx||0));
         storeCorePasswordInSession();
+        scheduleServerSnapshotPersist(snapshot);
     } catch(e){}
 }
 // Persist initial merged state so it survives cross-page navigation immediately
@@ -5199,6 +5812,8 @@ const dropdownsBySection = {
 const proxInventoryFetchInFlight = new Set();
 // Feature flag: disable automatic CORE VM interface refresh; require explicit user action
 const HOST_INTERFACES_AUTO_REFRESH_ENABLED = false;
+// Feature flag: disable automatic Proxmox VM inventory refresh; rely on user action
+const PROXMOX_INVENTORY_AUTO_REFRESH_ENABLED = false;
 const HOST_INTERFACES_REFRESH_COOLDOWN_MS = 10_000;
 const HOST_INTERFACES_REQUEST_TIMEOUT_MS = 15_000;
 const HOST_INTERFACES_MAX_AUTO_RETRIES = 5;
@@ -5557,19 +6172,57 @@ function updateHitlStatusForScenario(sidx) {
     }
 }
 
+function updateParticipantProxmoxNavLink() {
+    const wrapper = document.getElementById('navParticipantLinkWrap');
+    const link = document.getElementById('navParticipantLink');
+    if (!wrapper || !link) return;
+    const scenario = state.scenarios?.[activeIdx];
+    if (!scenario) {
+        wrapper.classList.add('d-none');
+        link.href = '#';
+        link.setAttribute('aria-disabled', 'true');
+        return;
+    }
+    const hitlState = ensureHitlStateForScenario(scenario);
+    const href = normalizeParticipantProxmoxHref(hitlState.participant_proxmox_url || '');
+    if (!href) {
+        wrapper.classList.add('d-none');
+        link.setAttribute('aria-disabled', 'true');
+        link.setAttribute('title', 'Participant UI unavailable');
+        link.dataset.participantUiHref = '';
+        window.CORETG_PARTICIPANT_UI_HREF = '';
+        return;
+    }
+    wrapper.classList.remove('d-none');
+    link.setAttribute('aria-disabled', 'false');
+    link.setAttribute('title', `Participant UI (${href})`);
+    link.dataset.participantUiHref = href;
+    window.CORETG_PARTICIPANT_UI_HREF = href;
+}
+
+function updateDownloadButtonState() {
+    const dlBtn = document.getElementById('downloadXmlBtn');
+    if (!dlBtn) return;
+    const rp = state.result_path || '';
+    if (rp && rp.endsWith('.xml')) {
+        dlBtn.removeAttribute('disabled');
+        dlBtn.classList.remove('pe-none');
+        dlBtn.setAttribute('title', '');
+    } else {
+        dlBtn.setAttribute('disabled', 'disabled');
+        dlBtn.classList.add('pe-none');
+        dlBtn.setAttribute('title', 'Save XML first');
+    }
+}
+
 function render() {
     renderSidebar();
     renderMain();
+    updateParticipantProxmoxNavLink();
     // Ensure H/S bounds visibility reflects initial r2s_mode values
     updateHsBoundsVisibility();
-    // Download link visibility if provided
     // Enable/disable Download XML button based on saved xml path
-    const dlBtn = document.getElementById('downloadXmlBtn');
-    if (dlBtn) {
-        const rp = state.result_path || '';
-        if (rp && rp.endsWith('.xml')) { dlBtn.removeAttribute('disabled'); dlBtn.classList.remove('pe-none'); dlBtn.setAttribute('title',''); }
-        else { dlBtn.setAttribute('disabled','disabled'); dlBtn.classList.add('pe-none'); dlBtn.setAttribute('title','Save XML first'); }
-    }
+    updateDownloadButtonState();
     // Sync Base Scenario UI with persisted metadata (independent of active scenario)
     const scen0 = state.scenarios?.[0] || {};
     const scen0Base = (typeof scen0.base === 'object' && scen0.base) ? scen0.base : {};
@@ -6000,17 +6653,35 @@ async function handleExternalIfxApply() {
             }
         }, 150);
         window.setTimeout(() => {
-            const editorForm = document.getElementById('editorForm');
-            try {
-                if (editorForm && typeof editorForm.requestSubmit === 'function') {
-                    editorForm.requestSubmit();
-                } else if (editorForm) {
-                    editorForm.submit();
+            const fallbackSubmit = () => {
+                const editorForm = document.getElementById('editorForm');
+                try {
+                    if (editorForm && typeof editorForm.requestSubmit === 'function') {
+                        editorForm.requestSubmit();
+                    } else if (editorForm) {
+                        editorForm.submit();
+                    }
+                } catch (submitErr) {
+                    console.warn('Failed to auto-save scenario after External IFX apply (fallback submit)', submitErr);
                 }
-            } catch (submitErr) {
-                console.warn('Failed to auto-save scenario after External IFX apply', submitErr);
+            };
+            if (typeof autoSaveXml !== 'function') {
+                fallbackSubmit();
+                return;
             }
-        }, 250);
+            (async () => {
+                try {
+                    await autoSaveXml();
+                    logInfo('Scenario auto-saved after External IFX apply');
+                } catch (saveErr) {
+                    const warningMessage = 'Bridge applied but auto-save failed. Save XML manually.';
+                    logWarn(`${warningMessage}: ${saveErr}`);
+                    updateExternalIfxStatus(warningMessage, 'warning');
+                    try { showToast(warningMessage, { autohide: false }); } catch (toastErr) { console.warn('Toast failed', toastErr); }
+                    fallbackSubmit();
+                }
+            })();
+        }, 300);
     } catch (err) {
         try {
             const detail = err && err.stack ? err.stack : (err && err.toString ? err.toString() : 'unknown error');
@@ -6867,6 +7538,9 @@ function renderMain() {
     const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
     const hitl = ensureHitlStateForScenario(scen);
     const proxmox = hitl.proxmox || { url: '', port: 8006, username: '', password: '' };
+    const participantProxmoxUrlRaw = (hitl.participant_proxmox_url || '').toString();
+    const participantProxmoxUrlHtml = escapeHtml(participantProxmoxUrlRaw);
+    const participantProxmoxUrlHasValue = participantProxmoxUrlRaw.trim().length > 0;
     const proxValidated = !!(proxmox.validated && proxmox.secret_id);
     const hasProxmox = !!(proxmox.url && proxmox.username);
     const proxPort = proxmox.port ?? 8006;
@@ -6908,7 +7582,7 @@ function renderMain() {
     }
     const proxInventoryStatusHtml = escapeHtml(proxInventoryStatus);
     const proxRefreshDisabledAttr = (proxValidated && !proxInventoryBusy) ? '' : 'disabled';
-    if (proxValidated && !proxInventoryBusy && !proxInventory.length && !proxInventoryError) {
+    if (PROXMOX_INVENTORY_AUTO_REFRESH_ENABLED && proxValidated && !proxInventoryBusy && !proxInventory.length && !proxInventoryError) {
         fetchProxmoxInventory(activeIdx)
             .catch(err => console.warn('Proxmox inventory fetch failed', err));
     }
@@ -6935,13 +7609,39 @@ function renderMain() {
     const corePasswordRaw = (core.ssh_password || '').toString();
     const corePassword = corePasswordRaw;
     const corePasswordAvailable = !!corePasswordRaw || coreHasSecret;
-    const selectedCoreVm = proxInventory.find(vm => `${vm.node ?? ''}::${vm.vmid ?? ''}` === coreVmKey) || null;
-    const coreVmNode = selectedCoreVm && selectedCoreVm.node !== undefined && selectedCoreVm.node !== null
-        ? String(selectedCoreVm.node).trim()
-        : (core.vm_node ? String(core.vm_node).trim() : '');
-    const vmInterfaceCount = selectedCoreVm && Array.isArray(selectedCoreVm.interfaces) ? selectedCoreVm.interfaces.length : 0;
-    const coreVmHasInterfaces = !coreVmKey || vmInterfaceCount >= 1;
-    const coreVmSupportsHitl = !coreVmKey || vmInterfaceCount >= 2;
+    const vmKeyParts = coreVmKey ? coreVmKey.split('::') : [];
+    const vmKeyNodePart = (vmKeyParts[0] || '').trim();
+    const vmKeyIdPart = (vmKeyParts[1] || '').trim();
+    const cachedVmInterfaceCount = Number.isFinite(Number(core.cached_vm_interface_count)) ? Number(core.cached_vm_interface_count) : null;
+    const liveSelectedCoreVm = proxInventory.find(vm => `${vm.node ?? ''}::${vm.vmid ?? ''}` === coreVmKey) || null;
+    const fallbackCoreVm = (!liveSelectedCoreVm && coreVmKey) ? {
+        name: coreVmName || '',
+        node: core.vm_node || vmKeyNodePart || '',
+        status: core.cached_vm_status || '',
+        vmid: vmKeyIdPart || '',
+        interface_count_hint: cachedVmInterfaceCount,
+    } : null;
+    const resolvedCoreVm = liveSelectedCoreVm
+        ? { ...liveSelectedCoreVm, cached: false }
+        : (fallbackCoreVm ? { ...fallbackCoreVm, cached: true } : null);
+    const resolvedVmInterfaceCount = (() => {
+        if (resolvedCoreVm && Array.isArray(resolvedCoreVm.interfaces)) {
+            return resolvedCoreVm.interfaces.length;
+        }
+        if (resolvedCoreVm && Number.isFinite(resolvedCoreVm.interface_count_hint)) {
+            return Number(resolvedCoreVm.interface_count_hint);
+        }
+        if (cachedVmInterfaceCount !== null) {
+            return cachedVmInterfaceCount;
+        }
+        return null;
+    })();
+    const interfaceCountKnown = resolvedVmInterfaceCount !== null;
+    const coreVmHasInterfaces = !coreVmKey || !interfaceCountKnown || resolvedVmInterfaceCount >= 1;
+    const coreVmSupportsHitl = !coreVmKey || !interfaceCountKnown || resolvedVmInterfaceCount >= 2;
+    const coreVmNode = resolvedCoreVm && resolvedCoreVm.node !== undefined && resolvedCoreVm.node !== null
+        ? String(resolvedCoreVm.node).trim()
+        : (core.vm_node ? String(core.vm_node).trim() : vmKeyNodePart);
     const coreInputsComplete = !!(coreVmKey && coreHost && corePort && coreSshHost && coreSshPort && coreUser && corePasswordAvailable);
     const coreTestSuccess = core.last_tested_status === 'success';
     const coreTestMatches = coreTestSuccess
@@ -6954,9 +7654,10 @@ function renderMain() {
     const coreTestable = proxValidated && coreInputsComplete && coreVmHasInterfaces;
     const hitlAuthReady = proxValidated && coreHasSecret && !!coreVmKey;
     const coreVmInterfaceWarning = (() => {
-        if (!coreVmKey) return '';
+        if (!coreVmKey || !interfaceCountKnown) return '';
         if (!coreVmHasInterfaces) {
-            return `<div class="alert alert-danger small mt-2 mb-0">Selected VM exposes ${vmInterfaceCount || 0} network interface${vmInterfaceCount === 1 ? '' : 's'}. Add at least one interface to enable CORE connectivity.</div>`;
+            const count = resolvedVmInterfaceCount || 0;
+            return `<div class="alert alert-danger small mt-2 mb-0">Selected VM exposes ${count} network interface${count === 1 ? '' : 's'}. Add at least one interface to enable CORE connectivity.</div>`;
         }
         return '';
     })();
@@ -7431,29 +8132,47 @@ function renderMain() {
             return `<option value="${escapeHtml(vmKey)}" ${vmKey === coreVmKey ? 'selected' : ''}>${escapeHtml(parts.join(' — '))}</option>`;
         });
         coreVmOptionsMarkup = ['<option value="">Select VM…</option>', ...optionList].join('');
+    } else if (coreVmKey) {
+        const fallbackLabelParts = [];
+        if (coreVmName) fallbackLabelParts.push(coreVmName);
+        if (coreVmNode) fallbackLabelParts.push(`node ${coreVmNode}`);
+        fallbackLabelParts.push('cached selection');
+        const fallbackLabel = fallbackLabelParts.filter(Boolean).join(' — ');
+        coreVmOptionsMarkup = [
+            '<option value="">Select VM…</option>',
+            `<option value="${escapeHtml(coreVmKey)}" selected>${escapeHtml(fallbackLabel)}</option>`
+        ].join('');
     } else {
-        coreVmOptionsMarkup = '<option value="">No VMs available</option>';
+        coreVmOptionsMarkup = '<option value="">No VMs available (refresh list)</option>';
     }
 
-    const selectedCoreVmDetailsHtml = (() => {
-        if (!coreVmKey || !selectedCoreVm) {
+    const coreVmDetailsHtml = (() => {
+        if (!coreVmKey) {
             return '';
         }
-        const name = escapeHtml(selectedCoreVm.name ? String(selectedCoreVm.name) : `VM ${selectedCoreVm.vmid}`);
-        const node = escapeHtml(selectedCoreVm.node ? String(selectedCoreVm.node) : '—');
-        const status = selectedCoreVm.status ? escapeHtml(String(selectedCoreVm.status)) : null;
-        const vmid = selectedCoreVm.vmid !== undefined && selectedCoreVm.vmid !== null ? escapeHtml(String(selectedCoreVm.vmid)) : '—';
-        const ifaceCount = Array.isArray(selectedCoreVm.interfaces) ? selectedCoreVm.interfaces.length : 0;
-        const ifaceInfo = ifaceCount ? `${ifaceCount} interface${ifaceCount === 1 ? '' : 's'}` : 'No interfaces reported';
+        if (!resolvedCoreVm) {
+            return '<div class="alert alert-info small mb-0">Previously selected CORE VM preserved. Refresh the VM list to view details.</div>';
+        }
+        const name = escapeHtml(resolvedCoreVm.name ? String(resolvedCoreVm.name) : (resolvedCoreVm.vmid ? `VM ${resolvedCoreVm.vmid}` : 'Selected VM'));
+        const node = escapeHtml(resolvedCoreVm.node ? String(resolvedCoreVm.node) : (coreVmNode || '—'));
+        const status = resolvedCoreVm.status ? escapeHtml(String(resolvedCoreVm.status)) : (resolvedCoreVm.cached ? 'cached' : null);
+        const vmid = resolvedCoreVm.vmid !== undefined && resolvedCoreVm.vmid !== null && resolvedCoreVm.vmid !== ''
+            ? escapeHtml(String(resolvedCoreVm.vmid))
+            : (vmKeyIdPart ? escapeHtml(vmKeyIdPart) : '—');
+        const ifaceCountValue = interfaceCountKnown ? (resolvedVmInterfaceCount || 0) : null;
+        const ifaceInfo = ifaceCountValue === null
+            ? 'Interfaces unknown. Refresh VM list to confirm.'
+            : `${ifaceCountValue} interface${ifaceCountValue === 1 ? '' : 's'}`;
         const ifaceLabel = escapeHtml(ifaceInfo);
+        const cachedBadge = resolvedCoreVm.cached ? '<span class="badge text-bg-warning text-uppercase">Cached</span>' : (status ? `<span class="badge text-bg-secondary text-uppercase">${status}</span>` : '');
         return `
             <div class="border rounded p-3 bg-light small">
                 <div class="d-flex justify-content-between align-items-center mb-2">
                     <span class="fw-semibold">${name}</span>
-                    ${status ? `<span class="badge text-bg-secondary text-uppercase">${status}</span>` : ''}
+                    ${cachedBadge}
                 </div>
                 <dl class="row mb-0">
-                    <dt class="col-5 text-muted">Node</dt><dd class="col-7">${node}</dd>
+                    <dt class="col-5 text-muted">Node</dt><dd class="col-7">${node || '—'}</dd>
                     <dt class="col-5 text-muted">VM ID</dt><dd class="col-7">${vmid}</dd>
                     <dt class="col-5 text-muted">Interfaces</dt><dd class="col-7">${ifaceLabel}</dd>
                 </dl>
@@ -7475,7 +8194,8 @@ function renderMain() {
     } else if (!coreVmKey) {
         coreStatusText = 'Select a CORE VM to configure connection details.';
     } else if (!coreVmHasInterfaces) {
-        coreStatusText = `Selected CORE VM exposes ${vmInterfaceCount || 0} network interface${vmInterfaceCount === 1 ? '' : 's'}. Add at least one interface to enable CORE connectivity.`;
+        const count = interfaceCountKnown ? (resolvedVmInterfaceCount || 0) : 0;
+        coreStatusText = `Selected CORE VM exposes ${count} network interface${count === 1 ? '' : 's'}. Add at least one interface to enable CORE connectivity.`;
         coreStatusClass = 'text-danger';
     } else if (!coreInputsComplete) {
         coreStatusText = 'Use Configure Connection to enter gRPC and SSH details, including credentials.';
@@ -7576,7 +8296,7 @@ function renderMain() {
                             ${coreVmInterfaceWarning}
                         </div>
                         <div class="col-md-6">
-                            <div data-hitl-core-summary="${activeIdx}">${selectedCoreVmDetailsHtml}</div>
+                            <div data-hitl-core-summary="${activeIdx}">${coreVmDetailsHtml}</div>
                         </div>
                     </div>
                     <div class="mt-3" data-hitl-core-connection="${activeIdx}">${coreConnectionSummaryHtml}</div>
@@ -7601,7 +8321,7 @@ function renderMain() {
             </fieldset>
         </div>`;
     const step4SectionHtml = `
-        <div data-hitl-step="4">
+        <div class="mb-4" data-hitl-step="4">
             <h6 class="mb-2">Step 4 — CTF Participant VM</h6>
             <div class="form-text mb-2">Choose a VM that will connect a participant to the scenario.</div>
             <fieldset class="hitl-step-fieldset ${step3Disabled ? 'hitl-step-disabled' : ''}" ${step3Disabled ? 'disabled' : ''} data-hitl-step4-body>
@@ -7615,8 +8335,28 @@ function renderMain() {
                     </div>`;
             })()}
         </div>`;
+    const participantUrlStatusClass = participantProxmoxUrlHasValue ? 'text-success' : 'text-muted';
+    const participantUrlStatusText = participantProxmoxUrlHasValue
+        ? PARTICIPANT_STATUS_SAVED_TEXT
+        : PARTICIPANT_STATUS_EMPTY_TEXT;
+    const part5SectionHtml = `
+        <div data-hitl-part="5">
+            <h6 class="mb-2">Part 5 — Participant UI</h6>
+            <div class="form-text mb-3">Paste the Proxmox console or landing URL that participants should use. This adds the Participant UI navigation tab and links the HITL interface entry so facilitators and players open the same console.</div>
+            <div class="mb-3">
+                <label class="form-label small" for="participantProxmoxUrl_${activeIdx}">Participant UI URL</label>
+                <input type="url" class="form-control form-control-sm" id="participantProxmoxUrl_${activeIdx}" placeholder="https://proxmox.example.local" autocomplete="url" data-hitl-participant-url data-scen-idx="${activeIdx}" value="${participantProxmoxUrlHtml}">
+                <div class="form-text">Accepts HTTP or HTTPS targets, including console paths.</div>
+                <div class="form-text">The Apply button pins this URL to the editor and navigation tab, while Clear removes the Participant shortcut.</div>
+                <div class="small ${participantUrlStatusClass} mt-2" data-hitl-participant-status="${activeIdx}">${escapeHtml(participantUrlStatusText)}</div>
+            </div>
+            <div class="d-flex flex-wrap gap-2">
+                <button type="button" class="btn btn-sm btn-outline-primary" data-hitl-participant-apply data-scen-idx="${activeIdx}">Apply Participant URL</button>
+                <button type="button" class="btn btn-sm btn-outline-secondary" data-hitl-participant-clear data-scen-idx="${activeIdx}" ${participantProxmoxUrlHasValue ? '' : 'disabled'}>Clear Participant URL</button>
+            </div>
+        </div>`;
     const coreSectionsHtml = `${step1SectionHtml}${step2SectionHtml}`;
-    const hitlSectionsHtml = `${step3SectionHtml}${step4SectionHtml}`;
+    const hitlSectionsHtml = `${step3SectionHtml}${step4SectionHtml}${part5SectionHtml}`;
     const coreCard = document.createElement('div');
     coreCard.id = 'scenarioHitlCoreCard';
     coreCard.className = 'card mb-3';
@@ -8892,6 +9632,80 @@ function wireHandlers() {
             }
         });
     });
+    const setParticipantUrlStatus = (sidx, rawValue) => {
+        const indicator = document.querySelector(`[data-hitl-participant-status="${sidx}"]`);
+        if (!indicator) return;
+        const normalized = normalizeParticipantProxmoxHref(rawValue || '');
+        if (normalized) {
+            indicator.textContent = `${PARTICIPANT_STATUS_SAVED_TEXT} (${normalized})`;
+            indicator.classList.remove('text-muted');
+            indicator.classList.add('text-success');
+        } else {
+            indicator.textContent = PARTICIPANT_STATUS_EMPTY_TEXT;
+            indicator.classList.remove('text-success');
+            indicator.classList.add('text-muted');
+        }
+    };
+    const persistParticipantProxmoxUrl = (sidx, rawValue) => {
+        if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) return false;
+        const scenario = state.scenarios[sidx];
+        const hitlState = ensureHitlStateForScenario(scenario);
+        const nextValue = (rawValue || '').trim();
+        const previousValue = (hitlState.participant_proxmox_url || '').toString().trim();
+        hitlState.participant_proxmox_url = nextValue;
+        persistEditorState();
+        const hidden = document.getElementById('scenarios_json');
+        if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+        updateParticipantProxmoxNavLink();
+        setParticipantUrlStatus(sidx, nextValue);
+        return previousValue !== nextValue;
+    };
+    const syncParticipantProxmoxControls = (sidx) => {
+        const input = document.getElementById(`participantProxmoxUrl_${sidx}`);
+        const hasValue = !!(input && input.value && input.value.trim());
+        const clearBtn = document.querySelector(`[data-hitl-participant-clear][data-scen-idx="${sidx}"]`);
+        if (clearBtn) clearBtn.disabled = !hasValue;
+        setParticipantUrlStatus(sidx, input ? input.value : '');
+    };
+    document.querySelectorAll('[data-hitl-participant-url]').forEach(input => {
+        const applyValue = () => {
+            const sidx = parseInt(input.getAttribute('data-scen-idx'));
+            if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
+            persistParticipantProxmoxUrl(sidx, input.value);
+            syncParticipantProxmoxControls(sidx);
+        };
+        input.addEventListener('input', applyValue);
+        input.addEventListener('change', applyValue);
+        const sidx = parseInt(input.getAttribute('data-scen-idx'));
+        if (!Number.isNaN(sidx)) {
+            syncParticipantProxmoxControls(sidx);
+        }
+    });
+    document.querySelectorAll('[data-hitl-participant-apply]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (btn.disabled) return;
+            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+            if (Number.isNaN(sidx)) return;
+            const input = document.getElementById(`participantProxmoxUrl_${sidx}`);
+            const value = input ? input.value : '';
+            const changed = persistParticipantProxmoxUrl(sidx, value);
+            syncParticipantProxmoxControls(sidx);
+            const toastMsg = changed ? 'Participant UI link saved.' : 'Participant UI link already up to date.';
+            try { showToast(toastMsg, { autohide: true, delay: 2000 }); } catch (e) {}
+        });
+    });
+    document.querySelectorAll('[data-hitl-participant-clear]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (btn.disabled) return;
+            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
+            if (Number.isNaN(sidx)) return;
+            const input = document.getElementById(`participantProxmoxUrl_${sidx}`);
+            if (input) input.value = '';
+            persistParticipantProxmoxUrl(sidx, '');
+            syncParticipantProxmoxControls(sidx);
+            try { showToast('Participant UI link cleared.', { autohide: true, delay: 1800 }); } catch (e) {}
+        });
+    });
     document.querySelectorAll('[data-hitl-remove]').forEach(btn => {
         btn.addEventListener('click', () => {
             const sidx = parseInt(btn.getAttribute('data-scen-idx'));
@@ -8969,6 +9783,8 @@ function wireHandlers() {
                 coreState.stored_summary = null;
                 coreState.internal_bridge = '';
                 coreState.internal_bridge_owner = '';
+                coreState.cached_vm_interface_count = null;
+                coreState.cached_vm_status = null;
             };
             if (!rawValue) {
                 resetCoreSelection();
@@ -8993,6 +9809,8 @@ function wireHandlers() {
             if (!coreState.vm_name && coreState.vm_node && vmidPartRaw && vmidPartRaw.trim()) {
                 coreState.vm_name = `${coreState.vm_node}::${vmidPartRaw.trim()}`;
             }
+            coreState.cached_vm_interface_count = Array.isArray(selectedVm?.interfaces) ? selectedVm.interfaces.length : null;
+            coreState.cached_vm_status = selectedVm && selectedVm.status ? String(selectedVm.status) : null;
             persistEditorState();
             const pwdInput = document.querySelector(`[data-hitl-core-field="ssh_password"][data-scen-idx="${sidx}"]`);
             if (pwdInput) pwdInput.removeAttribute('placeholder');
@@ -9635,6 +10453,13 @@ let executeConfirmAlertEl = null;
 let executeConfirmRunBtn = null;
 let executeConfirmCancelBtn = null;
 let executeConfirmUpdateRemoteToggle = null;
+let executeConfirmUpdateRemoteHelpEl = null;
+let executeCoreStatusEl = null;
+let executeCoreTestBtn = null;
+let executeRemoteTestRow = null;
+let executeConfirmPushUpdateToggle = null;
+let executePushUpdateWrap = null;
+let executeConfirmPushUpdateHelpEl = null;
 const EXECUTE_CONFIRM_PREFS_STORAGE_KEY = 'coretg_execute_confirm_prefs';
 
 function loadExecuteConfirmPrefs() {
@@ -9676,9 +10501,43 @@ function setExecuteConfirmUpdateRemotePref(value) {
     persistExecuteConfirmPrefs();
 }
 
+function getExecuteRemoteModePref() {
+    if (executeConfirmPrefs && typeof executeConfirmPrefs.remoteExecution === 'boolean') {
+        return executeConfirmPrefs.remoteExecution;
+    }
+    if (executeConfirmPrefs && typeof executeConfirmPrefs.remoteExecution === 'undefined' && typeof executeConfirmPrefs.updateRemoteRepo === 'boolean') {
+        // Legacy preference stored only the repo push flag; reuse it for initial remote-mode opt-in.
+        return !!executeConfirmPrefs.updateRemoteRepo;
+    }
+    return false;
+}
+
+function setExecuteRemoteModePref(value) {
+    if (!executeConfirmPrefs || typeof executeConfirmPrefs !== 'object') {
+        executeConfirmPrefs = {};
+    }
+    executeConfirmPrefs.remoteExecution = !!value;
+    persistExecuteConfirmPrefs();
+}
+
+function isRemoteExecutionSelected() {
+    if (executeConfirmUpdateRemoteToggle) {
+        return !!executeConfirmUpdateRemoteToggle.checked;
+    }
+    return getExecuteRemoteModePref();
+}
+
 function getExecuteConfirmSelections() {
     return {
-        updateRemote: !!(executeConfirmUpdateRemoteToggle && executeConfirmUpdateRemoteToggle.checked),
+        remoteExecution: isRemoteExecutionSelected(),
+        pushPreference: executeConfirmPushUpdateToggle
+            ? !!executeConfirmPushUpdateToggle.checked
+            : getExecuteConfirmUpdateRemotePref(),
+        updateRemote: isRemoteExecutionSelected() && (
+            executeConfirmPushUpdateToggle
+                ? !!executeConfirmPushUpdateToggle.checked
+                : getExecuteConfirmUpdateRemotePref()
+        ),
     };
 }
 
@@ -9724,6 +10583,27 @@ function ensureExecuteConfirmElements() {
     if (!executeConfirmUpdateRemoteToggle) {
         executeConfirmUpdateRemoteToggle = document.getElementById('executeConfirmUpdateRemoteToggle');
     }
+    if (!executeConfirmUpdateRemoteHelpEl) {
+        executeConfirmUpdateRemoteHelpEl = document.getElementById('executeConfirmUpdateRemoteHelp');
+    }
+    if (!executeCoreStatusEl) {
+        executeCoreStatusEl = document.getElementById('executeCoreStatus');
+    }
+    if (!executeCoreTestBtn) {
+        executeCoreTestBtn = document.getElementById('executeCoreTestBtn');
+    }
+    if (!executeRemoteTestRow) {
+        executeRemoteTestRow = document.getElementById('executeCoreTestRow');
+    }
+    if (!executePushUpdateWrap) {
+        executePushUpdateWrap = document.getElementById('executePushUpdateToggleWrap');
+    }
+    if (!executeConfirmPushUpdateToggle) {
+        executeConfirmPushUpdateToggle = document.getElementById('executeConfirmPushUpdateToggle');
+    }
+    if (!executeConfirmPushUpdateHelpEl) {
+        executeConfirmPushUpdateHelpEl = document.getElementById('executeConfirmPushUpdateHelp');
+    }
     if (executeConfirmRunBtn && !executeConfirmRunBtn.dataset.execBound) {
         executeConfirmRunBtn.addEventListener('click', () => {
             const stayOpen = !!executeConfirmState.keepOpenOnConfirm;
@@ -9745,11 +10625,26 @@ function ensureExecuteConfirmElements() {
         executeConfirmCancelBtn.dataset.execBound = '1';
     }
     if (executeConfirmUpdateRemoteToggle && !executeConfirmUpdateRemoteToggle.dataset.execBound) {
-        executeConfirmUpdateRemoteToggle.checked = getExecuteConfirmUpdateRemotePref();
+        executeConfirmUpdateRemoteToggle.checked = getExecuteRemoteModePref();
         executeConfirmUpdateRemoteToggle.addEventListener('change', () => {
-            setExecuteConfirmUpdateRemotePref(executeConfirmUpdateRemoteToggle.checked);
+            setExecuteRemoteModePref(executeConfirmUpdateRemoteToggle.checked);
+            refreshExecuteRemoteToggleState();
         });
         executeConfirmUpdateRemoteToggle.dataset.execBound = '1';
+    }
+    if (executeConfirmPushUpdateToggle && !executeConfirmPushUpdateToggle.dataset.execBound) {
+        executeConfirmPushUpdateToggle.checked = getExecuteConfirmUpdateRemotePref();
+        executeConfirmPushUpdateToggle.addEventListener('change', () => {
+            setExecuteConfirmUpdateRemotePref(executeConfirmPushUpdateToggle.checked);
+            refreshExecuteRemoteToggleState();
+        });
+        executeConfirmPushUpdateToggle.dataset.execBound = '1';
+    }
+    if (executeCoreTestBtn && !executeCoreTestBtn.dataset.execBound) {
+        executeCoreTestBtn.addEventListener('click', () => {
+            handleExecuteCoreTestClick();
+        });
+        executeCoreTestBtn.dataset.execBound = '1';
     }
     if (executeConfirmModalEl && !executeConfirmModalEl.dataset.execHiddenBound) {
         executeConfirmModalEl.addEventListener('hidden.bs.modal', () => {
@@ -9761,8 +10656,102 @@ function ensureExecuteConfirmElements() {
     if (executeConfirmModalEl && !executeConfirmModalEl.dataset.execShowBound) {
         executeConfirmModalEl.addEventListener('show.bs.modal', () => {
             resetExecuteProgressUI();
+            refreshExecuteRemoteToggleState();
         });
         executeConfirmModalEl.dataset.execShowBound = '1';
+    }
+}
+
+function updateExecuteCoreStatus(info = null) {
+    if (!executeCoreStatusEl) return;
+    const statusInfo = info || detectLocalEmulation();
+    const classes = ['text-muted', 'text-success', 'text-warning', 'text-danger'];
+    executeCoreStatusEl.classList.remove(...classes);
+    if (statusInfo.verified) {
+        executeCoreStatusEl.textContent = `Connected to CORE ${statusInfo.host}:${statusInfo.port}`;
+        executeCoreStatusEl.classList.add('text-success');
+    } else if (statusInfo.shouldFake) {
+        executeCoreStatusEl.textContent = 'CORE not connected. Runs will fall back to local emulation.';
+        executeCoreStatusEl.classList.add('text-danger');
+    } else {
+        executeCoreStatusEl.textContent = 'CORE connection not validated yet. Test before running remotely.';
+        executeCoreStatusEl.classList.add('text-warning');
+    }
+}
+
+function refreshExecuteRemoteToggleState() {
+    const info = detectLocalEmulation();
+    updateExecuteCoreStatus(info);
+    const remoteSelected = isRemoteExecutionSelected();
+    const pushPref = getExecuteConfirmUpdateRemotePref();
+    if (executeRemoteTestRow) {
+        executeRemoteTestRow.classList.toggle('d-none', !remoteSelected);
+    }
+    if (executePushUpdateWrap) {
+        executePushUpdateWrap.classList.toggle('d-none', !remoteSelected);
+    }
+    if (executeConfirmPushUpdateToggle) {
+        if (remoteSelected) {
+            executeConfirmPushUpdateToggle.checked = pushPref;
+        }
+        executeConfirmPushUpdateToggle.disabled = !remoteSelected;
+    }
+    if (executeConfirmPushUpdateHelpEl) {
+        executeConfirmPushUpdateHelpEl.classList.toggle('text-muted', !remoteSelected);
+        executeConfirmPushUpdateHelpEl.textContent = remoteSelected
+            ? 'Sync the current repository snapshot to your CORE VM before execution.'
+            : 'Enable remote execution to push the latest backend before running.';
+    }
+    if (executeConfirmUpdateRemoteHelpEl) {
+        executeConfirmUpdateRemoteHelpEl.classList.remove('text-muted', 'text-success', 'text-warning');
+        if (remoteSelected) {
+            const remoteMsg = info.verified
+                ? 'Remote execution ready. Runs will target your CORE VM.'
+                : 'Remote execution requires a validated CORE connection. Test before running.';
+            executeConfirmUpdateRemoteHelpEl.textContent = remoteMsg;
+            executeConfirmUpdateRemoteHelpEl.classList.add(info.verified ? 'text-success' : 'text-warning');
+        } else {
+            executeConfirmUpdateRemoteHelpEl.textContent = 'Emulation mode runs locally on this workstation.';
+            executeConfirmUpdateRemoteHelpEl.classList.add('text-muted');
+        }
+    }
+    if (executeConfirmRunBtn) {
+        const shouldDisable = remoteSelected && !info.verified;
+        executeConfirmRunBtn.disabled = shouldDisable;
+        if (shouldDisable) {
+            executeConfirmRunBtn.setAttribute('title', 'Test the CORE connection to enable remote execution.');
+        } else {
+            executeConfirmRunBtn.removeAttribute('title');
+        }
+    }
+}
+
+async function handleExecuteCoreTestClick() {
+    const button = executeCoreTestBtn;
+    const statusEl = executeCoreStatusEl;
+    const { idx: scenarioIdx } = getActiveScenarioContext();
+    if (!Number.isInteger(scenarioIdx)) {
+        if (statusEl) {
+            statusEl.textContent = 'Select a scenario before testing the CORE connection.';
+            statusEl.classList.remove('text-success');
+            statusEl.classList.add('text-danger');
+        }
+        return;
+    }
+    try {
+        await validateCoreConnection(scenarioIdx, {
+            triggerButton: button || undefined,
+            statusEl: statusEl || undefined,
+            workingLabel: 'Testing…',
+            hintOnStart: 'Validating CORE connection…',
+            hintOnSuccess: 'CORE connection validated for remote execution.',
+            hintOnFailure: 'CORE connection test failed',
+            suppressToasts: false,
+        });
+    } catch (err) {
+        console.warn('CORE connection test from execute modal failed', err);
+    } finally {
+        refreshExecuteRemoteToggleState();
     }
 }
 
@@ -9852,6 +10841,7 @@ function resetExecuteProgressUI() {
         }
         executeConfirmRunBtn.disabled = false;
         executeConfirmRunBtn.textContent = executeConfirmRunBtn.dataset.defaultLabel;
+        executeConfirmRunBtn.removeAttribute('title');
     }
     if (executeConfirmCancelBtn) {
         if (!executeConfirmCancelBtn.dataset.cancelLabel) {
@@ -9994,11 +10984,18 @@ function settleExecuteConfirm(result) {
         payload = { confirmed: false };
     }
     const selections = getExecuteConfirmSelections();
-    if (selections && typeof selections.updateRemote !== 'undefined') {
-        if (typeof payload.updateRemote === 'undefined') {
+    if (selections) {
+        if (typeof selections.updateRemote !== 'undefined' && typeof payload.updateRemote === 'undefined') {
             payload.updateRemote = selections.updateRemote;
         }
-        setExecuteConfirmUpdateRemotePref(selections.updateRemote);
+        if (typeof selections.pushPreference !== 'undefined') {
+            setExecuteConfirmUpdateRemotePref(selections.pushPreference);
+        } else if (typeof selections.updateRemote !== 'undefined') {
+            setExecuteConfirmUpdateRemotePref(selections.updateRemote);
+        }
+        if (typeof selections.remoteExecution !== 'undefined') {
+            setExecuteRemoteModePref(selections.remoteExecution);
+        }
     }
     resolver?.({ ...payload, scenarioIndex });
 }
@@ -10032,17 +11029,33 @@ async function promptExecuteConfirmation(options = {}) {
     const alertTone = options.alertTone || 'warning';
     const keepOpenOnConfirm = !!options.keepOpenOnConfirm;
     ensureExecuteConfirmElements();
+    const remoteModeDefault = typeof options.remoteModeDefault === 'boolean'
+        ? options.remoteModeDefault
+        : getExecuteRemoteModePref();
     const updateRemoteDefault = typeof options.updateRemoteDefault === 'boolean'
         ? options.updateRemoteDefault
         : getExecuteConfirmUpdateRemotePref();
     if (executeConfirmUpdateRemoteToggle) {
-        executeConfirmUpdateRemoteToggle.checked = !!updateRemoteDefault;
+        executeConfirmUpdateRemoteToggle.checked = !!remoteModeDefault;
+    } else if (typeof remoteModeDefault === 'boolean') {
+        setExecuteRemoteModePref(remoteModeDefault);
+    }
+    if (executeConfirmPushUpdateToggle) {
+        executeConfirmPushUpdateToggle.checked = !!updateRemoteDefault;
     } else if (typeof updateRemoteDefault === 'boolean') {
         setExecuteConfirmUpdateRemotePref(updateRemoteDefault);
     }
     if (!executeConfirmModalEl || !window.bootstrap) {
         const confirmed = window.confirm(message);
-        return { confirmed, scenarioIndex, updateRemote: !!updateRemoteDefault };
+        const remoteExecution = !!remoteModeDefault;
+        const pushPreference = !!updateRemoteDefault;
+        return {
+            confirmed,
+            scenarioIndex,
+            updateRemote: remoteExecution && pushPreference,
+            remoteExecution,
+            pushPreference,
+        };
     }
     executeConfirmState.pending = true;
     executeConfirmState.scenarioIndex = Number.isInteger(scenarioIndex) ? scenarioIndex : null;
@@ -10051,10 +11064,11 @@ async function promptExecuteConfirmation(options = {}) {
         executeConfirmMessageEl.textContent = message;
     }
     updateExecuteConfirmAlert(alertMessage, alertTone);
+    resetExecuteProgressUI();
     if (executeConfirmRunBtn) {
         executeConfirmRunBtn.textContent = confirmLabel;
     }
-    resetExecuteProgressUI();
+    refreshExecuteRemoteToggleState();
     const modalInstance = bootstrap.Modal.getOrCreateInstance(executeConfirmModalEl);
     return new Promise((resolve) => {
         executeConfirmState.resolve = resolve;
@@ -10086,16 +11100,44 @@ function saveScrollBeforeNav(){
 const editorForm = document.getElementById('editorForm');
 
 if (editorForm) {
-    editorForm.addEventListener('submit', () => {
-        // preserve current scroll so we can restore after the server round-trip
+    const handleEditorFormSubmit = async (event) => {
+        if (event) {
+            event.preventDefault();
+        }
         try { sessionStorage.setItem('coretg_saved_scroll_y', String(window.scrollY || window.pageYOffset || 0)); } catch (e) { /* ignore */ }
-    document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+        const scenariosInput = document.getElementById('scenarios_json');
+        if (scenariosInput) {
+            scenariosInput.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+        }
         const coreJsonInput = document.getElementById('core_json');
         if (coreJsonInput) {
             coreJsonInput.value = JSON.stringify(getCoreConfig(true));
         }
+        const projectKeyInput = document.getElementById('project_key_hint');
+        if (projectKeyInput) {
+            projectKeyInput.value = currentProjectKey || DEFAULT_PROJECT_KEY;
+        }
+        const scenarioQueryInput = document.getElementById('scenario_query_input');
+        if (scenarioQueryInput) {
+            scenarioQueryInput.value = resolveScenarioQueryHint();
+        }
         persistEditorState();
-    });
+        if (typeof autoSaveXml === 'function') {
+            try {
+                await autoSaveXml();
+                return;
+            } catch (err) {
+                console.warn('Auto Save XML failed, falling back to full form submit', err);
+            }
+        }
+        editorForm.removeEventListener('submit', handleEditorFormSubmit);
+        try {
+            editorForm.submit();
+        } finally {
+            editorForm.addEventListener('submit', handleEditorFormSubmit);
+        }
+    };
+    editorForm.addEventListener('submit', handleEditorFormSubmit);
 }
 
 // Enable Bootstrap tooltips globally
@@ -10559,6 +11601,7 @@ async function openVulnPicker(sidx, secName, iidx){
 
 const RUN_CLI_URL = "{{ url_for('run_cli_async') }}";
 const PUSH_REPO_URL = "{{ url_for('core_push_repo_route') }}";
+const PUSH_REPO_STATUS_BASE = "{{ url_for('core_push_repo_status', progress_id='__PROGRESS__') }}";
 
 function buildRunFormData(xmlPath, options = {}) {
     const form = new FormData();
@@ -10622,7 +11665,9 @@ async function extractResponseDetail(response) {
 async function pushRepoToRemote(xmlPath, options = {}) {
     const formOptions = { ...options };
     const onProgress = typeof formOptions.onProgress === 'function' ? formOptions.onProgress : null;
+    const onFinalizeProgress = typeof formOptions.onFinalizeProgress === 'function' ? formOptions.onFinalizeProgress : null;
     delete formOptions.onProgress;
+    delete formOptions.onFinalizeProgress;
     formOptions.updateRemoteRepo = false;
     const form = buildRunFormData(xmlPath, formOptions);
     logInfo('Uploading repository to CORE host…');
@@ -10639,7 +11684,14 @@ async function pushRepoToRemote(xmlPath, options = {}) {
             }
             const data = await parseResponseJson(res);
             const repoPath = data && typeof data === 'object' ? data.repo_path : null;
+            const progressId = data && typeof data.progress_id === 'string' ? data.progress_id : null;
             logInfo(`Repository uploaded${repoPath ? ` to ${repoPath}` : ''}.`);
+            if (progressId) {
+                const finalized = await waitForRepoFinalize(progressId, { onProgress: onFinalizeProgress });
+                if (!finalized) {
+                    return false;
+                }
+            }
             return true;
         } catch (err) {
             const message = `Repo upload exception: ${err?.message || err}`;
@@ -10698,14 +11750,22 @@ async function pushRepoToRemote(xmlPath, options = {}) {
             alert(message);
             resolve(false);
         };
-        xhr.onreadystatechange = () => {
+        xhr.onreadystatechange = async () => {
             if (xhr.readyState !== XMLHttpRequest.DONE) {
                 return;
             }
             if (xhr.status >= 200 && xhr.status < 300) {
                 const data = xhr.response && typeof xhr.response === 'object' ? xhr.response : null;
                 const repoPath = data && typeof data.repo_path === 'string' ? data.repo_path : null;
+                const progressId = data && typeof data.progress_id === 'string' ? data.progress_id : null;
                 logInfo(`Repository uploaded${repoPath ? ` to ${repoPath}` : ''}.`);
+                if (progressId) {
+                    const finalized = await waitForRepoFinalize(progressId, { onProgress: onFinalizeProgress });
+                    if (!finalized) {
+                        resolve(false);
+                        return;
+                    }
+                }
                 resolve(true);
                 return;
             }
@@ -10726,6 +11786,69 @@ async function pushRepoToRemote(xmlPath, options = {}) {
     });
 }
 
+function buildRepoFinalizeStatusUrl(progressId) {
+    if (!progressId || !PUSH_REPO_STATUS_BASE) {
+        return null;
+    }
+    return PUSH_REPO_STATUS_BASE.replace('__PROGRESS__', encodeURIComponent(progressId));
+}
+
+async function waitForRepoFinalize(progressId, options = {}) {
+    if (!progressId) {
+        return true;
+    }
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const pollInterval = Math.max(500, options.intervalMs || 1500);
+    const timeoutMs = Math.max(pollInterval * 20, options.timeoutMs || 240000);
+    const started = Date.now();
+    let consecutiveUnknown = 0;
+    const statusUrl = buildRepoFinalizeStatusUrl(progressId);
+    if (!statusUrl) {
+        onProgress?.({ status: 'error', detail: 'Missing finalize status endpoint.' });
+        return false;
+    }
+    while (true) {
+        let response = null;
+        try {
+            response = await fetch(statusUrl, { method: 'GET', cache: 'no-store' });
+        } catch (err) {
+            if (Date.now() - started > timeoutMs) {
+                onProgress?.({ status: 'error', detail: `Finalize poll failed: ${err?.message || err}` });
+                return false;
+            }
+            await new Promise((resolve) => setTimeout(resolve, pollInterval));
+            continue;
+        }
+        if (response.status === 200) {
+            const info = (await parseResponseJson(response)) || {};
+            consecutiveUnknown = 0;
+            onProgress?.(info);
+            if (info.status === 'complete') {
+                return true;
+            }
+            if (info.status === 'error') {
+                return false;
+            }
+        } else if (response.status === 404) {
+            consecutiveUnknown += 1;
+            onProgress?.({ status: 'pending', stage: 'waiting', detail: 'Waiting for remote finalize tracker…' });
+            if (consecutiveUnknown >= 5) {
+                onProgress?.({ status: 'error', detail: 'Remote finalize tracker unavailable.' });
+                return false;
+            }
+        } else {
+            const detail = await extractResponseDetail(response);
+            onProgress?.({ status: 'error', detail: detail || `Finalize status failed (HTTP ${response.status})` });
+            return false;
+        }
+        if (Date.now() - started > timeoutMs) {
+            onProgress?.({ status: 'error', detail: 'Remote finalize timed out.' });
+            return false;
+        }
+        await new Promise((resolve) => setTimeout(resolve, pollInterval));
+    }
+}
+
 async function handleMissingRepoResponse(response, context = {}) {
     const info = await parseResponseJson(response);
     const repoPath = info?.missing_repo || context.repoPath || 'remote CORE workspace';
@@ -10743,6 +11866,11 @@ async function handleMissingRepoResponse(response, context = {}) {
     }
     const pushed = await pushRepoToRemote(context.xmlPath || info?.xml_path || null, {
         scenarioIndex: context.scenarioIndex,
+        onFinalizeProgress: (progressInfo) => {
+            if (progressInfo && progressInfo.detail) {
+                logInfo(`Remote finalize: ${progressInfo.detail}`);
+            }
+        },
     });
     if (!pushed) {
         return false;
@@ -10892,6 +12020,7 @@ async function saveXmlAjax(){
             if (data.result_path) {
                 state.result_path = data.result_path;
             }
+            try { updateDownloadButtonState(); } catch (err) {}
             persistEditorState();
             if (data.result_path) {
                 logInfo('Scenarios saved to ' + data.result_path);
@@ -11164,6 +12293,8 @@ async function runSyncWithModal(arg){
     let lastLoggedUploadBytes = null;
     let uploadDelivered = false;
     let lastFinalizeLogTs = null;
+    let lastProgressPercent = 0;
+    let lastFinalizeDetail = null;
     const updateRunStatus = (status, meta) => {
         if (executeProgressState.active) {
             setExecuteProgressStatus(status, meta);
@@ -11262,13 +12393,15 @@ async function runSyncWithModal(arg){
             return;
         }
         const clamped = Math.max(0, Math.min(100, percent));
+        const pctValue = Math.max(clamped, lastProgressPercent || 0);
+        lastProgressPercent = pctValue;
         if (executeProgressState.active) {
-            setExecuteProgressPercent(clamped, label || `${clamped.toFixed(1)}%`);
+            setExecuteProgressPercent(pctValue, label || `${pctValue.toFixed(1)}%`);
         } else if (showProgressModal) {
             const bar = document.getElementById('runProgressBar');
             if (bar) {
-                const pctText = clamped.toFixed(1).replace(/\.0$/, '');
-                bar.style.width = `${clamped.toFixed(1)}%`;
+                const pctText = pctValue.toFixed(1).replace(/\.0$/, '');
+                bar.style.width = `${pctValue.toFixed(1)}%`;
                 bar.textContent = label || `${pctText}%`;
             }
         }
@@ -11295,6 +12428,32 @@ async function runSyncWithModal(arg){
         }
         logUploadSnapshot(info);
     };
+    const handleFinalizeProgress = (info) => {
+        if (!info || typeof info !== 'object') {
+            return;
+        }
+        const status = info.status || 'pending';
+        const detail = info.detail || info.stage || 'Remote finalize in progress…';
+        const percent = typeof info.percent === 'number' ? Math.max(0, Math.min(100, info.percent)) : null;
+        if (detail && detail !== lastFinalizeDetail) {
+            lastFinalizeDetail = detail;
+            const pctText = percent !== null ? ` (${percent.toFixed(0)}%)` : '';
+            appendExecuteDialogLog(`Remote finalize: ${detail}${pctText}`);
+        }
+        if (detail) {
+            updateRunStatus('Finishing repository sync…', detail);
+        }
+        if (percent !== null) {
+            setUploadProgressValue(percent, `${percent.toFixed(0)}%`);
+        }
+        if (status === 'error') {
+            logError('Remote finalize reported an error; check server logs for details.');
+        }
+        if (status === 'complete') {
+            uploadDelivered = true;
+            stopUploadHeartbeat();
+        }
+    };
     // Validate saved XML
     let rp = state.result_path || '';
     if (!rp.endsWith('.xml')) {
@@ -11308,15 +12467,13 @@ async function runSyncWithModal(arg){
         } catch(e){ logError('Exception during auto-save; aborting run'); return false; }
     }
     const execInfo = detectLocalEmulation();
-    const confirmMsg = execInfo.shouldFake
-        ? 'CORE not connected; this run will use fake local emulation. Proceed?'
-        : 'This will generate a CORE scenario and attempt to start it. Proceed?';
+    const confirmMsg = 'This will generate a CORE scenario and attempt to start it. Proceed?';
     if (!skipConfirm) {
         const confirmResult = await promptExecuteConfirmation({
             message: confirmMsg,
             scenarioIndex: scenarioIndexForRun,
-            alertMessage: execInfo.shouldFake ? 'CORE not connected; run will use fake local emulation.' : '',
-            alertTone: execInfo.shouldFake ? 'warning' : 'info',
+            alertMessage: '',
+            alertTone: 'info',
         });
         if (!confirmResult?.confirmed) {
             logInfo('Run CLI cancelled by user at confirmation');
@@ -11353,6 +12510,7 @@ async function runSyncWithModal(arg){
             const pushed = await pushRepoToRemote(rp, {
                 scenarioIndex: scenarioIndexForRun,
                 onProgress: handleRepoUploadProgress,
+                onFinalizeProgress: handleFinalizeProgress,
             });
             if(!pushed){
                 appendExecuteDialogLog('Repository upload failed; aborting run.');
@@ -11554,15 +12712,13 @@ async function runWithSeedBuild(){
         return;
     }
     const execInfo = detectLocalEmulation();
-    const confirmMsg = execInfo.shouldFake
-        ? `CORE not connected; the run will use fake local emulation (seed=${seedVal}). Continue?`
-        : `Run CLI with seed=${seedVal}? This will start a CORE session.`;
+    const confirmMsg = `Run CLI with seed=${seedVal}? This will start a CORE session.`;
     const { idx: scenarioIdx } = getActiveScenarioContext();
     const confirmResult = await promptExecuteConfirmation({
         message: confirmMsg,
         scenarioIndex: scenarioIdx,
-        alertMessage: execInfo.shouldFake ? `CORE not connected; run will use fake local emulation (seed=${seedVal}).` : '',
-        alertTone: execInfo.shouldFake ? 'warning' : 'info',
+        alertMessage: '',
+        alertTone: 'info',
         confirmLabel: 'Run with seed',
     });
     if(!confirmResult?.confirmed) return;
@@ -11594,6 +12750,30 @@ async function runWithSeedBuild(){
             bar.textContent = `${clamped.toFixed(1)}%`;
         }
     };
+    let lastSeedFinalizeDetail = null;
+    const handleSeedFinalizeProgress = (info) => {
+        if (!info || typeof info !== 'object') {
+            return;
+        }
+        const detail = info.detail || info.stage || 'Remote finalize in progress…';
+        const percent = typeof info.percent === 'number' ? Math.max(0, Math.min(100, info.percent)) : null;
+        if (detail && detail !== lastSeedFinalizeDetail) {
+            lastSeedFinalizeDetail = detail;
+            runProgressLogLine(`[ui] Remote finalize: ${detail}${percent !== null ? ` (${percent.toFixed(0)}%)` : ''}`);
+        }
+        const metaEl = document.getElementById('runProgressMeta');
+        if (metaEl && detail) {
+            metaEl.textContent = detail;
+        }
+        if (percent !== null) {
+            const bar = document.getElementById('runProgressBar');
+            if (bar) {
+                const pct = percent.toFixed(1);
+                bar.style.width = `${pct}%`;
+                bar.textContent = `${pct}%`;
+            }
+        }
+    };
     if(updateRemoteRepo){
         runProgressLogLine('[ui] Repository sync requested by user.');
         const statusEl = document.getElementById('runProgressStatus');
@@ -11610,6 +12790,7 @@ async function runWithSeedBuild(){
         const pushed = await pushRepoToRemote(rp, {
             scenarioIndex: scenarioIdx,
             onProgress: updateSeedUploadProgress,
+            onFinalizeProgress: handleSeedFinalizeProgress,
         });
         if(!pushed){
             runProgressLogLine('[ui] Repository upload failed; aborting seeded run.');

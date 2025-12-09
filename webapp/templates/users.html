@@ -29,77 +29,122 @@
     <a class="btn btn-outline-secondary" href="{{ url_for('index') }}">Back</a>
     </form>
   {% else %}
-    <div class="d-flex justify-content-between align-items-center">
-      <h3>Users</h3>
+    <div class="d-flex justify-content-between align-items-center mb-3">
+      <h3 class="mb-0">User Administration</h3>
       <a class="btn btn-outline-secondary" href="{{ url_for('index') }}">Back</a>
     </div>
-      <div class="d-flex align-items-center gap-2">
-        {% if current_user and current_user.role == 'admin' %}
-        <div class="dropdown">
-          <button class="btn btn-sm btn-light dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">
-            Settings
-          </button>
-          <ul class="dropdown-menu dropdown-menu-end">
-            <li><a class="dropdown-item" href="{{ url_for('users_page') }}">Users</a></li>
-          </ul>
-        </div>
-        {% endif %}
-      </div>
-    <div class="row mt-3">
-      <div class="col-md-6">
-        <div class="card">
-          <div class="card-header">Create User</div>
-          <div class="card-body">
-            <form action="{{ url_for('users_create') }}" method="post">
-              <div class="mb-3">
-                <label class="form-label">Username</label>
-                <input type="text" name="username" class="form-control" required>
-              </div>
-              <div class="mb-3">
-                <label class="form-label">Password</label>
-                <input type="password" name="password" class="form-control" required>
-              </div>
-              <div class="mb-3">
-                <label class="form-label">Role</label>
-                <select name="role" class="form-select">
-                  <option value="user">user</option>
-                  <option value="admin">admin</option>
-                </select>
-              </div>
-              <button class="btn btn-primary">Create</button>
-            </form>
+    <div class="card mb-4">
+      <div class="card-header">Create User</div>
+      <div class="card-body">
+        <form action="{{ url_for('users_create') }}" method="post" class="row g-3">
+          <div class="col-md-4">
+            <label class="form-label">Username</label>
+            <input type="text" name="username" class="form-control" required>
           </div>
-        </div>
-      </div>
-      <div class="col-md-6">
-        <div class="card">
-          <div class="card-header">Existing Users</div>
-          <div class="card-body">
-            <table class="table table-sm">
-              <thead><tr><th>User</th><th>Role</th><th>Actions</th></tr></thead>
-              <tbody>
-              {% for u in users %}
-                <tr>
-                  <td>{{ u.username }}</td>
-                  <td>{{ u.role }}</td>
-                  <td class="d-flex gap-2">
-                    <form action="{{ url_for('users_password', username=u.username) }}" method="post" class="d-flex gap-1">
-                      <input type="password" name="password" class="form-control form-control-sm" placeholder="new password" required>
-                      <button class="btn btn-sm btn-outline-primary">Change</button>
-                    </form>
-                    <form action="{{ url_for('users_delete', username=u.username) }}" method="post" onsubmit="return confirm('Delete user {{ u.username }}?');">
-                      <button class="btn btn-sm btn-outline-danger">Delete</button>
-                    </form>
-                  </td>
-                </tr>
-              {% endfor %}
-              </tbody>
-            </table>
+          <div class="col-md-4">
+            <label class="form-label">Password</label>
+            <input type="password" name="password" class="form-control" required>
           </div>
+          <div class="col-md-4">
+            <label class="form-label">Role</label>
+            <select name="role" class="form-select" required>
+              <option value="participant" selected>participant</option>
+              <option value="builder">builder</option>
+              <option value="admin">admin</option>
+            </select>
+            <div class="form-text">Participants see only the Participant UI. Builders get admin tools except user management.</div>
+          </div>
+          <div class="col-12">
+            <label class="form-label">Assigned Scenarios</label>
+            {% if scenario_options %}
+              <select name="scenarios" multiple class="form-select" size="{{ [scenario_options|length, 8]|min }}">
+                {% for opt in scenario_options %}
+                  <option value="{{ opt.value }}">{{ opt.label }}</option>
+                {% endfor %}
+              </select>
+              <div class="form-text">Hold Cmd/Ctrl to select multiple. Leave empty to allow no scenarios yet.</div>
+            {% else %}
+              <div class="form-text text-muted">No scenarios detected yet. Assignments can be added later.</div>
+            {% endif %}
+          </div>
+          <div class="col-12 text-end">
+            <button class="btn btn-primary">Create</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header">Existing Users</div>
+      <div class="card-body">
+            <div class="table-responsive">
+              <table class="table table-sm align-middle">
+                <thead>
+                  <tr>
+                    <th style="width: 12%">User</th>
+                    <th style="width: 10%">Role</th>
+                    <th>Assigned Scenarios</th>
+                    <th style="width: 26%">Password / Delete</th>
+                  </tr>
+                </thead>
+                <tbody>
+                {% for u in users %}
+                  <tr>
+                    <td class="fw-semibold">{{ u.username }}</td>
+                    <td><span class="badge {% if u.role == 'admin' %}text-bg-danger{% elif u.role == 'builder' %}text-bg-warning text-dark{% else %}text-bg-secondary{% endif %}">{{ u.role }}</span></td>
+                    <td>
+                      {% if u.assigned_scenarios_display %}
+                        <div class="d-flex flex-wrap gap-1 mb-2">
+                          {% for label in u.assigned_scenarios_display %}
+                            <span class="badge text-bg-primary">{{ label }}</span>
+                          {% endfor %}
+                        </div>
+                      {% else %}
+                        <div class="text-muted small mb-2">No scenarios assigned</div>
+                      {% endif %}
+                      {% if scenario_options %}
+                      <form action="{{ url_for('users_assign_scenarios', username=u.username) }}" method="post" class="d-flex flex-column gap-2">
+                        <select name="scenarios" multiple class="form-select form-select-sm" size="{{ [scenario_options|length, 5]|min }}">
+                          {% for opt in scenario_options %}
+                            <option value="{{ opt.value }}" {% if opt.value in u.assigned_scenarios %}selected{% endif %}>{{ opt.label }}</option>
+                          {% endfor %}
+                        </select>
+                        <div class="d-flex gap-2 flex-wrap">
+                          <button class="btn btn-sm btn-outline-primary">Save</button>
+                          <button type="button" class="btn btn-sm btn-outline-secondary" data-clear-scenarios>Clear</button>
+                        </div>
+                      </form>
+                      {% else %}
+                        <div class="text-muted small">No scenarios available to assign.</div>
+                      {% endif %}
+                    </td>
+                    <td>
+                      <form action="{{ url_for('users_password', username=u.username) }}" method="post" class="d-flex gap-2 flex-wrap align-items-center mb-2">
+                        <input type="password" name="password" class="form-control form-control-sm" placeholder="new password" required>
+                        <button class="btn btn-sm btn-outline-primary">Update</button>
+                      </form>
+                      <form action="{{ url_for('users_delete', username=u.username) }}" method="post" onsubmit="return confirm('Delete user {{ u.username }}?');">
+                        <button class="btn btn-sm btn-outline-danger w-100">Delete</button>
+                      </form>
+                    </td>
+                  </tr>
+                {% endfor %}
+                </tbody>
+              </table>
+            </div>
         </div>
       </div>
     </div>
   {% endif %}
 </div>
+<script>
+  document.addEventListener('click', function(ev){
+    const btn = ev.target.closest('[data-clear-scenarios]');
+    if(!btn) return;
+    const form = btn.closest('form');
+    if(!form) return;
+    form.querySelectorAll('select option').forEach(opt => opt.selected = false);
+    form.submit();
+  });
+</script>
 </body>
 </html>

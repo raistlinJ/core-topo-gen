@@ -10,6 +10,15 @@
   <style>
     .nav-link.core-link { font-weight: 600; color: #0d6efd !important; border: 1px solid rgba(13,110,253,.2); border-radius: .25rem; padding-left: .5rem; padding-right: .5rem; }
     .navbar .nav-link.core-link .bi { margin-right: .25rem; }
+    .navbar.participant-view { background: #1f2933 !important; border: none !important; color: #f8fafc; }
+    .navbar.participant-view .nav-link { color: rgba(255,255,255,0.85); }
+    .navbar.participant-view .nav-link:hover,
+    .navbar.participant-view .nav-link:focus,
+    .navbar.participant-view .nav-link.active { color: #fff; }
+    .navbar.participant-view .nav-link.disabled { color: rgba(255,255,255,0.4); }
+    .view-toggle-form { display: inline; }
+    .view-toggle-form + .view-toggle-form { margin-left: 0.25rem; }
+    .view-toggle-group .btn.active { font-weight: 600; }
   </style>
   {% block extra_head %}{% endblock %}
 </head>
@@ -49,15 +58,42 @@
         {% set nav_scenario = request.args.get('scenario', '').strip() if request else '' %}
         {% set nav_reports_href = url_for('reports_page', scenario=nav_scenario) if nav_scenario else url_for('reports_page') %}
         {% set nav_core_href = url_for('core_page', scenario=nav_scenario) if nav_scenario else url_for('core_page') %}
-        <nav class="navbar navbar-expand bg-light border rounded-bottom shadow-sm mb-3 px-2 py-0">
+        {% set is_admin_view = (ui_view_mode == 'admin') %}
+        {% set navbar_classes = 'navbar navbar-expand rounded-bottom shadow-sm mb-3 px-2 py-0 ' ~ ('bg-light border admin-nav' if is_admin_view else 'participant-view text-white') %}
+        {% set nav_participant_available = nav_participant_url or '' %}
+        {% set nav_participant_link = url_for('participant_ui_page', scenario=nav_scenario) if nav_scenario else url_for('participant_ui_page') %}
+        <nav class="{{ navbar_classes }}">
           <ul class="navbar-nav me-auto mb-0 small">
+            {% if is_admin_view %}
             <li class="nav-item"><a class="nav-link {% if active_page=='scenarios' %}active{% endif %}" href="{{ url_for('index') }}">Scenarios</a></li>
             <li class="nav-item"><a class="nav-link {% if active_page=='data_sources' %}active{% endif %}" href="{{ url_for('data_sources_page') }}">Vulnerability Sources</a></li>
             <li class="nav-item"><a class="nav-link {% if active_page=='reports' %}active{% endif %}" href="{{ nav_reports_href }}">Reports</a></li>
             <li class="nav-item"><a id="navCoreLink" class="nav-link core-link {% if active_page=='core' %}active{% endif %}" href="{{ nav_core_href }}"><i class="bi bi-diagram-3-fill"></i> CORE</a></li>
+            {% endif %}
+            <li class="nav-item{% if not nav_participant_available %} d-none{% endif %}" id="navParticipantLinkWrap">
+              <a id="navParticipantLink" class="nav-link {% if active_page=='participant_ui' %}active{% endif %}" data-initial-participant-url="{{ nav_participant_available }}" href="{{ nav_participant_link }}" title="Participant UI">Participant UI</a>
+            </li>
           </ul>
-          <div class="d-flex align-items-center gap-2" id="navRightExtras">
-            {% block nav_right_extra %}{% endblock %}
+          <div class="d-flex align-items-center gap-3 ms-auto">
+            <div class="d-flex align-items-center gap-2 {% if not is_admin_view %}d-none{% endif %}" id="navRightExtras">
+              {% if is_admin_view %}{% block nav_right_extra %}{% endblock %}{% endif %}
+            </div>
+            {% if current_user.role in ['admin', 'builder'] %}
+              {% set toggle_outline = 'btn-outline-secondary' if is_admin_view else 'btn-outline-light' %}
+              {% set next_href = request.full_path if request and request.full_path else request.path %}
+              <div class="view-toggle-group d-flex align-items-center">
+                <form class="view-toggle-form" method="post" action="{{ url_for('set_ui_view_mode') }}">
+                  <input type="hidden" name="mode" value="participant">
+                  <input type="hidden" name="next" value="{{ next_href }}">
+                  <button type="submit" class="btn btn-sm {{ toggle_outline }} {% if not is_admin_view %}active{% endif %}">Participant View</button>
+                </form>
+                <form class="view-toggle-form" method="post" action="{{ url_for('set_ui_view_mode') }}">
+                  <input type="hidden" name="mode" value="admin">
+                  <input type="hidden" name="next" value="{{ next_href }}">
+                  <button type="submit" class="btn btn-sm {{ toggle_outline }} {% if is_admin_view %}active{% endif %}">Admin View</button>
+                </form>
+              </div>
+            {% endif %}
           </div>
         </nav>
       </div>
@@ -71,6 +107,68 @@
     {% endblock %}
   </div>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    (function(){
+      window.CORETG_PARTICIPANT_UI_HREF = window.CORETG_PARTICIPANT_UI_HREF || '';
+      const wrapper = document.getElementById('navParticipantLinkWrap');
+      const link = document.getElementById('navParticipantLink');
+      if(!wrapper || !link || typeof window === 'undefined') return;
+      const normalizeParticipantHref = (value) => {
+        if(value === undefined || value === null) return '';
+        let trimmed = String(value).trim();
+        if(!trimmed) return '';
+        if(!/^https?:\/\//i.test(trimmed)) trimmed = `https://${trimmed}`;
+        try {
+          const parsed = new URL(trimmed);
+          if(parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+          return parsed.toString();
+        } catch(err) {
+          return '';
+        }
+      };
+      const applyAvailability = (href) => {
+        const hasHref = !!href;
+        if(hasHref){
+          wrapper.classList.remove('d-none');
+          link.removeAttribute('aria-disabled');
+          link.setAttribute('title', `Participant UI (${href})`);
+          link.dataset.participantUiHref = href;
+        } else {
+          wrapper.classList.add('d-none');
+          link.setAttribute('aria-disabled', 'true');
+          link.setAttribute('title', 'Participant UI unavailable');
+          link.dataset.participantUiHref = '';
+        }
+        window.CORETG_PARTICIPANT_UI_HREF = href || '';
+      };
+      const loadEditorStateHref = () => {
+        if(!window.localStorage) return '';
+        const raw = window.localStorage.getItem('coretg_editor_state');
+        if(!raw) return '';
+        try {
+          const parsed = JSON.parse(raw);
+          if(!parsed || !Array.isArray(parsed.scenarios) || parsed.scenarios.length === 0) return '';
+          let idx = Number(parsed.active_index);
+          if(Number.isNaN(idx) || idx < 0 || idx >= parsed.scenarios.length) idx = 0;
+          const scenario = parsed.scenarios[idx];
+          const hitl = scenario && typeof scenario === 'object' ? scenario.hitl : null;
+          if(!hitl || typeof hitl !== 'object') return '';
+          return normalizeParticipantHref(hitl.participant_proxmox_url || hitl.participant_ui_url || '');
+        } catch(err) {
+          return '';
+        }
+      };
+      const storedDefault = normalizeParticipantHref(link.getAttribute('data-initial-participant-url'));
+      const updateFromSources = () => {
+        const localHref = loadEditorStateHref();
+        applyAvailability(localHref || storedDefault || '');
+      };
+      updateFromSources();
+      window.addEventListener('storage', (evt) => {
+        if(evt && evt.key === 'coretg_editor_state') updateFromSources();
+      });
+    })();
+  </script>
   {% block extra_scripts %}{% endblock %}
 </body>
 </html>

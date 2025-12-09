@@ -49,9 +49,43 @@
     svg.call(zoomBehavior);
 
     const vulnerabilityColor = '#28a745';
+    const hitlColor = '#2e7d32';
+    const hitlMarkers = ['rj45','rj-45','hitl','tap','bridge','ethernet','physical'];
     const typeColor = d3.scaleOrdinal()
-      .domain(['router','switch','hub','wlan','host','pc','server','docker'])
-      .range(['#d9534f','#f0ad4e','#5bc0de','#5cb85c','#0275d8','#6610f2','#6f42c1','#9c27b0']);
+      .domain(['router','switch','hub','wlan','host','pc','server','docker','node','hitl'])
+      .range(['#d9534f','#f0ad4e','#5bc0de','#5cb85c','#0275d8','#6610f2','#6f42c1','#9c27b0','#607d8b', hitlColor]);
+
+    function nodeHasVulnerabilities(node){
+      if(!node) return false;
+      const vulnList = Array.isArray(node.vulnerabilities) ? node.vulnerabilities
+        : (node.metadata && Array.isArray(node.metadata.vulnerabilities) ? node.metadata.vulnerabilities : []);
+      return (Array.isArray(vulnList) && vulnList.length > 0) || !!node.hasVuln;
+    }
+
+    function nodeIsHitl(node){
+      if(!node) return false;
+      if(node.is_hitl === true || node.is_hitl === 'true' || node.is_hitl === 'True'){ return true; }
+      const typeVal = (node.type||'').toLowerCase();
+      if(typeVal && hitlMarkers.some(marker => typeVal.includes(marker))){ return true; }
+      const nameVal = (node.name||'').toLowerCase();
+      if(nameVal && hitlMarkers.some(marker => nameVal.includes(marker))){ return true; }
+      return false;
+    }
+
+    function nodeCategory(node){
+      if(nodeIsHitl(node)){ return 'hitl'; }
+      const t = (node && node.type) ? node.type.toLowerCase() : '';
+      return t || 'node';
+    }
+
+    function nodeFillColor(node){
+      if(nodeIsHitl(node)){ return hitlColor; }
+      const typeVal = (node.type||'').toLowerCase();
+      if(nodeHasVulnerabilities(node) && (typeVal === 'host' || typeVal === 'pc' || typeVal === 'server')){
+        return vulnerabilityColor;
+      }
+      return typeColor(nodeCategory(node));
+    }
 
     const linkCounts = new Array(nodes.length).fill(0); links.forEach(l => { linkCounts[l.source]++; linkCounts[l.target]++; });
 
@@ -79,7 +113,13 @@
     const nodeGroup = g.selectAll('g.node')
       .data(nodes)
       .enter().append('g')
-      .attr('class', d => 'node' + ((d.type||'').toLowerCase()==='switch' ? ' switch-node' : ''))
+      .attr('class', d => {
+        const classes = ['node'];
+        const typeVal = (d.type||'').toLowerCase();
+        if(typeVal === 'switch'){ classes.push('switch-node'); }
+        if(nodeIsHitl(d)){ classes.push('hitl-node'); }
+        return classes.join(' ');
+      })
       .style('cursor','pointer')
       .call(d3.drag()
         .on('start', (ev,d)=>{ if(!ev.active) simulation.alphaTarget(0.35).restart(); d.fx = d.x; d.fy = d.y; })
@@ -93,16 +133,7 @@
       .attr('x', d => -(70 + Math.min(100, (d.services||[]).length * 8)) / 2)
       .attr('y', d => -(36 + Math.min(24, (d.services||[]).length * 1.2)) / 2)
       .attr('rx',6).attr('ry',6)
-      .attr('fill', d => {
-        const t = (d.type||'').toLowerCase();
-        const vulnList = Array.isArray(d.vulnerabilities) ? d.vulnerabilities
-          : (d.metadata && Array.isArray(d.metadata.vulnerabilities) ? d.metadata.vulnerabilities : []);
-        const hasVuln = (Array.isArray(vulnList) && vulnList.length > 0) || !!d.hasVuln;
-        if(hasVuln && (t === 'host' || t === 'pc' || t === 'server')){
-          return vulnerabilityColor;
-        }
-        return typeColor(t);
-      })
+      .attr('fill', d => nodeFillColor(d))
       .attr('stroke','#222')
       .attr('stroke-width',1.2)
       .on('click', (ev,d)=>{
@@ -205,23 +236,32 @@
     const legendEl = document.getElementById('graphLegendItems');
     if(legendEl){
       const degreePerType = new Map();
-      links.forEach(l=>{ const inc=(idx)=>{ const t=(nodes[idx].type||'').toLowerCase(); if(!t) return; const s=degreePerType.get(t)||0; degreePerType.set(t,s+1); }; inc(l.source.index??l.source); inc(l.target.index??l.target); });
-      const types = Array.from(new Set(nodes.map(n => (n.type||'').toLowerCase()))).filter(Boolean).sort();
+      links.forEach(l=>{
+        const inc=(idx)=>{
+          const cat=nodeCategory(nodes[idx]);
+          if(!cat) return;
+          const s=degreePerType.get(cat)||0;
+          degreePerType.set(cat,s+1);
+        };
+        inc(l.source.index??l.source);
+        inc(l.target.index??l.target);
+      });
+      const types = Array.from(new Set(nodes.map(n => nodeCategory(n)))).filter(Boolean).sort();
       const hasVulnerableHosts = nodes.some(n => {
         const t = (n.type||'').toLowerCase();
         if(!(t === 'host' || t === 'pc' || t === 'server')) return false;
-        const vulnList = Array.isArray(n.vulnerabilities) ? n.vulnerabilities
-          : (n.metadata && Array.isArray(n.metadata.vulnerabilities) ? n.metadata.vulnerabilities : []);
-        return (Array.isArray(vulnList) && vulnList.length > 0) || !!n.hasVuln;
+        return nodeHasVulnerabilities(n);
       });
-      let legendHtml = types.map(t => {
-        const nodeCount = nodes.filter(n => (n.type||'').toLowerCase()===t).length;
-        const deg = degreePerType.get(t)||0;
-        const isSwitch = t === 'switch';
+      let legendHtml = types.map(typeKey => {
+        const nodeCount = nodes.filter(n => nodeCategory(n)===typeKey).length;
+        const deg = degreePerType.get(typeKey)||0;
+        const isSwitch = typeKey === 'switch';
+        const colorSwatch = typeKey==='hitl' ? hitlColor : typeColor(typeKey);
         const swatchStyle = isSwitch
-          ? `display:inline-block;width:12px;height:12px;border:2px solid #ff9800;background:${typeColor(t)};box-shadow:0 0 0 1px #222 inset;`
-          : `display:inline-block;width:12px;height:12px;border:1px solid #222;background:${typeColor(t)}`;
-        return `<span class="d-flex align-items-center gap-1"><span style="${swatchStyle}"></span>${t}<span class="text-muted" style="font-size:.65rem;">(nodes:${nodeCount}, links:${deg})</span></span>`;
+          ? `display:inline-block;width:12px;height:12px;border:2px solid #ff9800;background:${colorSwatch};box-shadow:0 0 0 1px #222 inset;`
+          : `display:inline-block;width:12px;height:12px;border:1px solid #222;background:${colorSwatch}`;
+        const label = typeKey === 'hitl' ? 'HITL' : typeKey;
+        return `<span class="d-flex align-items-center gap-1"><span style="${swatchStyle}"></span>${label}<span class="text-muted" style="font-size:.65rem;">(nodes:${nodeCount}, links:${deg})</span></span>`;
       }).join(' ');
       if(hasVulnerableHosts){
         const vulnSwatch = `<span class="d-flex align-items-center gap-1"><span style="display:inline-block;width:12px;height:12px;border:1px solid #222;background:${vulnerabilityColor}"></span>host (vulnerable)</span>`;
@@ -248,11 +288,11 @@
   clusterBtn?.addEventListener('click', () => { if(clusterMode==='off') { clusterMode='type'; clusterBtn.textContent='Cluster: Type'; applyClustering(); } else { clusterMode='off'; clusterBtn.textContent='Cluster: Off'; simulation.force('x', null).force('y', null); simulation.alpha(0.5).restart(); } });
 
     function applyClustering(){
-      const types = Array.from(new Set(nodes.map(n => (n.type||'').toLowerCase()))).filter(Boolean);
+      const types = Array.from(new Set(nodes.map(n => nodeCategory(n)))).filter(Boolean);
       if(!types.length) return; const angleStep = (2*Math.PI)/types.length; const radius = Math.min(width,height)/3; const centers = new Map();
       types.forEach((t,i)=> centers.set(t,{x: Math.cos(i*angleStep)*radius, y: Math.sin(i*angleStep)*radius}));
-      simulation.force('x', d3.forceX(d => (centers.get((d.type||'').toLowerCase())||{x:0}).x + width/2).strength(0.12));
-      simulation.force('y', d3.forceY(d => (centers.get((d.type||'').toLowerCase())||{y:0}).y + height/2).strength(0.12));
+      simulation.force('x', d3.forceX(d => (centers.get(nodeCategory(d))||{x:0}).x + width/2).strength(0.12));
+      simulation.force('y', d3.forceY(d => (centers.get(nodeCategory(d))||{y:0}).y + height/2).strength(0.12));
   simulation.alpha(0.9).restart();
     }
 
@@ -276,7 +316,7 @@
     // Mini-map
     const miniMap = document.getElementById('graphMiniMap');
     const miniSvg = miniMap ? d3.select(miniMap).select('svg'):null; let miniG, miniLinks, miniNodes, viewRect;
-    if(miniSvg){ miniG = miniSvg.append('g'); miniLinks = miniG.selectAll('line').data(links).enter().append('line').attr('stroke','#bbb').attr('stroke-width',1); miniNodes = miniG.selectAll('circle').data(nodes).enter().append('circle').attr('r',2.8).attr('fill', d=>typeColor((d.type||'').toLowerCase())); viewRect = miniG.append('rect').attr('fill','none').attr('stroke','#ff5722').attr('stroke-width',1); miniMap.addEventListener('mousedown', (ev)=>{ ev.preventDefault(); const pt = d3.pointer(ev, miniG.node()); svg.transition().duration(300).call(zoomBehavior.transform, d3.zoomIdentity.translate(container.clientWidth/2 - pt[0], container.clientHeight/2 - pt[1]).scale(1)); }); }
+    if(miniSvg){ miniG = miniSvg.append('g'); miniLinks = miniG.selectAll('line').data(links).enter().append('line').attr('stroke','#bbb').attr('stroke-width',1); miniNodes = miniG.selectAll('circle').data(nodes).enter().append('circle').attr('r',2.8).attr('fill', d=>nodeFillColor(d)); viewRect = miniG.append('rect').attr('fill','none').attr('stroke','#ff5722').attr('stroke-width',1); miniMap.addEventListener('mousedown', (ev)=>{ ev.preventDefault(); const pt = d3.pointer(ev, miniG.node()); svg.transition().duration(300).call(zoomBehavior.transform, d3.zoomIdentity.translate(container.clientWidth/2 - pt[0], container.clientHeight/2 - pt[1]).scale(1)); }); }
     function updateMiniMap(){ if(!miniSvg) return; const xs=nodes.map(n=>n.x), ys=nodes.map(n=>n.y); if(!xs.length) return; const minX=Math.min(...xs), maxX=Math.max(...xs), minY=Math.min(...ys), maxY=Math.max(...ys); const pad=40; const w=(maxX-minX)||1, h=(maxY-minY)||1; const scaleX=(160-pad)/w, scaleY=(120-pad)/h; const s=Math.min(scaleX, scaleY); const ox=(160 - w*s)/2, oy=(120 - h*s)/2; miniG.attr('transform', `translate(${ox - minX*s},${oy - minY*s}) scale(${s})`); miniLinks.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y).attr('x2',d=>d.target.x).attr('y2',d=>d.target.y); miniNodes.attr('cx',d=>d.x).attr('cy',d=>d.y); updateMiniMapViewport(d3.zoomTransform(svg.node())); }
     function updateMiniMapViewport(z){ if(!viewRect) return; try { const t=z||d3.zoomTransform(svg.node()); const inv=t.invert([0,0]); const inv2=t.invert([container.clientWidth, container.clientHeight]); viewRect.attr('x',inv[0]).attr('y',inv[1]).attr('width',inv2[0]-inv[0]).attr('height',inv2[1]-inv[1]); } catch(e){} }
   simulation.on('tick.graphExtras', ()=> { updateMiniMap(); });

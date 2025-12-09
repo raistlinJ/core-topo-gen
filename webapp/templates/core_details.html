@@ -24,7 +24,12 @@
   <div class="container-fluid px-0">
 
     <div class="d-flex justify-content-between align-items-center mb-3">
-      <h3 class="mb-0">Scenario Details</h3>
+      <div class="d-flex align-items-center gap-2">
+        <h3 class="mb-0">Scenario Details</h3>
+        {% if scenario_label %}
+          <span class="badge text-bg-primary">{{ scenario_label }}</span>
+        {% endif %}
+      </div>
       {% if xml_path %}
         <div class="d-flex flex-column flex-sm-row align-items-sm-center gap-2">
           <div class="btn-group btn-group-sm">
@@ -52,47 +57,119 @@
       <div class="card mb-3">
         <div class="card-header"><strong>Summary</strong></div>
         <div class="card-body">
-          <ul class="mb-0">
-            <li>File classification: {{ classification|default('unknown')|title }}</li>
-            <li>Nodes: {{ summary.nodes_count or summary.devices_count or 0 }}</li>
-            {% if summary.switches_count is defined %}
-            <li>Switches: {{ summary.switches_count }}{% if summary.switches and summary.switches|length>0 %} ({{ summary.switches|join(', ') }}){% endif %}</li>
+          {% if summary.__planner_bundle %}
+            <div class="alert alert-info small" role="status">
+              Scenario Editor bundle detected. Use the Scenarios page to edit parameters; CORE schema validation is not applied here.
+            </div>
+            {% if summary.error %}
+              <div class="alert alert-warning" role="alert">{{ summary.error }}</div>
             {% endif %}
-            <li>Networks: {{ summary.networks_count or 0 }}</li>
-            <li>Links (count): {{ summary.links_count or 0 }}{% if summary.links_sample is defined %} (showing sample: {{ summary.links_sample or 0 }}){% endif %}</li>
-            <li>Services (total occurrences): {{ summary.services_count or 0 }}</li>
-            {% if summary.file_size_bytes %}
-            <li>File size: {{ summary.file_size_bytes }} bytes</li>
+            <ul class="mb-0">
+              <li>File classification: {{ classification|default('planner')|title }}</li>
+              <li>Scenarios: {{ summary.scenarios_count }}</li>
+            </ul>
+            {% if summary.scenarios and summary.scenarios|length > 0 %}
+              <div class="table-responsive mt-3">
+                <table class="table table-sm align-middle mb-0">
+                  <thead class="table-light">
+                    <tr>
+                      <th>Name</th>
+                      <th>Est. Nodes</th>
+                      <th>HITL</th>
+                      <th>Base File</th>
+                      <th>Sections</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for scen in summary.scenarios %}
+                      <tr>
+                        <td>{{ scen.name }}</td>
+                        <td>
+                          {% if scen.scenario_total_nodes is not none %}
+                            {{ scen.scenario_total_nodes }}
+                          {% elif scen.base_nodes is not none %}
+                            {{ scen.base_nodes }}
+                          {% else %}
+                            <span class="text-muted">n/a</span>
+                          {% endif %}
+                        </td>
+                        <td>
+                          {% if scen.hitl_enabled %}
+                            <span class="badge text-bg-success">Enabled</span>
+                          {% else %}
+                            <span class="badge text-bg-secondary">Disabled</span>
+                          {% endif %}
+                        </td>
+                        <td>
+                          {% if scen.base_file %}
+                            <div class="small text-truncate" style="max-width:180px;" title="{{ scen.base_file }}">{{ scen.base_file }}</div>
+                          {% else %}
+                            <span class="text-muted">None</span>
+                          {% endif %}
+                        </td>
+                        <td>
+                          {% if scen.sections and scen.sections|length > 0 %}
+                            <ul class="list-unstyled mb-0 small">
+                              {% for section in scen.sections %}
+                                <li>{{ section.name }} ({{ section.item_count or 0 }} item{{ 's' if (section.item_count or 0) != 1 else '' }}{% if section.total_nodes is not none %}, total {{ section.total_nodes }}{% endif %})</li>
+                              {% endfor %}
+                            </ul>
+                          {% else %}
+                            <span class="text-muted">None</span>
+                          {% endif %}
+                        </td>
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
             {% endif %}
-            {% if summary.router_degree_stats %}
-            <li>Router Degrees: min {{ summary.router_degree_stats.min }}, avg {{ summary.router_degree_stats.avg }}, max {{ summary.router_degree_stats.max }}</li>
-            {% endif %}
-            {% if summary.routing_edges_policies and summary.routing_edges_policies|length > 0 %}
-            <li>Connectivity Policies: {{ summary.routing_edges_policies|length }} routing item(s)
-              <details class="mt-1">
-                <summary class="small">Show items</summary>
-                <div class="small mt-1" style="max-height:180px;overflow:auto;">
-                  {% for pol in summary.routing_edges_policies %}
-                    <div class="mb-1">
-                      <strong>{{ pol.protocol or 'Protocol' }}</strong>:
-                      R2R=<span class="text-nowrap">{{ pol.r2r_mode or 'Random' }}{% if pol.edges is not none %}({{ pol.edges }}){% endif %}</span>
-                      {% if pol.r2s_mode or pol.r2s_edges %}
-                        &middot; R2S=<span class="text-nowrap">{{ pol.r2s_mode or 'Random' }}{% if pol.r2s_edges is not none %}({{ pol.r2s_edges }}){% endif %}</span>
-                      {% endif %}
-                    </div>
-                  {% endfor %}
-                </div>
-              </details>
-            </li>
-            {% endif %}
-          </ul>
+          {% else %}
+            <ul class="mb-0">
+              <li>File classification: {{ classification|default('unknown')|title }}</li>
+              <li>Nodes: {{ summary.nodes_count or summary.devices_count or 0 }}</li>
+              {% if summary.switches_count is defined %}
+              <li>Switches: {{ summary.switches_count }}{% if summary.switches and summary.switches|length>0 %} ({{ summary.switches|join(', ') }}){% endif %}</li>
+              {% endif %}
+              {% if summary.hitl_nodes_count is defined %}
+              <li>HITL interfaces: {{ summary.hitl_nodes_count }}</li>
+              {% endif %}
+              <li>Networks: {{ summary.networks_count or 0 }}</li>
+              <li>Links (count): {{ summary.links_count or 0 }}{% if summary.links_sample is defined %} (showing sample: {{ summary.links_sample or 0 }}){% endif %}</li>
+              <li>Services (total occurrences): {{ summary.services_count or 0 }}</li>
+              {% if summary.file_size_bytes %}
+              <li>File size: {{ summary.file_size_bytes }} bytes</li>
+              {% endif %}
+              {% if summary.router_degree_stats %}
+              <li>Router Degrees: min {{ summary.router_degree_stats.min }}, avg {{ summary.router_degree_stats.avg }}, max {{ summary.router_degree_stats.max }}</li>
+              {% endif %}
+              {% if summary.routing_edges_policies and summary.routing_edges_policies|length > 0 %}
+              <li>Connectivity Policies: {{ summary.routing_edges_policies|length }} routing item(s)
+                <details class="mt-1">
+                  <summary class="small">Show items</summary>
+                  <div class="small mt-1" style="max-height:180px;overflow:auto;">
+                    {% for pol in summary.routing_edges_policies %}
+                      <div class="mb-1">
+                        <strong>{{ pol.protocol or 'Protocol' }}</strong>:
+                        R2R=<span class="text-nowrap">{{ pol.r2r_mode or 'Random' }}{% if pol.edges is not none %}({{ pol.edges }}){% endif %}</span>
+                        {% if pol.r2s_mode or pol.r2s_edges %}
+                          &middot; R2S=<span class="text-nowrap">{{ pol.r2s_mode or 'Random' }}{% if pol.r2s_edges is not none %}({{ pol.r2s_edges }}){% endif %}</span>
+                        {% endif %}
+                      </div>
+                    {% endfor %}
+                  </div>
+                </details>
+              </li>
+              {% endif %}
+            </ul>
+          {% endif %}
         </div>
       </div>
 
 
       <!-- Topology Graph Card (auto-generated from summary.nodes / linked_nodes). Render even if invalid to aid debugging -->
       {# Render the graph card if we have any indication of topology data: nodes, switches, switch_nodes, or links_detail #}
-      {% if summary and ( (summary.nodes and summary.nodes|length > 0) or (summary.switch_nodes and summary.switch_nodes|length > 0) or (summary.links_detail and summary.links_detail|length > 0) ) %}
+      {% if summary and ( (summary.nodes and summary.nodes|length > 0) or (summary.switch_nodes and summary.switch_nodes|length > 0) or (summary.hitl_network_nodes and summary.hitl_network_nodes|length > 0) or (summary.links_detail and summary.links_detail|length > 0) ) %}
       <div class="card mb-3" id="topologyGraphCard">
         <div class="card-header d-flex flex-wrap justify-content-between align-items-center gap-2">
           <div class="d-flex align-items-center gap-2">
@@ -261,6 +338,7 @@
 {% if summary and (summary.nodes or summary.switches or summary.switch_nodes) %}
   {% set base_nodes = summary.nodes or [] %}
   {% set extra_switch_nodes = [] %}
+  {% set extra_hitl_nodes = [] %}
   {% if summary.switch_nodes %}
     {% for sn in summary.switch_nodes %}
       {% set exists = (summary.nodes and (summary.nodes|selectattr('id','equalto', sn.id)|list|length > 0)) %}
@@ -275,7 +353,23 @@
       {% endif %}
     {% endfor %}
   {% endif %}
-  {% set combined_nodes = base_nodes + extra_switch_nodes %}
+  {% if summary.hitl_network_nodes %}
+    {% for hn in summary.hitl_network_nodes %}
+      {% set exists = (summary.nodes and (summary.nodes|selectattr('id','equalto', hn.id)|list|length > 0)) %}
+      {% if not exists %}
+        {% set _ = extra_hitl_nodes.append({
+          'id': hn.id,
+          'name': hn.name or hn.id,
+          'type': hn.type or 'hitl',
+          'services': hn.services or [],
+          'linked_nodes': hn.linked_nodes or [],
+          'interfaces': hn.interfaces or [],
+          'is_hitl': hn.is_hitl or False
+        }) %}
+      {% endif %}
+    {% endfor %}
+  {% endif %}
+  {% set combined_nodes = base_nodes + extra_switch_nodes + extra_hitl_nodes %}
   <script id="summaryNodesJson" type="application/json">{{ combined_nodes|tojson }}</script>
 {% endif %}
 {% if summary and summary.links_detail %}

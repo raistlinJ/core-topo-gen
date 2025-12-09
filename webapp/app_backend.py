@@ -26,10 +26,11 @@ import textwrap
 import shlex
 import posixpath
 import fnmatch
+import copy
 from urllib.parse import urlparse
 
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Iterator, TextIO
+from typing import Dict, Any, Optional, List, Tuple, Iterator, TextIO, Iterable
 
 try:
     import psutil  # type: ignore
@@ -39,7 +40,7 @@ from collections import defaultdict
 from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
-from flask import Flask, render_template, request, redirect, url_for, flash, send_file, Response, jsonify, session, g, has_request_context
+from flask import Flask, render_template, request, redirect, url_for, flash, send_file, Response, jsonify, session, g, has_request_context, abort
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -156,6 +157,71 @@ REPO_PUSH_EXCLUDE_DIRS = {
     'tmp_hitl',
 }
 REPO_PUSH_EXCLUDE_PATTERNS = ('*.pyc', '*.pyo', '*.pyd', '*.log', '*.tmp', '*.swp', '*.swo')
+
+_SESSION_HITL_CACHE: Dict[str, Dict[str, Any]] = {}
+
+_REPO_PUSH_PROGRESS: Dict[str, Dict[str, Any]] = {}
+_REPO_PUSH_PROGRESS_LOCK = threading.Lock()
+_REPO_PUSH_PROGRESS_TTL_SECONDS = 600.0
+
+
+def _init_repo_push_progress(
+    progress_id: str,
+    *,
+    stage: str,
+    detail: str,
+    status: str = 'initializing',
+    percent: Optional[float] = None,
+) -> None:
+    now = time.time()
+    payload = {
+        'progress_id': progress_id,
+        'status': status,
+        'stage': stage,
+        'detail': detail,
+        'percent': percent,
+        'created_at': now,
+        'updated_at': now,
+    }
+    with _REPO_PUSH_PROGRESS_LOCK:
+        _REPO_PUSH_PROGRESS[progress_id] = payload
+
+
+def _update_repo_push_progress(progress_id: Optional[str], **fields: Any) -> None:
+    if not progress_id:
+        return
+    now = time.time()
+    with _REPO_PUSH_PROGRESS_LOCK:
+        entry = _REPO_PUSH_PROGRESS.get(progress_id)
+        if not entry:
+            entry = {
+                'progress_id': progress_id,
+                'created_at': now,
+            }
+            _REPO_PUSH_PROGRESS[progress_id] = entry
+        entry.update(fields)
+        entry['updated_at'] = now
+
+
+def _expire_repo_push_progress() -> None:
+    cutoff = time.time() - _REPO_PUSH_PROGRESS_TTL_SECONDS
+    with _REPO_PUSH_PROGRESS_LOCK:
+        stale = [
+            progress_id
+            for progress_id, payload in _REPO_PUSH_PROGRESS.items()
+            if payload.get('status') in ('complete', 'error') and payload.get('updated_at', 0) < cutoff
+        ]
+        for progress_id in stale:
+            _REPO_PUSH_PROGRESS.pop(progress_id, None)
+
+
+def _get_repo_push_progress(progress_id: str) -> Optional[Dict[str, Any]]:
+    _expire_repo_push_progress()
+    with _REPO_PUSH_PROGRESS_LOCK:
+        payload = _REPO_PUSH_PROGRESS.get(progress_id)
+        if not payload:
+            return None
+        return dict(payload)
 
 
 def _sanitize_venv_bin_path(path_value: Any) -> Optional[str]:
@@ -602,10 +668,17 @@ def _create_local_repo_archive(src_dir: str, dest_basename: str) -> str:
     return tmp_path
 
 
-def _push_repo_to_remote(core_cfg: Dict[str, Any], *, logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
+def _push_repo_to_remote(
+    core_cfg: Dict[str, Any],
+    *,
+    logger: Optional[logging.Logger] = None,
+    progress_id: Optional[str] = None,
+    finalize_async: bool = False,
+) -> Dict[str, Any]:
     cfg = _require_core_ssh_credentials(core_cfg)
     repo_root = _get_repo_root()
     log = logger or getattr(app, 'logger', logging.getLogger(__name__))
+    _update_repo_push_progress(progress_id, status='packaging', stage='packaging', percent=2.0, detail='Creating repository archive…')
     client = _open_ssh_client(cfg)
     sftp = None
     archive_path = None
@@ -615,17 +688,34 @@ def _push_repo_to_remote(core_cfg: Dict[str, Any], *, logger: Optional[logging.L
         remote_parent = posixpath.dirname(remote_repo.rstrip('/')) or '/'
         base_name = os.path.basename(remote_repo.rstrip('/')) or 'core-topo-gen'
         archive_path = _create_local_repo_archive(repo_root, base_name)
+        _update_repo_push_progress(progress_id, status='packaging', stage='packaging', percent=8.0, detail='Repository archive ready.')
         remote_archive = _remote_path_join(remote_parent, f"{uuid.uuid4().hex}.tar.gz")
+        _update_repo_push_progress(progress_id, status='uploading', stage='uploading', percent=12.0, detail='Uploading snapshot to CORE host…')
         sftp.put(archive_path, remote_archive)
+        _update_repo_push_progress(progress_id, status='uploading', stage='uploaded', percent=40.0, detail='Upload complete; preparing remote finalize…')
+        if finalize_async:
+            _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=45.0, detail='Remote finalization queued…')
+            _schedule_remote_repo_finalize(
+                progress_id,
+                cfg,
+                remote_repo=remote_repo,
+                remote_parent=remote_parent,
+                remote_archive=remote_archive,
+                logger=log,
+            )
+            return {'repo_path': remote_repo, 'progress_id': progress_id, 'finalizing': True}
         extract_script = (
             f"set -euo pipefail; mkdir -p {shlex.quote(remote_parent)}; "
             f"rm -rf {shlex.quote(remote_repo)}; "
             f"tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(remote_parent)}; "
             f"rm -f {shlex.quote(remote_archive)}"
         )
+        _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=60.0, detail='Extracting snapshot on CORE host…')
         _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=600.0)
+        _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=95.0, detail='Cleaning temporary archive…')
         log.info('[remote-sync] Repository uploaded to %s', remote_repo)
-        return {'repo_path': remote_repo}
+        _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository ready on remote host.')
+        return {'repo_path': remote_repo, 'progress_id': progress_id}
     finally:
         try:
             if archive_path and os.path.exists(archive_path):
@@ -641,6 +731,69 @@ def _push_repo_to_remote(core_cfg: Dict[str, Any], *, logger: Optional[logging.L
             client.close()
         except Exception:
             pass
+
+
+def _schedule_remote_repo_finalize(
+    progress_id: Optional[str],
+    core_cfg: Dict[str, Any],
+    *,
+    remote_repo: str,
+    remote_parent: str,
+    remote_archive: str,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    if not progress_id:
+        # No async tracking requested; fall back to synchronous finalize.
+        extract_script = (
+            f"set -euo pipefail; mkdir -p {shlex.quote(remote_parent)}; "
+            f"rm -rf {shlex.quote(remote_repo)}; "
+            f"tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(remote_parent)}; "
+            f"rm -f {shlex.quote(remote_archive)}"
+        )
+        try:
+            client = _open_ssh_client(core_cfg)
+            try:
+                _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=600.0)
+            finally:
+                client.close()
+        except Exception:
+            pass
+        return
+
+    def _worker() -> None:
+        client: Any | None = None
+        try:
+            _update_repo_push_progress(progress_id, status='finalizing', stage='cleanup', percent=55.0, detail='Removing previous repository…')
+            client = _open_ssh_client(core_cfg)
+            _exec_ssh_command(client, f"mkdir -p {shlex.quote(remote_parent)}", timeout=180.0)
+            _exec_ssh_command(client, f"rm -rf {shlex.quote(remote_repo)}", timeout=240.0)
+            _update_repo_push_progress(progress_id, status='finalizing', stage='extract', percent=75.0, detail='Extracting new snapshot on CORE host…')
+            _exec_ssh_command(client, f"tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(remote_parent)}", timeout=900.0)
+            _update_repo_push_progress(progress_id, status='finalizing', stage='cleanup', percent=90.0, detail='Cleaning temporary archive…')
+            _exec_ssh_command(client, f"rm -f {shlex.quote(remote_archive)}", timeout=120.0)
+            _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository ready on remote host.')
+            if logger:
+                logger.info('[remote-sync] Repository finalized at %s', remote_repo)
+        except Exception as exc:
+            if logger:
+                logger.exception('[remote-sync] finalize failed: %s', exc)
+            _update_repo_push_progress(progress_id, status='error', stage='error', detail=str(exc))
+            try:
+                if client:
+                    _exec_ssh_command(client, f"rm -f {shlex.quote(remote_archive)}", timeout=60.0)
+            except Exception:
+                pass
+        finally:
+            if client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception:
+        _update_repo_push_progress(progress_id, status='error', stage='error', detail='Failed to schedule remote finalization')
 
 
 def _prepare_remote_cli_context(
@@ -938,10 +1091,13 @@ def _extract_optional_core_config(raw: Any, *, include_password: bool = False) -
         return True
 
     significant_keys = ('host', 'port', 'ssh_host', 'ssh_port', 'ssh_username')
+    metadata_signal_keys = ('vm_key', 'vm_name', 'vm_node', 'core_secret_id')
     has_signal = any(_has_value(candidate.get(key)) for key in significant_keys)
     if not has_signal:
         nested = candidate.get('ssh') if isinstance(candidate.get('ssh'), dict) else {}
         has_signal = any(_has_value(nested.get(key)) for key in ('host', 'port', 'username', 'password'))
+    if not has_signal:
+        has_signal = any(_has_value(candidate.get(key)) for key in metadata_signal_keys)
     if include_password and not has_signal:
         has_signal = _has_value(candidate.get('ssh_password')) or (
             isinstance(candidate.get('ssh'), dict) and _has_value(candidate['ssh'].get('password'))
@@ -949,16 +1105,30 @@ def _extract_optional_core_config(raw: Any, *, include_password: bool = False) -
     if not has_signal:
         return None
 
+    provided_fields: Dict[str, Any] = {
+        key: candidate.get(key)
+        for key in ('host', 'port', 'ssh_host', 'ssh_port', 'ssh_username', 'venv_bin', 'venv_user_override')
+    }
+    if include_password:
+        provided_fields['ssh_password'] = candidate.get('ssh_password')
+
     normalized = _normalize_core_config(candidate, include_password=include_password)
     extras: Dict[str, Any] = {}
     for key, value in candidate.items():
         if key in {'host', 'port', 'ssh_enabled', 'ssh_host', 'ssh_port', 'ssh_username', 'ssh_password', 'venv_bin', 'venv_user_override', 'ssh'}:
             continue
         extras[key] = value
+    for field, original in provided_fields.items():
+        if field == 'ssh_password' and not include_password:
+            continue
+        if not _has_value(original):
+            normalized.pop(field, None)
     if extras:
         normalized.update(extras)
     if not include_password:
         normalized.pop('ssh_password', None)
+    if not normalized and extras:
+        normalized = extras
     return normalized
 
 def _scrub_scenario_core_config(raw: Any) -> Dict[str, Any] | None:
@@ -4032,6 +4202,38 @@ def _ensure_admin_user() -> None:
 
 _ensure_admin_user()
 
+def _current_user_record() -> Optional[dict]:
+    if not has_request_context():
+        return None
+    cached = getattr(g, '_current_user_record', _G_USER_RECORD_SENTINEL)
+    if cached is not _G_USER_RECORD_SENTINEL:
+        return cached
+    record: Optional[dict] = None
+    user = _current_user()
+    if user and user.get('username'):
+        username = user.get('username')
+        db = _load_users()
+        for entry in db.get('users', []):
+            if entry.get('username') != username:
+                continue
+            record = dict(entry)
+            record.pop('password_hash', None)
+            record['role'] = _normalize_role_value(entry.get('role'))
+            record['scenarios'] = _normalize_scenario_assignments(entry.get('scenarios'))
+            break
+    setattr(g, '_current_user_record', record)
+    return record
+
+
+def _current_user_assigned_scenarios() -> list[str]:
+    record = _current_user_record()
+    if not record:
+        return []
+    scenarios = record.get('scenarios')
+    if isinstance(scenarios, list):
+        return list(scenarios)
+    return []
+
 # Diagnostic endpoint for environment/module troubleshooting
 @app.route('/diag/modules')
 def diag_modules():
@@ -4063,7 +4265,7 @@ def _set_current_user(user: dict | None) -> None:
     if user:
         session['user'] = {
             'username': user.get('username'),
-            'role': user.get('role', 'user')
+            'role': _normalize_role_value(user.get('role'))
         }
     else:
         session.pop('user', None)
@@ -4077,6 +4279,14 @@ def _inject_current_user() -> None:
         g.current_user = None
 
 
+@app.before_request
+def _bind_ui_view_mode() -> None:
+    try:
+        g.ui_view_mode = _current_ui_view_mode()
+    except Exception:
+        g.ui_view_mode = _UI_VIEW_DEFAULT
+
+
 @app.context_processor
 def _inject_template_user() -> dict:
     try:
@@ -4085,7 +4295,7 @@ def _inject_template_user() -> dict:
             return {
                 'current_user': SimpleNamespace(
                     username=user.get('username'),
-                    role=user.get('role', 'user'),
+                    role=_normalize_role_value(user.get('role')),
                     is_authenticated=True,
                 )
             }
@@ -4098,6 +4308,58 @@ def _inject_template_user() -> dict:
             is_authenticated=False,
         )
     }
+
+
+@app.context_processor
+def _inject_nav_participant_link() -> dict:
+    try:
+        url_value, scenario_label = _resolve_participant_ui_target()
+        return {
+            'nav_participant_url': url_value,
+            'nav_participant_scenario': scenario_label,
+        }
+    except Exception:
+        return {'nav_participant_url': '', 'nav_participant_scenario': ''}
+
+
+@app.context_processor
+def _inject_ui_view_state() -> dict:
+    return {'ui_view_mode': getattr(g, 'ui_view_mode', _UI_VIEW_DEFAULT)}
+
+
+@app.route('/ui-view', methods=['POST'])
+def set_ui_view_mode():
+    user = _current_user()
+    if not user or not _is_admin_view_role(user.get('role')):
+        abort(403)
+    requested = (request.form.get('mode') or '').strip().lower()
+    if requested not in _UI_VIEW_ALLOWED:
+        requested = _UI_VIEW_DEFAULT
+    session[_UI_VIEW_SESSION_KEY] = requested
+    target = request.form.get('next') or request.referrer
+    redirect_target = _resolve_ui_view_redirect_target(target)
+    return redirect(redirect_target)
+
+
+@app.route('/participant-ui')
+def participant_ui_page():
+    state = _participant_ui_state()
+    url_value = state.get('selected_url', '')
+    scenario_label = state.get('selected_label', '')
+    override = _normalize_participant_proxmox_url(request.args.get('url')) if request.args.get('url') else ''
+    participant_url = override or url_value
+    return render_template(
+        'participant_ui.html',
+        participant_url=participant_url,
+        participant_scenario_label=scenario_label,
+        participant_scenarios=state.get('listing', []),
+        participant_scenarios_heading=state.get('listing_heading'),
+        participant_scenarios_hint=state.get('listing_hint'),
+        participant_scenarios_empty=state.get('listing_empty_message'),
+        participant_restricted=state.get('restrict_to_assigned', False),
+        participant_active_norm=state.get('selected_norm', ''),
+        participant_has_assignments=state.get('has_assignments', False),
+    )
 
 
 _LOGIN_EXEMPT_ENDPOINTS = {
@@ -4145,8 +4407,11 @@ def login():
     users = db.get('users', [])
     user = next((u for u in users if u.get('username') == username), None)
     if user and check_password_hash(user.get('password_hash', ''), password):
-        _set_current_user({'username': user.get('username'), 'role': user.get('role', 'user')})
+        role_value = _normalize_role_value(user.get('role'))
+        _set_current_user({'username': user.get('username'), 'role': role_value})
         session.permanent = True
+        if _is_participant_role(role_value):
+            return redirect(url_for('participant_ui_page'))
         return redirect(url_for('index'))
     flash('Invalid username or password')
     return render_template('login.html', error=True), 401
@@ -4163,8 +4428,35 @@ def users_page():
     if not _require_admin():
         return redirect(url_for('index'))
     db = _load_users()
-    users = db.get('users', [])
-    return render_template('users.html', users=users, self_change=False)
+    raw_users = db.get('users', [])
+    scenario_names, _scenario_paths, _scenario_url_hints = _collect_scenario_catalog()
+    scenario_options: list[dict[str, str]] = []
+    display_by_norm: dict[str, str] = {}
+    for display_name in scenario_names:
+        norm = _normalize_scenario_label(display_name)
+        if not norm:
+            continue
+        display_by_norm[norm] = display_name
+        scenario_options.append({'value': norm, 'label': display_name})
+    # Ensure stable alphabetical order
+    scenario_options.sort(key=lambda o: o['label'].lower())
+    users: list[dict] = []
+    for entry in raw_users:
+        if not isinstance(entry, dict):
+            continue
+        normalized = dict(entry)
+        normalized['role'] = _normalize_role_value(entry.get('role'))
+        assigned = _normalize_scenario_assignments(entry.get('scenarios'))
+        normalized['assigned_scenarios'] = assigned
+        normalized['assigned_scenarios_display'] = [display_by_norm.get(norm, norm) for norm in assigned]
+        users.append(normalized)
+    return render_template(
+        'users.html',
+        users=users,
+        scenario_options=scenario_options,
+        scenario_lookup=display_by_norm,
+        self_change=False,
+    )
 
 
 @app.route('/users', methods=['POST'])
@@ -4173,7 +4465,8 @@ def users_create():
         return redirect(url_for('index'))
     username = (request.form.get('username') or '').strip()
     password = (request.form.get('password') or '').strip()
-    role = (request.form.get('role') or 'user').strip() or 'user'
+    role = _normalize_role_value(request.form.get('role'))
+    scenarios = _normalize_scenario_assignments(request.form.getlist('scenarios'))
     if not username or not password:
         flash('Username and password required')
         return redirect(url_for('users_page'))
@@ -4185,7 +4478,8 @@ def users_create():
     users.append({
         'username': username,
         'password_hash': generate_password_hash(password),
-        'role': role
+        'role': role,
+        'scenarios': scenarios,
     })
     db['users'] = users
     _save_users(db)
@@ -4235,6 +4529,31 @@ def users_password(username: str):
     if changed:
         _save_users(db)
         flash('Password updated')
+    else:
+        flash('User not found')
+    return redirect(url_for('users_page'))
+
+
+@app.route('/users/scenarios/<username>', methods=['POST'])
+def users_assign_scenarios(username: str):
+    if not _require_admin():
+        return redirect(url_for('users_page'))
+    username = (username or '').strip()
+    if not username:
+        flash('Invalid username')
+        return redirect(url_for('users_page'))
+    selections = _normalize_scenario_assignments(request.form.getlist('scenarios'))
+    db = _load_users()
+    users = db.get('users', [])
+    updated = False
+    for entry in users:
+        if entry.get('username') == username:
+            entry['scenarios'] = selections
+            updated = True
+            break
+    if updated:
+        _save_users(db)
+        flash('Scenario assignments updated')
     else:
         flash('User not found')
     return redirect(url_for('users_page'))
@@ -4424,6 +4743,166 @@ def _append_run_history(entry: dict):
         except Exception:
             pass
 
+
+EDITOR_STATE_SNAPSHOT_SUBDIR = 'editor_snapshots'
+
+
+def _editor_state_snapshot_dir() -> str:
+    return _ensure_private_dir(os.path.join(_outputs_dir(), EDITOR_STATE_SNAPSHOT_SUBDIR))
+
+
+def _editor_state_snapshot_slug(username: Optional[str]) -> str:
+    raw = (username or '').strip().lower()
+    cleaned = re.sub(r'[^a-z0-9._-]+', '-', raw)
+    cleaned = re.sub(r'-{2,}', '-', cleaned).strip('-_.')
+    return cleaned or 'anonymous'
+
+
+def _editor_state_snapshot_path(owner: dict | str | None = None) -> str:
+    username: Optional[str]
+    if isinstance(owner, dict):
+        username = owner.get('username') if owner else None
+    elif isinstance(owner, str):
+        username = owner
+    else:
+        username = None
+    slug = _editor_state_snapshot_slug(username)
+    return os.path.join(_editor_state_snapshot_dir(), f"{slug}.json")
+
+
+def _sanitize_snapshot_scenario(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    scenario = copy.deepcopy(raw)
+    hitl_meta = scenario.get('hitl') if isinstance(scenario.get('hitl'), dict) else None
+    if hitl_meta is not None:
+        core_meta = _extract_optional_core_config(hitl_meta.get('core'), include_password=False)
+        if core_meta:
+            hitl_meta['core'] = core_meta
+        elif 'core' in hitl_meta:
+            hitl_meta.pop('core', None)
+        prox_meta = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else None
+        if prox_meta is not None:
+            prox_clean = {k: v for k, v in prox_meta.items() if k not in {'password', 'token_secret', 'api_secret', 'api_token_secret', 'inventory_error'}}
+            hitl_meta['proxmox'] = prox_clean
+        interfaces = hitl_meta.get('interfaces')
+        if isinstance(interfaces, list):
+            hitl_meta['interfaces'] = [iface for iface in interfaces if isinstance(iface, dict)]
+    return scenario
+
+
+def _build_editor_snapshot_payload(raw_state: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_state, dict):
+        return None
+    scenarios_raw = raw_state.get('scenarios')
+    if not isinstance(scenarios_raw, list):
+        return None
+    sanitized_scenarios: List[Dict[str, Any]] = []
+    for scen in scenarios_raw:
+        sanitized = _sanitize_snapshot_scenario(scen)
+        if sanitized:
+            sanitized_scenarios.append(sanitized)
+    if not sanitized_scenarios:
+        return None
+    snapshot: Dict[str, Any] = {'scenarios': sanitized_scenarios}
+    core_meta = _normalize_core_config(raw_state.get('core'), include_password=False)
+    if core_meta:
+        snapshot['core'] = core_meta
+    result_path = raw_state.get('result_path') or raw_state.get('resultPath')
+    if isinstance(result_path, str) and result_path.strip():
+        snapshot['result_path'] = result_path.strip()
+    base_upload = raw_state.get('base_upload')
+    if isinstance(base_upload, dict):
+        base_copy: Dict[str, Any] = {}
+        path_val = base_upload.get('path') or base_upload.get('filepath')
+        if isinstance(path_val, str) and path_val:
+            base_copy['path'] = path_val
+        display_name = base_upload.get('display_name') or base_upload.get('displayName')
+        if isinstance(display_name, str) and display_name:
+            base_copy['display_name'] = display_name
+        if 'valid' in base_upload:
+            base_copy['valid'] = bool(base_upload.get('valid'))
+        if base_copy:
+            snapshot['base_upload'] = base_copy
+    host_ifaces = raw_state.get('host_interfaces')
+    if isinstance(host_ifaces, list) and host_ifaces:
+        snapshot['host_interfaces'] = [iface for iface in host_ifaces if isinstance(iface, dict)]
+    for key in ('host_interfaces_source', 'host_interfaces_metadata', 'host_interfaces_fetched_at'):
+        value = raw_state.get(key)
+        if value is not None:
+            snapshot[key] = value
+    project_hint = raw_state.get('project_key_hint')
+    if isinstance(project_hint, str) and project_hint.strip():
+        snapshot['project_key_hint'] = project_hint.strip()
+    elif 'result_path' in snapshot:
+        snapshot['project_key_hint'] = snapshot['result_path']
+    active_index = raw_state.get('active_index')
+    if isinstance(active_index, int):
+        snapshot['active_index'] = active_index
+    elif isinstance(active_index, str):
+        try:
+            snapshot['active_index'] = int(active_index)
+        except Exception:
+            pass
+    scenario_query = raw_state.get('scenario_query')
+    if isinstance(scenario_query, str) and scenario_query.strip():
+        snapshot['scenario_query'] = scenario_query.strip()
+    return snapshot
+
+
+def _write_editor_state_snapshot(snapshot: Dict[str, Any], *, user: Optional[dict] = None) -> None:
+    if not snapshot:
+        return
+    path = _editor_state_snapshot_path(user)
+    tmp_path = f"{path}.tmp"
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as handle:
+            json.dump(snapshot, handle, indent=2)
+        os.replace(tmp_path, path)
+        _ensure_private_file(path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _persist_editor_state_snapshot(raw_state: Any, *, user: Optional[dict] = None) -> None:
+    snapshot = _build_editor_snapshot_payload(raw_state)
+    if not snapshot:
+        return
+    _write_editor_state_snapshot(snapshot, user=user)
+
+
+def _load_editor_state_snapshot(user: Optional[dict] = None) -> Optional[Dict[str, Any]]:
+    path = _editor_state_snapshot_path(user)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+        if isinstance(data, dict):
+            return _scrub_snapshot_transient_errors(data)
+    except Exception:
+        pass
+    return None
+
+
+def _scrub_snapshot_transient_errors(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    scenarios = snapshot.get('scenarios')
+    if isinstance(scenarios, list):
+        for scen in scenarios:
+            if not isinstance(scen, dict):
+                continue
+            hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else None
+            if not hitl_meta:
+                continue
+            prox_meta = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else None
+            if prox_meta:
+                prox_meta.pop('inventory_error', None)
+    return snapshot
+
 def _scenario_names_from_xml(xml_path: str) -> list[str]:
     names: list[str] = []
     try:
@@ -4493,14 +4972,147 @@ def _select_latest_core_secret_record(scenario_norm: str | None = None) -> Optio
     return best_overall[1] if best_overall else None
 
 
-def _collect_scenario_catalog(history: Optional[List[dict]] = None) -> tuple[list[str], dict[str, set[str]]]:
+def _scenario_catalog_file() -> str:
+    return os.path.join(_outputs_dir(), 'scenario_catalog.json')
+
+
+def _load_scenario_catalog_from_disk() -> tuple[list[str], dict[str, set[str]], dict[str, str]]:
+    path = _scenario_catalog_file()
+    if not os.path.exists(path):
+        return [], {}, {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return [], {}, {}
+    names_raw = data.get('names')
+    sources_raw = data.get('sources')
+    ordered: list[str] = []
+    path_map: dict[str, set[str]] = defaultdict(set)
+    seen_norms: set[str] = set()
+    participant_by_norm: dict[str, str] = {}
+
+    def _record_candidate(norm_key: str, candidate: Any) -> None:
+        if not norm_key or candidate in (None, ''):
+            return
+        if isinstance(candidate, (list, tuple, set)):
+            for item in candidate:
+                _record_candidate(norm_key, item)
+            return
+        value = str(candidate).strip()
+        if not value:
+            return
+        try:
+            ap = os.path.abspath(value)
+        except Exception:
+            ap = value
+        path_map[norm_key].add(ap)
+
+    if isinstance(names_raw, list):
+        for idx, raw_name in enumerate(names_raw):
+            name = (str(raw_name).strip() if raw_name is not None else '')
+            if not name:
+                continue
+            norm = _normalize_scenario_label(name)
+            if not norm or norm in seen_norms:
+                continue
+            seen_norms.add(norm)
+            ordered.append(name)
+            source_candidate: Any = None
+            if isinstance(sources_raw, list) and idx < len(sources_raw):
+                source_candidate = sources_raw[idx]
+            elif isinstance(sources_raw, dict):
+                source_candidate = sources_raw.get(name) or sources_raw.get(norm)
+            _record_candidate(norm, source_candidate)
+
+    if isinstance(sources_raw, dict):
+        for key, candidate in sources_raw.items():
+            norm = _normalize_scenario_label(key)
+            if not norm:
+                continue
+            _record_candidate(norm, candidate)
+
+    participant_raw = data.get('participant_urls')
+    if isinstance(participant_raw, dict):
+        for key, value in participant_raw.items():
+            norm = _normalize_scenario_label(key)
+            url_value = _normalize_participant_proxmox_url(value)
+            if norm and url_value:
+                participant_by_norm[norm] = url_value
+
+    return ordered, path_map, participant_by_norm
+
+
+def _persist_scenario_catalog(
+    names: Iterable[Any],
+    source_path: Optional[str] = None,
+    participant_urls: Optional[Dict[str, Any]] = None,
+) -> None:
+    catalog_path = _scenario_catalog_file()
+    tmp_path = catalog_path + '.tmp'
+    ordered: list[str] = []
+    seen_norms: set[str] = set()
+    participant_map_input = participant_urls or {}
+    participant_by_norm: dict[str, str] = {}
+    for raw in names or []:
+        if raw in (None, ''):
+            continue
+        name = str(raw).strip()
+        if not name:
+            continue
+        norm = _normalize_scenario_label(name)
+        if not norm or norm in seen_norms:
+            continue
+        seen_norms.add(norm)
+        ordered.append(name)
+        # Capture participant URL hints for each unique scenario
+        if norm in participant_map_input and norm not in participant_by_norm:
+            normalized_url = _normalize_participant_proxmox_url(participant_map_input[norm])
+            if normalized_url:
+                participant_by_norm[norm] = normalized_url
+    try:
+        abs_source = ''
+        if source_path:
+            candidate = str(source_path).strip()
+            if candidate:
+                try:
+                    abs_source = os.path.abspath(candidate)
+                except Exception:
+                    abs_source = candidate
+        sources_out = [abs_source for _ in ordered]
+        payload = {
+            'names': ordered,
+            'sources': sources_out,
+            'updated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+        }
+        if participant_by_norm:
+            payload['participant_urls'] = participant_by_norm
+        os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp_path, catalog_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _collect_scenario_catalog(history: Optional[List[dict]] = None) -> tuple[list[str], dict[str, set[str]], dict[str, str]]:
+    catalog_names, catalog_paths, catalog_participants = _load_scenario_catalog_from_disk()
     entries = history if history is not None else _load_run_history()
     display_by_norm: dict[str, str] = {}
     ordered: list[str] = []
     path_map: dict[str, set[str]] = defaultdict(set)
+    participant_by_norm: dict[str, str] = dict(catalog_participants)
 
     def _record_path(norm_key: str, path_value: Any) -> None:
         if not path_value or not norm_key:
+            return
+        if isinstance(path_value, (list, tuple, set)):
+            for item in path_value:
+                _record_path(norm_key, item)
             return
         try:
             ap = os.path.abspath(str(path_value))
@@ -4524,7 +5136,434 @@ def _collect_scenario_catalog(history: Optional[List[dict]] = None) -> tuple[lis
                 candidate = entry.get(key)
                 if candidate:
                     _record_path(normalized, candidate)
-    return ordered, path_map
+    if catalog_paths:
+        for norm_key, candidates in catalog_paths.items():
+            if not candidates:
+                continue
+            path_map[norm_key].update(candidates)
+    if catalog_names:
+        final_order: list[str] = []
+        seen_norms: set[str] = set()
+        for display in catalog_names:
+            norm = _normalize_scenario_label(display)
+            if not norm or norm in seen_norms:
+                continue
+            seen_norms.add(norm)
+            display_by_norm[norm] = display
+            path_map.setdefault(norm, set())
+            final_order.append(display)
+        ordered = final_order
+    return ordered, path_map, participant_by_norm
+
+
+def _merge_editor_scenarios_into_catalog(
+    scenario_names: list[str],
+    scenario_paths: dict[str, set[str]],
+    scenario_url_hints: Optional[Dict[str, str]] = None,
+    *,
+    user: Optional[dict] = None,
+) -> tuple[list[str], dict[str, set[str]], dict[str, str]]:
+    snapshot = _load_editor_state_snapshot(user)
+    scen_list = snapshot.get('scenarios') if isinstance(snapshot, dict) else None
+    if not scen_list or not isinstance(scen_list, list):
+        return scenario_names, scenario_paths, scenario_url_hints or {}
+
+    names_out = list(scenario_names or [])
+    paths_out: dict[str, set[str]] = {k: set(v) for k, v in (scenario_paths or {}).items()}
+    hints_out: dict[str, str] = dict(scenario_url_hints or {})
+    seen_norms: set[str] = set()
+    for existing in names_out:
+        norm = _normalize_scenario_label(existing)
+        if norm:
+            seen_norms.add(norm)
+
+    raw_result_path = snapshot.get('result_path') if isinstance(snapshot, dict) else None
+    abs_result_path = ''
+    if isinstance(raw_result_path, str) and raw_result_path.strip():
+        candidate = raw_result_path.strip()
+        try:
+            abs_result_path = os.path.abspath(candidate)
+        except Exception:
+            abs_result_path = candidate
+
+    for idx, scen in enumerate(scen_list, start=1):
+        if not isinstance(scen, dict):
+            continue
+        raw_name_value = scen.get('name')
+        if isinstance(raw_name_value, str):
+            display_name = raw_name_value.strip()
+        elif raw_name_value not in (None, ''):
+            try:
+                display_name = str(raw_name_value).strip()
+            except Exception:
+                display_name = ''
+        else:
+            display_name = ''
+        if not display_name:
+            display_name = f"Scenario {idx}"
+        norm = _normalize_scenario_label(display_name)
+        if not norm:
+            continue
+        if norm not in seen_norms:
+            names_out.append(display_name)
+            seen_norms.add(norm)
+        target_paths = paths_out.setdefault(norm, set())
+        if abs_result_path:
+            target_paths.add(abs_result_path)
+        base_meta = scen.get('base') if isinstance(scen.get('base'), dict) else None
+        base_file = base_meta.get('filepath') if base_meta else None
+        if isinstance(base_file, str) and base_file.strip():
+            try:
+                target_paths.add(os.path.abspath(base_file.strip()))
+            except Exception:
+                target_paths.add(base_file.strip())
+        hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else None
+        if hitl_meta:
+            participant_url = ''
+            for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+                normalized = _normalize_participant_proxmox_url(hitl_meta.get(key))
+                if normalized:
+                    participant_url = normalized
+                    break
+            if participant_url:
+                hints_out[norm] = participant_url
+
+    return names_out, paths_out, hints_out
+
+
+def _scenario_catalog_for_user(
+    history: Optional[List[dict]] = None,
+    *,
+    user: Optional[dict] = None,
+) -> tuple[list[str], dict[str, set[str]], dict[str, str]]:
+    names, paths, hints = _collect_scenario_catalog(history)
+    return _merge_editor_scenarios_into_catalog(names, paths, hints, user=user)
+
+
+_SCENARIO_PARTICIPANT_CACHE: dict[str, dict[str, Any]] = {}
+_G_USER_RECORD_SENTINEL = object()
+_G_PARTICIPANT_STATE_SENTINEL = object()
+_UI_VIEW_SESSION_KEY = 'ui_view_mode'
+_UI_VIEW_DEFAULT = 'participant'
+_UI_VIEW_ALLOWED = {'participant', 'admin'}
+_ADMIN_VIEW_ROLES = {'admin', 'builder'}
+_ALLOWED_USER_ROLES = {'admin', 'builder', 'participant'}
+_ROLE_ALIASES = {'user': 'participant'}
+_PARTICIPANT_ROLES = {'participant', 'user'}
+
+
+def _normalize_role_value(role: Any) -> str:
+    text = ''
+    if role not in (None, ''):
+        try:
+            text = str(role).strip().lower()
+        except Exception:
+            text = ''
+    if not text:
+        text = 'participant'
+    text = _ROLE_ALIASES.get(text, text)
+    if text not in _ALLOWED_USER_ROLES:
+        text = 'participant'
+    return text
+
+
+def _is_participant_role(role: Optional[str]) -> bool:
+    if role is None:
+        return False
+    return role.strip().lower() in _PARTICIPANT_ROLES
+
+
+def _is_admin_view_role(role: Optional[str]) -> bool:
+    if role is None:
+        return False
+    return role.strip().lower() in _ADMIN_VIEW_ROLES
+
+
+def _current_ui_view_mode() -> str:
+    user = _current_user()
+    raw = session.get(_UI_VIEW_SESSION_KEY, _UI_VIEW_DEFAULT)
+    if raw not in _UI_VIEW_ALLOWED:
+        raw = _UI_VIEW_DEFAULT
+        session[_UI_VIEW_SESSION_KEY] = raw
+    if not user or user.get('role') not in _ADMIN_VIEW_ROLES:
+        if session.get(_UI_VIEW_SESSION_KEY) != _UI_VIEW_DEFAULT:
+            session[_UI_VIEW_SESSION_KEY] = _UI_VIEW_DEFAULT
+        return _UI_VIEW_DEFAULT
+    return raw
+
+
+def _normalize_participant_proxmox_url(value: Any) -> str:
+    if value in (None, ''):
+        return ''
+    text = str(value).strip()
+    if not text:
+        return ''
+    candidate = text
+    parsed = urlparse(candidate)
+    if not parsed.scheme:
+        candidate = f'https://{candidate}'
+        parsed = urlparse(candidate)
+    scheme = (parsed.scheme or '').lower()
+    if scheme not in {'http', 'https'}:
+        return ''
+    if not parsed.netloc:
+        return ''
+    return parsed.geturl()
+
+
+def _participant_url_from_editor(editor: Optional[ET.Element]) -> str:
+    if editor is None:
+        return ''
+    hitl_el = editor.find('HardwareInLoop')
+    if hitl_el is None:
+        return ''
+    for attr in (
+        'participant_proxmox_url',
+        'participant_ui_url',
+        'participant_url',
+        'participant',
+    ):
+        raw = hitl_el.get(attr)
+        if raw:
+            normalized = _normalize_participant_proxmox_url(raw)
+            if normalized:
+                return normalized
+    return ''
+
+
+def _participant_urls_from_xml(path: str) -> dict[str, str]:
+    if not path:
+        return {}
+    try:
+        abs_path = os.path.abspath(path)
+    except Exception:
+        abs_path = str(path)
+    try:
+        mtime = os.path.getmtime(abs_path)
+    except Exception:
+        mtime = None
+    cached = _SCENARIO_PARTICIPANT_CACHE.get(abs_path)
+    if cached and cached.get('mtime') == mtime:
+        return dict(cached.get('data') or {})
+    mapping: dict[str, str] = {}
+    try:
+        tree = ET.parse(abs_path)
+        root = tree.getroot()
+    except Exception:
+        _SCENARIO_PARTICIPANT_CACHE[abs_path] = {'mtime': mtime, 'data': mapping}
+        return {}
+    if root.tag == 'Scenarios':
+        for scen_el in root.findall('Scenario'):
+            name = scen_el.get('name') or os.path.splitext(os.path.basename(abs_path))[0]
+            norm = _normalize_scenario_label(name)
+            if not norm:
+                continue
+            editor = scen_el.find('ScenarioEditor')
+            participant_url = _participant_url_from_editor(editor)
+            if participant_url:
+                mapping[norm] = participant_url
+    elif root.tag == 'ScenarioEditor':
+        name = root.get('name') or os.path.splitext(os.path.basename(abs_path))[0]
+        norm = _normalize_scenario_label(name)
+        if norm:
+            participant_url = _participant_url_from_editor(root)
+            if participant_url:
+                mapping[norm] = participant_url
+    _SCENARIO_PARTICIPANT_CACHE[abs_path] = {'mtime': mtime, 'data': mapping}
+    return dict(mapping)
+
+
+def _collect_scenario_participant_urls(
+    scenario_paths: dict[str, set[str]],
+    catalog_hints: Optional[Dict[str, Any]] = None,
+) -> dict[str, str]:
+    urls: dict[str, str] = {}
+    if catalog_hints:
+        for norm_key, raw_value in catalog_hints.items():
+            norm = _normalize_scenario_label(norm_key)
+            normalized_url = _normalize_participant_proxmox_url(raw_value)
+            if norm and normalized_url:
+                urls[norm] = normalized_url
+    if not scenario_paths:
+        return urls
+    cache: dict[str, dict[str, str]] = {}
+    for norm_key, candidates in scenario_paths.items():
+        if not candidates:
+            continue
+        for candidate in candidates:
+            try:
+                abs_path = os.path.abspath(str(candidate))
+            except Exception:
+                abs_path = str(candidate)
+            if not abs_path:
+                continue
+            if abs_path not in cache:
+                cache[abs_path] = _participant_urls_from_xml(abs_path)
+            url_value = cache[abs_path].get(norm_key)
+            if url_value:
+                urls[norm_key] = url_value
+                break
+    return urls
+
+
+def _normalize_scenario_assignments(values: Iterable[Any] | None) -> list[str]:
+    result: list[str] = []
+    if not values:
+        return result
+    for value in values:
+        norm = _normalize_scenario_label(value)
+        if norm and norm not in result:
+            result.append(norm)
+    return result
+
+
+def _participant_ui_state() -> Dict[str, Any]:
+    if has_request_context():
+        cached = getattr(g, '_participant_ui_state', _G_PARTICIPANT_STATE_SENTINEL)
+        if cached is not _G_PARTICIPANT_STATE_SENTINEL:
+            return cached
+    user = _current_user()
+    scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(
+        None,
+        user=user,
+    )
+    display_by_norm: dict[str, str] = {}
+    ordered_norms: list[str] = []
+    for display in scenario_names:
+        norm = _normalize_scenario_label(display)
+        if not norm or norm in display_by_norm:
+            continue
+        display_by_norm[norm] = display
+        ordered_norms.append(norm)
+    mapping = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
+    for norm_key in mapping.keys():
+        if not norm_key or norm_key in display_by_norm:
+            continue
+        display_by_norm[norm_key] = norm_key
+        ordered_norms.append(norm_key)
+    assigned_norms = _current_user_assigned_scenarios()
+    assigned_set = set(assigned_norms)
+    restrict_to_assigned = bool(user and _is_participant_role(user.get('role')))
+    allowed_norms: Optional[set[str]] = set(assigned_norms) if restrict_to_assigned else None
+    scenario_arg_norm = ''
+    if has_request_context():
+        try:
+            scenario_arg_norm = _normalize_scenario_label(request.args.get('scenario'))
+        except Exception:
+            scenario_arg_norm = ''
+
+    def _pick_norm(candidates: Iterable[str]) -> str:
+        for norm in candidates:
+            if not norm:
+                continue
+            if allowed_norms is not None and norm not in allowed_norms:
+                continue
+            url_value = mapping.get(norm)
+            if url_value:
+                return norm
+        return ''
+
+    ordered_mapping_norms = [key for key in mapping.keys() if key]
+    selected_norm = (
+        _pick_norm([scenario_arg_norm])
+        or _pick_norm(assigned_norms)
+        or _pick_norm(ordered_norms)
+        or _pick_norm(ordered_mapping_norms)
+    )
+    selected_label = display_by_norm.get(selected_norm, selected_norm)
+    selected_url = mapping.get(selected_norm, '')
+
+    listing: list[dict[str, Any]] = []
+    for norm in ordered_norms:
+        if not norm:
+            continue
+        entry = {
+            'norm': norm,
+            'display': display_by_norm.get(norm, norm),
+            'url': mapping.get(norm, ''),
+            'has_url': bool(mapping.get(norm)),
+            'assigned': norm in assigned_set,
+        }
+        listing.append(entry)
+    if restrict_to_assigned:
+        listing = [row for row in listing if row['assigned']]
+    for row in listing:
+        row['active'] = bool(selected_norm) and row['norm'] == selected_norm
+    heading = 'Your Assigned Scenarios' if restrict_to_assigned else 'Available Scenarios'
+    empty_message = (
+        'No scenarios have been assigned to your account yet. Ask an administrator for access.'
+        if restrict_to_assigned
+        else 'No scenarios with participant links are available yet.'
+    )
+    hint = 'Load a scenario into the console or open its participant link in a new tab.'
+    state = {
+        'selected_norm': selected_norm,
+        'selected_label': selected_label if selected_norm else '',
+        'selected_url': selected_url or '',
+        'listing': listing,
+        'listing_heading': heading,
+        'listing_empty_message': empty_message,
+        'listing_hint': hint,
+        'restrict_to_assigned': restrict_to_assigned,
+        'has_assignments': bool(assigned_norms),
+    }
+    if has_request_context():
+        setattr(g, '_participant_ui_state', state)
+    return state
+
+
+def _resolve_participant_ui_target() -> tuple[str, str]:
+    state = _participant_ui_state()
+    return state.get('selected_url', ''), state.get('selected_label', '')
+
+
+def _current_nav_participant_url() -> str:
+    url_value, _label = _resolve_participant_ui_target()
+    return url_value
+
+
+def _resolve_ui_view_redirect_target(candidate: Optional[str]) -> str:
+    fallback = url_for('index')
+    if not candidate:
+        return fallback
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return fallback
+    if not parsed.scheme and candidate.startswith('/'):
+        return candidate
+    try:
+        host_url = urlparse(request.host_url)
+    except Exception:
+        host_url = None
+    if parsed.scheme and host_url and parsed.netloc == host_url.netloc:
+        return candidate
+    return fallback
+
+
+def _select_existing_path(candidates) -> Optional[str]:
+    """Return the newest existing file path from an iterable of candidates."""
+    best_path: Optional[str] = None
+    best_mtime = float('-inf')
+    if not candidates:
+        return None
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            ap = os.path.abspath(str(candidate))
+        except Exception:
+            ap = str(candidate)
+        if not os.path.exists(ap):
+            continue
+        try:
+            mt = os.path.getmtime(ap)
+        except Exception:
+            mt = 0.0
+        if best_path is None or mt > best_mtime:
+            best_path = ap
+            best_mtime = mt
+    return best_path
 
 
 def _filter_history_by_scenario(history: List[dict], scenario_norm: str) -> List[dict]:
@@ -5534,6 +6573,11 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]]) -> Dict[str, A
     else:
         payload = dict(payload)
 
+    project_hint_raw = payload.get('project_key_hint') if isinstance(payload.get('project_key_hint'), str) else None
+    project_hint = project_hint_raw.strip() if isinstance(project_hint_raw, str) else None
+    scenario_hint_raw = payload.get('scenario_query') if isinstance(payload.get('scenario_query'), str) else None
+    scenario_hint = scenario_hint_raw.strip() if isinstance(scenario_hint_raw, str) else None
+
     defaults = _default_scenarios_payload()
 
     # --- Core connection defaults ---
@@ -5691,7 +6735,61 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]]) -> Dict[str, A
 
     payload.setdefault('result_path', defaults['result_path'])
 
+    try:
+        scen_names_for_catalog = [scen.get('name') for scen in normalized_scenarios if isinstance(scen, dict)]
+        participant_hints: Dict[str, str] = {}
+        for scen in normalized_scenarios:
+            if not isinstance(scen, dict):
+                continue
+            name = scen.get('name')
+            norm = _normalize_scenario_label(name)
+            if not norm:
+                continue
+            hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else None
+            participant_url_value = ''
+            if hitl_meta:
+                for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+                    candidate = hitl_meta.get(key)
+                    normalized = _normalize_participant_proxmox_url(candidate)
+                    if normalized:
+                        participant_url_value = normalized
+                        break
+            if participant_url_value:
+                participant_hints[norm] = participant_url_value
+        _persist_scenario_catalog(scen_names_for_catalog, payload.get('result_path'), participant_urls=participant_hints)
+    except Exception:
+        pass
+
+    if project_hint:
+        payload['project_key_hint'] = project_hint
+    elif payload.get('result_path') and not payload.get('project_key_hint'):
+        payload['project_key_hint'] = payload['result_path']
+    if scenario_hint:
+        payload['scenario_query'] = scenario_hint
+
     return payload
+
+
+@app.route('/api/editor_snapshot', methods=['POST'])
+def api_editor_snapshot():
+    user = _current_user()
+    if not user or not user.get('username'):
+        return jsonify({'success': False, 'error': 'Authentication required'}), 401
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'success': False, 'error': 'Invalid snapshot payload'}), 400
+    snapshot = _build_editor_snapshot_payload(payload)
+    if not snapshot:
+        return jsonify({'success': False, 'error': 'Snapshot rejected'}), 400
+    try:
+        _write_editor_state_snapshot(snapshot, user=user)
+    except Exception as exc:
+        try:
+            app.logger.exception('[editor_snapshot] persist failed: %s', exc)
+        except Exception:
+            pass
+        return jsonify({'success': False, 'error': 'Unable to persist snapshot'}), 500
+    return jsonify({'success': True})
 
 
 # Hardware in the Loop utilities
@@ -6625,6 +7723,18 @@ def _parse_scenarios_xml(path):
                 scen['density_count'] = int(dc_attr)
             except Exception:
                 pass
+        total_nodes_attr = scen_el.get('scenario_total_nodes')
+        if total_nodes_attr not in (None, ''):
+            try:
+                scen['scenario_total_nodes'] = int(total_nodes_attr)
+            except Exception:
+                scen['scenario_total_nodes'] = total_nodes_attr
+        base_nodes_attr = scen_el.get('base_nodes')
+        if base_nodes_attr not in (None, ''):
+            try:
+                scen['base_nodes'] = int(base_nodes_attr)
+            except Exception:
+                scen['base_nodes'] = base_nodes_attr
         se = scen_el.find("ScenarioEditor")
         if se is None:
             continue
@@ -6662,6 +7772,15 @@ def _parse_scenario_editor(se):
     if hitl_el is not None:
         enabled_raw = (hitl_el.get("enabled") or "").strip().lower()
         hitl_info["enabled"] = enabled_raw in ("1", "true", "yes", "on")
+        participant_attr = (
+            hitl_el.get('participant_proxmox_url')
+            or hitl_el.get('participant_url')
+            or hitl_el.get('participant')
+        )
+        if participant_attr not in (None, ''):
+            participant_clean = str(participant_attr).strip()
+            if participant_clean:
+                hitl_info['participant_proxmox_url'] = participant_clean
         interfaces: List[Dict[str, Any]] = []
         for iface_el in hitl_el.findall("Interface"):
             name = (iface_el.get("name") or "").strip()
@@ -6883,9 +8002,20 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
             if "attachment" not in iface:
                 iface["attachment"] = _DEFAULT_HITL_ATTACHMENT
 
-        if hitl and (hitl.get("enabled") or normalized_ifaces or hitl.get("core")):
+        participant_url_raw = hitl.get("participant_proxmox_url") if isinstance(hitl, dict) else None
+        if participant_url_raw not in (None, ''):
+            try:
+                participant_url = str(participant_url_raw).strip()
+            except Exception:
+                participant_url = ''
+        else:
+            participant_url = ''
+
+        if hitl and (hitl.get("enabled") or normalized_ifaces or hitl.get("core") or participant_url):
             hitl_el = ET.SubElement(se, "HardwareInLoop")
             hitl_el.set("enabled", "true" if hitl.get("enabled") else "false")
+            if participant_url:
+                hitl_el.set('participant_proxmox_url', participant_url)
             hitl_core_cfg = _extract_optional_core_config(hitl.get("core"), include_password=False)
             if hitl_core_cfg:
                 hitl_core_el = ET.SubElement(hitl_el, "CoreConnection")
@@ -7457,16 +8587,22 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
 
         switches = [n for n in nodes if (n.get('type') or '').lower() == 'switch']
         extra_switch_nodes: list[dict] = []
+        extra_hitl_network_nodes: list[dict] = []
+        hitl_network_markers = ('rj45', 'rj-45', 'hitl', 'tap', 'bridge', 'ethernet', 'physical')
         try:
             for net in networks:
                 ntype = (net.get('type') or '').lower()
-                if 'switch' not in ntype:
+                is_switch_candidate = 'switch' in ntype
+                is_hitl_candidate = any(marker in ntype for marker in hitl_network_markers)
+                if not is_switch_candidate and not is_hitl_candidate:
                     continue
                 sw_id = normalize_ref(net.get('id') or net.get('name'))
                 if not sw_id:
                     continue
                 sw_name = (net.get('name') or sw_id).strip() or sw_id
-                if any(sw_id == sw.get('id') or sw_name == sw.get('name') for sw in switches):
+                if is_switch_candidate and any(sw_id == sw.get('id') or sw_name == sw.get('name') for sw in switches):
+                    continue
+                if is_hitl_candidate and any(sw_id == n.get('id') or sw_name == n.get('name') for n in nodes):
                     continue
                 raw_ifaces = interface_store.get(sw_id, {})
                 iface_entries = []
@@ -7475,23 +8611,37 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
                     if cleaned:
                         iface_entries.append(cleaned)
                 iface_entries.sort(key=lambda e: ((e.get('name') or '').lower(), e.get('ipv4') or '', e.get('ipv6') or ''))
-                extra_switch = {
-                    'id': sw_id,
-                    'name': sw_name,
-                    'type': 'switch',
-                    'services': [],
-                    'linked_nodes': [],
-                    'interfaces': iface_entries,
-                }
-                switches.append(extra_switch)
-                extra_switch_nodes.append(extra_switch)
-                id_to_name.setdefault(sw_id, sw_name)
-                id_to_type.setdefault(sw_id, 'switch')
+                if is_switch_candidate:
+                    extra_switch = {
+                        'id': sw_id,
+                        'name': sw_name,
+                        'type': 'switch',
+                        'services': [],
+                        'linked_nodes': [],
+                        'interfaces': iface_entries,
+                    }
+                    switches.append(extra_switch)
+                    extra_switch_nodes.append(extra_switch)
+                    id_to_name.setdefault(sw_id, sw_name)
+                    id_to_type.setdefault(sw_id, 'switch')
+                elif is_hitl_candidate:
+                    extra_hitl = {
+                        'id': sw_id,
+                        'name': sw_name,
+                        'type': net.get('type') or 'rj45',
+                        'services': [],
+                        'linked_nodes': [],
+                        'interfaces': iface_entries,
+                    }
+                    extra_hitl_network_nodes.append(extra_hitl)
+                    id_to_name.setdefault(sw_id, sw_name)
+                    id_to_type.setdefault(sw_id, extra_hitl['type'].lower())
         except Exception:
             pass
 
         valid_ids: set[str] = {n['id'] for n in nodes}
         valid_ids.update(sw['id'] for sw in extra_switch_nodes)
+        valid_ids.update(hitl['id'] for hitl in extra_hitl_network_nodes)
         adj_clean: Dict[str, set[str]] = {}
         for nid, neighbors in adj.items():
             if nid not in valid_ids:
@@ -7499,6 +8649,8 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
             adj_clean[nid] = {nbr for nbr in neighbors if nbr in valid_ids}
         for sw in extra_switch_nodes:
             adj_clean.setdefault(sw['id'], set())
+        for hitl in extra_hitl_network_nodes:
+            adj_clean.setdefault(hitl['id'], set())
 
         def _prune_neighbors(node_id: str, node_type: str) -> None:
             if node_type in ('router', 'switch'):
@@ -7523,16 +8675,20 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
             _prune_neighbors(node['id'], (node.get('type') or '').lower())
         for sw in extra_switch_nodes:
             _prune_neighbors(sw['id'], (sw.get('type') or '').lower())
+        for hitl in extra_hitl_network_nodes:
+            _prune_neighbors(hitl['id'], (hitl.get('type') or '').lower())
 
         def _neighbor_names(node_id: str) -> list[str]:
             neighbors = sorted(adj_clean.get(node_id, set()), key=lambda vid: id_to_name.get(vid, vid).lower())
             return [id_to_name.get(vid, vid) for vid in neighbors]
 
         filtered_nodes: list[dict] = []
+        important_types = {'router', 'switch', 'rj45', 'rj-45', 'tap', 'bridge'}
         for node in nodes:
             nid = node['id']
             linked = adj_clean.get(nid, set())
-            if linked or (node.get('interfaces') and len(node.get('interfaces')) > 0) or (node.get('type') or '').lower() in ('router', 'switch'):
+            node_type = (node.get('type') or '').lower()
+            if linked or (node.get('interfaces') and len(node.get('interfaces')) > 0) or node_type in important_types:
                 node['linked_nodes'] = _neighbor_names(nid)
                 filtered_nodes.append(node)
         nodes = filtered_nodes
@@ -7546,11 +8702,44 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
                 filtered_extra_switch_nodes.append(sw)
         extra_switch_nodes = filtered_extra_switch_nodes
 
+        filtered_extra_hitl_nodes: list[dict] = []
+        for hitl in extra_hitl_network_nodes:
+            nid = hitl['id']
+            linked = adj_clean.get(nid, set())
+            if linked:
+                hitl['linked_nodes'] = _neighbor_names(nid)
+                filtered_extra_hitl_nodes.append(hitl)
+        extra_hitl_network_nodes = filtered_extra_hitl_nodes
+
         valid_ids = {n['id'] for n in nodes}
         valid_ids.update(sw['id'] for sw in extra_switch_nodes)
+        valid_ids.update(hitl['id'] for hitl in extra_hitl_network_nodes)
         adj_clean = {nid: {nbr for nbr in neighbors if nbr in valid_ids} for nid, neighbors in adj_clean.items() if nid in valid_ids}
 
         switches = [n for n in nodes if (n.get('type') or '').lower() == 'switch']
+        hitl_markers = ('rj45', 'hitl', 'tap', 'bridge', 'ethernet', 'rj-45')
+
+        def _is_hitl_node(node: dict) -> bool:
+            node_type = (node.get('type') or '').lower()
+            if node_type and any(marker in node_type for marker in hitl_markers):
+                return True
+            for svc in node.get('services') or []:
+                svc_name = (svc or '').lower()
+                if any(marker in svc_name for marker in hitl_markers):
+                    return True
+            node_name = (node.get('name') or '').lower()
+            if node_name and any(marker in node_name for marker in ('rj45', 'hitl')):
+                return True
+            return False
+
+        hitl_nodes: list[dict] = []
+        for node in nodes:
+            if _is_hitl_node(node):
+                node['is_hitl'] = True
+                hitl_nodes.append(node)
+        for hitl in extra_hitl_network_nodes:
+            hitl['is_hitl'] = True
+            hitl_nodes.append(hitl)
 
         link_details: list[dict] = []
         seen_pairs: set[tuple[str, str]] = set()
@@ -7575,9 +8764,13 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
             'links_count': len(link_details),
             'services_count': len(services),
             'nodes': nodes,
-            'switches_count': len(switches),
-            'switches': [sw['name'] for sw in switches],
+            'switches_count': len(switches) + len(extra_switch_nodes),
+            'switches_device_count': len(switches),
+            'switches': [sw['name'] for sw in switches] + [sw['name'] for sw in extra_switch_nodes],
             'switch_nodes': extra_switch_nodes,
+            'hitl_network_nodes': extra_hitl_network_nodes,
+            'hitl_nodes': hitl_nodes,
+            'hitl_nodes_count': len(hitl_nodes),
             'links_detail': link_details,
             'routing_edges_policies': routing_edge_policies,
         })
@@ -7610,8 +8803,56 @@ def _analyze_core_xml(xml_path: str) -> Dict[str, Any]:
         return {'error': str(e)}
 
 
+def _summarize_planner_scenarios(xml_path: str) -> Dict[str, Any]:
+    """Create a lightweight summary for Scenario Editor bundles (root <Scenarios>)."""
+    summary: Dict[str, Any] = {'__planner_bundle': True, 'scenarios': [], 'scenarios_count': 0}
+    try:
+        payload = _parse_scenarios_xml(xml_path)
+    except Exception as exc:
+        summary['error'] = str(exc)
+        return summary
+    scen_list = payload.get('scenarios') or []
+    for scen in scen_list:
+        if not isinstance(scen, dict):
+            continue
+        sections_meta = scen.get('sections') if isinstance(scen.get('sections'), dict) else {}
+        sections_summary: List[Dict[str, Any]] = []
+        for sec_name, sec_val in sections_meta.items():
+            if not isinstance(sec_val, dict):
+                continue
+            sections_summary.append({
+                'name': sec_name,
+                'item_count': len(sec_val.get('items') or []),
+                'density': sec_val.get('density'),
+                'total_nodes': sec_val.get('total_nodes'),
+            })
+        summary['scenarios'].append({
+            'name': scen.get('name') or 'Scenario',
+            'density_count': scen.get('density_count'),
+            'scenario_total_nodes': scen.get('scenario_total_nodes'),
+            'base_nodes': scen.get('base_nodes'),
+            'hitl_enabled': bool(((scen.get('hitl') or {}).get('enabled'))),
+            'base_file': ((scen.get('base') or {}).get('filepath') or ''),
+            'sections': sections_summary,
+        })
+    summary['scenarios_count'] = len(summary['scenarios'])
+    core_meta = payload.get('core') if isinstance(payload.get('core'), dict) else None
+    if core_meta:
+        summary['core'] = core_meta
+    return summary
+
+
 @app.route('/', methods=['GET'])
 def index():
+    current = _current_user()
+    scenario_query = ''
+    try:
+        scenario_query = (request.args.get('scenario') or '').strip()
+    except Exception:
+        scenario_query = ''
+    if current and _is_participant_role(current.get('role')):
+        target_args = {'scenario': scenario_query} if scenario_query else {}
+        return redirect(url_for('participant_ui_page', **target_args))
     payload = _default_scenarios_payload()
     # Reconstruct base_upload if base filepath already present
     _attach_base_upload(payload)
@@ -7620,11 +8861,23 @@ def index():
     if payload.get('base_upload'):
         _save_base_upload_state(payload['base_upload'])
     payload = _prepare_payload_for_index(payload)
+    if scenario_query:
+        payload['scenario_query'] = scenario_query
+    if payload.get('result_path') and not payload.get('project_key_hint'):
+        payload['project_key_hint'] = payload['result_path']
+    snapshot = _load_editor_state_snapshot(current)
+    if snapshot:
+        payload['editor_snapshot'] = snapshot
+        if snapshot.get('project_key_hint') and not payload.get('project_key_hint'):
+            payload['project_key_hint'] = snapshot.get('project_key_hint')
+        if snapshot.get('scenario_query') and not payload.get('scenario_query'):
+            payload['scenario_query'] = snapshot.get('scenario_query')
     return render_template('index.html', payload=payload, logs="", xml_preview="")
 
 
 @app.route('/load_xml', methods=['POST'])
 def load_xml():
+    user = _current_user()
     file = request.files.get('scenarios_xml')
     if not file or file.filename == '':
         flash('No file selected.')
@@ -7654,6 +8907,13 @@ def load_xml():
         except Exception:
             xml_text = ""
         payload = _prepare_payload_for_index(payload)
+        snapshot_source = dict(payload)
+        snapshot_source['active_index'] = 0
+        snapshot_source['project_key_hint'] = payload.get('result_path')
+        _persist_editor_state_snapshot(snapshot_source, user=user)
+        snapshot = _load_editor_state_snapshot(user)
+        if snapshot:
+            payload['editor_snapshot'] = snapshot
         return render_template('index.html', payload=payload, logs="", xml_preview=xml_text)
     except Exception as e:
         flash(f'Failed to parse XML: {e}')
@@ -7666,6 +8926,7 @@ def save_xml():
     if not data_str:
         flash('No data received.')
         return redirect(url_for('index'))
+    user = _current_user()
     try:
         data = json.loads(data_str)
     except Exception as e:
@@ -7684,7 +8945,28 @@ def save_xml():
                 core_meta = json.loads(core_str)
         except Exception:
             core_meta = None
+        client_project_hint = (request.form.get('project_key_hint') or '').strip()
+        client_scenario_query = (request.form.get('scenario_query') or '').strip()
         normalized_core = _normalize_core_config(core_meta, include_password=True) if core_meta else None
+        scenario_count = len(data.get('scenarios') or []) if isinstance(data.get('scenarios'), list) else 0
+        scenario_names_desc = []
+        try:
+            scenario_names_desc = [str((sc or {}).get('name') or '').strip() for sc in (data.get('scenarios') or []) if isinstance(sc, dict)]
+        except Exception:
+            scenario_names_desc = []
+        username = (user or {}).get('username') if isinstance(user, dict) else None
+        try:
+            app.logger.info(
+                '[save_xml] user=%s scen_count=%s active_index=%s project_hint=%s scenario_query=%s names=%s',
+                username or 'anonymous',
+                scenario_count,
+                active_index if active_index is not None else 'none',
+                client_project_hint or '<none>',
+                client_scenario_query or '<none>',
+                ', '.join(name for name in scenario_names_desc if name) or '<unnamed>'
+            )
+        except Exception:
+            pass
         tree = _build_scenarios_xml({ 'scenarios': data.get('scenarios'), 'core': normalized_core })
         ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
@@ -7703,6 +8985,10 @@ def save_xml():
         stem_raw = (chosen_name or (scen_names[0] if scen_names else 'scenarios')) or 'scenarios'
         stem = secure_filename(stem_raw).strip('_-.') or 'scenarios'
         out_path = os.path.join(out_dir, f"{stem}.xml")
+        try:
+            app.logger.info('[save_xml] writing xml out_path=%s stem=%s', out_path, stem)
+        except Exception:
+            pass
         # Pretty print if lxml available else fallback
         try:
             from lxml import etree as LET  # type: ignore
@@ -7737,6 +9023,34 @@ def save_xml():
         if payload.get('base_upload'):
             _save_base_upload_state(payload['base_upload'])
         payload = _prepare_payload_for_index(payload)
+        if client_project_hint:
+            payload['project_key_hint'] = client_project_hint
+        if client_scenario_query:
+            payload['scenario_query'] = client_scenario_query
+        snapshot_source = dict(payload)
+        try:
+            snapshot_source['scenarios'] = copy.deepcopy(data.get('scenarios') or [])
+        except Exception:
+            snapshot_source['scenarios'] = data.get('scenarios') or []
+        snapshot_source['active_index'] = active_index
+        if client_project_hint:
+            snapshot_source['project_key_hint'] = client_project_hint
+        elif payload.get('project_key_hint'):
+            snapshot_source['project_key_hint'] = payload.get('project_key_hint')
+        else:
+            snapshot_source['project_key_hint'] = payload.get('result_path')
+        if client_scenario_query:
+            snapshot_source['scenario_query'] = client_scenario_query
+        elif payload.get('scenario_query'):
+            snapshot_source['scenario_query'] = payload.get('scenario_query')
+        _persist_editor_state_snapshot(snapshot_source, user=user)
+        snapshot = _load_editor_state_snapshot(user)
+        if snapshot:
+            payload['editor_snapshot'] = snapshot
+        try:
+            app.logger.info('[save_xml] success user=%s xml=%s scen_count=%s', username or 'anonymous', out_path, scenario_count)
+        except Exception:
+            pass
         return render_template('index.html', payload=payload, logs="", xml_preview=xml_text)
     except Exception as e:
         flash(f'Failed to save XML: {e}')
@@ -7746,10 +9060,15 @@ def save_xml():
 @app.route('/save_xml_api', methods=['POST'])
 def save_xml_api():
     try:
+        user = _current_user()
         data = request.get_json(silent=True) or {}
         scenarios = data.get('scenarios')
         core_meta = data.get('core')
         normalized_core = _normalize_core_config(core_meta, include_password=True) if isinstance(core_meta, (dict, list)) or core_meta else None
+        raw_project_hint = data.get('project_key_hint') if isinstance(data, dict) else None
+        project_key_hint = raw_project_hint.strip() if isinstance(raw_project_hint, str) else ''
+        raw_scenario_query = data.get('scenario_query') if isinstance(data, dict) else None
+        scenario_query_hint = raw_scenario_query.strip() if isinstance(raw_scenario_query, str) else ''
         active_index = None
         try:
             active_index = int(data.get('active_index')) if 'active_index' in data else None
@@ -7757,6 +9076,24 @@ def save_xml_api():
             active_index = None
         if not isinstance(scenarios, list):
             return jsonify({ 'ok': False, 'error': 'Invalid payload (scenarios list required)' }), 400
+        scenario_names: list[str] = []
+        try:
+            scenario_names = [str((s or {}).get('name') or '').strip() for s in scenarios if isinstance(s, dict)]
+        except Exception:
+            scenario_names = []
+        username = (user or {}).get('username') if isinstance(user, dict) else None
+        try:
+            app.logger.info(
+                '[save_xml_api] user=%s scen_count=%s active_index=%s project_hint=%s scenario_query=%s names=%s',
+                username or 'anonymous',
+                len(scenarios),
+                active_index if active_index is not None else 'none',
+                project_key_hint or '<none>',
+                scenario_query_hint or '<none>',
+                ', '.join(name for name in scenario_names if name) or '<unnamed>'
+            )
+        except Exception:
+            pass
         tree = _build_scenarios_xml({ 'scenarios': scenarios, 'core': normalized_core })
         ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
@@ -7775,6 +9112,10 @@ def save_xml_api():
         stem_raw = (chosen_name or (scen_names[0] if scen_names else 'scenarios')) or 'scenarios'
         stem = secure_filename(stem_raw).strip('_-.') or 'scenarios'
         out_path = os.path.join(out_dir, f"{stem}.xml")
+        try:
+            app.logger.info('[save_xml_api] writing xml out_path=%s stem=%s', out_path, stem)
+        except Exception:
+            pass
         # Pretty print when possible
         try:
             raw = ET.tostring(tree.getroot(), encoding='utf-8')
@@ -7785,6 +9126,20 @@ def save_xml_api():
         except Exception:
             tree.write(out_path, encoding='utf-8', xml_declaration=True)
         resp_core = _normalize_core_config(normalized_core or core_meta or {}, include_password=False) if (normalized_core or core_meta) else _default_core_dict()
+        snapshot_source = {
+            'scenarios': scenarios,
+            'core': resp_core,
+            'result_path': out_path,
+            'active_index': active_index,
+            'project_key_hint': project_key_hint or out_path,
+        }
+        if scenario_query_hint:
+            snapshot_source['scenario_query'] = scenario_query_hint
+        _persist_editor_state_snapshot(snapshot_source, user=user)
+        try:
+            app.logger.info('[save_xml_api] success user=%s xml=%s scen_count=%s', username or 'anonymous', out_path, len(scenarios))
+        except Exception:
+            pass
         return jsonify({ 'ok': True, 'result_path': out_path, 'core': resp_core })
     except Exception as e:
         try:
@@ -8822,7 +10177,10 @@ def reports_page():
                 e['scenario_names'] = []
         enriched.append(e)
     enriched = sorted(enriched, key=lambda x: x.get('timestamp',''), reverse=True)
-    scenario_names, _scenario_paths = _collect_scenario_catalog(enriched)
+    scenario_names, _scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(
+        enriched,
+        user=_current_user(),
+    )
     scenario_query = request.args.get('scenario', '').strip()
     scenario_norm = _normalize_scenario_label(scenario_query)
     if scenario_norm:
@@ -8866,7 +10224,10 @@ def reports_data():
                 e['scenario_names'] = []
         enriched.append(e)
     enriched = sorted(enriched, key=lambda x: x.get('timestamp',''), reverse=True)
-    scenario_names, scenario_paths = _collect_scenario_catalog(enriched)
+    scenario_names, scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(
+        enriched,
+        user=_current_user(),
+    )
     scenario_query = request.args.get('scenario', '').strip()
     scenario_norm = _normalize_scenario_label(scenario_query)
     if scenario_norm:
@@ -10094,6 +11455,230 @@ def _list_active_core_sessions(
     return items
 
 
+def _collect_node_ips(node: dict[str, Any]) -> list[str]:
+    ips: list[str] = []
+    try:
+        interfaces = node.get('interfaces') or []
+        for iface in interfaces:
+            if not isinstance(iface, dict):
+                continue
+            ip4 = (iface.get('ipv4') or '').strip()
+            ip4_mask = (iface.get('ipv4_mask') or '').strip()
+            ip6 = (iface.get('ipv6') or '').strip()
+            ip6_mask = (iface.get('ipv6_mask') or '').strip()
+            if ip4:
+                val = f"{ip4}/{ip4_mask}" if ip4_mask else ip4
+                if val not in ips:
+                    ips.append(val)
+            if ip6:
+                val6 = f"{ip6}/{ip6_mask}" if ip6_mask else ip6
+                if val6 not in ips:
+                    ips.append(val6)
+    except Exception:
+        pass
+    return ips
+
+
+def _hitl_details_from_path(xml_path: str) -> list[dict[str, Any]]:
+    try:
+        abs_path = os.path.abspath(xml_path)
+    except Exception:
+        abs_path = xml_path
+    if not abs_path:
+        return []
+    try:
+        st = os.stat(abs_path)
+        mtime = st.st_mtime
+    except Exception:
+        mtime = None
+    cached = _SESSION_HITL_CACHE.get(abs_path)
+    if cached and cached.get('mtime') == mtime:
+        return cached.get('data', [])
+    hitl_details: list[dict[str, Any]] = []
+    try:
+        summary = _analyze_core_xml(abs_path)
+        nodes = summary.get('hitl_nodes') or []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            name = (node.get('name') or node.get('id') or '').strip()
+            node_type = (node.get('type') or '').strip()
+            ips = _collect_node_ips(node)
+            hitl_details.append({
+                'name': name or node_type or 'HITL',
+                'type': node_type,
+                'ips': ips,
+            })
+    except Exception:
+        hitl_details = []
+    _SESSION_HITL_CACHE[abs_path] = {'mtime': mtime, 'data': hitl_details}
+    return hitl_details
+
+
+def _session_hitl_metadata(
+    session: dict,
+    *,
+    core_cfg: Optional[Dict[str, Any]] = None,
+    session_store: Optional[dict] = None,
+) -> list[dict[str, Any]]:
+    candidate_paths: list[str] = []
+    file_path = session.get('file')
+    if file_path:
+        candidate_paths.append(str(file_path))
+    store = session_store if isinstance(session_store, dict) else _load_core_sessions_store()
+    sid = session.get('id')
+    sid_int: Optional[int] = None
+    if sid not in (None, ''):
+        try:
+            sid_int = int(sid)
+        except Exception:
+            sid_int = None
+        if sid_int is not None and isinstance(store, dict):
+            for path, stored in store.items():
+                if _session_store_entry_session_id(stored) == sid_int:
+                    candidate_paths.append(path)
+                    break
+    seen: set[str] = set()
+    for path in candidate_paths:
+        if not path:
+            continue
+        try:
+            abs_path = os.path.abspath(path)
+        except Exception:
+            abs_path = path
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        if not os.path.exists(abs_path):
+            continue
+        details = _hitl_details_from_path(abs_path)
+        if details:
+            try:
+                existing_file = session.get('file')
+                if not existing_file or not os.path.exists(existing_file):
+                    session['file'] = abs_path
+            except Exception:
+                pass
+            return details
+    if core_cfg and sid_int is not None:
+        try:
+            out_dir = os.path.join(_outputs_dir(), 'core-sessions')
+        except Exception:
+            out_dir = _outputs_dir()
+        try:
+            saved = _grpc_save_current_session_xml_with_config(core_cfg, out_dir, session_id=str(sid_int))
+        except Exception:
+            saved = None
+        if saved and os.path.exists(saved):
+            try:
+                _update_xml_session_mapping(saved, sid_int, scenario_name=session.get('scenario_name') or None)
+            except Exception:
+                pass
+            try:
+                existing_file = session.get('file')
+                if not existing_file:
+                    session['file'] = saved
+            except Exception:
+                pass
+            return _hitl_details_from_path(saved)
+    return []
+
+
+def _attach_participant_urls_to_sessions(
+    sessions: list[dict],
+    session_store: dict,
+    scenario_paths: dict[str, set[str]],
+    participant_urls: dict[str, str],
+) -> None:
+    if not sessions or not participant_urls:
+        return
+    path_to_norm: dict[str, str] = {}
+    for norm_key, candidates in (scenario_paths or {}).items():
+        for candidate in candidates or []:
+            try:
+                ap = os.path.abspath(str(candidate))
+            except Exception:
+                ap = str(candidate)
+            if ap:
+                path_to_norm[ap] = norm_key
+    sessions_by_id: dict[int, tuple[dict, str]] = {}
+    for path, entry in (session_store or {}).items():
+        sid = _session_store_entry_session_id(entry)
+        if sid is None:
+            continue
+        try:
+            ap = os.path.abspath(path)
+        except Exception:
+            ap = str(path)
+        sessions_by_id[sid] = (entry, ap)
+    path_lookup_cache: dict[str, dict[str, str]] = {}
+    for sess in sessions:
+        scenario_norm = ''
+        candidate_paths: list[str] = []
+        sid_raw = sess.get('id')
+        sid_int: Optional[int] = None
+        if sid_raw not in (None, ''):
+            try:
+                sid_int = int(sid_raw)
+            except Exception:
+                sid_int = None
+        if sid_int is not None and sid_int in sessions_by_id:
+            entry, mapped_path = sessions_by_id[sid_int]
+            if mapped_path:
+                candidate_paths.append(mapped_path)
+            scenario_norm = _session_store_entry_scenario_norm(entry)
+            if (not scenario_norm) and mapped_path:
+                scenario_norm = path_to_norm.get(mapped_path, '')
+            if (not scenario_norm) and mapped_path:
+                base = os.path.splitext(os.path.basename(mapped_path))[0]
+                scenario_norm = _normalize_scenario_label(base)
+        if not scenario_norm:
+            scenario_name = sess.get('scenario_name')
+            if scenario_name:
+                scenario_norm = _normalize_scenario_label(scenario_name)
+        if not scenario_norm:
+            candidate_path = sess.get('file') or sess.get('dir')
+            if candidate_path:
+                try:
+                    ap = os.path.abspath(candidate_path)
+                except Exception:
+                    ap = str(candidate_path)
+                scenario_norm = path_to_norm.get(ap, '')
+                if not scenario_norm:
+                    base = os.path.splitext(os.path.basename(ap))[0]
+                    scenario_norm = _normalize_scenario_label(base)
+                if ap:
+                    candidate_paths.append(ap)
+        if scenario_norm:
+            sess['scenario_norm'] = scenario_norm
+            participant_url = participant_urls.get(scenario_norm)
+            if not participant_url:
+                for candidate_path in candidate_paths:
+                    if not candidate_path:
+                        continue
+                    if candidate_path not in path_lookup_cache:
+                        path_lookup_cache[candidate_path] = _participant_urls_from_xml(candidate_path)
+                    candidate_url = path_lookup_cache[candidate_path].get(scenario_norm)
+                    if candidate_url:
+                        participant_url = candidate_url
+                        participant_urls.setdefault(scenario_norm, candidate_url)
+                        break
+            if participant_url:
+                sess['participant_proxmox_url'] = participant_url
+
+
+def _attach_hitl_metadata_to_sessions(
+    sessions: list[dict],
+    core_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    allow_remote_fetch: bool = False,
+) -> None:
+    store = _load_core_sessions_store()
+    cfg = core_cfg if allow_remote_fetch else None
+    for sess in sessions:
+        sess['hitl'] = _session_hitl_metadata(sess, core_cfg=cfg, session_store=store)
+
+
 def _scan_core_xmls(max_count: int = 200) -> list[dict]:
     """Scan for runnable CORE XMLs and exclude scenario editor saves.
 
@@ -10146,7 +11731,9 @@ def _scan_core_xmls(max_count: int = 200) -> list[dict]:
 @app.route('/core')
 def core_page():
     history = _load_run_history()
-    scenario_names, scenario_paths = _collect_scenario_catalog(history)
+    current_user = _current_user()
+    scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
+    scenario_participant_urls = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
     scenario_query = request.args.get('scenario', '').strip()
     scenario_norm = _normalize_scenario_label(scenario_query)
     active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
@@ -10195,6 +11782,8 @@ def core_page():
             xmls = filtered_xmls
         else:
             app.logger.info('[core.page] scenario=%s produced no XML matches; showing all XMLs', scenario_norm)
+    _attach_hitl_metadata_to_sessions(sessions, core_cfg, allow_remote_fetch=False)
+    _attach_participant_urls_to_sessions(sessions, mapping, scenario_paths, scenario_participant_urls)
     file_to_sid: dict[str, int] = {}
     # From gRPC session summaries (file path may be absolute)
     for s in sessions:
@@ -10232,7 +11821,9 @@ def core_page():
 @app.route('/core/data')
 def core_data():
     history = _load_run_history()
-    scenario_names, scenario_paths = _collect_scenario_catalog(history)
+    current_user = _current_user()
+    scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
+    scenario_participant_urls = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
     scenario_query = request.args.get('scenario', '').strip()
     scenario_norm = _normalize_scenario_label(scenario_query)
     scenario_display = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
@@ -10277,6 +11868,8 @@ def core_data():
             xmls = filtered_xmls
         else:
             app.logger.info('[core.data] scenario=%s produced no XML matches; showing all XMLs', scenario_norm)
+    _attach_hitl_metadata_to_sessions(sessions, core_cfg, allow_remote_fetch=True)
+    _attach_participant_urls_to_sessions(sessions, mapping, scenario_paths, scenario_participant_urls)
     file_to_sid: dict[str, int] = {}
     for s in sessions:
         f = s.get('file')
@@ -10431,14 +12024,40 @@ def core_push_repo_route():
         scenario_core_override if isinstance(scenario_core_override, dict) else None,
         include_password=True,
     )
+    progress_id = uuid.uuid4().hex
+    _init_repo_push_progress(progress_id, stage='packaging', detail='Preparing repository snapshot…', status='packaging', percent=0.0)
     try:
-        result = _push_repo_to_remote(core_cfg, logger=app.logger)
+        result = _push_repo_to_remote(
+            core_cfg,
+            logger=app.logger,
+            progress_id=progress_id,
+            finalize_async=True,
+        )
     except _SSHTunnelError as exc:
+        _update_repo_push_progress(progress_id, status='error', stage='error', detail=str(exc))
         return jsonify({'error': str(exc)}), 400
     except Exception as exc:
         app.logger.exception('[core.push_repo] Failed syncing repo: %s', exc)
-        return jsonify({'error': f'Failed pushing repo: {exc}'}), 500
-    return jsonify({'ok': True, 'repo_path': result.get('repo_path')})
+        _update_repo_push_progress(progress_id, status='error', stage='error', detail=str(exc))
+        return jsonify({'error': f'Failed pushing repo: {exc}', 'progress_id': progress_id}), 500
+    return jsonify({'ok': True, 'repo_path': result.get('repo_path'), 'progress_id': progress_id})
+
+
+@app.route('/core/push_repo/status/<progress_id>', methods=['GET'])
+def core_push_repo_status(progress_id: str):
+    payload = _get_repo_push_progress(progress_id)
+    if not payload:
+        return jsonify({'progress_id': progress_id, 'status': 'unknown'}), 404
+    response = {
+        'progress_id': progress_id,
+        'status': payload.get('status') or 'pending',
+        'stage': payload.get('stage'),
+        'detail': payload.get('detail'),
+        'percent': payload.get('percent'),
+        'updated_at': payload.get('updated_at'),
+        'created_at': payload.get('created_at'),
+    }
+    return jsonify(response)
 
 
 @app.route('/core/start', methods=['POST'])
@@ -10584,18 +12203,27 @@ def core_delete():
 
 @app.route('/core/details')
 def core_details():
+    scenario_param = (request.args.get('scenario_name') or request.args.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_param)
+    history = _load_run_history()
+    scenario_names, scenario_paths, _scenario_url_hints = _collect_scenario_catalog(history)
+    scenario_label = _resolve_scenario_display(scenario_norm, scenario_names, scenario_param)
     core_cfg = _core_config_for_request(include_password=True)
     core_host = core_cfg.get('host', CORE_HOST)
     core_port = int(core_cfg.get('port', CORE_PORT))
-    xml_path = request.args.get('path')
+    xml_param = request.args.get('path')
+    xml_path = os.path.abspath(xml_param) if xml_param else None
+    if xml_path and not os.path.exists(xml_path):
+        xml_path = None
     sid = request.args.get('session_id')
     xml_summary = None
     xml_valid = False
     errors = ''
-    classification = None  # 'scenario' | 'session' | 'unknown'
+    classification = None  # 'scenario' | 'session' | 'unknown' | 'planner'
     container_flag = False
+    planner_bundle = False
     # If no XML path given but we have a session id, attempt to export the session XML so we can show details
-    if (not xml_path or not os.path.exists(xml_path)) and sid:
+    if not xml_path and sid:
         try:
             out_dir = os.path.join(_outputs_dir(), 'core-sessions')
             os.makedirs(out_dir, exist_ok=True)
@@ -10604,6 +12232,14 @@ def core_details():
                 xml_path = saved
         except Exception:
             pass
+    if not xml_path and scenario_norm:
+        fallback = _select_existing_path(scenario_paths.get(scenario_norm))
+        if fallback:
+            xml_path = fallback
+            try:
+                app.logger.info('[core.details] Using scenario fallback %s for %s', xml_path, scenario_label or scenario_norm)
+            except Exception:
+                pass
     if xml_path and os.path.exists(xml_path):
         try:
             # Lightweight classification: scenario XML should have <Scenarios>, session XML will have <session> and possibly <container>
@@ -10621,7 +12257,11 @@ def core_details():
             if root is not None:
                 tag_lower = root.tag.lower()
                 if 'scenarios' in tag_lower:
-                    classification = 'scenario'
+                    if root.find('.//ScenarioEditor') is not None:
+                        planner_bundle = True
+                        classification = 'planner'
+                    else:
+                        classification = 'scenario'
                 elif 'session' in tag_lower:
                     classification = 'session'
                 else:
@@ -10630,29 +12270,34 @@ def core_details():
                     container_flag = True
                     if classification != 'scenario':
                         classification = 'session'
-            ok, errs = _validate_core_xml(xml_path)
-            if ok:
+            if planner_bundle:
                 xml_valid = True
+                errors = ''
+                xml_summary = _summarize_planner_scenarios(xml_path)
             else:
-                if classification == 'session':
+                ok, errs = _validate_core_xml(xml_path)
+                if ok:
                     xml_valid = True
-                    # Suppress schema errors for session exports; treat as advisory only.
                 else:
-                    xml_valid = False
-                    if errs and not errors:
-                        errors = errs
-            # Always attempt analysis so graph can render even for invalid/session XML; mark summary with invalid flag
-            try:
-                xml_summary = _analyze_core_xml(xml_path)
-                if xml_summary is None:
-                    xml_summary = {}
-                if classification == 'session':
-                    xml_summary['__session_export'] = True
-                if not xml_valid:
-                    xml_summary['__invalid'] = True
-            except Exception:
-                # On total failure keep prior xml_summary (None)
-                xml_summary = xml_summary or None
+                    if classification == 'session':
+                        xml_valid = True
+                        # Suppress schema errors for session exports; treat as advisory only.
+                    else:
+                        xml_valid = False
+                        if errs and not errors:
+                            errors = errs
+                # Always attempt analysis so graph can render even for invalid/session XML; mark summary with invalid flag
+                try:
+                    xml_summary = _analyze_core_xml(xml_path)
+                    if xml_summary is None:
+                        xml_summary = {}
+                    if classification == 'session':
+                        xml_summary['__session_export'] = True
+                    if not xml_valid:
+                        xml_summary['__invalid'] = True
+                except Exception:
+                    # On total failure keep prior xml_summary (None)
+                    xml_summary = xml_summary or None
         except Exception as _e:
             errors = errors or f'XML inspection failed: {_e}'
     session_info = None
@@ -10693,6 +12338,7 @@ def core_details():
         session=session_info,
         classification=classification,
         container_flag=container_flag,
+        scenario_label=scenario_label,
     )
 
 

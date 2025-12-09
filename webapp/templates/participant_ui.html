@@ -1,0 +1,286 @@
+{% extends 'layout.html' %}
+{% block title %}Participant UI{% endblock %}
+{% block active_page %}{% set active_page = 'participant_ui' %}{% endblock %}
+{% block header_icon %}<i class="bi bi-person-video2 fs-4"></i>{% endblock %}
+{% block header_title %}Participant Console{% endblock %}
+{% block extra_head %}
+{{ super() }}
+<style>
+  #participantUiRoot.participant-sidebar-hidden .participant-sidebar-col { display: none !important; }
+  #participantUiRoot.participant-sidebar-hidden .participant-content-col {
+    flex: 0 0 100%;
+    max-width: 100%;
+  }
+  .participant-sidebar-toggle-restore { display: none; }
+  #participantUiRoot.participant-sidebar-hidden .participant-sidebar-toggle-restore {
+    display: inline-flex !important;
+  }
+</style>
+{% endblock %}
+{% block content %}
+<div class="row g-3" id="participantUiRoot" data-active-norm="{{ participant_active_norm or '' }}">
+  <div class="col-12 col-lg-4 participant-sidebar-col">
+    <div class="card shadow-sm h-100">
+      <div class="card-body d-flex flex-column gap-3">
+        <div class="d-flex justify-content-between align-items-start gap-2">
+          <div>
+            <h5 class="mb-0">{{ participant_scenarios_heading or 'Available Scenarios' }}</h5>
+            {% if participant_scenarios_hint %}<small class="text-muted">{{ participant_scenarios_hint }}</small>{% endif %}
+          </div>
+          {% if participant_scenarios %}
+            <button class="btn btn-sm btn-outline-secondary" type="button" data-participant-toggle-sidebar aria-expanded="true">
+              <span class="participant-collapse-label" data-label-expanded="Hide list" data-label-collapsed="Show list">Hide list</span>
+            </button>
+          {% endif %}
+        </div>
+        {% if participant_scenarios %}
+          <div class="collapse show flex-grow-1" id="participantScenarioListWrap">
+            <div class="list-group list-group-flush overflow-auto" style="max-height: 65vh;">
+              {% for scenario in participant_scenarios %}
+                <div class="list-group-item border-top {% if loop.first %}border-top-0{% endif %} participant-scenario-item {% if scenario.active %}active border border-primary{% endif %} {% if not scenario.has_url %}opacity-75{% endif %}"
+                     role="button" tabindex="0"
+                     data-participant-scenario
+                     data-scenario-norm="{{ scenario.norm|e }}"
+                     data-scenario-display="{{ scenario.display|e }}"
+                     data-scenario-url="{{ scenario.url|e }}"
+                     data-scenario-has-url="{{ 1 if scenario.has_url else 0 }}">
+                  <div class="d-flex flex-column gap-1">
+                    <div class="d-flex flex-wrap align-items-center gap-2">
+                      <span class="fw-semibold">{{ scenario.display }}</span>
+                      {% if scenario.active %}<span class="badge bg-primary">Active</span>{% endif %}
+                      {% if scenario.assigned %}<span class="badge text-bg-secondary">Assigned</span>{% endif %}
+                      {% if not scenario.has_url %}<span class="badge bg-warning text-dark">No Link</span>{% endif %}
+                    </div>
+                    {% if scenario.url %}
+                      <div class="text-muted small text-truncate">{{ scenario.url }}</div>
+                    {% else %}
+                      <div class="text-muted small">Participant URL not configured yet.</div>
+                    {% endif %}
+                  </div>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        {% else %}
+          <div class="alert alert-info mb-0">{{ participant_scenarios_empty or 'No scenarios available.' }}</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  <div class="col-12 col-lg-8 participant-content-col">
+    <div class="card shadow-sm mb-0">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+          <div class="d-flex align-items-center gap-2">
+            <button class="btn btn-sm btn-outline-secondary participant-sidebar-toggle-restore" type="button" data-participant-show-sidebar>Show list</button>
+            <div>
+              <h5 class="mb-0">Embedded Participant UI</h5>
+              <small class="text-muted" id="participantScenarioSubhead" data-default-text="Select a scenario to load its participant console below.">{% if participant_scenario_label %}Scenario: {{ participant_scenario_label }}{% else %}Select a scenario to load its participant console below.{% endif %}</small>
+            </div>
+          </div>
+          <a class="btn btn-sm btn-outline-secondary {% if not participant_url %}disabled{% endif %}" id="participantOpenLinkBtn" href="{{ participant_url or '#' }}" target="_blank" rel="noopener noreferrer" {% if not participant_url %}aria-disabled="true" tabindex="-1"{% endif %}>Open in New Window</a>
+        </div>
+        <div class="ratio ratio-16x9 mb-3" id="participantUiFrameWrap" {% if not participant_url %}style="display:none;"{% endif %}>
+          <iframe id="participantUiFrame" class="w-100 h-100 border-0 rounded" title="Participant UI" data-initial-src="{{ participant_url or '' }}" {% if participant_url %}src="{{ participant_url }}"{% endif %} allow="clipboard-read; clipboard-write; autoplay; fullscreen" allowfullscreen referrerpolicy="no-referrer"></iframe>
+        </div>
+        <div id="participantUiFallback" class="alert alert-warning mb-0 {% if participant_url %}d-none{% endif %}">
+          No Participant UI link is available yet. Select a scenario with a participant URL or ask an administrator to provide one.
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block extra_scripts %}
+{{ super() }}
+<script>
+(function(){
+  if(typeof window === 'undefined') return;
+  const root = document.getElementById('participantUiRoot');
+  const frame = document.getElementById('participantUiFrame');
+  const wrap = document.getElementById('participantUiFrameWrap');
+  const fallback = document.getElementById('participantUiFallback');
+  if(!root || !frame || !wrap) return;
+  const subhead = document.getElementById('participantScenarioSubhead');
+  const openBtn = document.getElementById('participantOpenLinkBtn');
+  const scenarioItems = Array.from(document.querySelectorAll('[data-participant-scenario]'));
+  const toggleSidebarBtn = document.querySelector('[data-participant-toggle-sidebar]');
+  const showSidebarBtn = document.querySelector('[data-participant-show-sidebar]');
+  const collapseLabel = toggleSidebarBtn ? toggleSidebarBtn.querySelector('.participant-collapse-label') : null;
+
+  const normalizeParticipantHref = (value) => {
+    if(value === undefined || value === null) return '';
+    let trimmed = String(value).trim();
+    if(!trimmed) return '';
+    if(!/^https?:\/\//i.test(trimmed)) trimmed = `https://${trimmed}`;
+    try {
+      const parsed = new URL(trimmed);
+      if(parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+      return parsed.toString();
+    } catch(err) {
+      return '';
+    }
+  };
+
+  const loadEditorStateHref = () => {
+    if(!window.localStorage) return '';
+    const raw = window.localStorage.getItem('coretg_editor_state');
+    if(!raw) return '';
+    try {
+      const parsed = JSON.parse(raw);
+      if(!parsed || !Array.isArray(parsed.scenarios) || parsed.scenarios.length === 0) return '';
+      let idx = Number(parsed.active_index);
+      if(Number.isNaN(idx) || idx < 0 || idx >= parsed.scenarios.length) idx = 0;
+      const scenario = parsed.scenarios[idx];
+      const hitl = scenario && typeof scenario === 'object' ? scenario.hitl : null;
+      if(!hitl || typeof hitl !== 'object') return '';
+      return normalizeParticipantHref(hitl.participant_proxmox_url || hitl.participant_ui_url || '');
+    } catch(err) {
+      return '';
+    }
+  };
+
+  const initialHref = normalizeParticipantHref(frame.getAttribute('data-initial-src'));
+  let currentHasDirectUrl = !!initialHref;
+  let currentNorm = root.getAttribute('data-active-norm') || '';
+
+  const applyFrameHref = (href) => {
+    if(href){
+      frame.src = href;
+      wrap.style.display = '';
+      fallback?.classList.add('d-none');
+    } else {
+      frame.removeAttribute('src');
+      wrap.style.display = 'none';
+      fallback?.classList.remove('d-none');
+    }
+  };
+
+  const fallbackHref = () => {
+    const localHref = loadEditorStateHref();
+    const globalHref = normalizeParticipantHref(window.CORETG_PARTICIPANT_UI_HREF);
+    return localHref || globalHref || initialHref || '';
+  };
+
+  const updateSubhead = (display) => {
+    if(!subhead) return;
+    const base = subhead.getAttribute('data-default-text') || '';
+    subhead.textContent = display ? `Scenario: ${display}` : base;
+  };
+
+  const updateOpenButton = (href) => {
+    if(!openBtn) return;
+    if(href){
+      openBtn.href = href;
+      openBtn.classList.remove('disabled');
+      openBtn.removeAttribute('aria-disabled');
+      openBtn.removeAttribute('tabindex');
+    } else {
+      openBtn.href = '#';
+      openBtn.classList.add('disabled');
+      openBtn.setAttribute('aria-disabled', 'true');
+      openBtn.setAttribute('tabindex', '-1');
+    }
+  };
+
+  const highlightScenario = (norm) => {
+    scenarioItems.forEach(item => {
+      const isActive = norm && item.getAttribute('data-scenario-norm') === norm;
+      item.classList.toggle('active', !!isActive);
+      item.classList.toggle('border', !!isActive);
+      item.classList.toggle('border-primary', !!isActive);
+    });
+  };
+
+  const persistSelectionInQuery = (norm) => {
+    try {
+      const urlObj = new URL(window.location.href);
+      if(norm) {
+        urlObj.searchParams.set('scenario', norm);
+      } else {
+        urlObj.searchParams.delete('scenario');
+      }
+      window.history.replaceState({}, '', `${urlObj.pathname}${urlObj.search}${urlObj.hash}`);
+    } catch(err) {
+      /* ignore */
+    }
+  };
+
+  const applyScenarioSelection = (norm, display, rawUrl) => {
+    const normalized = normalizeParticipantHref(rawUrl);
+    currentNorm = norm || '';
+    currentHasDirectUrl = !!normalized;
+    highlightScenario(currentNorm);
+    updateSubhead(display || '');
+    updateOpenButton(normalized);
+    applyFrameHref(normalized || fallbackHref());
+    persistSelectionInQuery(currentNorm);
+  };
+
+  const activateFromElement = (item) => {
+    if(!item) return;
+    const norm = item.getAttribute('data-scenario-norm') || '';
+    const display = item.getAttribute('data-scenario-display') || '';
+    const url = item.getAttribute('data-scenario-url') || '';
+    applyScenarioSelection(norm, display, url);
+  };
+
+  scenarioItems.forEach(item => {
+    item.addEventListener('click', () => activateFromElement(item));
+    item.addEventListener('keydown', (evt) => {
+      if(evt.key === 'Enter' || evt.key === ' '){
+        evt.preventDefault();
+        activateFromElement(item);
+      }
+    });
+  });
+
+  const initialTarget = scenarioItems.find(el => el.getAttribute('data-scenario-norm') === currentNorm)
+    || scenarioItems.find(el => el.getAttribute('data-scenario-has-url') === '1')
+    || scenarioItems[0];
+  if(initialTarget){
+    activateFromElement(initialTarget);
+  } else {
+    updateSubhead('');
+    updateOpenButton('');
+    applyFrameHref(fallbackHref());
+    persistSelectionInQuery('');
+  }
+
+  window.addEventListener('storage', (evt) => {
+    if(evt && evt.key && evt.key !== 'coretg_editor_state') return;
+    if(currentHasDirectUrl) return;
+    const nextHref = fallbackHref();
+    applyFrameHref(nextHref);
+    updateOpenButton(nextHref);
+  });
+
+  const applySidebarHidden = (hidden) => {
+    if(!root) return;
+    root.classList.toggle('participant-sidebar-hidden', hidden);
+    if(toggleSidebarBtn){
+      toggleSidebarBtn.setAttribute('aria-expanded', hidden ? 'false' : 'true');
+    }
+    if(collapseLabel){
+      const expandedText = collapseLabel.getAttribute('data-label-expanded') || 'Hide list';
+      const collapsedText = collapseLabel.getAttribute('data-label-collapsed') || 'Show list';
+      collapseLabel.textContent = hidden ? collapsedText : expandedText;
+    }
+  };
+  if(toggleSidebarBtn){
+    toggleSidebarBtn.addEventListener('click', (evt) => {
+      evt.preventDefault();
+      const currentlyHidden = root.classList.contains('participant-sidebar-hidden');
+      applySidebarHidden(!currentlyHidden);
+    });
+    applySidebarHidden(root.classList.contains('participant-sidebar-hidden'));
+  }
+  if(showSidebarBtn){
+    showSidebarBtn.addEventListener('click', (evt) => {
+      evt.preventDefault();
+      applySidebarHidden(false);
+    });
+  }
+})();
+</script>
+{% endblock %}
