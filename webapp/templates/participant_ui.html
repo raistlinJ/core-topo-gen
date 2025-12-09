@@ -18,6 +18,8 @@
 </style>
 {% endblock %}
 {% block content %}
+{% set _user_role = (current_user.role.lower() if (current_user is defined and current_user.is_authenticated and current_user.role) else '') %}
+{% set participant_hide_urls = _user_role in ['builder', 'participant'] %}
 <div class="row g-3" id="participantUiRoot" data-active-norm="{{ participant_active_norm or '' }}">
   <div class="col-12 col-lg-4 participant-sidebar-col">
     <div class="card shadow-sm h-100">
@@ -52,7 +54,13 @@
                       {% if not scenario.has_url %}<span class="badge bg-warning text-dark">No Link</span>{% endif %}
                     </div>
                     {% if scenario.url %}
-                      <div class="text-muted small text-truncate">{{ scenario.url }}</div>
+                      <div class="text-muted small">
+                        {% if participant_hide_urls %}
+                          Participant link available.
+                        {% else %}
+                          <span class="text-truncate d-inline-block" style="max-width: 100%;">{{ scenario.url }}</span>
+                        {% endif %}
+                      </div>
                     {% else %}
                       <div class="text-muted small">Participant URL not configured yet.</div>
                     {% endif %}

@@ -17,7 +17,9 @@
     <span id="refreshStatus" class="text-white-50">auto</span>
     <button class="btn btn-sm btn-outline-light" id="toggleRefreshBtn" type="button">Pause</button>
   </div>
+  {% if not is_builder_view %}
   <div class="text-white-50 small">Daemon: {{ host }}:{{ port }}</div>
+  {% endif %}
 </div>
 {% endblock %}
 {% block extra_head %}
