@@ -10,7 +10,9 @@
 <div class="container py-4">
   {% with messages = get_flashed_messages() %}
     {% if messages %}
-      <div class="alert alert-info">{{ messages[0] }}</div>
+      {% for message in messages %}
+        <div class="alert alert-info">{{ message }}</div>
+      {% endfor %}
     {% endif %}
   {% endwith %}
 
@@ -57,12 +59,17 @@
           <div class="col-12">
             <label class="form-label">Assigned Scenarios</label>
             {% if scenario_options %}
-              <select name="scenarios" multiple class="form-select" size="{{ [scenario_options|length, 8]|min }}">
+              <div class="row row-cols-1 row-cols-md-2 g-2">
                 {% for opt in scenario_options %}
-                  <option value="{{ opt.value }}">{{ opt.label }}</option>
+                  <div class="col">
+                    <div class="form-check">
+                      <input class="form-check-input" type="checkbox" name="scenarios" value="{{ opt.value }}" id="createScenario_{{ loop.index }}">
+                      <label class="form-check-label" for="createScenario_{{ loop.index }}">{{ opt.label }}</label>
+                    </div>
+                  </div>
                 {% endfor %}
-              </select>
-              <div class="form-text">Hold Cmd/Ctrl to select multiple. Leave empty to allow no scenarios yet.</div>
+              </div>
+              <div class="form-text">Leave unchecked to keep the user unassigned until later.</div>
             {% else %}
               <div class="form-text text-muted">No scenarios detected yet. Assignments can be added later.</div>
             {% endif %}
@@ -90,31 +97,57 @@
                 {% for u in users %}
                   <tr>
                     <td class="fw-semibold">{{ u.username }}</td>
-                    <td><span class="badge {% if u.role == 'admin' %}text-bg-danger{% elif u.role == 'builder' %}text-bg-warning text-dark{% else %}text-bg-secondary{% endif %}">{{ u.role }}</span></td>
                     <td>
-                      {% if u.assigned_scenarios_display %}
-                        <div class="d-flex flex-wrap gap-1 mb-2">
-                          {% for label in u.assigned_scenarios_display %}
-                            <span class="badge text-bg-primary">{{ label }}</span>
-                          {% endfor %}
-                        </div>
-                      {% else %}
-                        <div class="text-muted small mb-2">No scenarios assigned</div>
-                      {% endif %}
-                      {% if scenario_options %}
-                      <form action="{{ url_for('users_assign_scenarios', username=u.username) }}" method="post" class="d-flex flex-column gap-2">
-                        <select name="scenarios" multiple class="form-select form-select-sm" size="{{ [scenario_options|length, 5]|min }}">
-                          {% for opt in scenario_options %}
-                            <option value="{{ opt.value }}" {% if opt.value in u.assigned_scenarios %}selected{% endif %}>{{ opt.label }}</option>
-                          {% endfor %}
+                      {% set role_locked = u.role_locked|default(False) %}
+                      {% set role_locked_reason = u.role_locked_reason|default('') %}
+                      <form action="{{ url_for('users_update_role', username=u.username) }}" method="post" class="d-flex flex-column gap-2">
+                        <select name="role" class="form-select form-select-sm" {% if role_locked %}disabled title="{{ role_locked_reason }}"{% endif %}>
+                          <option value="participant" {% if u.role == 'participant' %}selected{% endif %}>participant</option>
+                          <option value="builder" {% if u.role == 'builder' %}selected{% endif %}>builder</option>
+                          <option value="admin" {% if u.role == 'admin' %}selected{% endif %}>admin</option>
                         </select>
-                        <div class="d-flex gap-2 flex-wrap">
-                          <button class="btn btn-sm btn-outline-primary">Save</button>
-                          <button type="button" class="btn btn-sm btn-outline-secondary" data-clear-scenarios>Clear</button>
-                        </div>
+                        <button type="submit" class="btn btn-sm btn-outline-primary align-self-start" {% if role_locked %}disabled title="{{ role_locked_reason }}"{% endif %}>Update</button>
                       </form>
+                      {% if role_locked and role_locked_reason %}
+                        <div class="form-text text-danger small mt-1">{{ role_locked_reason }}</div>
+                      {% endif %}
+                    </td>
+                    <td>
+                      {% if u.role == 'admin' %}
+                        <div class="text-muted small">Admins inherit access to every scenario.</div>
                       {% else %}
-                        <div class="text-muted small">No scenarios available to assign.</div>
+                        {% if u.assigned_scenarios_display %}
+                          <div class="d-flex flex-wrap gap-1 mb-2">
+                            {% for label in u.assigned_scenarios_display %}
+                              <span class="badge text-bg-primary">{{ label }}</span>
+                            {% endfor %}
+                          </div>
+                        {% else %}
+                          <div class="text-muted small mb-2">No scenarios assigned</div>
+                        {% endif %}
+                        {% if scenario_options %}
+                        <form action="{{ url_for('users_assign_scenarios', username=u.username) }}" method="post" class="d-flex flex-column gap-2">
+                          <div class="border rounded p-2 bg-light-subtle">
+                            <div class="row row-cols-1 row-cols-md-2 g-2">
+                              {% for opt in scenario_options %}
+                                {% set checkbox_id = 'assign_' ~ u.username|replace(' ', '_') ~ '_' ~ loop.index %}
+                                <div class="col">
+                                  <div class="form-check form-check-sm">
+                                    <input class="form-check-input" type="checkbox" name="scenarios" value="{{ opt.value }}" id="{{ checkbox_id }}" {% if opt.value in u.assigned_scenarios %}checked{% endif %}>
+                                    <label class="form-check-label" for="{{ checkbox_id }}">{{ opt.label }}</label>
+                                  </div>
+                                </div>
+                              {% endfor %}
+                            </div>
+                          </div>
+                          <div class="d-flex gap-2 flex-wrap">
+                            <button class="btn btn-sm btn-outline-primary">Save</button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" data-clear-scenarios>Clear</button>
+                          </div>
+                        </form>
+                        {% else %}
+                          <div class="text-muted small">No scenarios available to assign.</div>
+                        {% endif %}
                       {% endif %}
                     </td>
                     <td>
@@ -142,7 +175,18 @@
     if(!btn) return;
     const form = btn.closest('form');
     if(!form) return;
-    form.querySelectorAll('select option').forEach(opt => opt.selected = false);
+    let cleared = false;
+    const checkboxes = form.querySelectorAll('input[type="checkbox"][name="scenarios"]');
+    if (checkboxes.length) {
+      checkboxes.forEach(cb => cb.checked = false);
+      cleared = true;
+    }
+    const selectOptions = form.querySelectorAll('select option');
+    if (selectOptions.length) {
+      selectOptions.forEach(opt => opt.selected = false);
+      cleared = true;
+    }
+    if (!cleared) return;
     form.submit();
   });
 </script>

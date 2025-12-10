@@ -679,6 +679,7 @@ const CORETG_USER_ROLE = (currentUserMeta && typeof currentUserMeta.role === 'st
 window.CORETG_USERNAME = CORETG_USERNAME;
 window.CORETG_USER_ROLE = CORETG_USER_ROLE;
 const IS_BUILDER_VIEW = (window.CORETG_VIEW_MODE || '') === 'builder';
+const USE_LOCAL_EDITOR_STATE = !IS_BUILDER_VIEW;
 const BUILDER_BACKEND_UNAVAILABLE_MESSAGE = 'Backend temporarily unavailable. Please ask an admin.';
 window.IS_BUILDER_VIEW = IS_BUILDER_VIEW;
 const DEFAULT_INTERNAL_BRIDGE_NAME = 'corebridge';
@@ -1015,9 +1016,11 @@ if (serverResultPath) {
 }
 
 let persistedState = null;
-const keyedStateForCurrentProject = projectStateMap[currentProjectKey];
-if (keyedStateForCurrentProject) {
-    persistedState = keyedStateForCurrentProject;
+if (USE_LOCAL_EDITOR_STATE) {
+    const keyedStateForCurrentProject = projectStateMap[currentProjectKey];
+    if (keyedStateForCurrentProject) {
+        persistedState = keyedStateForCurrentProject;
+    }
 }
 const CORE_DEFAULT_VENV_BIN = (initialPayload && typeof initialPayload.core === 'object' && typeof initialPayload.core.venv_bin === 'string' && initialPayload.core.venv_bin.trim())
     ? initialPayload.core.venv_bin.trim()
@@ -1026,7 +1029,7 @@ const PARTICIPANT_STATUS_EMPTY_TEXT = 'No Participant UI URL saved yet. Apply on
 const PARTICIPANT_STATUS_SAVED_TEXT = 'Participant UI link saved. The navigation tab is enabled for this scenario.';
 // If server provides a fresh result_path (e.g., after Save XML), reflect it in localStorage early
 try {
-    if (serverResultPath) {
+    if (USE_LOCAL_EDITOR_STATE && serverResultPath) {
         const existingSnapshot = projectStateMap[currentProjectKey] || legacyEditorState || {};
         const persisted = { ...existingSnapshot };
         const existingCoreSnapshot = (existingSnapshot && existingSnapshot.core)
@@ -3497,73 +3500,77 @@ function enableAutoStartDaemonPreference() {
     return true;
 }
 
-// Restore persisted editor state (scenarios and last saved xml) and active index from localStorage
-persistedState = projectStateMap[currentProjectKey];
-if (!persistedState && currentProjectKey !== DEFAULT_PROJECT_KEY) {
-    persistedState = projectStateMap[DEFAULT_PROJECT_KEY];
-}
-if (!persistedState && scenarioQueryToken) {
-    try {
-        const matchingKey = Object.keys(projectStateMap || {}).find(key => {
-            const entry = projectStateMap[key];
-            if (!entry || typeof entry !== 'object') return false;
-            const entryScenario = typeof entry.scenario_query === 'string' ? entry.scenario_query.trim() : '';
-            return entryScenario && entryScenario === scenarioQueryToken;
-        });
-        if (matchingKey) {
-            persistedState = projectStateMap[matchingKey];
-            currentProjectKey = matchingKey;
-        }
-    } catch (err) {}
-}
-if (!persistedState) {
-    const signatureFallback = resolveScenarioQueryHintFromSource(serverEditorSnapshot || initialPayload) || scenarioQueryToken;
-    if (signatureFallback) {
+let persistedActiveIdx = 0;
+if (USE_LOCAL_EDITOR_STATE) {
+    // Restore persisted editor state (scenarios and last saved xml) and active index from localStorage
+    persistedState = projectStateMap[currentProjectKey];
+    if (!persistedState && currentProjectKey !== DEFAULT_PROJECT_KEY) {
+        persistedState = projectStateMap[DEFAULT_PROJECT_KEY];
+    }
+    if (!persistedState && scenarioQueryToken) {
         try {
-            const signatureKey = `${DEFAULT_PROJECT_KEY}::${signatureFallback.toLowerCase()}`;
-            if (projectStateMap[signatureKey]) {
-                currentProjectKey = signatureKey;
-                persistedState = projectStateMap[signatureKey];
+            const matchingKey = Object.keys(projectStateMap || {}).find(key => {
+                const entry = projectStateMap[key];
+                if (!entry || typeof entry !== 'object') return false;
+                const entryScenario = typeof entry.scenario_query === 'string' ? entry.scenario_query.trim() : '';
+                return entryScenario && entryScenario === scenarioQueryToken;
+            });
+            if (matchingKey) {
+                persistedState = projectStateMap[matchingKey];
+                currentProjectKey = matchingKey;
             }
         } catch (err) {}
     }
-}
-if (!persistedState) {
-    if (serverEditorSnapshot) {
+    if (!persistedState) {
+        const signatureFallback = resolveScenarioQueryHintFromSource(serverEditorSnapshot || initialPayload) || scenarioQueryToken;
+        if (signatureFallback) {
+            try {
+                const signatureKey = `${DEFAULT_PROJECT_KEY}::${signatureFallback.toLowerCase()}`;
+                if (projectStateMap[signatureKey]) {
+                    currentProjectKey = signatureKey;
+                    persistedState = projectStateMap[signatureKey];
+                }
+            } catch (err) {}
+        }
+    }
+    if (!persistedState) {
+        if (serverEditorSnapshot) {
+            try {
+                persistedState = JSON.parse(JSON.stringify(serverEditorSnapshot));
+            } catch (err) {
+                persistedState = serverEditorSnapshot;
+            }
+        }
+    }
+    const serverSnapshotHasScenarios = Array.isArray(serverEditorSnapshot?.scenarios) && serverEditorSnapshot.scenarios.length > 0;
+    const persistedMissingScenarios = (
+        !persistedState ||
+        !Array.isArray(persistedState.scenarios) ||
+        !persistedState.scenarios.length
+    );
+    if (persistedMissingScenarios && serverSnapshotHasScenarios) {
         try {
-            persistedState = JSON.parse(JSON.stringify(serverEditorSnapshot));
+            const snapshotClone = JSON.parse(JSON.stringify(serverEditorSnapshot));
+            if (snapshotClone) {
+                persistedState = snapshotClone;
+            }
         } catch (err) {
             persistedState = serverEditorSnapshot;
         }
     }
-}
-const serverSnapshotHasScenarios = Array.isArray(serverEditorSnapshot?.scenarios) && serverEditorSnapshot.scenarios.length > 0;
-const persistedMissingScenarios = (
-    !persistedState ||
-    !Array.isArray(persistedState.scenarios) ||
-    !persistedState.scenarios.length
-);
-if (persistedMissingScenarios && serverSnapshotHasScenarios) {
-    try {
-        const snapshotClone = JSON.parse(JSON.stringify(serverEditorSnapshot));
-        if (snapshotClone) {
-            persistedState = snapshotClone;
-        }
-    } catch (err) {
-        persistedState = serverEditorSnapshot;
+    if (!persistedState) {
+        persistedState = legacyEditorState;
     }
-}
-if (!persistedState) {
-    persistedState = legacyEditorState;
-}
-persistedState = scrubSnapshotTransientErrors(persistedState);
-let persistedActiveIdx = 0;
-const activeIdxCandidateRaw = activeIdxMap[currentProjectKey];
-if (activeIdxCandidateRaw !== undefined) {
-    const parsedIdx = parseInt(activeIdxCandidateRaw, 10);
-    if (!isNaN(parsedIdx)) persistedActiveIdx = parsedIdx;
+    persistedState = scrubSnapshotTransientErrors(persistedState);
+    const activeIdxCandidateRaw = activeIdxMap[currentProjectKey];
+    if (activeIdxCandidateRaw !== undefined) {
+        const parsedIdx = parseInt(activeIdxCandidateRaw, 10);
+        if (!isNaN(parsedIdx)) persistedActiveIdx = parsedIdx;
+    } else {
+        try { const v = parseInt(localStorage.getItem('coretg_active_idx')||'0',10); if(!isNaN(v)) persistedActiveIdx = v; } catch(e){}
+    }
 } else {
-    try { const v = parseInt(localStorage.getItem('coretg_active_idx')||'0',10); if(!isNaN(v)) persistedActiveIdx = v; } catch(e){}
+    persistedState = null;
 }
 
 // Base state is from server payload or default
@@ -3571,15 +3578,16 @@ let state = initialPayload ?? { scenarios: [ defaultScenario('Scenario 1') ], re
 if (!Array.isArray(state.host_interfaces)) {
     if (Array.isArray(initialPayload?.host_interfaces)) {
         state.host_interfaces = initialPayload.host_interfaces;
-    } else if (Array.isArray(persistedState?.host_interfaces)) {
+    } else if (USE_LOCAL_EDITOR_STATE && Array.isArray(persistedState?.host_interfaces)) {
         state.host_interfaces = persistedState.host_interfaces;
     } else {
         state.host_interfaces = [];
     }
 }
-state.host_interfaces_source = initialPayload?.host_interfaces_source ?? persistedState?.host_interfaces_source ?? state.host_interfaces_source ?? null;
-state.host_interfaces_metadata = initialPayload?.host_interfaces_metadata ?? persistedState?.host_interfaces_metadata ?? state.host_interfaces_metadata ?? null;
-state.host_interfaces_fetched_at = initialPayload?.host_interfaces_fetched_at ?? persistedState?.host_interfaces_fetched_at ?? state.host_interfaces_fetched_at ?? null;
+const persistedHostMeta = USE_LOCAL_EDITOR_STATE ? persistedState : null;
+state.host_interfaces_source = initialPayload?.host_interfaces_source ?? persistedHostMeta?.host_interfaces_source ?? state.host_interfaces_source ?? null;
+state.host_interfaces_metadata = initialPayload?.host_interfaces_metadata ?? persistedHostMeta?.host_interfaces_metadata ?? state.host_interfaces_metadata ?? null;
+state.host_interfaces_fetched_at = initialPayload?.host_interfaces_fetched_at ?? persistedHostMeta?.host_interfaces_fetched_at ?? state.host_interfaces_fetched_at ?? null;
 // If server provided a concrete result_path (save/load/run), prefer server scenarios; else, restore from localStorage if available
 const serverHasResult = !!(initialPayload && initialPayload.result_path);
 const serverScenarioBases = Array.isArray(initialPayload?.scenarios)
@@ -3591,7 +3599,7 @@ const serverScenarioBases = Array.isArray(initialPayload?.scenarios)
         return Object.keys(meta).length ? meta : undefined;
     })
     : [];
-if (!serverHasResult && persistedState && Array.isArray(persistedState.scenarios) && persistedState.scenarios.length) {
+if (USE_LOCAL_EDITOR_STATE && !serverHasResult && persistedState && Array.isArray(persistedState.scenarios) && persistedState.scenarios.length) {
     state.scenarios = persistedState.scenarios;
     if (persistedState.result_path) state.result_path = persistedState.result_path;
     if (serverScenarioBases.length) {
@@ -3610,12 +3618,12 @@ if (!serverHasResult && persistedState && Array.isArray(persistedState.scenarios
     }
 }
 
-if (persistedState && Array.isArray(persistedState.scenarios) && Array.isArray(state.scenarios)) {
+if (USE_LOCAL_EDITOR_STATE && persistedState && Array.isArray(persistedState.scenarios) && Array.isArray(state.scenarios)) {
     mergePersistedHitlStateIntoScenarios(state.scenarios, persistedState.scenarios);
 }
 const serverBaseUpload = normalizeBaseUpload(initialPayload?.base_upload);
-const persistedBaseUpload = normalizeBaseUpload(persistedState?.base_upload);
-if (!serverHasResult && persistedBaseUpload && (!state.base_upload || !state.base_upload.path)) {
+const persistedBaseUpload = USE_LOCAL_EDITOR_STATE ? normalizeBaseUpload(persistedState?.base_upload) : null;
+if (USE_LOCAL_EDITOR_STATE && !serverHasResult && persistedBaseUpload && (!state.base_upload || !state.base_upload.path)) {
     if (state.scenarios?.[0] && state.scenarios[0].base && (state.scenarios[0].base.filepath || state.scenarios[0].base.display_name)) {
         state.base_upload = { ...persistedBaseUpload };
     }
@@ -5715,7 +5723,7 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 state.core = restoreCorePasswordFromSession(state.core);
-if (persistedState && persistedState.core) {
+if (USE_LOCAL_EDITOR_STATE && persistedState && persistedState.core) {
     const persistedCore = normalizeCoreState(persistedState.core, false);
     state.core = {
         ...state.core,
@@ -5726,7 +5734,7 @@ if (persistedState && persistedState.core) {
 if (!state.core) {
     state.core = restoreCorePasswordFromSession({});
 }
-if (persistedState) {
+if (USE_LOCAL_EDITOR_STATE && persistedState) {
     if (persistedState.core_ok !== undefined) state.core_ok = persistedState.core_ok;
     if (persistedState.core_tested_host !== undefined) state.core_tested_host = persistedState.core_tested_host;
     if (persistedState.core_tested_port !== undefined) state.core_tested_port = persistedState.core_tested_port;

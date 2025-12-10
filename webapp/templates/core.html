@@ -4,6 +4,8 @@
 {% block header_icon %}<i class="bi bi-diagram-3-fill fs-4"></i>{% endblock %}
 {% block header_title %}CORE Sessions & Topologies{% endblock %}
 {% block header_right_extra %}
+{% set current_role = (current_user.role|default('')|lower) if (current_user is defined and current_user.is_authenticated) else '' %}
+{% set hide_daemon_badge = is_builder_view or current_role == 'builder' %}
 <div class="d-flex align-items-center gap-3 small flex-wrap justify-content-end">
   <div class="d-flex align-items-center gap-2">
     <label for="refreshInterval" class="form-label mb-0 text-white">Every</label>
@@ -17,7 +19,7 @@
     <span id="refreshStatus" class="text-white-50">auto</span>
     <button class="btn btn-sm btn-outline-light" id="toggleRefreshBtn" type="button">Pause</button>
   </div>
-  {% if not is_builder_view %}
+  {% if not hide_daemon_badge %}
   <div class="text-white-50 small">Daemon: {{ host }}:{{ port }}</div>
   {% endif %}
 </div>

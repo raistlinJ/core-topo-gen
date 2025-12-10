@@ -49,8 +49,6 @@
                   <div class="d-flex flex-column gap-1">
                     <div class="d-flex flex-wrap align-items-center gap-2">
                       <span class="fw-semibold">{{ scenario.display }}</span>
-                      {% if scenario.active %}<span class="badge bg-primary">Active</span>{% endif %}
-                      {% if scenario.assigned %}<span class="badge text-bg-secondary">Assigned</span>{% endif %}
                       {% if not scenario.has_url %}<span class="badge bg-warning text-dark">No Link</span>{% endif %}
                     </div>
                     {% if scenario.url %}

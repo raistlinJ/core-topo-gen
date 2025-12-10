@@ -4274,6 +4274,112 @@ def _builder_allowed_norms(user: Optional[dict] = None) -> Optional[set[str]]:
     assigned = _assigned_scenarios_for_user(effective_user)
     return {norm for norm in assigned if norm}
 
+
+def _builder_placeholder_scenario(name: str, participant_url: str = '') -> Dict[str, Any]:
+    """Return a minimal scenario structure for builder-only views."""
+    template = copy.deepcopy(_default_scenarios_payload()['scenarios'][0])
+    template['name'] = name or template.get('name') or 'Scenario'
+    hitl_meta = template.get('hitl') if isinstance(template.get('hitl'), dict) else {}
+    hitl_meta = dict(hitl_meta)
+    if participant_url:
+        for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+            hitl_meta[key] = participant_url
+    else:
+        for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+            hitl_meta.pop(key, None)
+    template['hitl'] = hitl_meta
+    return template
+
+
+def _builder_catalog_seed_scenarios(
+    allowed_norms: set[str],
+    assignment_order: Optional[Iterable[str]] = None,
+    *,
+    user: Optional[dict] = None,
+) -> list[Dict[str, Any]]:
+    """Hydrate scenario payloads for builders from catalog + assignments."""
+    if not allowed_norms:
+        return []
+    names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(None, user=user)
+    display_by_norm: dict[str, str] = {}
+    for display in names:
+        norm = _normalize_scenario_label(display)
+        if norm:
+            display_by_norm.setdefault(norm, display)
+    ordered_norms: list[str] = []
+    if assignment_order:
+        for entry in assignment_order:
+            norm = _normalize_scenario_label(entry)
+            if norm and norm in allowed_norms and norm not in ordered_norms:
+                ordered_norms.append(norm)
+    for display in names:
+        norm = _normalize_scenario_label(display)
+        if norm and norm in allowed_norms and norm not in ordered_norms:
+            ordered_norms.append(norm)
+    for norm in sorted(allowed_norms):
+        if norm not in ordered_norms:
+            ordered_norms.append(norm)
+
+    parsed_cache: dict[str, list[Dict[str, Any]]] = {}
+    hydrated: list[Dict[str, Any]] = []
+
+    def _humanize(norm_value: str) -> str:
+        text = (norm_value or '').replace('_', ' ').strip()
+        text = re.sub(r'\s+', ' ', text)
+        return text.title() if text else norm_value
+
+    for norm in ordered_norms:
+        display_name = display_by_norm.get(norm) or _humanize(norm)
+        participant_hint = scenario_url_hints.get(norm, '') if scenario_url_hints else ''
+        scenario_copy: Optional[Dict[str, Any]] = None
+        candidate_paths = scenario_paths.get(norm) if scenario_paths else None
+        best_path = _select_existing_path(candidate_paths) if candidate_paths else None
+        if best_path:
+            cached = parsed_cache.get(best_path)
+            if cached is None:
+                try:
+                    parsed = _parse_scenarios_xml(best_path)
+                    cached = parsed.get('scenarios', []) if isinstance(parsed, dict) else []
+                except Exception:
+                    cached = []
+                parsed_cache[best_path] = cached
+            for scen in cached or []:
+                if not isinstance(scen, dict):
+                    continue
+                scen_norm = _normalize_scenario_label(scen.get('name'))
+                if scen_norm == norm:
+                    scenario_copy = copy.deepcopy(scen)
+                    break
+        if not scenario_copy:
+            scenario_copy = _builder_placeholder_scenario(display_name, participant_hint)
+        else:
+            scenario_copy['name'] = display_name
+            if participant_hint:
+                hitl_meta = scenario_copy.get('hitl') if isinstance(scenario_copy.get('hitl'), dict) else {}
+                hitl_meta = dict(hitl_meta)
+                for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+                    hitl_meta[key] = participant_hint
+                scenario_copy['hitl'] = hitl_meta
+        hydrated.append(scenario_copy)
+    return hydrated
+
+
+def _builder_filter_report_scenarios(
+    scenario_names: list[str],
+    scenario_norm: str,
+    *,
+    user: Optional[dict] = None,
+) -> tuple[list[str], str, Optional[set[str]]]:
+    allowed_norms = _builder_allowed_norms(user)
+    if allowed_norms is None:
+        return scenario_names, scenario_norm, None
+    filtered = [
+        name for name in scenario_names or []
+        if _normalize_scenario_label(name) in allowed_norms
+    ]
+    normalized_selection = scenario_norm if (not scenario_norm or scenario_norm in allowed_norms) else ''
+    return filtered, normalized_selection, allowed_norms
+
 # Diagnostic endpoint for environment/module troubleshooting
 @app.route('/diag/modules')
 def diag_modules():
@@ -4490,7 +4596,12 @@ def users_page():
         return redirect(url_for('index'))
     db = _load_users()
     raw_users = db.get('users', [])
-    scenario_names, _scenario_paths, _scenario_url_hints = _collect_scenario_catalog()
+    admin_count = sum(
+        1
+        for entry in raw_users
+        if isinstance(entry, dict) and _normalize_role_value(entry.get('role')) == 'admin'
+    )
+    scenario_names, _scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(user=_current_user())
     scenario_options: list[dict[str, str]] = []
     display_by_norm: dict[str, str] = {}
     for display_name in scenario_names:
@@ -4510,6 +4621,12 @@ def users_page():
         assigned = _normalize_scenario_assignments(entry.get('scenarios'))
         normalized['assigned_scenarios'] = assigned
         normalized['assigned_scenarios_display'] = [display_by_norm.get(norm, norm) for norm in assigned]
+        is_only_admin = normalized['role'] == 'admin' and admin_count <= 1
+        normalized['role_locked'] = is_only_admin
+        if is_only_admin:
+            normalized['role_locked_reason'] = 'At least one admin must remain.'
+        else:
+            normalized['role_locked_reason'] = ''
         users.append(normalized)
     return render_template(
         'users.html',
@@ -4592,6 +4709,40 @@ def users_password(username: str):
         flash('Password updated')
     else:
         flash('User not found')
+    return redirect(url_for('users_page'))
+
+
+@app.route('/users/role/<username>', methods=['POST'])
+def users_update_role(username: str):
+    if not _require_admin():
+        return redirect(url_for('users_page'))
+    username = (username or '').strip()
+    role_value = _normalize_role_value(request.form.get('role'))
+    if not username or role_value not in _ALLOWED_USER_ROLES:
+        flash('Invalid role update request')
+        return redirect(url_for('users_page'))
+    db = _load_users()
+    users = db.get('users', [])
+    target = next((u for u in users if u.get('username') == username), None)
+    if not target:
+        flash('User not found')
+        return redirect(url_for('users_page'))
+    current_role = _normalize_role_value(target.get('role'))
+    if current_role == role_value:
+        flash('Role unchanged')
+        return redirect(url_for('users_page'))
+    if current_role == 'admin' and role_value != 'admin':
+        has_other_admin = any(_normalize_role_value(u.get('role')) == 'admin' and u.get('username') != username for u in users)
+        if not has_other_admin:
+            flash('At least one admin must remain')
+            return redirect(url_for('users_page'))
+    target['role'] = role_value
+    db['users'] = users
+    _save_users(db)
+    cur = _current_user()
+    if cur and cur.get('username') == username:
+        _set_current_user({'username': username, 'role': role_value})
+    flash(f"Role updated to {role_value}")
     return redirect(url_for('users_page'))
 
 
@@ -5225,7 +5376,7 @@ def _collect_scenario_catalog(history: Optional[List[dict]] = None) -> tuple[lis
                 continue
             path_map[norm_key].update(candidates)
     if catalog_names:
-        final_order: list[str] = []
+        merged_order: list[str] = []
         seen_norms: set[str] = set()
         for display in catalog_names:
             norm = _normalize_scenario_label(display)
@@ -5234,9 +5385,103 @@ def _collect_scenario_catalog(history: Optional[List[dict]] = None) -> tuple[lis
             seen_norms.add(norm)
             display_by_norm[norm] = display
             path_map.setdefault(norm, set())
-            final_order.append(display)
-        ordered = final_order
-    return ordered, path_map, participant_by_norm
+            merged_order.append(display)
+        for display in ordered:
+            norm = _normalize_scenario_label(display)
+            if not norm or norm in seen_norms:
+                continue
+            seen_norms.add(norm)
+            merged_order.append(display)
+        ordered = merged_order
+
+    # Merge scenario names from all editor snapshots so manually created scenarios are assignable
+    snapshot_dir = _editor_state_snapshot_dir()
+    try:
+        snapshot_entries = [name for name in os.listdir(snapshot_dir) if name.endswith('.json')]
+    except Exception:
+        snapshot_entries = []
+    snapshot_protected_norms: set[str] = set()
+    for entry in snapshot_entries:
+        full_path = os.path.join(snapshot_dir, entry)
+        try:
+            with open(full_path, 'r', encoding='utf-8') as handle:
+                snapshot_data = json.load(handle)
+        except Exception:
+            continue
+        scen_list = snapshot_data.get('scenarios')
+        if not isinstance(scen_list, list):
+            continue
+        for idx, scen in enumerate(scen_list, start=1):
+            if not isinstance(scen, dict):
+                continue
+            raw_name = scen.get('name')
+            if isinstance(raw_name, str) and raw_name.strip():
+                display = raw_name.strip()
+            else:
+                display = f"Scenario {idx}"
+            norm = _normalize_scenario_label(display)
+            if not norm:
+                continue
+            if norm not in display_by_norm:
+                display_by_norm[norm] = display
+                path_map.setdefault(norm, set())
+                ordered.append(display)
+            snapshot_protected_norms.add(norm)
+            hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else None
+            if hitl_meta:
+                participant_url = ''
+                for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+                    normalized = _normalize_participant_proxmox_url(hitl_meta.get(key))
+                    if normalized:
+                        participant_url = normalized
+                        break
+                if participant_url:
+                    participant_by_norm[norm] = participant_url
+    protected = snapshot_protected_norms or None
+    return _prune_stale_scenario_entries(ordered, path_map, participant_by_norm, protected_norms=protected)
+
+
+def _prune_stale_scenario_entries(
+    scenario_names: list[str],
+    scenario_paths: dict[str, set[str]],
+    scenario_url_hints: dict[str, str],
+    *,
+    protected_norms: Optional[set[str]] = None,
+) -> tuple[list[str], dict[str, set[str]], dict[str, str]]:
+    cleaned_names: list[str] = []
+    cleaned_paths: dict[str, set[str]] = {}
+    cleaned_hints: dict[str, str] = {}
+    seen_norms: set[str] = set()
+    protected = {n.strip().lower() for n in (protected_norms or set()) if n}
+
+    for display in scenario_names:
+        norm = _normalize_scenario_label(display)
+        if not norm or norm in seen_norms:
+            continue
+        seen_norms.add(norm)
+        candidates = scenario_paths.get(norm) or set()
+        valid_paths: set[str] = set()
+        for candidate in candidates:
+            if candidate in (None, ''):
+                continue
+            try:
+                abs_candidate = os.path.abspath(str(candidate))
+            except Exception:
+                abs_candidate = str(candidate)
+            try:
+                exists = os.path.exists(abs_candidate)
+            except Exception:
+                exists = False
+            if exists:
+                valid_paths.add(abs_candidate)
+        if not valid_paths and norm not in protected:
+            continue
+        cleaned_names.append(display)
+        cleaned_paths[norm] = valid_paths
+        if norm in scenario_url_hints:
+            cleaned_hints[norm] = scenario_url_hints[norm]
+
+    return cleaned_names, cleaned_paths, cleaned_hints
 
 
 def _merge_editor_scenarios_into_catalog(
@@ -5249,7 +5494,11 @@ def _merge_editor_scenarios_into_catalog(
     snapshot = _load_editor_state_snapshot(user)
     scen_list = snapshot.get('scenarios') if isinstance(snapshot, dict) else None
     if not scen_list or not isinstance(scen_list, list):
-        return scenario_names, scenario_paths, scenario_url_hints or {}
+        return (
+            list(scenario_names or []),
+            {k: set(v) for k, v in (scenario_paths or {}).items()},
+            dict(scenario_url_hints or {}),
+        )
 
     names_out = list(scenario_names or [])
     paths_out: dict[str, set[str]] = {k: set(v) for k, v in (scenario_paths or {}).items()}
@@ -5269,6 +5518,7 @@ def _merge_editor_scenarios_into_catalog(
         except Exception:
             abs_result_path = candidate
 
+    snapshot_norms: set[str] = set()
     for idx, scen in enumerate(scen_list, start=1):
         if not isinstance(scen, dict):
             continue
@@ -5310,8 +5560,9 @@ def _merge_editor_scenarios_into_catalog(
                     break
             if participant_url:
                 hints_out[norm] = participant_url
+        snapshot_norms.add(norm)
 
-    return names_out, paths_out, hints_out
+    return _prune_stale_scenario_entries(names_out, paths_out, hints_out, protected_norms=snapshot_norms or None)
 
 
 def _scenario_catalog_for_user(
@@ -5506,6 +5757,7 @@ def _participant_ui_state() -> Dict[str, Any]:
         if cached is not _G_PARTICIPANT_STATE_SENTINEL:
             return cached
     user = _current_user()
+    user_role = _normalize_role_value(user.get('role')) if user else ''
     scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(
         None,
         user=user,
@@ -5526,7 +5778,8 @@ def _participant_ui_state() -> Dict[str, Any]:
         ordered_norms.append(norm_key)
     assigned_norms = _current_user_assigned_scenarios()
     assigned_set = set(assigned_norms)
-    restrict_to_assigned = bool(user and _is_participant_role(user.get('role')))
+    has_assignments = bool(assigned_norms)
+    restrict_to_assigned = user_role in {'participant', 'builder'}
     allowed_norms: Optional[set[str]] = set(assigned_norms) if restrict_to_assigned else None
     scenario_arg_norm = ''
     if has_request_context():
@@ -5534,6 +5787,13 @@ def _participant_ui_state() -> Dict[str, Any]:
             scenario_arg_norm = _normalize_scenario_label(request.args.get('scenario'))
         except Exception:
             scenario_arg_norm = ''
+
+    def _humanize_norm_text(value: str) -> str:
+        if not value:
+            return ''
+        text = value.replace('_', ' ')
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text.title() if text else ''
 
     def _pick_norm(candidates: Iterable[str]) -> str:
         for norm in candidates:
@@ -5570,14 +5830,28 @@ def _participant_ui_state() -> Dict[str, Any]:
         listing.append(entry)
     if restrict_to_assigned:
         listing = [row for row in listing if row['assigned']]
+        present_norms = {row['norm'] for row in listing}
+        missing_norms = [norm for norm in assigned_norms if norm and norm not in present_norms]
+        for norm in missing_norms:
+            display_value = display_by_norm.get(norm) or _humanize_norm_text(norm) or norm
+            listing.append({
+                'norm': norm,
+                'display': display_value,
+                'url': '',
+                'has_url': False,
+                'assigned': True,
+                'placeholder': True,
+            })
     for row in listing:
         row['active'] = bool(selected_norm) and row['norm'] == selected_norm
     heading = 'Your Assigned Scenarios' if restrict_to_assigned else 'Available Scenarios'
-    empty_message = (
-        'No scenarios have been assigned to your account yet. Ask an administrator for access.'
-        if restrict_to_assigned
-        else 'No scenarios with participant links are available yet.'
-    )
+    if restrict_to_assigned:
+        if has_assignments:
+            empty_message = 'Your assigned scenarios are not available in the participant console yet. Ask an administrator to publish them.'
+        else:
+            empty_message = 'No scenarios have been assigned to your account yet. Ask an administrator for access.'
+    else:
+        empty_message = 'No scenarios with participant links are available yet.'
     hint = 'Load a scenario into the console or open its participant link in a new tab.'
     state = {
         'selected_norm': selected_norm,
@@ -5588,7 +5862,7 @@ def _participant_ui_state() -> Dict[str, Any]:
         'listing_empty_message': empty_message,
         'listing_hint': hint,
         'restrict_to_assigned': restrict_to_assigned,
-        'has_assignments': bool(assigned_norms),
+        'has_assignments': has_assignments,
     }
     if has_request_context():
         setattr(g, '_participant_ui_state', state)
@@ -6665,6 +6939,17 @@ def _filter_scenarios_by_norms(
     return filtered
 
 
+def _collect_scenario_norms(scenarios: Iterable[Any]) -> set[str]:
+    norms: set[str] = set()
+    for scen in scenarios or []:
+        if not isinstance(scen, dict):
+            continue
+        norm = _normalize_scenario_label(scen.get('name'))
+        if norm:
+            norms.add(norm)
+    return norms
+
+
 def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optional[dict] = None) -> Dict[str, Any]:
     """Normalize payload data before rendering the index page."""
     if not isinstance(payload, dict):
@@ -6677,6 +6962,9 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
     scenario_hint_raw = payload.get('scenario_query') if isinstance(payload.get('scenario_query'), str) else None
     scenario_hint = scenario_hint_raw.strip() if isinstance(scenario_hint_raw, str) else None
     allowed_norms = _builder_allowed_norms(user)
+    builder_assignment_order: Optional[list[str]] = None
+    if allowed_norms is not None:
+        builder_assignment_order = _assigned_scenarios_for_user(user)
 
     defaults = _default_scenarios_payload()
 
@@ -6698,6 +6986,13 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
     scenarios_raw = payload.get('scenarios')
     if not isinstance(scenarios_raw, list) or not scenarios_raw:
         scenarios_raw = defaults['scenarios']
+    if allowed_norms:
+        existing_norms = _collect_scenario_norms(scenarios_raw)
+        missing_norms = allowed_norms - existing_norms
+        if missing_norms:
+            seeded = _builder_catalog_seed_scenarios(allowed_norms, builder_assignment_order, user=user)
+            if seeded:
+                scenarios_raw = seeded
 
     required_sections = {
         'Node Information': {'density': None, 'total_nodes': None},
@@ -10289,12 +10584,18 @@ def reports_page():
                 e['scenario_names'] = []
         enriched.append(e)
     enriched = sorted(enriched, key=lambda x: x.get('timestamp',''), reverse=True)
+    user = _current_user()
     scenario_names, _scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(
         enriched,
-        user=_current_user(),
+        user=user,
     )
     scenario_query = request.args.get('scenario', '').strip()
     scenario_norm = _normalize_scenario_label(scenario_query)
+    scenario_names, scenario_norm, _allowed_norms = _builder_filter_report_scenarios(
+        scenario_names,
+        scenario_norm,
+        user=user,
+    )
     if scenario_norm:
         enriched = _filter_history_by_scenario(enriched, scenario_norm)
     scenario_display = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
@@ -10336,12 +10637,18 @@ def reports_data():
                 e['scenario_names'] = []
         enriched.append(e)
     enriched = sorted(enriched, key=lambda x: x.get('timestamp',''), reverse=True)
+    user = _current_user()
     scenario_names, scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(
         enriched,
-        user=_current_user(),
+        user=user,
     )
     scenario_query = request.args.get('scenario', '').strip()
     scenario_norm = _normalize_scenario_label(scenario_query)
+    scenario_names, scenario_norm, _allowed_norms = _builder_filter_report_scenarios(
+        scenario_names,
+        scenario_norm,
+        user=user,
+    )
     if scenario_norm:
         enriched = _filter_history_by_scenario(enriched, scenario_norm)
     scenario_display = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
