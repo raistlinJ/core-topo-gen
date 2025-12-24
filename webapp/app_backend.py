@@ -12374,40 +12374,42 @@ def _hitl_details_from_path(xml_path: str) -> list[dict[str, Any]]:
     hitl_details: list[dict[str, Any]] = []
     try:
         summary = _analyze_core_xml(abs_path)
-        # Prefer RJ45 node interface IPs for the core.html HITL column.
-        # This is the "rj-45 interface address" (not the router-side connection point).
-        rj45_preferred: list[dict[str, Any]] = []
+        # Prefer the gateway/router-side interface IP for the RJ45 attachment.
+        # Our generated scenarios name that interface "hitl<idx>", so we can reliably
+        # pick only the gateway IP (not router uplinks or the RJ45 node IP).
+        gateway_preferred: list[dict[str, Any]] = []
         for node in summary.get('nodes') or []:
             if not isinstance(node, dict):
                 continue
-            node_type = (node.get('type') or '').strip().lower()
-            if 'rj45' not in node_type and 'rj-45' not in node_type:
+            node_type = (node.get('type') or '').strip()
+            if node_type.lower() != 'router':
                 continue
-            ips = _force_ipv4_prefixlen(_collect_node_ips(node), prefixlen='24')
+            ips = _collect_named_iface_ips(node, name_prefix='hitl')
+            ips = _force_ipv4_prefixlen(ips, prefixlen='24')
             if not ips:
                 continue
             name = (node.get('name') or node.get('id') or '').strip()
-            rj45_preferred.append({'name': name or 'RJ45', 'type': node.get('type') or 'rj45', 'ips': ips[:1]})
+            gateway_preferred.append({'name': name or 'HITL gateway', 'type': node_type, 'ips': ips[:1]})
 
-        if rj45_preferred:
-            hitl_details = rj45_preferred
+        if gateway_preferred:
+            hitl_details = gateway_preferred
         else:
-            # Fall back to router-side HITL interfaces (named hitl*) if we can't find RJ45 nodes.
-            router_preferred: list[dict[str, Any]] = []
+            # Fallback for legacy XMLs without the hitl* interface naming:
+            # show RJ45 node IPs if present, otherwise show whatever HITL-like nodes exist.
+            rj45_fallback: list[dict[str, Any]] = []
             for node in summary.get('nodes') or []:
                 if not isinstance(node, dict):
                     continue
-                node_type = (node.get('type') or '').strip()
-                if node_type.lower() != 'router':
+                node_type_lower = (node.get('type') or '').strip().lower()
+                if 'rj45' not in node_type_lower and 'rj-45' not in node_type_lower:
                     continue
-                ips = _collect_named_iface_ips(node, name_prefix='hitl')
-                ips = _force_ipv4_prefixlen(ips, prefixlen='24')
+                ips = _force_ipv4_prefixlen(_collect_node_ips(node), prefixlen='24')
                 if not ips:
                     continue
                 name = (node.get('name') or node.get('id') or '').strip()
-                router_preferred.append({'name': name or 'HITL Router', 'type': node_type, 'ips': ips[:1]})
-            if router_preferred:
-                hitl_details = router_preferred
+                rj45_fallback.append({'name': name or 'RJ45', 'type': node.get('type') or 'rj45', 'ips': ips[:1]})
+            if rj45_fallback:
+                hitl_details = rj45_fallback
             else:
                 nodes = summary.get('hitl_nodes') or []
                 for node in nodes:
