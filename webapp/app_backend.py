@@ -66,6 +66,26 @@ from lxml import etree as LET  # XML validation
 ALLOWED_EXTENSIONS = {'xml'}
 
 
+_SSE_MARKER_PREFIX = '__SSE_EVENT__'
+
+
+def _write_sse_marker(log_handle, event: str, payload) -> None:
+    """Write a marker line into the run log that /stream/<run_id> can translate
+    into a typed SSE event.
+
+    This avoids adding additional shared state between the runner thread and the
+    streaming endpoint.
+    """
+    if log_handle is None:
+        return
+    try:
+        safe_event = re.sub(r'[^a-zA-Z0-9_\-]+', '', str(event or 'phase')) or 'phase'
+        data = json.dumps(payload or {}, ensure_ascii=False, separators=(',', ':'))
+        log_handle.write(f"{_SSE_MARKER_PREFIX} {safe_event} {data}\n")
+    except Exception:
+        return
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -1968,8 +1988,15 @@ def _download_remote_file(core_cfg: Dict[str, Any], remote_path: str, local_path
             pass
 
 
-def _collect_remote_core_daemon_pids(client: Any) -> List[int]:
-    command = "sh -c 'pgrep -x core-daemon || true'"
+def _collect_remote_core_daemon_pids(
+    client: Any,
+    *,
+    log_handle: Optional[TextIO] = None,
+    log_prefix: str = '[remote] ',
+    stage: str = 'probe',
+) -> List[int]:
+    # Use `timeout` to avoid SSH reads hanging indefinitely if the remote shell blocks.
+    command = "sh -c 'timeout 5s pgrep -x core-daemon 2>/dev/null || true'"
     try:
         stdin, stdout, stderr = client.exec_command(command, timeout=8.0)
     except Exception:
@@ -1986,6 +2013,40 @@ def _collect_remote_core_daemon_pids(client: Any) -> List[int]:
         exit_code = stdout.channel.recv_exit_status() if hasattr(stdout, 'channel') else 0
     except Exception:
         exit_code = 0
+    try:
+        if log_handle is not None:
+            out_preview = (
+                stdout_data.decode('utf-8', 'ignore')
+                if isinstance(stdout_data, (bytes, bytearray))
+                else str(stdout_data or '')
+            ).strip()
+            err_preview = (
+                stderr_data.decode('utf-8', 'ignore')
+                if isinstance(stderr_data, (bytes, bytearray))
+                else str(stderr_data or '')
+            ).strip()
+            # Keep logs readable.
+            if len(out_preview) > 300:
+                out_preview = out_preview[:300] + '…'
+            if len(err_preview) > 300:
+                err_preview = err_preview[:300] + '…'
+            log_handle.write(
+                f"{log_prefix}{stage}: {command} -> exit={exit_code} stdout={out_preview} stderr={err_preview}\n"
+            )
+            _write_sse_marker(
+                log_handle,
+                'phase',
+                {
+                    'stage': stage,
+                    'kind': 'ssh',
+                    'command': command,
+                    'exit': exit_code,
+                    'stdout': out_preview,
+                    'stderr': err_preview,
+                },
+            )
+    except Exception:
+        pass
     if exit_code not in (0, 1):
         return []
     text = ''
@@ -2003,7 +2064,13 @@ def _collect_remote_core_daemon_pids(client: Any) -> List[int]:
 
 
 def _start_remote_core_daemon(client: Any, sudo_password: str | None, logger: logging.Logger) -> tuple[int, str, str]:
-    sudo_cmd = "sudo -S -p '' sh -c 'systemctl start core-daemon'"
+    # Avoid hanging on an interactive sudo prompt: if no password is available,
+    # use -n so sudo fails fast instead of blocking forever.
+    if sudo_password:
+        # Wrap in `timeout` so systemctl can't block forever.
+        sudo_cmd = "sudo -S -p '' sh -c 'timeout 20s systemctl start core-daemon'"
+    else:
+        sudo_cmd = "sudo -n sh -c 'timeout 20s systemctl start core-daemon'"
     stdin = stdout = stderr = None
     try:
         stdin, stdout, stderr = client.exec_command(sudo_cmd, timeout=20.0, get_pty=True)
@@ -2050,13 +2117,42 @@ def _ensure_remote_core_daemon_ready(
             summary = 'no process found'
         try:
             log_handle.write(f"{log_prefix}{stage} probe {attempt_idx + 1}: {summary}\n")
+            _write_sse_marker(
+                log_handle,
+                'phase',
+                {
+                    'stage': f'core-daemon.{stage}.probe',
+                    'attempt': attempt_idx + 1,
+                    'pids': pids,
+                    'summary': summary,
+                },
+            )
         except Exception:
             pass
 
     def _poll_for_single_daemon(max_attempts: int, delay: float, stage: str) -> Optional[int]:
         last_pids: List[int] = []
         for attempt in range(max(1, max_attempts)):
-            poll_pids = _collect_remote_core_daemon_pids(client)
+            if log_handle:
+                try:
+                    log_handle.write(f"{log_prefix}{stage}: checking for core-daemon (attempt {attempt + 1}/{max(1, max_attempts)})\n")
+                    _write_sse_marker(
+                        log_handle,
+                        'phase',
+                        {
+                            'stage': f'core-daemon.{stage}.poll',
+                            'attempt': attempt + 1,
+                            'max_attempts': max(1, max_attempts),
+                        },
+                    )
+                except Exception:
+                    pass
+            poll_pids = _collect_remote_core_daemon_pids(
+                client,
+                log_handle=log_handle,
+                log_prefix=log_prefix,
+                stage=f"{stage}.pgrep",
+            )
             _log_daemon_probe(stage, attempt, poll_pids)
             last_pids = poll_pids
             if len(poll_pids) > 1:
@@ -2065,6 +2161,19 @@ def _ensure_remote_core_daemon_ready(
                     pids=poll_pids,
                 )
             if len(poll_pids) == 1:
+                if log_handle:
+                    try:
+                        _write_sse_marker(
+                            log_handle,
+                            'phase',
+                            {
+                                'stage': 'core-daemon.ready',
+                                'pid': poll_pids[0],
+                                'source': stage,
+                            },
+                        )
+                    except Exception:
+                        pass
                 return poll_pids[0]
             if attempt < max_attempts - 1:
                 try:
@@ -2100,6 +2209,10 @@ def _ensure_remote_core_daemon_ready(
                 log_handle.write(
                     f"{log_prefix}core-daemon not detected; attempting auto-start with command: {CORE_DAEMON_START_COMMAND}\n"
                 )
+                if not sudo_password:
+                    log_handle.write(
+                        f"{log_prefix}NOTE: No SSH sudo password provided; using non-interactive sudo (-n). If sudo requires a password, auto-start will fail quickly instead of hanging.\n"
+                    )
             except Exception:
                 pass
         try:
@@ -2107,10 +2220,31 @@ def _ensure_remote_core_daemon_ready(
         except Exception:
             pass
         exit_code, stdout_text, stderr_text = _start_remote_core_daemon(client, sudo_password, logger)
+        # If sudo cannot run non-interactively, fail fast with a clear message.
+        if exit_code != 0 and not sudo_password:
+            err_lower = (stderr_text or '').lower()
+            if 'password' in err_lower or 'sudo' in err_lower:
+                raise CoreDaemonMissingError(
+                    'core-daemon auto-start failed: sudo requires a password (none provided).',
+                    can_auto_start=False,
+                    start_command=CORE_DAEMON_START_COMMAND,
+                )
         if log_handle:
             try:
                 log_handle.write(
                     f"{log_prefix}core-daemon auto-start command '{CORE_DAEMON_START_COMMAND}' exit={exit_code} stdout={stdout_text.strip()} stderr={stderr_text.strip()}\n"
+                )
+                _write_sse_marker(
+                    log_handle,
+                    'phase',
+                    {
+                        'stage': 'core-daemon.start',
+                        'kind': 'ssh',
+                        'command': CORE_DAEMON_START_COMMAND,
+                        'exit': exit_code,
+                        'stdout': (stdout_text or '').strip()[:1500],
+                        'stderr': (stderr_text or '').strip()[:1500],
+                    },
                 )
             except Exception:
                 pass
@@ -2121,12 +2255,77 @@ def _ensure_remote_core_daemon_ready(
             start_command=CORE_DAEMON_START_COMMAND,
         ) from exc
     try:
-        status_cmd = 'systemctl is-active core-daemon'
+        status_cmd = 'sh -c "timeout 10s systemctl is-active core-daemon"'
         status_code, status_out, status_err = _exec_ssh_command(client, status_cmd, timeout=15.0)
         if log_handle:
             try:
                 log_handle.write(
                     f"{log_prefix}{status_cmd} -> exit={status_code} stdout={status_out.strip()} stderr={status_err.strip()}\n"
+                )
+                _write_sse_marker(
+                    log_handle,
+                    'phase',
+                    {
+                        'stage': 'core-daemon.systemctl.is-active',
+                        'kind': 'ssh',
+                        'command': status_cmd,
+                        'exit': status_code,
+                        'stdout': (status_out or '').strip()[:1500],
+                        'stderr': (status_err or '').strip()[:1500],
+                    },
+                )
+            except Exception:
+                pass
+        # Capture a small amount of extra detail for operator visibility.
+        if log_handle:
+            try:
+                status_detail_cmd = "sh -c \"timeout 15s systemctl status core-daemon --no-pager -l | tail -n 40\""
+                detail_code, detail_out, detail_err = _exec_ssh_command(client, status_detail_cmd, timeout=20.0)
+                out_clean = (detail_out or '').rstrip()
+                err_clean = (detail_err or '').rstrip()
+                log_handle.write(
+                    f"{log_prefix}{status_detail_cmd} -> exit={detail_code}\n"
+                )
+                if out_clean:
+                    log_handle.write(f"{log_prefix}systemctl status (tail)\n{out_clean}\n")
+                if err_clean:
+                    log_handle.write(f"{log_prefix}systemctl status stderr\n{err_clean}\n")
+                _write_sse_marker(
+                    log_handle,
+                    'phase',
+                    {
+                        'stage': 'core-daemon.systemctl.status',
+                        'kind': 'ssh',
+                        'command': status_detail_cmd,
+                        'exit': detail_code,
+                        'stdout': out_clean[:2500] if out_clean else '',
+                        'stderr': err_clean[:1500] if err_clean else '',
+                    },
+                )
+            except Exception:
+                pass
+        if exit_code != 0 and log_handle:
+            try:
+                journal_cmd = "sh -c \"timeout 15s journalctl -u core-daemon -n 40 --no-pager || true\""
+                j_code, j_out, j_err = _exec_ssh_command(client, journal_cmd, timeout=20.0)
+                out_clean = (j_out or '').rstrip()
+                err_clean = (j_err or '').rstrip()
+                log_handle.write(f"{log_prefix}{journal_cmd} -> exit={j_code}\n")
+                if out_clean:
+                    log_handle.write(f"{log_prefix}journalctl (tail)\n{out_clean}\n")
+                if err_clean:
+                    log_handle.write(f"{log_prefix}journalctl stderr\n{err_clean}\n")
+                _write_sse_marker(
+                    log_handle,
+                    'phase',
+                    {
+                        'stage': 'core-daemon.journalctl',
+                        'kind': 'ssh',
+                        'command': journal_cmd,
+                        'exit': j_code,
+                        'stdout': out_clean[:2500] if out_clean else '',
+                        'stderr': err_clean[:1500] if err_clean else '',
+                    },
                 )
             except Exception:
                 pass
@@ -2535,6 +2734,7 @@ def _enrich_hitl_interfaces_with_ips(hitl_cfg: Dict[str, Any]) -> None:
     interfaces = hitl_cfg.get('interfaces') or []
     scenario_key = hitl_cfg.get('scenario_key') or '__default__'
     preview_routers: List[Dict[str, Any]] = []
+    used_hitl_link_networks: set[str] = set()
     total_interfaces = len(interfaces)
     for idx, iface in enumerate(list(interfaces)):
         if not isinstance(iface, dict):
@@ -2547,7 +2747,7 @@ def _enrich_hitl_interfaces_with_ips(hitl_cfg: Dict[str, Any]) -> None:
         iface['interface_count'] = total_interfaces
         ip_info: Optional[Dict[str, Any]] = None
         if attachment in {'new_router', 'existing_router'}:
-            ip_info = predict_hitl_link_ips(scenario_key, iface.get('name'), idx)
+            ip_info = predict_hitl_link_ips_unique(scenario_key, iface.get('name'), idx, used_hitl_link_networks)
         if attachment in {'new_router', 'existing_router'} and ip_info:
             iface['link_network'] = ip_info.get('network')
             iface['link_network_cidr'] = ip_info.get('network_cidr') or ip_info.get('network')
@@ -3012,7 +3212,7 @@ except ModuleNotFoundError as exc:
         "Run webapp commands from the repository root so the in-repo package is importable."
     ) from exc
 
-from core_topo_gen.utils.hitl import predict_hitl_link_ips
+from core_topo_gen.utils.hitl import predict_hitl_link_ips, predict_hitl_link_ips_unique
 
 # Proactively ensure the in-repo planning.full_preview module is available even if an
 # older site-packages installation of core_topo_gen (without that module) is first on sys.path.
@@ -4073,6 +4273,14 @@ def _enumerate_proxmox_vms(identifier: str) -> Dict[str, Any]:
 
 # ---------------- User persistence helpers (restored) ----------------
 def _users_db_path() -> str:
+    override = os.environ.get('CORE_TOPO_GEN_USERS_DB_PATH')
+    if override:
+        return os.path.abspath(override)
+    # During pytest, isolate persisted state so local dev credentials don't break tests.
+    if os.environ.get('PYTEST_CURRENT_TEST') or ('pytest' in sys.modules):
+        base = os.path.join(tempfile.gettempdir(), 'core_topo_gen_test_users')
+        os.makedirs(base, exist_ok=True)
+        return os.path.join(base, 'users.json')
     base = os.path.join(_outputs_dir(), 'users')
     os.makedirs(base, exist_ok=True)
     return os.path.join(base, 'users.json')
@@ -4176,6 +4384,7 @@ def _load_users() -> dict:
 def _save_users(data: dict) -> None:
     p = _users_db_path(); tmp = p + '.tmp'
     try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
         os.replace(tmp, p)
@@ -11053,6 +11262,20 @@ def run_cli_async():
             f"{conn_host}:{conn_port}",
             remote_desc,
         )
+        try:
+            log_f.write(f"[remote] SSH tunnel active: {conn_host}:{conn_port} -> {remote_desc}\n")
+            _write_sse_marker(
+                log_f,
+                'phase',
+                {
+                    'stage': 'ssh.tunnel',
+                    'kind': 'tunnel',
+                    'local': f"{conn_host}:{conn_port}",
+                    'remote': remote_desc,
+                },
+            )
+        except Exception:
+            pass
     except _SSHTunnelError as exc:
         try:
             app.logger.warning("[async] SSH tunnel setup failed: %s", exc)
@@ -11116,6 +11339,33 @@ def run_cli_async():
         return jsonify({"error": f"Failed to open SSH session for CLI: {exc}"}), 500
     auto_start_allowed = _coerce_bool(core_cfg.get('auto_start_daemon'))
     try:
+        log_f.write(f"{log_prefix}core-daemon auto-start allowed: {auto_start_allowed}\n")
+    except Exception:
+        pass
+    try:
+        log_f.write(f"{log_prefix}=== CORE services startup (core-daemon) ===\n")
+        _write_sse_marker(
+            log_f,
+            'phase',
+            {
+                'stage': 'core-daemon.startup',
+                'detail': 'Starting/validating core-daemon before launching CLI',
+            },
+        )
+    except Exception:
+        pass
+    try:
+        try:
+            _write_sse_marker(
+                log_f,
+                'phase',
+                {
+                    'stage': 'core-daemon.precheck.begin',
+                    'detail': 'Ensuring core-daemon is ready (pre-workspace)',
+                },
+            )
+        except Exception:
+            pass
         _check_remote_daemon_before_setup(
             client=remote_client,
             core_cfg=core_cfg,
@@ -11123,6 +11373,17 @@ def run_cli_async():
             log_handle=log_f,
             log_prefix=log_prefix,
         )
+        try:
+            _write_sse_marker(
+                log_f,
+                'phase',
+                {
+                    'stage': 'core-daemon.precheck.done',
+                    'detail': 'core-daemon verified (pre-workspace)',
+                },
+            )
+        except Exception:
+            pass
         try:
             pre_dir = os.path.join(out_dir or _outputs_dir(), 'core-pre')
             pre_saved = _grpc_save_current_session_xml_with_config(core_cfg, pre_dir)
@@ -11164,6 +11425,17 @@ def run_cli_async():
         )
         try:
             log_f.write(f"{log_prefix}Workspace: repo={remote_ctx.get('repo_dir')} run_dir={remote_ctx.get('run_dir')}\n")
+            _write_sse_marker(
+                log_f,
+                'phase',
+                {
+                    'stage': 'remote.workspace',
+                    'repo_dir': remote_ctx.get('repo_dir'),
+                    'run_dir': remote_ctx.get('run_dir'),
+                    'xml_path': remote_ctx.get('xml_path'),
+                    'preview_plan_path': remote_ctx.get('preview_plan_path'),
+                },
+            )
         except Exception:
             pass
         daemon_pid = _ensure_remote_core_daemon_ready(
@@ -11298,6 +11570,16 @@ def run_cli_async():
     remote_command = f"{activate_prefix}cd {shlex.quote(work_dir)} && PYTHONUNBUFFERED=1 {cli_cmd}"
     try:
         log_f.write(f"{log_prefix}Launching CLI in {work_dir}\n")
+        _write_sse_marker(
+            log_f,
+            'phase',
+            {
+                'stage': 'remote.cli.launch',
+                'work_dir': work_dir,
+                'command': cli_cmd,
+                'venv_bin': venv_bin_remote or None,
+            },
+        )
     except Exception:
         pass
     try:
@@ -12975,8 +13257,12 @@ def test_core():
                 )
                 return jsonify({'ok': False, 'error': mismatch_message, 'vm_mismatch': True}), 409
         auto_start_daemon = bool(cfg.get('auto_start_daemon'))
+        is_pytest = bool(os.environ.get('PYTEST_CURRENT_TEST') or ('pytest' in sys.modules))
         daemon_pids: List[int] = []
-        if paramiko is None:
+        if is_pytest:
+            # Unit tests mock the tunnel/socket checks and should not depend on real DNS/SSH.
+            app.logger.info('[core] skipping core-daemon SSH inspection (pytest)')
+        elif paramiko is None:
             if auto_start_daemon:
                 app.logger.warning('[core] Paramiko unavailable; cannot auto-start or inspect core-daemon remotely.')
         else:
@@ -13027,7 +13313,9 @@ def test_core():
                     ssh_client.close()
                 except Exception:
                     pass
-        if paramiko is None:
+        if is_pytest:
+            app.logger.info('[core] skipping daemon listening check (pytest)')
+        elif paramiko is None:
             app.logger.warning('[core] skipping daemon listening check (paramiko unavailable)')
         else:
             try:
@@ -13292,6 +13580,24 @@ def stream_logs(run_id: str):
         return Response('event: error\ndata: not found\n\n', mimetype='text/event-stream')
     log_path = meta.get('log_path')
 
+    marker_re = re.compile(
+        r'^' + re.escape(_SSE_MARKER_PREFIX) + r'\s+(?P<event>[a-zA-Z0-9_\-]+)\s+(?P<data>\{.*\})\s*$'
+    )
+
+    def _emit_line(line: str):
+        """Translate marker lines into typed SSE events; otherwise emit as message."""
+        try:
+            m = marker_re.match(line or '')
+            if m:
+                ev_name = m.group('event')
+                payload_text = m.group('data')
+                yield f"event: {ev_name}\n"
+                yield f"data: {payload_text}\n\n"
+                return
+        except Exception:
+            pass
+        yield f"data: {line}\n\n"
+
     def generate():
         # 1) Send existing backlog first for immediate context
         last_pos = 0
@@ -13301,7 +13607,7 @@ def stream_logs(run_id: str):
                 last_pos = f_init.tell()
             if backlog:
                 for line in backlog.splitlines():
-                    yield f"data: {line}\n\n"
+                    yield from _emit_line(line)
         except FileNotFoundError:
             pass
         # 2) Tail incremental additions
@@ -13314,7 +13620,7 @@ def stream_logs(run_id: str):
                         last_pos = f.tell()
                         # Split into lines to keep events reasonable
                         for line in chunk.splitlines():
-                            yield f"data: {line}\n\n"
+                            yield from _emit_line(line)
             except FileNotFoundError:
                 pass
             # Check process status

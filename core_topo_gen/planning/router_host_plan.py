@@ -18,6 +18,7 @@ import random
 import ipaddress
 import math
 from ..utils.allocators import make_subnet_allocator
+from ..constants import DEFAULT_IPV4_PREFIXLEN
 
 def _expand_roles(role_counts: Dict[str, int]) -> List[str]:
     out: List[str] = []
@@ -110,6 +111,7 @@ def plan_r2s_grouping(
     ip4_prefix: str | None = None,
     ip_mode: str | None = None,
     ip_region: str | None = None,
+    subnet_alloc_override: Any | None = None,
 ) -> Dict[str, Any]:
     """Replica of grouping logic from full_preview, returned as a structured dict.
 
@@ -161,10 +163,10 @@ def plan_r2s_grouping(
     per_router_bounds: Dict[int, Dict[str, Optional[int]]] = {}
     switch_nodes: List[Dict[str,Any]] = []
     switches_detail: List[Dict[str,Any]] = []
-    router_switch_subnets: List[str] = []  # /30 subnets for each router<->switch link
-    lan_subnets: List[str] = []
-    ptp_subnets: List[str] = []
-    r2r_subnets: List[str] = []  # /30 subnets for router<->router links (preview purpose)
+    router_switch_subnets: List[str] = []  # /24 subnets for each router<->switch link (temporary /24-only policy)
+    lan_subnets: List[str] = []  # /24 subnets for each LAN behind a router-switch
+    ptp_subnets: List[str] = []  # /24 subnets for host<->router direct links (when used)
+    r2r_subnets: List[str] = []  # /24 subnets for router<->router links (preview purpose)
     next_switch_id = routers_planned + total_hosts + 1
     # Derive target if Exact but unspecified
     if effective_mode == 'exact' and (target_per_router is None):
@@ -181,60 +183,29 @@ def plan_r2s_grouping(
             target_per_router = 1
             derived_effective_target = 1
     # Prepare allocator for realistic subnet assignment (optional)
-    subnet_alloc = None
-    try:
-        # Provide a deterministic default pool if caller omitted prefix (tests often do)
-        eff_prefix = ip4_prefix or '10.200.0.0/15'
-        subnet_alloc = make_subnet_allocator(ip_mode or 'private', eff_prefix, ip_region or 'all')
-    except Exception:
-        subnet_alloc = None
+    subnet_alloc = subnet_alloc_override
+    if subnet_alloc is None:
+        try:
+            # Provide a deterministic default pool if caller omitted prefix (tests often do)
+            eff_prefix = ip4_prefix or '10.200.0.0/15'
+            subnet_alloc = make_subnet_allocator(ip_mode or 'private', eff_prefix, ip_region or 'all')
+        except Exception:
+            subnet_alloc = None
 
-    def _lan_prefix_for_hosts(host_count: int, reserve: int = 2, max_prefix: int = 24) -> int:
-        """Return the smallest prefix length that can fit host_count plus reserve with 25% headroom.
+    def _next_group_subnets(router_id: int, group_idx: int, host_count: int = 0) -> tuple[str, str]:
+        """Allocate subnets for router/group.
 
-        headroom factor: we inflate required hosts by 1.25 (ceil) so that modest future growth
-        or service IPs can be added without immediate reallocation.
-
-        We cap expansion at /24 (prefixlen <= 24). We never go beyond /24 to keep address blocks
-        reasonably sized and routing table compact.
-        """
-        if host_count <= 0:
-            return 30  # degenerate tiny case
-        needed = int((host_count + reserve) * 1.25 + 0.9999)  # ceil((hosts+reserve)*1.25)
-        # Iterate candidate prefix lengths from /30 (4 addresses) up to max_prefix (/24 default: 256 addresses)
-        for p in range(30, max_prefix + 1):
-            size = 1 << (32 - p)
-            usable = size - 2  # network + broadcast removed
-            if usable >= needed:
-                return p
-        return max_prefix
-
-    def _next_group_subnets(router_id: int, group_idx: int, host_count: int = 0) -> tuple[str,str]:
-        """Allocate subnets for router/group using the real allocator only with dynamic LAN sizing.
-
-        Layout inside parent /24 (allocator enforced):
-          - First /30 for router-switch link
-          - LAN starts at +64 offset (as before) but prefix chosen dynamically.
+        Temporary policy: ALL subnets are /24. We allocate a dedicated /24 for the
+        router<->switch link and a separate dedicated /24 for the LAN behind the switch.
         """
         if subnet_alloc is None:
-            raise RuntimeError("Subnet allocator unavailable; cannot synthesize legacy subnets (removed).")
+            raise RuntimeError("Subnet allocator unavailable; cannot allocate /24 subnets.")
         try:
-            parent = subnet_alloc.next_subnet(24)  # parent slice (/24)
-            base_int = int(parent.network_address)
-            rsw_net = ipaddress.ip_network((ipaddress.IPv4Address(base_int), 30), strict=False)
-            lan_base = ipaddress.IPv4Address(base_int + 64)
-            lan_prefix = _lan_prefix_for_hosts(host_count)
-            # Ensure LAN fits within the same /24 parent; if prefix is too small (too many addresses), fallback to /24 aligned at lan_base's /24
-            try:
-                lan_net = ipaddress.ip_network((lan_base, lan_prefix), strict=False)
-                # If LAN would overflow parent, fallback to parent-aligned /24
-                if not (int(lan_net.network_address) >= base_int and int(lan_net.broadcast_address) <= int(parent.broadcast_address)):
-                    lan_net = ipaddress.ip_network((ipaddress.IPv4Address(base_int), 24), strict=False)
-            except Exception:
-                lan_net = ipaddress.ip_network((ipaddress.IPv4Address(base_int), 24), strict=False)
+            rsw_net = subnet_alloc.next_subnet(DEFAULT_IPV4_PREFIXLEN)
+            lan_net = subnet_alloc.next_subnet(DEFAULT_IPV4_PREFIXLEN)
             return str(rsw_net), str(lan_net)
         except Exception as e:
-            raise RuntimeError(f"Failed to allocate R2S group subnets for router {router_id}: {e}")
+            raise RuntimeError(f"Failed to allocate /24 subnets for router {router_id} group {group_idx}: {e}")
 
     router_meta: Dict[int, Dict[str, Any]] = {}
     for rid in sorted(hosts_by_router.keys()):
@@ -338,7 +309,7 @@ def plan_r2s_grouping(
                     lan_hosts = []
                 for idx_h, h_id in enumerate(host_list_sorted):
                     if lan_hosts and idx_h + 2 < len(lan_hosts):
-                        host_if_ips[h_id] = str(lan_hosts[idx_h + 2]) + f"/{lan_net.prefixlen if lan_hosts else 28}"
+                        host_if_ips[h_id] = f"{lan_hosts[idx_h + 2]}/{lan_net.prefixlen}"
                 router_ip = None
                 switch_ip = None
                 try:

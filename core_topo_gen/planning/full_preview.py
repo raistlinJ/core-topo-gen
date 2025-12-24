@@ -21,11 +21,15 @@ import os
 import tempfile
 import xml.etree.ElementTree as ET
 import math
+import sys
+
+from ..constants import DEFAULT_IPV4_PREFIXLEN
 
 from .layout_positions import compute_clustered_layout
 from ..utils.allocators import UniqueAllocator, make_subnet_allocator  # runtime-like allocators
 from .router_host_plan import plan_router_counts, plan_r2s_grouping  # reuse builder's router count & grouping logic
 from .node_plan import _normalize_role_name  # internal normalization helper
+from .preview_validation import validate_full_preview
 
 
 @dataclass
@@ -367,6 +371,30 @@ def build_full_preview(
         seed_generated = True
     rnd_seed = seed
 
+    # ---- Shared subnet allocator (prevents /24 collisions across R2R/R2S/LAN/P2P) ----
+    shared_subnet_alloc = None
+    try:
+        eff_prefix = ip4_prefix or '10.200.0.0/15'
+        shared_subnet_alloc = make_subnet_allocator(ip_mode or 'private', eff_prefix, ip_region or 'all')
+    except Exception:
+        shared_subnet_alloc = None
+
+    def _maybe_validate_preview(preview_payload: Dict[str, Any]) -> None:
+        strict = bool(os.environ.get('PYTEST_CURRENT_TEST') or ('pytest' in sys.modules))
+        enabled = strict or (os.environ.get('CORE_TOPO_GEN_VALIDATE_PREVIEW') == '1')
+        if not enabled:
+            return
+        issues = validate_full_preview(preview_payload)
+        if not issues:
+            return
+        if strict:
+            raise ValueError('Full preview validation failed: ' + '; '.join(issues))
+        try:
+            import logging
+            logging.getLogger(__name__).warning('Full preview validation issues: %s', issues)
+        except Exception:
+            pass
+
     # ---- Validation: any remaining 'Random' placeholders indicate upstream resolution failed ----
     def _has_random_label() -> List[str]:
         offenders: List[str] = []
@@ -558,17 +586,12 @@ def build_full_preview(
     def _assign_r2r_link_interfaces(
         router_nodes: List[PreviewNode],
         edges: List[Tuple[int, int]],
-        ip4_prefix: str | None,
-        ip_mode: str | None,
-        ip_region: str | None,
+        subnet_alloc,
     ) -> Tuple[List[Dict[str, Any]], List[str]]:
         if not edges or not router_nodes:
             return [], []
         router_map: Dict[int, PreviewNode] = {r.node_id: r for r in router_nodes}
-        try:
-            allocator = make_subnet_allocator(ip_mode or 'private', ip4_prefix or '10.224.0.0/11', ip_region or 'all')
-        except Exception:
-            allocator = None
+        allocator = subnet_alloc
         fallback_base = int(ipaddress.IPv4Address('10.240.0.0'))
         fallback_idx = 0
         link_details: List[Dict[str, Any]] = []
@@ -577,16 +600,17 @@ def build_full_preview(
             subnet_obj = None
             if allocator is not None:
                 try:
-                    subnet_obj = allocator.next_subnet(30)
+                    # Temporary policy: /24-only subnets everywhere
+                    subnet_obj = allocator.next_subnet(DEFAULT_IPV4_PREFIXLEN)
                 except Exception:
                     subnet_obj = None
             if subnet_obj is None:
                 try:
-                    base_addr = ipaddress.IPv4Address(fallback_base + (fallback_idx * 4))
-                    subnet_obj = ipaddress.ip_network((base_addr, 30), strict=False)
+                    base_addr = ipaddress.IPv4Address(fallback_base + (fallback_idx * 256))
+                    subnet_obj = ipaddress.ip_network((base_addr, DEFAULT_IPV4_PREFIXLEN), strict=False)
                     fallback_idx += 1
                 except Exception:
-                    subnet_obj = ipaddress.ip_network('10.254.0.0/30', strict=False)
+                    subnet_obj = ipaddress.ip_network(f'10.254.0.0/{DEFAULT_IPV4_PREFIXLEN}', strict=False)
             hosts = list(subnet_obj.hosts())
             ip_a = f"{hosts[0]}/{subnet_obj.prefixlen}" if len(hosts) >= 1 else None
             ip_b = f"{hosts[1]}/{subnet_obj.prefixlen}" if len(hosts) >= 2 else None
@@ -827,7 +851,7 @@ def build_full_preview(
     if r2r_edges:
         for router in router_nodes:
             router.r2r_interfaces.clear()
-        r2r_links_detail, r2r_subnets = _assign_r2r_link_interfaces(router_nodes, r2r_edges, ip4_prefix, ip_mode, ip_region)
+        r2r_links_detail, r2r_subnets = _assign_r2r_link_interfaces(router_nodes, r2r_edges, shared_subnet_alloc)
     if router_nodes:
         r2r_degree = _degree_counts(router_ids_for_stats, r2r_edges)
         if r2r_edges or any(v > 0 for v in r2r_degree.values()):
@@ -865,7 +889,18 @@ def build_full_preview(
                 target_per_router = 1
                 derived_effective_target = 1
 
-    grouping_out = plan_r2s_grouping(routers_planned, host_router_map, host_nodes, routing_items, r2s_policy, rnd_seed, ip4_prefix=ip4_prefix, ip_mode=ip_mode, ip_region=ip_region)
+    grouping_out = plan_r2s_grouping(
+        routers_planned,
+        host_router_map,
+        host_nodes,
+        routing_items,
+        r2s_policy,
+        rnd_seed,
+        ip4_prefix=ip4_prefix,
+        ip_mode=ip_mode,
+        ip_region=ip_region,
+        subnet_alloc_override=shared_subnet_alloc,
+    )
     grouping_preview = grouping_out['grouping_preview']
     computed_r2s_policy = grouping_out['computed_r2s_policy']
     # adopt switch + subnet previews
@@ -1352,6 +1387,8 @@ def build_full_preview(
         'ip_allocation_mode': ip_alloc_mode,
         'router_plan_stats': router_plan_stats,
     }
+
+    _maybe_validate_preview(preview)
 
     layout_input = {
         'routers': routers_payload,

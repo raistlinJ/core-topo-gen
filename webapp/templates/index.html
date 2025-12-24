@@ -154,7 +154,7 @@
                                 <input type="hidden" name="scenario_query" id="scenario_query_input">
                                 <div id="editorRoot"></div>
                                 <div class="d-flex gap-2 mt-3">
-                                    <button type="submit" class="btn btn-success">Save XML</button>
+                                    <button type="submit" class="btn btn-success" id="saveXmlBtn">Save XML</button>
                                     <button type="button" class="btn btn-outline-info" id="downloadXmlBtn" disabled title="Save XML first">Download XML</button>
                                 </div>
                             </form>
@@ -460,7 +460,10 @@
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title">Execute Scenario</h5>
+                <div>
+                    <h5 class="modal-title mb-0">Execute Scenario</h5>
+                    <div class="small text-muted" id="executePhaseHeader">Phase: —</div>
+                </div>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
@@ -2306,9 +2309,9 @@ function slugifyHitlName(rawValue, fallback) {
     return slug;
 }
 
-function computeHitlPreviewLinkIps(scenarioKey, ifaceName, ordinal, prefixLen = 29) {
+function computeHitlPreviewLinkIps(scenarioKey, ifaceName, ordinal, prefixLen = 24) {
     try {
-        const sanitizedPrefix = Number.isFinite(prefixLen) ? Math.min(Math.max(Math.trunc(prefixLen), 0), 32) : 29;
+        const sanitizedPrefix = Number.isFinite(prefixLen) ? Math.min(Math.max(Math.trunc(prefixLen), 0), 32) : 24;
         const baseNetworkInt = (10 << 24) | (254 << 16); // 10.254.0.0
         const addressSpaceSize = 1 << 16; // /16 block span
         const hostBlock = sanitizedPrefix >= 32 ? 1 : (1 << Math.max(0, 32 - sanitizedPrefix));
@@ -4251,9 +4254,9 @@ function renderFullPreviewStructured(){
                 ['R2R Edges', (full.r2r_edges_preview||[]).length],
                 ['Avg R2R Deg', full.r2r_stats_preview && full.r2r_stats_preview.avg],
                 ['Seg Rules', full.segmentation_preview && full.segmentation_preview.rules ? full.segmentation_preview.rules.length : 0],
-                ['P2P /30', (full.ptp_subnets||[]).length],
-                ['Router-Sw /30', (full.router_switch_subnets||[]).length],
-                ['LAN /28', (full.lan_subnets||[]).length],
+                ['P2P /24', (full.ptp_subnets||[]).length],
+                ['Router-Sw /24', (full.router_switch_subnets||[]).length],
+                ['LAN /24', (full.lan_subnets||[]).length],
                 // Seed removed from UI summary
             ];
             contentEl.innerHTML = '<div class="row g-2">' + stats.map(s=>`<div class="col-auto"><span class="badge text-bg-secondary">${esc(s[0])}: ${esc(s[1]??'-')}</span></div>`).join('') + '</div>';
@@ -4273,7 +4276,7 @@ function renderFullPreviewStructured(){
             const p2p = (full.ptp_subnets||[]).map(s=>`<li>${esc(s)}</li>`).join('');
             const rs = (full.router_switch_subnets||[]).map(s=>`<li>${esc(s)}</li>`).join('');
             const lan = (full.lan_subnets||[]).map(s=>`<li>${esc(s)}</li>`).join('');
-            contentEl.innerHTML = `<div class="row small g-3"><div class="col"><h6 class="fw-bold">Host P2P (/30)</h6><ul class="mb-0">${p2p||'<li>(none)</li>'}</ul></div><div class="col"><h6 class="fw-bold">Router-Switch (/30)</h6><ul class="mb-0">${rs||'<li>(none)</li>'}</ul></div><div class="col"><h6 class="fw-bold">LAN (/28)</h6><ul class="mb-0">${lan||'<li>(none)</li>'}</ul></div></div>`; return;
+            contentEl.innerHTML = `<div class="row small g-3"><div class="col"><h6 class="fw-bold">Host P2P (/24)</h6><ul class="mb-0">${p2p||'<li>(none)</li>'}</ul></div><div class="col"><h6 class="fw-bold">Router-Switch (/24)</h6><ul class="mb-0">${rs||'<li>(none)</li>'}</ul></div><div class="col"><h6 class="fw-bold">LAN (/24)</h6><ul class="mb-0">${lan||'<li>(none)</li>'}</ul></div></div>`; return;
         }
         if(id==='r2r'){
             const edges = full.r2r_edges_preview || [];
@@ -4379,9 +4382,9 @@ function showFullPreviewModal(full){
         ['Switches',(full.switches||[]).length],
         ['R2R Edges',(full.r2r_edges_preview||[]).length],
         ['Seg Rules', (full.segmentation_preview && full.segmentation_preview.rules ? full.segmentation_preview.rules.length:0)],
-        ['P2P /30',(full.ptp_subnets||[]).length],
-        ['R-Sw /30',(full.router_switch_subnets||[]).length],
-        ['LAN /28',(full.lan_subnets||[]).length],
+        ['P2P /24',(full.ptp_subnets||[]).length],
+        ['R-Sw /24',(full.router_switch_subnets||[]).length],
+        ['LAN /24',(full.lan_subnets||[]).length],
     ];
     countsEl.innerHTML = '<div class="row g-1">' + stats.map(s=>`<div class="col-auto"><span class="badge text-bg-secondary">${s[0]}: ${s[1]}</span></div>`).join('') + '</div>';
     // Policies & segmentation
@@ -11189,6 +11192,7 @@ let executeProgressBarEl = null;
 let executeProgressLogEl = null;
 let executeProgressSpinnerEl = null;
 let executeProgressPopoutBtn = null;
+let executePhaseHeaderEl = null;
 const executeProgressState = {
     active: false,
     logLines: [],
@@ -11198,6 +11202,27 @@ const executeProgressState = {
     heartbeatIndex: 0,
 };
 let setCoreConnectionHint = null;
+
+// If the browser throws during execution flow, surface it in the Execute progress panel
+// so users aren't left with only heartbeat messages.
+if (!window.__coretg_exec_error_hooked) {
+    window.__coretg_exec_error_hooked = true;
+    window.addEventListener('error', (ev) => {
+        try {
+            if (!executeProgressState || !executeProgressState.active) return;
+            const msg = ev?.message || 'Unknown error';
+            appendExecuteProgressLog(`[ui] JS error: ${msg}`);
+        } catch (e) {}
+    });
+    window.addEventListener('unhandledrejection', (ev) => {
+        try {
+            if (!executeProgressState || !executeProgressState.active) return;
+            const reason = ev?.reason;
+            const msg = (reason && (reason.message || String(reason))) || 'Unhandled promise rejection';
+            appendExecuteProgressLog(`[ui] JS unhandled rejection: ${msg}`);
+        } catch (e) {}
+    });
+}
 
 function ensureExecuteConfirmElements() {
     if (!executeConfirmModalEl) {
@@ -11214,6 +11239,9 @@ function ensureExecuteConfirmElements() {
     }
     if (!executeConfirmCancelBtn) {
         executeConfirmCancelBtn = document.getElementById('executeConfirmCancelBtn');
+    }
+    if (!executePhaseHeaderEl) {
+        executePhaseHeaderEl = document.getElementById('executePhaseHeader');
     }
     if (!executeConfirmUpdateRemoteToggle) {
         executeConfirmUpdateRemoteToggle = document.getElementById('executeConfirmUpdateRemoteToggle');
@@ -11335,12 +11363,16 @@ function refreshExecuteRemoteToggleState() {
     if (executeRemoteTestRow) {
         executeRemoteTestRow.classList.toggle('d-none', !remoteSelected);
     }
-    const hidePushControls = !remoteSelected || IS_BUILDER_VIEW;
+    // If we're explicitly in the "CORE not connected; local emulation fallback" state,
+    // never show push controls (there is no usable remote target).
+    const hidePushControls = !remoteSelected || IS_BUILDER_VIEW || !!info.shouldFake;
     if (executePushUpdateWrap) {
         executePushUpdateWrap.classList.toggle('d-none', hidePushControls);
     }
     if (executeConfirmPushUpdateToggle) {
         if (IS_BUILDER_VIEW) {
+            executeConfirmPushUpdateToggle.checked = false;
+        } else if (hidePushControls) {
             executeConfirmPushUpdateToggle.checked = false;
         } else if (remoteSelected) {
             executeConfirmPushUpdateToggle.checked = pushPref;
@@ -11478,6 +11510,7 @@ function ensureExecuteProgressElements() {
     if (!executeProgressLogEl) executeProgressLogEl = document.getElementById('executeProgressLog');
     if (!executeProgressSpinnerEl) executeProgressSpinnerEl = document.getElementById('executeProgressSpinner');
     if (!executeProgressPopoutBtn) executeProgressPopoutBtn = document.getElementById('executeProgressPopoutBtn');
+    if (!executePhaseHeaderEl) executePhaseHeaderEl = document.getElementById('executePhaseHeader');
     if (executeProgressPopoutBtn && !executeProgressPopoutBtn.dataset.execBound) {
         executeProgressPopoutBtn.addEventListener('click', () => {
             try {
@@ -11501,13 +11534,105 @@ const EXECUTE_PROGRESS_HEARTBEAT_MESSAGES = [
 ];
 const EXECUTE_PROGRESS_HEARTBEAT_INTERVAL_MS = 4500;
 
+function buildExecuteProgressDiagnosticsLines(){
+    const lines = [];
+    try {
+        const info = detectLocalEmulation();
+        const remoteSelected = isRemoteExecutionSelected();
+        const selections = (typeof getExecuteConfirmSelections === 'function') ? getExecuteConfirmSelections() : null;
+        const pushPref = selections && typeof selections.pushPreference !== 'undefined'
+            ? !!selections.pushPreference
+            : (typeof getExecuteConfirmUpdateRemotePref === 'function' ? !!getExecuteConfirmUpdateRemotePref() : false);
+        const remoteMode = remoteSelected ? 'REMOTE' : 'LOCAL';
+        lines.push(`[ui] Mode: ${remoteMode}${remoteSelected ? (info.verified ? ' (verified)' : ' (not verified)') : ''}`);
+        if (remoteSelected) {
+            lines.push(`[ui] Push updated backend: ${pushPref ? 'enabled' : 'disabled'}`);
+        }
+        const core = (typeof getCoreConfig === 'function') ? getCoreConfig(false) : (state?.core || {});
+        const sshHost = (core?.ssh_host || core?.host || 'localhost').toString().trim() || 'localhost';
+        const sshPort = Number.isFinite(Number(core?.ssh_port)) && Number(core.ssh_port) > 0 ? Number(core.ssh_port) : 22;
+        const sshUser = (core?.ssh_username || '').toString().trim();
+        const grpcHost = (core?.grpc_host || core?.host || 'localhost').toString().trim() || 'localhost';
+        const grpcPort = Number.isFinite(Number(core?.grpc_port)) && Number(core.grpc_port) > 0
+            ? Number(core.grpc_port)
+            : (Number.isFinite(Number(core?.port)) && Number(core.port) > 0 ? Number(core.port) : 50051);
+        const venv = (core?.venv_bin || '').toString().trim();
+        const daemonAuto = !!(core?.auto_start_daemon);
+        const sshPrefix = sshUser ? `${sshUser}@` : '';
+        lines.push(`[ui] SSH target: ${sshPrefix}${sshHost}:${sshPort}`);
+        lines.push(`[ui] gRPC target: ${grpcHost}:${grpcPort}`);
+        if (venv) lines.push(`[ui] Remote venv bin: ${venv}`);
+        lines.push(`[ui] core-daemon auto-start: ${daemonAuto ? 'enabled' : 'disabled'}`);
+        try {
+            const testedHost = state?.core_tested_host || null;
+            const testedPort = state?.core_tested_port || null;
+            if (testedHost || testedPort) {
+                lines.push(`[ui] Last validated: ${testedHost || '?'}:${testedPort || '?'}`);
+            }
+        } catch (_) {}
+    } catch (e) {
+        // best-effort; no throw
+    }
+    return lines;
+}
+
+function buildExecuteStartCoreServicesMessage(){
+    try {
+        const core = (typeof getCoreConfig === 'function') ? getCoreConfig(false) : (state?.core || {});
+        const sshHost = (core?.ssh_host || core?.host || 'localhost').toString().trim() || 'localhost';
+        const sshPort = Number.isFinite(Number(core?.ssh_port)) && Number(core.ssh_port) > 0 ? Number(core.ssh_port) : 22;
+        const sshUser = (core?.ssh_username || '').toString().trim();
+        const grpcHost = (core?.grpc_host || core?.host || 'localhost').toString().trim() || 'localhost';
+        const grpcPort = Number.isFinite(Number(core?.grpc_port)) && Number(core.grpc_port) > 0
+            ? Number(core.grpc_port)
+            : (Number.isFinite(Number(core?.port)) && Number(core.port) > 0 ? Number(core.port) : 50051);
+        const venv = (core?.venv_bin || '').toString().trim();
+        const daemonAuto = !!(core?.auto_start_daemon);
+        const sshPrefix = sshUser ? `${sshUser}@` : '';
+        const venvSuffix = venv ? `, venv ${venv}` : '';
+        const daemonSuffix = daemonAuto ? ', daemon auto-start enabled' : '';
+        return `Starting CORE services via SSH ${sshPrefix}${sshHost}:${sshPort} (gRPC ${grpcHost}:${grpcPort}${venvSuffix}${daemonSuffix})…`;
+    } catch (e) {
+        return 'Starting CORE services on remote host…';
+    }
+}
+
+function buildExecuteProgressStepMessage(stepIndex){
+    try {
+        const core = (typeof getCoreConfig === 'function') ? getCoreConfig(false) : (state?.core || {});
+        const sshHost = (core?.ssh_host || core?.host || 'localhost').toString().trim() || 'localhost';
+        const sshPort = Number.isFinite(Number(core?.ssh_port)) && Number(core.ssh_port) > 0 ? Number(core.ssh_port) : 22;
+        const sshUser = (core?.ssh_username || '').toString().trim();
+        const grpcHost = (core?.grpc_host || core?.host || 'localhost').toString().trim() || 'localhost';
+        const grpcPort = Number.isFinite(Number(core?.grpc_port)) && Number(core.grpc_port) > 0
+            ? Number(core.grpc_port)
+            : (Number.isFinite(Number(core?.port)) && Number(core.port) > 0 ? Number(core.port) : 50051);
+        const sshPrefix = sshUser ? `${sshUser}@` : '';
+
+        if (stepIndex === 0) {
+            return `Establishing SSH tunnel to ${sshPrefix}${sshHost}:${sshPort}…`;
+        }
+        if (stepIndex === 1) {
+            return `Validating CORE backend (gRPC ${grpcHost}:${grpcPort})…`;
+        }
+        if (stepIndex === 2) {
+            const rp = (state?.result_path || '').toString().trim();
+            const suffix = rp ? ` (XML ${rp.split(/[/\\]/).pop() || rp})` : '';
+            return `Preparing remote workspace and syncing inputs${suffix}…`;
+        }
+        return buildExecuteStartCoreServicesMessage();
+    } catch (_) {
+        return EXECUTE_PROGRESS_HEARTBEAT_MESSAGES[Math.min(stepIndex, EXECUTE_PROGRESS_HEARTBEAT_MESSAGES.length - 1)] || 'Working…';
+    }
+}
+
 function emitExecuteProgressHeartbeatMessage() {
     if (!executeProgressState.active) return;
     const idx = Math.min(
         executeProgressState.heartbeatIndex,
         EXECUTE_PROGRESS_HEARTBEAT_MESSAGES.length - 1
     );
-    const msg = EXECUTE_PROGRESS_HEARTBEAT_MESSAGES[idx];
+    const msg = buildExecuteProgressStepMessage(idx);
     appendExecuteProgressLog(`[ui] ${msg}`);
     setExecuteProgressStatus('Preparing CORE run…', msg);
     if (executeProgressState.heartbeatIndex < EXECUTE_PROGRESS_HEARTBEAT_MESSAGES.length - 1) {
@@ -11550,6 +11675,7 @@ function resetExecuteProgressUI() {
     if (executeProgressLogEl) executeProgressLogEl.textContent = '';
     if (executeProgressSpinnerEl) executeProgressSpinnerEl.classList.remove('d-none');
     if (executeProgressPopoutBtn) executeProgressPopoutBtn.classList.add('d-none');
+    if (executePhaseHeaderEl) executePhaseHeaderEl.textContent = 'Phase: —';
     if (executeConfirmRunBtn) {
         if (!executeConfirmRunBtn.dataset.defaultLabel) {
             executeConfirmRunBtn.dataset.defaultLabel = executeConfirmRunBtn.textContent || 'Execute';
@@ -11589,6 +11715,13 @@ function showExecuteProgressPanel(status, meta) {
         executeConfirmCancelBtn.textContent = 'Hide';
         executeConfirmCancelBtn.disabled = false;
     }
+    try {
+        const diag = buildExecuteProgressDiagnosticsLines();
+        if (Array.isArray(diag) && diag.length) {
+            diag.forEach(line => { appendExecuteProgressLog(line); });
+        }
+    } catch (_) {}
+    if (executePhaseHeaderEl) executePhaseHeaderEl.textContent = 'Phase: Preparing…';
     setExecuteProgressStatus(status || 'Preparing run…', meta || '');
     setExecuteProgressPercent(0, '0%');
     startExecuteProgressHeartbeat();
@@ -11642,6 +11775,7 @@ function completeExecuteProgressPanel(success, message, meta) {
         executeProgressBarEl.textContent = success ? 'Done' : 'Error';
     }
     setExecuteProgressStatus(message || (success ? 'Scenario started' : 'Failed to start'), meta || '');
+    if (executePhaseHeaderEl) executePhaseHeaderEl.textContent = success ? 'Phase: Complete' : 'Phase: Error';
     if (executeConfirmCancelBtn) {
         executeConfirmCancelBtn.textContent = 'Close';
         executeConfirmCancelBtn.disabled = false;
@@ -11680,6 +11814,58 @@ function handleExecuteProgressLog(line) {
         setExecuteProgressPercent(100, 'Workspace ready');
         return;
     }
+}
+
+function handleExecuteProgressPhase(payload) {
+    if (!executeProgressState.active) return;
+    const stage = (payload && payload.stage) ? String(payload.stage) : 'phase';
+    const detail = (payload && payload.detail) ? String(payload.detail) : '';
+    const meta = [];
+    if (payload && payload.local && payload.remote) meta.push(`${payload.local} → ${payload.remote}`);
+    if (payload && payload.exit !== undefined && payload.exit !== null) meta.push(`exit=${payload.exit}`);
+    const metaText = meta.filter(Boolean).join(' · ');
+
+    appendExecuteProgressLog(`[phase] ${stage}${detail ? ': ' + detail : ''}${metaText ? ' (' + metaText + ')' : ''}`);
+
+    if (executePhaseHeaderEl) executePhaseHeaderEl.textContent = `Phase: ${stage}`;
+
+    if (stage === 'ssh.tunnel') {
+        setExecuteProgressStatus('SSH tunnel established', metaText);
+        setExecuteProgressPercent(2, 'Tunnel');
+        return;
+    }
+    if (stage === 'core-daemon.startup') {
+        setExecuteProgressStatus('Checking core-daemon…', detail || '');
+        setExecuteProgressPercent(5, 'Daemon');
+        return;
+    }
+    if (stage === 'core-daemon.start') {
+        setExecuteProgressStatus('Starting core-daemon…', metaText);
+        setExecuteProgressPercent(8, 'Starting');
+        return;
+    }
+    if (stage === 'core-daemon.systemctl.is-active') {
+        setExecuteProgressStatus('Validating core-daemon…', metaText);
+        setExecuteProgressPercent(10, 'Validating');
+        return;
+    }
+    if (stage === 'remote.workspace') {
+        setExecuteProgressStatus('Remote workspace ready', (payload && payload.repo_dir) ? `repo=${payload.repo_dir}` : '');
+        setExecuteProgressPercent(15, 'Workspace');
+        return;
+    }
+    if (stage === 'remote.cli.launch') {
+        setExecuteProgressStatus('Launching CLI…', (payload && payload.work_dir) ? `cwd=${payload.work_dir}` : '');
+        setExecuteProgressPercent(20, 'Launching');
+        return;
+    }
+    // If there's structured output, append a short excerpt.
+    try {
+        const out = (payload && payload.stdout) ? String(payload.stdout).trim() : '';
+        const err = (payload && payload.stderr) ? String(payload.stderr).trim() : '';
+        if (out) appendExecuteProgressLog(out);
+        if (err) appendExecuteProgressLog(err);
+    } catch (e) {}
 }
 
 function settleExecuteConfirm(result) {
@@ -11813,12 +11999,85 @@ function saveScrollBeforeNav(){
 
 // Always serialize state just before submitting the Save XML form
 const editorForm = document.getElementById('editorForm');
+const saveXmlBtn = document.getElementById('saveXmlBtn');
+let saveXmlToastHandle = null;
+let saveXmlToastStartedAt = 0;
+let saveXmlToastToken = 0;
+
+function setSaveXmlBusy(busy) {
+    if (!saveXmlBtn) return;
+    if (!saveXmlBtn.dataset.defaultLabel) {
+        saveXmlBtn.dataset.defaultLabel = saveXmlBtn.innerHTML;
+    }
+    if (busy) {
+        saveXmlBtn.disabled = true;
+        saveXmlBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Saving…';
+    } else {
+        saveXmlBtn.disabled = false;
+        saveXmlBtn.innerHTML = saveXmlBtn.dataset.defaultLabel;
+    }
+}
+
+function flashSaveXmlSaved() {
+    if (!saveXmlBtn) return;
+    if (!saveXmlBtn.dataset.defaultLabel) {
+        saveXmlBtn.dataset.defaultLabel = saveXmlBtn.innerHTML;
+    }
+    const token = String(Date.now());
+    saveXmlBtn.dataset.flashToken = token;
+    saveXmlBtn.innerHTML = 'Saved';
+    window.setTimeout(() => {
+        try {
+            if (!saveXmlBtn) return;
+            if (saveXmlBtn.dataset.flashToken !== token) return;
+            saveXmlBtn.innerHTML = saveXmlBtn.dataset.defaultLabel;
+        } catch (e) { /* ignore */ }
+    }, 1200);
+}
+
+function setSaveXmlToastBusy(busy) {
+    const MIN_TOAST_MS = 650;
+    try {
+        if (!busy && saveXmlToastHandle && saveXmlToastHandle.toast && typeof saveXmlToastHandle.toast.hide === 'function') {
+            const now = Date.now();
+            const elapsed = saveXmlToastStartedAt ? (now - saveXmlToastStartedAt) : MIN_TOAST_MS;
+            const remaining = Math.max(0, MIN_TOAST_MS - elapsed);
+            const token = saveXmlToastToken;
+            if (remaining > 0) {
+                window.setTimeout(() => {
+                    try {
+                        // Avoid hiding a newer toast if a second save started.
+                        if (token !== saveXmlToastToken) return;
+                        if (saveXmlToastHandle && saveXmlToastHandle.toast && typeof saveXmlToastHandle.toast.hide === 'function') {
+                            saveXmlToastHandle.toast.hide();
+                        }
+                    } catch (e) { /* ignore */ }
+                }, remaining);
+                return;
+            }
+            saveXmlToastHandle.toast.hide();
+        }
+    } catch (e) { /* ignore */ }
+    saveXmlToastHandle = null;
+    saveXmlToastStartedAt = 0;
+    if (!busy) return;
+    try {
+        // Keep it visible until the save completes.
+        saveXmlToastToken += 1;
+        saveXmlToastStartedAt = Date.now();
+        saveXmlToastHandle = showToast('Saving XML…', { autohide: false });
+    } catch (e) { /* ignore */ }
+}
 
 if (editorForm) {
     const handleEditorFormSubmit = async (event) => {
         if (event) {
             event.preventDefault();
         }
+        setSaveXmlBusy(true);
+        setSaveXmlToastBusy(true);
+        // Yield a frame so the toast/spinner can paint before heavy work.
+        try { await new Promise(requestAnimationFrame); } catch (_) {}
         try { sessionStorage.setItem('coretg_saved_scroll_y', String(window.scrollY || window.pageYOffset || 0)); } catch (e) { /* ignore */ }
         const scenariosInput = document.getElementById('scenarios_json');
         if (scenariosInput) {
@@ -11840,9 +12099,15 @@ if (editorForm) {
         if (typeof autoSaveXml === 'function') {
             try {
                 await autoSaveXml();
+                setSaveXmlBusy(false);
+                setSaveXmlToastBusy(false);
+                flashSaveXmlSaved();
+                try { showToast('XML saved.', { autohide: true, delay: 2200 }); } catch (_) {}
                 return;
             } catch (err) {
                 console.warn('Auto Save XML failed, falling back to full form submit', err);
+                setSaveXmlToastBusy(false);
+                try { showToast('Auto-save failed; submitting form…', { autohide: true, delay: 2600 }); } catch (_) {}
             }
         }
         editorForm.removeEventListener('submit', handleEditorFormSubmit);
@@ -12595,9 +12860,27 @@ async function handleMissingRepoResponse(response, context = {}) {
 }
 
 async function submitRunCliRequest(buildRequest, options = {}) {
+    const logRunRequestDebug = (message) => {
+        const line = `[ui] ${message}`;
+        try {
+            if (typeof executeProgressState !== 'undefined' && executeProgressState && executeProgressState.active) {
+                appendExecuteProgressLog(line);
+            } else if (typeof runProgressLogLine === 'function') {
+                runProgressLogLine(line);
+            } else {
+                logInfo(line);
+            }
+        } catch (e) {}
+    };
     const attempts = Math.max(1, options.maxAttempts || 2);
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-        const request = typeof buildRequest === 'function' ? buildRequest() : null;
+        let request = null;
+        try {
+            request = typeof buildRequest === 'function' ? buildRequest() : null;
+        } catch (err) {
+            logRunRequestDebug(`Run request build failed: ${err?.message || err}`);
+            throw err;
+        }
         if (!request || !request.body) {
             throw new Error('buildRequest must return an object with a body property');
         }
@@ -12605,7 +12888,22 @@ async function submitRunCliRequest(buildRequest, options = {}) {
         if (request.headers) {
             init.headers = request.headers;
         }
-        const res = await fetch(RUN_CLI_URL, init);
+        logRunRequestDebug(`Submitting run request: POST ${RUN_CLI_URL || '(missing URL)'} (attempt ${attempt + 1}/${attempts})`);
+        let slowTimer = null;
+        try {
+            slowTimer = window.setTimeout(() => {
+                logRunRequestDebug(`Still waiting for run start response from ${RUN_CLI_URL || '(missing URL)'}…`);
+            }, 5000);
+        } catch (e) {}
+        let res;
+        try {
+            res = await fetch(RUN_CLI_URL, init);
+        } catch (err) {
+            logRunRequestDebug(`Run request fetch failed: ${err?.message || err}`);
+            throw err;
+        } finally {
+            try { if (slowTimer) window.clearTimeout(slowTimer); } catch (e) {}
+        }
         // Handle daemon-missing prompt (backend returns 428 with can_auto_start hint)
         if (res.status === 428) {
             const info = await parseResponseJson(res);
@@ -12756,6 +13054,28 @@ async function saveXmlAjax(){
         return false;
     } catch(e) { logError('Save threw an exception'); return false; }
 }
+
+// Some flows historically used appendLog(level,msg) while the dock exposes logLine/logInfo/etc.
+// Provide a compatibility shim so execution flows never crash on missing appendLog.
+if (typeof window.appendLog !== 'function') {
+    window.appendLog = (message, level = 'INFO') => {
+        try {
+            const lvl = String(level || 'INFO').toUpperCase();
+            if (typeof window.logLine === 'function') {
+                window.logLine(lvl, String(message ?? ''));
+                return;
+            }
+            if (typeof window.dispatchEvent === 'function' && typeof window.CustomEvent === 'function') {
+                window.dispatchEvent(new CustomEvent('dock-log', { detail: { level: lvl, message: String(message ?? '') } }));
+                return;
+            }
+        } catch (e) {}
+        try {
+            console.log(message);
+        } catch (e) {}
+    };
+}
+
 let evtSrc = null;
 function startLogStream(runId) {
     if (evtSrc) { try { evtSrc.close(); } catch(e){} }
@@ -12778,6 +13098,13 @@ function startLogStream(runId) {
         else if (/\bDEBUG\b/.test(raw)) lvl = 'DEBUG';
     appendLog(raw, lvl);
     };
+    evtSrc.addEventListener('phase', (ev) => {
+        try {
+            const payload = JSON.parse(ev.data || '{}');
+            // Only show phases if execute progress panel is open.
+            handleExecuteProgressPhase(payload);
+        } catch (e) {}
+    });
     evtSrc.addEventListener('end', () => {
         evtSrc.close();
         document.getElementById('runAsyncBtn').classList.remove('d-none');
@@ -12838,6 +13165,16 @@ function ensureRunProgressModal(){
         if(el){ runProgressModalInst = new bootstrap.Modal(el, { backdrop: 'static', keyboard: false }); }
     }
     return runProgressModalInst;
+}
+
+function markRunProgressComplete(){
+    try {
+        const hideBtn = document.getElementById('runProgressHideBtn');
+        if (hideBtn) {
+            hideBtn.textContent = 'Close';
+            hideBtn.onclick = null;
+        }
+    } catch(e) {}
 }
 function runProgressLogLine(s){
     const pre = document.getElementById('runProgressLog');
@@ -13027,6 +13364,7 @@ async function runSyncWithModal(arg){
             runProgressLogLine(line);
         }
     };
+    appendExecuteDialogLog('runSyncWithModal() entered.');
     const stopUploadHeartbeat = () => {
         if (uploadHeartbeatTimer) {
             clearInterval(uploadHeartbeatTimer);
@@ -13280,6 +13618,7 @@ async function runSyncWithModal(arg){
             if (showBtn && !showBtn.classList.contains('d-none')) { showBtn.click(); }
         } catch(e){}
         appendExecuteDialogLog('Requesting remote CLI run…');
+        appendExecuteDialogLog(`RUN_CLI_URL=${RUN_CLI_URL || '(missing)'}`);
         updateRunStatus('Preparing remote workspace…', 'Submitting run request to CORE host…');
         const formOptions = { updateRemoteRepo };
         if (Number.isInteger(scenarioIndexForRun)) {
@@ -13299,6 +13638,7 @@ async function runSyncWithModal(arg){
                     if(metaEl) metaEl.textContent = 'Repository upload required';
                     const bar = document.getElementById('runProgressBar');
                     if(bar){ bar.classList.remove('progress-bar-animated'); bar.textContent = 'Aborted'; }
+                    markRunProgressComplete();
                 } catch(e){}
             }
             try { opts.onError?.(new Error('Run aborted before launch')); } catch(e){}
@@ -13316,6 +13656,7 @@ async function runSyncWithModal(arg){
                     if(metaEl) metaEl.textContent = message;
                     const bar = document.getElementById('runProgressBar');
                     if(bar){ bar.classList.remove('progress-bar-animated'); bar.textContent = 'Error'; }
+                    markRunProgressComplete();
                 } catch(e){}
             }
             try { opts.onError?.(new Error(message)); } catch(e){}
@@ -13340,6 +13681,7 @@ async function runSyncWithModal(arg){
                     if(metaEl) metaEl.textContent = 'Missing run id';
                     const bar = document.getElementById('runProgressBar');
                     if(bar){ bar.classList.remove('progress-bar-animated'); bar.textContent = 'Error'; }
+                    markRunProgressComplete();
                 } catch(e){}
             }
             try { opts.onError?.(new Error('Missing run id')); } catch(e){}
@@ -13350,6 +13692,12 @@ async function runSyncWithModal(arg){
         try { if(runProgressEvtSrc) runProgressEvtSrc.close(); } catch(e){}
         runProgressEvtSrc = new EventSource('/stream/' + run_id);
         appendExecuteDialogLog('Subscribed to remote log stream. Awaiting first line…');
+        runProgressEvtSrc.addEventListener('phase', (ev) => {
+            try {
+                const payload = JSON.parse(ev.data || '{}');
+                handleExecuteProgressPhase(payload);
+            } catch (e) {}
+        });
         runProgressEvtSrc.onmessage = (ev)=>{
             if (waitingForRemoteLogs) {
                 waitingForRemoteLogs = false;
@@ -13357,6 +13705,7 @@ async function runSyncWithModal(arg){
                 updateRunStatus('Running CLI…', 'Streaming remote logs…');
             }
             runProgressLogLine(ev.data||'');
+            handleExecuteProgressLog(ev.data||'');
         };
         runProgressEvtSrc.addEventListener('end', ()=>{
             waitingForRemoteLogs = false;
@@ -13384,6 +13733,7 @@ async function runSyncWithModal(arg){
                     if(showProgressModal){
                         document.getElementById('runProgressStatus').textContent = (data.returncode===0) ? 'Scenario started' : 'Finished with errors';
                         document.getElementById('runProgressBar').classList.remove('progress-bar-animated');
+                        markRunProgressComplete();
                     }
                     try { opts.onComplete?.(data); } catch(e){}
                     try {
@@ -13515,6 +13865,7 @@ async function runWithSeedBuild(){
                 bar.classList.remove('progress-bar-animated');
                 bar.textContent = 'Error';
             }
+            markRunProgressComplete();
             return;
         }
         runProgressLogLine('[ui] Repository upload complete.');
@@ -13554,6 +13905,7 @@ async function runWithSeedBuild(){
         if(!res.ok){
             const detail = await extractResponseDetail(res);
             runProgressLogLine('Failed to start seeded run' + (detail ? `: ${detail}` : ''));
+            markRunProgressComplete();
             return;
         }
         const { run_id } = await res.json();
@@ -13566,6 +13918,12 @@ async function runWithSeedBuild(){
         try { if(runProgressEvtSrc) runProgressEvtSrc.close(); } catch(e){}
         runProgressEvtSrc = new EventSource('/stream/' + run_id);
         runProgressLogLine('[ui] Subscribed to remote log stream. Awaiting first line…');
+        runProgressEvtSrc.addEventListener('phase', (ev) => {
+            try {
+                const payload = JSON.parse(ev.data || '{}');
+                handleExecuteProgressPhase(payload);
+            } catch (e) {}
+        });
         runProgressEvtSrc.onmessage = (ev)=> {
             if(waitingForSeedLogs){
                 waitingForSeedLogs = false;
@@ -13575,6 +13933,7 @@ async function runWithSeedBuild(){
                 if(meta) meta.textContent = 'Streaming remote logs…';
             }
             runProgressLogLine(ev.data||'');
+            handleExecuteProgressLog(ev.data||'');
         };
         runProgressEvtSrc.addEventListener('end', ()=>{ waitingForSeedLogs = false; try { runProgressEvtSrc.close(); } catch(e){} });
         // Poll status similar to runSyncWithModal
@@ -13588,6 +13947,7 @@ async function runWithSeedBuild(){
                 if(!data.done){ setTimeout(poll, 1000); return; }
                 document.getElementById('runProgressStatus').textContent = (data.returncode===0) ? 'Scenario started' : 'Finished with errors';
                 document.getElementById('runProgressBar').classList.remove('progress-bar-animated');
+                markRunProgressComplete();
                 if(data.returncode===0){ scheduleScenarioRedirect("{{ url_for('reports_page') }}", { delay: 600 }); }
             } catch(e){ setTimeout(poll, 1500); }
         })();
@@ -13746,7 +14106,9 @@ async function runWithSeedBuild(){
                 const t = new bootstrap.Toast(node, Object.assign({ delay: 2500, autohide: true }, (opts||{})));
                 t.show();
                 node.addEventListener('hidden.bs.toast', () => { try { node.remove(); } catch(e){} });
+                return { node, toast: t };
             } catch(e){}
+            return null;
         }
     </script>
 </div>

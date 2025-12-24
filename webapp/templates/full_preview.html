@@ -912,9 +912,9 @@
       return slug;
     }
 
-    function computeHitlPreviewLinkIps(scenarioKey, ifaceName, ordinal, prefixLen = 29){
+    function computeHitlPreviewLinkIps(scenarioKey, ifaceName, ordinal, prefixLen = 24){
       try {
-        const sanitizedPrefix = Number.isFinite(prefixLen) ? Math.min(Math.max(Math.trunc(prefixLen), 0), 32) : 29;
+        const sanitizedPrefix = Number.isFinite(prefixLen) ? Math.min(Math.max(Math.trunc(prefixLen), 0), 32) : 24;
         const baseNetworkInt = (10 << 24) | (254 << 16);
         const addressSpaceSize = 1 << 16;
         const hostBlock = sanitizedPrefix >= 32 ? 1 : (1 << Math.max(0, 32 - sanitizedPrefix));
@@ -2769,6 +2769,12 @@
       if(animate === true){ bar.classList.add('progress-bar-animated','progress-bar-striped'); }
       else if(animate === false){ bar.classList.remove('progress-bar-animated','progress-bar-striped'); }
     }
+    try {
+      const hideBtn = document.getElementById('executeProgressHideBtn');
+      if(hideBtn){
+        hideBtn.textContent = (animate === false) ? 'Close' : 'Hide';
+      }
+    } catch(e) {}
   }
 
   function openExecuteProgress(title){
@@ -2860,13 +2866,29 @@
             if(data.returncode===0){
               appendExecuteProgressLog('Execution complete: success; redirecting to Reports');
               setExecuteProgressUI({ status: 'Scenario started', meta: 'Completed', barText: 'Done', animate: false });
-              const reportsHref = buildScenarioUrl("{{ url_for('reports_page') }}");
-              setTimeout(()=>{ window.location.href = reportsHref; }, 700);
+              try {
+                const reportsHref = buildScenarioUrl("{{ url_for('reports_page') }}");
+                setTimeout(()=>{
+                  try {
+                    // Use assign so the browser treats it as a navigation.
+                    window.location.assign(reportsHref);
+                  } catch (navErr) {
+                    try { appendExecuteProgressLog('Redirect to Reports failed: ' + navErr); } catch(_) {}
+                  }
+                }, 700);
+              } catch (err) {
+                try { appendExecuteProgressLog('Could not build Reports URL: ' + err); } catch(_) {}
+              }
+              return;
             } else {
               appendExecuteProgressLog('Execution finished with errors (code '+data.returncode+')');
               setExecuteProgressUI({ status: 'Finished with errors', meta: 'Code '+data.returncode, barText: 'Error', animate: false });
+              return;
             }
-          } catch(e){ setTimeout(poll, 1500); }
+          } catch(e){
+            // Only retry while the run is still pending; once it completes we return above.
+            setTimeout(poll, 1500);
+          }
         })();
       } catch(e){
         appendExecuteProgressLog('Exception starting execution: '+e);

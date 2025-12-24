@@ -560,6 +560,7 @@
         const titleEl = document.getElementById('composeActionModalLabel');
         if(titleEl) titleEl.textContent = (titleEl.textContent || '') + ' — Complete';
         document.getElementById('composeActionFooterText').textContent = `Complete — ${ok} ok, ${bad} failed`;
+        try { document.querySelector('#composeActionModal .modal-footer .btn.btn-secondary').textContent = 'Close'; } catch(e) {}
         // No global refresh at the end; each item was refreshed individually
       };
       modalEl.addEventListener('shown.bs.modal', onShown, { once: true });

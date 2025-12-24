@@ -3,6 +3,8 @@ import ipaddress
 import random
 from typing import Tuple, List, Dict, Set
 
+from ..constants import DEFAULT_IPV4_PREFIXLEN
+
 
 class UniqueAllocator:
     def __init__(self, ip4_prefix: str):
@@ -45,7 +47,7 @@ class SubnetAllocator:
         self._next_addr = int(self.base.network_address)
 
     def _force24(self) -> int:
-        return 24
+        return DEFAULT_IPV4_PREFIXLEN
 
     def next_subnet(self, prefixlen: int) -> ipaddress.IPv4Network:
         prefixlen = self._force24()
@@ -101,7 +103,7 @@ class MultiPoolSubnetAllocator:
         self._next_addrs: Dict[int, int] = {int(p.network_address): int(p.network_address) for p in pools}
 
     def _force24(self) -> int:
-        return 24
+        return DEFAULT_IPV4_PREFIXLEN
 
     def next_subnet(self, prefixlen: int) -> ipaddress.IPv4Network:
         prefixlen = self._force24()

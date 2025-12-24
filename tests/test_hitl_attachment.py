@@ -138,12 +138,12 @@ def test_hitl_preview_router_added_to_full_preview(monkeypatch) -> None:
 
     monkeypatch.setattr(
         backend,
-        'predict_hitl_link_ips',
-        lambda scenario_key, iface_name, idx: {
+        'predict_hitl_link_ips_unique',
+        lambda scenario_key, iface_name, idx, used: {
             'network': '10.254.100.0',
-            'network_cidr': '10.254.100.0/29',
-            'prefix_len': 29,
-            'netmask': '255.255.255.248',
+            'network_cidr': '10.254.100.0/24',
+            'prefix_len': 24,
+            'netmask': '255.255.255.0',
             'existing_router_ip4': '10.254.100.1',
             'new_router_ip4': '10.254.100.2',
             'rj45_ip4': '10.254.100.3',
@@ -162,7 +162,7 @@ def test_hitl_preview_router_added_to_full_preview(monkeypatch) -> None:
     preview_routers = hitl_cfg.get('preview_routers') or []
     assert preview_routers, 'expected preview routers in sanitized HITL config'
     preview_router = preview_routers[0]
-    assert preview_router['ip4'] == '10.254.100.2/29'
+    assert preview_router['ip4'] == '10.254.100.2/24'
     assert preview_router['metadata'].get('hitl_preview') is True
 
     full_preview = {
@@ -192,8 +192,8 @@ def test_hitl_preview_router_added_to_full_preview(monkeypatch) -> None:
     hitl_node_id = hitl_entry['node_id']
 
     assert hitl_entry['metadata'].get('peer_router_node_id') == 101
-    assert hitl_entry['r2r_interfaces'].get(str(101)) == '10.254.100.2/29'
-    assert existing_entry['r2r_interfaces'].get(str(hitl_node_id)) == '10.254.100.1/29'
+    assert hitl_entry['r2r_interfaces'].get(str(101)) == '10.254.100.2/24'
+    assert existing_entry['r2r_interfaces'].get(str(hitl_node_id)) == '10.254.100.1/24'
 
     edges = full_preview.get('r2r_edges_preview', [])
     normalized_edges = {tuple(sorted(edge)) for edge in edges}
@@ -203,7 +203,7 @@ def test_hitl_preview_router_added_to_full_preview(monkeypatch) -> None:
     assert any(link.get('hitl_preview') and {router['id'] for router in link.get('routers', [])} == {101, hitl_node_id} for link in links)
 
     subnets = full_preview.get('r2r_subnets', [])
-    assert '10.254.100.0/29' in subnets
+    assert '10.254.100.0/24' in subnets
 
     degree_preview = full_preview.get('r2r_degree_preview', {})
     assert degree_preview.get(101) == 1
@@ -234,12 +234,12 @@ def test_hitl_existing_router_attachment_populates_router_interfaces(monkeypatch
 
     monkeypatch.setattr(
         backend,
-        'predict_hitl_link_ips',
-        lambda scenario_key, iface_name, idx: {
+        'predict_hitl_link_ips_unique',
+        lambda scenario_key, iface_name, idx, used: {
             'network': '10.254.200.0',
-            'network_cidr': '10.254.200.0/29',
-            'prefix_len': 29,
-            'netmask': '255.255.255.248',
+            'network_cidr': '10.254.200.0/24',
+            'prefix_len': 24,
+            'netmask': '255.255.255.0',
             'existing_router_ip4': '10.254.200.1',
             'new_router_ip4': '10.254.200.2',
             'rj45_ip4': '10.254.200.3',
@@ -285,17 +285,17 @@ def test_hitl_existing_router_attachment_populates_router_interfaces(monkeypatch
     hitl_keys = [key for key in router_entry['r2r_interfaces'].keys() if key == slug]
     assert hitl_keys, 'expected HITL RJ45 interface on router'
     peer_key = hitl_keys[0]
-    assert router_entry['r2r_interfaces'][peer_key] == '10.254.200.1/29'
+    assert router_entry['r2r_interfaces'][peer_key] == '10.254.200.1/24'
 
     metadata_list = router_entry['metadata'].get('hitl_existing_router_interfaces') or []
     assert metadata_list, 'expected router metadata for HITL interface'
     metadata_entry = metadata_list[0]
-    assert metadata_entry['ip'] == '10.254.200.1/29'
-    assert metadata_entry['rj45_ip'] == '10.254.200.3/29'
+    assert metadata_entry['ip'] == '10.254.200.1/24'
+    assert metadata_entry['rj45_ip'] == '10.254.200.3/24'
     assert metadata_entry['router_id'] == 301
 
     assert hitl_cfg['interfaces'][0]['target_router_id'] == 301
-    assert hitl_cfg['interfaces'][0]['existing_router_ip4_cidr'] == '10.254.200.1/29'
+    assert hitl_cfg['interfaces'][0]['existing_router_ip4_cidr'] == '10.254.200.1/24'
 
     links = full_preview.get('r2r_links_preview', [])
     assert any(
@@ -374,12 +374,12 @@ def test_attach_hitl_rj45_nodes_assigns_ipv4_for_new_router(monkeypatch) -> None
     assert entry.get("existing_router_ip4")
     assert entry.get("new_router_ip4")
     assert entry.get("rj45_ip4")
-    assert entry.get("prefix_len") == 29
+    assert entry.get("prefix_len") == 24
 
     router_id = entry["router_node_id"]
     router_node = session.nodes[router_id]
     assert any(getattr(iface, "ip4", None) for iface in router_node.ifaces)
-    assert any(getattr(iface, "ip4_mask", None) == 29 for iface in router_node.ifaces)
+    assert any(getattr(iface, "ip4_mask", None) == 24 for iface in router_node.ifaces)
 
     rj45_node = session.nodes[entry["rj45_node_id"]]
     assert any(getattr(iface, "ip4", None) == entry["rj45_ip4"] for iface in rj45_node.ifaces)

@@ -5,6 +5,7 @@ import ipaddress
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 
+from ..constants import DEFAULT_IPV4_PREFIXLEN
 from ..types import NodeInfo
 
 try:  # pragma: no cover - exercised with real CORE installs
@@ -313,12 +314,11 @@ def _compute_hitl_link_ips(
     iface_name: str,
     ordinal: int,
     *,
-    prefix_len: int = 29,
+    prefix_len: int = DEFAULT_IPV4_PREFIXLEN,
 ) -> Optional[Dict[str, Any]]:
     """Deterministically derive IPv4 assignments for a HITL uplink.
 
-    Produces a stable /29 (6 usable addresses) inside 10.254.0.0/16 to avoid
-    overlap with the default 10.0.0.0/24 preview allocations. Returns None if
+    Temporary policy: produces a stable /24 inside 10.254.0.0/16. Returns None if
     the prefix cannot be derived for any reason.
     """
 
@@ -364,6 +364,51 @@ def _compute_hitl_link_ips(
         }
     except Exception:
         return None
+
+
+def _compute_hitl_link_ips_unique(
+    scenario_key: str,
+    iface_name: str,
+    ordinal: int,
+    used_network_cidrs: Set[str],
+    *,
+    prefix_len: int = DEFAULT_IPV4_PREFIXLEN,
+    max_attempts: int = 512,
+) -> Optional[Dict[str, Any]]:
+    """Compute HITL link IPs while avoiding duplicate link subnets.
+
+    The underlying derivation is deterministic but can collide because a /16
+    only contains 256 distinct /24s. This helper deterministically probes
+    alternative ordinals until it finds an unused subnet.
+    """
+
+    try:
+        base_ordinal = int(ordinal)
+    except Exception:
+        base_ordinal = 0
+
+    for attempt in range(max_attempts):
+        # Large odd stride to explore different hash inputs deterministically.
+        effective_ordinal = base_ordinal + (attempt * 1_000_003)
+        info = _compute_hitl_link_ips(
+            scenario_key,
+            iface_name,
+            effective_ordinal,
+            prefix_len=prefix_len,
+        )
+        if not info:
+            continue
+        cidr = info.get("network_cidr") or info.get("network")
+        if not cidr:
+            continue
+        cidr_str = str(cidr)
+        if cidr_str in used_network_cidrs:
+            continue
+        used_network_cidrs.add(cidr_str)
+        return info
+
+    # Fall back to the base allocation even if it collides.
+    return _compute_hitl_link_ips(scenario_key, iface_name, base_ordinal, prefix_len=prefix_len)
 
 
 def _apply_iface_ip(iface: Any, ip: Optional[str], prefix_len: Optional[int]) -> None:
@@ -581,6 +626,7 @@ def attach_hitl_rj45_nodes(
     created_router_nodes: List[int] = []
     created_router_id_set: Set[int] = set()
     scenario_key = str(hitl_config.get("scenario_key") or hitl_config.get("scenario_name") or "")
+    used_hitl_link_networks: Set[str] = set()
     preference_values: List[str] = []
     for iface_entry in interfaces:
         if isinstance(iface_entry, dict):
@@ -631,7 +677,12 @@ def attach_hitl_rj45_nodes(
                     assignment_kind = "router"
                     anchor = target_node
                     if router_candidates:
-                        link_ips_candidate = _compute_hitl_link_ips(scenario_key, raw_name, idx)
+                        link_ips_candidate = _compute_hitl_link_ips_unique(
+                            scenario_key,
+                            raw_name,
+                            idx,
+                            used_hitl_link_networks,
+                        )
                         uplink_linked, uplink_router_id, new_router_iface_obj, peer_router_iface_obj = _link_node_to_router(
                             session,
                             target_node,
@@ -744,7 +795,12 @@ def attach_hitl_rj45_nodes(
         target_is_router = bool(target_node_id is not None and target_node_id in router_node_ids)
         if target_is_router and rj_link_ips is None:
             rj_link_seed = f"{raw_name}|router-{target_node_id}|rj45"
-            rj_link_ips = _compute_hitl_link_ips(scenario_key, rj_link_seed, idx + len(interfaces))
+            rj_link_ips = _compute_hitl_link_ips_unique(
+                scenario_key,
+                rj_link_seed,
+                idx + len(interfaces),
+                used_hitl_link_networks,
+            )
         iface_peer_id = _next_iface_id(target_node, iface_id_cache)
         peer_iface_name = f"{getattr(target_node, 'name', 'peer')}-hitl{idx}".lower()
         try:
@@ -805,3 +861,15 @@ def predict_hitl_link_ips(scenario_key: str, interface_name: str, ordinal: int) 
 
     name = interface_name if isinstance(interface_name, str) else str(interface_name or ordinal)
     return _compute_hitl_link_ips(scenario_key, name, ordinal)
+
+
+def predict_hitl_link_ips_unique(
+    scenario_key: str,
+    interface_name: str,
+    ordinal: int,
+    used_network_cidrs: Set[str],
+) -> Optional[Dict[str, Any]]:
+    """Like predict_hitl_link_ips, but avoids duplicate subnets within a run."""
+
+    name = interface_name if isinstance(interface_name, str) else str(interface_name or ordinal)
+    return _compute_hitl_link_ips_unique(scenario_key, name, ordinal, used_network_cidrs)
