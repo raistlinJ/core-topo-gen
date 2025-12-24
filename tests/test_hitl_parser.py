@@ -12,6 +12,7 @@ def test_parse_hitl_info_handles_interfaces(tmp_path: Path) -> None:
           <HardwareInLoop enabled="true">
             <Interface name="en0" alias="ethernet" mac="aa:bb:cc:dd:ee:ff" ipv4="10.0.0.1/24, 10.0.0.2/24" ipv6="fe80::1" />
             <Interface name=" usb 0 " />
+            <Interface name="hitl-router-ens19-hitl0" />
           </HardwareInLoop>
         </ScenarioEditor>
       </Scenario>
@@ -23,7 +24,7 @@ def test_parse_hitl_info_handles_interfaces(tmp_path: Path) -> None:
     info = parse_hitl_info(str(xml_path), "Demo")
 
     assert info["enabled"] is True
-    assert len(info["interfaces"]) == 2
+    assert len(info["interfaces"]) == 3
     first = info["interfaces"][0]
     assert first["name"] == "en0"
     assert first["alias"] == "ethernet"
@@ -34,3 +35,7 @@ def test_parse_hitl_info_handles_interfaces(tmp_path: Path) -> None:
 
     second = info["interfaces"][1]
     assert second["attachment"] == "existing_router"
+
+    third = info["interfaces"][2]
+    assert third["name"] == "ens19"
+    assert third["attachment"] == "existing_router"

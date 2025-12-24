@@ -185,6 +185,32 @@ _REPO_PUSH_PROGRESS_LOCK = threading.Lock()
 _REPO_PUSH_PROGRESS_TTL_SECONDS = 600.0
 
 
+def _schedule_repo_push_to_remote(progress_id: str, core_cfg: Dict[str, Any], *, logger: Optional[logging.Logger] = None) -> None:
+    log = logger or getattr(app, 'logger', logging.getLogger(__name__))
+
+    def _worker() -> None:
+        try:
+            # _push_repo_to_remote will update progress_id throughout packaging/uploading
+            # and then queue remote finalization (also progress tracked).
+            _push_repo_to_remote(
+                core_cfg,
+                logger=log,
+                progress_id=progress_id,
+                finalize_async=True,
+            )
+        except Exception as exc:
+            try:
+                log.exception('[core.push_repo] background sync failed: %s', exc)
+            except Exception:
+                pass
+            _update_repo_push_progress(progress_id, status='error', stage='error', detail=str(exc))
+
+    try:
+        threading.Thread(target=_worker, daemon=True, name=f'core-repo-push-{progress_id[:8]}').start()
+    except Exception as exc:
+        _update_repo_push_progress(progress_id, status='error', stage='error', detail=f'Failed to schedule repo push: {exc}')
+
+
 def _init_repo_push_progress(
     progress_id: str,
     *,
@@ -560,27 +586,85 @@ def _relay_remote_channel_to_log(channel: Any, log_handle: Any) -> None:
             pass
 
 
-def _exec_ssh_command(client: Any, command: str, *, timeout: float = 120.0) -> tuple[int, str, str]:
+def _exec_ssh_command(
+    client: Any,
+    command: str,
+    *,
+    timeout: float = 120.0,
+    check: bool = False,
+) -> tuple[int, str, str]:
+    """Execute a command over SSH and capture stdout/stderr.
+
+    Uses a wall-clock timeout to avoid hanging on blocking reads.
+    When check=True, raises RuntimeError on non-zero exit codes.
+    """
+
     if command:
         _append_core_ui_log('DEBUG', f'[ssh.exec] COMMAND START\n{command}')
-    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+
+    start = time.time()
+    stdin, stdout, stderr = client.exec_command(command)
+    channel = getattr(stdout, 'channel', None)
+
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+
     try:
-        stdout_data = stdout.read()
-        stderr_data = stderr.read()
+        if channel is not None:
+            try:
+                channel.settimeout(1.0)
+            except Exception:
+                pass
+        while True:
+            if channel is None:
+                break
+            try:
+                if channel.recv_ready():
+                    stdout_chunks.append(channel.recv(REMOTE_LOG_CHUNK_SIZE))
+                if channel.recv_stderr_ready():
+                    stderr_chunks.append(channel.recv_stderr(REMOTE_LOG_CHUNK_SIZE))
+            except Exception:
+                # Don't wedge on transient read errors.
+                pass
+
+            try:
+                if channel.exit_status_ready():
+                    # Drain remaining buffered output then exit.
+                    if not channel.recv_ready() and not channel.recv_stderr_ready():
+                        break
+            except Exception:
+                break
+
+            if (time.time() - start) >= max(0.1, float(timeout)):
+                try:
+                    if channel is not None and not channel.closed:
+                        channel.close()
+                except Exception:
+                    pass
+                raise TimeoutError(f'SSH command timed out after {timeout:.0f}s')
+
+            time.sleep(0.15)
     finally:
         try:
             stdin.close()
         except Exception:
             pass
-    exit_code = stdout.channel.recv_exit_status() if hasattr(stdout, 'channel') else 0
+
+    exit_code = 0
+    try:
+        if channel is not None:
+            exit_code = int(channel.recv_exit_status())
+    except Exception:
+        exit_code = 0
 
     def _decode(blob: Any) -> str:
         if isinstance(blob, bytes):
             return blob.decode('utf-8', 'ignore')
         return str(blob or '')
 
-    stdout_text = _decode(stdout_data)
-    stderr_text = _decode(stderr_data)
+    stdout_text = _decode(b''.join(stdout_chunks))
+    stderr_text = _decode(b''.join(stderr_chunks))
+
     log_lines = [f'[ssh.exec] EXIT {exit_code}']
     stdout_tag = 'stdout (empty)' if not stdout_text else f'stdout:\n{stdout_text}'
     stderr_tag = 'stderr (empty)' if not stderr_text else f'stderr:\n{stderr_text}'
@@ -588,6 +672,11 @@ def _exec_ssh_command(client: Any, command: str, *, timeout: float = 120.0) -> t
     log_lines.append(stderr_tag)
     log_level = 'WARN' if exit_code != 0 else 'DEBUG'
     _append_core_ui_log(log_level, '\n'.join(log_lines))
+
+    if check and exit_code != 0:
+        detail = stderr_text.strip() or stdout_text.strip() or f'Exit {exit_code}'
+        raise RuntimeError(f'SSH command failed: {detail}')
+
     return exit_code, stdout_text, stderr_text
 
 
@@ -731,7 +820,7 @@ def _push_repo_to_remote(
             f"rm -f {shlex.quote(remote_archive)}"
         )
         _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=60.0, detail='Extracting snapshot on CORE host…')
-        _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=600.0)
+        _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=600.0, check=True)
         _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=95.0, detail='Cleaning temporary archive…')
         log.info('[remote-sync] Repository uploaded to %s', remote_repo)
         _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository ready on remote host.')
@@ -773,7 +862,7 @@ def _schedule_remote_repo_finalize(
         try:
             client = _open_ssh_client(core_cfg)
             try:
-                _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=600.0)
+                _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=600.0, check=True)
             finally:
                 client.close()
         except Exception:
@@ -785,12 +874,17 @@ def _schedule_remote_repo_finalize(
         try:
             _update_repo_push_progress(progress_id, status='finalizing', stage='cleanup', percent=55.0, detail='Removing previous repository…')
             client = _open_ssh_client(core_cfg)
-            _exec_ssh_command(client, f"mkdir -p {shlex.quote(remote_parent)}", timeout=180.0)
-            _exec_ssh_command(client, f"rm -rf {shlex.quote(remote_repo)}", timeout=240.0)
+            _exec_ssh_command(client, f"mkdir -p {shlex.quote(remote_parent)}", timeout=180.0, check=True)
+            _exec_ssh_command(client, f"rm -rf {shlex.quote(remote_repo)}", timeout=240.0, check=True)
             _update_repo_push_progress(progress_id, status='finalizing', stage='extract', percent=75.0, detail='Extracting new snapshot on CORE host…')
-            _exec_ssh_command(client, f"tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(remote_parent)}", timeout=900.0)
+            _exec_ssh_command(
+                client,
+                f"tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(remote_parent)}",
+                timeout=900.0,
+                check=True,
+            )
             _update_repo_push_progress(progress_id, status='finalizing', stage='cleanup', percent=90.0, detail='Cleaning temporary archive…')
-            _exec_ssh_command(client, f"rm -f {shlex.quote(remote_archive)}", timeout=120.0)
+            _exec_ssh_command(client, f"rm -f {shlex.quote(remote_archive)}", timeout=120.0, check=True)
             _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository ready on remote host.')
             if logger:
                 logger.info('[remote-sync] Repository finalized at %s', remote_repo)
@@ -12210,6 +12304,58 @@ def _collect_node_ips(node: dict[str, Any]) -> list[str]:
     return ips
 
 
+def _collect_named_iface_ips(node: dict[str, Any], *, name_prefix: str) -> list[str]:
+    ips: list[str] = []
+    prefix = (name_prefix or '').strip().lower()
+    if not prefix:
+        return ips
+    try:
+        interfaces = node.get('interfaces') or []
+        for iface in interfaces:
+            if not isinstance(iface, dict):
+                continue
+            iface_name = (iface.get('name') or '').strip().lower()
+            if not iface_name.startswith(prefix):
+                continue
+            ip4 = (iface.get('ipv4') or '').strip()
+            ip4_mask = (iface.get('ipv4_mask') or '').strip()
+            ip6 = (iface.get('ipv6') or '').strip()
+            ip6_mask = (iface.get('ipv6_mask') or '').strip()
+            if ip4:
+                val = f"{ip4}/{ip4_mask}" if ip4_mask else ip4
+                if val not in ips:
+                    ips.append(val)
+            if ip6:
+                val6 = f"{ip6}/{ip6_mask}" if ip6_mask else ip6
+                if val6 not in ips:
+                    ips.append(val6)
+    except Exception:
+        pass
+    return ips
+
+
+_IPV4_ADDR_RE = re.compile(r"^(?P<ip>(?:\d{1,3}\.){3}\d{1,3})(?:/(?P<suffix>[^\s]+))?$")
+
+
+def _force_ipv4_prefixlen(ips: list[str], prefixlen: str = "24") -> list[str]:
+    forced: list[str] = []
+    seen: set[str] = set()
+    for raw in ips or []:
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        m = _IPV4_ADDR_RE.match(text)
+        if m:
+            text = f"{m.group('ip')}/{prefixlen}"
+        if text in seen:
+            continue
+        seen.add(text)
+        forced.append(text)
+    return forced
+
+
 def _hitl_details_from_path(xml_path: str) -> list[dict[str, Any]]:
     try:
         abs_path = os.path.abspath(xml_path)
@@ -12228,18 +12374,53 @@ def _hitl_details_from_path(xml_path: str) -> list[dict[str, Any]]:
     hitl_details: list[dict[str, Any]] = []
     try:
         summary = _analyze_core_xml(abs_path)
-        nodes = summary.get('hitl_nodes') or []
-        for node in nodes:
+        # Prefer RJ45 node interface IPs for the core.html HITL column.
+        # This is the "rj-45 interface address" (not the router-side connection point).
+        rj45_preferred: list[dict[str, Any]] = []
+        for node in summary.get('nodes') or []:
             if not isinstance(node, dict):
                 continue
+            node_type = (node.get('type') or '').strip().lower()
+            if 'rj45' not in node_type and 'rj-45' not in node_type:
+                continue
+            ips = _force_ipv4_prefixlen(_collect_node_ips(node), prefixlen='24')
+            if not ips:
+                continue
             name = (node.get('name') or node.get('id') or '').strip()
-            node_type = (node.get('type') or '').strip()
-            ips = _collect_node_ips(node)
-            hitl_details.append({
-                'name': name or node_type or 'HITL',
-                'type': node_type,
-                'ips': ips,
-            })
+            rj45_preferred.append({'name': name or 'RJ45', 'type': node.get('type') or 'rj45', 'ips': ips[:1]})
+
+        if rj45_preferred:
+            hitl_details = rj45_preferred
+        else:
+            # Fall back to router-side HITL interfaces (named hitl*) if we can't find RJ45 nodes.
+            router_preferred: list[dict[str, Any]] = []
+            for node in summary.get('nodes') or []:
+                if not isinstance(node, dict):
+                    continue
+                node_type = (node.get('type') or '').strip()
+                if node_type.lower() != 'router':
+                    continue
+                ips = _collect_named_iface_ips(node, name_prefix='hitl')
+                ips = _force_ipv4_prefixlen(ips, prefixlen='24')
+                if not ips:
+                    continue
+                name = (node.get('name') or node.get('id') or '').strip()
+                router_preferred.append({'name': name or 'HITL Router', 'type': node_type, 'ips': ips[:1]})
+            if router_preferred:
+                hitl_details = router_preferred
+            else:
+                nodes = summary.get('hitl_nodes') or []
+                for node in nodes:
+                    if not isinstance(node, dict):
+                        continue
+                    name = (node.get('name') or node.get('id') or '').strip()
+                    node_type = (node.get('type') or '').strip()
+                    ips = _force_ipv4_prefixlen(_collect_node_ips(node), prefixlen="24")
+                    hitl_details.append({
+                        'name': name or node_type or 'HITL',
+                        'type': node_type,
+                        'ips': ips,
+                    })
     except Exception:
         hitl_details = []
     _SESSION_HITL_CACHE[abs_path] = {'mtime': mtime, 'data': hitl_details}
@@ -12756,14 +12937,9 @@ def core_push_repo_route():
         include_password=True,
     )
     progress_id = uuid.uuid4().hex
-    _init_repo_push_progress(progress_id, stage='packaging', detail='Preparing repository snapshot…', status='packaging', percent=0.0)
+    _init_repo_push_progress(progress_id, stage='queued', detail='Queued repository sync…', status='queued', percent=0.0)
     try:
-        result = _push_repo_to_remote(
-            core_cfg,
-            logger=app.logger,
-            progress_id=progress_id,
-            finalize_async=True,
-        )
+        _schedule_repo_push_to_remote(progress_id, core_cfg, logger=app.logger)
     except _SSHTunnelError as exc:
         _update_repo_push_progress(progress_id, status='error', stage='error', detail=str(exc))
         return jsonify({'error': str(exc)}), 400
@@ -12771,7 +12947,7 @@ def core_push_repo_route():
         app.logger.exception('[core.push_repo] Failed syncing repo: %s', exc)
         _update_repo_push_progress(progress_id, status='error', stage='error', detail=str(exc))
         return jsonify({'error': f'Failed pushing repo: {exc}', 'progress_id': progress_id}), 500
-    return jsonify({'ok': True, 'repo_path': result.get('repo_path'), 'progress_id': progress_id})
+    return jsonify({'ok': True, 'progress_id': progress_id})
 
 
 @app.route('/core/push_repo/status/<progress_id>', methods=['GET'])

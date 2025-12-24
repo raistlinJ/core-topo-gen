@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 import logging
 import os
 import xml.etree.ElementTree as ET
@@ -18,6 +19,26 @@ _ATTACHMENT_ALLOWED = {
 _DEFAULT_ATTACHMENT = "existing_router"
 
 
+_HITL_ROUTER_PEER_IFACE_RE = re.compile(r"^hitl-router-(?P<ifname>.+)-hitl\d+$", re.IGNORECASE)
+_IFNAME_ALLOWED_RE = re.compile(r"^[a-zA-Z0-9_.:-]{1,15}$")
+
+
+def _normalize_hitl_ifname(name: str) -> str:
+    candidate = (name or "").strip()
+    if not candidate:
+        return ""
+    lower = candidate.lower()
+    if lower.startswith("hitl-") and not lower.startswith("hitl-router-"):
+        candidate = candidate[5:]
+    candidate = candidate.split("@", 1)[0].strip()
+    m = _HITL_ROUTER_PEER_IFACE_RE.match(candidate)
+    if m:
+        extracted = (m.group("ifname") or "").strip()
+        if extracted and _IFNAME_ALLOWED_RE.match(extracted):
+            return extracted
+    return candidate
+
+
 def _normalize_attachment(value: Any) -> str:
     if value is None:
         return _DEFAULT_ATTACHMENT
@@ -31,7 +52,7 @@ def _normalize_attachment(value: Any) -> str:
 
 
 def _normalize_interface_element(element: ET.Element) -> Optional[Dict[str, Any]]:
-    name = (element.get("name") or element.get("interface") or "").strip()
+    name = _normalize_hitl_ifname((element.get("name") or element.get("interface") or "").strip())
     if not name:
         return None
     entry: Dict[str, Any] = {"name": name}

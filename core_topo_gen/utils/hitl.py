@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import re
 import hashlib
 import ipaddress
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 
 from ..constants import DEFAULT_IPV4_PREFIXLEN
 from ..types import NodeInfo
+from ..utils.services import mark_node_as_router
 
 try:  # pragma: no cover - exercised with real CORE installs
     from core.api.grpc.wrappers import NodeType, Position, Interface  # type: ignore
@@ -15,6 +17,26 @@ except ModuleNotFoundError:  # pragma: no cover - fallback used in tests/offline
     from ..builders.topology import NodeType, Position, Interface  # type: ignore  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+
+_HITL_ROUTER_PEER_IFACE_RE = re.compile(r"^hitl-router-(?P<ifname>.+)-hitl\d+$", re.IGNORECASE)
+_IFNAME_ALLOWED_RE = re.compile(r"^[a-zA-Z0-9_.:-]{1,15}$")
+
+
+def _normalize_rj45_ifname(value: str) -> str:
+    candidate = (value or "").strip()
+    if not candidate:
+        return ""
+    lower = candidate.lower()
+    if lower.startswith("hitl-") and not lower.startswith("hitl-router-"):
+        candidate = candidate[5:]
+    candidate = candidate.split("@", 1)[0].strip()
+    m = _HITL_ROUTER_PEER_IFACE_RE.match(candidate)
+    if m:
+        extracted = (m.group("ifname") or "").strip()
+        if extracted and _IFNAME_ALLOWED_RE.match(extracted):
+            return extracted
+    return candidate
 
 _ATTACHMENT_ALLOWED = {
     "existing_router",
@@ -511,8 +533,10 @@ def _link_node_to_router(
         return False, None, None, None
     router_iface_id = _next_iface_id(router_node, iface_id_cache)
     new_iface_id = _next_iface_id(new_node, iface_id_cache)
-    router_iface_name = f"{getattr(router_node, 'name', 'router')}-{name_seed}".lower()
-    new_iface_name = f"{name_seed}".lower()
+    # CORE renames Linux veth interfaces to Interface.name; Linux ifnames are limited
+    # (typically <= 15 chars). Use short names derived from interface IDs.
+    router_iface_name = f"if{router_iface_id}".lower()
+    new_iface_name = f"if{new_iface_id}".lower()
     try:
         router_iface = Interface(id=router_iface_id, name=router_iface_name)
     except Exception:
@@ -526,6 +550,7 @@ def _link_node_to_router(
 
 
 def _prepare_rj45_options(node: Any, iface_name: str) -> None:
+    iface_name = _normalize_rj45_ifname(iface_name)
     try:
         setattr(node, "model", "RJ45")
     except Exception:
@@ -671,6 +696,10 @@ def attach_hitl_rj45_nodes(
                 router_candidates = list(router_nodes)
                 try:
                     target_node = session.add_node(router_id, _type=router_type, position=router_position, name=router_name)
+                    try:
+                        mark_node_as_router(target_node, session)
+                    except Exception:
+                        pass
                     created_nodes.append(router_id)
                     created_router_nodes.append(router_id)
                     created_router_id_set.add(router_id)
@@ -802,14 +831,17 @@ def attach_hitl_rj45_nodes(
                 used_hitl_link_networks,
             )
         iface_peer_id = _next_iface_id(target_node, iface_id_cache)
-        peer_iface_name = f"{getattr(target_node, 'name', 'peer')}-hitl{idx}".lower()
+        # Keep peer ifname short/valid for CORE/vcmd rename.
+        # Also make it recognizable so the web UI can show only the RJ45-facing router IP.
+        peer_iface_name = (f"hitl{idx}" if target_is_router else f"if{iface_peer_id}").lower()
         try:
             peer_iface = Interface(id=iface_peer_id, name=peer_iface_name)
         except Exception:
             peer_iface = None
         rj_iface_id = _next_iface_id(rj45_node, iface_id_cache)
         try:
-            rj_iface = Interface(id=rj_iface_id, name=f"{clean_name}-uplink")
+            # Keep RJ45 ifname short/valid.
+            rj_iface = Interface(id=rj_iface_id, name=f"rj{idx}".lower())
         except Exception:
             rj_iface = None
         if target_is_router and rj_link_ips:

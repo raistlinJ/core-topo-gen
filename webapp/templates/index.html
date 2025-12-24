@@ -12645,8 +12645,10 @@ async function extractResponseDetail(response) {
 async function pushRepoToRemote(xmlPath, options = {}) {
     const formOptions = { ...options };
     const onProgress = typeof formOptions.onProgress === 'function' ? formOptions.onProgress : null;
+    const onResponseProgress = typeof formOptions.onResponseProgress === 'function' ? formOptions.onResponseProgress : null;
     const onFinalizeProgress = typeof formOptions.onFinalizeProgress === 'function' ? formOptions.onFinalizeProgress : null;
     delete formOptions.onProgress;
+    delete formOptions.onResponseProgress;
     delete formOptions.onFinalizeProgress;
     formOptions.updateRemoteRepo = false;
     const form = buildRunFormData(xmlPath, formOptions);
@@ -12695,7 +12697,15 @@ async function pushRepoToRemote(xmlPath, options = {}) {
                 return '';
             }
         }
-        const text = xhr.responseText;
+        // NOTE: Some browsers throw if you read responseText when responseType !== ''/'text'.
+        let text = '';
+        try {
+            if (!xhr.responseType || xhr.responseType === '' || xhr.responseType === 'text') {
+                text = xhr.responseText || '';
+            }
+        } catch (err) {
+            text = '';
+        }
         if (text) {
             try {
                 const parsed = JSON.parse(text);
@@ -12722,6 +12732,17 @@ async function pushRepoToRemote(xmlPath, options = {}) {
                 const total = event.lengthComputable ? event.total : null;
                 const percent = total ? (loaded / total) * 100 : null;
                 onProgress({ loaded, total, percent });
+            };
+        }
+        if (onResponseProgress) {
+            xhr.onprogress = (event) => {
+                if (!onResponseProgress) {
+                    return;
+                }
+                const loaded = event.loaded || 0;
+                const total = event.lengthComputable ? event.total : null;
+                const percent = total ? (loaded / total) * 100 : null;
+                onResponseProgress({ loaded, total, percent });
             };
         }
         xhr.onerror = () => {
@@ -13341,12 +13362,18 @@ async function runSyncWithModal(arg){
     let uploadStartTime = null;
     let uploadFinalizeStart = null;
     let lastUploadStats = null;
+    let lastResponseStats = null;
     let lastLoggedUploadPercent = null;
     let lastLoggedUploadBytes = null;
+    let lastLoggedResponsePercent = null;
+    let lastLoggedResponseBytes = null;
     let uploadDelivered = false;
+    let uploadRequestComplete = false;
     let lastFinalizeLogTs = null;
     let lastProgressPercent = 0;
     let lastFinalizeDetail = null;
+    let finalizeAnnounced = false;
+    let lastFinalizeInfo = null;
     const updateRunStatus = (status, meta) => {
         if (executeProgressState.active) {
             setExecuteProgressStatus(status, meta);
@@ -13384,8 +13411,74 @@ async function runSyncWithModal(arg){
                 const finalizeElapsed = uploadFinalizeStart ? Math.round((now - uploadFinalizeStart) / 1000) : elapsedSec;
                 if (!lastFinalizeLogTs || (now - lastFinalizeLogTs) >= 12000) {
                     lastFinalizeLogTs = now;
-                    appendExecuteDialogLog(`Repository upload delivered; waiting for CORE host to finalize (${finalizeElapsed}s).`);
+                    const suffix = lastFinalizeDetail ? ` (${lastFinalizeDetail})` : '';
+                    const percent = lastFinalizeInfo && typeof lastFinalizeInfo.percent === 'number'
+                        ? Math.max(0, Math.min(100, lastFinalizeInfo.percent))
+                        : null;
+                    const percentSuffix = percent !== null ? ` [server: ${percent.toFixed(0)}%]` : '';
+                    let staleSuffix = '';
+                    try {
+                        const updatedAt = lastFinalizeInfo && typeof lastFinalizeInfo.updated_at === 'number' ? lastFinalizeInfo.updated_at : null;
+                        if (updatedAt) {
+                            const ageSec = Math.max(0, Math.round(now / 1000 - updatedAt));
+                            staleSuffix = ` [last update: ${ageSec}s ago]`;
+                        }
+                    } catch (e) {}
+                    appendExecuteDialogLog(`Waiting for CORE host to finalize (${finalizeElapsed}s)${suffix}${percentSuffix}${staleSuffix}.`);
                 }
+                // Keep the status/meta line accurate while waiting.
+                try {
+                    const parts = [];
+                    if (lastFinalizeDetail) parts.push(lastFinalizeDetail);
+                    if (lastUploadStats) {
+                        const loaded = lastUploadStats.loaded || 0;
+                        const total = lastUploadStats.total || null;
+                        if (total) parts.push(`upload: ${formatBytes(loaded)} / ${formatBytes(total)}`);
+                        else if (loaded) parts.push(`upload: ${formatBytes(loaded)} transferred`);
+                    }
+                    if (lastResponseStats) {
+                        const loaded = lastResponseStats.loaded || 0;
+                        const total = lastResponseStats.total || null;
+                        if (total) parts.push(`response: ${formatBytes(loaded)} / ${formatBytes(total)}`);
+                        else if (loaded) parts.push(`response: ${formatBytes(loaded)} received`);
+                    }
+                    updateRunStatus('Finishing repository sync… (this may take a few minutes)', parts.length ? parts.join(' | ') : 'Remote finalize in progress…');
+                } catch (e) {}
+                return;
+            }
+            if (uploadRequestComplete) {
+                // Browser finished sending bytes, but the server is still packaging/uploading to CORE host.
+                // This can take a while, so keep the log and status line honest.
+                const phaseElapsed = uploadFinalizeStart ? Math.round((now - uploadFinalizeStart) / 1000) : elapsedSec;
+                let uploadDetail = '';
+                if (lastUploadStats) {
+                    const loaded = lastUploadStats.loaded || 0;
+                    const total = lastUploadStats.total || null;
+                    if (total) {
+                        uploadDetail = `${formatBytes(loaded)} / ${formatBytes(total)}`;
+                    } else if (loaded) {
+                        uploadDetail = `${formatBytes(loaded)} transferred`;
+                    }
+                }
+                let responseDetail = '';
+                if (lastResponseStats) {
+                    const loaded = lastResponseStats.loaded || 0;
+                    const total = lastResponseStats.total || null;
+                    if (total) {
+                        responseDetail = `${formatBytes(loaded)} / ${formatBytes(total)}`;
+                    } else if (loaded) {
+                        responseDetail = `${formatBytes(loaded)} received`;
+                    }
+                }
+                const uploadSuffix = uploadDetail ? ` [upload: ${uploadDetail}]` : '';
+                const responseSuffix = responseDetail ? ` [response: ${responseDetail}]` : '';
+                appendExecuteDialogLog(`Repository upload request complete; server preparing snapshot (${phaseElapsed}s)${uploadSuffix}${responseSuffix}.`);
+                try {
+                    const parts = [];
+                    if (lastUploadStats) parts.push(uploadDetail ? `upload: ${uploadDetail}` : 'upload: complete');
+                    if (responseDetail) parts.push(`response: ${responseDetail}`);
+                    updateRunStatus('Preparing repository snapshot…', parts.filter(Boolean).join(' | ') || 'Server preparing snapshot…');
+                } catch (e) {}
                 return;
             }
             let detail = 'transferring…';
@@ -13402,24 +13495,6 @@ async function runSyncWithModal(arg){
             }
             appendExecuteDialogLog(`Repository upload still running (${elapsedSec}s): ${detail}`);
         }, 4000);
-    };
-    const markUploadDelivered = (info) => {
-        if (uploadDelivered || !info) {
-            return;
-        }
-        const loaded = info.loaded || 0;
-        const total = info.total || null;
-        const percent = typeof info.percent === 'number' ? info.percent : null;
-        const totalComplete = total && loaded >= total;
-        const percentComplete = percent !== null && percent >= 99.9;
-        if (totalComplete || percentComplete) {
-            uploadDelivered = true;
-            uploadFinalizeStart = Date.now();
-            lastFinalizeLogTs = Date.now();
-            const detail = total ? `${formatBytes(loaded)} / ${formatBytes(total)}` : `${formatBytes(loaded)} transferred`;
-            appendExecuteDialogLog(`Repository upload delivered; remote host is finalizing (${detail}).`);
-            updateRunStatus('Finishing repository sync…', 'Remote CORE host is finalizing the uploaded snapshot…');
-        }
     };
     const logUploadSnapshot = (info) => {
         if (!info) {
@@ -13467,6 +13542,16 @@ async function runSyncWithModal(arg){
         const total = info.total || null;
         const percentRaw = typeof info.percent === 'number' ? info.percent : null;
         const percent = percentRaw !== null ? Math.max(0, Math.min(100, percentRaw)) : null;
+        try {
+            const totalComplete = total && loaded >= total;
+            const percentComplete = percent !== null && percent >= 99.9;
+            if (totalComplete || percentComplete) {
+                uploadRequestComplete = true;
+                if (!uploadFinalizeStart) {
+                    uploadFinalizeStart = Date.now();
+                }
+            }
+        } catch (e) {}
         let meta = `${formatBytes(loaded)} transferred`;
         if (total) {
             meta = `${formatBytes(loaded)} / ${formatBytes(total)}`;
@@ -13474,27 +13559,68 @@ async function runSyncWithModal(arg){
                 meta += ` (${percent.toFixed(1)}%)`;
             }
         }
-        markUploadDelivered(info);
-        updateRunStatus(uploadDelivered ? 'Finishing repository sync…' : 'Copying repository…', uploadDelivered ? 'Remote CORE host is finalizing the uploaded snapshot…' : meta);
+        updateRunStatus('Copying repository…', meta);
         if (percent !== null) {
             setUploadProgressValue(percent, `${percent.toFixed(1)}%`);
         }
         logUploadSnapshot(info);
     };
+
+    const handleRepoResponseProgress = (info) => {
+        if (!info) return;
+        lastResponseStats = info;
+        // Only log occasionally to avoid spamming.
+        const percentRaw = typeof info.percent === 'number' ? info.percent : null;
+        const percent = percentRaw !== null ? Math.max(0, Math.min(100, percentRaw)) : null;
+        const loaded = info.loaded || 0;
+        const total = info.total || null;
+        if (percent !== null) {
+            if (lastLoggedResponsePercent === null || Math.abs(percent - lastLoggedResponsePercent) >= 10) {
+                const detail = total ? `${formatBytes(loaded)} / ${formatBytes(total)}` : `${formatBytes(loaded)} received`;
+                appendExecuteDialogLog(`Repository response ${percent.toFixed(1)}% (${detail})`);
+                lastLoggedResponsePercent = percent;
+            }
+        } else if (loaded) {
+            if (lastLoggedResponseBytes === null || (loaded - lastLoggedResponseBytes) >= (2 * 1024 * 1024)) {
+                appendExecuteDialogLog(`Repository response received ${formatBytes(loaded)}…`);
+                lastLoggedResponseBytes = loaded;
+            }
+        }
+    };
     const handleFinalizeProgress = (info) => {
         if (!info || typeof info !== 'object') {
             return;
         }
+        lastFinalizeInfo = info;
+        // Finalize polling only starts after the server has received the upload and returned a progress id.
+        // This is the most reliable moment to switch the UI from "uploading" to "finalizing".
+        if (!uploadDelivered) {
+            uploadDelivered = true;
+            uploadFinalizeStart = Date.now();
+            lastFinalizeLogTs = Date.now();
+        }
         const status = info.status || 'pending';
         const detail = info.detail || info.stage || 'Remote finalize in progress…';
         const percent = typeof info.percent === 'number' ? Math.max(0, Math.min(100, info.percent)) : null;
+        if (!finalizeAnnounced) {
+            finalizeAnnounced = true;
+            let uploadDetail = '';
+            if (lastUploadStats) {
+                const loaded = lastUploadStats.loaded || 0;
+                const total = lastUploadStats.total || null;
+                if (total) uploadDetail = `${formatBytes(loaded)} / ${formatBytes(total)}`;
+                else if (loaded) uploadDetail = `${formatBytes(loaded)} transferred`;
+            }
+            const suffix = uploadDetail ? ` (${uploadDetail})` : '';
+            appendExecuteDialogLog(`Remote host is finalizing${suffix}.`);
+        }
         if (detail && detail !== lastFinalizeDetail) {
             lastFinalizeDetail = detail;
             const pctText = percent !== null ? ` (${percent.toFixed(0)}%)` : '';
             appendExecuteDialogLog(`Remote finalize: ${detail}${pctText}`);
         }
         if (detail) {
-            updateRunStatus('Finishing repository sync…', detail);
+            updateRunStatus('Finishing repository sync… (this may take a few minutes)', detail);
         }
         if (percent !== null) {
             setUploadProgressValue(percent, `${percent.toFixed(0)}%`);
@@ -13503,7 +13629,6 @@ async function runSyncWithModal(arg){
             logError('Remote finalize reported an error; check server logs for details.');
         }
         if (status === 'complete') {
-            uploadDelivered = true;
             stopUploadHeartbeat();
         }
     };
@@ -13563,6 +13688,7 @@ async function runSyncWithModal(arg){
             const pushed = await pushRepoToRemote(rp, {
                 scenarioIndex: scenarioIndexForRun,
                 onProgress: handleRepoUploadProgress,
+                onResponseProgress: handleRepoResponseProgress,
                 onFinalizeProgress: handleFinalizeProgress,
             });
             if(!pushed){
