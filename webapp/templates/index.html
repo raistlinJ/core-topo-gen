@@ -402,6 +402,24 @@
         </div>
     </div>
 </div>
+
+<!-- CORE Nav Blocked Modal (missing Proxmox setup) -->
+<div class="modal fade" id="coreNavBlockedModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">CORE</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                You must first select a CORE VM in the Scenarios Page to view this page.
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
 {% include 'partials/dock.html' %}
 
 <!-- Graph libraries for Full Preview Modal -->
@@ -6631,26 +6649,13 @@ async function handleExternalIfxApply() {
         const successMessage = data.message || `Bridge "${appliedBridgeName}" applied successfully.`;
         logInfo(`External IFX apply confirmed for scenario ${idx} with bridge ${appliedBridgeName}`);
         updateExternalIfxStatus(successMessage, 'success', { busy: false, autoHideMs: 3000 });
-        try { showToast(`${successMessage} Scenario saved and modal closing…`, { autohide: true, delay: 3500 }); } catch (e) {}
+        try { showToast(`${successMessage} Scenario saved.`, { autohide: true, delay: 2500 }); } catch (e) {}
         if (Array.isArray(data.warnings) && data.warnings.length) {
             const warningText = data.warnings.join('\n');
             logWarn(`External IFX apply warnings: ${warningText}`);
             updateExternalIfxStatus(`${successMessage}\n${warningText}`, 'warning');
             try { showToast(warningText, { autohide: false }); } catch (e) {}
         }
-        window.setTimeout(() => {
-            const modalEl = document.getElementById('externalIfxModal');
-            if (modalEl && window.bootstrap && window.bootstrap.Modal) {
-                try {
-                    const modalInstance = window.bootstrap.Modal.getOrCreateInstance(modalEl);
-                    modalInstance.hide();
-                } catch (modalErr) { console.warn('Failed to close External IFX modal', modalErr); }
-            } else if (modalEl) {
-                modalEl.classList.remove('show');
-                modalEl.setAttribute('aria-hidden', 'true');
-                modalEl.style.display = 'none';
-            }
-        }, 150);
         window.setTimeout(() => {
             const fallbackSubmit = () => {
                 const editorForm = document.getElementById('editorForm');
@@ -8631,6 +8636,28 @@ function renderMain() {
                 return false;
             }
         };
+
+        const hasVerifiedCoreConnection = () => {
+            try {
+                const { scenario } = getActiveScenarioContext();
+                if (!scenario) return false;
+                const hitlState = ensureHitlStateForScenario(scenario);
+                const coreState = hitlState.core || {};
+                const status = (coreState.last_tested_status || '').toString().trim().toLowerCase();
+                return status === 'success';
+            } catch (err) {
+                return false;
+            }
+        };
+
+        const openCoreNavBlockedModal = () => {
+            const modalEl = document.getElementById('coreNavBlockedModal');
+            if (modalEl && window.bootstrap) {
+                const modalInstance = bootstrap.Modal.getInstance(modalEl)
+                    || new bootstrap.Modal(modalEl, { backdrop: true, keyboard: true });
+                modalInstance.show();
+            }
+        };
         const ensureValidationHook = () => {
             if (window.__coreNavValidationHookInstalled) {
                 return;
@@ -8675,20 +8702,22 @@ function renderMain() {
             }
         };
         navLink.addEventListener('click', (event) => {
-            if (hasCoreVmSelection()) {
+            if (!hasCoreVmSelection()) {
+                event.preventDefault();
+                openCoreNavBlockedModal();
                 return;
             }
+
+            if (hasVerifiedCoreConnection()) {
+                return;
+            }
+
             event.preventDefault();
             window._coreNavAwaitingValidation = navLink.href;
             ensureValidationHook();
             openModalForActiveScenario();
             if (typeof setCoreConnectionHint === 'function') {
-                setCoreConnectionHint('Select and validate a CORE VM before opening the CORE page.', 'warning');
-            }
-            try {
-                showToast('Configure a CORE VM before opening the CORE page.', { autohide: true, delay: 3200 });
-            } catch (toastErr) {
-                console.warn('CORE nav guard toast failed', toastErr);
+                setCoreConnectionHint('Verify the CORE connection before opening the CORE page.', 'warning');
             }
         });
     })();

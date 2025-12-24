@@ -4577,6 +4577,10 @@ def login():
         role_value = _normalize_role_value(user.get('role'))
         _set_current_user({'username': user.get('username'), 'role': role_value})
         session.permanent = True
+        try:
+            session[_UI_VIEW_SESSION_KEY] = _default_ui_view_mode_for_role(role_value)
+        except Exception:
+            pass
         if _is_participant_role(role_value):
             return redirect(url_for('participant_ui_page'))
         return redirect(url_for('index'))
@@ -5613,16 +5617,41 @@ def _is_admin_view_role(role: Optional[str]) -> bool:
     return role.strip().lower() in _ADMIN_VIEW_ROLES
 
 
+def _default_ui_view_mode_for_role(role: Any) -> str:
+    normalized = _normalize_role_value(role)
+    if normalized == 'admin':
+        return 'admin'
+    if normalized == 'builder':
+        return 'builder'
+    return _UI_VIEW_DEFAULT
+
+
 def _current_ui_view_mode() -> str:
     user = _current_user()
-    raw = session.get(_UI_VIEW_SESSION_KEY, _UI_VIEW_DEFAULT)
-    if raw not in _UI_VIEW_ALLOWED:
-        raw = _UI_VIEW_DEFAULT
-        session[_UI_VIEW_SESSION_KEY] = raw
     if not user or user.get('role') not in _ADMIN_VIEW_ROLES:
         if session.get(_UI_VIEW_SESSION_KEY) != _UI_VIEW_DEFAULT:
             session[_UI_VIEW_SESSION_KEY] = _UI_VIEW_DEFAULT
         return _UI_VIEW_DEFAULT
+
+    role = _normalize_role_value(user.get('role'))
+
+    # Admin/builder roles: if no preference saved yet, default by role.
+    if _UI_VIEW_SESSION_KEY not in session:
+        raw = _default_ui_view_mode_for_role(role)
+        session[_UI_VIEW_SESSION_KEY] = raw
+        return raw
+
+    raw = session.get(_UI_VIEW_SESSION_KEY, _UI_VIEW_DEFAULT)
+    if raw not in _UI_VIEW_ALLOWED:
+        raw = _default_ui_view_mode_for_role(role)
+        session[_UI_VIEW_SESSION_KEY] = raw
+        return raw
+
+    # Builders should never be in admin mode.
+    if role == 'builder' and raw == 'admin':
+        raw = 'builder'
+        session[_UI_VIEW_SESSION_KEY] = raw
+
     return raw
 
 
@@ -9255,8 +9284,7 @@ def index():
         scenario_query = (request.args.get('scenario') or '').strip()
     except Exception:
         scenario_query = ''
-    view_mode = _current_ui_view_mode()
-    if view_mode == 'participant' or (current and _is_participant_role(current.get('role'))):
+    if current and _is_participant_role(current.get('role')):
         target_args = {'scenario': scenario_query} if scenario_query else {}
         return redirect(url_for('participant_ui_page', **target_args))
     payload = _default_scenarios_payload()

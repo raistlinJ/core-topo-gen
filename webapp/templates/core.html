@@ -33,20 +33,28 @@
   }
   th.actions-col, td.actions-col { white-space: nowrap; }
   th.col-check, td.col-check { width: 2rem; text-align: center; }
-  th.filename-col, td.filename-col { width: 100%; }
+  /* File column: fixed width + horizontal scroll inside the cell */
+  th.filename-col, td.filename-col { overflow: hidden; }
   .filename-scroll { max-width: 100%; display:block; overflow-x:auto; overflow-y:hidden; white-space:nowrap; }
   #sessionsTable { table-layout: fixed; }
   #sessionsTable th, #sessionsTable td { padding: .3rem .35rem; }
   #sessionsTable th.col-id, #sessionsTable td.col-id { width: 5%; white-space: nowrap; text-align: center; overflow: hidden; text-overflow: ellipsis; }
   #sessionsTable th.col-state, #sessionsTable td.col-state { width: 10%; white-space: nowrap; text-align: center; }
   #sessionsTable th.col-nodes, #sessionsTable td.col-nodes { width: 7%; white-space: nowrap; text-align: center; overflow: hidden; text-overflow: ellipsis; }
-  #sessionsTable th.col-hitl, #sessionsTable td.col-hitl { width: 18%; white-space: nowrap; }
+  #sessionsTable th.col-hitl, #sessionsTable td.col-hitl { width: 28%; }
   #sessionsTable td.col-hitl { font-size: 0.85rem; }
-  #sessionsTable td.col-hitl .hitl-entry { line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #sessionsTable td.col-hitl .hitl-scroll { max-height: 3.5rem; overflow: auto; }
+  #sessionsTable td.col-hitl .hitl-entry { line-height: 1.2; white-space: nowrap; }
   #sessionsTable td.col-hitl .hitl-entry-link { color: inherit; text-decoration: none; display: inline-flex; align-items: baseline; gap: .15rem; }
   #sessionsTable td.col-hitl .hitl-entry-link:hover { text-decoration: underline; }
   #sessionsTable th.col-scenario, #sessionsTable td.col-scenario { width: 13%; white-space: nowrap; text-align: center; }
-  #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 38%; }
+  #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 22rem; max-width: 22rem; }
+  #sessionsTable th.actions-col, #sessionsTable td.actions-col { width: 15rem; }
+
+  #xmlsTable { table-layout: fixed; }
+  #xmlsTable th.filename-col, #xmlsTable td.filename-col { width: 26rem; max-width: 26rem; }
+  #xmlsTable th.actions-col, #xmlsTable td.actions-col { width: 14rem; }
+  #xmlsTable thead th:nth-child(3), #xmlsTable tbody td:nth-child(3) { width: 5rem; text-align: center; white-space: nowrap; }
   .actions-col .btn { padding: .15rem .3rem; line-height: 1; vertical-align: middle; display: inline-flex; align-items: center; justify-content: center; }
   .actions-col .btn i, .actions-col .btn .bi { font-size: .95em; line-height: 1; display: block; }
   .actions-col .actions-wrap > a { display: inline-flex; align-items: center; margin-right: 2px; }
@@ -54,9 +62,6 @@
   .actions-col .actions-wrap > form > .btn { margin-right: 2px; }
   .actions-col .actions-wrap > a:last-child { margin-right: 0; }
   .actions-col .actions-wrap > form:last-child > .btn { margin-right: 0; }
-  @media (max-width: 1200px) { #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 18%; } }
-  @media (max-width: 992px) { #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 16%; } }
-  @media (max-width: 768px) { #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 14%; } }
   /* Inline loading bar */
   #dataLoadingBar { height:4px; position:relative; margin-bottom:.5rem; overflow:hidden; border-radius:2px; background:rgba(0,0,0,0.08); }
   #dataLoadingBar.d-none { display:none !important; }
@@ -509,7 +514,7 @@
       return parts.join(' ');
     }).join(' ');
     const hitlCell = hitlEntries.length
-        ? `<div class="d-flex flex-column gap-1">${hitlEntries.map(entry => {
+        ? `<div class="hitl-scroll d-flex flex-column gap-1">${hitlEntries.map(entry => {
           const name = esc((entry && entry.name) || (entry && entry.type) || 'HITL');
           const ips = (entry && Array.isArray(entry.ips)) ? entry.ips.filter(ip => !!ip).map(ip => esc(ip)) : [];
           const ipLabel = ips.length ? ` <span class="text-muted">(${ips.join(', ')})</span>` : ' <span class="text-muted">(no IP)</span>';

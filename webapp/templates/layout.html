@@ -84,16 +84,6 @@
               {% set toggle_outline = 'btn-outline-secondary' if is_power_view else 'btn-outline-light' %}
               {% set next_href = request.full_path if request and request.full_path else request.path %}
               <div class="view-toggle-group d-flex align-items-center">
-                <form class="view-toggle-form" method="post" action="{{ url_for('set_ui_view_mode') }}">
-                  <input type="hidden" name="mode" value="participant">
-                  <input type="hidden" name="next" value="{{ next_href }}">
-                  <button type="submit" class="btn btn-sm {{ toggle_outline }} {% if ui_view_mode == 'participant' %}active{% endif %}">Participant View</button>
-                </form>
-                <form class="view-toggle-form" method="post" action="{{ url_for('set_ui_view_mode') }}">
-                  <input type="hidden" name="mode" value="builder">
-                  <input type="hidden" name="next" value="{{ next_href }}">
-                  <button type="submit" class="btn btn-sm {{ toggle_outline }} {% if is_builder_view %}active{% endif %}">Builder View</button>
-                </form>
                 {% if current_user.role == 'admin' %}
                 <form class="view-toggle-form" method="post" action="{{ url_for('set_ui_view_mode') }}">
                   <input type="hidden" name="mode" value="admin">
@@ -101,6 +91,16 @@
                   <button type="submit" class="btn btn-sm {{ toggle_outline }} {% if is_admin_view %}active{% endif %}">Admin View</button>
                 </form>
                 {% endif %}
+                <form class="view-toggle-form" method="post" action="{{ url_for('set_ui_view_mode') }}">
+                  <input type="hidden" name="mode" value="builder">
+                  <input type="hidden" name="next" value="{{ next_href }}">
+                  <button type="submit" class="btn btn-sm {{ toggle_outline }} {% if is_builder_view %}active{% endif %}">Builder View</button>
+                </form>
+                <form class="view-toggle-form" method="post" action="{{ url_for('set_ui_view_mode') }}">
+                  <input type="hidden" name="mode" value="participant">
+                  <input type="hidden" name="next" value="{{ next_href }}">
+                  <button type="submit" class="btn btn-sm {{ toggle_outline }} {% if ui_view_mode == 'participant' %}active{% endif %}">Participant View</button>
+                </form>
               </div>
             {% endif %}
           </div>
