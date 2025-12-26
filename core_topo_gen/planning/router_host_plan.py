@@ -196,14 +196,18 @@ def plan_r2s_grouping(
         """Allocate subnets for router/group.
 
         Temporary policy: ALL subnets are /24. We allocate a dedicated /24 for the
-        router<->switch link and a separate dedicated /24 for the LAN behind the switch.
+        router<->switch link and the LAN behind the switch.
+
+        Addressing invariant: the router interface connected to an L2 switch and all
+        nodes attached to that switch must share ONE common subnet.
         """
         if subnet_alloc is None:
             raise RuntimeError("Subnet allocator unavailable; cannot allocate /24 subnets.")
         try:
-            rsw_net = subnet_alloc.next_subnet(DEFAULT_IPV4_PREFIXLEN)
-            lan_net = subnet_alloc.next_subnet(DEFAULT_IPV4_PREFIXLEN)
-            return str(rsw_net), str(lan_net)
+            shared_net = subnet_alloc.next_subnet(DEFAULT_IPV4_PREFIXLEN)
+            # Return the same subnet for both fields for backward compatibility with
+            # existing payload consumers.
+            return str(shared_net), str(shared_net)
         except Exception as e:
             raise RuntimeError(f"Failed to allocate /24 subnets for router {router_id} group {group_idx}: {e}")
 
@@ -303,24 +307,23 @@ def plan_r2s_grouping(
                 switch_nodes.append({'node_id': next_switch_id, 'name': f"rsw-{rid}-1"})
                 host_if_ips: Dict[int, str] = {}
                 try:
-                    lan_net = ipaddress.ip_network(lan_subnet, strict=False)
-                    lan_hosts = list(lan_net.hosts())
+                    shared_net = ipaddress.ip_network(lan_subnet, strict=False)
+                    shared_hosts = list(shared_net.hosts())
                 except Exception:
-                    lan_hosts = []
+                    shared_net = None
+                    shared_hosts = []
                 for idx_h, h_id in enumerate(host_list_sorted):
-                    if lan_hosts and idx_h + 2 < len(lan_hosts):
-                        host_if_ips[h_id] = f"{lan_hosts[idx_h + 2]}/{lan_net.prefixlen}"
+                    # Router consumes the first usable address; hosts start from the second usable.
+                    if shared_hosts and idx_h + 1 < len(shared_hosts):
+                        host_if_ips[h_id] = f"{shared_hosts[idx_h + 1]}/{shared_net.prefixlen}"
                 router_ip = None
-                switch_ip = None
                 try:
-                    rsw_net = ipaddress.ip_network(rsw_subnet, strict=False)
-                    rsw_hosts = list(rsw_net.hosts())
-                    if len(rsw_hosts) >= 2:
-                        router_ip = f"{rsw_hosts[0]}/{rsw_net.prefixlen}"
-                        switch_ip = f"{rsw_hosts[1]}/{rsw_net.prefixlen}"
+                    if shared_hosts:
+                        router_ip = f"{shared_hosts[0]}/{shared_net.prefixlen}"
                 except Exception:
                     pass
-                switches_detail.append({'switch_id': next_switch_id, 'router_id': rid, 'hosts': host_list_sorted, 'rsw_subnet': rsw_subnet, 'lan_subnet': lan_subnet, 'router_ip': router_ip, 'switch_ip': switch_ip, 'host_if_ips': host_if_ips})
+                # switch_ip intentionally omitted (L2 switch).
+                switches_detail.append({'switch_id': next_switch_id, 'router_id': rid, 'hosts': host_list_sorted, 'rsw_subnet': rsw_subnet, 'lan_subnet': lan_subnet, 'router_ip': router_ip, 'switch_ip': None, 'host_if_ips': host_if_ips})
                 next_switch_id += 1
                 r2s_counts[rid] = 1
                 r2s_host_pairs_used[rid] = len(host_list_sorted) // 2
@@ -334,16 +337,14 @@ def plan_r2s_grouping(
                 router_switch_subnets.append(rsw_subnet)
                 lan_subnets.append(lan_subnet)
                 router_ip = None
-                switch_ip = None
                 try:
-                    rsw_net = ipaddress.ip_network(rsw_subnet, strict=False)
-                    rsw_hosts = list(rsw_net.hosts())
-                    if len(rsw_hosts) >= 2:
-                        router_ip = f"{rsw_hosts[0]}/{rsw_net.prefixlen}"
-                        switch_ip = f"{rsw_hosts[1]}/{rsw_net.prefixlen}"
+                    shared_net = ipaddress.ip_network(lan_subnet, strict=False)
+                    shared_hosts = list(shared_net.hosts())
+                    if shared_hosts:
+                        router_ip = f"{shared_hosts[0]}/{shared_net.prefixlen}"
                 except Exception:
                     pass
-                switches_detail.append({'switch_id': next_switch_id, 'router_id': rid, 'hosts': list(group), 'rsw_subnet': rsw_subnet, 'lan_subnet': lan_subnet, 'router_ip': router_ip, 'switch_ip': switch_ip, 'host_if_ips': {}})
+                switches_detail.append({'switch_id': next_switch_id, 'router_id': rid, 'hosts': list(group), 'rsw_subnet': rsw_subnet, 'lan_subnet': lan_subnet, 'router_ip': router_ip, 'switch_ip': None, 'host_if_ips': {}})
                 switch_nodes.append({'node_id': next_switch_id, 'name': f"rsw-{rid}-{gi+1}"})
                 next_switch_id += 1
             r2s_counts[rid] = len(groups)
@@ -400,16 +401,14 @@ def plan_r2s_grouping(
             router_switch_subnets.append(rsw_subnet)
             lan_subnets.append(lan_subnet)
             router_ip = None
-            switch_ip = None
             try:
-                rsw_net = ipaddress.ip_network(rsw_subnet, strict=False)
-                rsw_hosts = list(rsw_net.hosts())
-                if len(rsw_hosts) >= 2:
-                    router_ip = f"{rsw_hosts[0]}/{rsw_net.prefixlen}"
-                    switch_ip = f"{rsw_hosts[1]}/{rsw_net.prefixlen}"
+                shared_net = ipaddress.ip_network(lan_subnet, strict=False)
+                shared_hosts = list(shared_net.hosts())
+                if shared_hosts:
+                    router_ip = f"{shared_hosts[0]}/{shared_net.prefixlen}"
             except Exception:
                 pass
-            switches_detail.append({'switch_id': next_switch_id, 'router_id': rid, 'hosts': list(group), 'rsw_subnet': rsw_subnet, 'lan_subnet': lan_subnet, 'router_ip': router_ip, 'switch_ip': switch_ip, 'host_if_ips': {}})
+            switches_detail.append({'switch_id': next_switch_id, 'router_id': rid, 'hosts': list(group), 'rsw_subnet': rsw_subnet, 'lan_subnet': lan_subnet, 'router_ip': router_ip, 'switch_ip': None, 'host_if_ips': {}})
             switch_nodes.append({'node_id': next_switch_id, 'name': f"rsw-{rid}-{gi+1}"})
             next_switch_id += 1
         r2s_counts[rid] = len(groups)

@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 
 from ..constants import DEFAULT_IPV4_PREFIXLEN
 from ..types import NodeInfo
-from ..utils.services import mark_node_as_router
+from ..utils.services import mark_node_as_router, set_node_services
 
 try:  # pragma: no cover - exercised with real CORE installs
     from core.api.grpc.wrappers import NodeType, Position, Interface  # type: ignore
@@ -517,9 +517,9 @@ def _link_node_to_router(
     iface_id_cache: Dict[int, int],
     rng,
     name_seed: str,
-) -> Tuple[bool, Optional[int], Optional[Any], Optional[Any]]:
+) -> Tuple[bool, Optional[int], Optional[Any], Optional[Any], Optional[Any]]:
     if not router_candidates:
-        return False, None, None, None
+        return False, None, None, None, None
     try:
         choice_idx = int(rng() * len(router_candidates)) % len(router_candidates)
     except Exception:
@@ -530,7 +530,7 @@ def _link_node_to_router(
         router_node = router_candidates[0]
     router_id = _extract_node_id(router_node, 0)
     if router_id is None:
-        return False, None, None, None
+        return False, None, None, None, None
     router_iface_id = _next_iface_id(router_node, iface_id_cache)
     new_iface_id = _next_iface_id(new_node, iface_id_cache)
     # CORE renames Linux veth interfaces to Interface.name; Linux ifnames are limited
@@ -546,7 +546,62 @@ def _link_node_to_router(
     except Exception:
         new_iface = None
     linked = _link_nodes(session, new_node, router_node, new_iface, router_iface)
-    return linked, router_id, new_iface, router_iface
+    return linked, router_id, new_iface, router_iface, router_node
+
+
+def _get_node_services_best_effort(session: Any, node_id: int, node_obj: Optional[Any] = None) -> List[str]:
+    """Return enabled services for a node using the most likely CORE wrapper APIs.
+
+    Returns [] if the service list cannot be determined.
+    """
+    current_raw: Optional[List[Any]] = None
+    try:
+        if hasattr(session, "services") and hasattr(session.services, "get"):
+            try:
+                current_raw = list(session.services.get(node_id) or [])
+            except Exception:
+                current_raw = None
+            if (not current_raw) and node_obj is not None:
+                try:
+                    current_raw = list(session.services.get(node_obj) or [])
+                except Exception:
+                    current_raw = current_raw or None
+    except Exception:
+        current_raw = None
+
+    if (not current_raw) and node_obj is not None:
+        try:
+            cur = getattr(node_obj, "services", None)
+            if isinstance(cur, (list, tuple)):
+                current_raw = list(cur)
+        except Exception:
+            current_raw = None
+
+    if not current_raw:
+        return []
+
+    normalized: List[str] = []
+    seen: Set[str] = set()
+    for item in current_raw:
+        name: Optional[str] = None
+        try:
+            if isinstance(item, str):
+                name = item
+            else:
+                # CORE wrappers may return service objects; prefer their declared name.
+                cand = getattr(item, "name", None)
+                if isinstance(cand, str) and cand.strip():
+                    name = cand
+                else:
+                    name = str(item)
+        except Exception:
+            continue
+        name = (name or "").strip()
+        if not name or name in seen:
+            continue
+        normalized.append(name)
+        seen.add(name)
+    return normalized
 
 
 def _prepare_rj45_options(node: Any, iface_name: str) -> None:
@@ -712,7 +767,7 @@ def attach_hitl_rj45_nodes(
                             idx,
                             used_hitl_link_networks,
                         )
-                        uplink_linked, uplink_router_id, new_router_iface_obj, peer_router_iface_obj = _link_node_to_router(
+                        uplink_linked, uplink_router_id, new_router_iface_obj, peer_router_iface_obj, uplink_router_node = _link_node_to_router(
                             session,
                             target_node,
                             router_candidates,
@@ -723,6 +778,27 @@ def attach_hitl_rj45_nodes(
                         if link_ips_candidate:
                             _apply_iface_ip(new_router_iface_obj, link_ips_candidate.get("new_router_ip4"), link_ips_candidate.get("prefix_len"))
                             _apply_iface_ip(peer_router_iface_obj, link_ips_candidate.get("existing_router_ip4"), link_ips_candidate.get("prefix_len"))
+                        # When HITL requests a new router, mirror the routing stack/services of the
+                        # router we're attaching to (RIP/OSPF/zebra/etc.). This keeps protocol
+                        # behavior consistent without needing additional UI inputs.
+                        try:
+                            if uplink_router_id is not None:
+                                peer_services = _get_node_services_best_effort(session, int(uplink_router_id), uplink_router_node)
+                                if peer_services:
+                                    set_node_services(session, router_id, peer_services, node_obj=target_node)
+                                    # Keep baseline router services even if peer is missing them.
+                                    mark_node_as_router(target_node, session)
+                                else:
+                                    # Some CORE wrappers can set services but cannot reliably read them.
+                                    # Fall back to the peer router's routing_protocol attribute set by
+                                    # our topology builder (e.g., 'RIP', 'OSPFv2', 'OSPFv3').
+                                    peer_proto = getattr(uplink_router_node, "routing_protocol", None) if uplink_router_node is not None else None
+                                    if isinstance(peer_proto, str) and peer_proto.strip():
+                                        desired = ["IPForward", "zebra", peer_proto.strip()]
+                                        set_node_services(session, router_id, desired, node_obj=target_node)
+                        except Exception:
+                            # Best-effort only; do not fail HITL attachment if service APIs are missing.
+                            pass
                     router_nodes.append(target_node)
                     router_node_ids.add(router_id)
                     break
@@ -753,7 +829,7 @@ def attach_hitl_rj45_nodes(
                     assignment_kind = "network"
                     anchor = network_node
                     if router_nodes:
-                        uplink_linked, uplink_router_id, _, _ = _link_node_to_router(
+                            uplink_linked, uplink_router_id, _, _, _ = _link_node_to_router(
                             session,
                             network_node,
                             router_nodes,

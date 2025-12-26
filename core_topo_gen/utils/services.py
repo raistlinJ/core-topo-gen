@@ -352,12 +352,65 @@ def set_node_services(session: object, node_id: int, services: List[str], node_o
                 logger.info("Filtered DefaultRoute from DOCKER node %s service set", node_id)
     except Exception:
         pass
+    def _read_back() -> List[str]:
+        cur: List[str] = []
+        try:
+            if hasattr(session, "services") and hasattr(session.services, "get"):
+                try:
+                    cur = list(session.services.get(node_id) or [])
+                except Exception:
+                    cur = []
+                if (not cur) and node_obj is not None:
+                    try:
+                        cur = list(session.services.get(node_obj) or [])
+                    except Exception:
+                        cur = cur or []
+        except Exception:
+            cur = []
+        # Normalize potential service objects to strings
+        normalized: List[str] = []
+        seen_local = set()
+        for it in cur:
+            try:
+                if isinstance(it, str):
+                    name = it
+                else:
+                    name = getattr(it, "name", None) if hasattr(it, "name") else None
+                    if not isinstance(name, str) or not name.strip():
+                        name = str(it)
+                name = (name or "").strip()
+            except Exception:
+                continue
+            if not name or name in seen_local:
+                continue
+            normalized.append(name)
+            seen_local.add(name)
+        return normalized
+
+    requested = set(ordered)
     try:
         if hasattr(session, "services") and hasattr(session.services, "set"):
+            # Some CORE wrapper versions accept node_id, others require node_obj.
+            # Try node_id first for compatibility.
             session.services.set(node_id, tuple(ordered))
-            logger.debug("Set services on node %s -> %s", node_id, ", ".join(ordered))
-            return True
+            if requested:
+                current = set(_read_back())
+                if requested.issubset(current):
+                    logger.debug("Set services on node %s -> %s", node_id, ", ".join(ordered))
+                    return True
+            # If it didn't stick (or get() not available), retry with node_obj when available.
+            if node_obj is not None:
+                try:
+                    session.services.set(node_obj, tuple(ordered))
+                    logger.debug("Set services on node %s (node_obj) -> %s", node_id, ", ".join(ordered))
+                    return True
+                except Exception as e:
+                    logger.debug("session.services.set(node_obj) failed for node %s: %s", node_id, e)
+            # If we cannot verify and no node_obj, treat as best-effort.
+            if not requested:
+                return True
     except Exception as e:
+        # TypeError/AttributeError/etc; fall through to clear+add loop
         logger.debug("session.services.set failed for node %s: %s", node_id, e)
     try:
         if hasattr(session, "services") and hasattr(session.services, "clear"):

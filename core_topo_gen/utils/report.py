@@ -54,6 +54,18 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(value)
+
+
 def write_report(
     out_path: str,
     scenario_name: Optional[str],
@@ -129,6 +141,14 @@ def write_report(
     except Exception:
         pass
     lines.append(f"- Total nodes: {total_nodes}")
+    # Preview parity (only shown when metadata provides these fields)
+    try:
+        if metadata and ('preview_attached' in metadata or 'preview_realized' in metadata):
+            pa = _boolish(metadata.get('preview_attached'))
+            pr = _boolish(metadata.get('preview_realized'))
+            lines.append(f"- Preview parity: attached={pa} realized={pr}")
+    except Exception:
+        pass
     # Base host pool removed; show additive breakdown only if provided
     try:
         if metadata:

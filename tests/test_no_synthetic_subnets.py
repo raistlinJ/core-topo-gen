@@ -18,6 +18,9 @@ def test_grouping_no_legacy_synthetic_subnets():
     host_router_map = {i+1: (i % routers)+1 for i in range(4)}
     hosts = [DummyHost(i+1) for i in range(4)]
     out = plan_r2s_grouping(routers, host_router_map, hosts, routing_items=[DummyRoutingItem()], r2s_policy={'mode':'Exact','target_per_router':1}, seed=1234)
+    # Addressing invariant: router<->switch and all hosts behind the switch share ONE subnet.
+    for detail in out.get('switches_detail') or []:
+        assert detail.get('rsw_subnet') == detail.get('lan_subnet'), f"Expected shared subnet, got rsw_subnet={detail.get('rsw_subnet')} lan_subnet={detail.get('lan_subnet')}"
     for subnet in out['router_switch_subnets'] + out['lan_subnets']:
         assert not subnet.startswith('10.254.'), f"Found legacy synthetic subnet {subnet}"
         assert not subnet.startswith('10.253.'), f"Found legacy synthetic subnet {subnet}"

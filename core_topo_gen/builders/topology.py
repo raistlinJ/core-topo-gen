@@ -1438,6 +1438,7 @@ def _try_build_segmented_topology_from_preview(
 
     hosts_attached: Set[int] = set()
     host_switch_assignment: Dict[int, int] = {}
+    used_ipv4_addrs: Set[str] = set()
 
     for detail in switches_detail:
         try:
@@ -1462,33 +1463,62 @@ def _try_build_segmented_topology_from_preview(
             lan_net = ipaddress.ip_network(lan_subnet, strict=False) if lan_subnet else None
         except Exception:
             lan_net = None
-        rsw_hosts = list(rsw_net.hosts()) if rsw_net else []
-        lan_hosts = list(lan_net.hosts()) if lan_net else []
-        if (not router_ip or '/' not in str(router_ip)) and rsw_hosts:
-            router_ip = f"{rsw_hosts[0]}/{rsw_net.prefixlen}"
-        if (not switch_ip or '/' not in str(switch_ip)) and len(rsw_hosts) >= 2:
-            switch_ip = f"{rsw_hosts[1]}/{rsw_net.prefixlen}"
+        # IMPORTANT: Router<->switch and all hosts attached to that switch must share ONE subnet.
+        # Prefer the LAN subnet when provided; otherwise fall back to rsw_subnet.
+        shared_net = lan_net or rsw_net
+        shared_hosts = list(shared_net.hosts()) if shared_net else []
+        if lan_net and rsw_net and (lan_net.network_address != rsw_net.network_address or lan_net.prefixlen != rsw_net.prefixlen):
+            logger.warning(
+                "[preview] subnet mismatch for switch %s (router %s): rsw_subnet=%s lan_subnet=%s; using lan_subnet for all attachments",
+                sid,
+                router_id,
+                rsw_subnet,
+                lan_subnet,
+            )
 
-        if router_ip and '/' in router_ip:
-            r_ip_val, r_mask = router_ip.split('/', 1)
-            r_mask_int = int(r_mask)
+        # Router IP: force to the first usable address on the shared subnet.
+        # Ignore switch_ip entirely; switches are L2 and should not own gateway IPs.
+        if shared_hosts:
+            r_ip_val = str(shared_hosts[0])
+            r_mask_int = int(shared_net.prefixlen)
         else:
-            r_ip_val = router_ip or None
-            r_mask_int = rsw_net.prefixlen if rsw_net else 30
+            # Last-resort fallback when no subnet is available.
+            if router_ip and '/' in str(router_ip):
+                r_ip_val, r_mask = str(router_ip).split('/', 1)
+                r_mask_int = int(r_mask)
+            else:
+                r_ip_val = None
+                r_mask_int = 24
+        s_ip_val = None
+        s_mask_int = r_mask_int
 
-        if switch_ip and '/' in switch_ip:
-            s_ip_val, s_mask = switch_ip.split('/', 1)
-            s_mask_int = int(s_mask)
-        else:
-            s_ip_val = switch_ip or None
-            s_mask_int = rsw_net.prefixlen if rsw_net else r_mask_int
+        # Canonicalize the "shared" subnet to the router's actual interface subnet.
+        # This guarantees host IPs match the router<->switch link even if preview data
+        # contains mismatched rsw_subnet vs lan_subnet.
+        try:
+            if r_ip_val:
+                router_link_net = ipaddress.ip_network(f"{r_ip_val}/{r_mask_int}", strict=False)
+                if shared_net and (router_link_net.network_address != shared_net.network_address or router_link_net.prefixlen != shared_net.prefixlen):
+                    logger.warning(
+                        "[preview] overriding shared subnet for switch %s (router %s) from %s to router link %s",
+                        sid,
+                        router_id,
+                        shared_net,
+                        router_link_net,
+                    )
+                shared_net = router_link_net
+                shared_hosts = list(shared_net.hosts())
+        except Exception:
+            pass
 
         r_ifid = router_next_ifid[router_id]
         router_next_ifid[router_id] += 1
         base_name = f"r{router_id}-rsw{sid}"
         r_iface_name = _ensure_router_iface_name(router_iface_names, router_id, base_name)
         r_iface = Interface(id=r_ifid, name=r_iface_name, ip4=r_ip_val, ip4_mask=r_mask_int, mac=mac_alloc.next_mac())
-        sw_iface = Interface(id=0, name=f"{getattr(sw_node, 'name', f'rsw-{sid}')}-r{router_id}", ip4=s_ip_val, ip4_mask=s_mask_int, mac=mac_alloc.next_mac())
+        # Force switch-side interface to have no IPv4; some CORE builds auto-assign
+        # addresses unless we explicitly send empty/0 values.
+        sw_iface = Interface(id=0, name=f"{getattr(sw_node, 'name', f'rsw-{sid}')}-r{router_id}", ip4="", ip4_mask=0, mac=mac_alloc.next_mac())
         safe_add_link(session, router_node, sw_node, iface1=r_iface, iface2=sw_iface)
         link_counters['attempts'] += 1
         link_counters['success'] += 1
@@ -1518,22 +1548,38 @@ def _try_build_segmented_topology_from_preview(
                     logger.debug("[preview] host %s already attached to switch %s; skipping duplicate entry", hid, sid)
                 continue
             ip_str = host_if_ips.get(hid)
-            if not ip_str and lan_hosts:
-                assign_idx = min(index + 1, len(lan_hosts) - 1)
+            # Only accept explicit host IPs that belong to the shared subnet.
+            ip_iface = None
+            if ip_str and '/' in str(ip_str):
                 try:
-                    ip_str = f"{lan_hosts[assign_idx]}/{lan_net.prefixlen}"
+                    ip_iface = ipaddress.ip_interface(str(ip_str))
+                    if shared_net and ip_iface.network != shared_net:
+                        ip_iface = None
                 except Exception:
-                    ip_str = None
-            if ip_str and '/' in ip_str:
-                hip_val, hip_mask = ip_str.split('/', 1)
-                hip_mask_int = int(hip_mask)
+                    ip_iface = None
+
+            if ip_iface is None and shared_hosts:
+                # Allocate from shared subnet, skipping router's first usable address.
+                # Start at shared_hosts[1] (typically .2).
+                assign_idx = min(index + 1, len(shared_hosts) - 1)
+                # Ensure global uniqueness as well.
+                while assign_idx < len(shared_hosts) and str(shared_hosts[assign_idx]) in used_ipv4_addrs:
+                    assign_idx += 1
+                if assign_idx < len(shared_hosts):
+                    ip_iface = ipaddress.ip_interface(f"{shared_hosts[assign_idx]}/{shared_net.prefixlen}")
+
+            if ip_iface is not None:
+                hip_val = str(ip_iface.ip)
+                hip_mask_int = int(ip_iface.network.prefixlen)
             else:
-                hip_val = None if not ip_str else str(ip_str)
-                hip_mask_int = lan_net.prefixlen if lan_net else 24
+                hip_val = None
+                hip_mask_int = int(shared_net.prefixlen) if shared_net else 24
             iface_id = host_next_ifid[hid]
             host_iface = Interface(id=iface_id, name=f"eth{iface_id}", ip4=hip_val, ip4_mask=hip_mask_int, mac=mac_alloc.next_mac())
-            gateway_ip = str(lan_hosts[0]) if lan_hosts else None
-            sw_host_iface = Interface(id=index + 1, name=f"{getattr(sw_node, 'name', 'rsw')}-h{hid}", ip4=gateway_ip, ip4_mask=(lan_net.prefixlen if lan_net else hip_mask_int), mac=mac_alloc.next_mac())
+            # Switches are L2; do not assign a gateway IP on the switch interface.
+            # Switches are L2; do not assign a gateway IP on the switch interface.
+            # Use empty/0 to avoid CORE auto-allocation.
+            sw_host_iface = Interface(id=index + 1, name=f"{getattr(sw_node, 'name', 'rsw')}-h{hid}", ip4="", ip4_mask=0, mac=mac_alloc.next_mac())
             if safe_add_link(session, host_node, sw_node, iface1=host_iface, iface2=sw_host_iface):
                 host_next_ifid[hid] += 1
                 link_counters['attempts'] += 1
@@ -1542,6 +1588,7 @@ def _try_build_segmented_topology_from_preview(
                 host_switch_assignment[hid] = sid
                 if hip_val:
                     host_primary_ips[hid] = f"{hip_val}/{hip_mask_int}"
+                    used_ipv4_addrs.add(str(hip_val))
             else:
                 logger.warning("[preview] failed to link host %s to switch %s; host may remain unattached", hid, sid)
 
@@ -1765,8 +1812,29 @@ def build_segmented_topology(core,
                              docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None,
                              router_mesh_style: str = "full",
                              preview_plan: Optional[Dict[str, Any]] = None):
+    def _preview_payload_present(payload: Optional[Dict[str, Any]]) -> bool:
+        """Return True when caller provided a preview-like payload (not just a seed override)."""
+        if not isinstance(payload, dict):
+            return False
+        # Keys that indicate a full preview payload from planning.full_preview
+        previewish_keys = {
+            'routers',
+            'hosts',
+            'switches',
+            'switches_detail',
+            'layout_positions',
+            'host_router_map',
+            'r2r_links_preview',
+            'r2r_edges_preview',
+            'r2s_grouping_preview',
+            'services_preview',
+        }
+        return any(k in payload for k in previewish_keys)
+
     expected_switch_ids: Set[int] = set()
     if preview_plan:
+        allow_preview_fallback = _env_flag("CORETG_ALLOW_PREVIEW_FALLBACK", default_on=False)
+        require_exact_preview = _preview_payload_present(preview_plan) and not allow_preview_fallback
         preview_result = _try_build_segmented_topology_from_preview(
             core=core,
             services=services,
@@ -1779,6 +1847,19 @@ def build_segmented_topology(core,
         )
         if preview_result is not None:
             return preview_result
+        if require_exact_preview:
+            issues: List[str] = []
+            try:
+                from ..planning.preview_validation import validate_full_preview  # local import to avoid cycles
+                issues = validate_full_preview(preview_plan)
+            except Exception:
+                issues = []
+            detail = ("; ".join(issues[:8]) + ("; ..." if len(issues) > 8 else "")) if issues else "(no validation details)"
+            raise RuntimeError(
+                "Preview plan was provided but could not be realized exactly; refusing to fall back to a randomized build. "
+                "Set CORETG_ALLOW_PREVIEW_FALLBACK=1 to permit fallback. "
+                f"Preview validation: {detail}"
+            )
         try:
             switches_decl = preview_plan.get('switches') or []
             for sw in switches_decl:
@@ -2661,6 +2742,8 @@ def build_segmented_topology(core,
         grouping_preview = (grouping_out or {}).get('grouping_preview')
 
         created_switch_nodes: Dict[int, Any] = {}
+        switch_shared_net: Dict[int, Any] = {}
+        switch_used_ipv4: Dict[int, Set[str]] = defaultdict(set)
         switch_offsets: Dict[int, int] = {rid: 0 for rid in range(1, router_count + 1)}
         rehomed_hosts: List[int] = []
         router_switch_counts: Dict[int, int] = defaultdict(int)
@@ -2706,38 +2789,56 @@ def build_segmented_topology(core,
                 router_ip_raw = detail.get('router_ip')
                 switch_ip_raw = detail.get('switch_ip')
                 rsw_subnet = detail.get('rsw_subnet')
+                lan_subnet = detail.get('lan_subnet')
+                # One subnet for router<->switch and all hosts behind this switch.
+                shared_net = None
+                try:
+                    if lan_subnet:
+                        shared_net = ipaddress.ip_network(lan_subnet, strict=False)
+                except Exception:
+                    shared_net = None
+                if shared_net is None:
+                    try:
+                        if rsw_subnet:
+                            shared_net = ipaddress.ip_network(rsw_subnet, strict=False)
+                    except Exception:
+                        shared_net = None
+                switch_shared_net[switch_id] = shared_net
+
                 r_ip = router_ip_raw
                 s_ip = switch_ip_raw
                 mask_len = None
-                if not r_ip or '/' not in str(r_ip) or not s_ip or '/' not in str(s_ip):
-                    if rsw_subnet:
-                        try:
-                            rsw_net = ipaddress.ip_network(rsw_subnet, strict=False)
-                            hosts_iter = list(rsw_net.hosts())
-                            if hosts_iter:
-                                r_ip = r_ip or f"{hosts_iter[0]}/{rsw_net.prefixlen}"
-                            if len(hosts_iter) >= 2:
-                                s_ip = s_ip or f"{hosts_iter[1]}/{rsw_net.prefixlen}"
-                        except Exception:
-                            pass
+                if shared_net is not None:
+                    hosts_iter = list(shared_net.hosts())
+                    if hosts_iter:
+                        r_ip = f"{hosts_iter[0]}/{shared_net.prefixlen}"
+                        # Switch gets no IP (L2)
+                        s_ip = None
+                        mask_len = int(shared_net.prefixlen)
                 if r_ip and '/' in str(r_ip):
                     r_ip_val, mask = str(r_ip).split('/', 1)
-                    mask_len = int(mask)
-                else:
-                    r_ip_val = None
-                if s_ip and '/' in str(s_ip):
-                    s_ip_val, mask = str(s_ip).split('/', 1)
                     mask_len = mask_len or int(mask)
                 else:
-                    s_ip_val = None
+                    r_ip_val = None
+                s_ip_val = None
                 if mask_len is None:
-                    mask_len = 30
+                    mask_len = 24
+
+                # Canonicalize the shared subnet to the router's actual interface subnet so
+                # host IP allocation cannot drift to a different subnet.
+                try:
+                    if r_ip_val:
+                        router_link_net = ipaddress.ip_network(f"{r_ip_val}/{mask_len}", strict=False)
+                        switch_shared_net[switch_id] = router_link_net
+                except Exception:
+                    pass
                 r_ifid = router_next_ifid.get(router_id, 0)
                 router_next_ifid[router_id] = r_ifid + 1
                 base_name = f"r{router_id}-rsw{switch_id}-if{r_ifid}"
                 r_iface_name = _ensure_router_iface_name(router_iface_names, router_id, base_name)
                 r_iface = Interface(id=r_ifid, name=r_iface_name, ip4=r_ip_val, ip4_mask=mask_len, mac=mac_alloc.next_mac())
-                sw_iface = Interface(id=0, name=f"{getattr(sw_node, 'name', f'rsw-{switch_id}')}-r{router_id}", ip4=s_ip_val, ip4_mask=mask_len, mac=mac_alloc.next_mac())
+                # Switch is L2: no IPv4 on the switch interface (use empty/0 to prevent auto-allocation).
+                sw_iface = Interface(id=0, name=f"{getattr(sw_node, 'name', f'rsw-{switch_id}')}-r{router_id}", ip4="", ip4_mask=0, mac=mac_alloc.next_mac())
                 safe_add_link(session, router_node, sw_node, iface1=r_iface, iface2=sw_iface)
 
             # Attach hosts for this switch
@@ -2750,16 +2851,15 @@ def build_segmented_topology(core,
                     host_if_ips[int(hk)] = str(hv)
                 except Exception:
                     continue
-            lan_net = None
-            lan_hosts: List[ipaddress.IPv4Address] = []
-            if lan_subnet:
+            # Use the same subnet as the router-switch link.
+            lan_net = switch_shared_net.get(switch_id)
+            if lan_net is None and lan_subnet:
                 try:
                     lan_net = ipaddress.ip_network(lan_subnet, strict=False)
-                    lan_hosts = list(lan_net.hosts())
+                    switch_shared_net[switch_id] = lan_net
                 except Exception:
                     lan_net = None
-                    lan_hosts = []
-            gateway_ip = str(lan_hosts[0]) if lan_hosts else None
+            lan_hosts: List[ipaddress.IPv4Address] = list(lan_net.hosts()) if lan_net else []
             for idx, hid_raw in enumerate(host_ids_raw):
                 try:
                     hid = int(hid_raw)
@@ -2772,20 +2872,36 @@ def build_segmented_topology(core,
                     _remove_link(hid, router_id)
                 host_direct_link[hid] = False
                 ip_cidr = host_if_ips.get(hid)
-                if not ip_cidr and lan_net and len(lan_hosts) > (idx + 1):
-                    ip_cidr = f"{lan_hosts[idx + 1]}/{lan_net.prefixlen}"
-                if ip_cidr and '/' in ip_cidr:
-                    hip, mask = ip_cidr.split('/', 1)
-                    hip_mask = int(mask)
+                ip_iface = None
+                if ip_cidr and '/' in str(ip_cidr):
+                    try:
+                        ip_iface = ipaddress.ip_interface(str(ip_cidr))
+                        if lan_net and ip_iface.network != lan_net:
+                            ip_iface = None
+                    except Exception:
+                        ip_iface = None
+                if ip_iface is None and lan_net and len(lan_hosts) > (idx + 1):
+                    assign_idx = idx + 1
+                    while assign_idx < len(lan_hosts) and str(lan_hosts[assign_idx]) in switch_used_ipv4[switch_id]:
+                        assign_idx += 1
+                    if assign_idx < len(lan_hosts):
+                        ip_iface = ipaddress.ip_interface(f"{lan_hosts[assign_idx]}/{lan_net.prefixlen}")
+                if ip_iface is not None:
+                    hip = str(ip_iface.ip)
+                    hip_mask = int(ip_iface.network.prefixlen)
                 else:
-                    hip = ip_cidr or None
+                    hip = None
                     hip_mask = lan_net.prefixlen if lan_net else 24
                 next_if = host_next_ifid.get(hid, 1)
                 host_iface = Interface(id=next_if, name=f"eth{next_if}", ip4=hip, ip4_mask=hip_mask, mac=mac_alloc.next_mac())
                 host_next_ifid[hid] = next_if + 1
-                sw_iface = Interface(id=idx + 1, name=f"{getattr(created_switch_nodes[switch_id], 'name', f'rsw-{switch_id}')}-h{hid}-{idx+1}", ip4=gateway_ip, ip4_mask=hip_mask, mac=mac_alloc.next_mac())
+                # Switch is L2: no gateway IP on the switch interface.
+                # Switch is L2: no IPv4 on the switch interface (use empty/0 to prevent auto-allocation).
+                sw_iface = Interface(id=idx + 1, name=f"{getattr(created_switch_nodes[switch_id], 'name', f'rsw-{switch_id}')}-h{hid}-{idx+1}", ip4="", ip4_mask=0, mac=mac_alloc.next_mac())
                 safe_add_link(session, h_obj, created_switch_nodes[switch_id], iface1=host_iface, iface2=sw_iface)
                 rehomed_hosts.append(hid)
+                if hip:
+                    switch_used_ipv4[switch_id].add(str(hip))
 
             if host_ids_raw:
                 router_switch_counts[router_id] += 1

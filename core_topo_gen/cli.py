@@ -788,6 +788,18 @@ def main():
             router_mesh_style=args.router_mesh,
             preview_plan=preview_full,
         )
+        # Preview parity signal (authoritative when preview_full was provided)
+        try:
+            ts = getattr(session, 'topo_stats', None)
+            realized = bool(ts.get('preview_realized')) if isinstance(ts, dict) else False
+            logging.info("Preview parity: preview_attached=%s preview_realized=%s", bool(preview_full), realized)
+            try:
+                generation_meta['preview_attached'] = bool(preview_full)
+                generation_meta['preview_realized'] = realized
+            except Exception:
+                pass
+        except Exception:
+            pass
         # Merge topo stats if present
         try:
             ts = getattr(session, 'topo_stats', None)
@@ -807,6 +819,16 @@ def main():
             layout_density=args.layout_density,
             docker_slot_plan=docker_slot_plan,
         )
+        # Star topologies don't use preview realization, but log for consistency.
+        try:
+            logging.info("Preview parity: preview_attached=%s preview_realized=%s", bool(preview_full), False)
+            try:
+                generation_meta['preview_attached'] = bool(preview_full)
+                generation_meta['preview_realized'] = False
+            except Exception:
+                pass
+        except Exception:
+            pass
         # Align function return signature with segmented path
         router_protocols = {}
         routers = []

@@ -21,6 +21,10 @@ class StubSession:
         self.nodes: dict[int, Any] = {}
         self.links: list[tuple[int, int, Any, Any]] = []
         self.session_options: OptionsDict = OptionsDict()
+        self.services = _StubServices()
+
+    def add_service(self, node_id: int, service_name: str) -> None:
+        self.services.add(node_id, service_name)
 
     def add_node(self, node_id: int, _type: Any = None, position: Any = None, name: str | None = None) -> Any:
         node = SimpleNamespace(id=node_id, name=name or f"node-{node_id}", type=_type, position=position, ifaces=[], options=None)
@@ -63,6 +67,29 @@ class StubSession:
         if hasattr(value, "id"):
             return value
         return self.nodes[int(value)]
+
+
+class _StubServices:
+    def __init__(self) -> None:
+        self._by_node_id: dict[int, list[str]] = {}
+
+    def get(self, node_id_or_obj: Any) -> tuple[str, ...]:
+        node_id = int(getattr(node_id_or_obj, "id", node_id_or_obj))
+        return tuple(self._by_node_id.get(node_id, []))
+
+    def set(self, node_id_or_obj: Any, services: tuple[str, ...]) -> None:
+        node_id = int(getattr(node_id_or_obj, "id", node_id_or_obj))
+        self._by_node_id[node_id] = list(services)
+
+    def add(self, node_id_or_obj: Any, service_name: str) -> None:
+        node_id = int(getattr(node_id_or_obj, "id", node_id_or_obj))
+        cur = self._by_node_id.setdefault(node_id, [])
+        if service_name not in cur:
+            cur.append(service_name)
+
+    def clear(self, node_id_or_obj: Any) -> None:
+        node_id = int(getattr(node_id_or_obj, "id", node_id_or_obj))
+        self._by_node_id[node_id] = []
 
 
 def test_attach_hitl_rj45_nodes_creates_router_when_requested(monkeypatch) -> None:
@@ -131,6 +158,96 @@ def test_attach_hitl_rj45_nodes_creates_link_and_option() -> None:
     assert getattr(hitl_node.options, "interface", None) == "en0"
     assert (router.id, created_id) in {(a, b) for a, b, *_ in session.links} or (created_id, router.id) in {(a, b) for a, b, *_ in session.links}
     assert session.session_options["enablerj45"] == "1"
+
+
+def test_attach_hitl_new_router_clones_peer_router_services(monkeypatch) -> None:
+    session = StubSession()
+    router_type = getattr(NodeType, "ROUTER", getattr(NodeType, "DEFAULT", None))
+    peer_router = session.add_node(10, _type=router_type, position=Position(x=250, y=250), name="router-1")
+
+    # Give the peer router a representative routing stack.
+    for svc in ("IPForward", "zebra", "OSPFv2", "OSPFv3", "RIP"):
+        session.services.add(peer_router.id, svc)
+
+    routers = [NodeInfo(node_id=peer_router.id, ip4="10.0.0.1/24", role="Router")]
+    hosts: list[NodeInfo] = []
+    hitl_config = {
+        "enabled": True,
+        "interfaces": [
+            {"name": "eth1", "attachment": "new_router"},
+        ],
+        "scenario_key": "RouterPref",
+    }
+
+    def _fixed_rng(seed: str):
+        def _next() -> float:
+            return 0.0
+
+        return _next
+
+    monkeypatch.setattr(hitl_mod, "_make_deterministic_rng", _fixed_rng)
+
+    summary = attach_hitl_rj45_nodes(session, routers, hosts, hitl_config)
+
+    created_router_ids = summary.get("created_router_nodes", [])
+    assert created_router_ids, "expected a new router node to be created"
+    new_router_id = created_router_ids[0]
+
+    peer_services = set(session.services.get(peer_router.id))
+    new_services = set(session.services.get(new_router_id))
+
+    assert new_services == peer_services
+
+
+def test_hitl_get_node_services_normalizes_service_objects() -> None:
+    class _Svc:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class _Services:
+        def get(self, node_id_or_obj):
+            return (_Svc("IPForward"), _Svc("zebra"), _Svc("RIP"))
+
+    class _Session:
+        services = _Services()
+
+    names = hitl_mod._get_node_services_best_effort(_Session(), 1, None)
+    assert set(names) == {"IPForward", "zebra", "RIP"}
+
+
+def test_attach_hitl_new_router_falls_back_to_peer_routing_protocol(monkeypatch) -> None:
+    # Force the service read helper to return empty, simulating wrappers that can set
+    # services but cannot read them.
+    monkeypatch.setattr(hitl_mod, "_get_node_services_best_effort", lambda *args, **kwargs: [])
+
+    session = StubSession()
+    router_type = getattr(NodeType, "ROUTER", getattr(NodeType, "DEFAULT", None))
+    peer_router = session.add_node(10, _type=router_type, position=Position(x=250, y=250), name="router-1")
+    setattr(peer_router, "routing_protocol", "RIP")
+
+    routers = [NodeInfo(node_id=peer_router.id, ip4="10.0.0.1/24", role="Router")]
+    hosts: list[NodeInfo] = []
+    hitl_config = {
+        "enabled": True,
+        "interfaces": [{"name": "eth1", "attachment": "new_router"}],
+        "scenario_key": "RouterPref",
+    }
+
+    def _fixed_rng(seed: str):
+        def _next() -> float:
+            return 0.0
+
+        return _next
+
+    monkeypatch.setattr(hitl_mod, "_make_deterministic_rng", _fixed_rng)
+
+    summary = attach_hitl_rj45_nodes(session, routers, hosts, hitl_config)
+    created_router_ids = summary.get("created_router_nodes", [])
+    assert created_router_ids
+    new_router_id = created_router_ids[0]
+
+    # Should include RIP when peer routing_protocol is RIP.
+    assert set(session.services.get(new_router_id)) == {"IPForward", "zebra", "RIP"}
 
 
 def test_hitl_preview_router_added_to_full_preview(monkeypatch) -> None:

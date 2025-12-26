@@ -4664,7 +4664,7 @@ function buildFullPreviewModalGraph(full){
             if(r==null || r.node_id===undefined || r.node_id===null) return;
             const routerIdNum = Number(r.node_id);
             const isBridgeRouter = Number.isFinite(bridgeRouterIdNum) && routerIdNum === bridgeRouterIdNum;
-            addNode({id:r.node_id, label:r.name, type:'router', isBaseBridge: isBridgeRouter});
+            addNode({id:r.node_id, label:r.name, type:'router', ip4: r.ip4 || '', isBaseBridge: isBridgeRouter});
         });
         (full.hosts||[]).forEach(hn=>{
             if(hn==null) return;
@@ -4674,7 +4674,7 @@ function buildFullPreviewModalGraph(full){
             const assignment = Array.isArray(hn.vulnerabilities) ? hn.vulnerabilities : vulnerabilitiesByNode[keyStr] || vulnerabilitiesByNode[hostId] || [];
             const vulnList = Array.isArray(assignment) ? assignment : [];
             const hasVuln = vulnList.length > 0;
-            addNode({id:hostId, label:hn.name, type:'host', hasVuln: hasVuln, vulnerabilities: vulnList});
+            addNode({id:hostId, label:hn.name, type:'host', ip4: hn.ip4 || '', hasVuln: hasVuln, vulnerabilities: vulnList});
         });
         (full.switches_detail||[]).forEach(sw=>{
             if(sw==null) return;
@@ -5056,7 +5056,74 @@ function buildFullPreviewModalGraph(full){
             });
         }
 
-    const simLinks = filteredLinks.map(l=>({...l, source:l.sourceId, target:l.targetId}));
+        const simLinks = filteredLinks.map(l=>({...l, source:l.sourceId, target:l.targetId}));
+
+        // Build per-node interface/IP hints for hover tooltips.
+        function buildIfaceHints(preview){
+            const map = new Map();
+            const add = (id, line) => {
+                if(id === undefined || id === null || line == null) return;
+                const key = String(id);
+                const txt = String(line).trim();
+                if(!txt) return;
+                if(!map.has(key)) map.set(key, []);
+                const arr = map.get(key);
+                if(arr.length >= 20) return;
+                if(!arr.includes(txt)) arr.push(txt);
+            };
+
+            // Router-router links with explicit IPs (preferred)
+            try {
+                (preview.r2r_links_preview || []).forEach(link => {
+                    const routers = link && link.routers ? link.routers : null;
+                    if(!Array.isArray(routers) || routers.length !== 2) return;
+                    const a = routers[0];
+                    const b = routers[1];
+                    const aId = a && a.id !== undefined ? a.id : null;
+                    const bId = b && b.id !== undefined ? b.id : null;
+                    if(aId === null || bId === null) return;
+                    if(a.ip) add(aId, `to r${bId}: ${a.ip}`);
+                    if(b.ip) add(bId, `to r${aId}: ${b.ip}`);
+                });
+            } catch(e){}
+
+            // Router<->switch and host<->switch interface IPs
+            try {
+                (preview.switches_detail || []).forEach(sw => {
+                    if(!sw) return;
+                    const sid = sw.switch_id;
+                    const rid = sw.router_id;
+                    if(sw.router_ip) add(rid, `to sw${sid}: ${sw.router_ip}`);
+                    const hostIps = (sw.host_if_ips && typeof sw.host_if_ips === 'object') ? sw.host_if_ips : {};
+                    (sw.hosts || []).forEach(hid => {
+                        const ip = hostIps[String(hid)] || hostIps[hid];
+                        if(ip) add(hid, `to sw${sid}: ${ip}`);
+                    });
+                });
+            } catch(e){}
+
+            return map;
+        }
+
+        const ifaceHints = buildIfaceHints(full);
+
+        function nodeTitle(d){
+            const label = d.label || d.name || String(d.id);
+            const lines = [`${label} (${d.type || 'node'})`];
+            const ip4 = (d.ip4 || '').trim();
+            if(ip4) lines.push(`IP: ${ip4}`);
+            const extras = ifaceHints.get(String(d.id)) || [];
+            // HITL overlays: include any explicit peer/existing router IP hints
+            if(d.peerRouterIp4) extras.unshift(`peer: ${d.peerRouterIp4}`);
+            if(d.existingRouterIp4) extras.unshift(`uplink: ${d.existingRouterIp4}`);
+            if(extras.length){
+                lines.push('Interfaces:');
+                extras.slice(0, 12).forEach(x => lines.push(`- ${x}`));
+            } else {
+                lines.push('Interfaces: -');
+            }
+            return lines.join('\n');
+        }
 
         const isHitlLink = (kind) => typeof kind === 'string' && kind.startsWith('hitl');
         const link = zoomLayer.selectAll('line').data(simLinks).enter().append('line')
@@ -5080,6 +5147,8 @@ function buildFullPreviewModalGraph(full){
             })
             .attr('opacity', .9);
     const node = zoomLayer.selectAll('g').data(nodes).enter().append('g');
+        // Native SVG tooltip on hover
+        node.insert('title', ':first-child').text(d => nodeTitle(d));
         const vulnerabilityColor = '#28a745';
         const hasVulnerableHosts = nodes.some(n => n.type === 'host' && n.hasVuln);
         const normalNode = node.filter(d => !(d.type === 'host' && d.hasVuln));
@@ -5215,7 +5284,7 @@ function buildFullPreviewModalGraph(full){
     const traffic = full.traffic_summary || {};
     const tSend = {}; const tRecv = {};
     try { (traffic.flows || traffic || []).forEach(f=>{ const s=f.src_id??f.src; const d=f.dst_id??f.dst; if(s!==undefined) tSend[s]=(tSend[s]||0)+1; if(d!==undefined) tRecv[d]=(tRecv[d]||0)+1; }); } catch(e){}
-    // Tooltip functionality removed per request
+    // Hover tooltips use native SVG <title> (see nodeTitle)
     function dragstarted(event,d){
         try { event.sourceEvent?.stopPropagation?.(); } catch(e){}
         if(sim && !event.active) sim.alphaTarget(.35).restart();

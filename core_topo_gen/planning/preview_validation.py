@@ -21,8 +21,10 @@ def validate_full_preview(preview: Dict[str, Any]) -> List[str]:
 
     Invariants checked (intentionally minimal and fast):
     - All subnets are valid IPv4 networks and use DEFAULT_IPV4_PREFIXLEN.
-    - No duplicate subnet CIDRs across subnet lists.
-    - Switch details: router/switch IPs are in rsw_subnet; host_if_ips are in lan_subnet.
+        - No duplicate subnet CIDRs across ptp/r2r/router-switch subnet lists.
+            (lan_subnets may mirror router_switch_subnets under the single-subnet R2S policy.)
+        - Switch details: rsw_subnet and lan_subnet match (single shared subnet);
+            router/switch IPs and host_if_ips belong to that shared subnet.
     - R2R link details: per-router interface IPs belong to the declared link subnet.
     """
 
@@ -30,6 +32,9 @@ def validate_full_preview(preview: Dict[str, Any]) -> List[str]:
     if not isinstance(preview, dict):
         return ["preview is not a dict"]
 
+    # Only enforce global uniqueness for subnets that should not overlap across lists.
+    # Under the single-subnet router-to-switch policy, lan_subnets may intentionally
+    # mirror router_switch_subnets.
     all_subnets: List[str] = []
     for key in _SUBNET_KEYS:
         subnets = preview.get(key) or []
@@ -38,7 +43,8 @@ def validate_full_preview(preview: Dict[str, Any]) -> List[str]:
             continue
         for raw in subnets:
             s = str(raw)
-            all_subnets.append(s)
+            if key != "lan_subnets":
+                all_subnets.append(s)
             try:
                 net = ipaddress.ip_network(s, strict=False)
             except Exception as e:
@@ -79,18 +85,31 @@ def validate_full_preview(preview: Dict[str, Any]) -> List[str]:
                 issues.append(f"switch {switch_id} invalid subnet: {e}")
                 continue
 
-            for field in ("router_ip", "switch_ip"):
-                ip_cidr = detail.get(field)
-                if not ip_cidr:
-                    issues.append(f"switch {switch_id} missing {field}")
-                    continue
+            if rsw_net.network_address != lan_net.network_address or rsw_net.prefixlen != lan_net.prefixlen:
+                issues.append(f"switch {switch_id} subnet mismatch: rsw_subnet={rsw_net} lan_subnet={lan_net}")
+
+            shared_net = rsw_net
+
+            # router_ip is required; switch_ip is optional (switches are L2).
+            router_ip_cidr = detail.get("router_ip")
+            if not router_ip_cidr:
+                issues.append(f"switch {switch_id} missing router_ip")
+            else:
                 try:
-                    iface = ipaddress.ip_interface(str(ip_cidr))
+                    iface = ipaddress.ip_interface(str(router_ip_cidr))
+                    if iface.ip not in shared_net:
+                        issues.append(f"switch {switch_id} router_ip {router_ip_cidr} not in {shared_net}")
                 except Exception as e:
-                    issues.append(f"switch {switch_id} bad {field} {ip_cidr}: {e}")
-                    continue
-                if iface.ip not in rsw_net:
-                    issues.append(f"switch {switch_id} {field} {ip_cidr} not in {rsw_net}")
+                    issues.append(f"switch {switch_id} bad router_ip {router_ip_cidr}: {e}")
+
+            switch_ip_cidr = detail.get("switch_ip")
+            if switch_ip_cidr:
+                try:
+                    iface = ipaddress.ip_interface(str(switch_ip_cidr))
+                    if iface.ip not in shared_net:
+                        issues.append(f"switch {switch_id} switch_ip {switch_ip_cidr} not in {shared_net}")
+                except Exception as e:
+                    issues.append(f"switch {switch_id} bad switch_ip {switch_ip_cidr}: {e}")
 
             host_if_ips = detail.get("host_if_ips") or {}
             if isinstance(host_if_ips, dict):
@@ -102,8 +121,8 @@ def validate_full_preview(preview: Dict[str, Any]) -> List[str]:
                     except Exception as e:
                         issues.append(f"switch {switch_id} host {host_id} bad ip {ip_cidr}: {e}")
                         continue
-                    if iface.ip not in lan_net:
-                        issues.append(f"switch {switch_id} host {host_id} ip {ip_cidr} not in {lan_net}")
+                    if iface.ip not in shared_net:
+                        issues.append(f"switch {switch_id} host {host_id} ip {ip_cidr} not in {shared_net}")
             else:
                 issues.append(f"switch {switch_id} host_if_ips is not a dict")
 
