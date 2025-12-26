@@ -370,14 +370,38 @@ def build_full_preview(
         seed = random.randint(1, 2**31 - 1)
         seed_generated = True
     rnd_seed = seed
+    rnd = random.Random(rnd_seed)
+
+    # IP variety choices (seeded): pick a base private pool and subnet sizes
+    _PRIVATE_POOLS = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']
+    # allow some less-common preview pools for variety
+    _EXTRA_POOLS = ['100.64.0.0/10']
+    pool_candidates = list(_PRIVATE_POOLS) + list(_EXTRA_POOLS)
+    # If caller specified an explicit ip4_prefix, prefer it; otherwise pick one from candidates
+    chosen_base_pool = ip4_prefix if ip4_prefix and str(ip4_prefix).strip() else rnd.choice(pool_candidates)
+    # Choose LAN/subnet prefix lengths to vary per-preview (common sizes)
+    _LAN_PREFIX_OPTIONS = [24, 26, 22, 28]
+    chosen_lan_prefix = rnd.choice(_LAN_PREFIX_OPTIONS)
+    # Choose R2R prefix size (often /30 or /29 or /24); prefer /30 for P2P when possible
+    _R2R_PREFIX_OPTIONS = [30, 29, 28, DEFAULT_IPV4_PREFIXLEN]
+    chosen_r2r_prefix = rnd.choice(_R2R_PREFIX_OPTIONS)
 
     # ---- Shared subnet allocator (prevents /24 collisions across R2R/R2S/LAN/P2P) ----
     shared_subnet_alloc = None
     try:
-        eff_prefix = ip4_prefix or '10.200.0.0/15'
+        # create an allocator seeded to the chosen base pool for varied previews
+        eff_prefix = (ip4_prefix if ip4_prefix and str(ip4_prefix).strip() else chosen_base_pool) or '10.200.0.0/15'
         shared_subnet_alloc = make_subnet_allocator(ip_mode or 'private', eff_prefix, ip_region or 'all')
     except Exception:
         shared_subnet_alloc = None
+    # If we have a multi-pool allocator, reseed its pool order deterministically
+    try:
+        from ..utils.allocators import MultiPoolSubnetAllocator
+        if isinstance(shared_subnet_alloc, MultiPoolSubnetAllocator):
+            # deterministic shuffle for preview seed
+            rnd.shuffle(shared_subnet_alloc.pools)
+    except Exception:
+        pass
 
     def _maybe_validate_preview(preview_payload: Dict[str, Any]) -> None:
         strict = bool(os.environ.get('PYTEST_CURRENT_TEST') or ('pytest' in sys.modules))
@@ -487,7 +511,8 @@ def build_full_preview(
     ip_alloc_mode = 'runtime_like'
     assigned_ips: Set[str] = set()
     try:
-        uniq_alloc = UniqueAllocator(ip4_prefix)
+        # Unique allocator seeded to the chosen base pool to increase variability
+        uniq_alloc = UniqueAllocator(eff_prefix)
     except Exception:
         uniq_alloc = None
     fallback_ip_iter = None
@@ -600,17 +625,25 @@ def build_full_preview(
             subnet_obj = None
             if allocator is not None:
                 try:
-                    # Temporary policy: /24-only subnets everywhere
-                    subnet_obj = allocator.next_subnet(DEFAULT_IPV4_PREFIXLEN)
+                    # Prefer a randomized subnet from the allocator for preview variety
+                    # Use allocator.next_random_subnet if available and pass our seeded RNG
+                    try:
+                        subnet_obj = allocator.next_random_subnet(chosen_r2r_prefix, rnd=rnd)
+                    except TypeError:
+                        # older allocator without rnd param
+                        subnet_obj = allocator.next_random_subnet(chosen_r2r_prefix)
                 except Exception:
                     subnet_obj = None
             if subnet_obj is None:
                 try:
-                    base_addr = ipaddress.IPv4Address(fallback_base + (fallback_idx * 256))
-                    subnet_obj = ipaddress.ip_network((base_addr, DEFAULT_IPV4_PREFIXLEN), strict=False)
+                    # fallback: pick a base range per-seed to scatter addresses across private ranges
+                    fallback_ranges = [int(ipaddress.IPv4Address('10.0.0.0')), int(ipaddress.IPv4Address('172.16.0.0')), int(ipaddress.IPv4Address('192.168.0.0'))]
+                    base_choice = rnd.choice(fallback_ranges)
+                    base_addr = ipaddress.IPv4Address(base_choice + (fallback_idx * (1 << (32 - chosen_r2r_prefix))))
+                    subnet_obj = ipaddress.ip_network((base_addr, chosen_r2r_prefix), strict=False)
                     fallback_idx += 1
                 except Exception:
-                    subnet_obj = ipaddress.ip_network(f'10.254.0.0/{DEFAULT_IPV4_PREFIXLEN}', strict=False)
+                    subnet_obj = ipaddress.ip_network(f'10.254.0.0/{chosen_r2r_prefix}', strict=False)
             hosts = list(subnet_obj.hosts())
             ip_a = f"{hosts[0]}/{subnet_obj.prefixlen}" if len(hosts) >= 1 else None
             ip_b = f"{hosts[1]}/{subnet_obj.prefixlen}" if len(hosts) >= 2 else None

@@ -66,15 +66,16 @@ class SubnetAllocator:
             return net
         raise RuntimeError("SubnetAllocator: ran out of attempts allocating unique /24s")
 
-    def next_random_subnet(self, prefixlen: int, attempts: int = 256) -> ipaddress.IPv4Network:
+    def next_random_subnet(self, prefixlen: int, attempts: int = 256, rnd: random.Random | None = None) -> ipaddress.IPv4Network:
         prefixlen = self._force24()
         size = 1 << (32 - prefixlen)
         start = int(self.base.network_address)
         end = start + self.base.num_addresses
         total_slots = self.base.num_addresses // size if self.base.num_addresses >= size else 0
+        rng = rnd or random
         if total_slots > 0:
             for _ in range(max(8, attempts)):
-                slot = random.randrange(0, total_slots)
+                slot = rng.randrange(0, total_slots)
                 cand = start + slot * size
                 key = (cand, prefixlen)
                 if key in self._allocated:
@@ -133,17 +134,18 @@ class MultiPoolSubnetAllocator:
                 return net
         raise RuntimeError("No available /24 subnets left across pools")
 
-    def next_random_subnet(self, prefixlen: int, attempts: int = 256) -> ipaddress.IPv4Network:
+    def next_random_subnet(self, prefixlen: int, attempts: int = 256, rnd: random.Random | None = None) -> ipaddress.IPv4Network:
         prefixlen = self._force24()
         size = 1 << (32 - prefixlen)
+        rng = rnd or random
         for _ in range(max(8, attempts)):
-            pool = random.choice(self.pools)
+            pool = rng.choice(self.pools)
             start = int(pool.network_address)
             end = start + pool.num_addresses
             total_slots = pool.num_addresses // size if pool.num_addresses >= size else 0
             if total_slots <= 0:
                 continue
-            slot = random.randrange(0, total_slots)
+            slot = rng.randrange(0, total_slots)
             cand = start + slot * size
             key = (cand, prefixlen)
             if key in self._allocated:

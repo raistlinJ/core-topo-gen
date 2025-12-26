@@ -191,6 +191,8 @@ def plan_r2s_grouping(
             subnet_alloc = make_subnet_allocator(ip_mode or 'private', eff_prefix, ip_region or 'all')
         except Exception:
             subnet_alloc = None
+    # seeded RNG for deterministic but varied subnet selection per preview seed
+    rnd = random.Random(seed if seed is not None else 0)
 
     def _next_group_subnets(router_id: int, group_idx: int, host_count: int = 0) -> tuple[str, str]:
         """Allocate subnets for router/group.
@@ -204,7 +206,12 @@ def plan_r2s_grouping(
         if subnet_alloc is None:
             raise RuntimeError("Subnet allocator unavailable; cannot allocate /24 subnets.")
         try:
-            shared_net = subnet_alloc.next_subnet(DEFAULT_IPV4_PREFIXLEN)
+            # Prefer randomized subnet selection when allocator supports it to vary ranges per-preview
+            try:
+                shared_net = subnet_alloc.next_random_subnet(DEFAULT_IPV4_PREFIXLEN, rnd=rnd)
+            except TypeError:
+                # older allocator signature without rnd
+                shared_net = subnet_alloc.next_random_subnet(DEFAULT_IPV4_PREFIXLEN)
             # Return the same subnet for both fields for backward compatibility with
             # existing payload consumers.
             return str(shared_net), str(shared_net)
