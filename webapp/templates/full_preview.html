@@ -2885,7 +2885,45 @@
         const form = new FormData(); form.append('xml_path', '{{ xml_path }}');
         const planPath = executeRunBtn.getAttribute('data-preview-plan');
         if(planPath){ form.append('preview_plan', planPath); }
-        const res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+        let res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+        if(res.status === 423){
+          let info = null;
+          try { info = await res.json(); } catch(e) {}
+          const hostPart = info && info.core_host ? String(info.core_host) : 'CORE host';
+          const portPart = info && (info.core_port || info.core_port === 0) ? `:${info.core_port}` : '';
+          const sessions = Array.isArray(info?.active_sessions) ? info.active_sessions : [];
+          const detailLines = sessions.slice(0, 3).map((entry) => {
+            const sid = entry && entry.id !== undefined ? `#${entry.id}` : '#?';
+            const state = entry && entry.state ? String(entry.state) : 'UNKNOWN';
+            const file = entry && entry.file ? String(entry.file) : '';
+            return `• Session ${sid} (${state}${file ? ` • ${file}` : ''})`;
+          }).join('\n');
+          const messageParts = [info?.error || `A run is already active on ${hostPart}${portPart}. Finish the active CORE session before starting another.`];
+          if(detailLines){ messageParts.push('', 'Active sessions:', detailLines); }
+          const proceed = window.confirm(messageParts.join('\n') + '\n\nKill the active CORE session(s) and retry now?');
+          if(!proceed){
+            appendExecuteProgressLog('Execution blocked by active CORE session(s); user declined kill.');
+            setExecuteProgressUI({ status: 'Blocked by active session', meta: '', barText: 'Blocked', animate: false });
+            return;
+          }
+          appendExecuteProgressLog('Killing active CORE session(s)…');
+          const killRes = await fetch('/core/kill_active_sessions_api', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kill_all: true })
+          });
+          let killInfo = null;
+          try { killInfo = await killRes.json(); } catch(e) {}
+          if(!killRes.ok || !killInfo || killInfo.ok === false){
+            const errs = Array.isArray(killInfo?.errors) ? killInfo.errors.join('; ') : (killInfo?.error || 'Unknown error');
+            appendExecuteProgressLog('Failed to kill active CORE session(s): ' + errs);
+            setExecuteProgressUI({ status: 'Failed to kill active session(s)', meta: '', barText: 'Error', animate: false });
+            return;
+          }
+          const deleted = Array.isArray(killInfo?.deleted) ? killInfo.deleted.length : 0;
+          appendExecuteProgressLog('Killed ' + deleted + ' active CORE session(s); retrying…');
+          res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+        }
         if(!res.ok){
           appendExecuteProgressLog('Failed to start execution (HTTP '+res.status+')');
           setExecuteProgressUI({ status: 'Failed to start', meta: 'HTTP '+res.status, barText: 'Error', animate: false });

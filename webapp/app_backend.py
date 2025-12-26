@@ -6309,7 +6309,13 @@ def _scenario_label_from_path(
     base = os.path.splitext(os.path.basename(ap))[0]
     base_norm = _normalize_scenario_label(base)
     if base_norm:
-        return _resolve_scenario_display(base_norm, scenario_names, base)
+        # Avoid showing CORE internal session directories like /tmp/pycore.* as
+        # scenario names in the UI.
+        if base_norm.startswith('pycore'):
+            return ''
+        # Only return a display name if it matches a known scenario.
+        display = _resolve_scenario_display(base_norm, scenario_names, '')
+        return display or ''
     return ''
 
 
@@ -12249,9 +12255,10 @@ def _list_active_core_sessions(
             if (not file_path) and sid is not None:
                 try:
                     store_map = _load_core_sessions_store()
-                    for pth, stored_sid in store_map.items():
+                    for pth, stored_entry in store_map.items():
                         try:
-                            if int(stored_sid) == int(sid):
+                            stored_sid = _session_store_entry_session_id(stored_entry)
+                            if stored_sid is not None and int(stored_sid) == int(sid):
                                 file_path = pth
                                 break
                         except Exception:
@@ -13053,6 +13060,74 @@ def core_stop():
     except Exception as exc:
         flash(f'Failed to stop session: {exc}')
     return redirect(url_for('core_page'))
+
+
+@app.route('/core/kill_active_sessions_api', methods=['POST'])
+def core_kill_active_sessions_api():
+    """Delete active CORE sessions.
+
+    Intended for the Execute flow: when a run is blocked due to active sessions,
+    the UI can prompt the user to kill the previous session(s) and retry.
+    """
+    payload = request.get_json(silent=True) or {}
+    kill_all = bool(payload.get('kill_all'))
+    session_ids_raw = payload.get('session_ids')
+
+    core_cfg = _core_config_for_request(include_password=True)
+    core_host = core_cfg.get('host', CORE_HOST)
+    try:
+        core_port = int(core_cfg.get('port', CORE_PORT))
+    except Exception:
+        core_port = CORE_PORT
+
+    session_ids: list[int] = []
+    if not kill_all:
+        if isinstance(session_ids_raw, list):
+            for item in session_ids_raw:
+                try:
+                    session_ids.append(int(str(item).strip()))
+                except Exception:
+                    continue
+
+    if kill_all or not session_ids:
+        try:
+            sessions = _list_active_core_sessions(core_host, int(core_port), core_cfg, errors=[], meta={})
+        except Exception:
+            sessions = []
+        for entry in sessions:
+            sid = entry.get('id')
+            if sid in (None, ''):
+                continue
+            try:
+                session_ids.append(int(str(sid).strip()))
+            except Exception:
+                continue
+
+    # De-dupe while preserving order
+    seen: set[int] = set()
+    ordered_ids: list[int] = []
+    for sid in session_ids:
+        if sid in seen:
+            continue
+        seen.add(sid)
+        ordered_ids.append(sid)
+
+    deleted: list[int] = []
+    errors: list[str] = []
+    for sid in ordered_ids:
+        try:
+            _execute_remote_core_session_action(core_cfg, 'delete', sid, logger=app.logger)
+            deleted.append(sid)
+        except Exception as exc:
+            errors.append(f"Failed deleting session {sid}: {exc}")
+
+    return jsonify({
+        'ok': not errors,
+        'deleted': deleted,
+        'errors': errors,
+        'core_host': core_host,
+        'core_port': core_port,
+    }), 200
 
 
 @app.route('/core/start_session', methods=['POST'])

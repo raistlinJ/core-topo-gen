@@ -13041,9 +13041,39 @@ async function submitRunCliRequest(buildRequest, options = {}) {
             if (detailLines) {
                 messageParts.push('', 'Active sessions:', detailLines);
             }
-            window.alert(messageParts.join('\n'));
-            try { logWarn(`Active CORE session detected; run blocked (${sessionCount}).`); } catch (e) {}
-            return null;
+            const promptText = messageParts.join('\n') + `\n\nKill the active CORE session(s) and retry now?`;
+            const proceed = window.confirm(promptText);
+            if (!proceed) {
+                try { logWarn(`Active CORE session detected; user declined kill (${sessionCount}).`); } catch (e) {}
+                return null;
+            }
+            try {
+                const killRes = await fetch('/core/kill_active_sessions_api', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ kill_all: true })
+                });
+                const killInfo = await parseResponseJson(killRes);
+                if (!killRes.ok || !killInfo || killInfo.ok === false) {
+                    const errs = Array.isArray(killInfo?.errors) ? killInfo.errors.join('; ') : (killInfo?.error || 'Unknown error');
+                    window.alert(`Failed to kill active CORE session(s): ${errs}`);
+                    return null;
+                }
+                try {
+                    const deleted = Array.isArray(killInfo?.deleted) ? killInfo.deleted.length : 0;
+                    logInfo(`Killed ${deleted} active CORE session(s); retrying run launch.`);
+                } catch (e) {}
+                // Do not consume an attempt when we killed sessions to unblock the run.
+                if (attempt > 0) {
+                    attempt -= 1;
+                } else {
+                    attempt = -1;
+                }
+                continue;
+            } catch (e) {
+                window.alert('Failed to kill active CORE session(s).');
+                return null;
+            }
         }
         // Handle multiple daemons detected (409 with daemon_conflict)
         if (res.status === 409) {
@@ -13900,7 +13930,6 @@ async function runSyncWithModal(arg){
                 updateRunStatus('Running CLI…', 'Streaming remote logs…');
             }
             runProgressLogLine(ev.data||'');
-            handleExecuteProgressLog(ev.data||'');
         };
         runProgressEvtSrc.addEventListener('end', ()=>{
             waitingForRemoteLogs = false;
@@ -14128,7 +14157,6 @@ async function runWithSeedBuild(){
                 if(meta) meta.textContent = 'Streaming remote logs…';
             }
             runProgressLogLine(ev.data||'');
-            handleExecuteProgressLog(ev.data||'');
         };
         runProgressEvtSrc.addEventListener('end', ()=>{ waitingForSeedLogs = false; try { runProgressEvtSrc.close(); } catch(e){} });
         // Poll status similar to runSyncWithModal

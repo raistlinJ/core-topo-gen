@@ -323,8 +323,8 @@
           <dl class="row mb-0">
             <dt class="col-sm-3">ID</dt><dd class="col-sm-9">{{ session.id }}</dd>
             <dt class="col-sm-3">State</dt><dd class="col-sm-9">{{ session.state }}</dd>
-            <dt class="col-sm-3">Nodes</dt><dd class="col-sm-9">{{ '-' if session.nodes is none else session.nodes }}</dd>
-            <dt class="col-sm-3">File</dt><dd class="col-sm-9">{{ session.file or '-' }}</dd>
+            <dt class="col-sm-3">Nodes (from XML)</dt><dd class="col-sm-9">{{ (summary.nodes_count if summary and summary.nodes_count is defined else '-') }}</dd>
+            <dt class="col-sm-3">Session XML</dt><dd class="col-sm-9">{{ xml_path or '-' }}</dd>
           </dl>
         </div>
       </div>

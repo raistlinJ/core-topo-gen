@@ -81,6 +81,23 @@
   {% set core_modal_href = url_for('index', core_modal=1) %}
 {% endif %}
 <div id="dataLoadingBar" class="d-none"><div class="bar"></div></div>
+
+<!-- Loading modal for slow CORE details navigation -->
+<div class="modal fade" id="coreDetailsLoadingModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Loading…</h5>
+      </div>
+      <div class="modal-body">
+        <div class="small text-muted mb-2">Loading scenario details…</div>
+        <div class="progress" role="progressbar" aria-label="Loading" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-bar progress-bar-striped progress-bar-animated" style="width: 100%">Loading</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 <div id="coreErrorContainer" class="mb-3">
   {% if core_errors and not is_builder_view %}
   <div class="alert alert-danger" role="alert">
@@ -528,12 +545,10 @@
     const hasFile = !!s.file;
     const rowStr = `${id} ${state} ${nodes} ${scenarioRaw} ${file} ${hitlFilterText}`.toLowerCase();
     if (sessionsFilterText && !rowStr.includes(sessionsFilterText)) return '';
+    // Always pass session_id for Details so the backend can export session XML via gRPC.
+    // NOTE: `s.file` is commonly a remote path (not readable locally), so `path=` would cause fallback/mismatch.
     const detailsParams = [];
-    if (hasFile && s.file) {
-      detailsParams.push('path=' + encodeURIComponent(s.file));
-    } else {
-      detailsParams.push('session_id=' + encodeURIComponent(String(s.id||'')));
-    }
+    detailsParams.push('session_id=' + encodeURIComponent(String(s.id||'')));
     if (scenarioRaw) {
       detailsParams.push('scenario_name=' + encodeURIComponent(scenarioRaw));
     }
@@ -693,6 +708,44 @@
       setTimeout(()=> { setLoading(false); isFetching=false; firstLoadDone=true; }, remain);
     }
   }
+
+  // Show a "Loading" progress modal when navigating to core_details.
+  (function bindCoreDetailsLoading(){
+    function shouldInterceptClick(ev){
+      if(!ev) return false;
+      if(ev.defaultPrevented) return false;
+      // Respect new-tab / new-window gestures.
+      if(ev.button !== 0) return false;
+      if(ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return false;
+      return true;
+    }
+    function showLoadingModal(){
+      try {
+        const el = document.getElementById('coreDetailsLoadingModal');
+        if(!el) return null;
+        if(window.bootstrap && window.bootstrap.Modal){
+          const inst = bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
+          inst.show();
+          return inst;
+        }
+      } catch(e) {}
+      return null;
+    }
+    document.addEventListener('click', (ev)=>{
+      try {
+        const a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+        if(!a) return;
+        const href = a.getAttribute('href') || '';
+        if(!href) return;
+        if(href.indexOf('{{ url_for('core_details') }}') === -1 && href.indexOf('/core/details') === -1) return;
+        if(!shouldInterceptClick(ev)) return;
+        ev.preventDefault();
+        showLoadingModal();
+        // Give the browser a moment to paint the modal before navigating.
+        requestAnimationFrame(()=>{ setTimeout(()=>{ window.location.assign(href); }, 50); });
+      } catch(e) {}
+    }, true);
+  })();
 
   function schedule(){
     if(timer) clearTimeout(timer);
