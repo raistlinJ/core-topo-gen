@@ -300,6 +300,166 @@ def test_test_core_install_custom_services_triggers_installer(client, monkeypatc
     assert installer_calls and installer_calls[0]['sudo_password'] == 'pw'
 
 
+def test_test_core_daemon_conflict_prompts_with_pids(client, monkeypatch):
+    monkeypatch.setattr(backend, '_core_connection', _fake_core_connection)
+    monkeypatch.setattr(backend.socket, 'socket', _FakeSocket)
+    monkeypatch.setattr(backend, '_load_core_credentials', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backend, '_ensure_core_daemon_listening', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backend, '_ensure_paramiko_available', lambda *_args, **_kwargs: None)
+
+    # Force a daemon conflict.
+    monkeypatch.setattr(backend, '_collect_remote_core_daemon_pids', lambda *_args, **_kwargs: [18263, 78479])
+
+    def _fail_save(_payload):  # pragma: no cover - should not be called
+        raise AssertionError('Should not persist credentials when daemon conflict exists')
+
+    monkeypatch.setattr(backend, '_save_core_credentials', _fail_save)
+
+    class _FakeSSH:
+        def set_missing_host_key_policy(self, *_args, **_kwargs):
+            return None
+
+        def connect(self, **_kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    class _FakeParamiko:
+        @staticmethod
+        def SSHClient():
+            return _FakeSSH()
+
+        @staticmethod
+        def AutoAddPolicy():
+            return object()
+
+    monkeypatch.setattr(backend, 'paramiko', _FakeParamiko())
+
+    payload = {
+        'core': {
+            'host': 'core-host',
+            'port': 50051,
+            'ssh_host': 'core-host',
+            'ssh_port': 22,
+            'ssh_username': 'core',
+            'ssh_password': 'pw',
+            'auto_start_daemon': True,
+        },
+        'scenario_name': 'Scenario Conflict',
+        'scenario_index': 0,
+        'hitl_core': {
+            'vm_key': 'pve1::101',
+            'vm_node': 'pve1',
+            'vm_name': 'CORE VM',
+            'vmid': 101,
+        },
+    }
+
+    resp = client.post('/test_core', json=payload)
+    assert resp.status_code == 409
+    data = resp.get_json()
+    assert data['ok'] is False
+    assert data.get('daemon_conflict') is True
+    assert data.get('code') == 'core_daemon_conflict'
+    assert data.get('daemon_pids') == [18263, 78479]
+    assert data.get('can_stop_daemons') is True
+
+
+def test_test_core_daemon_conflict_can_be_auto_stopped(client, monkeypatch):
+    monkeypatch.setattr(backend, '_core_connection', _fake_core_connection)
+    monkeypatch.setattr(backend.socket, 'socket', _FakeSocket)
+    monkeypatch.setattr(backend, '_load_core_credentials', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backend, '_ensure_core_daemon_listening', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backend, '_ensure_paramiko_available', lambda *_args, **_kwargs: None)
+
+    pid_calls = {'count': 0}
+
+    def _fake_collect(*_args, **_kwargs):
+        pid_calls['count'] += 1
+        return [18263, 78479] if pid_calls['count'] == 1 else [18263]
+
+    monkeypatch.setattr(backend, '_collect_remote_core_daemon_pids', _fake_collect)
+
+    stop_calls = []
+
+    def _fake_stop(ssh_client, *, sudo_password, pids, logger):
+        stop_calls.append({'sudo_password': sudo_password, 'pids': list(pids)})
+        return {'status': 'attempted'}
+
+    monkeypatch.setattr(backend, '_stop_remote_core_daemon_conflict', _fake_stop)
+
+    class _FakeSSH:
+        def set_missing_host_key_policy(self, *_args, **_kwargs):
+            return None
+
+        def connect(self, **_kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    class _FakeParamiko:
+        @staticmethod
+        def SSHClient():
+            return _FakeSSH()
+
+        @staticmethod
+        def AutoAddPolicy():
+            return object()
+
+    monkeypatch.setattr(backend, 'paramiko', _FakeParamiko())
+
+    def _fake_save(payload):
+        return {
+            'identifier': 'secret-conflict-fixed',
+            'scenario_name': payload.get('scenario_name'),
+            'scenario_index': payload.get('scenario_index'),
+            'host': payload['grpc_host'],
+            'port': payload['grpc_port'],
+            'grpc_host': payload['grpc_host'],
+            'grpc_port': payload['grpc_port'],
+            'ssh_host': payload['ssh_host'],
+            'ssh_port': payload['ssh_port'],
+            'ssh_username': payload['ssh_username'],
+            'ssh_enabled': payload['ssh_enabled'],
+            'vm_key': payload.get('vm_key'),
+            'vm_name': payload.get('vm_name'),
+            'vm_node': payload.get('vm_node'),
+            'vmid': payload.get('vmid'),
+            'stored_at': '2025-10-28T00:00:00Z',
+        }
+
+    monkeypatch.setattr(backend, '_save_core_credentials', _fake_save)
+
+    payload = {
+        'core': {
+            'host': 'core-host',
+            'port': 50051,
+            'ssh_host': 'core-host',
+            'ssh_port': 22,
+            'ssh_username': 'core',
+            'ssh_password': 'pw',
+            'stop_duplicate_daemons': True,
+        },
+        'scenario_name': 'Scenario Conflict Fixed',
+        'scenario_index': 0,
+        'hitl_core': {
+            'vm_key': 'pve1::101',
+            'vm_node': 'pve1',
+            'vm_name': 'CORE VM',
+            'vmid': 101,
+        },
+    }
+
+    resp = client.post('/test_core', json=payload)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['ok'] is True
+    assert stop_calls and stop_calls[0]['sudo_password'] == 'pw'
+    assert stop_calls[0]['pids'] == [18263, 78479]
+
+
 def test_run_cli_async_requires_ssh_credentials(client, tmp_path, monkeypatch):
     xml_path = tmp_path / 'scenarios.xml'
     xml_path.write_text('<Scenarios></Scenarios>')

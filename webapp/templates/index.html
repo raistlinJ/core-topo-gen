@@ -327,7 +327,7 @@
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
-                <div class="alert alert-info small d-none" id="coreConnectionHint"></div>
+                <div class="alert alert-info small d-none" id="coreConnectionHint" style="white-space: pre-wrap;"></div>
                 <form id="coreConnectionForm" class="needs-validation" novalidate>
                     <div class="row g-2">
                         <div class="col-md-8">
@@ -6897,6 +6897,9 @@ async function validateCoreConnection(sidx, options = {}) {
         rememberCredentials = true,
         autoStartDaemon = false,
         installCustomServices = false,
+        stopDuplicateDaemons = false,
+        _daemonConflictPrompted = false,
+        showSummaryOnSuccess = false,
     } = options;
     if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) {
         return { ok: false, message: 'Scenario unavailable' };
@@ -6927,6 +6930,7 @@ async function validateCoreConnection(sidx, options = {}) {
             vm_node: vmNode,
             auto_start_daemon: autoStartDaemon,
             install_custom_services: installCustomServices,
+            stop_duplicate_daemons: stopDuplicateDaemons,
         },
     };
     enrichPayloadWithScenarioContext(body, { scenarioIndex: sidx, scenarioOverride: scenario });
@@ -6976,6 +6980,45 @@ async function validateCoreConnection(sidx, options = {}) {
         try { data = await resp.json(); } catch (err) { data = null; }
         const nowIso = new Date().toISOString();
         if (data && data.ok) {
+            const buildSummary = () => {
+                const lines = [];
+                lines.push('CORE connection validated.');
+                const coreHost = data.host || (data.core && data.core.host) || '';
+                const corePort = (data.port !== undefined && data.port !== null) ? data.port : (data.core && data.core.port);
+                if (coreHost && corePort) {
+                    lines.push(`gRPC: ${coreHost}:${corePort}`);
+                } else if (data.remote) {
+                    lines.push(`gRPC: ${data.remote}`);
+                }
+                if (data.forward_host && data.forward_port) {
+                    lines.push(`Tunnel: ${data.forward_host}:${data.forward_port}`);
+                }
+                const pids = Array.isArray(data.daemon_pids) ? data.daemon_pids : [];
+                if (pids.length === 1) {
+                    lines.push(`core-daemon: running (PID ${pids[0]})`);
+                } else if (pids.length > 1) {
+                    lines.push(`core-daemon: multiple processes detected (PIDs: ${pids.join(', ')})`);
+                } else {
+                    lines.push('core-daemon: not checked');
+                }
+                if (installCustomServices) {
+                    const meta = (data.install_custom_services && typeof data.install_custom_services === 'object') ? data.install_custom_services : null;
+                    const modules = meta && Array.isArray(meta.modules) ? meta.modules.map(v => String(v)).filter(Boolean) : [];
+                    const servicesDir = meta && meta.services_dir ? String(meta.services_dir) : '';
+                    if (modules.length && servicesDir) {
+                        lines.push(`Custom services: installed (${modules.join(', ')}) -> ${servicesDir}`);
+                    } else if (modules.length) {
+                        lines.push(`Custom services: installed (${modules.join(', ')})`);
+                    } else {
+                        lines.push('Custom services: installed');
+                    }
+                } else {
+                    lines.push('Custom services: not installed');
+                }
+                lines.push(rememberCredentials ? 'Credentials: stored in vault.' : 'Credentials: not stored.');
+                return lines.join('\n');
+            };
+
             const summary = (data.core_summary && typeof data.core_summary === 'object') ? data.core_summary : null;
             coreState.last_tested_status = 'success';
             coreState.last_tested_message = data.message
@@ -7012,7 +7055,9 @@ async function validateCoreConnection(sidx, options = {}) {
             updateProxmoxSummary(sidx);
             renderMain();
             if (typeof setCoreConnectionHint === 'function') {
-                if (hintOnSuccess) {
+                if (showSummaryOnSuccess) {
+                    setCoreConnectionHint(buildSummary(), rememberCredentials ? 'success' : 'warning');
+                } else if (hintOnSuccess) {
                     setCoreConnectionHint(hintOnSuccess, rememberCredentials ? 'success' : 'warning');
                 } else if (hintOnStart) {
                     setCoreConnectionHint(rememberCredentials ? 'Validation successful.' : 'Validated without storing credentials. Re-enter password next time.', rememberCredentials ? 'success' : 'warning');
@@ -7029,6 +7074,35 @@ async function validateCoreConnection(sidx, options = {}) {
             }
             return { ok: true, data };
         }
+
+        // If the backend detected multiple core-daemon processes, offer to stop them and retry once.
+        if (
+            data &&
+            data.daemon_conflict &&
+            !_daemonConflictPrompted &&
+            !stopDuplicateDaemons
+        ) {
+            const canStop = (data.can_stop_daemons !== false);
+            const pids = Array.isArray(data.daemon_pids) ? data.daemon_pids.map(v => String(v)).filter(Boolean) : [];
+            const pidText = pids.length ? pids.join(', ') : '';
+            if (canStop) {
+                const prompt = pidText
+                    ? `Multiple core-daemon processes are running on the CORE VM (PIDs: ${pidText}).\n\nWould you like CORE TopoGen to stop them and restart core-daemon now?`
+                    : 'Multiple core-daemon processes are running on the CORE VM.\n\nWould you like CORE TopoGen to stop them and restart core-daemon now?';
+                let doFix = false;
+                try { doFix = window.confirm(prompt); } catch (e) { doFix = false; }
+                if (doFix) {
+                    return await validateCoreConnection(sidx, {
+                        ...options,
+                        workingLabel: 'Fixing…',
+                        hintOnStart: 'Stopping duplicate core-daemon processes…',
+                        stopDuplicateDaemons: true,
+                        _daemonConflictPrompted: true,
+                    });
+                }
+            }
+        }
+
         const message = (data && data.error) ? data.error : `HTTP ${resp.status}`;
         coreState.last_tested_status = 'failure';
         coreState.last_tested_message = message;
@@ -7268,10 +7342,11 @@ async function handleCoreConnectionSave(event) {
         hintOnSuccess: 'Connection saved and validated.',
         hintOnFailure: 'Validation failed',
         successToastMessage: rememberCreds ? 'CORE connection saved & validated' : 'CORE connection verified (not stored)',
-        closeModalOnSuccess: true,
+        closeModalOnSuccess: false,
         rememberCredentials: rememberCreds,
         autoStartDaemon: autoStartDaemon,
         installCustomServices: installCustomServices,
+        showSummaryOnSuccess: true,
     });
 }
 

@@ -2267,6 +2267,75 @@ def _start_remote_core_daemon(client: Any, sudo_password: str | None, logger: lo
             pass
 
 
+def _stop_remote_core_daemon_conflict(
+    client: Any,
+    *,
+    sudo_password: str | None,
+    pids: List[int],
+    logger: logging.Logger,
+) -> Dict[str, Any]:
+    """Stop duplicate core-daemon processes.
+
+    Implementation strategy:
+    - Stop the systemd service (best-effort)
+    - Kill the discovered PIDs
+    - Start the service again
+
+    This intentionally errs on the side of producing a single clean daemon.
+    """
+
+    if not pids:
+        return {'status': 'noop', 'detail': 'no pids provided'}
+    if not sudo_password:
+        raise RuntimeError('Stopping core-daemon requires sudo; provide an SSH password.')
+
+    def _sudo(cmd: str, *, timeout: float = 30.0) -> tuple[int, str, str]:
+        wrapped = f"sudo -S -p '' sh -c {shlex.quote(cmd)}"
+        stdin = stdout = stderr = None
+        try:
+            stdin, stdout, stderr = client.exec_command(wrapped, timeout=timeout, get_pty=True)
+            try:
+                stdin.write(str(sudo_password) + '\n')
+                stdin.flush()
+            except Exception:
+                pass
+            out = stdout.read() if stdout else b''
+            err = stderr.read() if stderr else b''
+            try:
+                exit_code = stdout.channel.recv_exit_status() if (stdout and hasattr(stdout, 'channel')) else 0
+            except Exception:
+                exit_code = 0
+            out_text = out.decode('utf-8', 'ignore') if isinstance(out, (bytes, bytearray)) else str(out or '')
+            err_text = err.decode('utf-8', 'ignore') if isinstance(err, (bytes, bytearray)) else str(err or '')
+            return exit_code, out_text, err_text
+        finally:
+            try:
+                if stdin:
+                    stdin.close()
+            except Exception:
+                pass
+
+    pid_args = ' '.join(str(int(pid)) for pid in pids if str(pid).strip().isdigit())
+    if not pid_args:
+        return {'status': 'noop', 'detail': 'no valid pids provided'}
+
+    steps: List[Dict[str, Any]] = []
+    for label, cmd in (
+        ('systemctl_stop', 'timeout 15s systemctl stop core-daemon || true'),
+        ('kill_term', f'kill -TERM {pid_args} 2>/dev/null || true'),
+        ('sleep', 'sleep 1'),
+        ('kill_kill', f'kill -KILL {pid_args} 2>/dev/null || true'),
+        ('systemctl_start', 'timeout 20s systemctl start core-daemon || true'),
+    ):
+        code, out, err = _sudo(cmd, timeout=35.0)
+        steps.append({'step': label, 'command': cmd, 'exit': code, 'stdout': (out or '').strip(), 'stderr': (err or '').strip()})
+        try:
+            logger.info('[core] stop duplicate daemons: %s exit=%s', label, code)
+        except Exception:
+            pass
+    return {'status': 'attempted', 'pids': pids, 'steps': steps}
+
+
 def _local_custom_services_dir() -> str:
     repo_root = _get_repo_root()
     return os.path.join(repo_root, 'on_core_machine', 'custom_services')
@@ -16760,9 +16829,11 @@ def test_core():
                 return jsonify({'ok': False, 'error': mismatch_message, 'vm_mismatch': True}), 409
         auto_start_daemon = bool(cfg.get('auto_start_daemon'))
         install_custom_services = bool(cfg.get('install_custom_services'))
+        stop_duplicate_daemons = bool(cfg.get('stop_duplicate_daemons'))
         is_pytest = bool(os.environ.get('PYTEST_CURRENT_TEST') or ('pytest' in sys.modules))
         daemon_pids: List[int] = []
-        if is_pytest and not (auto_start_daemon or install_custom_services):
+        install_meta: Optional[Dict[str, Any]] = None
+        if is_pytest and not (auto_start_daemon or install_custom_services or stop_duplicate_daemons):
             # Unit tests mock the tunnel/socket checks and should not depend on real DNS/SSH.
             app.logger.info('[core] skipping core-daemon SSH inspection (pytest)')
         elif paramiko is None:
@@ -16788,12 +16859,46 @@ def test_core():
                 )
                 daemon_pids = _collect_remote_core_daemon_pids(ssh_client)
                 if len(daemon_pids) > 1:
-                    msg = (
-                        'Multiple core-daemon processes are running on the CORE VM. '
-                        f'PIDs: {", ".join(str(pid) for pid in daemon_pids)}. '
-                        'Stop duplicate daemons before continuing.'
-                    )
-                    return jsonify({'ok': False, 'error': msg, 'daemon_conflict': True}), 409
+                    if stop_duplicate_daemons:
+                        try:
+                            _stop_remote_core_daemon_conflict(
+                                ssh_client,
+                                sudo_password=cfg.get('ssh_password'),
+                                pids=daemon_pids,
+                                logger=app.logger,
+                            )
+                            try:
+                                time.sleep(1.0)
+                            except Exception:
+                                pass
+                            daemon_pids = _collect_remote_core_daemon_pids(ssh_client)
+                        except Exception as exc:
+                            msg = (
+                                'Multiple core-daemon processes are running on the CORE VM, and the automatic stop failed. '
+                                f'PIDs: {", ".join(str(pid) for pid in daemon_pids)}. Error: {exc}'
+                            )
+                            return jsonify({
+                                'ok': False,
+                                'error': msg,
+                                'daemon_conflict': True,
+                                'daemon_pids': daemon_pids,
+                                'can_stop_daemons': bool(cfg.get('ssh_password')),
+                                'code': 'core_daemon_conflict',
+                            }), 409
+                    if len(daemon_pids) > 1:
+                        msg = (
+                            'Multiple core-daemon processes are running on the CORE VM. '
+                            f'PIDs: {", ".join(str(pid) for pid in daemon_pids)}. '
+                            'Stop duplicate daemons before continuing.'
+                        )
+                        return jsonify({
+                            'ok': False,
+                            'error': msg,
+                            'daemon_conflict': True,
+                            'daemon_pids': daemon_pids,
+                            'can_stop_daemons': bool(cfg.get('ssh_password')),
+                            'code': 'core_daemon_conflict',
+                        }), 409
 
                 if install_custom_services:
                     app.logger.info('[core] Installing custom services on CORE VM...')
@@ -16813,12 +16918,47 @@ def test_core():
                         pass
                     daemon_pids = _collect_remote_core_daemon_pids(ssh_client)
                     if len(daemon_pids) > 1:
-                        msg = (
-                            'Multiple core-daemon processes are running on the CORE VM after installing services. '
-                            f'PIDs: {", ".join(str(pid) for pid in daemon_pids)}. '
-                            'Stop duplicate daemons before continuing.'
-                        )
-                        return jsonify({'ok': False, 'error': msg, 'daemon_conflict': True}), 409
+                        if stop_duplicate_daemons:
+                            try:
+                                _stop_remote_core_daemon_conflict(
+                                    ssh_client,
+                                    sudo_password=cfg.get('ssh_password'),
+                                    pids=daemon_pids,
+                                    logger=app.logger,
+                                )
+                                try:
+                                    time.sleep(1.0)
+                                except Exception:
+                                    pass
+                                daemon_pids = _collect_remote_core_daemon_pids(ssh_client)
+                            except Exception as exc:
+                                msg = (
+                                    'Multiple core-daemon processes are running on the CORE VM after installing services, '
+                                    'and the automatic stop failed. '
+                                    f'PIDs: {", ".join(str(pid) for pid in daemon_pids)}. Error: {exc}'
+                                )
+                                return jsonify({
+                                    'ok': False,
+                                    'error': msg,
+                                    'daemon_conflict': True,
+                                    'daemon_pids': daemon_pids,
+                                    'can_stop_daemons': bool(cfg.get('ssh_password')),
+                                    'code': 'core_daemon_conflict',
+                                }), 409
+                        if len(daemon_pids) > 1:
+                            msg = (
+                                'Multiple core-daemon processes are running on the CORE VM after installing services. '
+                                f'PIDs: {", ".join(str(pid) for pid in daemon_pids)}. '
+                                'Stop duplicate daemons before continuing.'
+                            )
+                            return jsonify({
+                                'ok': False,
+                                'error': msg,
+                                'daemon_conflict': True,
+                                'daemon_pids': daemon_pids,
+                                'can_stop_daemons': bool(cfg.get('ssh_password')),
+                                'code': 'core_daemon_conflict',
+                            }), 409
 
                 if auto_start_daemon:
                     if daemon_pids:
@@ -16920,6 +17060,8 @@ def test_core():
             "ssh_enabled": bool(cfg.get('ssh_enabled')),
             "host": cfg.get('host'),
             "port": int(cfg.get('port', 0)) if cfg.get('port') is not None else None,
+            "daemon_pids": daemon_pids,
+            "install_custom_services": install_meta,
             "core": _normalize_core_config(cfg, include_password=False),
             "core_secret_id": stored_meta['identifier'],
             "core_summary": stored_meta,
