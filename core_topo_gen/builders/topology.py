@@ -66,6 +66,31 @@ logger = logging.getLogger(__name__)
 import os
 
 
+def _docker_ifid_start() -> int:
+    """Return the first interface id to use for CORE-attached DockerNode interfaces.
+
+    Docker containers typically already have an eth0 from Docker's own networking.
+    Set CORETG_DOCKER_IFID_START=1 to start at eth1 when Docker's own eth0 exists and
+    causes "interface already exists" collisions.
+    """
+    raw = os.getenv('CORETG_DOCKER_IFID_START', '0')
+    try:
+        val = int(str(raw).strip() or '0')
+    except Exception:
+        val = 0
+    return 0 if val < 0 else val
+
+
+def _docker_default_route_enabled() -> bool:
+    """Whether to auto-add CORE's DefaultRoute service to Docker nodes.
+
+    Default is OFF because Docker nodes often already have a Docker-injected default
+    gateway that conflicts with CORE routing expectations.
+    """
+    val = os.getenv('CORETG_DOCKER_ADD_DEFAULTROUTE', '0')
+    return val not in ('0', 'false', 'False', '')
+
+
 def _is_docker_node_type(node_type: object) -> bool:
     try:
         return hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER")
@@ -75,6 +100,8 @@ def _is_docker_node_type(node_type: object) -> bool:
 
 def _ensure_default_route_for_docker(session: object, node_obj: object) -> None:
     """Ensure DefaultRoute service is present on a DOCKER node (best-effort)."""
+    if not _docker_default_route_enabled():
+        return
     try:
         ensure_service(session, getattr(node_obj, 'id'), "DefaultRoute", node_obj=node_obj)
     except Exception:
@@ -605,6 +632,7 @@ def build_star_from_roles(core,
                           ip_region: str = "all",
                           docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None):
     logger.info("Creating CORE session and building star topology")
+    logger.info("Docker CORE interfaces start at eth%s (CORETG_DOCKER_IFID_START)", _docker_ifid_start())
     mac_alloc = UniqueAllocator(ip4_prefix)
     subnet_alloc = make_subnet_allocator(ip_mode, ip4_prefix, ip_region)
     session = safe_create_session(core)
@@ -638,6 +666,7 @@ def build_star_from_roles(core,
 
     sw_ifid = 0
     dev_next_ifid: Dict[int, int] = {}
+    docker_ifid_start = _docker_ifid_start()
     nodes_by_id: Dict[int, object] = {}
     # slot counter for host nodes (DEFAULT prior to any override)
     host_slot_idx = 0
@@ -684,6 +713,10 @@ def build_star_from_roles(core,
         logger.debug("Added node id=%s name=%s type=%s at (%s,%s)", node.id, node_name, node_type, x, y)
         nodes_by_id[node.id] = node
 
+        # Seed docker interface numbering to avoid colliding with Docker's eth0.
+        if _is_docker_node_type(node_type):
+            dev_next_ifid.setdefault(node.id, docker_ifid_start)
+
         # If this is a DOCKER node, attach compose/compose_name metadata now
         try:
             if _is_docker_node_type(node_type):
@@ -723,7 +756,7 @@ def build_star_from_roles(core,
             # add explicit device and switch interfaces for visibility in XML
             is_docker = _is_docker_node_type(node_type)
 
-            dev_ifid = dev_next_ifid.get(node.id, 0)
+            dev_ifid = dev_next_ifid.get(node.id, docker_ifid_start if is_docker else 0)
             dev_iface_name = f"eth{dev_ifid}" if is_docker else f"{node_name}-uplink"
             dev_iface = Interface(id=dev_ifid, name=dev_iface_name)
             dev_next_ifid[node.id] = dev_ifid + 1
@@ -825,6 +858,7 @@ def build_multi_switch_topology(core,
     mac_alloc = UniqueAllocator(ip4_prefix)
     subnet_alloc = make_subnet_allocator(ip_mode, ip4_prefix, ip_region)
     session = safe_create_session(core)
+    logger.info("Docker CORE interfaces start at eth%s (CORETG_DOCKER_IFID_START)", _docker_ifid_start())
     existing_links, safe_add_link, link_counters = _make_safe_link_tracker()
     if DIAG_ENABLED:
         try:
@@ -900,6 +934,7 @@ def build_multi_switch_topology(core,
     sw_ifid: Dict[int, int] = {sid: 0 for sid in switch_ids}
     nodes_by_id: Dict[int, object] = {}
     dev_next_ifid: Dict[int, int] = {}
+    docker_ifid_start = _docker_ifid_start()
     next_id = access_count + 2
     host_slot_idx = 0
     docker_by_name: Dict[str, Dict[str, str]] = {}
@@ -945,6 +980,9 @@ def build_multi_switch_topology(core,
 
         actual_node_id = getattr(node, "id", next_id)
 
+        if _is_docker_node_type(node_type):
+            dev_next_ifid.setdefault(actual_node_id, docker_ifid_start)
+
         # If this is a DOCKER node, attach compose/compose_name metadata now
         try:
             if _is_docker_node_type(node_type):
@@ -988,7 +1026,7 @@ def build_multi_switch_topology(core,
             sw_if = Interface(id=sw_ifid[sw_node_id], name=f"sw{sw_node_id}-d{node.id}")
             is_docker = _is_docker_node_type(node_type)
             if is_docker:
-                dev_ifid = dev_next_ifid.get(node.id, 0)
+                dev_ifid = dev_next_ifid.get(node.id, docker_ifid_start)
                 dev_next_ifid[node.id] = dev_ifid + 1
                 dev_if = Interface(id=dev_ifid, name=f"eth{dev_ifid}")
                 safe_add_link(session, node, sw_node, iface1=dev_if, iface2=sw_if)
@@ -1353,6 +1391,8 @@ def _try_build_segmented_topology_from_preview(
     docker_by_name: Dict[str, Dict[str, str]] = {}
     created_docker = 0
 
+    docker_ifid_start = _docker_ifid_start()
+
     sorted_hosts = sorted(hosts_data, key=lambda h: h.get('node_id', 0))
     for idx, hdata in enumerate(sorted_hosts):
         try:
@@ -1410,8 +1450,8 @@ def _try_build_segmented_topology_from_preview(
             pass
         host_nodes_by_id[hid] = host_node
         is_docker = _is_docker_node_type(node_type)
-        # Docker-backed nodes use eth0 for CORE interfaces.
-        host_next_ifid[hid] = 0
+        # Docker-backed nodes typically already have a Docker eth0; start CORE interfaces at eth1.
+        host_next_ifid[hid] = docker_ifid_start if is_docker else 0
         if node_type == NodeType.DEFAULT:
             default_host_ids.add(hid)
 
@@ -1863,6 +1903,7 @@ def build_segmented_topology(core,
                              docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None,
                              router_mesh_style: str = "full",
                              preview_plan: Optional[Dict[str, Any]] = None):
+    logger.info("Docker CORE interfaces start at eth%s (CORETG_DOCKER_IFID_START)", _docker_ifid_start())
     def _preview_payload_present(payload: Optional[Dict[str, Any]]) -> bool:
         """Return True when caller provided a preview-like payload (not just a seed override)."""
         if not isinstance(payload, dict):
@@ -2475,6 +2516,8 @@ def build_segmented_topology(core,
     docker_slots_used: Set[str] = set()
     docker_by_name: Dict[str, Dict[str, str]] = {}
     created_docker = 0
+
+    docker_ifid_start = _docker_ifid_start()
     for ridx, roles in enumerate(buckets):
         rx, ry = r_positions[ridx]
         router_node = router_objs[ridx]
@@ -2520,8 +2563,8 @@ def build_segmented_topology(core,
             actual_host_id = getattr(host, "id", node_id_counter)
             host_nodes_by_id[host.id] = host
             is_docker = _is_docker_node_type(node_type)
-            # First link consumes eth0 for both DEFAULT and DOCKER hosts.
-            host_next_ifid[host.id] = 1
+            # Start CORE-attached interfaces from the configured base ifid for docker nodes.
+            host_next_ifid[host.id] = docker_ifid_start if is_docker else 1
             # Apply DOCKER compose metadata when applicable
             try:
                 if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
@@ -2548,7 +2591,7 @@ def build_segmented_topology(core,
             r_ip = str(lan_hosts[0])
             h_ip = str(lan_hosts[1])
             h_mac = mac_alloc.next_mac()
-            host_if_id = 0
+            host_if_id = docker_ifid_start if is_docker else 0
             host_if = Interface(id=host_if_id, name=f"eth{host_if_id}", ip4=h_ip, ip4_mask=lan_net.prefixlen, mac=h_mac)
             r_ifid = router_next_ifid.get(router_node.id, 0)
             router_next_ifid[router_node.id] = r_ifid + 1
@@ -2619,14 +2662,14 @@ def build_segmented_topology(core,
                 actual_host_id = getattr(host, "id", node_id_counter)
                 host_nodes_by_id[host.id] = host
                 is_docker = _is_docker_node_type(node_type)
-                host_next_ifid[host.id] = 1
+                host_next_ifid[host.id] = (docker_ifid_start + 1) if is_docker else 1
                 # Addressing: allocate per-host /24 directly to router (direct link) for now
                 lan_net = subnet_alloc.next_random_subnet(24)
                 lan_hosts = list(lan_net.hosts())
                 r_ip = str(lan_hosts[0])
                 h_ip = str(lan_hosts[1])
                 h_mac = mac_alloc.next_mac()
-                host_if_id = 0
+                host_if_id = docker_ifid_start if is_docker else 0
                 host_if = Interface(id=host_if_id, name=f"eth{host_if_id}", ip4=h_ip, ip4_mask=lan_net.prefixlen, mac=h_mac)
                 r_ifid = router_next_ifid.get(router_node.id, 0)
                 router_next_ifid[router_node.id] = r_ifid + 1

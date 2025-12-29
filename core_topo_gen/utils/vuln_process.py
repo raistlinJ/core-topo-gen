@@ -653,6 +653,79 @@ def _prune_service_ports(service: Dict[str, object]) -> None:
 		service['ports'] = new_ports
 
 
+def _force_service_network_mode_none(service: Dict[str, object]) -> None:
+	"""Force a docker-compose service to run without Docker-managed networking.
+
+	This prevents Docker from injecting an eth0 + default gateway (bridge/NAT),
+	so CORE can own all container networking via interfaces it adds.
+	"""
+	if not isinstance(service, dict):
+		return
+	# Compose cannot combine explicit networks with network_mode.
+	service.pop('networks', None)
+	service['network_mode'] = 'none'
+
+
+def _force_compose_no_network(compose_obj: dict) -> dict:
+	"""Best-effort: make all services run with network_mode: none.
+
+	Also drops top-level networks to avoid compose validation conflicts.
+	"""
+	try:
+		if not isinstance(compose_obj, dict):
+			return compose_obj
+		services = compose_obj.get('services')
+		if not isinstance(services, dict):
+			return compose_obj
+		for _svc_name, svc in services.items():
+			if isinstance(svc, dict):
+				_force_service_network_mode_none(svc)
+				# If a compose file had published host ports, strip the publishing
+				# so running multiple stacks on the CORE VM doesn't collide.
+				_prune_service_ports(svc)
+		compose_obj.pop('networks', None)
+		return compose_obj
+	except Exception:
+		return compose_obj
+
+
+def _inject_network_mode_none_text(text: str) -> str:
+	"""Fallback text-level injection of network_mode: none.
+
+	Only used when YAML parsing isn't available; conservative best-effort.
+	"""
+	if 'network_mode:' in text:
+		return text
+	lines = text.splitlines()
+	result: List[str] = []
+	in_services = False
+	services_indent: Optional[int] = None
+	for line in lines:
+		stripped = line.lstrip()
+		indent = len(line) - len(stripped)
+		# Enter services block
+		if not in_services and stripped.startswith('services:'):
+			in_services = True
+			services_indent = indent
+			result.append(line)
+			continue
+		# Exit services block when indentation drops back
+		if in_services and stripped and services_indent is not None and indent <= services_indent and not stripped.startswith('#'):
+			in_services = False
+			services_indent = None
+		# When inside services, detect service header lines like "  app:" and inject
+		if in_services and services_indent is not None:
+			# Service header is typically indented 2 spaces beyond services:
+			if stripped.endswith(':') and not stripped.startswith(('-', '#')) and indent == services_indent + 2 and ' ' not in stripped[:-1]:
+				result.append(line)
+				result.append(' ' * (indent + 2) + 'network_mode: none')
+				continue
+		result.append(line)
+	if text.endswith('\n'):
+		return '\n'.join(result) + '\n'
+	return '\n'.join(result)
+
+
 def _strip_port_mappings_from_text(text: str) -> str:
 	"""Best-effort removal of host->container port mappings in compose YAML text."""
 	lines = text.splitlines()
@@ -1039,6 +1112,8 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			prefer = key[0]
 			obj = dict(base_compose_obj)
 			obj = _set_container_name_one_service(obj, node_name, prefer_service=prefer)
+			# Ensure Docker does not inject its own networking for vuln nodes.
+			obj = _force_compose_no_network(obj)
 			# Ensure the selected service uses a wrapper build that installs iproute2.
 			try:
 				svc_key = _select_service_key(obj, prefer_service=prefer)
@@ -1081,6 +1156,7 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 					else:
 						txt = txt.rstrip() + f"\n\n# injected container_name\ncontainer_name: {node_name}\n"
 					text_sanitized = _strip_port_mappings_from_text(txt)
+					text_sanitized = _inject_network_mode_none_text(text_sanitized)
 					logger.debug(
 						"[vuln] sanitized compose text node=%s original_len=%s new_len=%s",
 						node_name,

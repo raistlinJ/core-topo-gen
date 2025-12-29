@@ -212,6 +212,94 @@ def test_test_core_success_includes_vm_metadata(client, monkeypatch):
     assert saved_payloads[0]['vmid'] == 101
 
 
+def test_test_core_install_custom_services_triggers_installer(client, monkeypatch):
+    monkeypatch.setattr(backend, '_core_connection', _fake_core_connection)
+    monkeypatch.setattr(backend.socket, 'socket', _FakeSocket)
+    monkeypatch.setattr(backend, '_load_core_credentials', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backend, '_ensure_core_daemon_listening', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backend, '_ensure_paramiko_available', lambda *_args, **_kwargs: None)
+
+    # Avoid depending on process inspection details.
+    monkeypatch.setattr(backend, '_collect_remote_core_daemon_pids', lambda *_args, **_kwargs: [123])
+
+    installer_calls = []
+
+    def _fake_installer(ssh_client, *, sudo_password, logger):
+        installer_calls.append({'ssh_client': ssh_client, 'sudo_password': sudo_password})
+        return {'services_dir': '/opt/core/services', 'modules': ['TrafficService']}
+
+    monkeypatch.setattr(backend, '_install_custom_services_to_core_vm', _fake_installer)
+
+    class _FakeSSH:
+        def set_missing_host_key_policy(self, *_args, **_kwargs):
+            return None
+
+        def connect(self, **_kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    class _FakeParamiko:
+        @staticmethod
+        def SSHClient():
+            return _FakeSSH()
+
+        @staticmethod
+        def AutoAddPolicy():
+            return object()
+
+    monkeypatch.setattr(backend, 'paramiko', _FakeParamiko())
+
+    def _fake_save(payload):
+        return {
+            'identifier': 'secret-install-services',
+            'scenario_name': payload.get('scenario_name'),
+            'scenario_index': payload.get('scenario_index'),
+            'host': payload['grpc_host'],
+            'port': payload['grpc_port'],
+            'grpc_host': payload['grpc_host'],
+            'grpc_port': payload['grpc_port'],
+            'ssh_host': payload['ssh_host'],
+            'ssh_port': payload['ssh_port'],
+            'ssh_username': payload['ssh_username'],
+            'ssh_enabled': payload['ssh_enabled'],
+            'vm_key': payload.get('vm_key'),
+            'vm_name': payload.get('vm_name'),
+            'vm_node': payload.get('vm_node'),
+            'vmid': payload.get('vmid'),
+            'stored_at': '2025-10-28T00:00:00Z',
+        }
+
+    monkeypatch.setattr(backend, '_save_core_credentials', _fake_save)
+
+    payload = {
+        'core': {
+            'host': 'core-host',
+            'port': 50051,
+            'ssh_host': 'core-host',
+            'ssh_port': 22,
+            'ssh_username': 'core',
+            'ssh_password': 'pw',
+            'install_custom_services': True,
+        },
+        'scenario_name': 'Scenario Install',
+        'scenario_index': 2,
+        'hitl_core': {
+            'vm_key': 'pve1::101',
+            'vm_node': 'pve1',
+            'vm_name': 'CORE VM',
+            'vmid': 101,
+        },
+    }
+
+    resp = client.post('/test_core', json=payload)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['ok'] is True
+    assert installer_calls and installer_calls[0]['sudo_password'] == 'pw'
+
+
 def test_run_cli_async_requires_ssh_credentials(client, tmp_path, monkeypatch):
     xml_path = tmp_path / 'scenarios.xml'
     xml_path.write_text('<Scenarios></Scenarios>')

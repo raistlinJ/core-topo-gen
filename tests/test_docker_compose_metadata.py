@@ -44,7 +44,10 @@ services:
         yaml = None  # type: ignore
     if yaml is not None:
         obj = yaml.safe_load(open(expected_path, encoding="utf-8"))
+        assert obj.get("networks") in (None, {}), "top-level networks should be removed when using network_mode none"
         svc = obj["services"]["app"]
+        assert svc.get("network_mode") == "none"
+        assert "networks" not in svc
         assert "build" in svc
         assert svc["build"]["dockerfile"] == "Dockerfile"
         assert "cap_add" in svc and "NET_ADMIN" in (svc["cap_add"] or [])

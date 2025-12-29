@@ -148,6 +148,7 @@ def test_participant_ui_details_api_ok_shape(tmp_path):
         assert payload['counts']['routers'] == 2
         assert payload['counts']['switches'] == 3
         assert payload['counts']['vulnerabilities'] == 7
+        assert payload.get('vulnerability_ips') == []
 
 
 def test_participant_ui_details_reports_running_when_core_session_active():

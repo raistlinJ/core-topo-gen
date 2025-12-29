@@ -2267,6 +2267,265 @@ def _start_remote_core_daemon(client: Any, sudo_password: str | None, logger: lo
             pass
 
 
+def _local_custom_services_dir() -> str:
+    repo_root = _get_repo_root()
+    return os.path.join(repo_root, 'on_core_machine', 'custom_services')
+
+
+def _local_custom_service_files() -> list[str]:
+    base = _local_custom_services_dir()
+    try:
+        if not os.path.isdir(base):
+            return []
+    except Exception:
+        return []
+    out: list[str] = []
+    try:
+        for name in os.listdir(base):
+            if not name.endswith('.py'):
+                continue
+            if name.startswith('.'):
+                continue
+            ap = os.path.join(base, name)
+            if os.path.isfile(ap):
+                out.append(ap)
+    except Exception:
+        return []
+    out.sort(key=lambda p: os.path.basename(p).lower())
+    return out
+
+
+def _install_custom_services_to_core_vm(
+    ssh_client: Any,
+    *,
+    sudo_password: str | None,
+    logger: logging.Logger,
+) -> dict:
+    """Copy repo-provided CORE custom services to the remote CORE VM.
+
+    - Uploads python service modules under on_core_machine/custom_services.
+    - Installs them into the remote core.services package directory.
+    - Restarts (or starts) core-daemon.
+    - Verifies the modules import successfully.
+    """
+
+    local_files = _local_custom_service_files()
+    if not local_files:
+        raise RuntimeError(f'No custom services found under {_local_custom_services_dir()}')
+    module_names = [os.path.splitext(os.path.basename(p))[0] for p in local_files]
+
+    def _exec(cmd: str, *, timeout: float = 25.0) -> tuple[int, str, str]:
+        stdin = stdout = stderr = None
+        try:
+            stdin, stdout, stderr = ssh_client.exec_command(cmd, timeout=timeout, get_pty=True)
+            out = stdout.read() if stdout else b''
+            err = stderr.read() if stderr else b''
+            try:
+                exit_code = stdout.channel.recv_exit_status() if (stdout and hasattr(stdout, 'channel')) else 0
+            except Exception:
+                exit_code = 0
+            out_text = out.decode('utf-8', 'ignore') if isinstance(out, (bytes, bytearray)) else str(out or '')
+            err_text = err.decode('utf-8', 'ignore') if isinstance(err, (bytes, bytearray)) else str(err or '')
+            return exit_code, out_text, err_text
+        finally:
+            try:
+                if stdin:
+                    stdin.close()
+            except Exception:
+                pass
+
+    def _sudo(cmd: str, *, timeout: float = 45.0) -> tuple[int, str, str]:
+        if not sudo_password:
+            # Installing into site-packages requires root on typical CORE installs.
+            raise RuntimeError('Installing custom services requires sudo; provide an SSH password in Step 2.')
+        wrapped = f"sudo -S -p '' sh -c {shlex.quote(cmd)}"
+        stdin = stdout = stderr = None
+        try:
+            stdin, stdout, stderr = ssh_client.exec_command(wrapped, timeout=timeout, get_pty=True)
+            try:
+                stdin.write(str(sudo_password) + '\n')
+                stdin.flush()
+            except Exception:
+                pass
+            out = stdout.read() if stdout else b''
+            err = stderr.read() if stderr else b''
+            try:
+                exit_code = stdout.channel.recv_exit_status() if (stdout and hasattr(stdout, 'channel')) else 0
+            except Exception:
+                exit_code = 0
+            out_text = out.decode('utf-8', 'ignore') if isinstance(out, (bytes, bytearray)) else str(out or '')
+            err_text = err.decode('utf-8', 'ignore') if isinstance(err, (bytes, bytearray)) else str(err or '')
+            return exit_code, out_text, err_text
+        finally:
+            try:
+                if stdin:
+                    stdin.close()
+            except Exception:
+                pass
+
+    # Discover the remote core.services directory (where CORE loads service modules).
+    probe = (
+        "python3 -c \"import os, core.services; print(os.path.dirname(core.services.__file__))\" 2>/dev/null "
+        "|| python -c \"import os, core.services; print(os.path.dirname(core.services.__file__))\" 2>/dev/null"
+    )
+    code, out, err = _exec(f"sh -c {shlex.quote(probe)}", timeout=20.0)
+    services_dir = (out or '').strip().splitlines()[-1].strip() if (out or '').strip() else ''
+    if not services_dir:
+        raise RuntimeError(f'Failed to locate remote core.services directory (probe exit={code}): {(err or out or "").strip()}')
+
+    logger.info('[core] Installing custom services into %s', services_dir)
+
+    # Upload files to a temp directory first.
+    tmp_dir = '/tmp/coretg_custom_services'
+    _exec(f"sh -c {shlex.quote(f'mkdir -p {tmp_dir}')}", timeout=15.0)
+    sftp = None
+    try:
+        sftp = ssh_client.open_sftp()
+        for lp in local_files:
+            rp = f"{tmp_dir}/{os.path.basename(lp)}"
+            sftp.put(lp, rp)
+    finally:
+        try:
+            if sftp:
+                sftp.close()
+        except Exception:
+            pass
+
+    # Install into core.services directory.
+    install_cmd = f"install -m 0644 {tmp_dir}/*.py {shlex.quote(services_dir)}/"
+    code, out, err = _sudo(install_cmd, timeout=45.0)
+    if code != 0:
+        raise RuntimeError(f'Failed installing custom services (exit={code}): {(err or out or "").strip()}')
+
+    # Restart (or start) core-daemon.
+    restart_cmd = "systemctl restart core-daemon || systemctl start core-daemon"
+    code, out, err = _sudo(restart_cmd, timeout=45.0)
+    if code != 0:
+        raise RuntimeError(f'Failed restarting core-daemon after install (exit={code}): {(err or out or "").strip()}')
+
+    # Verify CORE discovers these services (not just that files exist).
+    # We import the installed modules, extract CoreService subclasses and their `name`s,
+    # then ensure those names are present in the discoverable scan of `core.services`.
+    module_list_literal = json.dumps(module_names)
+    verify_script = textwrap.dedent(
+        f"""
+        import importlib
+        import inspect
+        import json
+        import pkgutil
+        import sys
+
+        import core.services
+
+        try:
+            from core.services.base import CoreService  # type: ignore
+        except Exception:  # pragma: no cover - remote execution
+            from core.services.coreservices import CoreService  # type: ignore
+
+        custom_modules = json.loads({module_list_literal!r})
+
+        def service_names_from_module(mod):
+            names = []
+            for _name, obj in inspect.getmembers(mod, inspect.isclass):
+                try:
+                    is_service = issubclass(obj, CoreService) and obj is not CoreService
+                except Exception:
+                    continue
+                if not is_service:
+                    continue
+                svc_name = getattr(obj, 'name', None)
+                if isinstance(svc_name, str) and svc_name.strip():
+                    names.append(svc_name.strip())
+            # keep deterministic output
+            return sorted(set(names))
+
+        module_service_names = {{}}
+        missing_modules = []
+        modules_without_services = []
+        custom_names = set()
+
+        for mod_name in custom_modules:
+            fq = f"core.services.{{mod_name}}"
+            try:
+                mod = importlib.import_module(fq)
+            except Exception as exc:
+                missing_modules.append({{'module': mod_name, 'error': repr(exc)}})
+                continue
+            names = service_names_from_module(mod)
+            module_service_names[mod_name] = names
+            if not names:
+                modules_without_services.append(mod_name)
+            custom_names.update(names)
+
+        # Discoverable scan across core.services.
+        all_names = set()
+        for m in pkgutil.iter_modules(core.services.__path__):
+            name = getattr(m, 'name', None)
+            if not name:
+                continue
+            try:
+                mod = importlib.import_module(f"core.services.{{name}}")
+            except Exception:
+                continue
+            for svc_name in service_names_from_module(mod):
+                all_names.add(svc_name)
+
+        custom_names_missing_from_scan = sorted([n for n in custom_names if n not in all_names])
+
+        result = {{
+            'custom_modules': custom_modules,
+            'module_service_names': module_service_names,
+            'custom_service_names': sorted(custom_names),
+            'missing_modules': missing_modules,
+            'modules_without_services': modules_without_services,
+            'all_service_names_count': len(all_names),
+            'custom_names_missing_from_scan': custom_names_missing_from_scan,
+        }}
+        print('::SERVICESCHECK::' + json.dumps(result, sort_keys=True))
+
+        if missing_modules or modules_without_services or custom_names_missing_from_scan:
+            sys.exit(4)
+        """
+    ).strip()
+
+    verify_cmd_py3 = textwrap.dedent(
+        f"""
+        cat <<'PY' | python3 -
+        {verify_script}
+        PY
+        """
+    ).strip()
+    verify_cmd_py = textwrap.dedent(
+        f"""
+        cat <<'PY' | python -
+        {verify_script}
+        PY
+        """
+    ).strip()
+    verify_cmd = f"{verify_cmd_py3} 2>/dev/null || {verify_cmd_py}"
+    code, out, err = _exec(f"sh -c {shlex.quote(verify_cmd)}", timeout=35.0)
+    marker = '::SERVICESCHECK::'
+    payload_line = ''
+    for line in (out or '').splitlines():
+        if marker in line:
+            payload_line = line.strip()
+    if not payload_line:
+        raise RuntimeError(f'Custom services verification did not produce expected output (exit={code}): {(err or out or "").strip()}')
+    try:
+        verify_payload = json.loads(payload_line.split(marker, 1)[1])
+    except Exception as exc:
+        raise RuntimeError(f'Custom services verification output could not be parsed: {exc}: {payload_line}')
+    if code != 0:
+        raise RuntimeError(f'Custom services failed CORE discovery verification: {json.dumps(verify_payload, indent=2)}')
+
+    return {
+        'services_dir': services_dir,
+        'modules': module_names,
+        'service_names': verify_payload.get('custom_service_names') if isinstance(verify_payload, dict) else None,
+        'module_service_names': verify_payload.get('module_service_names') if isinstance(verify_payload, dict) else None,
+    }
+
+
 def _ensure_remote_core_daemon_ready(
     client: Any,
     *,
@@ -5157,6 +5416,80 @@ def _subnet_cidrs_from_session_xml(session_xml_path: Optional[str]) -> list[str]
     return sorted(networks, key=lambda s: (s.split('/', 1)[0], int(s.split('/', 1)[1]) if '/' in s else 999))
 
 
+def _vulnerability_ipv4s_from_session_xml(session_xml_path: Optional[str]) -> list[str]:
+    """Best-effort vulnerability IPv4 addresses from a CORE session XML.
+
+    We treat Docker-backed nodes as "vulnerabilities" for Participant UI purposes.
+    """
+
+    if not session_xml_path:
+        return []
+    try:
+        ap = os.path.abspath(str(session_xml_path))
+    except Exception:
+        ap = str(session_xml_path)
+    if not ap or not os.path.exists(ap):
+        return []
+
+    try:
+        import ipaddress
+    except Exception:
+        return []
+
+    try:
+        summary = _analyze_core_xml(ap)
+    except Exception:
+        summary = {}
+
+    nodes = summary.get('nodes') if isinstance(summary, dict) else None
+    if not isinstance(nodes, list):
+        return []
+
+    def _is_vuln_node(node: dict) -> bool:
+        node_type = str(node.get('type') or '').strip().lower()
+        if 'docker' in node_type:
+            return True
+        services = node.get('services')
+        if isinstance(services, list):
+            for svc in services:
+                if 'docker' in str(svc or '').lower():
+                    return True
+        return False
+
+    ips: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if not _is_vuln_node(node):
+            continue
+        ifaces = node.get('interfaces')
+        if not isinstance(ifaces, list):
+            continue
+        for iface in ifaces:
+            if not isinstance(iface, dict):
+                continue
+            ip_raw = str(iface.get('ipv4') or '').strip()
+            if not ip_raw:
+                continue
+            ip_text = ip_raw.split('/', 1)[0].strip()
+            if not ip_text:
+                continue
+            try:
+                ip_obj = ipaddress.ip_address(ip_text)
+            except Exception:
+                continue
+            if getattr(ip_obj, 'version', None) != 4:
+                continue
+            if ip_obj.is_loopback or ip_obj.is_unspecified or ip_obj.is_link_local:
+                continue
+            ips.add(str(ip_obj))
+
+    try:
+        return sorted(ips, key=lambda s: int(ipaddress.ip_address(s)))
+    except Exception:
+        return sorted(ips)
+
+
 def _counts_from_session_xml(session_xml_path: Optional[str]) -> dict:
     """Best-effort {nodes, routers, switches} from a CORE session XML."""
     if not session_xml_path:
@@ -5422,6 +5755,8 @@ def participant_ui_details_api():
         session_xml_path = last_run.get('session_xml_path') or last_run.get('post_xml_path')
     subnetworks = _subnet_cidrs_from_session_xml(session_xml_path)
 
+    vulnerability_ips = _vulnerability_ipv4s_from_session_xml(session_xml_path)
+
     # Gateway: prefer the scenario's last session XML (matches core.html HITL gateway logic)
     gateway = ''
     if session_xml_path:
@@ -5522,6 +5857,7 @@ def participant_ui_details_api():
             'vulnerabilities': vuln_total,
         },
         'subnetworks': subnetworks,
+        'vulnerability_ips': vulnerability_ips,
     })
 
 
@@ -16423,14 +16759,17 @@ def test_core():
                 )
                 return jsonify({'ok': False, 'error': mismatch_message, 'vm_mismatch': True}), 409
         auto_start_daemon = bool(cfg.get('auto_start_daemon'))
+        install_custom_services = bool(cfg.get('install_custom_services'))
         is_pytest = bool(os.environ.get('PYTEST_CURRENT_TEST') or ('pytest' in sys.modules))
         daemon_pids: List[int] = []
-        if is_pytest:
+        if is_pytest and not (auto_start_daemon or install_custom_services):
             # Unit tests mock the tunnel/socket checks and should not depend on real DNS/SSH.
             app.logger.info('[core] skipping core-daemon SSH inspection (pytest)')
         elif paramiko is None:
             if auto_start_daemon:
                 app.logger.warning('[core] Paramiko unavailable; cannot auto-start or inspect core-daemon remotely.')
+            if install_custom_services:
+                app.logger.warning('[core] Paramiko unavailable; cannot install custom services remotely.')
         else:
             _ensure_paramiko_available()
             ssh_client = paramiko.SSHClient()  # type: ignore[assignment]
@@ -16455,6 +16794,32 @@ def test_core():
                         'Stop duplicate daemons before continuing.'
                     )
                     return jsonify({'ok': False, 'error': msg, 'daemon_conflict': True}), 409
+
+                if install_custom_services:
+                    app.logger.info('[core] Installing custom services on CORE VM...')
+                    install_meta = _install_custom_services_to_core_vm(
+                        ssh_client,
+                        sudo_password=cfg.get('ssh_password'),
+                        logger=app.logger,
+                    )
+                    app.logger.info(
+                        '[core] Custom services installed: modules=%s target=%s',
+                        ','.join(install_meta.get('modules') or []),
+                        install_meta.get('services_dir'),
+                    )
+                    try:
+                        time.sleep(1.0)
+                    except Exception:
+                        pass
+                    daemon_pids = _collect_remote_core_daemon_pids(ssh_client)
+                    if len(daemon_pids) > 1:
+                        msg = (
+                            'Multiple core-daemon processes are running on the CORE VM after installing services. '
+                            f'PIDs: {", ".join(str(pid) for pid in daemon_pids)}. '
+                            'Stop duplicate daemons before continuing.'
+                        )
+                        return jsonify({'ok': False, 'error': msg, 'daemon_conflict': True}), 409
+
                 if auto_start_daemon:
                     if daemon_pids:
                         app.logger.info('[core] Skipping auto-start; core-daemon already running (PID %s).', daemon_pids[0])

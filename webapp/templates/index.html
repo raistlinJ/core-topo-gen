@@ -368,6 +368,11 @@
                         <label class="form-check-label" for="coreAutoStartDaemon">Auto-start core-daemon if not running</label>
                         <div class="form-text">Runs 'sudo core-daemon -d' on the CORE VM during connection validation.</div>
                     </div>
+                    <div class="form-check form-switch mb-3">
+                        <input class="form-check-input" type="checkbox" id="coreInstallCustomServices">
+                        <label class="form-check-label" for="coreInstallCustomServices">Install custom services</label>
+                        <div class="form-text">Copies services from <code>on_core_machine/custom_services</code> to the CORE VM, restarts core-daemon, and verifies they load.</div>
+                    </div>
                     <div class="mt-4">
                         <button class="btn btn-link p-0" type="button" data-bs-toggle="collapse" data-bs-target="#coreConnAdvanced" aria-expanded="false" aria-controls="coreConnAdvanced">Advanced</button>
                         <div class="collapse" id="coreConnAdvanced">
@@ -6891,6 +6896,7 @@ async function validateCoreConnection(sidx, options = {}) {
         suppressToasts = false,
         rememberCredentials = true,
         autoStartDaemon = false,
+        installCustomServices = false,
     } = options;
     if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) {
         return { ok: false, message: 'Scenario unavailable' };
@@ -6920,6 +6926,7 @@ async function validateCoreConnection(sidx, options = {}) {
             vm_key: vmKey,
             vm_node: vmNode,
             auto_start_daemon: autoStartDaemon,
+            install_custom_services: installCustomServices,
         },
     };
     enrichPayloadWithScenarioContext(body, { scenarioIndex: sidx, scenarioOverride: scenario });
@@ -7185,6 +7192,9 @@ async function handleCoreConnectionSave(event) {
     const autoStartToggle = document.getElementById('coreAutoStartDaemon');
     const autoStartDaemon = autoStartToggle ? !!autoStartToggle.checked : !!(coreState.auto_start_daemon);
     coreState.auto_start_daemon = autoStartDaemon;
+    const installServicesToggle = document.getElementById('coreInstallCustomServices');
+    const installCustomServices = installServicesToggle ? !!installServicesToggle.checked : !!(coreState.install_custom_services);
+    coreState.install_custom_services = installCustomServices;
     const proxState = hitlState.proxmox || {};
     const prerequisitesMet = !!(proxState.validated && proxState.secret_id && coreState.vm_key);
     if (!prerequisitesMet) {
@@ -7261,6 +7271,7 @@ async function handleCoreConnectionSave(event) {
         closeModalOnSuccess: true,
         rememberCredentials: rememberCreds,
         autoStartDaemon: autoStartDaemon,
+        installCustomServices: installCustomServices,
     });
 }
 

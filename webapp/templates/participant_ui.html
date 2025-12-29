@@ -159,6 +159,24 @@
                   </div>
                 </details>
               </div>
+              <div class="col-12">
+                <details id="participantVulnIpsDetails">
+                  <summary class="text-secondary" id="participantVulnIpsSummary">Vulnerability IP addresses (0)</summary>
+                  <div class="mt-2">
+                    <div class="table-responsive">
+                      <table class="table table-sm table-dark table-striped align-middle mb-0 fs-6" aria-label="Vulnerability IP addresses">
+                        <thead>
+                          <tr>
+                            <th scope="col" style="width: 4rem;">#</th>
+                            <th scope="col">IP Address</th>
+                          </tr>
+                        </thead>
+                        <tbody id="participantVulnIpsList"></tbody>
+                      </table>
+                    </div>
+                  </div>
+                </details>
+              </div>
             </div>
           </div>
         </div>
@@ -193,6 +211,9 @@
   const subnetworksDetails = document.getElementById('participantSubnetworksDetails');
   const subnetworksSummary = document.getElementById('participantSubnetworksSummary');
   const subnetworksList = document.getElementById('participantSubnetworksList');
+  const vulnIpsDetails = document.getElementById('participantVulnIpsDetails');
+  const vulnIpsSummary = document.getElementById('participantVulnIpsSummary');
+  const vulnIpsList = document.getElementById('participantVulnIpsList');
   const scenarioItems = Array.from(document.querySelectorAll('[data-participant-scenario]'));
   const toggleSidebarBtn = document.querySelector('[data-participant-toggle-sidebar]');
   const showSidebarBtn = document.querySelector('[data-participant-show-sidebar]');
@@ -282,6 +303,47 @@
     }
   };
 
+  const renderVulnerabilityIps = (items) => {
+    if(!vulnIpsList || !vulnIpsSummary) return;
+    const names = Array.isArray(items) ? items.map(v => String(v || '').trim()).filter(Boolean) : [];
+    const ipToInt = (ip) => {
+      const parts = String(ip || '').trim().split('.');
+      if(parts.length !== 4) return null;
+      const nums = parts.map(p => Number(p));
+      if(nums.some(n => !Number.isFinite(n) || n < 0 || n > 255)) return null;
+      return ((nums[0] << 24) >>> 0) + (nums[1] << 16) + (nums[2] << 8) + nums[3];
+    };
+    const uniq = Array.from(new Set(names));
+    const sorted = uniq
+      .map(ip => ({ ip, ipInt: ipToInt(ip) }))
+      .sort((a, b) => {
+        if(a.ipInt !== null && b.ipInt !== null) return a.ipInt - b.ipInt;
+        if(a.ipInt !== null) return -1;
+        if(b.ipInt !== null) return 1;
+        return a.ip.localeCompare(b.ip);
+      });
+    vulnIpsSummary.textContent = `Vulnerability IP addresses (${uniq.length})`;
+    vulnIpsList.innerHTML = '';
+    sorted.forEach((row, idx) => {
+      const tr = document.createElement('tr');
+      const tdIdx = document.createElement('td');
+      tdIdx.className = 'text-secondary';
+      tdIdx.textContent = String(idx + 1);
+      const tdVal = document.createElement('td');
+      tdVal.className = 'text-white fw-semibold';
+      tdVal.textContent = row.ip;
+      tr.appendChild(tdIdx);
+      tr.appendChild(tdVal);
+      vulnIpsList.appendChild(tr);
+    });
+    if(vulnIpsDetails){
+      vulnIpsDetails.style.display = '';
+      if(uniq.length === 0){
+        vulnIpsDetails.open = false;
+      }
+    }
+  };
+
   const fetchScenarioDetails = async (norm) => {
     try {
       const url = norm ? `/participant-ui/details?scenario=${encodeURIComponent(norm)}` : '/participant-ui/details';
@@ -339,6 +401,7 @@
     if(statVulns) statVulns.textContent = (counts.vulnerabilities !== null && counts.vulnerabilities !== undefined) ? String(counts.vulnerabilities) : '-';
 
     renderSubnetworks(payload && payload.subnetworks);
+    renderVulnerabilityIps(payload && payload.vulnerability_ips);
   };
 
   const refreshStats = async () => {

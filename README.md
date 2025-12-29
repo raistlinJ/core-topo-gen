@@ -91,7 +91,7 @@ Popular options:
 ### Traffic, segmentation, and services
 - Traffic scripts land in `/tmp/traffic` (with companion services) and respect overrides for pattern, rate, jitter, and content hints.
 - Segmentation scripts land in `/tmp/segmentation` alongside a `segmentation_summary.json`; NAT mode, DNAT probability, host inclusion, and docker port allowances are configurable.
-- Docker vulnerabilities attach per-node docker-compose files in `/tmp/vulns`, with metadata embedded into CORE nodes.
+- Docker vulnerabilities attach per-node docker-compose files in `/tmp/vulns` with `network_mode: none` enforced per service (to prevent Docker-injected `eth0`/default gateways), and metadata embedded into CORE nodes.
 - Custom traffic plugins can register via `core_topo_gen.plugins.traffic.register()` for bespoke sender/receiver code.
 
 ### Reports & artifacts
