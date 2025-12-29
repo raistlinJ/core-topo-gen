@@ -151,6 +151,121 @@ def test_participant_ui_details_api_ok_shape(tmp_path):
         assert payload.get('vulnerability_ips') == []
 
 
+def test_participant_ui_details_populates_vulnerability_ips_from_session_xml(tmp_path):
+        app.config['TESTING'] = True
+        client = app.test_client()
+
+        login_resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
+        assert login_resp.status_code in (302, 303)
+
+        session_xml_path = tmp_path / 'core-session.xml'
+        session_xml_path.write_text(
+                """<?xml version='1.0' encoding='UTF-8'?>
+<scenario>
+    <devices>
+        <device id=\"30\" name=\"h15\" type=\"docker\" class=\"docker\" compose=\"/tmp/vulns/docker-compose-h15.yml\" compose_name=\"mysql\"/>
+        <device id=\"51\" name=\"rsw\" type=\"switch\"/>
+    </devices>
+    <links>
+        <link node1=\"30\" node2=\"51\">
+            <iface1 id=\"0\" name=\"eth0\" ip4=\"192.168.50.10\" ip4_mask=\"24\"/>
+            <iface2 id=\"0\" name=\"veth51.0.1\"/>
+        </link>
+    </links>
+</scenario>
+""",
+                encoding='utf-8',
+        )
+
+        fake_history = [
+                {
+                        'timestamp': '2025-01-01T00:00:00Z',
+                        'scenario_names': ['Test Scenario'],
+                        'returncode': 0,
+                        'summary_path': None,
+                        'session_xml_path': str(session_xml_path),
+                }
+        ]
+        fake_state = {
+                'selected_norm': 'test scenario',
+                'selected_nearest_gateway': '',
+                'listing': [
+                        {
+                                'norm': 'test scenario',
+                                'display': 'Test Scenario',
+                                'url': 'https://example.com',
+                                'has_url': True,
+                                'assigned': True,
+                                'active': True,
+                        }
+                ],
+        }
+
+        with patch('webapp.app_backend._participant_ui_state', return_value=fake_state), \
+                 patch('webapp.app_backend._load_run_history', return_value=fake_history), \
+                 patch('webapp.app_backend._hitl_details_from_path', return_value=[]):
+                resp = client.get('/participant-ui/details?scenario=test%20scenario')
+                assert resp.status_code == 200
+                payload = resp.get_json()
+                assert payload and payload.get('ok') is True
+                assert payload.get('vulnerability_ips') == ['192.168.50.10']
+
+
+        def test_participant_ui_details_vulnerability_ips_fallback_from_device_descendant_ip_attr(tmp_path):
+            app.config['TESTING'] = True
+            client = app.test_client()
+
+            login_resp = client.post('/login', data={'username': 'coreadmin', 'password': 'coreadmin'})
+            assert login_resp.status_code in (302, 303)
+
+            session_xml_path = tmp_path / 'core-session.xml'
+            session_xml_path.write_text(
+                """<?xml version='1.0' encoding='UTF-8'?>
+        <scenario>
+            <devices>
+            <device id=\"30\" name=\"h15\" type=\"docker\" class=\"docker\" compose=\"/tmp/vulns/docker-compose-h15.yml\" compose_name=\"mysql\">
+                <netif name=\"eth0\" ip=\"172.16.99.7/24\"/>
+            </device>
+            </devices>
+        </scenario>
+        """,
+                encoding='utf-8',
+            )
+
+            fake_history = [
+                {
+                    'timestamp': '2025-01-01T00:00:00Z',
+                    'scenario_names': ['Test Scenario'],
+                    'returncode': 0,
+                    'summary_path': None,
+                    'session_xml_path': str(session_xml_path),
+                }
+            ]
+            fake_state = {
+                'selected_norm': 'test scenario',
+                'selected_nearest_gateway': '',
+                'listing': [
+                    {
+                        'norm': 'test scenario',
+                        'display': 'Test Scenario',
+                        'url': 'https://example.com',
+                        'has_url': True,
+                        'assigned': True,
+                        'active': True,
+                    }
+                ],
+            }
+
+            with patch('webapp.app_backend._participant_ui_state', return_value=fake_state), \
+                 patch('webapp.app_backend._load_run_history', return_value=fake_history), \
+                 patch('webapp.app_backend._hitl_details_from_path', return_value=[]):
+                resp = client.get('/participant-ui/details?scenario=test%20scenario')
+                assert resp.status_code == 200
+                payload = resp.get_json()
+                assert payload and payload.get('ok') is True
+                assert payload.get('vulnerability_ips') == ['172.16.99.7']
+
+
 def test_participant_ui_details_reports_running_when_core_session_active():
     app.config['TESTING'] = True
     client = app.test_client()

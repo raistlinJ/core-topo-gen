@@ -5505,53 +5505,162 @@ def _vulnerability_ipv4s_from_session_xml(session_xml_path: Optional[str]) -> li
     except Exception:
         return []
 
+    # NOTE: We intentionally parse the XML directly instead of relying on
+    # _analyze_core_xml() because its node list is filtered for UI convenience
+    # and can drop docker/compose nodes when interface/link info is missing.
     try:
-        summary = _analyze_core_xml(ap)
+        root = LET.parse(ap).getroot()
     except Exception:
-        summary = {}
-
-    nodes = summary.get('nodes') if isinstance(summary, dict) else None
-    if not isinstance(nodes, list):
         return []
 
-    def _is_vuln_node(node: dict) -> bool:
-        node_type = str(node.get('type') or '').strip().lower()
-        if 'docker' in node_type:
+    def _local(tag: str) -> str:
+        if not tag:
+            return ''
+        if '}' in tag:
+            return tag.split('}', 1)[1]
+        return tag
+
+    def _iter_local(el, lname: str):
+        lname = lname.lower()
+        for e in el.iter():
+            if _local(getattr(e, 'tag', '')).lower() == lname:
+                yield e
+
+    def _looks_like_vuln(dev) -> bool:
+        try:
+            t = str(dev.get('type') or '').strip().lower()
+        except Exception:
+            t = ''
+        try:
+            cls = str(dev.get('class') or '').strip().lower()
+        except Exception:
+            cls = ''
+        try:
+            comp = str(dev.get('compose') or '').strip()
+        except Exception:
+            comp = ''
+        try:
+            comp_name = str(dev.get('compose_name') or '').strip()
+        except Exception:
+            comp_name = ''
+        if 'docker' in t or 'docker' in cls:
             return True
-        services = node.get('services')
-        if isinstance(services, list):
-            for svc in services:
-                if 'docker' in str(svc or '').lower():
+        if comp or comp_name:
+            return True
+        # fall back to services, if present
+        try:
+            for svc in dev.findall('.//service'):
+                nm = (svc.get('name') or (svc.text or '')).strip().lower()
+                if 'docker' in nm:
                     return True
+        except Exception:
+            pass
         return False
 
+    vuln_ids: set[str] = set()
+    # session exports sometimes use <node> instead of <device>
+    for dev in list(_iter_local(root, 'device')) + list(_iter_local(root, 'node')):
+        if not _looks_like_vuln(dev):
+            continue
+        did = str(dev.get('id') or '').strip()
+        if did:
+            vuln_ids.add(did)
+
+    if not vuln_ids:
+        return []
+
     ips: set[str] = set()
-    for node in nodes:
-        if not isinstance(node, dict):
+
+    def _add_ipv4(ip_value: Any) -> None:
+        if not ip_value:
+            return
+        ip_raw = str(ip_value).strip()
+        if not ip_raw:
+            return
+        ip_text = ip_raw.split('/', 1)[0].strip()
+        if not ip_text:
+            return
+        try:
+            ip_obj = ipaddress.ip_address(ip_text)
+        except Exception:
+            return
+        if getattr(ip_obj, 'version', None) != 4:
+            return
+        if ip_obj.is_loopback or ip_obj.is_unspecified or ip_obj.is_link_local:
+            return
+        ips.add(str(ip_obj))
+
+    def _maybe_add_ipv4_from_attrib(attrib: dict) -> None:
+        if not attrib:
+            return
+        for k, v in attrib.items():
+            key = str(k or '').strip().lower().replace('-', '_')
+            if not key:
+                continue
+            # Common encodings seen across CORE XML exports.
+            if key in {'ip4', 'ipv4', 'ip', 'addr', 'address'}:
+                _add_ipv4(v)
+                continue
+            if key.endswith('_ip4') or key.endswith('_ipv4') or key.endswith('_ip'):
+                _add_ipv4(v)
+                continue
+
+    # Collect addresses from link endpoints.
+    for link in _iter_local(root, 'link'):
+        try:
+            n1 = str(link.get('node1') or link.get('node1_id') or '').strip()
+            n2 = str(link.get('node2') or link.get('node2_id') or '').strip()
+        except Exception:
+            n1, n2 = '', ''
+
+        # Common CORE format: iface1 belongs to node1; iface2 belongs to node2.
+        try:
+            if n1 and n1 in vuln_ids:
+                iface1 = next(_iter_local(link, 'iface1'), None)
+                if iface1 is not None:
+                    _maybe_add_ipv4_from_attrib(getattr(iface1, 'attrib', {}) or {})
+            if n2 and n2 in vuln_ids:
+                iface2 = next(_iter_local(link, 'iface2'), None)
+                if iface2 is not None:
+                    _maybe_add_ipv4_from_attrib(getattr(iface2, 'attrib', {}) or {})
+        except Exception:
+            pass
+
+        # Additional address encodings
+        try:
+            for child in list(link):
+                tag = _local(getattr(child, 'tag', '')).lower()
+                if tag not in ('iface', 'interface', 'addr', 'address'):
+                    continue
+                target = str(child.get('node') or child.get('node_id') or child.get('device') or '').strip()
+                if target and target not in vuln_ids:
+                    continue
+                _maybe_add_ipv4_from_attrib(getattr(child, 'attrib', {}) or {})
+                _add_ipv4(child.get('value') or (child.text or '').strip())
+        except Exception:
+            pass
+
+    # Also attempt to read any interfaces nested under the vuln node itself.
+    for dev in list(_iter_local(root, 'device')) + list(_iter_local(root, 'node')):
+        did = str(dev.get('id') or '').strip()
+        if not did or did not in vuln_ids:
             continue
-        if not _is_vuln_node(node):
-            continue
-        ifaces = node.get('interfaces')
-        if not isinstance(ifaces, list):
-            continue
-        for iface in ifaces:
-            if not isinstance(iface, dict):
-                continue
-            ip_raw = str(iface.get('ipv4') or '').strip()
-            if not ip_raw:
-                continue
-            ip_text = ip_raw.split('/', 1)[0].strip()
-            if not ip_text:
-                continue
-            try:
-                ip_obj = ipaddress.ip_address(ip_text)
-            except Exception:
-                continue
-            if getattr(ip_obj, 'version', None) != 4:
-                continue
-            if ip_obj.is_loopback or ip_obj.is_unspecified or ip_obj.is_link_local:
-                continue
-            ips.add(str(ip_obj))
+        try:
+            _maybe_add_ipv4_from_attrib(getattr(dev, 'attrib', {}) or {})
+            for iface in list(_iter_local(dev, 'interface')) + list(_iter_local(dev, 'iface')):
+                _maybe_add_ipv4_from_attrib(getattr(iface, 'attrib', {}) or {})
+        except Exception:
+            pass
+
+        # Fallback: scan any descendant elements for common address attributes.
+        try:
+            for child in dev.iter():
+                _maybe_add_ipv4_from_attrib(getattr(child, 'attrib', {}) or {})
+                tag = _local(getattr(child, 'tag', '')).lower()
+                if tag in {'ip', 'ip4', 'ipv4', 'addr', 'address'}:
+                    _add_ipv4((child.text or '').strip())
+        except Exception:
+            pass
 
     try:
         return sorted(ips, key=lambda s: int(ipaddress.ip_address(s)))
@@ -15777,6 +15886,20 @@ def core_page():
 
 @app.route('/core/data')
 def core_data():
+    def _query_bool_param(name: str, default: bool) -> bool:
+        raw = request.args.get(name)
+        if raw is None:
+            return default
+        try:
+            v = str(raw).strip().lower()
+        except Exception:
+            return default
+        if v in ('1', 'true', 'yes', 'on'):
+            return True
+        if v in ('0', 'false', 'no', 'off'):
+            return False
+        return default
+
     history = _load_run_history()
     current_user = _current_user()
     scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
@@ -15804,10 +15927,14 @@ def core_data():
         core_cfg.get('ssh_port'),
     )
     session_meta: Dict[str, Any] = {}
+    include_xmls = _query_bool_param('include_xmls', True)
+
     sessions = _list_active_core_sessions(host, port, core_cfg, errors=core_errors, meta=session_meta)
     grpc_command = session_meta.get('grpc_command')
     app.logger.info('[core.data] session_count=%d', len(sessions))
-    xmls = _scan_core_xmls()
+    xmls: Optional[list[dict]] = None
+    if include_xmls:
+        xmls = _scan_core_xmls()
     # annotate xmls with running/session_id best-effort mapping, as in core_page. Scope by CORE VM.
     mapping = _load_core_sessions_store()
     mapping = _migrate_core_sessions_store_with_core_targets(mapping, history)
@@ -15919,6 +16046,22 @@ def core_data():
     except Exception:
         active_session_counts = {}
 
+    # Scenario "items" = saved artifacts known for that scenario (e.g., saved XMLs).
+    # This is intentionally derived from the scenario catalog (paths) to avoid extra
+    # filesystem scanning cost during polling.
+    scenario_item_counts: dict[str, int] = {}
+    try:
+        for name in scenario_names or []:
+            try:
+                disp = str(name)
+                norm = _normalize_scenario_label(name)
+                paths = scenario_paths.get(norm) if isinstance(scenario_paths, dict) else None
+                scenario_item_counts[disp] = len(paths or [])
+            except Exception:
+                continue
+    except Exception:
+        scenario_item_counts = {}
+
     if scenario_norm:
         # Prefer scenario_name equality when we have it (including from remote meta).
         filtered: list[dict] = []
@@ -15974,11 +16117,12 @@ def core_data():
                     s['scenario_name'] = scenario_display or s.get('scenario_name') or ''
                 except Exception:
                     pass
-        filtered_xmls, xml_matched = _filter_xmls_by_scenario(xmls, scenario_norm, scenario_paths, mapping)
-        if xml_matched:
-            xmls = filtered_xmls
-        else:
-            app.logger.info('[core.data] scenario=%s produced no XML matches; showing all XMLs', scenario_norm)
+        if include_xmls and xmls is not None:
+            filtered_xmls, xml_matched = _filter_xmls_by_scenario(xmls, scenario_norm, scenario_paths, mapping)
+            if xml_matched:
+                xmls = filtered_xmls
+            else:
+                app.logger.info('[core.data] scenario=%s produced no XML matches; showing all XMLs', scenario_norm)
     # Provide the requested generated filename: <scenario-name><timestamp>.xml.
     for s in sessions:
         try:
@@ -16015,18 +16159,19 @@ def core_data():
         if sid is None:
             continue
         file_to_sid.setdefault(os.path.abspath(k), sid)
-    for x in xmls:
-        sid = file_to_sid.get(x['path'])
-        x['session_id'] = sid
-        x['running'] = sid is not None
+    if include_xmls and xmls is not None:
+        for x in xmls:
+            sid = file_to_sid.get(x['path'])
+            x['session_id'] = sid
+            x['running'] = sid is not None
 
     core_modal_href = url_for('index', core_modal=1, scenario=scenario_display) if scenario_display else url_for('index', core_modal=1)
-    return jsonify({
+    payload: dict[str, Any] = {
         'sessions': sessions,
-        'xmls': xmls,
         'scenarios': scenario_names,
         'active_scenario': scenario_display,
         'active_session_counts': active_session_counts,
+        'scenario_item_counts': scenario_item_counts,
         'host': host,
         'port': port,
         'core_vm_configured': bool(core_vm_configured),
@@ -16035,7 +16180,10 @@ def core_data():
         'errors': core_errors,
         'grpc_command': grpc_command,
         'logs': _current_core_ui_logs(),
-    })
+    }
+    if include_xmls:
+        payload['xmls'] = xmls or []
+    return jsonify(payload)
 
 
 @app.route('/core/upload', methods=['POST'])

@@ -59,6 +59,7 @@
 
   /* Scenario list indicator */
   .scenario-active-dot { font-size: .55rem; line-height: 1; vertical-align: middle; }
+  .scenario-item-dot { font-size: .55rem; line-height: 1; vertical-align: middle; }
   /* Inline loading bar */
   #dataLoadingBar { height:4px; position:relative; margin-bottom:.5rem; overflow:hidden; border-radius:2px; background:rgba(0,0,0,0.08); }
   #dataLoadingBar.d-none { display:none !important; }
@@ -188,6 +189,7 @@
           <button type="button" class="list-group-item list-group-item-action py-1 {% if active_scenario and active_scenario==s %}active bg-primary text-white{% endif %}" data-scen-name="{{ s }}">
             <span class="scenario-name">{{ s }}</span>
             <span class="scenario-active-dot d-none ms-1" aria-hidden="true"><i class="bi bi-circle-fill text-success"></i></span>
+            <span class="scenario-item-dot d-none ms-1" aria-hidden="true"><i class="bi bi-circle-fill text-warning"></i></span>
           </button>
           {% endfor %}
         {% else %}
@@ -239,7 +241,7 @@
               <small class="text-muted ms-2">on disk</small>
             </div>
           </div>
-          <div class="table-responsive flex-grow-1" style="overflow-y:auto; overflow-x:auto;">
+          <div class="table-responsive flex-grow-1" style="max-height: 320px; overflow-y:auto; overflow-x:auto;">
             <table class="table table-sm align-middle mb-0" id="xmlsTable">
               <thead class="table-light">
                 <tr>
@@ -312,6 +314,7 @@
 (function(){
   let auto = true;
   let timer = null;
+  let tabVisible = true;
   let intervalMs = parseInt(localStorage.getItem('coreRefreshMs') || '5000', 10);
   const coreDataBaseUrl = "{{ url_for('core_data') }}";
   const isBuilderView = {{ 'true' if is_builder_view else 'false' }};
@@ -339,6 +342,12 @@
   let xmlsFilterText = '';
   let sessionsFilterText = '';
   let latestSessionIds = new Set();
+  let lastDockerScenario = null;
+  let corePollSeq = 0;
+  let lastXmlsScenario = null;
+  let lastSessionsSig = null;
+  let lastXmlsSig = null;
+  let lastDotSig = null;
   // Persistent selection state (restored across full page reloads)
   const LS_KEYS = {
     xmls: 'coreSelectedXmls',
@@ -452,11 +461,18 @@
 </div>`;
   }
 
-  function buildCoreDataUrl(){
+  function buildCoreDataUrl(opts){
     ensureScenarioSelected();
     if(!scenarioFilter) return coreDataBaseUrl;
+    const params = new URLSearchParams();
+    params.set('scenario', scenarioFilter);
+    if(opts && opts.includeXmls === false){
+      params.set('include_xmls', '0');
+    } else if(opts && opts.includeXmls === true){
+      params.set('include_xmls', '1');
+    }
     const sep = coreDataBaseUrl.includes('?') ? '&' : '?';
-    return `${coreDataBaseUrl}${sep}scenario=${encodeURIComponent(scenarioFilter)}`;
+    return `${coreDataBaseUrl}${sep}${params.toString()}`;
   }
 
   function updateCoreScenarioQueryParam(){
@@ -485,15 +501,19 @@
     });
   }
 
-  function updateScenarioActiveDots(counts){
+  function updateScenarioActiveDots(counts, itemCounts){
     if(!scenarioFilterList) return;
     const c = (counts && typeof counts === 'object') ? counts : {};
+    const items = (itemCounts && typeof itemCounts === 'object') ? itemCounts : {};
     scenarioFilterList.querySelectorAll('button[data-scen-name]').forEach(btn => {
       const name = btn.getAttribute('data-scen-name') || '';
       const dot = btn.querySelector('.scenario-active-dot');
-      if(!dot) return;
+      const itemDot = btn.querySelector('.scenario-item-dot');
+      if(!dot && !itemDot) return;
       const n = (name && Object.prototype.hasOwnProperty.call(c, name)) ? Number(c[name]) : 0;
-      dot.classList.toggle('d-none', !(n > 0));
+      const hasItems = (name && Object.prototype.hasOwnProperty.call(items, name)) ? (Number(items[name]) > 0) : false;
+      if(dot) dot.classList.toggle('d-none', !(n > 0));
+      if(itemDot) itemDot.classList.toggle('d-none', !((n <= 0) && hasItems));
     });
   }
 
@@ -530,7 +550,7 @@
       btn.type = 'button';
       btn.className = 'list-group-item list-group-item-action py-1 text-start';
       btn.dataset.scenName = name;
-      btn.innerHTML = `<span class="scenario-name">${esc(name)}</span><span class="scenario-active-dot d-none ms-1" aria-hidden="true"><i class="bi bi-circle-fill text-success"></i></span>`;
+      btn.innerHTML = `<span class="scenario-name">${esc(name)}</span><span class="scenario-active-dot d-none ms-1" aria-hidden="true"><i class="bi bi-circle-fill text-success"></i></span><span class="scenario-item-dot d-none ms-1" aria-hidden="true"><i class="bi bi-circle-fill text-warning"></i></span>`;
       if(scenarioFilter && name === scenarioFilter){
         btn.classList.add('active','bg-primary','text-white');
       }
@@ -584,6 +604,58 @@
   function closeProgress(){ progressModalInstance?.hide(); }
 
   function esc(s){ return (s||'').toString().replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+
+  function signatureForSessions(list){
+    try {
+      if(!Array.isArray(list)) return '';
+      const rows = list.map(s => {
+        const sid = (s && (s.id ?? s.session_id));
+        const sidText = (sid !== undefined && sid !== null) ? String(sid) : '';
+        const state = (s && (s.state ?? '')) ? String(s.state) : '';
+        const nodes = (s && (s.nodes ?? '')) ? String(s.nodes) : '';
+        const scen = (s && (s.scenario_name ?? '')) ? String(s.scenario_name) : '';
+        const file = (s && (s.file ?? '')) ? String(s.file) : '';
+        const dir = (s && (s.dir ?? '')) ? String(s.dir) : '';
+        const filename = (s && (s.filename ?? '')) ? String(s.filename) : '';
+        const hitl = firstHitlIp(s);
+        return [sidText, state, nodes, scen, file, dir, filename, hitl];
+      });
+      return JSON.stringify(rows);
+    } catch(e){
+      return String(Math.random());
+    }
+  }
+
+  function signatureForXmls(list){
+    try {
+      if(!Array.isArray(list)) return '';
+      const rows = list.map(x => [
+        x && x.path ? String(x.path) : '',
+        x && x.name ? String(x.name) : '',
+        x && x.valid ? 1 : 0,
+        x && x.running ? 1 : 0,
+        (x && x.session_id !== undefined && x.session_id !== null) ? String(x.session_id) : '',
+      ]);
+      return JSON.stringify(rows);
+    } catch(e){
+      return String(Math.random());
+    }
+  }
+
+  function signatureForScenarioDots(counts, itemCounts){
+    try {
+      const c = (counts && typeof counts === 'object') ? counts : {};
+      const items = (itemCounts && typeof itemCounts === 'object') ? itemCounts : {};
+      const keys = Array.from(new Set([...
+        Object.keys(c || {}),
+        Object.keys(items || {}),
+      ])).sort();
+      const rows = keys.map(k => [k, Number(c[k] || 0), Number(items[k] || 0)]);
+      return JSON.stringify(rows);
+    } catch(e){
+      return String(Math.random());
+    }
+  }
 
   function basenameFromPath(p){
     try {
@@ -720,13 +792,17 @@
     if(on){ bar.classList.remove('d-none'); }
     else { bar.classList.add('d-none'); }
   }
-  async function refresh(){
+  async function refresh(opts){
     if(isFetching) return; // avoid overlaps
     isFetching = true;
     const startTs = performance.now();
     setLoading(true);
     try{
-      const dataUrl = buildCoreDataUrl();
+      corePollSeq += 1;
+      const scenarioNow = scenarioFilter || null;
+      const forceXmls = !!(opts && opts.forceXmls);
+      const shouldIncludeXmls = forceXmls || (!firstLoadDone) || (scenarioNow !== lastXmlsScenario) || (corePollSeq % 6 === 0);
+      const dataUrl = buildCoreDataUrl({ includeXmls: shouldIncludeXmls });
       dockLog('DEBUG', `[core] Refreshing core data from ${dataUrl}${scenarioFilter ? ` (scenario=${scenarioFilter})` : ''}`);
       const res = await fetch(dataUrl, { cache:'no-store' });
       if(!res.ok){
@@ -774,34 +850,71 @@
         }
       }
       if(Array.isArray(data.scenarios)){
-        scenarioNamesCache = data.scenarios;
-        ensureScenarioSelected();
-        renderCoreScenarioButtons();
-        updateScenarioActiveDots(data.active_session_counts);
+        const next = data.scenarios.map(v => String(v));
+        const prev = Array.isArray(scenarioNamesCache) ? scenarioNamesCache.map(v => String(v)) : [];
+        const same = (next.length === prev.length) && next.every((v, i) => v === prev[i]);
+        if(!same){
+          scenarioNamesCache = next;
+          ensureScenarioSelected();
+          renderCoreScenarioButtons();
+        } else {
+          ensureScenarioSelected();
+          updateCoreScenarioControls();
+        }
+        const nextDotSig = signatureForScenarioDots(data.active_session_counts, data.scenario_item_counts);
+        if(nextDotSig !== lastDotSig){
+          updateScenarioActiveDots(data.active_session_counts, data.scenario_item_counts);
+          lastDotSig = nextDotSig;
+        }
       } else {
+        ensureScenarioSelected();
         updateCoreScenarioControls();
-        updateScenarioActiveDots(data.active_session_counts);
+        const nextDotSig = signatureForScenarioDots(data.active_session_counts, data.scenario_item_counts);
+        if(nextDotSig !== lastDotSig){
+          updateScenarioActiveDots(data.active_session_counts, data.scenario_item_counts);
+          lastDotSig = nextDotSig;
+        }
       }
       updateCoreScenarioQueryParam();
       if(Array.isArray(data.sessions) && sessionsTBody){
-        latestSessionIds = new Set();
-        data.sessions.forEach(s=>{
-          const sid = (s && (s.id ?? s.session_id));
-          const sidText = sid !== undefined && sid !== null ? String(sid) : '';
-          if(sidText) latestSessionIds.add(sidText);
-        });
-        sessionsTBody.innerHTML = data.sessions.map(buildSessionRow).filter(Boolean).join('\n');
-        dockLog('DEBUG', `[core] Sessions updated (${data.sessions.length} items)`);
-        bindSessionsSelectionHandlers();
-        if (sessionsMasterSelectAll && sessionsAutoReapply) applySessionsMasterSelectAll();
+        const nextSig = signatureForSessions(data.sessions);
+        if(nextSig !== lastSessionsSig){
+          latestSessionIds = new Set();
+          data.sessions.forEach(s=>{
+            const sid = (s && (s.id ?? s.session_id));
+            const sidText = sid !== undefined && sid !== null ? String(sid) : '';
+            if(sidText) latestSessionIds.add(sidText);
+          });
+          sessionsTBody.innerHTML = data.sessions.map(buildSessionRow).filter(Boolean).join('\n');
+          dockLog('DEBUG', `[core] Sessions updated (${data.sessions.length} items)`);
+          bindSessionsSelectionHandlers();
+          if (sessionsMasterSelectAll && sessionsAutoReapply) applySessionsMasterSelectAll();
+          lastSessionsSig = nextSig;
+        } else {
+          dockLog('DEBUG', `[core] Sessions unchanged (${data.sessions.length} items)`);
+        }
       }
       if(Array.isArray(data.xmls) && xmlsTBody){
-        xmlsTBody.innerHTML = data.xmls.map(buildXmlRow).filter(Boolean).join('\n');
-        bindXmlSelectionHandlers();
-        if (xmlsMasterSelectAll && xmlsAutoReapply) applyXmlMasterSelectAll();
-        dockLog('DEBUG', `[core] XML catalog updated (${data.xmls.length} files)`);
+        const nextSig = signatureForXmls(data.xmls);
+        if(nextSig !== lastXmlsSig){
+          xmlsTBody.innerHTML = data.xmls.map(buildXmlRow).filter(Boolean).join('\n');
+          bindXmlSelectionHandlers();
+          if (xmlsMasterSelectAll && xmlsAutoReapply) applyXmlMasterSelectAll();
+          dockLog('DEBUG', `[core] XML catalog updated (${data.xmls.length} files)`);
+          lastXmlsSig = nextSig;
+        } else {
+          dockLog('DEBUG', `[core] XML catalog unchanged (${data.xmls.length} files)`);
+        }
+        lastXmlsScenario = scenarioFilter || null;
       }
-      await refreshDocker();
+      // Docker status refresh can be expensive; only refresh when the scenario changes
+      // (or on first load). Manual refresh via the button is always available.
+      const dockerScenario = scenarioFilter || null;
+      const shouldRefreshDocker = (!firstLoadDone) || (dockerScenario !== lastDockerScenario);
+      if(shouldRefreshDocker){
+        lastDockerScenario = dockerScenario;
+        await refreshDocker();
+      }
     }catch(e){ dockLog('ERROR', `[core] refresh error: ${e}`); }
     finally {
       const elapsed = performance.now() - startTs;
@@ -850,11 +963,36 @@
 
   function schedule(){
     if(timer) clearTimeout(timer);
-    if(!auto) return;
+    if(typeof document !== 'undefined'){
+      try { tabVisible = !document.hidden; } catch(e) { tabVisible = true; }
+    }
+    if(!auto || !tabVisible){
+      setLoading(false);
+      return;
+    }
     // Show loading bar immediately upon scheduling next cycle (visual immediacy)
     setLoading(true);
     timer = setTimeout(async ()=>{ await refresh(); schedule(); }, intervalMs);
   }
+
+  // Pause polling when the tab is hidden (saves network/CPU). Resume when visible.
+  try {
+    if(typeof document !== 'undefined'){
+      tabVisible = !document.hidden;
+      document.addEventListener('visibilitychange', ()=>{
+        try { tabVisible = !document.hidden; } catch(e) { tabVisible = true; }
+        if(!tabVisible){
+          if(timer) clearTimeout(timer);
+          timer = null;
+          setLoading(false);
+          return;
+        }
+        if(auto){
+          refresh().then(()=> schedule()).catch(()=> schedule());
+        }
+      });
+    }
+  } catch(e) {}
 
   document.getElementById('toggleRefreshBtn')?.addEventListener('click', ()=>{
     auto = !auto;
@@ -964,7 +1102,8 @@
 
   xmlsFilterInput?.addEventListener('input', ()=>{
     xmlsFilterText = xmlsFilterInput.value.trim().toLowerCase();
-    refresh();
+    // Force XML payload for filter changes so we can re-render correctly.
+    refresh({ forceXmls: true });
   });
 
   sessionsFilterInput?.addEventListener('input', ()=>{

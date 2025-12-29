@@ -145,17 +145,7 @@
                 <details id="participantSubnetworksDetails">
                   <summary class="text-secondary" id="participantSubnetworksSummary">Subnetworks (CIDR) (0)</summary>
                   <div class="mt-2">
-                    <div class="table-responsive">
-                      <table class="table table-sm table-dark table-striped align-middle mb-0 fs-6" aria-label="Subnetworks">
-                        <thead>
-                          <tr>
-                            <th scope="col" style="width: 4rem;">#</th>
-                            <th scope="col">CIDR</th>
-                          </tr>
-                        </thead>
-                        <tbody id="participantSubnetworksList"></tbody>
-                      </table>
-                    </div>
+                    <div class="row g-2" id="participantSubnetworksList" aria-label="Subnetworks"></div>
                   </div>
                 </details>
               </div>
@@ -163,17 +153,7 @@
                 <details id="participantVulnIpsDetails">
                   <summary class="text-secondary" id="participantVulnIpsSummary">Vulnerability IP addresses (0)</summary>
                   <div class="mt-2">
-                    <div class="table-responsive">
-                      <table class="table table-sm table-dark table-striped align-middle mb-0 fs-6" aria-label="Vulnerability IP addresses">
-                        <thead>
-                          <tr>
-                            <th scope="col" style="width: 4rem;">#</th>
-                            <th scope="col">IP Address</th>
-                          </tr>
-                        </thead>
-                        <tbody id="participantVulnIpsList"></tbody>
-                      </table>
-                    </div>
+                    <div class="row g-2" id="participantVulnIpsList" aria-label="Vulnerability IP addresses"></div>
                   </div>
                 </details>
               </div>
@@ -283,17 +263,14 @@
       });
     subnetworksSummary.textContent = `Subnetworks (CIDR) (${names.length})`;
     subnetworksList.innerHTML = '';
-    sorted.forEach((row, idx) => {
-      const tr = document.createElement('tr');
-      const tdIdx = document.createElement('td');
-      tdIdx.className = 'text-secondary';
-      tdIdx.textContent = String(idx + 1);
-      const tdVal = document.createElement('td');
-      tdVal.className = 'text-white fw-semibold';
-      tdVal.textContent = row.text;
-      tr.appendChild(tdIdx);
-      tr.appendChild(tdVal);
-      subnetworksList.appendChild(tr);
+    sorted.forEach((row) => {
+      const col = document.createElement('div');
+      col.className = 'col-6 col-md-4 col-lg-3';
+      const box = document.createElement('div');
+      box.className = 'border border-secondary rounded px-2 py-1 small font-monospace text-white';
+      box.textContent = row.text;
+      col.appendChild(box);
+      subnetworksList.appendChild(col);
     });
     if(subnetworksDetails){
       subnetworksDetails.style.display = '';
@@ -324,17 +301,14 @@
       });
     vulnIpsSummary.textContent = `Vulnerability IP addresses (${uniq.length})`;
     vulnIpsList.innerHTML = '';
-    sorted.forEach((row, idx) => {
-      const tr = document.createElement('tr');
-      const tdIdx = document.createElement('td');
-      tdIdx.className = 'text-secondary';
-      tdIdx.textContent = String(idx + 1);
-      const tdVal = document.createElement('td');
-      tdVal.className = 'text-white fw-semibold';
-      tdVal.textContent = row.ip;
-      tr.appendChild(tdIdx);
-      tr.appendChild(tdVal);
-      vulnIpsList.appendChild(tr);
+    sorted.forEach((row) => {
+      const col = document.createElement('div');
+      col.className = 'col-6 col-md-4 col-lg-3';
+      const box = document.createElement('div');
+      box.className = 'border border-secondary rounded px-2 py-1 small font-monospace text-white';
+      box.textContent = row.ip;
+      col.appendChild(box);
+      vulnIpsList.appendChild(col);
     });
     if(vulnIpsDetails){
       vulnIpsDetails.style.display = '';
