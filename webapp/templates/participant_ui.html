@@ -15,23 +15,25 @@
   #participantUiRoot.participant-sidebar-hidden .participant-sidebar-toggle-restore {
     display: inline-flex !important;
   }
+  .participant-mission-title { letter-spacing: 0.08em; text-transform: uppercase; }
+  .participant-open-primary { letter-spacing: 0.12em; }
 </style>
 {% endblock %}
 {% block content %}
 {% set _user_role = (current_user.role.lower() if (current_user is defined and current_user.is_authenticated and current_user.role) else '') %}
 {% set participant_hide_urls = _user_role in ['builder', 'participant'] %}
-<div class="row g-3" id="participantUiRoot" data-active-norm="{{ participant_active_norm or '' }}">
+<div class="row g-3" id="participantUiRoot" data-active-norm="{{ participant_active_norm or '' }}" data-initial-href="{% if not participant_hide_urls %}{{ participant_url or '' }}{% endif %}">
   <div class="col-12 col-lg-4 participant-sidebar-col">
-    <div class="card shadow-sm h-100">
+    <div class="card shadow-sm h-100 bg-dark text-light">
       <div class="card-body d-flex flex-column gap-3">
         <div class="d-flex justify-content-between align-items-start gap-2">
           <div>
             <h5 class="mb-0">{{ participant_scenarios_heading or 'Available Scenarios' }}</h5>
-            {% if participant_scenarios_hint %}<small class="text-muted">{{ participant_scenarios_hint }}</small>{% endif %}
+            {% if participant_scenarios_hint %}<small class="text-secondary">{{ participant_scenarios_hint }}</small>{% endif %}
           </div>
           {% if participant_scenarios %}
             <button class="btn btn-sm btn-outline-secondary" type="button" data-participant-toggle-sidebar aria-expanded="true">
-              <span class="participant-collapse-label" data-label-expanded="Hide list" data-label-collapsed="Show list">Hide list</span>
+              <span class="participant-collapse-label" data-label-expanded="Hide" data-label-collapsed="Show All Scenarios">Hide</span>
             </button>
           {% endif %}
         </div>
@@ -39,12 +41,12 @@
           <div class="collapse show flex-grow-1" id="participantScenarioListWrap">
             <div class="list-group list-group-flush overflow-auto" style="max-height: 65vh;">
               {% for scenario in participant_scenarios %}
-                <div class="list-group-item border-top {% if loop.first %}border-top-0{% endif %} participant-scenario-item {% if scenario.active %}active border border-primary{% endif %} {% if not scenario.has_url %}opacity-75{% endif %}"
+                <div class="list-group-item bg-black text-light border-top border-secondary {% if loop.first %}border-top-0{% endif %} participant-scenario-item {% if scenario.active %}active border border-primary{% endif %} {% if not scenario.has_url %}opacity-75{% endif %}"
                      role="button" tabindex="0"
                      data-participant-scenario
                      data-scenario-norm="{{ scenario.norm|e }}"
                      data-scenario-display="{{ scenario.display|e }}"
-                     data-scenario-url="{{ scenario.url|e }}"
+                     data-scenario-url="{% if not participant_hide_urls %}{{ scenario.url|e }}{% endif %}"
                      data-scenario-has-url="{{ 1 if scenario.has_url else 0 }}">
                   <div class="d-flex flex-column gap-1">
                     <div class="d-flex flex-wrap align-items-center gap-2">
@@ -52,15 +54,11 @@
                       {% if not scenario.has_url %}<span class="badge bg-warning text-dark">No Link</span>{% endif %}
                     </div>
                     {% if scenario.url %}
-                      <div class="text-muted small">
-                        {% if participant_hide_urls %}
-                          Participant link available.
-                        {% else %}
-                          <span class="text-truncate d-inline-block" style="max-width: 100%;">{{ scenario.url }}</span>
-                        {% endif %}
+                      <div class="text-secondary small">
+                        Participant console link available.
                       </div>
                     {% else %}
-                      <div class="text-muted small">Participant URL not configured yet.</div>
+                      <div class="text-secondary small">Participant URL not configured yet.</div>
                     {% endif %}
                   </div>
                 </div>
@@ -68,30 +66,103 @@
             </div>
           </div>
         {% else %}
-          <div class="alert alert-info mb-0">{{ participant_scenarios_empty or 'No scenarios available.' }}</div>
+          <div class="alert alert-secondary mb-0">{{ participant_scenarios_empty or 'No scenarios available.' }}</div>
         {% endif %}
       </div>
     </div>
   </div>
   <div class="col-12 col-lg-8 participant-content-col">
-    <div class="card shadow-sm mb-0">
+    <div class="card shadow-sm mb-0 bg-dark text-light">
       <div class="card-body">
         <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
           <div class="d-flex align-items-center gap-2">
-            <button class="btn btn-sm btn-outline-secondary participant-sidebar-toggle-restore" type="button" data-participant-show-sidebar>Show list</button>
+            <button class="btn btn-sm btn-outline-secondary participant-sidebar-toggle-restore" type="button" data-participant-show-sidebar>Show All Scenarios</button>
             <div>
-              <h5 class="mb-0">Embedded Participant UI</h5>
-              <small class="text-muted" id="participantScenarioSubhead" data-default-text="Select a scenario to load its participant console below.">{% if participant_scenario_label %}Scenario: {{ participant_scenario_label }}{% else %}Select a scenario to load its participant console below.{% endif %}</small>
+              <h5 class="mb-0 participant-mission-title font-monospace">Mission Briefing</h5>
+              <small class="text-secondary" id="participantScenarioSubhead" data-default-text="Select a scenario to load its participant console below.">{% if participant_scenario_label %}Scenario: {{ participant_scenario_label }}{% else %}Select a scenario to load its participant console below.{% endif %}</small>
             </div>
           </div>
-          <a class="btn btn-sm btn-outline-secondary {% if not participant_url %}disabled{% endif %}" id="participantOpenLinkBtn" href="{{ participant_url or '#' }}" target="_blank" rel="noopener noreferrer" {% if not participant_url %}aria-disabled="true" tabindex="-1"{% endif %}>Open in New Window</a>
         </div>
-        <div class="ratio ratio-16x9 mb-3" id="participantUiFrameWrap" {% if not participant_url %}style="display:none;"{% endif %}>
-          <iframe id="participantUiFrame" class="w-100 h-100 border-0 rounded" title="Participant UI" data-initial-src="{{ participant_url or '' }}" {% if participant_url %}src="{{ participant_url }}"{% endif %} allow="clipboard-read; clipboard-write; autoplay; fullscreen" allowfullscreen referrerpolicy="no-referrer"></iframe>
+        <div class="text-center mb-3">
+          <button class="btn btn-lg btn-warning fw-bold text-uppercase font-monospace participant-open-primary px-4" type="button" id="participantOpenBtn" disabled>
+            <i class="bi bi-box-arrow-up-right me-2"></i>Open Console
+          </button>
         </div>
-        <div id="participantUiFallback" class="alert alert-warning mb-0 {% if participant_url %}d-none{% endif %}">
-          No Participant UI link is available yet. Select a scenario with a participant URL or ask an administrator to provide one.
+        <div class="card border bg-black mb-3" id="participantStatsCard" style="display:none;">
+          <div class="card-body py-2">
+            <div class="row g-2 small font-monospace">
+              <div class="col-12 col-md-6">
+                <div class="text-secondary">Nearest Gateway Address</div>
+                <div class="fw-semibold text-white" id="participantStatGateway">{{ participant_nearest_gateway or '-' }}</div>
+              </div>
+              <div class="col-12 col-md-6">
+                <div class="text-secondary">Scenario Link</div>
+                <div class="fw-semibold text-white" id="participantStatLinkConfigured">-</div>
+              </div>
+              <div class="col-12 col-md-6">
+                <div class="text-secondary">Last opened (all users)</div>
+                <div class="fw-semibold text-white" id="participantStatLastAll">-</div>
+              </div>
+              <div class="col-12 col-md-6">
+                <div class="text-secondary">Open count (all users)</div>
+                <div class="fw-semibold text-white" id="participantStatCountAll">0</div>
+              </div>
+              <div class="col-12 col-md-6">
+                <div class="text-secondary">Session Status</div>
+                <div class="fw-semibold text-white" id="participantStatSessionStatus">-</div>
+              </div>
+              <div class="col-12 col-md-6">
+                <div class="text-secondary">Session ID</div>
+                <div class="fw-semibold text-white" id="participantStatSessionId">-</div>
+              </div>
+              <div class="col-12 col-md-6">
+                <div class="text-secondary">Last Execute</div>
+                <div class="fw-semibold text-white" id="participantStatLastExecute">-</div>
+              </div>
+              <div class="col-12 col-md-6">
+                <div class="text-secondary">Last Execute Result</div>
+                <div>
+                  <span class="badge bg-secondary text-uppercase" id="participantStatLastExecuteResult">-</span>
+                </div>
+              </div>
+              <div class="col-12 col-md-3">
+                <div class="text-secondary">Nodes</div>
+                <div class="fw-semibold text-white" id="participantStatNodes">-</div>
+              </div>
+              <div class="col-12 col-md-3">
+                <div class="text-secondary">Routers</div>
+                <div class="fw-semibold text-white" id="participantStatRouters">-</div>
+              </div>
+              <div class="col-12 col-md-3">
+                <div class="text-secondary">Switches</div>
+                <div class="fw-semibold text-white" id="participantStatSwitches">-</div>
+              </div>
+              <div class="col-12 col-md-3">
+                <div class="text-secondary">Vulnerabilities</div>
+                <div class="fw-semibold text-white" id="participantStatVulns">-</div>
+              </div>
+              <div class="col-12">
+                <details id="participantSubnetworksDetails">
+                  <summary class="text-secondary" id="participantSubnetworksSummary">Subnetworks (CIDR) (0)</summary>
+                  <div class="mt-2">
+                    <div class="table-responsive">
+                      <table class="table table-sm table-dark table-striped align-middle mb-0 fs-6" aria-label="Subnetworks">
+                        <thead>
+                          <tr>
+                            <th scope="col" style="width: 4rem;">#</th>
+                            <th scope="col">CIDR</th>
+                          </tr>
+                        </thead>
+                        <tbody id="participantSubnetworksList"></tbody>
+                      </table>
+                    </div>
+                  </div>
+                </details>
+              </div>
+            </div>
+          </div>
         </div>
+        
       </div>
     </div>
   </div>
@@ -103,69 +174,37 @@
 (function(){
   if(typeof window === 'undefined') return;
   const root = document.getElementById('participantUiRoot');
-  const frame = document.getElementById('participantUiFrame');
-  const wrap = document.getElementById('participantUiFrameWrap');
-  const fallback = document.getElementById('participantUiFallback');
-  if(!root || !frame || !wrap) return;
+  if(!root) return;
   const subhead = document.getElementById('participantScenarioSubhead');
-  const openBtn = document.getElementById('participantOpenLinkBtn');
+  const openBtn = document.getElementById('participantOpenBtn');
+  const statsCard = document.getElementById('participantStatsCard');
+  const statGateway = document.getElementById('participantStatGateway');
+  const statLinkConfigured = document.getElementById('participantStatLinkConfigured');
+  const statLastAll = document.getElementById('participantStatLastAll');
+  const statCountAll = document.getElementById('participantStatCountAll');
+  const statSessionStatus = document.getElementById('participantStatSessionStatus');
+  const statSessionId = document.getElementById('participantStatSessionId');
+  const statLastExecute = document.getElementById('participantStatLastExecute');
+  const statLastExecuteResult = document.getElementById('participantStatLastExecuteResult');
+  const statNodes = document.getElementById('participantStatNodes');
+  const statRouters = document.getElementById('participantStatRouters');
+  const statSwitches = document.getElementById('participantStatSwitches');
+  const statVulns = document.getElementById('participantStatVulns');
+  const subnetworksDetails = document.getElementById('participantSubnetworksDetails');
+  const subnetworksSummary = document.getElementById('participantSubnetworksSummary');
+  const subnetworksList = document.getElementById('participantSubnetworksList');
   const scenarioItems = Array.from(document.querySelectorAll('[data-participant-scenario]'));
   const toggleSidebarBtn = document.querySelector('[data-participant-toggle-sidebar]');
   const showSidebarBtn = document.querySelector('[data-participant-show-sidebar]');
   const collapseLabel = toggleSidebarBtn ? toggleSidebarBtn.querySelector('.participant-collapse-label') : null;
 
-  const normalizeParticipantHref = (value) => {
-    if(value === undefined || value === null) return '';
-    let trimmed = String(value).trim();
-    if(!trimmed) return '';
-    if(!/^https?:\/\//i.test(trimmed)) trimmed = `https://${trimmed}`;
-    try {
-      const parsed = new URL(trimmed);
-      if(parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
-      return parsed.toString();
-    } catch(err) {
-      return '';
-    }
-  };
-
-  const loadEditorStateHref = () => {
-    if(!window.localStorage) return '';
-    const raw = window.localStorage.getItem('coretg_editor_state');
-    if(!raw) return '';
-    try {
-      const parsed = JSON.parse(raw);
-      if(!parsed || !Array.isArray(parsed.scenarios) || parsed.scenarios.length === 0) return '';
-      let idx = Number(parsed.active_index);
-      if(Number.isNaN(idx) || idx < 0 || idx >= parsed.scenarios.length) idx = 0;
-      const scenario = parsed.scenarios[idx];
-      const hitl = scenario && typeof scenario === 'object' ? scenario.hitl : null;
-      if(!hitl || typeof hitl !== 'object') return '';
-      return normalizeParticipantHref(hitl.participant_proxmox_url || hitl.participant_ui_url || '');
-    } catch(err) {
-      return '';
-    }
-  };
-
-  const initialHref = normalizeParticipantHref(frame.getAttribute('data-initial-src'));
-  let currentHasDirectUrl = !!initialHref;
   let currentNorm = root.getAttribute('data-active-norm') || '';
+  let currentHasUrl = false;
+  let currentHref = '';
 
-  const applyFrameHref = (href) => {
-    if(href){
-      frame.src = href;
-      wrap.style.display = '';
-      fallback?.classList.add('d-none');
-    } else {
-      frame.removeAttribute('src');
-      wrap.style.display = 'none';
-      fallback?.classList.remove('d-none');
-    }
-  };
-
-  const fallbackHref = () => {
-    const localHref = loadEditorStateHref();
-    const globalHref = normalizeParticipantHref(window.CORETG_PARTICIPANT_UI_HREF);
-    return localHref || globalHref || initialHref || '';
+  const openRedirectHref = (norm) => {
+    if(!norm) return '/participant-ui/open';
+    return `/participant-ui/open?scenario=${encodeURIComponent(norm)}`;
   };
 
   const updateSubhead = (display) => {
@@ -176,18 +215,153 @@
 
   const updateOpenButton = (href) => {
     if(!openBtn) return;
-    if(href){
-      openBtn.href = href;
-      openBtn.classList.remove('disabled');
-      openBtn.removeAttribute('aria-disabled');
-      openBtn.removeAttribute('tabindex');
-    } else {
-      openBtn.href = '#';
-      openBtn.classList.add('disabled');
-      openBtn.setAttribute('aria-disabled', 'true');
-      openBtn.setAttribute('tabindex', '-1');
+    currentHref = href || '';
+    openBtn.disabled = !(currentHref && currentHasUrl);
+    if(statsCard){
+      statsCard.style.display = currentNorm ? '' : 'none';
     }
   };
+
+  const fmtTs = (ts) => {
+    if(!ts) return 'Never';
+    try {
+      const d = new Date(ts);
+      if(Number.isNaN(d.getTime())) return String(ts);
+      return d.toLocaleString();
+    } catch(e){
+      return String(ts);
+    }
+  };
+  const renderSubnetworks = (items) => {
+    if(!subnetworksList || !subnetworksSummary) return;
+    const names = Array.isArray(items) ? items.map(v => String(v || '').trim()).filter(Boolean) : [];
+    const ipToInt = (ip) => {
+      const parts = String(ip || '').trim().split('.');
+      if(parts.length !== 4) return null;
+      const nums = parts.map(p => Number(p));
+      if(nums.some(n => !Number.isFinite(n) || n < 0 || n > 255)) return null;
+      return ((nums[0] << 24) >>> 0) + (nums[1] << 16) + (nums[2] << 8) + nums[3];
+    };
+    const parseCidr = (cidr) => {
+      const text = String(cidr || '').trim();
+      const [ip, suffix] = text.split('/', 2);
+      const ipInt = ipToInt(ip);
+      const prefix = suffix !== undefined ? Number(suffix) : null;
+      return { text, ip, ipInt, prefix: Number.isFinite(prefix) ? prefix : null };
+    };
+    const sorted = names
+      .map(parseCidr)
+      .sort((a, b) => {
+        if(a.ipInt !== null && b.ipInt !== null) {
+          if(a.ipInt !== b.ipInt) return a.ipInt - b.ipInt;
+          const ap = a.prefix === null ? 999 : a.prefix;
+          const bp = b.prefix === null ? 999 : b.prefix;
+          return ap - bp;
+        }
+        return a.text.localeCompare(b.text);
+      });
+    subnetworksSummary.textContent = `Subnetworks (CIDR) (${names.length})`;
+    subnetworksList.innerHTML = '';
+    sorted.forEach((row, idx) => {
+      const tr = document.createElement('tr');
+      const tdIdx = document.createElement('td');
+      tdIdx.className = 'text-secondary';
+      tdIdx.textContent = String(idx + 1);
+      const tdVal = document.createElement('td');
+      tdVal.className = 'text-white fw-semibold';
+      tdVal.textContent = row.text;
+      tr.appendChild(tdIdx);
+      tr.appendChild(tdVal);
+      subnetworksList.appendChild(tr);
+    });
+    if(subnetworksDetails){
+      subnetworksDetails.style.display = '';
+      if(names.length === 0){
+        subnetworksDetails.open = false;
+      }
+    }
+  };
+
+  const fetchScenarioDetails = async (norm) => {
+    try {
+      const url = norm ? `/participant-ui/details?scenario=${encodeURIComponent(norm)}` : '/participant-ui/details';
+      const resp = await fetch(url, { credentials: 'same-origin' });
+      if(!resp.ok) return null;
+      const payload = await resp.json();
+      if(!payload || !payload.ok) return null;
+      return payload;
+    } catch(e){
+      return null;
+    }
+  };
+
+  const renderScenarioDetails = (payload) => {
+    const gw = payload && typeof payload.gateway === 'string' ? payload.gateway : '';
+    if(statGateway) statGateway.textContent = gw || '-';
+
+    const openStats = (payload && payload.open_stats) || {};
+    if(statLastAll) statLastAll.textContent = fmtTs(openStats.last_open_ts || '');
+    if(statCountAll) statCountAll.textContent = String(Number(openStats.open_count) || 0);
+
+    const scen = (payload && payload.scenario) || {};
+    if(statLinkConfigured) statLinkConfigured.textContent = scen.participant_link_configured ? 'Configured' : 'Missing';
+
+    const sess = (payload && payload.session) || {};
+    if(statSessionStatus){
+      if(sess.running === true) statSessionStatus.textContent = sess.state ? `Running (${sess.state})` : 'Running';
+      else if(sess.running === false) statSessionStatus.textContent = 'Not running';
+      else statSessionStatus.textContent = 'Unknown';
+    }
+    if(statSessionId) statSessionId.textContent = (sess.session_id !== null && sess.session_id !== undefined) ? String(sess.session_id) : '-';
+
+    const exec = (payload && payload.execute) || {};
+    if(statLastExecute) statLastExecute.textContent = fmtTs(exec.last_execute_ts || '');
+    if(statLastExecuteResult){
+      statLastExecuteResult.classList.remove('bg-success', 'bg-danger', 'bg-secondary');
+      if(exec.ok === true) {
+        statLastExecuteResult.textContent = 'Success';
+        statLastExecuteResult.classList.add('bg-success');
+      }
+      else if(exec.ok === false) {
+        statLastExecuteResult.textContent = 'Failure';
+        statLastExecuteResult.classList.add('bg-danger');
+      }
+      else {
+        statLastExecuteResult.textContent = '-';
+        statLastExecuteResult.classList.add('bg-secondary');
+      }
+    }
+
+    const counts = (payload && payload.counts) || {};
+    if(statNodes) statNodes.textContent = (counts.nodes !== null && counts.nodes !== undefined) ? String(counts.nodes) : '-';
+    if(statRouters) statRouters.textContent = (counts.routers !== null && counts.routers !== undefined) ? String(counts.routers) : '-';
+    if(statSwitches) statSwitches.textContent = (counts.switches !== null && counts.switches !== undefined) ? String(counts.switches) : '-';
+    if(statVulns) statVulns.textContent = (counts.vulnerabilities !== null && counts.vulnerabilities !== undefined) ? String(counts.vulnerabilities) : '-';
+
+    renderSubnetworks(payload && payload.subnetworks);
+  };
+
+  const refreshStats = async () => {
+    const details = await fetchScenarioDetails(currentNorm);
+    if(details) renderScenarioDetails(details);
+  };
+
+  if(openBtn && !openBtn.dataset.bound){
+    openBtn.dataset.bound = '1';
+    openBtn.addEventListener('click', async (ev)=>{
+      ev.preventDefault();
+      if(!(currentHref && currentHasUrl)) return;
+      try {
+        fetch('/participant-ui/record-open', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ scenario_norm: currentNorm, href: currentHref })
+        }).then(()=> refreshStats()).catch(()=>{});
+      } catch(e){}
+      try { window.open(currentHref, '_blank', 'noopener'); } catch(e) {}
+    });
+  }
 
   const highlightScenario = (norm) => {
     scenarioItems.forEach(item => {
@@ -212,23 +386,33 @@
     }
   };
 
-  const applyScenarioSelection = (norm, display, rawUrl) => {
-    const normalized = normalizeParticipantHref(rawUrl);
+  const persistSelectionInLocalStorage = (norm) => {
+    try {
+      if(!norm) return;
+      window.localStorage.setItem('participant_ui_last_scenario_norm', String(norm));
+    } catch(err) {
+      /* ignore */
+    }
+  };
+
+  const applyScenarioSelection = (norm, display, hasUrl) => {
     currentNorm = norm || '';
-    currentHasDirectUrl = !!normalized;
+    currentHasUrl = !!hasUrl;
     highlightScenario(currentNorm);
     updateSubhead(display || '');
-    updateOpenButton(normalized);
-    applyFrameHref(normalized || fallbackHref());
+    const resolvedHref = currentNorm ? openRedirectHref(currentNorm) : '';
+    updateOpenButton(resolvedHref);
     persistSelectionInQuery(currentNorm);
+    persistSelectionInLocalStorage(currentNorm);
+    refreshStats();
   };
 
   const activateFromElement = (item) => {
     if(!item) return;
     const norm = item.getAttribute('data-scenario-norm') || '';
     const display = item.getAttribute('data-scenario-display') || '';
-    const url = item.getAttribute('data-scenario-url') || '';
-    applyScenarioSelection(norm, display, url);
+    const hasUrl = item.getAttribute('data-scenario-has-url') === '1';
+    applyScenarioSelection(norm, display, hasUrl);
   };
 
   scenarioItems.forEach(item => {
@@ -241,24 +425,27 @@
     });
   });
 
-  const initialTarget = scenarioItems.find(el => el.getAttribute('data-scenario-norm') === currentNorm)
-    || scenarioItems.find(el => el.getAttribute('data-scenario-has-url') === '1')
+  let storedNorm = '';
+  try { storedNorm = window.localStorage.getItem('participant_ui_last_scenario_norm') || ''; } catch(e) { storedNorm = ''; }
+
+  const initialTarget = scenarioItems.find(el => storedNorm && el.getAttribute('data-scenario-norm') === storedNorm)
+    || scenarioItems.find(el => el.getAttribute('data-scenario-norm') === currentNorm)
     || scenarioItems[0];
   if(initialTarget){
     activateFromElement(initialTarget);
   } else {
     updateSubhead('');
+    currentHasUrl = false;
     updateOpenButton('');
-    applyFrameHref(fallbackHref());
     persistSelectionInQuery('');
+    refreshStats();
   }
 
   window.addEventListener('storage', (evt) => {
     if(evt && evt.key && evt.key !== 'coretg_editor_state') return;
-    if(currentHasDirectUrl) return;
-    const nextHref = fallbackHref();
-    applyFrameHref(nextHref);
+    const nextHref = currentNorm ? openRedirectHref(currentNorm) : '';
     updateOpenButton(nextHref);
+    refreshStats();
   });
 
   const applySidebarHidden = (hidden) => {
@@ -279,7 +466,8 @@
       const currentlyHidden = root.classList.contains('participant-sidebar-hidden');
       applySidebarHidden(!currentlyHidden);
     });
-    applySidebarHidden(root.classList.contains('participant-sidebar-hidden'));
+    // Default to hidden to keep the center action prominent.
+    applySidebarHidden(true);
   }
   if(showSidebarBtn){
     showSidebarBtn.addEventListener('click', (evt) => {

@@ -65,6 +65,21 @@ from ..utils.allocation import compute_counts_by_factor
 logger = logging.getLogger(__name__)
 import os
 
+
+def _is_docker_node_type(node_type: object) -> bool:
+    try:
+        return hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER")
+    except Exception:
+        return False
+
+
+def _ensure_default_route_for_docker(session: object, node_obj: object) -> None:
+    """Ensure DefaultRoute service is present on a DOCKER node (best-effort)."""
+    try:
+        ensure_service(session, getattr(node_obj, 'id'), "DefaultRoute", node_obj=node_obj)
+    except Exception:
+        pass
+
 # Enable verbose gRPC call trace if env var set (default off unless user requests)
 def _env_flag(name: str, default_on: bool = True) -> bool:
     val = os.getenv(name)
@@ -385,11 +400,22 @@ def _apply_docker_compose_meta(node, rec, session=None):
             compose_path = None
         if not compose_path:
             compose_path = f"/tmp/vulns/docker-compose-{n}.yml"
-            logger.warning(
-                "[vuln-node] node=%s compose_path missing in record; falling back to %s",
+            # This is expected when the caller planned docker assignments but hasn't
+            # generated per-node compose files yet (or when CORE is remote).
+            logger.debug(
+                "[vuln-node] node=%s compose_path missing in record; using default %s",
                 n,
                 compose_path,
             )
+            try:
+                if rec is not None and isinstance(rec, dict):
+                    rec.setdefault('compose_path', compose_path)
+            except Exception:
+                pass
+
+        # NOTE: The compose_path is evaluated on the CORE host (core-daemon). This
+        # code often runs on a different machine (e.g., webapp/CLI against remote CORE),
+        # and compose files may also be generated later in the CLI pipeline.
         path_exists = False
         path_size = None
         try:
@@ -398,18 +424,18 @@ def _apply_docker_compose_meta(node, rec, session=None):
                 path_size = os.path.getsize(compose_path)
         except Exception:
             path_exists = False
-        if not path_exists:
-            logger.warning(
-                "[vuln-node] node=%s compose file not found at %s (CORE may fall back to default docker behavior)",
-                n,
-                compose_path,
-            )
-        else:
-            logger.info(
-                "[vuln-node] node=%s compose file ready path=%s size=%s bytes",
+        if path_exists:
+            logger.debug(
+                "[vuln-node] node=%s compose file present locally path=%s size=%s bytes",
                 n,
                 compose_path,
                 path_size,
+            )
+        else:
+            logger.debug(
+                "[vuln-node] node=%s compose file not present locally at %s (may be generated later or exist on CORE host)",
+                n,
+                compose_path,
             )
         vname = None
         try:
@@ -660,7 +686,7 @@ def build_star_from_roles(core,
 
         # If this is a DOCKER node, attach compose/compose_name metadata now
         try:
-            if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
+            if _is_docker_node_type(node_type):
                 rec = docker_by_name.get(node_name)
                 try:
                     if rec:
@@ -673,24 +699,7 @@ def build_star_from_roles(core,
                 except Exception:
                     pass
                 _apply_docker_compose_meta(node, rec, session=session)
-                # Explicitly ensure DefaultRoute is NOT present on docker nodes
-                try:
-                    present = has_service(session, node.id, "DefaultRoute", node_obj=node)
-                except Exception:
-                    present = False
-                if present:
-                    try:
-                        logger.info("Removing DefaultRoute from DOCKER node %s (id=%s)", getattr(node, "name", node.id), node.id)
-                    except Exception:
-                        pass
-                    ok = remove_service(session, node.id, "DefaultRoute", node_obj=node)
-                    try:
-                        if ok:
-                            logger.info("Removed DefaultRoute from DOCKER node %s (id=%s)", getattr(node, "name", node.id), node.id)
-                        else:
-                            logger.info("DefaultRoute not present or could not remove on DOCKER node %s (id=%s)", getattr(node, "name", node.id), node.id)
-                    except Exception:
-                        pass
+                _ensure_default_route_for_docker(session, node)
         except Exception:
             pass
 
@@ -712,13 +721,20 @@ def build_star_from_roles(core,
                 pass
         else:
             # add explicit device and switch interfaces for visibility in XML
+            is_docker = _is_docker_node_type(node_type)
+
             dev_ifid = dev_next_ifid.get(node.id, 0)
-            dev_iface = Interface(id=dev_ifid, name=f"{node_name}-uplink")
+            dev_iface_name = f"eth{dev_ifid}" if is_docker else f"{node_name}-uplink"
+            dev_iface = Interface(id=dev_ifid, name=dev_iface_name)
             dev_next_ifid[node.id] = dev_ifid + 1
+
             sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=mac_alloc.next_mac())
             sw_ifid += 1
             safe_add_link(session, node, switch, iface1=dev_iface, iface2=sw_iface)
             logger.debug("Link device %s <-> switch (dev ifid=%d, sw ifid=%d)", node.id, dev_ifid, sw_ifid-1)
+
+            if is_docker:
+                _ensure_default_route_for_docker(session, node)
 
     if docker_slot_plan:
         missing_slots = set(docker_slot_plan.keys()) - docker_slots_used
@@ -883,6 +899,7 @@ def build_multi_switch_topology(core,
     host_radius = 120 if layout_density == "compact" else (240 if layout_density == "spacious" else 180)
     sw_ifid: Dict[int, int] = {sid: 0 for sid in switch_ids}
     nodes_by_id: Dict[int, object] = {}
+    dev_next_ifid: Dict[int, int] = {}
     next_id = access_count + 2
     host_slot_idx = 0
     docker_by_name: Dict[str, Dict[str, str]] = {}
@@ -930,7 +947,7 @@ def build_multi_switch_topology(core,
 
         # If this is a DOCKER node, attach compose/compose_name metadata now
         try:
-            if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
+            if _is_docker_node_type(node_type):
                 rec = docker_by_name.get(name)
                 try:
                     if rec:
@@ -943,25 +960,7 @@ def build_multi_switch_topology(core,
                 except Exception:
                     pass
                 _apply_docker_compose_meta(node, rec, session=session)
-                # Explicitly ensure DefaultRoute is NOT present on docker nodes
-                present = False
-                try:
-                    present = has_service(session, node.id, "DefaultRoute", node_obj=node)
-                except Exception:
-                    present = False
-                if present:
-                    try:
-                        logger.info("Removing DefaultRoute from DOCKER node %s (id=%s)", getattr(node, "name", node.id), node.id)
-                    except Exception:
-                        pass
-                    ok = remove_service(session, node.id, "DefaultRoute", node_obj=node)
-                    try:
-                        if ok:
-                            logger.info("Removed DefaultRoute from DOCKER node %s (id=%s)", getattr(node, "name", node.id), node.id)
-                        else:
-                            logger.info("DefaultRoute not present or could not remove on DOCKER node %s (id=%s)", getattr(node, "name", node.id), node.id)
-                    except Exception:
-                        pass
+                _ensure_default_route_for_docker(session, node)
         except Exception:
             pass
 
@@ -987,7 +986,15 @@ def build_multi_switch_topology(core,
         else:
             sw_ifid[sw_node_id] += 1
             sw_if = Interface(id=sw_ifid[sw_node_id], name=f"sw{sw_node_id}-d{node.id}")
-            safe_add_link(session, node, sw_node, iface2=sw_if)
+            is_docker = _is_docker_node_type(node_type)
+            if is_docker:
+                dev_ifid = dev_next_ifid.get(node.id, 0)
+                dev_next_ifid[node.id] = dev_ifid + 1
+                dev_if = Interface(id=dev_ifid, name=f"eth{dev_ifid}")
+                safe_add_link(session, node, sw_node, iface1=dev_if, iface2=sw_if)
+                _ensure_default_route_for_docker(session, node)
+            else:
+                safe_add_link(session, node, sw_node, iface2=sw_if)
 
     if created_docker:
         logger.info("Docker nodes created in multi-switch topology: %d", created_docker)
@@ -1208,6 +1215,7 @@ def _try_build_segmented_topology_from_preview(
     ip_region: str,
     layout_density: str,
     preview_plan: Dict[str, Any],
+    docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Optional[Tuple[Any, List[NodeInfo], List[NodeInfo], Dict[int, List[str]], Dict[int, List[str]], Dict[str, Dict[str, str]]]]:
     """Attempt to realize the provided preview plan exactly. Returns None on failure."""
 
@@ -1339,6 +1347,12 @@ def _try_build_segmented_topology_from_preview(
     hosts_info: List[NodeInfo] = []
     default_host_ids: Set[int] = set()
 
+    # Apply vulnerability docker slot plan (slot-N => convert Nth DEFAULT host to DOCKER)
+    host_slot_idx = 0
+    docker_slots_used: Set[str] = set()
+    docker_by_name: Dict[str, Dict[str, str]] = {}
+    created_docker = 0
+
     sorted_hosts = sorted(hosts_data, key=lambda h: h.get('node_id', 0))
     for idx, hdata in enumerate(sorted_hosts):
         try:
@@ -1364,6 +1378,23 @@ def _try_build_segmented_topology_from_preview(
             x = int(base_x + radius * math.cos(angle))
             y = int(base_y + radius * math.sin(angle))
         name = str(hdata.get('name') or f"host-{hid}")
+
+        # If this would be a DEFAULT host, allow the docker slot plan to override it.
+        if node_type == NodeType.DEFAULT:
+            host_slot_idx += 1
+            slot_key = f"slot-{host_slot_idx}"
+            try:
+                if docker_slot_plan and slot_key in docker_slot_plan:
+                    if hasattr(NodeType, "DOCKER"):
+                        node_type = getattr(NodeType, "DOCKER")
+                        docker_by_name[name] = docker_slot_plan[slot_key]
+                        created_docker += 1
+                        docker_slots_used.add(slot_key)
+                    else:
+                        logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan during preview realization")
+            except Exception:
+                pass
+
         logger.info("[preview] add_host id=%s name=%s type=%s pos=(%s,%s)", hid, name, _type_desc(node_type), x, y)
         host_position = Position(x=x, y=y)
         host_node = session.add_node(hid, _type=node_type, position=host_position, name=name)
@@ -1378,12 +1409,33 @@ def _try_build_segmented_topology_from_preview(
         except Exception:
             pass
         host_nodes_by_id[hid] = host_node
+        is_docker = _is_docker_node_type(node_type)
+        # Docker-backed nodes use eth0 for CORE interfaces.
         host_next_ifid[hid] = 0
         if node_type == NodeType.DEFAULT:
             default_host_ids.add(hid)
+
+        # Attach compose metadata when the plan made this host a DOCKER node.
+        try:
+            if _is_docker_node_type(node_type):
+                rec = docker_by_name.get(name)
+                _apply_docker_compose_meta(host_node, rec, session=session)
+                _ensure_default_route_for_docker(session, host_node)
+        except Exception:
+            pass
+
         ip_hint = str(hdata.get('ip4') or "")
         if node_type == NodeType.DEFAULT:
             hosts_info.append(NodeInfo(node_id=hid, ip4=ip_hint, role=role))
+
+    if docker_slot_plan:
+        missing_slots = set(docker_slot_plan.keys()) - docker_slots_used
+        if missing_slots:
+            raise RuntimeError(
+                f"Unable to provision Docker nodes for vulnerability assignments during preview realization: {sorted(missing_slots)}"
+            )
+        if created_docker:
+            logger.info("[preview] Docker nodes created during preview realization: %d", created_docker)
 
     switches_preview = preview_plan.get('switches') or []
     switch_name_map = {}
@@ -1793,7 +1845,6 @@ def _try_build_segmented_topology_from_preview(
     except Exception:
         pass
 
-    docker_by_name: Dict[str, Dict[str, str]] = {}
     logger.info("[preview] topology realized from persisted preview: routers=%d hosts=%d switches=%d", len(router_objs), len(host_nodes_by_id), len(switch_nodes))
 
     return session, routers_info, [ni for ni in hosts_info], {k: v for k, v in host_service_assignments.items()}, {k: v for k, v in router_protocols.items()}, docker_by_name
@@ -1844,6 +1895,7 @@ def build_segmented_topology(core,
             ip_region=ip_region,
             layout_density=layout_density,
             preview_plan=preview_plan,
+            docker_slot_plan=docker_slot_plan,
         )
         if preview_result is not None:
             return preview_result
@@ -2467,7 +2519,9 @@ def build_segmented_topology(core,
             logger.debug("Added host id=%s name=%s type=%s at (%s,%s)", host.id, name, node_type, x, y)
             actual_host_id = getattr(host, "id", node_id_counter)
             host_nodes_by_id[host.id] = host
-            host_next_ifid[host.id] = 1  # eth0 consumed
+            is_docker = _is_docker_node_type(node_type)
+            # First link consumes eth0 for both DEFAULT and DOCKER hosts.
+            host_next_ifid[host.id] = 1
             # Apply DOCKER compose metadata when applicable
             try:
                 if hasattr(NodeType, "DOCKER") and node_type == getattr(NodeType, "DOCKER"):
@@ -2483,25 +2537,7 @@ def build_segmented_topology(core,
                     except Exception:
                         pass
                     _apply_docker_compose_meta(host, rec, session=session)
-                    # Explicitly ensure DefaultRoute is NOT present on docker nodes
-                    present = False
-                    try:
-                        present = has_service(session, host.id, "DefaultRoute", node_obj=host)
-                    except Exception:
-                        present = False
-                    if present:
-                        try:
-                            logger.info("Removing DefaultRoute from DOCKER node %s (id=%s)", getattr(host, "name", host.id), host.id)
-                        except Exception:
-                            pass
-                        ok = remove_service(session, host.id, "DefaultRoute", node_obj=host)
-                        try:
-                            if ok:
-                                logger.info("Removed DefaultRoute from DOCKER node %s (id=%s)", getattr(host, "name", host.id), host.id)
-                            else:
-                                logger.info("DefaultRoute not present or could not remove on DOCKER node %s (id=%s)", getattr(host, "name", host.id), host.id)
-                        except Exception:
-                            pass
+                    _ensure_default_route_for_docker(session, host)
             except Exception:
                 pass
             _log_add_node_result(session, host, node_id_counter, node_type, name, position=host_position)
@@ -2512,7 +2548,8 @@ def build_segmented_topology(core,
             r_ip = str(lan_hosts[0])
             h_ip = str(lan_hosts[1])
             h_mac = mac_alloc.next_mac()
-            host_if = Interface(id=0, name="eth0", ip4=h_ip, ip4_mask=lan_net.prefixlen, mac=h_mac)
+            host_if_id = 0
+            host_if = Interface(id=host_if_id, name=f"eth{host_if_id}", ip4=h_ip, ip4_mask=lan_net.prefixlen, mac=h_mac)
             r_ifid = router_next_ifid.get(router_node.id, 0)
             router_next_ifid[router_node.id] = r_ifid + 1
             r_if = Interface(id=r_ifid, name=f"r{router_node.id}-h{host.id}", ip4=r_ip, ip4_mask=lan_net.prefixlen, mac=mac_alloc.next_mac())
@@ -2581,6 +2618,7 @@ def build_segmented_topology(core,
                     pass
                 actual_host_id = getattr(host, "id", node_id_counter)
                 host_nodes_by_id[host.id] = host
+                is_docker = _is_docker_node_type(node_type)
                 host_next_ifid[host.id] = 1
                 # Addressing: allocate per-host /24 directly to router (direct link) for now
                 lan_net = subnet_alloc.next_random_subnet(24)
@@ -2588,7 +2626,8 @@ def build_segmented_topology(core,
                 r_ip = str(lan_hosts[0])
                 h_ip = str(lan_hosts[1])
                 h_mac = mac_alloc.next_mac()
-                host_if = Interface(id=0, name="eth0", ip4=h_ip, ip4_mask=lan_net.prefixlen, mac=h_mac)
+                host_if_id = 0
+                host_if = Interface(id=host_if_id, name=f"eth{host_if_id}", ip4=h_ip, ip4_mask=lan_net.prefixlen, mac=h_mac)
                 r_ifid = router_next_ifid.get(router_node.id, 0)
                 router_next_ifid[router_node.id] = r_ifid + 1
                 r_if = Interface(id=r_ifid, name=f"r{router_node.id}-h{host.id}", ip4=r_ip, ip4_mask=lan_net.prefixlen, mac=mac_alloc.next_mac())
@@ -2624,24 +2663,7 @@ def build_segmented_topology(core,
                         except Exception:
                             pass
                         _apply_docker_compose_meta(host, rec, session=session)
-                        present = False
-                        try:
-                            present = has_service(session, host.id, "DefaultRoute", node_obj=host)
-                        except Exception:
-                            present = False
-                        if present:
-                            try:
-                                logger.info("Removing DefaultRoute from DOCKER node %s (id=%s)", getattr(host, "name", host.id), host.id)
-                            except Exception:
-                                pass
-                            ok = remove_service(session, host.id, "DefaultRoute", node_obj=host)
-                            try:
-                                if ok:
-                                    logger.info("Removed DefaultRoute from DOCKER node %s (id=%s)", getattr(host, "name", host.id), host.id)
-                                else:
-                                    logger.info("DefaultRoute not present or could not remove on DOCKER node %s (id=%s)", getattr(host, "name", host.id), host.id)
-                            except Exception:
-                                pass
+                        _ensure_default_route_for_docker(session, host)
                 except Exception:
                     pass
 

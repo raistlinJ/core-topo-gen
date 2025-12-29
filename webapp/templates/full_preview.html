@@ -2882,7 +2882,12 @@
         openExecuteProgress('Executing scenario…');
         appendExecuteProgressLog('Submitting run for {{ xml_path }}');
         cleanupExecuteProgress();
-        const form = new FormData(); form.append('xml_path', '{{ xml_path }}');
+        const form = new FormData();
+        form.append('xml_path', '{{ xml_path }}');
+        try {
+          const scen = (typeof scenarioMeta?.scenario === 'string' ? scenarioMeta.scenario : '').trim();
+          if(scen){ form.append('scenario', scen); }
+        } catch(e) {}
         const planPath = executeRunBtn.getAttribute('data-preview-plan');
         if(planPath){ form.append('preview_plan', planPath); }
         let res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });

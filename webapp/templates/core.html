@@ -20,7 +20,7 @@
     <button class="btn btn-sm btn-outline-light" id="toggleRefreshBtn" type="button">Pause</button>
   </div>
   {% if not hide_daemon_badge %}
-  <div class="text-white-50 small">Daemon: {{ host }}:{{ port }}</div>
+  <div class="text-white-50 small" id="coreDaemonBadge">Daemon: <span id="coreDaemonHostPort">{{ host }}:{{ port }}</span></div>
   {% endif %}
 </div>
 {% endblock %}
@@ -36,20 +36,14 @@
   /* File column: fixed width + horizontal scroll inside the cell */
   th.filename-col, td.filename-col { overflow: hidden; }
   .filename-scroll { max-width: 100%; display:block; overflow-x:auto; overflow-y:hidden; white-space:nowrap; }
+
   #sessionsTable { table-layout: fixed; }
   #sessionsTable th, #sessionsTable td { padding: .3rem .35rem; }
-  #sessionsTable th.col-id, #sessionsTable td.col-id { width: 5%; white-space: nowrap; text-align: center; overflow: hidden; text-overflow: ellipsis; }
-  #sessionsTable th.col-state, #sessionsTable td.col-state { width: 10%; white-space: nowrap; text-align: center; }
-  #sessionsTable th.col-nodes, #sessionsTable td.col-nodes { width: 7%; white-space: nowrap; text-align: center; overflow: hidden; text-overflow: ellipsis; }
-  #sessionsTable th.col-hitl, #sessionsTable td.col-hitl { width: 28%; }
-  #sessionsTable td.col-hitl { font-size: 0.85rem; }
-  #sessionsTable td.col-hitl .hitl-scroll { max-height: 3.5rem; overflow: auto; }
-  #sessionsTable td.col-hitl .hitl-entry { line-height: 1.2; white-space: nowrap; }
-  #sessionsTable td.col-hitl .hitl-entry-link { color: inherit; text-decoration: none; display: inline-flex; align-items: baseline; gap: .15rem; }
-  #sessionsTable td.col-hitl .hitl-entry-link:hover { text-decoration: underline; }
-  #sessionsTable th.col-scenario, #sessionsTable td.col-scenario { width: 13%; white-space: nowrap; text-align: center; }
-  #sessionsTable th.filename-col, #sessionsTable td.filename-col { width: 22rem; max-width: 22rem; }
-  #sessionsTable th.actions-col, #sessionsTable td.actions-col { width: 15rem; }
+  #sessionsTable th.col-scenario, #sessionsTable td.col-scenario { width: 12rem; white-space: nowrap; }
+  #sessionsTable th.col-id, #sessionsTable td.col-id { width: 7rem; white-space: nowrap; text-align: center; }
+  #sessionsTable th.col-file, #sessionsTable td.col-file { width: 28rem; max-width: 28rem; }
+  #sessionsTable th.col-hitl, #sessionsTable td.col-hitl { width: 16rem; white-space: nowrap; }
+  #sessionsTable th.actions-col, #sessionsTable td.actions-col { width: 18rem; }
 
   #xmlsTable { table-layout: fixed; }
   #xmlsTable th.filename-col, #xmlsTable td.filename-col { width: 26rem; max-width: 26rem; }
@@ -57,11 +51,14 @@
   #xmlsTable thead th:nth-child(3), #xmlsTable tbody td:nth-child(3) { width: 5rem; text-align: center; white-space: nowrap; }
   .actions-col .btn { padding: .15rem .3rem; line-height: 1; vertical-align: middle; display: inline-flex; align-items: center; justify-content: center; }
   .actions-col .btn i, .actions-col .btn .bi { font-size: .95em; line-height: 1; display: block; }
-  .actions-col .actions-wrap > a { display: inline-flex; align-items: center; margin-right: 2px; }
-  .actions-col .actions-wrap > form { display: contents; }
-  .actions-col .actions-wrap > form > .btn { margin-right: 2px; }
-  .actions-col .actions-wrap > a:last-child { margin-right: 0; }
-  .actions-col .actions-wrap > form:last-child > .btn { margin-right: 0; }
+  /* Bootstrap Icons glyphs are not optically centered equally; nudge info icon to match the other action icons. */
+  .actions-col .btn .bi-info-circle { transform: translateY(0.05em); }
+  .actions-col .actions-wrap { display: inline-flex; align-items: center; gap: 2px; }
+  .actions-col .actions-wrap > a { display: inline-flex; align-items: center; }
+  .actions-col .actions-wrap > form { display: inline-flex; align-items: center; margin: 0; }
+
+  /* Scenario list indicator */
+  .scenario-active-dot { font-size: .55rem; line-height: 1; vertical-align: middle; }
   /* Inline loading bar */
   #dataLoadingBar { height:4px; position:relative; margin-bottom:.5rem; overflow:hidden; border-radius:2px; background:rgba(0,0,0,0.08); }
   #dataLoadingBar.d-none { display:none !important; }
@@ -111,6 +108,7 @@
   {% endif %}
 </div>
 {% set has_core_errors = core_errors|default([])|length > 0 %}
+<div id="coreVmBannerContainer">
 {% if core_vm_configured and core_vm_summary and not has_core_errors %}
 <div class="alert alert-success" role="status">
   <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
@@ -135,7 +133,7 @@
       {% endif %}
     </div>
     {% if not is_builder_view %}
-    <a class="btn btn-sm btn-dark" href="{{ core_modal_href }}">Change CORE VM</a>
+    <a class="btn btn-sm btn-dark" id="coreVmActionLink" href="{{ core_modal_href }}">Change CORE VM</a>
     {% else %}
     <span class="badge text-bg-secondary">Admin managed</span>
     {% endif %}
@@ -160,7 +158,7 @@
       <div class="small text-muted">Resolve the errors above and re-validate the CORE connection.</div>
     </div>
     {% if not is_builder_view %}
-    <a class="btn btn-sm btn-outline-dark" href="{{ core_modal_href }}">Review CORE VM</a>
+    <a class="btn btn-sm btn-outline-dark" id="coreVmActionLink" href="{{ core_modal_href }}">Review CORE VM</a>
     {% else %}
     <span class="badge text-bg-secondary">Contact admin</span>
     {% endif %}
@@ -170,12 +168,13 @@
 <div class="alert alert-warning d-flex flex-wrap justify-content-between align-items-center gap-3" role="status">
   <span class="fw-semibold">No CORE VM configured</span>
   {% if not is_builder_view %}
-  <a class="btn btn-sm btn-outline-primary" href="{{ core_modal_href }}">Select CORE VM</a>
+  <a class="btn btn-sm btn-outline-primary" id="coreVmActionLink" href="{{ core_modal_href }}">Select CORE VM</a>
   {% else %}
   <span class="text-muted small">Contact an admin to assign a CORE VM.</span>
   {% endif %}
 </div>
 {% endif %}
+</div>
 <div class="row g-3 align-items-stretch" id="coreLayoutRow">
   <div class="col-12 col-lg-3 d-flex">
     <div class="card shadow-sm flex-fill d-flex flex-column">
@@ -183,10 +182,13 @@
         <span class="fw-bold">Scenarios</span>
         <button class="btn btn-sm btn-outline-secondary {% if not active_scenario %}d-none{% endif %}" id="coreScenarioFilterClear" type="button">Clear</button>
       </div>
-      <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="coreScenarioList" style="min-height:0; max-height:65vh;">
+      <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="coreScenarioList" style="min-height:0;">
         {% if scenarios %}
           {% for s in scenarios %}
-          <button type="button" class="list-group-item list-group-item-action small py-2 {% if active_scenario and active_scenario==s %}active{% endif %}" data-scen-name="{{ s }}">{{ s }}</button>
+          <button type="button" class="list-group-item list-group-item-action py-1 {% if active_scenario and active_scenario==s %}active bg-primary text-white{% endif %}" data-scen-name="{{ s }}">
+            <span class="scenario-name">{{ s }}</span>
+            <span class="scenario-active-dot d-none ms-1" aria-hidden="true"><i class="bi bi-circle-fill text-success"></i></span>
+          </button>
           {% endfor %}
         {% else %}
           <div class="p-3 text-muted small">No scenarios yet</div>
@@ -197,7 +199,7 @@
   <div class="col-12 col-lg-9">
     <div class="row g-3">
       <div class="col-12">
-        <div class="card mb-3">
+        <div class="card mb-3 h-100 d-flex flex-column">
           <div class="card-header py-2 d-flex justify-content-between align-items-center">
             <strong class="mb-0">Active Sessions</strong>
             <div class="d-flex align-items-center gap-2">
@@ -208,17 +210,15 @@
               <small class="text-muted ms-2">via gRPC</small>
             </div>
           </div>
-          <div class="table-responsive" style="max-height:60vh; overflow-y:auto; overflow-x:auto;">
+          <div class="table-responsive flex-grow-1" style="overflow-y:auto; overflow-x:auto;">
             <table class="table table-sm align-middle mb-0" id="sessionsTable">
               <thead class="table-light">
                 <tr>
                   <th class="col-check"><input type="checkbox" id="sessionsCheckAll"></th>
-                  <th class="col-id">ID</th>
-                  <th class="col-state">State</th>
-                  <th class="col-nodes">Nodes</th>
-                  <th class="col-hitl">HITL gateway</th>
                   <th class="col-scenario">Scenario</th>
-                  <th class="filename-col">File</th>
+                  <th class="col-id">Session ID</th>
+                  <th class="col-file">Filename</th>
+                  <th class="col-hitl">HITL Gateway IP</th>
                   <th class="actions-col">Actions</th>
                 </tr>
               </thead>
@@ -228,7 +228,7 @@
         </div>
       </div>
       <div class="col-12">
-        <div class="card mb-3">
+        <div class="card mb-3 h-100 d-flex flex-column">
           <div class="card-header py-2 d-flex justify-content-between align-items-center">
             <strong class="mb-0">Saved XML Topologies</strong>
             <div class="d-flex align-items-center gap-2">
@@ -239,7 +239,7 @@
               <small class="text-muted ms-2">on disk</small>
             </div>
           </div>
-          <div class="table-responsive" style="max-height:60vh; overflow-y:auto; overflow-x:auto;">
+          <div class="table-responsive flex-grow-1" style="overflow-y:auto; overflow-x:auto;">
             <table class="table table-sm align-middle mb-0" id="xmlsTable">
               <thead class="table-light">
                 <tr>
@@ -314,6 +314,7 @@
   let timer = null;
   let intervalMs = parseInt(localStorage.getItem('coreRefreshMs') || '5000', 10);
   const coreDataBaseUrl = "{{ url_for('core_data') }}";
+  const isBuilderView = {{ 'true' if is_builder_view else 'false' }};
   let scenarioNamesCache = {{ (scenarios or [])|tojson }};
   const initialScenarioFilter = {{ (active_scenario or '')|tojson }};
   let scenarioFilter = initialScenarioFilter || null;
@@ -327,22 +328,23 @@
   const xmlsTBody = xmlsTable?.querySelector('tbody');
   const dockerTable = document.getElementById('dockerTable');
   const dockerTBody = dockerTable?.querySelector('tbody');
-  const sessionsFilterInput = document.getElementById('sessionsFilter');
   const xmlsFilterInput = document.getElementById('xmlsFilter');
-  const sessionsCheckAll = document.getElementById('sessionsCheckAll');
+  const sessionsFilterInput = document.getElementById('sessionsFilter');
   const xmlsCheckAll = document.getElementById('xmlsCheckAll');
-  const sessionsDeleteBtn = document.getElementById('sessionsDeleteBtn');
+  const sessionsCheckAll = document.getElementById('sessionsCheckAll');
   const xmlsDeleteBtn = document.getElementById('xmlsDeleteBtn');
+  const sessionsDeleteBtn = document.getElementById('sessionsDeleteBtn');
   const scenarioFilterList = document.getElementById('coreScenarioList');
   const scenarioClearBtn = document.getElementById('coreScenarioFilterClear');
-  let sessionsFilterText = '';
   let xmlsFilterText = '';
+  let sessionsFilterText = '';
+  let latestSessionIds = new Set();
   // Persistent selection state (restored across full page reloads)
   const LS_KEYS = {
-    sessions: 'coreSelectedSessions',
     xmls: 'coreSelectedXmls',
-    masterSessions: 'coreMasterSessionsAll',
-    masterXmls: 'coreMasterXmlsAll'
+    masterXmls: 'coreMasterXmlsAll',
+    sessions: 'coreSelectedSessions',
+    masterSessions: 'coreMasterSessionsAll'
   };
   function loadJsonArray(key){
     try { const raw = localStorage.getItem(key); if(!raw) return []; const arr = JSON.parse(raw); return Array.isArray(arr)? arr: []; } catch(e){ return []; }
@@ -350,21 +352,21 @@
   function loadBool(key){
     try { const raw = localStorage.getItem(key); return raw === 'true'; } catch(e){ return false; }
   }
-  const selectedSessions = new Set(loadJsonArray(LS_KEYS.sessions));
   const selectedXmlPaths = new Set(loadJsonArray(LS_KEYS.xmls));
-  let sessionsMasterSelectAll = loadBool(LS_KEYS.masterSessions);
   let xmlsMasterSelectAll = loadBool(LS_KEYS.masterXmls);
+  const selectedSessionIds = new Set(loadJsonArray(LS_KEYS.sessions));
+  let sessionsMasterSelectAll = loadBool(LS_KEYS.masterSessions);
   // Auto reapply flags (so user can permanently opt-out of reapplication until they re-enable)
-  let sessionsAutoReapply = true;
   let xmlsAutoReapply = true;
+  let sessionsAutoReapply = true;
   // Timestamp of last manual header toggle (used if we want throttling)
   let lastHeaderToggleTs = 0;
   function persistSelections(){
     try {
-      localStorage.setItem(LS_KEYS.sessions, JSON.stringify(Array.from(selectedSessions)));
       localStorage.setItem(LS_KEYS.xmls, JSON.stringify(Array.from(selectedXmlPaths)));
-      localStorage.setItem(LS_KEYS.masterSessions, sessionsMasterSelectAll ? 'true':'false');
       localStorage.setItem(LS_KEYS.masterXmls, xmlsMasterSelectAll ? 'true':'false');
+      localStorage.setItem(LS_KEYS.sessions, JSON.stringify(Array.from(selectedSessionIds)));
+      localStorage.setItem(LS_KEYS.masterSessions, sessionsMasterSelectAll ? 'true':'false');
     } catch(e) {}
   }
 
@@ -378,7 +380,80 @@
     }
   }
 
+  function defaultScenarioName(){
+    return (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length) ? String(scenarioNamesCache[0]) : null;
+  }
+
+  function ensureScenarioSelected(){
+    if(scenarioFilter) return;
+    const def = defaultScenarioName();
+    if(def) scenarioFilter = def;
+  }
+
+  function renderCoreVmBanner(payload){
+    const container = document.getElementById('coreVmBannerContainer');
+    if(!container) return;
+    if(isBuilderView) return;
+
+    const errs = Array.isArray(payload?.errors) ? payload.errors : [];
+    const hasErrs = errs.length > 0;
+    const configured = !!payload?.core_vm_configured;
+    const summary = (payload && payload.core_vm_summary && typeof payload.core_vm_summary === 'object') ? payload.core_vm_summary : {};
+    const href = (payload && typeof payload.core_modal_href === 'string') ? payload.core_modal_href : '';
+
+    if(configured && summary && !hasErrs){
+      const label = esc(summary.label || 'CORE VM');
+      const node = summary.node ? ` <span class="text-muted">• Node ${esc(summary.node)}</span>` : '';
+      const grpc = (summary.host && summary.port) ? `gRPC ${esc(summary.host)}:${esc(summary.port)}` : '';
+      const sshUser = esc(summary.ssh_username || 'unknown');
+      const sshHost = esc(summary.ssh_host || '');
+      const sshPort = esc(summary.ssh_port || '');
+      const ssh = (sshHost && sshPort) ? `SSH ${sshUser}@${sshHost}:${sshPort}` : '';
+      const meta = [grpc, ssh].filter(Boolean).join(' • ');
+      container.innerHTML = `
+<div class="alert alert-success" role="status">
+  <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
+    <div class="flex-grow-1">
+      <div class="d-flex flex-wrap align-items-center gap-2">
+        <span class="fw-bold">CORE VM connected</span>
+        <span>${label}${node}</span>
+      </div>
+      ${meta ? `<div class="small text-muted">${meta}</div>` : ''}
+    </div>
+    ${href ? `<a class="btn btn-sm btn-dark" id="coreVmActionLink" href="${esc(href)}">Change CORE VM</a>` : ''}
+  </div>
+</div>`;
+      return;
+    }
+
+    if(configured && summary){
+      const label = esc(summary.label || 'CORE VM');
+      const node = summary.node ? ` <span class="text-muted">• Node ${esc(summary.node)}</span>` : '';
+      container.innerHTML = `
+<div class="alert alert-warning" role="status">
+  <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
+    <div class="flex-grow-1">
+      <div class="d-flex flex-wrap align-items-center gap-2">
+        <span class="fw-bold">CORE VM assigned, but connection issues detected</span>
+        <span>${label}${node}</span>
+      </div>
+      <div class="small text-muted">Resolve the errors above and re-validate the CORE connection.</div>
+    </div>
+    ${href ? `<a class="btn btn-sm btn-outline-dark" id="coreVmActionLink" href="${esc(href)}">Review CORE VM</a>` : ''}
+  </div>
+</div>`;
+      return;
+    }
+
+    container.innerHTML = `
+<div class="alert alert-warning d-flex flex-wrap justify-content-between align-items-center gap-3" role="status">
+  <span class="fw-semibold">No CORE VM configured</span>
+  ${href ? `<a class="btn btn-sm btn-outline-primary" id="coreVmActionLink" href="${esc(href)}">Select CORE VM</a>` : ''}
+</div>`;
+  }
+
   function buildCoreDataUrl(){
+    ensureScenarioSelected();
     if(!scenarioFilter) return coreDataBaseUrl;
     const sep = coreDataBaseUrl.includes('?') ? '&' : '?';
     return `${coreDataBaseUrl}${sep}scenario=${encodeURIComponent(scenarioFilter)}`;
@@ -396,12 +471,29 @@
 
   function updateCoreScenarioControls(){
     if(scenarioClearBtn){
-      scenarioClearBtn.classList.toggle('d-none', !scenarioFilter);
+      const def = defaultScenarioName();
+      const show = !!scenarioFilter && !!def && scenarioFilter !== def;
+      scenarioClearBtn.classList.toggle('d-none', !show);
     }
     if(!scenarioFilterList) return;
     scenarioFilterList.querySelectorAll('[data-scen-name]').forEach(btn => {
       const name = btn.getAttribute('data-scen-name');
-      btn.classList.toggle('active', !!scenarioFilter && name === scenarioFilter);
+      const isActive = !!scenarioFilter && name === scenarioFilter;
+      btn.classList.toggle('active', isActive);
+      btn.classList.toggle('bg-primary', isActive);
+      btn.classList.toggle('text-white', isActive);
+    });
+  }
+
+  function updateScenarioActiveDots(counts){
+    if(!scenarioFilterList) return;
+    const c = (counts && typeof counts === 'object') ? counts : {};
+    scenarioFilterList.querySelectorAll('button[data-scen-name]').forEach(btn => {
+      const name = btn.getAttribute('data-scen-name') || '';
+      const dot = btn.querySelector('.scenario-active-dot');
+      if(!dot) return;
+      const n = (name && Object.prototype.hasOwnProperty.call(c, name)) ? Number(c[name]) : 0;
+      dot.classList.toggle('d-none', !(n > 0));
     });
   }
 
@@ -431,18 +523,20 @@
       updateCoreScenarioControls();
       return;
     }
+
+    ensureScenarioSelected();
     scenarioNamesCache.forEach(name => {
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = 'list-group-item list-group-item-action small py-2 text-start';
+      btn.className = 'list-group-item list-group-item-action py-1 text-start';
       btn.dataset.scenName = name;
-      btn.textContent = name;
+      btn.innerHTML = `<span class="scenario-name">${esc(name)}</span><span class="scenario-active-dot d-none ms-1" aria-hidden="true"><i class="bi bi-circle-fill text-success"></i></span>`;
       if(scenarioFilter && name === scenarioFilter){
-        btn.classList.add('active');
+        btn.classList.add('active','bg-primary','text-white');
       }
       btn.addEventListener('click', async () => {
-        const nextValue = (scenarioFilter === name) ? null : name;
-        await setCoreScenarioFilter(nextValue);
+        if(scenarioFilter === name) return; // never allow "All" by deselecting
+        await setCoreScenarioFilter(name);
       });
       scenarioFilterList.appendChild(btn);
     });
@@ -450,10 +544,10 @@
   }
 
   async function setCoreScenarioFilter(value){
-    scenarioFilter = value || null;
+    scenarioFilter = value || defaultScenarioName() || null;
     updateCoreScenarioQueryParam();
     updateCoreScenarioControls();
-    dockLog('INFO', `[core] Scenario filter set to ${scenarioFilter || 'All'}`);
+    dockLog('INFO', `[core] Scenario filter set to ${scenarioFilter || '<none>'}`);
     await refresh();
   }
 
@@ -491,116 +585,98 @@
 
   function esc(s){ return (s||'').toString().replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
 
-  function normalizeParticipantHitlHref(value){
-    if(value === undefined || value === null) return '';
-    let trimmed = String(value).trim();
-    if(!trimmed) return '';
-    if(!/^https?:\/\//i.test(trimmed)){
-      trimmed = `https://${trimmed}`;
-    }
+  function basenameFromPath(p){
     try {
-      const parsed = new URL(trimmed);
-      if(parsed.protocol !== 'http:' && parsed.protocol !== 'https:'){
-        return '';
+      const raw = (p || '').toString();
+      if(!raw) return '';
+      const parts = raw.split(/[/\\]/);
+      return parts[parts.length - 1] || '';
+    } catch(e){
+      return '';
+    }
+  }
+
+  function firstHitlIp(session){
+    try {
+      const entries = Array.isArray(session?.hitl) ? session.hitl : [];
+      const ips = [];
+      for(const entry of entries){
+        if(entry && Array.isArray(entry.ips)){
+          for(const ip of entry.ips){
+            const v = (ip || '').toString().trim();
+            if(v) ips.push(v);
+          }
+        }
       }
-      return parsed.toString();
+      const uniq = Array.from(new Set(ips));
+      return uniq.join(', ');
     } catch(e){
       return '';
     }
   }
 
   function buildSessionRow(s){
-    const id = esc(s.id);
-    const state = esc(s.state||'');
-    const nodesVal = (s.nodes === null || s.nodes === undefined) ? '-' : String(s.nodes);
-    const nodes = esc(nodesVal);
-    const rawFile = s.file || s.filename || s.path || '';
-    const baseName = rawFile ? rawFile.split(/[/\\\\]/).pop() : '—';
-    const file = esc(baseName);
-    const fullFileTitle = esc(rawFile || '');
-    const scenarioRaw = (s.scenario_name || '').toString().trim();
-    const scenarioDisplay = scenarioRaw ? `<span class="badge text-bg-primary">${esc(scenarioRaw)}</span>` : '<span class="text-muted">—</span>';
-    const hitlEntries = Array.isArray(s.hitl) ? s.hitl : [];
-    const participantHref = normalizeParticipantHitlHref(s.participant_proxmox_url || '');
-    const participantHrefEsc = participantHref ? esc(participantHref) : '';
-    const hitlFilterText = hitlEntries.map(entry => {
-      const parts = [];
-      if(entry && entry.name) parts.push(entry.name);
-      if(entry && entry.type) parts.push(entry.type);
-      if(entry && Array.isArray(entry.ips)) parts.push(entry.ips.join(' '));
-      return parts.join(' ');
-    }).join(' ');
-    const hitlCell = hitlEntries.length
-        ? `<div class="hitl-scroll d-flex flex-column gap-1">${hitlEntries.map(entry => {
-          const name = esc((entry && entry.name) || (entry && entry.type) || 'HITL');
-          const ips = (entry && Array.isArray(entry.ips)) ? entry.ips.filter(ip => !!ip).map(ip => esc(ip)) : [];
-          const ipLabel = ips.length ? ` <span class="text-muted">(${ips.join(', ')})</span>` : ' <span class="text-muted">(no IP)</span>';
-          const inner = participantHrefEsc
-            ? `<a class="hitl-entry-link" href="${participantHrefEsc}" target="_blank" rel="noopener noreferrer" title="Open Participant UI">${name}${ipLabel}</a>`
-            : `${name}${ipLabel}`;
-          return `<div class="hitl-entry">${inner}</div>`;
-        }).join('')}</div>`
-      : '<span class="text-muted">—</span>';
-    const lower = (s.state||'').toString().toLowerCase();
-    const hasFile = !!s.file;
-    const rowStr = `${id} ${state} ${nodes} ${scenarioRaw} ${file} ${hitlFilterText}`.toLowerCase();
+    const sid = (s && (s.id ?? s.session_id))
+    const sidText = sid !== undefined && sid !== null ? String(sid) : '';
+    const scen = (s && (s.scenario_name || s.scenario || '')) ? String(s.scenario_name || s.scenario || '').trim() : '';
+    const filePath = (s && (s.file || s.path || '')) ? String(s.file || s.path || '') : '';
+    const fileName = (s && s.filename) ? String(s.filename) : (basenameFromPath(filePath) || '—');
+    const hitlIp = firstHitlIp(s) || '—';
+
+    const rowStr = `${scen} ${sidText} ${fileName} ${filePath} ${hitlIp} ${(s && s.state) ? String(s.state) : ''}`.toLowerCase();
     if (sessionsFilterText && !rowStr.includes(sessionsFilterText)) return '';
-    // Always pass session_id for Details so the backend can export session XML via gRPC.
-    // NOTE: `s.file` is commonly a remote path (not readable locally), so `path=` would cause fallback/mismatch.
-    const detailsParams = [];
-    detailsParams.push('session_id=' + encodeURIComponent(String(s.id||'')));
-    if (scenarioRaw) {
-      detailsParams.push('scenario_name=' + encodeURIComponent(scenarioRaw));
-    }
+
+    const scenarioBadge = scen ? `<span class="badge text-bg-primary">${esc(scen)}</span>` : '<span class="text-muted">—</span>';
+    const sidCell = sidText ? esc(sidText) : '<span class="text-muted">—</span>';
+    const fileCell = `<div class="filename-scroll" title="${esc(filePath)}">${esc(fileName)}</div>`;
+    const hitlCell = `<div class="filename-scroll" title="${esc(hitlIp)}">${esc(hitlIp)}</div>`;
+
     const detailsHrefBase = '{{ url_for('core_details') }}';
+    const detailsParams = [];
+    if(sidText) detailsParams.push('session_id=' + encodeURIComponent(sidText));
+    if(scen) detailsParams.push('scenario_name=' + encodeURIComponent(scen));
     const detailsHref = detailsParams.length ? `${detailsHrefBase}?${detailsParams.join('&')}` : detailsHrefBase;
+
     const scenarioHidden = scenarioFilter ? `<input type="hidden" name="scenario" value="${esc(scenarioFilter)}">` : '';
-    const stopBtn = `
-      <form action="{{ url_for('core_stop') }}" method="post">
+
+    const stateLower = ((s && s.state) ? String(s.state) : '').toLowerCase();
+    const isRunning = stateLower.includes('run');
+    const isShutdown = stateLower.includes('shutdown');
+
+    const toggleAction = isRunning ? "{{ url_for('core_stop') }}" : "{{ url_for('core_start_session') }}";
+    const toggleTitle = isRunning ? 'Stop' : 'Start';
+    const toggleIcon = isRunning ? '<i class="bi bi-stop-circle"></i>' : '<i class="bi bi-play-circle"></i>';
+    const toggleBtnClass = isRunning ? 'btn-outline-secondary' : 'btn-outline-success';
+    const toggleDisabled = (!sidText) ? 'disabled' : '';
+    const startStopBtn = `
+      <form action="${toggleAction}" method="post" class="d-inline" title="${toggleTitle}">
         ${scenarioHidden}
-        <input type="hidden" name="session_id" value="${id}">
-        <button class="btn btn-sm btn-outline-warning" title="Stop"><i class="bi bi-stop-circle"></i></button>
+        <input type="hidden" name="session_id" value="${esc(sidText)}">
+        <button class="btn btn-sm ${toggleBtnClass}" ${toggleDisabled}>${toggleIcon}</button>
       </form>`;
-    const startBtn = `
-      <form action="{{ url_for('core_start_session') }}" method="post">
+    const downloadBtn = `
+      <form action="{{ url_for('core_save_xml') }}" method="post" class="d-inline" title="Download">
         ${scenarioHidden}
-        <input type="hidden" name="session_id" value="${id}">
-        <button class="btn btn-sm btn-outline-success" title="Start"><i class="bi bi-play-circle"></i></button>
+        <input type="hidden" name="session_id" value="${esc(sidText)}">
+        <button class="btn btn-sm btn-outline-secondary" ${(!sidText) ? 'disabled' : ''}><i class="bi bi-download"></i></button>
       </form>`;
-    const participantBtn = participantHrefEsc
-      ? `<a class="btn btn-sm btn-outline-success" href="${participantHrefEsc}" target="_blank" rel="noopener noreferrer" title="Open Participant UI"><i class="bi bi-box-arrow-up-right"></i></a>`
-      : '';
-    const stateIcon = (
-      lower.includes('run')
-        ? `<i class="bi bi-play-circle-fill text-success" data-bs-toggle="tooltip" title="${state}"></i>`
-        : (lower.includes('shutdown')
-          ? `<i class="bi bi-power text-secondary" data-bs-toggle="tooltip" title="${state}"></i>`
-          : `<i class="bi bi-question-circle text-muted" data-bs-toggle="tooltip" title="${state}"></i>`)
-    );
-    const actions = `
-      <div class="d-flex align-items-center flex-nowrap actions-wrap">
-        ${participantBtn}
-        <a class=\"btn btn-sm btn-outline-info\" href=\"${detailsHref}\" title=\"Details\"><i class=\"bi bi-info-circle\"></i></a>
-        ${lower.includes('run') ? stopBtn : (lower.includes('shutdown') ? startBtn : '')}
-        <form action=\"{{ url_for('core_delete') }}\" method=\"post\" onsubmit=\"return confirm('Delete session ${id}?')\">
-          ${scenarioHidden}
-          <input type=\"hidden\" name=\"session_id\" value=\"${id}\">
-          <button class=\"btn btn-sm btn-outline-danger\" title=\"Delete\"><i class=\"bi bi-trash\"></i></button>
-        </form>
-        <form action=\"{{ url_for('core_save_xml') }}\" method=\"post\" title=\"Save XML\">
-          ${scenarioHidden}
-          <input type=\"hidden\" name=\"session_id\" value=\"${id}\">
-          <button class=\"btn btn-sm btn-outline-secondary\"><i class=\"bi bi-download\"></i></button>
-        </form>
-      </div>`;
+    const deleteBtn = `
+      <form action="{{ url_for('core_delete') }}" method="post" class="d-inline" title="Delete" onsubmit="return confirm('Delete session ${esc(sidText)}?')">
+        ${scenarioHidden}
+        <input type="hidden" name="session_id" value="${esc(sidText)}">
+        <button class="btn btn-sm btn-outline-danger" ${(!sidText) ? 'disabled' : ''}><i class="bi bi-trash"></i></button>
+      </form>`;
+    const detailsBtn = `<a class="btn btn-sm btn-outline-info" href="${detailsHref}" title="Details"><i class="bi bi-info-circle"></i></a>`;
+
+    // Mirror the Saved XML Topologies actions layout (no d-flex wrapper).
+    const actions = `${detailsBtn}${startStopBtn}${downloadBtn}${deleteBtn}`;
+
     return `<tr>
-      <td class="col-check"><input type="checkbox" class="row-select" data-type="session" data-id="${id}" ${selectedSessions.has(String(s.id))? 'checked':''}></td>
-      <td class="col-id">${id}</td>
-      <td class="col-state">${stateIcon}</td>
-      <td class="col-nodes">${nodes}</td>
+      <td class="col-check"><input type="checkbox" class="row-select" data-type="session" data-id="${esc(sidText)}" ${sidText && selectedSessionIds.has(sidText) ? 'checked' : ''} ${(!sidText) ? 'disabled' : ''}></td>
+      <td class="col-scenario">${scenarioBadge}</td>
+      <td class="col-id">${sidCell}</td>
+      <td class="col-file">${fileCell}</td>
       <td class="col-hitl">${hitlCell}</td>
-      <td class="col-scenario">${scenarioDisplay}</td>
-      <td class="filename-col"><div class="filename-scroll" title="${fullFileTitle}">${file}</div></td>
       <td class="actions-col">${actions}</td>
     </tr>`;
   }
@@ -651,7 +727,7 @@
     setLoading(true);
     try{
       const dataUrl = buildCoreDataUrl();
-      dockLog('DEBUG', `[core] Refreshing sessions from ${dataUrl}${scenarioFilter ? ` (scenario=${scenarioFilter})` : ''}`);
+      dockLog('DEBUG', `[core] Refreshing core data from ${dataUrl}${scenarioFilter ? ` (scenario=${scenarioFilter})` : ''}`);
       const res = await fetch(dataUrl, { cache:'no-store' });
       if(!res.ok){
         dockLog('WARN', `[core] refresh failed (${res.status}) for ${dataUrl}`);
@@ -669,35 +745,60 @@
       } else {
         renderCoreErrors([]);
       }
+      try {
+        renderCoreVmBanner(data);
+        const daemon = document.getElementById('coreDaemonHostPort');
+        if(daemon && data.host && data.port){
+          daemon.textContent = `${data.host}:${data.port}`;
+        }
+      } catch(_e) {}
       if(data.grpc_command && data.grpc_command !== lastGrpcCommand){
         dockLog('INFO', `[core] gRPC command: ${data.grpc_command}`);
         lastGrpcCommand = data.grpc_command;
       }
       const serverScenario = (data.active_scenario || '').trim();
       if(serverScenario){
-        scenarioFilter = serverScenario;
-      } else if(!serverScenario && scenarioFilter){
-        scenarioFilter = null;
+        // Only accept serverScenario if it matches the current selection (or if we had none).
+        // This avoids UI flipping back to the first scenario if the backend defaults.
+        const norm = (v) => (v || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
+        if(!scenarioFilter || norm(serverScenario) === norm(scenarioFilter)){
+          scenarioFilter = serverScenario;
+        } else {
+          dockLog('DEBUG', `[core] Ignoring server active_scenario=${serverScenario} (UI selected ${scenarioFilter})`);
+        }
+      } else {
+        // Never allow an implicit "All" state if scenarios exist.
+        if(!scenarioFilter){
+          const first = (Array.isArray(data.scenarios) && data.scenarios.length) ? String(data.scenarios[0]) : null;
+          if(first) scenarioFilter = first;
+        }
       }
       if(Array.isArray(data.scenarios)){
         scenarioNamesCache = data.scenarios;
+        ensureScenarioSelected();
         renderCoreScenarioButtons();
+        updateScenarioActiveDots(data.active_session_counts);
       } else {
         updateCoreScenarioControls();
+        updateScenarioActiveDots(data.active_session_counts);
       }
       updateCoreScenarioQueryParam();
       if(Array.isArray(data.sessions) && sessionsTBody){
+        latestSessionIds = new Set();
+        data.sessions.forEach(s=>{
+          const sid = (s && (s.id ?? s.session_id));
+          const sidText = sid !== undefined && sid !== null ? String(sid) : '';
+          if(sidText) latestSessionIds.add(sidText);
+        });
         sessionsTBody.innerHTML = data.sessions.map(buildSessionRow).filter(Boolean).join('\n');
-        try { document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => new bootstrap.Tooltip(el)); } catch(e) {}
-        bindSelectionHandlers('session');
-        // Re-apply master select-all if active AND auto-reapply still allowed
-        if (sessionsMasterSelectAll && sessionsAutoReapply) applyMasterSelectAll('session');
-        dockLog('INFO', `[core] Sessions updated (${data.sessions.length} items)`);
+        dockLog('DEBUG', `[core] Sessions updated (${data.sessions.length} items)`);
+        bindSessionsSelectionHandlers();
+        if (sessionsMasterSelectAll && sessionsAutoReapply) applySessionsMasterSelectAll();
       }
       if(Array.isArray(data.xmls) && xmlsTBody){
         xmlsTBody.innerHTML = data.xmls.map(buildXmlRow).filter(Boolean).join('\n');
-        bindSelectionHandlers('xml');
-        if (xmlsMasterSelectAll && xmlsAutoReapply) applyMasterSelectAll('xml');
+        bindXmlSelectionHandlers();
+        if (xmlsMasterSelectAll && xmlsAutoReapply) applyXmlMasterSelectAll();
         dockLog('DEBUG', `[core] XML catalog updated (${data.xmls.length} files)`);
       }
       await refreshDocker();
@@ -785,10 +886,16 @@
       dockLog(entry.level || 'INFO', entry.message || '');
     });
   }
+  // Ensure a scenario is selected and reflected in the URL immediately,
+  // so copy/paste links preserve the active scenario even before refresh completes.
+  try {
+    ensureScenarioSelected();
+    updateCoreScenarioQueryParam();
+    updateCoreScenarioControls();
+  } catch(_e) {}
   setLoading(true);
   refresh().then(()=> schedule());
-  try { bindSelectionHandlers('session'); } catch(e) {}
-  try { bindSelectionHandlers('xml'); } catch(e) {}
+  try { bindXmlSelectionHandlers(); } catch(e) {}
 
   function badge(ok, yes, no){ return ok ? `<span class="badge text-bg-success">${yes}</span>` : `<span class="badge text-bg-secondary">${no}</span>`; }
   function badgeWarn(ok, yes, no){ return ok ? `<span class="badge text-bg-success">${yes}</span>` : `<span class="badge text-bg-danger">${no}</span>`; }
@@ -796,12 +903,16 @@
     if(!dockerTBody) return;
     try{
       dockLog('DEBUG', '[core] Refreshing docker status');
-      const res = await fetch("/docker/status");
+      const url = scenarioFilter ? `/docker/status?scenario=${encodeURIComponent(scenarioFilter)}` : '/docker/status';
+      const res = await fetch(url);
       if(!res.ok){
         dockLog('WARN', `[core] docker refresh failed (${res.status})`);
         return;
       }
       const js = await res.json();
+      if(js && js.error){
+        dockLog('WARN', `[core] docker status: ${js.error}`);
+      }
       const rows = (js.items||[]).map(it=>{
         const file = badge(!!it.exists, 'yes', 'no');
         const pulled = badge(!!it.pulled, 'yes', 'no');
@@ -825,7 +936,8 @@
     if(!confirm('Stop and remove containers for all assigned docker nodes?')) return;
     openProgress('Cleaning stale containers…', 1);
     try{
-      const res = await fetch('/docker/cleanup', { method:'POST' });
+      const url = scenarioFilter ? `/docker/cleanup?scenario=${encodeURIComponent(scenarioFilter)}` : '/docker/cleanup';
+      const res = await fetch(url, { method:'POST' });
       if(res.ok){
         updateProgress(1,1,'Cleanup done');
         dockLog('INFO', '[core] Docker cleanup completed');
@@ -839,26 +951,31 @@
     finally{ closeProgress(); }
   });
 
-  scenarioClearBtn?.addEventListener('click', async ()=>{ await setCoreScenarioFilter(null); });
+  scenarioClearBtn?.addEventListener('click', async ()=>{
+    const def = defaultScenarioName();
+    if(!def) return;
+    await setCoreScenarioFilter(def);
+  });
   renderCoreScenarioButtons();
   renderCoreErrors(initialCoreErrors);
   if(initialGrpcCommand){
     dockLog('INFO', `[core] gRPC command: ${initialGrpcCommand}`);
   }
 
-  sessionsFilterInput?.addEventListener('input', ()=>{
-    sessionsFilterText = sessionsFilterInput.value.trim().toLowerCase();
-    refresh();
-  });
   xmlsFilterInput?.addEventListener('input', ()=>{
     xmlsFilterText = xmlsFilterInput.value.trim().toLowerCase();
     refresh();
   });
 
-  function bindSelectionHandlers(type){
-    const table = type==='session' ? sessionsTable : xmlsTable;
-    const checkAll = type==='session' ? sessionsCheckAll : xmlsCheckAll;
-    const deleteBtn = type==='session' ? sessionsDeleteBtn : xmlsDeleteBtn;
+  sessionsFilterInput?.addEventListener('input', ()=>{
+    sessionsFilterText = sessionsFilterInput.value.trim().toLowerCase();
+    refresh();
+  });
+
+  function bindXmlSelectionHandlers(){
+    const table = xmlsTable;
+    const checkAll = xmlsCheckAll;
+    const deleteBtn = xmlsDeleteBtn;
     if (!table) return;
     const checkboxes = table.querySelectorAll('tbody input.row-select');
     const updateSetsFromDom = ()=>{
@@ -872,20 +989,12 @@
         persistSelections();
         return;
       }
-      if(type==='session'){
-        checkboxes.forEach(cb=>{
-          const id = cb.getAttribute('data-id');
-          if(!id) return;
-          if(cb.checked) selectedSessions.add(id); else selectedSessions.delete(id);
-        });
-      } else {
-        checkboxes.forEach(cb=>{
-          const p = cb.getAttribute('data-path');
-          if(!p) return;
-          if(cb.checked) selectedXmlPaths.add(p); else selectedXmlPaths.delete(p);
-        });
-      }
-      const anyChecked = (type==='session') ? (selectedSessions.size>0) : (selectedXmlPaths.size>0);
+      checkboxes.forEach(cb=>{
+        const p = cb.getAttribute('data-path');
+        if(!p) return;
+        if(cb.checked) selectedXmlPaths.add(p); else selectedXmlPaths.delete(p);
+      });
+      const anyChecked = (selectedXmlPaths.size>0);
       if(deleteBtn){ deleteBtn.disabled = !anyChecked; }
       const total = checkboxes.length;
       const checkedCount = Array.from(checkboxes).filter(cb=>cb.checked).length;
@@ -894,7 +1003,7 @@
           checkAll.indeterminate = false;
           checkAll.checked = false;
         } else {
-          const master = (type==='session') ? sessionsMasterSelectAll : xmlsMasterSelectAll;
+          const master = xmlsMasterSelectAll;
           if (master) {
             checkAll.indeterminate = false;
             checkAll.checked = true;
@@ -909,25 +1018,20 @@
     checkboxes.forEach(cb=> cb.addEventListener('change', ()=>{
       updateSetsFromDom();
       // If user manually unchecks any box while master select-all was active, disable master for that table
-      const master = (type==='session') ? sessionsMasterSelectAll : xmlsMasterSelectAll;
+      const master = xmlsMasterSelectAll;
       if (master) {
         const allChecked = Array.from(checkboxes).every(c=>c.checked);
         if(!allChecked){
-          if(type==='session') sessionsMasterSelectAll = false; else xmlsMasterSelectAll = false;
+          xmlsMasterSelectAll = false;
           // disable auto reapply for this table until user re-enables explicitly
-          if(type==='session') sessionsAutoReapply = false; else xmlsAutoReapply = false;
+          xmlsAutoReapply = false;
           updateSetsFromDom();
         }
       }
     }));
     checkboxes.forEach(cb=>{
-      if(type==='session'){
-        const id = cb.getAttribute('data-id');
-        if(id && selectedSessions.has(id)) cb.checked = true;
-      } else {
-        const p = cb.getAttribute('data-path');
-        if(p && selectedXmlPaths.has(p)) cb.checked = true;
-      }
+      const p = cb.getAttribute('data-path');
+      if(p && selectedXmlPaths.has(p)) cb.checked = true;
     });
     updateSetsFromDom();
     if(checkAll && !checkAll.dataset.selAllBound){
@@ -936,14 +1040,14 @@
         lastHeaderToggleTs = Date.now();
         const target = checkAll.checked;
         if (target){
-          if(type==='session') sessionsMasterSelectAll = true; else xmlsMasterSelectAll = true;
-          if(type==='session') sessionsAutoReapply = true; else xmlsAutoReapply = true; // re-enable auto reapply when user explicitly selects all
-          applyMasterSelectAll(type);
+          xmlsMasterSelectAll = true;
+          xmlsAutoReapply = true; // re-enable auto reapply when user explicitly selects all
+          applyXmlMasterSelectAll();
         } else {
-          if(type==='session') sessionsMasterSelectAll = false; else xmlsMasterSelectAll = false;
-          if(type==='session') sessionsAutoReapply = false; else xmlsAutoReapply = false; // user turned it off
+          xmlsMasterSelectAll = false;
+          xmlsAutoReapply = false; // user turned it off
           // Clear ALL selections (including those not currently visible due to filtering)
-          if(type==='session') selectedSessions.clear(); else selectedXmlPaths.clear();
+          selectedXmlPaths.clear();
           const rows = table.querySelectorAll('tbody input.row-select');
           rows.forEach(cb=>{ cb.checked = false; });
           // Reflect cleared state in UI (no indeterminate, unchecked)
@@ -955,23 +1059,121 @@
     }
   }
 
-  function applyMasterSelectAll(type){
-    const table = type==='session' ? sessionsTable : xmlsTable;
+  function bindSessionsSelectionHandlers(){
+    const table = sessionsTable;
+    const checkAll = sessionsCheckAll;
+    const deleteBtn = sessionsDeleteBtn;
+    if (!table) return;
+    const checkboxes = table.querySelectorAll('tbody input.row-select[data-type="session"]');
+
+    const updateSetsFromDom = ()=>{
+      if(!checkboxes || checkboxes.length===0){
+        if(checkAll){
+          checkAll.indeterminate = false;
+          checkAll.checked = false;
+        }
+        // Prune selections only for sessions that no longer exist.
+        Array.from(selectedSessionIds).forEach(sid=>{ if(!latestSessionIds.has(sid)) selectedSessionIds.delete(sid); });
+        if(deleteBtn) deleteBtn.disabled = selectedSessionIds.size === 0;
+        persistSelections();
+        return;
+      }
+
+      // Update selection set based on currently-visible rows.
+      checkboxes.forEach(cb=>{
+        const sid = cb.getAttribute('data-id');
+        if(!sid) return;
+        if(cb.checked) selectedSessionIds.add(sid); else selectedSessionIds.delete(sid);
+      });
+      // Prune selection for sessions that no longer exist (but keep selections for sessions hidden by filtering).
+      Array.from(selectedSessionIds).forEach(sid=>{ if(!latestSessionIds.has(sid)) selectedSessionIds.delete(sid); });
+      if(deleteBtn) deleteBtn.disabled = selectedSessionIds.size === 0;
+
+      const total = checkboxes.length;
+      const checkedCount = Array.from(checkboxes).filter(cb=>cb.checked).length;
+      if(checkAll){
+        const master = sessionsMasterSelectAll;
+        if (master) {
+          checkAll.indeterminate = false;
+          checkAll.checked = true;
+        } else {
+          checkAll.indeterminate = checkedCount>0 && checkedCount<total;
+          checkAll.checked = checkedCount===total;
+        }
+      }
+      persistSelections();
+    };
+
+    checkboxes.forEach(cb=> cb.addEventListener('change', ()=>{
+      updateSetsFromDom();
+      const master = sessionsMasterSelectAll;
+      if (master) {
+        const allChecked = Array.from(checkboxes).every(c=>c.checked);
+        if(!allChecked){
+          sessionsMasterSelectAll = false;
+          sessionsAutoReapply = false;
+          updateSetsFromDom();
+        }
+      }
+    }));
+
+    // Reapply persisted selections for currently-visible rows.
+    checkboxes.forEach(cb=>{
+      const sid = cb.getAttribute('data-id');
+      if(sid && selectedSessionIds.has(sid)) cb.checked = true;
+    });
+
+    updateSetsFromDom();
+
+    if(checkAll && !checkAll.dataset.selAllBound){
+      checkAll.dataset.selAllBound = '1';
+      checkAll.addEventListener('change', ()=>{
+        lastHeaderToggleTs = Date.now();
+        const target = checkAll.checked;
+        if (target){
+          sessionsMasterSelectAll = true;
+          sessionsAutoReapply = true;
+          applySessionsMasterSelectAll();
+        } else {
+          sessionsMasterSelectAll = false;
+          sessionsAutoReapply = false;
+          selectedSessionIds.clear();
+          const rows = table.querySelectorAll('tbody input.row-select[data-type="session"]');
+          rows.forEach(cb=>{ cb.checked = false; });
+          if(checkAll){ checkAll.indeterminate = false; checkAll.checked = false; }
+          persistSelections();
+        }
+      });
+    }
+  }
+
+  function applySessionsMasterSelectAll(){
+    const table = sessionsTable;
+    if(!table) return;
+    const rows = table.querySelectorAll('tbody input.row-select[data-type="session"]');
+    rows.forEach(cb=>{ if(!cb.disabled) cb.checked = true; });
+    selectedSessionIds.clear();
+    rows.forEach(cb=>{ const sid = cb.getAttribute('data-id'); if(sid && cb.checked) selectedSessionIds.add(sid); });
+    const checkAll = sessionsCheckAll;
+    if(checkAll){
+      checkAll.indeterminate = false;
+      checkAll.checked = rows.length > 0;
+    }
+    persistSelections();
+  }
+
+  function applyXmlMasterSelectAll(){
+    const table = xmlsTable;
     if(!table) return;
     const rows = table.querySelectorAll('tbody input.row-select');
     // Mark all as checked (only current visible rows)
     rows.forEach(cb=>{ cb.checked = true; });
     // Update internal selection sets without rebinding handlers (avoid duplicate listeners)
-    if(type==='session'){
-      selectedSessions.clear();
-      rows.forEach(cb=>{ const id = cb.getAttribute('data-id'); if(id) selectedSessions.add(id); });
-    } else {
-      selectedXmlPaths.clear();
-      rows.forEach(cb=>{ const p = cb.getAttribute('data-path'); if(p) selectedXmlPaths.add(p); });
-    }
+    selectedXmlPaths.clear();
+    rows.forEach(cb=>{ const p = cb.getAttribute('data-path'); if(p) selectedXmlPaths.add(p); });
     // Reflect header & action button state
-    const checkAll = type==='session' ? sessionsCheckAll : xmlsCheckAll;
-    const deleteBtn = type==='session' ? sessionsDeleteBtn : xmlsDeleteBtn;
+    const checkAll = xmlsCheckAll;
+    const deleteBtn = xmlsDeleteBtn;
     if(checkAll){
       checkAll.indeterminate = false;
       checkAll.checked = rows.length > 0;
@@ -993,28 +1195,6 @@
     return res.ok;
   }
 
-  sessionsDeleteBtn?.addEventListener('click', async ()=>{
-    const ids = Array.from(selectedSessions);
-    if(ids.length===0) return;
-    if(!confirm(`Delete ${ids.length} selected session(s)?`)) return;
-    openProgress(`Deleting ${ids.length} session(s)…`, ids.length);
-    let done = 0;
-    for(const id of ids){
-      const fd = new FormData();
-      fd.append('session_id', id);
-      const ok = await postForm("{{ url_for('core_delete') }}", fd);
-      if(ok){
-        selectedSessions.delete(id);
-        updateProgress(++done, ids.length, `Deleted session ${id}`);
-      } else {
-        updateProgress(done, ids.length, `Failed to delete session ${id}`);
-      }
-    }
-    closeProgress();
-    persistSelections();
-    refresh();
-  });
-
   xmlsDeleteBtn?.addEventListener('click', async ()=>{
     const paths = Array.from(selectedXmlPaths);
     if(paths.length===0) return;
@@ -1030,6 +1210,28 @@
         updateProgress(++done, paths.length, `Deleted ${path}`);
       } else {
         updateProgress(done, paths.length, `Failed to delete ${path}`);
+      }
+    }
+    closeProgress();
+    persistSelections();
+    refresh();
+  });
+
+  sessionsDeleteBtn?.addEventListener('click', async ()=>{
+    const ids = Array.from(selectedSessionIds);
+    if(ids.length===0) return;
+    if(!confirm(`Delete ${ids.length} selected session(s)?`)) return;
+    openProgress(`Deleting ${ids.length} session(s)…`, ids.length);
+    let done = 0;
+    for(const id of ids){
+      const fd = new FormData();
+      fd.append('session_id', id);
+      const ok = await postForm("{{ url_for('core_delete') }}", fd);
+      if(ok){
+        selectedSessionIds.delete(id);
+        updateProgress(++done, ids.length, `Deleted session ${id}`);
+      } else {
+        updateProgress(done, ids.length, `Failed to delete session ${id}`);
       }
     }
     closeProgress();

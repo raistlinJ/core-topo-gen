@@ -422,22 +422,18 @@
 </div>
 {% include 'partials/dock.html' %}
 
+<!-- Toasts removed (requested). Keep a no-op helper so legacy call sites don't error. -->
+<script>
+    function showToast(_message, _opts){
+        return null;
+    }
+</script>
+
 <!-- Graph libraries for Full Preview Modal -->
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 <script src="{{ url_for('static', filename='core_graph.js') }}"></script>
 
-<!-- Toast container -->
-<div aria-live="polite" aria-atomic="true" class="position-fixed" style="z-index: 1080; right: 12px; bottom: 12px;">
-    <div id="toastContainer" class="toast-container"></div>
-    <template id="toastTemplate">
-        <div class="toast align-items-center text-bg-dark border-0" role="alert" aria-live="assertive" aria-atomic="true">
-            <div class="d-flex">
-                <div class="toast-body">Action completed.</div>
-                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
-            </div>
-        </div>
-    </template>
-</div>
+<!-- Toast container removed (requested) -->
 <!-- Success Modal -->
 <div class="modal fade" id="runSuccessModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered">
@@ -480,6 +476,13 @@
                         </div>
                     </div>
                     <div class="small text-muted mt-2" id="executeConfirmUpdateRemoteHelp">Emulation mode runs locally on this workstation.</div>
+                    <div class="d-flex flex-wrap align-items-center justify-content-between gap-3 mt-3 d-none" id="executeCoreNotConfiguredRow">
+                        <div class="flex-grow-1">
+                            <div class="text-uppercase small text-muted fw-semibold">Remote CORE Connection</div>
+                            <div class="small text-danger" id="executeCoreNotConfiguredStatus">CORE VM not configured.</div>
+                        </div>
+                        <button type="button" class="btn btn-outline-primary btn-sm" id="executeSelectCoreVmBtn">Select CORE VM</button>
+                    </div>
                     <div class="d-flex flex-wrap align-items-center justify-content-between gap-3 mt-3 d-none" id="executeCoreTestRow">
                         <div class="flex-grow-1">
                             <div class="text-uppercase small text-muted fw-semibold">Remote CORE Connection</div>
@@ -493,6 +496,34 @@
                         <div class="form-text" id="executeConfirmPushUpdateHelp">Sync the current repository snapshot to your CORE VM before execution.</div>
                     </div>
                 </div>
+
+                <details class="border rounded-3 p-3 bg-body-tertiary mb-3 d-none" id="executeAdvancedWrap">
+                    <summary class="fw-semibold">Advanced</summary>
+                    <div class="small text-muted mt-2">Applies to remote execution only.</div>
+                    <div class="mt-3 d-grid gap-2">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="executeAdvFixDockerDaemon">
+                            <label class="form-check-label" for="executeAdvFixDockerDaemon">Fix Docker daemon for CORE (disable default bridge + iptables)</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="executeAdvRunCoreCleanup">
+                            <label class="form-check-label" for="executeAdvRunCoreCleanup">Run core-cleanup</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="executeAdvCheckCoreVersion">
+                            <label class="form-check-label" for="executeAdvCheckCoreVersion">Check CORE version is 9.2.1</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="executeAdvRestartCoreDaemon">
+                            <label class="form-check-label" for="executeAdvRestartCoreDaemon">Restart core-daemon</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="executeAdvAutoKillSessions">
+                            <label class="form-check-label" for="executeAdvAutoKillSessions">Auto-kill any running sessions</label>
+                        </div>
+                    </div>
+                </details>
+
                 <div class="border rounded p-3 mt-3 bg-body-tertiary d-none" id="executeProgressWrap">
                     <div class="d-flex align-items-center gap-2">
                         <div class="spinner-border spinner-border-sm text-primary" role="status" aria-hidden="true" id="executeProgressSpinner"></div>
@@ -4019,6 +4050,8 @@ function setupPreviewModalExecute(modalEl, modalInstance){
                 skipConfirm: true,
                 scenarioIndex: scenarioIdx,
                 updateRemoteRepo,
+                confirmResult,
+                advanced: confirmResult?.advanced,
                 onRunId: (runId) => {
                     bindExecuteProgressToRun(runId);
                 },
@@ -5547,6 +5580,8 @@ document.addEventListener('DOMContentLoaded', ()=>{
                     skipConfirm: true,
                     scenarioIndex: scenarioIdx,
                     updateRemoteRepo,
+                    confirmResult,
+                    advanced: confirmResult?.advanced,
                     onRunId: (runId) => {
                         bindExecuteProgressToRun(runId);
                         appendLog('Run ID: '+runId,'info');
@@ -6310,6 +6345,8 @@ function render() {
     updateParticipantProxmoxNavLink();
     // Ensure H/S bounds visibility reflects initial r2s_mode values
     updateHsBoundsVisibility();
+    // Ensure routing policy preview replaces the default "(pending)" label.
+    setTimeout(validateRoutingEdges, 0);
     // Enable/disable Download XML button based on saved xml path
     updateDownloadButtonState();
     // Sync Base Scenario UI with persisted metadata (independent of active scenario)
@@ -11050,6 +11087,8 @@ function computeRoutingEdgePolicyPreview(){
     const summaryEl = document.getElementById('routingEdgesSummary');
     if(!summaryEl) return;
     if(!routing.length){ summaryEl.style.display='none'; return; }
+    // Make sure the preview is visible once we have routing rows.
+    summaryEl.style.display = 'flex';
     // Determine target policy: Exact avg > Max > Min > Random (mirrors backend)
     const exactVals = routing.filter(r=> r.r2r_mode==='Exact' && r.edges>=1).map(r=>r.edges);
     let mode='Random'; let target=0;
@@ -11163,9 +11202,17 @@ let executeConfirmUpdateRemoteHelpEl = null;
 let executeCoreStatusEl = null;
 let executeCoreTestBtn = null;
 let executeRemoteTestRow = null;
+let executeCoreNotConfiguredRow = null;
+let executeSelectCoreVmBtn = null;
 let executeConfirmPushUpdateToggle = null;
 let executePushUpdateWrap = null;
 let executeConfirmPushUpdateHelpEl = null;
+let executeAdvancedWrap = null;
+let executeAdvFixDockerDaemon = null;
+let executeAdvRunCoreCleanup = null;
+let executeAdvCheckCoreVersion = null;
+let executeAdvRestartCoreDaemon = null;
+let executeAdvAutoKillSessions = null;
 const EXECUTE_CONFIRM_PREFS_STORAGE_KEY = 'coretg_execute_confirm_prefs';
 
 function loadExecuteConfirmPrefs() {
@@ -11241,10 +11288,18 @@ function getExecuteConfirmSelections() {
             ? !!executeConfirmPushUpdateToggle.checked
             : getExecuteConfirmUpdateRemotePref()
     );
+    const advanced = {
+        fixDockerDaemon: remoteExecution && !!(executeAdvFixDockerDaemon && executeAdvFixDockerDaemon.checked),
+        runCoreCleanup: remoteExecution && !!(executeAdvRunCoreCleanup && executeAdvRunCoreCleanup.checked),
+        checkCoreVersion: remoteExecution && !!(executeAdvCheckCoreVersion && executeAdvCheckCoreVersion.checked),
+        restartCoreDaemon: remoteExecution && !!(executeAdvRestartCoreDaemon && executeAdvRestartCoreDaemon.checked),
+        autoKillSessions: remoteExecution && !!(executeAdvAutoKillSessions && executeAdvAutoKillSessions.checked),
+    };
     return {
         remoteExecution,
         pushPreference: pushAllowed ? pushEnabled : false,
         updateRemote: remoteExecution && pushAllowed && pushEnabled,
+        advanced,
     };
 }
 
@@ -11327,6 +11382,12 @@ function ensureExecuteConfirmElements() {
     if (!executeRemoteTestRow) {
         executeRemoteTestRow = document.getElementById('executeCoreTestRow');
     }
+    if (!executeCoreNotConfiguredRow) {
+        executeCoreNotConfiguredRow = document.getElementById('executeCoreNotConfiguredRow');
+    }
+    if (!executeSelectCoreVmBtn) {
+        executeSelectCoreVmBtn = document.getElementById('executeSelectCoreVmBtn');
+    }
     if (!executePushUpdateWrap) {
         executePushUpdateWrap = document.getElementById('executePushUpdateToggleWrap');
     }
@@ -11335,6 +11396,24 @@ function ensureExecuteConfirmElements() {
     }
     if (!executeConfirmPushUpdateHelpEl) {
         executeConfirmPushUpdateHelpEl = document.getElementById('executeConfirmPushUpdateHelp');
+    }
+    if (!executeAdvancedWrap) {
+        executeAdvancedWrap = document.getElementById('executeAdvancedWrap');
+    }
+    if (!executeAdvFixDockerDaemon) {
+        executeAdvFixDockerDaemon = document.getElementById('executeAdvFixDockerDaemon');
+    }
+    if (!executeAdvRunCoreCleanup) {
+        executeAdvRunCoreCleanup = document.getElementById('executeAdvRunCoreCleanup');
+    }
+    if (!executeAdvCheckCoreVersion) {
+        executeAdvCheckCoreVersion = document.getElementById('executeAdvCheckCoreVersion');
+    }
+    if (!executeAdvRestartCoreDaemon) {
+        executeAdvRestartCoreDaemon = document.getElementById('executeAdvRestartCoreDaemon');
+    }
+    if (!executeAdvAutoKillSessions) {
+        executeAdvAutoKillSessions = document.getElementById('executeAdvAutoKillSessions');
     }
     if (executeConfirmRunBtn && !executeConfirmRunBtn.dataset.execBound) {
         executeConfirmRunBtn.addEventListener('click', async () => {
@@ -11385,6 +11464,19 @@ function ensureExecuteConfirmElements() {
         });
         executeCoreTestBtn.dataset.execBound = '1';
     }
+    if (executeSelectCoreVmBtn && !executeSelectCoreVmBtn.dataset.execBound) {
+        executeSelectCoreVmBtn.addEventListener('click', () => {
+            try {
+                if (executeConfirmModalEl && window.bootstrap) {
+                    bootstrap.Modal.getOrCreateInstance(executeConfirmModalEl).hide();
+                }
+                if (typeof window.openCoreVmSelectModal === 'function') {
+                    window.openCoreVmSelectModal();
+                }
+            } catch (err) { /* ignore */ }
+        });
+        executeSelectCoreVmBtn.dataset.execBound = '1';
+    }
     if (executeConfirmModalEl && !executeConfirmModalEl.dataset.execHiddenBound) {
         executeConfirmModalEl.addEventListener('hidden.bs.modal', () => {
             settleExecuteConfirm({ confirmed: false });
@@ -11398,6 +11490,24 @@ function ensureExecuteConfirmElements() {
             refreshExecuteRemoteToggleState();
         });
         executeConfirmModalEl.dataset.execShowBound = '1';
+    }
+}
+
+function isExecuteCoreVmConfigured() {
+    if (IS_BUILDER_VIEW) return true;
+    try {
+        const scenarioIdx = Number.isInteger(executeConfirmState?.scenarioIndex)
+            ? executeConfirmState.scenarioIndex
+            : getActiveScenarioContext().idx;
+        if (!Number.isInteger(scenarioIdx)) return false;
+        const scen = state?.scenarios?.[scenarioIdx];
+        if (!scen) return false;
+        const hitl = typeof ensureHitlStateForScenario === 'function' ? ensureHitlStateForScenario(scen) : (scen.hitl || {});
+        const core = (hitl && typeof hitl === 'object' && hitl.core && typeof hitl.core === 'object') ? hitl.core : (scen.hitl?.core || {});
+        const vmKey = (core?.vm_key ?? '').toString().trim();
+        return !!vmKey;
+    } catch (err) {
+        return false;
     }
 }
 
@@ -11428,13 +11538,20 @@ function refreshExecuteRemoteToggleState() {
     const info = detectLocalEmulation();
     updateExecuteCoreStatus(info);
     const remoteSelected = isRemoteExecutionSelected();
+    const coreVmConfigured = isExecuteCoreVmConfigured();
     const pushPref = getExecuteConfirmUpdateRemotePref();
-    if (executeRemoteTestRow) {
-        executeRemoteTestRow.classList.toggle('d-none', !remoteSelected);
+    const showNotConfigured = remoteSelected && !coreVmConfigured && !IS_BUILDER_VIEW;
+
+    if (executeCoreNotConfiguredRow) {
+        executeCoreNotConfiguredRow.classList.toggle('d-none', !showNotConfigured);
     }
+    if (executeRemoteTestRow) {
+        executeRemoteTestRow.classList.toggle('d-none', !remoteSelected || showNotConfigured);
+    }
+
     // If we're explicitly in the "CORE not connected; local emulation fallback" state,
     // never show push controls (there is no usable remote target).
-    const hidePushControls = !remoteSelected || IS_BUILDER_VIEW || !!info.shouldFake;
+    const hidePushControls = !remoteSelected || IS_BUILDER_VIEW || !!info.shouldFake || showNotConfigured;
     if (executePushUpdateWrap) {
         executePushUpdateWrap.classList.toggle('d-none', hidePushControls);
     }
@@ -11463,21 +11580,24 @@ function refreshExecuteRemoteToggleState() {
             }
         }
     }
+
     if (executeConfirmUpdateRemoteHelpEl) {
         executeConfirmUpdateRemoteHelpEl.classList.remove('text-muted', 'text-success', 'text-warning');
         if (remoteSelected) {
             const hideBuilderNotice = IS_BUILDER_VIEW && !info.verified;
-            const remoteMsg = info.verified
-                ? (IS_BUILDER_VIEW
-                    ? 'Remote execution ready. Backend managed by an admin.'
-                    : 'Remote execution ready. Runs will target your CORE VM.')
-                : (IS_BUILDER_VIEW
-                    ? ''
-                    : 'Remote execution requires a validated CORE connection. Test before running.');
+            const remoteMsg = showNotConfigured
+                ? 'CORE VM not configured. Select a CORE VM to enable remote execution.'
+                : (info.verified
+                    ? (IS_BUILDER_VIEW
+                        ? 'Remote execution ready. Backend managed by an admin.'
+                        : 'Remote execution ready. Runs will target your CORE VM.')
+                    : (IS_BUILDER_VIEW
+                        ? ''
+                        : 'Remote execution requires a validated CORE connection. Test before running.'));
             executeConfirmUpdateRemoteHelpEl.textContent = remoteMsg;
             executeConfirmUpdateRemoteHelpEl.classList.toggle('d-none', hideBuilderNotice);
             if (!hideBuilderNotice) {
-                executeConfirmUpdateRemoteHelpEl.classList.add(info.verified ? 'text-success' : 'text-warning');
+                executeConfirmUpdateRemoteHelpEl.classList.add(showNotConfigured ? 'text-warning' : (info.verified ? 'text-success' : 'text-warning'));
             }
         } else {
             executeConfirmUpdateRemoteHelpEl.textContent = 'Emulation mode runs locally on this workstation.';
@@ -11485,14 +11605,23 @@ function refreshExecuteRemoteToggleState() {
             executeConfirmUpdateRemoteHelpEl.classList.add('text-muted');
         }
     }
+
     if (executeConfirmRunBtn) {
-        const shouldDisable = remoteSelected && !info.verified && !IS_BUILDER_VIEW;
+        const shouldDisable = showNotConfigured || (remoteSelected && !info.verified && !IS_BUILDER_VIEW);
         executeConfirmRunBtn.disabled = shouldDisable;
         if (shouldDisable) {
-            executeConfirmRunBtn.setAttribute('title', 'Test the CORE connection to enable remote execution.');
+            executeConfirmRunBtn.setAttribute('title', showNotConfigured
+                ? 'Select a CORE VM to enable remote execution.'
+                : 'Test the CORE connection to enable remote execution.');
         } else {
             executeConfirmRunBtn.removeAttribute('title');
         }
+    }
+
+    // Advanced: only relevant for remote execution with a configured CORE VM.
+    if (executeAdvancedWrap) {
+        const showAdvanced = remoteSelected && !showNotConfigured && !IS_BUILDER_VIEW && !info.shouldFake;
+        executeAdvancedWrap.classList.toggle('d-none', !showAdvanced);
     }
 }
 
@@ -11603,6 +11732,25 @@ const EXECUTE_PROGRESS_HEARTBEAT_MESSAGES = [
 ];
 const EXECUTE_PROGRESS_HEARTBEAT_INTERVAL_MS = 4500;
 
+function buildExecuteAdvancedPreflightSuffix() {
+    try {
+        if (!isRemoteExecutionSelected()) return '';
+        const selections = (typeof getExecuteConfirmSelections === 'function') ? getExecuteConfirmSelections() : null;
+        const adv = selections && selections.advanced && typeof selections.advanced === 'object' ? selections.advanced : null;
+        if (!adv) return '';
+        const enabled = [];
+        if (adv.fixDockerDaemon) enabled.push('fix docker daemon');
+        if (adv.runCoreCleanup) enabled.push('run core cleanup');
+        if (adv.checkCoreVersion) enabled.push('check CORE version');
+        if (adv.restartCoreDaemon) enabled.push('restart core-daemon');
+        if (adv.autoKillSessions) enabled.push('auto-kill sessions');
+        if (!enabled.length) return '';
+        return ` (Advanced: ${enabled.join(', ')})`;
+    } catch (_) {
+        return '';
+    }
+}
+
 function buildExecuteProgressDiagnosticsLines(){
     const lines = [];
     try {
@@ -11616,6 +11764,20 @@ function buildExecuteProgressDiagnosticsLines(){
         lines.push(`[ui] Mode: ${remoteMode}${remoteSelected ? (info.verified ? ' (verified)' : ' (not verified)') : ''}`);
         if (remoteSelected) {
             lines.push(`[ui] Push updated backend: ${pushPref ? 'enabled' : 'disabled'}`);
+            try {
+                const adv = selections && selections.advanced && typeof selections.advanced === 'object' ? selections.advanced : null;
+                if (adv) {
+                    const enabled = [];
+                    if (adv.fixDockerDaemon) enabled.push('fix docker daemon');
+                    if (adv.runCoreCleanup) enabled.push('run core cleanup');
+                    if (adv.checkCoreVersion) enabled.push('check CORE version');
+                    if (adv.restartCoreDaemon) enabled.push('restart core-daemon');
+                    if (adv.autoKillSessions) enabled.push('auto-kill sessions');
+                    if (enabled.length) {
+                        lines.push(`[ui] Advanced pre-flight: ${enabled.join(', ')}`);
+                    }
+                }
+            } catch (_) {}
         }
         const core = (typeof getCoreConfig === 'function') ? getCoreConfig(false) : (state?.core || {});
         const sshHost = (core?.ssh_host || core?.host || 'localhost').toString().trim() || 'localhost';
@@ -11660,7 +11822,8 @@ function buildExecuteStartCoreServicesMessage(){
         const sshPrefix = sshUser ? `${sshUser}@` : '';
         const venvSuffix = venv ? `, venv ${venv}` : '';
         const daemonSuffix = daemonAuto ? ', daemon auto-start enabled' : '';
-        return `Starting CORE services via SSH ${sshPrefix}${sshHost}:${sshPort} (gRPC ${grpcHost}:${grpcPort}${venvSuffix}${daemonSuffix})…`;
+        const advSuffix = buildExecuteAdvancedPreflightSuffix();
+        return `Starting CORE services via SSH ${sshPrefix}${sshHost}:${sshPort} (gRPC ${grpcHost}:${grpcPort}${venvSuffix}${daemonSuffix})…${advSuffix}`;
     } catch (e) {
         return 'Starting CORE services on remote host…';
     }
@@ -11677,17 +11840,18 @@ function buildExecuteProgressStepMessage(stepIndex){
             ? Number(core.grpc_port)
             : (Number.isFinite(Number(core?.port)) && Number(core.port) > 0 ? Number(core.port) : 50051);
         const sshPrefix = sshUser ? `${sshUser}@` : '';
+        const advSuffix = buildExecuteAdvancedPreflightSuffix();
 
         if (stepIndex === 0) {
-            return `Establishing SSH tunnel to ${sshPrefix}${sshHost}:${sshPort}…`;
+            return `Establishing SSH tunnel to ${sshPrefix}${sshHost}:${sshPort}…${advSuffix}`;
         }
         if (stepIndex === 1) {
-            return `Validating CORE backend (gRPC ${grpcHost}:${grpcPort})…`;
+            return `Validating CORE backend (gRPC ${grpcHost}:${grpcPort})…${advSuffix}`;
         }
         if (stepIndex === 2) {
             const rp = (state?.result_path || '').toString().trim();
             const suffix = rp ? ` (XML ${rp.split(/[/\\]/).pop() || rp})` : '';
-            return `Preparing remote workspace and syncing inputs${suffix}…`;
+            return `Preparing remote workspace and syncing inputs${suffix}…${advSuffix}`;
         }
         return buildExecuteStartCoreServicesMessage();
     } catch (_) {
@@ -11814,7 +11978,7 @@ function setExecuteProgressPercent(percent, label) {
     executeProgressBarEl.textContent = label || clamped.toFixed(0) + '%';
 }
 
-function appendExecuteProgressLog(line) {
+function appendExecuteProgressLog(line, options = {}) {
     if (!executeProgressState.active || !executeProgressLogEl) return;
     const normalized = (line || '').trimEnd();
     executeProgressState.logLines.push(normalized);
@@ -11823,6 +11987,20 @@ function appendExecuteProgressLog(line) {
     }
     executeProgressLogEl.textContent = executeProgressState.logLines.join('\n');
     executeProgressLogEl.scrollTop = executeProgressLogEl.scrollHeight;
+    try {
+        const mirror = (options && typeof options === 'object' && Object.prototype.hasOwnProperty.call(options, 'mirrorToDock'))
+            ? !!options.mirrorToDock
+            : true;
+        if (mirror && typeof dockLog === 'function') {
+            let lvl = 'INFO';
+            try {
+                if (/\bERROR\b/.test(normalized)) lvl = 'ERROR';
+                else if (/\bWARN(ING)?\b/.test(normalized)) lvl = 'WARN';
+                else if (/\bDEBUG\b/.test(normalized)) lvl = 'DEBUG';
+            } catch (e) {}
+            dockLog(normalized, lvl);
+        }
+    } catch (e) {}
 }
 
 function bindExecuteProgressToRun(runId) {
@@ -11894,7 +12072,9 @@ function handleExecuteProgressPhase(payload) {
     if (payload && payload.exit !== undefined && payload.exit !== null) meta.push(`exit=${payload.exit}`);
     const metaText = meta.filter(Boolean).join(' · ');
 
-    appendExecuteProgressLog(`[phase] ${stage}${detail ? ': ' + detail : ''}${metaText ? ' (' + metaText + ')' : ''}`);
+    // Do not append synthetic "[phase]" lines here.
+    // The backend already streams detailed logs for these phases, and duplicating them
+    // makes the Execute log noisy (especially around repo push/finalize).
 
     if (executePhaseHeaderEl) executePhaseHeaderEl.textContent = `Phase: ${stage}`;
 
@@ -11957,6 +12137,15 @@ function settleExecuteConfirm(result) {
     if (selections) {
         if (typeof selections.updateRemote !== 'undefined' && typeof payload.updateRemote === 'undefined') {
             payload.updateRemote = selections.updateRemote;
+        }
+        if (typeof selections.remoteExecution !== 'undefined' && typeof payload.remoteExecution === 'undefined') {
+            payload.remoteExecution = selections.remoteExecution;
+        }
+        if (typeof selections.pushPreference !== 'undefined' && typeof payload.pushPreference === 'undefined') {
+            payload.pushPreference = selections.pushPreference;
+        }
+        if (typeof selections.advanced !== 'undefined' && typeof payload.advanced === 'undefined') {
+            payload.advanced = selections.advanced;
         }
         if (typeof selections.pushPreference !== 'undefined') {
             setExecuteConfirmUpdateRemotePref(selections.pushPreference);
@@ -12666,6 +12855,14 @@ function buildRunFormData(xmlPath, options = {}) {
     if (options && options.updateRemoteRepo) {
         form.append('update_remote_repo', '1');
     }
+    try {
+        const adv = options && typeof options.advanced === 'object' ? options.advanced : null;
+        if (adv && adv.fixDockerDaemon) form.append('adv_fix_docker_daemon', '1');
+        if (adv && adv.runCoreCleanup) form.append('adv_run_core_cleanup', '1');
+        if (adv && adv.checkCoreVersion) form.append('adv_check_core_version', '1');
+        if (adv && adv.restartCoreDaemon) form.append('adv_restart_core_daemon', '1');
+        if (adv && adv.autoKillSessions) form.append('adv_auto_kill_sessions', '1');
+    } catch (err) { /* ignore */ }
     return form;
 }
 
@@ -12872,6 +13069,7 @@ async function waitForRepoFinalize(progressId, options = {}) {
     const timeoutMs = Math.max(pollInterval * 20, options.timeoutMs || 240000);
     const started = Date.now();
     let consecutiveUnknown = 0;
+    let lastProgressKey = '';
     const statusUrl = buildRepoFinalizeStatusUrl(progressId);
     if (!statusUrl) {
         onProgress?.({ status: 'error', detail: 'Missing finalize status endpoint.' });
@@ -12892,7 +13090,20 @@ async function waitForRepoFinalize(progressId, options = {}) {
         if (response.status === 200) {
             const info = (await parseResponseJson(response)) || {};
             consecutiveUnknown = 0;
-            onProgress?.(info);
+            try {
+                const key = JSON.stringify({
+                    status: info?.status || null,
+                    stage: info?.stage || null,
+                    detail: info?.detail || null,
+                    percent: (info?.percent !== undefined && info?.percent !== null) ? Number(info.percent) : null,
+                });
+                if (key != lastProgressKey) {
+                    lastProgressKey = key;
+                    onProgress?.(info);
+                }
+            } catch (e) {
+                onProgress?.(info);
+            }
             if (info.status === 'complete') {
                 return true;
             }
@@ -12901,7 +13112,10 @@ async function waitForRepoFinalize(progressId, options = {}) {
             }
         } else if (response.status === 404) {
             consecutiveUnknown += 1;
-            onProgress?.({ status: 'pending', stage: 'waiting', detail: 'Waiting for remote finalize tracker…' });
+            // Avoid spamming the same waiting message every poll.
+            if (consecutiveUnknown === 1) {
+                onProgress?.({ status: 'pending', stage: 'waiting', detail: 'Waiting for remote finalize tracker…' });
+            }
             if (consecutiveUnknown >= 5) {
                 onProgress?.({ status: 'error', detail: 'Remote finalize tracker unavailable.' });
                 return false;
@@ -13177,23 +13391,43 @@ async function saveXmlAjax(){
 
 // Some flows historically used appendLog(level,msg) while the dock exposes logLine/logInfo/etc.
 // Provide a compatibility shim so execution flows never crash on missing appendLog.
+
+function dockLog(message, level = 'INFO') {
+    const lvl = String(level || 'INFO').toUpperCase();
+    const msg = String(message ?? '');
+    try {
+        if (typeof window.logLine === 'function') {
+            window.logLine(lvl, msg);
+            return;
+        }
+        if (lvl === 'ERROR' && typeof window.logError === 'function') {
+            window.logError(msg);
+            return;
+        }
+        if (lvl === 'WARN' && typeof window.logWarn === 'function') {
+            window.logWarn(msg);
+            return;
+        }
+        if (lvl === 'DEBUG' && typeof window.logDebug === 'function') {
+            window.logDebug(msg);
+            return;
+        }
+        if (typeof window.logInfo === 'function') {
+            window.logInfo(msg);
+            return;
+        }
+        if (typeof window.dispatchEvent === 'function' && typeof window.CustomEvent === 'function') {
+            window.dispatchEvent(new CustomEvent('dock-log', { detail: { level: lvl, message: msg } }));
+            return;
+        }
+    } catch (e) {}
+    try {
+        console.log(msg);
+    } catch (e) {}
+}
+
 if (typeof window.appendLog !== 'function') {
-    window.appendLog = (message, level = 'INFO') => {
-        try {
-            const lvl = String(level || 'INFO').toUpperCase();
-            if (typeof window.logLine === 'function') {
-                window.logLine(lvl, String(message ?? ''));
-                return;
-            }
-            if (typeof window.dispatchEvent === 'function' && typeof window.CustomEvent === 'function') {
-                window.dispatchEvent(new CustomEvent('dock-log', { detail: { level: lvl, message: String(message ?? '') } }));
-                return;
-            }
-        } catch (e) {}
-        try {
-            console.log(message);
-        } catch (e) {}
-    };
+    window.appendLog = dockLog;
 }
 
 let evtSrc = null;
@@ -13216,7 +13450,7 @@ function startLogStream(runId) {
         if (/\bERROR\b/.test(raw)) lvl = 'ERROR';
         else if (/\bWARN(ING)?\b/.test(raw)) lvl = 'WARN';
         else if (/\bDEBUG\b/.test(raw)) lvl = 'DEBUG';
-    appendLog(raw, lvl);
+        dockLog(raw, lvl);
     };
     evtSrc.addEventListener('phase', (ev) => {
         try {
@@ -13312,7 +13546,7 @@ function runProgressLogLine(s){
         if(typeof pre.append === 'function'){ pre.append(text); }
         else { pre.appendChild(document.createTextNode(text)); }
     } catch(e){}
-    appendLog(line, lvl);
+    dockLog(line, lvl);
     pre.parentElement?.scrollTo({ top: pre.parentElement.scrollHeight });
     handleExecuteProgressLog(line);
 }
@@ -13456,6 +13690,10 @@ async function runSyncWithModal(arg){
     const activeScenarioCtx = getActiveScenarioContext();
     let scenarioIndexForRun = Number.isInteger(opts.scenarioIndex) ? opts.scenarioIndex : activeScenarioCtx.idx;
     let updateRemoteRepo = opts.updateRemoteRepo === true;
+    // Some entrypoints perform confirmation externally and call with skipConfirm=true.
+    // In that case, advanced selections must be passed in via opts.confirmResult or opts.advanced.
+    let confirmResult = (opts && typeof opts === 'object' && opts.confirmResult) ? opts.confirmResult : null;
+    const advancedFromOpts = (opts && typeof opts === 'object' && opts.advanced) ? opts.advanced : null;
     let waitingForRemoteLogs = false;
     let uploadHeartbeatTimer = null;
     let uploadStartTime = null;
@@ -13485,7 +13723,7 @@ async function runSyncWithModal(arg){
     };
     const appendExecuteDialogLog = (message) => {
         const line = `[ui] ${message}`;
-        appendExecuteProgressLog(line);
+        appendExecuteProgressLog(line, { mirrorToDock: !showProgressModal });
         if (showProgressModal) {
             runProgressLogLine(line);
         }
@@ -13746,7 +13984,7 @@ async function runSyncWithModal(arg){
     const execInfo = detectLocalEmulation();
     const confirmMsg = 'This will generate a CORE scenario and attempt to start it. Proceed?';
     if (!skipConfirm) {
-        const confirmResult = await promptExecuteConfirmation({
+        confirmResult = await promptExecuteConfirmation({
             message: confirmMsg,
             scenarioIndex: scenarioIndexForRun,
             alertMessage: '',
@@ -13848,6 +14086,11 @@ async function runSyncWithModal(arg){
         const formOptions = { updateRemoteRepo };
         if (Number.isInteger(scenarioIndexForRun)) {
             formOptions.scenarioIndex = scenarioIndexForRun;
+        }
+        if (confirmResult && typeof confirmResult === 'object' && confirmResult.advanced) {
+            formOptions.advanced = confirmResult.advanced;
+        } else if (advancedFromOpts && typeof advancedFromOpts === 'object') {
+            formOptions.advanced = advancedFromOpts;
         }
         const res = await submitRunCliRequest(() => ({ body: buildRunFormData(rp, formOptions), xmlPath: rp, scenarioIndex: scenarioIndexForRun }));
         if (res) {
@@ -14012,6 +14255,7 @@ async function runWithSeedBuild(){
     });
     if(!confirmResult?.confirmed) return;
     const updateRemoteRepo = !!confirmResult?.updateRemote;
+    const advancedSelections = (confirmResult && typeof confirmResult === 'object' && confirmResult.advanced) ? confirmResult.advanced : null;
     let sendUpdateRemoteFlag = updateRemoteRepo;
     let waitingForSeedLogs = false;
     openRunProgress('Running CLI (seed='+seedVal+')…');
@@ -14114,6 +14358,15 @@ async function runWithSeedBuild(){
             if (sendUpdateRemoteFlag) {
                 payload.update_remote_repo = true;
             }
+            try {
+                if (advancedSelections && typeof advancedSelections === 'object') {
+                    if (advancedSelections.fixDockerDaemon) payload.adv_fix_docker_daemon = true;
+                    if (advancedSelections.runCoreCleanup) payload.adv_run_core_cleanup = true;
+                    if (advancedSelections.checkCoreVersion) payload.adv_check_core_version = true;
+                    if (advancedSelections.restartCoreDaemon) payload.adv_restart_core_daemon = true;
+                    if (advancedSelections.autoKillSessions) payload.adv_auto_kill_sessions = true;
+                }
+            } catch (e) {}
             return {
                 body: JSON.stringify(payload),
                 headers: { 'Content-Type': 'application/json' },
@@ -14305,36 +14558,7 @@ async function runWithSeedBuild(){
 
     // Dock setup handled by partial
 </script>
-</body>
-<!-- Toast container -->
-<div aria-live="polite" aria-atomic="true" class="position-fixed" style="z-index: 1080; right: 12px; bottom: 12px;">
-    <div id="toastContainer" class="toast-container"></div>
-    <template id="toastTemplate">
-        <div class="toast align-items-center text-bg-dark border-0" role="alert" aria-live="assertive" aria-atomic="true">
-            <div class="d-flex">
-                <div class="toast-body">Action completed.</div>
-                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
-            </div>
-        </div>
-    </template>
-    <script>
-        function showToast(message, opts){
-            try {
-                const container = document.getElementById('toastContainer');
-                const tmpl = document.getElementById('toastTemplate');
-                if(!container || !tmpl) return;
-                const node = tmpl.content.firstElementChild.cloneNode(true);
-                node.querySelector('.toast-body').textContent = message || 'Done';
-                container.appendChild(node);
-                const t = new bootstrap.Toast(node, Object.assign({ delay: 2500, autohide: true }, (opts||{})));
-                t.show();
-                node.addEventListener('hidden.bs.toast', () => { try { node.remove(); } catch(e){} });
-                return { node, toast: t };
-            } catch(e){}
-            return null;
-        }
-    </script>
-</div>
+ </body>
 <!-- Success Modal -->
 <div class="modal fade" id="runSuccessModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered">

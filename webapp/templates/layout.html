@@ -198,9 +198,10 @@
             // If already on the destination, don't block the click.
             if(dest.pathname === here.pathname && dest.search === here.search) return;
 
-            ev.preventDefault();
+            // Show a lightweight loading indication, but do NOT prevent default navigation.
+            // Preventing + delayed location.assign can appear to “hang” if the main thread
+            // is busy (e.g., large details graphs) and the timer doesn’t get to run.
             showNavLoading('Loading CORE…');
-            requestAnimationFrame(()=>{ setTimeout(()=>{ window.location.assign(href); }, 50); });
           } catch(e) {}
         }, true);
       })();

@@ -299,15 +299,41 @@ def _venv_is_explicit(core_cfg: Dict[str, Any], preferred_venv_bin: Optional[str
     sanitized = _sanitize_venv_bin_path(preferred_venv_bin)
     if not sanitized:
         return False
-    if 'venv_user_override' in core_cfg:
-        return bool(core_cfg.get('venv_user_override'))
-    default_venv = _sanitize_venv_bin_path(DEFAULT_CORE_VENV_BIN)
-    env_override = _sanitize_venv_bin_path(os.environ.get('CORE_REMOTE_VENV_BIN'))
-    if env_override and sanitized == env_override:
-        return True
-    if default_venv and sanitized == default_venv:
-        return False
-    return True
+
+        # If the session has a file path but it's not accessible locally (common when the
+        # webapp is not running on the CORE VM), prefer fetching the current session XML via
+        # gRPC rather than using any stored mapping-by-session-id (which can be stale).
+        sid = session.get('id')
+        sid_int: Optional[int] = None
+        if sid not in (None, ''):
+            try:
+                sid_int = int(sid)
+            except Exception:
+                sid_int = None
+        if core_cfg and sid_int is not None and file_path:
+            try:
+                # Only do this when the provided file path doesn't exist locally.
+                fp = str(file_path)
+                if fp and (not os.path.exists(fp)):
+                    out_dir = os.path.join(_outputs_dir(), 'core-sessions')
+                    saved = _grpc_save_current_session_xml_with_config(core_cfg, out_dir, session_id=str(sid_int))
+                    if saved and os.path.exists(saved):
+                        try:
+                            _update_xml_session_mapping(
+                                saved,
+                                sid_int,
+                                scenario_name=session.get('scenario_name') or None,
+                                core_host=core_cfg.get('host', CORE_HOST) if isinstance(core_cfg, dict) else None,
+                                core_port=core_cfg.get('port', CORE_PORT) if isinstance(core_cfg, dict) else None,
+                            )
+                        except Exception:
+                            pass
+                        session['file'] = saved
+                        session['_hitl_source'] = 'grpc.save_xml'
+                        return _hitl_details_from_path(saved)
+            except Exception:
+                pass
+        store = session_store if isinstance(session_store, dict) else _load_core_sessions_store()
 
 
 class _SSHTunnelError(RuntimeError):
@@ -1385,6 +1411,44 @@ def _normalize_run_history_entry(entry: Any) -> Dict[str, Any]:
     if not isinstance(entry, dict):
         return {}
     normalized = dict(entry)
+
+    # Per-scenario invariant: run history entries represent a single scenario.
+    # Prefer explicit scenario_name; otherwise fall back to scenario_names[0].
+    try:
+        scenario_name = normalized.get('scenario_name')
+        if isinstance(scenario_name, str):
+            scenario_name = scenario_name.strip()
+        else:
+            scenario_name = ''
+    except Exception:
+        scenario_name = ''
+    if not scenario_name:
+        try:
+            names = normalized.get('scenario_names')
+            if isinstance(names, list) and names:
+                first = names[0]
+                scenario_name = first.strip() if isinstance(first, str) else str(first).strip()
+        except Exception:
+            scenario_name = ''
+    if scenario_name:
+        normalized['scenario_name'] = scenario_name
+        normalized['scenario_names'] = [scenario_name]
+    else:
+        # Normalize legacy non-list forms and then truncate to one.
+        sn = normalized.get('scenario_names')
+        if not isinstance(sn, list):
+            if sn is None:
+                sn_list: list[str] = []
+            elif isinstance(sn, str):
+                if '||' in sn:
+                    sn_list = [s for s in sn.split('||') if s]
+                else:
+                    sn_list = [s.strip() for s in sn.split(',') if s.strip()]
+            else:
+                sn_list = []
+            normalized['scenario_names'] = sn_list
+        if isinstance(normalized.get('scenario_names'), list) and len(normalized['scenario_names']) > 1:
+            normalized['scenario_names'] = [normalized['scenario_names'][0]]
     try:
         normalized['core'] = _normalize_history_core_value(normalized.get('core'))
     except Exception:
@@ -1956,19 +2020,25 @@ def _run_remote_python_json(
         venv_bin = str(cfg.get('venv_bin') or '').strip()
         activate_path = posixpath.join(venv_bin, 'activate') if venv_bin else None
         last_error: Optional[str] = None
+        last_stdout_text: str = ''
+        last_stderr_text: str = ''
+        last_interpreter: str = ''
         for interpreter in interpreter_candidates:
             command = _compose_remote_python_command(interpreter, script, activate_path)
             logger.info('[core.remote] (%s) executing via %s', label, interpreter)
             exit_code, stdout, stderr = _exec_ssh_command(client, command, timeout=timeout)
             stdout_text = (stdout or '').strip()
             stderr_text = (stderr or '').strip()
+            last_stdout_text = stdout_text
+            last_stderr_text = stderr_text
+            last_interpreter = interpreter
             if stderr_text:
                 logger.debug('[core.remote] (%s) stderr (%s): %s', label, interpreter, stderr_text)
             if exit_code != 0:
-                last_error = f"exit={exit_code}"
+                last_error = f"interpreter={interpreter} exit={exit_code} stdout={_summarize_for_log(stdout_text)} stderr={_summarize_for_log(stderr_text)}"
                 continue
             if not stdout_text:
-                last_error = 'empty stdout'
+                last_error = f"interpreter={interpreter} empty stdout"
                 continue
             try:
                 return json.loads(stdout_text)
@@ -1978,7 +2048,15 @@ def _run_remote_python_json(
                 last_error = f'json decode error: {exc}'
                 continue
         detail = f' ({last_error})' if last_error else ''
-        raise RuntimeError(f'Remote execution failed for {label}{detail}')
+        # Include a small amount of last output to aid troubleshooting (passwords are not logged).
+        out_detail = ''
+        if last_stdout_text or last_stderr_text:
+            out_detail = (
+                f" last_interpreter={last_interpreter}"
+                f" last_stdout={_summarize_for_log(last_stdout_text)}"
+                f" last_stderr={_summarize_for_log(last_stderr_text)}"
+            )
+        raise RuntimeError(f'Remote execution failed for {label}{detail}{out_detail}')
     finally:
         try:
             client.close()
@@ -4762,6 +4840,28 @@ def _inject_template_user() -> dict:
 @app.context_processor
 def _inject_nav_participant_link() -> dict:
     try:
+        # If the current page is scoped to a scenario, the navbar Participant UI link
+        # should reflect THAT scenario only. If that scenario has no participant URL,
+        # hide the nav item instead of falling back to some other scenario that does.
+        scenario_norm = ''
+        scenario_label = ''
+        try:
+            scenario_label = (request.args.get('scenario') or '').strip() if has_request_context() else ''
+            scenario_norm = _normalize_scenario_label(scenario_label)
+        except Exception:
+            scenario_norm = ''
+            scenario_label = ''
+
+        if scenario_norm:
+            user = _current_user()
+            scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(None, user=user)
+            mapping = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
+            url_value = mapping.get(scenario_norm, '')
+            return {
+                'nav_participant_url': url_value or '',
+                'nav_participant_scenario': scenario_label or '',
+            }
+
         url_value, scenario_label = _resolve_participant_ui_target()
         return {
             'nav_participant_url': url_value,
@@ -4816,12 +4916,14 @@ def participant_ui_page():
     state = _participant_ui_state()
     url_value = state.get('selected_url', '')
     scenario_label = state.get('selected_label', '')
+    nearest_gateway = state.get('selected_nearest_gateway', '')
     override = _normalize_participant_proxmox_url(request.args.get('url')) if request.args.get('url') else ''
     participant_url = override or url_value
     return render_template(
         'participant_ui.html',
         participant_url=participant_url,
         participant_scenario_label=scenario_label,
+        participant_nearest_gateway=nearest_gateway,
         participant_scenarios=state.get('listing', []),
         participant_scenarios_heading=state.get('listing_heading'),
         participant_scenarios_hint=state.get('listing_hint'),
@@ -4830,6 +4932,746 @@ def participant_ui_page():
         participant_active_norm=state.get('selected_norm', ''),
         participant_has_assignments=state.get('has_assignments', False),
     )
+
+
+@app.route('/participant-ui/gateway')
+def participant_ui_gateway_api():
+    state = _participant_ui_state()
+    scenario_norm = _normalize_scenario_label(request.args.get('scenario') or '')
+    if not scenario_norm:
+        scenario_norm = state.get('selected_norm', '')
+
+    gateway = ''
+
+    # Prefer the most recent session XML for this scenario (matches core.html HITL gateway logic).
+    try:
+        history = _load_run_history()
+        last_run = _latest_run_history_for_scenario(scenario_norm, history)
+    except Exception:
+        last_run = None
+    session_xml_path = None
+    if isinstance(last_run, dict):
+        session_xml_path = last_run.get('session_xml_path') or last_run.get('post_xml_path')
+    if session_xml_path:
+        try:
+            hitl = _hitl_details_from_path(str(session_xml_path))
+            first = hitl[0] if isinstance(hitl, list) and hitl else None
+            ips = first.get('ips') if isinstance(first, dict) else None
+            if isinstance(ips, list) and ips:
+                gateway = str(ips[0]).split('/', 1)[0]
+        except Exception:
+            gateway = ''
+
+    # Fallback to participant state / saved XML mapping if we couldn't derive it from the last session XML.
+    if not gateway:
+        if scenario_norm and scenario_norm == state.get('selected_norm', ''):
+            gateway = state.get('selected_nearest_gateway', '')
+        else:
+            try:
+                _names, scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(None, user=_current_user())
+            except Exception:
+                scenario_paths = {}
+            gateway = _nearest_gateway_address_for_scenario(scenario_norm, scenario_paths=scenario_paths)
+
+    return jsonify({'ok': True, 'scenario_norm': scenario_norm, 'nearest_gateway': gateway or ''})
+
+
+def _parse_iso_ts(ts: Any) -> float:
+    if not ts:
+        return 0.0
+    if not isinstance(ts, str):
+        ts = str(ts)
+    text = ts.strip()
+    if not text:
+        return 0.0
+    try:
+        return datetime.datetime.fromisoformat(text.replace('Z', '+00:00')).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _latest_run_history_for_scenario(scenario_norm: str, history: Optional[list[dict]] = None) -> Optional[dict]:
+    scenario_norm = _normalize_scenario_label(scenario_norm)
+    if not scenario_norm:
+        return None
+    if history is None:
+        history = _load_run_history()
+    filtered = _filter_history_by_scenario(history, scenario_norm)
+    if not filtered:
+        return None
+    best: Optional[dict] = None
+    best_ts = -1.0
+    for entry in filtered:
+        if not isinstance(entry, dict):
+            continue
+        ts_val = _parse_iso_ts(entry.get('timestamp'))
+        if ts_val > best_ts:
+            best_ts = ts_val
+            best = entry
+    return best
+
+
+def _load_summary_counts(summary_path: Optional[str]) -> dict:
+    if not summary_path:
+        return {}
+    try:
+        ap = os.path.abspath(str(summary_path))
+    except Exception:
+        ap = str(summary_path)
+    if not ap or not os.path.exists(ap):
+        return {}
+    try:
+        with open(ap, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        counts = payload.get('counts') if isinstance(payload, dict) else None
+        return counts if isinstance(counts, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_summary_metadata(summary_path: Optional[str]) -> dict:
+    if not summary_path:
+        return {}
+    try:
+        ap = os.path.abspath(str(summary_path))
+    except Exception:
+        ap = str(summary_path)
+    if not ap or not os.path.exists(ap):
+        return {}
+    try:
+        with open(ap, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        meta = payload.get('metadata') if isinstance(payload, dict) else None
+        return meta if isinstance(meta, dict) else {}
+    except Exception:
+        return {}
+
+
+def _seed_from_preview_plan(preview_plan_path: Optional[str]) -> Optional[int]:
+    if not preview_plan_path:
+        return None
+    try:
+        ap = os.path.abspath(str(preview_plan_path))
+    except Exception:
+        ap = str(preview_plan_path)
+    if not ap or not os.path.exists(ap):
+        return None
+    try:
+        with open(ap, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            return None
+        meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+        seed = meta.get('seed')
+        if seed is None and isinstance(payload.get('full_preview'), dict):
+            seed = payload['full_preview'].get('seed')
+        if seed is None:
+            return None
+        return int(seed)
+    except Exception:
+        return None
+
+
+def _switch_names_from_session_xml(session_xml_path: Optional[str]) -> list[str]:
+    if not session_xml_path:
+        return []
+    try:
+        ap = os.path.abspath(str(session_xml_path))
+    except Exception:
+        ap = str(session_xml_path)
+    if not ap or not os.path.exists(ap):
+        return []
+    try:
+        summary = _analyze_core_xml(ap)
+    except Exception:
+        summary = {}
+    switches = summary.get('switches') if isinstance(summary, dict) else None
+    if not isinstance(switches, list):
+        return []
+    out: list[str] = []
+    for s in switches:
+        name = str(s).strip() if s is not None else ''
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def _subnet_cidrs_from_session_xml(session_xml_path: Optional[str]) -> list[str]:
+    if not session_xml_path:
+        return []
+    try:
+        ap = os.path.abspath(str(session_xml_path))
+    except Exception:
+        ap = str(session_xml_path)
+    if not ap or not os.path.exists(ap):
+        return []
+
+    try:
+        import ipaddress
+    except Exception:
+        return []
+
+    try:
+        summary = _analyze_core_xml(ap)
+    except Exception:
+        summary = {}
+    nodes = summary.get('nodes') if isinstance(summary, dict) else None
+    if not isinstance(nodes, list):
+        return []
+
+    networks: set[str] = set()
+
+    def _add_ipv4(ipv4: Any, ipv4_mask: Any = None) -> None:
+        if not ipv4:
+            return
+        ip_text = str(ipv4).strip()
+        if not ip_text:
+            return
+        try:
+            if '/' in ip_text:
+                iface = ipaddress.ip_interface(ip_text)
+            else:
+                mask_text = str(ipv4_mask).strip() if ipv4_mask else ''
+                if not mask_text:
+                    return
+                iface = ipaddress.ip_interface(f"{ip_text}/{mask_text}")
+            net = iface.network
+            # Filter out host routes; we only want meaningful subnetworks.
+            if getattr(net, 'prefixlen', 32) >= 32:
+                return
+            networks.add(str(net))
+        except Exception:
+            return
+
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        ifaces = node.get('interfaces')
+        if not isinstance(ifaces, list):
+            continue
+        for iface in ifaces:
+            if not isinstance(iface, dict):
+                continue
+            _add_ipv4(iface.get('ipv4'), iface.get('ipv4_mask'))
+
+    return sorted(networks, key=lambda s: (s.split('/', 1)[0], int(s.split('/', 1)[1]) if '/' in s else 999))
+
+
+def _counts_from_session_xml(session_xml_path: Optional[str]) -> dict:
+    """Best-effort {nodes, routers, switches} from a CORE session XML."""
+    if not session_xml_path:
+        return {}
+    try:
+        ap = os.path.abspath(str(session_xml_path))
+    except Exception:
+        ap = str(session_xml_path)
+    if not ap or not os.path.exists(ap):
+        return {}
+    try:
+        summary = _analyze_core_xml(ap)
+    except Exception:
+        return {}
+    if not isinstance(summary, dict):
+        return {}
+    nodes_list = summary.get('nodes')
+    routers = 0
+    if isinstance(nodes_list, list):
+        for n in nodes_list:
+            if not isinstance(n, dict):
+                continue
+            t = str(n.get('type') or '').strip().lower()
+            if 'router' in t:
+                routers += 1
+    switches_count = summary.get('switches_count')
+    try:
+        switches = int(switches_count) if switches_count is not None else None
+    except Exception:
+        switches = None
+    nodes_count = summary.get('nodes_count')
+    try:
+        nodes = int(nodes_count) if nodes_count is not None else None
+    except Exception:
+        nodes = None
+    out: dict[str, Any] = {}
+    if nodes is not None:
+        out['nodes'] = nodes
+    out['routers'] = routers
+    if switches is not None:
+        out['switches'] = switches
+    return out
+
+
+def _recent_session_id_for_scenario(
+    scenario_norm: str,
+    *,
+    scenario_paths: dict[str, set[str]],
+) -> tuple[Optional[int], float]:
+    """Return (session_id, last_seen_epoch) from the newest known CORE session XML mapping."""
+    scenario_norm = _normalize_scenario_label(scenario_norm)
+    if not scenario_norm:
+        return None, 0.0
+    try:
+        store = _load_core_sessions_store()
+    except Exception:
+        store = {}
+    best_sid: Optional[int] = None
+    best_mtime: float = 0.0
+    for path, entry in (store or {}).items():
+        if not path:
+            continue
+        stored_norm = _session_store_entry_scenario_norm(entry)
+        if stored_norm and stored_norm != scenario_norm:
+            continue
+        if not stored_norm and not _path_matches_scenario(path, scenario_norm, scenario_paths):
+            continue
+        try:
+            ap = os.path.abspath(str(path))
+        except Exception:
+            ap = str(path)
+        if not ap or not os.path.exists(ap):
+            continue
+        try:
+            mtime = os.path.getmtime(ap)
+        except Exception:
+            mtime = 0.0
+        sid = _session_store_entry_session_id(entry)
+        if sid is None:
+            continue
+        if best_sid is None or mtime > best_mtime:
+            best_sid = sid
+            best_mtime = mtime
+    return best_sid, best_mtime
+
+
+def _live_core_session_status_for_scenario(
+    scenario_norm: str,
+    *,
+    history: list[dict],
+    scenario_names: list[str],
+    scenario_paths: dict[str, set[str]],
+) -> Optional[dict]:
+    """Best-effort live CORE session status for a scenario.
+
+    Returns None if CORE cannot be queried (no credentials / remote failure).
+    Otherwise returns: {running: bool, session_id: int|None, state: str}.
+
+    This does not expose host/port; it only uses them server-side.
+    """
+
+    scenario_norm = _normalize_scenario_label(scenario_norm)
+    if not scenario_norm:
+        return None
+
+    try:
+        mapping = _load_core_sessions_store()
+    except Exception:
+        mapping = {}
+
+    scenario_session_ids = _session_ids_for_scenario(mapping, scenario_norm, scenario_paths)
+
+    try:
+        core_cfg = _select_core_config_for_page(scenario_norm, history, include_password=True)
+        host = core_cfg.get('host', CORE_HOST)
+        port = int(core_cfg.get('port', CORE_PORT))
+    except Exception:
+        return None
+
+    errors: list[str] = []
+    meta: dict[str, Any] = {}
+    try:
+        sessions = _list_active_core_sessions(host, port, core_cfg, errors=errors, meta=meta)
+    except Exception:
+        return None
+    if not isinstance(sessions, list):
+        return None
+
+    def _is_active(sess: dict) -> bool:
+        state_raw = str(sess.get('state') or '').strip().lower()
+        return state_raw not in {'shutdown'}
+
+    def _session_id_int(sess: dict) -> Optional[int]:
+        sid = sess.get('id')
+        try:
+            return int(sid) if sid is not None else None
+        except Exception:
+            return None
+
+    def _matches(sess: dict) -> bool:
+        # 1) session_id linkage via stored XML mapping
+        sid_int = _session_id_int(sess)
+        if sid_int is not None and sid_int in scenario_session_ids:
+            return True
+        # 2) CORE-provided scenario_name match (if present)
+        label = _normalize_scenario_label(sess.get('scenario_name')) if sess.get('scenario_name') else ''
+        if label and label == scenario_norm:
+            return True
+        # 3) file/dir path match
+        if _path_matches_scenario(sess.get('file'), scenario_norm, scenario_paths):
+            return True
+        if _path_matches_scenario(sess.get('dir'), scenario_norm, scenario_paths):
+            return True
+        return False
+
+    active_sessions = [s for s in sessions if isinstance(s, dict) and _is_active(s)]
+    matching_active = [s for s in active_sessions if _matches(s)]
+
+    # If we can't match the scenario but there is exactly one active CORE session,
+    # treat it as the selected scenario to avoid a misleading "Not running".
+    if not matching_active and len(active_sessions) == 1:
+        matching_active = active_sessions
+
+    for sess in matching_active:
+        if not isinstance(sess, dict):
+            continue
+        state_raw = str(sess.get('state') or '').strip().lower()
+        sid_int = _session_id_int(sess)
+        return {
+            'running': True,
+            'session_id': sid_int,
+            'state': state_raw,
+        }
+
+    # Queried successfully but no matching active sessions
+    return {
+        'running': False,
+        'session_id': None,
+        'state': '',
+    }
+
+
+@app.route('/participant-ui/details')
+def participant_ui_details_api():
+    state = _participant_ui_state()
+    scenario_norm = _normalize_scenario_label(request.args.get('scenario') or '')
+    if not scenario_norm:
+        scenario_norm = _normalize_scenario_label(state.get('selected_norm', ''))
+
+    listing = state.get('listing', [])
+    listing_entry: Optional[dict] = None
+    if isinstance(listing, list) and scenario_norm:
+        for entry in listing:
+            if isinstance(entry, dict) and (entry.get('norm') or '') == scenario_norm:
+                listing_entry = entry
+                break
+
+    display = ''
+    has_url = False
+    assigned = False
+    placeholder = False
+    if isinstance(listing_entry, dict):
+        display = str(listing_entry.get('display') or '')
+        has_url = bool(listing_entry.get('has_url'))
+        assigned = bool(listing_entry.get('assigned'))
+        placeholder = bool(listing_entry.get('placeholder'))
+
+    # Global open stats
+    stats = _load_participant_ui_stats()
+    scenarios_stats = stats.get('scenarios') if isinstance(stats.get('scenarios'), dict) else {}
+    scenario_stats = scenarios_stats.get(scenario_norm, {}) if scenario_norm else {}
+    if not isinstance(scenario_stats, dict):
+        scenario_stats = {}
+
+    # Execute history
+    history = _load_run_history()
+    last_run = _latest_run_history_for_scenario(scenario_norm, history)
+    last_execute_ts = (last_run or {}).get('timestamp') if isinstance(last_run, dict) else ''
+    returncode = (last_run or {}).get('returncode') if isinstance(last_run, dict) else None
+    try:
+        returncode_int = int(returncode) if returncode is not None else None
+    except Exception:
+        returncode_int = None
+    last_execute_ok = (returncode_int == 0) if returncode_int is not None else None
+
+    summary_path = (last_run or {}).get('summary_path') if isinstance(last_run, dict) else None
+    summary_counts = _load_summary_counts(summary_path)
+    summary_meta = _load_summary_metadata(summary_path)
+
+    # Vulnerabilities (best-effort from summary metadata)
+    vuln_total: Optional[int] = None
+    for key in ('vuln_total_planned_additive', 'plan_vuln_total', 'vuln_density_target', 'vuln_count_items_total'):
+        if not isinstance(summary_meta, dict):
+            break
+        val = summary_meta.get(key)
+        try:
+            vuln_total = int(val) if val is not None else None
+        except Exception:
+            vuln_total = None
+        if vuln_total is not None:
+            break
+
+    # Counts
+    nodes_total = summary_counts.get('total_nodes')
+    routers_total = summary_counts.get('routers')
+    switches_total = summary_counts.get('switches')
+    try:
+        nodes_total = int(nodes_total) if nodes_total is not None else None
+    except Exception:
+        nodes_total = None
+    try:
+        routers_total = int(routers_total) if routers_total is not None else None
+    except Exception:
+        routers_total = None
+    try:
+        switches_total = int(switches_total) if switches_total is not None else None
+    except Exception:
+        switches_total = None
+
+    # Subnetworks (best-effort: CIDR networks from session XML interface addresses)
+    session_xml_path = None
+    if isinstance(last_run, dict):
+        session_xml_path = last_run.get('session_xml_path') or last_run.get('post_xml_path')
+    subnetworks = _subnet_cidrs_from_session_xml(session_xml_path)
+
+    # Gateway: prefer the scenario's last session XML (matches core.html HITL gateway logic)
+    gateway = ''
+    if session_xml_path:
+        try:
+            hitl = _hitl_details_from_path(str(session_xml_path))
+            first = hitl[0] if isinstance(hitl, list) and hitl else None
+            ips = first.get('ips') if isinstance(first, dict) else None
+            if isinstance(ips, list) and ips:
+                gateway = str(ips[0]).split('/', 1)[0]
+        except Exception:
+            gateway = ''
+
+    # Fallback to participant state / saved XML mapping if session XML doesn't yield a gateway.
+    if not gateway:
+        if scenario_norm and scenario_norm == _normalize_scenario_label(state.get('selected_norm', '')):
+            gateway = str(state.get('selected_nearest_gateway') or '')
+        else:
+            try:
+                _names, scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(None, user=_current_user())
+            except Exception:
+                scenario_paths = {}
+            gateway = _nearest_gateway_address_for_scenario(scenario_norm, scenario_paths=scenario_paths) if scenario_norm else ''
+
+    # Fill missing counts from session XML if available.
+    xml_counts = _counts_from_session_xml(session_xml_path)
+    if nodes_total is None and isinstance(xml_counts.get('nodes'), int):
+        nodes_total = xml_counts.get('nodes')
+    if routers_total is None and isinstance(xml_counts.get('routers'), int):
+        routers_total = xml_counts.get('routers')
+    if (switches_total is None or switches_total == 0) and isinstance(xml_counts.get('switches'), int):
+        switches_total = xml_counts.get('switches')
+
+    # Session status: prefer live CORE query; fall back to unknown instead of guessing.
+    session_running: Optional[bool] = None
+    session_state = ''
+    session_id: Optional[int] = None
+    # Catalog paths/names for live lookup.
+    scenario_names_live: list[str]
+    scenario_paths_live: dict[str, set[str]]
+    try:
+        scenario_names_live, scenario_paths_live, _scenario_url_hints_live = _scenario_catalog_for_user(history, user=_current_user())
+    except Exception:
+        scenario_names_live, scenario_paths_live = [], {}
+
+    live = _live_core_session_status_for_scenario(
+        scenario_norm,
+        history=history,
+        scenario_names=scenario_names_live,
+        scenario_paths=scenario_paths_live,
+    )
+
+    if isinstance(live, dict):
+        session_running = bool(live.get('running'))
+        session_state = str(live.get('state') or '')
+        sid_val = live.get('session_id')
+        try:
+            session_id = int(sid_val) if sid_val is not None else None
+        except Exception:
+            session_id = None
+    else:
+        session_running = None
+
+    if session_id is None:
+        # Best-effort show the most recent known session id from saved XML mapping.
+        try:
+            session_id, _last_seen = _recent_session_id_for_scenario(scenario_norm, scenario_paths=scenario_paths_live)
+        except Exception:
+            session_id = None
+
+    return jsonify({
+        'ok': True,
+        'scenario_norm': scenario_norm,
+        'scenario': {
+            'display': display,
+            'assigned': assigned,
+            'placeholder': placeholder,
+            'participant_link_configured': bool(has_url),
+        },
+        'gateway': gateway or '',
+        'open_stats': {
+            'open_count': int(scenario_stats.get('open_count') or 0),
+            'last_open_ts': str(scenario_stats.get('last_open_ts') or ''),
+        },
+        'execute': {
+            'last_execute_ts': str(last_execute_ts or ''),
+            'returncode': returncode_int,
+            'ok': last_execute_ok,
+        },
+        'session': {
+            'session_id': session_id,
+            'running': session_running,
+            'state': session_state,
+        },
+        'counts': {
+            'nodes': nodes_total,
+            'routers': routers_total,
+            'switches': switches_total,
+            'vulnerabilities': vuln_total,
+        },
+        'subnetworks': subnetworks,
+    })
+
+
+_PARTICIPANT_UI_STATS_PATH = os.path.join(_outputs_dir(), 'participant_ui_stats.json')
+
+
+def _load_participant_ui_stats() -> dict:
+    try:
+        if not os.path.exists(_PARTICIPANT_UI_STATS_PATH):
+            return {
+                'version': 1,
+                'totals': {'open_count': 0, 'last_open_ts': ''},
+                'scenarios': {},
+            }
+        with open(_PARTICIPANT_UI_STATS_PATH, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            raise ValueError('participant_ui_stats payload not a dict')
+        payload.setdefault('version', 1)
+        totals = payload.get('totals')
+        if not isinstance(totals, dict):
+            payload['totals'] = {'open_count': 0, 'last_open_ts': ''}
+        payload.setdefault('scenarios', {})
+        if not isinstance(payload.get('scenarios'), dict):
+            payload['scenarios'] = {}
+        return payload
+    except Exception:
+        return {
+            'version': 1,
+            'totals': {'open_count': 0, 'last_open_ts': ''},
+            'scenarios': {},
+        }
+
+
+def _save_participant_ui_stats(payload: dict) -> None:
+    os.makedirs(os.path.dirname(_PARTICIPANT_UI_STATS_PATH), exist_ok=True)
+    tmp_path = _PARTICIPANT_UI_STATS_PATH + '.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as fh:
+        json.dump(payload, fh, indent=2)
+    try:
+        _ensure_private_file(tmp_path)
+    except Exception:
+        pass
+    os.replace(tmp_path, _PARTICIPANT_UI_STATS_PATH)
+    try:
+        _ensure_private_file(_PARTICIPANT_UI_STATS_PATH)
+    except Exception:
+        pass
+
+
+@app.route('/participant-ui/stats')
+def participant_ui_stats_api():
+    # Returns global stats (all users) for the selected scenario.
+    scenario_norm = _normalize_scenario_label(request.args.get('scenario') or '')
+    if not scenario_norm:
+        try:
+            scenario_norm = _normalize_scenario_label(_participant_ui_state().get('selected_norm', ''))
+        except Exception:
+            scenario_norm = ''
+    stats = _load_participant_ui_stats()
+    scenarios = stats.get('scenarios') if isinstance(stats.get('scenarios'), dict) else {}
+    scenario_stats = scenarios.get(scenario_norm, {}) if scenario_norm else {}
+    if not isinstance(scenario_stats, dict):
+        scenario_stats = {}
+    totals = stats.get('totals') if isinstance(stats.get('totals'), dict) else {}
+    return jsonify({
+        'ok': True,
+        'scenario_norm': scenario_norm,
+        'scenario': {
+            'open_count': int(scenario_stats.get('open_count') or 0),
+            'last_open_ts': scenario_stats.get('last_open_ts') or '',
+        },
+        'totals': {
+            'open_count': int(totals.get('open_count') or 0),
+            'last_open_ts': totals.get('last_open_ts') or '',
+        },
+    })
+
+
+@app.route('/participant-ui/record-open', methods=['POST'])
+def participant_ui_record_open_api():
+    # Records a user pressing the Open button (used for global stats).
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    scenario_norm = _normalize_scenario_label(payload.get('scenario_norm') or '')
+    href_raw = (payload.get('href') or '').strip()
+    href = _normalize_participant_proxmox_url(href_raw)
+    # Allow recording same-origin redirect endpoints (used to avoid exposing participant URLs in HTML).
+    if not href and href_raw.startswith('/participant-ui/'):
+        href = href_raw
+    if not href:
+        # Do not record meaningless events.
+        return jsonify({'ok': False, 'error': 'missing href'}), 400
+    now = datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+    stats = _load_participant_ui_stats()
+    totals = stats.get('totals') if isinstance(stats.get('totals'), dict) else {}
+    totals['open_count'] = int(totals.get('open_count') or 0) + 1
+    totals['last_open_ts'] = now
+    stats['totals'] = totals
+    if scenario_norm:
+        scenarios = stats.get('scenarios') if isinstance(stats.get('scenarios'), dict) else {}
+        entry = scenarios.get(scenario_norm)
+        if not isinstance(entry, dict):
+            entry = {}
+        entry['open_count'] = int(entry.get('open_count') or 0) + 1
+        entry['last_open_ts'] = now
+        scenarios[scenario_norm] = entry
+        stats['scenarios'] = scenarios
+    _save_participant_ui_stats(stats)
+    return jsonify({
+        'ok': True,
+        'scenario_norm': scenario_norm,
+        'last_open_ts': now,
+        'totals': stats.get('totals', {}),
+        'scenario': (stats.get('scenarios', {}) or {}).get(scenario_norm, {}) if scenario_norm else {},
+    })
+
+
+@app.route('/participant-ui/open')
+def participant_ui_open_redirect():
+    """Open the selected participant console as a top-level navigation.
+
+    This endpoint intentionally redirects to the configured participant URL so the UI can avoid
+    embedding or exposing raw participant URLs in HTML for restricted roles.
+    """
+    scenario_norm = _normalize_scenario_label(request.args.get('scenario') or '')
+    state = _participant_ui_state()
+    resolved = ''
+    try:
+        listing = state.get('listing', [])
+        if isinstance(listing, list) and scenario_norm:
+            for entry in listing:
+                if not isinstance(entry, dict):
+                    continue
+                if (entry.get('norm') or '') == scenario_norm and entry.get('url'):
+                    resolved = str(entry.get('url') or '')
+                    break
+    except Exception:
+        resolved = ''
+    if not resolved:
+        try:
+            resolved = str(state.get('selected_url') or '')
+        except Exception:
+            resolved = ''
+
+    resolved = _normalize_participant_proxmox_url(resolved)
+    if not resolved:
+        abort(404)
+    return redirect(resolved)
 
 
 _LOGIN_EXEMPT_ENDPOINTS = {
@@ -5247,6 +6089,11 @@ def _load_run_history():
     return []
 
 def _append_run_history(entry: dict):
+    # Enforce per-scenario semantics at the write boundary.
+    try:
+        entry = _normalize_run_history_entry(entry)
+    except Exception:
+        pass
     history = _load_run_history()
     history.append(entry)
     os.makedirs(os.path.dirname(RUN_HISTORY_PATH), exist_ok=True)
@@ -5662,21 +6509,49 @@ def _collect_scenario_catalog(history: Optional[List[dict]] = None) -> tuple[lis
         path_map[norm_key].add(ap)
 
     for entry in entries:
-        names = entry.get('scenario_names') or []
-        if not isinstance(names, list):
+        # Per-scenario: prefer explicit scenario_name, otherwise scenario_names[0].
+        primary_display = ''
+        try:
+            raw_primary = entry.get('scenario_name')
+            if isinstance(raw_primary, str) and raw_primary.strip():
+                primary_display = raw_primary.strip()
+        except Exception:
+            primary_display = ''
+        if not primary_display:
+            names = entry.get('scenario_names') or []
+            if isinstance(names, list) and names:
+                raw0 = names[0]
+                primary_display = raw0.strip() if isinstance(raw0, str) else str(raw0).strip()
+        normalized = _normalize_scenario_label(primary_display)
+        if not normalized:
             continue
-        for raw_name in names:
-            normalized = _normalize_scenario_label(raw_name)
-            if not normalized:
-                continue
-            display = raw_name.strip() if isinstance(raw_name, str) else str(raw_name)
-            if normalized not in display_by_norm:
-                display_by_norm[normalized] = display
-                ordered.append(display)
-            for key in ('scenario_xml_path', 'xml_path', 'single_scenario_xml_path', 'session_xml_path', 'post_xml_path'):
+        if normalized not in display_by_norm:
+            display_by_norm[normalized] = primary_display
+            ordered.append(primary_display)
+
+        # Prefer a single-scenario XML for path matching.
+        single_xml = entry.get('single_scenario_xml_path')
+        if single_xml:
+            _record_path(normalized, single_xml)
+        else:
+            # Avoid multi-scenario Scenario Editor outputs like outputs/scenarios-*/scenarios.xml.
+            for key in ('scenario_xml_path', 'xml_path'):
                 candidate = entry.get(key)
-                if candidate:
-                    _record_path(normalized, candidate)
+                if not candidate:
+                    continue
+                try:
+                    base = os.path.basename(str(candidate))
+                except Exception:
+                    base = ''
+                if base.lower() == 'scenarios.xml':
+                    continue
+                _record_path(normalized, candidate)
+
+        # Session captures are useful for participant URL inference and mapping.
+        for key in ('session_xml_path', 'post_xml_path'):
+            candidate = entry.get(key)
+            if candidate:
+                _record_path(normalized, candidate)
     if catalog_paths:
         for norm_key, candidates in catalog_paths.items():
             if not candidates:
@@ -6083,6 +6958,67 @@ def _normalize_scenario_assignments(values: Iterable[Any] | None) -> list[str]:
     return result
 
 
+def _nearest_gateway_address_for_scenario(
+    scenario_norm: str,
+    *,
+    scenario_paths: dict[str, set[str]],
+) -> str:
+    """Best-effort HITL gateway address for a scenario.
+
+    Uses the most recently saved CORE session XML for that scenario (from outputs/core_sessions.json
+    + outputs/core-sessions/**/*.xml) and extracts the router-side IP of the HITL attachment.
+    Returns an IPv4 string without CIDR (e.g., '10.12.34.1').
+    """
+
+    scenario_norm = _normalize_scenario_label(scenario_norm)
+    if not scenario_norm:
+        return ''
+
+    try:
+        store = _load_core_sessions_store()
+    except Exception:
+        store = {}
+
+    best_path: str = ''
+    best_mtime: float = 0.0
+    for path, entry in (store or {}).items():
+        if not path:
+            continue
+        stored_norm = _session_store_entry_scenario_norm(entry)
+        if stored_norm and stored_norm != scenario_norm:
+            continue
+        if not stored_norm and not _path_matches_scenario(path, scenario_norm, scenario_paths):
+            continue
+        try:
+            ap = os.path.abspath(str(path))
+        except Exception:
+            ap = str(path)
+        if not ap or not os.path.exists(ap):
+            continue
+        try:
+            mtime = os.path.getmtime(ap)
+        except Exception:
+            mtime = 0.0
+        if not best_path or mtime > best_mtime:
+            best_path = ap
+            best_mtime = mtime
+
+    if not best_path:
+        return ''
+
+    details = _hitl_details_from_path(best_path)
+    if not details:
+        return ''
+    try:
+        first = details[0] if details else None
+        ips = first.get('ips') if isinstance(first, dict) else None
+        if isinstance(ips, list) and ips:
+            return str(ips[0]).split('/', 1)[0]
+    except Exception:
+        return ''
+    return ''
+
+
 def _participant_ui_state() -> Dict[str, Any]:
     if has_request_context():
         cached = getattr(g, '_participant_ui_state', _G_PARTICIPANT_STATE_SENTINEL)
@@ -6147,6 +7083,7 @@ def _participant_ui_state() -> Dict[str, Any]:
     )
     selected_label = display_by_norm.get(selected_norm, selected_norm)
     selected_url = mapping.get(selected_norm, '')
+    selected_nearest_gateway = _nearest_gateway_address_for_scenario(selected_norm, scenario_paths=scenario_paths)
 
     listing: list[dict[str, Any]] = []
     for norm in ordered_norms:
@@ -6189,6 +7126,7 @@ def _participant_ui_state() -> Dict[str, Any]:
         'selected_norm': selected_norm,
         'selected_label': selected_label if selected_norm else '',
         'selected_url': selected_url or '',
+        'selected_nearest_gateway': selected_nearest_gateway or '',
         'listing': listing,
         'listing_heading': heading,
         'listing_empty_message': empty_message,
@@ -6288,8 +7226,49 @@ def _path_matches_scenario(path_value: Any, scenario_norm: str, scenario_paths: 
         ap = str(path_value)
     if ap in (scenario_paths.get(scenario_norm) or set()):
         return True
+
+    # CORE internal session directories (pycore.<id>) often contain generic filenames
+    # like Scenario_1.xml that do not encode the scenario. Even when the webapp runs
+    # on the CORE VM and these paths exist locally, do not infer scenario membership
+    # from the basename. Use session-meta or our mapping store instead.
+    try:
+        ap_norm = ap.replace('\\', '/')
+        if '/tmp/pycore.' in ap_norm:
+            return False
+    except Exception:
+        pass
+
+    # If the path doesn't exist locally (common for CORE-reported remote paths like
+    # /tmp/Scenario_1.xml), do not infer scenario membership from the basename.
+    # Rely on explicit scenario_paths or our local mapping store instead.
+    try:
+        if not os.path.exists(ap):
+            return False
+    except Exception:
+        return False
     base = os.path.splitext(os.path.basename(ap))[0]
     return _normalize_scenario_label(base) == scenario_norm
+
+
+def _latest_session_owner_by_id(mapping: dict) -> dict[int, dict[str, Any]]:
+    """Return session_id -> best mapping entry (newest updated_at).
+
+    This prevents CORE session-id reuse from making a session appear under multiple scenarios.
+    """
+    owners: dict[int, dict[str, Any]] = {}
+    best_ts: dict[int, float] = {}
+    for _path, entry in (mapping or {}).items():
+        sid = _session_store_entry_session_id(entry)
+        if sid is None:
+            continue
+        ts = _session_store_entry_updated_at_epoch(entry)
+        if ts is None:
+            ts = 0.0
+        prev = best_ts.get(sid)
+        if prev is None or ts >= prev:
+            best_ts[sid] = ts
+            owners[sid] = entry if isinstance(entry, dict) else {'session_id': sid}
+    return owners
 
 
 def _scenario_label_from_path(
@@ -6303,9 +7282,26 @@ def _scenario_label_from_path(
         ap = os.path.abspath(str(path_value))
     except Exception:
         ap = str(path_value)
+
+    # Never infer scenario names from CORE internal session paths. These often use
+    # generic filenames like Scenario_1.xml that do not correspond to our scenarios.
+    try:
+        if '/tmp/pycore.' in ap.replace('\\', '/'):
+            return ''
+    except Exception:
+        return ''
     for norm_key, paths in (scenario_paths or {}).items():
         if ap in paths:
             return _resolve_scenario_display(norm_key, scenario_names, norm_key)
+
+    # If the path doesn't exist locally, don't try to infer the scenario by basename.
+    # CORE often reports remote paths like /tmp/Scenario_1.xml which would otherwise
+    # incorrectly label Scenario 2 sessions as Scenario 1.
+    try:
+        if not os.path.exists(ap):
+            return ''
+    except Exception:
+        return ''
     base = os.path.splitext(os.path.basename(ap))[0]
     base_norm = _normalize_scenario_label(base)
     if base_norm:
@@ -6323,9 +7319,21 @@ def _session_ids_for_scenario(mapping: dict, scenario_norm: str, scenario_paths:
     ids: set[int] = set()
     if not scenario_norm:
         return ids
+    # Session IDs can be reused across CORE restarts and across scenarios.
+    # When that happens, only the *latest* mapping entry should own the session id.
+    owners = _latest_session_owner_by_id(mapping)
+    for sid, entry in owners.items():
+        stored_norm = _session_store_entry_scenario_norm(entry)
+        if stored_norm and stored_norm == scenario_norm:
+            ids.add(sid)
+
+    # Legacy fallback: if we have no owner for a session id (missing/invalid updated_at),
+    # allow path-based inference based on the mapping key.
     for path, entry in (mapping or {}).items():
         sid = _session_store_entry_session_id(entry)
         if sid is None:
+            continue
+        if sid in owners:
             continue
         stored_norm = _session_store_entry_scenario_norm(entry)
         if stored_norm and stored_norm == scenario_norm:
@@ -6358,10 +7366,6 @@ def _filter_sessions_by_scenario(
             filtered.append(session)
             matched = True
             continue
-        if sid_int is not None and sid_int in scenario_session_ids:
-            filtered.append(session)
-            matched = True
-            continue
         if _path_matches_scenario(session.get('file'), scenario_norm, scenario_paths):
             filtered.append(session)
             matched = True
@@ -6370,6 +7374,13 @@ def _filter_sessions_by_scenario(
             filtered.append(session)
             matched = True
             continue
+        # Session IDs can be reused across CORE restarts; only fall back to ID-based
+        # matching when we have no path information.
+        if (not session.get('file')) and (not session.get('dir')):
+            if sid_int is not None and sid_int in scenario_session_ids:
+                filtered.append(session)
+                matched = True
+                continue
     return filtered, matched
 
 
@@ -6421,6 +7432,7 @@ def _build_session_scenario_labels(
     scenario_paths: dict[str, set[str]],
 ) -> dict[int, str]:
     labels: dict[int, str] = {}
+    best_ts: dict[int, float] = {}
     for path, entry in (mapping or {}).items():
         sid = _session_store_entry_session_id(entry)
         if sid is None:
@@ -6434,7 +7446,18 @@ def _build_session_scenario_labels(
                 label = _resolve_scenario_display(norm, scenario_names, norm)
         if not label:
             label = _scenario_label_from_path(path, scenario_names, scenario_paths)
-        if label:
+        if not label:
+            continue
+
+        ts = _session_store_entry_updated_at_epoch(entry)
+        if ts is None:
+            ts = _safe_path_mtime_epoch(path)
+        if ts is None:
+            ts = 0.0
+
+        prev = best_ts.get(sid)
+        if prev is None or ts >= prev:
+            best_ts[sid] = ts
             labels[sid] = label
     return labels
 
@@ -6452,22 +7475,37 @@ def _annotate_sessions_with_scenarios(
     matched_ids = set(scenario_session_ids or [])
     for session in sessions:
         label: Optional[str] = None
+        # If the session dict already carries a scenario name, preserve it (when it
+        # matches a known scenario) rather than clobbering it with empty inference.
+        try:
+            existing = (session.get('scenario_name') or '').strip()
+        except Exception:
+            existing = ''
+        if existing:
+            existing_norm = _normalize_scenario_label(existing)
+            display = _resolve_scenario_display(existing_norm, scenario_names, existing)
+            if display:
+                label = display
         sid = session.get('id')
         sid_int: Optional[int]
         try:
             sid_int = int(sid) if sid is not None else None
         except Exception:
             sid_int = None
-        if sid_int is not None:
+        # Prefer the live session path over any cached session-id mapping.
+        candidate_file = session.get('file') or ''
+        candidate_dir = session.get('dir') or ''
+        if not label and candidate_file:
+            label = _scenario_label_from_path(candidate_file, scenario_names, scenario_paths)
+        if not label and candidate_dir:
+            label = _scenario_label_from_path(candidate_dir, scenario_names, scenario_paths)
+        if not label and sid_int is not None:
             label = session_labels.get(sid_int)
         if not label and sid is not None:
             try:
                 label = session_labels.get(int(str(sid)))
             except Exception:
                 label = None
-        if not label:
-            candidate_path = session.get('file') or session.get('dir') or ''
-            label = _scenario_label_from_path(candidate_path, scenario_names, scenario_paths)
         if not label and scenario_norm:
             if sid_int is not None and sid_int in matched_ids:
                 label = active_display or scenario_query
@@ -6809,6 +7847,388 @@ def _extract_session_id_from_text(text: str) -> str | None:
     except Exception:
         pass
     return None
+
+
+def _extract_session_id_from_core_path(text: str) -> int | None:
+    """Best-effort: extract a CORE session id from a CORE VM path or filename.
+
+    Examples:
+      - /tmp/pycore.17/Scenario_1.xml -> 17
+      - /tmp/pycore.17 -> 17
+      - core-session-17-20251227-153012.xml -> 17
+      - session-17.xml -> 17
+    """
+    if not text:
+        return None
+    s = str(text)
+    try:
+        m = re.search(r"(?:^|/|\\)pycore\.(\d+)(?:/|\\|$)", s)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    try:
+        m = re.search(r"\bcore-session-(\d+)\b", s)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    try:
+        m = re.search(r"\bsession-(\d+)\b", s)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _session_store_scenario_for_session_id(store: dict, session_id: int, *, host: str, port: int) -> str | None:
+    """Return the newest known scenario_name for a given session id (scoped by CORE host/port)."""
+    if not isinstance(store, dict) or not store:
+        return None
+    best_label: str | None = None
+    best_ts: float | None = None
+    for _path, entry in store.items():
+        try:
+            sid = _session_store_entry_session_id(entry)
+            if sid is None or int(sid) != int(session_id):
+                continue
+            if not _session_store_entry_matches_core(entry, host, port):
+                continue
+            ts = _session_store_entry_updated_at_epoch(entry)
+            if ts is None:
+                ts = 0.0
+            label = (entry.get('scenario_name') or '').strip() if isinstance(entry, dict) else ''
+            if not label:
+                continue
+            if best_ts is None or ts >= best_ts:
+                best_ts = ts
+                best_label = label
+        except Exception:
+            continue
+    return best_label
+
+
+def _remote_write_session_scenario_meta_script(
+    session_id: int,
+    scenario_name: str | None,
+    scenario_norm: str | None,
+    scenario_xml_basename: str | None,
+) -> str:
+    sid_lit = json.dumps(int(session_id))
+    name_lit = json.dumps((scenario_name or '').strip())
+    norm_lit = json.dumps((scenario_norm or '').strip())
+    base_lit = json.dumps((scenario_xml_basename or '').strip())
+    template = textwrap.dedent(
+        """
+import json
+import os
+import time
+import traceback
+
+
+def main():
+    payload = {}
+    try:
+        sid = __SID__
+        meta_dir = '/tmp/core-topo-gen/session-meta'
+        os.makedirs(meta_dir, exist_ok=True)
+        meta_path = os.path.join(meta_dir, f"{sid}.json")
+        meta = {
+            'session_id': sid,
+            'scenario_name': __SCEN_NAME__,
+            'scenario_norm': __SCEN_NORM__,
+            'scenario_xml_basename': __SCEN_BASE__,
+            'written_at_epoch': time.time(),
+        }
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
+        payload['ok'] = True
+        payload['meta_path'] = meta_path
+    except Exception as exc:
+        payload['ok'] = False
+        payload['error'] = str(exc)
+        payload['traceback'] = traceback.format_exc()
+    print(json.dumps(payload))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    )
+    script = template.replace('__SID__', sid_lit)
+    script = script.replace('__SCEN_NAME__', name_lit)
+    script = script.replace('__SCEN_NORM__', norm_lit)
+    script = script.replace('__SCEN_BASE__', base_lit)
+    return script
+
+
+def _remote_read_session_scenario_meta_script(session_id: int) -> str:
+    sid_lit = json.dumps(int(session_id))
+    template = textwrap.dedent(
+        """
+import json
+import os
+import traceback
+
+
+def main():
+    payload = {}
+    try:
+        sid = __SID__
+        meta_path = os.path.join('/tmp/core-topo-gen/session-meta', f"{sid}.json")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(meta_path)
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        payload['ok'] = True
+        payload['meta'] = meta
+        payload['meta_path'] = meta_path
+    except Exception as exc:
+        payload['ok'] = False
+        payload['error'] = str(exc)
+        payload['traceback'] = traceback.format_exc()
+    print(json.dumps(payload))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    )
+    return template.replace('__SID__', sid_lit)
+
+
+def _remote_read_session_scenario_meta_bulk_script(session_ids: list[int]) -> str:
+    ids_lit = json.dumps([int(x) for x in (session_ids or [])])
+    template = textwrap.dedent(
+        """
+import json
+import os
+import traceback
+
+
+def main():
+    payload = {}
+    try:
+        sids = __SIDS__
+        out = {}
+        for sid in sids:
+            try:
+                meta_path = os.path.join('/tmp/core-topo-gen/session-meta', f"{int(sid)}.json")
+                if not os.path.exists(meta_path):
+                    continue
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+                if isinstance(meta, dict):
+                    out[int(sid)] = meta
+            except Exception:
+                continue
+        payload['ok'] = True
+        payload['meta_by_sid'] = out
+    except Exception as exc:
+        payload['ok'] = False
+        payload['error'] = str(exc)
+        payload['traceback'] = traceback.format_exc()
+    print(json.dumps(payload))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    )
+    return template.replace('__SIDS__', ids_lit)
+
+
+def _write_remote_session_scenario_meta(
+    core_cfg: Dict[str, Any],
+    *,
+    session_id: int,
+    scenario_name: str | None,
+    scenario_xml_basename: str | None = None,
+    logger: Optional[logging.Logger] = None,
+) -> None:
+    """Write a small session->scenario mapping file on the CORE VM.
+
+    This makes it possible to map a *session XML path on the CORE VM* back to the
+    scenario by extracting the session id from the path and reading this file.
+    """
+    log = logger or getattr(app, 'logger', logging.getLogger(__name__))
+    scenario_label = (scenario_name or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label) if scenario_label else ''
+    script = _remote_write_session_scenario_meta_script(
+        int(session_id),
+        scenario_label,
+        scenario_norm,
+        scenario_xml_basename,
+    )
+    cfg = _normalize_core_config(core_cfg, include_password=True)
+    ssh_user = (cfg.get('ssh_username') or '').strip() or '<unknown>'
+    ssh_host = cfg.get('ssh_host') or cfg.get('host') or 'localhost'
+    command_desc = f"remote ssh {ssh_user}@{ssh_host} -> write /tmp/core-topo-gen/session-meta/{int(session_id)}.json"
+    try:
+        payload = _run_remote_python_json(
+            cfg,
+            script,
+            logger=log,
+            label='core.write_session_meta',
+            command_desc=command_desc,
+            timeout=30.0,
+        )
+        if payload.get('error'):
+            log.debug('[core.session_meta] remote error: %s', payload.get('error'))
+    except Exception as exc:
+        log.debug('[core.session_meta] write failed: %s', exc)
+
+
+def _read_remote_session_scenario_meta(
+    core_cfg: Dict[str, Any],
+    *,
+    session_id: int,
+    logger: Optional[logging.Logger] = None,
+) -> dict[str, Any] | None:
+    log = logger or getattr(app, 'logger', logging.getLogger(__name__))
+    script = _remote_read_session_scenario_meta_script(int(session_id))
+    cfg = _normalize_core_config(core_cfg, include_password=True)
+    ssh_user = (cfg.get('ssh_username') or '').strip() or '<unknown>'
+    ssh_host = cfg.get('ssh_host') or cfg.get('host') or 'localhost'
+    command_desc = f"remote ssh {ssh_user}@{ssh_host} -> read /tmp/core-topo-gen/session-meta/{int(session_id)}.json"
+    try:
+        payload = _run_remote_python_json(
+            cfg,
+            script,
+            logger=log,
+            label='core.read_session_meta',
+            command_desc=command_desc,
+            timeout=30.0,
+        )
+        if payload.get('ok') and isinstance(payload.get('meta'), dict):
+            return payload.get('meta')
+    except Exception as exc:
+        log.debug('[core.session_meta] read failed: %s', exc)
+    return None
+
+
+def _read_local_session_scenario_meta_bulk(session_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """Best-effort local read of session-meta files.
+
+    When the webapp runs on the CORE VM, the session-meta directory is directly
+    accessible and SSH may be disabled/unavailable.
+    """
+    ids = [int(x) for x in (session_ids or []) if x not in (None, '')]
+    if not ids:
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    meta_dir = '/tmp/core-topo-gen/session-meta'
+    try:
+        if not os.path.isdir(meta_dir):
+            return {}
+    except Exception:
+        return {}
+    for sid in ids:
+        try:
+            meta_path = os.path.join(meta_dir, f"{int(sid)}.json")
+            if not os.path.exists(meta_path):
+                continue
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+            if isinstance(meta, dict):
+                out[int(sid)] = meta
+        except Exception:
+            continue
+    return out
+
+
+def _read_remote_session_scenario_meta_bulk(
+    core_cfg: Dict[str, Any],
+    *,
+    session_ids: list[int],
+    logger: Optional[logging.Logger] = None,
+) -> dict[int, dict[str, Any]]:
+    """Read multiple session meta files from the CORE VM in one remote call."""
+    log = logger or getattr(app, 'logger', logging.getLogger(__name__))
+    ids = [int(x) for x in (session_ids or []) if x not in (None, '')]
+    if not ids:
+        return {}
+
+    # Fast-path: if we are running on the CORE VM, read directly.
+    local = _read_local_session_scenario_meta_bulk(ids)
+    if local and len(local) == len(set(ids)):
+        return local
+    script = _remote_read_session_scenario_meta_bulk_script(ids)
+    cfg = _normalize_core_config(core_cfg, include_password=True)
+    ssh_user = (cfg.get('ssh_username') or '').strip() or '<unknown>'
+    ssh_host = cfg.get('ssh_host') or cfg.get('host') or 'localhost'
+    command_desc = f"remote ssh {ssh_user}@{ssh_host} -> read /tmp/core-topo-gen/session-meta/*.json (bulk)"
+    try:
+        payload = _run_remote_python_json(
+            cfg,
+            script,
+            logger=log,
+            label='core.read_session_meta_bulk',
+            command_desc=command_desc,
+            timeout=30.0,
+        )
+        if payload.get('ok') and isinstance(payload.get('meta_by_sid'), dict):
+            out: dict[int, dict[str, Any]] = {}
+            for k, v in payload.get('meta_by_sid', {}).items():
+                try:
+                    sid = int(k)
+                except Exception:
+                    continue
+                if isinstance(v, dict):
+                    out[sid] = v
+            if local:
+                merged = dict(local)
+                merged.update(out)
+                return merged
+            return out
+    except Exception as exc:
+        log.debug('[core.session_meta] bulk read failed: %s', exc)
+    return local or {}
+
+
+def _session_store_updated_at_for_session_id(store: dict, session_id: int, *, host: str, port: int) -> float | None:
+    """Return the newest known updated_at epoch for a session id (scoped by CORE host/port)."""
+    if not isinstance(store, dict) or not store:
+        return None
+    best_ts: float | None = None
+    for _path, entry in store.items():
+        try:
+            sid = _session_store_entry_session_id(entry)
+            if sid is None or int(sid) != int(session_id):
+                continue
+            if not _session_store_entry_matches_core(entry, host, port):
+                continue
+            ts = _session_store_entry_updated_at_epoch(entry)
+            if ts is None:
+                continue
+            if best_ts is None or ts >= best_ts:
+                best_ts = ts
+        except Exception:
+            continue
+    return best_ts
+
+
+def _scenario_timestamped_filename(scenario_name: str | None, ts_epoch: float | None) -> str:
+    """Build <scenario-name><timestamp>.xml (timestamp includes leading '-') for UI display."""
+    try:
+        stem = secure_filename((scenario_name or 'scenario')).strip('_-.') or 'scenario'
+    except Exception:
+        stem = 'scenario'
+    try:
+        epoch = float(ts_epoch) if ts_epoch is not None else None
+    except Exception:
+        epoch = None
+    if epoch is None or epoch <= 0:
+        try:
+            epoch = time.time()
+        except Exception:
+            epoch = 0.0
+    try:
+        ts = datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc).strftime('-%Y%m%d-%H%M%S')
+    except Exception:
+        ts = '-unknown'
+    return f"{stem}{ts}.xml"
 
 def _safe_add_to_zip(zf: zipfile.ZipFile, abs_path: str, arcname: str) -> None:
     try:
@@ -8203,16 +9623,141 @@ def _images_pulled_for_compose_safe(yml_path: str) -> bool:
         return False
 
 
-@app.route('/docker/status', methods=['GET'])
-def docker_status():
-    data = _load_compose_assignments()
+def _remote_docker_status_script(sudo_password: str | None = None) -> str:
+    """Remote script to read compose assignments + docker state on the CORE VM.
+
+    This intentionally runs on the remote CORE host (via SSH) so the Docker Compose
+    card reflects remote state, not the local Flask machine.
+    """
+
+    sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else "")
+    return (
+        """
+import json, os, time, subprocess
+
+SUDO_PASSWORD = __SUDO_PASSWORD_LITERAL__
+
+
+def _run_docker(cmd, timeout=20, capture=True):
+    # Run docker on the CORE VM via sudo.
+    # - Try non-interactive sudo first (fast fail if password is required).
+    # - If a sudo password is available, retry with sudo -S.
+    stdout = subprocess.PIPE if capture else subprocess.DEVNULL
+    stderr = subprocess.STDOUT if capture else subprocess.DEVNULL
+    try:
+        p = subprocess.run(['sudo', '-n', 'docker'] + list(cmd), stdout=stdout, stderr=stderr, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        if SUDO_PASSWORD:
+            # -k forces sudo to prompt for password (so -S matters even if a cached ticket exists).
+            return subprocess.run(
+                ['sudo', '-S', '-k', '-p', '', 'docker'] + list(cmd),
+                input=str(SUDO_PASSWORD) + "\\n",
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+                timeout=timeout,
+            )
+        return p
+    except Exception as e:
+        class _P:
+            returncode = 1
+            stdout = str(e)
+        return _P()
+
+
+def _first_existing(path_candidates):
+    for p in path_candidates:
+        if not p:
+            continue
+        try:
+            if os.path.exists(p):
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def _read_json(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _docker_names():
+    try:
+        p = _run_docker(['ps', '-a', '--format', '{{.Names}}'], timeout=15, capture=True)
+        if p.returncode != 0:
+            out = (p.stdout or '').strip()
+            if out and 'permission denied' in out.lower():
+                out = out + "\\nHint: add the SSH user to the 'docker' group or allow passwordless sudo for docker."
+            return set(), out
+        return set(ln.strip() for ln in (p.stdout or '').splitlines() if ln.strip()), ''
+    except Exception as e:
+        return set(), str(e)
+
+
+def _container_running(name):
+    try:
+        p = _run_docker(['inspect', '-f', '{{.State.Running}}', name], timeout=10, capture=True)
+        return (p.returncode == 0 and (p.stdout or '').strip().lower() == 'true')
+    except Exception:
+        return False
+
+
+def _images_pulled_for_compose(yml_path):
+    # Best-effort: list images referenced by the compose file and confirm they exist locally.
+    try:
+        p = _run_docker(['compose', '-f', yml_path, 'config', '--images'], timeout=20, capture=True)
+        if p.returncode != 0:
+            return False
+        images = [ln.strip() for ln in (p.stdout or '').splitlines() if ln.strip()]
+        if not images:
+            return False
+        for img in images:
+            chk = _run_docker(['image', 'inspect', img], timeout=20, capture=False)
+            if chk.returncode != 0:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def main():
+    base = os.environ.get('CORE_REMOTE_BASE_DIR', '/tmp/core-topo-gen')
+    candidates = [
+        os.path.join(base, 'vulns', 'compose_assignments.json'),
+        os.path.join(base, 'outputs', 'vulns', 'compose_assignments.json'),
+        os.path.join(base, 'compose_assignments.json'),
+        '/tmp/vulns/compose_assignments.json',
+    ]
+    assignments_path = _first_existing(candidates)
+    if not assignments_path:
+        print(json.dumps({'items': [], 'timestamp': int(time.time()), 'error': 'compose_assignments.json not found on CORE VM'}))
+        return
+
+    try:
+        data = _read_json(assignments_path)
+    except Exception as e:
+        print(json.dumps({'items': [], 'timestamp': int(time.time()), 'error': f'failed reading assignments: {e}'}))
+        return
+
     assignments = data.get('assignments', {}) if isinstance(data, dict) else {}
+    if not isinstance(assignments, dict):
+        assignments = {}
+
+    assign_dir = os.path.dirname(assignments_path)
+    names, docker_err = _docker_names()
     items = []
     for node_name in sorted(assignments.keys()):
-        yml = _compose_file_for_node(node_name)
-        exists = os.path.exists(yml)
-        pulled = _images_pulled_for_compose_safe(yml) if exists else False
-        c_exists, running = _docker_container_exists(node_name)
+        yml = os.path.join(assign_dir, f'docker-compose-{node_name}.yml')
+        exists = False
+        try:
+            exists = os.path.exists(yml)
+        except Exception:
+            exists = False
+        pulled = _images_pulled_for_compose(yml) if exists else False
+        c_exists = node_name in names
+        running = _container_running(node_name) if c_exists else False
         items.append({
             'name': node_name,
             'compose': yml,
@@ -8221,12 +9766,201 @@ def docker_status():
             'container_exists': bool(c_exists),
             'running': bool(running),
         })
-    return jsonify({'items': items, 'timestamp': int(time.time())})
+
+    payload = {'items': items, 'timestamp': int(time.time())}
+    if docker_err:
+        payload['error'] = docker_err
+    print(json.dumps(payload))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
+
+
+def _sync_local_vulns_to_remote(
+    core_cfg: Dict[str, Any],
+    *,
+    local_dir: str = "/tmp/vulns",
+    remote_dir: str = "/tmp/vulns",
+    logger: Optional[logging.Logger] = None,
+) -> bool:
+    """Copy vulnerability compose artifacts created locally to the remote CORE host.
+
+    The webapp runs the CLI locally (with a tunneled gRPC connection), so the CLI
+    writes compose artifacts under local /tmp. The Docker Compose card and CORE
+    DockerComposeService run on the CORE VM and expect the same artifacts on the
+    remote filesystem.
+
+    Returns True if any files were uploaded.
+    """
+
+    log = logger or getattr(app, 'logger', logging.getLogger(__name__))
+
+    assignments_path = os.path.join(local_dir, "compose_assignments.json")
+    if not os.path.exists(assignments_path):
+        return False
+
+    node_names: List[str] = []
+    try:
+        with open(assignments_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        assignments = data.get('assignments', {}) if isinstance(data, dict) else {}
+        if isinstance(assignments, dict):
+            node_names = [str(k) for k in assignments.keys()]
+    except Exception:
+        node_names = []
+
+    local_files: List[str] = [assignments_path]
+    for nm in sorted(set(node_names)):
+        yml = os.path.join(local_dir, f"docker-compose-{nm}.yml")
+        if os.path.exists(yml):
+            local_files.append(yml)
+
+    if not local_files:
+        return False
+
+    client = None
+    sftp = None
+    uploaded = 0
+    try:
+        client = _open_ssh_client(core_cfg)
+        sftp = client.open_sftp()
+        remote_dir_resolved = _remote_expand_path(sftp, remote_dir)
+        _remote_mkdirs(client, remote_dir_resolved)
+        for lp in local_files:
+            rp = _remote_path_join(remote_dir_resolved, os.path.basename(lp))
+            try:
+                sftp.put(lp, rp)
+                uploaded += 1
+            except Exception:
+                log.exception("[sync] Failed uploading %s -> %s", lp, rp)
+        if uploaded:
+            log.info("[sync] Uploaded %d vuln artifact(s) to CORE host dir=%s", uploaded, remote_dir_resolved)
+        return uploaded > 0
+    except Exception:
+        log.exception("[sync] Vulnerability artifact upload skipped/failed")
+        return False
+    finally:
+        try:
+            if sftp:
+                sftp.close()
+        except Exception:
+            pass
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+
+
+def _remote_docker_cleanup_script(names: list[str], sudo_password: str | None = None) -> str:
+    names_literal = json.dumps([str(x) for x in (names or [])])
+    sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else "")
+    return (
+        """
+import json, subprocess
+
+NAMES = __NAMES_LITERAL__
+
+SUDO_PASSWORD = __SUDO_PASSWORD_LITERAL__
+
+
+def _run_docker(cmd, timeout=20):
+    # Run docker on the CORE VM via sudo.
+    # - Try non-interactive sudo first (fast fail if password is required).
+    # - If a sudo password is available, retry with sudo -S.
+    try:
+        p = subprocess.run(['sudo', '-n', 'docker'] + list(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        if SUDO_PASSWORD:
+            return subprocess.run(
+                ['sudo', '-S', '-k', '-p', '', 'docker'] + list(cmd),
+                input=str(SUDO_PASSWORD) + "\\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+            )
+        return p
+    except Exception as e:
+        class _P:
+            returncode = 1
+            stdout = str(e)
+        return _P()
+
+
+def main():
+    results = []
+    for nm in (NAMES or []):
+        stopped = removed = False
+        try:
+            p1 = _run_docker(['stop', nm], timeout=20)
+            stopped = (p1.returncode == 0)
+        except Exception:
+            stopped = False
+        try:
+            p2 = _run_docker(['rm', nm], timeout=20)
+            removed = (p2.returncode == 0)
+        except Exception:
+            removed = False
+        results.append({'name': nm, 'stopped': bool(stopped), 'removed': bool(removed)})
+    # Prune unused networks to avoid exhausting Docker's default address pools.
+    # CORE docker nodes frequently create per-node compose networks; if sessions are
+    # started/stopped repeatedly without network cleanup, docker can hit:
+    # "all predefined address pools have been fully subnetted".
+    net_prune_ok = False
+    net_prune_out = ''
+    try:
+        p3 = _run_docker(['network', 'prune', '-f'], timeout=30)
+        net_prune_ok = (getattr(p3, 'returncode', 1) == 0)
+        net_prune_out = (getattr(p3, 'stdout', '') or '').strip()
+    except Exception as e:
+        net_prune_ok = False
+        net_prune_out = str(e)
+    print(json.dumps({'ok': True, 'results': results, 'network_prune': {'ok': bool(net_prune_ok), 'output': net_prune_out}}))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__NAMES_LITERAL__', names_literal).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
+
+
+@app.route('/docker/status', methods=['GET'])
+def docker_status():
+    # Use the scenario-selected CORE VM (remote) to populate docker status.
+    history = _load_run_history()
+    current_user = _current_user()
+    scenario_names, _scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
+    scenario_query = request.args.get('scenario', '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_query)
+    if scenario_names:
+        if not scenario_norm or not any(_normalize_scenario_label(n) == scenario_norm for n in scenario_names):
+            scenario_norm = _normalize_scenario_label(scenario_names[0])
+    core_cfg = _select_core_config_for_page(scenario_norm, history, include_password=True)
+    core_cfg = _ensure_core_vm_metadata(core_cfg)
+    try:
+        payload = _run_remote_python_json(
+            core_cfg,
+            _remote_docker_status_script(core_cfg.get('ssh_password')),
+            logger=app.logger,
+            label='docker.status',
+            timeout=60.0,
+        )
+        if not isinstance(payload, dict):
+            payload = {'items': [], 'timestamp': int(time.time()), 'error': 'invalid remote payload'}
+        payload.setdefault('timestamp', int(time.time()))
+        return jsonify(payload)
+    except Exception as exc:
+        return jsonify({'items': [], 'timestamp': int(time.time()), 'error': str(exc)}), 200
 
 
 @app.route('/docker/cleanup', methods=['POST'])
 def docker_cleanup():
-    names = []
+    names: list[str] = []
     try:
         if request.is_json:
             body = request.get_json(silent=True) or {}
@@ -8241,25 +9975,43 @@ def docker_cleanup():
                         names = [str(x) for x in arr]
                 except Exception:
                     names = [str(raw)]
+        # Use the scenario-selected CORE VM (remote) to cleanup docker containers.
+        history = _load_run_history()
+        current_user = _current_user()
+        scenario_names, _scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
+        scenario_query = request.args.get('scenario', '').strip()
+        scenario_norm = _normalize_scenario_label(scenario_query)
+        if scenario_names:
+            if not scenario_norm or not any(_normalize_scenario_label(n) == scenario_norm for n in scenario_names):
+                scenario_norm = _normalize_scenario_label(scenario_names[0])
+        core_cfg = _select_core_config_for_page(scenario_norm, history, include_password=True)
+        core_cfg = _ensure_core_vm_metadata(core_cfg)
+
         if not names:
-            data = _load_compose_assignments()
-            assignments = data.get('assignments', {}) if isinstance(data, dict) else {}
-            names = list(assignments.keys())
-        results = []
-        for nm in names:
-            stopped = removed = False
+            # If no names supplied, reuse the remote status listing to derive all node names.
             try:
-                p1 = subprocess.run(['docker', 'stop', nm], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                stopped = (p1.returncode == 0)
+                status_payload = _run_remote_python_json(
+                    core_cfg,
+                    _remote_docker_status_script(core_cfg.get('ssh_password')),
+                    logger=app.logger,
+                    label='docker.status(for cleanup)',
+                    timeout=60.0,
+                )
+                if isinstance(status_payload, dict) and isinstance(status_payload.get('items'), list):
+                    names = [str(it.get('name')) for it in status_payload['items'] if isinstance(it, dict) and it.get('name')]
             except Exception:
-                stopped = False
-            try:
-                p2 = subprocess.run(['docker', 'rm', nm], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                removed = (p2.returncode == 0)
-            except Exception:
-                removed = False
-            results.append({'name': nm, 'stopped': bool(stopped), 'removed': bool(removed)})
-        return jsonify({'ok': True, 'results': results})
+                names = []
+
+        payload = _run_remote_python_json(
+            core_cfg,
+            _remote_docker_cleanup_script(names, core_cfg.get('ssh_password')),
+            logger=app.logger,
+            label='docker.cleanup',
+            timeout=120.0,
+        )
+        if not isinstance(payload, dict):
+            payload = {'ok': False, 'error': 'invalid remote payload'}
+        return jsonify(payload)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
@@ -8308,8 +10060,43 @@ def _grpc_save_current_session_xml_with_config(core_cfg: Dict[str, Any], out_dir
     ssh_user = (cfg.get('ssh_username') or '').strip() or '<unknown>'
     ssh_host = cfg.get('ssh_host') or cfg.get('host') or 'localhost'
     address = f"{cfg.get('host') or CORE_HOST}:{cfg.get('port') or CORE_PORT}"
-    ts = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')
-    stem = f"core-session-{session_id or 'active'}"
+
+    # Desired local filename: <scenario-name><timestamp>.xml
+    sid_int: int | None = None
+    try:
+        sid_int = int(session_id) if session_id not in (None, '') else None
+    except Exception:
+        sid_int = None
+    scenario_label: str | None = None
+    ts_epoch: float | None = None
+    if sid_int is not None:
+        try:
+            meta_by_sid = _read_remote_session_scenario_meta_bulk(cfg, session_ids=[sid_int], logger=app.logger)
+            meta = meta_by_sid.get(sid_int) if isinstance(meta_by_sid, dict) else None
+            if isinstance(meta, dict):
+                scenario_label = (meta.get('scenario_name') or '').strip() or None
+                if meta.get('written_at_epoch') not in (None, ''):
+                    try:
+                        ts_epoch = float(meta.get('written_at_epoch'))
+                    except Exception:
+                        ts_epoch = None
+        except Exception:
+            pass
+    if ts_epoch is None and sid_int is not None:
+        try:
+            store_map = _load_core_sessions_store()
+            host = cfg.get('host') or CORE_HOST
+            port = int(cfg.get('port') or CORE_PORT)
+            ts_epoch = _session_store_updated_at_for_session_id(store_map, sid_int, host=host, port=port)
+        except Exception:
+            ts_epoch = None
+    desired_name = _scenario_timestamped_filename(scenario_label or 'scenario', ts_epoch)
+    # Use the scenario stem (not full desired_name) for remote uniqueness prefix.
+    try:
+        desired_stem = os.path.splitext(secure_filename(desired_name))[0]
+    except Exception:
+        desired_stem = 'scenario'
+    stem = desired_stem.split('-')[0] or desired_stem or 'scenario'
     base_sessions_dir = os.path.join(_outputs_dir(), 'core-sessions')
     for directory in (out_dir, base_sessions_dir):
         try:
@@ -8344,8 +10131,7 @@ def _grpc_save_current_session_xml_with_config(core_cfg: Dict[str, Any], out_dir
         return _find_latest_session_xml(out_dir, stem)
     remote_output = payload.get('output_path') or remote_path
     session_id_remote = payload.get('session_id') or session_id or 'core'
-    local_name = f"core-session-{session_id_remote}-{ts}.xml"
-    local_path = os.path.join(out_dir, secure_filename(local_name))
+    local_path = os.path.join(out_dir, secure_filename(desired_name))
     try:
         _download_remote_file(cfg, remote_output, local_path)
     except Exception as exc:
@@ -10060,6 +11846,14 @@ def run_cli():
             proc = subprocess.run(cli_args, cwd=repo_root, check=False, capture_output=True, text=True, env=cli_env)
         logs = (proc.stdout or '') + ('\n' + proc.stderr if proc.stderr else '')
         app.logger.debug("[sync] CLI return code: %s", proc.returncode)
+
+        # If the CLI generated vulnerability compose artifacts locally, copy them to the CORE VM
+        # so the remote Docker Compose card and DockerComposeService can access them.
+        try:
+            _sync_local_vulns_to_remote(core_cfg, logger=app.logger)
+        except Exception:
+            pass
+
         # Report path (if generated by CLI): parse logs or fallback to latest under reports/
         report_md = _extract_report_path_from_text(logs) or _find_latest_report_path()
         if report_md:
@@ -10082,6 +11876,17 @@ def run_cli():
                 session_id,
                 scenario_name=active_scenario_name or scenario_name_hint or None,
             )
+            try:
+                sid_int = int(str(session_id).strip())
+                _write_remote_session_scenario_meta(
+                    core_cfg,
+                    session_id=sid_int,
+                    scenario_name=active_scenario_name or scenario_name_hint or None,
+                    scenario_xml_basename=os.path.basename(xml_path),
+                    logger=app.logger,
+                )
+            except Exception:
+                pass
         # Read XML for preview
         xml_text = ""
         try:
@@ -10893,11 +12698,15 @@ def reports_page():
     enriched = []
     for entry in raw:
         e = dict(entry)
-        # Keep xml_path as stored (session xml only if available)
-        if 'scenario_names' not in e:
-            # Prefer names parsed from the Scenario Editor XML, fall back to session xml if missing
-            src_xml = e.get('scenario_xml_path') or e.get('xml_path')
-            e['scenario_names'] = _scenario_names_from_xml(src_xml)
+        # Per-scenario: always show exactly one scenario name.
+        if not (isinstance(e.get('scenario_names'), list) and e.get('scenario_names')):
+            scen = (e.get('scenario_name') or '').strip() if isinstance(e.get('scenario_name'), str) else ''
+            if scen:
+                e['scenario_names'] = [scen]
+            else:
+                src_xml = e.get('single_scenario_xml_path') or e.get('scenario_xml_path') or e.get('xml_path')
+                names = _scenario_names_from_xml(src_xml) if src_xml else []
+                e['scenario_names'] = [names[0]] if isinstance(names, list) and names else []
         # Normalize session xml pointer for UI compatibility
         session_xml = e.get('session_xml_path') or e.get('post_xml_path')
         if session_xml:
@@ -10906,7 +12715,7 @@ def reports_page():
             derived_summary = _derive_summary_from_report(e.get('report_path'))
             if derived_summary:
                 e['summary_path'] = derived_summary
-        # Hardening: ensure scenario_names is always a list
+        # Hardening: ensure scenario_names is always a list (and truncate to 1)
         sn = e.get('scenario_names')
         if not isinstance(sn, list):
             if sn is None:
@@ -10919,6 +12728,8 @@ def reports_page():
                     e['scenario_names'] = [s.strip() for s in sn.split(',') if s.strip()]
             else:
                 e['scenario_names'] = []
+        if isinstance(e.get('scenario_names'), list) and len(e['scenario_names']) > 1:
+            e['scenario_names'] = [e['scenario_names'][0]]
         enriched.append(e)
     enriched = sorted(enriched, key=lambda x: x.get('timestamp',''), reverse=True)
     user = _current_user()
@@ -10933,6 +12744,9 @@ def reports_page():
         scenario_norm,
         user=user,
     )
+    # Enforce per-scenario view: default to the first available scenario when unset.
+    if scenario_names and not scenario_norm:
+        scenario_norm = _normalize_scenario_label(scenario_names[0])
     if scenario_norm:
         enriched = _filter_history_by_scenario(enriched, scenario_norm)
     scenario_display = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
@@ -10949,10 +12763,15 @@ def reports_data():
     enriched = []
     for entry in raw:
         e = dict(entry)
-        # Keep xml_path as stored (session xml only if available)
-        if 'scenario_names' not in e:
-            src_xml = e.get('scenario_xml_path') or e.get('xml_path')
-            e['scenario_names'] = _scenario_names_from_xml(src_xml)
+        # Per-scenario: always show exactly one scenario name.
+        if not (isinstance(e.get('scenario_names'), list) and e.get('scenario_names')):
+            scen = (e.get('scenario_name') or '').strip() if isinstance(e.get('scenario_name'), str) else ''
+            if scen:
+                e['scenario_names'] = [scen]
+            else:
+                src_xml = e.get('single_scenario_xml_path') or e.get('scenario_xml_path') or e.get('xml_path')
+                names = _scenario_names_from_xml(src_xml) if src_xml else []
+                e['scenario_names'] = [names[0]] if isinstance(names, list) and names else []
         session_xml = e.get('session_xml_path') or e.get('post_xml_path')
         if session_xml:
             e['session_xml_path'] = session_xml
@@ -10960,7 +12779,7 @@ def reports_data():
             derived_summary = _derive_summary_from_report(e.get('report_path'))
             if derived_summary:
                 e['summary_path'] = derived_summary
-        # Hardening: normalize scenario_names to list
+        # Hardening: normalize scenario_names to list (and truncate to 1)
         sn = e.get('scenario_names')
         if not isinstance(sn, list):
             if sn is None:
@@ -10972,6 +12791,8 @@ def reports_data():
                     e['scenario_names'] = [s.strip() for s in sn.split(',') if s.strip()]
             else:
                 e['scenario_names'] = []
+        if isinstance(e.get('scenario_names'), list) and len(e['scenario_names']) > 1:
+            e['scenario_names'] = [e['scenario_names'][0]]
         enriched.append(e)
     enriched = sorted(enriched, key=lambda x: x.get('timestamp',''), reverse=True)
     user = _current_user()
@@ -10986,6 +12807,9 @@ def reports_data():
         scenario_norm,
         user=user,
     )
+    # Enforce per-scenario view: default to the first available scenario when unset.
+    if scenario_names and not scenario_norm:
+        scenario_norm = _normalize_scenario_label(scenario_names[0])
     if scenario_norm:
         enriched = _filter_history_by_scenario(enriched, scenario_norm)
     scenario_display = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
@@ -11072,6 +12896,11 @@ def run_cli_async():
     scenario_name_hint = None
     scenario_index_hint: Optional[int] = None
     update_remote_repo = False
+    adv_fix_docker_daemon = False
+    adv_run_core_cleanup = False
+    adv_check_core_version = False
+    adv_restart_core_daemon = False
+    adv_auto_kill_sessions = False
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
         xml_path = request.form.get('xml_path')
@@ -11101,6 +12930,11 @@ def run_cli_async():
             scenario_core_override = None
         if 'update_remote_repo' in request.form:
             update_remote_repo = _coerce_bool(request.form.get('update_remote_repo'))
+        adv_fix_docker_daemon = _coerce_bool(request.form.get('adv_fix_docker_daemon'))
+        adv_run_core_cleanup = _coerce_bool(request.form.get('adv_run_core_cleanup'))
+        adv_check_core_version = _coerce_bool(request.form.get('adv_check_core_version'))
+        adv_restart_core_daemon = _coerce_bool(request.form.get('adv_restart_core_daemon'))
+        adv_auto_kill_sessions = _coerce_bool(request.form.get('adv_auto_kill_sessions'))
     if not xml_path:
         try:
             j = request.get_json(silent=True) or {}
@@ -11123,6 +12957,11 @@ def run_cli_async():
                     scenario_index_hint = None
             if 'update_remote_repo' in j:
                 update_remote_repo = _coerce_bool(j.get('update_remote_repo'))
+            adv_fix_docker_daemon = _coerce_bool(j.get('adv_fix_docker_daemon'))
+            adv_run_core_cleanup = _coerce_bool(j.get('adv_run_core_cleanup'))
+            adv_check_core_version = _coerce_bool(j.get('adv_check_core_version'))
+            adv_restart_core_daemon = _coerce_bool(j.get('adv_restart_core_daemon'))
+            adv_auto_kill_sessions = _coerce_bool(j.get('adv_auto_kill_sessions'))
         except Exception:
             pass
     if not xml_path:
@@ -11300,18 +13139,26 @@ def run_cli_async():
     except Exception:
         core_port = 50051
     remote_desc = f"{core_host}:{core_port}"
-    blocking_sessions: list[dict] = []
-    try:
-        existing_sessions = _list_active_core_sessions(core_host, core_port, core_cfg, errors=[], meta={})
-    except Exception as exc:
-        app.logger.warning('[async] Failed to enumerate existing CORE sessions: %s', exc)
-        existing_sessions = []
-    for entry in existing_sessions:
-        state_raw = str(entry.get('state') or '').strip().lower()
-        if state_raw in {'shutdown'}:
-            continue
-        blocking_sessions.append(entry)
-    if blocking_sessions:
+
+    def _collect_blocking_sessions() -> list[dict]:
+        blocking: list[dict] = []
+        try:
+            sessions = _list_active_core_sessions(core_host, core_port, core_cfg, errors=[], meta={})
+        except Exception as exc:
+            try:
+                app.logger.warning('[async] Failed to enumerate existing CORE sessions: %s', exc)
+            except Exception:
+                pass
+            sessions = []
+        for entry in sessions:
+            state_raw = str(entry.get('state') or '').strip().lower()
+            if state_raw in {'shutdown'}:
+                continue
+            blocking.append(entry)
+        return blocking
+
+    blocking_sessions = _collect_blocking_sessions()
+    if blocking_sessions and not adv_auto_kill_sessions:
         count = len(blocking_sessions)
         message = (
             f"CORE VM {remote_desc} already has {count} active session(s); finish or stop the running scenario before starting another."
@@ -11340,6 +13187,13 @@ def run_cli_async():
             ],
         }
         return jsonify(payload), 423
+    if blocking_sessions and adv_auto_kill_sessions:
+        try:
+            log_f.write(
+                f"[remote] NOTE: CORE VM {remote_desc} has {len(blocking_sessions)} active session(s); Advanced option will attempt to delete them before running.\n"
+            )
+        except Exception:
+            pass
     app.logger.info("[async] CORE remote=%s (ssh_enabled=%s)", remote_desc, core_cfg.get('ssh_enabled'))
     pre_saved = None
     # Establish SSH tunnel so CLI subprocess can reach CORE
@@ -11437,11 +13291,311 @@ def run_cli_async():
             pass
         _close_async_run_tunnel({'ssh_tunnel': ssh_tunnel})
         return jsonify({"error": f"Failed to open SSH session for CLI: {exc}"}), 500
-    auto_start_allowed = _coerce_bool(core_cfg.get('auto_start_daemon'))
+    auto_start_allowed = _coerce_bool(core_cfg.get('auto_start_daemon')) or bool(adv_restart_core_daemon)
     try:
         log_f.write(f"{log_prefix}core-daemon auto-start allowed: {auto_start_allowed}\n")
     except Exception:
         pass
+
+    def _exec_sudo(
+        cmd: str,
+        *,
+        timeout: float = 30.0,
+        stage: str = 'sudo',
+    ) -> tuple[int, str, str]:
+        sudo_password = core_cfg.get('ssh_password')
+        # Wrap in `timeout` to avoid hanging indefinitely.
+        wrapped = f"sh -c 'timeout {int(max(5, timeout))}s {cmd}'"
+        if sudo_password:
+            sudo_cmd = f"sudo -S -p '' {wrapped}"
+        else:
+            sudo_cmd = f"sudo -n {wrapped}"
+        stdin = stdout = stderr = None
+        try:
+            stdin, stdout, stderr = remote_client.exec_command(sudo_cmd, timeout=timeout + 5.0, get_pty=True)
+            if sudo_password:
+                try:
+                    stdin.write(str(sudo_password) + '\n')
+                    stdin.flush()
+                except Exception:
+                    pass
+            stdout_data = stdout.read()
+            stderr_data = stderr.read()
+            try:
+                exit_code = stdout.channel.recv_exit_status() if hasattr(stdout, 'channel') else 0
+            except Exception:
+                exit_code = 0
+            out_text = stdout_data.decode('utf-8', 'ignore') if isinstance(stdout_data, bytes) else str(stdout_data or '')
+            err_text = stderr_data.decode('utf-8', 'ignore') if isinstance(stderr_data, bytes) else str(stderr_data or '')
+            try:
+                log_f.write(
+                    f"{log_prefix}{stage}: {sudo_cmd} -> exit={exit_code} stdout={_summarize_for_log(out_text.strip())} stderr={_summarize_for_log(err_text.strip())}\n"
+                )
+            except Exception:
+                pass
+            return exit_code, out_text, err_text
+        finally:
+            try:
+                if stdin:
+                    stdin.close()
+            except Exception:
+                pass
+
+    def _check_core_version(required: str = '9.2.1') -> None:
+        candidates = [
+            "sh -c 'timeout 6s core-daemon --version 2>/dev/null || true'",
+            "sh -c 'timeout 6s core-daemon -v 2>/dev/null || true'",
+            "sh -c 'timeout 6s dpkg-query -W -f=\"${Version}\" core-daemon 2>/dev/null || true'",
+            "sh -c 'timeout 6s rpm -q --qf \"%{VERSION}-%{RELEASE}\" core-daemon 2>/dev/null || true'",
+            "sh -c 'timeout 6s core --version 2>/dev/null || true'",
+        ]
+        raw = ''
+        for cmd in candidates:
+            try:
+                code, out, err = _exec_ssh_command(remote_client, cmd, timeout=10.0)
+            except Exception:
+                continue
+            text = (out or '').strip() or (err or '').strip()
+            if not text:
+                continue
+            raw = text
+            break
+        found = None
+        try:
+            m = re.search(r"(\d+\.\d+\.\d+)", raw)
+            if m:
+                found = m.group(1)
+        except Exception:
+            found = None
+        try:
+            log_f.write(f"{log_prefix}CORE version probe: {raw or '(no output)'}\n")
+        except Exception:
+            pass
+        if not found:
+            raise RuntimeError('Unable to determine CORE version on remote host')
+        if found != required:
+            raise RuntimeError(f"CORE version mismatch: expected {required}, found {found}")
+
+    def _maybe_fix_docker_daemon() -> None:
+        desired = {'bridge': 'none', 'iptables': False}
+        # Best-effort merge with existing daemon.json if readable.
+        existing: dict[str, Any] = {}
+        try:
+            code, out, err = _exec_ssh_command(remote_client, "sh -c 'timeout 5s cat /etc/docker/daemon.json 2>/dev/null || true'", timeout=10.0)
+            text = (out or '').strip()
+            if text:
+                try:
+                    existing = json.loads(text)
+                except Exception:
+                    existing = {}
+        except Exception:
+            existing = {}
+        merged = dict(existing) if isinstance(existing, dict) else {}
+        merged.update(desired)
+        payload = json.dumps(merged, indent=2, sort_keys=True) + "\n"
+        tmp_local = None
+        remote_tmp = None
+        try:
+            import tempfile
+
+            with tempfile.NamedTemporaryFile('w', delete=False, encoding='utf-8') as tf:
+                tf.write(payload)
+                tmp_local = tf.name
+            remote_tmp = _upload_file_to_core_host(core_cfg, tmp_local, remote_dir='/tmp/core-topo-gen/uploads')
+            try:
+                log_f.write(f"{log_prefix}Uploaded docker daemon.json to {remote_tmp}\n")
+            except Exception:
+                pass
+            # Install into /etc/docker/daemon.json with sudo.
+            try:
+                log_f.write(f"{log_prefix}Installing docker daemon config to /etc/docker/daemon.json (sudo)…\n")
+            except Exception:
+                pass
+            # Some images don't have /etc/docker pre-created.
+            exit_code, _out, err = _exec_sudo("install -d -m 0755 /etc/docker", timeout=15.0, stage='docker.etcdir')
+            if exit_code != 0:
+                err_lower = (err or '').lower()
+                if (not core_cfg.get('ssh_password')) and ('password' in err_lower or 'sudo' in err_lower):
+                    raise RuntimeError('Fix docker daemon failed: sudo requires a password (none provided).')
+                raise RuntimeError('Fix docker daemon failed: could not create /etc/docker')
+            exit_code, _out, err = _exec_sudo(f"install -m 0644 {shlex.quote(remote_tmp)} /etc/docker/daemon.json", timeout=20.0, stage='docker.daemon.json')
+            if exit_code != 0:
+                err_lower = (err or '').lower()
+                if (not core_cfg.get('ssh_password')) and ('password' in err_lower or 'sudo' in err_lower):
+                    raise RuntimeError('Fix docker daemon failed: sudo requires a password (none provided).')
+                raise RuntimeError('Fix docker daemon failed: could not write /etc/docker/daemon.json')
+            try:
+                log_f.write(f"{log_prefix}Wrote /etc/docker/daemon.json successfully.\n")
+            except Exception:
+                pass
+            # Verify file exists and is readable.
+            _exec_sudo("ls -l /etc/docker/daemon.json", timeout=10.0, stage='docker.daemon.json.verify')
+            # Restart docker so changes take effect.
+            try:
+                log_f.write(f"{log_prefix}Restarting docker daemon (sudo systemctl restart docker)…\n")
+            except Exception:
+                pass
+            # Capture systemd service info (best-effort) so we can verify a real restart.
+            show_cmd = "systemctl show docker -p MainPID -p ActiveEnterTimestampMonotonic -p SubState --no-pager"
+            show_cmd_alt = "systemctl show docker.service -p MainPID -p ActiveEnterTimestampMonotonic -p SubState --no-pager"
+            show_before = None
+            try:
+                rc_show, out_show, _err_show = _exec_sudo(show_cmd, timeout=15.0, stage='docker.show.before')
+                if rc_show != 0:
+                    rc_show, out_show, _err_show = _exec_sudo(show_cmd_alt, timeout=15.0, stage='docker.show.before')
+                show_before = (out_show or '').strip() or None
+            except Exception:
+                show_before = None
+            rc, _o, _e = _exec_sudo("systemctl restart docker", timeout=35.0, stage='docker.restart')
+            if rc != 0:
+                try:
+                    log_f.write(f"{log_prefix}systemctl restart docker failed; trying: sudo service docker restart…\n")
+                except Exception:
+                    pass
+                rc2, _o2, _e2 = _exec_sudo("service docker restart", timeout=35.0, stage='docker.restart')
+                if rc2 != 0:
+                    raise RuntimeError('Fix docker daemon failed: docker restart did not succeed')
+            else:
+                # Some systems require the explicit unit name.
+                show_after = None
+                try:
+                    rc_show2, out_show2, _err_show2 = _exec_sudo(show_cmd, timeout=15.0, stage='docker.show.after')
+                    if rc_show2 != 0:
+                        rc_show2, out_show2, _err_show2 = _exec_sudo(show_cmd_alt, timeout=15.0, stage='docker.show.after')
+                    show_after = (out_show2 or '').strip() or None
+                except Exception:
+                    show_after = None
+                try:
+                    if show_before and show_after and show_before == show_after:
+                        log_f.write(f"{log_prefix}NOTE: docker systemd service metadata unchanged after restart; retrying with docker.service…\n")
+                        _exec_sudo("systemctl restart docker.service", timeout=35.0, stage='docker.restart')
+                        _exec_sudo(show_cmd_alt, timeout=15.0, stage='docker.show.after')
+                except Exception:
+                    pass
+            rc3, out3, err3 = _exec_sudo("systemctl is-active docker", timeout=15.0, stage='docker.is-active')
+            try:
+                status = (out3 or '').strip() or (err3 or '').strip() or f"(exit={rc3})"
+                log_f.write(f"{log_prefix}docker service status: {status}\n")
+            except Exception:
+                pass
+        finally:
+            try:
+                if tmp_local and os.path.exists(tmp_local):
+                    os.remove(tmp_local)
+            except Exception:
+                pass
+            try:
+                if remote_tmp:
+                    _remove_remote_file(core_cfg, remote_tmp)
+            except Exception:
+                pass
+
+    def _maybe_core_cleanup() -> None:
+        # Prefer system-provided core-cleanup if available; otherwise do a safe stale /tmp/pycore.* purge.
+        try:
+            code, out, err = _exec_ssh_command(remote_client, "sh -c 'command -v core-cleanup >/dev/null 2>&1; echo $?'", timeout=10.0)
+            has_core_cleanup = (out or '').strip() == '0'
+        except Exception:
+            has_core_cleanup = False
+        if has_core_cleanup:
+            exit_code, _out, err = _exec_sudo('core-cleanup', timeout=60.0, stage='core.cleanup')
+            if exit_code != 0:
+                err_lower = (err or '').lower()
+                if (not core_cfg.get('ssh_password')) and ('password' in err_lower or 'sudo' in err_lower):
+                    raise RuntimeError('core-cleanup failed: sudo requires a password (none provided).')
+                raise RuntimeError('core-cleanup failed')
+            return
+        # Fallback: remove stale pycore directories not in active session ids.
+        try:
+            sessions = _list_active_core_sessions(core_host, core_port, core_cfg, errors=[], meta={})
+        except Exception:
+            sessions = []
+        active_ids: set[int] = set()
+        for entry in sessions:
+            try:
+                sid = entry.get('id')
+                if sid is None:
+                    continue
+                active_ids.add(int(str(sid).strip()))
+            except Exception:
+                continue
+        active_json = json.dumps(sorted(active_ids))
+        cleanup_cmd = (
+            "python3 - <<'PY'\n"
+            "import os, json, glob, shutil, time\n"
+            "active=set(json.loads(os.environ.get('ACTIVE_IDS','[]')))\n"
+            "removed=[]\nkept=[]\nnow=time.time()\n"
+            "for p in glob.glob('/tmp/pycore.*'):\n"
+            "  base=os.path.basename(p)\n"
+            "  try: sid=int(base.split('.')[-1])\n"
+            "  except Exception: kept.append(p); continue\n"
+            "  if sid in active: kept.append(p); continue\n"
+            "  try: age=now-os.stat(p).st_mtime\n"
+            "  except Exception: age=999\n"
+            "  if age < 30: kept.append(p); continue\n"
+            "  try: shutil.rmtree(p); removed.append(p)\n"
+            "  except Exception: kept.append(p)\n"
+            "print(json.dumps({'removed':removed,'kept':kept,'active_session_ids':sorted(active)}))\n"
+            "PY"
+        )
+        shell_cmd = f"ACTIVE_IDS={shlex.quote(active_json)} {cleanup_cmd}"
+        code, out, err = _exec_ssh_command(
+            remote_client,
+            f"sh -c {shlex.quote(shell_cmd)}",
+            timeout=25.0,
+        )
+        try:
+            log_f.write(f"{log_prefix}pycore cleanup result: {(out or err or '').strip()}\n")
+        except Exception:
+            pass
+
+    def _maybe_restart_core_daemon() -> None:
+        exit_code, _out, err = _exec_sudo('systemctl restart core-daemon', timeout=30.0, stage='core-daemon.restart')
+        if exit_code != 0:
+            err_lower = (err or '').lower()
+            if (not core_cfg.get('ssh_password')) and ('password' in err_lower or 'sudo' in err_lower):
+                raise CoreDaemonMissingError(
+                    'Restart core-daemon failed: sudo requires a password (none provided).',
+                    can_auto_start=False,
+                    start_command='sudo systemctl restart core-daemon',
+                )
+            raise CoreDaemonMissingError(
+                'Restart core-daemon failed.',
+                can_auto_start=False,
+                start_command='sudo systemctl restart core-daemon',
+            )
+
+    def _maybe_kill_active_sessions() -> tuple[list[int], list[str]]:
+        deleted: list[int] = []
+        errors: list[str] = []
+        try:
+            sessions = _list_active_core_sessions(core_host, core_port, core_cfg, errors=[], meta={})
+        except Exception as exc:
+            errors.append(f"Failed listing active CORE sessions: {exc}")
+            return deleted, errors
+        ids: list[int] = []
+        for entry in sessions:
+            sid = entry.get('id')
+            if sid in (None, ''):
+                continue
+            try:
+                ids.append(int(str(sid).strip()))
+            except Exception:
+                continue
+        seen: set[int] = set()
+        ordered: list[int] = []
+        for sid in ids:
+            if sid in seen:
+                continue
+            seen.add(sid)
+            ordered.append(sid)
+        for sid in ordered:
+            try:
+                _execute_remote_core_session_action(core_cfg, 'delete', sid, logger=app.logger)
+                deleted.append(sid)
+            except Exception as exc:
+                errors.append(f"Failed deleting session {sid}: {exc}")
+        return deleted, errors
     try:
         log_f.write(f"{log_prefix}=== CORE services startup (core-daemon) ===\n")
         _write_sse_marker(
@@ -11455,6 +13609,62 @@ def run_cli_async():
     except Exception:
         pass
     try:
+        # Execute advanced pre-flight actions (remote only)
+        try:
+            log_f.write(
+                f"{log_prefix}Advanced options received: "
+                f"fix_docker_daemon={adv_fix_docker_daemon} "
+                f"run_core_cleanup={adv_run_core_cleanup} "
+                f"check_core_version={adv_check_core_version} "
+                f"restart_core_daemon={adv_restart_core_daemon} "
+                f"auto_kill_sessions={adv_auto_kill_sessions}\n"
+            )
+        except Exception:
+            pass
+        if adv_check_core_version:
+            try:
+                log_f.write(f"{log_prefix}=== Advanced: Check CORE version (expected 9.2.1) ===\n")
+            except Exception:
+                pass
+            _check_core_version('9.2.1')
+            try:
+                log_f.write(f"{log_prefix}CORE version check passed.\n")
+            except Exception:
+                pass
+
+        if adv_fix_docker_daemon:
+            try:
+                log_f.write(f"{log_prefix}=== Advanced: Fix docker daemon for CORE ===\n")
+            except Exception:
+                pass
+            _maybe_fix_docker_daemon()
+            try:
+                log_f.write(f"{log_prefix}Docker daemon.json updated and docker restarted.\n")
+            except Exception:
+                pass
+
+        if adv_run_core_cleanup:
+            try:
+                log_f.write(f"{log_prefix}=== Advanced: Run core cleanup ===\n")
+            except Exception:
+                pass
+            _maybe_core_cleanup()
+            try:
+                log_f.write(f"{log_prefix}CORE cleanup complete.\n")
+            except Exception:
+                pass
+
+        if adv_restart_core_daemon:
+            try:
+                log_f.write(f"{log_prefix}=== Advanced: Restart core-daemon ===\n")
+            except Exception:
+                pass
+            _maybe_restart_core_daemon()
+            try:
+                log_f.write(f"{log_prefix}core-daemon restart requested.\n")
+            except Exception:
+                pass
+
         try:
             _write_sse_marker(
                 log_f,
@@ -11515,6 +13725,63 @@ def run_cli_async():
             "start_command": getattr(exc, 'start_command', CORE_DAEMON_START_COMMAND),
         }
         return jsonify(payload), status
+
+    # Advanced: kill active sessions (if requested). This is done after core-daemon is confirmed,
+    # to maximize chances that gRPC session deletion works.
+    if adv_auto_kill_sessions:
+        try:
+            log_f.write(f"{log_prefix}=== Advanced: Auto-kill any running sessions ===\n")
+        except Exception:
+            pass
+        deleted_ids, kill_errors = _maybe_kill_active_sessions()
+        try:
+            if deleted_ids:
+                log_f.write(f"{log_prefix}Deleted sessions: {', '.join(str(x) for x in deleted_ids)}\n")
+            else:
+                log_f.write(f"{log_prefix}No sessions deleted.\n")
+            for err in kill_errors:
+                log_f.write(f"{log_prefix}{err}\n")
+        except Exception:
+            pass
+        # Re-check session conflicts.
+        blocking_sessions = _collect_blocking_sessions()
+        if blocking_sessions:
+            count = len(blocking_sessions)
+            message = (
+                f"CORE VM {remote_desc} still has {count} active session(s); cannot start another session."
+            )
+            try:
+                log_f.write(f"{log_prefix}{message}\n")
+            except Exception:
+                pass
+            try:
+                remote_client.close()
+            except Exception:
+                pass
+            try:
+                log_f.close()
+            except Exception:
+                pass
+            _close_async_run_tunnel({'ssh_tunnel': ssh_tunnel})
+            payload = {
+                "error": message,
+                "session_count": count,
+                "core_host": core_host,
+                "core_port": core_port,
+                "deleted": deleted_ids,
+                "errors": kill_errors,
+                "active_sessions": [
+                    {
+                        "id": entry.get('id'),
+                        "state": entry.get('state'),
+                        "nodes": entry.get('nodes'),
+                        "file": entry.get('file'),
+                    }
+                    for entry in blocking_sessions[:5]
+                ],
+            }
+            return jsonify(payload), 423
+
     try:
         remote_ctx = _prepare_remote_cli_context(
             client=remote_client,
@@ -11808,6 +14075,19 @@ def run_cli_async():
                             scenario_label = None
                     if sid:
                         _record_session_mapping(xml_path_local, sid, scenario_label)
+                        try:
+                            sid_int = int(str(sid).strip())
+                            cfg_for_meta = meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None
+                            if cfg_for_meta:
+                                _write_remote_session_scenario_meta(
+                                    cfg_for_meta,
+                                    session_id=sid_int,
+                                    scenario_name=scenario_label,
+                                    scenario_xml_basename=os.path.basename(xml_path_local or '') or None,
+                                    logger=app.logger,
+                                )
+                        except Exception:
+                            pass
                     cfg_for_post = meta.get('core_cfg') or {
                         'host': meta.get('core_host') or CORE_HOST,
                         'port': meta.get('core_port') or CORE_PORT,
@@ -11955,6 +14235,19 @@ def run_status(run_id: str):
                                 scenario_label = None
                         if sid:
                             _record_session_mapping(xml_path_local, sid, scenario_label)
+                            try:
+                                sid_int = int(str(sid).strip())
+                                cfg_for_meta = meta.get('core_cfg') if isinstance(meta.get('core_cfg'), dict) else None
+                                if cfg_for_meta:
+                                    _write_remote_session_scenario_meta(
+                                        cfg_for_meta,
+                                        session_id=sid_int,
+                                        scenario_name=scenario_label,
+                                        scenario_xml_basename=os.path.basename(xml_path_local or '') or None,
+                                        logger=app.logger,
+                                    )
+                            except Exception:
+                                pass
                         cfg_for_post = meta.get('core_cfg') or {
                             'host': meta.get('core_host') or CORE_HOST,
                             'port': meta.get('core_port') or CORE_PORT,
@@ -12182,6 +14475,47 @@ def _session_store_entry_scenario_norm(value: Any) -> str:
     return _normalize_scenario_label(raw)
 
 
+def _session_store_entry_updated_at_epoch(value: Any) -> Optional[float]:
+    """Best-effort parse of mapping update time.
+
+    Stored as ISO8601 (usually with trailing 'Z'). Returns epoch seconds.
+    """
+    if not isinstance(value, dict):
+        return None
+    raw = value.get('updated_at') or value.get('recorded_at') or value.get('ts')
+    if not raw:
+        return None
+    try:
+        text = str(raw).strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        # Accept both explicit Z and +00:00 offsets.
+        if text.endswith('Z'):
+            text = text[:-1] + '+00:00'
+        dt = datetime.datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _safe_path_mtime_epoch(path_value: Any) -> Optional[float]:
+    if not path_value:
+        return None
+    try:
+        ap = os.path.abspath(str(path_value))
+    except Exception:
+        ap = str(path_value)
+    try:
+        return os.path.getmtime(ap)
+    except Exception:
+        return None
+
+
 def _save_core_sessions_store(d: dict) -> None:
     try:
         os.makedirs(os.path.dirname(_core_sessions_store_path()), exist_ok=True)
@@ -12193,11 +14527,119 @@ def _save_core_sessions_store(d: dict) -> None:
         pass
 
 
+def _session_store_entry_core_host(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ''
+    raw = value.get('core_host') or value.get('host')
+    return str(raw).strip() if raw not in (None, '') else ''
+
+
+def _session_store_entry_core_port(value: Any) -> Optional[int]:
+    if not isinstance(value, dict):
+        return None
+    raw = value.get('core_port') or value.get('port')
+    if raw in (None, ''):
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _session_store_entry_matches_core(value: Any, host: str, port: int) -> bool:
+    """True when the mapping entry belongs to the given CORE daemon."""
+    entry_host = _session_store_entry_core_host(value)
+    entry_port = _session_store_entry_core_port(value)
+    if entry_host and entry_port is not None:
+        return (entry_host == str(host).strip()) and (int(entry_port) == int(port))
+    # Legacy entries without core_host/core_port are treated as non-matching to avoid
+    # cross-VM session-id collisions.
+    return False
+
+
+def _migrate_core_sessions_store_with_core_targets(store: dict, history: list[dict]) -> dict:
+    """Best-effort: tag legacy core_sessions.json entries with core_host/core_port.
+
+    We use the stored scenario_norm to look up that scenario's CORE host/port from run history.
+    """
+    if not isinstance(store, dict) or not store:
+        return store
+    if not isinstance(history, list) or not history:
+        return store
+
+    # Build scenario_norm -> (core_host, core_port) map.
+    scenario_to_core: dict[str, tuple[str, int]] = {}
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        scen = (entry.get('scenario_name') or '').strip()
+        norm = _normalize_scenario_label(scen)
+        if not norm or norm in scenario_to_core:
+            continue
+        try:
+            cfg = _select_core_config_for_page(norm, history, include_password=False)
+            chost = str(cfg.get('host') or CORE_HOST).strip()
+            cport = int(cfg.get('port') or CORE_PORT)
+            scenario_to_core[norm] = (chost, cport)
+        except Exception:
+            continue
+
+    dirty = False
+    migrated = dict(store)
+    for path, value in migrated.items():
+        if not isinstance(value, dict):
+            continue
+        # Add a best-effort timestamp for older entries so "latest mapping" selection
+        # behaves sensibly even when keys are reused across runs.
+        if not value.get('updated_at'):
+            mt = _safe_path_mtime_epoch(path)
+            if mt is not None:
+                try:
+                    value['updated_at'] = datetime.datetime.fromtimestamp(
+                        mt,
+                        tz=datetime.timezone.utc,
+                    ).isoformat().replace('+00:00', 'Z')
+                    dirty = True
+                except Exception:
+                    pass
+        if _session_store_entry_core_host(value) and (_session_store_entry_core_port(value) is not None):
+            continue
+        norm = _session_store_entry_scenario_norm(value)
+        if not norm:
+            continue
+        target = scenario_to_core.get(norm)
+        if not target:
+            continue
+        chost, cport = target
+        value['core_host'] = chost
+        value['core_port'] = int(cport)
+        dirty = True
+
+    if dirty:
+        try:
+            _save_core_sessions_store(migrated)
+        except Exception:
+            pass
+    return migrated
+
+
+def _filter_core_sessions_store_for_core(store: dict, host: str, port: int) -> dict:
+    if not isinstance(store, dict) or not store:
+        return {}
+    filtered: dict = {}
+    for path, value in store.items():
+        if _session_store_entry_matches_core(value, host, port):
+            filtered[path] = value
+    return filtered
+
+
 def _update_xml_session_mapping(
     xml_path: str,
     session_id: int | None,
     *,
     scenario_name: Optional[str] = None,
+    core_host: Optional[str] = None,
+    core_port: Optional[int] = None,
 ) -> None:
     try:
         store = _load_core_sessions_store()
@@ -12208,11 +14650,22 @@ def _update_xml_session_mapping(
         else:
             scenario_label = (scenario_name or '').strip()
             entry: dict[str, Any] = {'session_id': int(session_id)}
+            try:
+                entry['updated_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+            except Exception:
+                pass
             scenario_norm = _normalize_scenario_label(scenario_label)
             if scenario_norm:
                 entry['scenario_norm'] = scenario_norm
             if scenario_label:
                 entry['scenario_name'] = scenario_label
+            if core_host not in (None, ''):
+                entry['core_host'] = str(core_host).strip()
+            if core_port is not None:
+                try:
+                    entry['core_port'] = int(core_port)
+                except Exception:
+                    pass
             store[key] = entry
         _save_core_sessions_store(store)
     except Exception:
@@ -12223,6 +14676,8 @@ def _record_session_mapping(
     xml_path: str | None,
     session_id: Any,
     scenario_name: Optional[str] = None,
+    core_host: Optional[str] = None,
+    core_port: Optional[int] = None,
 ) -> None:
     if not xml_path or session_id in (None, ''):
         return
@@ -12230,7 +14685,13 @@ def _record_session_mapping(
         sid_int = int(str(session_id).strip())
     except Exception:
         return
-    _update_xml_session_mapping(xml_path, sid_int, scenario_name=scenario_name)
+    _update_xml_session_mapping(
+        xml_path,
+        sid_int,
+        scenario_name=scenario_name,
+        core_host=core_host,
+        core_port=core_port,
+    )
 
 
 def _list_active_core_sessions(
@@ -12252,17 +14713,65 @@ def _list_active_core_sessions(
             state = entry.get('state')
             file_path = entry.get('file')
             sess_dir = entry.get('dir')
-            if (not file_path) and sid is not None:
+            # If remote session doesn't provide a usable file path *and* we don't even
+            # have a session directory hint, fall back to our local store mapping.
+            # Prefer paths under outputs/core-sessions (gRPC save_xml exports) when present.
+            if (not file_path) and (not sess_dir) and sid is not None:
                 try:
                     store_map = _load_core_sessions_store()
+                    outputs_root = _outputs_dir()
+                    preferred_prefix = os.path.join(outputs_root, 'core-sessions')
+                    best_path: Optional[str] = None
+                    best_ts: Optional[float] = None
+                    best_is_preferred = False
+                    legacy_candidates: list[str] = []
                     for pth, stored_entry in store_map.items():
                         try:
                             stored_sid = _session_store_entry_session_id(stored_entry)
-                            if stored_sid is not None and int(stored_sid) == int(sid):
-                                file_path = pth
-                                break
+                            if stored_sid is None or int(stored_sid) != int(sid):
+                                continue
+                            # Prefer exact CORE host/port match.
+                            if not _session_store_entry_matches_core(stored_entry, host, port):
+                                # Legacy entries without core_host/core_port are ambiguous across CORE VMs.
+                                if (not _session_store_entry_core_host(stored_entry)) and (
+                                    _session_store_entry_core_port(stored_entry) is None
+                                ):
+                                    legacy_candidates.append(pth)
+                                continue
+
+                            ts = _session_store_entry_updated_at_epoch(stored_entry)
+                            if ts is None:
+                                ts = _safe_path_mtime_epoch(pth)
+                            if ts is None:
+                                ts = 0.0
+
+                            is_preferred = False
+                            try:
+                                ap = os.path.abspath(str(pth))
+                            except Exception:
+                                ap = str(pth)
+                            try:
+                                is_preferred = bool(ap and preferred_prefix and ap.startswith(preferred_prefix + os.sep))
+                            except Exception:
+                                is_preferred = False
+
+                            if best_path is None:
+                                best_path, best_ts, best_is_preferred = pth, ts, is_preferred
+                                continue
+
+                            # Prefer core-sessions exports over any other mapping path.
+                            if is_preferred and (not best_is_preferred):
+                                best_path, best_ts, best_is_preferred = pth, ts, True
+                                continue
+                            if is_preferred == best_is_preferred:
+                                if best_ts is None or ts >= best_ts:
+                                    best_path, best_ts = pth, ts
                         except Exception:
                             continue
+                    if best_path:
+                        file_path = best_path
+                    elif len(legacy_candidates) == 1:
+                        file_path = legacy_candidates[0]
                 except Exception:
                     pass
             if (not file_path) and sess_dir and os.path.isdir(sess_dir):
@@ -12280,6 +14789,7 @@ def _list_active_core_sessions(
                 'nodes': nodes_count if nodes_count is not None else None,
                 'file': file_path,
                 'dir': sess_dir,
+                'filename': None,
             })
         except Exception:
             logger.exception('[core.grpc] Failed processing remote session entry: %s', entry)
@@ -12381,11 +14891,18 @@ def _hitl_details_from_path(xml_path: str) -> list[dict[str, Any]]:
     hitl_details: list[dict[str, Any]] = []
     try:
         summary = _analyze_core_xml(abs_path)
+        nodes_summary = summary.get('nodes') or []
+        has_rj45 = any(
+            isinstance(node, dict) and str(node.get('type') or '').strip().lower() == 'rj45'
+            for node in nodes_summary
+        )
+        has_hitl_nodes = bool(summary.get('hitl_nodes') or [])
+        has_explicit_hitl_indicator = has_rj45 or has_hitl_nodes
         # Prefer the gateway/router-side interface IP for the RJ45 attachment.
         # Our generated scenarios name that interface "hitl<idx>", so we can reliably
         # pick only the gateway IP (not router uplinks or the RJ45 node IP).
         gateway_preferred: list[dict[str, Any]] = []
-        for node in summary.get('nodes') or []:
+        for node in nodes_summary:
             if not isinstance(node, dict):
                 continue
             node_type = (node.get('type') or '').strip()
@@ -12398,38 +14915,26 @@ def _hitl_details_from_path(xml_path: str) -> list[dict[str, Any]]:
             name = (node.get('name') or node.get('id') or '').strip()
             gateway_preferred.append({'name': name or 'HITL gateway', 'type': node_type, 'ips': ips[:1]})
 
-        if gateway_preferred:
+        # Only accept hitl* router interfaces as HITL if there is an explicit HITL indicator
+        # in the XML analysis (e.g., an RJ45/external node or analyzer-provided hitl_nodes).
+        if gateway_preferred and has_explicit_hitl_indicator:
             hitl_details = gateway_preferred
         else:
-            # Fallback for legacy XMLs without the hitl* interface naming:
-            # show RJ45 node IPs if present, otherwise show whatever HITL-like nodes exist.
-            rj45_fallback: list[dict[str, Any]] = []
-            for node in summary.get('nodes') or []:
+            # Legacy fallback: rely on explicit HITL nodes from the analyzer.
+            # Avoid inferring HITL from RJ45 nodes, as some sessions include RJ45-like
+            # devices even when HITL is not configured.
+            nodes = summary.get('hitl_nodes') or []
+            for node in nodes:
                 if not isinstance(node, dict):
                     continue
-                node_type_lower = (node.get('type') or '').strip().lower()
-                if 'rj45' not in node_type_lower and 'rj-45' not in node_type_lower:
-                    continue
-                ips = _force_ipv4_prefixlen(_collect_node_ips(node), prefixlen='24')
-                if not ips:
-                    continue
                 name = (node.get('name') or node.get('id') or '').strip()
-                rj45_fallback.append({'name': name or 'RJ45', 'type': node.get('type') or 'rj45', 'ips': ips[:1]})
-            if rj45_fallback:
-                hitl_details = rj45_fallback
-            else:
-                nodes = summary.get('hitl_nodes') or []
-                for node in nodes:
-                    if not isinstance(node, dict):
-                        continue
-                    name = (node.get('name') or node.get('id') or '').strip()
-                    node_type = (node.get('type') or '').strip()
-                    ips = _force_ipv4_prefixlen(_collect_node_ips(node), prefixlen="24")
-                    hitl_details.append({
-                        'name': name or node_type or 'HITL',
-                        'type': node_type,
-                        'ips': ips,
-                    })
+                node_type = (node.get('type') or '').strip()
+                ips = _force_ipv4_prefixlen(_collect_node_ips(node), prefixlen="24")
+                hitl_details.append({
+                    'name': name or node_type or 'HITL',
+                    'type': node_type,
+                    'ips': ips,
+                })
     except Exception:
         hitl_details = []
     _SESSION_HITL_CACHE[abs_path] = {'mtime': mtime, 'data': hitl_details}
@@ -12444,7 +14949,18 @@ def _session_hitl_metadata(
 ) -> list[dict[str, Any]]:
     candidate_paths: list[str] = []
     file_path = session.get('file')
+    # If the session already points at an existing XML, treat it as authoritative.
+    # Avoid falling back to session-id-based store lookups which can be stale when
+    # CORE session IDs are reused.
     if file_path:
+        try:
+            fp = str(file_path)
+            if os.path.exists(fp):
+                details = _hitl_details_from_path(fp)
+                session['_hitl_source'] = 'session.file'
+                return details
+        except Exception:
+            pass
         candidate_paths.append(str(file_path))
     store = session_store if isinstance(session_store, dict) else _load_core_sessions_store()
     sid = session.get('id')
@@ -12454,11 +14970,63 @@ def _session_hitl_metadata(
             sid_int = int(sid)
         except Exception:
             sid_int = None
-        if sid_int is not None and isinstance(store, dict):
-            for path, stored in store.items():
-                if _session_store_entry_session_id(stored) == sid_int:
-                    candidate_paths.append(path)
-                    break
+
+    # If the session has a file path but it's not accessible locally, prefer fetching
+    # the current session XML via gRPC (when allowed) before consulting any stored
+    # mappings by session id.
+    if core_cfg and sid_int is not None and file_path:
+        try:
+            fp = str(file_path)
+            if fp and (not os.path.exists(fp)):
+                try:
+                    out_dir = os.path.join(_outputs_dir(), 'core-sessions')
+                except Exception:
+                    out_dir = _outputs_dir()
+                saved = _grpc_save_current_session_xml_with_config(core_cfg, out_dir, session_id=str(sid_int))
+                if saved and os.path.exists(saved):
+                    try:
+                        _update_xml_session_mapping(
+                            saved,
+                            sid_int,
+                            scenario_name=session.get('scenario_name') or None,
+                            core_host=core_cfg.get('host', CORE_HOST) if isinstance(core_cfg, dict) else None,
+                            core_port=core_cfg.get('port', CORE_PORT) if isinstance(core_cfg, dict) else None,
+                        )
+                    except Exception:
+                        pass
+                    session['file'] = saved
+                    session['_hitl_source'] = 'grpc.save_xml'
+                    return _hitl_details_from_path(saved)
+        except Exception:
+            pass
+
+    if sid_int is not None and isinstance(store, dict):
+        matches: list[str] = []
+        for path, stored in store.items():
+            if _session_store_entry_session_id(stored) == sid_int:
+                matches.append(path)
+        if matches:
+            # Prefer the most recently modified existing file when multiple paths map to the same session id.
+            best = None
+            best_mtime = -1.0
+            for p in matches:
+                if not p:
+                    continue
+                try:
+                    ap = os.path.abspath(str(p))
+                except Exception:
+                    ap = str(p)
+                try:
+                    if not os.path.exists(ap):
+                        continue
+                    mt = os.path.getmtime(ap)
+                except Exception:
+                    mt = -1.0
+                if mt > best_mtime:
+                    best_mtime = mt
+                    best = ap
+            if best:
+                candidate_paths.append(best)
     seen: set[str] = set()
     for path in candidate_paths:
         if not path:
@@ -12475,8 +15043,10 @@ def _session_hitl_metadata(
         details = _hitl_details_from_path(abs_path)
         if details:
             try:
+                # Only set a file path if the session didn't already have one.
+                # Avoid overwriting a remote CORE VM path with a stale local store path.
                 existing_file = session.get('file')
-                if not existing_file or not os.path.exists(existing_file):
+                if not existing_file:
                     session['file'] = abs_path
             except Exception:
                 pass
@@ -12492,13 +15062,18 @@ def _session_hitl_metadata(
             saved = None
         if saved and os.path.exists(saved):
             try:
-                _update_xml_session_mapping(saved, sid_int, scenario_name=session.get('scenario_name') or None)
+                _update_xml_session_mapping(
+                    saved,
+                    sid_int,
+                    scenario_name=session.get('scenario_name') or None,
+                    core_host=core_cfg.get('host', CORE_HOST) if isinstance(core_cfg, dict) else None,
+                    core_port=core_cfg.get('port', CORE_PORT) if isinstance(core_cfg, dict) else None,
+                )
             except Exception:
                 pass
             try:
-                existing_file = session.get('file')
-                if not existing_file:
-                    session['file'] = saved
+                # Prefer showing the fetched local XML path for details/debugging.
+                session['file'] = saved
             except Exception:
                 pass
             return _hitl_details_from_path(saved)
@@ -12593,8 +15168,9 @@ def _attach_hitl_metadata_to_sessions(
     core_cfg: Optional[Dict[str, Any]] = None,
     *,
     allow_remote_fetch: bool = False,
+    session_store: Optional[Dict[str, Any]] = None,
 ) -> None:
-    store = _load_core_sessions_store()
+    store = session_store if session_store is not None else _load_core_sessions_store()
     cfg = core_cfg if allow_remote_fetch else None
     for sess in sessions:
         sess['hitl'] = _session_hitl_metadata(sess, core_cfg=cfg, session_store=store)
@@ -12657,6 +15233,10 @@ def core_page():
     scenario_participant_urls = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
     scenario_query = request.args.get('scenario', '').strip()
     scenario_norm = _normalize_scenario_label(scenario_query)
+    # Enforce per-scenario view: default to the first available scenario when unset/invalid.
+    if scenario_names:
+        if not scenario_norm or not any(_normalize_scenario_label(n) == scenario_norm for n in scenario_names):
+            scenario_norm = _normalize_scenario_label(scenario_names[0])
     active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
     core_cfg = _select_core_config_for_page(scenario_norm, history, include_password=True)
     core_cfg = _ensure_core_vm_metadata(core_cfg)
@@ -12680,8 +15260,10 @@ def core_page():
     app.logger.info('[core.page] session_count=%d', len(sessions))
     # Known XMLs
     xmls = _scan_core_xmls()
-    # Map running by file path, with fallback to local store
+    # Map running by file path, with fallback to local store. Scope by CORE VM.
     mapping = _load_core_sessions_store()
+    mapping = _migrate_core_sessions_store_with_core_targets(mapping, history)
+    mapping = _filter_core_sessions_store_for_core(mapping, host, port)
     session_label_map = _build_session_scenario_labels(mapping, scenario_names, scenario_paths)
     scenario_session_ids = _session_ids_for_scenario(mapping, scenario_norm, scenario_paths) if scenario_norm else set()
     _annotate_sessions_with_scenarios(
@@ -12703,7 +15285,56 @@ def core_page():
             xmls = filtered_xmls
         else:
             app.logger.info('[core.page] scenario=%s produced no XML matches; showing all XMLs', scenario_norm)
-    _attach_hitl_metadata_to_sessions(sessions, core_cfg, allow_remote_fetch=False)
+    # Provide desired display filenames for the UI: <scenario-name><timestamp>.xml.
+    # For pycore sessions, the CORE-VM session-meta is the authoritative scenario source.
+    try:
+        all_sids: list[int] = []
+        for s in sessions:
+            try:
+                sid = s.get('id')
+                if sid in (None, ''):
+                    continue
+                all_sids.append(int(sid))
+            except Exception:
+                continue
+        meta_by_sid = _read_remote_session_scenario_meta_bulk(core_cfg, session_ids=all_sids, logger=app.logger) if all_sids else {}
+    except Exception:
+        meta_by_sid = {}
+
+    for s in sessions:
+        try:
+            sid = s.get('id')
+            sid_int = int(sid) if sid not in (None, '') else None
+        except Exception:
+            sid_int = None
+
+        # Prefer meta scenario label when present.
+        if sid_int is not None:
+            try:
+                meta = meta_by_sid.get(sid_int) or {}
+                meta_label = (meta.get('scenario_name') or '').strip() if isinstance(meta, dict) else ''
+                if meta_label:
+                    s['scenario_name'] = meta_label
+            except Exception:
+                pass
+
+        try:
+            scen = (s.get('scenario_name') or '').strip() or active_scenario or ''
+            ts_epoch = None
+            if sid_int is not None:
+                try:
+                    meta = meta_by_sid.get(sid_int) or {}
+                    if isinstance(meta, dict) and meta.get('written_at_epoch') not in (None, ''):
+                        ts_epoch = float(meta.get('written_at_epoch'))
+                except Exception:
+                    ts_epoch = None
+            if ts_epoch is None and sid_int is not None:
+                ts_epoch = _session_store_updated_at_for_session_id(mapping, sid_int, host=host, port=port)
+            s['filename'] = _scenario_timestamped_filename(scen or None, ts_epoch)
+        except Exception:
+            pass
+
+    _attach_hitl_metadata_to_sessions(sessions, core_cfg, allow_remote_fetch=False, session_store=mapping)
     _attach_participant_urls_to_sessions(sessions, mapping, scenario_paths, scenario_participant_urls)
     file_to_sid: dict[str, int] = {}
     # From gRPC session summaries (file path may be absolute)
@@ -12747,10 +15378,16 @@ def core_data():
     scenario_participant_urls = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
     scenario_query = request.args.get('scenario', '').strip()
     scenario_norm = _normalize_scenario_label(scenario_query)
+    # Enforce per-scenario view: default to the first available scenario when unset/invalid.
+    if scenario_names:
+        if not scenario_norm or not any(_normalize_scenario_label(n) == scenario_norm for n in scenario_names):
+            scenario_norm = _normalize_scenario_label(scenario_names[0])
     scenario_display = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
     core_cfg = _select_core_config_for_page(scenario_norm, history, include_password=True)
+    core_cfg = _ensure_core_vm_metadata(core_cfg)
     host = core_cfg.get('host', CORE_HOST)
     port = int(core_cfg.get('port', CORE_PORT))
+    core_vm_configured, core_vm_summary = _build_core_vm_summary(core_cfg)
     core_errors: list[str] = []
     app.logger.info(
         '[core.data] scenario=%s host=%s:%s ssh=%s@%s:%s',
@@ -12766,8 +15403,10 @@ def core_data():
     grpc_command = session_meta.get('grpc_command')
     app.logger.info('[core.data] session_count=%d', len(sessions))
     xmls = _scan_core_xmls()
-    # annotate xmls with running/session_id best-effort mapping, as in core_page
+    # annotate xmls with running/session_id best-effort mapping, as in core_page. Scope by CORE VM.
     mapping = _load_core_sessions_store()
+    mapping = _migrate_core_sessions_store_with_core_targets(mapping, history)
+    mapping = _filter_core_sessions_store_for_core(mapping, host, port)
     session_label_map = _build_session_scenario_labels(mapping, scenario_names, scenario_paths)
     scenario_session_ids = _session_ids_for_scenario(mapping, scenario_norm, scenario_paths) if scenario_norm else set()
     _annotate_sessions_with_scenarios(
@@ -12779,17 +15418,186 @@ def core_data():
         scenario_query,
         scenario_session_ids,
     )
+
+    # If session file/dir paths are on the CORE VM (common for webapp not running on CORE),
+    # local path-based inference is disabled. Use CORE-VM session-meta as a fallback.
+    missing_sids: list[int] = []
+    for s in sessions:
+        try:
+            scen = (s.get('scenario_name') or '').strip()
+            sid = s.get('id')
+            if sid in (None, ''):
+                continue
+            candidate_path = ''
+            try:
+                candidate_path = str(s.get('file') or s.get('dir') or '').strip()
+            except Exception:
+                candidate_path = ''
+            is_pycore = False
+            try:
+                if candidate_path.replace('\\', '/').startswith('/tmp/pycore.') or '/tmp/pycore.' in candidate_path.replace('\\', '/'):
+                    is_pycore = True
+            except Exception:
+                is_pycore = False
+            # Always try remote meta for pycore sessions because their filenames are generic.
+            if is_pycore or (not scen):
+                missing_sids.append(int(sid))
+        except Exception:
+            continue
+    remote_meta_by_sid: dict[int, dict[str, Any]] = {}
+    if missing_sids:
+        try:
+            remote_meta_by_sid = _read_remote_session_scenario_meta_bulk(core_cfg, session_ids=missing_sids, logger=app.logger)
+        except Exception:
+            remote_meta_by_sid = {}
+    if remote_meta_by_sid:
+        for s in sessions:
+            try:
+                sid = s.get('id')
+                sid_int = int(sid) if sid not in (None, '') else None
+            except Exception:
+                sid_int = None
+            if sid_int is None:
+                continue
+            try:
+                meta = remote_meta_by_sid.get(sid_int) or {}
+                label = (meta.get('scenario_name') or '').strip() if isinstance(meta, dict) else ''
+                if not label:
+                    continue
+
+                # If the session file path is remote/unavailable locally, treat the
+                # CORE-VM meta label as authoritative (it was written at session start).
+                candidate_path = ''
+                try:
+                    candidate_path = str(s.get('file') or s.get('dir') or '').strip()
+                except Exception:
+                    candidate_path = ''
+                is_remote = False
+                try:
+                    if candidate_path and (candidate_path.startswith('/tmp/pycore.') or candidate_path.startswith('\\tmp\\pycore.')):
+                        is_remote = True
+                except Exception:
+                    is_remote = False
+                if not is_remote:
+                    try:
+                        if candidate_path and (not os.path.exists(candidate_path)):
+                            is_remote = True
+                    except Exception:
+                        is_remote = True
+
+                if is_remote or (not (s.get('scenario_name') or '').strip()):
+                    s['scenario_name'] = label
+            except Exception:
+                continue
+
+    # Provide counts for *all* scenarios so the UI can indicate which scenario(s)
+    # currently have active sessions, even though this endpoint is scenario-filtered.
+    active_session_counts: dict[str, int] = {}
+    try:
+        norm_to_display: dict[str, str] = {}
+        for name in scenario_names or []:
+            try:
+                norm_to_display[_normalize_scenario_label(name)] = str(name)
+            except Exception:
+                continue
+        for s in sessions:
+            try:
+                lbl_norm = _normalize_scenario_label((s.get('scenario_name') or '').strip())
+            except Exception:
+                lbl_norm = ''
+            if not lbl_norm:
+                continue
+            disp = norm_to_display.get(lbl_norm)
+            if not disp:
+                continue
+            active_session_counts[disp] = active_session_counts.get(disp, 0) + 1
+    except Exception:
+        active_session_counts = {}
+
     if scenario_norm:
-        filtered_sessions, matched = _filter_sessions_by_scenario(sessions, scenario_norm, scenario_paths, scenario_session_ids)
-        sessions = filtered_sessions
+        # Prefer scenario_name equality when we have it (including from remote meta).
+        filtered: list[dict] = []
+        matched = False
+        for s in sessions:
+            try:
+                lbl = _normalize_scenario_label((s.get('scenario_name') or '').strip())
+            except Exception:
+                lbl = ''
+            if lbl and lbl == scenario_norm:
+                filtered.append(s)
+                matched = True
+        if not matched:
+            # Fall back to the legacy path/id-based filter only when we couldn't match by label.
+            filtered, matched = _filter_sessions_by_scenario(sessions, scenario_norm, scenario_paths, scenario_session_ids)
+        sessions = filtered
         if not matched:
             app.logger.info('[core.data] scenario=%s produced no session matches', scenario_norm)
+
+        # Finalize display label: if the session is in this scenario view by owner-id or
+        # by path, ensure the badge reflects the selected scenario. This avoids stale
+        # labels from remote CORE paths or session-meta when session IDs are reused.
+        for s in sessions:
+            try:
+                sid = s.get('id')
+                sid_int = int(sid) if sid not in (None, '') else None
+            except Exception:
+                sid_int = None
+            try:
+                is_owned = sid_int is not None and sid_int in (scenario_session_ids or set())
+            except Exception:
+                is_owned = False
+            try:
+                is_path_match = _path_matches_scenario(s.get('file'), scenario_norm, scenario_paths) or _path_matches_scenario(s.get('dir'), scenario_norm, scenario_paths)
+            except Exception:
+                is_path_match = False
+            if is_owned or is_path_match:
+                # If CORE-VM meta already supplied a scenario label, keep it.
+                try:
+                    sid = s.get('id')
+                    sid_int = int(sid) if sid not in (None, '') else None
+                except Exception:
+                    sid_int = None
+                if sid_int is not None:
+                    try:
+                        meta = remote_meta_by_sid.get(sid_int) or {}
+                        meta_label = (meta.get('scenario_name') or '').strip() if isinstance(meta, dict) else ''
+                    except Exception:
+                        meta_label = ''
+                    if meta_label:
+                        continue
+                try:
+                    s['scenario_name'] = scenario_display or s.get('scenario_name') or ''
+                except Exception:
+                    pass
         filtered_xmls, xml_matched = _filter_xmls_by_scenario(xmls, scenario_norm, scenario_paths, mapping)
         if xml_matched:
             xmls = filtered_xmls
         else:
             app.logger.info('[core.data] scenario=%s produced no XML matches; showing all XMLs', scenario_norm)
-    _attach_hitl_metadata_to_sessions(sessions, core_cfg, allow_remote_fetch=True)
+    # Provide the requested generated filename: <scenario-name><timestamp>.xml.
+    for s in sessions:
+        try:
+            sid = s.get('id')
+            sid_int = int(sid) if sid not in (None, '') else None
+        except Exception:
+            sid_int = None
+        try:
+            scen = (s.get('scenario_name') or '').strip() or scenario_display or ''
+            ts_epoch = None
+            if sid_int is not None and sid_int in remote_meta_by_sid:
+                meta = remote_meta_by_sid.get(sid_int) or {}
+                if isinstance(meta, dict) and meta.get('written_at_epoch') not in (None, ''):
+                    try:
+                        ts_epoch = float(meta.get('written_at_epoch'))
+                    except Exception:
+                        ts_epoch = None
+            if ts_epoch is None and sid_int is not None:
+                ts_epoch = _session_store_updated_at_for_session_id(mapping, sid_int, host=host, port=port)
+            s['filename'] = _scenario_timestamped_filename(scen or None, ts_epoch)
+        except Exception:
+            pass
+
+    _attach_hitl_metadata_to_sessions(sessions, core_cfg, allow_remote_fetch=True, session_store=mapping)
     _attach_participant_urls_to_sessions(sessions, mapping, scenario_paths, scenario_participant_urls)
     file_to_sid: dict[str, int] = {}
     for s in sessions:
@@ -12806,11 +15614,19 @@ def core_data():
         sid = file_to_sid.get(x['path'])
         x['session_id'] = sid
         x['running'] = sid is not None
+
+    core_modal_href = url_for('index', core_modal=1, scenario=scenario_display) if scenario_display else url_for('index', core_modal=1)
     return jsonify({
         'sessions': sessions,
         'xmls': xmls,
         'scenarios': scenario_names,
         'active_scenario': scenario_display,
+        'active_session_counts': active_session_counts,
+        'host': host,
+        'port': port,
+        'core_vm_configured': bool(core_vm_configured),
+        'core_vm_summary': core_vm_summary or {},
+        'core_modal_href': core_modal_href,
         'errors': core_errors,
         'grpc_command': grpc_command,
         'logs': _current_core_ui_logs(),
@@ -12822,11 +15638,11 @@ def core_upload():
     f = request.files.get('xml_file')
     if not f or f.filename == '':
         flash('No file selected.')
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario()
     filename = secure_filename(f.filename)
     if not filename.lower().endswith('.xml'):
         flash('Only .xml allowed.')
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario()
     dest_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'core')
     os.makedirs(dest_dir, exist_ok=True)
     unique = datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
@@ -12837,8 +15653,23 @@ def core_upload():
         try: os.remove(path)
         except Exception: pass
         flash(f'Invalid CORE XML: {errs}')
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario()
     flash('XML uploaded and validated.')
+    return _redirect_core_page_with_scenario()
+
+
+def _redirect_core_page_with_scenario(*, scenario_hint: Optional[str] = None):
+    """Redirect back to /core while preserving the current scenario filter.
+
+    Many /core actions are POSTs from core.html. If we drop the scenario on redirect,
+    the page will default back to the first scenario (often "Scenario 1").
+    """
+    try:
+        scenario = (scenario_hint or request.values.get('scenario') or request.values.get('scenario_name') or '').strip()
+    except Exception:
+        scenario = (scenario_hint or '').strip() if isinstance(scenario_hint, str) else ''
+    if scenario:
+        return redirect(url_for('core_page', scenario=scenario))
     return redirect(url_for('core_page'))
 
 
@@ -12981,16 +15812,16 @@ def core_start():
     xml_path = request.form.get('path')
     if not xml_path:
         flash('Missing XML path')
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario()
     scenario_label = (request.form.get('scenario') or '').strip()
     ap = os.path.abspath(xml_path)
     if not os.path.exists(ap):
         flash('File not found')
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario(scenario_hint=scenario_label)
     ok, errs = _validate_core_xml(ap)
     if not ok:
         flash(f'Invalid CORE XML: {errs}')
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario(scenario_hint=scenario_label)
     core_cfg = _core_config_for_request(include_password=True)
     cfg = _normalize_core_config(core_cfg, include_password=True)
     ssh_user = (cfg.get('ssh_username') or '').strip() or '<unknown>'
@@ -13001,7 +15832,7 @@ def core_start():
         remote_xml_path = _upload_file_to_core_host(cfg, ap)
     except Exception as exc:
         flash(f'Failed to upload XML to CORE host: {exc}')
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario(scenario_hint=scenario_label)
     try:
         script = _remote_core_open_xml_script(address, remote_xml_path, auto_start=True)
         command_desc = (
@@ -13016,7 +15847,7 @@ def core_start():
         )
     except Exception as exc:
         flash(f'Failed to start CORE session: {exc}')
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario(scenario_hint=scenario_label)
     finally:
         if remote_xml_path:
             _remove_remote_file(cfg, remote_xml_path)
@@ -13027,19 +15858,37 @@ def core_start():
         tb = payload.get('traceback')
         if tb:
             app.logger.debug('[core.start] traceback: %s', tb)
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario(scenario_hint=scenario_label)
     sid = payload.get('session_id')
     if sid is None:
         flash('Remote CORE did not return a session id.')
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario(scenario_hint=scenario_label)
     try:
         sid_int = int(sid)
     except Exception:
         sid_int = sid
     app.logger.info('[core.start] Started session %s via %s (scenario=%r)', sid_int, address, scenario_label)
-    _update_xml_session_mapping(ap, sid_int, scenario_name=scenario_label or None)
+    _update_xml_session_mapping(
+        ap,
+        sid_int,
+        scenario_name=scenario_label or None,
+        core_host=cfg.get('host', CORE_HOST) if isinstance(cfg, dict) else None,
+        core_port=cfg.get('port', CORE_PORT) if isinstance(cfg, dict) else None,
+    )
+    # Also persist a session->scenario tag on the CORE VM itself so a remote
+    # session XML path (e.g., /tmp/pycore.<sid>/...) can be mapped back to a scenario.
+    try:
+        _write_remote_session_scenario_meta(
+            cfg,
+            session_id=int(sid_int) if isinstance(sid_int, int) else int(str(sid_int)),
+            scenario_name=scenario_label or None,
+            scenario_xml_basename=os.path.basename(ap),
+            logger=app.logger,
+        )
+    except Exception:
+        pass
     flash(f'Started session {sid_int}.')
-    return redirect(url_for('core_page'))
+    return _redirect_core_page_with_scenario(scenario_hint=scenario_label)
 
 
 @app.route('/core/stop', methods=['POST'])
@@ -13047,19 +15896,19 @@ def core_stop():
     sid = request.form.get('session_id')
     if not sid:
         flash('Missing session id')
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario()
     try:
         sid_int = int(sid)
     except Exception:
         flash('Invalid session id')
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario()
     core_cfg = _core_config_for_request(include_password=True)
     try:
         _execute_remote_core_session_action(core_cfg, 'stop', sid_int, logger=app.logger)
         flash(f'Stopped session {sid_int}.')
     except Exception as exc:
         flash(f'Failed to stop session: {exc}')
-    return redirect(url_for('core_page'))
+    return _redirect_core_page_with_scenario()
 
 
 @app.route('/core/kill_active_sessions_api', methods=['POST'])
@@ -13135,19 +15984,19 @@ def core_start_session():
     sid = request.form.get('session_id')
     if not sid:
         flash('Missing session id')
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario()
     try:
         sid_int = int(sid)
     except Exception:
         flash('Invalid session id')
-        return redirect(url_for('core_page'))
+        return _redirect_core_page_with_scenario()
     core_cfg = _core_config_for_request(include_password=True)
     try:
         _execute_remote_core_session_action(core_cfg, 'start', sid_int, logger=app.logger)
         flash(f'Started session {sid_int}.')
     except Exception as exc:
         flash(f'Failed to start session: {exc}')
-    return redirect(url_for('core_page'))
+    return _redirect_core_page_with_scenario()
 
 
 @app.route('/core/delete', methods=['POST'])
@@ -13182,7 +16031,8 @@ def core_delete():
                 flash('Refusing to delete file outside outputs/ or uploads/.')
         except Exception:
             pass
-    return redirect(url_for('core_page'))
+    return _redirect_core_page_with_scenario()
+
 
 
 @app.route('/core/details')
@@ -13396,6 +16246,69 @@ def core_save_xml():
         return send_file(saved, as_attachment=True, download_name=os.path.basename(saved), mimetype='application/xml')
     except Exception as e:
         return Response(f'Error saving session XML: {e}', status=500)
+
+
+@app.route('/core/session_scenario', methods=['GET'])
+def core_session_scenario():
+    """Resolve a CORE session (by sid or by remote path) to a scenario label.
+
+    Query params:
+      - sid: CORE session id
+      - path: remote CORE VM path (e.g. /tmp/pycore.17/Scenario_1.xml)
+    """
+    sid_raw = (request.args.get('sid') or '').strip()
+    path_raw = (request.args.get('path') or '').strip()
+    sid: int | None = None
+    if sid_raw:
+        try:
+            sid = int(sid_raw)
+        except Exception:
+            sid = None
+    if sid is None and path_raw:
+        sid = _extract_session_id_from_core_path(path_raw)
+    if sid is None:
+        return jsonify({'ok': False, 'error': 'Provide sid or path.'}), 400
+
+    history = _load_run_history()
+    scenario_names, scenario_paths, _scenario_url_hints = _collect_scenario_catalog(history)
+    core_cfg = _core_config_for_request(include_password=True)
+    host = core_cfg.get('host', CORE_HOST)
+    try:
+        port = int(core_cfg.get('port', CORE_PORT))
+    except Exception:
+        port = CORE_PORT
+
+    # 1) Prefer local mapping store (already scoped by CORE host/port and timestamps).
+    scenario_label: str | None = None
+    try:
+        store = _load_core_sessions_store()
+        store = _migrate_core_sessions_store_with_core_targets(store, history)
+        store = _filter_core_sessions_store_for_core(store, host, port)
+        scenario_label = _session_store_scenario_for_session_id(store, int(sid), host=host, port=port)
+    except Exception:
+        scenario_label = None
+
+    # 2) Fallback to CORE-VM-resident meta file.
+    remote_meta: dict[str, Any] | None = None
+    if not scenario_label:
+        try:
+            remote_meta = _read_remote_session_scenario_meta(core_cfg, session_id=int(sid), logger=app.logger)
+            if isinstance(remote_meta, dict):
+                scenario_label = (remote_meta.get('scenario_name') or '').strip() or None
+        except Exception:
+            remote_meta = None
+
+    scenario_norm = _normalize_scenario_label(scenario_label or '') if scenario_label else ''
+    scenario_display = _resolve_scenario_display(scenario_norm, scenario_names, scenario_label or '') if scenario_norm else ''
+    return jsonify({
+        'ok': True,
+        'session_id': int(sid),
+        'scenario_name': scenario_display or (scenario_label or ''),
+        'scenario_norm': scenario_norm,
+        'core_host': host,
+        'core_port': port,
+        'source': 'local_store' if scenario_label and not remote_meta else ('remote_meta' if remote_meta else 'unknown'),
+    })
 
 
 @app.route('/core/session/<int:sid>')

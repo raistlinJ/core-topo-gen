@@ -37,6 +37,24 @@ services:
     assert expected_path in created
     assert record.get("compose_path") == expected_path
 
+    # Validate iproute2 wrapper injection (best-effort; requires PyYAML)
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None  # type: ignore
+    if yaml is not None:
+        obj = yaml.safe_load(open(expected_path, encoding="utf-8"))
+        svc = obj["services"]["app"]
+        assert "build" in svc
+        assert svc["build"]["dockerfile"] == "Dockerfile"
+        assert "cap_add" in svc and "NET_ADMIN" in (svc["cap_add"] or [])
+        wrap_dir = svc["build"]["context"]
+        dockerfile = os.path.join(wrap_dir, "Dockerfile")
+        assert os.path.exists(dockerfile)
+        txt = open(dockerfile, encoding="utf-8").read()
+        assert "iproute2" in txt
+        assert "ethtool" in txt
+
 
 def test_apply_docker_compose_meta_pushes_options(tmp_path):
     record = {"Name": "Example Vuln", "compose_path": str(tmp_path / "docker-compose-host-1.yml")}

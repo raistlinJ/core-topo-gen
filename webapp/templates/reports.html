@@ -4,7 +4,8 @@
 {% block extra_head %}
 <style>
   body { padding-bottom: 0; }
-  .sidebar { max-height: calc(100vh - 220px); overflow:auto; }
+  /* Fill the remaining viewport below the app chrome (header+nav). */
+  #reportsPageWrap { min-height: calc(100vh - 200px); }
 </style>
 {% endblock %}
 {% block nav_right_extra %}
@@ -14,18 +15,18 @@
   </div>
 {% endblock %}
 {% block content %}
-<div class="container-fluid mt-3">
-  <div class="row">
-    <div class="col-3">
-      <div class="card mb-3">
-        <div class="card-header py-2 d-flex justify-content-between align-items-center">
-          <strong class="small mb-0">Scenarios</strong>
+<div class="container-fluid mt-3 d-flex flex-column" id="reportsPageWrap">
+  <div class="row flex-grow-1 align-items-stretch">
+    <div class="col-3 d-flex">
+      <div class="card shadow-sm mb-3 flex-fill d-flex flex-column">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span class="fw-bold">Scenarios</span>
           <button class="btn btn-sm btn-outline-secondary" id="clearScenarioFilter" type="button" title="Clear filter" style="{% if not active_scenario %}display:none{% endif %}">Clear</button>
         </div>
-        <div class="list-group list-group-flush sidebar" id="scenarioFilterList">
+        <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="scenarioFilterList" style="min-height:0;">
           {% if scenarios %}
             {% for s in scenarios %}
-            <button type="button" class="list-group-item list-group-item-action py-1 px-2 small {% if active_scenario and active_scenario==s %}active{% endif %}" data-scen-name="{{ s }}">{{ s }}</button>
+            <button type="button" class="list-group-item list-group-item-action py-1 {% if active_scenario and active_scenario==s %}active bg-primary text-white{% endif %}" data-scen-name="{{ s }}">{{ s }}</button>
             {% endfor %}
           {% else %}
           <div class="p-2 small text-muted">No scenarios yet</div>
@@ -33,8 +34,8 @@
         </div>
       </div>
     </div>
-    <div class="col-9">
-      <div class="card mb-3">
+    <div class="col-9 d-flex">
+      <div class="card mb-3 flex-fill d-flex flex-column">
         <div class="card-header d-flex justify-content-between align-items-center py-2">
           <strong class="mb-0">Run History</strong>
           <div class="d-flex align-items-center gap-2">
@@ -44,7 +45,7 @@
             <small class="text-muted" id="runCount"></small>
           </div>
         </div>
-        <div class="table-responsive" style="max-height:60vh; overflow:auto;">
+        <div class="table-responsive flex-grow-1" style="overflow:auto;">
           <table class="table table-sm align-middle mb-0" id="runsTable">
             <thead class="table-light">
               <tr>
@@ -150,7 +151,19 @@ function renderRows(history){
   }
   updateHeader();
 }
+
+function defaultScenarioName(){
+  return (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length) ? String(scenarioNamesCache[0]) : null;
+}
+
+function ensureScenarioSelected(){
+  if(activeScenarioFilter) return;
+  const def = defaultScenarioName();
+  if(def) activeScenarioFilter = def;
+}
+
 function buildReportsDataUrl(){
+  ensureScenarioSelected();
   if(!activeScenarioFilter) return reportsDataBaseUrl;
   const url = new URL(reportsDataBaseUrl, window.location.origin);
   url.searchParams.set('scenario', activeScenarioFilter);
@@ -166,12 +179,19 @@ function updateScenarioQueryParam(){
   window.history.replaceState({}, '', url.toString());
 }
 function updateScenarioFilterControls(){
-  if(clearScenarioBtn){ clearScenarioBtn.style.display = activeScenarioFilter ? 'inline-block':'none'; }
+  if(clearScenarioBtn){
+    const def = defaultScenarioName();
+    const show = !!activeScenarioFilter && !!def && activeScenarioFilter !== def;
+    clearScenarioBtn.style.display = show ? 'inline-block' : 'none';
+  }
   const list = document.getElementById('scenarioFilterList');
   if(!list) return;
   list.querySelectorAll('[data-scen-name]').forEach(btn => {
     const name = btn.getAttribute('data-scen-name');
-    btn.classList.toggle('active', !!activeScenarioFilter && name === activeScenarioFilter);
+    const isActive = !!activeScenarioFilter && name === activeScenarioFilter;
+    btn.classList.toggle('active', isActive);
+    btn.classList.toggle('bg-primary', isActive);
+    btn.classList.toggle('text-white', isActive);
   });
 }
 function renderScenarioButtons(){
@@ -186,23 +206,24 @@ function renderScenarioButtons(){
     updateScenarioFilterControls();
     return;
   }
+  ensureScenarioSelected();
   scenarioNamesCache.forEach(name => {
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'list-group-item list-group-item-action py-1 px-2 small';
+    btn.className = 'list-group-item list-group-item-action py-1';
     btn.dataset.scenName = name;
     btn.textContent = name;
-    if(activeScenarioFilter && name === activeScenarioFilter){ btn.classList.add('active'); }
+    if(activeScenarioFilter && name === activeScenarioFilter){ btn.classList.add('active','bg-primary','text-white'); }
     btn.addEventListener('click', async () => {
-      const nextValue = (activeScenarioFilter === name) ? null : name;
-      await setScenarioFilter(nextValue);
+      if(activeScenarioFilter === name) return; // never allow "All" by deselecting
+      await setScenarioFilter(name);
     });
     list.appendChild(btn);
   });
   updateScenarioFilterControls();
 }
 async function setScenarioFilter(value){
-  activeScenarioFilter = value || null;
+  activeScenarioFilter = value || defaultScenarioName() || null;
   updateScenarioQueryParam();
   updateScenarioFilterControls();
   await fetchHistory();
@@ -216,8 +237,12 @@ async function fetchHistory(){
     const serverScenario = (data.active_scenario || '').trim();
     if(serverScenario){
       activeScenarioFilter = serverScenario;
-    } else if (!serverScenario && activeScenarioFilter){
-      activeScenarioFilter = null;
+    } else {
+      // Never allow an implicit "All" state if scenarios exist.
+      if(!activeScenarioFilter){
+        const first = (Array.isArray(data.scenarios) && data.scenarios.length) ? String(data.scenarios[0]) : null;
+        if(first) activeScenarioFilter = first;
+      }
     }
     if(Array.isArray(data.history)) renderRows(data.history);
     if(Array.isArray(data.scenarios)){
@@ -257,7 +282,11 @@ function updateCount(){
   const visible = rows.filter(r=>!r.classList.contains('d-none')).length;
   document.getElementById('runCount').textContent = visible + ' run' + (visible===1?'':'s');
 }
-document.getElementById('clearScenarioFilter').addEventListener('click', async () => { await setScenarioFilter(null); });
+document.getElementById('clearScenarioFilter').addEventListener('click', async () => {
+  const def = defaultScenarioName();
+  if(!def) return;
+  await setScenarioFilter(def);
+});
 renderScenarioButtons();
 applyScenarioFilter();
 updateCount();

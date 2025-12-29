@@ -740,6 +740,77 @@ def _set_container_name_one_service(compose_obj: dict, container_name: str, pref
 		return compose_obj
 
 
+def _select_service_key(compose_obj: dict, prefer_service: Optional[str] = None) -> Optional[str]:
+	"""Select a best-effort target service key from a compose object.
+
+	Matches the selection logic used by _set_container_name_one_service.
+	"""
+	try:
+		if not isinstance(compose_obj, dict):
+			return None
+		services = compose_obj.get('services')
+		if not isinstance(services, dict) or not services:
+			return None
+		target_key: Optional[str] = None
+		if prefer_service:
+			pref = prefer_service.strip().lower()
+			for svc_key in services.keys():
+				if pref in str(svc_key).strip().lower():
+					target_key = str(svc_key)
+					break
+		if target_key is None:
+			target_key = str(next(iter(services.keys())))
+		return target_key
+	except Exception:
+		return None
+
+
+def _ensure_list_field_has(value: object, item: str) -> List[str]:
+	"""Normalize a compose field that may be a string/list and ensure item is present."""
+	out: List[str] = []
+	try:
+		if value is None:
+			out = []
+		elif isinstance(value, str):
+			out = [value]
+		elif isinstance(value, list):
+			out = [str(v) for v in value if v is not None and str(v).strip()]
+		else:
+			out = [str(value)]
+	except Exception:
+		out = []
+	if item not in out:
+		out.append(item)
+	return out
+
+
+def _write_iproute2_wrapper(out_dir: str, base_image: str) -> str:
+	"""Write a minimal Dockerfile that installs iproute2 and ethtool (best-effort across distros)."""
+	os.makedirs(out_dir, exist_ok=True)
+	dockerfile_path = os.path.join(out_dir, 'Dockerfile')
+	content = f"""FROM {base_image}
+
+RUN set -eux; \\
+		if command -v apt-get >/dev/null 2>&1; then \\
+			apt-get update; \\
+			apt-get install -y --no-install-recommends iproute2 ethtool; \\
+			rm -rf /var/lib/apt/lists/*; \\
+		elif command -v apk >/dev/null 2>&1; then \\
+			apk add --no-cache iproute2 ethtool; \\
+		elif command -v dnf >/dev/null 2>&1; then \\
+			dnf install -y iproute ethtool && dnf clean all; \\
+		elif command -v yum >/dev/null 2>&1; then \\
+			yum install -y iproute ethtool && yum clean all; \\
+    else \\
+			echo "No supported package manager found to install iproute2/ethtool" >&2; \\
+      exit 1; \\
+    fi
+"""
+	with open(dockerfile_path, 'w', encoding='utf-8') as f:
+		f.write(content)
+	return dockerfile_path
+
+
 def _parse_compose_ports_entry(entry: object) -> List[Tuple[str, int]]:
 	"""Convert a docker-compose ports entry into one or more (protocol, port) tuples."""
 	results: List[Tuple[str, int]] = []
@@ -966,7 +1037,27 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 		wrote = False
 		if base_compose_obj is not None and yaml is not None:
 			prefer = key[0]
-			obj = _set_container_name_one_service(dict(base_compose_obj), node_name, prefer_service=prefer)
+			obj = dict(base_compose_obj)
+			obj = _set_container_name_one_service(obj, node_name, prefer_service=prefer)
+			# Ensure the selected service uses a wrapper build that installs iproute2.
+			try:
+				svc_key = _select_service_key(obj, prefer_service=prefer)
+				services = obj.get('services') if isinstance(obj, dict) else None
+				if svc_key and isinstance(services, dict) and isinstance(services.get(svc_key), dict):
+					svc = services.get(svc_key)
+					base_image = str(svc.get('image') or '').strip()
+					if base_image:
+						wrap_dir = os.path.join(out_base, f"docker-wrap-{_safe_name(node_name)}")
+						_write_iproute2_wrapper(wrap_dir, base_image)
+						# Rewrite service to build the wrapper; keep a tagged image for caching.
+						svc['build'] = {'context': wrap_dir, 'dockerfile': 'Dockerfile'}
+						svc['image'] = f"coretg/{_safe_name(node_name)}:iproute2"
+						# DefaultRoute needs iproute2 + NET_ADMIN in many images.
+						svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_ADMIN')
+					else:
+						logger.warning("[vuln] compose service has no image; cannot inject iproute2 wrapper for node=%s service=%s", node_name, svc_key)
+			except Exception:
+				logger.exception("[vuln] failed injecting iproute2 wrapper for node=%s", node_name)
 			try:
 				with open(out_path, 'w', encoding='utf-8') as f:
 					yaml.safe_dump(obj, f, sort_keys=False)
