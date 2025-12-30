@@ -8067,7 +8067,10 @@ def _collect_scenario_participant_urls(
                 cache[abs_path] = _participant_urls_from_xml(abs_path)
             url_value = cache[abs_path].get(norm_key)
             if url_value:
-                urls[norm_key] = url_value
+                # Prefer catalog hints (e.g., saved from editor snapshots) over XML values.
+                # XML can lag behind the editor state when the user hasn't re-saved scenarios.xml.
+                if not urls.get(norm_key):
+                    urls[norm_key] = url_value
                 break
     return urls
 

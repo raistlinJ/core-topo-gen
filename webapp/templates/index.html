@@ -12100,6 +12100,8 @@ function wireHandlers() {
             setParticipantUrlFeedback(sidx, 'Saving…', 'neutral');
             const changed = persistParticipantProxmoxUrl(sidx, value);
             syncParticipantProxmoxControls(sidx);
+            // Refresh the CORE/Participant setup summary table (Participant UI row) immediately.
+            try { renderMain(); } catch (e) {}
             const result = await persistParticipantUrlToServerNow();
             if (result && result.ok) {
                 setParticipantUrlFeedback(sidx, 'Saved.', 'success');
@@ -12131,6 +12133,8 @@ function wireHandlers() {
             if (input) input.value = '';
             persistParticipantProxmoxUrl(sidx, '');
             syncParticipantProxmoxControls(sidx);
+            // Refresh the CORE/Participant setup summary table (Participant UI row) immediately.
+            try { renderMain(); } catch (e) {}
             const result = await persistParticipantUrlToServerNow();
             if (result && result.ok) {
                 setParticipantUrlFeedback(sidx, 'Cleared.', 'success');
