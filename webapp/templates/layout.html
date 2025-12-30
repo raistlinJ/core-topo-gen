@@ -94,7 +94,7 @@
             {% if is_power_view %}
             <li class="nav-item"><a class="nav-link {% if active_page=='scenarios' %}active{% endif %}" href="{{ url_for('index') }}">Scenarios</a></li>
             <li class="nav-item"><a class="nav-link {% if active_page=='data_sources' %}active{% endif %}" href="{{ url_for('data_sources_page') }}">Vulnerability Catalog</a></li>
-            <li class="nav-item"><a class="nav-link {% if active_page=='reports' %}active{% endif %}" href="{{ nav_reports_href }}">Reports</a></li>
+            <li class="nav-item"><a id="navReportsLink" class="nav-link {% if active_page=='reports' %}active{% endif %}" href="{{ nav_reports_href }}">Reports</a></li>
             <li class="nav-item"><a id="navCoreLink" class="nav-link {% if active_page=='core' %}active{% endif %}" href="{{ nav_core_href }}">CORE</a></li>
             {% endif %}
             <li class="nav-item{% if not nav_participant_available %} d-none{% endif %}" id="navParticipantLinkWrap">
@@ -210,6 +210,26 @@
     (function(){
       window.CORETG_VIEW_MODE = {{ ui_view_mode|tojson }};
       window.CORETG_PARTICIPANT_UI_HREF = window.CORETG_PARTICIPANT_UI_HREF || '';
+      // Helper: patch CORE/Reports navbar hrefs to include the active scenario.
+      // This is needed because index.html updates ?scenario= via history.replaceState,
+      // but server-rendered hrefs won't automatically pick that up.
+      window.CORETG_PATCH_SCENARIO_NAV = function(scenarioName){
+        try {
+          const scen = (scenarioName || '').toString().trim();
+          if(!scen) return;
+          const patchLink = (id) => {
+            const el = document.getElementById(id);
+            if(!el) return;
+            const rawHref = el.getAttribute('href') || '';
+            if(!rawHref || rawHref.startsWith('#')) return;
+            const url = new URL(rawHref, window.location.origin);
+            url.searchParams.set('scenario', scen);
+            el.setAttribute('href', `${url.pathname}${url.search}${url.hash}`);
+          };
+          patchLink('navCoreLink');
+          patchLink('navReportsLink');
+        } catch(e) {}
+      };
       const wrapper = document.getElementById('navParticipantLinkWrap');
       const link = document.getElementById('navParticipantLink');
       if(!wrapper || !link || typeof window === 'undefined') return;
@@ -241,32 +261,16 @@
         }
         window.CORETG_PARTICIPANT_UI_HREF = href || '';
       };
-      const loadEditorStateHref = () => {
-        if(!window.localStorage) return '';
-        const raw = window.localStorage.getItem('coretg_editor_state');
-        if(!raw) return '';
-        try {
-          const parsed = JSON.parse(raw);
-          if(!parsed || !Array.isArray(parsed.scenarios) || parsed.scenarios.length === 0) return '';
-          let idx = Number(parsed.active_index);
-          if(Number.isNaN(idx) || idx < 0 || idx >= parsed.scenarios.length) idx = 0;
-          const scenario = parsed.scenarios[idx];
-          const hitl = scenario && typeof scenario === 'object' ? scenario.hitl : null;
-          if(!hitl || typeof hitl !== 'object') return '';
-          return normalizeParticipantHref(hitl.participant_proxmox_url || hitl.participant_ui_url || '');
-        } catch(err) {
-          return '';
-        }
-      };
       const storedDefault = normalizeParticipantHref(link.getAttribute('data-initial-participant-url'));
       const updateFromSources = () => {
-        const localHref = loadEditorStateHref();
-        applyAvailability(localHref || storedDefault || '');
+        // Only show the Participant UI tab when the server provided a URL for the current page/scenario
+        // (or when a page explicitly sets window.CORETG_PARTICIPANT_UI_HREF).
+        // Avoid using the editor's localStorage state here, otherwise CORE/Reports can incorrectly
+        // show Participant UI even when no Participant URL is set.
+        const explicitHref = normalizeParticipantHref(window.CORETG_PARTICIPANT_UI_HREF || '');
+        applyAvailability(explicitHref || storedDefault || '');
       };
       updateFromSources();
-      window.addEventListener('storage', (evt) => {
-        if(evt && evt.key === 'coretg_editor_state') updateFromSources();
-      });
     })();
   </script>
   <script>

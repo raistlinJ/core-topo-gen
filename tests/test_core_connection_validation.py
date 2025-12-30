@@ -460,6 +460,82 @@ def test_test_core_daemon_conflict_can_be_auto_stopped(client, monkeypatch):
     assert stop_calls[0]['pids'] == [18263, 78479]
 
 
+def test_test_core_advanced_checks_fail_as_warning(client, monkeypatch):
+    # Force the handler down the non-pytest code path so we exercise warning behavior.
+    # (The backend intentionally skips remote checks during pytest.)
+    monkeypatch.delenv('PYTEST_CURRENT_TEST', raising=False)
+    monkeypatch.delitem(backend.sys.modules, 'pytest', raising=False)
+
+    monkeypatch.setattr(backend, '_core_connection', _fake_core_connection)
+    monkeypatch.setattr(backend.socket, 'socket', _FakeSocket)
+    monkeypatch.setattr(backend, '_load_core_credentials', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backend, '_ensure_core_daemon_listening', lambda *_args, **_kwargs: None)
+
+    def _fake_adv(_cfg, **_kwargs):
+        return {
+            'adv_check_core_version': {'enabled': True, 'ok': False, 'message': 'CORE version mismatch'},
+            'adv_fix_docker_daemon': {'enabled': False, 'ok': None, 'message': ''},
+            'adv_run_core_cleanup': {'enabled': True, 'ok': True, 'message': 'completed'},
+            'adv_restart_core_daemon': {'enabled': False, 'ok': None, 'message': ''},
+            'adv_auto_kill_sessions': {'enabled': False, 'ok': None, 'message': ''},
+        }
+
+    monkeypatch.setattr(backend, '_run_core_connection_advanced_checks', _fake_adv)
+
+    def _fake_save(payload):
+        return {
+            'identifier': 'secret-adv-warning',
+            'scenario_name': payload.get('scenario_name'),
+            'scenario_index': payload.get('scenario_index'),
+            'host': payload['grpc_host'],
+            'port': payload['grpc_port'],
+            'grpc_host': payload['grpc_host'],
+            'grpc_port': payload['grpc_port'],
+            'ssh_host': payload['ssh_host'],
+            'ssh_port': payload['ssh_port'],
+            'ssh_username': payload['ssh_username'],
+            'ssh_enabled': payload['ssh_enabled'],
+            'vm_key': payload.get('vm_key'),
+            'vm_name': payload.get('vm_name'),
+            'vm_node': payload.get('vm_node'),
+            'vmid': payload.get('vmid'),
+            'stored_at': '2025-10-28T00:00:00Z',
+        }
+
+    monkeypatch.setattr(backend, '_save_core_credentials', _fake_save)
+
+    payload = {
+        'core': {
+            'host': 'core-host',
+            'port': 50051,
+            'ssh_host': 'core-host',
+            'ssh_port': 22,
+            'ssh_username': 'core',
+            'ssh_password': 'pw',
+            'adv_check_core_version': True,
+            'adv_run_core_cleanup': True,
+        },
+        'scenario_name': 'Scenario Advanced',
+        'scenario_index': 3,
+        'hitl_core': {
+            'vm_key': 'pve1::101',
+            'vm_node': 'pve1',
+            'vm_name': 'CORE VM',
+            'vmid': 101,
+        },
+    }
+
+    resp = client.post('/test_core', json=payload)
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['ok'] is True
+    assert isinstance(data.get('advanced_checks'), dict)
+    assert data['advanced_checks']['adv_check_core_version']['enabled'] is True
+    assert data['advanced_checks']['adv_check_core_version']['ok'] is False
+    assert isinstance(data.get('warnings'), list)
+    assert data['warnings'] and 'Advanced checks failed' in data['warnings'][0]
+
+
 def test_run_cli_async_requires_ssh_credentials(client, tmp_path, monkeypatch):
     xml_path = tmp_path / 'scenarios.xml'
     xml_path.write_text('<Scenarios></Scenarios>')

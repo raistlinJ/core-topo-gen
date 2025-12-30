@@ -277,6 +277,116 @@ def test_hitl_apply_bridge_infers_proxmox_attachment(client, monkeypatch):
     assert data['success'] is True
 
 
+def test_hitl_validate_bridge_does_not_update_vms(client, monkeypatch):
+    posts_core = []
+    posts_external = []
+
+    fake_client = _FakeClient({
+        'pve1': _FakeNode({
+            101: _FakeQemu({'net0': 'virtio=de:ad:be:ef:00:01,bridge=vmbr-old'}, posts_core),
+            202: _FakeQemu({'net1': 'virtio=de:ad:be:ef:02:01,firewall=1'}, posts_external),
+        })
+    })
+
+    def fake_connect(secret_id: str):
+        assert secret_id == 'secret-1'
+        return fake_client, {'url': 'https://pve1.local', 'username': 'root@pam'}
+
+    monkeypatch.setattr(backend, '_connect_proxmox_from_secret', fake_connect)
+    monkeypatch.setattr(backend, '_ensure_proxmox_bridge', lambda *args, **kwargs: {
+        'created': False,
+        'already_exists': True,
+        'reload_invoked': False,
+        'reload_ok': True,
+        'reload_error': None,
+    })
+
+    payload = {
+        'bridge_name': 'vmbr-new',
+        'scenario_name': 'Scenario Demo',
+        'scenario_index': 0,
+        'hitl': {
+            'proxmox': {'secret_id': 'secret-1'},
+            'core': {
+                'vm_key': 'pve1::101',
+                'vm_name': 'CORE VM',
+            },
+            'interfaces': [
+                {
+                    'name': 'Link 1',
+                    'attachment': 'proxmox_vm',
+                    'proxmox_target': {
+                        'node': 'pve1',
+                        'vmid': 101,
+                        'interface_id': 'net0',
+                    },
+                    'external_vm': {
+                        'vm_key': 'pve1::202',
+                        'vm_name': 'External VM',
+                        'interface_id': 'net1',
+                    },
+                }
+            ],
+        },
+    }
+
+    resp = client.post('/api/hitl/validate_bridge', data=json.dumps(payload), content_type='application/json')
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data['success'] is True
+    assert data['assignments'] == 1
+    assert data['changed_interfaces'] == 2
+    assert posts_core == []
+    assert posts_external == []
+
+
+def test_hitl_validate_bridge_errors_when_bridge_missing(client, monkeypatch):
+    fake_client = _FakeClient({
+        'pve1': _FakeNode({
+            101: _FakeQemu({'net0': 'virtio=de:ad:be:ef:00:01,bridge=vmbr-old'}, []),
+            202: _FakeQemu({'net1': 'virtio=de:ad:be:ef:02:01,firewall=1'}, []),
+        })
+    })
+
+    monkeypatch.setattr(backend, '_connect_proxmox_from_secret', lambda _: (fake_client, {}))
+
+    def fake_ensure(*_args, **_kwargs):
+        raise RuntimeError('Bridge vmbr-missing not found on node pve1. Create it manually.')
+
+    monkeypatch.setattr(backend, '_ensure_proxmox_bridge', fake_ensure)
+
+    payload = {
+        'bridge_name': 'vmbr-missing',
+        'hitl': {
+            'proxmox': {'secret_id': 'secret-1'},
+            'core': {
+                'vm_key': 'pve1::101',
+            },
+            'interfaces': [
+                {
+                    'name': 'Link 1',
+                    'attachment': 'proxmox_vm',
+                    'proxmox_target': {
+                        'node': 'pve1',
+                        'vmid': 101,
+                        'interface_id': 'net0',
+                    },
+                    'external_vm': {
+                        'vm_key': 'pve1::202',
+                        'interface_id': 'net1',
+                    },
+                }
+            ],
+        },
+    }
+
+    resp = client.post('/api/hitl/validate_bridge', data=json.dumps(payload), content_type='application/json')
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert data['success'] is False
+    assert 'Bridge vmbr-missing' in data['error']
+
+
 def test_normalize_internal_bridge_name_truncates_and_sanitizes():
     assert backend._normalize_internal_bridge_name('MyUserName12345') == 'myusername'
     assert backend._normalize_internal_bridge_name('user name with spaces') == 'user-name'

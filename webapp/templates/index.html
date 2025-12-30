@@ -30,6 +30,9 @@
         opacity: 0.6;
         pointer-events: none;
     }
+    .hitl-entry-btn {
+        min-height: 38px;
+    }
     .hitl-step-disabled {
         filter: grayscale(0.3);
         opacity: 0.85;
@@ -135,14 +138,16 @@
                         <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
                             <strong>Scenario Editor</strong>
                             <div class="d-flex flex-wrap align-items-center gap-2">
-                                {% if not is_builder_view %}
-                                <div class="btn-group btn-group-sm" role="group" aria-label="HITL setup actions">
-                                    <button class="btn btn-outline-primary" type="button" id="selectCoreVmBtn">Select CORE VM</button>
-                                    <button class="btn btn-primary" type="button" id="configHitlBtn" disabled title="Complete Steps 1 and 2 first.">Config HITL</button>
+                                <div id="hitlEntryButtonsWrap" class="d-flex align-items-center gap-2">
+                                    {% if not is_builder_view %}
+                                    <div class="btn-group btn-group-sm" role="group" aria-label="HITL setup actions">
+                                        <button class="btn btn-outline-primary" type="button" id="selectCoreVmBtn">Select CORE VM</button>
+                                        <button class="btn btn-primary" type="button" id="configHitlBtn" disabled title="Complete Steps 1 and 2 first.">Config HITL</button>
+                                    </div>
+                                    {% else %}
+                                    <span class="badge text-bg-secondary">HITL settings managed by admin</span>
+                                    {% endif %}
                                 </div>
-                                {% else %}
-                                <span class="badge text-bg-secondary">HITL settings managed by admin</span>
-                                {% endif %}
                             </div>
                         </div>
                         <div class="card-body">
@@ -320,7 +325,7 @@
 </div>
 <!-- CORE Connection Modal -->
 <div class="modal fade" id="coreConnectionModal" tabindex="-1" aria-hidden="true">
-    <div class="modal-dialog">
+    <div class="modal-dialog modal-xl">
         <div class="modal-content">
             <div class="modal-header">
                 <h5 class="modal-title">CORE Connection</h5>
@@ -372,6 +377,39 @@
                         <input class="form-check-input" type="checkbox" id="coreInstallCustomServices">
                         <label class="form-check-label" for="coreInstallCustomServices">Install custom services</label>
                         <div class="form-text">Copies services from <code>on_core_machine/custom_services</code> to the CORE VM, restarts core-daemon, and verifies they load.</div>
+                    </div>
+
+                    <div class="row g-2 mb-3">
+                        <div class="col-12 col-md-6">
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" role="switch" id="coreAdvFixDockerDaemon">
+                                <label class="form-check-label" for="coreAdvFixDockerDaemon">Fix Docker daemon for CORE (disable default bridge + iptables)</label>
+                            </div>
+                        </div>
+                        <div class="col-12 col-md-6">
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" role="switch" id="coreAdvRunCoreCleanup">
+                                <label class="form-check-label" for="coreAdvRunCoreCleanup">Run core-cleanup</label>
+                            </div>
+                        </div>
+                        <div class="col-12 col-md-6">
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" role="switch" id="coreAdvCheckCoreVersion">
+                                <label class="form-check-label" for="coreAdvCheckCoreVersion">Check CORE version is 9.2.1</label>
+                            </div>
+                        </div>
+                        <div class="col-12 col-md-6">
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" role="switch" id="coreAdvRestartCoreDaemon">
+                                <label class="form-check-label" for="coreAdvRestartCoreDaemon">Restart core-daemon</label>
+                            </div>
+                        </div>
+                        <div class="col-12 col-md-6">
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" role="switch" id="coreAdvAutoKillSessions">
+                                <label class="form-check-label" for="coreAdvAutoKillSessions">Auto-kill any running sessions</label>
+                            </div>
+                        </div>
                     </div>
                     <div class="mt-4">
                         <button class="btn btn-link p-0" type="button" data-bs-toggle="collapse" data-bs-target="#coreConnAdvanced" aria-expanded="false" aria-controls="coreConnAdvanced">Advanced</button>
@@ -439,6 +477,35 @@
 <script src="{{ url_for('static', filename='core_graph.js') }}"></script>
 
 <!-- Toast container removed (requested) -->
+<!-- Verify Setup Modal -->
+<div class="modal fade" id="verifySetupModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="verifySetupTitle">Verify</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="border rounded p-3 bg-body-tertiary" id="verifySetupProgressWrap">
+                    <div class="d-flex align-items-center gap-2">
+                        <div class="spinner-border spinner-border-sm text-primary" role="status" aria-hidden="true" id="verifySetupSpinner"></div>
+                        <div class="flex-grow-1">
+                            <div class="fw-semibold" id="verifySetupStatus">Preparing…</div>
+                            <div class="small text-muted" id="verifySetupMeta"></div>
+                        </div>
+                        <span class="badge text-bg-secondary" id="verifySetupResultBadge">Running</span>
+                    </div>
+                    <pre class="form-control bg-dark text-white border-0 mt-3 small" id="verifySetupLog" style="height: 190px; overflow:auto; font-family: SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;"></pre>
+                </div>
+                <div class="alert d-none mt-3" id="verifySetupFinalAlert" role="alert"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" id="verifySetupCloseBtn">Close</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Success Modal -->
 <div class="modal fade" id="runSuccessModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered">
@@ -472,15 +539,8 @@
                 <div class="alert alert-warning small d-none" id="executeConfirmAlert"></div>
                 <div class="border rounded-3 p-3 bg-body-tertiary mb-3">
                     <div class="d-flex flex-wrap align-items-center justify-content-between gap-3">
-                        <div class="flex-grow-1">
-                            <div class="text-uppercase small text-muted fw-semibold">Execution Mode</div>
-                        </div>
-                        <div class="form-check form-switch m-0" id="executeUpdateRemoteToggleWrap">
-                            <input class="form-check-input" type="checkbox" role="switch" id="executeConfirmUpdateRemoteToggle">
-                            <label class="form-check-label fw-semibold" for="executeConfirmUpdateRemoteToggle">Generate on Remote CORE VM</label>
-                        </div>
+                        <div class="flex-grow-1"></div>
                     </div>
-                    <div class="small text-muted mt-2" id="executeConfirmUpdateRemoteHelp">Emulation mode runs locally on this workstation.</div>
                     <div class="d-flex flex-wrap align-items-center justify-content-between gap-3 mt-3 d-none" id="executeCoreNotConfiguredRow">
                         <div class="flex-grow-1">
                             <div class="text-uppercase small text-muted fw-semibold">Remote CORE Connection</div>
@@ -736,7 +796,12 @@ const CORETG_USER_ROLE = (currentUserMeta && typeof currentUserMeta.role === 'st
 window.CORETG_USERNAME = CORETG_USERNAME;
 window.CORETG_USER_ROLE = CORETG_USER_ROLE;
 const IS_BUILDER_VIEW = (window.CORETG_VIEW_MODE || '') === 'builder';
-const USE_LOCAL_EDITOR_STATE = !IS_BUILDER_VIEW;
+const IS_ADMIN_USER = (CORETG_USER_ROLE || '') === 'admin';
+// Local editor state is only trusted for admins.
+// Builder/participant roles must rely on server-restricted scenario lists.
+const USE_LOCAL_EDITOR_STATE = IS_ADMIN_USER;
+// Builder view is read-only; never write local snapshots from it.
+const ALLOW_LOCAL_EDITOR_PERSISTENCE = IS_ADMIN_USER && !IS_BUILDER_VIEW;
 const BUILDER_BACKEND_UNAVAILABLE_MESSAGE = 'Backend temporarily unavailable. Please ask an admin.';
 window.IS_BUILDER_VIEW = IS_BUILDER_VIEW;
 const DEFAULT_INTERNAL_BRIDGE_NAME = 'corebridge';
@@ -960,6 +1025,30 @@ function cloneScenariosForSnapshot(source) {
     }
 }
 
+function pickBestLocalSnapshotByScenarioCount(snapshotMap) {
+    try {
+        if (!snapshotMap || typeof snapshotMap !== 'object') return { key: '', snapshot: null, count: 0 };
+        let bestKey = '';
+        let bestSnapshot = null;
+        let bestCount = 0;
+        Object.keys(snapshotMap).forEach(key => {
+            const entry = snapshotMap[key];
+            if (!entry || typeof entry !== 'object') return;
+            const scenarios = Array.isArray(entry.scenarios) ? entry.scenarios : null;
+            if (!scenarios || !scenarios.length) return;
+            const count = scenarios.length;
+            if (count > bestCount) {
+                bestCount = count;
+                bestKey = key;
+                bestSnapshot = entry;
+            }
+        });
+        return { key: bestKey, snapshot: bestSnapshot, count: bestCount };
+    } catch (err) {
+        return { key: '', snapshot: null, count: 0 };
+    }
+}
+
 let projectStateMap = readJsonFromLocalStorage(PROJECT_STATE_STORAGE_KEY, {});
 if (!projectStateMap || typeof projectStateMap !== 'object') projectStateMap = {};
 let legacyEditorState = readJsonFromLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, null);
@@ -978,6 +1067,12 @@ if ((!currentProjectKey || currentProjectKey === DEFAULT_PROJECT_KEY) && legacyP
     currentProjectKey = legacyProjectKeyHint;
 }
 let activeIdxMap = readJsonFromLocalStorage(PROJECT_ACTIVE_IDX_STORAGE_KEY, {});
+
+// Persisted collapse state (shared across cards/sections).
+// Must be in the outer scope because multiple handlers (including the generic
+// [data-action="toggle-collapse"] handler) reference it.
+let collapseState = {};
+try { collapseState = JSON.parse(localStorage.getItem('sectionCollapseState') || '{}'); } catch(e) { collapseState = {}; }
 if (!activeIdxMap || typeof activeIdxMap !== 'object') activeIdxMap = {};
 const serverEditorSnapshot = (initialPayload && typeof initialPayload.editor_snapshot === 'object')
     ? initialPayload.editor_snapshot
@@ -989,7 +1084,7 @@ const serverScenarioQuery = (serverEditorSnapshot && typeof serverEditorSnapshot
     ? serverEditorSnapshot.scenario_query.trim()
     : '';
 let serverSnapshotKey = '';
-if (serverEditorSnapshot && typeof serverEditorSnapshot === 'object') {
+if (ALLOW_LOCAL_EDITOR_PERSISTENCE && serverEditorSnapshot && typeof serverEditorSnapshot === 'object') {
     try {
         const cloned = JSON.parse(JSON.stringify(serverEditorSnapshot));
         const sanitized = scrubSnapshotTransientErrors(cloned);
@@ -1086,7 +1181,7 @@ const PARTICIPANT_STATUS_EMPTY_TEXT = 'No Participant UI URL saved yet. Apply on
 const PARTICIPANT_STATUS_SAVED_TEXT = 'Participant UI link saved. The navigation tab is enabled for this scenario.';
 // If server provides a fresh result_path (e.g., after Save XML), reflect it in localStorage early
 try {
-    if (USE_LOCAL_EDITOR_STATE && serverResultPath) {
+    if (ALLOW_LOCAL_EDITOR_PERSISTENCE && serverResultPath) {
         const existingSnapshot = projectStateMap[currentProjectKey] || legacyEditorState || {};
         const persisted = { ...existingSnapshot };
         const existingCoreSnapshot = (existingSnapshot && existingSnapshot.core)
@@ -1498,6 +1593,12 @@ function _structuredCloneSafe(value) {
 function _normalizeScenarioLookupKey(raw) {
     if (raw === undefined || raw === null) return '';
     return String(raw).trim().toLowerCase();
+}
+
+function _scenarioMatchKey(raw) {
+    if (raw === undefined || raw === null) return '';
+    // Punctuation-insensitive match key to avoid name mismatches like "Scenario_1b" vs "Scenario 1b".
+    return String(raw).trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
 function _hitlInterfaceKey(entry, fallbackIndex = null) {
@@ -3410,6 +3511,13 @@ function updateActiveScenarioQueryParam() {
             url.searchParams.delete('scenario');
         }
         window.history.replaceState({}, '', url.toString());
+        try {
+            if (typeof window !== 'undefined' && typeof window.CORETG_PATCH_SCENARIO_NAV === 'function') {
+                window.CORETG_PATCH_SCENARIO_NAV(trimmed);
+            }
+        } catch (e) {
+            /* ignore */
+        }
     } catch (err) {
         /* ignore */
     }
@@ -3618,6 +3726,23 @@ if (USE_LOCAL_EDITOR_STATE) {
     if (!persistedState) {
         persistedState = legacyEditorState;
     }
+
+    // Safety net: if the selected key resolves to a minimal snapshot (often 1 scenario)
+    // but localStorage contains a richer snapshot, prefer the richer one.
+    // This prevents view-mode switches from making scenarios appear to "disappear".
+    try {
+        const persistedCount = Array.isArray(persistedState?.scenarios) ? persistedState.scenarios.length : 0;
+        const serverCount = Array.isArray(initialPayload?.scenarios) ? initialPayload.scenarios.length : 0;
+        const wantsRecovery = (!serverResultPath && (persistedCount <= 1) && (serverCount <= 1));
+        if (wantsRecovery) {
+            const best = pickBestLocalSnapshotByScenarioCount(projectStateMap);
+            if (best.snapshot && best.count > persistedCount && best.key) {
+                persistedState = best.snapshot;
+                currentProjectKey = best.key;
+            }
+        }
+    } catch (err) {}
+
     persistedState = scrubSnapshotTransientErrors(persistedState);
     const activeIdxCandidateRaw = activeIdxMap[currentProjectKey];
     if (activeIdxCandidateRaw !== undefined) {
@@ -3632,19 +3757,30 @@ if (USE_LOCAL_EDITOR_STATE) {
 
 // Base state is from server payload or default
 let state = initialPayload ?? { scenarios: [ defaultScenario('Scenario 1') ], result_path: null };
-if (!Array.isArray(state.host_interfaces)) {
-    if (Array.isArray(initialPayload?.host_interfaces)) {
-        state.host_interfaces = initialPayload.host_interfaces;
-    } else if (USE_LOCAL_EDITOR_STATE && Array.isArray(persistedState?.host_interfaces)) {
-        state.host_interfaces = persistedState.host_interfaces;
+// Host interface cache: prefer a non-empty server payload; otherwise fall back to persisted cache.
+// This prevents a page refresh from wiping out interface-derived summary fields (e.g., CORE VM Bridge)
+// when the server renders an empty `host_interfaces: []`.
+{
+    const serverHostInterfaces = Array.isArray(initialPayload?.host_interfaces) ? initialPayload.host_interfaces : null;
+    const persistedHostInterfaces = (USE_LOCAL_EDITOR_STATE && Array.isArray(persistedState?.host_interfaces)) ? persistedState.host_interfaces : null;
+    const currentHostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : null;
+
+    if (serverHostInterfaces && serverHostInterfaces.length) {
+        state.host_interfaces = serverHostInterfaces;
+    } else if (persistedHostInterfaces && persistedHostInterfaces.length) {
+        state.host_interfaces = persistedHostInterfaces;
+    } else if (currentHostInterfaces) {
+        state.host_interfaces = currentHostInterfaces;
+    } else if (serverHostInterfaces) {
+        state.host_interfaces = serverHostInterfaces;
     } else {
         state.host_interfaces = [];
     }
 }
 const persistedHostMeta = USE_LOCAL_EDITOR_STATE ? persistedState : null;
-state.host_interfaces_source = initialPayload?.host_interfaces_source ?? persistedHostMeta?.host_interfaces_source ?? state.host_interfaces_source ?? null;
-state.host_interfaces_metadata = initialPayload?.host_interfaces_metadata ?? persistedHostMeta?.host_interfaces_metadata ?? state.host_interfaces_metadata ?? null;
-state.host_interfaces_fetched_at = initialPayload?.host_interfaces_fetched_at ?? persistedHostMeta?.host_interfaces_fetched_at ?? state.host_interfaces_fetched_at ?? null;
+state.host_interfaces_source = (initialPayload?.host_interfaces_source ?? null) || (persistedHostMeta?.host_interfaces_source ?? null) || state.host_interfaces_source || null;
+state.host_interfaces_metadata = (initialPayload?.host_interfaces_metadata ?? null) || (persistedHostMeta?.host_interfaces_metadata ?? null) || state.host_interfaces_metadata || null;
+state.host_interfaces_fetched_at = (initialPayload?.host_interfaces_fetched_at ?? null) || (persistedHostMeta?.host_interfaces_fetched_at ?? null) || state.host_interfaces_fetched_at || null;
 // If server provided a concrete result_path (save/load/run), prefer server scenarios; else, restore from localStorage if available
 const serverHasResult = !!(initialPayload && initialPayload.result_path);
 const serverScenarioBases = Array.isArray(initialPayload?.scenarios)
@@ -3657,22 +3793,27 @@ const serverScenarioBases = Array.isArray(initialPayload?.scenarios)
     })
     : [];
 if (USE_LOCAL_EDITOR_STATE && !serverHasResult && persistedState && Array.isArray(persistedState.scenarios) && persistedState.scenarios.length) {
-    state.scenarios = persistedState.scenarios;
+    // Admin UX: prefer the server-rendered scenario list (catalog-driven) so scenarios like
+    // "Scenario 1b" appear consistently. Then append any local-only scenarios so unsaved
+    // work in localStorage isn't lost.
     if (persistedState.result_path) state.result_path = persistedState.result_path;
-    if (serverScenarioBases.length) {
-        serverScenarioBases.forEach((serverMeta, idx) => {
-            if (!serverMeta) return;
-            if (!state.scenarios[idx]) return;
-            const scen = state.scenarios[idx];
-            if (!scen.base || typeof scen.base !== 'object') scen.base = {};
-            scen.base.filepath = (serverMeta.filepath || '');
-            if ('display_name' in serverMeta) {
-                scen.base.display_name = serverMeta.display_name;
-            } else if (scen.base.display_name) {
-                delete scen.base.display_name;
-            }
+
+    try {
+        const serverScenarios = Array.isArray(state.scenarios) ? state.scenarios : [];
+        const localScenarios = Array.isArray(persistedState.scenarios) ? persistedState.scenarios : [];
+        const serverKeys = new Set(
+            serverScenarios
+                .map((scen) => _scenarioMatchKey(scen && typeof scen === 'object' ? scen.name : ''))
+                .filter(Boolean)
+        );
+        localScenarios.forEach((localScen) => {
+            const k = _scenarioMatchKey(localScen && typeof localScen === 'object' ? localScen.name : '');
+            if (!k || serverKeys.has(k)) return;
+            serverScenarios.push(localScen);
+            serverKeys.add(k);
         });
-    }
+        state.scenarios = serverScenarios;
+    } catch (err) {}
 }
 
 if (USE_LOCAL_EDITOR_STATE && persistedState && Array.isArray(persistedState.scenarios) && Array.isArray(state.scenarios)) {
@@ -5649,6 +5790,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // ------------- Auto-Save Support for Planning -------------
 async function autoSaveXml(){
+    if (IS_BUILDER_VIEW) {
+        try { showToast('Builder view is read-only.', { autohide: true, delay: 2500 }); } catch (_) {}
+        return Promise.reject(new Error('Builder view is read-only'));
+    }
     return new Promise((resolve, reject) => {
         try {
             const scenariosJsonInput = document.getElementById('scenarios_json');
@@ -5673,7 +5818,9 @@ async function autoSaveXml(){
             const applyResultPath = (resultPath) => {
                 if (!resultPath) return;
                 const previousProjectKey = currentProjectKey;
-                const previousSnapshot = { ...(projectStateMap[previousProjectKey] || legacyEditorState || {}) };
+                const previousSnapshot = USE_LOCAL_EDITOR_STATE
+                    ? { ...(projectStateMap[previousProjectKey] || legacyEditorState || {}) }
+                    : {};
                 state.result_path = resultPath;
                 try { updateDownloadButtonState(); } catch (err) {}
                 try {
@@ -5693,13 +5840,15 @@ async function autoSaveXml(){
                     }
                 }
                 try {
-                    const persisted = { ...previousSnapshot };
-                    persisted.result_path = state.result_path;
-                    persisted.project_key_hint = state.result_path;
-                    projectStateMap[currentProjectKey] = persisted;
-                    legacyEditorState = persisted;
-                    writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, persisted);
-                    writeJsonToLocalStorage(PROJECT_STATE_STORAGE_KEY, projectStateMap);
+                    if (USE_LOCAL_EDITOR_STATE) {
+                        const persisted = { ...previousSnapshot };
+                        persisted.result_path = state.result_path;
+                        persisted.project_key_hint = state.result_path;
+                        projectStateMap[currentProjectKey] = persisted;
+                        legacyEditorState = persisted;
+                        writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, persisted);
+                        writeJsonToLocalStorage(PROJECT_STATE_STORAGE_KEY, projectStateMap);
+                    }
                 } catch(err) {}
                 // Persist again so the new result_path becomes the active project key
                 persistEditorState();
@@ -5873,6 +6022,7 @@ let activeIdx = Math.min(Math.max(0, persistedActiveIdx), (state.scenarios.lengt
 
 function persistEditorState(){
     try {
+        if (!ALLOW_LOCAL_EDITOR_PERSISTENCE) return;
         const baseUploadMeta = normalizeBaseUpload(state.base_upload) || (state.scenarios?.[0]?.base?.filepath || state.scenarios?.[0]?.base?.display_name ? {
             path: state.scenarios?.[0]?.base?.filepath || '',
             display_name: state.scenarios?.[0]?.base?.display_name || (state.scenarios?.[0]?.base?.filepath ? state.scenarios[0].base.filepath.split(/[/\\]/).pop() || '' : '')
@@ -6814,6 +6964,677 @@ async function handleExternalIfxApply() {
     }
 }
 
+async function verifyScenarioCoreSetup(sidx, options = {}) {
+    const { triggerButton = null } = options;
+    if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) {
+        return { ok: false, message: 'Scenario unavailable' };
+    }
+    if (IS_BUILDER_VIEW) {
+        try { showToast('Builder view is read-only.', { autohide: true, delay: 2500 }); } catch (_) {}
+        return { ok: false, message: 'Builder view is read-only' };
+    }
+
+    const scenario = state.scenarios[sidx];
+    const hitlState = ensureHitlStateForScenario(scenario);
+    const prox = hitlState.proxmox || (hitlState.proxmox = {});
+    const core = hitlState.core || (hitlState.core = {});
+
+    const verifyModal = (() => {
+        const modalEl = document.getElementById('verifySetupModal');
+        if (!modalEl || !window.bootstrap) return null;
+        const get = (id) => document.getElementById(id);
+        return {
+            modalEl,
+            instance: bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl, { backdrop: true, keyboard: true }),
+            titleEl: get('verifySetupTitle'),
+            statusEl: get('verifySetupStatus'),
+            metaEl: get('verifySetupMeta'),
+            spinnerEl: get('verifySetupSpinner'),
+            badgeEl: get('verifySetupResultBadge'),
+            logEl: get('verifySetupLog'),
+            finalAlertEl: get('verifySetupFinalAlert'),
+        };
+    })();
+
+    const verifyResetUi = ({ title }) => {
+        if (!verifyModal) return;
+        if (verifyModal.titleEl) verifyModal.titleEl.textContent = title || 'Verify';
+        if (verifyModal.statusEl) {
+            verifyModal.statusEl.textContent = 'Preparing…';
+            verifyModal.statusEl.classList.remove('text-success', 'text-warning', 'text-danger');
+        }
+        if (verifyModal.metaEl) verifyModal.metaEl.textContent = '';
+        if (verifyModal.spinnerEl) verifyModal.spinnerEl.classList.remove('d-none');
+        if (verifyModal.badgeEl) {
+            verifyModal.badgeEl.textContent = 'Running';
+            verifyModal.badgeEl.classList.remove('text-bg-success', 'text-bg-danger', 'text-bg-warning');
+            verifyModal.badgeEl.classList.add('text-bg-secondary');
+        }
+        if (verifyModal.logEl) verifyModal.logEl.textContent = '';
+        if (verifyModal.finalAlertEl) {
+            verifyModal.finalAlertEl.classList.add('d-none');
+            verifyModal.finalAlertEl.classList.remove('alert-success', 'alert-danger', 'alert-warning', 'alert-info');
+            verifyModal.finalAlertEl.textContent = '';
+        }
+        verifyModal.instance.show();
+    };
+
+    const verifyLog = (line) => {
+        if (!verifyModal?.logEl) return;
+        const next = (verifyModal.logEl.textContent || '') + (verifyModal.logEl.textContent ? '\n' : '') + String(line);
+        verifyModal.logEl.textContent = next;
+        verifyModal.logEl.scrollTop = verifyModal.logEl.scrollHeight;
+    };
+
+    const verifySetStatus = (statusText, metaText = '') => {
+        if (!verifyModal) return;
+        if (verifyModal.statusEl) verifyModal.statusEl.textContent = statusText || '';
+        if (verifyModal.metaEl) verifyModal.metaEl.textContent = metaText || '';
+    };
+
+    const verifyFinish = ({ ok, message, tone = null }) => {
+        if (!verifyModal) return;
+        if (verifyModal.spinnerEl) verifyModal.spinnerEl.classList.add('d-none');
+        if (verifyModal.badgeEl) {
+            verifyModal.badgeEl.classList.remove('text-bg-secondary', 'text-bg-success', 'text-bg-danger', 'text-bg-warning');
+            if (ok) {
+                verifyModal.badgeEl.textContent = 'SUCCESS';
+                verifyModal.badgeEl.classList.add('text-bg-success');
+            } else {
+                verifyModal.badgeEl.textContent = 'FAILURE';
+                verifyModal.badgeEl.classList.add('text-bg-danger');
+            }
+        }
+        if (verifyModal.finalAlertEl) {
+            verifyModal.finalAlertEl.classList.remove('d-none');
+            verifyModal.finalAlertEl.classList.remove('alert-success', 'alert-danger', 'alert-warning', 'alert-info');
+            const resolvedTone = tone || (ok ? 'success' : 'danger');
+            verifyModal.finalAlertEl.classList.add(`alert-${resolvedTone}`);
+            verifyModal.finalAlertEl.textContent = message || (ok ? 'Verification succeeded.' : 'Verification failed.');
+        }
+        if (verifyModal.statusEl) {
+            verifyModal.statusEl.classList.remove('text-success', 'text-warning', 'text-danger');
+            verifyModal.statusEl.classList.add(ok ? 'text-success' : 'text-danger');
+            verifyModal.statusEl.textContent = ok ? 'Verification succeeded' : 'Verification failed';
+        }
+    };
+
+    const btn = triggerButton;
+    const originalLabel = btn?.textContent;
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Verifying…';
+    }
+
+    const restore = () => {
+        if (btn) {
+            btn.disabled = false;
+            if (originalLabel !== undefined) btn.textContent = originalLabel;
+        }
+    };
+
+    try {
+        verifyResetUi({ title: 'Verify CORE Setup' });
+        verifySetStatus('Checking prerequisites…');
+        verifyLog(`Scenario ${sidx + 1}: checking Proxmox + CORE settings`);
+
+        // Step 1: Proxmox must be validated & stored.
+        const proxHasStored = !!(prox.validated && prox.secret_id);
+        if (!proxHasStored) {
+            const msg = 'Validate Proxmox credentials (Step 1) before verifying CORE.';
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            return { ok: false, message: msg };
+        }
+
+        // Step 2: CORE connection validation requires a selected VM and connection details.
+        const vmKey = (core.vm_key || '').toString().trim();
+        if (!vmKey) {
+            const msg = 'Select a CORE VM (Step 2) before verifying CORE.';
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            return { ok: false, message: msg };
+        }
+
+        const coreHost = (core.grpc_host || '').toString().trim();
+        const corePort = Number.isFinite(Number(core.grpc_port)) && Number(core.grpc_port) > 0 ? Number(core.grpc_port) : 50051;
+        const coreSshHost = ((core.ssh_host || '').toString().trim() || coreHost);
+        const coreSshPort = Number.isFinite(Number(core.ssh_port)) && Number(core.ssh_port) > 0 ? Number(core.ssh_port) : 22;
+        const coreUser = (core.ssh_username || '').toString().trim();
+        const hasSecret = typeof core.core_secret_id === 'string' && core.core_secret_id.trim();
+        const hasPassword = !!(core.ssh_password || hasSecret);
+
+        if (!coreHost || !coreUser || !hasPassword || !coreSshHost || !corePort || !coreSshPort) {
+            const msg = 'Complete Step 2 connection details (gRPC host/port, SSH host/port, SSH user, and password) before verifying.';
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            return { ok: false, message: msg };
+        }
+
+        verifySetStatus('Validating CORE connection…', `/test_core → ${coreHost}:${corePort}`);
+        const autoStartDaemon = !!(core.auto_start_daemon);
+        const installCustomServices = !!(core.install_custom_services);
+        const advFixDockerDaemon = !!(core.adv_fix_docker_daemon);
+        const advRunCoreCleanup = !!(core.adv_run_core_cleanup);
+        const advCheckCoreVersion = !!(core.adv_check_core_version);
+        const advRestartCoreDaemon = !!(core.adv_restart_core_daemon);
+        const advAutoKillSessions = !!(core.adv_auto_kill_sessions);
+        const enabledFlags = [];
+        if (autoStartDaemon) enabledFlags.push('Auto-start core-daemon');
+        if (installCustomServices) enabledFlags.push('Install custom services');
+        if (advFixDockerDaemon) enabledFlags.push('Advanced: Fix Docker daemon');
+        if (advRunCoreCleanup) enabledFlags.push('Advanced: Run core-cleanup');
+        if (advCheckCoreVersion) enabledFlags.push('Advanced: Check CORE version');
+        if (advRestartCoreDaemon) enabledFlags.push('Advanced: Restart core-daemon');
+        if (advAutoKillSessions) enabledFlags.push('Advanced: Auto-kill sessions');
+        verifyLog(`Calling /test_core for ${coreHost}:${corePort}`);
+        verifyLog(`Using last dialog options: ${enabledFlags.length ? enabledFlags.join(' | ') : 'none'}`);
+        const result = await validateCoreConnection(sidx, {
+            triggerButton: null,
+            workingLabel: 'Verifying…',
+            statusEl: verifyModal?.statusEl || null,
+            rememberCredentials: shouldRememberCore(hitlState),
+            closeModalOnSuccess: false,
+            suppressToasts: true,
+            showSummaryOnSuccess: false,
+            autoStartDaemon,
+            installCustomServices,
+            advFixDockerDaemon,
+            advRunCoreCleanup,
+            advCheckCoreVersion,
+            advRestartCoreDaemon,
+            advAutoKillSessions,
+        });
+
+        if (result && result.ok) {
+            let hasAdvancedFailures = false;
+            try {
+                const advObj = result.data && result.data.advanced_checks;
+                if (advObj && typeof advObj === 'object') {
+                    hasAdvancedFailures = Object.values(advObj).some((entry) => {
+                        return entry && typeof entry === 'object' && entry.enabled && entry.ok === false;
+                    });
+                }
+            } catch (e) {}
+            const msg = (result.data && (result.data.message || result.data.core_message))
+                ? (result.data.message || result.data.core_message)
+                : 'CORE connection verified.';
+            verifyLog(`SUCCESS: ${msg}`);
+            if (hasAdvancedFailures) {
+                verifyLog('Completed with warnings (advanced checks failed).');
+                verifyFinish({ ok: true, message: `${msg} (with warnings)`, tone: 'warning' });
+            } else {
+                verifyFinish({ ok: true, message: msg });
+            }
+            return result;
+        }
+
+        const failMsg = (result && result.message) ? result.message : 'CORE verification failed.';
+        verifyLog(`FAILED: ${failMsg}`);
+        verifyFinish({ ok: false, message: failMsg });
+        return result;
+    } finally {
+        restore();
+    }
+}
+
+async function verifyScenarioHitlBridge(sidx, options = {}) {
+    const { triggerButton = null } = options;
+    if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) {
+        return { ok: false, message: 'Scenario unavailable' };
+    }
+    if (IS_BUILDER_VIEW) {
+        try { showToast('Builder view is read-only.', { autohide: true, delay: 2500 }); } catch (_) {}
+        return { ok: false, message: 'Builder view is read-only' };
+    }
+
+    const scenario = state.scenarios[sidx];
+    const hitlState = ensureHitlStateForScenario(scenario);
+    const coreState = hitlState.core || (hitlState.core = {});
+    const proxState = hitlState.proxmox || (hitlState.proxmox = {});
+
+    const verifyModal = (() => {
+        const modalEl = document.getElementById('verifySetupModal');
+        if (!modalEl || !window.bootstrap) return null;
+        const get = (id) => document.getElementById(id);
+        return {
+            modalEl,
+            instance: bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl, { backdrop: true, keyboard: true }),
+            titleEl: get('verifySetupTitle'),
+            statusEl: get('verifySetupStatus'),
+            metaEl: get('verifySetupMeta'),
+            spinnerEl: get('verifySetupSpinner'),
+            badgeEl: get('verifySetupResultBadge'),
+            logEl: get('verifySetupLog'),
+            finalAlertEl: get('verifySetupFinalAlert'),
+        };
+    })();
+
+    const verifyResetUi = ({ title }) => {
+        if (!verifyModal) return;
+        if (verifyModal.titleEl) verifyModal.titleEl.textContent = title || 'Verify';
+        if (verifyModal.statusEl) {
+            verifyModal.statusEl.textContent = 'Preparing…';
+            verifyModal.statusEl.classList.remove('text-success', 'text-warning', 'text-danger');
+        }
+        if (verifyModal.metaEl) verifyModal.metaEl.textContent = '';
+        if (verifyModal.spinnerEl) verifyModal.spinnerEl.classList.remove('d-none');
+        if (verifyModal.badgeEl) {
+            verifyModal.badgeEl.textContent = 'Running';
+            verifyModal.badgeEl.classList.remove('text-bg-success', 'text-bg-danger', 'text-bg-warning');
+            verifyModal.badgeEl.classList.add('text-bg-secondary');
+        }
+        if (verifyModal.logEl) verifyModal.logEl.textContent = '';
+        if (verifyModal.finalAlertEl) {
+            verifyModal.finalAlertEl.classList.add('d-none');
+            verifyModal.finalAlertEl.classList.remove('alert-success', 'alert-danger', 'alert-warning', 'alert-info');
+            verifyModal.finalAlertEl.textContent = '';
+        }
+        verifyModal.instance.show();
+    };
+
+    const verifyLog = (line) => {
+        if (!verifyModal?.logEl) return;
+        const next = (verifyModal.logEl.textContent || '') + (verifyModal.logEl.textContent ? '\n' : '') + String(line);
+        verifyModal.logEl.textContent = next;
+        verifyModal.logEl.scrollTop = verifyModal.logEl.scrollHeight;
+    };
+
+    const verifySetStatus = (statusText, metaText = '') => {
+        if (!verifyModal) return;
+        if (verifyModal.statusEl) verifyModal.statusEl.textContent = statusText || '';
+        if (verifyModal.metaEl) verifyModal.metaEl.textContent = metaText || '';
+    };
+
+    const verifyFinish = ({ ok, message }) => {
+        if (!verifyModal) return;
+        if (verifyModal.spinnerEl) verifyModal.spinnerEl.classList.add('d-none');
+        if (verifyModal.badgeEl) {
+            verifyModal.badgeEl.classList.remove('text-bg-secondary', 'text-bg-success', 'text-bg-danger');
+            if (ok) {
+                verifyModal.badgeEl.textContent = 'SUCCESS';
+                verifyModal.badgeEl.classList.add('text-bg-success');
+            } else {
+                verifyModal.badgeEl.textContent = 'FAILURE';
+                verifyModal.badgeEl.classList.add('text-bg-danger');
+            }
+        }
+        if (verifyModal.finalAlertEl) {
+            verifyModal.finalAlertEl.classList.remove('d-none');
+            verifyModal.finalAlertEl.classList.remove('alert-success', 'alert-danger');
+            verifyModal.finalAlertEl.classList.add(ok ? 'alert-success' : 'alert-danger');
+            verifyModal.finalAlertEl.textContent = message || (ok ? 'Verification succeeded.' : 'Verification failed.');
+        }
+        if (verifyModal.statusEl) {
+            verifyModal.statusEl.classList.remove('text-success', 'text-warning', 'text-danger');
+            verifyModal.statusEl.classList.add(ok ? 'text-success' : 'text-danger');
+            verifyModal.statusEl.textContent = ok ? 'Verification succeeded' : 'Verification failed';
+        }
+    };
+
+    const btn = triggerButton;
+    const originalLabel = btn?.textContent;
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Verifying…';
+    }
+
+    const restore = () => {
+        if (btn) {
+            btn.disabled = false;
+            if (originalLabel !== undefined) btn.textContent = originalLabel;
+        }
+    };
+
+    try {
+        verifyResetUi({ title: 'Verify HITL Bridge Setup' });
+        verifySetStatus('Checking prerequisites…');
+        verifyLog(`Scenario ${sidx + 1}: checking HITL prerequisites`);
+
+        const secretId = typeof proxState.secret_id === 'string' ? proxState.secret_id.trim() : '';
+        if (!secretId || !(proxState.validated && secretId)) {
+            const msg = 'Validate Proxmox credentials (Step 1) before verifying HITL.';
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            return { ok: false, message: msg };
+        }
+        const vmKey = (coreState.vm_key || '').toString().trim();
+        if (!vmKey) {
+            const msg = 'Select a CORE VM (Step 2) before verifying HITL.';
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            return { ok: false, message: msg };
+        }
+        const coreHasSecret = typeof coreState.core_secret_id === 'string' && coreState.core_secret_id.trim();
+        if (!coreHasSecret) {
+            const msg = 'Store CORE credentials (Step 2) before verifying HITL.';
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            return { ok: false, message: msg };
+        }
+        if (!hitlState.enabled) {
+            const msg = 'Enable Hardware in the Loop (Step 3) before verifying HITL.';
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            return { ok: false, message: msg };
+        }
+        const proxInventoryBusy = proxInventoryFetchInFlight && typeof proxInventoryFetchInFlight.has === 'function'
+            ? proxInventoryFetchInFlight.has(sidx)
+            : false;
+        const proxInventoryError = proxState.inventory_error ? proxState.inventory_error.toString() : '';
+        if (proxInventoryBusy) {
+            const msg = 'Wait for the Proxmox VM inventory fetch to finish before verifying HITL.';
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            return { ok: false, message: msg };
+        }
+        if (proxInventoryError) {
+            const msg = `Resolve Proxmox inventory error before verifying HITL: ${proxInventoryError}`;
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            return { ok: false, message: msg };
+        }
+
+        // Match the Config HITL dialog behavior: when the modal opens, it auto-refreshes
+        // the CORE VM interface catalog if empty or stale. Do the same before we evaluate
+        // Step 3 (interfaces cannot be added reliably until the catalog is loaded).
+        try {
+            if (isHitlAuthenticationReady(hitlState)) {
+                const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+                const lastRefreshMs = Date.parse(coreState.last_interfaces_refresh || '');
+                const hasError = !!coreState.last_interfaces_error;
+                const shouldRefresh = (() => {
+                    if (!hostInterfaces.length) return true;
+                    if (hasError) return true;
+                    if (Number.isNaN(lastRefreshMs)) return true;
+                    return (Date.now() - lastRefreshMs) > HITL_MODAL_AUTO_REFRESH_STALE_MS;
+                })();
+                if (shouldRefresh && !coreState.interfaces_refresh_inflight) {
+                    verifySetStatus('Loading CORE VM interfaces…', 'Same behavior as Config HITL dialog');
+                    verifyLog('Refreshing interface list from CORE VM…');
+                    const refreshRes = await refreshHostInterfacesForScenario(sidx, {
+                        reason: 'verify',
+                        silent: true,
+                        timeoutMs: HOST_INTERFACES_REQUEST_TIMEOUT_MS,
+                        setStatus: (message, tone) => {
+                            // Keep the Verify modal as the primary feedback surface.
+                            try { verifyLog(`[hitl] ${message}`); } catch (_) {}
+                        },
+                    });
+                    if (refreshRes && refreshRes.ok) {
+                        verifyLog('Interface list loaded.');
+                    } else {
+                        // Best-effort: if refresh fails, keep going — later payload building
+                        // may still succeed with cached mappings.
+                        verifyLog('WARN: Unable to refresh interface list right now.');
+                    }
+                }
+            }
+        } catch (err) {
+            verifyLog('WARN: Interface refresh threw; continuing.');
+        }
+
+        // Re-read after the auto-refresh attempt (state normalization can happen on access).
+        const hitlStateAfterRefresh = ensureHitlStateForScenario(scenario);
+        const ifaces = Array.isArray(hitlStateAfterRefresh.interfaces) ? hitlStateAfterRefresh.interfaces : [];
+        if (!ifaces.length) {
+            const msg = 'Add at least one HITL interface (Step 3) before verifying.';
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            return { ok: false, message: msg };
+        }
+        const extSelections = ifaces.filter(iface => iface?.external_vm && (iface.external_vm.vm_key || iface.external_vm.vmid || iface.external_vm.vm_name)).length;
+        const extSelectionsWithIface = ifaces.filter(iface => iface?.external_vm && (iface.external_vm.vm_key || iface.external_vm.vmid || iface.external_vm.vm_name) && iface.external_vm.interface_id).length;
+        if (extSelections <= 0) {
+            const msg = 'Map at least one HITL interface to an external VM (Step 4) before verifying.';
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            return { ok: false, message: msg };
+        }
+        if (extSelectionsWithIface <= 0) {
+            const msg = 'Select an external VM interface (for example, net0) in Step 4 before verifying.';
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            return { ok: false, message: msg };
+        }
+        const storedBridge = (coreState.internal_bridge || '').toString().trim();
+        const bridgeName = storedBridge || computeInternalBridgeName();
+        if (!bridgeName) {
+            const msg = 'Unable to compute internal bridge name.';
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            return { ok: false, message: msg };
+        }
+
+        verifySetStatus('Preparing HITL payload…');
+        verifyLog(storedBridge
+            ? `Using last applied bridge: ${bridgeName}`
+            : `Using computed bridge: ${bridgeName}`);
+
+        // Reuse the same sanitization logic as Apply.
+        const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+        const hostInfoLookup = new Map(
+            hostInterfaces
+                .filter(item => item && typeof item === 'object' && item.name)
+                .map(item => [item.name, item])
+        );
+        const proxInventoryList = proxState && proxState.inventory && Array.isArray(proxState.inventory.vms)
+            ? proxState.inventory.vms
+            : [];
+        const pickFirst = (...candidates) => {
+            for (let idxCandidate = 0; idxCandidate < candidates.length; idxCandidate += 1) {
+                const candidate = candidates[idxCandidate];
+                if (candidate === null || candidate === undefined) continue;
+                const text = String(candidate).trim();
+                if (text) return text;
+            }
+            return '';
+        };
+        const findVmRecord = (nodeVal, vmidVal) => {
+            if (!nodeVal || !vmidVal) return null;
+            const nodeKey = String(nodeVal).trim();
+            const vmidKey = String(vmidVal).trim();
+            if (!nodeKey || !vmidKey) return null;
+            for (let vmIdx = 0; vmIdx < proxInventoryList.length; vmIdx += 1) {
+                const vmEntry = proxInventoryList[vmIdx];
+                if (!vmEntry || typeof vmEntry !== 'object') continue;
+                const vmNode = vmEntry.node !== undefined && vmEntry.node !== null ? String(vmEntry.node).trim() : '';
+                const vmId = vmEntry.vmid !== undefined && vmEntry.vmid !== null ? String(vmEntry.vmid).trim() : '';
+                if (vmNode && vmId && vmNode === nodeKey && vmId === vmidKey) {
+                    return vmEntry;
+                }
+            }
+            return null;
+        };
+
+        const buildHitlApplyPayload = (rawHitl) => {
+            const clean = { enabled: !!rawHitl.enabled, interfaces: [], core: {}, proxmox: {} };
+            const missingCore = [];
+            const ifaceList = Array.isArray(rawHitl.interfaces) ? rawHitl.interfaces : [];
+            for (let i = 0; i < ifaceList.length; i += 1) {
+                const entry = ifaceList[i];
+                if (!entry || typeof entry !== 'object') {
+                    continue;
+                }
+                const sanitized = {
+                    name: entry.name || '',
+                    attachment: entry.attachment || '',
+                };
+                const hostInfo = hostInfoLookup.get(sanitized.name) || null;
+                let proxTargetClean = null;
+                const proxTarget = entry.proxmox_target;
+                if (proxTarget && typeof proxTarget === 'object') {
+                    proxTargetClean = {
+                        node: pickFirst(proxTarget.node, proxTarget.vm_node, proxTarget.raw && proxTarget.raw.node),
+                        vmid: pickFirst(proxTarget.vmid, proxTarget.vm_id, proxTarget.raw && proxTarget.raw.vmid, proxTarget.raw && proxTarget.raw.vm_id),
+                        interface_id: pickFirst(
+                            proxTarget.interface_id,
+                            proxTarget.id,
+                            proxTarget.adapter,
+                            proxTarget.raw && proxTarget.raw.interface_id,
+                            proxTarget.raw && proxTarget.raw.id,
+                            proxTarget.raw && proxTarget.raw.adapter
+                        ),
+                    };
+                    if (proxTarget.vm_name || proxTarget.label) {
+                        proxTargetClean.vm_name = proxTarget.vm_name ?? proxTarget.label ?? '';
+                    }
+                    if (proxTarget.macaddr) proxTargetClean.macaddr = proxTarget.macaddr;
+                    if (proxTarget.bridge) proxTargetClean.bridge = proxTarget.bridge;
+                    if (proxTarget.model) proxTargetClean.model = proxTarget.model;
+                }
+                if (!proxTargetClean && hostInfo && hostInfo.proxmox && typeof hostInfo.proxmox === 'object') {
+                    const hostProx = hostInfo.proxmox;
+                    proxTargetClean = {
+                        node: pickFirst(hostProx.vm_node, hostProx.node, hostProx.raw && hostProx.raw.node),
+                        vmid: pickFirst(hostProx.vmid, hostProx.vm_id, hostProx.raw && hostProx.raw.vmid, hostProx.raw && hostProx.raw.vm_id),
+                        interface_id: pickFirst(hostProx.id, hostProx.interface_id, hostProx.adapter, hostProx.raw && hostProx.raw.interface_id, hostProx.raw && hostProx.raw.id, hostProx.raw && hostProx.raw.adapter),
+                    };
+                    const vmName = pickFirst(hostProx.vm_name, hostProx.raw && hostProx.raw.vm_name, hostProx.raw && hostProx.raw.name);
+                    if (vmName) proxTargetClean.vm_name = vmName;
+                    if (hostProx.macaddr) proxTargetClean.macaddr = String(hostProx.macaddr).trim();
+                    if (hostProx.bridge) proxTargetClean.bridge = String(hostProx.bridge).trim();
+                    if (hostProx.model) proxTargetClean.model = String(hostProx.model).trim();
+                }
+                if (proxTargetClean) {
+                    if (!proxTargetClean.interface_id && hostInfo && hostInfo.mac) {
+                        const macKey = String(hostInfo.mac).trim().toLowerCase();
+                        const nodeVal = proxTargetClean.node || (hostInfo.proxmox && pickFirst(hostInfo.proxmox.vm_node, hostInfo.proxmox.node));
+                        const vmidVal = proxTargetClean.vmid || (hostInfo.proxmox && pickFirst(hostInfo.proxmox.vmid, hostInfo.proxmox.vm_id));
+                        const vmRecord = findVmRecord(nodeVal, vmidVal);
+                        if (vmRecord && Array.isArray(vmRecord.interfaces)) {
+                            for (let ifaceIdx = 0; ifaceIdx < vmRecord.interfaces.length; ifaceIdx += 1) {
+                                const vmIface = vmRecord.interfaces[ifaceIdx];
+                                if (!vmIface || typeof vmIface !== 'object') continue;
+                                const ifaceMac = vmIface.macaddr ? String(vmIface.macaddr).trim().toLowerCase() : '';
+                                if (ifaceMac && ifaceMac === macKey) {
+                                    proxTargetClean.interface_id = pickFirst(vmIface.id, vmIface.interface_id, vmIface.name);
+                                    if (!proxTargetClean.bridge && vmIface.bridge) proxTargetClean.bridge = String(vmIface.bridge).trim();
+                                    if (!proxTargetClean.model && vmIface.model) proxTargetClean.model = String(vmIface.model).trim();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (!proxTargetClean.interface_id && proxTargetClean.macaddr) {
+                        const macKey = String(proxTargetClean.macaddr).trim().toLowerCase();
+                        const vmRecord = findVmRecord(proxTargetClean.node, proxTargetClean.vmid);
+                        if (vmRecord && Array.isArray(vmRecord.interfaces)) {
+                            for (let ifaceIdx = 0; ifaceIdx < vmRecord.interfaces.length; ifaceIdx += 1) {
+                                const vmIface = vmRecord.interfaces[ifaceIdx];
+                                if (!vmIface || typeof vmIface !== 'object') continue;
+                                const ifaceMac = vmIface.macaddr ? String(vmIface.macaddr).trim().toLowerCase() : '';
+                                if (ifaceMac && ifaceMac === macKey) {
+                                    proxTargetClean.interface_id = pickFirst(vmIface.id, vmIface.interface_id, vmIface.name);
+                                    if (!proxTargetClean.bridge && vmIface.bridge) proxTargetClean.bridge = String(vmIface.bridge).trim();
+                                    if (!proxTargetClean.model && vmIface.model) proxTargetClean.model = String(vmIface.model).trim();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    sanitized.proxmox_target = proxTargetClean;
+                }
+                const external = entry.external_vm;
+                if (external && typeof external === 'object') {
+                    const ext = {
+                        vm_key: external.vm_key ?? '',
+                        vmid: external.vmid ?? '',
+                        interface_id: external.interface_id ?? '',
+                    };
+                    if (external.vm_node) ext.vm_node = external.vm_node;
+                    if (external.vm_name) ext.vm_name = external.vm_name;
+                    sanitized.external_vm = ext;
+                    const hasCoreSelection = proxTargetClean && proxTargetClean.interface_id;
+                    const hasExternalSelection = (ext.vm_key && String(ext.vm_key).trim()) ||
+                        (ext.vmid && String(ext.vmid).trim()) ||
+                        (ext.vm_name && String(ext.vm_name).trim());
+                    if (hasExternalSelection && !hasCoreSelection) {
+                        missingCore.push(sanitized.name || `Interface ${i + 1}`);
+                    }
+                }
+                clean.interfaces.push(sanitized);
+            }
+            const coreRaw = rawHitl.core;
+            if (coreRaw && typeof coreRaw === 'object') {
+                clean.core = {
+                    vm_key: coreRaw.vm_key ?? '',
+                    vm_name: coreRaw.vm_name ?? '',
+                    vm_node: coreRaw.vm_node ?? '',
+                    internal_bridge: coreRaw.internal_bridge ?? '',
+                    internal_bridge_owner: coreRaw.internal_bridge_owner ?? '',
+                };
+            }
+            const proxRaw = rawHitl.proxmox;
+            if (proxRaw && typeof proxRaw === 'object') {
+                clean.proxmox = {
+                    secret_id: proxRaw.secret_id ?? proxRaw.secretId ?? null,
+                };
+            }
+            return { clean, missingCore };
+        };
+
+        const { clean: sanitizedHitl, missingCore } = buildHitlApplyPayload(hitlState);
+        if (missingCore.length) {
+            const detailMessage = missingCore.length === 1
+                ? `${missingCore[0]} needs a Proxmox adapter (for example, net0) selected in Step 3 before verifying.`
+                : `Select a Proxmox adapter (for example, net0) in Step 3 for: ${missingCore.join(', ')}.`;
+            verifyLog(`FAILED: ${detailMessage}`);
+            verifyFinish({ ok: false, message: detailMessage });
+            return { ok: false, message: detailMessage };
+        }
+
+        // Keep payload consistent with the bridge we are verifying.
+        try {
+            if (!sanitizedHitl.core || typeof sanitizedHitl.core !== 'object') sanitizedHitl.core = {};
+            sanitizedHitl.core.internal_bridge = bridgeName;
+        } catch (e) {}
+
+        const requestPayload = {
+            bridge_name: bridgeName,
+            scenario_index: sidx,
+            scenario_name: (scenario?.name || '').toString(),
+            hitl: sanitizedHitl,
+        };
+
+        verifySetStatus('Validating HITL bridge settings…', '/api/hitl/validate_bridge');
+        verifyLog('Calling /api/hitl/validate_bridge');
+        const resp = await fetch('/api/hitl/validate_bridge', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify(requestPayload),
+        });
+        let data = null;
+        try { data = await resp.json(); } catch (err) { data = null; }
+        if (!resp.ok || !data || data.success === false) {
+            const errMessage = (data && (data.error || data.message)) ? (data.error || data.message) : `HITL verification failed (HTTP ${resp.status})`;
+            verifyLog(`FAILED: ${errMessage}`);
+            verifyFinish({ ok: false, message: errMessage });
+            return { ok: false, message: errMessage, data };
+        }
+
+        const msg = data.message || 'HITL bridge settings verified.';
+        try {
+            const changed = Array.isArray(data.changed_interfaces) ? data.changed_interfaces.length : null;
+            const unchanged = Array.isArray(data.unchanged_interfaces) ? data.unchanged_interfaces.length : null;
+            if (changed !== null || unchanged !== null) {
+                verifyLog(`Preview: ${changed ?? 0} interface(s) would change; ${unchanged ?? 0} unchanged`);
+            }
+        } catch (e) {}
+        verifyLog(`SUCCESS: ${msg}`);
+        verifyFinish({ ok: true, message: msg });
+        return { ok: true, data };
+    } catch (err) {
+        const message = err instanceof Error ? err.message : 'HITL verification failed';
+        verifyLog(`FAILED: ${message}`);
+        verifyFinish({ ok: false, message });
+        return { ok: false, message };
+    } finally {
+        restore();
+    }
+}
+
 function handleCoreFieldUpdate(inputEl, { rerender } = { rerender: false }) {
     if (!inputEl) return;
     if (IS_BUILDER_VIEW) return;
@@ -6898,6 +7719,11 @@ async function validateCoreConnection(sidx, options = {}) {
         autoStartDaemon = false,
         installCustomServices = false,
         stopDuplicateDaemons = false,
+        advFixDockerDaemon = false,
+        advRunCoreCleanup = false,
+        advCheckCoreVersion = false,
+        advRestartCoreDaemon = false,
+        advAutoKillSessions = false,
         _daemonConflictPrompted = false,
         showSummaryOnSuccess = false,
     } = options;
@@ -6931,6 +7757,11 @@ async function validateCoreConnection(sidx, options = {}) {
             auto_start_daemon: autoStartDaemon,
             install_custom_services: installCustomServices,
             stop_duplicate_daemons: stopDuplicateDaemons,
+            adv_fix_docker_daemon: advFixDockerDaemon,
+            adv_run_core_cleanup: advRunCoreCleanup,
+            adv_check_core_version: advCheckCoreVersion,
+            adv_restart_core_daemon: advRestartCoreDaemon,
+            adv_auto_kill_sessions: advAutoKillSessions,
         },
     };
     enrichPayloadWithScenarioContext(body, { scenarioIndex: sidx, scenarioOverride: scenario });
@@ -6979,6 +7810,26 @@ async function validateCoreConnection(sidx, options = {}) {
         let data = null;
         try { data = await resp.json(); } catch (err) { data = null; }
         const nowIso = new Date().toISOString();
+        const _formatAdvancedCheckLines = (advObj) => {
+            if (!advObj || typeof advObj !== 'object') return [];
+            const rows = [
+                { key: 'adv_check_core_version', label: 'Check CORE version (9.2.1)' },
+                { key: 'adv_fix_docker_daemon', label: 'Fix Docker daemon' },
+                { key: 'adv_run_core_cleanup', label: 'Run core-cleanup' },
+                { key: 'adv_restart_core_daemon', label: 'Restart core-daemon' },
+                { key: 'adv_auto_kill_sessions', label: 'Auto-kill running sessions' },
+            ];
+            const out = [];
+            rows.forEach((row) => {
+                const entry = advObj[row.key];
+                if (!entry || typeof entry !== 'object') return;
+                if (!entry.enabled) return;
+                const ok = entry.ok === true;
+                const msg = (entry.message || '').toString().trim();
+                out.push(`Advanced: ${row.label}: ${ok ? 'OK' : 'FAILED'}${msg ? ` (${msg})` : ''}`);
+            });
+            return out;
+        };
         if (data && data.ok) {
             const buildSummary = () => {
                 const lines = [];
@@ -7015,6 +7866,10 @@ async function validateCoreConnection(sidx, options = {}) {
                 } else {
                     lines.push('Custom services: not installed');
                 }
+                const advLines = _formatAdvancedCheckLines(data.advanced_checks);
+                if (advLines.length) {
+                    lines.push(...advLines);
+                }
                 lines.push(rememberCredentials ? 'Credentials: stored in vault.' : 'Credentials: not stored.');
                 return lines.join('\n');
             };
@@ -7028,6 +7883,10 @@ async function validateCoreConnection(sidx, options = {}) {
             coreState.last_tested_at = nowIso;
             coreState.last_tested_host = data.host || coreState.grpc_host || '';
             coreState.last_tested_port = data.port || coreState.grpc_port || null;
+            state.core_last_test_status = 'success';
+            state.core_last_test_host = coreState.last_tested_host;
+            state.core_last_test_port = coreState.last_tested_port;
+            state.core_last_test_at = nowIso;
             const incomingSecretId = data.core_secret_id || (summary && summary.identifier) || null;
             if (rememberCredentials) {
                 coreState.core_secret_id = incomingSecretId;
@@ -7054,18 +7913,38 @@ async function validateCoreConnection(sidx, options = {}) {
             }
             updateProxmoxSummary(sidx);
             renderMain();
+
+            let hasAdvancedFailures = false;
+            try {
+                const advObj = data && data.advanced_checks;
+                if (advObj && typeof advObj === 'object') {
+                    hasAdvancedFailures = Object.values(advObj).some((entry) => {
+                        return entry && typeof entry === 'object' && entry.enabled && entry.ok === false;
+                    });
+                }
+            } catch (e) {}
+
             if (typeof setCoreConnectionHint === 'function') {
                 if (showSummaryOnSuccess) {
-                    setCoreConnectionHint(buildSummary(), rememberCredentials ? 'success' : 'warning');
+                    const tone = hasAdvancedFailures ? 'warning' : (rememberCredentials ? 'success' : 'warning');
+                    setCoreConnectionHint(buildSummary(), tone);
                 } else if (hintOnSuccess) {
-                    setCoreConnectionHint(hintOnSuccess, rememberCredentials ? 'success' : 'warning');
+                    const tone = hasAdvancedFailures ? 'warning' : (rememberCredentials ? 'success' : 'warning');
+                    setCoreConnectionHint(hintOnSuccess, tone);
                 } else if (hintOnStart) {
-                    setCoreConnectionHint(rememberCredentials ? 'Validation successful.' : 'Validated without storing credentials. Re-enter password next time.', rememberCredentials ? 'success' : 'warning');
+                    const tone = hasAdvancedFailures ? 'warning' : (rememberCredentials ? 'success' : 'warning');
+                    setCoreConnectionHint(
+                        rememberCredentials ? 'Validation successful.' : 'Validated without storing credentials. Re-enter password next time.',
+                        tone,
+                    );
                 }
             }
             if (!suppressToasts) {
                 try {
-                    const toastMessage = successToastMessage || data.message || (rememberCredentials ? 'CORE connection verified' : 'CORE verified (not stored)');
+                    let toastMessage = successToastMessage || data.message || (rememberCredentials ? 'CORE connection verified' : 'CORE verified (not stored)');
+                    if (hasAdvancedFailures) {
+                        toastMessage = `${toastMessage} (with warnings)`;
+                    }
                     showToast(toastMessage, { autohide: true, delay: 2500 });
                 } catch (e) {}
             }
@@ -7109,6 +7988,10 @@ async function validateCoreConnection(sidx, options = {}) {
         coreState.last_tested_at = nowIso;
         coreState.last_tested_host = coreState.grpc_host || '';
         coreState.last_tested_port = coreState.grpc_port || null;
+        state.core_last_test_status = 'failure';
+        state.core_last_test_host = coreState.last_tested_host;
+        state.core_last_test_port = coreState.last_tested_port;
+        state.core_last_test_at = nowIso;
         markGlobalCoreDisconnected();
         persistEditorState();
         const hidden = document.getElementById('scenarios_json');
@@ -7119,7 +8002,14 @@ async function validateCoreConnection(sidx, options = {}) {
         if (pwdInput) pwdInput.removeAttribute('placeholder');
         if (typeof setCoreConnectionHint === 'function') {
             if (hintOnFailure) {
-                setCoreConnectionHint(`${hintOnFailure}: ${message}`, 'danger');
+                let detail = `${hintOnFailure}: ${message}`;
+                try {
+                    const advLines = (data && data.advanced_checks) ? _formatAdvancedCheckLines(data.advanced_checks) : [];
+                    if (advLines && advLines.length) {
+                        detail = `${detail}\n${advLines.join('\n')}`;
+                    }
+                } catch (e) {}
+                setCoreConnectionHint(detail, 'danger');
             } else if (hintOnStart) {
                 setCoreConnectionHint(message, 'danger');
             }
@@ -7135,6 +8025,10 @@ async function validateCoreConnection(sidx, options = {}) {
         coreState.last_tested_at = new Date().toISOString();
         coreState.last_tested_host = coreState.grpc_host || '';
         coreState.last_tested_port = coreState.grpc_port || null;
+        state.core_last_test_status = 'failure';
+        state.core_last_test_host = coreState.last_tested_host;
+        state.core_last_test_port = coreState.last_tested_port;
+        state.core_last_test_at = coreState.last_tested_at;
         markGlobalCoreDisconnected();
         persistEditorState();
         const hidden = document.getElementById('scenarios_json');
@@ -7269,6 +8163,22 @@ async function handleCoreConnectionSave(event) {
     const installServicesToggle = document.getElementById('coreInstallCustomServices');
     const installCustomServices = installServicesToggle ? !!installServicesToggle.checked : !!(coreState.install_custom_services);
     coreState.install_custom_services = installCustomServices;
+
+    const advFixDockerToggle = document.getElementById('coreAdvFixDockerDaemon');
+    const advRunCleanupToggle = document.getElementById('coreAdvRunCoreCleanup');
+    const advCheckVersionToggle = document.getElementById('coreAdvCheckCoreVersion');
+    const advRestartDaemonToggle = document.getElementById('coreAdvRestartCoreDaemon');
+    const advAutoKillToggle = document.getElementById('coreAdvAutoKillSessions');
+    const advFixDocker = advFixDockerToggle ? !!advFixDockerToggle.checked : !!(coreState.adv_fix_docker_daemon);
+    const advRunCleanup = advRunCleanupToggle ? !!advRunCleanupToggle.checked : !!(coreState.adv_run_core_cleanup);
+    const advCheckVersion = advCheckVersionToggle ? !!advCheckVersionToggle.checked : !!(coreState.adv_check_core_version);
+    const advRestartDaemon = advRestartDaemonToggle ? !!advRestartDaemonToggle.checked : !!(coreState.adv_restart_core_daemon);
+    const advAutoKill = advAutoKillToggle ? !!advAutoKillToggle.checked : !!(coreState.adv_auto_kill_sessions);
+    coreState.adv_fix_docker_daemon = advFixDocker;
+    coreState.adv_run_core_cleanup = advRunCleanup;
+    coreState.adv_check_core_version = advCheckVersion;
+    coreState.adv_restart_core_daemon = advRestartDaemon;
+    coreState.adv_auto_kill_sessions = advAutoKill;
     const proxState = hitlState.proxmox || {};
     const prerequisitesMet = !!(proxState.validated && proxState.secret_id && coreState.vm_key);
     if (!prerequisitesMet) {
@@ -7342,10 +8252,15 @@ async function handleCoreConnectionSave(event) {
         hintOnSuccess: 'Connection saved and validated.',
         hintOnFailure: 'Validation failed',
         successToastMessage: rememberCreds ? 'CORE connection saved & validated' : 'CORE connection verified (not stored)',
-        closeModalOnSuccess: false,
+        closeModalOnSuccess: true,
         rememberCredentials: rememberCreds,
         autoStartDaemon: autoStartDaemon,
         installCustomServices: installCustomServices,
+        advFixDockerDaemon: advFixDocker,
+        advRunCoreCleanup: advRunCleanup,
+        advCheckCoreVersion: advCheckVersion,
+        advRestartCoreDaemon: advRestartDaemon,
+        advAutoKillSessions: advAutoKill,
         showSummaryOnSuccess: true,
     });
 }
@@ -7753,7 +8668,19 @@ function renderMain() {
         .replace(/'/g,'&#39;');
     const safeScenarioName = escapeHtml(scen?.name || '');
     const defaultScenarioName = escapeHtml(`Scenario ${activeIdx + 1}`);
+
+    // Refresh persisted section collapse state (per scenario + section) early,
+    // before any of the per-card collapse reads.
+    try { collapseState = JSON.parse(localStorage.getItem('sectionCollapseState') || '{}'); } catch(e) { collapseState = {}; }
+
+    const coreParticipantCollapseKey = `${activeIdx}::core_participant_setup`;
+    const coreParticipantCollapsed = !!collapseState[coreParticipantCollapseKey];
     const existingMetaCard = document.getElementById('scenarioMetaCard');
+    const hitlEntryWrap = document.getElementById('hitlEntryButtonsWrap');
+    // Capture existing button elements BEFORE removing/rebuilding containers.
+    const selectCoreVmBtnEl = document.getElementById('selectCoreVmBtn');
+    const configHitlBtnEl = document.getElementById('configHitlBtn');
+    const hitlAdminBadgeEl = hitlEntryWrap ? hitlEntryWrap.querySelector('.badge') : null;
     if (existingMetaCard && existingMetaCard.parentNode) {
         existingMetaCard.parentNode.removeChild(existingMetaCard);
     }
@@ -7763,8 +8690,51 @@ function renderMain() {
     metaCard.className = 'card mb-3';
     metaCard.innerHTML = `
         <div class="card-body">
-            <label class="form-label mb-1 small text-muted" for="scenarioNameInput_${activeIdx}">Scenario name</label>
-            <input type="text" class="form-control" id="scenarioNameInput_${activeIdx}" data-field="name" data-scen-idx="${activeIdx}" value="${safeScenarioName}" placeholder="${defaultScenarioName}">
+            <div class="d-flex flex-wrap justify-content-between align-items-end gap-3">
+                <div class="flex-grow-1" style="min-width: 240px;">
+                    <label class="form-label mb-1 small text-muted" for="scenarioNameInput_${activeIdx}">Scenario name</label>
+                    <input type="text" class="form-control" id="scenarioNameInput_${activeIdx}" data-field="name" data-scen-idx="${activeIdx}" value="${safeScenarioName}" placeholder="${defaultScenarioName}">
+                </div>
+            </div>
+            <div id="scenarioNameHitlSection" class="border border-secondary rounded p-2 mt-3 bg-light">
+                <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
+                    <div class="fw-semibold small">CORE / Participant Setup (optional)</div>
+                    <div class="d-flex align-items-center gap-2">
+                        <span id="scenarioNameHitlStatusBadge" class="badge text-bg-secondary">Not configured</span>
+                        <button class="btn btn-sm btn-outline-secondary" type="button" data-action="toggle-collapse" data-target="#collapse-core_participant_setup">${coreParticipantCollapsed ? 'Expand' : 'Collapse'}</button>
+                    </div>
+                </div>
+                <div id="collapse-core_participant_setup" style="${coreParticipantCollapsed ? 'display:none;' : 'display:block;'}">
+                    <div class="table-responsive">
+                        <table class="table table-sm mb-0 align-middle">
+                            <tbody>
+                                <tr>
+                                    <td style="width: 240px;">
+                                        <div class="d-flex flex-column gap-2">
+                                            <div id="scenarioNameCoreBtnSlot"></div>
+                                            <button type="button" class="btn btn-outline-secondary hitl-entry-btn" id="scenarioNameCoreVerifyBtn" title="Verify CORE/Proxmox settings">Verify</button>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <div class="small text-body" id="scenarioNameCoreSummary"></div>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td style="width: 240px;">
+                                        <div class="d-flex flex-column gap-2">
+                                            <div id="scenarioNameHitlBtnSlot"></div>
+                                            <button type="button" class="btn btn-outline-secondary hitl-entry-btn" id="scenarioNameHitlVerifyBtn" title="Verify HITL bridge settings">Verify</button>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <div class="small text-body" id="scenarioNameHitlSummary"></div>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
         </div>`;
     const baseScenarioCard = document.getElementById('baseCoreScenarioCard');
     if (baseScenarioCard && baseScenarioCard.parentNode) {
@@ -7772,6 +8742,66 @@ function renderMain() {
     } else {
         root.appendChild(metaCard);
     }
+
+    if (hitlEntryWrap || selectCoreVmBtnEl || configHitlBtnEl || hitlAdminBadgeEl) {
+        const coreBtnSlot = document.getElementById('scenarioNameCoreBtnSlot');
+        const hitlBtnSlot = document.getElementById('scenarioNameHitlBtnSlot');
+        if (coreBtnSlot || hitlBtnSlot) {
+            try {
+                // Move the actual button elements (keep existing event handlers).
+                if (selectCoreVmBtnEl && coreBtnSlot) {
+                    selectCoreVmBtnEl.classList.add('w-100', 'hitl-entry-btn');
+                    coreBtnSlot.appendChild(selectCoreVmBtnEl);
+                }
+                if (configHitlBtnEl && hitlBtnSlot) {
+                    configHitlBtnEl.classList.add('w-100', 'hitl-entry-btn');
+                    hitlBtnSlot.appendChild(configHitlBtnEl);
+                }
+                // If we're in builder view, move the admin badge too.
+                if (hitlAdminBadgeEl && coreBtnSlot) {
+                    coreBtnSlot.appendChild(hitlAdminBadgeEl);
+                }
+            } catch (e) {}
+        }
+        // Remove the old wrapper container (now empty/unused after moving children).
+        try {
+            if (hitlEntryWrap && hitlEntryWrap.parentNode) hitlEntryWrap.parentNode.removeChild(hitlEntryWrap);
+        } catch (e) {}
+    }
+
+    // Tooltips (native title tooltip) for the optional entry points.
+    try {
+        const selectBtn = document.getElementById('selectCoreVmBtn');
+        if (selectBtn) {
+            selectBtn.setAttribute('title', 'Optional: Select a Proxmox resource and remote CORE VM for HITL runs.');
+        }
+        const cfgBtn = document.getElementById('configHitlBtn');
+        if (cfgBtn) {
+            // Keep gating tooltip if disabled; otherwise show the purpose.
+            if (!cfgBtn.disabled) {
+                cfgBtn.setAttribute('title', 'Optional: Configure HITL interfaces and participant VM mappings for this scenario.');
+            } else if (!cfgBtn.getAttribute('title')) {
+                cfgBtn.setAttribute('title', 'Complete Steps 1 and 2 first.');
+            }
+        }
+    } catch (e) {}
+
+    // Bind scenario-name Verify buttons (buttons are recreated every renderMain).
+    try {
+        const coreVerifyBtn = document.getElementById('scenarioNameCoreVerifyBtn');
+        if (coreVerifyBtn) {
+            coreVerifyBtn.addEventListener('click', async () => {
+                await verifyScenarioCoreSetup(activeIdx, { triggerButton: coreVerifyBtn });
+            });
+        }
+        const hitlVerifyBtn = document.getElementById('scenarioNameHitlVerifyBtn');
+        if (hitlVerifyBtn) {
+            hitlVerifyBtn.addEventListener('click', async () => {
+                await verifyScenarioHitlBridge(activeIdx, { triggerButton: hitlVerifyBtn });
+            });
+        }
+    } catch (e) {}
+
 
     const removeExistingCard = (cardId) => {
         const existing = document.getElementById(cardId);
@@ -7910,7 +8940,18 @@ function renderMain() {
         }
         return '';
     })();
-    const hostLookup = new Map(hostInterfaces.filter(it => it && typeof it === 'object').map(it => [it.name, it]));
+    const hostLookup = new Map();
+    hostInterfaces
+        .filter(it => it && typeof it === 'object')
+        .forEach((it) => {
+            const rawName = (it.name ?? it.interface ?? it.iface ?? it.id ?? '').toString().trim();
+            if (!rawName) return;
+            hostLookup.set(rawName, it);
+            const normalized = normalizeHostInterfaceName(rawName);
+            if (normalized && normalized !== rawName) {
+                hostLookup.set(normalized, it);
+            }
+        });
     const getBridgeName = (iface) => {
         const direct = iface.bridge || iface.proxmox_bridge;
         if (direct) return String(direct).trim();
@@ -8003,6 +9044,395 @@ function renderMain() {
     };
     const hitlInterfaces = Array.isArray(hitl.interfaces) ? hitl.interfaces : [];
     const hasHitlInterfaces = hitlInterfaces.length > 0;
+    const hitlToggleWasEnabled = !!hitl.enabled;
+    const extSelections = hitlInterfaces.filter(iface => iface?.external_vm && (iface.external_vm.vm_key || iface.external_vm.vmid || iface.external_vm.vm_name)).length;
+    const extSelectionsWithIface = hitlInterfaces.filter(iface => iface?.external_vm && (iface.external_vm.vm_key || iface.external_vm.vmid || iface.external_vm.vm_name) && iface.external_vm.interface_id).length;
+    const step3EnabledForVerify = hitlToggleWasEnabled && hitlAuthReady;
+    const hitlBridgeVerifyReady = !!(
+        hitlAuthReady
+        && step3EnabledForVerify
+        && hitlInterfaces.length > 0
+        && proxValidated
+        && !proxInventoryBusy
+        && !proxInventoryError
+        && extSelections > 0
+        && extSelectionsWithIface > 0
+    );
+
+    // Scenario-name card summary (tabular, separated per button).
+    try {
+        const coreSummaryEl = document.getElementById('scenarioNameCoreSummary');
+        const hitlSummaryEl = document.getElementById('scenarioNameHitlSummary');
+        const sectionEl = document.getElementById('scenarioNameHitlSection');
+        const badgeEl = document.getElementById('scenarioNameHitlStatusBadge');
+        if (coreSummaryEl && hitlSummaryEl) {
+            const coreTouched = !!(coreVmKey || coreHost || coreUser || coreSecretId || hasProxmox || proxHasSecret);
+            const hitlTouched = !!(participantProxmoxUrlHasValue || hitlToggleWasEnabled || hasHitlInterfaces || extSelections);
+            const anyTouched = coreTouched || hitlTouched;
+
+            const coreConfigured = !!(hasProxmox || proxHasSecret || coreVmKey || coreHost || coreUser || coreHasSecret);
+            const coreValidated = !!(proxValidated && coreTestMatches);
+            const hitlConfigured = !!(participantProxmoxUrlHasValue || hasHitlInterfaces || extSelections || hitlToggleWasEnabled);
+            const hitlEnabled = !!hitlToggleWasEnabled;
+            const hitlStep4Applied = !!((core.internal_bridge || '').toString().trim());
+
+            const getVmKeyFromParts = (node, vmid) => {
+                const n = (node ?? '').toString().trim();
+                const v = (vmid ?? '').toString().trim();
+                if (!n || !v) return '';
+                return `${n}::${v}`;
+            };
+            const findVmInInventory = (vmKey) => {
+                if (!vmKey) return null;
+                return proxInventory.find(vm => `${vm?.node ?? ''}::${vm?.vmid ?? ''}` === vmKey) || null;
+            };
+            const resolveInterfaceBridge = (vm, ifaceIdRaw) => {
+                if (!vm || !ifaceIdRaw) return '';
+                const ifaceId = (ifaceIdRaw ?? '').toString().trim();
+                if (!ifaceId) return '';
+                const ifaces = Array.isArray(vm.interfaces) ? vm.interfaces : [];
+                const match = ifaces.find((it) => {
+                    const id = (it?.id ?? it?.interface_id ?? it?.iface ?? it?.name ?? '').toString().trim();
+                    return id === ifaceId;
+                }) || null;
+                const bridge = (match?.bridge ?? match?.interface_bridge ?? match?.proxmox_bridge ?? match?.raw?.bridge ?? '').toString().trim();
+                return bridge;
+            };
+
+            const coreVmForBridge = findVmInInventory(coreVmKey);
+            // Step 4 only requires configuring at least one participant attachment (VM + interface).
+            // Do not require *every* HITL interface to be mapped to an external VM.
+            // If the user picked an external VM for any interface, require the external interface id as well.
+            const hitlMappingsSufficient = !!(
+                hitlEnabled
+                && hasHitlInterfaces
+                && extSelectionsWithIface > 0
+                && extSelectionsWithIface === extSelections
+            );
+
+            const bridgePairs = hitlInterfaces
+                .map((iface) => {
+                    const proxTarget = (iface && iface.proxmox_target && typeof iface.proxmox_target === 'object') ? iface.proxmox_target : null;
+                    const ext = (iface && iface.external_vm && typeof iface.external_vm === 'object') ? iface.external_vm : null;
+                    const coreIfaceId = (proxTarget?.interface_id ?? '').toString().trim();
+                    const extIfaceId = (ext?.interface_id ?? '').toString().trim();
+
+                    const coreBridgeStored = (proxTarget?.bridge ?? '').toString().trim();
+                    const extBridgeStored = (ext?.interface_bridge ?? '').toString().trim();
+
+                    const coreBridgeFromHostIface = (() => {
+                        try {
+                            const name = (iface?.name ?? '').toString().trim();
+                            if (!name) return '';
+                            const hostIface = hostLookup.get(name);
+                            if (!hostIface) return '';
+                            return (getBridgeName(hostIface) ?? '').toString().trim();
+                        } catch (e) {
+                            return '';
+                        }
+                    })();
+
+                    const extVmKey = (ext?.vm_key ?? '').toString().trim() || getVmKeyFromParts(ext?.vm_node, ext?.vmid);
+                    const extVmForBridge = findVmInInventory(extVmKey);
+
+                    const coreBridge = coreBridgeStored || coreBridgeFromHostIface || resolveInterfaceBridge(coreVmForBridge, coreIfaceId);
+                    const extBridge = extBridgeStored || resolveInterfaceBridge(extVmForBridge, extIfaceId);
+
+                    const name = (iface?.name ?? '').toString().trim();
+                    return {
+                        name,
+                        coreIfaceId,
+                        extIfaceId,
+                        coreBridge,
+                        extBridge,
+                    };
+                })
+                .filter((row) => row.name || row.coreIfaceId || row.extIfaceId);
+
+            const normalizeBridge = (b) => (b ?? '').toString().trim().toLowerCase();
+            const hitlBridgesKnown = bridgePairs.length > 0 && bridgePairs.every(p => !!normalizeBridge(p.coreBridge) && !!normalizeBridge(p.extBridge));
+            const hitlBridgesMatch = bridgePairs.length > 0 && bridgePairs.every(p => normalizeBridge(p.coreBridge) === normalizeBridge(p.extBridge));
+
+            // "Ready" should reflect completion through Step 4. Step 5 (Participant UI URL) is optional.
+            // Verification can succeed even if Step 4 wasn't "applied" (internal bridge not yet persisted).
+            // Also, users may verify before running the CORE connection "Test".
+            // Only block Ready if we can positively detect a mismatch.
+            const hitlBridgeMismatchKnown = bridgePairs.length > 0 && bridgePairs.some(p => {
+                const coreNorm = normalizeBridge(p.coreBridge);
+                const extNorm = normalizeBridge(p.extBridge);
+                return !!coreNorm && !!extNorm && coreNorm !== extNorm;
+            });
+
+            // Mirror Verify prerequisites rather than requiring Apply/Test.
+            const hitlSummaryPrereqsReady = !!(
+                hitlAuthReady
+                && hitlEnabled
+                && coreVmSupportsHitl
+                && proxValidated
+                && !proxInventoryBusy
+                && !proxInventoryError
+                && hitlMappingsSufficient
+            );
+            const hitlReady = !!(hitlSummaryPrereqsReady && !hitlBridgeMismatchKnown);
+
+            const clearStatusClasses = () => {
+                if (badgeEl) badgeEl.classList.remove('text-bg-secondary', 'text-bg-info', 'text-bg-warning', 'text-bg-success');
+                if (sectionEl) sectionEl.classList.remove('border-secondary', 'border-info', 'border-warning', 'border-success');
+            };
+
+            if (!anyTouched) {
+                coreSummaryEl.innerHTML = '<div class="text-muted">Not configured</div>';
+                hitlSummaryEl.innerHTML = '<div class="text-muted">Not configured</div>';
+                clearStatusClasses();
+                if (badgeEl) {
+                    badgeEl.textContent = 'Not configured';
+                    badgeEl.classList.add('text-bg-secondary');
+                }
+                if (sectionEl) sectionEl.classList.add('border-secondary');
+            } else {
+                // Make it obvious if configured/validated/ready.
+                clearStatusClasses();
+                if (hitlReady || (coreValidated && !hitlConfigured)) {
+                    if (badgeEl) {
+                        badgeEl.textContent = hitlReady ? 'Ready' : 'Validated';
+                        badgeEl.classList.add('text-bg-success');
+                    }
+                    if (sectionEl) sectionEl.classList.add('border-success');
+                } else if ((coreConfigured && !coreValidated) || (hitlEnabled && !hitlReady) || (hitlConfigured && !hitlReady)) {
+                    if (badgeEl) {
+                        badgeEl.textContent = 'Needs validation';
+                        badgeEl.classList.add('text-bg-warning');
+                    }
+                    if (sectionEl) sectionEl.classList.add('border-warning');
+                } else {
+                    if (badgeEl) {
+                        badgeEl.textContent = 'Configured';
+                        badgeEl.classList.add('text-bg-info');
+                    }
+                    if (sectionEl) sectionEl.classList.add('border-info');
+                }
+
+                const esc = (value) => escapeHtml((value ?? '').toString());
+                const htmlVal = (html) => ({ __html: String(html ?? '') });
+                const isHtmlVal = (value) => {
+                    return !!(value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, '__html'));
+                };
+                const iconFor = (state) => {
+                    switch (state) {
+                        case 'ok':
+                            return '<i class="bi bi-check-square-fill text-success"></i>';
+                        case 'partial':
+                            return '<i class="bi bi-dash-square-fill text-warning"></i>';
+                        case 'no':
+                        default:
+                            return '<i class="bi bi-square text-muted"></i>';
+                    }
+                };
+                const renderKvTable = (rows, emptyLabel = 'Not configured') => {
+                    if (!rows || !rows.length) {
+                        return `<div class="text-muted">${esc(emptyLabel)}</div>`;
+                    }
+                    const body = rows.map(([k, v, state]) => {
+                        const icon = iconFor(state);
+                        const key = (k ?? '').toString();
+                        const isStatusRow = key === 'Status';
+                        const vIsHtml = isHtmlVal(v);
+                        let vEsc = vIsHtml ? (v.__html ?? '') : esc(v);
+                        if (isStatusRow && !vIsHtml) {
+                            // Emphasize key words in a safe way by applying replacements after escaping.
+                            vEsc = vEsc
+                                .replace(/\bReady\b/g, '<span class="fw-bold">Ready</span>')
+                                .replace(/\bValidated\b/g, '<span class="fw-bold">Validated</span>');
+                        }
+
+                        return `<tr><th class="fw-semibold" style="width: 160px;">${esc(k)}</th><td class="text-body">${icon} <span>${vEsc}</span></td></tr>`;
+                    }).join('');
+                    return `<table class="table table-sm mb-0"><tbody>${body}</tbody></table>`;
+                };
+
+                const coreRows = [];
+                coreRows.push(['Status', coreValidated ? 'Validated' : (coreConfigured ? 'Configured (not validated)' : 'Not configured'), coreValidated ? 'ok' : (coreConfigured ? 'partial' : 'no')]);
+
+                // Proxmox details (URL + user + validated)
+                const proxUrl = (proxmox?.url || '').toString().trim();
+                const proxUser = (proxmox?.username || '').toString().trim();
+                const proxPortDisplay = (proxmox?.port ?? proxPort);
+                const proxUrlDisplay = proxUrl ? `${proxUrl}:${proxPortDisplay}` : 'Not set';
+                coreRows.push(['Proxmox', proxUrlDisplay, proxUrl ? 'ok' : ((proxHasSecret || proxUser) ? 'partial' : 'no')]);
+                coreRows.push(['Proxmox User', proxUser ? `${proxUser} — ${proxValidated ? 'Validated' : 'Not validated'}` : 'Not set', proxUser ? (proxValidated ? 'ok' : 'partial') : 'no']);
+
+                coreRows.push(['CORE VM', (coreVmName || coreVmKey) ? (coreVmName || 'Selected') : 'Not selected', (coreVmName || coreVmKey) ? 'ok' : 'no']);
+                coreRows.push(['gRPC', coreHost ? `${coreHost}:${corePort}` : 'Not set', coreHost ? 'ok' : 'no']);
+                coreRows.push(['SSH User', coreUser ? `${coreUser} — ${coreValidated ? 'Validated' : 'Not validated'}` : 'Not set', coreUser ? (coreValidated ? 'ok' : 'partial') : 'no']);
+                coreSummaryEl.innerHTML = renderKvTable(coreTouched ? coreRows : [], 'Not configured');
+
+                const hitlRows = [];
+                hitlRows.push(['Status', hitlReady ? 'Ready' : (hitlConfigured ? 'Configured (not ready)' : 'Not configured'), hitlReady ? 'ok' : (hitlConfigured ? 'partial' : 'no')]);
+                hitlRows.push(['Enabled', hitlEnabled ? 'Yes' : 'No', hitlEnabled ? 'ok' : 'no']);
+                const ifaceNames = hitlInterfaces
+                    .map(iface => (iface && iface.name ? String(iface.name).trim() : ''))
+                    .filter(Boolean);
+                const ifaceNamesUnique = Array.from(new Set(ifaceNames));
+                const ifaceValue = ifaceNamesUnique.length
+                    ? `${ifaceNamesUnique.length}: ${ifaceNamesUnique.join(', ')}`
+                    : '0';
+
+                const coreBridgeNames = bridgePairs
+                    .map(p => (p.coreBridge ?? '').toString().trim())
+                    .filter(Boolean);
+                const extBridgeNames = bridgePairs
+                    .map(p => (p.extBridge ?? '').toString().trim())
+                    .filter(Boolean);
+                const coreBridgeNamesUnique = Array.from(new Set(coreBridgeNames));
+                const extBridgeNamesUnique = Array.from(new Set(extBridgeNames));
+                const coreBridgeValue = coreBridgeNamesUnique.length
+                    ? `${coreBridgeNamesUnique.length}: ${coreBridgeNamesUnique.join(', ')}`
+                    : 'Not set';
+                const extBridgeValue = extBridgeNamesUnique.length
+                    ? `${extBridgeNamesUnique.length}: ${extBridgeNamesUnique.join(', ')}`
+                    : 'Not set';
+
+                const bridgeRowHtml = (() => {
+                    if (!bridgePairs.length) return '';
+                    const blocks = bridgePairs
+                        .map((p) => {
+                            const coreName = (coreVmName || coreVmKey || 'CORE VM').toString().trim();
+                            // CORE-side interface identifier should mirror "CORE VM Interfaces" (the HITL interface name).
+                            const coreIf = ((p.name || p.coreIfaceId || '').toString().trim()) || '—';
+                            const coreBridgeRaw = (p.coreBridge || '').toString().trim();
+
+                            const mappedName = (() => {
+                                const iface = hitlInterfaces.find(it => (it?.name ?? '').toString().trim() === (p.name ?? '').toString().trim());
+                                const ext = (iface && iface.external_vm && typeof iface.external_vm === 'object') ? iface.external_vm : null;
+                                const name = (ext?.vm_name ?? '').toString().trim();
+                                const key = (ext?.vm_key ?? '').toString().trim();
+                                const vmid = (ext?.vmid ?? '').toString().trim();
+                                return name || key || (vmid ? `VM ${vmid}` : 'Mapped');
+                            })();
+                            const mappedIf = (p.extIfaceId || '').toString().trim() || '—';
+                            const mappedBridgeRaw = (p.extBridge || '').toString().trim();
+
+                            const coreBridgeNorm = (coreBridgeRaw || '').toLowerCase();
+                            const mappedBridgeNorm = (mappedBridgeRaw || '').toLowerCase();
+                            const matchKnown = !!(coreBridgeNorm && mappedBridgeNorm);
+                            const bridgesMatch = matchKnown && coreBridgeNorm === mappedBridgeNorm;
+                            const bridgeClass = bridgesMatch ? 'text-success' : 'text-danger';
+
+                            const coreBridgeHtml = coreBridgeRaw
+                                ? `<span class="fw-bold ${bridgeClass}">${esc(coreBridgeRaw)}</span>`
+                                : `<span class="fw-bold text-danger">Not set</span>`;
+                            const mappedBridgeHtml = mappedBridgeRaw
+                                ? `<span class="fw-bold ${bridgeClass}">${esc(mappedBridgeRaw)}</span>`
+                                : `<span class="fw-bold text-danger">Not set</span>`;
+
+                            return `
+                                <table class="table table-sm table-borderless mb-0">
+                                    <thead>
+                                        <tr class="text-muted" style="font-size: 0.85em;">
+                                            <th style="width: 120px;"></th>
+                                            <th style="width: 260px;">VM Name</th>
+                                            <th style="width: 90px;">Ifx</th>
+                                            <th>Bridge <span class="text-muted">(must match)</span></th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <tr>
+                                            <td class="text-muted">CORE VM</td>
+                                            <td>${esc(coreName)}</td>
+                                            <td>${esc(coreIf)}</td>
+                                            <td>${coreBridgeHtml}</td>
+                                        </tr>
+                                        <tr>
+                                            <td class="text-muted">Mapped VM</td>
+                                            <td>${esc(mappedName)}</td>
+                                            <td>${esc(mappedIf)}</td>
+                                            <td>${mappedBridgeHtml}</td>
+                                        </tr>
+                                    </tbody>
+                                </table>`;
+                        })
+                        .filter(Boolean);
+                    return blocks.join('<div class="my-2"></div>');
+                })();
+
+                if (bridgeRowHtml) {
+                    const allKnown = bridgePairs.length > 0 && bridgePairs.every(p => (p.coreBridge || '').toString().trim() && (p.extBridge || '').toString().trim());
+                    const allMatch = bridgePairs.length > 0 && bridgePairs.every(p => (p.coreBridge || '').toString().trim().toLowerCase() === (p.extBridge || '').toString().trim().toLowerCase());
+                    const rowState = allKnown ? (allMatch ? 'ok' : 'partial') : 'partial';
+                    hitlRows.push(['Mapped Interfaces', htmlVal(bridgeRowHtml), rowState]);
+                } else {
+                    hitlRows.push(['Mapped Interfaces', 'Not set', (ifaceNamesUnique.length || extSelectionsWithIface) ? 'partial' : 'no']);
+                }
+
+                const mappedVmIfaceLabels = hitlInterfaces
+                    .map(iface => {
+                        const ext = iface && iface.external_vm && typeof iface.external_vm === 'object' ? iface.external_vm : null;
+                        if (!ext) return '';
+                        const ifaceId = (ext.interface_id ?? '').toString().trim();
+                        if (!ifaceId) return '';
+                        const name = (ext.vm_name ?? '').toString().trim();
+                        const key = (ext.vm_key ?? '').toString().trim();
+                        const vmid = (ext.vmid ?? '').toString().trim();
+                        const vmLabel = name || key || (vmid ? `VM ${vmid}` : '');
+                        return vmLabel ? `${vmLabel}: ${ifaceId}` : ifaceId;
+                    })
+                    .filter(Boolean);
+                const mappedVmIfaceLabelsUnique = Array.from(new Set(mappedVmIfaceLabels));
+                const mappedVmIfaceValue = mappedVmIfaceLabelsUnique.length
+                    ? `${mappedVmIfaceLabelsUnique.length}: ${mappedVmIfaceLabelsUnique.join(', ')}`
+                    : 'Not set';
+
+                const participantUrlValue = participantProxmoxUrlHasValue
+                    ? participantProxmoxUrlRaw
+                    : 'Not set';
+                hitlRows.push(['Participant UI', participantUrlValue, participantProxmoxUrlHasValue ? 'ok' : 'no']);
+                hitlSummaryEl.innerHTML = renderKvTable(hitlTouched ? hitlRows : [], 'Not configured');
+            }
+        }
+    } catch (e) {}
+
+    // Scenario-name Verify buttons gating.
+    try {
+        const coreVerifyBtn = document.getElementById('scenarioNameCoreVerifyBtn');
+        if (coreVerifyBtn) {
+            const coreVerifyReady = !!coreTestable;
+            coreVerifyBtn.disabled = !coreVerifyReady;
+            const coreHint = coreVerifyReady
+                ? 'Verify Proxmox + CORE connection (Steps 1 & 2).'
+                : (!proxValidated
+                    ? 'Complete Step 1 (Validate Proxmox credentials) first.'
+                    : (!coreVmKey
+                        ? 'Complete Step 2 (Select CORE VM) first.'
+                        : (!coreInputsComplete
+                            ? 'Complete Step 2 connection details (gRPC/SSH host/ports, SSH user, password) first.'
+                            : (!coreVmHasInterfaces
+                                ? 'Selected CORE VM must expose at least one interface to verify.'
+                                : 'Complete Steps 1 and 2 first.'))));
+            coreVerifyBtn.setAttribute('title', coreHint);
+        }
+        const hitlVerifyBtn = document.getElementById('scenarioNameHitlVerifyBtn');
+        if (hitlVerifyBtn) {
+            hitlVerifyBtn.disabled = !hitlBridgeVerifyReady;
+            const hitlHint = hitlBridgeVerifyReady
+                ? 'Verify HITL bridge settings (Steps 3 & 4).'
+                : (!hitlAuthReady
+                    ? (describeConfigHitlGate({ proxValidated, coreHasSecret, coreVmKey }) || 'Complete Steps 1 and 2 first.')
+                    : (!step3EnabledForVerify
+                        ? 'Enable the Hardware in the Loop toggle (Step 3) first.'
+                        : (!hitlInterfaces.length
+                            ? 'Add at least one HITL interface (Step 3) first.'
+                            : (proxInventoryBusy
+                                ? 'Wait for the Proxmox inventory fetch to finish.'
+                                : (proxInventoryError
+                                    ? 'Resolve Proxmox inventory error before verifying.'
+                                    : (extSelections <= 0
+                                        ? 'Map at least one HITL interface to an external VM (Step 4) first.'
+                                        : (extSelectionsWithIface <= 0
+                                            ? 'Select an external VM interface (Step 4) first.'
+                                            : 'Complete Steps 3 and 4 first.')))))));
+            hitlVerifyBtn.setAttribute('title', hitlHint);
+        }
+    } catch (e) {}
     const selectedNames = new Set(hitlInterfaces.map(entry => (entry && entry.name ? entry.name : '')).filter(Boolean));
     const availableInterfaces = hostInterfaces.filter(iface => iface && !selectedNames.has(iface.name));
     const selectableInterfaces = availableInterfaces.filter(iface => iface && !isVmbr0Bridge(iface));
@@ -8017,7 +9447,6 @@ function renderMain() {
             return `<option value="${escapeHtml(iface.name)}" ${disabledAttr} title="${escapeHtml(title)}">${escapeHtml(label + suffix)}</option>`;
         }).join('')
         : '<option disabled value="">All discovered interfaces selected</option>';
-    const hitlToggleWasEnabled = !!hitl.enabled;
     const step3Enabled = hitlToggleWasEnabled && hitlAuthReady;
     const step3Disabled = !step3Enabled;
     const step3ToggleDisabledAttr = hitlAuthReady ? '' : 'disabled';
@@ -8702,6 +10131,26 @@ function renderMain() {
             coreAutoStartInput.checked = !!(coreState.auto_start_daemon);
             coreAutoStartInput.disabled = builderLocked || inputsDisabled;
         }
+        if (coreAdvFixDockerDaemonInput) {
+            coreAdvFixDockerDaemonInput.checked = !!(coreState.adv_fix_docker_daemon);
+            coreAdvFixDockerDaemonInput.disabled = builderLocked || inputsDisabled;
+        }
+        if (coreAdvRunCoreCleanupInput) {
+            coreAdvRunCoreCleanupInput.checked = !!(coreState.adv_run_core_cleanup);
+            coreAdvRunCoreCleanupInput.disabled = builderLocked || inputsDisabled;
+        }
+        if (coreAdvCheckCoreVersionInput) {
+            coreAdvCheckCoreVersionInput.checked = !!(coreState.adv_check_core_version);
+            coreAdvCheckCoreVersionInput.disabled = builderLocked || inputsDisabled;
+        }
+        if (coreAdvRestartCoreDaemonInput) {
+            coreAdvRestartCoreDaemonInput.checked = !!(coreState.adv_restart_core_daemon);
+            coreAdvRestartCoreDaemonInput.disabled = builderLocked || inputsDisabled;
+        }
+        if (coreAdvAutoKillSessionsInput) {
+            coreAdvAutoKillSessionsInput.checked = !!(coreState.adv_auto_kill_sessions);
+            coreAdvAutoKillSessionsInput.disabled = builderLocked || inputsDisabled;
+        }
         if (coreModalInputs.grpc_host) {
             coreModalInputs.grpc_host.value = coreState.grpc_host || '';
             coreModalInputs.grpc_host.disabled = inputsDisabled;
@@ -8959,9 +10408,6 @@ function renderMain() {
             }
         }
     } catch(e) { console.warn('Normalization error', e); }
-    // Load persisted section collapse state (per scenario + section)
-    let collapseState = {};
-    try { collapseState = JSON.parse(localStorage.getItem('sectionCollapseState') || '{}'); } catch(e) { collapseState = {}; }
     // No auto-insertion of Count rows for Node Information; totals should only include user-added Count rows
     // Scenario header with Count for Density (base host pool) restored
     const niSec = scen.sections['Node Information'] || { items: [] };
@@ -10779,6 +12225,11 @@ function wireHandlers() {
     coreModalInputs.ssh_password = document.getElementById('coreSshPassword');
     coreRememberInput = document.getElementById('coreRememberCreds');
     coreAutoStartInput = document.getElementById('coreAutoStartDaemon');
+    coreAdvFixDockerDaemonInput = document.getElementById('coreAdvFixDockerDaemon');
+    coreAdvRunCoreCleanupInput = document.getElementById('coreAdvRunCoreCleanup');
+    coreAdvCheckCoreVersionInput = document.getElementById('coreAdvCheckCoreVersion');
+    coreAdvRestartCoreDaemonInput = document.getElementById('coreAdvRestartCoreDaemon');
+    coreAdvAutoKillSessionsInput = document.getElementById('coreAdvAutoKillSessions');
     setCoreConnectionHint = (message, tone = 'info') => {
         if (!coreConnectionHint) return;
         coreConnectionHint.textContent = message || '';
@@ -10820,6 +12271,25 @@ function wireHandlers() {
         });
         coreAutoStartInput.dataset.prefBound = '1';
     }
+
+    const bindCoreAdvToggle = (inputEl, fieldName) => {
+        if (!inputEl || inputEl.dataset.prefBound) return;
+        inputEl.addEventListener('change', () => {
+            if (IS_BUILDER_VIEW) return;
+            if (!coreConnectionModal) return;
+            const sidx = parseInt(coreConnectionModal.getAttribute('data-scen-idx') || '', 10);
+            if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
+            const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
+            hitlState.core[fieldName] = !!inputEl.checked;
+            persistEditorState();
+        });
+        inputEl.dataset.prefBound = '1';
+    };
+    bindCoreAdvToggle(coreAdvFixDockerDaemonInput, 'adv_fix_docker_daemon');
+    bindCoreAdvToggle(coreAdvRunCoreCleanupInput, 'adv_run_core_cleanup');
+    bindCoreAdvToggle(coreAdvCheckCoreVersionInput, 'adv_check_core_version');
+    bindCoreAdvToggle(coreAdvRestartCoreDaemonInput, 'adv_restart_core_daemon');
+    bindCoreAdvToggle(coreAdvAutoKillSessionsInput, 'adv_auto_kill_sessions');
     document.querySelectorAll('[data-proxmox-assign]').forEach(btn => {
         btn.addEventListener('click', async () => {
             const sidx = parseInt(btn.getAttribute('data-scen-idx'));
@@ -11267,6 +12737,11 @@ let coreConnectionHint = null;
 let coreConnectionSaveBtn = null;
 let coreRememberInput = null;
 let coreAutoStartInput = null;
+let coreAdvFixDockerDaemonInput = null;
+let coreAdvRunCoreCleanupInput = null;
+let coreAdvCheckCoreVersionInput = null;
+let coreAdvRestartCoreDaemonInput = null;
+let coreAdvAutoKillSessionsInput = null;
 let coreTestVenvBtn = null;
 let coreVenvTestStatus = null;
 const coreModalInputs = {
@@ -11283,8 +12758,6 @@ let executeConfirmMessageEl = null;
 let executeConfirmAlertEl = null;
 let executeConfirmRunBtn = null;
 let executeConfirmCancelBtn = null;
-let executeConfirmUpdateRemoteToggle = null;
-let executeConfirmUpdateRemoteHelpEl = null;
 let executeCoreStatusEl = null;
 let executeCoreTestBtn = null;
 let executeRemoteTestRow = null;
@@ -11340,34 +12813,14 @@ function setExecuteConfirmUpdateRemotePref(value) {
     persistExecuteConfirmPrefs();
 }
 
-function getExecuteRemoteModePref() {
-    if (executeConfirmPrefs && typeof executeConfirmPrefs.remoteExecution === 'boolean') {
-        return executeConfirmPrefs.remoteExecution;
-    }
-    if (executeConfirmPrefs && typeof executeConfirmPrefs.remoteExecution === 'undefined' && typeof executeConfirmPrefs.updateRemoteRepo === 'boolean') {
-        // Legacy preference stored only the repo push flag; reuse it for initial remote-mode opt-in.
-        return !!executeConfirmPrefs.updateRemoteRepo;
-    }
-    return false;
-}
-
-function setExecuteRemoteModePref(value) {
-    if (!executeConfirmPrefs || typeof executeConfirmPrefs !== 'object') {
-        executeConfirmPrefs = {};
-    }
-    executeConfirmPrefs.remoteExecution = !!value;
-    persistExecuteConfirmPrefs();
-}
-
 function isRemoteExecutionSelected() {
-    if (executeConfirmUpdateRemoteToggle) {
-        return !!executeConfirmUpdateRemoteToggle.checked;
-    }
-    return getExecuteRemoteModePref();
+    // Execute Confirm modal no longer provides a remote/local toggle.
+    // Executions from this dialog always target the configured remote CORE VM.
+    return true;
 }
 
 function getExecuteConfirmSelections() {
-    const remoteExecution = isRemoteExecutionSelected();
+    const remoteExecution = true;
     const pushAllowed = !IS_BUILDER_VIEW;
     const pushEnabled = pushAllowed && (
         executeConfirmPushUpdateToggle
@@ -11384,7 +12837,7 @@ function getExecuteConfirmSelections() {
     return {
         remoteExecution,
         pushPreference: pushAllowed ? pushEnabled : false,
-        updateRemote: remoteExecution && pushAllowed && pushEnabled,
+        updateRemote: pushAllowed && pushEnabled,
         advanced,
     };
 }
@@ -11394,6 +12847,7 @@ const executeConfirmState = {
     resolve: null,
     scenarioIndex: null,
     keepOpenOnConfirm: false,
+    autoLabel: true,
 };
 let executeProgressWrap = null;
 let executeProgressStatusEl = null;
@@ -11452,12 +12906,6 @@ function ensureExecuteConfirmElements() {
     }
     if (!executePhaseHeaderEl) {
         executePhaseHeaderEl = document.getElementById('executePhaseHeader');
-    }
-    if (!executeConfirmUpdateRemoteToggle) {
-        executeConfirmUpdateRemoteToggle = document.getElementById('executeConfirmUpdateRemoteToggle');
-    }
-    if (!executeConfirmUpdateRemoteHelpEl) {
-        executeConfirmUpdateRemoteHelpEl = document.getElementById('executeConfirmUpdateRemoteHelp');
     }
     if (!executeCoreStatusEl) {
         executeCoreStatusEl = document.getElementById('executeCoreStatus');
@@ -11528,14 +12976,6 @@ function ensureExecuteConfirmElements() {
         });
         executeConfirmCancelBtn.dataset.execBound = '1';
     }
-    if (executeConfirmUpdateRemoteToggle && !executeConfirmUpdateRemoteToggle.dataset.execBound) {
-        executeConfirmUpdateRemoteToggle.checked = getExecuteRemoteModePref();
-        executeConfirmUpdateRemoteToggle.addEventListener('change', () => {
-            setExecuteRemoteModePref(executeConfirmUpdateRemoteToggle.checked);
-            refreshExecuteRemoteToggleState();
-        });
-        executeConfirmUpdateRemoteToggle.dataset.execBound = '1';
-    }
     if (executeConfirmPushUpdateToggle && !executeConfirmPushUpdateToggle.dataset.execBound) {
         executeConfirmPushUpdateToggle.checked = getExecuteConfirmUpdateRemotePref();
         executeConfirmPushUpdateToggle.addEventListener('change', () => {
@@ -11600,22 +13040,67 @@ function isExecuteCoreVmConfigured() {
 function updateExecuteCoreStatus(info = null) {
     if (!executeCoreStatusEl) return;
     const statusInfo = info || detectLocalEmulation();
+    const normalizeHost = (raw) => {
+        if (raw === null || raw === undefined) return '';
+        let h = String(raw).trim().toLowerCase();
+        if (!h) return '';
+        if (h.startsWith('[') && h.endsWith(']')) {
+            h = h.slice(1, -1);
+        }
+        if (h.startsWith('::ffff:') && /^::ffff:\d+\.\d+\.\d+\.\d+$/.test(h)) {
+            h = h.replace('::ffff:', '');
+        }
+        return h;
+    };
     const classes = ['text-muted', 'text-success', 'text-warning', 'text-danger'];
     executeCoreStatusEl.classList.remove(...classes);
+    // Prefer explicit last test outcome (covers non-loopback targets), instead of relying on
+    // loopback-only heuristics.
+    const lastStatus = (state && state.core_last_test_status !== undefined)
+        ? state.core_last_test_status
+        : (initialPayload ? initialPayload.core_last_test_status : null);
+    const lastHost = (state && state.core_last_test_host !== undefined)
+        ? state.core_last_test_host
+        : (initialPayload ? initialPayload.core_last_test_host : null);
+    const lastPort = (state && state.core_last_test_port !== undefined)
+        ? state.core_last_test_port
+        : (initialPayload ? initialPayload.core_last_test_port : null);
+    const lastAt = (state && state.core_last_test_at !== undefined)
+        ? state.core_last_test_at
+        : (initialPayload ? initialPayload.core_last_test_at : null);
+    const lastPortNum = parseInt(lastPort ?? '', 10);
+    const lastPortVal = Number.isFinite(lastPortNum) && lastPortNum > 0 ? lastPortNum : null;
+    let lastFailedRecent = false;
+    try {
+        const atMs = Date.parse(lastAt ?? '');
+        if (Number.isFinite(atMs)) {
+            lastFailedRecent = (lastStatus === 'failure') && ((Date.now() - atMs) < (10 * 60 * 1000));
+        }
+    } catch (e) {}
+    const lastMatchesTarget = (
+        lastStatus === 'failure'
+        && !!lastPortVal
+        && lastPortVal === statusInfo.port
+        && normalizeHost(lastHost) === normalizeHost(statusInfo.host)
+    );
+
     if (statusInfo.verified) {
         executeCoreStatusEl.textContent = IS_BUILDER_VIEW
             ? 'CORE backend validated and ready.'
             : `Connected to CORE ${statusInfo.host}:${statusInfo.port}`;
         executeCoreStatusEl.classList.add('text-success');
+    } else if ((lastMatchesTarget || lastFailedRecent) && !IS_BUILDER_VIEW) {
+        executeCoreStatusEl.textContent = 'CORE connection failed, please check your settings and try again.';
+        executeCoreStatusEl.classList.add('text-danger');
     } else if (statusInfo.shouldFake) {
         executeCoreStatusEl.textContent = IS_BUILDER_VIEW
             ? 'Please test the connection. If it fails, contact your administrator.'
-            : 'CORE not connected. Runs will fall back to local emulation.';
+            : 'CORE connection failed, please check your settings and try again.';
         executeCoreStatusEl.classList.add('text-danger');
     } else {
         executeCoreStatusEl.textContent = IS_BUILDER_VIEW
             ? 'CORE backend status unknown. Ask an admin to validate the connection.'
-            : 'CORE connection not validated yet. Test before running remotely.';
+            : 'CORE connection needs to be tested.';
         executeCoreStatusEl.classList.add('text-warning');
     }
 }
@@ -11667,34 +13152,22 @@ function refreshExecuteRemoteToggleState() {
         }
     }
 
-    if (executeConfirmUpdateRemoteHelpEl) {
-        executeConfirmUpdateRemoteHelpEl.classList.remove('text-muted', 'text-success', 'text-warning');
-        if (remoteSelected) {
-            const hideBuilderNotice = IS_BUILDER_VIEW && !info.verified;
-            const remoteMsg = showNotConfigured
-                ? 'CORE VM not configured. Select a CORE VM to enable remote execution.'
-                : (info.verified
-                    ? (IS_BUILDER_VIEW
-                        ? 'Remote execution ready. Backend managed by an admin.'
-                        : 'Remote execution ready. Runs will target your CORE VM.')
-                    : (IS_BUILDER_VIEW
-                        ? ''
-                        : 'Remote execution requires a validated CORE connection. Test before running.'));
-            executeConfirmUpdateRemoteHelpEl.textContent = remoteMsg;
-            executeConfirmUpdateRemoteHelpEl.classList.toggle('d-none', hideBuilderNotice);
-            if (!hideBuilderNotice) {
-                executeConfirmUpdateRemoteHelpEl.classList.add(showNotConfigured ? 'text-warning' : (info.verified ? 'text-success' : 'text-warning'));
-            }
-        } else {
-            executeConfirmUpdateRemoteHelpEl.textContent = 'Emulation mode runs locally on this workstation.';
-            executeConfirmUpdateRemoteHelpEl.classList.remove('d-none');
-            executeConfirmUpdateRemoteHelpEl.classList.add('text-muted');
-        }
-    }
-
     if (executeConfirmRunBtn) {
         const shouldDisable = showNotConfigured || (remoteSelected && !info.verified && !IS_BUILDER_VIEW);
         executeConfirmRunBtn.disabled = shouldDisable;
+
+        // Only auto-adjust the label for the default Execute flow.
+        // Some callers (e.g., seeded runs) supply custom labels like "Run with seed".
+        if (!executeProgressState.active && executeConfirmState.autoLabel) {
+            const label = remoteSelected ? 'Execute' : 'Generate preview';
+            executeConfirmRunBtn.textContent = label;
+            if (!executeConfirmRunBtn.dataset.defaultLabel) {
+                executeConfirmRunBtn.dataset.defaultLabel = label;
+            } else {
+                executeConfirmRunBtn.dataset.defaultLabel = label;
+            }
+        }
+
         if (shouldDisable) {
             executeConfirmRunBtn.setAttribute('title', showNotConfigured
                 ? 'Select a CORE VM to enable remote execution.'
@@ -12238,9 +13711,6 @@ function settleExecuteConfirm(result) {
         } else if (typeof selections.updateRemote !== 'undefined') {
             setExecuteConfirmUpdateRemotePref(selections.updateRemote);
         }
-        if (typeof selections.remoteExecution !== 'undefined') {
-            setExecuteRemoteModePref(selections.remoteExecution);
-        }
     }
     resolver?.({ ...payload, scenarioIndex });
 }
@@ -12269,22 +13739,15 @@ async function promptExecuteConfirmation(options = {}) {
     const { idx: activeScenarioIdx } = getActiveScenarioContext();
     const scenarioIndex = Number.isInteger(options.scenarioIndex) ? options.scenarioIndex : activeScenarioIdx;
     const message = options.message || 'Execute this scenario now? This will start a CORE session.';
-    const confirmLabel = options.confirmLabel || 'Execute';
     const alertMessage = options.alertMessage || '';
     const alertTone = options.alertTone || 'warning';
     const keepOpenOnConfirm = !!options.keepOpenOnConfirm;
     ensureExecuteConfirmElements();
-    const remoteModeDefault = typeof options.remoteModeDefault === 'boolean'
-        ? options.remoteModeDefault
-        : getExecuteRemoteModePref();
+    const hasCustomConfirmLabel = Object.prototype.hasOwnProperty.call(options, 'confirmLabel');
+    const confirmLabel = hasCustomConfirmLabel ? (options.confirmLabel || 'Execute') : 'Execute';
     const updateRemoteDefault = typeof options.updateRemoteDefault === 'boolean'
         ? options.updateRemoteDefault
         : getExecuteConfirmUpdateRemotePref();
-    if (executeConfirmUpdateRemoteToggle) {
-        executeConfirmUpdateRemoteToggle.checked = !!remoteModeDefault;
-    } else if (typeof remoteModeDefault === 'boolean') {
-        setExecuteRemoteModePref(remoteModeDefault);
-    }
     if (executeConfirmPushUpdateToggle) {
         executeConfirmPushUpdateToggle.checked = !!updateRemoteDefault;
     } else if (typeof updateRemoteDefault === 'boolean') {
@@ -12292,12 +13755,12 @@ async function promptExecuteConfirmation(options = {}) {
     }
     if (!executeConfirmModalEl || !window.bootstrap) {
         const confirmed = window.confirm(message);
-        const remoteExecution = !!remoteModeDefault;
+        const remoteExecution = true;
         const pushPreference = !!updateRemoteDefault;
         return {
             confirmed,
             scenarioIndex,
-            updateRemote: remoteExecution && pushPreference,
+            updateRemote: pushPreference,
             remoteExecution,
             pushPreference,
         };
@@ -12305,6 +13768,7 @@ async function promptExecuteConfirmation(options = {}) {
     executeConfirmState.pending = true;
     executeConfirmState.scenarioIndex = Number.isInteger(scenarioIndex) ? scenarioIndex : null;
     executeConfirmState.keepOpenOnConfirm = keepOpenOnConfirm;
+    executeConfirmState.autoLabel = !hasCustomConfirmLabel;
     if (executeConfirmMessageEl) {
         executeConfirmMessageEl.textContent = message;
     }
@@ -12312,6 +13776,8 @@ async function promptExecuteConfirmation(options = {}) {
     resetExecuteProgressUI();
     if (executeConfirmRunBtn) {
         executeConfirmRunBtn.textContent = confirmLabel;
+        // Keep the reset/execute progress helpers consistent with the current label.
+        executeConfirmRunBtn.dataset.defaultLabel = confirmLabel;
     }
     refreshExecuteRemoteToggleState();
     const modalInstance = bootstrap.Modal.getOrCreateInstance(executeConfirmModalEl);
@@ -14340,6 +15806,7 @@ async function runWithSeedBuild(){
         confirmLabel: 'Run with seed',
     });
     if(!confirmResult?.confirmed) return;
+
     const updateRemoteRepo = !!confirmResult?.updateRemote;
     const advancedSelections = (confirmResult && typeof confirmResult === 'object' && confirmResult.advanced) ? confirmResult.advanced : null;
     let sendUpdateRemoteFlag = updateRemoteRepo;

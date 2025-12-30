@@ -3029,6 +3029,372 @@ def _ensure_core_daemon_listening(core_cfg: Dict[str, Any], *, timeout: float = 
             pass
 
 
+def _run_core_connection_advanced_checks(
+    cfg: Dict[str, Any],
+    *,
+    adv_fix_docker_daemon: bool = False,
+    adv_run_core_cleanup: bool = False,
+    adv_check_core_version: bool = False,
+    adv_restart_core_daemon: bool = False,
+    adv_auto_kill_sessions: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    """Run optional advanced checks against the CORE VM.
+
+    These checks mirror the ones available in the Execute Scenario modal.
+    Returns a dict keyed by adv_* flag names with shape:
+      { enabled: bool, ok: bool|None, message: str }
+
+    Notes:
+    - This function is best-effort: when a check is enabled, it will attempt the action
+      and report failure in its own result without raising (except for totally unexpected errors).
+    - Some checks require sudo (SSH password). If missing, the check is marked failed.
+    """
+
+    results: Dict[str, Dict[str, Any]] = {}
+
+    def _set(key: str, *, enabled: bool, ok: Optional[bool], message: str) -> None:
+        results[key] = {
+            'enabled': bool(enabled),
+            'ok': ok,
+            'message': str(message or '').strip(),
+        }
+
+    enabled_any = any(
+        bool(v)
+        for v in (
+            adv_fix_docker_daemon,
+            adv_run_core_cleanup,
+            adv_check_core_version,
+            adv_restart_core_daemon,
+            adv_auto_kill_sessions,
+        )
+    )
+    if not enabled_any:
+        # Keep keys present but disabled for stable UI.
+        _set('adv_check_core_version', enabled=False, ok=None, message='')
+        _set('adv_fix_docker_daemon', enabled=False, ok=None, message='')
+        _set('adv_run_core_cleanup', enabled=False, ok=None, message='')
+        _set('adv_restart_core_daemon', enabled=False, ok=None, message='')
+        _set('adv_auto_kill_sessions', enabled=False, ok=None, message='')
+        return results
+
+    logger = getattr(app, 'logger', logging.getLogger(__name__))
+    cfg = _normalize_core_config(cfg, include_password=True)
+    if paramiko is None:
+        # Can't run these without SSH.
+        for key, enabled in (
+            ('adv_check_core_version', adv_check_core_version),
+            ('adv_fix_docker_daemon', adv_fix_docker_daemon),
+            ('adv_run_core_cleanup', adv_run_core_cleanup),
+            ('adv_restart_core_daemon', adv_restart_core_daemon),
+            ('adv_auto_kill_sessions', adv_auto_kill_sessions),
+        ):
+            if enabled:
+                _set(key, enabled=True, ok=False, message='Paramiko unavailable; cannot run this check.')
+            else:
+                _set(key, enabled=False, ok=None, message='')
+        return results
+
+    def _check_core_version(client: Any, required: str = '9.2.1') -> str:
+        candidates = [
+            "sh -c 'timeout 6s core-daemon --version 2>/dev/null || true'",
+            "sh -c 'timeout 6s core-daemon -v 2>/dev/null || true'",
+            "sh -c 'timeout 6s dpkg-query -W -f=\"${Version}\" core-daemon 2>/dev/null || true'",
+            "sh -c 'timeout 6s rpm -q --qf \"%{VERSION}-%{RELEASE}\" core-daemon 2>/dev/null || true'",
+            "sh -c 'timeout 6s core --version 2>/dev/null || true'",
+        ]
+        raw = ''
+        for cmd in candidates:
+            try:
+                _code, out, err = _exec_ssh_command(client, cmd, timeout=12.0)
+            except Exception:
+                continue
+            text = (out or '').strip() or (err or '').strip()
+            if text:
+                raw = text
+                break
+        if not raw:
+            raise RuntimeError('Unable to determine CORE version on remote host')
+        found = None
+        try:
+            m = re.search(r"(\d+\.\d+\.\d+)", raw)
+            if m:
+                found = m.group(1)
+        except Exception:
+            found = None
+        if not found:
+            raise RuntimeError(f'Unable to parse CORE version from: {raw}')
+        if found != required:
+            raise RuntimeError(f'CORE version mismatch: expected {required}, found {found}')
+        return found
+
+    def _sudo_exec(client: Any, cmd: str, *, timeout: float = 45.0) -> tuple[int, str, str]:
+        sudo_password = cfg.get('ssh_password')
+        # Wrap in timeout to avoid hanging.
+        wrapped = f"sh -c 'timeout {int(max(5, timeout))}s {cmd}'"
+        if sudo_password:
+            sudo_cmd = f"sudo -S -p '' {wrapped}"
+        else:
+            sudo_cmd = f"sudo -n {wrapped}"
+        stdin = stdout = stderr = None
+        try:
+            stdin, stdout, stderr = client.exec_command(sudo_cmd, timeout=timeout + 5.0, get_pty=True)
+            if sudo_password:
+                try:
+                    stdin.write(str(sudo_password) + '\n')
+                    stdin.flush()
+                except Exception:
+                    pass
+            stdout_data = stdout.read() if stdout else b''
+            stderr_data = stderr.read() if stderr else b''
+            try:
+                exit_code = stdout.channel.recv_exit_status() if (stdout and hasattr(stdout, 'channel')) else 0
+            except Exception:
+                exit_code = 0
+            out_text = stdout_data.decode('utf-8', 'ignore') if isinstance(stdout_data, (bytes, bytearray)) else str(stdout_data or '')
+            err_text = stderr_data.decode('utf-8', 'ignore') if isinstance(stderr_data, (bytes, bytearray)) else str(stderr_data or '')
+            return exit_code, out_text, err_text
+        finally:
+            try:
+                if stdin:
+                    stdin.close()
+            except Exception:
+                pass
+
+    def _maybe_fix_docker_daemon(client: Any) -> None:
+        desired = {'bridge': 'none', 'iptables': False}
+        existing: dict[str, Any] = {}
+        try:
+            _code, out, _err = _exec_ssh_command(client, "sh -c 'timeout 5s cat /etc/docker/daemon.json 2>/dev/null || true'", timeout=10.0)
+            text = (out or '').strip()
+            if text:
+                try:
+                    existing = json.loads(text)
+                except Exception:
+                    existing = {}
+        except Exception:
+            existing = {}
+        merged = dict(existing) if isinstance(existing, dict) else {}
+        merged.update(desired)
+        payload = json.dumps(merged, indent=2, sort_keys=True) + "\n"
+
+        tmp_local = None
+        remote_tmp = None
+        try:
+            import tempfile
+
+            with tempfile.NamedTemporaryFile('w', delete=False, encoding='utf-8') as tf:
+                tf.write(payload)
+                tmp_local = tf.name
+            remote_tmp = _upload_file_to_core_host(cfg, tmp_local, remote_dir='/tmp/core-topo-gen/uploads')
+
+            exit_code, _out, err = _sudo_exec(client, 'install -d -m 0755 /etc/docker', timeout=20.0)
+            if exit_code != 0:
+                err_lower = (err or '').lower()
+                if (not cfg.get('ssh_password')) and ('password' in err_lower or 'sudo' in err_lower):
+                    raise RuntimeError('Fix docker daemon failed: sudo requires a password (none provided).')
+                raise RuntimeError('Fix docker daemon failed: could not create /etc/docker')
+            exit_code, _out, err = _sudo_exec(client, f"install -m 0644 {shlex.quote(remote_tmp)} /etc/docker/daemon.json", timeout=25.0)
+            if exit_code != 0:
+                err_lower = (err or '').lower()
+                if (not cfg.get('ssh_password')) and ('password' in err_lower or 'sudo' in err_lower):
+                    raise RuntimeError('Fix docker daemon failed: sudo requires a password (none provided).')
+                raise RuntimeError('Fix docker daemon failed: could not write /etc/docker/daemon.json')
+
+            rc, _o, _e = _sudo_exec(client, 'systemctl restart docker || service docker restart || true', timeout=40.0)
+            if rc != 0:
+                raise RuntimeError('Fix docker daemon failed: docker restart did not succeed')
+        finally:
+            try:
+                if tmp_local and os.path.exists(tmp_local):
+                    os.remove(tmp_local)
+            except Exception:
+                pass
+            try:
+                if remote_tmp:
+                    _remove_remote_file(cfg, remote_tmp)
+            except Exception:
+                pass
+
+    def _maybe_core_cleanup(client: Any) -> None:
+        # Prefer system-provided core-cleanup if available; otherwise do safe stale /tmp/pycore.* purge.
+        try:
+            _code, out, _err = _exec_ssh_command(client, "sh -c 'command -v core-cleanup >/dev/null 2>&1; echo $?'", timeout=10.0)
+            has_core_cleanup = (out or '').strip() == '0'
+        except Exception:
+            has_core_cleanup = False
+        if has_core_cleanup:
+            exit_code, _out, err = _sudo_exec(client, 'core-cleanup', timeout=70.0)
+            if exit_code != 0:
+                err_lower = (err or '').lower()
+                if (not cfg.get('ssh_password')) and ('password' in err_lower or 'sudo' in err_lower):
+                    raise RuntimeError('core-cleanup failed: sudo requires a password (none provided).')
+                raise RuntimeError('core-cleanup failed')
+            return
+
+        # Fallback: remove stale pycore directories not in active session ids.
+        try:
+            target_host = str(cfg.get('host') or CORE_HOST)
+            target_port = int(cfg.get('port') or CORE_PORT)
+        except Exception:
+            target_host = str(cfg.get('host') or CORE_HOST)
+            target_port = CORE_PORT
+        try:
+            sessions = _list_active_core_sessions(target_host, int(target_port), cfg, errors=[], meta={})
+        except Exception:
+            sessions = []
+        active_ids: set[int] = set()
+        for entry in sessions:
+            try:
+                sid = entry.get('id')
+                if sid is None:
+                    continue
+                active_ids.add(int(str(sid).strip()))
+            except Exception:
+                continue
+        active_json = json.dumps(sorted(active_ids))
+        cleanup_cmd = (
+            "python3 - <<'PY'\n"
+            "import os, json, glob, shutil, time\n"
+            "active=set(json.loads(os.environ.get('ACTIVE_IDS','[]')))\n"
+            "removed=[]\nkept=[]\nnow=time.time()\n"
+            "for p in glob.glob('/tmp/pycore.*'):\n"
+            "  base=os.path.basename(p)\n"
+            "  try: sid=int(base.split('.')[-1])\n"
+            "  except Exception: kept.append(p); continue\n"
+            "  if sid in active: kept.append(p); continue\n"
+            "  try: age=now-os.stat(p).st_mtime\n"
+            "  except Exception: age=999\n"
+            "  if age < 30: kept.append(p); continue\n"
+            "  try: shutil.rmtree(p); removed.append(p)\n"
+            "  except Exception: kept.append(p)\n"
+            "print(json.dumps({'removed':removed,'kept':kept,'active_session_ids':sorted(active)}))\n"
+            "PY"
+        )
+        shell_cmd = f"ACTIVE_IDS={shlex.quote(active_json)} {cleanup_cmd}"
+        _exec_ssh_command(client, f"sh -c {shlex.quote(shell_cmd)}", timeout=30.0)
+
+    def _maybe_restart_core_daemon(client: Any) -> None:
+        exit_code, _out, err = _sudo_exec(client, 'systemctl restart core-daemon', timeout=35.0)
+        if exit_code != 0:
+            err_lower = (err or '').lower()
+            if (not cfg.get('ssh_password')) and ('password' in err_lower or 'sudo' in err_lower):
+                raise RuntimeError('Restart core-daemon failed: sudo requires a password (none provided).')
+            raise RuntimeError('Restart core-daemon failed')
+
+    def _maybe_kill_active_sessions() -> tuple[list[int], list[str]]:
+        deleted: list[int] = []
+        errors: list[str] = []
+        try:
+            target_host = str(cfg.get('host') or CORE_HOST)
+            target_port = int(cfg.get('port') or CORE_PORT)
+        except Exception:
+            target_host = str(cfg.get('host') or CORE_HOST)
+            target_port = CORE_PORT
+        try:
+            sessions = _list_active_core_sessions(target_host, int(target_port), cfg, errors=[], meta={})
+        except Exception as exc:
+            errors.append(f"Failed listing active CORE sessions: {exc}")
+            return deleted, errors
+        ids: list[int] = []
+        for entry in sessions:
+            sid = entry.get('id')
+            if sid in (None, ''):
+                continue
+            try:
+                ids.append(int(str(sid).strip()))
+            except Exception:
+                continue
+        seen: set[int] = set()
+        ordered: list[int] = []
+        for sid in ids:
+            if sid in seen:
+                continue
+            seen.add(sid)
+            ordered.append(sid)
+        for sid in ordered:
+            try:
+                _execute_remote_core_session_action(cfg, 'delete', sid, logger=logger)
+                deleted.append(sid)
+            except Exception as exc:
+                errors.append(f"Failed deleting session {sid}: {exc}")
+        return deleted, errors
+
+    _ensure_paramiko_available()
+    client = paramiko.SSHClient()  # type: ignore[assignment]
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # type: ignore[attr-defined]
+    try:
+        client.connect(
+            hostname=str(cfg.get('ssh_host') or cfg.get('host') or 'localhost'),
+            port=int(cfg.get('ssh_port') or 22),
+            username=str(cfg.get('ssh_username') or ''),
+            password=cfg.get('ssh_password') or '',
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=15.0,
+            banner_timeout=15.0,
+            auth_timeout=15.0,
+        )
+
+        if adv_check_core_version:
+            try:
+                ver = _check_core_version(client, '9.2.1')
+                _set('adv_check_core_version', enabled=True, ok=True, message=f'found {ver}')
+            except Exception as exc:
+                _set('adv_check_core_version', enabled=True, ok=False, message=str(exc))
+        else:
+            _set('adv_check_core_version', enabled=False, ok=None, message='')
+
+        if adv_fix_docker_daemon:
+            try:
+                _maybe_fix_docker_daemon(client)
+                _set('adv_fix_docker_daemon', enabled=True, ok=True, message='applied /etc/docker/daemon.json and restarted docker')
+            except Exception as exc:
+                _set('adv_fix_docker_daemon', enabled=True, ok=False, message=str(exc))
+        else:
+            _set('adv_fix_docker_daemon', enabled=False, ok=None, message='')
+
+        if adv_run_core_cleanup:
+            try:
+                _maybe_core_cleanup(client)
+                _set('adv_run_core_cleanup', enabled=True, ok=True, message='completed')
+            except Exception as exc:
+                _set('adv_run_core_cleanup', enabled=True, ok=False, message=str(exc))
+        else:
+            _set('adv_run_core_cleanup', enabled=False, ok=None, message='')
+
+        if adv_restart_core_daemon:
+            try:
+                _maybe_restart_core_daemon(client)
+                _set('adv_restart_core_daemon', enabled=True, ok=True, message='requested')
+            except Exception as exc:
+                _set('adv_restart_core_daemon', enabled=True, ok=False, message=str(exc))
+        else:
+            _set('adv_restart_core_daemon', enabled=False, ok=None, message='')
+
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    # Auto-kill sessions is done via gRPC calls (remote python) and does not require an open SSHClient.
+    if adv_auto_kill_sessions:
+        try:
+            deleted, errs = _maybe_kill_active_sessions()
+            if errs:
+                _set('adv_auto_kill_sessions', enabled=True, ok=False, message='; '.join(errs)[:500])
+            else:
+                detail = f"deleted {len(deleted)} session(s)" if deleted else 'no sessions deleted'
+                _set('adv_auto_kill_sessions', enabled=True, ok=True, message=detail)
+        except Exception as exc:
+            _set('adv_auto_kill_sessions', enabled=True, ok=False, message=str(exc))
+    else:
+        _set('adv_auto_kill_sessions', enabled=False, ok=None, message='')
+
+    return results
+
+
 def _normalize_hitl_attachment(raw_value: Any) -> str:
     if isinstance(raw_value, str):
         candidate = raw_value.strip()
@@ -4972,13 +5338,19 @@ def _assigned_scenarios_for_user(user: Optional[dict]) -> list[str]:
 
 
 def _builder_allowed_norms(user: Optional[dict] = None) -> Optional[set[str]]:
+    """Return assigned scenario norms for roles that must be restricted.
+
+    Historically this function applied only to the builder role.
+    Participants are also restricted to their assigned scenarios across the UI,
+    so we include them here to keep scenario visibility consistent.
+    """
     effective_user = user
     if effective_user is None and has_request_context():
         effective_user = _current_user()
     if not effective_user:
         return None
     role = _normalize_role_value(effective_user.get('role'))
-    if role != 'builder':
+    if role not in {'builder', 'participant'}:
         return None
     assigned = _assigned_scenarios_for_user(effective_user)
     return {norm for norm in assigned if norm}
@@ -5010,35 +5382,55 @@ def _builder_catalog_seed_scenarios(
     if not allowed_norms:
         return []
     names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(None, user=user)
+    # Compare permissions using match keys so minor punctuation differences
+    # (e.g., "Scenario_1b" vs "Scenario 1b") don't hide scenarios.
+    allowed_keys = {k for k in (_scenario_match_key(v) for v in allowed_norms) if k}
+    if not allowed_keys:
+        return []
+
     display_by_norm: dict[str, str] = {}
+    catalog_norm_by_key: dict[str, str] = {}
     for display in names:
         norm = _normalize_scenario_label(display)
+        key = _scenario_match_key(display)
         if norm:
             display_by_norm.setdefault(norm, display)
-    ordered_norms: list[str] = []
-    if assignment_order:
-        for entry in assignment_order:
-            norm = _normalize_scenario_label(entry)
-            if norm and norm in allowed_norms and norm not in ordered_norms:
-                ordered_norms.append(norm)
-    for display in names:
-        norm = _normalize_scenario_label(display)
-        if norm and norm in allowed_norms and norm not in ordered_norms:
-            ordered_norms.append(norm)
-    for norm in sorted(allowed_norms):
-        if norm not in ordered_norms:
-            ordered_norms.append(norm)
-
-    parsed_cache: dict[str, list[Dict[str, Any]]] = {}
-    hydrated: list[Dict[str, Any]] = []
+        if key and norm and key not in catalog_norm_by_key:
+            catalog_norm_by_key[key] = norm
 
     def _humanize(norm_value: str) -> str:
         text = (norm_value or '').replace('_', ' ').strip()
         text = re.sub(r'\s+', ' ', text)
         return text.title() if text else norm_value
 
-    for norm in ordered_norms:
-        display_name = display_by_norm.get(norm) or _humanize(norm)
+    ordered_keys: list[str] = []
+    if assignment_order:
+        for entry in assignment_order:
+            k = _scenario_match_key(entry)
+            if k and k in allowed_keys and k not in ordered_keys:
+                ordered_keys.append(k)
+    for display in names:
+        k = _scenario_match_key(display)
+        if k and k in allowed_keys and k not in ordered_keys:
+            ordered_keys.append(k)
+    # Any remaining allowed scenarios (not in catalog/assignment order)
+    for k in sorted(allowed_keys):
+        if k not in ordered_keys:
+            ordered_keys.append(k)
+
+    parsed_cache: dict[str, list[Dict[str, Any]]] = {}
+    hydrated: list[Dict[str, Any]] = []
+
+    # Map allowed keys back to a catalog norm if available (preserves exact display names).
+    allowed_norm_by_key: dict[str, str] = {}
+    for norm in allowed_norms:
+        k = _scenario_match_key(norm)
+        if k and k not in allowed_norm_by_key:
+            allowed_norm_by_key[k] = norm
+
+    for key in ordered_keys:
+        norm = catalog_norm_by_key.get(key) or allowed_norm_by_key.get(key) or ''
+        display_name = display_by_norm.get(norm) or _humanize(norm or key)
         participant_hint = scenario_url_hints.get(norm, '') if scenario_url_hints else ''
         scenario_copy: Optional[Dict[str, Any]] = None
         candidate_paths = scenario_paths.get(norm) if scenario_paths else None
@@ -5082,11 +5474,12 @@ def _builder_filter_report_scenarios(
     allowed_norms = _builder_allowed_norms(user)
     if allowed_norms is None:
         return scenario_names, scenario_norm, None
+    allowed_keys = {key for key in (_scenario_match_key(v) for v in allowed_norms) if key}
     filtered = [
         name for name in scenario_names or []
-        if _normalize_scenario_label(name) in allowed_norms
+        if _scenario_match_key(name) in allowed_keys
     ]
-    normalized_selection = scenario_norm if (not scenario_norm or scenario_norm in allowed_norms) else ''
+    normalized_selection = scenario_norm if (not scenario_norm or _scenario_match_key(scenario_norm) in allowed_keys) else ''
     return filtered, normalized_selection, allowed_norms
 
 # Diagnostic endpoint for environment/module troubleshooting
@@ -5189,6 +5582,12 @@ def _inject_nav_participant_link() -> dict:
                 'nav_participant_url': url_value or '',
                 'nav_participant_scenario': scenario_label or '',
             }
+
+        # If the page is not scoped to a scenario (no `?scenario=`), avoid "guessing" a participant URL
+        # for admin/builder views. Otherwise CORE/Reports can show Participant UI for an unrelated scenario.
+        view_mode = getattr(g, 'ui_view_mode', _UI_VIEW_DEFAULT)
+        if view_mode != 'participant':
+            return {'nav_participant_url': '', 'nav_participant_scenario': ''}
 
         url_value, scenario_label = _resolve_participant_ui_target()
         return {
@@ -6828,6 +7227,43 @@ def _normalize_scenario_label(value: Any) -> str:
     return re.sub(r'\s+', ' ', text)
 
 
+def _scenario_match_key(value: Any) -> str:
+    """Return a forgiving key for scenario-name comparisons.
+
+    We keep _normalize_scenario_label() stable for display and storage,
+    but compare assignments using this match key so punctuation differences
+    don't hide scenarios (e.g., 'Scenario-1' vs 'Scenario 1').
+    """
+    norm = _normalize_scenario_label(value)
+    if not norm:
+        return ''
+    return re.sub(r'[^a-z0-9]+', '', norm)
+
+
+def _scenario_display_sort_key(value: Any) -> tuple:
+    """Natural-ish sort for scenario display strings.
+
+    Examples:
+      - Scenario 1 < Scenario 1b < Scenario 2
+      - Anything without a number sorts after numbered scenarios.
+    """
+    if value is None:
+        return (1, '', float('inf'), '', '')
+    text = value if isinstance(value, str) else str(value)
+    text = text.strip()
+    lowered = text.lower()
+    m = re.search(r'(\d+)([a-z]*)', lowered)
+    if not m:
+        return (1, lowered, float('inf'), '', lowered)
+    try:
+        num = int(m.group(1))
+    except Exception:
+        num = float('inf')
+    suffix = m.group(2) or ''
+    prefix = lowered[:m.start(1)].strip()
+    return (0, prefix, num, suffix, lowered)
+
+
 def _select_latest_core_secret_record(scenario_norm: str | None = None) -> Optional[Dict[str, Any]]:
     """Find the most recent stored CORE credential, optionally filtered by scenario."""
 
@@ -7009,6 +7445,55 @@ def _collect_scenario_catalog(history: Optional[List[dict]] = None) -> tuple[lis
     path_map: dict[str, set[str]] = defaultdict(set)
     participant_by_norm: dict[str, str] = dict(catalog_participants)
 
+    def _discover_saved_scenarios_from_outputs() -> list[tuple[str, str]]:
+        """Discover scenario names from saved web UI artifacts.
+
+        The web UI saves scenario XMLs under outputs/scenarios-*/Scenario_*.xml.
+        These may exist even when they haven't been executed (so run_history won't contain them).
+        Builders/participants still need to see these scenarios once assigned.
+        Returns a list of (scenario_display_name, xml_path).
+        """
+        out: list[tuple[str, str]] = []
+        try:
+            base = _outputs_dir()
+            if not base or not os.path.isdir(base):
+                return out
+            dirs: list[tuple[float, str]] = []
+            for entry in os.listdir(base):
+                if not entry.startswith('scenarios-'):
+                    continue
+                full = os.path.join(base, entry)
+                if not os.path.isdir(full):
+                    continue
+                try:
+                    mtime = os.path.getmtime(full)
+                except Exception:
+                    mtime = 0.0
+                dirs.append((mtime, full))
+            # Limit scan for performance; newest first.
+            dirs.sort(key=lambda t: t[0], reverse=True)
+            for _mtime, folder in dirs[:250]:
+                try:
+                    for fname in os.listdir(folder):
+                        if not fname.endswith('.xml'):
+                            continue
+                        # Skip CORE pre/post captures; only include user-authored scenario XML.
+                        if fname.startswith('core-'):
+                            continue
+                        if not fname.startswith('Scenario_'):
+                            continue
+                        path = os.path.join(folder, fname)
+                        if not os.path.isfile(path):
+                            continue
+                        for name in _scenario_names_from_xml(path):
+                            if name:
+                                out.append((name, path))
+                except Exception:
+                    continue
+        except Exception:
+            return out
+        return out
+
     def _record_path(norm_key: str, path_value: Any) -> None:
         if not path_value or not norm_key:
             return
@@ -7066,6 +7551,19 @@ def _collect_scenario_catalog(history: Optional[List[dict]] = None) -> tuple[lis
             candidate = entry.get(key)
             if candidate:
                 _record_path(normalized, candidate)
+
+    # Merge in saved scenario XMLs from outputs/ (covers saved-but-not-executed scenarios like "Scenario 1b").
+    try:
+        for display_name, xml_path in _discover_saved_scenarios_from_outputs():
+            norm = _normalize_scenario_label(display_name)
+            if not norm:
+                continue
+            if norm not in display_by_norm:
+                display_by_norm[norm] = display_name
+                ordered.append(display_name)
+            _record_path(norm, xml_path)
+    except Exception:
+        pass
     if catalog_paths:
         for norm_key, candidates in catalog_paths.items():
             if not candidates:
@@ -7133,6 +7631,12 @@ def _collect_scenario_catalog(history: Optional[List[dict]] = None) -> tuple[lis
                         break
                 if participant_url:
                     participant_by_norm[norm] = participant_url
+
+    # Stable, shared ordering across all pages.
+    try:
+        ordered = sorted(ordered, key=_scenario_display_sort_key)
+    except Exception:
+        pass
     protected = snapshot_protected_norms or None
     return _prune_stale_scenario_entries(ordered, path_map, participant_by_norm, protected_norms=protected)
 
@@ -9171,24 +9675,43 @@ def _validate_and_normalize_data_source_csv(file_path: str, max_bytes: int = 2_0
         return False, str(e), None, []
 
 def _default_scenarios_payload():
+    return _default_scenarios_payload_for_names(["Scenario 1"])
+
+
+def _default_scenario_payload(name: str) -> Dict[str, Any]:
     # Single default scenario with empty sections mirroring PyQt structure
     sections = [
         "Node Information", "Routing", "Services", "Traffic",
         "Events", "Vulnerabilities", "Segmentation", "HITL"
     ]
-    scen = {
-        "name": "Scenario 1",
+    display_name = str(name or '').strip() or "Scenario"
+    return {
+        "name": display_name,
         "base": {"filepath": ""},
         "hitl": {"enabled": False, "interfaces": [], "core": None},
-        "sections": {name: {
-            "density": 0.5 if name not in ("Node Information", "HITL") else None,
-            "total_nodes": 1 if name == "Node Information" else None,
+        "sections": {sec_name: {
+            "density": 0.5 if sec_name not in ("Node Information", "HITL") else None,
+            "total_nodes": 1 if sec_name == "Node Information" else None,
             "items": []
-        } for name in sections},
+        } for sec_name in sections},
         "notes": ""
     }
+
+
+def _default_scenarios_payload_for_names(names: Iterable[Any] | None) -> Dict[str, Any]:
+    scenario_names: list[str] = []
+    for entry in names or []:
+        try:
+            text = str(entry or '').strip()
+        except Exception:
+            text = ''
+        if text:
+            scenario_names.append(text)
+    if not scenario_names:
+        scenario_names = ["Scenario 1"]
+
     return {
-        "scenarios": [scen],
+        "scenarios": [_default_scenario_payload(name) for name in scenario_names],
         "result_path": None,
         "core": _default_core_dict(),
         "host_interfaces": _enumerate_host_interfaces(),
@@ -9202,11 +9725,13 @@ def _filter_scenarios_by_norms(
     filtered: List[Dict[str, Any]] = []
     if not allowed_norms:
         return filtered
+    allowed_keys = {key for key in (_scenario_match_key(v) for v in allowed_norms) if key}
+    if not allowed_keys:
+        return filtered
     for scen in scenarios or []:
         if not isinstance(scen, dict):
             continue
-        norm = _normalize_scenario_label(scen.get('name'))
-        if norm and norm in allowed_norms:
+        if _scenario_match_key(scen.get('name')) in allowed_keys:
             filtered.append(scen)
     return filtered
 
@@ -9258,13 +9783,12 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
     scenarios_raw = payload.get('scenarios')
     if not isinstance(scenarios_raw, list) or not scenarios_raw:
         scenarios_raw = defaults['scenarios']
+    # For restricted roles, always build scenarios from catalog + assignments so
+    # Scenarios/CORE/Reports are consistent (including ordering).
     if allowed_norms:
-        existing_norms = _collect_scenario_norms(scenarios_raw)
-        missing_norms = allowed_norms - existing_norms
-        if missing_norms:
-            seeded = _builder_catalog_seed_scenarios(allowed_norms, builder_assignment_order, user=user)
-            if seeded:
-                scenarios_raw = seeded
+        seeded = _builder_catalog_seed_scenarios(allowed_norms, builder_assignment_order, user=user)
+        if seeded:
+            scenarios_raw = seeded
 
     required_sections = {
         'Node Information': {'density': None, 'total_nodes': None},
@@ -9433,7 +9957,15 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
                             break
                 if participant_url_value:
                     participant_hints[norm] = participant_url_value
-            _persist_scenario_catalog(scen_names_for_catalog, payload.get('result_path'), participant_urls=participant_hints)
+            result_path = payload.get('result_path') if isinstance(payload.get('result_path'), str) else None
+            should_persist = bool(result_path)
+            if not should_persist:
+                try:
+                    should_persist = not os.path.exists(_scenario_catalog_file())
+                except Exception:
+                    should_persist = False
+            if should_persist:
+                _persist_scenario_catalog(scen_names_for_catalog, result_path, participant_urls=participant_hints)
         except Exception:
             pass
 
@@ -10089,6 +10621,209 @@ def api_hitl_apply_bridge():
         assignment_count,
         changed_interfaces,
     )
+    return jsonify(response)
+
+
+@app.route('/api/hitl/validate_bridge', methods=['POST'])
+def api_hitl_validate_bridge():
+    """Validate HITL bridge configuration without applying any changes."""
+
+    payload = request.get_json(silent=True) or {}
+    bridge_raw = payload.get('bridge_name') or payload.get('internal_bridge') or payload.get('bridge')
+    if bridge_raw in (None, ''):
+        return jsonify({'success': False, 'error': 'Bridge name is required'}), 400
+    try:
+        bridge_name = _normalize_internal_bridge_name(bridge_raw)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+
+    scenario_name = str(payload.get('scenario_name') or payload.get('scenario') or '').strip()
+    scenario_index_raw = payload.get('scenario_index')
+    try:
+        scenario_index = int(scenario_index_raw)
+    except Exception:
+        scenario_index = None
+
+    hitl_payload = payload.get('hitl') or payload.get('scenario_hitl') or payload.get('hitl_config')
+    if not isinstance(hitl_payload, dict):
+        return jsonify({'success': False, 'error': 'HITL configuration is required to validate bridge settings'}), 400
+
+    prox_state = hitl_payload.get('proxmox') or {}
+    secret_id_raw = prox_state.get('secret_id') or prox_state.get('secretId') or prox_state.get('identifier')
+    secret_id = secret_id_raw.strip() if isinstance(secret_id_raw, str) else ''
+    if not secret_id:
+        return jsonify({'success': False, 'error': 'Validate and store Proxmox credentials before verifying HITL bridge settings'}), 400
+
+    core_state = hitl_payload.get('core') or {}
+    vm_key_raw = core_state.get('vm_key') or core_state.get('vmKey')
+    vm_key = str(vm_key_raw or '').strip()
+    if not vm_key:
+        return jsonify({'success': False, 'error': 'Select a CORE VM before verifying HITL bridge settings'}), 400
+    try:
+        core_node, core_vmid = _parse_proxmox_vm_key(vm_key)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': f'CORE VM selection invalid: {exc}'}), 400
+    core_vm_name = str(core_state.get('vm_name') or core_state.get('vmName') or '').strip()
+
+    interfaces_payload = hitl_payload.get('interfaces')
+    if not isinstance(interfaces_payload, list) or not interfaces_payload:
+        return jsonify({'success': False, 'error': 'Add at least one HITL interface before verifying bridge settings'}), 400
+
+    validation_errors: List[str] = []
+    assignments: List[Dict[str, Any]] = []
+    for idx, iface in enumerate(interfaces_payload):
+        if not isinstance(iface, dict):
+            continue
+        iface_name = str(iface.get('name') or f'Interface {idx + 1}').strip() or f'Interface {idx + 1}'
+        prox_target = iface.get('proxmox_target')
+        if not isinstance(prox_target, dict):
+            validation_errors.append(f'{iface_name}: Map the interface to a CORE VM adapter in Step 3.')
+            continue
+        external = iface.get('external_vm')
+        attachment = _normalize_hitl_attachment(iface.get('attachment'))
+        if attachment != 'proxmox_vm':
+            if isinstance(external, dict):
+                attachment = 'proxmox_vm'
+            else:
+                continue
+        core_iface_id = str(prox_target.get('interface_id') or '').strip()
+        if not core_iface_id:
+            validation_errors.append(f'{iface_name}: Select the CORE VM interface to use for HITL connectivity.')
+            continue
+        target_node = str(prox_target.get('node') or '').strip() or core_node
+        try:
+            target_vmid = int(prox_target.get('vmid') or core_vmid)
+        except Exception:
+            validation_errors.append(f'{iface_name}: CORE VM identifier is invalid.')
+            continue
+        if target_node != core_node or target_vmid != core_vmid:
+            validation_errors.append(f'{iface_name}: CORE interface must belong to the selected CORE VM on node {core_node}.')
+            continue
+        if not isinstance(external, dict):
+            validation_errors.append(f'{iface_name}: Select an external Proxmox VM in Step 4.')
+            continue
+        external_vm_key = str(external.get('vm_key') or external.get('vmKey') or '').strip()
+        if not external_vm_key:
+            validation_errors.append(f'{iface_name}: Select an external Proxmox VM in Step 4.')
+            continue
+        try:
+            external_node, external_vmid = _parse_proxmox_vm_key(external_vm_key)
+        except ValueError as exc:
+            validation_errors.append(f'{iface_name}: External VM invalid: {exc}')
+            continue
+        if external_node != core_node:
+            validation_errors.append(f'{iface_name}: External VM must be hosted on node {core_node}.')
+            continue
+        external_iface_id = str(external.get('interface_id') or '').strip()
+        if not external_iface_id:
+            validation_errors.append(f'{iface_name}: Select the external VM interface to connect through the bridge.')
+            continue
+        assignments.append({
+            'name': iface_name,
+            'core': {
+                'node': core_node,
+                'vmid': core_vmid,
+                'vm_name': core_vm_name,
+                'interface_id': core_iface_id,
+            },
+            'external': {
+                'node': external_node,
+                'vmid': external_vmid,
+                'vm_name': str(external.get('vm_name') or '').strip(),
+                'interface_id': external_iface_id,
+            },
+        })
+
+    if validation_errors:
+        message = ' ; '.join(validation_errors[:3])
+        if len(validation_errors) > 3:
+            message += f' (and {len(validation_errors) - 3} more issue(s))'
+        return jsonify({'success': False, 'error': message, 'details': validation_errors}), 400
+    if not assignments:
+        return jsonify({'success': False, 'error': 'No eligible HITL interface mappings found. Map at least one interface to a CORE VM and external VM before verifying.'}), 400
+
+    try:
+        client, _record = _connect_proxmox_from_secret(secret_id)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 502
+    except Exception as exc:  # pragma: no cover
+        app.logger.exception('[hitl] unexpected failure connecting to Proxmox: %s', exc)
+        return jsonify({'success': False, 'error': 'Unexpected error connecting to Proxmox'}), 500
+
+    try:
+        bridge_meta = _ensure_proxmox_bridge(client, core_node, bridge_name)
+    except RuntimeError as exc:
+        msg = str(exc)
+        status = 400 if 'not found on node' in msg.lower() else 502
+        return jsonify({'success': False, 'error': msg}), status
+
+    vm_config_cache: Dict[tuple[str, int], Dict[str, Any]] = {}
+
+    def _get_vm_config(node: str, vmid: int) -> Dict[str, Any]:
+        key = (node, vmid)
+        if key not in vm_config_cache:
+            try:
+                vm_config_cache[key] = client.nodes(node).qemu(vmid).config.get()
+            except Exception as exc:
+                raise RuntimeError(f'Failed to fetch configuration for VM {vmid} on node {node}: {exc}') from exc
+        return vm_config_cache[key]
+
+    change_details: List[Dict[str, Any]] = []
+    try:
+        for assignment in assignments:
+            for role in ('core', 'external'):
+                vm_info = assignment[role]
+                node = vm_info['node']
+                vmid = vm_info['vmid']
+                interface_id = vm_info['interface_id']
+                vm_name = vm_info.get('vm_name') or ''
+                config = _get_vm_config(node, vmid)
+                net_config = config.get(interface_id)
+                if not isinstance(net_config, str) or not net_config.strip():
+                    raise ValueError(f'{role.title()} VM {vm_name or vmid} is missing Proxmox interface {interface_id}.')
+                _new_config, changed, previous_bridge = _rewrite_bridge_in_net_config(net_config, bridge_name)
+                change_details.append({
+                    'role': role,
+                    'scenario_interface': assignment['name'],
+                    'node': node,
+                    'vmid': vmid,
+                    'vm_name': vm_name,
+                    'interface_id': interface_id,
+                    'previous_bridge': previous_bridge,
+                    'new_bridge': bridge_name,
+                    'changed': changed,
+                })
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except RuntimeError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 502
+
+    changed_interfaces = sum(1 for change in change_details if change.get('changed'))
+    unchanged_interfaces = len(change_details) - changed_interfaces
+    assignment_count = len(assignments)
+
+    parts = [f'Bridge {bridge_name} validation succeeded for {assignment_count} HITL link{"s" if assignment_count != 1 else ""}.']
+    if changed_interfaces:
+        parts.append(f'{changed_interfaces} Proxmox interface{"s" if changed_interfaces != 1 else ""} would be updated.')
+    if unchanged_interfaces:
+        parts.append(f'{unchanged_interfaces} already on the requested bridge.')
+    message = ' '.join(parts)
+
+    response: Dict[str, Any] = {
+        'success': True,
+        'message': message,
+        'bridge_name': bridge_name,
+        'bridge_meta': bridge_meta,
+        'scenario_index': scenario_index,
+        'scenario_name': scenario_name,
+        'assignments': assignment_count,
+        'changed_interfaces': changed_interfaces,
+        'unchanged_interfaces': unchanged_interfaces,
+        'changes': change_details,
+        'proxmox_node': core_node,
+    }
     return jsonify(response)
 
 # ---------------- Docker (per-node) status & cleanup ----------------
@@ -11896,7 +12631,18 @@ def index():
     if current and _is_participant_role(current.get('role')):
         target_args = {'scenario': scenario_query} if scenario_query else {}
         return redirect(url_for('participant_ui_page', **target_args))
+    # Admin Scenarios editor should list the same scenarios as CORE/Reports.
+    # Start from catalog names so the left-hand scenario list includes saved-but-not-executed
+    # scenarios like "Scenario 1b".
     payload = _default_scenarios_payload()
+    try:
+        role = _normalize_role_value(current.get('role')) if current else ''
+        if role == 'admin':
+            scenario_names, _scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(None, user=current)
+            if scenario_names:
+                payload = _default_scenarios_payload_for_names(scenario_names)
+    except Exception:
+        payload = _default_scenarios_payload()
     # Reconstruct base_upload if base filepath already present
     _attach_base_upload(payload)
     _hydrate_base_upload_from_disk(payload)
@@ -16978,9 +17724,49 @@ def test_core():
         auto_start_daemon = bool(cfg.get('auto_start_daemon'))
         install_custom_services = bool(cfg.get('install_custom_services'))
         stop_duplicate_daemons = bool(cfg.get('stop_duplicate_daemons'))
+        adv_fix_docker_daemon = bool(cfg.get('adv_fix_docker_daemon'))
+        adv_run_core_cleanup = bool(cfg.get('adv_run_core_cleanup'))
+        adv_check_core_version = bool(cfg.get('adv_check_core_version'))
+        adv_restart_core_daemon = bool(cfg.get('adv_restart_core_daemon'))
+        adv_auto_kill_sessions = bool(cfg.get('adv_auto_kill_sessions'))
         is_pytest = bool(os.environ.get('PYTEST_CURRENT_TEST') or ('pytest' in sys.modules))
         daemon_pids: List[int] = []
         install_meta: Optional[Dict[str, Any]] = None
+
+        advanced_checks: Dict[str, Dict[str, Any]] = {}
+        advanced_warnings: List[str] = []
+        if (adv_fix_docker_daemon or adv_run_core_cleanup or adv_check_core_version or adv_restart_core_daemon or adv_auto_kill_sessions):
+            # These checks require remote access.
+            if is_pytest:
+                app.logger.info('[core] advanced checks enabled but skipping remote execution (pytest)')
+                advanced_checks = _run_core_connection_advanced_checks(
+                    cfg,
+                    adv_fix_docker_daemon=False,
+                    adv_run_core_cleanup=False,
+                    adv_check_core_version=False,
+                    adv_restart_core_daemon=False,
+                    adv_auto_kill_sessions=False,
+                )
+            else:
+                advanced_checks = _run_core_connection_advanced_checks(
+                    cfg,
+                    adv_fix_docker_daemon=adv_fix_docker_daemon,
+                    adv_run_core_cleanup=adv_run_core_cleanup,
+                    adv_check_core_version=adv_check_core_version,
+                    adv_restart_core_daemon=adv_restart_core_daemon,
+                    adv_auto_kill_sessions=adv_auto_kill_sessions,
+                )
+                failures = [
+                    (key, res)
+                    for key, res in (advanced_checks or {}).items()
+                    if isinstance(res, dict) and res.get('enabled') and (res.get('ok') is False)
+                ]
+                if failures:
+                    parts = []
+                    for key, res in failures:
+                        msg = str(res.get('message') or '').strip()
+                        parts.append(f"{key}: {msg or 'failed'}")
+                    advanced_warnings.append('Advanced checks failed: ' + '; '.join(parts))
         if is_pytest and not (auto_start_daemon or install_custom_services or stop_duplicate_daemons):
             # Unit tests mock the tunnel/socket checks and should not depend on real DNS/SSH.
             app.logger.info('[core] skipping core-daemon SSH inspection (pytest)')
@@ -17210,6 +17996,8 @@ def test_core():
             "port": int(cfg.get('port', 0)) if cfg.get('port') is not None else None,
             "daemon_pids": daemon_pids,
             "install_custom_services": install_meta,
+            "advanced_checks": advanced_checks,
+            "warnings": advanced_warnings,
             "core": _normalize_core_config(cfg, include_password=False),
             "core_secret_id": stored_meta['identifier'],
             "core_summary": stored_meta,
