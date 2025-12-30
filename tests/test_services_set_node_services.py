@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from core_topo_gen.utils.services import set_node_services
+from core_topo_gen.utils.services import ensure_service, set_node_services
 
 
 class _WeirdServices:
@@ -39,3 +39,21 @@ def test_set_node_services_retries_with_node_obj_when_id_noops() -> None:
     ok = set_node_services(session, 123, ["IPForward", "zebra", "RIP"], node_obj=node)
     assert ok is True
     assert set(session.services.get(123)) == {"IPForward", "zebra", "RIP"}
+
+
+def test_set_node_services_keeps_defaultroute_for_docker_nodes() -> None:
+    session = _Session()
+    node = SimpleNamespace(id=321, type="DOCKER")
+
+    ok = set_node_services(session, 321, ["DefaultRoute"], node_obj=node)
+    assert ok is True
+    assert set(session.services.get(321)) == {"DefaultRoute"}
+
+
+def test_ensure_service_retries_with_node_obj_when_id_noops() -> None:
+    session = _Session()
+    node = SimpleNamespace(id=999, type="DOCKER")
+
+    ok = ensure_service(session, 999, "DefaultRoute", node_obj=node)
+    assert ok is True
+    assert set(session.services.get(999)) == {"DefaultRoute"}

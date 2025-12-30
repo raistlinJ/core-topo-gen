@@ -10,6 +10,14 @@
 {% endblock %}
 {% block nav_right_extra %}
   <div class="d-flex align-items-center gap-2 small">
+    <label for="refreshInterval" class="form-label mb-0">Every</label>
+    <select id="refreshInterval" class="form-select form-select-sm w-auto" title="Auto-refresh interval">
+      <option value="2000">2s</option>
+      <option value="5000" selected>5s</option>
+      <option value="10000">10s</option>
+      <option value="30000">30s</option>
+      <option value="60000">60s</option>
+    </select>
     <span id="refreshStatus" class="text-muted">auto</span>
     <button class="btn btn-sm btn-outline-light text-dark bg-white" id="toggleRefreshBtn" type="button">Pause</button>
   </div>
@@ -92,7 +100,11 @@
 <script>
 let autoRefresh = true;
 let refreshTimer = null;
-const intervalMs = 5000;
+let intervalMs = 5000;
+try {
+  const stored = parseInt(localStorage.getItem('reportsRefreshMs') || '', 10);
+  if ([2000,5000,10000,30000,60000].includes(stored)) intervalMs = stored;
+} catch(e) {}
 const tableBody = document.querySelector('#runsTable tbody');
 const runsCheckAll = document.getElementById('runsCheckAll');
 const runsDeleteBtn = document.getElementById('runsDeleteBtn');
@@ -266,6 +278,21 @@ document.getElementById('toggleRefreshBtn').addEventListener('click', () => {
   document.getElementById('refreshStatus').textContent = autoRefresh? 'auto':'paused';
   schedule();
 });
+
+const sel = document.getElementById('refreshInterval');
+if (sel) {
+  if ([2000,5000,10000,30000,60000].includes(intervalMs)) {
+    sel.value = String(intervalMs);
+  }
+  sel.addEventListener('change', ()=>{
+    const v = parseInt(sel.value, 10);
+    if (!isNaN(v) && v > 0) {
+      intervalMs = v;
+      try { localStorage.setItem('reportsRefreshMs', String(intervalMs)); } catch(e) {}
+      schedule();
+    }
+  });
+}
 
 function applyScenarioFilter(){
   const rows = tableBody.querySelectorAll('tr');

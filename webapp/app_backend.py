@@ -6988,39 +6988,74 @@ RUNS: Dict[str, Dict[str, Any]] = {}
 
 # Run history persistence (simple JSON log)
 RUN_HISTORY_PATH = os.path.join(_outputs_dir(), 'run_history.json')
+RUN_HISTORY_LOCK = threading.RLock()
 
 def _load_run_history():
     try:
-        if os.path.exists(RUN_HISTORY_PATH):
-            with open(RUN_HISTORY_PATH, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return [_normalize_run_history_entry(item) for item in data if isinstance(item, dict)]
-                return []
+        with RUN_HISTORY_LOCK:
+            if os.path.exists(RUN_HISTORY_PATH):
+                with open(RUN_HISTORY_PATH, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return [_normalize_run_history_entry(item) for item in data if isinstance(item, dict)]
+                    return []
     except Exception:
-        pass
+        try:
+            app.logger.exception('[run_history] failed reading %s', RUN_HISTORY_PATH)
+        except Exception:
+            pass
     return []
 
-def _append_run_history(entry: dict):
+def _append_run_history(entry: dict) -> bool:
+    """Append a run history entry to outputs/run_history.json.
+
+    Returns True on success, False on failure.
+    """
     # Enforce per-scenario semantics at the write boundary.
     try:
         entry = _normalize_run_history_entry(entry)
     except Exception:
-        pass
-    history = _load_run_history()
-    history.append(entry)
+        entry = entry if isinstance(entry, dict) else {}
+
+    run_id = None
+    try:
+        run_id = (entry.get('run_id') or '').strip() if isinstance(entry.get('run_id'), str) else None
+    except Exception:
+        run_id = None
+
     os.makedirs(os.path.dirname(RUN_HISTORY_PATH), exist_ok=True)
     tmp = RUN_HISTORY_PATH + '.tmp'
-    try:
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(history, f, indent=2)
-        os.replace(tmp, RUN_HISTORY_PATH)
-    except Exception:
+    with RUN_HISTORY_LOCK:
+        history = _load_run_history()
+        if run_id:
+            try:
+                for existing in history:
+                    if not isinstance(existing, dict):
+                        continue
+                    existing_id = existing.get('run_id')
+                    if isinstance(existing_id, str) and existing_id.strip() == run_id:
+                        return True
+            except Exception:
+                pass
+        history.append(entry)
         try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
+            with open(tmp, 'w', encoding='utf-8') as f:
+                # Use default=str to avoid silently dropping entries due to an unexpected
+                # non-serializable value. Paths/objects become strings.
+                json.dump(history, f, indent=2, default=str)
+            os.replace(tmp, RUN_HISTORY_PATH)
+            return True
         except Exception:
-            pass
+            try:
+                app.logger.exception('[run_history] failed writing %s', RUN_HISTORY_PATH)
+            except Exception:
+                pass
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            return False
 
 
 EDITOR_STATE_SNAPSHOT_SUBDIR = 'editor_snapshots'
@@ -7435,6 +7470,78 @@ def _persist_scenario_catalog(
                 os.remove(tmp_path)
         except Exception:
             pass
+
+
+def _merge_participant_urls_into_scenario_catalog(participant_urls: Dict[str, Any]) -> None:
+    """Merge participant URL hints into the scenario catalog without changing names/sources."""
+    if not isinstance(participant_urls, dict) or not participant_urls:
+        return
+    catalog_path = _scenario_catalog_file()
+    if not catalog_path:
+        return
+    try:
+        if not os.path.exists(catalog_path):
+            return
+    except Exception:
+        return
+
+    normalized_updates: dict[str, str] = {}
+    for key, value in participant_urls.items():
+        norm = _normalize_scenario_label(key)
+        url_value = _normalize_participant_proxmox_url(value)
+        if norm and url_value:
+            normalized_updates[norm] = url_value
+    if not normalized_updates:
+        return
+
+    tmp_path = catalog_path + '.tmp'
+    try:
+        with open(catalog_path, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            return
+        existing = payload.get('participant_urls')
+        if not isinstance(existing, dict):
+            existing = {}
+        merged = dict(existing)
+        merged.update(normalized_updates)
+        payload['participant_urls'] = merged
+        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+
+        os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
+        with open(tmp_path, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp_path, catalog_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _extract_participant_url_hints_from_scenarios(scenarios: Any) -> dict[str, str]:
+    hints: dict[str, str] = {}
+    if not isinstance(scenarios, list):
+        return hints
+    for scen in scenarios:
+        if not isinstance(scen, dict):
+            continue
+        norm = _normalize_scenario_label(scen.get('name'))
+        if not norm:
+            continue
+        hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else None
+        if not hitl_meta:
+            continue
+        url_value = ''
+        for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+            normalized = _normalize_participant_proxmox_url(hitl_meta.get(key))
+            if normalized:
+                url_value = normalized
+                break
+        if url_value:
+            hints[norm] = url_value
+    return hints
 
 
 def _collect_scenario_catalog(history: Optional[List[dict]] = None) -> tuple[list[str], dict[str, set[str]], dict[str, str]]:
@@ -9935,28 +10042,29 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
 
     payload.setdefault('result_path', defaults['result_path'])
 
-    if allowed_norms is None:
-        try:
-            scen_names_for_catalog = [scen.get('name') for scen in normalized_scenarios if isinstance(scen, dict)]
-            participant_hints: Dict[str, str] = {}
-            for scen in normalized_scenarios:
-                if not isinstance(scen, dict):
-                    continue
-                name = scen.get('name')
-                norm = _normalize_scenario_label(name)
-                if not norm:
-                    continue
-                hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else None
-                participant_url_value = ''
-                if hitl_meta:
-                    for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
-                        candidate = hitl_meta.get(key)
-                        normalized = _normalize_participant_proxmox_url(candidate)
-                        if normalized:
-                            participant_url_value = normalized
-                            break
-                if participant_url_value:
-                    participant_hints[norm] = participant_url_value
+    try:
+        scen_names_for_catalog = [scen.get('name') for scen in normalized_scenarios if isinstance(scen, dict)]
+        participant_hints: Dict[str, str] = {}
+        for scen in normalized_scenarios:
+            if not isinstance(scen, dict):
+                continue
+            name = scen.get('name')
+            norm = _normalize_scenario_label(name)
+            if not norm:
+                continue
+            hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else None
+            participant_url_value = ''
+            if hitl_meta:
+                for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+                    candidate = hitl_meta.get(key)
+                    normalized = _normalize_participant_proxmox_url(candidate)
+                    if normalized:
+                        participant_url_value = normalized
+                        break
+            if participant_url_value:
+                participant_hints[norm] = participant_url_value
+
+        if allowed_norms is None:
             result_path = payload.get('result_path') if isinstance(payload.get('result_path'), str) else None
             should_persist = bool(result_path)
             if not should_persist:
@@ -9966,8 +10074,11 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
                     should_persist = False
             if should_persist:
                 _persist_scenario_catalog(scen_names_for_catalog, result_path, participant_urls=participant_hints)
-        except Exception:
-            pass
+        else:
+            if participant_hints:
+                _merge_participant_urls_into_scenario_catalog(participant_hints)
+    except Exception:
+        pass
 
     if project_hint:
         payload['project_key_hint'] = project_hint
@@ -9992,6 +10103,21 @@ def api_editor_snapshot():
         return jsonify({'success': False, 'error': 'Snapshot rejected'}), 400
     try:
         _write_editor_state_snapshot(snapshot, user=user)
+        # Persist Participant UI URL hints immediately so other pages (Reports/CORE/Participant UI)
+        # can reflect the updated link without requiring an index-page reload.
+        try:
+            participant_hints = _extract_participant_url_hints_from_scenarios(snapshot.get('scenarios'))
+            if participant_hints:
+                role = _normalize_role_value(user.get('role'))
+                catalog_path = _scenario_catalog_file()
+                if role == 'admin' and not os.path.exists(catalog_path):
+                    scenario_names = [s.get('name') for s in snapshot.get('scenarios') if isinstance(s, dict)]
+                    source_path = snapshot.get('result_path') if isinstance(snapshot.get('result_path'), str) else None
+                    _persist_scenario_catalog(scenario_names, source_path, participant_urls=participant_hints)
+                else:
+                    _merge_participant_urls_into_scenario_catalog(participant_hints)
+        except Exception:
+            pass
     except Exception as exc:
         try:
             app.logger.exception('[editor_snapshot] persist failed: %s', exc)
@@ -15377,7 +15503,7 @@ def run_cli_async():
                 if full_bundle:
                     meta['full_scenario_path'] = full_bundle
                 session_xml_path = post_saved if (post_saved and os.path.exists(post_saved)) else None
-                _append_run_history({
+                history_ok = _append_run_history({
                     'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
                     'mode': 'async',
                     'xml_path': xml_path_local,
@@ -15397,7 +15523,8 @@ def run_cli_async():
                     'core': meta.get('core_cfg_public') or _normalize_core_config(meta.get('core_cfg') or {}, include_password=False),
                     'scenario_core': meta.get('scenario_core'),
                 })
-                meta['history_added'] = True
+                if history_ok:
+                    meta['history_added'] = True
             except Exception as e_final:
                 try:
                     app.logger.exception("[async-finalizer] failed finalizing run %s: %s", run_id_local, e_final)
@@ -15537,7 +15664,7 @@ def run_status(run_id: str):
                     if full_bundle:
                         meta['full_scenario_path'] = full_bundle
                     session_xml_path = post_saved if (post_saved and os.path.exists(post_saved)) else None
-                    _append_run_history({
+                    history_ok = _append_run_history({
                         'timestamp': datetime.datetime.utcnow().isoformat() + 'Z',
                         'mode': 'async',
                         'xml_path': xml_path_local,
@@ -15563,7 +15690,8 @@ def run_status(run_id: str):
                     except Exception:
                         pass
                 finally:
-                    meta['history_added'] = True
+                    if 'history_ok' in locals() and history_ok:
+                        meta['history_added'] = True
                     _close_async_run_tunnel(meta)
                     try:
                         _cleanup_remote_workspace(meta)
@@ -19105,4 +19233,8 @@ def purge_history_for_scenario():
         return jsonify({'removed': 0, 'error': str(e)}), 200
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=9090, debug=True)
+    try:
+        port = int(os.environ.get('PORT') or os.environ.get('WEBAPP_PORT') or '9090')
+    except Exception:
+        port = 9090
+    app.run(host='0.0.0.0', port=port, debug=True)

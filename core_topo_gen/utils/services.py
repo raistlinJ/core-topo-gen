@@ -174,31 +174,6 @@ def ensure_service(session: object, node_id: int, service_name: str, node_obj: O
         except Exception:
             node_obj = None
 
-    # Policy: never add DefaultRoute to DOCKER nodes
-    try:
-        if service_name == "DefaultRoute" and node_obj is not None:
-            ntype = getattr(node_obj, "type", None)
-            is_docker = False
-            try:
-                # Direct enum comparison when available
-                if hasattr(NodeType, "DOCKER") and ntype == getattr(NodeType, "DOCKER"):
-                    is_docker = True
-            except Exception:
-                pass
-            if not is_docker:
-                # String fallback check
-                try:
-                    s = str(ntype)
-                    if s and s.upper().find("DOCKER") >= 0:
-                        is_docker = True
-                except Exception:
-                    pass
-            if is_docker:
-                logger.info("Skipping DefaultRoute for DOCKER node %s", node_id)
-                return False
-    except Exception:
-        pass
-
     # First, attempt to read existing and set with union
     current = None
     try:
@@ -225,15 +200,23 @@ def ensure_service(session: object, node_id: int, service_name: str, node_obj: O
             current.append(service_name)
         try:
             if hasattr(session, "services") and hasattr(session.services, "set"):
+                # Some CORE wrapper versions accept node_id, others require a node object.
+                # Worse: some accept an int but silently no-op. Verify after setting.
                 try:
                     session.services.set(node_id, tuple(current))
-                    logger.info("services.set: updated node %s -> %s", node_id, ", ".join(current))
-                    return True
-                except TypeError:
-                    if node_obj is not None:
-                        session.services.set(node_obj, tuple(current))
-                        logger.info("services.set(node_obj): updated node %s -> %s", node_id, ", ".join(current))
+                    if has_service(session, node_id, service_name, node_obj=node_obj):
+                        logger.info("services.set: updated node %s -> %s", node_id, ", ".join(current))
                         return True
+                except TypeError:
+                    pass
+                if node_obj is not None:
+                    try:
+                        session.services.set(node_obj, tuple(current))
+                        if has_service(session, node_id, service_name, node_obj=node_obj):
+                            logger.info("services.set(node_obj): updated node %s -> %s", node_id, ", ".join(current))
+                            return True
+                    except Exception as e:
+                        logger.debug("services.set(node_obj) failed for node %s: %s", node_id, e)
         except Exception as e:
             logger.debug("services.set failed for node %s: %s", node_id, e)
 
@@ -325,33 +308,7 @@ def set_node_services(session: object, node_id: int, services: List[str], node_o
         if s not in seen:
             ordered.append(s)
             seen.add(s)
-    # Policy: never include DefaultRoute on DOCKER nodes
-    try:
-        if node_obj is None and hasattr(session, "get_node"):
-            node_obj = session.get_node(node_id)
-    except Exception:
-        pass
-    try:
-        if node_obj is not None and "DefaultRoute" in ordered:
-            ntype = getattr(node_obj, "type", None)
-            is_docker = False
-            try:
-                if hasattr(NodeType, "DOCKER") and ntype == getattr(NodeType, "DOCKER"):
-                    is_docker = True
-            except Exception:
-                pass
-            if not is_docker:
-                try:
-                    s = str(ntype)
-                    if s and s.upper().find("DOCKER") >= 0:
-                        is_docker = True
-                except Exception:
-                    pass
-            if is_docker:
-                ordered = [s for s in ordered if s != "DefaultRoute"]
-                logger.info("Filtered DefaultRoute from DOCKER node %s service set", node_id)
-    except Exception:
-        pass
+    # NOTE: DefaultRoute is allowed on Docker nodes.
     def _read_back() -> List[str]:
         cur: List[str] = []
         try:

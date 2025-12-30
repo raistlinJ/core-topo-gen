@@ -3801,18 +3801,50 @@ if (USE_LOCAL_EDITOR_STATE && !serverHasResult && persistedState && Array.isArra
     try {
         const serverScenarios = Array.isArray(state.scenarios) ? state.scenarios : [];
         const localScenarios = Array.isArray(persistedState.scenarios) ? persistedState.scenarios : [];
+
+        // Build a lookup of local scenarios by match key so we can restore values
+        // without letting localStorage hide server/catalog scenarios.
+        const localByKey = new Map();
+        localScenarios.forEach((localScen) => {
+            if (!localScen || typeof localScen !== 'object') return;
+            const k = _scenarioMatchKey(localScen.name);
+            if (!k) return;
+            if (!localByKey.has(k)) {
+                localByKey.set(k, localScen);
+            }
+        });
+
+        const mergedServerScenarios = serverScenarios.map((serverScen) => {
+            if (!serverScen || typeof serverScen !== 'object') return serverScen;
+            const k = _scenarioMatchKey(serverScen.name);
+            const localScen = k ? localByKey.get(k) : null;
+            if (!localScen || typeof localScen !== 'object') return serverScen;
+
+            // Prefer local values for user-edited fields, but keep any new server-provided
+            // structure/fields around by shallow-merging.
+            const out = { ...serverScen, ...localScen };
+            out.name = (serverScen.name || localScen.name || '').toString();
+            out.base = { ...(serverScen.base && typeof serverScen.base === 'object' ? serverScen.base : {}), ...(localScen.base && typeof localScen.base === 'object' ? localScen.base : {}) };
+            out.hitl = { ...(serverScen.hitl && typeof serverScen.hitl === 'object' ? serverScen.hitl : {}), ...(localScen.hitl && typeof localScen.hitl === 'object' ? localScen.hitl : {}) };
+            out.sections = { ...(serverScen.sections && typeof serverScen.sections === 'object' ? serverScen.sections : {}), ...(localScen.sections && typeof localScen.sections === 'object' ? localScen.sections : {}) };
+            return out;
+        });
+
         const serverKeys = new Set(
-            serverScenarios
+            mergedServerScenarios
                 .map((scen) => _scenarioMatchKey(scen && typeof scen === 'object' ? scen.name : ''))
                 .filter(Boolean)
         );
+
+        // Append any local-only scenarios.
         localScenarios.forEach((localScen) => {
             const k = _scenarioMatchKey(localScen && typeof localScen === 'object' ? localScen.name : '');
             if (!k || serverKeys.has(k)) return;
-            serverScenarios.push(localScen);
+            mergedServerScenarios.push(localScen);
             serverKeys.add(k);
         });
-        state.scenarios = serverScenarios;
+
+        state.scenarios = mergedServerScenarios;
     } catch (err) {}
 }
 
@@ -3903,14 +3935,29 @@ async function transmitEditorSnapshotToServer(payload) {
         });
         if (resp.status === 401) {
             serverSnapshotDisabled = true;
-            return;
+            return { ok: false, error: 'Authentication required' };
+        }
+        let data = null;
+        try {
+            data = await resp.clone().json();
+        } catch (e) {
+            data = null;
         }
         if (!resp.ok) {
-            const detail = await resp.text().catch(() => '');
-            throw new Error(detail || `HTTP ${resp.status}`);
+            const detail = (data && typeof data.error === 'string' && data.error.trim())
+                ? data.error.trim()
+                : await resp.text().catch(() => '');
+            return { ok: false, error: (detail || `HTTP ${resp.status}`) };
         }
+        if (data && typeof data === 'object' && data.success === false) {
+            const err = (typeof data.error === 'string' && data.error.trim()) ? data.error.trim() : 'Snapshot rejected';
+            return { ok: false, error: err };
+        }
+        return { ok: true };
     } catch (err) {
+        const message = (err && err.message) ? err.message : 'Failed to persist editor snapshot on server';
         console.warn('Failed to persist editor snapshot on server', err);
+        return { ok: false, error: message };
     }
 }
 
@@ -3939,6 +3986,23 @@ function scheduleServerSnapshotPersist(snapshot) {
         }
         transmitEditorSnapshotToServer(payload);
     }, 900);
+}
+
+async function flushServerSnapshotPersistNow() {
+    if (serverSnapshotDisabled) return { ok: false, error: 'Authentication required' };
+    const payload = serverSnapshotPendingPayload;
+    if (!payload) return { ok: true, skipped: true };
+    serverSnapshotPendingPayload = null;
+    if (serverSnapshotTimerId) {
+        window.clearTimeout(serverSnapshotTimerId);
+        serverSnapshotTimerId = null;
+    }
+    try {
+        return await transmitEditorSnapshotToServer(payload);
+    } catch (err) {
+        const message = (err && err.message) ? err.message : 'Snapshot persist failed';
+        return { ok: false, error: message };
+    }
 }
 
 let previewState = {
@@ -10064,6 +10128,7 @@ function renderMain() {
                 <button type="button" class="btn btn-sm btn-outline-primary" data-hitl-participant-apply data-scen-idx="${activeIdx}">Apply Participant URL</button>
                 <button type="button" class="btn btn-sm btn-outline-secondary" data-hitl-participant-clear data-scen-idx="${activeIdx}" ${participantProxmoxUrlHasValue ? '' : 'disabled'}>Clear Participant URL</button>
             </div>
+            <div class="small text-muted mt-2" data-hitl-participant-feedback="${activeIdx}"></div>
         </div>`;
     const coreSectionsHtml = `${step1SectionHtml}${step2SectionHtml}`;
     const hitlSectionsHtml = `${step3SectionHtml}${step4SectionHtml}${part5SectionHtml}`;
@@ -11915,6 +11980,78 @@ function wireHandlers() {
             indicator.classList.add('text-muted');
         }
     };
+    const setParticipantUrlFeedback = (sidx, message, tone) => {
+        const el = document.querySelector(`[data-hitl-participant-feedback="${sidx}"]`);
+        if (!el) return;
+        const text = (message ?? '').toString();
+        el.textContent = text;
+        el.classList.remove('text-muted', 'text-success', 'text-danger');
+        if (tone === 'success') {
+            el.classList.add('text-success');
+        } else if (tone === 'error') {
+            el.classList.add('text-danger');
+        } else {
+            el.classList.add('text-muted');
+        }
+    };
+    const buildEditorSnapshotPayloadForServer = () => {
+        const baseUploadMeta = normalizeBaseUpload(state.base_upload) || (state.scenarios?.[0]?.base?.filepath || state.scenarios?.[0]?.base?.display_name ? {
+            path: state.scenarios?.[0]?.base?.filepath || '',
+            display_name: state.scenarios?.[0]?.base?.display_name || (state.scenarios?.[0]?.base?.filepath ? state.scenarios[0].base.filepath.split(/[/\\]/).pop() || '' : '')
+        } : null);
+        const coreForPersist = sanitizeCoreForPersist(state.core);
+        const scenariosForSnapshot = cloneScenariosForSnapshot(state.scenarios || []);
+        const snapshot = {
+            scenarios: scenariosForSnapshot,
+            result_path: state.result_path || null,
+            core: coreForPersist || null,
+            core_ok: !!state.core_ok,
+            core_tested_host: state.core_tested_host || null,
+            core_tested_port: state.core_tested_port || null,
+            base_upload: baseUploadMeta,
+            host_interfaces: Array.isArray(state.host_interfaces) ? state.host_interfaces : [],
+            host_interfaces_source: state.host_interfaces_source || null,
+            host_interfaces_metadata: state.host_interfaces_metadata || null,
+            host_interfaces_fetched_at: state.host_interfaces_fetched_at || null,
+        };
+        snapshot.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
+        try {
+            const scenarioSignature = deriveScenarioSignature({ scenarios: scenariosForSnapshot });
+            const trimmedScenarioToken = (scenarioQueryToken || '').trim();
+            const resolvedScenarioQuery = trimmedScenarioToken || scenarioSignature || resolveScenarioQueryHint() || '';
+            snapshot.scenario_query = resolvedScenarioQuery || null;
+            if (!trimmedScenarioToken && resolvedScenarioQuery) {
+                scenarioQueryToken = resolvedScenarioQuery;
+            }
+            const stableProjectHint = (() => {
+                if (currentProjectKey && currentProjectKey !== DEFAULT_PROJECT_KEY) return currentProjectKey;
+                if (snapshot.project_key_hint) return snapshot.project_key_hint;
+                if (resolvedScenarioQuery) return resolvedScenarioQuery;
+                if (snapshot.result_path) return snapshot.result_path;
+                if (snapshot.base_upload && snapshot.base_upload.path) return snapshot.base_upload.path;
+                return null;
+            })();
+            snapshot.project_key_hint = stableProjectHint;
+        } catch (e) {
+            /* best-effort */
+        }
+        scrubSnapshotTransientErrors(snapshot);
+        return snapshot;
+    };
+    const persistParticipantUrlToServerNow = async () => {
+        // Prefer flushing a pending payload (admin view); otherwise synthesize a snapshot (builder view).
+        try {
+            const pending = !!serverSnapshotPendingPayload;
+            if (pending) {
+                return await flushServerSnapshotPersistNow();
+            }
+            const snapshot = buildEditorSnapshotPayloadForServer();
+            return await transmitEditorSnapshotToServer(snapshot);
+        } catch (err) {
+            const message = (err && err.message) ? err.message : 'Failed to persist participant URL';
+            return { ok: false, error: message };
+        }
+    };
     const persistParticipantProxmoxUrl = (sidx, rawValue) => {
         if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) return false;
         const scenario = state.scenarios[sidx];
@@ -11951,28 +12088,64 @@ function wireHandlers() {
         }
     });
     document.querySelectorAll('[data-hitl-participant-apply]').forEach(btn => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', async () => {
             if (btn.disabled) return;
             const sidx = parseInt(btn.getAttribute('data-scen-idx'));
             if (Number.isNaN(sidx)) return;
             const input = document.getElementById(`participantProxmoxUrl_${sidx}`);
             const value = input ? input.value : '';
+            const originalHtml = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Saving';
+            setParticipantUrlFeedback(sidx, 'Saving…', 'neutral');
             const changed = persistParticipantProxmoxUrl(sidx, value);
             syncParticipantProxmoxControls(sidx);
-            const toastMsg = changed ? 'Participant UI link saved.' : 'Participant UI link already up to date.';
-            try { showToast(toastMsg, { autohide: true, delay: 2000 }); } catch (e) {}
+            const result = await persistParticipantUrlToServerNow();
+            if (result && result.ok) {
+                setParticipantUrlFeedback(sidx, 'Saved.', 'success');
+                const toastMsg = changed ? 'Participant UI link saved.' : 'Participant UI link already up to date.';
+                try { if (typeof showToast === 'function') showToast(toastMsg, { autohide: true, delay: 2000 }); } catch (e) {}
+            } else {
+                const errMsg = (result && typeof result.error === 'string' && result.error.trim()) ? result.error.trim() : 'Save failed';
+                setParticipantUrlFeedback(sidx, `Save failed: ${errMsg}`, 'error');
+                try {
+                    if (typeof showToast === 'function') {
+                        showToast(`Participant UI link save failed: ${errMsg}`, { autohide: false });
+                    }
+                } catch (e) {}
+            }
+            btn.disabled = false;
+            btn.innerHTML = originalHtml;
         });
     });
     document.querySelectorAll('[data-hitl-participant-clear]').forEach(btn => {
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', async () => {
             if (btn.disabled) return;
             const sidx = parseInt(btn.getAttribute('data-scen-idx'));
             if (Number.isNaN(sidx)) return;
             const input = document.getElementById(`participantProxmoxUrl_${sidx}`);
+            const originalHtml = btn.innerHTML;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>Clearing';
+            setParticipantUrlFeedback(sidx, 'Saving…', 'neutral');
             if (input) input.value = '';
             persistParticipantProxmoxUrl(sidx, '');
             syncParticipantProxmoxControls(sidx);
-            try { showToast('Participant UI link cleared.', { autohide: true, delay: 1800 }); } catch (e) {}
+            const result = await persistParticipantUrlToServerNow();
+            if (result && result.ok) {
+                setParticipantUrlFeedback(sidx, 'Cleared.', 'success');
+                try { if (typeof showToast === 'function') showToast('Participant UI link cleared.', { autohide: true, delay: 1800 }); } catch (e) {}
+            } else {
+                const errMsg = (result && typeof result.error === 'string' && result.error.trim()) ? result.error.trim() : 'Clear failed';
+                setParticipantUrlFeedback(sidx, `Clear failed: ${errMsg}`, 'error');
+                try {
+                    if (typeof showToast === 'function') {
+                        showToast(`Participant UI link clear failed: ${errMsg}`, { autohide: false });
+                    }
+                } catch (e) {}
+            }
+            btn.disabled = false;
+            btn.innerHTML = originalHtml;
         });
     });
     document.querySelectorAll('[data-hitl-remove]').forEach(btn => {
@@ -12848,6 +13021,7 @@ const executeConfirmState = {
     scenarioIndex: null,
     keepOpenOnConfirm: false,
     autoLabel: true,
+    coreTestFailed: false,
 };
 let executeProgressWrap = null;
 let executeProgressStatusEl = null;
@@ -13006,6 +13180,8 @@ function ensureExecuteConfirmElements() {
     if (executeConfirmModalEl && !executeConfirmModalEl.dataset.execHiddenBound) {
         executeConfirmModalEl.addEventListener('hidden.bs.modal', () => {
             settleExecuteConfirm({ confirmed: false });
+            // Clear any per-open error messaging so reopening the modal starts clean.
+            executeConfirmState.coreTestFailed = false;
             resetExecuteProgressUI();
         });
         executeConfirmModalEl.dataset.execHiddenBound = '1';
@@ -13013,6 +13189,7 @@ function ensureExecuteConfirmElements() {
     if (executeConfirmModalEl && !executeConfirmModalEl.dataset.execShowBound) {
         executeConfirmModalEl.addEventListener('show.bs.modal', () => {
             resetExecuteProgressUI();
+            executeConfirmState.coreTestFailed = false;
             refreshExecuteRemoteToggleState();
         });
         executeConfirmModalEl.dataset.execShowBound = '1';
@@ -13040,62 +13217,20 @@ function isExecuteCoreVmConfigured() {
 function updateExecuteCoreStatus(info = null) {
     if (!executeCoreStatusEl) return;
     const statusInfo = info || detectLocalEmulation();
-    const normalizeHost = (raw) => {
-        if (raw === null || raw === undefined) return '';
-        let h = String(raw).trim().toLowerCase();
-        if (!h) return '';
-        if (h.startsWith('[') && h.endsWith(']')) {
-            h = h.slice(1, -1);
-        }
-        if (h.startsWith('::ffff:') && /^::ffff:\d+\.\d+\.\d+\.\d+$/.test(h)) {
-            h = h.replace('::ffff:', '');
-        }
-        return h;
-    };
     const classes = ['text-muted', 'text-success', 'text-warning', 'text-danger'];
     executeCoreStatusEl.classList.remove(...classes);
-    // Prefer explicit last test outcome (covers non-loopback targets), instead of relying on
-    // loopback-only heuristics.
-    const lastStatus = (state && state.core_last_test_status !== undefined)
-        ? state.core_last_test_status
-        : (initialPayload ? initialPayload.core_last_test_status : null);
-    const lastHost = (state && state.core_last_test_host !== undefined)
-        ? state.core_last_test_host
-        : (initialPayload ? initialPayload.core_last_test_host : null);
-    const lastPort = (state && state.core_last_test_port !== undefined)
-        ? state.core_last_test_port
-        : (initialPayload ? initialPayload.core_last_test_port : null);
-    const lastAt = (state && state.core_last_test_at !== undefined)
-        ? state.core_last_test_at
-        : (initialPayload ? initialPayload.core_last_test_at : null);
-    const lastPortNum = parseInt(lastPort ?? '', 10);
-    const lastPortVal = Number.isFinite(lastPortNum) && lastPortNum > 0 ? lastPortNum : null;
-    let lastFailedRecent = false;
-    try {
-        const atMs = Date.parse(lastAt ?? '');
-        if (Number.isFinite(atMs)) {
-            lastFailedRecent = (lastStatus === 'failure') && ((Date.now() - atMs) < (10 * 60 * 1000));
-        }
-    } catch (e) {}
-    const lastMatchesTarget = (
-        lastStatus === 'failure'
-        && !!lastPortVal
-        && lastPortVal === statusInfo.port
-        && normalizeHost(lastHost) === normalizeHost(statusInfo.host)
-    );
-
     if (statusInfo.verified) {
         executeCoreStatusEl.textContent = IS_BUILDER_VIEW
             ? 'CORE backend validated and ready.'
             : `Connected to CORE ${statusInfo.host}:${statusInfo.port}`;
         executeCoreStatusEl.classList.add('text-success');
-    } else if ((lastMatchesTarget || lastFailedRecent) && !IS_BUILDER_VIEW) {
+    } else if (!IS_BUILDER_VIEW && executeConfirmState && executeConfirmState.coreTestFailed) {
         executeCoreStatusEl.textContent = 'CORE connection failed, please check your settings and try again.';
         executeCoreStatusEl.classList.add('text-danger');
     } else if (statusInfo.shouldFake) {
         executeCoreStatusEl.textContent = IS_BUILDER_VIEW
             ? 'Please test the connection. If it fails, contact your administrator.'
-            : 'CORE connection failed, please check your settings and try again.';
+            : 'CORE connection failed, please check your settings.';
         executeCoreStatusEl.classList.add('text-danger');
     } else {
         executeCoreStatusEl.textContent = IS_BUILDER_VIEW
@@ -13197,7 +13332,7 @@ async function handleExecuteCoreTestClick() {
         return;
     }
     try {
-        await validateCoreConnection(scenarioIdx, {
+        const result = await validateCoreConnection(scenarioIdx, {
             triggerButton: button || undefined,
             statusEl: statusEl || undefined,
             workingLabel: 'Testing…',
@@ -13206,8 +13341,10 @@ async function handleExecuteCoreTestClick() {
             hintOnFailure: 'CORE connection test failed',
             suppressToasts: false,
         });
+        executeConfirmState.coreTestFailed = !(result && result.ok);
     } catch (err) {
         console.warn('CORE connection test from execute modal failed', err);
+        executeConfirmState.coreTestFailed = true;
     } finally {
         refreshExecuteRemoteToggleState();
     }

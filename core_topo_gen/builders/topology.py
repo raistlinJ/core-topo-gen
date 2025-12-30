@@ -84,10 +84,12 @@ def _docker_ifid_start() -> int:
 def _docker_default_route_enabled() -> bool:
     """Whether to auto-add CORE's DefaultRoute service to Docker nodes.
 
-    Default is OFF because Docker nodes often already have a Docker-injected default
-    gateway that conflicts with CORE routing expectations.
+    Default is ON so Docker nodes behave like other hosts from CORE's perspective.
+    Can be explicitly disabled by setting CORETG_DOCKER_ADD_DEFAULTROUTE=0/false.
     """
-    val = os.getenv('CORETG_DOCKER_ADD_DEFAULTROUTE', '0')
+    val = os.getenv('CORETG_DOCKER_ADD_DEFAULTROUTE')
+    if val is None:
+        return True
     return val not in ('0', 'false', 'False', '')
 
 
@@ -106,6 +108,41 @@ def _ensure_default_route_for_docker(session: object, node_obj: object) -> None:
         ensure_service(session, getattr(node_obj, 'id'), "DefaultRoute", node_obj=node_obj)
     except Exception:
         pass
+
+
+def _enforce_default_route_on_docker_nodes(session: object, node_objs: List[object], *, context: str) -> None:
+    """Re-apply DefaultRoute to every Docker node at the end of a build.
+
+    Rationale: some build paths call set_node_services() later (eg distribution) which can overwrite
+    earlier service additions. This final pass makes DefaultRoute a last-write-wins policy for Docker.
+    """
+    if not _docker_default_route_enabled():
+        return
+    for node in node_objs:
+        try:
+            node_id = getattr(node, 'id', None)
+            if node_id is None:
+                continue
+            node_type = getattr(node, 'type', None)
+            if not _is_docker_node_type(node_type) and getattr(node, 'model', None) != 'docker':
+                continue
+            try:
+                ensure_service(session, node_id, "DefaultRoute", node_obj=node)
+            except Exception:
+                continue
+            try:
+                if not has_service(session, node_id, "DefaultRoute", node_obj=node):
+                    logger.warning(
+                        "DefaultRoute missing after enforcement on docker node id=%s name=%s (context=%s)",
+                        node_id,
+                        getattr(node, 'name', None),
+                        context,
+                    )
+            except Exception:
+                # Some CORE wrappers cannot reliably read back services; don't fail the build.
+                pass
+        except Exception:
+            continue
 
 # Enable verbose gRPC call trace if env var set (default off unless user requests)
 def _env_flag(name: str, default_on: bool = True) -> bool:
@@ -829,6 +866,12 @@ def build_star_from_roles(core,
                                     session.services.add(node_obj_try, "zebra")
                     except Exception:
                         pass
+
+    # Final pass: ensure Docker nodes still have DefaultRoute after any other service operations.
+    try:
+        _enforce_default_route_on_docker_nodes(session, list(nodes_by_id.values()), context="star")
+    except Exception:
+        pass
     if DIAG_ENABLED:
         try:
             link_len = len(getattr(session, 'links', []) or []) if hasattr(session,'links') else 'n/a'
@@ -1063,6 +1106,12 @@ def build_multi_switch_topology(core,
                                 session.services.add(node_obj_try, "zebra")
                     except Exception:
                         pass
+
+    # Final pass: ensure Docker nodes still have DefaultRoute after any other service operations.
+    try:
+        _enforce_default_route_on_docker_nodes(session, list(nodes_by_id.values()), context="multi-switch")
+    except Exception:
+        pass
 
     if DIAG_ENABLED:
         try:
@@ -1886,6 +1935,12 @@ def _try_build_segmented_topology_from_preview(
         pass
 
     logger.info("[preview] topology realized from persisted preview: routers=%d hosts=%d switches=%d", len(router_objs), len(host_nodes_by_id), len(switch_nodes))
+
+    # Final pass: ensure Docker nodes still have DefaultRoute after preview service application.
+    try:
+        _enforce_default_route_on_docker_nodes(session, list(host_nodes_by_id.values()), context="segmented-preview")
+    except Exception:
+        pass
 
     return session, routers_info, [ni for ni in hosts_info], {k: v for k, v in host_service_assignments.items()}, {k: v for k, v in router_protocols.items()}, docker_by_name
 
@@ -3550,5 +3605,11 @@ def build_segmented_topology(core,
             pass
         if int(os.getenv('CORETG_LINK_FAIL_HARD','0') not in ('0','false','False','')) and link_counters['success']==0:
             raise RuntimeError('No links created in segmented topology')
+
+    # Final pass: ensure Docker nodes still have DefaultRoute after any service distribution/reset.
+    try:
+        _enforce_default_route_on_docker_nodes(session, list(host_nodes_by_id.values()), context="segmented")
+    except Exception:
+        pass
     return session, routers, hosts, host_service_assignments, router_protocols, docker_by_name
     
