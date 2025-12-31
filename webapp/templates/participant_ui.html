@@ -109,7 +109,9 @@
               </div>
               <div class="col-12 col-md-6">
                 <div class="text-secondary">Session Status</div>
-                <div class="fw-semibold text-white" id="participantStatSessionStatus">-</div>
+                <div>
+                  <span class="badge bg-secondary text-uppercase" id="participantStatSessionStatus">-</span>
+                </div>
               </div>
               <div class="col-12 col-md-6">
                 <div class="text-secondary">Session ID</div>
@@ -121,9 +123,7 @@
               </div>
               <div class="col-12 col-md-6">
                 <div class="text-secondary">Last Execute Result</div>
-                <div>
-                  <span class="badge bg-secondary text-uppercase" id="participantStatLastExecuteResult">-</span>
-                </div>
+                <div class="fw-semibold text-white" id="participantStatLastExecuteResult">-</div>
               </div>
               <div class="col-12 col-md-3">
                 <div class="text-secondary">Nodes</div>
@@ -344,27 +344,33 @@
 
     const sess = (payload && payload.session) || {};
     if(statSessionStatus){
-      if(sess.running === true) statSessionStatus.textContent = sess.state ? `Running (${sess.state})` : 'Running';
-      else if(sess.running === false) statSessionStatus.textContent = 'Not running';
-      else statSessionStatus.textContent = 'Unknown';
+      statSessionStatus.classList.remove('bg-success', 'bg-danger', 'bg-secondary');
+      if(sess.running === true) {
+        statSessionStatus.textContent = sess.state ? `Running (${sess.state})` : 'Running';
+        statSessionStatus.classList.add('bg-success');
+      }
+      else if(sess.running === false) {
+        statSessionStatus.textContent = 'Not running';
+        statSessionStatus.classList.add('bg-secondary');
+      }
+      else {
+        statSessionStatus.textContent = 'Unknown';
+        statSessionStatus.classList.add('bg-secondary');
+      }
     }
     if(statSessionId) statSessionId.textContent = (sess.session_id !== null && sess.session_id !== undefined) ? String(sess.session_id) : '-';
 
     const exec = (payload && payload.execute) || {};
     if(statLastExecute) statLastExecute.textContent = fmtTs(exec.last_execute_ts || '');
     if(statLastExecuteResult){
-      statLastExecuteResult.classList.remove('bg-success', 'bg-danger', 'bg-secondary');
       if(exec.ok === true) {
         statLastExecuteResult.textContent = 'Success';
-        statLastExecuteResult.classList.add('bg-success');
       }
       else if(exec.ok === false) {
         statLastExecuteResult.textContent = 'Failure';
-        statLastExecuteResult.classList.add('bg-danger');
       }
       else {
         statLastExecuteResult.textContent = '-';
-        statLastExecuteResult.classList.add('bg-secondary');
       }
     }
 
