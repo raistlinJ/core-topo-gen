@@ -311,6 +311,12 @@
 {% endblock %}
 {% block extra_scripts %}
 <script>
+  // Server-injected: scenarioNorm -> hasParticipantUrl
+  const participantUrlFlags = {{ participant_url_flags|tojson }};
+  function normalizeScenarioNorm(raw){
+    return (raw || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
+  }
+
 (function(){
   let auto = true;
   let timer = null;
@@ -321,6 +327,8 @@
   let scenarioNamesCache = {{ (scenarios or [])|tojson }};
   const initialScenarioFilter = {{ (active_scenario or '')|tojson }};
   let scenarioFilter = initialScenarioFilter || null;
+  const participantDetailsBaseUrl = {{ url_for('participant_ui_details_api')|tojson }};
+  let lastParticipantScenarioKey = null;
   const initialCoreErrors = {{ (core_errors or [])|tojson }};
   const initialGrpcCommand = {{ (core_grpc_command or '')|tojson }};
   const initialCoreLogs = {{ (core_log_entries or [])|tojson }};
@@ -616,7 +624,45 @@
     updateCoreScenarioQueryParam();
     updateCoreScenarioControls();
     dockLog('INFO', `[core] Scenario filter set to ${scenarioFilter || '<none>'}`);
+    refreshParticipantNavForScenario(scenarioFilter);
     await refresh();
+  }
+
+  async function refreshParticipantNavForScenario(scenarioName){
+    try {
+      const scen = (scenarioName || '').toString().trim();
+      if (typeof window.CORETG_PATCH_SCENARIO_NAV === 'function') {
+        window.CORETG_PATCH_SCENARIO_NAV(scen);
+      }
+      if (!scen) {
+        if (typeof window.CORETG_SET_PARTICIPANT_NAV_VISIBLE === 'function') {
+          window.CORETG_SET_PARTICIPANT_NAV_VISIBLE(false);
+        }
+        return;
+      }
+
+      // Fast path: decide instantly from server-injected flags.
+      const scenNorm = normalizeScenarioNorm(scen);
+      if (participantUrlFlags && Object.prototype.hasOwnProperty.call(participantUrlFlags, scenNorm)) {
+        const configured = !!participantUrlFlags[scenNorm];
+        if (typeof window.CORETG_SET_PARTICIPANT_NAV_VISIBLE === 'function') {
+          window.CORETG_SET_PARTICIPANT_NAV_VISIBLE(configured);
+        }
+        return;
+      }
+
+      const url = new URL(participantDetailsBaseUrl, window.location.origin);
+      url.searchParams.set('scenario', scen);
+      const res = await fetch(url.pathname + url.search, { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+      const configured = !!(data && data.scenario && data.scenario.participant_link_configured);
+      if (typeof window.CORETG_SET_PARTICIPANT_NAV_VISIBLE === 'function') {
+        window.CORETG_SET_PARTICIPANT_NAV_VISIBLE(configured);
+      }
+    } catch (e) {
+      // ignore
+    }
   }
 
   let progressModalInstance = null;
@@ -926,6 +972,16 @@
           if(first) scenarioFilter = first;
         }
       }
+
+      // Keep Participant-UI tab in sync with the selected scenario without full page reload.
+      try {
+        const key = (scenarioFilter || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
+        if (key && key !== lastParticipantScenarioKey) {
+          lastParticipantScenarioKey = key;
+          refreshParticipantNavForScenario(scenarioFilter);
+        }
+      } catch(e) {}
+
       if(Array.isArray(data.scenarios)){
         const next = data.scenarios.map(v => String(v));
         const prev = Array.isArray(scenarioNamesCache) ? scenarioNamesCache.map(v => String(v)) : [];
@@ -1172,6 +1228,8 @@
     await setCoreScenarioFilter(def);
   });
   renderCoreScenarioButtons();
+  ensureScenarioSelected();
+  refreshParticipantNavForScenario(scenarioFilter);
   renderCoreErrors(initialCoreErrors);
   if(initialGrpcCommand){
     dockLog('INFO', `[core] gRPC command: ${initialGrpcCommand}`);

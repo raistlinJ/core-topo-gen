@@ -553,7 +553,7 @@
                     </div>
                     <div class="form-check form-switch mt-3 d-none" id="executePushUpdateToggleWrap">
                         <input class="form-check-input" type="checkbox" role="switch" id="executeConfirmPushUpdateToggle">
-                        <label class="form-check-label fw-semibold" for="executeConfirmPushUpdateToggle">Push updated backend</label>
+                        <label class="form-check-label fw-semibold" for="executeConfirmPushUpdateToggle">Push updated backend (may take several minutes)</label>
                         <div class="form-text" id="executeConfirmPushUpdateHelp">Sync the current repository snapshot to your CORE VM before execution.</div>
                     </div>
                 </div>
@@ -6902,25 +6902,52 @@ function updateParticipantProxmoxNavLink() {
     const link = document.getElementById('navParticipantLink');
     if (!wrapper || !link) return;
     const scenario = state.scenarios?.[activeIdx];
+
+    // Server can inject the participant URL for the currently loaded `?scenario=` even before
+    // the editor state is fully hydrated. Use it as a fallback ONLY when it matches the loaded
+    // scenario query, so switching scenarios in the editor doesn't accidentally inherit it.
+    const serverInitial = normalizeParticipantProxmoxHref(link.getAttribute('data-initial-participant-url') || '');
+    let serverInitialApplicable = false;
+    try {
+        const params = new URLSearchParams(window.location.search || '');
+        const queryScenario = (params.get('scenario') || '').trim();
+        const queryKey = _scenarioMatchKey(queryScenario);
+        if (!link.dataset.serverInitialScenarioKey) {
+            link.dataset.serverInitialScenarioKey = queryKey;
+        }
+        const isInitialScenario = !!queryKey && link.dataset.serverInitialScenarioKey === queryKey;
+        if (isInitialScenario && queryScenario && scenario && _scenarioMatchKey(queryScenario) === _scenarioMatchKey(scenario.name || '')) {
+            serverInitialApplicable = true;
+        }
+    } catch (e) {
+        serverInitialApplicable = false;
+    }
+
     if (!scenario) {
         wrapper.classList.add('d-none');
         link.href = '#';
         link.setAttribute('aria-disabled', 'true');
-        return;
-    }
-    const hitlState = ensureHitlStateForScenario(scenario);
-    const href = normalizeParticipantProxmoxHref(hitlState.participant_proxmox_url || '');
-    if (!href) {
-        wrapper.classList.add('d-none');
-        link.setAttribute('aria-disabled', 'true');
-        link.setAttribute('title', 'Participant UI unavailable');
         link.dataset.participantUiHref = '';
         window.CORETG_PARTICIPANT_UI_HREF = '';
         return;
     }
+
+    const hitlState = ensureHitlStateForScenario(scenario);
+    const stateHref = normalizeParticipantProxmoxHref(hitlState.participant_proxmox_url || '');
+    const href = stateHref || (serverInitialApplicable ? serverInitial : '');
+
+    if (!href) {
+        wrapper.classList.add('d-none');
+        link.setAttribute('aria-disabled', 'true');
+        link.setAttribute('title', 'Participant-UI unavailable');
+        link.dataset.participantUiHref = '';
+        window.CORETG_PARTICIPANT_UI_HREF = '';
+        return;
+    }
+
     wrapper.classList.remove('d-none');
-    link.setAttribute('aria-disabled', 'false');
-    link.setAttribute('title', `Participant UI (${href})`);
+    link.removeAttribute('aria-disabled');
+    link.setAttribute('title', `Participant-UI (${href})`);
     link.dataset.participantUiHref = href;
     window.CORETG_PARTICIPANT_UI_HREF = href;
 }
@@ -14303,13 +14330,13 @@ function updateExecuteCoreStatus(info = null) {
     } else if (statusInfo.shouldFake) {
         const base = IS_BUILDER_VIEW
             ? 'Please test the connection. If it fails, contact your administrator.'
-            : 'CORE connection failed, please check your settings.';
+            : 'Please test the connection to proceed.';
         executeCoreStatusEl.textContent = lastTestSummary ? `${base} • ${lastTestSummary}` : base;
-        executeCoreStatusEl.classList.add('text-danger');
+        executeCoreStatusEl.classList.add(IS_BUILDER_VIEW ? 'text-danger' : 'text-warning');
     } else {
         const base = IS_BUILDER_VIEW
             ? 'CORE backend status unknown. Ask an admin to validate the connection.'
-            : 'CORE connection needs to be tested.';
+            : 'Please test the connection to proceed.';
         executeCoreStatusEl.textContent = lastTestSummary ? `${base} • ${lastTestSummary}` : base;
         executeCoreStatusEl.classList.add('text-warning');
     }

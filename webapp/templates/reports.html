@@ -13,9 +13,9 @@
     <label for="refreshInterval" class="form-label mb-0">Every</label>
     <select id="refreshInterval" class="form-select form-select-sm w-auto" title="Auto-refresh interval">
       <option value="2000">2s</option>
-      <option value="5000" selected>5s</option>
+      <option value="5000">5s</option>
       <option value="10000">10s</option>
-      <option value="30000">30s</option>
+      <option value="30000" selected>30s</option>
       <option value="60000">60s</option>
     </select>
     <span id="refreshStatus" class="text-muted">auto</span>
@@ -98,9 +98,18 @@
 {% endblock %}
 {% block extra_scripts %}
 <script>
+  // Server-injected: scenarioNorm -> hasParticipantUrl
+  const participantUrlFlags = {{ participant_url_flags|tojson }};
+  function normalizeScenarioNorm(raw){
+    return (raw || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
+  }
+
 let autoRefresh = true;
 let refreshTimer = null;
-let intervalMs = 5000;
+let intervalMs = 30000;
+let refreshInFlight = false;
+let lastManualRefreshAt = 0;
+let lastScenarioChangeAt = 0;
 try {
   const stored = parseInt(localStorage.getItem('reportsRefreshMs') || '', 10);
   if ([2000,5000,10000,30000,60000].includes(stored)) intervalMs = stored;
@@ -110,6 +119,7 @@ const runsCheckAll = document.getElementById('runsCheckAll');
 const runsDeleteBtn = document.getElementById('runsDeleteBtn');
 const selectedRunIds = new Set();
 const reportsDataBaseUrl = "{{ url_for('reports_data') }}";
+const participantDetailsBaseUrl = "{{ url_for('participant_ui_details_api') }}";
 let scenarioNamesCache = {{ (scenarios or [])|tojson }};
 const initialScenarioFilter = {{ (active_scenario or '')|tojson }};
 let activeScenarioFilter = initialScenarioFilter || null;
@@ -236,11 +246,52 @@ function renderScenarioButtons(){
 }
 async function setScenarioFilter(value){
   activeScenarioFilter = value || defaultScenarioName() || null;
+  lastScenarioChangeAt = Date.now();
   updateScenarioQueryParam();
   updateScenarioFilterControls();
+  refreshParticipantNavForScenario(activeScenarioFilter);
   await fetchHistory();
 }
+
+async function refreshParticipantNavForScenario(scenarioName){
+  try {
+    const scen = (scenarioName || '').toString().trim();
+    if (typeof window.CORETG_PATCH_SCENARIO_NAV === 'function') {
+      window.CORETG_PATCH_SCENARIO_NAV(scen);
+    }
+    if (!scen) {
+      if (typeof window.CORETG_SET_PARTICIPANT_NAV_VISIBLE === 'function') {
+        window.CORETG_SET_PARTICIPANT_NAV_VISIBLE(false);
+      }
+      return;
+    }
+
+    // Fast path: decide instantly from server-injected flags.
+    const scenNorm = normalizeScenarioNorm(scen);
+    if (participantUrlFlags && Object.prototype.hasOwnProperty.call(participantUrlFlags, scenNorm)) {
+      const configured = !!participantUrlFlags[scenNorm];
+      if (typeof window.CORETG_SET_PARTICIPANT_NAV_VISIBLE === 'function') {
+        window.CORETG_SET_PARTICIPANT_NAV_VISIBLE(configured);
+      }
+      return;
+    }
+
+    const url = new URL(participantDetailsBaseUrl, window.location.origin);
+    url.searchParams.set('scenario', scen);
+    const res = await fetch(url.pathname + url.search, { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json();
+    const configured = !!(data && data.scenario && data.scenario.participant_link_configured);
+    if (typeof window.CORETG_SET_PARTICIPANT_NAV_VISIBLE === 'function') {
+      window.CORETG_SET_PARTICIPANT_NAV_VISIBLE(configured);
+    }
+  } catch (e) {
+    // ignore
+  }
+}
 async function fetchHistory(){
+  if (refreshInFlight) return;
+  refreshInFlight = true;
   try {
     const url = buildReportsDataUrl();
     const res = await fetch(url);
@@ -265,8 +316,28 @@ async function fetchHistory(){
     updateScenarioFilterControls();
   } catch(e) {
     // transient errors ignored
+  } finally {
+    refreshInFlight = false;
   }
 }
+
+async function refreshNow(reason){
+  const status = document.getElementById('refreshStatus');
+  if (!autoRefresh) return;
+  const now = Date.now();
+  // If the user just clicked a scenario filter, don't race it.
+  if (now - lastScenarioChangeAt < 800) return;
+  // Simple throttle for noisy events (click + focus + visibility can stack).
+  if (now - lastManualRefreshAt < 800) return;
+  lastManualRefreshAt = now;
+  if (status) status.textContent = 'refreshing…';
+  await fetchHistory();
+  refreshParticipantNavForScenario(activeScenarioFilter);
+  if (status) status.textContent = 'auto';
+  // Restart the timer so the next refresh is `intervalMs` from now.
+  schedule();
+}
+
 function schedule(){
   if(refreshTimer) clearTimeout(refreshTimer);
   if(!autoRefresh) return;
@@ -319,6 +390,38 @@ applyScenarioFilter();
 updateCount();
 // Bind row + header selection handlers for initial server-rendered rows
 wireSelectionHandlers();
+// Refresh immediately on load, then start polling.
+refreshNow('load');
+
+// Refresh when the user returns attention to the page.
+window.addEventListener('focus', () => { refreshNow('focus'); });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') refreshNow('visible');
+});
+// Refresh when the page is clicked (discoverability + quick update), but do not
+// interfere with scenario selection or other controls.
+document.addEventListener('click', (ev) => {
+  try {
+    const target = ev && ev.target ? ev.target : null;
+    if (!target || !(target instanceof Element)) { refreshNow('click'); return; }
+    // Ignore clicks on interactive controls / scenario list / table.
+    if (
+      target.closest('#scenarioFilterList') ||
+      target.closest('#runsTable') ||
+      target.closest('#navRightExtras') ||
+      target.closest('button') ||
+      target.closest('a') ||
+      target.closest('input') ||
+      target.closest('select') ||
+      target.closest('textarea') ||
+      target.closest('label')
+    ) {
+      return;
+    }
+  } catch(e) {}
+  refreshNow('click');
+}, { capture: true });
+
 schedule();
 
 function wireSelectionHandlers(){

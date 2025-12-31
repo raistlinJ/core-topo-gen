@@ -15373,10 +15373,16 @@ def reports_page():
         enriched.append(e)
     enriched = sorted(enriched, key=lambda x: x.get('timestamp',''), reverse=True)
     user = _current_user()
-    scenario_names, _scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(
+    scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(
         enriched,
         user=user,
     )
+    scenario_participant_urls = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
+    participant_url_flags = {
+        norm: bool(url)
+        for norm, url in scenario_participant_urls.items()
+        if isinstance(norm, str) and norm
+    }
     scenario_query = request.args.get('scenario', '').strip()
     scenario_norm = _normalize_scenario_label(scenario_query)
     scenario_names, scenario_norm, _allowed_norms = _builder_filter_report_scenarios(
@@ -15395,6 +15401,7 @@ def reports_page():
         history=enriched,
         scenarios=scenario_names,
         active_scenario=scenario_display,
+        participant_url_flags=participant_url_flags,
     )
 
 @app.route('/reports_data')
@@ -17873,6 +17880,11 @@ def core_page():
     current_user = _current_user()
     scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
     scenario_participant_urls = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
+    participant_url_flags = {
+        norm: bool(url)
+        for norm, url in scenario_participant_urls.items()
+        if isinstance(norm, str) and norm
+    }
     scenario_query = request.args.get('scenario', '').strip()
     scenario_norm = _normalize_scenario_label(scenario_query)
     # Enforce per-scenario view: default to the first available scenario when unset/invalid.
@@ -18009,6 +18021,7 @@ def core_page():
         core_vm_configured=core_vm_configured,
         core_vm_summary=core_vm_summary,
         core_log_entries=_current_core_ui_logs(),
+        participant_url_flags=participant_url_flags,
     )
 
 
@@ -20530,6 +20543,9 @@ if __name__ == '__main__':
         port = int(os.environ.get('PORT') or os.environ.get('WEBAPP_PORT') or '9090')
     except Exception:
         port = 9090
+    host = os.environ.get('CORETG_HOST') or '0.0.0.0'
+    debug = _env_flag('CORETG_DEBUG', False) or _env_flag('FLASK_DEBUG', False)
+    use_reloader = _env_flag('CORETG_USE_RELOADER', debug)
     try:
         did_scrub = _scrub_hitl_validation_usernames_in_scenario_catalog()
         if did_scrub:
@@ -20548,4 +20564,4 @@ if __name__ == '__main__':
             app.logger.info('[hitl_config] scrubbed unverified hitl_config entries from scenario_catalog.json')
     except Exception:
         pass
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host=host, port=port, debug=debug, use_reloader=use_reloader)

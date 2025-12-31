@@ -93,12 +93,13 @@
           <ul class="navbar-nav me-auto mb-0 small">
             {% if is_power_view %}
             <li class="nav-item"><a class="nav-link {% if active_page=='scenarios' %}active{% endif %}" href="{{ url_for('index') }}">Scenarios</a></li>
-            <li class="nav-item"><a class="nav-link {% if active_page=='data_sources' %}active{% endif %}" href="{{ url_for('data_sources_page') }}">Vulnerability Catalog</a></li>
+            <li class="nav-item"><a class="nav-link {% if active_page=='data_sources' %}active{% endif %}" href="{{ url_for('data_sources_page') }}">Vulnerability-Catalog</a></li>
             <li class="nav-item"><a id="navReportsLink" class="nav-link {% if active_page=='reports' %}active{% endif %}" href="{{ nav_reports_href }}">Reports</a></li>
-            <li class="nav-item"><a id="navCoreLink" class="nav-link {% if active_page=='core' %}active{% endif %}" href="{{ nav_core_href }}">CORE</a></li>
+            <li class="nav-item"><a id="navCoreLink" class="nav-link {% if active_page=='core' %}active{% endif %}" href="{{ nav_core_href }}">CORE-Management</a></li>
             {% endif %}
-            <li class="nav-item{% if not nav_participant_available %} d-none{% endif %}" id="navParticipantLinkWrap">
-              <a id="navParticipantLink" class="nav-link {% if active_page=='participant_ui' %}active{% endif %}" data-initial-participant-url="{{ nav_participant_available }}" href="{{ nav_participant_link }}" title="Participant UI">Participant UI</a>
+            {% set show_participant_nav_anyway = false %}
+            <li class="nav-item{% if (not nav_participant_available) and (not show_participant_nav_anyway) %} d-none{% endif %}" id="navParticipantLinkWrap" data-force-visible="{{ '1' if show_participant_nav_anyway else '' }}">
+              <a id="navParticipantLink" class="nav-link {% if active_page=='participant_ui' %}active{% endif %}" data-initial-participant-url="{{ nav_participant_available }}" href="{{ nav_participant_link }}" title="Participant-UI">Participant-UI</a>
             </li>
           </ul>
           <div class="d-flex align-items-center gap-3 ms-auto">
@@ -228,6 +229,27 @@
           };
           patchLink('navCoreLink');
           patchLink('navReportsLink');
+          patchLink('navParticipantLink');
+        } catch(e) {}
+      };
+
+      // Helper: show/hide Participant-UI tab (boolean-based).
+      // Used by pages that change the active scenario without full reload (CORE/Reports).
+      window.CORETG_SET_PARTICIPANT_NAV_VISIBLE = function(isVisible){
+        try {
+          const wrapperEl = document.getElementById('navParticipantLinkWrap');
+          const linkEl = document.getElementById('navParticipantLink');
+          if(!wrapperEl || !linkEl) return;
+          const visible = !!isVisible;
+          if(visible){
+            wrapperEl.classList.remove('d-none');
+            linkEl.removeAttribute('aria-disabled');
+            linkEl.setAttribute('title', 'Participant-UI');
+          } else {
+            wrapperEl.classList.add('d-none');
+            linkEl.setAttribute('aria-disabled', 'true');
+            linkEl.setAttribute('title', 'Participant-UI unavailable');
+          }
         } catch(e) {}
       };
       const wrapper = document.getElementById('navParticipantLinkWrap');
@@ -248,25 +270,35 @@
       };
       const applyAvailability = (href) => {
         const hasHref = !!href;
+        const forceVisible = (wrapper.getAttribute('data-force-visible') || '') === '1';
         if(hasHref){
           wrapper.classList.remove('d-none');
           link.removeAttribute('aria-disabled');
-          link.setAttribute('title', `Participant UI (${href})`);
+          link.setAttribute('title', `Participant-UI (${href})`);
           link.dataset.participantUiHref = href;
         } else {
-          wrapper.classList.add('d-none');
-          link.setAttribute('aria-disabled', 'true');
-          link.setAttribute('title', 'Participant UI unavailable');
+          if(!forceVisible){
+            wrapper.classList.add('d-none');
+          } else {
+            wrapper.classList.remove('d-none');
+          }
+          if(forceVisible){
+            link.removeAttribute('aria-disabled');
+            link.setAttribute('title', 'Participant-UI');
+          } else {
+            link.setAttribute('aria-disabled', 'true');
+            link.setAttribute('title', 'Participant-UI unavailable');
+          }
           link.dataset.participantUiHref = '';
         }
         window.CORETG_PARTICIPANT_UI_HREF = href || '';
       };
       const storedDefault = normalizeParticipantHref(link.getAttribute('data-initial-participant-url'));
       const updateFromSources = () => {
-        // Only show the Participant UI tab when the server provided a URL for the current page/scenario
+        // Only show the Participant-UI tab when the server provided a URL for the current page/scenario
         // (or when a page explicitly sets window.CORETG_PARTICIPANT_UI_HREF).
         // Avoid using the editor's localStorage state here, otherwise CORE/Reports can incorrectly
-        // show Participant UI even when no Participant URL is set.
+        // show Participant-UI even when no Participant URL is set.
         const explicitHref = normalizeParticipantHref(window.CORETG_PARTICIPANT_UI_HREF || '');
         applyAvailability(explicitHref || storedDefault || '');
       };
