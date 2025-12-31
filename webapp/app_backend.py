@@ -5809,6 +5809,16 @@ def participant_ui_gateway_api():
     if not scenario_norm:
         scenario_norm = state.get('selected_norm', '')
 
+    # Enforce assignment-based access: do not allow restricted users to query
+    # gateway details for scenarios outside their assigned list.
+    try:
+        if state.get('restrict_to_assigned'):
+            allowed_norms = {row.get('norm') for row in (state.get('listing') or []) if isinstance(row, dict) and row.get('norm')}
+            if scenario_norm and scenario_norm not in allowed_norms:
+                return jsonify({'ok': False, 'error': 'Scenario not assigned.'}), 403
+    except Exception:
+        pass
+
     gateway = ''
 
     # Prefer the most recent session XML for this scenario (matches core.html HITL gateway logic).
@@ -7231,18 +7241,49 @@ def _sanitize_snapshot_scenario(raw: Any) -> Optional[Dict[str, Any]]:
     scenario = copy.deepcopy(raw)
     hitl_meta = scenario.get('hitl') if isinstance(scenario.get('hitl'), dict) else None
     if hitl_meta is not None:
-        core_meta = _extract_optional_core_config(hitl_meta.get('core'), include_password=False)
-        if core_meta:
-            hitl_meta['core'] = core_meta
-        elif 'core' in hitl_meta:
-            hitl_meta.pop('core', None)
+        # Only persist HITL fields after verification.
+        # Credentials and HITL mappings are saved via explicit validation/apply endpoints.
+
         prox_meta = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else None
+        prox_validated = False
         if prox_meta is not None:
-            prox_clean = {k: v for k, v in prox_meta.items() if k not in {'password', 'token_secret', 'api_secret', 'api_token_secret', 'inventory_error'}}
-            hitl_meta['proxmox'] = prox_clean
-        interfaces = hitl_meta.get('interfaces')
-        if isinstance(interfaces, list):
-            hitl_meta['interfaces'] = [iface for iface in interfaces if isinstance(iface, dict)]
+            secret_id = (prox_meta.get('secret_id') or '').strip() if isinstance(prox_meta.get('secret_id'), str) else ''
+            prox_validated = bool(prox_meta.get('validated')) and bool(secret_id)
+            if prox_validated:
+                prox_clean = {
+                    k: v
+                    for k, v in prox_meta.items()
+                    if k not in {'password', 'token_secret', 'api_secret', 'api_token_secret', 'inventory_error'}
+                }
+                hitl_meta['proxmox'] = prox_clean
+            else:
+                hitl_meta.pop('proxmox', None)
+
+        core_meta_raw = hitl_meta.get('core') if isinstance(hitl_meta.get('core'), dict) else None
+        core_meta = _extract_optional_core_config(core_meta_raw, include_password=False)
+        core_validated = False
+        if core_meta:
+            secret_id = (core_meta.get('core_secret_id') or '').strip() if isinstance(core_meta.get('core_secret_id'), str) else ''
+            core_validated = bool(core_meta.get('validated')) and bool(secret_id)
+            if core_validated:
+                hitl_meta['core'] = core_meta
+            else:
+                hitl_meta.pop('core', None)
+        else:
+            hitl_meta.pop('core', None)
+
+        bridge_validated = bool(hitl_meta.get('bridge_validated'))
+        if not bridge_validated:
+            # Steps 3–5 are not persisted until HITL bridge verification/apply succeeds.
+            hitl_meta.pop('interfaces', None)
+            hitl_meta.pop('participant_proxmox_url', None)
+            hitl_meta.pop('participant_ui_url', None)
+            hitl_meta.pop('participant_url', None)
+            hitl_meta['enabled'] = False
+        else:
+            interfaces = hitl_meta.get('interfaces')
+            if isinstance(interfaces, list):
+                hitl_meta['interfaces'] = [iface for iface in interfaces if isinstance(iface, dict)]
     return scenario
 
 
@@ -7851,6 +7892,109 @@ def _clear_hitl_validation_in_scenario_catalog(scenario_name: str, *, proxmox: b
             pass
 
 
+def _clear_hitl_config_in_scenario_catalog(
+    scenario_name: str,
+    *,
+    clear_core_vm: bool = False,
+    clear_config: bool = False,
+) -> None:
+    """Clear builder-safe HITL config hints stored in scenario_catalog.json.
+
+    Notes:
+    - This never deletes encrypted secrets; it only clears non-secret hints.
+    - clear_core_vm implies clearing all HITL config for that scenario.
+    - clear_config clears Steps 3–5 fields, keeping Step 2 selection if present.
+    """
+
+    scenario_norm = _normalize_scenario_label(scenario_name)
+    if not scenario_norm:
+        return
+    if not clear_core_vm and not clear_config:
+        return
+
+    catalog_path = _scenario_catalog_file()
+    if not catalog_path:
+        return
+    try:
+        if not os.path.exists(catalog_path):
+            return
+    except Exception:
+        return
+
+    tmp_path = catalog_path + '.tmp'
+    try:
+        with open(catalog_path, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            return
+
+        hc = payload.get('hitl_config')
+        if not isinstance(hc, dict):
+            hc = {}
+        hc = dict(hc)
+
+        hv = payload.get('hitl_validation')
+        if not isinstance(hv, dict):
+            hv = {}
+        hv = dict(hv)
+
+        if clear_core_vm:
+            # Drop all config hints for this scenario.
+            hc.pop(scenario_norm, None)
+
+            # Also clear CORE VM selection fields from hitl_validation so builder doesn't
+            # keep showing a previously-selected CORE VM after admin clears it.
+            entry = hv.get(scenario_norm)
+            if isinstance(entry, dict):
+                entry = dict(entry)
+                core_hint = entry.get('core')
+                if isinstance(core_hint, dict):
+                    core_hint = dict(core_hint)
+                    for key in ('vm_key', 'vm_name', 'vm_node', 'vmid'):
+                        core_hint.pop(key, None)
+                    if core_hint:
+                        entry['core'] = core_hint
+                    else:
+                        entry.pop('core', None)
+                if entry:
+                    hv[scenario_norm] = entry
+                else:
+                    hv.pop(scenario_norm, None)
+
+        elif clear_config:
+            entry = hc.get(scenario_norm)
+            if isinstance(entry, dict):
+                entry = dict(entry)
+                entry['enabled'] = False
+                entry.pop('interfaces', None)
+                entry.pop('participant_proxmox_url', None)
+                core_cfg = entry.get('core')
+                if isinstance(core_cfg, dict):
+                    core_cfg = dict(core_cfg)
+                    core_cfg.pop('internal_bridge', None)
+                    core_cfg.pop('internal_bridge_owner', None)
+                    if core_cfg:
+                        entry['core'] = core_cfg
+                    else:
+                        entry.pop('core', None)
+                hc[scenario_norm] = entry
+
+        payload['hitl_config'] = hc
+        payload['hitl_validation'] = hv
+        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+
+        os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
+        with open(tmp_path, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp_path, catalog_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
 def _scrub_hitl_validation_usernames_in_scenario_catalog() -> bool:
     """Remove any stored usernames/secret material from hitl_validation entries.
 
@@ -8144,10 +8288,88 @@ def _extract_hitl_config_hints_from_scenarios(scenarios: Any) -> Dict[str, Dict[
         hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else None
         if not hitl_meta:
             continue
+        # Only backfill verified HITL configs.
+        if not bool(hitl_meta.get('bridge_validated')):
+            continue
         hint = _sanitize_hitl_config_hint(hitl_meta)
         if hint:
             out[norm] = hint
     return out
+
+
+def _scrub_unverified_hitl_config_in_scenario_catalog() -> bool:
+    """Remove any HITL config hints that are not backed by verified credentials.
+
+    This is a safety cleanup for older catalogs/snapshots from before the
+    "persist only after verify" rule.
+
+    Returns True if the catalog was modified.
+    """
+
+    catalog_path = _scenario_catalog_file()
+    if not catalog_path:
+        return False
+    try:
+        if not os.path.exists(catalog_path):
+            return False
+    except Exception:
+        return False
+
+    tmp_path = catalog_path + '.tmp'
+    try:
+        with open(catalog_path, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            return False
+
+        hc = payload.get('hitl_config')
+        hv = payload.get('hitl_validation')
+        if not isinstance(hc, dict) or not hc:
+            return False
+        if not isinstance(hv, dict):
+            hv = {}
+
+        changed = False
+        cleaned: Dict[str, Any] = {}
+        for scen_key, cfg in hc.items():
+            norm = _normalize_scenario_label(scen_key)
+            if not norm or not isinstance(cfg, dict):
+                continue
+            val_entry = hv.get(norm)
+            if not isinstance(val_entry, dict):
+                # No verified credentials recorded -> drop config.
+                changed = True
+                continue
+            prox_ok = False
+            core_ok = False
+            prox = val_entry.get('proxmox')
+            if isinstance(prox, dict):
+                prox_ok = bool(prox.get('validated')) and bool((prox.get('secret_id') or '').strip())
+            core = val_entry.get('core')
+            if isinstance(core, dict):
+                core_ok = bool(core.get('validated')) and bool((core.get('core_secret_id') or '').strip())
+            if not (prox_ok and core_ok):
+                changed = True
+                continue
+            cleaned[norm] = cfg
+
+        if not changed:
+            return False
+
+        payload['hitl_config'] = cleaned
+        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
+        with open(tmp_path, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp_path, catalog_path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
 
 
 def _load_scenario_hitl_config_from_disk() -> dict[str, Dict[str, Any]]:
@@ -10634,10 +10856,12 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
     # --- Scenarios ---
     scenarios_raw = payload.get('scenarios')
     if not isinstance(scenarios_raw, list) or not scenarios_raw:
-        scenarios_raw = defaults['scenarios']
+        # For actual restricted roles (builder/participant), an empty assignment list
+        # should result in an empty scenario list ("all or none" visibility).
+        scenarios_raw = defaults['scenarios'] if allowed_norms is None else []
     # For restricted roles, always build scenarios from catalog + assignments so
     # Scenarios/CORE/Reports are consistent (including ordering).
-    if allowed_norms:
+    if allowed_norms is not None and allowed_norms:
         seeded = _builder_catalog_seed_scenarios(allowed_norms, builder_assignment_order, user=user)
         if seeded:
             scenarios_raw = seeded
@@ -10730,7 +10954,8 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
 
         normalized_scenarios.append(scen_norm)
 
-    if not normalized_scenarios:
+    # Only fall back to default scenarios for unrestricted users.
+    if not normalized_scenarios and allowed_norms is None:
         normalized_scenarios = defaults['scenarios']
 
     # If the UI is in builder mode (even for admin users previewing builder view),
@@ -10768,6 +10993,8 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
             if not (isinstance(effective_hint, dict) and effective_hint) and not (isinstance(effective_cfg, dict) and effective_cfg):
                 continue
 
+            effective_hint_dict: Dict[str, Any] = effective_hint if isinstance(effective_hint, dict) else {}
+
             hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else {}
             hitl_meta = dict(hitl_meta)
 
@@ -10781,7 +11008,7 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
             except Exception:
                 pass
 
-            prox_hint = effective_hint.get('proxmox') if isinstance(effective_hint.get('proxmox'), dict) else None
+            prox_hint = effective_hint_dict.get('proxmox') if isinstance(effective_hint_dict.get('proxmox'), dict) else None
             if isinstance(prox_hint, dict) and prox_hint:
                 prox_state = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else {}
                 prox_state = dict(prox_state)
@@ -10790,7 +11017,7 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
                         prox_state[k] = v
                 hitl_meta['proxmox'] = prox_state
 
-            core_hint = effective_hint.get('core') if isinstance(effective_hint.get('core'), dict) else None
+            core_hint = effective_hint_dict.get('core') if isinstance(effective_hint_dict.get('core'), dict) else None
             if isinstance(core_hint, dict) and core_hint:
                 core_state = hitl_meta.get('core') if isinstance(hitl_meta.get('core'), dict) else {}
                 core_state = dict(core_state)
@@ -10828,12 +11055,19 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
 
             scen['hitl'] = hitl_meta
     if allowed_norms is not None:
-        normalized_scenarios = _filter_scenarios_by_norms(normalized_scenarios, allowed_norms)
+        # If there are assignments, filter to them.
+        if allowed_norms:
+            normalized_scenarios = _filter_scenarios_by_norms(normalized_scenarios, allowed_norms)
+        else:
+            normalized_scenarios = []
+        # Always mark as restricted when allowed_norms is not None.
         payload['builder_restricted_scenarios'] = True
         payload['builder_assigned_scenarios'] = sorted(allowed_norms)
         payload['builder_no_assignments'] = not bool(allowed_norms)
     else:
         payload.pop('builder_restricted_scenarios', None)
+        payload.pop('builder_assigned_scenarios', None)
+        payload.pop('builder_no_assignments', None)
         payload.pop('builder_assigned_scenarios', None)
         payload.pop('builder_no_assignments', None)
     payload['scenarios'] = normalized_scenarios
@@ -10943,36 +11177,6 @@ def api_editor_snapshot():
         return jsonify({'success': False, 'error': 'Snapshot rejected'}), 400
     try:
         _write_editor_state_snapshot(snapshot, user=user)
-        # Persist Participant UI URL hints immediately so other pages (Reports/CORE/Participant UI)
-        # can reflect the updated link without requiring an index-page reload.
-        try:
-            participant_hints = _extract_participant_url_hints_from_scenarios(snapshot.get('scenarios'))
-            if participant_hints:
-                role = _normalize_role_value(user.get('role'))
-                catalog_path = _scenario_catalog_file()
-                if role == 'admin' and not os.path.exists(catalog_path):
-                    scenario_names = [s.get('name') for s in snapshot.get('scenarios') if isinstance(s, dict)]
-                    source_path = snapshot.get('result_path') if isinstance(snapshot.get('result_path'), str) else None
-                    _persist_scenario_catalog(scenario_names, source_path, participant_urls=participant_hints)
-                else:
-                    _merge_participant_urls_into_scenario_catalog(participant_hints)
-        except Exception:
-            pass
-
-        # Persist admin-managed HITL configuration so builder view sees it permanently.
-        try:
-            role = _normalize_role_value(user.get('role'))
-            if role == 'admin':
-                catalog_path = _scenario_catalog_file()
-                if not os.path.exists(catalog_path):
-                    scenario_names = [s.get('name') for s in snapshot.get('scenarios') if isinstance(s, dict)]
-                    source_path = snapshot.get('result_path') if isinstance(snapshot.get('result_path'), str) else None
-                    _persist_scenario_catalog(scenario_names, source_path, participant_urls={})
-                hitl_hints = _extract_hitl_config_hints_from_scenarios(snapshot.get('scenarios'))
-                if hitl_hints:
-                    _merge_hitl_config_map_into_scenario_catalog(hitl_hints)
-        except Exception:
-            pass
     except Exception as exc:
         try:
             app.logger.exception('[editor_snapshot] persist failed: %s', exc)
@@ -11152,7 +11356,9 @@ def api_proxmox_validate():
     except Exception:
         timeout = 5.0
     timeout = max(1.0, min(timeout, 30.0))
-    remember_credentials = _coerce_bool(payload.get('remember_credentials'))
+    # Per requirement: only persist credentials when they are verified.
+    # This endpoint is the verification step, so always store securely on success.
+    remember_credentials = True
     prox_kwargs = {
         'host': host,
         'user': username,
@@ -11192,30 +11398,21 @@ def api_proxmox_validate():
     }
     summary: Dict[str, Any]
     secret_identifier: Optional[str] = None
-    if remember_credentials:
-        try:
-            stored_meta = _save_proxmox_credentials(secret_payload)
-        except RuntimeError as exc:
-            return jsonify({'success': False, 'error': str(exc)}), 500
-        except Exception as exc:
-            app.logger.exception('[proxmox] failed to persist credentials: %s', exc)
-            return jsonify({'success': False, 'error': 'Credentials validated but could not be stored'}), 500
-        summary = {
-            'url': stored_meta['url'],
-            'port': stored_meta['port'],
-            'username': stored_meta['username'],
-            'verify_ssl': stored_meta['verify_ssl'],
-            'stored_at': stored_meta['stored_at'],
-        }
-        secret_identifier = stored_meta['identifier']
-    else:
-        summary = {
-            'url': url_raw,
-            'port': port,
-            'username': username,
-            'verify_ssl': verify_ssl,
-            'stored_at': datetime.datetime.now(datetime.UTC).isoformat(),
-        }
+    try:
+        stored_meta = _save_proxmox_credentials(secret_payload)
+    except RuntimeError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+    except Exception as exc:
+        app.logger.exception('[proxmox] failed to persist credentials: %s', exc)
+        return jsonify({'success': False, 'error': 'Credentials validated but could not be stored'}), 500
+    summary = {
+        'url': stored_meta['url'],
+        'port': stored_meta['port'],
+        'username': stored_meta['username'],
+        'verify_ssl': stored_meta['verify_ssl'],
+        'stored_at': stored_meta['stored_at'],
+    }
+    secret_identifier = stored_meta['identifier']
     message = f"Validated Proxmox access for {username} at {host}:{port}"
     # Persist a safe shared hint so builders/participants can see the validated state.
     # This is the non-secret subset (no password/token material).
@@ -11383,6 +11580,42 @@ def api_core_credentials_get():
         'stored_at': record.get('stored_at'),
     }
     return jsonify({'success': True, 'credentials': credentials})
+
+
+@app.route('/api/hitl/core_vm/clear', methods=['POST'])
+def api_hitl_core_vm_clear():
+    current = _current_user()
+    if not current or _normalize_role_value(current.get('role')) != 'admin':
+        return jsonify({'success': False, 'error': 'Admin privileges required'}), 403
+    payload = request.get_json(silent=True) or {}
+    scenario_name = str(payload.get('scenario_name') or payload.get('scenario') or '').strip()
+    scenario_index = payload.get('scenario_index')
+    if not scenario_name:
+        return jsonify({'success': False, 'error': 'scenario_name is required'}), 400
+    try:
+        _clear_hitl_config_in_scenario_catalog(scenario_name, clear_core_vm=True)
+    except Exception:
+        app.logger.exception('[hitl] failed clearing CORE VM selection for %s', scenario_name)
+        return jsonify({'success': False, 'error': 'Failed to clear CORE VM selection'}), 500
+    return jsonify({'success': True, 'scenario_name': scenario_name, 'scenario_index': scenario_index})
+
+
+@app.route('/api/hitl/config/clear', methods=['POST'])
+def api_hitl_config_clear():
+    current = _current_user()
+    if not current or _normalize_role_value(current.get('role')) != 'admin':
+        return jsonify({'success': False, 'error': 'Admin privileges required'}), 403
+    payload = request.get_json(silent=True) or {}
+    scenario_name = str(payload.get('scenario_name') or payload.get('scenario') or '').strip()
+    scenario_index = payload.get('scenario_index')
+    if not scenario_name:
+        return jsonify({'success': False, 'error': 'scenario_name is required'}), 400
+    try:
+        _clear_hitl_config_in_scenario_catalog(scenario_name, clear_config=True)
+    except Exception:
+        app.logger.exception('[hitl] failed clearing HITL config for %s', scenario_name)
+        return jsonify({'success': False, 'error': 'Failed to clear HITL config'}), 500
+    return jsonify({'success': True, 'scenario_name': scenario_name, 'scenario_index': scenario_index})
 
 
 @app.route('/api/proxmox/vms', methods=['POST'])
@@ -11874,6 +12107,18 @@ def api_hitl_validate_bridge():
         'changes': change_details,
         'proxmox_node': core_node,
     }
+
+    # Persist verified HITL config for builder view (non-secret fields only).
+    try:
+        if scenario_name:
+            hitl_to_store = dict(hitl_payload)
+            core_store = hitl_to_store.get('core') if isinstance(hitl_to_store.get('core'), dict) else {}
+            core_store = dict(core_store)
+            core_store['internal_bridge'] = bridge_name
+            hitl_to_store['core'] = core_store
+            _merge_hitl_config_into_scenario_catalog(scenario_name, hitl_to_store)
+    except Exception:
+        pass
     return jsonify(response)
 
 # ---------------- Docker (per-node) status & cleanup ----------------
@@ -18391,13 +18636,22 @@ def core_details():
     scenario_param = (request.args.get('scenario_name') or request.args.get('scenario') or '').strip()
     scenario_norm = _normalize_scenario_label(scenario_param)
     history = _load_run_history()
-    scenario_names, scenario_paths, _scenario_url_hints = _collect_scenario_catalog(history)
+    current_user = _current_user()
+    scenario_names, scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
     scenario_label = _resolve_scenario_display(scenario_norm, scenario_names, scenario_param)
     core_cfg = _core_config_for_request(include_password=True)
     core_host = core_cfg.get('host', CORE_HOST)
     core_port = int(core_cfg.get('port', CORE_PORT))
     xml_param = request.args.get('path')
     xml_path = os.path.abspath(xml_param) if xml_param else None
+    # Safety: only allow inspecting local files we manage.
+    if xml_path:
+        try:
+            allowed_roots = [os.path.abspath(_uploads_dir()), os.path.abspath(_outputs_dir())]
+            if not any(xml_path == root or xml_path.startswith(root + os.sep) for root in allowed_roots):
+                xml_path = None
+        except Exception:
+            xml_path = None
     if xml_path and not os.path.exists(xml_path):
         xml_path = None
     sid = request.args.get('session_id')
@@ -18621,7 +18875,8 @@ def core_session_scenario():
         return jsonify({'ok': False, 'error': 'Provide sid or path.'}), 400
 
     history = _load_run_history()
-    scenario_names, scenario_paths, _scenario_url_hints = _collect_scenario_catalog(history)
+    current_user = _current_user()
+    scenario_names, scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
     core_cfg = _core_config_for_request(include_password=True)
     host = core_cfg.get('host', CORE_HOST)
     try:
@@ -18650,6 +18905,10 @@ def core_session_scenario():
             remote_meta = None
 
     scenario_norm = _normalize_scenario_label(scenario_label or '') if scenario_label else ''
+    # Enforce assignment-based access for restricted roles.
+    allowed_norms = _builder_allowed_norms(current_user)
+    if allowed_norms is not None and scenario_norm and scenario_norm not in allowed_norms:
+        return jsonify({'ok': False, 'error': 'Scenario not assigned.'}), 403
     scenario_display = _resolve_scenario_display(scenario_norm, scenario_names, scenario_label or '') if scenario_norm else ''
     return jsonify({
         'ok': True,
@@ -20196,6 +20455,12 @@ if __name__ == '__main__':
         did_backfill = _backfill_hitl_config_from_editor_snapshots()
         if did_backfill:
             app.logger.info('[hitl_config] backfilled hitl_config from editor snapshots')
+    except Exception:
+        pass
+    try:
+        did_scrub_cfg = _scrub_unverified_hitl_config_in_scenario_catalog()
+        if did_scrub_cfg:
+            app.logger.info('[hitl_config] scrubbed unverified hitl_config entries from scenario_catalog.json')
     except Exception:
         pass
     app.run(host='0.0.0.0', port=port, debug=True)

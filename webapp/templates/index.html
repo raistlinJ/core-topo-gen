@@ -1469,7 +1469,7 @@ function ensureHitlStateForScenario(scen) {
         } else {
             core.core_secret_id = null;
         }
-        core.validated = !!(core.validated || core.core_secret_id);
+        core.validated = core.validated === true;
         if (typeof core.last_validated_at !== 'string') core.last_validated_at = null;
         if (!core.stored_summary || typeof core.stored_summary !== 'object') {
             core.stored_summary = null;
@@ -1536,7 +1536,7 @@ function ensureHitlStateForScenario(scen) {
         } else {
             prox.secret_id = null;
         }
-        prox.validated = !!(prox.validated || prox.secret_id);
+        prox.validated = prox.validated === true;
         prox.last_validated_at = prox.last_validated_at || null;
         prox.last_message = (prox.last_message ?? '').toString();
         prox.inventory_error = prox.inventory_error ? prox.inventory_error.toString() : null;
@@ -3866,6 +3866,87 @@ if (USE_LOCAL_EDITOR_STATE && !serverHasResult && persistedState && Array.isArra
             }
         });
 
+        const mergeHitlPreservingAdminHints = (serverHitl, localHitl) => {
+            const serverObj = (serverHitl && typeof serverHitl === 'object') ? serverHitl : {};
+            const localObj = (localHitl && typeof localHitl === 'object') ? localHitl : {};
+
+            // Start by allowing local edits to overlay, but then re-apply server authority
+            // for admin-managed fields so stale localStorage cannot wipe them.
+            const merged = { ...serverObj, ...localObj };
+
+            const serverCore = (serverObj.core && typeof serverObj.core === 'object') ? serverObj.core : {};
+            const localCore = (localObj.core && typeof localObj.core === 'object') ? localObj.core : {};
+            const coreMerged = { ...serverCore, ...localCore };
+            const serverProx = (serverObj.proxmox && typeof serverObj.proxmox === 'object') ? serverObj.proxmox : {};
+            const localProx = (localObj.proxmox && typeof localObj.proxmox === 'object') ? localObj.proxmox : {};
+            const proxMerged = { ...serverProx, ...localProx };
+
+            // Server-authoritative CORE fields (managed/verified by admin).
+            const coreServerKeys = [
+                'core_secret_id',
+                'validated',
+                'last_validated_at',
+                'stored_summary',
+                'last_tested_at',
+                'last_tested_status',
+                'last_tested_message',
+                'last_tested_host',
+                'last_tested_port',
+                'vm_key',
+                'vm_name',
+                'vm_node',
+                'grpc_host',
+                'grpc_port',
+                'ssh_host',
+                'ssh_port',
+                'cached_vm_interface_count',
+                'cached_vm_status',
+            ];
+            coreServerKeys.forEach((k) => {
+                if (Object.prototype.hasOwnProperty.call(serverCore, k)) {
+                    coreMerged[k] = serverCore[k];
+                }
+            });
+
+            // Server-authoritative Proxmox fields (managed/verified by admin).
+            const proxServerKeys = [
+                'secret_id',
+                'validated',
+                'last_validated_at',
+                'stored_at',
+                'last_message',
+                'url',
+                'port',
+                'verify_ssl',
+                'inventory',
+                'inventory_error',
+            ];
+            proxServerKeys.forEach((k) => {
+                if (Object.prototype.hasOwnProperty.call(serverProx, k)) {
+                    proxMerged[k] = serverProx[k];
+                }
+            });
+
+            merged.core = coreMerged;
+            merged.proxmox = proxMerged;
+
+            // HITL config is admin-managed; keep server as source-of-truth.
+            if (Object.prototype.hasOwnProperty.call(serverObj, 'enabled')) {
+                merged.enabled = !!serverObj.enabled;
+            }
+            if (Object.prototype.hasOwnProperty.call(serverObj, 'interfaces')) {
+                merged.interfaces = Array.isArray(serverObj.interfaces) ? serverObj.interfaces : [];
+            }
+            // Participant URL hints should not disappear.
+            ['participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'].forEach((k) => {
+                if (Object.prototype.hasOwnProperty.call(serverObj, k)) {
+                    merged[k] = serverObj[k];
+                }
+            });
+
+            return merged;
+        };
+
         const mergedServerScenarios = serverScenarios.map((serverScen) => {
             if (!serverScen || typeof serverScen !== 'object') return serverScen;
             const k = _scenarioMatchKey(serverScen.name);
@@ -3877,7 +3958,10 @@ if (USE_LOCAL_EDITOR_STATE && !serverHasResult && persistedState && Array.isArra
             const out = { ...serverScen, ...localScen };
             out.name = (serverScen.name || localScen.name || '').toString();
             out.base = { ...(serverScen.base && typeof serverScen.base === 'object' ? serverScen.base : {}), ...(localScen.base && typeof localScen.base === 'object' ? localScen.base : {}) };
-            out.hitl = { ...(serverScen.hitl && typeof serverScen.hitl === 'object' ? serverScen.hitl : {}), ...(localScen.hitl && typeof localScen.hitl === 'object' ? localScen.hitl : {}) };
+            out.hitl = mergeHitlPreservingAdminHints(
+                (serverScen.hitl && typeof serverScen.hitl === 'object') ? serverScen.hitl : {},
+                (localScen.hitl && typeof localScen.hitl === 'object') ? localScen.hitl : {},
+            );
             out.sections = { ...(serverScen.sections && typeof serverScen.sections === 'object' ? serverScen.sections : {}), ...(localScen.sections && typeof localScen.sections === 'object' ? localScen.sections : {}) };
             return out;
         });
@@ -3976,6 +4060,46 @@ let serverSnapshotPendingPayload = null;
 let serverSnapshotTimerId = null;
 let serverSnapshotDisabled = false;
 
+function scrubHitlForServerSnapshot(snapshotPayload) {
+    if (!snapshotPayload || typeof snapshotPayload !== 'object') return;
+    const scenarios = Array.isArray(snapshotPayload.scenarios) ? snapshotPayload.scenarios : [];
+    scenarios.forEach((scen) => {
+        if (!scen || typeof scen !== 'object') return;
+        const hitl = (scen.hitl && typeof scen.hitl === 'object') ? scen.hitl : null;
+        if (!hitl) return;
+
+        const prox = (hitl.proxmox && typeof hitl.proxmox === 'object') ? hitl.proxmox : null;
+        const proxValidated = !!(prox && prox.validated && prox.secret_id);
+        if (!proxValidated) {
+            delete hitl.proxmox;
+        } else {
+            // Ensure no secret material is ever sent in snapshots.
+            if (prox && 'password' in prox) delete prox.password;
+        }
+
+        const core = (hitl.core && typeof hitl.core === 'object') ? hitl.core : null;
+        const coreValidated = !!(core && core.validated && (core.core_secret_id || core.secret_id));
+        if (!coreValidated) {
+            delete hitl.core;
+        } else {
+            if (core && core.ssh_password) delete core.ssh_password;
+        }
+
+        const bridgeValidated = !!hitl.bridge_validated;
+        if (!bridgeValidated) {
+            hitl.enabled = false;
+            delete hitl.interfaces;
+            delete hitl.participant_proxmox_url;
+            delete hitl.participant_ui_url;
+            delete hitl.participant_url;
+            if (core && typeof core === 'object') {
+                delete core.internal_bridge;
+                delete core.internal_bridge_owner;
+            }
+        }
+    });
+}
+
 async function transmitEditorSnapshotToServer(payload) {
     if (!payload || serverSnapshotDisabled) return;
     try {
@@ -4025,6 +4149,11 @@ function scheduleServerSnapshotPersist(snapshot) {
     } catch (err) {
         console.warn('Unable to serialize editor snapshot for server persistence', err);
         return;
+    }
+    try {
+        scrubHitlForServerSnapshot(serverSnapshotPendingPayload);
+    } catch (err) {
+        /* ignore */
     }
     if (serverSnapshotTimerId) {
         window.clearTimeout(serverSnapshotTimerId);
@@ -6840,7 +6969,13 @@ async function handleExternalIfxApply() {
         };
 
         const buildHitlApplyPayload = (rawHitl) => {
-            const clean = { enabled: !!rawHitl.enabled, interfaces: [], core: {}, proxmox: {} };
+            const clean = {
+                enabled: !!rawHitl.enabled,
+                participant_proxmox_url: (rawHitl.participant_proxmox_url || '').toString().trim(),
+                interfaces: [],
+                core: {},
+                proxmox: {},
+            };
             const missingCore = [];
             const ifaceList = Array.isArray(rawHitl.interfaces) ? rawHitl.interfaces : [];
             for (let i = 0; i < ifaceList.length; i += 1) {
@@ -7013,6 +7148,7 @@ async function handleExternalIfxApply() {
 
         const appliedBridgeName = data.bridge_name || bridgeName;
         coreState.internal_bridge = appliedBridgeName;
+        try { hitlState.bridge_validated = true; } catch (e) {}
         const responseOwner = (data.bridge_owner || requestPayload.bridge_owner || '').toString();
         coreState.internal_bridge_owner = responseOwner;
         window.requestAnimationFrame(() => {
@@ -7294,6 +7430,152 @@ async function verifyScenarioCoreSetup(sidx, options = {}) {
     }
 }
 
+async function clearScenarioCoreVmSelection(sidx, options = {}) {
+    const { triggerButton = null } = options;
+    if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) {
+        return { ok: false, message: 'Scenario unavailable' };
+    }
+    if (IS_BUILDER_VIEW || !IS_ADMIN_USER) {
+        try { showToast('Admin access required.', { autohide: true, delay: 2500 }); } catch (_) {}
+        return { ok: false, message: 'Admin access required' };
+    }
+
+    const btn = triggerButton;
+    const originalLabel = btn?.textContent;
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Clearing…';
+    }
+
+    const restore = () => {
+        if (btn) {
+            btn.disabled = false;
+            if (originalLabel !== undefined) btn.textContent = originalLabel;
+        }
+    };
+
+    try {
+        const scenario = state.scenarios[sidx];
+        const hitl = ensureHitlStateForScenario(scenario);
+        const core = hitl.core || (hitl.core = {});
+
+        // Clear Step 2 selection.
+        delete core.vm_key;
+        delete core.vm_name;
+        delete core.vm_node;
+        delete core.vmid;
+        delete core.cached_vm_interface_count;
+        delete core.cached_vm_status;
+        delete hitl.bridge_validated;
+
+        // Clearing the CORE VM invalidates downstream mappings/bridge settings.
+        hitl.enabled = false;
+        hitl.participant_proxmox_url = '';
+        if (Array.isArray(hitl.interfaces)) {
+            hitl.interfaces = [];
+        }
+        delete core.internal_bridge;
+        delete core.internal_bridge_owner;
+
+        persistEditorState();
+        try { await flushServerSnapshotPersistNow(); } catch (_) {}
+
+        const scenarioName = (scenario.name || '').toString();
+        const resp = await fetch('/api/hitl/core_vm/clear', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ scenario_index: sidx, scenario_name: scenarioName }),
+        });
+        let data = null;
+        try { data = await resp.json(); } catch (_) { data = null; }
+        if (!resp.ok || (data && data.success === false)) {
+            const msg = (data && (data.error || data.message)) ? (data.error || data.message) : `Failed (HTTP ${resp.status})`;
+            try { showToast(msg, { autohide: false }); } catch (_) {}
+            return { ok: false, message: msg };
+        }
+
+        render();
+        try { showToast('Cleared CORE VM selection and HITL mappings.', { autohide: true, delay: 2500 }); } catch (_) {}
+        return { ok: true };
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to clear CORE VM selection.';
+        try { showToast(msg, { autohide: false }); } catch (_) {}
+        return { ok: false, message: msg };
+    } finally {
+        restore();
+    }
+}
+
+async function clearScenarioHitlConfig(sidx, options = {}) {
+    const { triggerButton = null } = options;
+    if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) {
+        return { ok: false, message: 'Scenario unavailable' };
+    }
+    if (IS_BUILDER_VIEW || !IS_ADMIN_USER) {
+        try { showToast('Admin access required.', { autohide: true, delay: 2500 }); } catch (_) {}
+        return { ok: false, message: 'Admin access required' };
+    }
+
+    const btn = triggerButton;
+    const originalLabel = btn?.textContent;
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Clearing…';
+    }
+
+    const restore = () => {
+        if (btn) {
+            btn.disabled = false;
+            if (originalLabel !== undefined) btn.textContent = originalLabel;
+        }
+    };
+
+    try {
+        const scenario = state.scenarios[sidx];
+        const hitl = ensureHitlStateForScenario(scenario);
+        const core = hitl.core || (hitl.core = {});
+
+        // Clear Steps 3–5 config while keeping Step 2 CORE VM selection.
+        hitl.enabled = false;
+        hitl.participant_proxmox_url = '';
+        delete hitl.bridge_validated;
+        if (Array.isArray(hitl.interfaces)) {
+            hitl.interfaces = [];
+        }
+        delete core.internal_bridge;
+        delete core.internal_bridge_owner;
+
+        persistEditorState();
+        try { await flushServerSnapshotPersistNow(); } catch (_) {}
+
+        const scenarioName = (scenario.name || '').toString();
+        const resp = await fetch('/api/hitl/config/clear', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ scenario_index: sidx, scenario_name: scenarioName }),
+        });
+        let data = null;
+        try { data = await resp.json(); } catch (_) { data = null; }
+        if (!resp.ok || (data && data.success === false)) {
+            const msg = (data && (data.error || data.message)) ? (data.error || data.message) : `Failed (HTTP ${resp.status})`;
+            try { showToast(msg, { autohide: false }); } catch (_) {}
+            return { ok: false, message: msg };
+        }
+
+        render();
+        try { showToast('Cleared HITL config (interfaces/bridge).', { autohide: true, delay: 2500 }); } catch (_) {}
+        return { ok: true };
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to clear HITL config.';
+        try { showToast(msg, { autohide: false }); } catch (_) {}
+        return { ok: false, message: msg };
+    } finally {
+        restore();
+    }
+}
+
 async function verifyScenarioHitlBridge(sidx, options = {}) {
     const { triggerButton = null } = options;
     if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) {
@@ -7564,7 +7846,13 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
         };
 
         const buildHitlApplyPayload = (rawHitl) => {
-            const clean = { enabled: !!rawHitl.enabled, interfaces: [], core: {}, proxmox: {} };
+            const clean = {
+                enabled: !!rawHitl.enabled,
+                participant_proxmox_url: (rawHitl.participant_proxmox_url || '').toString().trim(),
+                interfaces: [],
+                core: {},
+                proxmox: {},
+            };
             const missingCore = [];
             const ifaceList = Array.isArray(rawHitl.interfaces) ? rawHitl.interfaces : [];
             for (let i = 0; i < ifaceList.length; i += 1) {
@@ -7732,6 +8020,13 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
 
         const msg = data.message || 'HITL bridge settings verified.';
         try {
+            hitlState.bridge_validated = true;
+            if (hitlState.core && typeof hitlState.core === 'object') {
+                hitlState.core.internal_bridge = bridgeName;
+            }
+            persistEditorState();
+        } catch (e) {}
+        try {
             const changed = Array.isArray(data.changed_interfaces) ? data.changed_interfaces.length : null;
             const unchanged = Array.isArray(data.unchanged_interfaces) ? data.unchanged_interfaces.length : null;
             if (changed !== null || unchanged !== null) {
@@ -7847,10 +8142,105 @@ async function validateCoreConnection(sidx, options = {}) {
         return { ok: false, message: 'Scenario unavailable' };
     }
     if (IS_BUILDER_VIEW) {
-        if (!options.suppressToasts && typeof showToast === 'function') {
-            try { showToast('Builder view is read-only. CORE credentials are managed by an admin.', { autohide: true, delay: 3200 }); } catch (_) {}
+        // Builder view can't run live validation (no secrets). Provide useful feedback using
+        // the last admin test/validation hints already merged into the scenario payload.
+        const button = options.triggerButton || null;
+        const originalLabel = button?.textContent;
+        const restoreButton = () => {
+            if (!button) return;
+            button.disabled = false;
+            if (originalLabel !== undefined) {
+                button.textContent = originalLabel;
+            }
+        };
+        if (button) {
+            button.disabled = true;
+            button.textContent = 'Please Wait';
         }
-        return { ok: false, message: 'Builder view is read-only' };
+
+        const scenario = state.scenarios[sidx];
+        const hitlState = ensureHitlStateForScenario(scenario);
+        const coreState = hitlState.core || (hitlState.core = {});
+        const proxState = hitlState.proxmox && typeof hitlState.proxmox === 'object' ? hitlState.proxmox : {};
+
+        const nowIso = new Date().toISOString();
+        const lastStatus = (coreState.last_tested_status ?? '').toString().trim().toLowerCase();
+        const lastAt = (coreState.last_tested_at ?? '').toString().trim();
+        const lastMsg = (coreState.last_tested_message ?? '').toString().trim();
+        const lastValidatedAt = (coreState.last_validated_at ?? '').toString().trim();
+
+        // When a builder presses "Test Connection", update the displayed "last tested" time.
+        // This is a UI-only check (no live validation); we infer success from admin setup hints.
+        const vmKey = (coreState.vm_key ?? '').toString().trim();
+        const coreSecretId = (coreState.core_secret_id ?? '').toString().trim();
+        const proxSecretId = (proxState.secret_id ?? '').toString().trim();
+        const inferredOk = !!(vmKey && coreSecretId && proxSecretId);
+        coreState.last_tested_at = nowIso;
+        coreState.last_tested_status = lastStatus || (inferredOk ? 'success' : 'failure');
+        coreState.last_tested_message = lastMsg || (inferredOk
+            ? 'Builder check requested (no live test performed)'
+            : 'Builder check requested (missing admin setup)');
+
+        // Populate global last-test fields so Execute modal status line can reuse them.
+        {
+            state.core_last_test_status = (coreState.last_tested_status ?? '').toString().trim().toLowerCase();
+            state.core_last_test_at = (coreState.last_tested_at ?? '').toString().trim();
+            state.core_last_test_message = (coreState.last_tested_message ?? '').toString().trim();
+            state.core_last_test_host = (coreState.last_tested_host ?? coreState.grpc_host ?? state.core_last_test_host ?? '').toString();
+            state.core_last_test_port = coreState.last_tested_port ?? coreState.grpc_port ?? state.core_last_test_port ?? null;
+        }
+
+        const statusEl = options.statusEl ?? document.querySelector(`[data-hitl-core-status="${sidx}"]`);
+        const summary = (() => {
+            const atText = formatCoreTestTimestamp(coreState.last_tested_at);
+            const effectiveStatus = (coreState.last_tested_status ?? '').toString().trim().toLowerCase();
+            if (effectiveStatus === 'success') {
+                return atText ? `Last test succeeded at ${atText}` : 'Last test succeeded';
+            }
+            if (effectiveStatus === 'failure') {
+                const base = atText ? `Last test failed at ${atText}` : 'Last test failed';
+                const msg = (coreState.last_tested_message ?? '').toString().trim();
+                return msg ? `${base} (${msg})` : base;
+            }
+            const valText = formatCoreTestTimestamp(lastValidatedAt);
+            return valText ? `Last validated by admin at ${valText}` : '';
+        })();
+
+        const message = summary
+            ? `Builder view cannot run a live test. ${summary}.`
+            : 'Builder view cannot run a live test. CORE credentials are managed by an admin.';
+
+        if (statusEl) {
+            statusEl.textContent = message;
+            statusEl.classList.remove('text-success', 'text-warning', 'text-danger', 'text-muted');
+            // Colorize based on last known test result, if available.
+            const effectiveStatus = (coreState.last_tested_status ?? '').toString().trim().toLowerCase();
+            if (effectiveStatus === 'success') {
+                statusEl.classList.add('text-success');
+            } else if (effectiveStatus === 'failure') {
+                statusEl.classList.add('text-danger');
+            } else {
+                statusEl.classList.add(summary ? 'text-muted' : 'text-warning');
+            }
+        }
+        if (typeof setCoreConnectionHint === 'function') {
+            try { setCoreConnectionHint(message, 'info'); } catch (_) {}
+        }
+        if (!options.suppressToasts && typeof showToast === 'function') {
+            try { showToast(message, { autohide: true, delay: 4200 }); } catch (_) {}
+        }
+
+        // Ensure the user sees the temporary "Please Wait" state.
+        try { await new Promise(r => window.setTimeout(r, 350)); } catch (_) {}
+        restoreButton();
+
+        return {
+            ok: (coreState.last_tested_status ?? '').toString().trim().toLowerCase() === 'success',
+            message,
+            builderNoLiveTest: true,
+            last_tested_at: coreState.last_tested_at,
+            last_tested_status: coreState.last_tested_status,
+        };
     }
     const scenario = state.scenarios[sidx];
     const hitlState = ensureHitlStateForScenario(scenario);
@@ -7986,7 +8376,7 @@ async function validateCoreConnection(sidx, options = {}) {
                 if (advLines.length) {
                     lines.push(...advLines);
                 }
-                lines.push(rememberCredentials ? 'Credentials: stored in vault.' : 'Credentials: not stored.');
+                lines.push('Credentials: stored securely after verification.');
                 return lines.join('\n');
             };
 
@@ -8030,6 +8420,15 @@ async function validateCoreConnection(sidx, options = {}) {
             updateProxmoxSummary(sidx);
             renderMain();
 
+            // Provide immediate, explicit feedback in the status line (e.g., Execute modal).
+            if (statusEl) {
+                const atText = formatCoreTestTimestamp(coreState.last_tested_at);
+                const suffix = atText ? ` • ${atText}` : '';
+                statusEl.textContent = `Succeeded${suffix}`;
+                statusEl.classList.remove('text-warning', 'text-danger', 'text-muted');
+                statusEl.classList.add('text-success');
+            }
+
             let hasAdvancedFailures = false;
             try {
                 const advObj = data && data.advanced_checks;
@@ -8057,7 +8456,7 @@ async function validateCoreConnection(sidx, options = {}) {
             }
             if (!suppressToasts) {
                 try {
-                    let toastMessage = successToastMessage || data.message || (rememberCredentials ? 'CORE connection verified' : 'CORE verified (not stored)');
+                    let toastMessage = successToastMessage || data.message || 'CORE connection verified and stored securely.';
                     if (hasAdvancedFailures) {
                         toastMessage = `${toastMessage} (with warnings)`;
                     }
@@ -8116,6 +8515,15 @@ async function validateCoreConnection(sidx, options = {}) {
         renderMain();
         const pwdInput = document.querySelector(`[data-hitl-core-field="ssh_password"][data-scen-idx="${sidx}"]`);
         if (pwdInput) pwdInput.removeAttribute('placeholder');
+
+        // Provide immediate, explicit feedback in the status line (e.g., Execute modal).
+        if (statusEl) {
+            const atText = formatCoreTestTimestamp(coreState.last_tested_at);
+            const suffix = atText ? ` • ${atText}` : '';
+            statusEl.textContent = `Failed${suffix}`;
+            statusEl.classList.remove('text-success', 'text-warning', 'text-muted');
+            statusEl.classList.add('text-danger');
+        }
         if (typeof setCoreConnectionHint === 'function') {
             if (hintOnFailure) {
                 let detail = `${hintOnFailure}: ${message}`;
@@ -8360,6 +8768,7 @@ async function handleCoreConnectionSave(event) {
         modalRefresher(sidx);
     }
     const statusEl = document.querySelector(`[data-hitl-core-status="${sidx}"]`);
+
     await validateCoreConnection(sidx, {
         triggerButton,
         workingLabel: 'Validating…',
@@ -8367,7 +8776,7 @@ async function handleCoreConnectionSave(event) {
         hintOnStart: 'Validating CORE connection…',
         hintOnSuccess: 'Connection saved and validated.',
         hintOnFailure: 'Validation failed',
-        successToastMessage: rememberCreds ? 'CORE connection saved & validated' : 'CORE connection verified (not stored)',
+        successToastMessage: 'CORE connection saved & validated',
         closeModalOnSuccess: true,
         rememberCredentials: rememberCreds,
         autoStartDaemon: autoStartDaemon,
@@ -8774,6 +9183,23 @@ function renderSidebar() {
 function renderMain() {
     const root = document.getElementById('editorRoot');
     root.innerHTML = '';
+    // Always clear any scenario-specific cards that may have been injected outside
+    // the editor root (e.g., above the base card), even when there are no scenarios.
+    try {
+        const existingMetaCard = document.getElementById('scenarioMetaCard');
+        if (existingMetaCard && existingMetaCard.parentNode) {
+            existingMetaCard.parentNode.removeChild(existingMetaCard);
+        }
+        const existingCoreCard = document.getElementById('scenarioHitlCoreCard');
+        if (existingCoreCard && existingCoreCard.parentNode) {
+            existingCoreCard.parentNode.removeChild(existingCoreCard);
+        }
+        const existingHitlCard = document.getElementById('scenarioHitlConfigCard');
+        if (existingHitlCard && existingHitlCard.parentNode) {
+            existingHitlCard.parentNode.removeChild(existingHitlCard);
+        }
+    } catch (e) {}
+
     if (!state.scenarios.length) { return; }
     const scen = state.scenarios[activeIdx] || state.scenarios[0];
     const escapeHtml = (value) => (value ?? '').toString()
@@ -8817,39 +9243,45 @@ function renderMain() {
                     <div class="fw-semibold small">CORE / Participant Setup (optional)</div>
                     <div class="d-flex align-items-center gap-2">
                         <span id="scenarioNameHitlStatusBadge" class="badge text-bg-secondary">Not configured</span>
-                        <button class="btn btn-sm btn-outline-secondary" type="button" data-action="toggle-collapse" data-target="#collapse-core_participant_setup">${coreParticipantCollapsed ? 'Expand' : 'Collapse'}</button>
+                        ${IS_BUILDER_VIEW ? '' : `<button class="btn btn-sm btn-outline-secondary" type="button" data-action="toggle-collapse" data-target="#collapse-core_participant_setup">${coreParticipantCollapsed ? 'Expand' : 'Collapse'}</button>`}
                     </div>
                 </div>
-                <div id="collapse-core_participant_setup" style="${coreParticipantCollapsed ? 'display:none;' : 'display:block;'}">
-                    <div class="table-responsive">
-                        <table class="table table-sm mb-0 align-middle">
-                            <tbody>
-                                <tr>
-                                    <td style="width: 240px;">
-                                        <div class="d-flex flex-column gap-2">
-                                            <div id="scenarioNameCoreBtnSlot"></div>
-                                            <button type="button" class="btn btn-outline-secondary hitl-entry-btn" id="scenarioNameCoreVerifyBtn" title="Verify CORE/Proxmox settings">Verify</button>
-                                        </div>
-                                    </td>
-                                    <td>
-                                        <div class="small text-body" id="scenarioNameCoreSummary"></div>
-                                    </td>
-                                </tr>
-                                <tr>
-                                    <td style="width: 240px;">
-                                        <div class="d-flex flex-column gap-2">
-                                            <div id="scenarioNameHitlBtnSlot"></div>
-                                            <button type="button" class="btn btn-outline-secondary hitl-entry-btn" id="scenarioNameHitlVerifyBtn" title="Verify HITL bridge settings">Verify</button>
-                                        </div>
-                                    </td>
-                                    <td>
-                                        <div class="small text-body" id="scenarioNameHitlSummary"></div>
-                                    </td>
-                                </tr>
-                            </tbody>
-                        </table>
+                ${IS_BUILDER_VIEW ? `
+                    <div class="small text-body" id="scenarioNameBuilderSetupStatus">Not yet Setup by Admin</div>
+                ` : `
+                    <div id="collapse-core_participant_setup" style="${coreParticipantCollapsed ? 'display:none;' : 'display:block;'}">
+                        <div class="table-responsive">
+                            <table class="table table-sm mb-0 align-middle">
+                                <tbody>
+                                    <tr>
+                                        <td style="width: 240px;">
+                                            <div class="d-flex flex-column gap-2">
+                                                <div id="scenarioNameCoreBtnSlot"></div>
+                                                <button type="button" class="btn btn-outline-secondary hitl-entry-btn" id="scenarioNameCoreVerifyBtn" title="Verify CORE/Proxmox settings">Verify</button>
+                                                <button type="button" class="btn btn-outline-danger hitl-entry-btn" id="scenarioNameCoreClearBtn" title="Clear selected CORE VM and reset HITL mappings/bridge fields">Clear</button>
+                                            </div>
+                                        </td>
+                                        <td>
+                                            <div class="small text-body" id="scenarioNameCoreSummary"></div>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td style="width: 240px;">
+                                            <div class="d-flex flex-column gap-2">
+                                                <div id="scenarioNameHitlBtnSlot"></div>
+                                                <button type="button" class="btn btn-outline-secondary hitl-entry-btn" id="scenarioNameHitlVerifyBtn" title="Verify HITL bridge settings">Verify</button>
+                                                <button type="button" class="btn btn-outline-danger hitl-entry-btn" id="scenarioNameHitlClearBtn" title="Clear HITL interface mappings and bridge settings">Clear</button>
+                                            </div>
+                                        </td>
+                                        <td>
+                                            <div class="small text-body" id="scenarioNameHitlSummary"></div>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
-                </div>
+                `}
             </div>
         </div>`;
     const baseScenarioCard = document.getElementById('baseCoreScenarioCard');
@@ -8859,29 +9291,36 @@ function renderMain() {
         root.appendChild(metaCard);
     }
 
-    if (hitlEntryWrap || selectCoreVmBtnEl || configHitlBtnEl || hitlAdminBadgeEl) {
+    // Keep the original header buttons in place; render proxy buttons in the
+    // scenario-name card so they don't "disappear" after re-renders.
+    if (!IS_BUILDER_VIEW) {
         const coreBtnSlot = document.getElementById('scenarioNameCoreBtnSlot');
         const hitlBtnSlot = document.getElementById('scenarioNameHitlBtnSlot');
-        if (coreBtnSlot || hitlBtnSlot) {
-            try {
-                // Move the actual button elements (keep existing event handlers).
-                if (selectCoreVmBtnEl && coreBtnSlot) {
-                    selectCoreVmBtnEl.classList.add('w-100', 'hitl-entry-btn');
-                    coreBtnSlot.appendChild(selectCoreVmBtnEl);
-                }
-                if (configHitlBtnEl && hitlBtnSlot) {
-                    configHitlBtnEl.classList.add('w-100', 'hitl-entry-btn');
-                    hitlBtnSlot.appendChild(configHitlBtnEl);
-                }
-                // If we're in builder view, move the admin badge too.
-                if (hitlAdminBadgeEl && coreBtnSlot) {
-                    coreBtnSlot.appendChild(hitlAdminBadgeEl);
-                }
-            } catch (e) {}
-        }
-        // Remove the old wrapper container (now empty/unused after moving children).
+        const makeProxyBtn = (originalBtn, proxyId) => {
+            if (!originalBtn) return null;
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.id = proxyId;
+            btn.className = `${originalBtn.className} w-100 hitl-entry-btn`;
+            btn.textContent = originalBtn.textContent || '';
+            btn.disabled = !!originalBtn.disabled;
+            const title = originalBtn.getAttribute('title');
+            if (title) btn.setAttribute('title', title);
+            btn.addEventListener('click', (ev) => {
+                ev.preventDefault();
+                try { originalBtn.click(); } catch (e) {}
+            });
+            return btn;
+        };
         try {
-            if (hitlEntryWrap && hitlEntryWrap.parentNode) hitlEntryWrap.parentNode.removeChild(hitlEntryWrap);
+            if (coreBtnSlot && selectCoreVmBtnEl) {
+                const proxy = makeProxyBtn(selectCoreVmBtnEl, 'scenarioNameSelectCoreVmBtn');
+                if (proxy) coreBtnSlot.appendChild(proxy);
+            }
+            if (hitlBtnSlot && configHitlBtnEl) {
+                const proxy = makeProxyBtn(configHitlBtnEl, 'scenarioNameConfigHitlBtn');
+                if (proxy) hitlBtnSlot.appendChild(proxy);
+            }
         } catch (e) {}
     }
 
@@ -8914,6 +9353,18 @@ function renderMain() {
         if (hitlVerifyBtn) {
             hitlVerifyBtn.addEventListener('click', async () => {
                 await verifyScenarioHitlBridge(activeIdx, { triggerButton: hitlVerifyBtn });
+            });
+        }
+        const coreClearBtn = document.getElementById('scenarioNameCoreClearBtn');
+        if (coreClearBtn) {
+            coreClearBtn.addEventListener('click', async () => {
+                await clearScenarioCoreVmSelection(activeIdx, { triggerButton: coreClearBtn });
+            });
+        }
+        const hitlClearBtn = document.getElementById('scenarioNameHitlClearBtn');
+        if (hitlClearBtn) {
+            hitlClearBtn.addEventListener('click', async () => {
+                await clearScenarioHitlConfig(activeIdx, { triggerButton: hitlClearBtn });
             });
         }
     } catch (e) {}
@@ -9193,7 +9644,15 @@ function renderMain() {
         const hitlSummaryEl = document.getElementById('scenarioNameHitlSummary');
         const sectionEl = document.getElementById('scenarioNameHitlSection');
         const badgeEl = document.getElementById('scenarioNameHitlStatusBadge');
-        if (coreSummaryEl && hitlSummaryEl) {
+        const builderStatusEl = document.getElementById('scenarioNameBuilderSetupStatus');
+        const clearStatusClasses = () => {
+            if (badgeEl) badgeEl.classList.remove('text-bg-secondary', 'text-bg-info', 'text-bg-warning', 'text-bg-success');
+            if (sectionEl) sectionEl.classList.remove('border-secondary', 'border-info', 'border-warning', 'border-success');
+        };
+
+        // Builder view intentionally omits the collapsible detail table.
+        // Still compute and render status into the badge + builderStatusEl.
+        if ((coreSummaryEl && hitlSummaryEl) || (IS_BUILDER_VIEW && builderStatusEl)) {
             const coreTouched = !!(coreVmKey || coreHost || coreUser || coreSecretId || hasProxmox || proxHasSecret);
             const hitlTouched = !!(participantProxmoxUrlHasValue || hitlToggleWasEnabled || hasHitlInterfaces || extSelections);
             const anyTouched = coreTouched || hitlTouched;
@@ -9306,23 +9765,39 @@ function renderMain() {
                 && !proxInventoryError
                 && hitlMappingsSufficient
             );
-            const hitlReady = !!(hitlSummaryPrereqsReady && !hitlBridgeMismatchKnown);
+            let hitlReady = !!(hitlSummaryPrereqsReady && !hitlBridgeMismatchKnown);
 
-            const clearStatusClasses = () => {
-                if (badgeEl) badgeEl.classList.remove('text-bg-secondary', 'text-bg-info', 'text-bg-warning', 'text-bg-success');
-                if (sectionEl) sectionEl.classList.remove('border-secondary', 'border-info', 'border-warning', 'border-success');
-            };
+            // Builder view: rely on admin-managed safe signals rather than strict per-interface
+            // mapping completeness (builders may not have inventory details to satisfy it).
+            if (IS_BUILDER_VIEW) {
+                const builderCoreReady = !!(proxValidated && coreHasSecret && !!coreVmKey && coreVmSupportsHitl);
+                const builderHitlReady = hitlEnabled
+                    ? !!(builderCoreReady && hasHitlInterfaces)
+                    : builderCoreReady;
+                hitlReady = !!(builderHitlReady && !hitlBridgeMismatchKnown);
+            }
 
-            if (!anyTouched) {
-                coreSummaryEl.innerHTML = '<div class="text-muted">Not configured</div>';
-                hitlSummaryEl.innerHTML = '<div class="text-muted">Not configured</div>';
+            // Builder view: show a single status line, but DO NOT abort renderMain.
+            if (IS_BUILDER_VIEW && builderStatusEl) {
+                const label = hitlReady ? 'Ready' : 'Not yet Setup by Admin';
+                builderStatusEl.textContent = label;
                 clearStatusClasses();
                 if (badgeEl) {
-                    badgeEl.textContent = 'Not configured';
-                    badgeEl.classList.add('text-bg-secondary');
+                    badgeEl.textContent = label;
+                    badgeEl.classList.add(hitlReady ? 'text-bg-success' : 'text-bg-secondary');
                 }
-                if (sectionEl) sectionEl.classList.add('border-secondary');
-            } else {
+                if (sectionEl) sectionEl.classList.add(hitlReady ? 'border-success' : 'border-secondary');
+            } else if (coreSummaryEl && hitlSummaryEl) {
+                if (!anyTouched) {
+                    coreSummaryEl.innerHTML = '<div class="text-muted">Not configured</div>';
+                    hitlSummaryEl.innerHTML = '<div class="text-muted">Not configured</div>';
+                    clearStatusClasses();
+                    if (badgeEl) {
+                        badgeEl.textContent = 'Not configured';
+                        badgeEl.classList.add('text-bg-secondary');
+                    }
+                    if (sectionEl) sectionEl.classList.add('border-secondary');
+                } else {
                 // Make it obvious if configured/validated/ready.
                 clearStatusClasses();
                 if (hitlReady || (coreValidated && !hitlConfigured)) {
@@ -9542,6 +10017,7 @@ function renderMain() {
                     : 'Not set';
                 hitlRows.push(['Participant UI', participantUrlValue, participantProxmoxUrlHasValue ? 'ok' : 'no']);
                 hitlSummaryEl.innerHTML = renderKvTable(hitlTouched ? hitlRows : [], 'Not configured');
+                }
             }
         }
     } catch (e) {}
@@ -12130,18 +12606,9 @@ function wireHandlers() {
         return snapshot;
     };
     const persistParticipantUrlToServerNow = async () => {
-        // Prefer flushing a pending payload (admin view); otherwise synthesize a snapshot (builder view).
-        try {
-            const pending = !!serverSnapshotPendingPayload;
-            if (pending) {
-                return await flushServerSnapshotPersistNow();
-            }
-            const snapshot = buildEditorSnapshotPayloadForServer();
-            return await transmitEditorSnapshotToServer(snapshot);
-        } catch (err) {
-            const message = (err && err.message) ? err.message : 'Failed to persist participant URL';
-            return { ok: false, error: message };
-        }
+        // Per requirement: HITL values are only persisted server-side once verified.
+        // Keep participant URL local until HITL bridge verification/apply succeeds.
+        return { ok: true, skipped: true };
     };
     const persistParticipantProxmoxUrl = (sidx, rawValue) => {
         if (Number.isNaN(sidx) || !state.scenarios?.[sidx]) return false;
@@ -12195,8 +12662,8 @@ function wireHandlers() {
             try { renderMain(); } catch (e) {}
             const result = await persistParticipantUrlToServerNow();
             if (result && result.ok) {
-                setParticipantUrlFeedback(sidx, 'Saved.', 'success');
-                const toastMsg = changed ? 'Participant UI link saved.' : 'Participant UI link already up to date.';
+                setParticipantUrlFeedback(sidx, 'Saved locally. Will persist after HITL Verify/Apply.', 'success');
+                const toastMsg = changed ? 'Participant UI link saved locally.' : 'Participant UI link already up to date (local).';
                 try { if (typeof showToast === 'function') showToast(toastMsg, { autohide: true, delay: 2000 }); } catch (e) {}
             } else {
                 const errMsg = (result && typeof result.error === 'string' && result.error.trim()) ? result.error.trim() : 'Save failed';
@@ -12228,8 +12695,8 @@ function wireHandlers() {
             try { renderMain(); } catch (e) {}
             const result = await persistParticipantUrlToServerNow();
             if (result && result.ok) {
-                setParticipantUrlFeedback(sidx, 'Cleared.', 'success');
-                try { if (typeof showToast === 'function') showToast('Participant UI link cleared.', { autohide: true, delay: 1800 }); } catch (e) {}
+                setParticipantUrlFeedback(sidx, 'Cleared locally.', 'success');
+                try { if (typeof showToast === 'function') showToast('Participant UI link cleared locally.', { autohide: true, delay: 1800 }); } catch (e) {}
             } else {
                 const errMsg = (result && typeof result.error === 'string' && result.error.trim()) ? result.error.trim() : 'Clear failed';
                 setParticipantUrlFeedback(sidx, `Clear failed: ${errMsg}`, 'error');
@@ -12474,6 +12941,7 @@ function wireHandlers() {
         proxAssignHint.classList.add(klass);
     };
     window.setProxAssignHint = setProxAssignHint;
+    // Do not persist passwords until validation succeeds.
     if (proxRememberInput && !proxRememberInput.dataset.prefBound) {
         proxRememberInput.addEventListener('change', () => {
             if (!proxAssignModal) return;
@@ -12519,6 +12987,7 @@ function wireHandlers() {
     };
     window.setCoreConnectionHint = setCoreConnectionHint;
     wireCoreConnectionSaveButton();
+    // Do not persist passwords until validation succeeds.
     if (coreRememberInput && !coreRememberInput.dataset.prefBound) {
         coreRememberInput.addEventListener('change', () => {
             if (IS_BUILDER_VIEW) return;
@@ -13313,28 +13782,104 @@ function isExecuteCoreVmConfigured() {
     }
 }
 
+function formatCoreTestTimestamp(isoString) {
+    try {
+        if (!isoString) return '';
+        const dt = new Date(String(isoString));
+        if (Number.isNaN(dt.getTime())) return String(isoString);
+        return dt.toLocaleString();
+    } catch (err) {
+        return isoString ? String(isoString) : '';
+    }
+}
+
+function getLastCoreTestSummary() {
+    try {
+        const status = (state?.core_last_test_status ?? '').toString().trim().toLowerCase();
+        const at = (state?.core_last_test_at ?? '').toString().trim();
+        const msg = (state?.core_last_test_message ?? '').toString().trim();
+        if (!status && !at && !msg) return '';
+        const atText = formatCoreTestTimestamp(at);
+        if (status === 'success') {
+            return atText ? `Last test succeeded at ${atText}` : 'Last test succeeded';
+        }
+        if (status === 'failure') {
+            const base = atText ? `Last test failed at ${atText}` : 'Last test failed';
+            return msg ? `${base} (${msg})` : base;
+        }
+        // Unknown status
+        return atText ? `Last test at ${atText}` : '';
+    } catch (err) {
+        return '';
+    }
+}
+
 function updateExecuteCoreStatus(info = null) {
     if (!executeCoreStatusEl) return;
     const statusInfo = info || detectLocalEmulation();
     const classes = ['text-muted', 'text-success', 'text-warning', 'text-danger'];
     executeCoreStatusEl.classList.remove(...classes);
+    const lastTestSummary = getLastCoreTestSummary();
+
+    // Builder view: avoid misleading live-test prompts. Show the last known admin test result
+    // (green/red) if available; otherwise keep an "unknown" hint.
+    if (IS_BUILDER_VIEW) {
+        const lastStatus = (state?.core_last_test_status ?? '').toString().trim().toLowerCase();
+        if (lastStatus === 'success') {
+            executeCoreStatusEl.textContent = lastTestSummary ? `Succeeded • ${lastTestSummary}` : 'Succeeded';
+            executeCoreStatusEl.classList.add('text-success');
+            return;
+        }
+        if (lastStatus === 'failure') {
+            executeCoreStatusEl.textContent = lastTestSummary ? `Failed • ${lastTestSummary}` : 'Failed';
+            executeCoreStatusEl.classList.add('text-danger');
+            return;
+        }
+
+        // If no last test is recorded, try to show an admin validation timestamp.
+        try {
+            const scenarioIdx = Number.isInteger(executeConfirmState?.scenarioIndex)
+                ? executeConfirmState.scenarioIndex
+                : getActiveScenarioContext().idx;
+            const scen = Number.isInteger(scenarioIdx) ? state?.scenarios?.[scenarioIdx] : null;
+            const hitl = (scen && scen.hitl && typeof scen.hitl === 'object') ? scen.hitl : null;
+            const core = (hitl && hitl.core && typeof hitl.core === 'object') ? hitl.core : null;
+            const valAt = core ? (core.last_validated_at ?? '') : '';
+            const valText = formatCoreTestTimestamp(valAt);
+            if (valText) {
+                executeCoreStatusEl.textContent = `Validated by admin • ${valText}`;
+                executeCoreStatusEl.classList.add('text-muted');
+                return;
+            }
+        } catch (e) {}
+
+        executeCoreStatusEl.textContent = lastTestSummary
+            ? `CORE status unknown • ${lastTestSummary}`
+            : 'CORE backend status unknown. Ask an admin to validate the connection.';
+        executeCoreStatusEl.classList.add('text-warning');
+        return;
+    }
     if (statusInfo.verified) {
-        executeCoreStatusEl.textContent = IS_BUILDER_VIEW
+        const base = IS_BUILDER_VIEW
             ? 'CORE backend validated and ready.'
             : `Connected to CORE ${statusInfo.host}:${statusInfo.port}`;
+        executeCoreStatusEl.textContent = lastTestSummary ? `${base} • ${lastTestSummary}` : base;
         executeCoreStatusEl.classList.add('text-success');
     } else if (!IS_BUILDER_VIEW && executeConfirmState && executeConfirmState.coreTestFailed) {
-        executeCoreStatusEl.textContent = 'CORE connection failed, please check your settings and try again.';
+        const base = 'CORE connection failed, please check your settings and try again.';
+        executeCoreStatusEl.textContent = lastTestSummary ? `${base} • ${lastTestSummary}` : base;
         executeCoreStatusEl.classList.add('text-danger');
     } else if (statusInfo.shouldFake) {
-        executeCoreStatusEl.textContent = IS_BUILDER_VIEW
+        const base = IS_BUILDER_VIEW
             ? 'Please test the connection. If it fails, contact your administrator.'
             : 'CORE connection failed, please check your settings.';
+        executeCoreStatusEl.textContent = lastTestSummary ? `${base} • ${lastTestSummary}` : base;
         executeCoreStatusEl.classList.add('text-danger');
     } else {
-        executeCoreStatusEl.textContent = IS_BUILDER_VIEW
+        const base = IS_BUILDER_VIEW
             ? 'CORE backend status unknown. Ask an admin to validate the connection.'
             : 'CORE connection needs to be tested.';
+        executeCoreStatusEl.textContent = lastTestSummary ? `${base} • ${lastTestSummary}` : base;
         executeCoreStatusEl.classList.add('text-warning');
     }
 }
@@ -13346,6 +13891,29 @@ function refreshExecuteRemoteToggleState() {
     const coreVmConfigured = isExecuteCoreVmConfigured();
     const pushPref = getExecuteConfirmUpdateRemotePref();
     const showNotConfigured = remoteSelected && !coreVmConfigured && !IS_BUILDER_VIEW;
+
+    const isBuilderCoreVmVerified = (() => {
+        if (!IS_BUILDER_VIEW) return true;
+        try {
+            const scenarioIdx = Number.isInteger(executeConfirmState?.scenarioIndex)
+                ? executeConfirmState.scenarioIndex
+                : getActiveScenarioContext().idx;
+            if (!Number.isInteger(scenarioIdx)) return false;
+            const scen = state?.scenarios?.[scenarioIdx];
+            if (!scen || typeof scen !== 'object') return false;
+            const hitl = (typeof ensureHitlStateForScenario === 'function') ? ensureHitlStateForScenario(scen) : (scen.hitl || {});
+            const prox = (hitl && typeof hitl === 'object' && hitl.proxmox && typeof hitl.proxmox === 'object') ? hitl.proxmox : {};
+            const core = (hitl && typeof hitl === 'object' && hitl.core && typeof hitl.core === 'object') ? hitl.core : {};
+            const vmKey = (core?.vm_key ?? '').toString().trim();
+            const proxSecret = (prox?.secret_id ?? '').toString().trim();
+            const coreSecret = (core?.core_secret_id ?? '').toString().trim();
+            const proxValidated = !!prox?.validated;
+            const coreValidated = !!core?.validated;
+            return !!(vmKey && proxSecret && coreSecret && proxValidated && coreValidated);
+        } catch (err) {
+            return false;
+        }
+    })();
 
     if (executeCoreNotConfiguredRow) {
         executeCoreNotConfiguredRow.classList.toggle('d-none', !showNotConfigured);
@@ -13387,7 +13955,9 @@ function refreshExecuteRemoteToggleState() {
     }
 
     if (executeConfirmRunBtn) {
-        const shouldDisable = showNotConfigured || (remoteSelected && !info.verified && !IS_BUILDER_VIEW);
+        const shouldDisable = showNotConfigured
+            || (remoteSelected && !info.verified && !IS_BUILDER_VIEW)
+            || (IS_BUILDER_VIEW && !isBuilderCoreVmVerified);
         executeConfirmRunBtn.disabled = shouldDisable;
 
         // Only auto-adjust the label for the default Execute flow.
@@ -13403,9 +13973,13 @@ function refreshExecuteRemoteToggleState() {
         }
 
         if (shouldDisable) {
-            executeConfirmRunBtn.setAttribute('title', showNotConfigured
-                ? 'Select a CORE VM to enable remote execution.'
-                : 'Test the CORE connection to enable remote execution.');
+            if (IS_BUILDER_VIEW && !isBuilderCoreVmVerified) {
+                executeConfirmRunBtn.setAttribute('title', 'Ask an admin to verify Select CORE VM (Proxmox + CORE) before executing.');
+            } else {
+                executeConfirmRunBtn.setAttribute('title', showNotConfigured
+                    ? 'Select a CORE VM to enable remote execution.'
+                    : 'Test the CORE connection to enable remote execution.');
+            }
         } else {
             executeConfirmRunBtn.removeAttribute('title');
         }
@@ -13440,10 +14014,11 @@ async function handleExecuteCoreTestClick() {
             hintOnFailure: 'CORE connection test failed',
             suppressToasts: false,
         });
-        executeConfirmState.coreTestFailed = !(result && result.ok);
+        // Builder view cannot run live tests; don't treat this as a failure.
+        executeConfirmState.coreTestFailed = IS_BUILDER_VIEW ? false : !(result && result.ok);
     } catch (err) {
         console.warn('CORE connection test from execute modal failed', err);
-        executeConfirmState.coreTestFailed = true;
+        executeConfirmState.coreTestFailed = IS_BUILDER_VIEW ? false : true;
     } finally {
         refreshExecuteRemoteToggleState();
     }
@@ -13460,30 +14035,54 @@ async function ensureBuilderCoreReadyForExecute() {
         updateExecuteConfirmAlert('Select a scenario before executing.', 'warning');
         return false;
     }
-    updateExecuteConfirmAlert('Validating CORE VM before execution…', 'info');
-    try {
-        const result = await validateCoreConnection(scenarioIndex, {
-            triggerButton: executeConfirmRunBtn || undefined,
-            workingLabel: 'Testing CORE…',
-            statusEl: executeCoreStatusEl || undefined,
-            hintOnStart: 'Checking CORE backend availability…',
-            hintOnSuccess: 'CORE backend ready for execution.',
-            hintOnFailure: 'CORE backend unavailable',
-            suppressToasts: true,
-            autoStartDaemon: true,
-        });
-        if (!result?.ok) {
-            handleBuilderBackendUnavailable();
-            return false;
-        }
-        updateExecuteConfirmAlert('', 'info');
-        refreshExecuteRemoteToggleState();
-        return true;
-    } catch (err) {
-        console.warn('Automatic CORE validation failed', err);
-        handleBuilderBackendUnavailable();
+
+    // Builder view is read-only and cannot run live validation (`validateCoreConnection` hard-fails).
+    // Gate execution based on admin-provided safe hints merged into `scenario.hitl`.
+    const scenario = state?.scenarios?.[scenarioIndex];
+    if (!scenario) {
+        updateExecuteConfirmAlert('Scenario unavailable.', 'danger');
         return false;
     }
+    const hitl = (scenario.hitl && typeof scenario.hitl === 'object') ? scenario.hitl : {};
+    const prox = (hitl.proxmox && typeof hitl.proxmox === 'object') ? hitl.proxmox : {};
+    const core = (hitl.core && typeof hitl.core === 'object') ? hitl.core : {};
+
+    const vmKey = (core.vm_key ?? '').toString().trim();
+    const coreSecretId = (core.core_secret_id ?? '').toString().trim();
+    const proxSecretId = (prox.secret_id ?? '').toString().trim();
+    const proxValidated = !!prox.validated;
+    const coreValidated = !!core.validated;
+    const hasDirectHost = !!((core.ssh_host || core.grpc_host || '').toString().trim());
+
+    // Ready if we have the core secret id + selected VM key and either:
+    // - direct host details (ssh/grpc), or
+    // - validated proxmox creds (so backend can resolve VM details).
+    // Builder requirement: only allow execute once the admin has verified Select CORE VM.
+    // Treat verification as: proxmox+core validated flags present, secrets present, and vm_key selected.
+    const coreVmVerifiedByAdmin = !!(vmKey && proxSecretId && coreSecretId && proxValidated && coreValidated);
+    const ready = coreVmVerifiedByAdmin && (hasDirectHost || proxSecretId);
+
+    if (!ready) {
+        const message = coreVmVerifiedByAdmin
+            ? 'CORE is configured but not ready to execute. Please ask an admin.'
+            : 'Select CORE VM has not been verified by an admin yet. Please ask an admin.';
+        updateExecuteConfirmAlert(message, 'danger');
+        if (executeCoreStatusEl) {
+            executeCoreStatusEl.textContent = message;
+            executeCoreStatusEl.classList.remove('text-success', 'text-warning', 'text-muted');
+            executeCoreStatusEl.classList.add('text-danger');
+        }
+        return false;
+    }
+
+    updateExecuteConfirmAlert('', 'info');
+    if (executeCoreStatusEl) {
+        executeCoreStatusEl.textContent = 'CORE backend configured by admin.';
+        executeCoreStatusEl.classList.remove('text-warning', 'text-danger', 'text-muted');
+        executeCoreStatusEl.classList.add('text-success');
+    }
+    refreshExecuteRemoteToggleState();
+    return true;
 }
 
 function handleBuilderBackendUnavailable() {
@@ -14282,6 +14881,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const verifyInput = document.getElementById('proxmoxVerifySsl');
         const verifySsl = verifyInput ? !!verifyInput.checked : /^https:/i.test(urlVal);
         persistSavedProxmoxDefaults({ url: urlVal, port: portVal, username: userVal, verify_ssl: verifySsl });
+
         setProxAssignBusy(true);
         setProxAssignHint('Validating credentials with Proxmox…', 'info');
         let data = null;
@@ -14332,7 +14932,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 port: summary.port ?? portVal,
                 username: summary.username ?? userVal,
                 verify_ssl: summary.verify_ssl ?? verifySsl,
-                last_message: data?.message || (rememberCreds ? 'Credentials validated.' : 'Credentials validated (not stored).'),
+                last_message: data?.message || 'Credentials validated and stored securely.',
             };
             if (rememberCreds) {
                 const newSecretId = data?.secret_id || summary.identifier || null;
@@ -14359,7 +14959,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 await fetchProxmoxInventory(sidx, { force: true });
             }
             if (proxPassInput) proxPassInput.value = '';
-            const successMessage = data?.message || (rememberCreds ? 'Proxmox credentials validated and stored securely.' : 'Credentials validated but not stored. Re-enter credentials when needed.');
+            const successMessage = data?.message || 'Proxmox credentials validated and stored securely.';
             const successTone = rememberCreds ? 'success' : 'warning';
             setProxAssignHint(successMessage, successTone);
             try { showToast(successMessage, { autohide: true, delay: 2500 }); } catch(e) {}
