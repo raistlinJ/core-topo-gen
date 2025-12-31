@@ -312,7 +312,7 @@
 {% block extra_scripts %}
 <script>
   // Server-injected: scenarioNorm -> hasParticipantUrl
-  const participantUrlFlags = {{ participant_url_flags|tojson }};
+  let participantUrlFlags = {{ participant_url_flags|tojson }};
   function normalizeScenarioNorm(raw){
     return (raw || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
   }
@@ -656,6 +656,9 @@
       const res = await fetch(url.pathname + url.search, { cache: 'no-store' });
       if (!res.ok) return;
       const data = await res.json();
+      if (data && data.participant_url_flags && typeof data.participant_url_flags === 'object') {
+        participantUrlFlags = data.participant_url_flags;
+      }
       const configured = !!(data && data.scenario && data.scenario.participant_link_configured);
       if (typeof window.CORETG_SET_PARTICIPANT_NAV_VISIBLE === 'function') {
         window.CORETG_SET_PARTICIPANT_NAV_VISIBLE(configured);

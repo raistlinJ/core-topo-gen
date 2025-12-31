@@ -99,7 +99,7 @@
 {% block extra_scripts %}
 <script>
   // Server-injected: scenarioNorm -> hasParticipantUrl
-  const participantUrlFlags = {{ participant_url_flags|tojson }};
+  let participantUrlFlags = {{ participant_url_flags|tojson }};
   function normalizeScenarioNorm(raw){
     return (raw || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
   }
@@ -297,6 +297,9 @@ async function fetchHistory(){
     const res = await fetch(url);
     if(!res.ok) return;
     const data = await res.json();
+    if (data && data.participant_url_flags && typeof data.participant_url_flags === 'object') {
+      participantUrlFlags = data.participant_url_flags;
+    }
     const serverScenario = (data.active_scenario || '').trim();
     if(serverScenario){
       activeScenarioFilter = serverScenario;

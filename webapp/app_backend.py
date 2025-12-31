@@ -15443,10 +15443,16 @@ def reports_data():
         enriched.append(e)
     enriched = sorted(enriched, key=lambda x: x.get('timestamp',''), reverse=True)
     user = _current_user()
-    scenario_names, scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(
+    scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(
         enriched,
         user=user,
     )
+    scenario_participant_urls = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
+    participant_url_flags = {
+        norm: bool(url)
+        for norm, url in scenario_participant_urls.items()
+        if isinstance(norm, str) and norm
+    }
     scenario_query = request.args.get('scenario', '').strip()
     scenario_norm = _normalize_scenario_label(scenario_query)
     scenario_names, scenario_norm, _allowed_norms = _builder_filter_report_scenarios(
@@ -15464,6 +15470,7 @@ def reports_data():
         'history': enriched,
         'scenarios': scenario_names,
         'active_scenario': scenario_display,
+        'participant_url_flags': participant_url_flags,
     })
 
 @app.route('/reports/delete', methods=['POST'])
@@ -18045,6 +18052,11 @@ def core_data():
     current_user = _current_user()
     scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
     scenario_participant_urls = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
+    participant_url_flags = {
+        norm: bool(url)
+        for norm, url in scenario_participant_urls.items()
+        if isinstance(norm, str) and norm
+    }
     scenario_query = request.args.get('scenario', '').strip()
     scenario_norm = _normalize_scenario_label(scenario_query)
     # Enforce per-scenario view: default to the first available scenario when unset/invalid.
@@ -18311,6 +18323,7 @@ def core_data():
         'sessions': sessions,
         'scenarios': scenario_names,
         'active_scenario': scenario_display,
+        'participant_url_flags': participant_url_flags,
         'active_session_counts': active_session_counts,
         'scenario_item_counts': scenario_item_counts,
         'host': host,
