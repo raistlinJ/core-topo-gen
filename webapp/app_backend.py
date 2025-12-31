@@ -6314,7 +6314,14 @@ def _live_core_session_status_for_scenario(
     """Best-effort live CORE session status for a scenario.
 
     Returns None if CORE cannot be queried (no credentials / remote failure).
-    Otherwise returns: {running: bool, session_id: int|None, state: str}.
+        Otherwise returns: {running: bool|None, session_id: int|None, state: str}.
+
+        Notes:
+        - running=True means we could positively associate an active CORE session
+            with the selected scenario.
+        - running=False means we could query CORE and there are no active sessions.
+        - running=None means we could query CORE and there are active sessions, but
+            we could not confidently associate any of them with the selected scenario.
 
     This does not expose host/port; it only uses them server-side.
     """
@@ -6376,11 +6383,6 @@ def _live_core_session_status_for_scenario(
     active_sessions = [s for s in sessions if isinstance(s, dict) and _is_active(s)]
     matching_active = [s for s in active_sessions if _matches(s)]
 
-    # If we can't match the scenario but there is exactly one active CORE session,
-    # treat it as the selected scenario to avoid a misleading "Not running".
-    if not matching_active and len(active_sessions) == 1:
-        matching_active = active_sessions
-
     for sess in matching_active:
         if not isinstance(sess, dict):
             continue
@@ -6392,7 +6394,16 @@ def _live_core_session_status_for_scenario(
             'state': state_raw,
         }
 
-    # Queried successfully but no matching active sessions
+    # Queried successfully but no matching active sessions.
+    # If there are active sessions but none match the selected scenario, prefer
+    # Unknown (None) over incorrectly marking the selected scenario as Running.
+    if active_sessions:
+        return {
+            'running': None,
+            'session_id': None,
+            'state': '',
+        }
+
     return {
         'running': False,
         'session_id': None,
@@ -6537,7 +6548,8 @@ def participant_ui_details_api():
     )
 
     if isinstance(live, dict):
-        session_running = bool(live.get('running'))
+        running_val = live.get('running')
+        session_running = running_val if isinstance(running_val, bool) else None
         session_state = str(live.get('state') or '')
         sid_val = live.get('session_id')
         try:
