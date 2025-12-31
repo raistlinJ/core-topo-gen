@@ -7649,9 +7649,15 @@ def _load_scenario_catalog_from_disk() -> tuple[list[str], dict[str, set[str]], 
     if isinstance(participant_raw, dict):
         for key, value in participant_raw.items():
             norm = _normalize_scenario_label(key)
+            if not norm:
+                continue
+            # Preserve explicit "cleared" values (empty/invalid) so the UI can override
+            # stale scenario XML that might still contain a participant URL.
             url_value = _normalize_participant_proxmox_url(value)
-            if norm and url_value:
+            if url_value:
                 participant_by_norm[norm] = url_value
+            else:
+                participant_by_norm.setdefault(norm, '')
 
     return ordered, path_map, participant_by_norm
 
@@ -7726,12 +7732,20 @@ def _merge_participant_urls_into_scenario_catalog(participant_urls: Dict[str, An
         return
 
     normalized_updates: dict[str, str] = {}
+    normalized_clears: set[str] = set()
     for key, value in participant_urls.items():
         norm = _normalize_scenario_label(key)
+        if not norm:
+            continue
         url_value = _normalize_participant_proxmox_url(value)
-        if norm and url_value:
+        if url_value:
             normalized_updates[norm] = url_value
-    if not normalized_updates:
+        else:
+            # Explicitly cleared values should persist as an override (empty)
+            # to prevent falling back to stale scenario XML.
+            normalized_clears.add(norm)
+
+    if not normalized_updates and not normalized_clears:
         return
 
     tmp_path = catalog_path + '.tmp'
@@ -7743,8 +7757,12 @@ def _merge_participant_urls_into_scenario_catalog(participant_urls: Dict[str, An
         existing = payload.get('participant_urls')
         if not isinstance(existing, dict):
             existing = {}
+
         merged = dict(existing)
+        for norm_key in normalized_clears:
+            merged[norm_key] = ''
         merged.update(normalized_updates)
+
         payload['participant_urls'] = merged
         payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
 
@@ -9070,8 +9088,13 @@ def _collect_scenario_participant_urls(
         for norm_key, raw_value in catalog_hints.items():
             norm = _normalize_scenario_label(norm_key)
             normalized_url = _normalize_participant_proxmox_url(raw_value)
-            if norm and normalized_url:
+            if not norm:
+                continue
+            if normalized_url:
                 urls[norm] = normalized_url
+            else:
+                # Explicitly cleared hint overrides stale XML.
+                urls.setdefault(norm, '')
     if not scenario_paths:
         return urls
     cache: dict[str, dict[str, str]] = {}
@@ -9091,7 +9114,7 @@ def _collect_scenario_participant_urls(
             if url_value:
                 # Prefer catalog hints (e.g., saved from editor snapshots) over XML values.
                 # XML can lag behind the editor state when the user hasn't re-saved scenarios.xml.
-                if not urls.get(norm_key):
+                if norm_key not in urls:
                     urls[norm_key] = url_value
                 break
     return urls
@@ -11056,7 +11079,7 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
             hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else {}
             hitl_meta = dict(hitl_meta)
 
-            # Merge participant URL hints (non-secret) so builder view shows Part 5 as configured.
+            # Merge participant URL hints (non-secret) so builder view shows Step 5 as configured.
             try:
                 participant_hint = participant_urls_by_norm.get(norm) if (norm and isinstance(participant_urls_by_norm, dict)) else ''
                 if participant_hint:
@@ -11176,7 +11199,9 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
 
     try:
         scen_names_for_catalog = [scen.get('name') for scen in normalized_scenarios if isinstance(scen, dict)]
-        participant_hints: Dict[str, str] = {}
+        # Build a per-scenario participant URL hint map. Include explicit empty values
+        # so we can clear stale catalog hints when a user removes a URL in the editor.
+        participant_hints: Dict[str, Any] = {}
         for scen in normalized_scenarios:
             if not isinstance(scen, dict):
                 continue
@@ -11193,8 +11218,7 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
                     if normalized:
                         participant_url_value = normalized
                         break
-            if participant_url_value:
-                participant_hints[norm] = participant_url_value
+            participant_hints[norm] = participant_url_value or ''
 
         if allowed_norms is None:
             result_path = payload.get('result_path') if isinstance(payload.get('result_path'), str) else None
@@ -11206,6 +11230,9 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
                     should_persist = False
             if should_persist:
                 _persist_scenario_catalog(scen_names_for_catalog, result_path, participant_urls=participant_hints)
+            else:
+                if participant_hints:
+                    _merge_participant_urls_into_scenario_catalog(participant_hints)
         else:
             if participant_hints:
                 _merge_participant_urls_into_scenario_catalog(participant_hints)

@@ -53,7 +53,7 @@
                       <span class="fw-semibold">{{ scenario.display }}</span>
                       {% if not scenario.has_url %}<span class="badge bg-warning text-dark">No Link</span>{% endif %}
                     </div>
-                    {% if scenario.url %}
+                    {% if scenario.has_url %}
                       <div class="text-secondary small">
                         Participant console link available.
                       </div>

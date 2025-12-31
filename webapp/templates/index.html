@@ -136,7 +136,9 @@
                                     {% if not is_builder_view %}
                                     <div class="btn-group btn-group-sm" role="group" aria-label="HITL setup actions">
                                         <button class="btn btn-outline-primary" type="button" id="selectCoreVmBtn">Select CORE VM</button>
-                                        <button class="btn btn-primary" type="button" id="configHitlBtn" disabled title="Complete Steps 1 and 2 first.">Config HITL</button>
+                                        <span class="d-inline-block" tabindex="0" id="configHitlBtnWrap">
+                                            <button class="btn btn-primary" type="button" id="configHitlBtn" disabled>Config HITL</button>
+                                        </span>
                                     </div>
                                     {% else %}
                                     <span class="badge text-bg-secondary">HITL settings managed by admin</span>
@@ -244,7 +246,7 @@
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
-                <button type="button" class="btn btn-primary" id="coreVmModalSaveBtn">Save Scenario</button>
+                <button type="button" class="btn btn-primary" id="coreVmModalSaveBtn">Verify &amp; Save</button>
             </div>
         </div>
     </div>
@@ -264,7 +266,7 @@
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
-                <button type="button" class="btn btn-primary" id="externalIfxModalSaveBtn">Save Scenario</button>
+                <button type="button" class="btn btn-primary" id="externalIfxModalSaveBtn">Validate &amp; Save</button>
             </div>
         </div>
     </div>
@@ -1894,24 +1896,92 @@ async function fetchStoredCoreCredentials(secretId) {
     return creds;
 }
 
-function describeConfigHitlGate({ proxValidated, coreHasSecret, coreVmKey }) {
-    if (!proxValidated) return 'Validate Proxmox credentials (Step 1) to continue.';
-    if (!coreVmKey) return 'Select a CORE VM in Step 2 to continue.';
-    if (!coreHasSecret) return 'Store CORE credentials (Step 2) to continue.';
+function describeConfigHitlGate({ coreVmVerified }) {
+    if (!coreVmVerified) return 'CORE VM has to be selected/verified';
     return '';
 }
 
-function updateHitlEntryButtons({ hitlAuthReady, proxValidated, coreHasSecret, coreVmKey }) {
+function _hideDisposeTooltip(el) {
+    if (!el || !window.bootstrap || !bootstrap.Tooltip) return;
+    try {
+        const inst = bootstrap.Tooltip.getInstance(el);
+        if (inst) {
+            try { inst.hide(); } catch (e) {}
+            try { inst.dispose(); } catch (e) {}
+        }
+    } catch (e) {}
+}
+
+function _ensureHoverOnlyTooltip(el, title) {
+    if (!el) return;
+    // Ensure hover-only so tooltips don't stick due to focus.
+    el.setAttribute('data-bs-toggle', 'tooltip');
+    el.setAttribute('data-bs-trigger', 'hover');
+    el.setAttribute('data-bs-placement', 'top');
+    if (title !== undefined) {
+        el.setAttribute('data-bs-title', title);
+    }
+    if (window.bootstrap && bootstrap.Tooltip) {
+        _hideDisposeTooltip(el);
+        try { new bootstrap.Tooltip(el, { trigger: 'hover', container: 'body' }); } catch (e) {}
+    }
+    // Defensive: if the element loses hover/focus, force-hide.
+    if (!el.dataset._ttBound) {
+        el.addEventListener('mouseleave', () => _hideDisposeTooltip(el));
+        el.addEventListener('blur', () => _hideDisposeTooltip(el));
+        el.dataset._ttBound = '1';
+    }
+}
+
+function updateHitlEntryButtons({ coreVmVerified }) {
     const configBtn = document.getElementById('configHitlBtn');
+    const configWrap = document.getElementById('configHitlBtnWrap');
+    const proxyConfigBtn = document.getElementById('scenarioNameConfigHitlBtn');
+    const proxyConfigWrap = proxyConfigBtn ? proxyConfigBtn.parentElement : null;
     if (configBtn) {
-        const ready = !!hitlAuthReady;
+        const ready = !!coreVmVerified;
         configBtn.disabled = !ready;
         const hint = ready
             ? 'Configure HITL interfaces and participant VMs (Steps 3 & 4).'
-            : describeConfigHitlGate({ proxValidated, coreHasSecret, coreVmKey }) || 'Complete Steps 1 and 2 first.';
+            : describeConfigHitlGate({ coreVmVerified }) || 'CORE VM has to be selected/verified';
+        // Keep title for non-disabled contexts; bootstrap tooltip will use data-bs-title.
         configBtn.setAttribute('title', hint);
         configBtn.dataset.hitlReady = ready ? '1' : '0';
         configBtn.dataset.hitlHint = hint;
+
+        // Enable tooltip even when the button is disabled by applying it to the wrapper.
+        if (configWrap) {
+            try {
+                if (!ready) {
+                    _ensureHoverOnlyTooltip(configWrap, hint);
+                } else {
+                    _hideDisposeTooltip(configWrap);
+                    configWrap.removeAttribute('data-bs-toggle');
+                    configWrap.removeAttribute('data-bs-trigger');
+                    configWrap.removeAttribute('data-bs-placement');
+                    configWrap.removeAttribute('data-bs-title');
+                }
+            } catch (e) {}
+        }
+
+        // Keep the scenario-name proxy button in sync too.
+        if (proxyConfigBtn) {
+            proxyConfigBtn.disabled = !ready;
+            proxyConfigBtn.setAttribute('title', hint);
+            if (proxyConfigWrap) {
+                try {
+                    if (!ready) {
+                        _ensureHoverOnlyTooltip(proxyConfigWrap, hint);
+                    } else {
+                        _hideDisposeTooltip(proxyConfigWrap);
+                        proxyConfigWrap.removeAttribute('data-bs-toggle');
+                        proxyConfigWrap.removeAttribute('data-bs-trigger');
+                        proxyConfigWrap.removeAttribute('data-bs-placement');
+                        proxyConfigWrap.removeAttribute('data-bs-title');
+                    }
+                } catch (e) {}
+            }
+        }
     }
 }
 
@@ -1997,6 +2067,7 @@ function updateProxmoxSummary(sidx) {
         const coreReady = coreConnectionReady && coreVmSupportsHitl;
         const coreHitlBlocked = coreConnectionReady && !coreVmSupportsHitl;
         const coreTestable = proxValidated && coreInputsComplete && coreVmHasInterfaces;
+    const coreVmVerified = !!(core && core.validated === true && coreHasSecret && !!coreVmKey);
     const hitlAuthReady = proxValidated && coreHasSecret && !!coreVmKey;
 
         const summaryEl = document.querySelector(`[data-proxmox-summary="${sidx}"]`);
@@ -2113,7 +2184,7 @@ function updateProxmoxSummary(sidx) {
                 className = 'text-danger';
             } else if (!coreInputsComplete) {
                 statusText = IS_BUILDER_VIEW
-                    ? 'CORE credentials are not stored for this scenario in builder view. Ask an admin to validate and store them.'
+                    ? 'CORE credentials are not stored for this scenario in builder view. Ask an admin to verify and store them.'
                     : 'Enter gRPC and SSH connection details, including credentials.';
                 className = 'text-warning';
             } else if (!coreVmSupportsHitl) {
@@ -2147,7 +2218,7 @@ function updateProxmoxSummary(sidx) {
                 className = 'text-warning';
             } else {
                 statusText = IS_BUILDER_VIEW
-                    ? 'CORE connection must be validated by an admin.'
+                    ? 'CORE connection must be verified by an admin.'
                     : 'Test the CORE connection to continue.';
                 className = 'text-warning';
             }
@@ -2167,6 +2238,22 @@ function updateProxmoxSummary(sidx) {
             coreClearBtn.disabled = IS_BUILDER_VIEW || !(coreVmKey || coreHost || coreUser || corePasswordRaw || coreSshHostRaw || coreHasSecret);
             if (IS_BUILDER_VIEW) {
                 coreClearBtn.title = 'Builder view is read-only. Ask an admin to clear CORE credentials.';
+            }
+        }
+
+        // Scenario-name "Clear" for Config HITL (only exists for the active scenario).
+        if (sidx === activeIdx) {
+            const hitlClearBtn = document.getElementById('scenarioNameHitlClearBtn');
+            if (hitlClearBtn) {
+                const hitlEnabled = !!hitl.enabled;
+                const hitlHasValues = (
+                    (Array.isArray(hitl.interfaces) && hitl.interfaces.length > 0)
+                    || (((hitl.participant_proxmox_url || '').toString().trim()).length > 0)
+                    || !!hitl.bridge_validated
+                    || (((core.internal_bridge || '').toString().trim()).length > 0)
+                    || (((core.internal_bridge_owner || '').toString().trim()).length > 0)
+                );
+                hitlClearBtn.disabled = (!hitlEnabled) || (!hitlHasValues);
             }
         }
         const summaryDetailEl = document.querySelector(`[data-hitl-core-summary="${sidx}"]`);
@@ -2232,7 +2319,8 @@ function updateProxmoxSummary(sidx) {
         if (availableSelect) {
             availableSelect.disabled = !(coreReady && step3Enabled);
         }
-        const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+        try { bindHostInterfacesToScenarioCache(sidx); } catch (e) {}
+        const hostInterfaces = getEffectiveHostInterfacesForScenario(sidx);
         const selectedNames = new Set((Array.isArray(hitl.interfaces) ? hitl.interfaces : []).map(entry => (entry && entry.name) ? String(entry.name) : '').filter(Boolean));
         const selectableInterfaces = hostInterfaces.filter(entry => {
             if (!entry || !entry.name || selectedNames.has(entry.name)) return false;
@@ -3893,6 +3981,12 @@ if (USE_LOCAL_EDITOR_STATE && !serverHasResult && persistedState && Array.isArra
                 'grpc_port',
                 'ssh_host',
                 'ssh_port',
+                // Persist last-known CORE VM interface enumeration across reloads.
+                'cached_host_interfaces',
+                'cached_host_interfaces_vm_key',
+                'cached_host_interfaces_source',
+                'cached_host_interfaces_metadata',
+                'cached_host_interfaces_fetched_at',
                 'cached_vm_interface_count',
                 'cached_vm_status',
             ];
@@ -6213,6 +6307,70 @@ document.addEventListener('DOMContentLoaded', () => {
         btn.addEventListener('click', async () => {
             if (btn.disabled) return;
             const originalHtml = btn.innerHTML;
+
+            // CORE VM select modal: verify first; only close on success.
+            if (buttonId === 'coreVmModalSaveBtn') {
+                try {
+                    btn.disabled = true;
+                    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Verifying…';
+                    const verifyRes = await verifyScenarioCoreSetup(activeIdx, { triggerButton: null });
+                    if (!verifyRes || verifyRes.ok !== true) {
+                        // Keep the modal open unless user presses Cancel.
+                        return;
+                    }
+                    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Saving…';
+                    await runSave();
+                    closeParentModal();
+                } catch (err) {
+                    const message = err && err.message ? err.message : (typeof err === 'string' ? err : 'Verify & Save failed');
+                    console.warn(`Modal verify/save failed: ${message}`);
+                    // Toasts are intentionally disabled on this page; fall back to an alert.
+                    try { alert(`Verify & Save failed: ${message}`); } catch (_) {}
+                } finally {
+                    btn.disabled = false;
+                    btn.innerHTML = originalHtml;
+                }
+                return;
+            }
+
+            // Config HITL modal: validate + apply + confirm; only close on success.
+            if (buttonId === 'externalIfxModalSaveBtn') {
+                try {
+                    btn.disabled = true;
+                    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Validating…';
+                    const validateRes = await verifyScenarioHitlBridge(activeIdx, { triggerButton: null });
+                    if (!validateRes || validateRes.ok !== true) {
+                        // Keep the modal open unless user presses Cancel.
+                        return;
+                    }
+
+                    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Applying…';
+                    const applyRes = await handleExternalIfxApply({ confirmUser: false, setBusy: false, autoSave: false });
+                    if (!applyRes || applyRes.ok !== true) {
+                        return;
+                    }
+
+                    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Confirming…';
+                    const confirmRes = await verifyScenarioHitlBridge(activeIdx, { triggerButton: null });
+                    if (!confirmRes || confirmRes.ok !== true) {
+                        return;
+                    }
+
+                    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Saving…';
+                    await runSave();
+                    closeParentModal();
+                } catch (err) {
+                    const message = err && err.message ? err.message : (typeof err === 'string' ? err : 'Validate & Save failed');
+                    console.warn(`Modal verify/save failed: ${message}`);
+                    // Toasts are intentionally disabled on this page; fall back to an alert.
+                    try { alert(`Validate & Save failed: ${message}`); } catch (_) {}
+                } finally {
+                    btn.disabled = false;
+                    btn.innerHTML = originalHtml;
+                }
+                return;
+            }
+
             btn.disabled = true;
             btn.innerHTML = busyHtml;
             try {
@@ -6515,12 +6673,20 @@ async function refreshHostInterfacesForScenario(sidx, options = {}) {
         }
         const interfaces = Array.isArray(data.interfaces) ? data.interfaces : [];
         state.host_interfaces = interfaces;
+        state.host_interfaces_vm_key = (coreState.vm_key || '').toString();
         state.host_interfaces_source = data.source || 'core_vm';
         state.host_interfaces_metadata = data.metadata || null;
         const fetchedAt = data.fetched_at || new Date().toISOString();
         state.host_interfaces_fetched_at = fetchedAt;
         coreState.last_interfaces_refresh = fetchedAt;
         coreState.last_interfaces_error = null;
+
+        // Persist per-scenario cache so interfaces survive reloads until VM is changed/cleared.
+        coreState.cached_host_interfaces = interfaces;
+        coreState.cached_host_interfaces_vm_key = (coreState.vm_key || '').toString();
+        coreState.cached_host_interfaces_source = state.host_interfaces_source;
+        coreState.cached_host_interfaces_metadata = state.host_interfaces_metadata;
+        coreState.cached_host_interfaces_fetched_at = fetchedAt;
         persistEditorState();
         hostInterfacesRetryCounters.delete(retryKey);
         const hidden = document.getElementById('scenarios_json');
@@ -6580,13 +6746,15 @@ async function refreshHostInterfacesForScenario(sidx, options = {}) {
 }
 
 function maybeAutoRefreshHitlInterfacesOnModalOpen(sidx) {
+    // (helper declarations live above; keep function order stable)
     const scenario = Number.isInteger(sidx) ? state.scenarios?.[sidx] : null;
     if (!scenario) return;
     const hitlState = ensureHitlStateForScenario(scenario);
     if (!isHitlAuthenticationReady(hitlState)) return;
     const coreState = hitlState.core || {};
     if (coreState.interfaces_refresh_inflight) return;
-    const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+    try { bindHostInterfacesToScenarioCache(sidx); } catch (e) {}
+    const hostInterfaces = getEffectiveHostInterfacesForScenario(sidx);
     const lastRefreshMs = Date.parse(coreState.last_interfaces_refresh || '');
     const hasError = !!coreState.last_interfaces_error;
     const shouldRefresh = (() => {
@@ -6603,6 +6771,44 @@ function maybeAutoRefreshHitlInterfacesOnModalOpen(sidx) {
     }).catch(err => console.warn('HITL modal auto-refresh failed', err));
 }
 
+function getEffectiveHostInterfacesForScenario(sidx) {
+    const scenario = Number.isInteger(sidx) ? state.scenarios?.[sidx] : null;
+    const hitlState = scenario ? ensureHitlStateForScenario(scenario) : null;
+    const coreState = hitlState && hitlState.core && typeof hitlState.core === 'object' ? hitlState.core : {};
+    const vmKey = (coreState.vm_key || '').toString();
+    const currentVmKey = (state.host_interfaces_vm_key || '').toString();
+    const current = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+    if (current.length && vmKey && currentVmKey === vmKey) {
+        return current;
+    }
+    const cached = Array.isArray(coreState.cached_host_interfaces) ? coreState.cached_host_interfaces : [];
+    const cachedVmKey = (coreState.cached_host_interfaces_vm_key || '').toString();
+    if (cached.length && vmKey && cachedVmKey === vmKey) {
+        return cached;
+    }
+    return current;
+}
+
+function bindHostInterfacesToScenarioCache(sidx) {
+    const scenario = Number.isInteger(sidx) ? state.scenarios?.[sidx] : null;
+    if (!scenario) return;
+    const hitlState = ensureHitlStateForScenario(scenario);
+    const coreState = (hitlState.core && typeof hitlState.core === 'object') ? hitlState.core : {};
+    const vmKey = (coreState.vm_key || '').toString();
+    if (!vmKey) return;
+    const cached = Array.isArray(coreState.cached_host_interfaces) ? coreState.cached_host_interfaces : [];
+    const cachedVmKey = (coreState.cached_host_interfaces_vm_key || '').toString();
+    if (!cached.length || cachedVmKey !== vmKey) return;
+    const currentVmKey = (state.host_interfaces_vm_key || '').toString();
+    const current = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+    if (current.length && currentVmKey === vmKey) return;
+    state.host_interfaces = cached;
+    state.host_interfaces_vm_key = vmKey;
+    state.host_interfaces_source = (coreState.cached_host_interfaces_source ?? state.host_interfaces_source ?? null);
+    state.host_interfaces_metadata = (coreState.cached_host_interfaces_metadata ?? state.host_interfaces_metadata ?? null);
+    state.host_interfaces_fetched_at = (coreState.cached_host_interfaces_fetched_at ?? state.host_interfaces_fetched_at ?? null);
+}
+
 function scheduleAutoRefreshHostInterfaces(sidx) {
     if (!HOST_INTERFACES_AUTO_REFRESH_ENABLED) return;
     const scenario = Number.isInteger(sidx) ? state.scenarios?.[sidx] : null;
@@ -6611,7 +6817,8 @@ function scheduleAutoRefreshHostInterfaces(sidx) {
     if (!hitlState.enabled) return;
     if (!isHitlAuthenticationReady(hitlState)) return;
     const coreState = hitlState.core || (hitlState.core = {});
-    const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+    try { bindHostInterfacesToScenarioCache(sidx); } catch (e) {}
+    const hostInterfaces = getEffectiveHostInterfacesForScenario(sidx);
     if (hostInterfaces.length) return;
     if (coreState.interfaces_refresh_inflight) return;
     const coreSecretId = typeof coreState.core_secret_id === 'string' ? coreState.core_secret_id.trim() : '';
@@ -6660,7 +6867,8 @@ function updateHitlStatusForScenario(sidx) {
         return;
     }
     const coreState = hitlState.core || {};
-    const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+    try { bindHostInterfacesToScenarioCache(sidx); } catch (e) {}
+    const hostInterfaces = getEffectiveHostInterfacesForScenario(sidx);
     const hasInterfaces = hostInterfaces.length > 0;
     const refreshBusy = coreState.interfaces_refresh_inflight === true;
     const lastAttemptStr = coreState.last_interfaces_attempt;
@@ -6902,15 +7110,20 @@ function setExternalIfxApplyBusy(isBusy, label = 'Applying…') {
     }
 }
 
-async function handleExternalIfxApply() {
+async function handleExternalIfxApply(options = {}) {
+    const { confirmUser = true, setBusy = true, autoSave = true } = options || {};
     const bridgeName = computeInternalBridgeName();
     logInfo(`External IFX apply initiated for bridge ${bridgeName}`);
-    const message = `This will create a new internal bridge named "${bridgeName}" and use it to connect the CORE VM with the selected VM.\n\nDo you want to continue?`;
-    if (!window.confirm(message)) {
-        logInfo('External IFX apply cancelled by user');
-        return;
+    if (confirmUser) {
+        const message = `This will create a new internal bridge named "${bridgeName}" and use it to connect the CORE VM with the selected VM.\n\nDo you want to continue?`;
+        if (!window.confirm(message)) {
+            logInfo('External IFX apply cancelled by user');
+            return { ok: false, cancelled: true, message: 'Cancelled' };
+        }
     }
-    setExternalIfxApplyBusy(true);
+    if (setBusy) {
+        setExternalIfxApplyBusy(true);
+    }
     updateExternalIfxStatus(`Applying bridge "${bridgeName}"…`, 'info', { busy: true });
     try {
         const { idx, scenario, name: scenarioName } = getActiveScenarioContext();
@@ -6919,7 +7132,7 @@ async function handleExternalIfxApply() {
             logWarn('External IFX apply failed: active scenario not found');
             updateExternalIfxStatus(failureMessage, 'danger');
             try { showToast('Unable to determine active scenario for Apply.', { autohide: true, delay: 2500 }); } catch (e) {}
-            return;
+            return { ok: false, message: failureMessage };
         }
 
         logInfo(`External IFX apply context resolved for scenario ${idx} (${scenarioName || 'unnamed'})`);
@@ -6936,7 +7149,8 @@ async function handleExternalIfxApply() {
             }
             return '';
         };
-        const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+        try { bindHostInterfacesToScenarioCache(idx); } catch (e) {}
+        const hostInterfaces = getEffectiveHostInterfacesForScenario(idx);
         const hostInfoLookup = new Map(
             hostInterfaces
                 .filter(item => item && typeof item === 'object' && item.name)
@@ -7107,7 +7321,11 @@ async function handleExternalIfxApply() {
             logWarn(`External IFX apply blocked: no Proxmox adapter chosen for ${missingCore.join(', ')}`);
             updateExternalIfxStatus(detailMessage, 'warning', { busy: false });
             try { showToast(detailMessage, { autohide: false }); } catch (e) {}
-            return;
+            try { delete hitlState.bridge_validated; } catch (e) {}
+            try { persistEditorState(); } catch (e) {}
+            try { updateProxmoxSummary(idx); } catch (e) {}
+            try { renderMain(); } catch (e) {}
+            return { ok: false, message: detailMessage };
         }
         const requestPayload = {
             bridge_name: bridgeName,
@@ -7137,7 +7355,11 @@ async function handleExternalIfxApply() {
             logError(`External IFX apply failed: ${errMessage}`);
             updateExternalIfxStatus(errMessage, 'danger');
             try { showToast(errMessage, { autohide: false }); } catch (e) {}
-            return;
+            try { delete hitlState.bridge_validated; } catch (e) {}
+            try { persistEditorState(); } catch (e) {}
+            try { updateProxmoxSummary(idx); } catch (e) {}
+            try { renderMain(); } catch (e) {}
+            return { ok: false, message: errMessage, data };
         }
 
         const appliedBridgeName = data.bridge_name || bridgeName;
@@ -7166,7 +7388,7 @@ async function handleExternalIfxApply() {
             updateExternalIfxStatus(`${successMessage}\n${warningText}`, 'warning');
             try { showToast(warningText, { autohide: false }); } catch (e) {}
         }
-        window.setTimeout(() => {
+        if (autoSave) window.setTimeout(() => {
             const fallbackSubmit = () => {
                 const editorForm = document.getElementById('editorForm');
                 try {
@@ -7196,6 +7418,8 @@ async function handleExternalIfxApply() {
                 }
             })();
         }, 300);
+
+        return { ok: true, message: successMessage, data };
     } catch (err) {
         try {
             const detail = err && err.stack ? err.stack : (err && err.toString ? err.toString() : 'unknown error');
@@ -7205,8 +7429,11 @@ async function handleExternalIfxApply() {
         logError(`External IFX apply failed: ${errMessage}`);
         updateExternalIfxStatus(errMessage, 'danger');
         try { showToast(errMessage, { autohide: false }); } catch (e) {}
+        return { ok: false, message: errMessage };
     } finally {
-        setExternalIfxApplyBusy(false);
+        if (setBusy) {
+            setExternalIfxApplyBusy(false);
+        }
     }
 }
 
@@ -7324,12 +7551,29 @@ async function verifyScenarioCoreSetup(sidx, options = {}) {
         verifySetStatus('Checking prerequisites…');
         verifyLog(`Scenario ${sidx + 1}: checking Proxmox + CORE settings`);
 
+        const markCoreVerifyFailed = (message) => {
+            try {
+                core.validated = false;
+                persistEditorState();
+                const hidden = document.getElementById('scenarios_json');
+                if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+                updateProxmoxSummary(sidx);
+                renderMain();
+            } catch (e) {}
+            try {
+                if (message) {
+                    showToast(message, { autohide: false });
+                }
+            } catch (e) {}
+        };
+
         // Step 1: Proxmox must be validated & stored.
         const proxHasStored = !!(prox.validated && prox.secret_id);
         if (!proxHasStored) {
             const msg = 'Validate Proxmox credentials (Step 1) before verifying CORE.';
             verifyLog(`FAILED: ${msg}`);
             verifyFinish({ ok: false, message: msg });
+            markCoreVerifyFailed(msg);
             return { ok: false, message: msg };
         }
 
@@ -7339,6 +7583,46 @@ async function verifyScenarioCoreSetup(sidx, options = {}) {
             const msg = 'Select a CORE VM (Step 2) before verifying CORE.';
             verifyLog(`FAILED: ${msg}`);
             verifyFinish({ ok: false, message: msg });
+            markCoreVerifyFailed(msg);
+            return { ok: false, message: msg };
+        }
+
+        // Confirm the selected VM exists in the current Proxmox inventory (and has interfaces).
+        try {
+            verifySetStatus('Checking selected CORE VM…');
+            const ensureInventory = async () => {
+                const inv = prox.inventory && typeof prox.inventory === 'object' ? prox.inventory : null;
+                const vms = inv && Array.isArray(inv.vms) ? inv.vms : [];
+                if (vms.length) return vms;
+                verifyLog('Proxmox inventory not loaded; fetching now…');
+                verifySetStatus('Loading Proxmox inventory…');
+                const fetched = await fetchProxmoxInventory(sidx, { force: false });
+                const vms2 = fetched && Array.isArray(fetched.vms) ? fetched.vms : [];
+                return vms2;
+            };
+            const vms = await ensureInventory();
+            const selectedVm = vms.find(vm => `${vm?.node ?? ''}::${vm?.vmid ?? ''}` === vmKey) || null;
+            if (!selectedVm) {
+                const msg = 'Selected CORE VM is not present in the current Proxmox inventory. Refresh the VM list and re-select the VM.';
+                verifyLog(`FAILED: ${msg}`);
+                verifyFinish({ ok: false, message: msg });
+                markCoreVerifyFailed(msg);
+                return { ok: false, message: msg };
+            }
+            const ifaceCount = Array.isArray(selectedVm.interfaces) ? selectedVm.interfaces.length : null;
+            if (ifaceCount !== null && ifaceCount < 1) {
+                const msg = 'Selected CORE VM reports zero interfaces in Proxmox. Add at least one interface and refresh the VM list.';
+                verifyLog(`FAILED: ${msg}`);
+                verifyFinish({ ok: false, message: msg });
+                markCoreVerifyFailed(msg);
+                return { ok: false, message: msg };
+            }
+            verifyLog(`Selected CORE VM present in inventory: ${selectedVm.name || selectedVm.vmid || vmKey}`);
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : 'Unable to confirm CORE VM in Proxmox inventory.';
+            verifyLog(`FAILED: ${msg}`);
+            verifyFinish({ ok: false, message: msg });
+            markCoreVerifyFailed(msg);
             return { ok: false, message: msg };
         }
 
@@ -7354,6 +7638,7 @@ async function verifyScenarioCoreSetup(sidx, options = {}) {
             const msg = 'Complete Step 2 connection details (gRPC host/port, SSH host/port, SSH user, and password) before verifying.';
             verifyLog(`FAILED: ${msg}`);
             verifyFinish({ ok: false, message: msg });
+            markCoreVerifyFailed(msg);
             return { ok: false, message: msg };
         }
 
@@ -7393,6 +7678,58 @@ async function verifyScenarioCoreSetup(sidx, options = {}) {
         });
 
         if (result && result.ok) {
+            // Ensure the CORE VM host interface catalog is loaded and consistent.
+            try {
+                verifySetStatus('Loading CORE VM interfaces…');
+                const refreshRes = await refreshHostInterfacesForScenario(sidx, {
+                    reason: 'core_verify',
+                    silent: true,
+                    timeoutMs: HOST_INTERFACES_REQUEST_TIMEOUT_MS,
+                    setStatus: (message, tone) => {
+                        try { verifyLog(`[interfaces] ${message}`); } catch (_) {}
+                    },
+                });
+                if (!refreshRes || !refreshRes.ok) {
+                    const msg = (refreshRes && refreshRes.message) ? refreshRes.message : 'Failed to load CORE VM interfaces.';
+                    verifyLog(`FAILED: ${msg}`);
+                    verifyFinish({ ok: false, message: msg });
+                    markCoreVerifyFailed(msg);
+                    return { ok: false, message: msg };
+                }
+                try { bindHostInterfacesToScenarioCache(sidx); } catch (e) {}
+                const catalog = getEffectiveHostInterfacesForScenario(sidx);
+                if (!Array.isArray(catalog) || catalog.length < 1) {
+                    const msg = 'CORE VM interface catalog is empty. Refresh interfaces and retry verification.';
+                    verifyLog(`FAILED: ${msg}`);
+                    verifyFinish({ ok: false, message: msg });
+                    markCoreVerifyFailed(msg);
+                    return { ok: false, message: msg };
+                }
+
+                // If Step 3 already has selected interfaces, confirm they still exist.
+                const selected = Array.isArray(hitlState.interfaces) ? hitlState.interfaces : [];
+                const selectedNames = selected
+                    .map(entry => (entry && entry.name) ? String(entry.name).trim() : '')
+                    .filter(Boolean);
+                if (selectedNames.length) {
+                    const catalogNames = new Set(catalog.map(item => (item && item.name) ? String(item.name).trim() : '').filter(Boolean));
+                    const missing = selectedNames.filter(name => !catalogNames.has(name));
+                    if (missing.length) {
+                        const msg = `One or more selected HITL interfaces no longer exist on the CORE VM: ${missing.join(', ')}`;
+                        verifyLog(`FAILED: ${msg}`);
+                        verifyFinish({ ok: false, message: msg });
+                        markCoreVerifyFailed(msg);
+                        return { ok: false, message: msg };
+                    }
+                }
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : 'Failed while validating CORE VM interface catalog.';
+                verifyLog(`FAILED: ${msg}`);
+                verifyFinish({ ok: false, message: msg });
+                markCoreVerifyFailed(msg);
+                return { ok: false, message: msg };
+            }
+
             let hasAdvancedFailures = false;
             try {
                 const advObj = result.data && result.data.advanced_checks;
@@ -7418,6 +7755,7 @@ async function verifyScenarioCoreSetup(sidx, options = {}) {
         const failMsg = (result && result.message) ? result.message : 'CORE verification failed.';
         verifyLog(`FAILED: ${failMsg}`);
         verifyFinish({ ok: false, message: failMsg });
+        markCoreVerifyFailed(failMsg);
         return result;
     } finally {
         restore();
@@ -7452,15 +7790,48 @@ async function clearScenarioCoreVmSelection(sidx, options = {}) {
         const scenario = state.scenarios[sidx];
         const hitl = ensureHitlStateForScenario(scenario);
         const core = hitl.core || (hitl.core = {});
+        const oldVmKey = (core.vm_key || '').toString();
 
         // Clear Step 2 selection.
         delete core.vm_key;
         delete core.vm_name;
         delete core.vm_node;
         delete core.vmid;
+
+        // Clear connection + verification fields shown in the Step 2 table.
+        core.grpc_host = '';
+        core.grpc_port = 50051;
+        core.venv_bin = '';
+        core.ssh_host = '';
+        core.ssh_port = 22;
+        core.ssh_username = '';
+        core.ssh_password = '';
+        core.core_secret_id = null;
+        core.validated = false;
+        core.last_validated_at = null;
+        core.stored_summary = null;
+        core.last_tested_at = null;
+        core.last_tested_status = null;
+        core.last_tested_message = null;
+        core.last_tested_host = null;
+        core.last_tested_port = null;
+
         delete core.cached_vm_interface_count;
         delete core.cached_vm_status;
+        delete core.cached_host_interfaces;
+        delete core.cached_host_interfaces_vm_key;
+        delete core.cached_host_interfaces_source;
+        delete core.cached_host_interfaces_metadata;
+        delete core.cached_host_interfaces_fetched_at;
         delete hitl.bridge_validated;
+
+        if (oldVmKey && (state.host_interfaces_vm_key || '').toString() === oldVmKey) {
+            state.host_interfaces = [];
+            state.host_interfaces_vm_key = '';
+            state.host_interfaces_source = null;
+            state.host_interfaces_metadata = null;
+            state.host_interfaces_fetched_at = null;
+        }
 
         // Clearing the CORE VM invalidates downstream mappings/bridge settings.
         hitl.enabled = false;
@@ -7678,6 +8049,22 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
         }
     };
 
+    const markHitlVerifyFailed = (message) => {
+        try {
+            delete hitlState.bridge_validated;
+            persistEditorState();
+            const hidden = document.getElementById('scenarios_json');
+            if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+            updateProxmoxSummary(sidx);
+            renderMain();
+        } catch (e) {}
+        try {
+            if (message) {
+                showToast(message, { autohide: false });
+            }
+        } catch (e) {}
+    };
+
     try {
         verifyResetUi({ title: 'Verify HITL Bridge Setup' });
         verifySetStatus('Checking prerequisites…');
@@ -7688,6 +8075,7 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
             const msg = 'Validate Proxmox credentials (Step 1) before verifying HITL.';
             verifyLog(`FAILED: ${msg}`);
             verifyFinish({ ok: false, message: msg });
+            markHitlVerifyFailed(msg);
             return { ok: false, message: msg };
         }
         const vmKey = (coreState.vm_key || '').toString().trim();
@@ -7695,6 +8083,7 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
             const msg = 'Select a CORE VM (Step 2) before verifying HITL.';
             verifyLog(`FAILED: ${msg}`);
             verifyFinish({ ok: false, message: msg });
+            markHitlVerifyFailed(msg);
             return { ok: false, message: msg };
         }
         const coreHasSecret = typeof coreState.core_secret_id === 'string' && coreState.core_secret_id.trim();
@@ -7702,12 +8091,14 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
             const msg = 'Store CORE credentials (Step 2) before verifying HITL.';
             verifyLog(`FAILED: ${msg}`);
             verifyFinish({ ok: false, message: msg });
+            markHitlVerifyFailed(msg);
             return { ok: false, message: msg };
         }
         if (!hitlState.enabled) {
             const msg = 'Enable Hardware in the Loop (Step 3) before verifying HITL.';
             verifyLog(`FAILED: ${msg}`);
             verifyFinish({ ok: false, message: msg });
+            markHitlVerifyFailed(msg);
             return { ok: false, message: msg };
         }
         const proxInventoryBusy = proxInventoryFetchInFlight && typeof proxInventoryFetchInFlight.has === 'function'
@@ -7718,12 +8109,14 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
             const msg = 'Wait for the Proxmox VM inventory fetch to finish before verifying HITL.';
             verifyLog(`FAILED: ${msg}`);
             verifyFinish({ ok: false, message: msg });
+            markHitlVerifyFailed(msg);
             return { ok: false, message: msg };
         }
         if (proxInventoryError) {
             const msg = `Resolve Proxmox inventory error before verifying HITL: ${proxInventoryError}`;
             verifyLog(`FAILED: ${msg}`);
             verifyFinish({ ok: false, message: msg });
+            markHitlVerifyFailed(msg);
             return { ok: false, message: msg };
         }
 
@@ -7732,7 +8125,8 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
         // Step 3 (interfaces cannot be added reliably until the catalog is loaded).
         try {
             if (isHitlAuthenticationReady(hitlState)) {
-                const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+                try { bindHostInterfacesToScenarioCache(sidx); } catch (e) {}
+                const hostInterfaces = getEffectiveHostInterfacesForScenario(sidx);
                 const lastRefreshMs = Date.parse(coreState.last_interfaces_refresh || '');
                 const hasError = !!coreState.last_interfaces_error;
                 const shouldRefresh = (() => {
@@ -7773,6 +8167,7 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
             const msg = 'Add at least one HITL interface (Step 3) before verifying.';
             verifyLog(`FAILED: ${msg}`);
             verifyFinish({ ok: false, message: msg });
+            markHitlVerifyFailed(msg);
             return { ok: false, message: msg };
         }
         const extSelections = ifaces.filter(iface => iface?.external_vm && (iface.external_vm.vm_key || iface.external_vm.vmid || iface.external_vm.vm_name)).length;
@@ -7781,12 +8176,14 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
             const msg = 'Map at least one HITL interface to an external VM (Step 4) before verifying.';
             verifyLog(`FAILED: ${msg}`);
             verifyFinish({ ok: false, message: msg });
+            markHitlVerifyFailed(msg);
             return { ok: false, message: msg };
         }
         if (extSelectionsWithIface <= 0) {
             const msg = 'Select an external VM interface (for example, net0) in Step 4 before verifying.';
             verifyLog(`FAILED: ${msg}`);
             verifyFinish({ ok: false, message: msg });
+            markHitlVerifyFailed(msg);
             return { ok: false, message: msg };
         }
         const storedBridge = (coreState.internal_bridge || '').toString().trim();
@@ -7795,6 +8192,7 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
             const msg = 'Unable to compute internal bridge name.';
             verifyLog(`FAILED: ${msg}`);
             verifyFinish({ ok: false, message: msg });
+            markHitlVerifyFailed(msg);
             return { ok: false, message: msg };
         }
 
@@ -7804,7 +8202,8 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
             : `Using computed bridge: ${bridgeName}`);
 
         // Reuse the same sanitization logic as Apply.
-        const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+        try { bindHostInterfacesToScenarioCache(sidx); } catch (e) {}
+        const hostInterfaces = getEffectiveHostInterfacesForScenario(sidx);
         const hostInfoLookup = new Map(
             hostInterfaces
                 .filter(item => item && typeof item === 'object' && item.name)
@@ -7979,6 +8378,7 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
                 : `Select a Proxmox adapter (for example, net0) in Step 3 for: ${missingCore.join(', ')}.`;
             verifyLog(`FAILED: ${detailMessage}`);
             verifyFinish({ ok: false, message: detailMessage });
+            markHitlVerifyFailed(detailMessage);
             return { ok: false, message: detailMessage };
         }
 
@@ -8009,6 +8409,7 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
             const errMessage = (data && (data.error || data.message)) ? (data.error || data.message) : `HITL verification failed (HTTP ${resp.status})`;
             verifyLog(`FAILED: ${errMessage}`);
             verifyFinish({ ok: false, message: errMessage });
+            markHitlVerifyFailed(errMessage);
             return { ok: false, message: errMessage, data };
         }
 
@@ -8034,6 +8435,7 @@ async function verifyScenarioHitlBridge(sidx, options = {}) {
         const message = err instanceof Error ? err.message : 'HITL verification failed';
         verifyLog(`FAILED: ${message}`);
         verifyFinish({ ok: false, message });
+        markHitlVerifyFailed(message);
         return { ok: false, message };
     } finally {
         restore();
@@ -8270,6 +8672,7 @@ async function validateCoreConnection(sidx, options = {}) {
     const originalLabel = button?.textContent;
     if (!vmKey) {
         const message = 'Select a CORE VM before testing the connection.';
+        try { coreState.validated = false; } catch (e) {}
         if (statusEl) {
             statusEl.textContent = message;
             statusEl.classList.remove('text-success', 'text-warning', 'text-danger', 'text-muted');
@@ -8497,6 +8900,8 @@ async function validateCoreConnection(sidx, options = {}) {
         coreState.last_tested_at = nowIso;
         coreState.last_tested_host = coreState.grpc_host || '';
         coreState.last_tested_port = coreState.grpc_port || null;
+        // A failed verification should disable Step 3 entry points until re-verified.
+        coreState.validated = false;
         state.core_last_test_status = 'failure';
         state.core_last_test_host = coreState.last_tested_host;
         state.core_last_test_port = coreState.last_tested_port;
@@ -8543,6 +8948,8 @@ async function validateCoreConnection(sidx, options = {}) {
         coreState.last_tested_at = new Date().toISOString();
         coreState.last_tested_host = coreState.grpc_host || '';
         coreState.last_tested_port = coreState.grpc_port || null;
+        // A failed verification should disable Step 3 entry points until re-verified.
+        coreState.validated = false;
         state.core_last_test_status = 'failure';
         state.core_last_test_host = coreState.last_tested_host;
         state.core_last_test_port = coreState.last_tested_port;
@@ -9155,15 +9562,7 @@ function renderSidebar() {
     }
     if (configHitlBtn && !configHitlBtn.dataset.hitlModalBound) {
         configHitlBtn.addEventListener('click', () => {
-            if (configHitlBtn.disabled) {
-                const hint = configHitlBtn.getAttribute('title') || 'Complete Steps 1 and 2 first.';
-                if (typeof showToast === 'function') {
-                    showToast(hint, { autohide: true, delay: 2500 });
-                } else if (window.alert) {
-                    window.alert(hint);
-                }
-                return;
-            }
+            if (configHitlBtn.disabled) return;
             if (!configHitlModalEl || !window.bootstrap) return;
             const modalInstance = bootstrap.Modal.getInstance(configHitlModalEl) || new bootstrap.Modal(configHitlModalEl, { backdrop: true, keyboard: true });
             maybeAutoRefreshHitlInterfacesOnModalOpen(activeIdx);
@@ -9175,6 +9574,16 @@ function renderSidebar() {
 }
 
 function renderMain() {
+    // Dispose any tooltips attached to scenario-specific UI before re-rendering.
+    try {
+        _hideDisposeTooltip(document.getElementById('configHitlBtnWrap'));
+        _hideDisposeTooltip(document.getElementById('scenarioNameConfigHitlBtnWrap'));
+        const meta = document.getElementById('scenarioMetaCard');
+        if (meta) {
+            meta.querySelectorAll('[data-bs-toggle="tooltip"]').forEach((el) => _hideDisposeTooltip(el));
+        }
+    } catch (e) {}
+
     const root = document.getElementById('editorRoot');
     root.innerHTML = '';
     // Always clear any scenario-specific cards that may have been injected outside
@@ -9196,6 +9605,7 @@ function renderMain() {
 
     if (!state.scenarios.length) { return; }
     const scen = state.scenarios[activeIdx] || state.scenarios[0];
+    try { bindHostInterfacesToScenarioCache(activeIdx); } catch (e) {}
     const escapeHtml = (value) => (value ?? '').toString()
         .replace(/&/g,'&amp;')
         .replace(/</g,'&lt;')
@@ -9204,6 +9614,19 @@ function renderMain() {
         .replace(/'/g,'&#39;');
     const safeScenarioName = escapeHtml(scen?.name || '');
     const defaultScenarioName = escapeHtml(`Scenario ${activeIdx + 1}`);
+
+    // Scenario-name card button enablement (Config HITL Clear).
+    const metaHitlState = ensureHitlStateForScenario(scen);
+    const metaCoreState = metaHitlState.core || {};
+    const metaHitlEnabled = !!metaHitlState.enabled;
+    const metaHitlHasValues = (
+        (Array.isArray(metaHitlState.interfaces) && metaHitlState.interfaces.length > 0)
+        || (((metaHitlState.participant_proxmox_url || '').toString().trim()).length > 0)
+        || !!metaHitlState.bridge_validated
+        || (((metaCoreState.internal_bridge || '').toString().trim()).length > 0)
+        || (((metaCoreState.internal_bridge_owner || '').toString().trim()).length > 0)
+    );
+    const metaHitlClearDisabled = (!metaHitlEnabled) || (!metaHitlHasValues);
 
     // Refresh persisted section collapse state (per scenario + section) early,
     // before any of the per-card collapse reads.
@@ -9264,7 +9687,7 @@ function renderMain() {
                                             <div class="d-flex flex-column gap-2">
                                                 <div id="scenarioNameHitlBtnSlot"></div>
                                                 <button type="button" class="btn btn-outline-secondary hitl-entry-btn" id="scenarioNameHitlVerifyBtn" title="Verify HITL bridge settings">Verify</button>
-                                                <button type="button" class="btn btn-outline-danger hitl-entry-btn" id="scenarioNameHitlClearBtn" title="Clear HITL interface mappings and bridge settings">Clear</button>
+                                                <button type="button" class="btn btn-outline-danger hitl-entry-btn" id="scenarioNameHitlClearBtn" title="Clear HITL interface mappings and bridge settings" ${metaHitlClearDisabled ? 'disabled' : ''}>Clear</button>
                                             </div>
                                         </td>
                                         <td>
@@ -9292,6 +9715,10 @@ function renderMain() {
         const hitlBtnSlot = document.getElementById('scenarioNameHitlBtnSlot');
         const makeProxyBtn = (originalBtn, proxyId) => {
             if (!originalBtn) return null;
+            const wrap = document.createElement('span');
+            wrap.className = 'd-inline-block w-100';
+            wrap.tabIndex = 0;
+            wrap.id = `${proxyId}Wrap`;
             const btn = document.createElement('button');
             btn.type = 'button';
             btn.id = proxyId;
@@ -9300,11 +9727,15 @@ function renderMain() {
             btn.disabled = !!originalBtn.disabled;
             const title = originalBtn.getAttribute('title');
             if (title) btn.setAttribute('title', title);
+            if (btn.disabled && title) {
+                _ensureHoverOnlyTooltip(wrap, title);
+            }
             btn.addEventListener('click', (ev) => {
                 ev.preventDefault();
                 try { originalBtn.click(); } catch (e) {}
             });
-            return btn;
+            wrap.appendChild(btn);
+            return wrap;
         };
         try {
             if (coreBtnSlot && selectCoreVmBtnEl) {
@@ -9330,7 +9761,7 @@ function renderMain() {
             if (!cfgBtn.disabled) {
                 cfgBtn.setAttribute('title', 'Optional: Configure HITL interfaces and participant VM mappings for this scenario.');
             } else if (!cfgBtn.getAttribute('title')) {
-                cfgBtn.setAttribute('title', 'Complete Steps 1 and 2 first.');
+                cfgBtn.setAttribute('title', 'CORE VM has to be selected/verified');
             }
         }
     } catch (e) {}
@@ -9373,7 +9804,8 @@ function renderMain() {
     removeExistingCard('scenarioHitlCoreCard');
     removeExistingCard('scenarioHitlConfigCard');
 
-    const hostInterfaces = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+    try { bindHostInterfacesToScenarioCache(activeIdx); } catch (e) {}
+    const hostInterfaces = getEffectiveHostInterfacesForScenario(activeIdx);
     const hitl = ensureHitlStateForScenario(scen);
     const proxmox = hitl.proxmox || { url: '', port: 8006, username: '', password: '' };
     const participantProxmoxUrlRaw = (hitl.participant_proxmox_url || '').toString();
@@ -9792,17 +10224,17 @@ function renderMain() {
                     }
                     if (sectionEl) sectionEl.classList.add('border-secondary');
                 } else {
-                // Make it obvious if configured/validated/ready.
+                // Make it obvious if configured/verified/ready.
                 clearStatusClasses();
                 if (hitlReady || (coreValidated && !hitlConfigured)) {
                     if (badgeEl) {
-                        badgeEl.textContent = hitlReady ? 'Ready' : 'Validated';
+                        badgeEl.textContent = hitlReady ? 'Ready' : 'Verified';
                         badgeEl.classList.add('text-bg-success');
                     }
                     if (sectionEl) sectionEl.classList.add('border-success');
                 } else if ((coreConfigured && !coreValidated) || (hitlEnabled && !hitlReady) || (hitlConfigured && !hitlReady)) {
                     if (badgeEl) {
-                        badgeEl.textContent = 'Needs validation';
+                        badgeEl.textContent = 'Needs verification';
                         badgeEl.classList.add('text-bg-warning');
                     }
                     if (sectionEl) sectionEl.classList.add('border-warning');
@@ -9844,7 +10276,7 @@ function renderMain() {
                             // Emphasize key words in a safe way by applying replacements after escaping.
                             vEsc = vEsc
                                 .replace(/\bReady\b/g, '<span class="fw-bold">Ready</span>')
-                                .replace(/\bValidated\b/g, '<span class="fw-bold">Validated</span>');
+                                .replace(/\bVerified\b/g, '<span class="fw-bold">Verified</span>');
                         }
 
                         return `<tr><th class="fw-semibold" style="width: 160px;">${esc(k)}</th><td class="text-body">${icon} <span>${vEsc}</span></td></tr>`;
@@ -9854,9 +10286,9 @@ function renderMain() {
 
                 const coreRows = [];
                 const coreStatusLabel = coreValidated
-                    ? (IS_BUILDER_VIEW ? 'Validated by admin' : 'Validated')
+                    ? (IS_BUILDER_VIEW ? 'Verified by admin' : 'Verified')
                     : (coreConfigured
-                        ? (IS_BUILDER_VIEW ? 'Configured by admin' : 'Configured (not validated)')
+                        ? (IS_BUILDER_VIEW ? 'Configured by admin' : 'Configured (not verified)')
                         : 'Not configured');
                 coreRows.push(['Status', coreStatusLabel, coreValidated ? 'ok' : (coreConfigured ? 'partial' : 'no')]);
 
@@ -9882,11 +10314,11 @@ function renderMain() {
                 coreRows.push(['gRPC', coreHost ? `${coreHost}:${corePort}` : 'Not set', coreHost ? 'ok' : 'no']);
                 if (IS_BUILDER_VIEW) {
                     const sshUserLabel = coreHasSecret
-                        ? (coreValidated ? 'Not set in builder view — Validated by admin' : 'Not set in builder view — Managed by admin')
+                        ? (coreValidated ? 'Not set in builder view — Verified by admin' : 'Not set in builder view — Managed by admin')
                         : 'Not set in builder view';
                     coreRows.push(['SSH User', sshUserLabel, coreHasSecret ? (coreValidated ? 'ok' : 'partial') : 'no']);
                 } else {
-                    coreRows.push(['SSH User', coreUser ? `${coreUser} — ${coreValidated ? 'Validated' : 'Not validated'}` : 'Not set', coreUser ? (coreValidated ? 'ok' : 'partial') : 'no']);
+                    coreRows.push(['SSH User', coreUser ? `${coreUser} — ${coreValidated ? 'Verified' : 'Not verified'}` : 'Not set', coreUser ? (coreValidated ? 'ok' : 'partial') : 'no']);
                 }
                 coreSummaryEl.innerHTML = renderKvTable(coreTouched ? coreRows : [], 'Not configured');
 
@@ -10074,6 +10506,14 @@ function renderMain() {
         : '<option disabled value="">All discovered interfaces selected</option>';
     const step3Enabled = hitlToggleWasEnabled && hitlAuthReady;
     const step3Disabled = !step3Enabled;
+    // Step 5 should remain disabled until Step 3 is enabled and Step 4 has at least
+    // one complete participant VM + interface selection.
+    const step5Enabled = !!(
+        step3Enabled
+        && extSelectionsWithIface > 0
+        && extSelectionsWithIface === extSelections
+    );
+    const step5Disabled = !step5Enabled;
     const step3ToggleDisabledAttr = hitlAuthReady ? '' : 'disabled';
     const step3ToggleTooltipAttr = hitlAuthReady ? '' : 'data-bs-toggle="tooltip" data-bs-title="Validate Steps 1 and 2 before enabling Hardware in the Loop."';
     const step3ToggleCheckedAttr = hitlToggleWasEnabled ? 'checked' : '';
@@ -10534,6 +10974,7 @@ function renderMain() {
     const coreInputsDisabled = !(proxValidated && coreVmKey);
     const testBtnDisabledAttr = coreTestable ? '' : 'disabled';
     const configureBtnDisabledAttr = (!coreVmKey || !proxValidated || proxInventoryBusy) ? 'disabled' : '';
+    const coreVmVerified = !!(core && core.validated === true && coreHasSecret && !!coreVmKey);
         const coreConnectionSummaryHtml = (() => {
             if (IS_BUILDER_VIEW) {
                 const summaryBody = coreVmKey
@@ -10662,13 +11103,7 @@ function renderMain() {
             <fieldset class="hitl-step-fieldset ${step3Disabled ? 'hitl-step-disabled' : ''}" ${step3Disabled ? 'disabled' : ''} data-hitl-step4-body>
                 ${step4Content}
             </fieldset>
-            ${(() => {
-                const applyDisabledAttr = (step4BlockingItems.length === 0) ? '' : 'disabled';
-                return `
-                    <div class="d-flex justify-content-end mt-2">
-                        <button type="button" class="btn btn-primary" data-hitl-apply data-scen-idx="${activeIdx}" ${applyDisabledAttr}>Apply</button>
-                    </div>`;
-            })()}
+            <div class="text-center small text-muted mt-2">▼ Step 5 below</div>
         </div>`;
     const participantUrlStatusClass = participantProxmoxUrlHasValue ? 'text-success' : 'text-muted';
     const participantUrlStatusText = participantProxmoxUrlHasValue
@@ -10676,20 +11111,22 @@ function renderMain() {
         : PARTICIPANT_STATUS_EMPTY_TEXT;
     const part5SectionHtml = `
         <div data-hitl-part="5">
-            <h6 class="mb-2">Part 5 — Participant UI</h6>
+            <h6 class="mb-2">Step 5 — Participant UI (optional)</h6>
             <div class="form-text mb-3">Paste the Proxmox console or landing URL that participants should use. This adds the Participant UI navigation tab and links the HITL interface entry so facilitators and players open the same console.</div>
-            <div class="mb-3">
-                <label class="form-label small" for="participantProxmoxUrl_${activeIdx}">Participant UI URL</label>
-                <input type="url" class="form-control form-control-sm" id="participantProxmoxUrl_${activeIdx}" placeholder="https://proxmox.example.local" autocomplete="url" data-hitl-participant-url data-scen-idx="${activeIdx}" value="${participantProxmoxUrlHtml}">
-                <div class="form-text">Accepts HTTP or HTTPS targets, including console paths.</div>
-                <div class="form-text">The Apply button pins this URL to the editor and navigation tab, while Clear removes the Participant shortcut.</div>
-                <div class="small ${participantUrlStatusClass} mt-2" data-hitl-participant-status="${activeIdx}">${escapeHtml(participantUrlStatusText)}</div>
-            </div>
-            <div class="d-flex flex-wrap gap-2">
-                <button type="button" class="btn btn-sm btn-outline-primary" data-hitl-participant-apply data-scen-idx="${activeIdx}">Apply Participant URL</button>
-                <button type="button" class="btn btn-sm btn-outline-secondary" data-hitl-participant-clear data-scen-idx="${activeIdx}" ${participantProxmoxUrlHasValue ? '' : 'disabled'}>Clear Participant URL</button>
-            </div>
-            <div class="small text-muted mt-2" data-hitl-participant-feedback="${activeIdx}"></div>
+            <fieldset class="hitl-step-fieldset ${step5Disabled ? 'hitl-step-disabled' : ''}" ${step5Disabled ? 'disabled' : ''} data-hitl-step5-body>
+                <div class="mb-3">
+                    <label class="form-label small" for="participantProxmoxUrl_${activeIdx}">Participant UI URL</label>
+                    <input type="url" class="form-control form-control-sm" id="participantProxmoxUrl_${activeIdx}" placeholder="https://proxmox.example.local" autocomplete="url" data-hitl-participant-url data-scen-idx="${activeIdx}" value="${participantProxmoxUrlHtml}">
+                    <div class="form-text">Accepts HTTP or HTTPS targets, including console paths.</div>
+                    <div class="form-text">The Apply button pins this URL to the editor and navigation tab, while Clear removes the Participant shortcut.</div>
+                    <div class="small ${participantUrlStatusClass} mt-2" data-hitl-participant-status="${activeIdx}">${escapeHtml(participantUrlStatusText)}</div>
+                </div>
+                <div class="d-flex flex-wrap gap-2">
+                    <button type="button" class="btn btn-sm btn-outline-primary" data-hitl-participant-apply data-scen-idx="${activeIdx}">Apply Participant URL</button>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" data-hitl-participant-clear data-scen-idx="${activeIdx}" ${participantProxmoxUrlHasValue ? '' : 'disabled'}>Clear Participant URL</button>
+                </div>
+                <div class="small text-muted mt-2" data-hitl-participant-feedback="${activeIdx}"></div>
+            </fieldset>
         </div>`;
     const coreSectionsHtml = `${step1SectionHtml}${step2SectionHtml}`;
     const hitlSectionsHtml = `${step3SectionHtml}${step4SectionHtml}${part5SectionHtml}`;
@@ -10724,7 +11161,7 @@ function renderMain() {
     toggleExternalIfxModalBusy(proxInventoryFetchInFlight.size > 0);
 
     updateHitlStatusForScenario(activeIdx);
-    updateHitlEntryButtons({ hitlAuthReady, proxValidated, coreHasSecret, coreVmKey });
+    updateHitlEntryButtons({ coreVmVerified });
     // Prefer previously selected/available interfaces when Steps 1 and 2 are validated.
     // Only consider auto-refresh when explicitly enabled and no prior data exists.
     const shouldAutoRefreshHostIfx = HOST_INTERFACES_AUTO_REFRESH_ENABLED
@@ -12325,7 +12762,8 @@ function wireHandlers() {
                 return;
             }
             const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
-            const catalog = Array.isArray(state.host_interfaces) ? state.host_interfaces : [];
+            try { bindHostInterfacesToScenarioCache(sidx); } catch (e) {}
+            const catalog = getEffectiveHostInterfacesForScenario(sidx);
             const isVmbr0 = (entry) => {
                 if (!entry) return false;
                 const bridge = (entry.bridge || (entry.proxmox && entry.proxmox.bridge) || (entry.proxmox && entry.proxmox.raw && entry.proxmox.raw.bridge) || '').toString().trim().toLowerCase();
@@ -12742,27 +13180,6 @@ function wireHandlers() {
             }
         });
     });
-    document.querySelectorAll('[data-hitl-apply]').forEach(btn => {
-        btn.addEventListener('click', async () => {
-            if (btn.disabled) return;
-            const sidx = parseInt(btn.getAttribute('data-scen-idx'));
-            if (Number.isNaN(sidx)) return;
-            // Open the External IFX modal to display progress/status if available
-            try {
-                const modalEl = document.getElementById('externalIfxModal');
-                if (modalEl && window.bootstrap && window.bootstrap.Modal) {
-                    const modalInstance = window.bootstrap.Modal.getOrCreateInstance(modalEl);
-                    modalInstance.show();
-                }
-            } catch (e) { /* no-op */ }
-            // Delegate to existing apply handler
-            try {
-                await handleExternalIfxApply();
-            } catch (err) {
-                console.warn('HITL apply failed', err);
-            }
-        });
-    });
     if (!IS_BUILDER_VIEW) {
         document.querySelectorAll('[data-hitl-core-vm-select]').forEach(select => {
             select.addEventListener('change', () => {
@@ -12770,6 +13187,7 @@ function wireHandlers() {
                 if (isNaN(sidx) || !state.scenarios?.[sidx]) return;
                 const hitlState = ensureHitlStateForScenario(state.scenarios[sidx]);
                 const coreState = hitlState.core || (hitlState.core = {});
+                const prevVmKey = (coreState.vm_key || '').toString();
                 const rawValue = select.value || '';
                 const resetCoreSelection = () => {
                     coreState.vm_key = '';
@@ -12788,9 +13206,21 @@ function wireHandlers() {
                     coreState.internal_bridge_owner = '';
                     coreState.cached_vm_interface_count = null;
                     coreState.cached_vm_status = null;
+                    coreState.cached_host_interfaces = [];
+                    coreState.cached_host_interfaces_vm_key = '';
+                    coreState.cached_host_interfaces_source = null;
+                    coreState.cached_host_interfaces_metadata = null;
+                    coreState.cached_host_interfaces_fetched_at = null;
                 };
                 if (!rawValue) {
                     resetCoreSelection();
+                    if (prevVmKey && (state.host_interfaces_vm_key || '').toString() === prevVmKey) {
+                        state.host_interfaces = [];
+                        state.host_interfaces_vm_key = '';
+                        state.host_interfaces_source = null;
+                        state.host_interfaces_metadata = null;
+                        state.host_interfaces_fetched_at = null;
+                    }
                     persistEditorState();
                     const pwdInput = document.querySelector(`[data-hitl-core-field="ssh_password"][data-scen-idx="${sidx}"]`);
                     if (pwdInput) pwdInput.removeAttribute('placeholder');
@@ -12814,6 +13244,13 @@ function wireHandlers() {
                 }
                 coreState.cached_vm_interface_count = Array.isArray(selectedVm?.interfaces) ? selectedVm.interfaces.length : null;
                 coreState.cached_vm_status = selectedVm && selectedVm.status ? String(selectedVm.status) : null;
+                if (prevVmKey && (state.host_interfaces_vm_key || '').toString() === prevVmKey) {
+                    state.host_interfaces = [];
+                    state.host_interfaces_vm_key = '';
+                    state.host_interfaces_source = null;
+                    state.host_interfaces_metadata = null;
+                    state.host_interfaces_fetched_at = null;
+                }
                 persistEditorState();
                 const pwdInput = document.querySelector(`[data-hitl-core-field="ssh_password"][data-scen-idx="${sidx}"]`);
                 if (pwdInput) pwdInput.removeAttribute('placeholder');
@@ -13841,7 +14278,7 @@ function updateExecuteCoreStatus(info = null) {
             const valAt = core ? (core.last_validated_at ?? '') : '';
             const valText = formatCoreTestTimestamp(valAt);
             if (valText) {
-                executeCoreStatusEl.textContent = `Validated by admin • ${valText}`;
+                executeCoreStatusEl.textContent = `Verified by admin • ${valText}`;
                 executeCoreStatusEl.classList.add('text-muted');
                 return;
             }
@@ -15007,13 +15444,6 @@ document.addEventListener('DOMContentLoaded', () => {
             if (triggerBtn && typeof triggerBtn.focus === 'function') {
                 triggerBtn.focus();
             }
-        });
-    }
-    const externalIfxApplyBtn = document.getElementById('externalIfxApplyBtn');
-    if (externalIfxApplyBtn) {
-        externalIfxApplyBtn.addEventListener('click', () => {
-            if (externalIfxApplyBtn.disabled) return;
-            handleExternalIfxApply();
         });
     }
     // Wire Download XML button
