@@ -5372,6 +5372,66 @@ def _builder_placeholder_scenario(name: str, participant_url: str = '') -> Dict[
     return template
 
 
+def _parse_iso_datetime(raw: Any) -> Optional[datetime.datetime]:
+    if not raw:
+        return None
+    try:
+        text = str(raw).strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        # Accept trailing Z
+        if text.endswith('Z'):
+            text = text[:-1] + '+00:00'
+        dt = datetime.datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _select_builder_hitl_fallback(hints: dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Pick a best-effort admin HITL validation hint for builder scenarios.
+
+    Builder users (and admin users previewing builder mode) cannot validate or select
+    CORE VMs themselves, but they still need to see admin-managed connectivity.
+    """
+    best: Optional[Dict[str, Any]] = None
+    best_dt: Optional[datetime.datetime] = None
+    for value in (hints or {}).values():
+        if not isinstance(value, dict):
+            continue
+        prox = value.get('proxmox') if isinstance(value.get('proxmox'), dict) else {}
+        core = value.get('core') if isinstance(value.get('core'), dict) else {}
+        has_any = bool(
+            (prox.get('secret_id') or prox.get('validated'))
+            or (core.get('core_secret_id') or core.get('vm_key') or core.get('validated'))
+        )
+        if not has_any:
+            continue
+        dt = (
+            _parse_iso_datetime(core.get('stored_at'))
+            or _parse_iso_datetime(core.get('last_validated_at'))
+            or _parse_iso_datetime(prox.get('stored_at'))
+            or _parse_iso_datetime(prox.get('last_validated_at'))
+        )
+        if best is None:
+            best = value
+            best_dt = dt
+            continue
+        if best_dt is None and dt is not None:
+            best = value
+            best_dt = dt
+            continue
+        if best_dt is not None and dt is not None and dt > best_dt:
+            best = value
+            best_dt = dt
+    return best
+
+
 def _builder_catalog_seed_scenarios(
     allowed_norms: set[str],
     assignment_order: Optional[Iterable[str]] = None,
@@ -5382,6 +5442,10 @@ def _builder_catalog_seed_scenarios(
     if not allowed_norms:
         return []
     names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(None, user=user)
+    hitl_validation_hints = _load_scenario_hitl_validation_from_disk()
+    hitl_config_hints = _load_scenario_hitl_config_from_disk()
+    builder_hitl_fallback = _select_builder_hitl_fallback(hitl_validation_hints)
+    builder_hitl_config_fallback = _select_builder_hitl_fallback(hitl_config_hints) if hitl_config_hints else None
     # Compare permissions using match keys so minor punctuation differences
     # (e.g., "Scenario_1b" vs "Scenario 1b") don't hide scenarios.
     allowed_keys = {k for k in (_scenario_match_key(v) for v in allowed_norms) if k}
@@ -5432,6 +5496,8 @@ def _builder_catalog_seed_scenarios(
         norm = catalog_norm_by_key.get(key) or allowed_norm_by_key.get(key) or ''
         display_name = display_by_norm.get(norm) or _humanize(norm or key)
         participant_hint = scenario_url_hints.get(norm, '') if scenario_url_hints else ''
+        validation_hint = hitl_validation_hints.get(norm) if hitl_validation_hints else None
+        config_hint = hitl_config_hints.get(norm) if hitl_config_hints else None
         scenario_copy: Optional[Dict[str, Any]] = None
         candidate_paths = scenario_paths.get(norm) if scenario_paths else None
         best_path = _select_existing_path(candidate_paths) if candidate_paths else None
@@ -5461,6 +5527,81 @@ def _builder_catalog_seed_scenarios(
                 for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
                     hitl_meta[key] = participant_hint
                 scenario_copy['hitl'] = hitl_meta
+
+        # Merge admin-validated HITL hints (safe subset) into builder scenarios.
+        if isinstance(validation_hint, dict) and validation_hint:
+            hitl_meta = scenario_copy.get('hitl') if isinstance(scenario_copy.get('hitl'), dict) else {}
+            hitl_meta = dict(hitl_meta)
+            prox_hint = validation_hint.get('proxmox')
+            if isinstance(prox_hint, dict) and prox_hint:
+                prox_state = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else {}
+                prox_state = dict(prox_state)
+                prox_state.update(prox_hint)
+                hitl_meta['proxmox'] = prox_state
+            core_hint = validation_hint.get('core')
+            if isinstance(core_hint, dict) and core_hint:
+                core_state = hitl_meta.get('core') if isinstance(hitl_meta.get('core'), dict) else {}
+                core_state = dict(core_state)
+                core_state.update(core_hint)
+                hitl_meta['core'] = core_state
+            scenario_copy['hitl'] = hitl_meta
+
+        # Builder-only fallback: builders can't validate/select CORE VMs, so fill any missing
+        # hint fields (e.g., vm_key) from the best available admin validation hint.
+        if builder_hitl_fallback:
+            hitl_meta = scenario_copy.get('hitl') if isinstance(scenario_copy.get('hitl'), dict) else {}
+            hitl_meta = dict(hitl_meta)
+            prox_hint = builder_hitl_fallback.get('proxmox') if isinstance(builder_hitl_fallback.get('proxmox'), dict) else None
+            core_hint = builder_hitl_fallback.get('core') if isinstance(builder_hitl_fallback.get('core'), dict) else None
+
+            if isinstance(prox_hint, dict) and prox_hint:
+                prox_state = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else {}
+                prox_state = dict(prox_state)
+                for k, v in prox_hint.items():
+                    # Only fill missing values; don't override scenario-specific settings.
+                    if k not in prox_state or prox_state.get(k) in (None, '', False):
+                        prox_state[k] = v
+                hitl_meta['proxmox'] = prox_state
+
+            if isinstance(core_hint, dict) and core_hint:
+                core_state = hitl_meta.get('core') if isinstance(hitl_meta.get('core'), dict) else {}
+                core_state = dict(core_state)
+                for k, v in core_hint.items():
+                    if k not in core_state or core_state.get(k) in (None, '', False):
+                        core_state[k] = v
+                hitl_meta['core'] = core_state
+
+            scenario_copy['hitl'] = hitl_meta
+
+        # Merge admin-managed HITL configuration (enabled/interfaces/mappings) into builder scenarios.
+        effective_cfg = config_hint if (isinstance(config_hint, dict) and config_hint) else builder_hitl_config_fallback
+        if isinstance(effective_cfg, dict) and effective_cfg:
+            hitl_meta = scenario_copy.get('hitl') if isinstance(scenario_copy.get('hitl'), dict) else {}
+            hitl_meta = dict(hitl_meta)
+            # Config hints are authoritative for builder views.
+            try:
+                participant_cfg = _normalize_participant_proxmox_url(effective_cfg.get('participant_proxmox_url'))
+                if participant_cfg:
+                    for k in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+                        if k not in hitl_meta or hitl_meta.get(k) in (None, ''):
+                            hitl_meta[k] = participant_cfg
+            except Exception:
+                pass
+            if 'enabled' in effective_cfg:
+                hitl_meta['enabled'] = bool(effective_cfg.get('enabled'))
+            if isinstance(effective_cfg.get('interfaces'), list):
+                hitl_meta['interfaces'] = effective_cfg.get('interfaces')
+            if isinstance(effective_cfg.get('core'), dict):
+                core_state = hitl_meta.get('core') if isinstance(hitl_meta.get('core'), dict) else {}
+                core_state = dict(core_state)
+                core_state.update(effective_cfg.get('core'))
+                hitl_meta['core'] = core_state
+            if isinstance(effective_cfg.get('proxmox'), dict):
+                prox_state = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else {}
+                prox_state = dict(prox_state)
+                prox_state.update(effective_cfg.get('proxmox'))
+                hitl_meta['proxmox'] = prox_state
+            scenario_copy['hitl'] = hitl_meta
         hydrated.append(scenario_copy)
     return hydrated
 
@@ -7520,6 +7661,267 @@ def _merge_participant_urls_into_scenario_catalog(participant_urls: Dict[str, An
             pass
 
 
+def _sanitize_hitl_validation_hint(value: Any) -> Optional[Dict[str, Any]]:
+    """Return a safe, compact HITL validation hint payload.
+
+    This must never include secret material (passwords, tokens).
+    """
+    if not isinstance(value, dict):
+        return None
+    raw = dict(value)
+    out: Dict[str, Any] = {}
+    for key in (
+        'url',
+        'port',
+        'verify_ssl',
+        'secret_id',
+        'validated',
+        'last_validated_at',
+        'stored_at',
+        'last_message',
+        'vm_key',
+        'vm_name',
+        'vm_node',
+        'grpc_host',
+        'grpc_port',
+        'ssh_host',
+        'ssh_port',
+        'core_secret_id',
+        'stored_summary',
+        'last_tested_at',
+        'last_tested_status',
+        'last_tested_message',
+        'last_tested_host',
+        'last_tested_port',
+    ):
+        if key in raw:
+            out[key] = raw.get(key)
+    # Normalize identifiers
+    if isinstance(out.get('secret_id'), str):
+        out['secret_id'] = out['secret_id'].strip() or None
+    if isinstance(out.get('core_secret_id'), str):
+        out['core_secret_id'] = out['core_secret_id'].strip() or None
+    # Drop any known secret material, defensively.
+    for secret_field in ('password', 'token_secret', 'api_secret', 'api_token_secret', 'ssh_password'):
+        out.pop(secret_field, None)
+    if not out:
+        return None
+    return out
+
+
+def _load_scenario_hitl_validation_from_disk() -> dict[str, Dict[str, Any]]:
+    """Load per-scenario HITL validation hints from scenario_catalog.json."""
+    path = _scenario_catalog_file()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    raw = payload.get('hitl_validation')
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Dict[str, Any]] = {}
+    for scen_key, scen_val in raw.items():
+        norm = _normalize_scenario_label(scen_key)
+        if not norm or not isinstance(scen_val, dict):
+            continue
+        entry: Dict[str, Any] = {}
+        prox = _sanitize_hitl_validation_hint(scen_val.get('proxmox'))
+        core = _sanitize_hitl_validation_hint(scen_val.get('core'))
+        if prox:
+            entry['proxmox'] = prox
+        if core:
+            entry['core'] = core
+        if entry:
+            out[norm] = entry
+    return out
+
+
+def _merge_hitl_validation_into_scenario_catalog(
+    scenario_name: str,
+    *,
+    proxmox: Optional[Dict[str, Any]] = None,
+    core: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Merge safe HITL validation hints into the scenario catalog."""
+    scenario_norm = _normalize_scenario_label(scenario_name)
+    if not scenario_norm:
+        return
+    prox_clean = _sanitize_hitl_validation_hint(proxmox) if proxmox else None
+    core_clean = _sanitize_hitl_validation_hint(core) if core else None
+    if not prox_clean and not core_clean:
+        return
+
+    catalog_path = _scenario_catalog_file()
+    if not catalog_path:
+        return
+    try:
+        if not os.path.exists(catalog_path):
+            return
+    except Exception:
+        return
+
+    tmp_path = catalog_path + '.tmp'
+    try:
+        with open(catalog_path, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            return
+        existing = payload.get('hitl_validation')
+        if not isinstance(existing, dict):
+            existing = {}
+        merged = dict(existing)
+        current_entry = merged.get(scenario_norm)
+        if not isinstance(current_entry, dict):
+            current_entry = {}
+        current_entry = dict(current_entry)
+        if prox_clean:
+            current_entry['proxmox'] = prox_clean
+        if core_clean:
+            current_entry['core'] = core_clean
+        merged[scenario_norm] = current_entry
+        payload['hitl_validation'] = merged
+        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+
+        os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
+        with open(tmp_path, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp_path, catalog_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _clear_hitl_validation_in_scenario_catalog(scenario_name: str, *, proxmox: bool = False, core: bool = False) -> None:
+    scenario_norm = _normalize_scenario_label(scenario_name)
+    if not scenario_norm:
+        return
+    if not proxmox and not core:
+        return
+    catalog_path = _scenario_catalog_file()
+    if not catalog_path:
+        return
+    try:
+        if not os.path.exists(catalog_path):
+            return
+    except Exception:
+        return
+
+    tmp_path = catalog_path + '.tmp'
+    try:
+        with open(catalog_path, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            return
+        existing = payload.get('hitl_validation')
+        if not isinstance(existing, dict):
+            return
+        merged = dict(existing)
+        entry = merged.get(scenario_norm)
+        if not isinstance(entry, dict):
+            return
+        entry = dict(entry)
+        if proxmox:
+            entry.pop('proxmox', None)
+        if core:
+            entry.pop('core', None)
+        if entry:
+            merged[scenario_norm] = entry
+        else:
+            merged.pop(scenario_norm, None)
+        payload['hitl_validation'] = merged
+        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+
+        os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
+        with open(tmp_path, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp_path, catalog_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _scrub_hitl_validation_usernames_in_scenario_catalog() -> bool:
+    """Remove any stored usernames/secret material from hitl_validation entries.
+
+    This is an idempotent cleanup for older catalogs that may have persisted
+    proxmox/core username fields. Returns True if a write occurred.
+    """
+    catalog_path = _scenario_catalog_file()
+    if not catalog_path:
+        return False
+    try:
+        if not os.path.exists(catalog_path):
+            return False
+    except Exception:
+        return False
+
+    tmp_path = catalog_path + '.tmp'
+    try:
+        with open(catalog_path, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            return False
+        hv = payload.get('hitl_validation')
+        if not isinstance(hv, dict) or not hv:
+            return False
+
+        changed = False
+        cleaned: Dict[str, Any] = {}
+        for scen_key, scen_val in hv.items():
+            if not isinstance(scen_key, str):
+                continue
+            if not isinstance(scen_val, dict):
+                cleaned[scen_key] = scen_val
+                continue
+            entry = dict(scen_val)
+            prox = entry.get('proxmox')
+            if isinstance(prox, dict):
+                prox2 = dict(prox)
+                for k in ('username', 'user', 'password', 'token_secret', 'api_secret', 'api_token_secret'):
+                    if k in prox2:
+                        prox2.pop(k, None)
+                        changed = True
+                entry['proxmox'] = prox2
+            core = entry.get('core')
+            if isinstance(core, dict):
+                core2 = dict(core)
+                for k in ('ssh_username', 'username', 'user', 'ssh_password', 'password'):
+                    if k in core2:
+                        core2.pop(k, None)
+                        changed = True
+                entry['core'] = core2
+            cleaned[scen_key] = entry
+
+        if not changed:
+            return False
+        payload['hitl_validation'] = cleaned
+        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+
+        os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
+        with open(tmp_path, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp_path, catalog_path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+
 def _extract_participant_url_hints_from_scenarios(scenarios: Any) -> dict[str, str]:
     hints: dict[str, str] = {}
     if not isinstance(scenarios, list):
@@ -7542,6 +7944,346 @@ def _extract_participant_url_hints_from_scenarios(scenarios: Any) -> dict[str, s
         if url_value:
             hints[norm] = url_value
     return hints
+
+
+def _sanitize_hitl_config_hint(value: Any) -> Optional[Dict[str, Any]]:
+    """Return a safe HITL config payload suitable for sharing with builder views.
+
+    Must not include passwords/tokens and should avoid usernames.
+    """
+    if not isinstance(value, dict):
+        return None
+    raw = dict(value)
+    out: Dict[str, Any] = {
+        'enabled': bool(raw.get('enabled')),
+    }
+
+    # Participant UI URL is non-secret and should persist into builder view.
+    try:
+        for key in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+            candidate = raw.get(key)
+            normalized = _normalize_participant_proxmox_url(candidate)
+            if normalized:
+                out['participant_proxmox_url'] = normalized
+                break
+    except Exception:
+        pass
+
+    # Core (keep VM selection + connection endpoints, avoid ssh_username/password)
+    core_raw = raw.get('core') if isinstance(raw.get('core'), dict) else {}
+    core: Dict[str, Any] = {}
+    for key in (
+        'vm_key',
+        'vm_name',
+        'vm_node',
+        'grpc_host',
+        'grpc_port',
+        'ssh_host',
+        'ssh_port',
+        'internal_bridge',
+        'internal_bridge_owner',
+        'core_secret_id',
+        'validated',
+        'last_validated_at',
+        'stored_at',
+        'last_tested_at',
+        'last_tested_status',
+        'last_tested_message',
+        'last_tested_host',
+        'last_tested_port',
+    ):
+        if key in core_raw:
+            core[key] = core_raw.get(key)
+    if isinstance(core.get('core_secret_id'), str):
+        core['core_secret_id'] = core['core_secret_id'].strip() or None
+    if core:
+        out['core'] = core
+
+    # Proxmox (keep URL/port + secret_id, avoid username/password)
+    prox_raw = raw.get('proxmox') if isinstance(raw.get('proxmox'), dict) else {}
+    prox: Dict[str, Any] = {}
+    for key in ('url', 'port', 'verify_ssl', 'secret_id', 'validated', 'last_validated_at', 'stored_at'):
+        if key in prox_raw:
+            prox[key] = prox_raw.get(key)
+    if isinstance(prox.get('secret_id'), str):
+        prox['secret_id'] = prox['secret_id'].strip() or None
+    if prox:
+        out['proxmox'] = prox
+
+    # Interfaces + mappings (non-secret)
+    iface_list = raw.get('interfaces')
+
+    # Best-effort: if the admin snapshot contains a Proxmox inventory, we can
+    # resolve the CORE-side bridge by matching interface MACs.
+    inv_vms: List[Dict[str, Any]] = []
+    try:
+        prox_meta = raw.get('proxmox') if isinstance(raw.get('proxmox'), dict) else {}
+        inv = prox_meta.get('inventory') if isinstance(prox_meta.get('inventory'), dict) else {}
+        inv_vms_raw = inv.get('vms')
+        if isinstance(inv_vms_raw, list):
+            inv_vms = [v for v in inv_vms_raw if isinstance(v, dict)]
+    except Exception:
+        inv_vms = []
+
+    def _parse_vm_key(vm_key: Any) -> tuple[str, str]:
+        if not isinstance(vm_key, str):
+            return ('', '')
+        parts = vm_key.split('::', 1)
+        if len(parts) != 2:
+            return ('', '')
+        return (parts[0].strip(), parts[1].strip())
+
+    def _mac_norm(mac: Any) -> str:
+        if mac is None:
+            return ''
+        s = str(mac).strip().lower()
+        return s
+
+    core_node, core_vmid = _parse_vm_key((raw.get('core') or {}).get('vm_key') if isinstance(raw.get('core'), dict) else None)
+    if not core_node:
+        core_node = (core_raw.get('vm_node') or '').strip() if isinstance(core_raw.get('vm_node'), str) else str(core_raw.get('vm_node') or '').strip()
+    if not core_vmid:
+        core_vmid = str(core_raw.get('vmid') or '').strip()
+
+    def _find_inventory_vm(node: str, vmid: str) -> Optional[Dict[str, Any]]:
+        if not node or not vmid:
+            return None
+        for vm in inv_vms:
+            n = str(vm.get('node') or '').strip()
+            v = str(vm.get('vmid') or '').strip()
+            if n == node and v == vmid:
+                return vm
+        return None
+
+    core_inv_vm = _find_inventory_vm(core_node, core_vmid)
+    core_inv_ifaces = core_inv_vm.get('interfaces') if (core_inv_vm and isinstance(core_inv_vm.get('interfaces'), list)) else []
+
+    def _bridge_for_mac(mac: Any) -> str:
+        macn = _mac_norm(mac)
+        if not macn:
+            return ''
+        for it in core_inv_ifaces:
+            if not isinstance(it, dict):
+                continue
+            inv_mac = _mac_norm(it.get('macaddr') or it.get('mac') or it.get('hwaddr'))
+            if inv_mac and inv_mac == macn:
+                return str(it.get('bridge') or '').strip()
+        return ''
+
+    if isinstance(iface_list, list):
+        cleaned_ifaces: List[Dict[str, Any]] = []
+        for iface in iface_list:
+            if not isinstance(iface, dict):
+                continue
+            name_raw = iface.get('name')
+            name = name_raw.strip() if isinstance(name_raw, str) else str(name_raw or '').strip()
+            if not name:
+                continue
+            mac = iface.get('mac')
+            entry: Dict[str, Any] = {
+                'name': name,
+                'attachment': _normalize_hitl_attachment(iface.get('attachment')),
+            }
+
+            # Persist the interface MAC and a best-effort CORE bridge hint.
+            if mac:
+                entry['mac'] = str(mac).strip()
+            core_bridge_existing = iface.get('core_bridge')
+            core_bridge_hint = str(core_bridge_existing).strip() if core_bridge_existing not in (None, '') else ''
+            if not core_bridge_hint:
+                core_bridge_hint = _bridge_for_mac(mac)
+            if core_bridge_hint:
+                entry['core_bridge'] = core_bridge_hint
+            prox_target = iface.get('proxmox_target') if isinstance(iface.get('proxmox_target'), dict) else None
+            if prox_target:
+                pt: Dict[str, Any] = {}
+                for key in ('node', 'vmid', 'interface_id', 'vm_name', 'macaddr', 'bridge', 'model'):
+                    if key in prox_target:
+                        pt[key] = prox_target.get(key)
+                entry['proxmox_target'] = pt
+            external = iface.get('external_vm') if isinstance(iface.get('external_vm'), dict) else None
+            if external:
+                ext: Dict[str, Any] = {}
+                for key in ('vm_key', 'vmid', 'interface_id', 'interface_bridge', 'vm_node', 'vm_name'):
+                    if key in external:
+                        ext[key] = external.get(key)
+                entry['external_vm'] = ext
+            cleaned_ifaces.append(entry)
+        if cleaned_ifaces:
+            out['interfaces'] = cleaned_ifaces
+
+    # Defensive drop of any known secret/user fields.
+    def _strip(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            cleaned: Dict[str, Any] = {}
+            for k, v in obj.items():
+                if k in ('password', 'ssh_password', 'token_secret', 'api_secret', 'api_token_secret'):
+                    continue
+                if k in ('username', 'ssh_username', 'user'):
+                    continue
+                cleaned[k] = _strip(v)
+            return cleaned
+        if isinstance(obj, list):
+            return [_strip(v) for v in obj]
+        return obj
+    out = _strip(out)
+
+    return out or None
+
+
+def _extract_hitl_config_hints_from_scenarios(scenarios: Any) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(scenarios, list):
+        return out
+    for scen in scenarios:
+        if not isinstance(scen, dict):
+            continue
+        norm = _normalize_scenario_label(scen.get('name'))
+        if not norm:
+            continue
+        hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else None
+        if not hitl_meta:
+            continue
+        hint = _sanitize_hitl_config_hint(hitl_meta)
+        if hint:
+            out[norm] = hint
+    return out
+
+
+def _load_scenario_hitl_config_from_disk() -> dict[str, Dict[str, Any]]:
+    """Load per-scenario HITL config hints from scenario_catalog.json."""
+    path = _scenario_catalog_file()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    raw = payload.get('hitl_config')
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Dict[str, Any]] = {}
+    for scen_key, scen_val in raw.items():
+        norm = _normalize_scenario_label(scen_key)
+        if not norm or not isinstance(scen_val, dict):
+            continue
+        hint = _sanitize_hitl_config_hint(scen_val)
+        if hint:
+            out[norm] = hint
+    return out
+
+
+def _merge_hitl_config_map_into_scenario_catalog(hitl_configs: Dict[str, Dict[str, Any]]) -> None:
+    if not isinstance(hitl_configs, dict) or not hitl_configs:
+        return
+    catalog_path = _scenario_catalog_file()
+    if not catalog_path:
+        return
+    try:
+        if not os.path.exists(catalog_path):
+            return
+    except Exception:
+        return
+
+    normalized_updates: Dict[str, Dict[str, Any]] = {}
+    for scen_key, hitl in hitl_configs.items():
+        norm = _normalize_scenario_label(scen_key)
+        if not norm:
+            continue
+        clean = _sanitize_hitl_config_hint(hitl)
+        if clean:
+            # Stamp a write time so "latest" can be selected later.
+            stored_at = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+            if isinstance(clean.get('core'), dict) and 'stored_at' not in clean['core']:
+                clean['core']['stored_at'] = stored_at
+            if isinstance(clean.get('proxmox'), dict) and 'stored_at' not in clean['proxmox']:
+                clean['proxmox']['stored_at'] = stored_at
+            normalized_updates[norm] = clean
+    if not normalized_updates:
+        return
+
+    tmp_path = catalog_path + '.tmp'
+    try:
+        with open(catalog_path, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            return
+        existing = payload.get('hitl_config')
+        if not isinstance(existing, dict):
+            existing = {}
+        merged = dict(existing)
+        for norm, clean in normalized_updates.items():
+            entry = merged.get(norm)
+            if not isinstance(entry, dict):
+                entry = {}
+            entry = dict(entry)
+            entry.update(clean)
+            merged[norm] = entry
+        payload['hitl_config'] = merged
+        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+
+        os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
+        with open(tmp_path, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp_path, catalog_path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _merge_hitl_config_into_scenario_catalog(scenario_name: str, hitl_config: Dict[str, Any]) -> None:
+    scenario_norm = _normalize_scenario_label(scenario_name)
+    if not scenario_norm:
+        return
+    _merge_hitl_config_map_into_scenario_catalog({scenario_norm: hitl_config})
+
+
+def _backfill_hitl_config_from_editor_snapshots() -> bool:
+    """Seed scenario_catalog.json hitl_config from any existing editor snapshots.
+
+    This is a startup convenience so builder view reflects admin-configured HITL
+    settings immediately after deploy/upgrade.
+    """
+    catalog_path = _scenario_catalog_file()
+    try:
+        if not catalog_path or not os.path.exists(catalog_path):
+            return False
+    except Exception:
+        return False
+
+    snapshots_dir = os.path.join(_outputs_dir(), 'editor_snapshots')
+    try:
+        if not os.path.isdir(snapshots_dir):
+            return False
+    except Exception:
+        return False
+
+    any_updates = False
+    try:
+        for fname in os.listdir(snapshots_dir):
+            if not fname.endswith('.json'):
+                continue
+            path = os.path.join(snapshots_dir, fname)
+            try:
+                with open(path, 'r', encoding='utf-8') as fh:
+                    snap = json.load(fh)
+            except Exception:
+                continue
+            if not isinstance(snap, dict):
+                continue
+            hints = _extract_hitl_config_hints_from_scenarios(snap.get('scenarios'))
+            if hints:
+                _merge_hitl_config_map_into_scenario_catalog(hints)
+                any_updates = True
+    except Exception:
+        return any_updates
+    return any_updates
 
 
 def _collect_scenario_catalog(history: Optional[List[dict]] = None) -> tuple[list[str], dict[str, set[str]], dict[str, str]]:
@@ -9990,6 +10732,101 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
 
     if not normalized_scenarios:
         normalized_scenarios = defaults['scenarios']
+
+    # If the UI is in builder mode (even for admin users previewing builder view),
+    # merge admin-managed HITL validation hints into scenarios so builder cannot
+    # appear "unassigned" when admin has already selected a CORE VM.
+    try:
+        view_mode = getattr(g, 'ui_view_mode', _UI_VIEW_DEFAULT)
+    except Exception:
+        view_mode = _UI_VIEW_DEFAULT
+    if view_mode == 'builder':
+        try:
+            hitl_validation_hints = _load_scenario_hitl_validation_from_disk()
+            builder_hitl_fallback = _select_builder_hitl_fallback(hitl_validation_hints)
+            hitl_config_hints = _load_scenario_hitl_config_from_disk()
+            builder_hitl_config_fallback = _select_builder_hitl_fallback(hitl_config_hints) if hitl_config_hints else None
+            try:
+                _, _, participant_urls_by_norm = _load_scenario_catalog_from_disk()
+            except Exception:
+                participant_urls_by_norm = {}
+        except Exception:
+            hitl_validation_hints = {}
+            builder_hitl_fallback = None
+            hitl_config_hints = {}
+            builder_hitl_config_fallback = None
+            participant_urls_by_norm = {}
+
+        for scen in normalized_scenarios:
+            if not isinstance(scen, dict):
+                continue
+            norm = _normalize_scenario_label(scen.get('name'))
+            validation_hint = hitl_validation_hints.get(norm) if (norm and isinstance(hitl_validation_hints, dict)) else None
+            effective_hint = validation_hint if isinstance(validation_hint, dict) and validation_hint else builder_hitl_fallback
+            config_hint = hitl_config_hints.get(norm) if (norm and isinstance(hitl_config_hints, dict)) else None
+            effective_cfg = config_hint if isinstance(config_hint, dict) and config_hint else builder_hitl_config_fallback
+            if not (isinstance(effective_hint, dict) and effective_hint) and not (isinstance(effective_cfg, dict) and effective_cfg):
+                continue
+
+            hitl_meta = scen.get('hitl') if isinstance(scen.get('hitl'), dict) else {}
+            hitl_meta = dict(hitl_meta)
+
+            # Merge participant URL hints (non-secret) so builder view shows Part 5 as configured.
+            try:
+                participant_hint = participant_urls_by_norm.get(norm) if (norm and isinstance(participant_urls_by_norm, dict)) else ''
+                if participant_hint:
+                    for k in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+                        if k not in hitl_meta or hitl_meta.get(k) in (None, ''):
+                            hitl_meta[k] = participant_hint
+            except Exception:
+                pass
+
+            prox_hint = effective_hint.get('proxmox') if isinstance(effective_hint.get('proxmox'), dict) else None
+            if isinstance(prox_hint, dict) and prox_hint:
+                prox_state = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else {}
+                prox_state = dict(prox_state)
+                for k, v in prox_hint.items():
+                    if k not in prox_state or prox_state.get(k) in (None, '', False):
+                        prox_state[k] = v
+                hitl_meta['proxmox'] = prox_state
+
+            core_hint = effective_hint.get('core') if isinstance(effective_hint.get('core'), dict) else None
+            if isinstance(core_hint, dict) and core_hint:
+                core_state = hitl_meta.get('core') if isinstance(hitl_meta.get('core'), dict) else {}
+                core_state = dict(core_state)
+                for k, v in core_hint.items():
+                    if k not in core_state or core_state.get(k) in (None, '', False):
+                        core_state[k] = v
+                hitl_meta['core'] = core_state
+
+            # Apply HITL configuration hints (enabled/interfaces/mappings)
+            if isinstance(effective_cfg, dict) and effective_cfg:
+                try:
+                    participant_cfg = _normalize_participant_proxmox_url(effective_cfg.get('participant_proxmox_url'))
+                    if participant_cfg:
+                        for k in ('participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'):
+                            if k not in hitl_meta or hitl_meta.get(k) in (None, ''):
+                                hitl_meta[k] = participant_cfg
+                except Exception:
+                    pass
+                if 'enabled' in effective_cfg:
+                    hitl_meta['enabled'] = bool(effective_cfg.get('enabled'))
+                if isinstance(effective_cfg.get('interfaces'), list):
+                    hitl_meta['interfaces'] = effective_cfg.get('interfaces')
+                cfg_prox = effective_cfg.get('proxmox') if isinstance(effective_cfg.get('proxmox'), dict) else None
+                if isinstance(cfg_prox, dict) and cfg_prox:
+                    prox_state = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else {}
+                    prox_state = dict(prox_state)
+                    prox_state.update(cfg_prox)
+                    hitl_meta['proxmox'] = prox_state
+                cfg_core = effective_cfg.get('core') if isinstance(effective_cfg.get('core'), dict) else None
+                if isinstance(cfg_core, dict) and cfg_core:
+                    core_state = hitl_meta.get('core') if isinstance(hitl_meta.get('core'), dict) else {}
+                    core_state = dict(core_state)
+                    core_state.update(cfg_core)
+                    hitl_meta['core'] = core_state
+
+            scen['hitl'] = hitl_meta
     if allowed_norms is not None:
         normalized_scenarios = _filter_scenarios_by_norms(normalized_scenarios, allowed_norms)
         payload['builder_restricted_scenarios'] = True
@@ -10121,6 +10958,21 @@ def api_editor_snapshot():
                     _merge_participant_urls_into_scenario_catalog(participant_hints)
         except Exception:
             pass
+
+        # Persist admin-managed HITL configuration so builder view sees it permanently.
+        try:
+            role = _normalize_role_value(user.get('role'))
+            if role == 'admin':
+                catalog_path = _scenario_catalog_file()
+                if not os.path.exists(catalog_path):
+                    scenario_names = [s.get('name') for s in snapshot.get('scenarios') if isinstance(s, dict)]
+                    source_path = snapshot.get('result_path') if isinstance(snapshot.get('result_path'), str) else None
+                    _persist_scenario_catalog(scenario_names, source_path, participant_urls={})
+                hitl_hints = _extract_hitl_config_hints_from_scenarios(snapshot.get('scenarios'))
+                if hitl_hints:
+                    _merge_hitl_config_map_into_scenario_catalog(hitl_hints)
+        except Exception:
+            pass
     except Exception as exc:
         try:
             app.logger.exception('[editor_snapshot] persist failed: %s', exc)
@@ -10237,6 +11089,9 @@ def api_host_interfaces():
 
 @app.route('/api/proxmox/validate', methods=['POST'])
 def api_proxmox_validate():
+    current = _current_user()
+    if not current or _normalize_role_value(current.get('role')) != 'admin':
+        return jsonify({'success': False, 'error': 'Admin privileges required'}), 403
     if ProxmoxAPI is None:
         return jsonify({'success': False, 'error': 'Proxmox integration unavailable: install proxmoxer package'}), 500
     payload = request.get_json(silent=True) or {}
@@ -10362,6 +11217,25 @@ def api_proxmox_validate():
             'stored_at': datetime.datetime.now(datetime.UTC).isoformat(),
         }
     message = f"Validated Proxmox access for {username} at {host}:{port}"
+    # Persist a safe shared hint so builders/participants can see the validated state.
+    # This is the non-secret subset (no password/token material).
+    try:
+        if scenario_name:
+            _merge_hitl_validation_into_scenario_catalog(
+                scenario_name,
+                proxmox={
+                    'url': summary.get('url'),
+                    'port': summary.get('port'),
+                    'verify_ssl': summary.get('verify_ssl'),
+                    'secret_id': secret_identifier,
+                    'validated': bool(secret_identifier),
+                    'last_validated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                    'stored_at': summary.get('stored_at'),
+                    'last_message': message,
+                },
+            )
+    except Exception:
+        pass
     return jsonify({
         'success': True,
         'message': message,
@@ -10374,6 +11248,9 @@ def api_proxmox_validate():
 
 @app.route('/api/proxmox/clear', methods=['POST'])
 def api_proxmox_clear():
+    current = _current_user()
+    if not current or _normalize_role_value(current.get('role')) != 'admin':
+        return jsonify({'success': False, 'error': 'Admin privileges required'}), 403
     payload = request.get_json(silent=True) or {}
     secret_id_raw = payload.get('secret_id')
     secret_id = secret_id_raw.strip() if isinstance(secret_id_raw, str) else ''
@@ -10390,6 +11267,11 @@ def api_proxmox_clear():
         app.logger.info('[proxmox] cleared credentials request for %s (scenario_index=%s, removed=%s)', scenario_name or 'unnamed', scenario_index, removed)
     except Exception:
         pass
+    try:
+        if scenario_name:
+            _clear_hitl_validation_in_scenario_catalog(scenario_name, proxmox=True)
+    except Exception:
+        pass
     return jsonify({
         'success': True,
         'secret_removed': removed,
@@ -10400,6 +11282,9 @@ def api_proxmox_clear():
 
 @app.route('/api/proxmox/credentials/get', methods=['POST'])
 def api_proxmox_credentials_get():
+    current = _current_user()
+    if not current or _normalize_role_value(current.get('role')) != 'admin':
+        return jsonify({'success': False, 'error': 'Admin privileges required'}), 403
     payload = request.get_json(silent=True) or {}
     secret_id_raw = payload.get('secret_id')
     secret_id = secret_id_raw.strip() if isinstance(secret_id_raw, str) else ''
@@ -10427,6 +11312,9 @@ def api_proxmox_credentials_get():
 
 @app.route('/api/core/credentials/clear', methods=['POST'])
 def api_core_credentials_clear():
+    current = _current_user()
+    if not current or _normalize_role_value(current.get('role')) != 'admin':
+        return jsonify({'success': False, 'error': 'Admin privileges required'}), 403
     payload = request.get_json(silent=True) or {}
     secret_id_raw = payload.get('core_secret_id') or payload.get('secret_id')
     secret_id = secret_id_raw.strip() if isinstance(secret_id_raw, str) else ''
@@ -10443,6 +11331,11 @@ def api_core_credentials_clear():
         app.logger.info('[core] cleared credentials request for %s (scenario_index=%s, removed=%s)', scenario_name or 'unnamed', scenario_index, removed)
     except Exception:
         pass
+    try:
+        if scenario_name:
+            _clear_hitl_validation_in_scenario_catalog(scenario_name, core=True)
+    except Exception:
+        pass
     return jsonify({
         'success': True,
         'secret_removed': removed,
@@ -10453,6 +11346,9 @@ def api_core_credentials_clear():
 
 @app.route('/api/core/credentials/get', methods=['POST'])
 def api_core_credentials_get():
+    current = _current_user()
+    if not current or _normalize_role_value(current.get('role')) != 'admin':
+        return jsonify({'success': False, 'error': 'Admin privileges required'}), 403
     payload = request.get_json(silent=True) or {}
     secret_id_raw = payload.get('core_secret_id') or payload.get('secret_id')
     secret_id = secret_id_raw.strip() if isinstance(secret_id_raw, str) else ''
@@ -10491,6 +11387,9 @@ def api_core_credentials_get():
 
 @app.route('/api/proxmox/vms', methods=['POST'])
 def api_proxmox_vms():
+    current = _current_user()
+    if not current or _normalize_role_value(current.get('role')) != 'admin':
+        return jsonify({'success': False, 'error': 'Admin privileges required'}), 403
     payload = request.get_json(silent=True) or {}
     secret_id_raw = payload.get('secret_id')
     secret_id = secret_id_raw.strip() if isinstance(secret_id_raw, str) else ''
@@ -10510,6 +11409,10 @@ def api_proxmox_vms():
 
 @app.route('/api/hitl/apply_bridge', methods=['POST'])
 def api_hitl_apply_bridge():
+    current = _current_user()
+    if not current or _normalize_role_value(current.get('role')) != 'admin':
+        return jsonify({'success': False, 'error': 'Admin privileges required'}), 403
+
     payload = request.get_json(silent=True) or {}
     bridge_raw = payload.get('bridge_name') or payload.get('internal_bridge') or payload.get('bridge')
     if bridge_raw in (None, ''):
@@ -10743,6 +11646,20 @@ def api_hitl_apply_bridge():
     if bridge_owner:
         response['bridge_owner'] = bridge_owner
 
+    # Persist the applied HITL config for builder view (non-secret fields only).
+    try:
+        if scenario_name:
+            hitl_to_store = dict(hitl_payload)
+            core_store = hitl_to_store.get('core') if isinstance(hitl_to_store.get('core'), dict) else {}
+            core_store = dict(core_store)
+            core_store['internal_bridge'] = bridge_name
+            if bridge_owner:
+                core_store['internal_bridge_owner'] = bridge_owner
+            hitl_to_store['core'] = core_store
+            _merge_hitl_config_into_scenario_catalog(scenario_name, hitl_to_store)
+    except Exception:
+        pass
+
     app.logger.info(
         '[hitl] applied internal bridge %s on node %s (%d assignment(s), %d interface change(s))',
         bridge_name,
@@ -10756,6 +11673,10 @@ def api_hitl_apply_bridge():
 @app.route('/api/hitl/validate_bridge', methods=['POST'])
 def api_hitl_validate_bridge():
     """Validate HITL bridge configuration without applying any changes."""
+
+    current = _current_user()
+    if not current or _normalize_role_value(current.get('role')) != 'admin':
+        return jsonify({'success': False, 'error': 'Admin privileges required'}), 403
 
     payload = request.get_json(silent=True) or {}
     bridge_raw = payload.get('bridge_name') or payload.get('internal_bridge') or payload.get('bridge')
@@ -17775,6 +18696,9 @@ def core_session(sid: int):
 
 @app.route('/test_core', methods=['POST'])
 def test_core():
+    current = _current_user()
+    if not current or _normalize_role_value(current.get('role')) != 'admin':
+        return jsonify({'ok': False, 'error': 'Admin privileges required'}), 403
     try:
         data: Dict[str, Any] = {}
         if request.is_json:
@@ -18117,6 +19041,28 @@ def test_core():
             )
         else:
             summary_message = f"Validated CORE access for {stored_meta['ssh_username']} @ {stored_meta['ssh_host']}:{stored_meta['ssh_port']}"
+
+        # Persist a safe shared hint so builders/participants can see the validated state.
+        try:
+            if scenario_name_val:
+                _merge_hitl_validation_into_scenario_catalog(
+                    scenario_name_val,
+                    core={
+                        'core_secret_id': stored_meta.get('identifier'),
+                        'validated': bool(stored_meta.get('identifier')),
+                        'last_validated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                        'grpc_host': stored_meta.get('grpc_host') or stored_meta.get('host'),
+                        'grpc_port': stored_meta.get('grpc_port') or stored_meta.get('port'),
+                        'ssh_host': stored_meta.get('ssh_host'),
+                        'ssh_port': stored_meta.get('ssh_port'),
+                        'vm_key': stored_meta.get('vm_key'),
+                        'vm_name': stored_meta.get('vm_name'),
+                        'vm_node': stored_meta.get('vm_node'),
+                        'stored_at': stored_meta.get('stored_at'),
+                    },
+                )
+        except Exception:
+            pass
         return jsonify({
             "ok": True,
             "forward_host": forwarded_host,
@@ -19240,4 +20186,16 @@ if __name__ == '__main__':
         port = int(os.environ.get('PORT') or os.environ.get('WEBAPP_PORT') or '9090')
     except Exception:
         port = 9090
+    try:
+        did_scrub = _scrub_hitl_validation_usernames_in_scenario_catalog()
+        if did_scrub:
+            app.logger.info('[hitl_validation] scrubbed usernames from scenario_catalog.json')
+    except Exception:
+        pass
+    try:
+        did_backfill = _backfill_hitl_config_from_editor_snapshots()
+        if did_backfill:
+            app.logger.info('[hitl_config] backfilled hitl_config from editor snapshots')
+    except Exception:
+        pass
     app.run(host='0.0.0.0', port=port, debug=True)

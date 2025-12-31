@@ -1167,6 +1167,18 @@ if (serverResultPath) {
     }
 }
 
+// View-mode switches (admin <-> builder) should not change which local project snapshot we load.
+// Otherwise, a derived key from a minimal builder payload can select a different/older snapshot
+// and make CORE/Participant settings appear to be "cleared".
+try {
+    if (USE_LOCAL_EDITOR_STATE && !serverResultPath) {
+        const lastKey = (lastProjectKeyFromStorage || '').trim();
+        if (lastKey && projectStateMap && typeof projectStateMap === 'object' && projectStateMap[lastKey]) {
+            currentProjectKey = lastKey;
+        }
+    }
+} catch (err) {}
+
 let persistedState = null;
 if (USE_LOCAL_EDITOR_STATE) {
     const keyedStateForCurrentProject = projectStateMap[currentProjectKey];
@@ -1833,6 +1845,7 @@ function shouldRememberCore(hitlState) {
 const proxmoxSecretCache = new Map();
 
 async function fetchStoredProxmoxCredentials(secretId) {
+    if (!IS_ADMIN_USER || IS_BUILDER_VIEW) return null;
     if (!secretId) return null;
     if (proxmoxSecretCache.has(secretId)) {
         return proxmoxSecretCache.get(secretId);
@@ -1861,6 +1874,7 @@ async function fetchStoredProxmoxCredentials(secretId) {
 const coreSecretCache = new Map();
 
 async function fetchStoredCoreCredentials(secretId) {
+    if (!IS_ADMIN_USER || IS_BUILDER_VIEW) return null;
     if (!secretId) return null;
     if (coreSecretCache.has(secretId)) {
         return coreSecretCache.get(secretId);
@@ -1914,7 +1928,9 @@ function updateProxmoxSummary(sidx) {
         const hitl = ensureHitlStateForScenario(scenario);
         const prox = hitl.proxmox || { url: '', port: 8006, username: '' };
         const proxPort = prox.port ?? 8006;
-        const proxHasCreds = !!(prox.url && prox.username);
+        const proxHasCreds = IS_BUILDER_VIEW
+            ? !!(prox.url || prox.secret_id)
+            : !!(prox.url && prox.username);
         const proxValidated = !!(prox.validated && prox.secret_id);
         const normalizeHost = (raw) => {
             if (!raw && raw !== 0) return '';
@@ -1975,7 +1991,9 @@ function updateProxmoxSummary(sidx) {
         const interfaceCountKnown = resolvedVmInterfaceCount !== null;
         const coreVmHasInterfaces = !coreVmKey || !interfaceCountKnown || resolvedVmInterfaceCount >= 1;
         const coreVmSupportsHitl = !coreVmKey || !interfaceCountKnown || resolvedVmInterfaceCount >= 2;
-        const coreInputsComplete = !!(coreVmKey && coreHost && corePort && coreSshHost && coreSshPort && coreUser && corePasswordAvailable);
+        const coreInputsComplete = IS_BUILDER_VIEW
+            ? !!(coreVmKey && coreHost && corePort && coreSshHost && coreSshPort && coreHasSecret)
+            : !!(coreVmKey && coreHost && corePort && coreSshHost && coreSshPort && coreUser && corePasswordAvailable);
         const coreTestSuccess = core.last_tested_status === 'success';
         const coreTestMatches = coreTestSuccess
             && !!core.last_tested_host
@@ -2003,10 +2021,28 @@ function updateProxmoxSummary(sidx) {
                 }
                 detailParts.push(prox.verify_ssl === false ? 'SSL verify off' : 'SSL verify on');
             }
+            if (IS_BUILDER_VIEW && proxValidated) {
+                const stampRaw = prox.last_validated_at || prox.stored_at || null;
+                let stamp = '';
+                if (stampRaw) {
+                    try {
+                        const dt = new Date(stampRaw);
+                        if (!Number.isNaN(dt.getTime())) {
+                            stamp = dt.toLocaleString();
+                        }
+                    } catch (e) { /* ignore */ }
+                }
+                detailParts.push(stamp ? `Validated by admin (${stamp})` : 'Validated by admin');
+                detailParts.push('Username/password not set in builder view');
+            }
             const proxSummary = proxHasCreds
-                ? (proxValidated
-                    ? `Proxmox validated for ${prox.username} @ ${prox.url}:${proxPort}`
-                    : `Proxmox pending validation for ${prox.username} @ ${prox.url}:${proxPort}`)
+                ? (IS_BUILDER_VIEW
+                    ? (proxValidated
+                        ? (prox.url ? `Proxmox validated for ${prox.url}:${proxPort}` : 'Proxmox validated')
+                        : (prox.url ? `Proxmox assigned for ${prox.url}:${proxPort}` : 'Proxmox assigned'))
+                    : (proxValidated
+                        ? `Proxmox validated for ${prox.username} @ ${prox.url}:${proxPort}`
+                        : `Proxmox pending validation for ${prox.username} @ ${prox.url}:${proxPort}`))
                 : 'Proxmox resource not assigned.';
             const detailsText = detailParts.length ? ` • ${detailParts.join(' • ')}` : '';
             summaryEl.textContent = `${proxSummary}${detailsText}`;
@@ -2055,9 +2091,12 @@ function updateProxmoxSummary(sidx) {
         const refreshBtn = document.querySelector(`[data-proxmox-refresh][data-scen-idx="${sidx}"]`);
         if (refreshBtn) {
             const loading = proxInventoryFetchInFlight.has(sidx);
-            const canRefresh = proxValidated && !loading;
+            const canRefresh = proxValidated && !loading && !IS_BUILDER_VIEW;
             refreshBtn.disabled = !canRefresh;
             refreshBtn.textContent = loading ? 'Refreshing VMs' : 'Refresh VM List';
+            if (IS_BUILDER_VIEW) {
+                refreshBtn.title = 'Builder view is read-only. Ask an admin to refresh Proxmox inventory.';
+            }
         }
         const refreshBadge = document.querySelector(`[data-proxmox-refresh-badge="${sidx}"]`);
         if (refreshBadge) {
@@ -2079,7 +2118,9 @@ function updateProxmoxSummary(sidx) {
                 statusText = `Selected CORE VM exposes ${count} network interface${plural}. Add at least one interface to enable CORE connectivity.`;
                 className = 'text-danger';
             } else if (!coreInputsComplete) {
-                statusText = 'Enter gRPC and SSH connection details, including credentials.';
+                statusText = IS_BUILDER_VIEW
+                    ? 'CORE credentials are not stored for this scenario in builder view. Ask an admin to validate and store them.'
+                    : 'Enter gRPC and SSH connection details, including credentials.';
                 className = 'text-warning';
             } else if (!coreVmSupportsHitl) {
                 if (coreHitlBlocked) {
@@ -2095,8 +2136,11 @@ function updateProxmoxSummary(sidx) {
                 const storedAt = core.last_validated_at ? (() => {
                     try { return new Date(core.last_validated_at).toLocaleString(); } catch (err) { return null; }
                 })() : null;
-                const storedNote = storedAt ? ` • Credentials stored ${storedAt}` : '';
-                statusText = `CORE connection verified${testedAt ? ` • Last tested ${testedAt}` : ''}${storedNote}`;
+                const storedNote = storedAt
+                    ? (IS_BUILDER_VIEW ? ` • Credentials stored by admin ${storedAt}` : ` • Credentials stored ${storedAt}`)
+                    : (IS_BUILDER_VIEW ? ' • Credentials stored by admin' : '');
+                const builderSuffix = IS_BUILDER_VIEW ? ' • SSH user/password not set in builder view' : '';
+                statusText = `CORE connection verified${testedAt ? ` • Last tested ${testedAt}` : ''}${storedNote}${builderSuffix}`;
                 className = 'text-success';
             } else if (coreHasSecret && coreTestSuccess) {
                 statusText = 'Stored CORE credentials available. Re-test if connection details changed.';
@@ -2108,7 +2152,9 @@ function updateProxmoxSummary(sidx) {
                 statusText = 'CORE connection test succeeded for a different endpoint. Update details or re-test.';
                 className = 'text-warning';
             } else {
-                statusText = 'Test the CORE connection to continue.';
+                statusText = IS_BUILDER_VIEW
+                    ? 'CORE connection must be validated by an admin.'
+                    : 'Test the CORE connection to continue.';
                 className = 'text-warning';
             }
             coreStatusEl.textContent = statusText;
@@ -2117,11 +2163,17 @@ function updateProxmoxSummary(sidx) {
         }
         const testBtn = document.querySelector(`[data-hitl-core-test][data-scen-idx="${sidx}"]`);
         if (testBtn) {
-            testBtn.disabled = !coreTestable;
+            testBtn.disabled = IS_BUILDER_VIEW || !coreTestable;
+            if (IS_BUILDER_VIEW) {
+                testBtn.title = 'Builder view is read-only. Ask an admin to validate CORE.';
+            }
         }
         const coreClearBtn = document.querySelector(`[data-hitl-core-clear][data-scen-idx="${sidx}"]`);
         if (coreClearBtn) {
-            coreClearBtn.disabled = !(coreVmKey || coreHost || coreUser || corePasswordRaw || coreSshHostRaw || coreHasSecret);
+            coreClearBtn.disabled = IS_BUILDER_VIEW || !(coreVmKey || coreHost || coreUser || corePasswordRaw || coreSshHostRaw || coreHasSecret);
+            if (IS_BUILDER_VIEW) {
+                coreClearBtn.title = 'Builder view is read-only. Ask an admin to clear CORE credentials.';
+            }
         }
         const summaryDetailEl = document.querySelector(`[data-hitl-core-summary="${sidx}"]`);
         if (summaryDetailEl) {
@@ -8882,14 +8934,26 @@ function renderMain() {
     const participantProxmoxUrlRaw = (hitl.participant_proxmox_url || '').toString();
     const participantProxmoxUrlHtml = escapeHtml(participantProxmoxUrlRaw);
     const participantProxmoxUrlHasValue = participantProxmoxUrlRaw.trim().length > 0;
-    const proxValidated = !!(proxmox.validated && proxmox.secret_id);
-    const hasProxmox = !!(proxmox.url && proxmox.username);
+    // In builder view, credentials are intentionally hidden and secret-backed actions are disabled.
+    // Treat the presence of an admin-stored secret as sufficient signal that validation happened in admin view.
+    const proxValidated = IS_BUILDER_VIEW
+        ? !!proxmox.secret_id
+        : !!(proxmox.validated && proxmox.secret_id);
+    const hasProxmox = IS_BUILDER_VIEW
+        ? !!(proxmox.url || proxmox.secret_id)
+        : !!(proxmox.url && proxmox.username);
     const proxPort = proxmox.port ?? 8006;
-    const proxSummaryText = hasProxmox
+    const proxSummaryText = IS_BUILDER_VIEW
         ? (proxValidated
-            ? `Proxmox validated for ${proxmox.username} @ ${proxmox.url}:${proxPort}`
-            : `Proxmox pending validation for ${proxmox.username} @ ${proxmox.url}:${proxPort}`)
-        : 'Proxmox resource not assigned.';
+            ? 'Proxmox credentials validated by an admin.'
+            : ((proxmox.url || '').toString().trim()
+                ? 'Proxmox URL configured (credentials managed by an admin).'
+                : 'Proxmox resource not assigned.'))
+        : (hasProxmox
+            ? (proxValidated
+                ? `Proxmox validated for ${proxmox.username} @ ${proxmox.url}:${proxPort}`
+                : `Proxmox pending validation for ${proxmox.username} @ ${proxmox.url}:${proxPort}`)
+            : 'Proxmox resource not assigned.');
     const proxSummaryHtml = escapeHtml(proxSummaryText);
     const proxSummaryClass = proxValidated ? 'text-success' : (hasProxmox ? 'text-warning' : 'text-muted');
     const proxHasSecret = !!proxmox.secret_id;
@@ -9135,7 +9199,9 @@ function renderMain() {
             const anyTouched = coreTouched || hitlTouched;
 
             const coreConfigured = !!(hasProxmox || proxHasSecret || coreVmKey || coreHost || coreUser || coreHasSecret);
-            const coreValidated = !!(proxValidated && coreTestMatches);
+            const coreValidated = IS_BUILDER_VIEW
+                ? !!(proxValidated && coreHasSecret && coreVmKey)
+                : !!(proxValidated && coreTestMatches);
             const hitlConfigured = !!(participantProxmoxUrlHasValue || hasHitlInterfaces || extSelections || hitlToggleWasEnabled);
             const hitlEnabled = !!hitlToggleWasEnabled;
             const hitlStep4Applied = !!((core.internal_bridge || '').toString().trim());
@@ -9181,6 +9247,9 @@ function renderMain() {
                     const coreIfaceId = (proxTarget?.interface_id ?? '').toString().trim();
                     const extIfaceId = (ext?.interface_id ?? '').toString().trim();
 
+                    // Builder view may not have access to live inventories; prefer persisted hints.
+                    const coreBridgeHint = (iface?.core_bridge ?? iface?.bridge ?? '').toString().trim();
+
                     const coreBridgeStored = (proxTarget?.bridge ?? '').toString().trim();
                     const extBridgeStored = (ext?.interface_bridge ?? '').toString().trim();
 
@@ -9199,7 +9268,7 @@ function renderMain() {
                     const extVmKey = (ext?.vm_key ?? '').toString().trim() || getVmKeyFromParts(ext?.vm_node, ext?.vmid);
                     const extVmForBridge = findVmInInventory(extVmKey);
 
-                    const coreBridge = coreBridgeStored || coreBridgeFromHostIface || resolveInterfaceBridge(coreVmForBridge, coreIfaceId);
+                    const coreBridge = coreBridgeHint || coreBridgeStored || coreBridgeFromHostIface || resolveInterfaceBridge(coreVmForBridge, coreIfaceId);
                     const extBridge = extBridgeStored || resolveInterfaceBridge(extVmForBridge, extIfaceId);
 
                     const name = (iface?.name ?? '').toString().trim();
@@ -9315,7 +9384,12 @@ function renderMain() {
                 };
 
                 const coreRows = [];
-                coreRows.push(['Status', coreValidated ? 'Validated' : (coreConfigured ? 'Configured (not validated)' : 'Not configured'), coreValidated ? 'ok' : (coreConfigured ? 'partial' : 'no')]);
+                const coreStatusLabel = coreValidated
+                    ? (IS_BUILDER_VIEW ? 'Validated by admin' : 'Validated')
+                    : (coreConfigured
+                        ? (IS_BUILDER_VIEW ? 'Configured by admin' : 'Configured (not validated)')
+                        : 'Not configured');
+                coreRows.push(['Status', coreStatusLabel, coreValidated ? 'ok' : (coreConfigured ? 'partial' : 'no')]);
 
                 // Proxmox details (URL + user + validated)
                 const proxUrl = (proxmox?.url || '').toString().trim();
@@ -9323,11 +9397,28 @@ function renderMain() {
                 const proxPortDisplay = (proxmox?.port ?? proxPort);
                 const proxUrlDisplay = proxUrl ? `${proxUrl}:${proxPortDisplay}` : 'Not set';
                 coreRows.push(['Proxmox', proxUrlDisplay, proxUrl ? 'ok' : ((proxHasSecret || proxUser) ? 'partial' : 'no')]);
-                coreRows.push(['Proxmox User', proxUser ? `${proxUser} — ${proxValidated ? 'Validated' : 'Not validated'}` : 'Not set', proxUser ? (proxValidated ? 'ok' : 'partial') : 'no']);
+                if (IS_BUILDER_VIEW) {
+                    const proxUserLabel = proxHasSecret
+                        ? (proxValidated ? 'Not visible in builder view — Validated by admin' : 'Not visible in builder view — Managed by admin')
+                        : 'Not visible in builder view';
+                    coreRows.push(['Proxmox User', proxUserLabel, proxHasSecret ? (proxValidated ? 'ok' : 'partial') : 'no']);
+                } else {
+                    coreRows.push(['Proxmox User', proxUser ? `${proxUser} — ${proxValidated ? 'Validated' : 'Not validated'}` : 'Not set', proxUser ? (proxValidated ? 'ok' : 'partial') : 'no']);
+                }
 
-                coreRows.push(['CORE VM', (coreVmName || coreVmKey) ? (coreVmName || 'Selected') : 'Not selected', (coreVmName || coreVmKey) ? 'ok' : 'no']);
+                const coreVmRowLabel = (coreVmName || coreVmKey)
+                    ? (IS_BUILDER_VIEW ? 'Assigned by admin' : (coreVmName || 'Selected'))
+                    : 'Not selected';
+                coreRows.push(['CORE VM', coreVmRowLabel, (coreVmName || coreVmKey) ? 'ok' : 'no']);
                 coreRows.push(['gRPC', coreHost ? `${coreHost}:${corePort}` : 'Not set', coreHost ? 'ok' : 'no']);
-                coreRows.push(['SSH User', coreUser ? `${coreUser} — ${coreValidated ? 'Validated' : 'Not validated'}` : 'Not set', coreUser ? (coreValidated ? 'ok' : 'partial') : 'no']);
+                if (IS_BUILDER_VIEW) {
+                    const sshUserLabel = coreHasSecret
+                        ? (coreValidated ? 'Not set in builder view — Validated by admin' : 'Not set in builder view — Managed by admin')
+                        : 'Not set in builder view';
+                    coreRows.push(['SSH User', sshUserLabel, coreHasSecret ? (coreValidated ? 'ok' : 'partial') : 'no']);
+                } else {
+                    coreRows.push(['SSH User', coreUser ? `${coreUser} — ${coreValidated ? 'Validated' : 'Not validated'}` : 'Not set', coreUser ? (coreValidated ? 'ok' : 'partial') : 'no']);
+                }
                 coreSummaryEl.innerHTML = renderKvTable(coreTouched ? coreRows : [], 'Not configured');
 
                 const hitlRows = [];
@@ -12170,6 +12261,10 @@ function wireHandlers() {
     });
     document.querySelectorAll('[data-proxmox-refresh]').forEach(btn => {
         btn.addEventListener('click', async () => {
+            if (IS_BUILDER_VIEW) {
+                try { showToast('Builder view is read-only. Ask an admin to refresh Proxmox inventory.', { autohide: true, delay: 3000 }); } catch (e) {}
+                return;
+            }
             if (btn.disabled) return;
             const sidx = parseInt(btn.getAttribute('data-scen-idx'));
             if (Number.isNaN(sidx)) return;
