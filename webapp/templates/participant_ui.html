@@ -92,6 +92,16 @@
           <div class="card-body py-2">
             <div class="row g-2 small font-monospace">
               <div class="col-12 col-md-6">
+                <div class="text-secondary">Session Status</div>
+                <div>
+                  <span class="badge bg-secondary text-uppercase" id="participantStatSessionStatus">-</span>
+                </div>
+              </div>
+              <div class="col-12 col-md-6">
+                <div class="text-secondary">Session ID</div>
+                <div class="fw-semibold text-white" id="participantStatSessionId">-</div>
+              </div>
+              <div class="col-12 col-md-6">
                 <div class="text-secondary">Nearest Gateway Address</div>
                 <div class="fw-semibold text-white" id="participantStatGateway">{{ participant_nearest_gateway or '-' }}</div>
               </div>
@@ -106,16 +116,6 @@
               <div class="col-12 col-md-6">
                 <div class="text-secondary">Open count (all users)</div>
                 <div class="fw-semibold text-white" id="participantStatCountAll">0</div>
-              </div>
-              <div class="col-12 col-md-6">
-                <div class="text-secondary">Session Status</div>
-                <div>
-                  <span class="badge bg-secondary text-uppercase" id="participantStatSessionStatus">-</span>
-                </div>
-              </div>
-              <div class="col-12 col-md-6">
-                <div class="text-secondary">Session ID</div>
-                <div class="fw-semibold text-white" id="participantStatSessionId">-</div>
               </div>
               <div class="col-12 col-md-6">
                 <div class="text-secondary">Last Execute</div>
@@ -202,6 +202,7 @@
   let currentNorm = root.getAttribute('data-active-norm') || '';
   let currentHasUrl = false;
   let currentHref = '';
+  let currentSessionRunning = false;
 
   const openRedirectHref = (norm) => {
     if(!norm) return '/participant-ui/open';
@@ -217,7 +218,7 @@
   const updateOpenButton = (href) => {
     if(!openBtn) return;
     currentHref = href || '';
-    openBtn.disabled = !(currentHref && currentHasUrl);
+    openBtn.disabled = !(currentHref && currentHasUrl && currentSessionRunning === true);
     if(statsCard){
       statsCard.style.display = currentNorm ? '' : 'none';
     }
@@ -343,6 +344,7 @@
     if(statLinkConfigured) statLinkConfigured.textContent = scen.participant_link_configured ? 'Configured' : 'Missing';
 
     const sess = (payload && payload.session) || {};
+    currentSessionRunning = (sess.running === true);
     if(statSessionStatus){
       statSessionStatus.classList.remove('bg-success', 'bg-danger', 'bg-secondary');
       if(sess.running === true) {
@@ -359,6 +361,9 @@
       }
     }
     if(statSessionId) statSessionId.textContent = (sess.session_id !== null && sess.session_id !== undefined) ? String(sess.session_id) : '-';
+
+    // Session status affects Open Console gating.
+    updateOpenButton(currentHref);
 
     const exec = (payload && payload.execute) || {};
     if(statLastExecute) statLastExecute.textContent = fmtTs(exec.last_execute_ts || '');
@@ -393,7 +398,7 @@
     openBtn.dataset.bound = '1';
     openBtn.addEventListener('click', async (ev)=>{
       ev.preventDefault();
-      if(!(currentHref && currentHasUrl)) return;
+      if(!(currentHref && currentHasUrl && currentSessionRunning === true)) return;
       try {
         fetch('/participant-ui/record-open', {
           method: 'POST',

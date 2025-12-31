@@ -6219,7 +6219,11 @@ def _vulnerability_ipv4s_from_session_xml(session_xml_path: Optional[str]) -> li
 
 
 def _counts_from_session_xml(session_xml_path: Optional[str]) -> dict:
-    """Best-effort {nodes, routers, switches} from a CORE session XML."""
+    """Best-effort {nodes, routers, switches} from a CORE session XML.
+
+    This intentionally parses the XML directly (instead of _analyze_core_xml()) so
+    that counts are not affected by any UI-oriented filtering.
+    """
     if not session_xml_path:
         return {}
     try:
@@ -6229,36 +6233,83 @@ def _counts_from_session_xml(session_xml_path: Optional[str]) -> dict:
     if not ap or not os.path.exists(ap):
         return {}
     try:
-        summary = _analyze_core_xml(ap)
+        root = LET.parse(ap).getroot()
     except Exception:
         return {}
-    if not isinstance(summary, dict):
-        return {}
-    nodes_list = summary.get('nodes')
+
+    def _local(tag: str) -> str:
+        if not tag:
+            return ''
+        if '}' in tag:
+            return tag.split('}', 1)[1]
+        return tag
+
+    def _iter_local(el, lname: str):
+        lname = lname.lower()
+        for e in el.iter():
+            if _local(getattr(e, 'tag', '')).lower() == lname:
+                yield e
+
+    candidates = list(_iter_local(root, 'device')) + list(_iter_local(root, 'node'))
+    devices: list[Any] = []
+    seen_ids: set[str] = set()
+    for cand in candidates:
+        ident = cand.get('id') or cand.get('name')
+        key = str(ident).strip() if ident is not None else ''
+        if key and key in seen_ids:
+            continue
+        if key:
+            seen_ids.add(key)
+        devices.append(cand)
+
+    def _dev_type(dev) -> str:
+        try:
+            t = str(dev.get('type') or '').strip()
+        except Exception:
+            t = ''
+        if not t and hasattr(dev, 'find'):
+            try:
+                type_el = dev.find('./type') or dev.find('./model') or dev.find('./icon')
+                if type_el is not None and getattr(type_el, 'text', None):
+                    t = type_el.text.strip()
+            except Exception:
+                t = ''
+        return t
+
     routers = 0
-    if isinstance(nodes_list, list):
-        for n in nodes_list:
-            if not isinstance(n, dict):
+    switches_device = 0
+    switch_ids: set[str] = set()
+    for idx, dev in enumerate(devices, start=1):
+        try:
+            did = str((dev.get('id') or dev.get('name') or f"device_{idx}") or '').strip() or f"device_{idx}"
+        except Exception:
+            did = f"device_{idx}"
+        t = _dev_type(dev).lower()
+        if 'router' in t:
+            routers += 1
+        if t == 'switch':
+            switches_device += 1
+            if did:
+                switch_ids.add(did)
+
+    # Some session exports represent switches as <network type="switch"> entries.
+    extra_switches = 0
+    try:
+        for net in _iter_local(root, 'network'):
+            ntype = str(net.get('type') or '').strip().lower()
+            if 'switch' not in ntype:
                 continue
-            t = str(n.get('type') or '').strip().lower()
-            if 'router' in t:
-                routers += 1
-    switches_count = summary.get('switches_count')
-    try:
-        switches = int(switches_count) if switches_count is not None else None
+            nid = str(net.get('id') or net.get('name') or '').strip()
+            if nid and nid in switch_ids:
+                continue
+            extra_switches += 1
     except Exception:
-        switches = None
-    nodes_count = summary.get('nodes_count')
-    try:
-        nodes = int(nodes_count) if nodes_count is not None else None
-    except Exception:
-        nodes = None
+        extra_switches = 0
+
     out: dict[str, Any] = {}
-    if nodes is not None:
-        out['nodes'] = nodes
+    out['nodes'] = len(devices)
     out['routers'] = routers
-    if switches is not None:
-        out['switches'] = switches
+    out['switches'] = switches_device + extra_switches
     return out
 
 
@@ -6458,19 +6509,6 @@ def participant_ui_details_api():
     summary_counts = _load_summary_counts(summary_path)
     summary_meta = _load_summary_metadata(summary_path)
 
-    # Vulnerabilities (best-effort from summary metadata)
-    vuln_total: Optional[int] = None
-    for key in ('vuln_total_planned_additive', 'plan_vuln_total', 'vuln_density_target', 'vuln_count_items_total'):
-        if not isinstance(summary_meta, dict):
-            break
-        val = summary_meta.get(key)
-        try:
-            vuln_total = int(val) if val is not None else None
-        except Exception:
-            vuln_total = None
-        if vuln_total is not None:
-            break
-
     # Counts
     nodes_total = summary_counts.get('total_nodes')
     routers_total = summary_counts.get('routers')
@@ -6496,6 +6534,14 @@ def participant_ui_details_api():
 
     vulnerability_ips = _vulnerability_ipv4s_from_session_xml(session_xml_path)
 
+    # Vulnerabilities count: prefer actual session XML-derived value.
+    vuln_total: Optional[int] = None
+    if session_xml_path:
+        vuln_total = len(vulnerability_ips)
+    else:
+        # Avoid showing "planned" counts as if they were actual.
+        vuln_total = None
+
     # Gateway: prefer the scenario's last session XML (matches core.html HITL gateway logic)
     gateway = ''
     if session_xml_path:
@@ -6519,13 +6565,13 @@ def participant_ui_details_api():
                 scenario_paths = {}
             gateway = _nearest_gateway_address_for_scenario(scenario_norm, scenario_paths=scenario_paths) if scenario_norm else ''
 
-    # Fill missing counts from session XML if available.
+    # Prefer counts from session XML when available (authoritative for Participant UI).
     xml_counts = _counts_from_session_xml(session_xml_path)
-    if nodes_total is None and isinstance(xml_counts.get('nodes'), int):
+    if isinstance(xml_counts.get('nodes'), int):
         nodes_total = xml_counts.get('nodes')
-    if routers_total is None and isinstance(xml_counts.get('routers'), int):
+    if isinstance(xml_counts.get('routers'), int):
         routers_total = xml_counts.get('routers')
-    if (switches_total is None or switches_total == 0) and isinstance(xml_counts.get('switches'), int):
+    if isinstance(xml_counts.get('switches'), int):
         switches_total = xml_counts.get('switches')
 
     # Session status: prefer live CORE query; fall back to unknown instead of guessing.

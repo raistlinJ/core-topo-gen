@@ -348,6 +348,7 @@
   let lastSessionsSig = null;
   let lastXmlsSig = null;
   let lastDotSig = null;
+  const scenarioDotCache = {}; // norm -> { any: bool, running: bool }
   // Persistent selection state (restored across full page reloads)
   const LS_KEYS = {
     xmls: 'coreSelectedXmls',
@@ -501,19 +502,66 @@
     });
   }
 
-  function updateScenarioActiveDots(counts, itemCounts){
+  function updateScenarioActiveDots(sessions, selectedScenarioName){
     if(!scenarioFilterList) return;
-    const c = (counts && typeof counts === 'object') ? counts : {};
-    const items = (itemCounts && typeof itemCounts === 'object') ? itemCounts : {};
+    const list = Array.isArray(sessions) ? sessions : [];
+    const norm = (v) => (v || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
+    const statusByNorm = {};
+    const isRunningState = (raw) => {
+      const st = (raw !== undefined && raw !== null) ? String(raw).trim().toLowerCase() : '';
+      if(!st) return false;
+      if(st === 'running') return true;
+      // Some CORE/pycore variants use alternate encodings.
+      if(st === 'state_running' || st === 'runtime' || st === 'run') return true;
+      // Fall back to the same heuristic used by the start/stop toggle.
+      if(st.includes('shutdown')) return false;
+      return st.includes('run');
+    };
+
+    list.forEach(s => {
+      const scenRaw = (s && (s.scenario_name || s.scenario || '')) ? String(s.scenario_name || s.scenario || '') : '';
+      const scenNorm = norm(scenRaw);
+      if(!scenNorm) return;
+      const entry = statusByNorm[scenNorm] || { any: false, running: false };
+      entry.any = true;
+      if(isRunningState(s && s.state)) entry.running = true;
+      statusByNorm[scenNorm] = entry;
+    });
+
+    // If we're in a scenario-filtered view, the backend has already scoped
+    // sessions to the selected scenario. Use that as authoritative for the
+    // selected scenario dot even when individual session entries lack a
+    // reliable scenario_name.
+    const selectedNorm = norm(selectedScenarioName || '');
+    if(selectedNorm){
+      const anyForSelected = list.length > 0;
+      const runningForSelected = anyForSelected ? list.some(s => isRunningState(s && s.state)) : false;
+      statusByNorm[selectedNorm] = { any: anyForSelected, running: runningForSelected };
+    }
+
+    // Merge into last-seen cache. Only scenarios present in this response are updated.
+    Object.keys(statusByNorm).forEach(k => {
+      scenarioDotCache[k] = { any: !!statusByNorm[k].any, running: !!statusByNorm[k].running };
+    });
+
+    // Keep the selected scenario accurate even when responses are scoped:
+    // if the response contains no sessions for the selected scenario, clear its cache.
+    // Selected scenario is always updated (or cleared) from this response.
+    if(selectedNorm){
+      const selectedEntry = statusByNorm[selectedNorm] || { any: false, running: false };
+      scenarioDotCache[selectedNorm] = { any: !!selectedEntry.any, running: !!selectedEntry.running };
+    }
+
     scenarioFilterList.querySelectorAll('button[data-scen-name]').forEach(btn => {
       const name = btn.getAttribute('data-scen-name') || '';
       const dot = btn.querySelector('.scenario-active-dot');
       const itemDot = btn.querySelector('.scenario-item-dot');
       if(!dot && !itemDot) return;
-      const n = (name && Object.prototype.hasOwnProperty.call(c, name)) ? Number(c[name]) : 0;
-      const hasItems = (name && Object.prototype.hasOwnProperty.call(items, name)) ? (Number(items[name]) > 0) : false;
-      if(dot) dot.classList.toggle('d-none', !(n > 0));
-      if(itemDot) itemDot.classList.toggle('d-none', !((n <= 0) && hasItems));
+      const entry = scenarioDotCache[norm(name)] || { any: false, running: false };
+      const showGreen = !!entry.running;
+      const showYellow = (!!entry.any) && !entry.running;
+      if(dot) dot.classList.toggle('d-none', !showGreen);
+      if(itemDot) itemDot.classList.toggle('d-none', !showYellow);
     });
   }
 
@@ -642,15 +690,44 @@
     }
   }
 
-  function signatureForScenarioDots(counts, itemCounts){
+  function signatureForScenarioDots(sessions, selectedScenarioName){
     try {
-      const c = (counts && typeof counts === 'object') ? counts : {};
-      const items = (itemCounts && typeof itemCounts === 'object') ? itemCounts : {};
-      const keys = Array.from(new Set([...
-        Object.keys(c || {}),
-        Object.keys(items || {}),
-      ])).sort();
-      const rows = keys.map(k => [k, Number(c[k] || 0), Number(items[k] || 0)]);
+      const list = Array.isArray(sessions) ? sessions : [];
+      const norm = (v) => (v || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
+      const status = {};
+      const isRunningState = (raw) => {
+        const st = (raw !== undefined && raw !== null) ? String(raw).trim().toLowerCase() : '';
+        if(!st) return false;
+        if(st === 'running') return true;
+        if(st === 'state_running' || st === 'runtime' || st === 'run') return true;
+        if(st.includes('shutdown')) return false;
+        return st.includes('run');
+      };
+      list.forEach(s => {
+        const scenRaw = (s && (s.scenario_name || s.scenario || '')) ? String(s.scenario_name || s.scenario || '') : '';
+        const scenNorm = norm(scenRaw);
+        if(!scenNorm) return;
+        const entry = status[scenNorm] || { any: false, running: false };
+        entry.any = true;
+        if(isRunningState(s && s.state)) entry.running = true;
+        status[scenNorm] = entry;
+      });
+
+      // Apply scenario-filtered override for signature stability (see updateScenarioActiveDots).
+      const selectedNorm = norm(selectedScenarioName || '');
+      if(selectedNorm){
+        const anyForSelected = list.length > 0;
+        const runningForSelected = anyForSelected ? list.some(s => isRunningState(s && s.state)) : false;
+        status[selectedNorm] = { any: anyForSelected, running: runningForSelected };
+      }
+
+      // Merge into a copy of the last-seen cache (doesn't mutate).
+      const merged = Object.assign({}, scenarioDotCache);
+      Object.keys(status).forEach(k => {
+        merged[k] = { any: !!status[k].any, running: !!status[k].running };
+      });
+      const keys = Object.keys(merged).sort();
+      const rows = keys.map(k => [k, merged[k].any ? 1 : 0, merged[k].running ? 1 : 0]);
       return JSON.stringify(rows);
     } catch(e){
       return String(Math.random());
@@ -861,17 +938,17 @@
           ensureScenarioSelected();
           updateCoreScenarioControls();
         }
-        const nextDotSig = signatureForScenarioDots(data.active_session_counts, data.scenario_item_counts);
+        const nextDotSig = signatureForScenarioDots(data.sessions, scenarioFilter);
         if(nextDotSig !== lastDotSig){
-          updateScenarioActiveDots(data.active_session_counts, data.scenario_item_counts);
+          updateScenarioActiveDots(data.sessions, scenarioFilter);
           lastDotSig = nextDotSig;
         }
       } else {
         ensureScenarioSelected();
         updateCoreScenarioControls();
-        const nextDotSig = signatureForScenarioDots(data.active_session_counts, data.scenario_item_counts);
+        const nextDotSig = signatureForScenarioDots(data.sessions, scenarioFilter);
         if(nextDotSig !== lastDotSig){
-          updateScenarioActiveDots(data.active_session_counts, data.scenario_item_counts);
+          updateScenarioActiveDots(data.sessions, scenarioFilter);
           lastDotSig = nextDotSig;
         }
       }

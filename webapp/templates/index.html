@@ -84,12 +84,6 @@
         <div class="col-md-9">
             <div class="card shadow mt-3">
                 <div class="card-body">
-                    {% with messages = get_flashed_messages() %}
-                        {% if messages %}
-                            <div class="alert alert-info">{{ messages[0] }}</div>
-                        {% endif %}
-                    {% endwith %}
-
                     <div class="card mb-3" id="baseCoreScenarioCard">
                         <div class="card-header d-flex justify-content-between align-items-center">
                             <strong>Base CORE Scenario</strong>
