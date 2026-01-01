@@ -48,12 +48,12 @@
     const zoomBehavior = d3.zoom().scaleExtent([0.15,6]).on('zoom', ev=> { g.attr('transform', ev.transform); updateMiniMapViewport(ev.transform); });
     svg.call(zoomBehavior);
 
-    const vulnerabilityColor = '#28a745';
+    const vulnerabilityColor = '#ff0000';
     const hitlColor = '#2e7d32';
     const hitlMarkers = ['rj45','rj-45','hitl','tap','bridge','ethernet','physical'];
     const typeColor = d3.scaleOrdinal()
-      .domain(['router','switch','hub','wlan','host','pc','server','docker','node','hitl'])
-      .range(['#d9534f','#f0ad4e','#5bc0de','#5cb85c','#0275d8','#6610f2','#6f42c1','#9c27b0','#607d8b', hitlColor]);
+      .domain(['router','switch','hub','wlan','host','pc','server','vulnerability','node','hitl'])
+      .range(['#d9534f','#f0ad4e','#5bc0de','#5cb85c','#0275d8','#6610f2','#6f42c1', vulnerabilityColor,'#607d8b', hitlColor]);
 
     function nodeHasVulnerabilities(node){
       if(!node) return false;
@@ -72,14 +72,53 @@
       return false;
     }
 
+    // Pin HITL nodes away from the rest of the topology and label them clearly.
+    // This mirrors the intent of the details page where HITL nodes are distinct,
+    // and prevents the HITL gateway (e.g., ens19) from blending into LAN/switch clusters.
+    function placeHitlNodes(viewW, viewH){
+      try {
+        const hitlNodes = nodes.filter(n => nodeIsHitl(n));
+        if(!hitlNodes.length) return;
+        hitlNodes.sort((a,b)=> String(a.id ?? a.name ?? '').localeCompare(String(b.id ?? b.name ?? '')));
+        // Keep HITL as far away from the main topology as possible while staying in-bounds.
+        const marginRight = 60;
+        const startY = 90;
+        const gapY = 140;
+        const x = Math.max(160, (viewW || width) - marginRight);
+        hitlNodes.forEach((n, i)=>{
+          const y = Math.max(90, Math.min((viewH || height) - 90, startY + i * gapY));
+          n.fx = x;
+          n.fy = y;
+          n.x = x;
+          n.y = y;
+        });
+      } catch(e){}
+    }
+
+    // Ensure a CSS animation exists for the HITL callout label.
+    (function ensureHereLabelAnimation(){
+      try {
+        if(document.getElementById('hereLabelAnimStyle')) return;
+        const style = document.createElement('style');
+        style.id = 'hereLabelAnimStyle';
+        style.textContent = `
+@keyframes hereLabelFlash { 0% { opacity: 1; } 50% { opacity: 0.15; } 100% { opacity: 1; } }
+.here-label-flash { animation: hereLabelFlash 0.5s linear infinite; }
+`;
+        document.head.appendChild(style);
+      } catch(e){}
+    })();
+
     function nodeCategory(node){
       if(nodeIsHitl(node)){ return 'hitl'; }
       const t = (node && node.type) ? node.type.toLowerCase() : '';
+      if(t === 'docker') return 'vulnerability';
       return t || 'node';
     }
 
     function nodeFillColor(node){
       if(nodeIsHitl(node)){ return hitlColor; }
+      if(nodeCategory(node) === 'vulnerability') return vulnerabilityColor;
       const typeVal = (node.type||'').toLowerCase();
       if(nodeHasVulnerabilities(node) && (typeVal === 'host' || typeVal === 'pc' || typeVal === 'server')){
         return vulnerabilityColor;
@@ -102,14 +141,24 @@
     }
 
     function labelFill(node){
+      if(nodeIsHitl(node)) return '#000';
       return ((node?.type||'').toLowerCase()==='switch') ? '#000' : '#fff';
+    }
+
+    function displayName(node){
+      const raw = String(node?.name || '');
+      if(!raw) return '';
+      if(!nodeIsHitl(node)) return raw;
+      // Avoid showing IP/CIDR-like info on the HITL node label.
+      // Example: "ens19 (10.0.0.0/24)" -> "ens19".
+      return raw.replace(/\s*\(([^)]*[\d.:]+[^)]*)\)\s*$/,'').trim();
     }
 
     function boxW(node){
       const svc = (node?.services||[]).length;
       const base = 110 + Math.min(120, svc * 10);
-      const nameLen = String(node?.name || '').length;
-      const ipLen = String(primaryIpv4(node) || '').length;
+      const nameLen = String(displayName(node) || '').length;
+      const ipLen = nodeIsHitl(node) ? 0 : String(primaryIpv4(node) || '').length;
       // Heuristic text fit: ~6.4px per char at 10px font, plus padding.
       const textNeed = (Math.max(nameLen, ipLen) * 6.4) + 26;
       return Math.max(base, Math.min(320, textNeed));
@@ -118,6 +167,7 @@
     function boxH(node){
       const svc = (node?.services||[]).length;
       const base = 44 + Math.min(34, svc * 1.35);
+      if(nodeIsHitl(node)) return base;
       return base + (primaryIpv4(node) ? 14 : 0);
     }
 
@@ -128,7 +178,7 @@
       const t = (node && node.type) ? String(node.type).toLowerCase() : '';
       if(t === 'router') return 0;
       if(t === 'switch' || t === 'hub' || t === 'wlan') return 1;
-      if(t === 'host' || t === 'pc' || t === 'server' || t === 'docker' || t === 'node') return 2;
+      if(t === 'host' || t === 'pc' || t === 'server' || t === 'docker' || t === 'vulnerability' || t === 'node') return 2;
       if(nodeIsHitl(node)) return 2;
       return 2;
     }
@@ -334,6 +384,9 @@
       }
     });
 
+    // Ensure HITL node(s) start in a stable, separated location.
+    placeHitlNodes(width, height);
+
     let clusterMode = 'off';
 
     function linkTierDistance(l){
@@ -489,7 +542,7 @@
       const svcList = (d.services||[]);
       const ifaceList = Array.isArray(d.interfaces) ? d.interfaces : [];
       const lines = [];
-      lines.push(`<strong>${(d.name||'')} (${d.id})</strong>`);
+      lines.push(`<strong>${(displayName(d)||'')} (${d.id})</strong>`);
       if(svcList.length){
         svcList.forEach(s => lines.push(s));
       } else {
@@ -502,8 +555,10 @@
           if(iface.name){ parts.push(iface.name); }
           if(iface.mac){ parts.push(iface.mac); }
           const addrParts = [];
-          if(iface.ipv4){ addrParts.push(`${iface.ipv4}${iface.ipv4_mask ? '/' + iface.ipv4_mask : ''}`); }
-          if(iface.ipv6){ addrParts.push(`${iface.ipv6}${iface.ipv6_mask ? '/' + iface.ipv6_mask : ''}`); }
+          if(!nodeIsHitl(d)){
+            if(iface.ipv4){ addrParts.push(`${iface.ipv4}${iface.ipv4_mask ? '/' + iface.ipv4_mask : ''}`); }
+            if(iface.ipv6){ addrParts.push(`${iface.ipv6}${iface.ipv6_mask ? '/' + iface.ipv6_mask : ''}`); }
+          }
           if(addrParts.length){ parts.push(addrParts.join(' | ')); }
           if(parts.length){ lines.push(parts.join(' • ')); }
         });
@@ -532,7 +587,29 @@
       .attr('pointer-events','none')
       .attr('fill', d => labelFill(d))
       .attr('class','label')
-      .text(d => wrapLabel(d.name||''));
+      .text(d => wrapLabel(displayName(d)||''));
+
+    // Explicit HITL callout label.
+    const hereLabel = nodeGroup.append('text')
+      .attr('text-anchor','middle')
+      .attr('y', d => nodeIsHitl(d) ? (-(boxH(d) / 2) - 10) : ((boxH(d) / 2) + 18))
+      .attr('font-size','14px')
+      .attr('font-weight','700')
+      .attr('pointer-events','none')
+      .attr('fill', d => labelFill(d))
+      .attr('stroke', d => nodeIsHitl(d) ? '#fff' : 'none')
+      .attr('stroke-width', d => nodeIsHitl(d) ? 3 : 0)
+      .attr('paint-order', 'stroke')
+      .attr('class','here-label')
+      .text(d => nodeIsHitl(d) ? 'YOU ARE HERE' : '');
+
+    // Flash the HITL callout for ~5 seconds.
+    try {
+      hereLabel.filter(d => nodeIsHitl(d)).classed('here-label-flash', true);
+      setTimeout(()=>{
+        try { hereLabel.filter(d => nodeIsHitl(d)).classed('here-label-flash', false); } catch(e){}
+      }, 5000);
+    } catch(e){}
 
     nodeGroup.append('text')
       .attr('text-anchor','middle')
@@ -550,6 +627,7 @@
       .attr('pointer-events','none')
       .attr('fill', d => labelFill(d))
       .text(d => {
+        if(nodeIsHitl(d)) return '';
         const ip = primaryIpv4(d);
         return ip ? ip : '';
       });
@@ -769,7 +847,16 @@
     const statsEl = document.getElementById('graphStats'); if(statsEl){ statsEl.textContent = `${nodes.length} nodes, ${links.length} links`; }
 
     // Resize handling
-  const ro = new ResizeObserver(entries => { for(const e of entries){ const w = e.contentRect.width; const h = e.contentRect.height; svg.attr('width', w).attr('height', h); simulation.force('center', d3.forceCenter(w/2, h/2)); simulation.alpha(0.15).restart(); } });
+  const ro = new ResizeObserver(entries => {
+    for(const e of entries){
+      const w = e.contentRect.width;
+      const h = e.contentRect.height;
+      svg.attr('width', w).attr('height', h);
+      placeHitlNodes(w, h);
+      simulation.force('center', d3.forceCenter(w/2, h/2));
+      simulation.alpha(0.15).restart();
+    }
+  });
     ro.observe(container);
 
     // Persist positions on unload

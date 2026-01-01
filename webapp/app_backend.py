@@ -6840,14 +6840,14 @@ def participant_ui_topology_api():
         })
 
     try:
-        app.logger.info("[participant-ui.topology] scenario=%s session_xml=%s", scenario_norm, ap)
-    except Exception:
-        pass
-
-    try:
         ap = os.path.abspath(str(session_xml_path))
     except Exception:
         ap = str(session_xml_path)
+
+    try:
+        app.logger.info("[participant-ui.topology] scenario=%s session_xml=%s", scenario_norm, ap)
+    except Exception:
+        pass
     if not ap or not os.path.exists(ap):
         return jsonify({
             'ok': True,
@@ -6923,7 +6923,20 @@ def participant_ui_topology_api():
         raw_type = str(net.get('type') or '').strip()
         # Render network objects as "switch" by default to match graph styling.
         type_hint = (raw_type or '').lower()
-        if 'wlan' in type_hint or 'wireless' in type_hint:
+        name_hint = str(net.get('name') or '').strip().lower()
+        is_hitl = False
+        # Preserve RJ45/HITL network objects so the graph can style them correctly.
+        # The Details page exposes these via summary.hitl_network_nodes.
+        try:
+            import re
+            name_looks_like_iface = bool(re.match(r'^(ens|enp|eth)\d', name_hint))
+        except Exception:
+            name_looks_like_iface = False
+
+        if name_looks_like_iface or 'rj45' in type_hint or 'rj-45' in type_hint or 'hitl' in type_hint or 'tap' in type_hint:
+            coerced_type = 'hitl'
+            is_hitl = True
+        elif 'wlan' in type_hint or 'wireless' in type_hint:
             coerced_type = 'wlan'
         else:
             coerced_type = 'switch'
@@ -6934,6 +6947,7 @@ def participant_ui_topology_api():
             'services': [],
             'interfaces': [],
             'linked_nodes': [],
+            'is_hitl': bool(is_hitl),
         }
 
     # Vulnerability tagging: mark nodes whose ipv4 matches vulnerability IPs.
@@ -7003,6 +7017,7 @@ def participant_ui_topology_api():
             'ipv4s': ipv4s_u,
             'subnets': sorted(subnet_hits) if subnet_hits else [],
             'is_vulnerability': bool(is_vuln),
+            'is_hitl': bool(n.get('is_hitl')),
         })
 
     # Sort nodes for stable output.
@@ -7048,6 +7063,12 @@ def participant_ui_topology_api():
         for net_id in (network_ids or set()):
             if net_id not in id_to_node:
                 continue
+            # Never rename HITL/RJ45 network nodes to a subnet; keep interface label (e.g., ens19).
+            try:
+                if str(id_to_node[net_id].get('type') or '').strip().lower() == 'hitl':
+                    continue
+            except Exception:
+                pass
             neighbor_ids = list(adj.get(net_id, set()))
             if not neighbor_ids:
                 continue
