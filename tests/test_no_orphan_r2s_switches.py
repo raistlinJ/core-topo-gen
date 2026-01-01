@@ -114,3 +114,99 @@ def test_nonuniform_respects_host_bounds(monkeypatch):
             assert applied_min >= 3
         if applied_max is not None:
             assert applied_max <= 5
+
+
+def test_no_degree0_switch_when_link_noops(monkeypatch):
+    # Simulate a CORE/session implementation where add_link() silently no-ops for switch-related links.
+    # The builder should detect this (via session.links validation) and delete the created switch,
+    # rather than leaving behind a degree-0 switch node.
+    class NoopSwitchLinkSession(FakeSession):
+        def add_link(self, node1=None, node2=None, iface1=None, iface2=None):
+            if not node1 or not node2:
+                return
+            a_obj = node1 if hasattr(node1, 'id') else self.nodes.get(int(node1))
+            b_obj = node2 if hasattr(node2, 'id') else self.nodes.get(int(node2))
+            a_model = (getattr(a_obj, 'model', '') or '').lower() if a_obj is not None else ''
+            b_model = (getattr(b_obj, 'model', '') or '').lower() if b_obj is not None else ''
+            # Silent failure for any link involving a switch.
+            if a_model == 'switch' or b_model == 'switch':
+                return
+            return super().add_link(node1=node1, node2=node2, iface1=iface1, iface2=iface2)
+
+    ritems = [RoutingInfo(protocol='OSPFv2', factor=1.0, r2s_mode='Exact', r2s_edges=2)]
+    role_counts = {'workstation': 12}
+    sess = NoopSwitchLinkSession()
+    _patch(monkeypatch, sess)
+    random.seed(7)
+
+    topo_mod.build_segmented_topology(
+        DummyClient(),
+        role_counts=role_counts,
+        routing_density=0.5,
+        routing_items=ritems,
+        base_host_pool=sum(role_counts.values()),
+        services=None,
+    )
+
+    # No switch nodes should remain if switch links cannot be created.
+    switches = [nid for nid, node in sess.nodes.items() if getattr(node, 'model', '').lower() == 'switch']
+    assert not switches, f"Switch nodes should not persist when switch links fail: {switches}"
+
+    # Hosts should still have at least one link (direct to router), i.e., we didn't disconnect them.
+    host_ids = [nid for nid, node in sess.nodes.items() if getattr(node, 'model', '').lower() in ('pc', 'docker', 'host', 'default')]
+    assert host_ids, 'Expected hosts to be created'
+    linked_host_ids = {nid for lk in sess.links for nid in lk if nid in host_ids}
+    assert linked_host_ids == set(host_ids), f"Some hosts became disconnected: missing={sorted(set(host_ids) - linked_host_ids)}"
+
+
+def test_preview_realization_skips_empty_switch_details(monkeypatch):
+    # Preview payload with one empty switch detail (should be ignored) and one valid.
+    preview_plan = {
+        "routers": [{"node_id": 1, "name": "r1", "ip4": ""}],
+        "hosts": [
+            {"node_id": 2, "name": "h1", "role": "workstation", "ip4": ""},
+            {"node_id": 3, "name": "h2", "role": "workstation", "ip4": ""},
+        ],
+        "host_router_map": {"2": 1, "3": 1},
+        "switches_detail": [
+            {
+                "switch_id": 99,
+                "router_id": 1,
+                "hosts": [],
+                "rsw_subnet": "10.55.1.0/24",
+                "lan_subnet": "10.55.1.0/24",
+                "router_ip": "10.55.1.1/24",
+                "switch_ip": None,
+                "host_if_ips": {},
+            },
+            {
+                "switch_id": 100,
+                "router_id": 1,
+                "hosts": [2, 3],
+                "rsw_subnet": "10.55.2.0/24",
+                "lan_subnet": "10.55.2.0/24",
+                "router_ip": "10.55.2.1/24",
+                "switch_ip": None,
+                "host_if_ips": {"2": "10.55.2.2/24", "3": "10.55.2.3/24"},
+            },
+        ],
+    }
+
+    sess = FakeSession()
+    _patch(monkeypatch, sess)
+
+    topo_mod.build_segmented_topology(
+        DummyClient(),
+        role_counts={"workstation": 2},
+        routing_density=0.0,
+        routing_items=[],
+        base_host_pool=2,
+        services=None,
+        ip4_prefix="10.55.0.0/16",
+        preview_plan=preview_plan,
+    )
+
+    assert 99 not in sess.nodes
+    assert 100 in sess.nodes
+    assert tuple(sorted((1, 99))) not in sess.links
+    assert tuple(sorted((1, 100))) in sess.links

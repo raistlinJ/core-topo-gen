@@ -87,20 +87,337 @@
       return typeColor(nodeCategory(node));
     }
 
+    function primaryIpv4(node){
+      if(!node) return '';
+      const list = Array.isArray(node.ipv4s) ? node.ipv4s : [];
+      const first = list.find(v => v && String(v).trim());
+      if(first) return String(first).trim();
+      const ifaces = Array.isArray(node.interfaces) ? node.interfaces : [];
+      for(const iface of ifaces){
+        if(!iface || typeof iface !== 'object') continue;
+        const ip = (iface.ipv4 || iface.ip4 || '').toString().trim();
+        if(ip) return ip.split('/', 1)[0];
+      }
+      return '';
+    }
+
+    function labelFill(node){
+      return ((node?.type||'').toLowerCase()==='switch') ? '#000' : '#fff';
+    }
+
+    function boxW(node){
+      const svc = (node?.services||[]).length;
+      const base = 110 + Math.min(120, svc * 10);
+      const nameLen = String(node?.name || '').length;
+      const ipLen = String(primaryIpv4(node) || '').length;
+      // Heuristic text fit: ~6.4px per char at 10px font, plus padding.
+      const textNeed = (Math.max(nameLen, ipLen) * 6.4) + 26;
+      return Math.max(base, Math.min(320, textNeed));
+    }
+
+    function boxH(node){
+      const svc = (node?.services||[]).length;
+      const base = 44 + Math.min(34, svc * 1.35);
+      return base + (primaryIpv4(node) ? 14 : 0);
+    }
+
     const linkCounts = new Array(nodes.length).fill(0); links.forEach(l => { linkCounts[l.source]++; linkCounts[l.target]++; });
+
+    // Network-diagram-like tiering (keeps it readable vs. pure force soup)
+    function nodeTier(node){
+      const t = (node && node.type) ? String(node.type).toLowerCase() : '';
+      if(t === 'router') return 0;
+      if(t === 'switch' || t === 'hub' || t === 'wlan') return 1;
+      if(t === 'host' || t === 'pc' || t === 'server' || t === 'docker' || t === 'node') return 2;
+      if(nodeIsHitl(node)) return 2;
+      return 2;
+    }
+
+    const tiers = nodes.map(n => nodeTier(n));
+    const tierBuckets = new Map();
+    tiers.forEach((tier, idx)=>{
+      const arr = tierBuckets.get(tier) || [];
+      arr.push(idx);
+      tierBuckets.set(tier, arr);
+    });
+
+    // Primary subnet per node (used to horizontally separate subnet groups)
+    function primarySubnet(node){
+      const list = Array.isArray(node?.subnets) ? node.subnets : [];
+      const first = list.find(v => v && String(v).trim());
+      return first ? String(first).trim() : '';
+    }
+
+    const subnetKeys = Array.from(new Set(nodes.map(n => primarySubnet(n)).filter(Boolean))).sort();
+    const subnetMembers = new Map();
+    nodes.forEach((n, idx)=>{
+      if(nodeTier(n) === 0) return; // routers excluded from subnet boxes/lanes
+      const key = primarySubnet(n);
+      if(!key) return;
+      const arr = subnetMembers.get(key) || [];
+      arr.push(idx);
+      subnetMembers.set(key, arr);
+    });
+
+    // Use link structure to arrange routers → switches → hosts horizontally.
+    // This produces a more network-diagram-like layout than evenly spreading by type.
+    const neighbors = new Array(nodes.length).fill(0).map(()=> new Set());
+    links.forEach(l => {
+      const s = l.source; const t = l.target;
+      if(typeof s !== 'number' || typeof t !== 'number') return;
+      if(s === t) return;
+      neighbors[s].add(t);
+      neighbors[t].add(s);
+    });
+
+    const routerIdxs = (tierBuckets.get(0) || []).slice();
+    const switchIdxs = (tierBuckets.get(1) || []).slice();
+    const hostIdxs = (tierBuckets.get(2) || []).slice();
+
+    const nodeKey = (idx) => {
+      const n = nodes[idx] || {};
+      return String(n.id ?? n.name ?? idx);
+    };
+
+    const pickPrimary = (candidates) => {
+      if(!candidates || !candidates.length) return null;
+      const sorted = candidates.slice().sort((a,b)=> nodeKey(a).localeCompare(nodeKey(b)));
+      return sorted[0];
+    };
+
+    const switchToRouter = new Map();
+    switchIdxs.forEach(sw => {
+      const rNbrs = Array.from(neighbors[sw] || []).filter(nbr => tiers[nbr] === 0);
+      const primary = pickPrimary(rNbrs);
+      if(primary != null) switchToRouter.set(sw, primary);
+    });
+
+    const routerToSwitches = new Map();
+    routerIdxs.forEach(r => routerToSwitches.set(r, []));
+    const unassignedSwitches = [];
+    switchIdxs.forEach(sw => {
+      const r = switchToRouter.get(sw);
+      if(r != null && routerToSwitches.has(r)) routerToSwitches.get(r).push(sw);
+      else unassignedSwitches.push(sw);
+    });
+
+    const hostToSwitch = new Map();
+    hostIdxs.forEach(h => {
+      const sNbrs = Array.from(neighbors[h] || []).filter(nbr => tiers[nbr] === 1);
+      const primary = pickPrimary(sNbrs);
+      if(primary != null) hostToSwitch.set(h, primary);
+    });
+
+    const switchToHosts = new Map();
+    switchIdxs.forEach(sw => switchToHosts.set(sw, []));
+    const unassignedHosts = [];
+    hostIdxs.forEach(h => {
+      const sw = hostToSwitch.get(h);
+      if(sw != null && switchToHosts.has(sw)) switchToHosts.get(sw).push(h);
+      else unassignedHosts.push(h);
+    });
+
+    function tierY(tier){
+      // Larger vertical separation so routers sit clearly above distribution/access layers.
+      if(tier === 0) return height * 0.10;
+      if(tier === 1) return height * 0.56;
+      return height * 0.93;
+    }
+
+    function tierXFallback(idx){
+      const tier = tiers[idx] ?? 2;
+      const bucket = tierBuckets.get(tier) || [idx];
+      const pos = bucket.indexOf(idx);
+      const n = Math.max(1, bucket.length);
+      const pad = 40;
+      if(n === 1) return width / 2;
+      const frac = pos / (n - 1);
+      return pad + frac * Math.max(1, (width - pad * 2));
+    }
+
+    const preferredX = new Array(nodes.length).fill(0).map((_,i)=> tierXFallback(i));
+    if(routerIdxs.length){
+      const pad = 90;
+      const slotW = Math.max(320, (width - pad * 2) / Math.max(1, routerIdxs.length));
+      const routerOrder = routerIdxs.slice().sort((a,b)=> nodeKey(a).localeCompare(nodeKey(b)));
+
+      routerOrder.forEach((r, i) => {
+        const cx = pad + slotW * (i + 0.5);
+        preferredX[r] = cx;
+
+        const sws = (routerToSwitches.get(r) || []).slice().sort((a,b)=> nodeKey(a).localeCompare(nodeKey(b)));
+        if(sws.length){
+          // Spread switches wider under each router (more separation from the router node).
+          const inner = Math.max(420, slotW * 1.35);
+          const left = cx - inner / 2;
+          const right = cx + inner / 2;
+          const denom = Math.max(1, (sws.length - 1));
+          sws.forEach((sw, j) => {
+            const x = sws.length === 1 ? cx : (left + (j / denom) * (right - left));
+            preferredX[sw] = x;
+            const hs = (switchToHosts.get(sw) || []).slice().sort((a,b)=> nodeKey(a).localeCompare(nodeKey(b)));
+            if(hs.length){
+              // Spread hosts wider under each switch.
+              const span = Math.min(520, Math.max(260, inner * 0.78));
+              const hLeft = x - span / 2;
+              const hRight = x + span / 2;
+              const hDen = Math.max(1, (hs.length - 1));
+              hs.forEach((h, k) => {
+                preferredX[h] = (hs.length === 1) ? x : (hLeft + (k / hDen) * (hRight - hLeft));
+              });
+            }
+          });
+        }
+      });
+
+      // Place switches/hosts that couldn't be attached to the hierarchy using fallback spread.
+      unassignedSwitches.forEach(sw => { preferredX[sw] = tierXFallback(sw); });
+      unassignedHosts.forEach(h => { preferredX[h] = tierXFallback(h); });
+    }
+
+    // Compute subnet lane centers based on the *actual* preferred footprint of each subnet.
+    const subnetCenterX = new Map();
+    if(subnetKeys.length){
+      const gap = 240;
+      const pad = 160;
+      const widths = subnetKeys.map(key => {
+        const idxs = subnetMembers.get(key) || [];
+        if(!idxs.length) return 420;
+        let minX = Infinity, maxX = -Infinity;
+        idxs.forEach(i => {
+          const x = preferredX[i];
+          const w = boxW(nodes[i]);
+          minX = Math.min(minX, x - w/2);
+          maxX = Math.max(maxX, x + w/2);
+        });
+        if(!Number.isFinite(minX) || !Number.isFinite(maxX)) return 420;
+        return Math.max(420, Math.min(2200, (maxX - minX) + 320));
+      });
+
+      let cursor = pad;
+      subnetKeys.forEach((key, i)=>{
+        const w = widths[i];
+        const center = cursor + w / 2;
+        subnetCenterX.set(key, center);
+        cursor = center + w / 2 + gap;
+      });
+
+      const total = cursor - gap + pad;
+      if(Number.isFinite(total) && total < width){
+        const shift = (width - total) / 2;
+        subnetKeys.forEach(key => subnetCenterX.set(key, (subnetCenterX.get(key) || 0) + shift));
+      }
+    }
+
+    // Subnet-aware horizontal bias: keep hierarchy but push each subnet group into its own lane.
+    if(subnetCenterX.size){
+      nodes.forEach((n, i)=>{
+        const tier = tiers[i] ?? 2;
+        if(tier === 0) return; // never bias routers into subnet lanes
+        const sn = primarySubnet(n);
+        const cx = sn ? subnetCenterX.get(sn) : null;
+        if(cx == null) return;
+        const w = (tier === 1 ? 0.80 : 0.90);
+        preferredX[i] = preferredX[i] * (1 - w) + cx * w;
+      });
+    }
+
+    function tierX(idx){
+      return preferredX[idx] ?? tierXFallback(idx);
+    }
+
+    // Seed initial positions into tiers to reduce "explosion" on first tick.
+    nodes.forEach((n, i)=>{
+      if(n.x == null || n.y == null){
+        n.x = tierX(i);
+        n.y = tierY(tiers[i] ?? 2);
+      }
+    });
 
     let clusterMode = 'off';
 
+    function linkTierDistance(l){
+      const sObj = (l && typeof l.source === 'object') ? l.source : nodes[l?.source];
+      const tObj = (l && typeof l.target === 'object') ? l.target : nodes[l?.target];
+      const a = nodeTier(sObj);
+      const b = nodeTier(tObj);
+      // router↔switch longer; switch↔host medium; router↔router also long.
+      if((a === 0 && b === 1) || (a === 1 && b === 0)) return 360;
+      if((a === 1 && b === 2) || (a === 2 && b === 1)) return 230;
+      if(a === 0 && b === 0) return 300;
+      return 210;
+    }
+
     const simulation = d3.forceSimulation(nodes)
-      .force('link', d3.forceLink(links).id((d,i)=> i).distance(160).strength(0.35))
-      .force('charge', d3.forceManyBody().strength(-300))
+      .force('link', d3.forceLink(links).id((d,i)=> i).distance(linkTierDistance).strength(0.28))
+      .force('charge', d3.forceManyBody().strength(-520))
       .force('center', d3.forceCenter(width/2, height/2))
+      .force('tierY', d3.forceY((d)=> tierY(nodeTier(d))).strength(0.18))
+      .force('tierX', d3.forceX((d)=> tierX(d.index ?? 0)).strength(0.30))
+      .force('subnetX', d3.forceX(d => {
+        if(nodeTier(d) === 0) return width / 2;
+        const sn = primarySubnet(d);
+        const cx = sn ? subnetCenterX.get(sn) : null;
+        return (cx != null) ? cx : (d.x ?? width/2);
+      }).strength(0.22))
       .force('collision', d3.forceCollide().radius(d => {
-        const svc = (d.services||[]).length;
-        const w = 70 + Math.min(100, svc * 8);
-        const h = 36 + Math.min(24, svc * 1.2);
-        return Math.max(w,h)/2 + 14;
+        const w = boxW(d);
+        const h = boxH(d);
+        return Math.max(w,h)/2 + 32;
       }));
+
+    // Subnet bounding boxes (behind everything)
+    const subnetLayer = g.append('g').attr('class', 'subnet-layer');
+
+    function nodeSubnets(node){
+      // Use the primary subnet only to keep boxes disjoint and avoid overlaps.
+      const one = primarySubnet(node);
+      return one ? [one] : [];
+    }
+
+    function buildSubnetGroups(){
+      const groups = new Map();
+      nodes.forEach((n, idx)=>{
+        // Routers often have interfaces in multiple subnets; subnet boxes should
+        // represent L2/LAN groupings, so exclude routers from these boxes.
+        if(nodeTier(n) === 0) return;
+        const subs = nodeSubnets(n);
+        subs.forEach(cidr => {
+          const arr = groups.get(cidr) || [];
+          arr.push(idx);
+          groups.set(cidr, arr);
+        });
+      });
+      // Keep groups with at least 2 nodes (prevents lots of noisy single-node boxes).
+      const out = Array.from(groups.entries())
+        .filter(([_, idxs]) => idxs.length >= 2)
+        .map(([cidr, idxs]) => ({ cidr, idxs: idxs.slice() }))
+        .sort((a,b)=> a.cidr.localeCompare(b.cidr));
+      return out;
+    }
+
+    let subnetGroups = buildSubnetGroups();
+    const subnetG = subnetLayer.selectAll('g.subnet-group')
+      .data(subnetGroups, d => d.cidr)
+      .enter()
+      .append('g')
+      .attr('class', 'subnet-group');
+
+    subnetG.append('rect')
+      .attr('class', 'subnet-rect')
+      .attr('rx', 10)
+      .attr('ry', 10)
+      .attr('fill', 'rgba(255,255,255,0.58)')
+      .attr('stroke', '#2b2b2b')
+      .attr('stroke-width', 2)
+      .attr('stroke-dasharray', '6,4');
+
+    subnetG.append('text')
+      .attr('class', 'subnet-label')
+      .attr('font-size', '11px')
+      .attr('font-weight', '600')
+      .attr('fill', '#1f1f1f')
+      .text(d => d.cidr);
 
     const link = g.selectAll('line.link')
       .data(links)
@@ -127,11 +444,11 @@
         .on('end', (ev)=>{ if(!ev.active) simulation.alphaTarget(0); })
       );
 
-  const rects = nodeGroup.append('rect')
-      .attr('width', d => 70 + Math.min(100, (d.services||[]).length * 8))
-      .attr('height', d => 36 + Math.min(24, (d.services||[]).length * 1.2))
-      .attr('x', d => -(70 + Math.min(100, (d.services||[]).length * 8)) / 2)
-      .attr('y', d => -(36 + Math.min(24, (d.services||[]).length * 1.2)) / 2)
+    const rects = nodeGroup.append('rect')
+      .attr('width', d => boxW(d))
+      .attr('height', d => boxH(d))
+      .attr('x', d => -(boxW(d)) / 2)
+      .attr('y', d => -(boxH(d)) / 2)
       .attr('rx',6).attr('ry',6)
       .attr('fill', d => nodeFillColor(d))
       .attr('stroke','#222')
@@ -213,7 +530,7 @@
       .attr('y',-2)
       .attr('font-size','10px')
       .attr('pointer-events','none')
-      .attr('fill', d => ((d.type||'').toLowerCase()==='switch') ? '#000' : '#fff')
+      .attr('fill', d => labelFill(d))
       .attr('class','label')
       .text(d => wrapLabel(d.name||''));
 
@@ -224,6 +541,18 @@
       .attr('pointer-events','none')
       .attr('fill','#000')
       .text(d => (d.services||[]).length>0 ? (d.services||[]).length : '');
+
+    // Primary IPv4 (kept compact; full detail remains in tooltip)
+    nodeGroup.append('text')
+      .attr('text-anchor','middle')
+      .attr('y',24)
+      .attr('font-size','8px')
+      .attr('pointer-events','none')
+      .attr('fill', d => labelFill(d))
+      .text(d => {
+        const ip = primaryIpv4(d);
+        return ip ? ip : '';
+      });
 
     function highlightNeighbors(d, on){
       const neighborSet = new Set();
@@ -272,9 +601,123 @@
 
   simulation.on('tick', () => { updatePositions(); });
 
+    function packDisjointSubnetGroups(){
+      if(!subnetGroups || subnetGroups.length < 2) return;
+
+      // Disjoint means each node belongs to at most one drawn subnet group.
+      const membership = new Array(nodes.length).fill(0);
+      subnetGroups.forEach(g => {
+        (g.idxs || []).forEach(i => { if(typeof i === 'number') membership[i] += 1; });
+      });
+      const disjoint = membership.every(c => c <= 1);
+      if(!disjoint) return;
+
+      // Compute current bounds for each group.
+      const pad = 26;
+      const bounds = [];
+      subnetGroups.forEach(g => {
+        const idxs = g.idxs || [];
+        if(!idxs.length) return;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        idxs.forEach(i => {
+          const n = nodes[i];
+          if(!n || n.x == null || n.y == null) return;
+          const w = boxW(n);
+          const h = boxH(n);
+          minX = Math.min(minX, n.x - w/2);
+          maxX = Math.max(maxX, n.x + w/2);
+          minY = Math.min(minY, n.y - h/2);
+          maxY = Math.max(maxY, n.y + h/2);
+        });
+        if(!Number.isFinite(minX) || !Number.isFinite(minY)) return;
+        minX -= pad; minY -= pad;
+        maxX += pad; maxY += pad;
+        const cx = (minX + maxX) / 2;
+        bounds.push({ cidr: g.cidr, idxs: idxs.slice(), minX, maxX, minY, maxY, cx, w: (maxX - minX) });
+      });
+      if(bounds.length < 2) return;
+
+      // Prefer ordering by precomputed subnet lane center if available, else current center.
+      bounds.sort((a,b)=> {
+        const ax = subnetCenterX.get(a.cidr) ?? a.cx;
+        const bx = subnetCenterX.get(b.cidr) ?? b.cx;
+        return ax - bx;
+      });
+
+      const gap = 70; // explicit space between subnet boxes
+      const viewW = container.clientWidth || width;
+
+      // First pass: pack left-to-right starting at x=0.
+      let cursor = 0;
+      bounds.forEach(b => {
+        const desiredMinX = cursor;
+        const dx = desiredMinX - b.minX;
+        if(Math.abs(dx) > 0.01){
+          b.idxs.forEach(i => {
+            const n = nodes[i];
+            if(!n) return;
+            if(n.x != null) n.x += dx;
+            if(n.fx != null) n.fx += dx;
+          });
+          b.minX += dx; b.maxX += dx; b.cx += dx;
+        }
+        cursor = b.maxX + gap;
+      });
+
+      // Second pass: center the packed span within the viewport.
+      const span = (cursor - gap);
+      const shift = (viewW / 2) - (bounds[0].minX + span / 2);
+      if(Number.isFinite(shift) && Math.abs(shift) > 0.01){
+        bounds.forEach(b => {
+          b.idxs.forEach(i => {
+            const n = nodes[i];
+            if(!n) return;
+            if(n.x != null) n.x += shift;
+            if(n.fx != null) n.fx += shift;
+          });
+        });
+      }
+    }
+
     function updatePositions(){
+      packDisjointSubnetGroups();
       link.attr('x1', d => d.source.x).attr('y1', d => d.source.y).attr('x2', d => d.target.x).attr('y2', d => d.target.y);
       nodeGroup.attr('transform', d => `translate(${d.x},${d.y})`);
+      updateSubnetBoxes();
+    }
+
+    function updateSubnetBoxes(){
+      if(!subnetGroups || subnetGroups.length === 0) return;
+      const pad = 26;
+      subnetG.each(function(d){
+        const idxs = d.idxs || [];
+        if(!idxs.length) return;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        idxs.forEach(i => {
+          const n = nodes[i];
+          if(!n || n.x == null || n.y == null) return;
+          const w = boxW(n);
+          const h = boxH(n);
+          minX = Math.min(minX, n.x - w/2);
+          maxX = Math.max(maxX, n.x + w/2);
+          minY = Math.min(minY, n.y - h/2);
+          maxY = Math.max(maxY, n.y + h/2);
+        });
+        if(!Number.isFinite(minX) || !Number.isFinite(minY)) return;
+        minX -= pad; minY -= pad;
+        maxX += pad; maxY += pad;
+        const w = Math.max(40, maxX - minX);
+        const h = Math.max(40, maxY - minY);
+        const sel = d3.select(this);
+        sel.select('rect.subnet-rect')
+          .attr('x', minX)
+          .attr('y', minY)
+          .attr('width', w)
+          .attr('height', h);
+        sel.select('text.subnet-label')
+          .attr('x', minX + 10)
+          .attr('y', minY + 16);
+      });
     }
     // (Grid layout removal: updateLinksStatic no longer needed)
 

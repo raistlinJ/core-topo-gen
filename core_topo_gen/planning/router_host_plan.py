@@ -339,6 +339,9 @@ def plan_r2s_grouping(
                 continue
 
             groups = _distribute_exact_groups(host_list_sorted, desired_targets, hmin_r, hmax_r)
+            # Prune any would-be switches with no attached non-router nodes.
+            # (Empty buckets are possible when groups_desired > host_count.)
+            groups = [g for g in groups if g]
             for gi, group in enumerate(groups):
                 rsw_subnet, lan_subnet = _next_group_subnets(rid, gi, host_count=len(group))
                 router_switch_subnets.append(rsw_subnet)
@@ -368,6 +371,8 @@ def plan_r2s_grouping(
         target_groups = nonuniform_targets.get(rid) if effective_mode == 'nonuniform' else None
         if target_groups is not None:
             groups = _distribute_exact_groups(host_list_sorted, target_groups, hmin_r, hmax_r)
+            # Prune any would-be switches with no attached non-router nodes.
+            groups = [g for g in groups if g]
         else:
             rnd_local = random.Random(seed + 7000 + rid)
             lo = hmin_r if (hmin_r and hmin_r > 0) else 2

@@ -6647,6 +6647,448 @@ def participant_ui_details_api():
     })
 
 
+def _core_xml_device_summaries(xml_path: str) -> list[dict[str, str]]:
+    """Return a best-effort list of {id,name,type} from CORE XML."""
+    try:
+        root = LET.parse(xml_path).getroot()
+    except Exception:
+        return []
+
+    def _local(tag: str) -> str:
+        if not tag:
+            return ''
+        if '}' in tag:
+            return tag.split('}', 1)[1]
+        return tag
+
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for dev in list(root.iter()):
+        try:
+            lname = _local(getattr(dev, 'tag', '')).lower()
+        except Exception:
+            lname = ''
+        if lname not in {'device', 'node'}:
+            continue
+        did = (dev.get('id') or dev.get('name') or '').strip()
+        if not did:
+            continue
+        if did in seen:
+            continue
+        seen.add(did)
+        name_val = (dev.get('name') or '').strip()
+        if not name_val:
+            try:
+                name_el = dev.find('./name')
+                if name_el is not None and getattr(name_el, 'text', None):
+                    name_val = str(name_el.text).strip()
+            except Exception:
+                name_val = ''
+        type_val = (dev.get('type') or '').strip()
+        if not type_val:
+            try:
+                type_el = dev.find('./type') or dev.find('./model')
+                if type_el is not None and getattr(type_el, 'text', None):
+                    type_val = str(type_el.text).strip()
+            except Exception:
+                type_val = ''
+        out.append({
+            'id': did,
+            'name': name_val or did,
+            'type': type_val or '',
+        })
+    return out
+
+
+def _core_xml_network_summaries(xml_path: str) -> list[dict[str, str]]:
+    """Return a best-effort list of CORE network objects as {id,name,type} from CORE XML."""
+    try:
+        root = LET.parse(xml_path).getroot()
+    except Exception:
+        return []
+
+    def _local(tag: str) -> str:
+        if not tag:
+            return ''
+        if '}' in tag:
+            return tag.split('}', 1)[1]
+        return tag
+
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for el in list(root.iter()):
+        try:
+            lname = _local(getattr(el, 'tag', '')).lower()
+        except Exception:
+            lname = ''
+        if lname != 'network':
+            continue
+        nid = (el.get('id') or el.get('name') or '').strip()
+        if not nid or nid in seen:
+            continue
+        seen.add(nid)
+        name_val = (el.get('name') or '').strip() or nid
+        type_val = (el.get('type') or '').strip()
+        if not type_val:
+            try:
+                type_el = el.find('./type') or el.find('./model')
+                if type_el is not None and getattr(type_el, 'text', None):
+                    type_val = str(type_el.text).strip()
+            except Exception:
+                type_val = ''
+        out.append({'id': nid, 'name': name_val, 'type': type_val or ''})
+    return out
+
+
+def _core_xml_link_summaries(xml_path: str, id_to_name: dict[str, str] | None = None) -> list[dict[str, str]]:
+    """Return a best-effort list of link endpoints from CORE XML.
+
+    Important: CORE often represents host↔LAN connections as node↔network links.
+    This helper keeps those endpoints rather than filtering to only device IDs.
+    """
+    try:
+        root = LET.parse(xml_path).getroot()
+    except Exception:
+        return []
+
+    def _local(tag: str) -> str:
+        if not tag:
+            return ''
+        if '}' in tag:
+            return tag.split('}', 1)[1]
+        return tag
+
+    def _norm(value: Any) -> str:
+        return str(value).strip() if value is not None else ''
+
+    name_map = id_to_name or {}
+    out: list[dict[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    for link in list(root.iter()):
+        try:
+            lname = _local(getattr(link, 'tag', '')).lower()
+        except Exception:
+            lname = ''
+        if lname != 'link':
+            continue
+
+        n1 = _norm(getattr(link, 'get', lambda *_: None)('node1') or getattr(link, 'get', lambda *_: None)('node1_id'))
+        n2 = _norm(getattr(link, 'get', lambda *_: None)('node2') or getattr(link, 'get', lambda *_: None)('node2_id'))
+        if not n1 or not n2:
+            try:
+                if not n1 and hasattr(link, 'find'):
+                    iface1 = link.find('.//iface1') or link.find('.//interface1')
+                    if iface1 is not None:
+                        n1 = _norm(iface1.get('node') or iface1.get('device') or iface1.get('node_id'))
+                if not n2 and hasattr(link, 'find'):
+                    iface2 = link.find('.//iface2') or link.find('.//interface2')
+                    if iface2 is not None:
+                        n2 = _norm(iface2.get('node') or iface2.get('device') or iface2.get('node_id'))
+            except Exception:
+                pass
+        if not n1 or not n2 or n1 == n2:
+            continue
+        ordered = tuple(sorted((n1, n2)))
+        if ordered in seen_pairs:
+            continue
+        seen_pairs.add(ordered)
+        out.append({
+            'node1': ordered[0],
+            'node2': ordered[1],
+            'node1_name': str(name_map.get(ordered[0], ordered[0])),
+            'node2_name': str(name_map.get(ordered[1], ordered[1])),
+        })
+    return out
+
+
+@app.route('/participant-ui/topology')
+def participant_ui_topology_api():
+    state = _participant_ui_state()
+    scenario_norm = _normalize_scenario_label(request.args.get('scenario') or '')
+    if not scenario_norm:
+        scenario_norm = _normalize_scenario_label(state.get('selected_norm', ''))
+
+    # Enforce assignment-based access for restricted users.
+    try:
+        if state.get('restrict_to_assigned'):
+            allowed_norms = {row.get('norm') for row in (state.get('listing') or []) if isinstance(row, dict) and row.get('norm')}
+            if scenario_norm and scenario_norm not in allowed_norms:
+                return jsonify({'ok': False, 'error': 'Scenario not assigned.'}), 403
+    except Exception:
+        pass
+
+    # Resolve latest session XML.
+    try:
+        history = _load_run_history()
+        last_run = _latest_run_history_for_scenario(scenario_norm, history)
+    except Exception:
+        last_run = None
+    session_xml_path = None
+    if isinstance(last_run, dict):
+        session_xml_path = last_run.get('session_xml_path') or last_run.get('post_xml_path')
+
+    if not session_xml_path:
+        return jsonify({
+            'ok': True,
+            'scenario_norm': scenario_norm,
+            'status': 'No session XML available for this scenario yet.',
+            'nodes': [],
+            'links': [],
+            'subnets': [],
+            'vulnerability_ips': [],
+        })
+
+    try:
+        app.logger.info("[participant-ui.topology] scenario=%s session_xml=%s", scenario_norm, ap)
+    except Exception:
+        pass
+
+    try:
+        ap = os.path.abspath(str(session_xml_path))
+    except Exception:
+        ap = str(session_xml_path)
+    if not ap or not os.path.exists(ap):
+        return jsonify({
+            'ok': True,
+            'scenario_norm': scenario_norm,
+            'status': 'Session XML path missing on disk.',
+            'nodes': [],
+            'links': [],
+            'subnets': [],
+            'vulnerability_ips': [],
+        })
+
+    # Parse topology summary (used for enriched node details like services/interfaces).
+    try:
+        summary = _analyze_core_xml(ap)
+    except Exception:
+        summary = {}
+
+    raw_nodes = summary.get('nodes') if isinstance(summary, dict) else None
+    nodes_list: list[dict] = raw_nodes if isinstance(raw_nodes, list) else []
+
+    # IMPORTANT: do NOT use summary.links_detail here.
+    # The summary path intentionally filters/prunes to "important" nodes and can
+    # drop host↔LAN/switch edges, making it look like only routers are connected.
+    # Instead, extract raw links directly from the XML (including network nodes).
+    all_devices = _core_xml_device_summaries(ap)
+    all_networks = _core_xml_network_summaries(ap)
+    name_map: dict[str, str] = {}
+    type_map: dict[str, str] = {}
+    for row in (all_devices or []):
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get('id') or '').strip()
+        if not rid:
+            continue
+        name_map.setdefault(rid, str(row.get('name') or rid))
+        type_map.setdefault(rid, str(row.get('type') or ''))
+    for row in (all_networks or []):
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get('id') or '').strip()
+        if not rid:
+            continue
+        name_map.setdefault(rid, str(row.get('name') or rid))
+        type_map.setdefault(rid, str(row.get('type') or ''))
+    links_list: list[dict] = _core_xml_link_summaries(ap, id_to_name=name_map)
+
+    # Ensure we include *all* devices AND networks from the XML (even if filtered from summary).
+    by_id: dict[str, dict] = {}
+    for n in nodes_list:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if nid:
+            by_id[nid] = n
+    for dev in all_devices:
+        did = str(dev.get('id') or '').strip()
+        if not did or did in by_id:
+            continue
+        by_id[did] = {
+            'id': did,
+            'name': dev.get('name') or did,
+            'type': dev.get('type') or '',
+            'services': [],
+            'interfaces': [],
+            'linked_nodes': [],
+        }
+
+    # Add networks as graph nodes so node↔network links can be drawn.
+    for net in all_networks:
+        nid = str(net.get('id') or '').strip()
+        if not nid or nid in by_id:
+            continue
+        raw_type = str(net.get('type') or '').strip()
+        # Render network objects as "switch" by default to match graph styling.
+        type_hint = (raw_type or '').lower()
+        if 'wlan' in type_hint or 'wireless' in type_hint:
+            coerced_type = 'wlan'
+        else:
+            coerced_type = 'switch'
+        by_id[nid] = {
+            'id': nid,
+            'name': net.get('name') or nid,
+            'type': coerced_type,
+            'services': [],
+            'interfaces': [],
+            'linked_nodes': [],
+        }
+
+    # Vulnerability tagging: mark nodes whose ipv4 matches vulnerability IPs.
+    vuln_ips = _vulnerability_ipv4s_from_session_xml(ap)
+    vuln_set = {str(ip).strip() for ip in vuln_ips if ip}
+
+    # Subnet tagging.
+    subnets = _subnet_cidrs_from_session_xml(ap)
+
+    out_nodes: list[dict[str, Any]] = []
+    network_ids: set[str] = set()
+    try:
+        for net in (all_networks or []):
+            if isinstance(net, dict) and net.get('id'):
+                network_ids.add(str(net.get('id')).strip())
+    except Exception:
+        network_ids = set()
+    try:
+        import ipaddress
+    except Exception:
+        ipaddress = None
+
+    for nid, n in by_id.items():
+        name_val = str(n.get('name') or nid)
+        type_val = str(n.get('type') or '')
+        services_val = n.get('services') if isinstance(n.get('services'), list) else []
+        ifaces = n.get('interfaces') if isinstance(n.get('interfaces'), list) else []
+        ipv4s: list[str] = []
+        subnet_hits: set[str] = set()
+        for iface in ifaces:
+            if not isinstance(iface, dict):
+                continue
+            ip4 = (iface.get('ipv4') or '').strip() if isinstance(iface.get('ipv4'), str) else ''
+            mask = (iface.get('ipv4_mask') or '').strip() if isinstance(iface.get('ipv4_mask'), str) else ''
+            if ip4:
+                ip4_clean = ip4.split('/', 1)[0].strip()
+                if ip4_clean:
+                    ipv4s.append(ip4_clean)
+            if ipaddress is not None and ip4:
+                try:
+                    if '/' in ip4:
+                        net = ipaddress.ip_interface(ip4).network
+                    elif mask:
+                        net = ipaddress.ip_interface(f"{ip4}/{mask}").network
+                    else:
+                        net = None
+                    if net is not None and getattr(net, 'prefixlen', 32) < 32:
+                        subnet_hits.add(str(net))
+                except Exception:
+                    pass
+        ipv4s = [ip for ip in ipv4s if ip]
+        # stable unique
+        seen_ip: set[str] = set()
+        ipv4s_u: list[str] = []
+        for ip in ipv4s:
+            if ip in seen_ip:
+                continue
+            seen_ip.add(ip)
+            ipv4s_u.append(ip)
+        is_vuln = any(ip in vuln_set for ip in ipv4s_u)
+        out_nodes.append({
+            'id': nid,
+            'name': name_val,
+            'type': (type_val or '').strip() or 'node',
+            'services': services_val,
+            'interfaces': ifaces,
+            'ipv4s': ipv4s_u,
+            'subnets': sorted(subnet_hits) if subnet_hits else [],
+            'is_vulnerability': bool(is_vuln),
+        })
+
+    # Sort nodes for stable output.
+    def _type_rank(t: str) -> int:
+        tt = (t or '').lower()
+        if tt == 'router':
+            return 0
+        if tt == 'switch':
+            return 1
+        return 2
+
+    out_nodes.sort(key=lambda r: (_type_rank(str(r.get('type') or '')), str(r.get('name') or '').lower(), str(r.get('id') or '')))
+
+    out_links: list[dict[str, str]] = []
+    for l in links_list:
+        if not isinstance(l, dict):
+            continue
+        a = str(l.get('node1') or '').strip()
+        b = str(l.get('node2') or '').strip()
+        if not a or not b:
+            continue
+        # Only keep links whose endpoints exist in our node set.
+        if a not in by_id or b not in by_id:
+            continue
+        out_links.append({
+            'node1': a,
+            'node2': b,
+            'node1_name': str(l.get('node1_name') or name_map.get(a) or a),
+            'node2_name': str(l.get('node2_name') or name_map.get(b) or b),
+        })
+
+    # Improve readability: rename network/LAN nodes to their most common subnet (if any).
+    try:
+        id_to_node: dict[str, dict[str, Any]] = {str(n.get('id')): n for n in out_nodes if isinstance(n, dict) and n.get('id') is not None}
+        adj: dict[str, set[str]] = {}
+        for l in out_links:
+            a = str(l.get('node1') or '').strip()
+            b = str(l.get('node2') or '').strip()
+            if not a or not b:
+                continue
+            adj.setdefault(a, set()).add(b)
+            adj.setdefault(b, set()).add(a)
+        for net_id in (network_ids or set()):
+            if net_id not in id_to_node:
+                continue
+            neighbor_ids = list(adj.get(net_id, set()))
+            if not neighbor_ids:
+                continue
+            counts: dict[str, int] = {}
+            for nbr in neighbor_ids:
+                node_obj = id_to_node.get(nbr)
+                if not node_obj:
+                    continue
+                # Routers often have interfaces in many subnets and are excluded from subnet boxes.
+                # If we use router subnets to rename LAN/switch nodes, the UI can show confusing
+                # "CIDR switch" nodes that appear to be alone in their subnet.
+                try:
+                    if str(node_obj.get('type') or '').strip().lower() == 'router':
+                        continue
+                except Exception:
+                    pass
+                for cidr in (node_obj.get('subnets') or []):
+                    c = str(cidr).strip()
+                    if not c:
+                        continue
+                    counts[c] = counts.get(c, 0) + 1
+            if not counts:
+                continue
+            best = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+            net_obj = id_to_node[net_id]
+            net_obj['name'] = best
+            net_obj['subnets'] = [best]
+    except Exception:
+        pass
+
+    return jsonify({
+        'ok': True,
+        'scenario_norm': scenario_norm,
+        'status': '',
+        'nodes': out_nodes,
+        'links': out_links,
+        'subnets': subnets,
+        'vulnerability_ips': vuln_ips,
+    })
+
+
 _PARTICIPANT_UI_STATS_PATH = os.path.join(_outputs_dir(), 'participant_ui_stats.json')
 
 

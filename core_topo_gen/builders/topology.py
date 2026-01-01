@@ -187,6 +187,45 @@ def _make_safe_link_tracker():
     existing: Set[Tuple[int, int]] = set()
     link_failures: int = 0
     counters = { 'attempts': 0, 'success': 0, 'fail_total': 0 }
+
+    def _session_has_link(sess, key: Tuple[int, int]) -> Optional[bool]:
+        """Best-effort validation that a link was actually recorded.
+
+        Returns:
+        - True/False when we can confidently determine presence/absence
+        - None when we cannot introspect the session's link storage
+        """
+        try:
+            links_obj = getattr(sess, 'links', None)
+        except Exception:
+            return None
+        if links_obj is None:
+            return None
+        try:
+            links = list(links_obj)
+        except Exception:
+            return None
+        for lk in links:
+            a = b = None
+            try:
+                # Common test fakes store tuples.
+                a, b = lk[:2]
+            except Exception:
+                try:
+                    a = getattr(lk, 'node1_id', getattr(lk, 'node1', None))
+                    b = getattr(lk, 'node2_id', getattr(lk, 'node2', None))
+                except Exception:
+                    a = b = None
+            if a is None or b is None:
+                continue
+            try:
+                ka = int(a)
+                kb = int(b)
+            except Exception:
+                continue
+            if (min(ka, kb), max(ka, kb)) == key:
+                return True
+        return False
     def _compat_add_link(sess, a_obj, b_obj, iface1=None, iface2=None):
         """Attempt to add a link using multiple possible CORE API signatures.
 
@@ -340,6 +379,13 @@ def _make_safe_link_tracker():
             label = _compat_add_link(session_obj, a_obj, b_obj, iface1=iface1, iface2=iface2)
             if label is None:
                 raise RuntimeError('add_link: internal inconsistency, label None after success')
+
+            # Some CORE bindings (and some test fakes) can silently no-op without raising.
+            # When we can introspect a link list, confirm the link actually exists.
+            present = _session_has_link(session_obj, key)
+            if present is False:
+                raise RuntimeError('add_link reported success but link not present in session.links')
+
             if GRPC_TRACE:
                 try:
                     def _iface_repr(ifc):
@@ -1540,6 +1586,24 @@ def _try_build_segmented_topology_from_preview(
             sid = int(detail.get('switch_id'))
         except Exception:
             continue
+        # Defensive: skip creating switches that would have no attached non-router nodes.
+        # This can occur if a persisted preview payload contains empty groups or host IDs
+        # that cannot be resolved in this build.
+        try:
+            raw_hosts = detail.get('hosts') or []
+        except Exception:
+            raw_hosts = []
+        has_resolved_host = False
+        for h in raw_hosts:
+            try:
+                hid = int(h)
+            except Exception:
+                continue
+            if hid in host_nodes_by_id:
+                has_resolved_host = True
+                break
+        if not has_resolved_host:
+            continue
         if sid in switch_nodes:
             continue
         router_id = int(detail.get('router_id') or 0)
@@ -1587,6 +1651,25 @@ def _try_build_segmented_topology_from_preview(
             router_id = int(detail.get('router_id'))
         except Exception:
             continue
+
+        # Defensive: if no attached hosts resolve, skip the entire detail.
+        # This avoids creating router-only switches/links from malformed preview payloads.
+        try:
+            raw_hosts = detail.get('hosts') or []
+        except Exception:
+            raw_hosts = []
+        has_resolved_host = False
+        for h in raw_hosts:
+            try:
+                hid = int(h)
+            except Exception:
+                continue
+            if hid in host_nodes_by_id:
+                has_resolved_host = True
+                break
+        if not has_resolved_host:
+            continue
+
         sw_node = switch_nodes.get(sid)
         router_node = router_nodes.get(router_id)
         if not sw_node or not router_node:
@@ -2875,9 +2958,37 @@ def build_segmented_topology(core,
                 router_id = int(detail.get('router_id'))
             except Exception:
                 continue
+
+            # Defensive: skip creating/planning switches that would have no attached hosts.
+            # (Normally prevented by the planner, but this keeps us safe from malformed
+            # persisted previews or future planning changes.)
+            host_ids_raw = detail.get('hosts') or []
+            resolved_host_ids: List[int] = []
+            for hid_raw in host_ids_raw:
+                try:
+                    hid_int = int(hid_raw)
+                except Exception:
+                    continue
+                if hid_int in host_nodes_by_id:
+                    resolved_host_ids.append(hid_int)
+            if not resolved_host_ids:
+                continue
             router_node = router_nodes.get(router_id)
             if not router_node:
                 continue
+
+            def _best_effort_delete_node(node_id: int) -> None:
+                try:
+                    if hasattr(session, 'delete_node'):
+                        session.delete_node(node_id)  # type: ignore
+                        return
+                except Exception:
+                    pass
+                try:
+                    if hasattr(session, 'nodes') and isinstance(session.nodes, dict):  # type: ignore
+                        session.nodes.pop(node_id, None)  # type: ignore
+                except Exception:
+                    pass
 
             # Determine or create switch node
             sw_node = created_switch_nodes.get(switch_id)
@@ -2959,10 +3070,22 @@ def build_segmented_topology(core,
                 r_iface = Interface(id=r_ifid, name=r_iface_name, ip4=r_ip_val, ip4_mask=mask_len, mac=mac_alloc.next_mac())
                 # Switch is L2: no IPv4 on the switch interface (use empty/0 to prevent auto-allocation).
                 sw_iface = Interface(id=0, name=f"{getattr(sw_node, 'name', f'rsw-{switch_id}')}-r{router_id}", ip4="", ip4_mask=0, mac=mac_alloc.next_mac())
-                safe_add_link(session, router_node, sw_node, iface1=r_iface, iface2=sw_iface)
+                router_link_ok = safe_add_link(session, router_node, sw_node, iface1=r_iface, iface2=sw_iface)
+                if not router_link_ok:
+                    # If we cannot link the switch to its router, do not keep the switch and do NOT
+                    # attempt to rehome hosts onto an isolated L2 island.
+                    try:
+                        logger.warning("[r2s] failed to link router %s <-> switch %s; removing switch and skipping host rehome", router_id, switch_id)
+                    except Exception:
+                        pass
+                    _best_effort_delete_node(switch_id)
+                    created_switch_nodes.pop(switch_id, None)
+                    switch_shared_net.pop(switch_id, None)
+                    switch_used_ipv4.pop(switch_id, None)
+                    continue
 
             # Attach hosts for this switch
-            host_ids_raw = detail.get('hosts') or []
+            host_ids_raw = resolved_host_ids
             lan_subnet = detail.get('lan_subnet')
             host_if_ips_raw = detail.get('host_if_ips') or {}
             host_if_ips: Dict[int, str] = {}
@@ -2988,9 +3111,6 @@ def build_segmented_topology(core,
                 h_obj = host_nodes_by_id.get(hid)
                 if not h_obj:
                     continue
-                if host_direct_link.get(hid):
-                    _remove_link(hid, router_id)
-                host_direct_link[hid] = False
                 ip_cidr = host_if_ips.get(hid)
                 ip_iface = None
                 if ip_cidr and '/' in str(ip_cidr):
@@ -3014,11 +3134,19 @@ def build_segmented_topology(core,
                     hip_mask = lan_net.prefixlen if lan_net else 24
                 next_if = host_next_ifid.get(hid, 1)
                 host_iface = Interface(id=next_if, name=f"eth{next_if}", ip4=hip, ip4_mask=hip_mask, mac=mac_alloc.next_mac())
-                host_next_ifid[hid] = next_if + 1
                 # Switch is L2: no gateway IP on the switch interface.
                 # Switch is L2: no IPv4 on the switch interface (use empty/0 to prevent auto-allocation).
                 sw_iface = Interface(id=idx + 1, name=f"{getattr(created_switch_nodes[switch_id], 'name', f'rsw-{switch_id}')}-h{hid}-{idx+1}", ip4="", ip4_mask=0, mac=mac_alloc.next_mac())
-                safe_add_link(session, h_obj, created_switch_nodes[switch_id], iface1=host_iface, iface2=sw_iface)
+                host_link_ok = safe_add_link(session, h_obj, created_switch_nodes[switch_id], iface1=host_iface, iface2=sw_iface)
+                if not host_link_ok:
+                    # Keep the host's direct router link intact if the rehome link fails.
+                    continue
+                # Only now that the host is successfully attached to the switch do we remove any
+                # pre-existing direct host<->router link.
+                if host_direct_link.get(hid):
+                    _remove_link(hid, router_id)
+                host_direct_link[hid] = False
+                host_next_ifid[hid] = next_if + 1
                 rehomed_hosts.append(hid)
                 if hip:
                     switch_used_ipv4[switch_id].add(str(hip))
@@ -3511,6 +3639,21 @@ def build_segmented_topology(core,
                 sw_links.setdefault(a, []).append((a,b))
             if _is_switch(b):
                 sw_links.setdefault(b, []).append((a,b))
+        # Also consider switches with zero degree (no links at all) as orphans.
+        try:
+            all_switch_ids = [nid for nid in node_index.keys() if _is_switch(nid)]
+        except Exception:
+            all_switch_ids = []
+        for sw_id in all_switch_ids:
+            if sw_id in sw_links:
+                continue
+            if sw_id in expected_switch_ids:
+                try:
+                    logger.debug("[preview] preserving degree-0 switch %s (expected in preview)", sw_id)
+                except Exception:
+                    pass
+                continue
+            orphan_switch_ids.append(sw_id)
         for sw_id, edges in sw_links.items():
             # Determine if any edge connects to a host
             has_host = any(_is_host(b if a==sw_id else a) for a,b in edges)
@@ -3524,6 +3667,7 @@ def build_segmented_topology(core,
                     continue
                 orphan_switch_ids.append(sw_id)
         if orphan_switch_ids:
+            orphan_switch_ids = sorted(set(orphan_switch_ids))
             try:
                 logger.info("Removing %d orphan switches with no host attachments: %s", len(orphan_switch_ids), orphan_switch_ids)
             except Exception:
@@ -3539,6 +3683,11 @@ def build_segmented_topology(core,
                 try:
                     if hasattr(session, 'delete_node'):
                         session.delete_node(sw_id)  # type: ignore
+                except Exception:
+                    pass
+                try:
+                    if hasattr(session, 'nodes') and isinstance(session.nodes, dict):  # type: ignore
+                        session.nodes.pop(sw_id, None)  # type: ignore
                 except Exception:
                     pass
                 # Also prune from internal maps where used for stats

@@ -134,7 +134,10 @@ def _run_offline_report(
             router_protocols[node_id] = [proto]
             node_id += 1
 
-    switches = [1] if hosts or routers else []
+    # Planning rule: if a switch has no attached non-router nodes, omit it.
+    # In the offline/report-only approximation this means we only include the
+    # central switch when there are hosts to attach.
+    switches = [1] if hosts else []
     service_assignments: Dict[int, list[str]] = {}
 
     # Reuse existing helpers to parse additional configuration for the report

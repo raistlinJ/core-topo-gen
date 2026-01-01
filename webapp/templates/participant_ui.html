@@ -17,6 +17,18 @@
   }
   .participant-mission-title { letter-spacing: 0.08em; text-transform: uppercase; }
   .participant-open-primary { letter-spacing: 0.12em; }
+
+  /* Mirror core_details.html D3 graph styling */
+  #topologyGraphCard .link.highlight { stroke: #ff5722 !important; stroke-width: 2.2px; }
+  #topologyGraphCard .node.fade { opacity: 0.15; }
+  #topologyGraphCard .node text { font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  #topologyGraphCard .node rect { transition: stroke-dasharray 0.25s, width 0.25s, height 0.25s; }
+  #topologyGraphCard .node:hover rect { stroke-width: 2; }
+  #topologyGraphCard .node.switch-node rect { stroke: #ff9800; stroke-width: 2; }
+  #topologyGraphCard .node.switch-node text.label { font-weight: 600; }
+  #topologyGraphCard .btn-group .btn { white-space: nowrap; }
+  #topologyGraph .graph-tooltip { position:absolute; pointer-events:none; background:rgba(33,33,33,0.92); color:#fff; font-size:11px; line-height:1.3; padding:6px 8px; border-radius:4px; box-shadow:0 2px 4px rgba(0,0,0,0.3); z-index:20; max-width:260px; text-align:left; }
+  #topologyGraph .graph-tooltip.hidden { display:none; }
 </style>
 {% endblock %}
 {% block content %}
@@ -158,9 +170,37 @@
                 </details>
               </div>
             </div>
+
+            <div id="topologyGraphCard" style="display:none;">
+              <hr class="border-secondary my-3" />
+              <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                <div class="d-flex align-items-center gap-2">
+                  <strong class="text-white">Graph View</strong>
+                  <div class="btn-group btn-group-sm" role="group">
+                    <button type="button" class="btn btn-outline-secondary" id="graphCollapseBtn" data-bs-toggle="collapse" data-bs-target="#topologyGraphCollapse" aria-expanded="false">Show</button>
+                  </div>
+                  <div class="btn-group btn-group-sm" role="group">
+                    <button type="button" class="btn btn-outline-secondary" id="graphResetBtn" title="Reset zoom & layout">Reset</button>
+                    <button type="button" class="btn btn-outline-secondary" id="graphClusterBtn" title="Cluster by type">Cluster: Off</button>
+                  </div>
+                  <div class="btn-group btn-group-sm" role="group">
+                    <button type="button" class="btn btn-outline-secondary" id="graphExportSvgBtn" title="Download SVG">SVG</button>
+                    <button type="button" class="btn btn-outline-secondary" id="graphExportPngBtn" title="Download PNG">PNG</button>
+                  </div>
+                </div>
+                <div class="small text-secondary" id="graphStats"></div>
+              </div>
+              <div class="collapse" id="topologyGraphCollapse">
+                <div class="pt-2">
+                  <div id="topologyGraph" style="width:100%; height:460px; position:relative; border:1px solid #e0e0e0; border-radius:4px; background:#fafafa; overflow:hidden;"></div>
+                  <div class="form-text mt-1">Drag nodes to reposition (they’ll stay pinned), scroll or pinch to zoom, and drag the background to pan. Hover highlights neighbors. Use Reset to clear zoom & unpin positions; Cluster groups by type; SVG/PNG export the view.</div>
+                  <div class="text-secondary small mt-2" id="participantTopologyStatus"></div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
-        
+
       </div>
     </div>
   </div>
@@ -168,6 +208,8 @@
 {% endblock %}
 {% block extra_scripts %}
 {{ super() }}
+<script src="/static/vendor/d3.v7.min.js"></script>
+<script src="{{ url_for('static', filename='core_graph.js') }}"></script>
 <script>
 (function(){
   if(typeof window === 'undefined') return;
@@ -194,6 +236,11 @@
   const vulnIpsDetails = document.getElementById('participantVulnIpsDetails');
   const vulnIpsSummary = document.getElementById('participantVulnIpsSummary');
   const vulnIpsList = document.getElementById('participantVulnIpsList');
+  const topologyGraphCard = document.getElementById('topologyGraphCard');
+  const topologyGraph = document.getElementById('topologyGraph');
+  const topologyStatus = document.getElementById('participantTopologyStatus');
+  const graphCollapseBtn = document.getElementById('graphCollapseBtn');
+  const topologyGraphCollapse = document.getElementById('topologyGraphCollapse');
   const scenarioItems = Array.from(document.querySelectorAll('[data-participant-scenario]'));
   const toggleSidebarBtn = document.querySelector('[data-participant-toggle-sidebar]');
   const showSidebarBtn = document.querySelector('[data-participant-show-sidebar]');
@@ -234,6 +281,7 @@
       return String(ts);
     }
   };
+
   const renderSubnetworks = (items) => {
     if(!subnetworksList || !subnetworksSummary) return;
     const names = Array.isArray(items) ? items.map(v => String(v || '').trim()).filter(Boolean) : [];
@@ -332,6 +380,141 @@
     }
   };
 
+  const fetchScenarioTopology = async (norm) => {
+    try {
+      const url = norm ? `/participant-ui/topology?scenario=${encodeURIComponent(norm)}` : '/participant-ui/topology';
+      const resp = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+      if(!resp.ok) return null;
+      const payload = await resp.json();
+      if(!payload || !payload.ok) return null;
+      return payload;
+    } catch(e){
+      return null;
+    }
+  };
+
+  // Defensive: expose helpers on window so runtime calls won't fail if the
+  // surrounding script is accidentally re-scoped by a formatter/edit.
+  try {
+    window.fetchScenarioDetails = fetchScenarioDetails;
+    window.fetchScenarioTopology = fetchScenarioTopology;
+  } catch(e) {}
+
+  const _topologyGraphScaffoldHtml = () => {
+    return `
+      <div class="position-absolute top-50 start-50 translate-middle text-muted" id="graphLoading">Rendering graph...</div>
+      <div class="position-absolute top-50 start-50 translate-middle text-muted d-none" id="graphNoData" style="max-width:70%; text-align:center;">
+        <div class="mb-2">No device nodes were parsed from this scenario yet.</div>
+        <div class="small text-muted">Links detected: <span id="graphNoDataLinksCount">0</span>.</div>
+      </div>
+      <div class="position-absolute top-0 end-0 m-2 p-2 bg-white border rounded shadow-sm small" id="graphLegend" style="max-width:220px;">
+        <div class="fw-semibold mb-1">Legend</div>
+        <div id="graphLegendItems" class="d-flex flex-wrap gap-2"></div>
+        <div class="mt-1 text-muted" style="font-size:0.7rem;">Circle size = services count</div>
+      </div>
+      <div id="graphMiniMap" class="position-absolute bg-white border rounded shadow-sm" style="bottom:8px; right:8px; width:160px; height:120px; overflow:hidden; cursor:grab;">
+        <svg width="160" height="120"></svg>
+      </div>
+      <div id="graphTooltip" class="graph-tooltip hidden"></div>
+    `;
+  };
+
+  let _participantGraphInstance = null;
+
+  const renderTopologyGraph = (payload) => {
+    if(!topologyGraphCard || !topologyGraph) return;
+    if(!currentNorm){
+      topologyGraphCard.style.display = 'none';
+      return;
+    }
+    topologyGraphCard.style.display = '';
+
+    const nodesRaw = Array.isArray(payload && payload.nodes) ? payload.nodes : [];
+    const linksRaw = Array.isArray(payload && payload.links) ? payload.links : [];
+    // Keep this quiet; backend status can include filenames.
+    if(topologyStatus) topologyStatus.textContent = '';
+
+    if(!window.d3 || !window.CoreGraph){
+      topologyGraph.innerHTML = `<div class="p-3 text-muted small">Graph libraries not loaded (d3/CoreGraph).</div>`;
+      return;
+    }
+
+    topologyGraph.innerHTML = _topologyGraphScaffoldHtml();
+
+    const mappedNodes = nodesRaw
+      .filter(n => n && n.id !== null && n.id !== undefined)
+      .map(n => {
+        const idVal = String(n.id);
+        const nameVal = (n.name !== null && n.name !== undefined) ? String(n.name) : idVal;
+        const typeVal = (n.type !== null && n.type !== undefined) ? String(n.type) : 'node';
+        const servicesVal = Array.isArray(n.services) ? n.services : [];
+        const ifacesVal = Array.isArray(n.interfaces) ? n.interfaces : [];
+        const ipv4sVal = Array.isArray(n.ipv4s) ? n.ipv4s : [];
+        const subnetsVal = Array.isArray(n.subnets) ? n.subnets : [];
+        return {
+          id: idVal,
+          name: nameVal || idVal,
+          type: typeVal || 'node',
+          services: servicesVal,
+          interfaces: ifacesVal,
+          ipv4s: ipv4sVal,
+          subnets: subnetsVal,
+          hasVuln: !!n.is_vulnerability,
+        };
+      });
+
+    const mappedLinks = linksRaw
+      .map(l => {
+        const n1 = (l && (l.node1 ?? l.source)) !== null && (l && (l.node1 ?? l.source)) !== undefined ? String(l.node1 ?? l.source) : '';
+        const n2 = (l && (l.node2 ?? l.target)) !== null && (l && (l.node2 ?? l.target)) !== undefined ? String(l.node2 ?? l.target) : '';
+        const n1Name = (l && l.node1_name) !== null && (l && l.node1_name) !== undefined ? String(l.node1_name) : '';
+        const n2Name = (l && l.node2_name) !== null && (l && l.node2_name) !== undefined ? String(l.node2_name) : '';
+        return { node1: n1, node2: n2, node1_name: n1Name, node2_name: n2Name };
+      })
+      .filter(l => l.node1 && l.node2 && l.node1 !== l.node2);
+
+    // Lightweight diagnostics (mirrors Details page graph stats area)
+    try {
+      const statsEl = document.getElementById('graphStats');
+      if(statsEl){
+        const idIndex = new Map();
+        mappedNodes.forEach((n,i)=>{ idIndex.set(String(n.id), i); idIndex.set(String(n.name), i); });
+        const resolved = mappedLinks.filter(l => {
+          const s = idIndex.get(String(l.node1)) ?? idIndex.get(String(l.node1_name));
+          const t = idIndex.get(String(l.node2)) ?? idIndex.get(String(l.node2_name));
+          return s !== undefined && t !== undefined && s !== t;
+        }).length;
+        statsEl.textContent = `Nodes: ${mappedNodes.length} • Links: ${mappedLinks.length} • Resolved: ${resolved}`;
+      }
+    } catch(e) {}
+
+    const noDataEl = document.getElementById('graphNoData');
+    const loadingEl = document.getElementById('graphLoading');
+
+    if(mappedNodes.length === 0){
+      if(loadingEl) loadingEl.remove();
+      if(noDataEl){
+        noDataEl.classList.remove('d-none');
+        const lc = document.getElementById('graphNoDataLinksCount');
+        if(lc) lc.textContent = String(mappedLinks.length);
+      }
+      return;
+    }
+
+    if(noDataEl) noDataEl.classList.add('d-none');
+    try {
+      _participantGraphInstance = window.CoreGraph.init({
+        containerSelector: '#topologyGraph',
+        nodes: mappedNodes,
+        linksRaw: mappedLinks,
+        xmlPath: `participant_${currentNorm}`
+      });
+    } finally {
+      const loading2 = document.getElementById('graphLoading');
+      if(loading2) loading2.remove();
+    }
+  };
+
   const renderScenarioDetails = (payload) => {
     const gw = payload && typeof payload.gateway === 'string' ? payload.gateway : '';
     if(statGateway) statGateway.textContent = gw || '-';
@@ -392,7 +575,18 @@
   const refreshStats = async () => {
     const details = await fetchScenarioDetails(currentNorm);
     if(details) renderScenarioDetails(details);
+
+    const topo = await fetchScenarioTopology(currentNorm);
+    if(topo) {
+      renderTopologyGraph(topo);
+    } else {
+      if(topologyGraphCard && currentNorm) topologyGraphCard.style.display = '';
+      if(topologyGraph && currentNorm) topologyGraph.innerHTML = `<div class="p-3 text-muted small">Loading topology…</div>`;
+      if(topologyStatus && currentNorm) topologyStatus.textContent = '';
+    }
   };
+
+  try { window.participantRefreshStats = refreshStats; } catch(e) {}
 
   if(openBtn && !openBtn.dataset.bound){
     openBtn.dataset.bound = '1';
@@ -523,6 +717,17 @@
       applySidebarHidden(false);
     });
   }
+
+  // Graph collapse button label + layout nudge on expand.
+  try {
+    if(topologyGraphCollapse && graphCollapseBtn){
+      topologyGraphCollapse.addEventListener('hidden.bs.collapse', ()=>{ graphCollapseBtn.textContent = 'Show'; graphCollapseBtn.setAttribute('aria-expanded','false'); });
+      topologyGraphCollapse.addEventListener('shown.bs.collapse', ()=>{
+        graphCollapseBtn.textContent = 'Hide'; graphCollapseBtn.setAttribute('aria-expanded','true');
+        try { setTimeout(()=>{ _participantGraphInstance?.simulation?.alpha(0.15).restart(); }, 50); } catch(e) {}
+      });
+    }
+  } catch(e) {}
 })();
 </script>
 {% endblock %}
