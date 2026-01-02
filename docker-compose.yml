@@ -1,4 +1,41 @@
 services:
+  web:
+    profiles: ["http"]
+    build:
+      # Build from repo root so requirements.txt and core_topo_gen/ are available.
+      context: .
+      dockerfile: webapp/Dockerfile
+    container_name: core-topo-gen-web
+    environment:
+      - CORE_HOST=${CORE_HOST:-host.docker.internal}
+      - CORE_PORT=${CORE_PORT:-50051}
+    volumes:
+      # Persist state/artifacts on the host.
+      - ./outputs:/app/outputs
+      - ./reports:/app/reports
+      - ./uploads:/app/uploads
+    expose:
+      - "9090"
+    restart: unless-stopped
+    networks:
+      - app_net
+
+  nginx_http:
+    profiles: ["http"]
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: core-topo-gen-proxy-http
+    depends_on:
+      - web
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx-http.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+    networks:
+      - app_net
+
   nginx:
     profiles: ["nginx"]
     build:
@@ -16,24 +53,6 @@ services:
       - CERT_DAYS=${CERT_DAYS:-365}
       - CERT_SUBJECT=${CERT_SUBJECT:-/CN=localhost}
       - CERT_SANS=${CERT_SANS:-}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
-    networks:
-      - app_net
-
-  envoy:
-    profiles: ["envoy"]
-    image: envoyproxy/envoy:v1.31-latest
-    container_name: core-topo-gen-envoy
-    command: ["-c", "/etc/envoy/envoy.yaml"]
-    ports:
-      - "80:80"
-      - "443:443"
-      - "9901:9901"  # admin
-    volumes:
-      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
-      - ./nginx/certs:/etc/envoy/certs
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

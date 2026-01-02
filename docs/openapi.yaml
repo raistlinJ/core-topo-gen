@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Core Topology Generator Web API
-  version: "2025-10-23"
+  version: "2026-01-01"
   description: >-
     OpenAPI specification for the CORE topology generator web backend. The API
     combines JSON endpoints used by the web UI with a set of HTML form
@@ -12,7 +12,7 @@ servers:
   - url: http://localhost:9090
     description: Default development server
   - url: https://localhost
-    description: Reverse-proxied TLS endpoint (see README for nginx/envoy helpers)
+    description: Reverse-proxied TLS endpoint (see README for nginx helper)
 tags:
   - name: Authentication
     description: Session management and user login endpoints.
@@ -44,6 +44,8 @@ tags:
     description: Server-sent events and cancellation endpoints.
   - name: UI Pages
     description: HTML-rendering routes that back the web interface.
+  - name: Participant UI
+    description: JSON endpoints used by the Participant UI topology/status views.
 security:
   - sessionCookie: []
 paths:
@@ -923,6 +925,54 @@ paths:
             text/html:
               schema:
                 type: string
+  /participant-ui/details:
+    get:
+      tags:
+        - Participant UI
+      summary: Participant UI scenario status/details (JSON)
+      parameters:
+        - name: scenario
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Scenario label (display or normalized). Defaults to the currently selected scenario.
+      responses:
+        '200':
+          description: Scenario details payload used by the Participant UI dashboard.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParticipantUiDetailsResponse'
+  /participant-ui/topology:
+    get:
+      tags:
+        - Participant UI
+      summary: Participant UI topology graph (JSON)
+      description: >-
+        Returns graph nodes/links derived from the most recent saved CORE session XML for the requested scenario.
+        Network nodes may be returned as `type: switch` for styling purposes; HITL network/interface nodes are
+        returned with `type: hitl` and `is_hitl: true`.
+      parameters:
+        - name: scenario
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Scenario label (display or normalized). Defaults to the currently selected scenario.
+      responses:
+        '200':
+          description: Topology graph payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ParticipantUiTopologyResponse'
+        '403':
+          description: Scenario not assigned for restricted users.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /users:
     get:
       tags:
@@ -2113,3 +2163,214 @@ components:
           description: Number of invalid rows skipped during save.
         error:
           type: string
+
+    ParticipantUiGraphInterface:
+      type: object
+      description: Best-effort interface details extracted from CORE session XML.
+      properties:
+        name:
+          type: string
+          nullable: true
+        mac:
+          type: string
+          nullable: true
+        ipv4:
+          type: string
+          nullable: true
+        ipv4_mask:
+          type: string
+          nullable: true
+        ipv6:
+          type: string
+          nullable: true
+        ipv6_mask:
+          type: string
+          nullable: true
+      additionalProperties: true
+
+    ParticipantUiGraphNode:
+      type: object
+      required:
+        - id
+        - name
+        - type
+      properties:
+        id:
+          type: string
+          description: Node identifier (device or network id from CORE XML).
+        name:
+          type: string
+        type:
+          type: string
+          description: Node category (e.g., router/host/switch/hitl).
+        services:
+          type: array
+          items:
+            type: string
+        interfaces:
+          type: array
+          items:
+            $ref: '#/components/schemas/ParticipantUiGraphInterface'
+        ipv4s:
+          type: array
+          items:
+            type: string
+        subnets:
+          type: array
+          items:
+            type: string
+        is_vulnerability:
+          type: boolean
+        is_hitl:
+          type: boolean
+      additionalProperties: true
+
+    ParticipantUiGraphLink:
+      type: object
+      required:
+        - node1
+        - node2
+      properties:
+        node1:
+          type: string
+        node2:
+          type: string
+        node1_name:
+          type: string
+          nullable: true
+        node2_name:
+          type: string
+          nullable: true
+      additionalProperties: true
+
+    ParticipantUiTopologyResponse:
+      type: object
+      required:
+        - ok
+        - nodes
+        - links
+        - subnets
+        - vulnerability_ips
+      properties:
+        ok:
+          type: boolean
+        scenario_norm:
+          type: string
+          nullable: true
+        status:
+          type: string
+          nullable: true
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ParticipantUiGraphNode'
+        links:
+          type: array
+          items:
+            $ref: '#/components/schemas/ParticipantUiGraphLink'
+        subnets:
+          type: array
+          items:
+            type: string
+        vulnerability_ips:
+          type: array
+          items:
+            type: string
+      additionalProperties: true
+
+    ParticipantUiDetailsResponse:
+      type: object
+      required:
+        - ok
+        - scenario_norm
+        - scenario
+        - gateway
+        - open_stats
+        - execute
+        - session
+        - counts
+        - subnetworks
+        - vulnerability_ips
+      properties:
+        ok:
+          type: boolean
+        scenario_norm:
+          type: string
+        scenario:
+          type: object
+          required:
+            - participant_link_configured
+          properties:
+            display:
+              type: string
+              nullable: true
+            assigned:
+              type: boolean
+            placeholder:
+              type: boolean
+            participant_link_configured:
+              type: boolean
+          additionalProperties: true
+        gateway:
+          type: string
+          description: Best-effort gateway IPv4 address (without CIDR mask).
+        open_stats:
+          type: object
+          properties:
+            open_count:
+              type: integer
+            last_open_ts:
+              type: string
+              nullable: true
+          additionalProperties: true
+        execute:
+          type: object
+          properties:
+            last_execute_ts:
+              type: string
+              nullable: true
+            returncode:
+              type: integer
+              nullable: true
+            ok:
+              type: boolean
+              nullable: true
+          additionalProperties: true
+        session:
+          type: object
+          properties:
+            session_id:
+              type: integer
+              nullable: true
+            running:
+              type: boolean
+              nullable: true
+            state:
+              type: string
+              nullable: true
+          additionalProperties: true
+        counts:
+          type: object
+          properties:
+            nodes:
+              type: integer
+              nullable: true
+            routers:
+              type: integer
+              nullable: true
+            switches:
+              type: integer
+              nullable: true
+            vulnerabilities:
+              type: integer
+              nullable: true
+          additionalProperties: true
+        subnetworks:
+          type: array
+          items:
+            type: string
+        vulnerability_ips:
+          type: array
+          items:
+            type: string
+      additionalProperties: true

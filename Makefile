@@ -1,6 +1,6 @@
 # Simple developer conveniences
 
-.PHONY: dev-certs up clean force-certs host-web host-web-nginx host-web-envoy stop stop-host kill-backend
+.PHONY: dev-certs up clean force-certs host-web host-web-nginx stop stop-host kill-backend
 
 CERT_SANS?=DNS:localhost,IP:127.0.0.1
 CERT_SUBJECT?=/CN=localhost
@@ -36,9 +36,6 @@ force-certs:
 up: dev-certs
 	docker compose up --build
 
-# Start the Web UI on the host and run only the nginx TLS proxy in Docker
-PROXY?=nginx
-
 host-web: dev-certs
 	@if [ -n "$(WEBUI_PY)" ]; then \
 		echo "Starting host Web UI (WEBUI_PY=$(WEBUI_PY))..."; \
@@ -47,18 +44,11 @@ host-web: dev-certs
 	fi
 	@bash scripts/run_host_webui.sh & \
 	  sleep 2; \
-	  echo "Launching $(PROXY) proxy..."; \
-	  if [ "$(PROXY)" = "envoy" ]; then \
-	    docker compose --profile envoy up --build envoy; \
-	  else \
-	    docker compose --profile nginx up --build nginx; \
-	  fi
+	  echo "Launching nginx proxy..."; \
+	  docker compose --profile nginx up --build nginx
 
 host-web-nginx:
-	@$(MAKE) host-web PROXY=nginx
-
-host-web-envoy:
-	@$(MAKE) host-web PROXY=envoy
+	@$(MAKE) host-web
 
 # Stop only: stop host process and stop docker containers (do not remove)
 stop-host:

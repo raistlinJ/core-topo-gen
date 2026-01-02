@@ -28,6 +28,9 @@ Generate reproducible CORE network topologies from scenario XML files using a ri
 - **Rich topology policies** – per-routing-item R2R meshes, R2S aggregation, host grouping bounds, and switch re-homing.
 - **Artifacts on disk** – traffic scripts, segmentation rules, docker-compose definitions, Markdown reports, and JSON summaries are written to predictable locations for inspection.
 - **Hardware-in-the-Loop friendly** – manage HITL attachments directly in the editor, apply Proxmox bridge rewiring from the browser, and keep topologies deterministic by constraining attachments and generated devices.
+	- Participant graph renders HITL interface nodes (e.g., `ens19`) as **HITL** with a prominent “YOU ARE HERE” callout and keeps them visually separated from the main topology.
+	- HITL nodes intentionally omit IP labels in the graph to avoid implying that interface/network objects are routable “hosts”.
+	- The graph legend labels docker-based vulnerability targets as **vulnerability** and renders them in bright red.
 
 ## Screenshots
 
@@ -38,7 +41,7 @@ View the WebUI images gallery [`docs/screenshots.md`](docs/screenshots.md).
 ### Prerequisites
 - Python 3.10+ (3.11 recommended)
 - [CORE](https://www.nrl.navy.mil/Our-Work/Areas-of-Research/CORE/) 9.2 or newer with `core-daemon` running
-- Docker (optional) for nginx/envoy reverse proxy or vulnerability compose targets
+- Docker (optional) for nginx reverse proxy or vulnerability compose targets
 
 ### Install dependencies
 ```bash
@@ -53,7 +56,7 @@ python main.py
 ```
 - Visits `http://127.0.0.1:9090` by default (reverse proxy `nginx` compose targets `https://localhost`).
 - First launch seeds an `coreadmin / coreadmin` account; change it immediately under **Profile → Change Password**.
-- Configure TLS reverse proxies with `make host-web`, `make host-web-nginx`, or `make host-web PROXY=envoy`. The helper script `scripts/dev_gen_certs.sh` issues self-signed certificates with SAN support.
+- Configure the TLS reverse proxy with `make host-web` or `make host-web-nginx`. The helper script `scripts/dev_gen_certs.sh` issues self-signed certificates with SAN support.
 - HITL editor note: the “Attach to” dropdown now offers `Existing Router`, `Existing Switch`, or `New Router`. The legacy `New Switch` choice was removed to prevent hidden switch fan-out; saved scenarios using it are normalized to `Existing Router` during load. Once Proxmox credentials and VM selections are validated, use **Apply Internal Bridge** to create/update a Proxmox bridge and retarget both the CORE VM and external VM interfaces in one step.
 
 ### Run the CLI
