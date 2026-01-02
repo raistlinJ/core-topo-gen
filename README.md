@@ -121,6 +121,7 @@ Popular options:
 - **`core-daemon` unreachable`** – verify daemon status and host/port; GUI run modal will surface connection issues immediately.
 - **Docker vulnerabilities skipped** – ensure images are downloaded/pulled via the Vulnerabilities catalog and Docker is available to the host.
 - **Log dock won’t auto-scroll** – click the “Follow Off/On” toggle to re-enable auto-follow.
+- **Proxmox validate returns 502 (nginx)** – run `python scripts/proxmox_validate_smoke.py --base-url https://localhost` and confirm you get a clean `401 Authentication failed` (bad creds) or `success: true` (good creds) rather than a 502.
 
 ## Additional documentation
 - [API.md](./API.md) – REST endpoints exposed by the Web UI backend

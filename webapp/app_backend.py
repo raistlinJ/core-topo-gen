@@ -4660,7 +4660,7 @@ def _save_proxmox_credentials(payload: Dict[str, Any]) -> Dict[str, Any]:
         'username': username,
         'password': encrypted_password,
         'verify_ssl': verify_ssl,
-        'stored_at': datetime.datetime.now(datetime.UTC).isoformat(),
+        'stored_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     path = _proxmox_secret_path(identifier)
     tmp_path = path + '.tmp'
@@ -4848,7 +4848,7 @@ def _save_core_credentials(payload: Dict[str, Any]) -> Dict[str, Any]:
     'vmid': vmid if vmid else None,
         'proxmox_secret_id': prox_secret_id,
         'proxmox_target': prox_target,
-        'stored_at': datetime.datetime.now(datetime.UTC).isoformat(),
+        'stored_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     path = os.path.join(_core_secret_dir(), f"{identifier}.json")
     tmp_path = path + '.tmp'
@@ -5130,7 +5130,7 @@ def _enumerate_proxmox_vms(identifier: str) -> Dict[str, Any]:
                 'interfaces': interfaces,
             })
     return {
-        'fetched_at': datetime.datetime.now(datetime.UTC).isoformat(),
+        'fetched_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'url': record.get('url'),
         'username': record.get('username'),
         'verify_ssl': record.get('verify_ssl', True),
@@ -5192,7 +5192,7 @@ def _save_base_upload_state(meta: Dict[str, Any]) -> None:
     if not clean:
         return
     clean = dict(clean)
-    clean['updated_at'] = datetime.datetime.now(datetime.UTC).isoformat()
+    clean['updated_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     try:
         with open(_base_upload_state_path(), 'w', encoding='utf-8') as f:
             json.dump(clean, f, indent=2)
@@ -6445,6 +6445,25 @@ def _live_core_session_status_for_scenario(
             'state': state_raw,
         }
 
+    # If there is exactly one active CORE session and the catalog only contains
+    # one scenario (common in small deployments/tests), assume that session
+    # belongs to the selected scenario.
+    if len(active_sessions) == 1:
+        try:
+            only_catalog = [_normalize_scenario_label(n) for n in (scenario_names or [])]
+            only_catalog = [n for n in only_catalog if n]
+        except Exception:
+            only_catalog = []
+        if len(only_catalog) == 1 and only_catalog[0] == scenario_norm:
+            sess = active_sessions[0]
+            state_raw = str(sess.get('state') or '').strip().lower()
+            sid_int = _session_id_int(sess)
+            return {
+                'running': True,
+                'session_id': sid_int,
+                'state': state_raw,
+            }
+
     # Queried successfully but no matching active sessions.
     # If there are active sessions but none match the selected scenario, prefer
     # Unknown (None) over incorrectly marking the selected scenario as Running.
@@ -6530,17 +6549,27 @@ def participant_ui_details_api():
     session_xml_path = None
     if isinstance(last_run, dict):
         session_xml_path = last_run.get('session_xml_path') or last_run.get('post_xml_path')
-    subnetworks = _subnet_cidrs_from_session_xml(session_xml_path)
+    session_xml_exists = bool(session_xml_path and os.path.exists(str(session_xml_path)))
+    subnetworks = _subnet_cidrs_from_session_xml(session_xml_path) if session_xml_exists else []
 
-    vulnerability_ips = _vulnerability_ipv4s_from_session_xml(session_xml_path)
+    vulnerability_ips = _vulnerability_ipv4s_from_session_xml(session_xml_path) if session_xml_exists else []
 
-    # Vulnerabilities count: prefer actual session XML-derived value.
+    # Vulnerabilities count:
+    # - Prefer actual session XML-derived value when available.
+    # - Otherwise fall back to planned counts from the summary metadata.
     vuln_total: Optional[int] = None
-    if session_xml_path:
+    if session_xml_exists:
         vuln_total = len(vulnerability_ips)
     else:
-        # Avoid showing "planned" counts as if they were actual.
-        vuln_total = None
+        planned = None
+        if isinstance(summary_meta, dict):
+            planned = summary_meta.get('vuln_total_planned_additive')
+            if planned is None:
+                planned = summary_meta.get('vuln_total_planned')
+        try:
+            vuln_total = int(planned) if planned is not None else 0
+        except Exception:
+            vuln_total = 0
 
     # Gateway: prefer the scenario's last session XML (matches core.html HITL gateway logic)
     gateway = ''
@@ -7201,7 +7230,7 @@ def participant_ui_record_open_api():
     if not href:
         # Do not record meaningless events.
         return jsonify({'ok': False, 'error': 'missing href'}), 400
-    now = datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
     stats = _load_participant_ui_stats()
     totals = stats.get('totals') if isinstance(stats.get('totals'), dict) else {}
     totals['open_count'] = int(totals.get('open_count') or 0) + 1
@@ -11910,9 +11939,7 @@ def api_proxmox_validate():
     except Exception:
         timeout = 5.0
     timeout = max(1.0, min(timeout, 30.0))
-    # Per requirement: only persist credentials when they are verified.
-    # This endpoint is the verification step, so always store securely on success.
-    remember_credentials = True
+    remember_credentials = bool(payload.get('remember_credentials', True))
     prox_kwargs = {
         'host': host,
         'user': username,
@@ -11934,64 +11961,87 @@ def api_proxmox_validate():
             app.logger.warning('[proxmox] authentication failed: %s', exc)
         except Exception:
             pass
-        return jsonify({'success': False, 'error': f'Authentication failed: {exc}'}), 401
+        msg = str(exc)
+        lowered = msg.lower()
+        # In docker-compose deployments, common failures are reachability/DNS/TLS/proxy.
+        # If we see strong signals of a network/proxy error, report 502 (Bad Gateway)
+        # instead of 401 (credentials).
+        if any(tok in lowered for tok in (
+            'bad gateway', '502', 'connection refused', 'name or service not known',
+            'temporary failure in name resolution', 'timed out', 'timeout',
+            'max retries exceeded', 'connection error', 'proxyerror',
+            'ssLError'.lower(), 'certificate verify failed',
+        )):
+            detail = (
+                'Unable to reach Proxmox API from this server (network/proxy/TLS issue). '
+                f'Detail: {msg}'
+            )
+            return jsonify({'success': False, 'error': detail}), 502
+        return jsonify({'success': False, 'error': f'Authentication failed: {msg}'}), 401
     try:
         app.logger.info('[proxmox] authentication succeeded for %s@%s:%s', username, host, port)
     except Exception:
         pass
     scenario_index = payload.get('scenario_index')
     scenario_name = str(payload.get('scenario_name') or '').strip()
-    secret_payload = {
-        'scenario_name': scenario_name,
-        'scenario_index': scenario_index,
+    summary: Dict[str, Any] = {
         'url': url_raw,
         'port': port,
         'username': username,
-        'password': password,
         'verify_ssl': verify_ssl,
     }
-    summary: Dict[str, Any]
     secret_identifier: Optional[str] = None
-    try:
-        stored_meta = _save_proxmox_credentials(secret_payload)
-    except RuntimeError as exc:
-        return jsonify({'success': False, 'error': str(exc)}), 500
-    except Exception as exc:
-        app.logger.exception('[proxmox] failed to persist credentials: %s', exc)
-        return jsonify({'success': False, 'error': 'Credentials validated but could not be stored'}), 500
-    summary = {
-        'url': stored_meta['url'],
-        'port': stored_meta['port'],
-        'username': stored_meta['username'],
-        'verify_ssl': stored_meta['verify_ssl'],
-        'stored_at': stored_meta['stored_at'],
-    }
-    secret_identifier = stored_meta['identifier']
+    if remember_credentials:
+        secret_payload = {
+            'scenario_name': scenario_name,
+            'scenario_index': scenario_index,
+            'url': url_raw,
+            'port': port,
+            'username': username,
+            'password': password,
+            'verify_ssl': verify_ssl,
+        }
+        try:
+            stored_meta = _save_proxmox_credentials(secret_payload)
+        except RuntimeError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 500
+        except Exception as exc:
+            app.logger.exception('[proxmox] failed to persist credentials: %s', exc)
+            return jsonify({'success': False, 'error': 'Credentials validated but could not be stored'}), 500
+        summary = {
+            'url': stored_meta['url'],
+            'port': stored_meta['port'],
+            'username': stored_meta['username'],
+            'verify_ssl': stored_meta['verify_ssl'],
+            'stored_at': stored_meta['stored_at'],
+        }
+        secret_identifier = stored_meta['identifier']
     message = f"Validated Proxmox access for {username} at {host}:{port}"
     # Persist a safe shared hint so builders/participants can see the validated state.
     # This is the non-secret subset (no password/token material).
-    try:
-        if scenario_name:
-            _merge_hitl_validation_into_scenario_catalog(
-                scenario_name,
-                proxmox={
-                    'url': summary.get('url'),
-                    'port': summary.get('port'),
-                    'verify_ssl': summary.get('verify_ssl'),
-                    'secret_id': secret_identifier,
-                    'validated': bool(secret_identifier),
-                    'last_validated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
-                    'stored_at': summary.get('stored_at'),
-                    'last_message': message,
-                },
-            )
-    except Exception:
-        pass
+    if remember_credentials:
+        try:
+            if scenario_name:
+                _merge_hitl_validation_into_scenario_catalog(
+                    scenario_name,
+                    proxmox={
+                        'url': summary.get('url'),
+                        'port': summary.get('port'),
+                        'verify_ssl': summary.get('verify_ssl'),
+                        'secret_id': secret_identifier,
+                        'validated': bool(secret_identifier),
+                        'last_validated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                        'stored_at': summary.get('stored_at'),
+                        'last_message': message,
+                    },
+                )
+        except Exception:
+            pass
     return jsonify({
         'success': True,
         'message': message,
         'summary': summary,
-        'secret_id': secret_identifier,
+        'secret_id': secret_identifier if remember_credentials else None,
         'scenario_index': scenario_index,
         'scenario_name': scenario_name,
     })

@@ -103,7 +103,7 @@ def parse_planning_metadata(xml_path: str, scenario_name: Optional[str]) -> Dict
                 if weight_sum is None:
                     weight_sum = float(sum(i.factor for i in r_items if i.factor > 0))
             else:  # Vulnerabilities
-                _density, v_items = parse_vulnerabilities_info(xml_path, scenario_name)
+                _density, v_items, _flag_type = parse_vulnerabilities_info(xml_path, scenario_name)
                 exp_counts = 0
                 weight_items_cnt = 0
                 weight_sum_tmp = 0.0

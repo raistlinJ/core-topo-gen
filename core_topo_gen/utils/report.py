@@ -345,6 +345,7 @@ def write_report(
     # Vulnerability assignment count (best effort):
     # Prefer runtime assignment summary if present, else infer from vulnerabilities_cfg
     vuln_assigned = None
+    vuln_assigned_nodes: list[str] = []
     try:
         assign_summary_path = "/tmp/vulns/compose_assignments.json"
         if os.path.exists(assign_summary_path):
@@ -353,6 +354,10 @@ def write_report(
             assignments = (_assign_data.get("assignments") or {})
             if isinstance(assignments, dict):
                 vuln_assigned = len(assignments)
+                try:
+                    vuln_assigned_nodes = sorted(str(k) for k in assignments.keys() if k)
+                except Exception:
+                    vuln_assigned_nodes = []
     except Exception:
         pass
     if vuln_assigned is None and vulnerabilities_cfg:
@@ -372,6 +377,22 @@ def write_report(
             vuln_assigned = None
     if vuln_assigned is not None:
         lines.append(f"- Vulnerabilities assigned: {vuln_assigned}")
+
+    # Flag/artifact details (CTF)
+    try:
+        if vulnerabilities_cfg and isinstance(vulnerabilities_cfg, dict):
+            flag_type = str(vulnerabilities_cfg.get('flag_type') or '').strip() or 'text'
+            lines.append(f"- Vulnerability flag type: {flag_type}")
+            if flag_type == 'text':
+                lines.append("- Flag injection: host copy at /tmp/vulns/flag-<node>.txt; copied into container at /flag.txt (fallback /tmp/flag.txt)")
+                if vuln_assigned_nodes:
+                    lines.append("- Flag files (host):")
+                    for node_name in vuln_assigned_nodes[:50]:
+                        lines.append(f"  - /tmp/vulns/flag-{node_name}.txt")
+                    if len(vuln_assigned_nodes) > 50:
+                        lines.append(f"  - ... ({len(vuln_assigned_nodes) - 50} more)")
+    except Exception:
+        pass
     # Optional additive stats (routers/vulns) from metadata/topo_stats
     try:
         if metadata:
@@ -731,6 +752,12 @@ def write_report(
             items = vulnerabilities_cfg.get("items", []) or []
             lines.append("### Vulnerabilities config")
             lines.append(f"- Density: {den}")
+            try:
+                flag_type = vulnerabilities_cfg.get('flag_type')
+                if flag_type not in (None, ''):
+                    lines.append(f"- Flag type: {flag_type}")
+            except Exception:
+                pass
             if items:
                 lines.append("| Selected | Metric | Factor | Type | Vector | Name | Path | Count |")
                 lines.append("| --- | --- | ---: | --- | --- | --- | --- | ---: |")

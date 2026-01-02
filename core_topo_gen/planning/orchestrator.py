@@ -66,7 +66,7 @@ def compute_full_plan(
     service_plan, service_breakdown = compute_service_plan(svc_specs, density_base)
 
     # --- Vulnerabilities ---
-    vuln_density, vuln_items_xml = parse_vulnerabilities_info(xml_path, scenario)
+    vuln_density, vuln_items_xml, vuln_flag_type = parse_vulnerabilities_info(xml_path, scenario)
     vuln_items: List[VulnerabilityItem] = []
     for it in (vuln_items_xml or []):
         name = (it.get('selected') or 'Item') if hasattr(it, 'get') else 'Item'
@@ -85,6 +85,10 @@ def compute_full_plan(
         kind = (it.get('selected') or name) if hasattr(it, 'get') else name
         vuln_items.append(VulnerabilityItem(name=name, density=vuln_density, abs_count=abs_c, kind=kind, factor=factor_val, metric=vm))
     vulnerability_plan, vuln_breakdown = compute_vulnerability_plan(density_base, vuln_density, vuln_items)
+    try:
+        vuln_breakdown['flag_type'] = vuln_flag_type
+    except Exception:
+        pass
 
     # --- Segmentation ---
     seg_density, seg_items = parse_segmentation_info(xml_path, scenario)

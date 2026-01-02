@@ -177,10 +177,10 @@ def _run_offline_report(
     ]
 
     try:
-        vuln_density, vuln_items = parse_vulnerabilities_info(args.xml, args.scenario)
+        vuln_density, vuln_items, vuln_flag_type = parse_vulnerabilities_info(args.xml, args.scenario)
     except Exception:
-        vuln_density, vuln_items = None, []
-    vulnerabilities_cfg = {"density": vuln_density, "items": vuln_items or []}
+        vuln_density, vuln_items, vuln_flag_type = None, [], 'text'
+    vulnerabilities_cfg = {"density": vuln_density, "items": vuln_items or [], "flag_type": vuln_flag_type}
 
     try:
         seg_density, seg_items = parse_segmentation_info(args.xml, args.scenario)
@@ -512,7 +512,7 @@ def main():
         try:
             from .parsers.vulnerabilities import parse_vulnerabilities_info
             from .planning.vulnerability_plan import VulnerabilityItem, compute_vulnerability_plan
-            vuln_density, vuln_items_xml = parse_vulnerabilities_info(args.xml, args.scenario)
+            vuln_density, vuln_items_xml, _vuln_flag_type = parse_vulnerabilities_info(args.xml, args.scenario)
             vuln_items: list[VulnerabilityItem] = []
             for it in (vuln_items_xml or []):
                 name = (it.get('selected') or '').strip() or 'Item'
@@ -716,7 +716,7 @@ def main():
             vuln_items = orchestrated_plan.get('vulnerability_items_raw') or []
         if not vuln_density:
             # fallback legacy parse
-            vuln_density, vuln_items = parse_vulnerabilities_info(args.xml, args.scenario)
+            vuln_density, vuln_items, vuln_flag_type = parse_vulnerabilities_info(args.xml, args.scenario)
         catalog = load_vuln_catalog(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
         total_hosts = sum(role_counts.values())  # total allocated hosts (base + additive)
         slot_names = [f"slot-{i+1}" for i in range(total_hosts)]
@@ -1072,12 +1072,12 @@ def main():
             vuln_density = None
         vuln_items = orchestrated_plan.get('vulnerability_items_raw')
         if vuln_density is None or vuln_items is None:
-            vuln_density_fallback, vuln_items_fallback = parse_vulnerabilities_info(args.xml, args.scenario)
+            vuln_density_fallback, vuln_items_fallback, _vuln_flag_type_fb = parse_vulnerabilities_info(args.xml, args.scenario)
             if vuln_density is None:
                 vuln_density = vuln_density_fallback
             if vuln_items is None:
                 vuln_items = vuln_items_fallback
-        vulnerabilities_cfg = {"density": vuln_density, "items": vuln_items or []}
+        vulnerabilities_cfg = {"density": vuln_density, "items": vuln_items or [], "flag_type": vuln_flag_type}
         try:
             _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
             catalog_local = load_vuln_catalog(_repo_root)
