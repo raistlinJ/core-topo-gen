@@ -2877,7 +2877,14 @@ def _execute_remote_core_session_action(
     cfg = _normalize_core_config(core_cfg, include_password=True)
     ssh_user = (cfg.get('ssh_username') or '').strip() or '<unknown>'
     ssh_host = cfg.get('ssh_host') or cfg.get('host') or 'localhost'
-    address = f"{cfg.get('host') or CORE_HOST}:{cfg.get('port') or CORE_PORT}"
+    # This script runs on the SSH host. For docker-compose deployments, CORE is often
+    # the *host machine* and the container uses host.docker.internal to reach it.
+    # But host.docker.internal is not resolvable on the host itself, so we must
+    # translate that to a loopback address for the remote execution.
+    remote_target_host = str(cfg.get('host') or CORE_HOST or 'localhost').strip() or 'localhost'
+    if remote_target_host in {'host.docker.internal', 'localhost', '127.0.0.1', '::1'}:
+        remote_target_host = '127.0.0.1'
+    address = f"{remote_target_host}:{cfg.get('port') or CORE_PORT}"
     script = _remote_core_session_action_script(address, action, session_id)
     command_desc = (
         f"remote ssh {ssh_user}@{ssh_host} -> CoreGrpcClient.{action}_session {address} (session={session_id})"
@@ -2911,11 +2918,16 @@ def _list_active_core_sessions_via_remote_python(
     log = logger or getattr(app, 'logger', logging.getLogger(__name__))
     ssh_user = (cfg.get('ssh_username') or '').strip() or '<unknown>'
     ssh_host = cfg.get('ssh_host') or cfg.get('host') or 'localhost'
-    target_host = cfg.get('host') or 'localhost'
+    target_host = str(cfg.get('host') or 'localhost').strip() or 'localhost'
     try:
         target_port = int(cfg.get('port') or CORE_PORT)
     except Exception:
         target_port = CORE_PORT
+
+    # This remote script executes on ssh_host, so translate docker-only hostnames
+    # to a loopback address that is correct from the SSH host's perspective.
+    if target_host in {'host.docker.internal', 'localhost', '127.0.0.1', '::1'}:
+        target_host = '127.0.0.1'
     if meta is not None:
         meta['grpc_command'] = (
             f"remote ssh {ssh_user}@{ssh_host} -> CoreGrpcClient.get_sessions {target_host}:{target_port}"
