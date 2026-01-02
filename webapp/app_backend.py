@@ -11303,15 +11303,21 @@ def _default_scenario_payload(name: str) -> Dict[str, Any]:
         "Events", "Vulnerabilities", "Segmentation", "HITL"
     ]
     display_name = str(name or '').strip() or "Scenario"
+    sections_dict: Dict[str, Any] = {}
+    for sec_name in sections:
+        entry: Dict[str, Any] = {
+            "density": 0.5 if sec_name not in ("Node Information", "HITL") else None,
+            "total_nodes": 1 if sec_name == "Node Information" else None,
+            "items": [],
+        }
+        if sec_name == "Vulnerabilities":
+            entry["flag_type"] = "text"
+        sections_dict[sec_name] = entry
     return {
         "name": display_name,
         "base": {"filepath": ""},
         "hitl": {"enabled": False, "interfaces": [], "core": None},
-        "sections": {sec_name: {
-            "density": 0.5 if sec_name not in ("Node Information", "HITL") else None,
-            "total_nodes": 1 if sec_name == "Node Information" else None,
-            "items": []
-        } for sec_name in sections},
+        "sections": sections_dict,
         "notes": ""
     }
 
@@ -11416,7 +11422,7 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
         'Services': {'density': 0.5},
         'Traffic': {'density': 0.5},
         'Events': {'density': 0.5},
-        'Vulnerabilities': {'density': 0.5},
+        'Vulnerabilities': {'density': 0.5, 'flag_type': 'text'},
         'Segmentation': {'density': 0.5},
         'HITL': {},
     }
@@ -13446,6 +13452,8 @@ def _parse_scenario_editor(se):
         else:
             dens = sec.get("density")
             entry["density"] = float(dens) if dens is not None else 0.5
+        if name == "Vulnerabilities":
+            entry["flag_type"] = (sec.get("flag_type") or "text").strip() or "text"
         for item in sec.findall("item"):
             d = {
                 "selected": item.get("selected", "Random"),
@@ -13698,6 +13706,8 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                 continue
             sec_el = ET.SubElement(se, "section", name=name)
             items_list = sec.get("items", []) or []
+            if name == "Vulnerabilities":
+                sec_el.set("flag_type", str(sec.get("flag_type") or "text"))
             weight_rows = [it for it in items_list if (it.get('v_metric') or (it.get('selected')=='Specific' and name=='Vulnerabilities') or 'Weight') == 'Weight']
             count_rows = [it for it in items_list if (it.get('v_metric') == 'Count') or (name == 'Vulnerabilities' and it.get('selected') == 'Specific')]
             weight_sum = sum(float(it.get('factor', 0) or 0) for it in weight_rows) if weight_rows else 0.0

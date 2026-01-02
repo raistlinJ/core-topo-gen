@@ -50,4 +50,41 @@ class DockerComposeService(CoreService):
         fi
         # Bring up services in detached mode
         docker compose -f "$YML" up -d >> "$LOG" 2>&1 || echo "[DockerCompose] docker compose failed" >> "$LOG"
+
+        # --- CTF flag support (text only for now) ---
+        # Generate a random flag, store a copy on the host, then copy it into the
+        # vulnerability container filesystem. Container name is enforced by our
+        # compose generator (container_name: <node.name>).
+        FLAG_TYPE="text"
+        FLAG_HOST_PATH="/tmp/vulns/flag-${node.name}.txt"
+        FLAG_IN_CONTAINER_PRIMARY="/flag.txt"
+        FLAG_IN_CONTAINER_FALLBACK="/tmp/flag.txt"
+
+        mkdir -p /tmp/vulns >> "$LOG" 2>&1 || true
+        # Write a random text flag to host path
+        printf "FLAG{" > "$FLAG_HOST_PATH" 2>> "$LOG" || true
+        tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24 >> "$FLAG_HOST_PATH" 2>> "$LOG" || true
+        printf "}\n" >> "$FLAG_HOST_PATH" 2>> "$LOG" || true
+        echo "[DockerCompose] flag_type=${FLAG_TYPE} host_path=${FLAG_HOST_PATH}" >> "$LOG"
+
+        # Wait briefly for container to appear
+        for i in {1..20}; do
+          if docker ps -a --format '{{.Names}}' | grep -qx "${node.name}"; then
+            break
+          fi
+          sleep 0.5
+        done
+
+        if docker ps -a --format '{{.Names}}' | grep -qx "${node.name}"; then
+          if docker cp "$FLAG_HOST_PATH" "${node.name}:${FLAG_IN_CONTAINER_PRIMARY}" >> "$LOG" 2>&1; then
+            echo "[DockerCompose] flag copied to ${node.name}:${FLAG_IN_CONTAINER_PRIMARY}" >> "$LOG"
+          else
+            docker cp "$FLAG_HOST_PATH" "${node.name}:${FLAG_IN_CONTAINER_FALLBACK}" >> "$LOG" 2>&1 || true
+            echo "[DockerCompose] flag copied to ${node.name}:${FLAG_IN_CONTAINER_FALLBACK}" >> "$LOG"
+          fi
+        else
+          echo "[DockerCompose] container ${node.name} not found; flag not copied" >> "$LOG"
+        fi
+
+        exit 0
         """
