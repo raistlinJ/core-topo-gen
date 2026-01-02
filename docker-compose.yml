@@ -1,6 +1,5 @@
 services:
   web:
-    profiles: ["http"]
     build:
       # Build from repo root so requirements.txt and core_topo_gen/ are available.
       context: .
@@ -20,41 +19,23 @@ services:
     networks:
       - app_net
 
-  nginx_http:
-    profiles: ["http"]
-    build:
-      context: ./nginx
-      dockerfile: Dockerfile
-    container_name: core-topo-gen-proxy-http
-    depends_on:
-      - web
-    ports:
-      - "80:80"
-    volumes:
-      - ./nginx/nginx-http.conf:/etc/nginx/nginx.conf:ro
-    restart: unless-stopped
-    networks:
-      - app_net
-
   nginx:
-    profiles: ["nginx"]
     build:
       context: ./nginx
       dockerfile: Dockerfile
     container_name: core-topo-gen-proxy
+    depends_on:
+      - web
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      # Host-web mode by default: proxy to Web UI running on the host at 127.0.0.1:9090
-      - ./nginx/nginx-hostweb.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/certs:/etc/nginx/certs
     environment:
       - CERT_DAYS=${CERT_DAYS:-365}
       - CERT_SUBJECT=${CERT_SUBJECT:-/CN=localhost}
       - CERT_SANS=${CERT_SANS:-}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     networks:
       - app_net

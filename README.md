@@ -51,12 +51,13 @@ pip install -r requirements.txt
 ```
 
 ### Launch the Web UI
+Start the full stack (webapp + HTTPS reverse proxy):
 ```bash
-python main.py
+docker compose up -d --build
 ```
-- Visits `http://127.0.0.1:9090` by default (reverse proxy `nginx` compose targets `https://localhost`).
-- First launch seeds an `coreadmin / coreadmin` account; change it immediately under **Profile → Change Password**.
-- Configure the TLS reverse proxy with `make host-web` or `make host-web-nginx`. The helper script `scripts/dev_gen_certs.sh` issues self-signed certificates with SAN support.
+- Visit `https://localhost`.
+- First launch seeds a `coreadmin / coreadmin` account; change it immediately under **Profile → Change Password**.
+- Dev certs are generated automatically inside the nginx container (mounted under `nginx/certs/`).
 - HITL editor note: the “Attach to” dropdown now offers `Existing Router`, `Existing Switch`, or `New Router`. The legacy `New Switch` choice was removed to prevent hidden switch fan-out; saved scenarios using it are normalized to `Existing Router` during load. Once Proxmox credentials and VM selections are validated, use **Apply Internal Bridge** to create/update a Proxmox bridge and retarget both the CORE VM and external VM interfaces in one step.
 
 ### Run the CLI
