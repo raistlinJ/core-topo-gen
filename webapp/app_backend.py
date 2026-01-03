@@ -14576,7 +14576,48 @@ def index():
             payload['project_key_hint'] = snapshot.get('project_key_hint')
         if snapshot.get('scenario_query') and not payload.get('scenario_query'):
             payload['scenario_query'] = snapshot.get('scenario_query')
-    return render_template('index.html', payload=payload, logs="", xml_preview="")
+
+    # Populate XML preview on initial load so the dock isn't blank after refresh.
+    xml_text = ""
+    try:
+        # Prefer reading an existing persisted XML file if we have a path.
+        result_path = payload.get('result_path') if isinstance(payload, dict) else None
+        if isinstance(result_path, str) and result_path.strip() and result_path.lower().endswith('.xml'):
+            rp = os.path.expanduser(result_path.strip())
+            rp = os.path.normpath(rp)
+            candidates = [rp]
+            try:
+                repo_root = _get_repo_root()
+                if not os.path.isabs(rp):
+                    candidates.append(os.path.abspath(os.path.join(repo_root, rp)))
+                if rp.startswith('outputs' + os.sep):
+                    candidates.append(os.path.abspath(os.path.join(_outputs_dir(), rp.split(os.sep, 1)[-1])))
+            except Exception:
+                pass
+            chosen = next((p for p in candidates if p and os.path.exists(p)), None)
+            if chosen:
+                with open(chosen, 'r', encoding='utf-8', errors='ignore') as f:
+                    xml_text = f.read()
+
+        # Otherwise, generate a best-effort preview from the in-memory editor state.
+        if not xml_text:
+            scenarios = payload.get('scenarios') if isinstance(payload, dict) else None
+            if isinstance(scenarios, list) and scenarios:
+                core_meta = payload.get('core') if isinstance(payload.get('core'), dict) else None
+                tree = _build_scenarios_xml({'scenarios': scenarios, 'core': core_meta})
+                try:
+                    from lxml import etree as LET  # type: ignore
+
+                    raw = ET.tostring(tree.getroot(), encoding='utf-8')
+                    lroot = LET.fromstring(raw)
+                    pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+                    xml_text = pretty.decode('utf-8', errors='ignore')
+                except Exception:
+                    xml_text = ET.tostring(tree.getroot(), encoding='unicode')
+    except Exception:
+        xml_text = ""
+
+    return render_template('index.html', payload=payload, logs="", xml_preview=xml_text)
 
 
 @app.route('/load_xml', methods=['POST'])
