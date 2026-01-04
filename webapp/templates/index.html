@@ -6189,6 +6189,8 @@ async function autoSaveXml(){
             const finalizeSuccess = () => {
                 previewState.xmlSaved = true;
                 try { updatePlanButtons(); } catch(err) {}
+                // Keep the dock's XML Preview in sync for all save paths (auto-save + modal saves).
+                try { refreshXmlDockPreview({ force: true, preferSavedPath: true }); } catch (e) {}
                 resolve();
             };
             const legacySave = () => {
@@ -9595,7 +9597,13 @@ function renderSidebar() {
             ${checkboxHtml}
             <span class="flex-grow-1 text-truncate" title="${safeName}">${safeName}</span>
         </div>`;
-        a.onclick = (e) => { e.preventDefault(); activeIdx = idx; persistEditorState(); render(); };
+        a.onclick = (e) => {
+            e.preventDefault();
+            activeIdx = idx;
+            persistEditorState();
+            render();
+            try { refreshXmlDockPreview({ force: true }); } catch (err) {}
+        };
         list.appendChild(a);
     });
     const appendScenarioBtn = document.getElementById('appendScenarioBtn');
@@ -15200,6 +15208,8 @@ async function promptExecuteConfirmation(options = {}) {
 }
 
 render();
+// Populate the dock XML preview even before the first Save.
+try { refreshXmlDockPreview({ force: true }); } catch (e) {}
 
 // Restore scroll position if previously saved before a Save XML navigation
 function restoreScrollIfAny() {
@@ -16334,11 +16344,7 @@ async function saveXmlAjax(){
             }
             // Refresh XML preview lazily
             try {
-                const xmlPre = document.getElementById('xmlPre');
-                if (xmlPre && data.result_path) {
-                    const txt = await (await fetch('/download_report?path=' + encodeURIComponent(data.result_path))).text();
-                    xmlPre.textContent = txt;
-                }
+                await refreshXmlDockPreview({ force: true, preferSavedPath: true });
             } catch(e){}
             return true;
         }
@@ -16346,6 +16352,91 @@ async function saveXmlAjax(){
         return false;
     } catch(e) { logError('Save threw an exception'); return false; }
 }
+
+let __xmlDockPreviewReq = 0;
+async function refreshXmlDockPreview({ force = false, preferSavedPath = false } = {}) {
+    const xmlPre = document.getElementById('xmlPre');
+    if (!xmlPre) return;
+
+    const reqId = ++__xmlDockPreviewReq;
+    const applyIfLatest = (txt, meta = {}) => {
+        if (reqId !== __xmlDockPreviewReq) return;
+        try {
+            xmlPre.textContent = txt || '';
+            if (meta.path !== undefined) {
+                xmlPre.dataset.xmlPreviewPath = meta.path || '';
+            }
+        } catch (e) {}
+    };
+
+    const rp = String(state?.result_path || '');
+    const hasSaved = rp && rp.endsWith('.xml');
+    const lastPath = xmlPre.dataset.xmlPreviewPath || '';
+
+    // Prefer showing the persisted XML when available.
+    if (hasSaved && (preferSavedPath || force || !xmlPre.textContent.trim() || lastPath !== rp)) {
+        try {
+            const txt = await (await fetch('/download_report?path=' + encodeURIComponent(rp), { credentials: 'same-origin' })).text();
+            applyIfLatest(txt, { path: rp });
+            return;
+        } catch (e) {
+            // fall through to render API
+        }
+    }
+
+    // No saved XML yet (or download failed): render a preview from current editor state.
+    if (!force && xmlPre.textContent.trim()) return;
+    try {
+        const res = await fetch('/render_xml_api', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({
+                scenarios: state.scenarios,
+                core: getCoreConfig(true),
+                active_index: activeIdx,
+            }),
+        });
+        if (!res.ok) return;
+        const txt = await res.text();
+        applyIfLatest(txt, { path: '' });
+    } catch (e) {}
+}
+
+let __xmlDockPreviewDebounceTimer = null;
+function scheduleXmlDockPreviewRefresh() {
+    try {
+        // Only refresh live when the dock is visible (avoid background spam).
+        const dock = document.getElementById('dockPanel');
+        if (dock && dock.classList.contains('d-none')) return;
+    } catch (e) {}
+    try {
+        if (__xmlDockPreviewDebounceTimer) {
+            clearTimeout(__xmlDockPreviewDebounceTimer);
+        }
+        __xmlDockPreviewDebounceTimer = setTimeout(() => {
+            try { refreshXmlDockPreview({ force: true }); } catch (e) {}
+        }, 5000);
+    } catch (e) {}
+}
+
+// Live-update XML preview as the user edits fields.
+document.addEventListener('DOMContentLoaded', () => {
+    const root = document.getElementById('editorRoot');
+    if (!root) return;
+    const handler = (ev) => {
+        try {
+            const t = ev.target;
+            if (!t) return;
+            // Ignore dock controls if they bubble here (defensive)
+            if (t.closest && (t.closest('#dockPanel') || t.closest('#dockShowBtn'))) return;
+        } catch (e) {}
+        scheduleXmlDockPreviewRefresh();
+    };
+    // input covers typing; change covers selects/checkboxes
+    root.addEventListener('input', handler, true);
+    root.addEventListener('change', handler, true);
+});
 
 // Some flows historically used appendLog(level,msg) while the dock exposes logLine/logInfo/etc.
 // Provide a compatibility shim so execution flows never crash on missing appendLog.

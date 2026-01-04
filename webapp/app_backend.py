@@ -15088,6 +15088,34 @@ def save_xml_api():
         return jsonify({ 'ok': False, 'error': str(e) }), 500
 
 
+@app.route('/render_xml_api', methods=['POST'])
+def render_xml_api():
+    """Render scenario XML for preview without persisting to disk."""
+    try:
+        data = request.get_json(silent=True) or {}
+        scenarios = data.get('scenarios')
+        core_meta = data.get('core')
+        normalized_core = _normalize_core_config(core_meta, include_password=True) if isinstance(core_meta, (dict, list)) or core_meta else None
+        if not isinstance(scenarios, list):
+            return jsonify({ 'ok': False, 'error': 'Invalid payload (scenarios list required)' }), 400
+        tree = _build_scenarios_xml({ 'scenarios': scenarios, 'core': normalized_core })
+        # Pretty print when possible
+        try:
+            raw = ET.tostring(tree.getroot(), encoding='utf-8')
+            lroot = LET.fromstring(raw)
+            pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+            return Response(pretty, mimetype='application/xml')
+        except Exception:
+            out = ET.tostring(tree.getroot(), encoding='utf-8', xml_declaration=True)
+            return Response(out, mimetype='application/xml')
+    except Exception as e:
+        try:
+            app.logger.exception('[render_xml_api] failed: %s', e)
+        except Exception:
+            pass
+        return jsonify({ 'ok': False, 'error': str(e) }), 500
+
+
 @app.route('/run_cli', methods=['POST'])
 def run_cli():
     user = _current_user()
