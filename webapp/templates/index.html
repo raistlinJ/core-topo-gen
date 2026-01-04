@@ -6336,6 +6336,20 @@ document.addEventListener('DOMContentLoaded', () => {
             // Config HITL modal: validate + apply + confirm; only close on success.
             if (buttonId === 'externalIfxModalSaveBtn') {
                 try {
+                    // If HITL is disabled, just save the disabled setting.
+                    try {
+                        const modalEl = document.getElementById('externalIfxModal');
+                        const toggle = modalEl ? modalEl.querySelector(`[data-hitl-toggle][data-scen-idx="${activeIdx}"]`) : null;
+                        const enabled = toggle ? !!toggle.checked : !!(state?.scenarios?.[activeIdx]?.hitl?.enabled);
+                        if (!enabled) {
+                            btn.disabled = true;
+                            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Saving…';
+                            await runSave();
+                            closeParentModal();
+                            return;
+                        }
+                    } catch (e) {}
+
                     btn.disabled = true;
                     btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Validating…';
                     const validateRes = await verifyScenarioHitlBridge(activeIdx, { triggerButton: null });
@@ -6367,6 +6381,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 } finally {
                     btn.disabled = false;
                     btn.innerHTML = originalHtml;
+                    try { syncExternalIfxModalSaveLabel(); } catch (_) {}
                 }
                 return;
             }
@@ -9427,6 +9442,21 @@ function persistScenarioSelection() {
     try { localStorage.setItem('coretg_selected_scenarios', JSON.stringify(Array.from(selectedScenarioIds))); } catch(e){}
 }
 
+function syncExternalIfxModalSaveLabel() {
+    try {
+        const modalEl = document.getElementById('externalIfxModal');
+        if (!modalEl) return;
+        const btn = document.getElementById('externalIfxModalSaveBtn');
+        if (!btn) return;
+        // Don't override while busy/spinning.
+        if (btn.disabled && (btn.innerHTML || '').includes('spinner-border')) return;
+
+        const toggle = modalEl.querySelector(`[data-hitl-toggle][data-scen-idx="${activeIdx}"]`);
+        const enabled = toggle ? !!toggle.checked : !!(state?.scenarios?.[activeIdx]?.hitl?.enabled);
+        btn.textContent = enabled ? 'Validate & Save' : 'Save';
+    } catch (e) {}
+}
+
 function ensureScenarioIds() {
     let changed = false;
     state.scenarios.forEach(s => {
@@ -9451,11 +9481,22 @@ function selectAllScenarios() {
     renderSidebar();
 }
 
-function deleteSelectedScenarios() {
+async function deleteSelectedScenarios() {
     if (!selectedScenarioIds.size) return;
     const count = selectedScenarioIds.size;
     if (!confirm(`Delete ${count} selected scenario${count>1?'s':''}? This cannot be undone.`)) return;
     const beforeLen = state.scenarios.length;
+    const deletedNames = [];
+    try {
+        state.scenarios.forEach((s, idx) => {
+            try {
+                if (s && selectedScenarioIds.has(s._sid)) {
+                    const display = (s.name && String(s.name).trim()) ? String(s.name).trim() : `Scenario ${idx+1}`;
+                    deletedNames.push(display);
+                }
+            } catch (e) {}
+        });
+    } catch (e) {}
     state.scenarios = state.scenarios.filter(s => !selectedScenarioIds.has(s._sid));
     selectedScenarioIds.clear();
     if (!state.scenarios.length) {
@@ -9470,6 +9511,57 @@ function deleteSelectedScenarios() {
     persistScenarioSelection();
     try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
     render();
+
+    // Persist deletion across refresh: remove from server catalog and save snapshot.
+    try {
+        if (deletedNames.length) {
+            await fetch('/delete_scenarios', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({ names: deletedNames }),
+            });
+        }
+    } catch (e) {
+        console.warn('delete_scenarios failed', e);
+    }
+    try {
+        await autoSaveXml();
+    } catch (e) {
+        console.warn('autoSaveXml after delete failed', e);
+        try { showToast('Delete was not persisted (save failed).', { autohide: true, delay: 3500 }); } catch (_) {}
+    }
+
+    // Also purge from any other locally persisted project snapshots.
+    try {
+        const toKey = (v) => String(v || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+        const targetKeys = new Set((deletedNames || []).map(toKey).filter(Boolean));
+        if (targetKeys.size) {
+            let changed = false;
+            Object.keys(projectStateMap || {}).forEach(pk => {
+                const entry = projectStateMap[pk];
+                if (!entry || typeof entry !== 'object') return;
+                const scenList = Array.isArray(entry.scenarios) ? entry.scenarios : null;
+                if (!scenList || !scenList.length) return;
+                const kept = [];
+                scenList.forEach((sc, idx) => {
+                    if (!sc || typeof sc !== 'object') { kept.push(sc); return; }
+                    const nm = (sc.name && String(sc.name).trim()) ? String(sc.name).trim() : `Scenario ${idx+1}`;
+                    if (targetKeys.has(toKey(nm))) { changed = true; return; }
+                    kept.push(sc);
+                });
+                entry.scenarios = kept;
+                projectStateMap[pk] = entry;
+            });
+            if (changed) {
+                writeJsonToLocalStorage(PROJECT_STATE_STORAGE_KEY, projectStateMap);
+                legacyEditorState = scrubSnapshotTransientErrors(legacyEditorState);
+                writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, legacyEditorState);
+            }
+        }
+    } catch (e) {
+        console.warn('local project snapshot purge failed', e);
+    }
 }
 
 function updateBulkButtonsState() {
@@ -9593,7 +9685,16 @@ function renderSidebar() {
             if (!configHitlModalEl || !window.bootstrap) return;
             const modalInstance = bootstrap.Modal.getInstance(configHitlModalEl) || new bootstrap.Modal(configHitlModalEl, { backdrop: true, keyboard: true });
             maybeAutoRefreshHitlInterfacesOnModalOpen(activeIdx);
+            try { syncExternalIfxModalSaveLabel(); } catch (_) {}
             modalInstance.show();
+            try {
+                if (!configHitlModalEl.dataset.hitlSaveLabelBound) {
+                    configHitlModalEl.addEventListener('shown.bs.modal', () => {
+                        try { syncExternalIfxModalSaveLabel(); } catch (_) {}
+                    });
+                    configHitlModalEl.dataset.hitlSaveLabelBound = '1';
+                }
+            } catch (e) {}
         });
         configHitlBtn.dataset.hitlModalBound = '1';
     }
@@ -9735,8 +9836,8 @@ function renderMain() {
         root.appendChild(metaCard);
     }
 
-    // Keep the original header buttons in place; render proxy buttons in the
-    // scenario-name card so they don't "disappear" after re-renders.
+    // Render the optional entry buttons in the "CORE / Participant Setup (optional)"
+    // card via proxy buttons, while keeping the original header buttons hidden.
     if (!IS_BUILDER_VIEW) {
         const coreBtnSlot = document.getElementById('scenarioNameCoreBtnSlot');
         const hitlBtnSlot = document.getElementById('scenarioNameHitlBtnSlot');
@@ -9766,10 +9867,12 @@ function renderMain() {
         };
         try {
             if (coreBtnSlot && selectCoreVmBtnEl) {
+                coreBtnSlot.innerHTML = '';
                 const proxy = makeProxyBtn(selectCoreVmBtnEl, 'scenarioNameSelectCoreVmBtn');
                 if (proxy) coreBtnSlot.appendChild(proxy);
             }
             if (hitlBtnSlot && configHitlBtnEl) {
+                hitlBtnSlot.innerHTML = '';
                 const proxy = makeProxyBtn(configHitlBtnEl, 'scenarioNameConfigHitlBtn');
                 if (proxy) hitlBtnSlot.appendChild(proxy);
             }
@@ -12775,6 +12878,7 @@ function wireHandlers() {
             const hidden = document.getElementById('scenarios_json');
             if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
             renderMain();
+            try { syncExternalIfxModalSaveLabel(); } catch (_) {}
         });
     });
     document.querySelectorAll('[data-hitl-add]').forEach(btn => {
@@ -13775,6 +13879,8 @@ function wireHandlers() {
             const msg = lines.join('\n');
             if (!window.confirm(msg)) { return; }
 
+            const deletedName = (scen.name && String(scen.name).trim()) ? String(scen.name).trim() : `Scenario ${sidx+1}`;
+
             // Remove scenario
             state.scenarios.splice(sidx, 1);
             // Leave list empty if last scenario removed
@@ -13787,6 +13893,19 @@ function wireHandlers() {
             // Re-render UI
             render();
             try { showToast(`Scenario "${scen.name}" deleted`); } catch(e){}
+
+            // Persist deletion across refresh.
+            try {
+                if (deletedName) {
+                    await fetch('/delete_scenarios', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        credentials: 'same-origin',
+                        body: JSON.stringify({ names: [deletedName] })
+                    });
+                }
+            } catch (e) {}
+            try { await autoSaveXml(); } catch (e) {}
 
             // Purge matching run history and artifacts in background
             if (runCount > 0) {

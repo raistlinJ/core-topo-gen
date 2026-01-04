@@ -8181,6 +8181,313 @@ def _persist_scenario_catalog(
             pass
 
 
+def _remove_scenarios_from_catalog(names_to_remove: Iterable[Any]) -> Dict[str, Any]:
+    """Remove scenario names from outputs/scenario_catalog.json.
+
+    This is the server-side source of truth for which scenarios are listed on
+    refresh, so UI-only deletion must update this file.
+    """
+    catalog_path = _scenario_catalog_file()
+    try:
+        if not os.path.exists(catalog_path):
+            return {'removed': 0, 'remaining': 0}
+    except Exception:
+        return {'removed': 0, 'remaining': 0}
+
+    norms_to_remove: set[str] = set()
+    for raw in names_to_remove or []:
+        norm = _normalize_scenario_label(raw)
+        if norm:
+            norms_to_remove.add(norm)
+    if not norms_to_remove:
+        return {'removed': 0, 'remaining': 0}
+
+    tmp_path = catalog_path + '.tmp'
+    try:
+        with open(catalog_path, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            return {'removed': 0, 'remaining': 0}
+
+        existing_names = payload.get('names')
+        if not isinstance(existing_names, list):
+            existing_names = []
+        before = list(existing_names)
+        kept_names: list[str] = []
+        kept_norms: set[str] = set()
+        for name in before:
+            norm = _normalize_scenario_label(name)
+            if not norm:
+                continue
+            if norm in norms_to_remove:
+                continue
+            if norm in kept_norms:
+                continue
+            kept_norms.add(norm)
+            kept_names.append(str(name))
+        removed = max(0, len(before) - len(kept_names))
+
+        payload['names'] = kept_names
+        # Keep sources aligned to names length (list form).
+        existing_sources = payload.get('sources')
+        if isinstance(existing_sources, list):
+            payload['sources'] = [existing_sources[0] if existing_sources else '' for _ in kept_names]
+        elif isinstance(existing_sources, dict):
+            # Filter dict-form sources.
+            payload['sources'] = {
+                key: val
+                for key, val in existing_sources.items()
+                if _normalize_scenario_label(key) in kept_norms
+            }
+
+        # Prune hint maps keyed by scenario norm.
+        for hint_key in ('participant_urls', 'hitl_validation', 'hitl_config'):
+            hint_map = payload.get(hint_key)
+            if isinstance(hint_map, dict):
+                payload[hint_key] = {
+                    key: val
+                    for key, val in hint_map.items()
+                    if _normalize_scenario_label(key) in kept_norms
+                }
+
+        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+
+        os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
+        with open(tmp_path, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp_path, catalog_path)
+        return {'removed': removed, 'remaining': len(kept_names)}
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def _delete_saved_scenario_xml_artifacts(names_to_remove: Iterable[Any]) -> Dict[str, Any]:
+    """Delete saved scenario XML artifacts under outputs/scenarios-*/.
+
+    These artifacts are re-discovered on page load by _collect_scenario_catalog(),
+    so UI deletion must remove them to prevent the scenario from reappearing.
+    """
+    stems: set[str] = set()
+    match_keys: set[str] = set()
+    for raw in names_to_remove or []:
+        try:
+            name = str(raw).strip()
+        except Exception:
+            name = ''
+        if not name:
+            continue
+        mk = _scenario_match_key(name)
+        if mk:
+            match_keys.add(mk)
+        try:
+            stem = secure_filename(name).strip('_-.')
+        except Exception:
+            stem = ''
+        if stem:
+            stems.add(stem)
+    if not stems and not match_keys:
+        return {'artifacts_removed': 0}
+
+    outputs_root = os.path.abspath(_outputs_dir())
+    removed = 0
+    try:
+        if not outputs_root or not os.path.isdir(outputs_root):
+            return {'artifacts_removed': 0}
+    except Exception:
+        return {'artifacts_removed': 0}
+
+    # Mirror discovery logic: scan outputs/scenarios-* folders (newest first, bounded).
+    dirs: list[tuple[float, str]] = []
+    try:
+        for entry in os.listdir(outputs_root):
+            if not entry.startswith('scenarios-'):
+                continue
+            folder = os.path.join(outputs_root, entry)
+            if not os.path.isdir(folder):
+                continue
+            try:
+                mtime = os.path.getmtime(folder)
+            except Exception:
+                mtime = 0.0
+            dirs.append((mtime, folder))
+    except Exception:
+        dirs = []
+    dirs.sort(key=lambda t: t[0], reverse=True)
+
+    for _mtime, folder in dirs[:500]:
+        # Fast path: attempt stem-based delete when possible.
+        for stem in stems:
+            candidate = os.path.join(folder, f"{stem}.xml")
+            try:
+                if not os.path.isfile(candidate):
+                    continue
+                cand_abs = os.path.abspath(candidate)
+                if not cand_abs.startswith(outputs_root + os.sep):
+                    continue
+                os.remove(cand_abs)
+                removed += 1
+            except Exception:
+                continue
+
+        # Robust path: scan XML contents and delete any matching scenario(s).
+        if match_keys:
+            try:
+                for fname in os.listdir(folder):
+                    if not fname.endswith('.xml'):
+                        continue
+                    # Skip CORE pre/post captures; only include user-authored scenario XML.
+                    if fname.startswith('core-'):
+                        continue
+                    # Mirror discovery behavior for scenario editor saves.
+                    if not fname.startswith('Scenario_'):
+                        continue
+                    path = os.path.join(folder, fname)
+                    if not os.path.isfile(path):
+                        continue
+                    try:
+                        names_in_file = _scenario_names_from_xml(path)
+                    except Exception:
+                        names_in_file = []
+                    hit = False
+                    for nm in names_in_file:
+                        if _scenario_match_key(nm) in match_keys:
+                            hit = True
+                            break
+                    if not hit:
+                        continue
+                    p_abs = os.path.abspath(path)
+                    if not p_abs.startswith(outputs_root + os.sep):
+                        continue
+                    try:
+                        os.remove(p_abs)
+                        removed += 1
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        # Best-effort cleanup of empty folders
+        try:
+            if folder.startswith(outputs_root + os.sep) and os.path.isdir(folder) and not os.listdir(folder):
+                os.rmdir(folder)
+        except Exception:
+            pass
+
+    return {'artifacts_removed': removed}
+
+
+def _remove_scenarios_from_all_editor_snapshots(names_to_remove: Iterable[Any]) -> Dict[str, Any]:
+    """Remove scenario entries from all editor snapshots in outputs/editor_snapshots.
+
+    _collect_scenario_catalog() merges names from all snapshots and treats them as
+    protected, so we must purge deleted scenarios from these snapshots.
+    """
+    remove_norms: set[str] = set()
+    remove_match: set[str] = set()
+    for raw in names_to_remove or []:
+        norm = _normalize_scenario_label(raw)
+        if norm:
+            remove_norms.add(norm)
+        mk = _scenario_match_key(raw)
+        if mk:
+            remove_match.add(mk)
+    if not remove_norms:
+        return {'snapshots_updated': 0, 'snapshots_deleted': 0, 'snapshot_scenarios_removed': 0}
+
+    snap_dir = _editor_state_snapshot_dir()
+    try:
+        entries = [n for n in os.listdir(snap_dir) if n.endswith('.json')]
+    except Exception:
+        entries = []
+
+    updated = 0
+    deleted = 0
+    scenarios_removed = 0
+    for fname in entries:
+        path = os.path.join(snap_dir, fname)
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                snap = json.load(fh)
+        except Exception:
+            continue
+        if not isinstance(snap, dict):
+            continue
+        scen_list = snap.get('scenarios')
+        if not isinstance(scen_list, list) or not scen_list:
+            # Still clear scenario_query if it targets a deleted scenario.
+            try:
+                q = snap.get('scenario_query')
+                if q and (_normalize_scenario_label(q) in remove_norms or _scenario_match_key(q) in remove_match):
+                    snap['scenario_query'] = ''
+                    tmp = path + '.tmp'
+                    with open(tmp, 'w', encoding='utf-8') as fh:
+                        json.dump(snap, fh, indent=2)
+                    os.replace(tmp, path)
+                    updated += 1
+            except Exception:
+                pass
+            continue
+        kept: list[Any] = []
+        removed_here = 0
+        for idx, scen in enumerate(scen_list, start=1):
+            if not isinstance(scen, dict):
+                kept.append(scen)
+                continue
+            raw_name = scen.get('name')
+            display = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else f"Scenario {idx}"
+            norm = _normalize_scenario_label(display)
+            mk = _scenario_match_key(display)
+            if (norm and norm in remove_norms) or (mk and mk in remove_match):
+                removed_here += 1
+                continue
+            kept.append(scen)
+        if not removed_here:
+            # Still clear scenario_query if it targets a deleted scenario.
+            try:
+                q = snap.get('scenario_query')
+                if q and (_normalize_scenario_label(q) in remove_norms or _scenario_match_key(q) in remove_match):
+                    snap['scenario_query'] = ''
+                    tmp = path + '.tmp'
+                    with open(tmp, 'w', encoding='utf-8') as fh:
+                        json.dump(snap, fh, indent=2)
+                    os.replace(tmp, path)
+                    updated += 1
+            except Exception:
+                pass
+            continue
+        scenarios_removed += removed_here
+        snap['scenarios'] = kept
+        # Clear scenario_query if it targets a deleted scenario.
+        try:
+            q = snap.get('scenario_query')
+            if q and (_normalize_scenario_label(q) in remove_norms or _scenario_match_key(q) in remove_match):
+                snap['scenario_query'] = ''
+        except Exception:
+            pass
+        try:
+            if not kept:
+                os.remove(path)
+                deleted += 1
+            else:
+                tmp = path + '.tmp'
+                with open(tmp, 'w', encoding='utf-8') as fh:
+                    json.dump(snap, fh, indent=2)
+                os.replace(tmp, path)
+                updated += 1
+        except Exception:
+            continue
+
+    return {
+        'snapshots_updated': updated,
+        'snapshots_deleted': deleted,
+        'snapshot_scenarios_removed': scenarios_removed,
+    }
+
+
 def _merge_participant_urls_into_scenario_catalog(participant_urls: Dict[str, Any]) -> None:
     """Merge participant URL hints into the scenario catalog without changing names/sources."""
     if not isinstance(participant_urls, dict) or not participant_urls:
@@ -21013,6 +21320,48 @@ def purge_history_for_scenario():
         return jsonify({'removed': removed})
     except Exception as e:
         return jsonify({'removed': 0, 'error': str(e)}), 200
+
+
+@app.route('/delete_scenarios', methods=['POST'])
+def delete_scenarios():
+    """Persist scenario deletions across refresh.
+
+    This updates outputs/scenario_catalog.json, which seeds the Scenario Editor list
+    on initial page load.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        raw_names = data.get('names')
+        if isinstance(raw_names, str):
+            names = [raw_names]
+        elif isinstance(raw_names, list):
+            names = [n for n in raw_names if isinstance(n, (str, int, float))]
+        else:
+            names = []
+        names = [str(n).strip() for n in names if str(n).strip()]
+        if not names:
+            return jsonify({'ok': False, 'error': 'Missing scenario names'}), 400
+        result = _remove_scenarios_from_catalog(names)
+        # Also delete any saved Scenario_*.xml artifacts and remove the scenario(s)
+        # from all editor snapshots, otherwise they will be re-discovered on refresh.
+        artifacts = _delete_saved_scenario_xml_artifacts(names)
+        snapshots = _remove_scenarios_from_all_editor_snapshots(names)
+        history_removed = 0
+        try:
+            for nm in names:
+                try:
+                    history_removed += _purge_run_history_for_scenario(str(nm), delete_artifacts=True)
+                except Exception:
+                    continue
+        except Exception:
+            history_removed = history_removed
+        return jsonify({'ok': True, **result, **artifacts, **snapshots, 'history_removed': history_removed})
+    except Exception as e:
+        try:
+            app.logger.exception('[delete_scenarios] failed: %s', e)
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
     try:
