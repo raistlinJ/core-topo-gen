@@ -138,6 +138,30 @@
 			"type": "shell",
 			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
 			"isBackground": true
+		},
+		{
+			"label": "Web UI (9090)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
+			"isBackground": true
+		},
+		{
+			"label": "Web UI (9090)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
+			"isBackground": true
+		},
+		{
+			"label": "Healthz check",
+			"type": "shell",
+			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"isBackground": false
+		},
+		{
+			"label": "Web UI (9090)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
+			"isBackground": true
 		}
 	]
 }

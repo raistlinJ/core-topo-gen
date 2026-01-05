@@ -105,8 +105,8 @@
                       <th>Name</th>
                       <th>Language</th>
                       <th>Source</th>
-                      <th>Inputs</th>
-                      <th>Outputs</th>
+                      <th>Input Types</th>
+                      <th>Output Types</th>
                       <th>From Source</th>
                       <th style="width: 100px;">Test</th>
                     </tr>
@@ -170,6 +170,27 @@
   </div>
 </div>
 
+<!-- Cleanup Modal (shown while removing test artifacts) -->
+<div class="modal fade" id="genTestCleanupModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable" style="max-width: 600px;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Cleaning up</h5>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex align-items-center gap-2">
+          <span id="genTestCleanupSpinner" class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+          <span id="genTestCleanupText">Cleaning up, please wait…</span>
+        </div>
+        <pre class="small bg-light p-2 mt-2 mb-0" id="genTestCleanupLog" style="max-height: 320px; overflow: auto;"></pre>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary" id="genTestCleanupCloseBtn" data-bs-dismiss="modal" disabled>Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
   const genState = {
     generators: [],
@@ -185,6 +206,8 @@
     outputsLastSig: null,
     outputsStablePolls: 0,
   };
+
+  let pendingCleanupRunId = null;
 
   function setOutputsStatus(visible, text) {
     const box = document.getElementById('genTestOutputsStatus');
@@ -208,10 +231,137 @@
     genTestState.outputsStablePolls = 0;
   }
 
+  function resetGenTestUiState() {
+    stopOutputsPolling();
+    if (genTestState.eventSource) {
+      try { genTestState.eventSource.close(); } catch (e) {}
+      genTestState.eventSource = null;
+    }
+    genTestState.runId = null;
+    genTestState.current = null;
+    clearTestLog();
+    setOutputsHtml('');
+    setOutputsStatus(false);
+    const btn = document.getElementById('genTestRunBtn');
+    if (btn) btn.disabled = false;
+  }
+
+  function clearCleanupLog() {
+    const el = document.getElementById('genTestCleanupLog');
+    if (el) el.textContent = '';
+  }
+
+  function setCleanupLogLine(line) {
+    const el = document.getElementById('genTestCleanupLog');
+    if (!el) return;
+    el.textContent = (el.textContent || '') + (line || '') + '\n';
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function setCleanupSpinner(active) {
+    const sp = document.getElementById('genTestCleanupSpinner');
+    if (!sp) return;
+    sp.style.display = active ? 'inline-block' : 'none';
+  }
+
+  function _cleanupModalState(el) {
+    try {
+      const shown = !!(el && el.classList && el.classList.contains('show'));
+      const display = el ? (getComputedStyle(el).display || '') : '';
+      const backdrops = document.querySelectorAll('.modal-backdrop').length;
+      const openModals = document.querySelectorAll('.modal.show').length;
+      const bodyOpen = document.body && document.body.classList ? document.body.classList.contains('modal-open') : false;
+      return { shown, display, backdrops, openModals, bodyOpen };
+    } catch (e) {
+      return { error: String(e) };
+    }
+  }
+
+  function forceHideCleanupModal(cleanupModalEl) {
+    const el = cleanupModalEl;
+    if (!el) return;
+    const st0 = _cleanupModalState(el);
+    setCleanupLogLine(`[ui][cleanup] forceHide start state=${JSON.stringify(st0)}`);
+    try {
+      // Remove Bootstrap's show state.
+      el.classList.remove('show');
+      el.setAttribute('aria-hidden', 'true');
+      el.style.display = 'none';
+    } catch (e) {
+      setCleanupLogLine(`[ui][cleanup] forceHide modal element error: ${String(e)}`);
+    }
+    try {
+      // Remove any leftover backdrops.
+      const bds = Array.from(document.querySelectorAll('.modal-backdrop'));
+      bds.forEach(b => {
+        try { b.remove(); } catch (e) {}
+      });
+    } catch (e) {
+      setCleanupLogLine(`[ui][cleanup] forceHide backdrop error: ${String(e)}`);
+    }
+    try {
+      // Restore body scroll.
+      document.body.classList.remove('modal-open');
+      document.body.style.removeProperty('padding-right');
+      document.body.style.removeProperty('overflow');
+    } catch (e) {
+      setCleanupLogLine(`[ui][cleanup] forceHide body restore error: ${String(e)}`);
+    }
+    const st1 = _cleanupModalState(el);
+    setCleanupLogLine(`[ui][cleanup] forceHide end state=${JSON.stringify(st1)}`);
+  }
+
+  async function cleanupRunArtifacts(runId) {
+    if (!runId) return { ok: true };
+    const cleanupText = document.getElementById('genTestCleanupText');
+    const closeBtn = document.getElementById('genTestCleanupCloseBtn');
+    clearCleanupLog();
+    setCleanupLogLine(`[ui][cleanup] begin run_id=${runId}`);
+    if (cleanupText) cleanupText.textContent = 'Cleaning up, please wait…';
+    if (closeBtn) closeBtn.disabled = true;
+    setCleanupSpinner(true);
+    const cleanupModalEl = document.getElementById('genTestCleanupModal');
+    const cleanupModal = cleanupModalEl ? bootstrap.Modal.getOrCreateInstance(cleanupModalEl) : null;
+    if (cleanupModal) {
+      setCleanupLogLine('[ui][cleanup] showing modal…');
+      try { cleanupModal.show(); } catch (e) { setCleanupLogLine(`[ui][cleanup] modal.show error: ${String(e)}`); }
+    }
+    try {
+      const timeoutMs = 30000;
+      const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      const url = `/flag_generators_test/cleanup/${encodeURIComponent(runId)}`;
+      const doReq = async () => {
+        setCleanupLogLine(`[ui][cleanup] POST ${url}`);
+        return await fetchJson(url, { method: 'POST', signal: controller ? controller.signal : undefined });
+      };
+      const resp = await Promise.race([
+        doReq(),
+        new Promise((resolve) => setTimeout(() => {
+          try { if (controller) controller.abort(); } catch (e) {}
+          resolve({ ok: false, error: `Cleanup timed out after ${timeoutMs}ms.` });
+        }, timeoutMs)),
+      ]);
+
+      setCleanupLogLine(`[ui][cleanup] response ok=${resp && resp.ok !== false}`);
+      if (resp && resp.ok === false) {
+        setCleanupLogLine(`[ui][cleanup] error: ${resp.error || 'unknown error'}`);
+        if (cleanupText) cleanupText.textContent = resp.error || 'Cleanup failed.';
+        await new Promise(r => setTimeout(r, 800));
+      } else {
+        if (cleanupText) cleanupText.textContent = 'Cleanup completed.';
+      }
+      return resp || { ok: true };
+    } finally {
+      // Do NOT auto-close the modal. Enable Close when cleanup is complete.
+      if (closeBtn) closeBtn.disabled = false;
+      setCleanupSpinner(false);
+      setCleanupLogLine('[ui][cleanup] end');
+    }
+  }
+
   function fileListSignature(data) {
     const paths = [];
     try {
-      if (data && data.bundle && data.bundle.path) paths.push(String(data.bundle.path));
       const add = (arr) => {
         (Array.isArray(arr) ? arr : []).forEach(f => {
           if (f && f.path) paths.push(String(f.path));
@@ -260,9 +410,7 @@
 
     if (!data.done) {
       setOutputsStatus(true, 'Generating outputs…');
-    } else if (data.done && !data.bundle_ready) {
-      setOutputsStatus(true, 'Generating bundle…');
-    } else if (data.done && data.bundle_ready && genTestState.outputsStablePolls < 1) {
+    } else if (data.done && genTestState.outputsStablePolls < 1) {
       setOutputsStatus(true, 'Finalizing file list…');
     } else {
       setOutputsStatus(false);
@@ -272,8 +420,8 @@
     if (hasAny || data.done) {
       await loadTestOutputs(runId);
     }
-    // Stop polling only once bundle is ready AND the file list is stable.
-    if (data.done && data.bundle_ready && genTestState.outputsStablePolls >= 1) {
+    // Stop polling once the run is done and the file list is stable.
+    if (data.done && genTestState.outputsStablePolls >= 1) {
       stopOutputsPolling();
     }
   }
@@ -289,13 +437,23 @@
   }
 
   async function fetchJson(url, options) {
-    const resp = await fetch(url, options);
+    let resp;
+    try {
+      resp = await fetch(url, options);
+    } catch (e) {
+      return { ok: false, error: `Network error calling ${url}: ${String(e)}` };
+    }
     const ct = (resp.headers.get('content-type') || '').toLowerCase();
     const redirectedToLogin = !!(resp.redirected && (resp.url || '').includes('/login'));
     if (redirectedToLogin || (!ct.includes('application/json') && !ct.includes('+json'))) {
+      let snippet = '';
+      try {
+        const txt = await resp.text();
+        snippet = (txt || '').slice(0, 200);
+      } catch (e) {}
       return {
         ok: false,
-        error: 'Login required (your session may have expired). Please reload and sign in at /login.',
+        error: 'Login required (your session may have expired). Please reload and sign in at /login.' + (snippet ? ` Response: ${snippet}` : ''),
         _nonJson: true,
         _status: resp.status,
         _url: resp.url,
@@ -304,7 +462,12 @@
     try {
       return await resp.json();
     } catch (e) {
-      return { ok: false, error: 'Failed to parse server response.', _parseError: true };
+      let snippet = '';
+      try {
+        const txt = await resp.text();
+        snippet = (txt || '').slice(0, 200);
+      } catch (e2) {}
+      return { ok: false, error: 'Failed to parse server response.' + (snippet ? ` Response: ${snippet}` : ''), _parseError: true };
     }
   }
 
@@ -317,6 +480,43 @@
     const q = (genState.filter || '').toLowerCase();
     body.innerHTML = '';
 
+    const normalizeIOType = (t) => {
+      const v = String(t || '').trim().toLowerCase();
+      if (!v) return '';
+      const map = {
+        'string': 'text',
+        'text': 'text',
+        'json': 'json',
+        'yaml': 'yaml',
+        'yml': 'yaml',
+        'md': 'markdown',
+        'markdown': 'markdown',
+        'html': 'html',
+        'file': 'file',
+        'path': 'file',
+        'artifact': 'file',
+        'binary': 'binary file',
+        'exe': 'binary file',
+        'image': 'photo',
+        'photo': 'photo',
+        'picture': 'photo',
+      };
+      return map[v] || v;
+    };
+
+    const typeSummary = (items) => {
+      const arr = Array.isArray(items) ? items : [];
+      const seen = new Set();
+      arr.forEach((it) => {
+        if (!it || typeof it !== 'object') return;
+        const label = normalizeIOType(it.type);
+        if (label) seen.add(label);
+      });
+      const out = Array.from(seen);
+      out.sort();
+      return out.length ? out.join(', ') : '—';
+    };
+
     const filtered = (genState.generators || []).filter((g) => {
       if (!q) return true;
       const hay = [g.id, g.name, g.language, (g.source && g.source.path) ? g.source.path : '', g.description || '', g._source_name || ''].join(' ').toLowerCase();
@@ -326,8 +526,8 @@
     filtered.forEach((g) => {
       const tr = document.createElement('tr');
       const src = (g.source && g.source.path) ? g.source.path : '';
-      const inCount = Array.isArray(g.inputs) ? g.inputs.length : 0;
-      const outCount = Array.isArray(g.outputs) ? g.outputs.length : 0;
+      const inTypes = typeSummary(g.inputs);
+      const outTypes = typeSummary(g.outputs);
       const hasCompose = !!(g.compose && typeof g.compose === 'object');
       const composeService = hasCompose && typeof g.compose.service === 'string' ? g.compose.service : '';
       const composeLabel = composeService ? `compose: ${composeService}` : 'compose';
@@ -342,8 +542,8 @@
         </td>
         <td class="small">${escapeHtml(g.language || '')}</td>
         <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(src)}</td>
-        <td class="small">${inCount}</td>
-        <td class="small">${outCount}</td>
+        <td class="small">${escapeHtml(inTypes)}</td>
+        <td class="small">${escapeHtml(outTypes)}</td>
         <td class="small">${escapeHtml(g._source_name || '')}</td>
         <td>
           <button class="btn btn-sm btn-outline-primary genTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}">Test</button>
@@ -391,7 +591,6 @@
   function describeFile(path, category) {
     const p = String(path || '');
     const c = String(category || '').toLowerCase();
-    if (p === 'bundle.zip') return 'Bundle (inputs + outputs)';
     if (p === 'run.log') return 'Run log';
     if (p === 'outputs.json') return 'Outputs manifest';
     if (c === 'inputs') {
@@ -421,7 +620,7 @@
     if (!items.length) {
       return '<div class="text-muted">No files available.</div>';
     }
-    const body = items.map(r => {
+    const body = items.map((r, idx) => {
       const cat = escapeHtml(r.category || '');
       const p = escapeHtml(r.path || '');
       const size = escapeHtml(r.size || '');
@@ -429,6 +628,7 @@
       const href = r.href || '#';
       return `
         <tr>
+          <td class="text-muted">${idx + 1}</td>
           <td class="text-muted">${cat}</td>
           <td style="word-break: break-all;">${p}</td>
           <td class="text-muted">${size}</td>
@@ -442,6 +642,7 @@
         <table class="table table-sm align-middle mb-0">
           <thead>
             <tr>
+              <th style="width: 50px;">#</th>
               <th style="width: 90px;">Type</th>
               <th>Path</th>
               <th style="width: 90px;">Size</th>
@@ -527,17 +728,13 @@
     const outputs = Array.isArray(data.outputs) ? data.outputs : (Array.isArray(data.files) ? data.files : []);
     const misc = Array.isArray(data.misc) ? data.misc : [];
 
-    const bundle = (data && data.bundle && typeof data.bundle === 'object') ? data.bundle : null;
-
     if (!data.done) {
       setOutputsStatus(true, 'Generating outputs…');
-    } else if (data.done && !data.bundle_ready) {
-      setOutputsStatus(true, 'Generating bundle…');
     } else {
       setOutputsStatus(false);
     }
 
-    const all = [].concat(bundle ? [bundle] : [], inputs, outputs, misc);
+    const all = [].concat(inputs, outputs, misc);
     if (!all.length) {
       const rc = (data && (data.returncode === 0 || data.returncode)) ? String(data.returncode) : '';
       setOutputsHtml(`<div class=\"text-muted\">No outputs found${rc ? ` (returncode=${escapeHtml(rc)})` : ''}.</div>`);
@@ -548,9 +745,7 @@
     const pushFiles = (categoryLabel, files, categoryKey) => {
       (files || []).forEach(f => {
         const p = f.path || '';
-        const href = (p === 'bundle.zip')
-          ? `/flag_generators_test/bundle/${encodeURIComponent(runId)}`
-          : `/flag_generators_test/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(p)}`;
+        const href = `/flag_generators_test/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(p)}`;
         rows.push({
           category: categoryLabel,
           path: p,
@@ -561,7 +756,6 @@
       });
     };
 
-    pushFiles('Bundle', bundle ? [bundle] : [], 'bundle');
     pushFiles('Input', inputs, 'inputs');
     pushFiles('Output', outputs, 'outputs');
     pushFiles('Log', misc, 'logs');
@@ -599,9 +793,24 @@
     stopOutputsPolling();
     setOutputsStatus(true, 'Starting generator…');
 
+    setTestLogLine('[ui] preparing request…');
+
     const form = document.getElementById('genTestForm');
     const fd = new FormData(form);
+    setTestLogLine('[ui] POST /flag_generators_test/run …');
     const data = await fetchJson('/flag_generators_test/run', { method: 'POST', body: fd });
+    setTestLogLine(`[ui] response received (status unknown; ok=${data && data.ok !== false})`);
+
+    if (!data || data.ok === false) {
+      setTestLogLine(`ERROR: ${data && data.error ? data.error : 'Failed to start run'}`);
+      setOutputsStatus(false);
+      btn.disabled = false;
+      return;
+    }
+
+    const runId = data.run_id;
+    genTestState.runId = runId;
+    setTestLogLine(`[ui] run_id=${runId}`);
     setTestLogLine(`Started run ${runId}`);
 
     // Start polling outputs immediately (works even if SSE disconnects).
@@ -609,6 +818,7 @@
 
     const es = new EventSource(`/stream/${encodeURIComponent(runId)}`);
     genTestState.eventSource = es;
+    setTestLogLine('[ui] opening log stream…');
     es.onmessage = (ev) => {
       setTestLogLine(ev.data);
     };
@@ -625,7 +835,7 @@
       genTestState.eventSource = null;
       setTestLogLine('Completed.');
       await loadTestOutputsWithRetry(runId);
-      // Keep polling until bundle is ready.
+      // Keep polling until the file list stabilizes.
       btn.disabled = false;
     });
     es.onerror = () => {
@@ -676,5 +886,52 @@
   document.getElementById('genTestRunBtn').addEventListener('click', async () => {
     await runCurrentGenTest();
   });
+
+  // Cleanup when the Test Generator modal is closed.
+  // Important: don't block the close transition (Bootstrap can get stuck).
+  // Instead: capture run id on hide, then perform cleanup after it's hidden.
+  (function attachGenTestCleanupHandler() {
+    const el = document.getElementById('genTestModal');
+    if (!el) return;
+
+    el.addEventListener('hide.bs.modal', () => {
+      pendingCleanupRunId = genTestState.runId || null;
+      try { setTestLogLine(`[ui][cleanup] genTestModal hide: pendingCleanupRunId=${pendingCleanupRunId || ''}`); } catch (e) {}
+      // Stop background activity immediately to reduce flakiness.
+      stopOutputsPolling();
+      if (genTestState.eventSource) {
+        try { genTestState.eventSource.close(); } catch (e) {}
+        genTestState.eventSource = null;
+      }
+    });
+
+    el.addEventListener('hidden.bs.modal', async () => {
+      const runId = pendingCleanupRunId;
+      pendingCleanupRunId = null;
+      try { setTestLogLine(`[ui][cleanup] genTestModal hidden: runId=${runId || ''}`); } catch (e) {}
+      resetGenTestUiState();
+      if (!runId) return;
+      try {
+        try { setCleanupLogLine(`[ui][cleanup] invoked from genTestModal hidden (runId=${runId})`); } catch (e) {}
+        await cleanupRunArtifacts(runId);
+      } catch (e) {
+        // Ignore cleanup errors; UI already closed.
+      }
+    });
+  })();
+
+  (function attachCleanupModalHandlers() {
+    const el = document.getElementById('genTestCleanupModal');
+    if (!el) return;
+    const closeBtn = document.getElementById('genTestCleanupCloseBtn');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', () => {
+        try { setCleanupLogLine('[ui][cleanup] user clicked Close'); } catch (e) {}
+      });
+    }
+    el.addEventListener('hidden.bs.modal', () => {
+      try { clearCleanupLog(); } catch (e) {}
+    });
+  })();
 </script>
 {% endblock %}

@@ -114,7 +114,43 @@ def run_compose(
         cmd.extend(["-e", f"{k}={v}"])
     cmd.append(service)
 
-    run_cmd(cmd, source_dir, compose_env)
+    try:
+        run_cmd(cmd, source_dir, compose_env)
+    finally:
+        # `docker compose run --rm` removes the container, but it does not remove
+        # the project's network, and it won't remove any images built locally.
+        # Since each run uses a fresh project name, we must tear down explicitly
+        # to avoid exhausting Docker's default address pools.
+        down_cmd = [
+            "docker",
+            "compose",
+            "-f",
+            str(compose_path),
+            "-p",
+            project,
+            "down",
+            "--remove-orphans",
+            "--rmi",
+            "local",
+        ]
+        print(f"[cleanup] compose project={project}")
+        print(f"[cleanup] running: {' '.join(down_cmd)}")
+        try:
+            p = subprocess.run(
+                down_cmd,
+                cwd=str(source_dir),
+                env={**os.environ, **compose_env},
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            print(f"[cleanup] compose down rc={p.returncode}")
+            if p.returncode != 0:
+                err = (p.stderr or "").strip()
+                if err:
+                    print(f"[cleanup] compose down stderr: {err[-800:]}")
+        except Exception as e:
+            print(f"[cleanup] compose down failed: {e}")
 
 
 def main() -> int:

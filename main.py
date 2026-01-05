@@ -26,7 +26,10 @@ def main() -> None:
     except ValueError:
         raise SystemExit(f"Invalid CORETG_PORT value: {port_str!r}")
 
-    app.run(host=default_host, port=port, debug=debug)
+    # Threaded mode is important here because the UI uses Server-Sent Events (SSE)
+    # for log streaming; without threads, a single open SSE connection can block
+    # other requests (like starting a test run or polling outputs).
+    app.run(host=default_host, port=port, debug=debug, threaded=True)
 
 
 if __name__ == "__main__":

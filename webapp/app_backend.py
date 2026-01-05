@@ -20952,6 +20952,18 @@ def stream_logs(run_id: str):
                     meta['returncode'] = rc
                     meta['done'] = True
             if meta.get('done'):
+                # Drain any remaining buffered log lines before ending so late
+                # cleanup markers are visible to the client.
+                try:
+                    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f_final:
+                        f_final.seek(last_pos)
+                        tail = f_final.read()
+                        if tail:
+                            last_pos = f_final.tell()
+                            for line in tail.splitlines():
+                                yield from _emit_line(line)
+                except FileNotFoundError:
+                    pass
                 # Signal end regardless; client will stop listening
                 yield "event: end\ndata: done\n\n"
                 break
@@ -20964,6 +20976,118 @@ def stream_logs(run_id: str):
         'Connection': 'keep-alive',
     }
     return Response(generate(), headers=headers)
+
+
+@app.route('/flag_generators_test/cleanup/<run_id>', methods=['POST'])
+def flag_generators_test_cleanup(run_id: str):
+    """Delete all artifacts for a flag-generator test run.
+
+    This is intentionally scoped to outputs/ to avoid deleting arbitrary paths.
+    """
+    t0 = time.time()
+    app.logger.info("[flaggen_test] POST /flag_generators_test/cleanup run_id=%s", run_id)
+    meta = RUNS.get(run_id)
+    if meta and meta.get('kind') != 'flag_generator_test':
+        app.logger.info("[flaggen_test] cleanup refusing: kind=%r", meta.get('kind'))
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+
+    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+    if not isinstance(run_dir, str) or not run_dir:
+        run_dir = _flaggen_run_dir_for_id(run_id)
+    if not isinstance(run_dir, str) or not run_dir:
+        app.logger.warning("[flaggen_test] cleanup missing run dir run_id=%s", run_id)
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
+
+    abs_run_dir = os.path.abspath(run_dir)
+    outputs_root = os.path.abspath(_outputs_dir())
+    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+        app.logger.warning(
+            "[flaggen_test] cleanup refusing run_id=%s abs_run_dir=%s outputs_root=%s",
+            run_id,
+            abs_run_dir,
+            outputs_root,
+        )
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+
+    app.logger.info(
+        "[flaggen_test] cleanup resolved run_id=%s run_dir=%s exists=%s",
+        run_id,
+        abs_run_dir,
+        os.path.isdir(abs_run_dir),
+    )
+
+    # Best-effort: stop any still-running runner process.
+    try:
+        if isinstance(meta, dict):
+            meta['cleanup_requested'] = True
+        proc = meta.get('proc') if isinstance(meta, dict) else None
+        if proc and hasattr(proc, 'poll') and proc.poll() is None:
+            try:
+                app.logger.info("[flaggen_test] cleanup terminating runner run_id=%s", run_id)
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    app.logger.info("[flaggen_test] cleanup killing runner run_id=%s", run_id)
+                    proc.kill()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Emit cleanup markers to the log if possible.
+    try:
+        lp = meta.get('log_path') if isinstance(meta, dict) else os.path.join(abs_run_dir, 'run.log')
+        if isinstance(lp, str) and lp:
+            with open(lp, 'a', encoding='utf-8') as log_f:
+                _write_sse_marker(log_f, 'phase', {'phase': 'cleanup_start', 'run_id': run_id})
+    except Exception:
+        pass
+
+    removed = False
+    try:
+        if os.path.isdir(abs_run_dir):
+            shutil.rmtree(abs_run_dir, ignore_errors=True)
+        removed = True
+    except Exception:
+        removed = False
+
+    app.logger.info(
+        "[flaggen_test] cleanup removed=%s run_id=%s elapsed_ms=%d",
+        removed,
+        run_id,
+        int((time.time() - t0) * 1000),
+    )
+
+    try:
+        if isinstance(meta, dict):
+            meta['done'] = True
+    except Exception:
+        pass
+
+    try:
+        if isinstance(meta, dict):
+            lp = meta.get('log_path')
+        else:
+            lp = os.path.join(abs_run_dir, 'run.log')
+        if isinstance(lp, str) and lp and os.path.exists(lp):
+            with open(lp, 'a', encoding='utf-8') as log_f2:
+                _write_sse_marker(log_f2, 'phase', {'phase': 'cleanup_done', 'run_id': run_id, 'removed': removed})
+    except Exception:
+        pass
+
+    try:
+        RUNS.pop(run_id, None)
+    except Exception:
+        pass
+
+    app.logger.info(
+        "[flaggen_test] cleanup complete run_id=%s elapsed_ms=%d",
+        run_id,
+        int((time.time() - t0) * 1000),
+    )
+
+    return jsonify({'ok': True, 'removed': removed}), 200
 
 
 @app.route('/cancel_run/<run_id>', methods=['POST'])
@@ -21666,9 +21790,18 @@ def flag_generators_test_run():
     Accepts text inputs and file uploads based on the generator's declared inputs.
     Writes a run log and streams it via /stream/<run_id>.
     """
+    t0 = time.time()
     generator_id = (request.form.get('generator_id') or '').strip()
+    try:
+        app.logger.info("[flaggen_test] POST /flag_generators_test/run generator_id=%s", generator_id)
+    except Exception:
+        pass
     gen = _find_enabled_generator_by_id(generator_id)
     if not gen:
+        try:
+            app.logger.warning("[flaggen_test] generator not found: %s", generator_id)
+        except Exception:
+            pass
         return jsonify({'ok': False, 'error': 'Generator not found (must be in an enabled source).'}), 404
 
     run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
@@ -21703,6 +21836,11 @@ def flag_generators_test_run():
         if raw_val is not None:
             cfg[name] = raw_val
 
+    try:
+        app.logger.info("[flaggen_test] inputs keys=%s", sorted(list(cfg.keys())))
+    except Exception:
+        pass
+
     # Validate required inputs minimally (only presence).
     missing: list[str] = []
     for inp in inputs_list:
@@ -21720,6 +21858,10 @@ def flag_generators_test_run():
         except Exception:
             continue
     if missing:
+        try:
+            app.logger.warning("[flaggen_test] missing required inputs: %s", missing)
+        except Exception:
+            pass
         return jsonify({'ok': False, 'error': f"Missing required input(s): {', '.join(missing)}"}), 400
 
     # Launch runner.
@@ -21763,53 +21905,26 @@ def flag_generators_test_run():
             pass
         return jsonify({'ok': False, 'error': f"Failed launching generator: {exc}"}), 500
 
+    try:
+        app.logger.info(
+            "[flaggen_test] spawned pid=%s run_id=%s run_dir=%s elapsed_ms=%s",
+            getattr(proc, 'pid', None),
+            run_id,
+            run_dir,
+            int((time.time() - t0) * 1000),
+        )
+    except Exception:
+        pass
+
     RUNS[run_id] = {
         'proc': proc,
         'log_path': log_path,
         'done': False,
         'returncode': None,
         'run_dir': run_dir,
-        'bundle_path': None,
         'kind': 'flag_generator_test',
         'generator_id': generator_id,
     }
-
-    def _create_flaggen_bundle(run_dir_local: str, run_id_local: str) -> Optional[str]:
-        try:
-            abs_run_dir = os.path.abspath(run_dir_local)
-            outputs_root = os.path.abspath(_outputs_dir())
-            if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
-                return None
-            if not os.path.isdir(abs_run_dir):
-                return None
-            bundle_path = os.path.join(abs_run_dir, 'bundle.zip')
-            tmp = bundle_path + '.tmp'
-            prefix = f"flag_generator_run_{run_id_local}"
-            with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as z:
-                for root, _dirs, files in os.walk(abs_run_dir):
-                    for fn in files:
-                        # Exclude the bundle itself / temp.
-                        if fn == os.path.basename(bundle_path) or fn == os.path.basename(tmp):
-                            continue
-                        abs_path = os.path.join(root, fn)
-                        try:
-                            rel = os.path.relpath(abs_path, abs_run_dir).replace('\\', '/')
-                        except Exception:
-                            continue
-                        arc = f"{prefix}/{rel}"
-                        try:
-                            z.write(abs_path, arcname=arc)
-                        except Exception:
-                            continue
-            os.replace(tmp, bundle_path)
-            return bundle_path
-        except Exception:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-            return None
 
     def _finalize_flaggen(run_id_local: str, log_handle_local: Any):
         try:
@@ -21822,14 +21937,9 @@ def flag_generators_test_run():
             rc = p.wait()
             meta['done'] = True
             meta['returncode'] = rc
-            bundle = _create_flaggen_bundle(meta.get('run_dir') or '', run_id_local)
-            if bundle:
-                meta['bundle_path'] = bundle
             try:
                 with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
                     _write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
-                    if bundle:
-                        _write_sse_marker(log_f, 'phase', {'phase': 'bundle_ready'})
             except Exception:
                 pass
         finally:
@@ -21845,6 +21955,14 @@ def flag_generators_test_run():
         daemon=True,
     ).start()
 
+    try:
+        app.logger.info(
+            "[flaggen_test] responding ok run_id=%s elapsed_ms=%s",
+            run_id,
+            int((time.time() - t0) * 1000),
+        )
+    except Exception:
+        pass
     return jsonify({'ok': True, 'run_id': run_id})
 
 
@@ -21887,9 +22005,6 @@ def flag_generators_test_outputs(run_id: str):
                 input_files.append(entry)
             elif rel == 'run.log':
                 misc_files.append(entry)
-            elif rel == 'bundle.zip':
-                # bundle is exposed separately; keep it out of per-file lists
-                continue
             else:
                 output_files.append(entry)
 
@@ -21898,25 +22013,13 @@ def flag_generators_test_outputs(run_id: str):
     misc_files.sort(key=lambda x: x.get('path') or '')
     done = bool(meta.get('done')) if isinstance(meta, dict) else True
     returncode = meta.get('returncode') if isinstance(meta, dict) else None
-    bundle_ready = bool(meta.get('bundle_path')) if isinstance(meta, dict) else os.path.exists(os.path.join(abs_run_dir, 'bundle.zip'))
-
-    bundle_entry = None
-    try:
-        bundle_path_local = os.path.join(abs_run_dir, 'bundle.zip')
-        if os.path.exists(bundle_path_local) and os.path.isfile(bundle_path_local):
-            st = os.stat(bundle_path_local)
-            bundle_entry = {'path': 'bundle.zip', 'name': 'bundle.zip', 'size': st.st_size}
-    except Exception:
-        bundle_entry = None
     return jsonify({
         'ok': True,
-        'bundle': bundle_entry,
         'inputs': input_files,
         'outputs': output_files,
         'misc': misc_files,
         'done': done,
         'returncode': returncode,
-        'bundle_ready': bundle_ready,
     }), 200
 
 
@@ -21931,7 +22034,7 @@ def flag_generators_test_download(run_id: str):
     if not isinstance(run_dir, str) or not run_dir:
         return jsonify({'ok': False, 'error': 'missing run dir'}), 500
     rel = (request.args.get('p') or '').strip().lstrip('/').replace('\\', '/')
-    if not rel or rel == 'bundle.zip':
+    if not rel:
         return jsonify({'ok': False, 'error': 'invalid path'}), 400
     abs_run_dir = os.path.abspath(run_dir)
     outputs_root = os.path.abspath(_outputs_dir())
@@ -21947,69 +22050,7 @@ def flag_generators_test_download(run_id: str):
 
 @app.route('/flag_generators_test/bundle/<run_id>')
 def flag_generators_test_bundle(run_id: str):
-    """Download a zip bundle for a generator test run.
-
-    Bundle is created after the run completes.
-    """
-    meta = RUNS.get(run_id)
-    if meta and meta.get('kind') != 'flag_generator_test':
-        return jsonify({'ok': False, 'error': 'not found'}), 404
-
-    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
-    if not isinstance(run_dir, str) or not run_dir:
-        run_dir = _flaggen_run_dir_for_id(run_id)
-    if not isinstance(run_dir, str) or not run_dir:
-        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
-    abs_run_dir = os.path.abspath(run_dir)
-    outputs_root = os.path.abspath(_outputs_dir())
-    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
-        return jsonify({'ok': False, 'error': 'refusing'}), 400
-    if not os.path.isdir(abs_run_dir):
-        return jsonify({'ok': False, 'error': 'missing run dir'}), 404
-
-    bundle_path = meta.get('bundle_path') if isinstance(meta, dict) else None
-    if isinstance(bundle_path, str) and bundle_path and os.path.exists(bundle_path):
-        return send_file(bundle_path, as_attachment=True, download_name=f"flag_generator_run_{run_id}.zip")
-
-    # If the webapp restarted, allow bundle download once the bundle exists on disk.
-    existing_bundle = os.path.join(abs_run_dir, 'bundle.zip')
-    if os.path.exists(existing_bundle):
-        return send_file(existing_bundle, as_attachment=True, download_name=f"flag_generator_run_{run_id}.zip")
-
-    # If the run is still active, keep the previous behavior (409 until complete).
-    if isinstance(meta, dict) and not meta.get('done'):
-        return jsonify({'ok': False, 'error': 'run not complete'}), 409
-    # Fallback: create on-demand if missing
-    try:
-        bundle = None
-        try:
-            # reuse the same logic as the finalizer
-            bundle = os.path.join(abs_run_dir, 'bundle.zip')
-            tmp = bundle + '.tmp'
-            prefix = f"flag_generator_run_{run_id}"
-            with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as z:
-                for root, _dirs, files in os.walk(abs_run_dir):
-                    for fn in files:
-                        if fn == os.path.basename(bundle) or fn == os.path.basename(tmp):
-                            continue
-                        abs_path = os.path.join(root, fn)
-                        rel = os.path.relpath(abs_path, abs_run_dir).replace('\\', '/')
-                        arc = f"{prefix}/{rel}"
-                        z.write(abs_path, arcname=arc)
-            os.replace(tmp, bundle)
-            if isinstance(meta, dict):
-                meta['bundle_path'] = bundle
-        except Exception:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-        if bundle and os.path.exists(bundle):
-            return send_file(bundle, as_attachment=True, download_name=f"flag_generator_run_{run_id}.zip")
-    except Exception:
-        pass
-    return jsonify({'ok': False, 'error': 'failed creating bundle'}), 500
+    return jsonify({'ok': False, 'error': 'bundle.zip output disabled'}), 404
 
 
 def _flag_resolve_path(raw_path: str) -> str:
