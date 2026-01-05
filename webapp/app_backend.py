@@ -11420,9 +11420,475 @@ def _build_full_scenario_archive(out_dir: str, scenario_xml_path: str | None, re
         return None
 
 # Data sources state
-DATA_SOURCES_DIR = os.path.abspath(os.path.join('..', 'data_sources'))
+DATA_SOURCES_DIR = os.path.join(_get_repo_root(), 'data_sources')
 DATA_STATE_PATH = os.path.join(DATA_SOURCES_DIR, '_state.json')
 os.makedirs(DATA_SOURCES_DIR, exist_ok=True)
+
+# Flag catalog sources state (JSON)
+FLAG_SOURCES_DIR = os.path.join(DATA_SOURCES_DIR, 'flags')
+FLAG_STATE_PATH = os.path.join(FLAG_SOURCES_DIR, '_state.json')
+os.makedirs(FLAG_SOURCES_DIR, exist_ok=True)
+
+# Flag generator sources state (JSON)
+FLAG_GENERATORS_SOURCES_DIR = os.path.join(DATA_SOURCES_DIR, 'flag_generators')
+FLAG_GENERATORS_STATE_PATH = os.path.join(FLAG_GENERATORS_SOURCES_DIR, '_state.json')
+os.makedirs(FLAG_GENERATORS_SOURCES_DIR, exist_ok=True)
+
+
+# ---------------- Flag Generator Schema (v1) -----------------
+
+
+FLAG_GENERATOR_REQUIRED_FIELDS = ['id', 'name', 'language', 'source', 'outputs']
+FLAG_GENERATOR_OPTIONAL_FIELDS = [
+    'description',
+    'version',
+    'tags',
+    'compose',
+    'build',
+    'run',
+    'inputs',
+    'requirements',
+    'provides',
+]
+FLAG_GENERATOR_ALL_FIELDS = FLAG_GENERATOR_REQUIRED_FIELDS + FLAG_GENERATOR_OPTIONAL_FIELDS
+
+FLAG_GENERATOR_LANGUAGES = {'python', 'c', 'cpp'}
+
+
+def _load_flag_generator_sources_state() -> dict:
+    """Load flag generator sources state.
+
+    Mirrors the flag sources registry, but stores generator-catalog sources.
+    Auto-seeds a default generator catalog from data_sources/flag_generators_seed.json when present.
+    """
+    try:
+        if not os.path.exists(FLAG_GENERATORS_STATE_PATH):
+            seed_path = os.path.join(DATA_SOURCES_DIR, 'flag_generators_seed.json')
+            sources: list[dict] = []
+            if os.path.exists(seed_path):
+                try:
+                    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+                    dest = os.path.join(FLAG_GENERATORS_SOURCES_DIR, f"{unique}-flag_generators.json")
+                    shutil.copyfile(seed_path, dest)
+                    ok, note, _doc, _skipped = _validate_and_normalize_flag_generator_source_json(dest)
+                    sources.append({
+                        'id': uuid.uuid4().hex[:12],
+                        'name': 'flag_generators_seed.json',
+                        'path': dest,
+                        'enabled': True,
+                        'rows': note if ok else f"ERR: {note}",
+                        'uploaded': datetime.datetime.utcnow().isoformat() + 'Z',
+                    })
+                except Exception:
+                    pass
+            state = {'sources': sources}
+            _save_flag_generator_sources_state(state)
+            return state
+        with open(FLAG_GENERATORS_STATE_PATH, 'r', encoding='utf-8') as fh:
+            state = json.load(fh)
+        if not isinstance(state, dict):
+            return {'sources': []}
+        sources = state.get('sources')
+        if not isinstance(sources, list):
+            state['sources'] = []
+        return state
+    except Exception:
+        return {'sources': []}
+
+
+def _save_flag_generator_sources_state(state: dict) -> None:
+    try:
+        os.makedirs(FLAG_GENERATORS_SOURCES_DIR, exist_ok=True)
+        tmp = FLAG_GENERATORS_STATE_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(state, fh, indent=2)
+        os.replace(tmp, FLAG_GENERATORS_STATE_PATH)
+    except Exception:
+        pass
+
+
+def _coerce_bool(val, default: bool = False) -> bool:
+    try:
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return bool(val)
+        if isinstance(val, str):
+            v = val.strip().lower()
+            if v in {'true', '1', 'yes', 'y', 'on'}:
+                return True
+            if v in {'false', '0', 'no', 'n', 'off'}:
+                return False
+    except Exception:
+        pass
+    return default
+
+
+def _normalize_generator_id(val: str) -> str:
+    raw = (val or '').strip().lower()
+    if not raw:
+        return ''
+    # Keep it simple and stable: allow a-z0-9._-
+    out = []
+    for ch in raw:
+        if ch.isalnum() or ch in {'.', '_', '-'}:
+            out.append(ch)
+        elif ch.isspace():
+            out.append('-')
+    return ''.join(out).strip('-')
+
+
+def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool, str, dict | None, list[dict]]:
+    """Validate generator catalog source.
+
+    Expected format (v1):
+      {
+        "schema_version": 1,
+        "generators": [ { generatorDef }, ... ]
+      }
+
+    Returns: (ok, note, normalized_doc_or_none, skipped_generators)
+    """
+    skipped: list[dict] = []
+    try:
+        if not path or not os.path.exists(path):
+            return False, 'File not found', None, skipped
+        if os.path.getsize(path) > 5_000_000:
+            return False, 'File too large (>5MB)', None, skipped
+        with open(path, 'r', encoding='utf-8') as fh:
+            doc = json.load(fh)
+        if not isinstance(doc, dict):
+            return False, 'Top-level JSON must be an object', None, skipped
+        schema_version = doc.get('schema_version', 1)
+        try:
+            schema_version = int(schema_version)
+        except Exception:
+            schema_version = 1
+        if schema_version != 1:
+            return False, f'Unsupported schema_version: {schema_version}', None, skipped
+        gens = doc.get('generators')
+        if not isinstance(gens, list):
+            return False, 'Missing generators[]', None, skipped
+
+        normalized_generators: list[dict] = []
+        for raw in gens:
+            if not isinstance(raw, dict):
+                skipped.append({'reason': 'not an object', 'raw': raw})
+                continue
+            gen: dict = {}
+            # Preserve only known top-level fields for now.
+            for k in FLAG_GENERATOR_ALL_FIELDS:
+                if k in raw:
+                    gen[k] = raw.get(k)
+
+            gen_id = _normalize_generator_id(str(gen.get('id') or ''))
+            if not gen_id:
+                # Derive from name if possible
+                gen_id = _normalize_generator_id(str(gen.get('name') or ''))
+            if not gen_id:
+                skipped.append({'reason': 'missing id/name', 'raw': raw})
+                continue
+            gen['id'] = gen_id
+
+            name = (gen.get('name') or '').strip() if isinstance(gen.get('name'), str) else ''
+            if not name:
+                name = gen_id
+            gen['name'] = name
+
+            lang = (gen.get('language') or '').strip().lower() if isinstance(gen.get('language'), str) else ''
+            if lang not in FLAG_GENERATOR_LANGUAGES:
+                skipped.append({'reason': f'invalid language: {lang}', 'id': gen_id})
+                continue
+            gen['language'] = lang
+
+            # source: minimal structure, preserved as dict
+            source = gen.get('source')
+            if not isinstance(source, dict):
+                skipped.append({'reason': 'missing/invalid source', 'id': gen_id})
+                continue
+            src_type = (source.get('type') or 'local-path').strip() if isinstance(source.get('type'), str) else 'local-path'
+            src_path = (source.get('path') or '').strip() if isinstance(source.get('path'), str) else ''
+            if not src_path:
+                skipped.append({'reason': 'source.path required', 'id': gen_id})
+                continue
+            gen['source'] = {
+                'type': src_type,
+                'path': src_path,
+                'ref': (source.get('ref') or '').strip() if isinstance(source.get('ref'), str) else '',
+                'subpath': (source.get('subpath') or '').strip() if isinstance(source.get('subpath'), str) else '',
+                'entry': (source.get('entry') or '').strip() if isinstance(source.get('entry'), str) else '',
+            }
+
+            # compose execution (preferred for generation):
+            # { "file": "docker-compose.yml", "service": "generator" }
+            compose = gen.get('compose')
+            if isinstance(compose, dict):
+                file_val = (compose.get('file') or 'docker-compose.yml').strip() if isinstance(compose.get('file'), str) else 'docker-compose.yml'
+                service_val = (compose.get('service') or 'generator').strip() if isinstance(compose.get('service'), str) else 'generator'
+                gen['compose'] = {
+                    'file': file_val or 'docker-compose.yml',
+                    'service': service_val or 'generator',
+                }
+            else:
+                gen.pop('compose', None)
+
+            # inputs/outputs contracts (lists of dict)
+            inputs = gen.get('inputs')
+            if inputs is None:
+                inputs = []
+            if not isinstance(inputs, list):
+                inputs = []
+            norm_inputs: list[dict] = []
+            for it in inputs:
+                if not isinstance(it, dict):
+                    continue
+                nm = (it.get('name') or '').strip() if isinstance(it.get('name'), str) else ''
+                tp = (it.get('type') or '').strip() if isinstance(it.get('type'), str) else ''
+                if not nm or not tp:
+                    continue
+                norm_inputs.append({
+                    'name': nm,
+                    'type': tp,
+                    'description': (it.get('description') or '').strip() if isinstance(it.get('description'), str) else '',
+                    'required': _coerce_bool(it.get('required'), default=True),
+                })
+            gen['inputs'] = norm_inputs
+
+            outputs = gen.get('outputs')
+            if not isinstance(outputs, list) or not outputs:
+                skipped.append({'reason': 'missing outputs[]', 'id': gen_id})
+                continue
+            norm_outputs: list[dict] = []
+            for ot in outputs:
+                if not isinstance(ot, dict):
+                    continue
+                nm = (ot.get('name') or '').strip() if isinstance(ot.get('name'), str) else ''
+                tp = (ot.get('type') or '').strip() if isinstance(ot.get('type'), str) else ''
+                if not nm or not tp:
+                    continue
+                norm_outputs.append({
+                    'name': nm,
+                    'type': tp,
+                    'description': (ot.get('description') or '').strip() if isinstance(ot.get('description'), str) else '',
+                    'sensitive': _coerce_bool(ot.get('sensitive'), default=False),
+                })
+            if not norm_outputs:
+                skipped.append({'reason': 'outputs[] had no valid entries', 'id': gen_id})
+                continue
+            gen['outputs'] = norm_outputs
+
+            # build/run optional: preserve dict-ish
+            if isinstance(gen.get('build'), dict):
+                gen['build'] = gen['build']
+            else:
+                gen.pop('build', None)
+            if isinstance(gen.get('run'), dict):
+                gen['run'] = gen['run']
+            else:
+                gen.pop('run', None)
+
+            # requirements/metadata passthrough (dict-ish)
+            if isinstance(gen.get('requirements'), dict):
+                gen['requirements'] = gen['requirements']
+            else:
+                gen.pop('requirements', None)
+
+            # provides: optional, list of strings
+            provides = gen.get('provides')
+            if provides is not None and not isinstance(provides, list):
+                provides = None
+            if isinstance(provides, list):
+                gen['provides'] = [str(x).strip() for x in provides if str(x).strip()]
+
+            # tags: optional
+            tags = gen.get('tags')
+            if isinstance(tags, list):
+                gen['tags'] = [str(x).strip() for x in tags if str(x).strip()]
+            else:
+                gen.pop('tags', None)
+
+            # version/description normalization
+            if isinstance(gen.get('version'), str):
+                gen['version'] = gen['version'].strip()
+            else:
+                gen.pop('version', None)
+            if isinstance(gen.get('description'), str):
+                gen['description'] = gen['description'].strip()
+            else:
+                gen.pop('description', None)
+
+            normalized_generators.append(gen)
+
+        # Ensure stable order
+        normalized_generators.sort(key=lambda g: (g.get('name', '').lower(), g.get('id', '')))
+        normalized_doc = {
+            'schema_version': 1,
+            'generators': normalized_generators,
+        }
+        note = f"{len(normalized_generators)} generator(s)"
+        if skipped:
+            note = note + f"; skipped {len(skipped)}"
+        return True, note, normalized_doc, skipped
+    except Exception as e:
+        return False, str(e), None, skipped
+
+
+def _load_flag_sources_state() -> dict:
+    """Load flag sources state.
+
+    Mirrors _load_data_sources_state(), but for JSON-based flag sources.
+    Auto-seeds a default source from data_sources/flag_catalog.json when present.
+    """
+    try:
+        if not os.path.exists(FLAG_STATE_PATH):
+            # Seed from repo-provided catalog if present.
+            seed_path = os.path.abspath(os.path.join(DATA_SOURCES_DIR, 'flag_catalog.json'))
+            if os.path.exists(seed_path):
+                try:
+                    # Copy into the managed sources dir to keep edits isolated.
+                    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+                    dest = os.path.join(FLAG_SOURCES_DIR, f"{unique}-flag_catalog.json")
+                    shutil.copyfile(seed_path, dest)
+                    state = {
+                        'sources': [
+                            {
+                                'id': uuid.uuid4().hex[:12],
+                                'name': 'flag_catalog.json',
+                                'path': dest,
+                                'enabled': True,
+                                'rows': 'seeded',
+                                'uploaded': datetime.datetime.utcnow().isoformat() + 'Z',
+                            }
+                        ]
+                    }
+                    _save_flag_sources_state(state)
+                    return state
+                except Exception:
+                    pass
+            return {'sources': []}
+        with open(FLAG_STATE_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {'sources': []}
+        if 'sources' not in data or not isinstance(data.get('sources'), list):
+            data['sources'] = []
+        return data
+    except Exception:
+        return {'sources': []}
+
+
+def _save_flag_sources_state(state: dict) -> None:
+    tmp = FLAG_STATE_PATH + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, FLAG_STATE_PATH)
+
+
+FLAG_REQUIRED_FIELDS = ['id', 'name', 'type', 'path']
+FLAG_OPTIONAL_FIELDS = ['compose_name', 'security_profile', 'enforce_security', 'description']
+FLAG_ALL_FIELDS = FLAG_REQUIRED_FIELDS + [f for f in FLAG_OPTIONAL_FIELDS if f not in FLAG_REQUIRED_FIELDS]
+
+
+def _validate_and_normalize_flag_source_json(file_path: str, max_bytes: int = 5_000_000) -> tuple[bool, str, list[dict], list[str]]:
+    """Validate and normalize a flag catalog JSON file.
+
+    Expected format: a JSON list of objects with keys in FLAG_ALL_FIELDS.
+    Unknown keys are ignored.
+    Returns: (ok, note, items, skipped_reasons)
+    """
+    skipped: list[str] = []
+    try:
+        st = os.stat(file_path)
+        if st.st_size > max_bytes:
+            return False, f"File too large (> {max_bytes} bytes)", [], []
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            raw = json.load(f)
+        if not isinstance(raw, list):
+            return False, 'JSON must be a list of flag objects', [], []
+        out: list[dict] = []
+        for idx, item in enumerate(raw):
+            if not isinstance(item, dict):
+                skipped.append(f"row {idx+1}: not an object")
+                continue
+            rec = {}
+            for k in FLAG_ALL_FIELDS:
+                if k in item:
+                    rec[k] = item.get(k)
+            # Normalize required strings
+            for k in ('id', 'name', 'type', 'path', 'compose_name', 'security_profile', 'description'):
+                if k in rec and rec[k] is not None:
+                    rec[k] = str(rec[k]).strip()
+            if not rec.get('name'):
+                skipped.append(f"row {idx+1}: missing name")
+                continue
+            if not rec.get('id'):
+                rec['id'] = _safe_name(rec.get('name') or f"flag-{idx+1}")
+            if not rec.get('type'):
+                rec['type'] = 'docker-compose'
+            if not rec.get('path'):
+                skipped.append(f"row {idx+1}: missing path")
+                continue
+            if not rec.get('compose_name'):
+                rec['compose_name'] = 'docker-compose.yml'
+            if not rec.get('security_profile'):
+                rec['security_profile'] = 'strict'
+            # Normalize enforce_security boolean
+            if 'enforce_security' in rec:
+                v = rec.get('enforce_security')
+                if isinstance(v, bool):
+                    rec['enforce_security'] = v
+                elif isinstance(v, (int, float)):
+                    rec['enforce_security'] = bool(v)
+                elif isinstance(v, str):
+                    rec['enforce_security'] = v.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+                else:
+                    rec['enforce_security'] = True
+            else:
+                rec['enforce_security'] = True
+            out.append(rec)
+        note = f"{len(out)} items" + (f" (skipped {len(skipped)})" if skipped else '')
+        return True, note, out, skipped
+    except Exception as e:
+        return False, str(e), [], []
+
+
+def _flag_catalog_items_from_enabled_sources() -> tuple[list[dict], dict]:
+    """Aggregate flag catalog items from enabled flag sources."""
+    state = _load_flag_sources_state()
+    types: set[str] = set()
+    profiles: set[str] = set()
+    items: list[dict] = []
+    for s in state.get('sources', []):
+        if not s.get('enabled'):
+            continue
+        p = s.get('path')
+        if not p or not os.path.exists(p):
+            continue
+        ok, note, norm_items, _skipped = _validate_and_normalize_flag_source_json(p)
+        if not ok:
+            continue
+        for it in norm_items:
+            items.append(it)
+            try:
+                if it.get('type'):
+                    types.add(str(it.get('type')))
+                if it.get('security_profile'):
+                    profiles.add(str(it.get('security_profile')))
+            except Exception:
+                pass
+    meta = {
+        'types': sorted(types),
+        'security_profiles': sorted(profiles),
+    }
+    return items, meta
+
+
+def _flag_base_dir() -> str:
+    """Base directory for downloaded flag compose assets."""
+    try:
+        return os.path.abspath(os.path.join(_outputs_dir(), 'flags'))
+    except Exception:
+        return os.path.abspath(os.path.join('outputs', 'flags'))
 
 def _load_data_sources_state():
     try:
@@ -20660,6 +21126,1218 @@ def data_sources_export_all():
                 z.write(p, arcname=os.path.basename(p))
     mem.seek(0)
     return send_file(mem, as_attachment=True, download_name='data_sources.zip')
+
+
+# ---------------- Flag Catalog (mirror of Vulnerability Catalog) -----------------
+
+
+@app.route('/flag_catalog')
+def flag_catalog_page():
+    state = _load_flag_generator_sources_state()
+    return render_template('flag_catalog.html', sources=state.get('sources', []), active_page='flag_catalog')
+
+
+@app.route('/flag_catalog_data')
+def flag_catalog_data():
+    """Return aggregated flag catalog from enabled flag sources."""
+    try:
+        items, meta = _flag_catalog_items_from_enabled_sources()
+        return jsonify({
+            'types': meta.get('types', []),
+            'security_profiles': meta.get('security_profiles', []),
+            'items': items,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e), 'types': [], 'security_profiles': [], 'items': []}), 500
+
+
+@app.route('/flag_sources/upload', methods=['POST'])
+def flag_sources_upload():
+    f = request.files.get('json_file')
+    if not f or f.filename == '':
+        flash('No file selected.')
+        return redirect(url_for('flag_catalog_page'))
+    filename = secure_filename(f.filename)
+    if not filename.lower().endswith('.json'):
+        flash('Only .json allowed.')
+        return redirect(url_for('flag_catalog_page'))
+    unique = datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+    os.makedirs(FLAG_SOURCES_DIR, exist_ok=True)
+    path = os.path.join(FLAG_SOURCES_DIR, f"{unique}-{filename}")
+    f.save(path)
+    ok, note, items, skipped = _validate_and_normalize_flag_source_json(path)
+    if not ok:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        flash(f'Invalid JSON: {note}')
+        return redirect(url_for('flag_catalog_page'))
+    # Write back normalized JSON
+    try:
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(items, fh, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+    state = _load_flag_sources_state()
+    entry = {
+        'id': uuid.uuid4().hex[:12],
+        'name': filename,
+        'path': path,
+        'enabled': True,
+        'rows': note,
+        'uploaded': datetime.datetime.utcnow().isoformat() + 'Z',
+    }
+    state['sources'].append(entry)
+    _save_flag_sources_state(state)
+    if ok and skipped:
+        flash(f'JSON imported with {len(skipped)} invalid row(s) skipped.')
+    else:
+        flash('JSON imported.')
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_sources/toggle/<sid>', methods=['POST'])
+def flag_sources_toggle(sid):
+    state = _load_flag_sources_state()
+    for s in state.get('sources', []):
+        if s.get('id') == sid:
+            s['enabled'] = not s.get('enabled', False)
+            break
+    _save_flag_sources_state(state)
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_sources/delete/<sid>', methods=['POST'])
+def flag_sources_delete(sid):
+    state = _load_flag_sources_state()
+    kept = []
+    for s in state.get('sources', []):
+        if s.get('id') == sid:
+            try:
+                if os.path.exists(s.get('path', '')):
+                    os.remove(s['path'])
+            except Exception:
+                pass
+            continue
+        kept.append(s)
+    state['sources'] = kept
+    _save_flag_sources_state(state)
+    flash('Deleted.')
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_sources/refresh/<sid>', methods=['POST'])
+def flag_sources_refresh(sid):
+    state = _load_flag_sources_state()
+    for s in state.get('sources', []):
+        if s.get('id') == sid:
+            ok, note, items, skipped = _validate_and_normalize_flag_source_json(s.get('path', ''))
+            if ok and items is not None:
+                try:
+                    p = s.get('path', '')
+                    tmp = p + '.tmp'
+                    with open(tmp, 'w', encoding='utf-8') as fh:
+                        json.dump(items, fh, indent=2)
+                    os.replace(tmp, p)
+                except Exception:
+                    pass
+            if ok and skipped:
+                note = note + f" (skipped {len(skipped)} invalid)"
+            s['rows'] = note if ok else f"ERR: {note}"
+            break
+    _save_flag_sources_state(state)
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_sources/download/<sid>')
+def flag_sources_download(sid):
+    state = _load_flag_sources_state()
+    for s in state.get('sources', []):
+        if s.get('id') == sid and os.path.exists(s.get('path', '')):
+            return send_file(s['path'], as_attachment=True, download_name=os.path.basename(s.get('name') or 'flag_catalog.json'))
+    flash('Not found')
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_sources/export_all')
+def flag_sources_export_all():
+    import io, zipfile
+    state = _load_flag_sources_state()
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+        for s in state.get('sources', []):
+            p = s.get('path')
+            if p and os.path.exists(p):
+                z.write(p, arcname=os.path.basename(p))
+    mem.seek(0)
+    return send_file(mem, as_attachment=True, download_name='flag_sources.zip')
+
+
+@app.route('/flag_sources/edit/<sid>')
+def flag_sources_edit(sid):
+    state = _load_flag_sources_state()
+    target = None
+    for s in state.get('sources', []):
+        if s.get('id') == sid:
+            target = s
+            break
+    if not target:
+        flash('Source not found')
+        return redirect(url_for('flag_catalog_page'))
+    path = target.get('path')
+    if not path or not os.path.exists(path):
+        flash('File missing')
+        return redirect(url_for('flag_catalog_page'))
+    ok, note, items, _skipped = _validate_and_normalize_flag_source_json(path)
+    if not ok:
+        flash(f'Invalid source JSON: {note}')
+        items = []
+    name = target.get('name') or os.path.basename(path)
+    return render_template('flag_source_edit.html', sid=sid, name=name, path=path, items=items, columns=FLAG_ALL_FIELDS, active_page='flag_catalog')
+
+
+@app.route('/flag_sources/save/<sid>', methods=['POST'])
+def flag_sources_save(sid):
+    """Save edited flag source JSON content.
+
+    Expects JSON payload: { rows: string[][] }
+    First row is header; remaining rows are values.
+    """
+    try:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or 'rows' not in data:
+            return jsonify({'ok': False, 'error': 'Invalid payload'}), 400
+        rows = data.get('rows')
+        if not isinstance(rows, list) or any(not isinstance(r, list) for r in rows):
+            return jsonify({'ok': False, 'error': 'Rows must be a list of lists'}), 400
+        if not rows:
+            return jsonify({'ok': False, 'error': 'No rows provided'}), 400
+        header = [str(c).strip() for c in (rows[0] or [])]
+        if not header:
+            return jsonify({'ok': False, 'error': 'Missing header'}), 400
+        # Build list of objects
+        items: list[dict] = []
+        for r in rows[1:]:
+            rec = {}
+            for i, h in enumerate(header):
+                if not h:
+                    continue
+                rec[h] = r[i] if i < len(r) else ''
+            # Skip completely empty rows
+            if not any(str(v).strip() for v in rec.values()):
+                continue
+            items.append(rec)
+
+        state = _load_flag_sources_state()
+        target = None
+        for s in state.get('sources', []):
+            if s.get('id') == sid:
+                target = s
+                break
+        if not target:
+            return jsonify({'ok': False, 'error': 'Source not found'}), 404
+        path = target.get('path')
+        if not path:
+            return jsonify({'ok': False, 'error': 'Missing file path'}), 400
+
+        # Validate by writing a preview file and reusing canonical validator
+        tmp_preview = path + '.editpreview'
+        try:
+            with open(tmp_preview, 'w', encoding='utf-8') as fh:
+                json.dump(items, fh, indent=2)
+            ok2, note2, norm_items, skipped2 = _validate_and_normalize_flag_source_json(tmp_preview)
+        finally:
+            try:
+                os.remove(tmp_preview)
+            except Exception:
+                pass
+        if not ok2:
+            return jsonify({'ok': False, 'error': note2}), 200
+
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(norm_items, fh, indent=2)
+        os.replace(tmp, path)
+
+        # Update state row count
+        note = note2
+        if ok2 and skipped2:
+            note = note + f" (skipped {len(skipped2)} invalid)"
+        target['rows'] = note
+        _save_flag_sources_state(state)
+        return jsonify({'ok': True, 'skipped': len(skipped2) if ok2 else 0})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+# ---------------- Flag Generators (generator-first catalog) -----------------
+
+
+def _flag_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
+    """Aggregate generators from enabled generator sources.
+
+    Returns: (generators, errors)
+    """
+    state = _load_flag_generator_sources_state()
+    sources = state.get('sources') or []
+    all_gens: list[dict] = []
+    errors: list[dict] = []
+    seen_ids: set[str] = set()
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        if not s.get('enabled', False):
+            continue
+        path = s.get('path')
+        ok, note, doc, skipped = _validate_and_normalize_flag_generator_source_json(path)
+        if not ok or not doc:
+            errors.append({'source': s.get('name'), 'path': path, 'error': note})
+            continue
+        for gen in (doc.get('generators') or []):
+            if not isinstance(gen, dict):
+                continue
+            gid = str(gen.get('id') or '')
+            if not gid or gid in seen_ids:
+                continue
+            seen_ids.add(gid)
+            gen2 = dict(gen)
+            gen2['_source_name'] = s.get('name')
+            gen2['_source_path'] = path
+            all_gens.append(gen2)
+        if skipped:
+            errors.append({'source': s.get('name'), 'path': path, 'warning': f"skipped {len(skipped)} invalid generator(s)"})
+    all_gens.sort(key=lambda g: (str(g.get('name') or '').lower(), str(g.get('id') or '')))
+    return all_gens, errors
+
+
+@app.route('/flag_generators_data')
+def flag_generators_data():
+    try:
+        generators, errors = _flag_generators_from_enabled_sources()
+        return jsonify({'generators': generators, 'errors': errors})
+    except Exception as e:
+        return jsonify({'generators': [], 'errors': [{'error': str(e)}]}), 500
+
+
+@app.route('/flag_generators_sources/upload', methods=['POST'])
+def flag_generators_sources_upload():
+    f = request.files.get('json_file')
+    if not f or f.filename == '':
+        flash('No file selected.')
+        return redirect(url_for('flag_catalog_page'))
+    filename = secure_filename(f.filename)
+    if not filename.lower().endswith('.json'):
+        flash('Only .json allowed.')
+        return redirect(url_for('flag_catalog_page'))
+    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+    os.makedirs(FLAG_GENERATORS_SOURCES_DIR, exist_ok=True)
+    path = os.path.join(FLAG_GENERATORS_SOURCES_DIR, f"{unique}-{filename}")
+    f.save(path)
+    ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(path)
+    if not ok or not normalized_doc:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        flash(f'Invalid generator JSON: {note}')
+        return redirect(url_for('flag_catalog_page'))
+    try:
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(normalized_doc, fh, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+    state = _load_flag_generator_sources_state()
+    state.setdefault('sources', [])
+    state['sources'].append({
+        'id': uuid.uuid4().hex[:12],
+        'name': filename,
+        'path': path,
+        'enabled': True,
+        'rows': note,
+        'uploaded': datetime.datetime.utcnow().isoformat() + 'Z',
+    })
+    _save_flag_generator_sources_state(state)
+    flash('Generator JSON imported.')
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_generators_sources/toggle/<sid>', methods=['POST'])
+def flag_generators_sources_toggle(sid):
+    state = _load_flag_generator_sources_state()
+    for s in state.get('sources', []):
+        if isinstance(s, dict) and s.get('id') == sid:
+            s['enabled'] = not s.get('enabled', False)
+            break
+    _save_flag_generator_sources_state(state)
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_generators_sources/delete/<sid>', methods=['POST'])
+def flag_generators_sources_delete(sid):
+    state = _load_flag_generator_sources_state()
+    kept = []
+    for s in state.get('sources', []):
+        if isinstance(s, dict) and s.get('id') == sid:
+            try:
+                p = s.get('path')
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+            continue
+        kept.append(s)
+    state['sources'] = kept
+    _save_flag_generator_sources_state(state)
+    flash('Deleted.')
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_generators_sources/refresh/<sid>', methods=['POST'])
+def flag_generators_sources_refresh(sid):
+    state = _load_flag_generator_sources_state()
+    for s in state.get('sources', []):
+        if isinstance(s, dict) and s.get('id') == sid:
+            path = s.get('path')
+            ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(path)
+            if ok and normalized_doc:
+                try:
+                    tmp = path + '.tmp'
+                    with open(tmp, 'w', encoding='utf-8') as fh:
+                        json.dump(normalized_doc, fh, indent=2)
+                    os.replace(tmp, path)
+                except Exception:
+                    pass
+            s['rows'] = note if ok else f"ERR: {note}"
+            break
+    _save_flag_generator_sources_state(state)
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_generators_sources/download/<sid>')
+def flag_generators_sources_download(sid):
+    state = _load_flag_generator_sources_state()
+    for s in state.get('sources', []):
+        if isinstance(s, dict) and s.get('id') == sid:
+            p = s.get('path')
+            if p and os.path.exists(p):
+                download_name = s.get('name') or os.path.basename(p)
+                return send_file(p, as_attachment=True, download_name=download_name)
+    flash('Not found')
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_generators_sources/export_all')
+def flag_generators_sources_export_all():
+    import io, zipfile
+    state = _load_flag_generator_sources_state()
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+        for s in state.get('sources', []):
+            if not isinstance(s, dict):
+                continue
+            p = s.get('path')
+            if p and os.path.exists(p):
+                z.write(p, arcname=os.path.basename(p))
+    mem.seek(0)
+    return send_file(mem, as_attachment=True, download_name='flag_generators_sources.zip')
+
+
+@app.route('/flag_generators_sources/edit/<sid>')
+def flag_generators_sources_edit(sid):
+    state = _load_flag_generator_sources_state()
+    target = None
+    for s in state.get('sources', []):
+        if isinstance(s, dict) and s.get('id') == sid:
+            target = s
+            break
+    if not target:
+        flash('Source not found')
+        return redirect(url_for('flag_catalog_page'))
+    path = target.get('path')
+    if not path or not os.path.exists(path):
+        flash('File missing')
+        return redirect(url_for('flag_catalog_page'))
+    try:
+        raw_text = open(path, 'r', encoding='utf-8').read()
+    except Exception:
+        raw_text = ''
+    return render_template(
+        'flag_generator_source_edit.html',
+        sid=sid,
+        name=target.get('name') or os.path.basename(path),
+        path=path,
+        raw_text=raw_text,
+        active_page='flag_catalog',
+    )
+
+
+@app.route('/flag_generators_sources/save/<sid>', methods=['POST'])
+def flag_generators_sources_save(sid):
+    """Save raw generator source JSON.
+
+    Payload: {"raw": "{...}"}
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        raw = data.get('raw')
+        if not isinstance(raw, str):
+            return jsonify({'ok': False, 'error': 'Missing raw JSON'}), 400
+        state = _load_flag_generator_sources_state()
+        target = None
+        for s in state.get('sources', []):
+            if isinstance(s, dict) and s.get('id') == sid:
+                target = s
+                break
+        if not target:
+            return jsonify({'ok': False, 'error': 'Source not found'}), 404
+        path = target.get('path')
+        if not path:
+            return jsonify({'ok': False, 'error': 'Missing file path'}), 400
+
+        # Validate using a temp file
+        tmp_preview = path + '.editpreview'
+        try:
+            with open(tmp_preview, 'w', encoding='utf-8') as fh:
+                fh.write(raw)
+            ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(tmp_preview)
+        finally:
+            try:
+                os.remove(tmp_preview)
+            except Exception:
+                pass
+        if not ok or not normalized_doc:
+            return jsonify({'ok': False, 'error': note}), 200
+
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(normalized_doc, fh, indent=2)
+        os.replace(tmp, path)
+        target['rows'] = note
+        _save_flag_generator_sources_state(state)
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+def _flag_generators_runs_dir() -> str:
+    d = os.path.join(_outputs_dir(), 'flag_generators_runs')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _flaggen_run_dir_for_id(run_id: str) -> str:
+    """Resolve a local flag generator run directory for a run_id.
+
+    This allows artifact browsing/downloading even if the webapp restarted and
+    the in-memory RUNS registry was lost.
+    """
+    rid = (run_id or '').strip()
+    # Basic sanitization: avoid path traversal.
+    rid = rid.replace('..', '').replace('\\', '/').strip('/').strip()
+    return os.path.join(_flag_generators_runs_dir(), rid)
+
+
+def _find_enabled_generator_by_id(generator_id: str) -> Optional[dict]:
+    gid = (generator_id or '').strip()
+    if not gid:
+        return None
+    try:
+        generators, _errors = _flag_generators_from_enabled_sources()
+    except Exception:
+        return None
+    for g in generators:
+        try:
+            if str(g.get('id') or '').strip() == gid:
+                return g
+        except Exception:
+            continue
+    return None
+
+
+@app.route('/flag_generators_test/run', methods=['POST'])
+def flag_generators_test_run():
+    """Start a generator test run.
+
+    Accepts text inputs and file uploads based on the generator's declared inputs.
+    Writes a run log and streams it via /stream/<run_id>.
+    """
+    generator_id = (request.form.get('generator_id') or '').strip()
+    gen = _find_enabled_generator_by_id(generator_id)
+    if not gen:
+        return jsonify({'ok': False, 'error': 'Generator not found (must be in an enabled source).'}), 404
+
+    run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
+    run_dir = os.path.join(_flag_generators_runs_dir(), run_id)
+    inputs_dir = os.path.join(run_dir, 'inputs')
+    os.makedirs(inputs_dir, exist_ok=True)
+    log_path = os.path.join(run_dir, 'run.log')
+
+    # Build config object from declared inputs.
+    cfg: dict[str, Any] = {}
+    inputs = gen.get('inputs') if isinstance(gen, dict) else None
+    inputs_list = inputs if isinstance(inputs, list) else []
+    for inp in inputs_list:
+        if not isinstance(inp, dict):
+            continue
+        name = str(inp.get('name') or '').strip()
+        if not name:
+            continue
+        f = request.files.get(name)
+        if f and getattr(f, 'filename', ''):
+            safe_name = secure_filename(f.filename) or 'upload'
+            stored = f"{name}__{safe_name}"
+            dest = os.path.join(inputs_dir, stored)
+            try:
+                f.save(dest)
+                # Expose the in-container path.
+                cfg[name] = f"/inputs/{stored}"
+            except Exception:
+                return jsonify({'ok': False, 'error': f"Failed saving file input: {name}"}), 400
+            continue
+        raw_val = request.form.get(name)
+        if raw_val is not None:
+            cfg[name] = raw_val
+
+    # Validate required inputs minimally (only presence).
+    missing: list[str] = []
+    for inp in inputs_list:
+        if not isinstance(inp, dict):
+            continue
+        try:
+            if not inp.get('required'):
+                continue
+            name = str(inp.get('name') or '').strip()
+            if not name:
+                continue
+            val = cfg.get(name)
+            if val is None or (isinstance(val, str) and not val.strip()):
+                missing.append(name)
+        except Exception:
+            continue
+    if missing:
+        return jsonify({'ok': False, 'error': f"Missing required input(s): {', '.join(missing)}"}), 400
+
+    # Launch runner.
+    repo_root = _get_repo_root()
+    runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
+    cmd = [
+        sys.executable or 'python',
+        runner_path,
+        '--generator-id',
+        generator_id,
+        '--out-dir',
+        run_dir,
+        '--config',
+        json.dumps(cfg, ensure_ascii=False),
+        '--repo-root',
+        repo_root,
+    ]
+
+    try:
+        with open(log_path, 'a', encoding='utf-8') as log_f:
+            log_f.write(f"[flaggen] starting {generator_id}\n")
+            _write_sse_marker(log_f, 'phase', {'phase': 'starting', 'generator_id': generator_id, 'run_id': run_id})
+    except Exception:
+        pass
+
+    try:
+        log_handle = open(log_path, 'a', encoding='utf-8')
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=log_handle,
+            stderr=log_handle,
+            text=True,
+        )
+    except Exception as exc:
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_f:
+                log_f.write(f"[flaggen] failed to start: {exc}\n")
+                _write_sse_marker(log_f, 'phase', {'phase': 'error', 'error': str(exc)})
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': f"Failed launching generator: {exc}"}), 500
+
+    RUNS[run_id] = {
+        'proc': proc,
+        'log_path': log_path,
+        'done': False,
+        'returncode': None,
+        'run_dir': run_dir,
+        'bundle_path': None,
+        'kind': 'flag_generator_test',
+        'generator_id': generator_id,
+    }
+
+    def _create_flaggen_bundle(run_dir_local: str, run_id_local: str) -> Optional[str]:
+        try:
+            abs_run_dir = os.path.abspath(run_dir_local)
+            outputs_root = os.path.abspath(_outputs_dir())
+            if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+                return None
+            if not os.path.isdir(abs_run_dir):
+                return None
+            bundle_path = os.path.join(abs_run_dir, 'bundle.zip')
+            tmp = bundle_path + '.tmp'
+            prefix = f"flag_generator_run_{run_id_local}"
+            with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as z:
+                for root, _dirs, files in os.walk(abs_run_dir):
+                    for fn in files:
+                        # Exclude the bundle itself / temp.
+                        if fn == os.path.basename(bundle_path) or fn == os.path.basename(tmp):
+                            continue
+                        abs_path = os.path.join(root, fn)
+                        try:
+                            rel = os.path.relpath(abs_path, abs_run_dir).replace('\\', '/')
+                        except Exception:
+                            continue
+                        arc = f"{prefix}/{rel}"
+                        try:
+                            z.write(abs_path, arcname=arc)
+                        except Exception:
+                            continue
+            os.replace(tmp, bundle_path)
+            return bundle_path
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            return None
+
+    def _finalize_flaggen(run_id_local: str, log_handle_local: Any):
+        try:
+            meta = RUNS.get(run_id_local)
+            if not meta:
+                return
+            p = meta.get('proc')
+            if not p:
+                return
+            rc = p.wait()
+            meta['done'] = True
+            meta['returncode'] = rc
+            bundle = _create_flaggen_bundle(meta.get('run_dir') or '', run_id_local)
+            if bundle:
+                meta['bundle_path'] = bundle
+            try:
+                with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
+                    _write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
+                    if bundle:
+                        _write_sse_marker(log_f, 'phase', {'phase': 'bundle_ready'})
+            except Exception:
+                pass
+        finally:
+            try:
+                log_handle_local.close()
+            except Exception:
+                pass
+
+    threading.Thread(
+        target=_finalize_flaggen,
+        args=(run_id, log_handle),
+        name=f'flaggen-{run_id[:8]}',
+        daemon=True,
+    ).start()
+
+    return jsonify({'ok': True, 'run_id': run_id})
+
+
+@app.route('/flag_generators_test/outputs/<run_id>')
+def flag_generators_test_outputs(run_id: str):
+    meta = RUNS.get(run_id)
+    if meta and meta.get('kind') != 'flag_generator_test':
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+
+    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+    if not isinstance(run_dir, str) or not run_dir:
+        run_dir = _flaggen_run_dir_for_id(run_id)
+    if not isinstance(run_dir, str) or not run_dir:
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
+    abs_run_dir = os.path.abspath(run_dir)
+    outputs_root = os.path.abspath(_outputs_dir())
+    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+    if not os.path.isdir(abs_run_dir):
+        done = bool(meta.get('done')) if isinstance(meta, dict) else False
+        returncode = meta.get('returncode') if isinstance(meta, dict) else None
+        return jsonify({'ok': True, 'files': [], 'done': done, 'returncode': returncode}), 200
+
+    input_files: list[dict[str, Any]] = []
+    output_files: list[dict[str, Any]] = []
+    misc_files: list[dict[str, Any]] = []
+
+    for root, _dirs, filenames in os.walk(abs_run_dir):
+        rel_root = os.path.relpath(root, abs_run_dir).replace('\\', '/')
+        for fn in filenames:
+            abs_path = os.path.join(root, fn)
+            try:
+                st = os.stat(abs_path)
+                rel = os.path.relpath(abs_path, abs_run_dir).replace('\\', '/')
+                entry = {'path': rel, 'name': fn, 'size': st.st_size}
+            except Exception:
+                continue
+
+            if rel_root == 'inputs' or rel_root.startswith('inputs/'):
+                input_files.append(entry)
+            elif rel == 'run.log':
+                misc_files.append(entry)
+            elif rel == 'bundle.zip':
+                # bundle is exposed separately; keep it out of per-file lists
+                continue
+            else:
+                output_files.append(entry)
+
+    input_files.sort(key=lambda x: x.get('path') or '')
+    output_files.sort(key=lambda x: x.get('path') or '')
+    misc_files.sort(key=lambda x: x.get('path') or '')
+    done = bool(meta.get('done')) if isinstance(meta, dict) else True
+    returncode = meta.get('returncode') if isinstance(meta, dict) else None
+    bundle_ready = bool(meta.get('bundle_path')) if isinstance(meta, dict) else os.path.exists(os.path.join(abs_run_dir, 'bundle.zip'))
+
+    bundle_entry = None
+    try:
+        bundle_path_local = os.path.join(abs_run_dir, 'bundle.zip')
+        if os.path.exists(bundle_path_local) and os.path.isfile(bundle_path_local):
+            st = os.stat(bundle_path_local)
+            bundle_entry = {'path': 'bundle.zip', 'name': 'bundle.zip', 'size': st.st_size}
+    except Exception:
+        bundle_entry = None
+    return jsonify({
+        'ok': True,
+        'bundle': bundle_entry,
+        'inputs': input_files,
+        'outputs': output_files,
+        'misc': misc_files,
+        'done': done,
+        'returncode': returncode,
+        'bundle_ready': bundle_ready,
+    }), 200
+
+
+@app.route('/flag_generators_test/download/<run_id>')
+def flag_generators_test_download(run_id: str):
+    meta = RUNS.get(run_id)
+    if meta and meta.get('kind') != 'flag_generator_test':
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+    if not isinstance(run_dir, str) or not run_dir:
+        run_dir = _flaggen_run_dir_for_id(run_id)
+    if not isinstance(run_dir, str) or not run_dir:
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
+    rel = (request.args.get('p') or '').strip().lstrip('/').replace('\\', '/')
+    if not rel or rel == 'bundle.zip':
+        return jsonify({'ok': False, 'error': 'invalid path'}), 400
+    abs_run_dir = os.path.abspath(run_dir)
+    outputs_root = os.path.abspath(_outputs_dir())
+    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+    abs_path = os.path.abspath(os.path.join(abs_run_dir, rel))
+    if not (abs_path == abs_run_dir or abs_path.startswith(abs_run_dir + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+    if not os.path.exists(abs_path) or not os.path.isfile(abs_path):
+        return jsonify({'ok': False, 'error': 'missing file'}), 404
+    return send_file(abs_path, as_attachment=True, download_name=os.path.basename(abs_path))
+
+
+@app.route('/flag_generators_test/bundle/<run_id>')
+def flag_generators_test_bundle(run_id: str):
+    """Download a zip bundle for a generator test run.
+
+    Bundle is created after the run completes.
+    """
+    meta = RUNS.get(run_id)
+    if meta and meta.get('kind') != 'flag_generator_test':
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+
+    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+    if not isinstance(run_dir, str) or not run_dir:
+        run_dir = _flaggen_run_dir_for_id(run_id)
+    if not isinstance(run_dir, str) or not run_dir:
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
+    abs_run_dir = os.path.abspath(run_dir)
+    outputs_root = os.path.abspath(_outputs_dir())
+    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+    if not os.path.isdir(abs_run_dir):
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 404
+
+    bundle_path = meta.get('bundle_path') if isinstance(meta, dict) else None
+    if isinstance(bundle_path, str) and bundle_path and os.path.exists(bundle_path):
+        return send_file(bundle_path, as_attachment=True, download_name=f"flag_generator_run_{run_id}.zip")
+
+    # If the webapp restarted, allow bundle download once the bundle exists on disk.
+    existing_bundle = os.path.join(abs_run_dir, 'bundle.zip')
+    if os.path.exists(existing_bundle):
+        return send_file(existing_bundle, as_attachment=True, download_name=f"flag_generator_run_{run_id}.zip")
+
+    # If the run is still active, keep the previous behavior (409 until complete).
+    if isinstance(meta, dict) and not meta.get('done'):
+        return jsonify({'ok': False, 'error': 'run not complete'}), 409
+    # Fallback: create on-demand if missing
+    try:
+        bundle = None
+        try:
+            # reuse the same logic as the finalizer
+            bundle = os.path.join(abs_run_dir, 'bundle.zip')
+            tmp = bundle + '.tmp'
+            prefix = f"flag_generator_run_{run_id}"
+            with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as z:
+                for root, _dirs, files in os.walk(abs_run_dir):
+                    for fn in files:
+                        if fn == os.path.basename(bundle) or fn == os.path.basename(tmp):
+                            continue
+                        abs_path = os.path.join(root, fn)
+                        rel = os.path.relpath(abs_path, abs_run_dir).replace('\\', '/')
+                        arc = f"{prefix}/{rel}"
+                        z.write(abs_path, arcname=arc)
+            os.replace(tmp, bundle)
+            if isinstance(meta, dict):
+                meta['bundle_path'] = bundle
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+        if bundle and os.path.exists(bundle):
+            return send_file(bundle, as_attachment=True, download_name=f"flag_generator_run_{run_id}.zip")
+    except Exception:
+        pass
+    return jsonify({'ok': False, 'error': 'failed creating bundle'}), 500
+
+
+def _flag_resolve_path(raw_path: str) -> str:
+    """Resolve a flag path that may be repo-relative."""
+    p = (raw_path or '').strip()
+    if not p:
+        return ''
+    try:
+        if p.startswith('file://'):
+            p = p[len('file://'):]
+    except Exception:
+        pass
+    if os.path.isabs(p):
+        return p
+    try:
+        return os.path.abspath(os.path.join(_get_repo_root(), p))
+    except Exception:
+        return os.path.abspath(p)
+
+
+@app.route('/flag_compose/status', methods=['POST'])
+def flag_compose_status():
+    """Return status for a list of flag catalog items."""
+    try:
+        data = request.get_json(silent=True) or {}
+        items = data.get('items') or []
+        out = []
+        logs: list[str] = []
+        base_out = os.path.abspath(_flag_base_dir())
+        os.makedirs(base_out, exist_ok=True)
+        for it in items:
+            name = (it.get('name') or it.get('Name') or '').strip()
+            path_raw = (it.get('path') or it.get('Path') or '').strip()
+            compose_name = (it.get('compose_name') or it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
+            safe = _safe_name(name or 'flag')
+            fdir = os.path.join(base_out, safe)
+            gh = _parse_github_url(path_raw)
+            compose_file = None
+            base_dir = fdir
+            exists = False
+
+            # Local file path support (repo-relative)
+            local_path = _flag_resolve_path(path_raw)
+            if local_path and os.path.exists(local_path) and local_path.lower().endswith(('.yml', '.yaml')):
+                compose_file = local_path
+                base_dir = os.path.dirname(local_path)
+                exists = True
+                try:
+                    logs.append(f"[status] {name}: local compose={compose_file}")
+                except Exception:
+                    pass
+            elif gh.get('is_github'):
+                repo_dir = os.path.join(fdir, _vuln_repo_subdir())
+                sub = gh.get('subpath') or ''
+                is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                if is_file_sub:
+                    compose_file = os.path.join(repo_dir, sub)
+                    base_dir = os.path.dirname(compose_file)
+                    exists = os.path.exists(compose_file)
+                else:
+                    base_dir = os.path.join(repo_dir, sub) if sub else repo_dir
+                    exists = os.path.isdir(base_dir)
+                if exists and compose_name and not compose_file:
+                    p = os.path.join(base_dir, compose_name)
+                    if os.path.exists(p):
+                        compose_file = p
+                if not compose_file:
+                    cand = _compose_candidates(base_dir)
+                    compose_file = cand[0] if cand else None
+                try:
+                    logs.append(f"[status] {name}: github base={base_dir} exists={exists} compose={compose_name}")
+                except Exception:
+                    pass
+            else:
+                # Legacy direct download into outputs/flags/<safe>/compose_name
+                compose_file = os.path.join(fdir, compose_name)
+                exists = os.path.exists(compose_file)
+                base_dir = fdir
+
+            pulled = False
+            if exists and compose_file and shutil.which('docker'):
+                try:
+                    proc = subprocess.run(['docker', 'compose', '-f', compose_file, 'config', '--images'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
+                    if proc.returncode == 0:
+                        images = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
+                        if images:
+                            present = []
+                            for img in images:
+                                p2 = subprocess.run(['docker', 'image', 'inspect', img], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                present.append(p2.returncode == 0)
+                            pulled = all(present)
+                except Exception:
+                    pulled = False
+            out.append({
+                'name': name,
+                'path': path_raw,
+                'compose_name': compose_name,
+                'compose_path': compose_file,
+                'exists': bool(exists),
+                'pulled': bool(pulled),
+                'dir': base_dir,
+            })
+        return jsonify({'items': out, 'log': logs})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/flag_compose/download', methods=['POST'])
+def flag_compose_download():
+    """Download/clone docker-compose assets for the given flag catalog items."""
+    try:
+        data = request.get_json(silent=True) or {}
+        items = data.get('items') or []
+        out = []
+        logs: list[str] = []
+        base_out = os.path.abspath(_flag_base_dir())
+        os.makedirs(base_out, exist_ok=True)
+
+        try:
+            from core_topo_gen.utils.vuln_process import _github_tree_to_raw as _to_raw
+        except Exception:
+            def _to_raw(base_url: str, filename: str) -> str | None:
+                try:
+                    from urllib.parse import urlparse
+                    u = urlparse(base_url)
+                    if u.netloc.lower() != 'github.com':
+                        return None
+                    parts = [p for p in u.path.strip('/').split('/') if p]
+                    if len(parts) < 4 or parts[2] != 'tree':
+                        return None
+                    owner, repo, _tree, branch = parts[:4]
+                    rest = '/'.join(parts[4:])
+                    return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rest}/{filename}"
+                except Exception:
+                    return None
+
+        import urllib.request
+        import shlex
+        for it in items:
+            name = (it.get('name') or it.get('Name') or '').strip()
+            path_raw = (it.get('path') or it.get('Path') or '').strip()
+            compose_name = (it.get('compose_name') or it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
+            safe = _safe_name(name or 'flag')
+            fdir = os.path.join(base_out, safe)
+            os.makedirs(fdir, exist_ok=True)
+
+            # Local compose path support: nothing to download.
+            local_path = _flag_resolve_path(path_raw)
+            if local_path and os.path.exists(local_path) and local_path.lower().endswith(('.yml', '.yaml')):
+                out.append({'name': name, 'path': path_raw, 'ok': True, 'dir': os.path.dirname(local_path), 'message': 'local compose file'})
+                continue
+
+            gh = _parse_github_url(path_raw)
+            if gh.get('is_github'):
+                if not shutil.which('git'):
+                    logs.append(f"[download] {name}: git not available in PATH")
+                    out.append({'name': name, 'path': path_raw, 'ok': False, 'dir': fdir, 'message': 'git not available'})
+                    continue
+                repo_dir = os.path.join(fdir, _vuln_repo_subdir())
+                if os.path.isdir(os.path.join(repo_dir, '.git')):
+                    base_dir = os.path.join(repo_dir, gh.get('subpath') or '') if gh.get('subpath') else repo_dir
+                    out.append({'name': name, 'path': path_raw, 'ok': True, 'dir': base_dir, 'message': 'already downloaded'})
+                    continue
+                try:
+                    if os.path.exists(repo_dir):
+                        shutil.rmtree(repo_dir)
+                except Exception:
+                    pass
+                cmd = ['git', 'clone', '--depth', '1']
+                if gh.get('branch'):
+                    cmd += ['--branch', gh.get('branch')]
+                cmd += [gh.get('git_url'), repo_dir]
+                try:
+                    logs.append(f"[download] {name}: running: {' '.join(shlex.quote(c) for c in cmd)}")
+                    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+                    if proc.returncode == 0 and os.path.isdir(repo_dir):
+                        base_dir = os.path.join(repo_dir, gh.get('subpath') or '') if gh.get('subpath') else repo_dir
+                        out.append({'name': name, 'path': path_raw, 'ok': True, 'dir': base_dir, 'message': 'downloaded'})
+                    else:
+                        msg = (proc.stdout or '').strip()
+                        out.append({'name': name, 'path': path_raw, 'ok': False, 'dir': fdir, 'message': msg[-1000:] if msg else 'git clone failed'})
+                except Exception as e:
+                    out.append({'name': name, 'path': path_raw, 'ok': False, 'dir': fdir, 'message': str(e)})
+            else:
+                raw = _to_raw(path_raw, compose_name) or (path_raw.rstrip('/') + '/' + compose_name)
+                yml_path = os.path.join(fdir, compose_name)
+                try:
+                    logs.append(f"[download] {name}: GET {raw}")
+                    with urllib.request.urlopen(raw, timeout=30) as resp:
+                        data_bin = resp.read(1_000_000)
+                    with open(yml_path, 'wb') as fh:
+                        fh.write(data_bin)
+                    out.append({'name': name, 'path': path_raw, 'ok': True, 'dir': fdir, 'message': 'downloaded', 'compose_name': compose_name})
+                except Exception as e:
+                    out.append({'name': name, 'path': path_raw, 'ok': False, 'dir': fdir, 'message': str(e), 'compose_name': compose_name})
+        return jsonify({'items': out, 'log': logs})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/flag_compose/pull', methods=['POST'])
+def flag_compose_pull():
+    """Run docker compose pull for the given flag catalog items."""
+    try:
+        data = request.get_json(silent=True) or {}
+        items = data.get('items') or []
+        out = []
+        logs: list[str] = []
+        base_out = os.path.abspath(_flag_base_dir())
+        for it in items:
+            name = (it.get('name') or it.get('Name') or '').strip()
+            path_raw = (it.get('path') or it.get('Path') or '').strip()
+            compose_name = (it.get('compose_name') or it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
+            safe = _safe_name(name or 'flag')
+            fdir = os.path.join(base_out, safe)
+
+            local_path = _flag_resolve_path(path_raw)
+            if local_path and os.path.exists(local_path) and local_path.lower().endswith(('.yml', '.yaml')):
+                yml_path = local_path
+            else:
+                gh = _parse_github_url(path_raw)
+                if gh.get('is_github'):
+                    repo_dir = os.path.join(fdir, _vuln_repo_subdir())
+                    sub = gh.get('subpath') or ''
+                    is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                    base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
+                    yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
+                    if not os.path.exists(yml_path):
+                        cand = _compose_candidates(base_dir)
+                        yml_path = cand[0] if cand else None
+                else:
+                    yml_path = os.path.join(fdir, compose_name)
+
+            if not yml_path or not os.path.exists(yml_path):
+                out.append({'name': name, 'path': path_raw, 'ok': False, 'message': 'compose file missing', 'compose_name': compose_name})
+                continue
+            if not shutil.which('docker'):
+                out.append({'name': name, 'path': path_raw, 'ok': False, 'message': 'docker not available', 'compose_name': compose_name})
+                continue
+            try:
+                proc = subprocess.run(['docker', 'compose', '-f', yml_path, 'pull'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                logs.append(f"[pull] {name}: rc={proc.returncode} file={yml_path}")
+                ok = proc.returncode == 0
+                msg = 'ok' if ok else ((proc.stdout or '')[-1000:] if proc.stdout else 'failed')
+                out.append({'name': name, 'path': path_raw, 'ok': ok, 'message': msg, 'compose_name': compose_name})
+            except Exception as e:
+                out.append({'name': name, 'path': path_raw, 'ok': False, 'message': str(e), 'compose_name': compose_name})
+        return jsonify({'items': out, 'log': logs})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/flag_compose/remove', methods=['POST'])
+def flag_compose_remove():
+    """Remove compose assets and any local outputs for the given flag catalog items."""
+    try:
+        data = request.get_json(silent=True) or {}
+        items = data.get('items') or []
+        out = []
+        logs: list[str] = []
+        base_out = os.path.abspath(_flag_base_dir())
+        for it in items:
+            name = (it.get('name') or it.get('Name') or '').strip()
+            path_raw = (it.get('path') or it.get('Path') or '').strip()
+            compose_name = (it.get('compose_name') or it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
+            safe = _safe_name(name or 'flag')
+            fdir = os.path.join(base_out, safe)
+
+            # Prefer local compose file if path points at one.
+            local_path = _flag_resolve_path(path_raw)
+            yml_path = None
+            if local_path and os.path.exists(local_path) and local_path.lower().endswith(('.yml', '.yaml')):
+                yml_path = local_path
+            else:
+                gh = _parse_github_url(path_raw)
+                if gh.get('is_github'):
+                    repo_dir = os.path.join(fdir, _vuln_repo_subdir())
+                    sub = gh.get('subpath') or ''
+                    is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                    base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
+                    yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
+                    if not os.path.exists(yml_path):
+                        cand = _compose_candidates(base_dir)
+                        yml_path = cand[0] if cand else None
+                else:
+                    yml_path = os.path.join(fdir, compose_name)
+
+            if yml_path and os.path.exists(yml_path) and shutil.which('docker'):
+                try:
+                    logs.append(f"[remove] {name}: docker compose down file={yml_path}")
+                except Exception:
+                    pass
+                try:
+                    subprocess.run(['docker', 'compose', '-f', yml_path, 'down', '--volumes', '--remove-orphans'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                except Exception:
+                    pass
+
+            # Remove downloaded dirs under outputs/flags only (never delete repo-local templates)
+            try:
+                gh = _parse_github_url(path_raw)
+                if gh.get('is_github'):
+                    repo_dir = os.path.join(fdir, _vuln_repo_subdir())
+                    if os.path.isdir(repo_dir):
+                        shutil.rmtree(repo_dir, ignore_errors=True)
+                        logs.append(f"[remove] {name}: deleted {repo_dir}")
+                else:
+                    yml = os.path.join(fdir, compose_name)
+                    if os.path.exists(yml):
+                        try:
+                            os.remove(yml)
+                            logs.append(f"[remove] {name}: deleted {yml}")
+                        except Exception:
+                            pass
+                try:
+                    if os.path.isdir(fdir) and not os.listdir(fdir):
+                        os.rmdir(fdir)
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    logs.append(f"[remove] cleanup error: {e}")
+                except Exception:
+                    pass
+
+            out.append({'name': name, 'path': path_raw, 'ok': True, 'message': 'removed', 'compose_name': compose_name})
+        return jsonify({'items': out, 'log': logs})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/vuln_catalog')
 def vuln_catalog():

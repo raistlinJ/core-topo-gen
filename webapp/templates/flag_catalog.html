@@ -1,0 +1,680 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="container-fluid">
+  <div class="row">
+    <div class="col-12">
+      <h3 class="mb-3">Flag-Catalog</h3>
+
+      <ul class="nav nav-tabs" id="flagTabs" role="tablist">
+        <li class="nav-item" role="presentation">
+          <button class="nav-link active" id="flagGenSourcesTab" data-bs-toggle="tab" data-bs-target="#flagGenSources" type="button" role="tab">Generator Sources</button>
+        </li>
+        <li class="nav-item" role="presentation">
+          <button class="nav-link" id="flagGeneratorsTab" data-bs-toggle="tab" data-bs-target="#flagGenerators" type="button" role="tab">Flag-Generators</button>
+        </li>
+      </ul>
+
+      <div class="tab-content mt-3">
+        <div class="tab-pane fade show active" id="flagGenSources" role="tabpanel">
+          <div class="card mb-3">
+            <div class="card-body">
+              <form class="row g-2" action="{{ url_for('flag_generators_sources_upload') }}" method="post" enctype="multipart/form-data">
+                <div class="col-auto">
+                  <input class="form-control" type="file" name="json_file" accept="application/json,.json" required>
+                </div>
+                <div class="col-auto">
+                  <button class="btn btn-primary" type="submit">Upload JSON</button>
+                </div>
+                <div class="col-auto">
+                  <a class="btn btn-outline-secondary" href="{{ url_for('flag_generators_sources_export_all') }}">Export All</a>
+                </div>
+              </form>
+              <div class="mt-2 small text-muted">Expected format: generator-catalog JSON ({"schema_version": 1, "generators": [...]})</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-body">
+              <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                  <thead>
+                    <tr>
+                      <th style="width: 80px;">Enabled</th>
+                      <th>Name</th>
+                      <th>Rows</th>
+                      <th style="width: 360px;">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for s in sources %}
+                    <tr>
+                      <td>
+                        <form action="{{ url_for('flag_generators_sources_toggle', sid=s.id) }}" method="post">
+                          <button class="btn btn-sm {{ 'btn-success' if s.enabled else 'btn-outline-secondary' }}" type="submit">{{ 'On' if s.enabled else 'Off' }}</button>
+                        </form>
+                      </td>
+                      <td>
+                        <div><strong>{{ s.name }}</strong></div>
+                        <div class="small text-muted" style="max-width: 760px; word-break: break-all;">{{ s.path }}</div>
+                      </td>
+                      <td class="small">{{ s.rows }}</td>
+                      <td>
+                        <div class="d-flex gap-2 flex-wrap">
+                          <form action="{{ url_for('flag_generators_sources_refresh', sid=s.id) }}" method="post">
+                            <button class="btn btn-sm btn-outline-primary" type="submit">Refresh</button>
+                          </form>
+                          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('flag_generators_sources_download', sid=s.id) }}">Download</a>
+                          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('flag_generators_sources_edit', sid=s.id) }}">Edit</a>
+                          <form action="{{ url_for('flag_generators_sources_delete', sid=s.id) }}" method="post" onsubmit="return confirm('Delete this source?');">
+                            <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+                          </form>
+                        </div>
+                      </td>
+                    </tr>
+                    {% endfor %}
+                    {% if not sources %}
+                    <tr><td colspan="4" class="text-muted">No sources uploaded yet.</td></tr>
+                    {% endif %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tab-pane fade" id="flagGenerators" role="tabpanel">
+          <div class="card mb-3">
+            <div class="card-body">
+              <div class="row g-2 align-items-center">
+                <div class="col-md-6">
+                  <input id="genFilter" class="form-control" placeholder="Filter generators…" />
+                </div>
+              </div>
+              <div class="small text-muted mt-2" id="genMeta"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-body">
+              <div class="table-responsive">
+                <table class="table table-sm align-middle" id="genTable">
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>Name</th>
+                      <th>Language</th>
+                      <th>Source</th>
+                      <th>Inputs</th>
+                      <th>Outputs</th>
+                      <th>From Source</th>
+                      <th style="width: 100px;">Test</th>
+                    </tr>
+                  </thead>
+                  <tbody id="genBody"></tbody>
+                </table>
+              </div>
+              <pre class="mt-3 small" id="genLog" style="max-height: 240px; overflow: auto;"></pre>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- Generator Test Modal -->
+<div class="modal fade" id="genTestModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Test Generator</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-2">
+          <div><strong id="genTestName"></strong></div>
+          <div class="small text-muted" id="genTestId"></div>
+        </div>
+
+        <form id="genTestForm">
+          <input type="hidden" name="generator_id" id="genTestGeneratorId" />
+          <div id="genTestInputs"></div>
+        </form>
+
+        <div class="mt-3">
+          <div class="small text-muted mb-1">Progress / Log</div>
+          <pre class="small bg-light p-2" id="genTestLog" style="max-height: 220px; overflow: auto;"></pre>
+        </div>
+
+        <div class="mt-3">
+          <div class="row g-3">
+            <div class="col-12">
+              <div class="small text-muted mb-1">Generated Files</div>
+              <div id="genTestOutputsStatus" class="small text-muted mb-2" style="display:none;">
+                <span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>
+                <span id="genTestOutputsStatusText">Working…</span>
+              </div>
+              <div id="genTestOutputs" class="small"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+        <button type="button" class="btn btn-primary" id="genTestRunBtn">Run</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const genState = {
+    generators: [],
+    errors: [],
+    filter: '',
+  };
+
+  const genTestState = {
+    current: null,
+    eventSource: null,
+    runId: null,
+    outputsPollTimer: null,
+    outputsLastSig: null,
+    outputsStablePolls: 0,
+  };
+
+  function setOutputsStatus(visible, text) {
+    const box = document.getElementById('genTestOutputsStatus');
+    const t = document.getElementById('genTestOutputsStatusText');
+    if (!box || !t) return;
+    if (!visible) {
+      box.style.display = 'none';
+      t.textContent = '';
+      return;
+    }
+    box.style.display = 'block';
+    t.textContent = text || 'Working…';
+  }
+
+  function stopOutputsPolling() {
+    if (genTestState.outputsPollTimer) {
+      try { clearInterval(genTestState.outputsPollTimer); } catch (e) {}
+      genTestState.outputsPollTimer = null;
+    }
+    genTestState.outputsLastSig = null;
+    genTestState.outputsStablePolls = 0;
+  }
+
+  function fileListSignature(data) {
+    const paths = [];
+    try {
+      if (data && data.bundle && data.bundle.path) paths.push(String(data.bundle.path));
+      const add = (arr) => {
+        (Array.isArray(arr) ? arr : []).forEach(f => {
+          if (f && f.path) paths.push(String(f.path));
+        });
+      };
+      add(data && data.inputs);
+      add(data && data.outputs);
+      add(data && data.files);
+      add(data && data.misc);
+    } catch (e) {}
+    paths.sort();
+    return JSON.stringify(paths);
+  }
+
+  async function pollOutputsOnce(runId) {
+    const data = await fetchJson(`/flag_generators_test/outputs/${encodeURIComponent(runId)}`);
+    if (!data) return;
+    if (data._nonJson) {
+      setOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Login required')}</div>`);
+      setOutputsStatus(false);
+      stopOutputsPolling();
+      return;
+    }
+    if (data.ok === false) {
+      // If the run isn't found (e.g., server restart), surface it.
+      setOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Failed loading outputs')}</div>`);
+      setOutputsStatus(false);
+      stopOutputsPolling();
+      return;
+    }
+
+    // Track stability of the file list so the spinner doesn't disappear
+    // before the last files (including bundle) are visible.
+    const sig = fileListSignature(data);
+    if (genTestState.outputsLastSig === sig) {
+      genTestState.outputsStablePolls = (genTestState.outputsStablePolls || 0) + 1;
+    } else {
+      genTestState.outputsLastSig = sig;
+      genTestState.outputsStablePolls = 0;
+    }
+
+    const inputs = Array.isArray(data.inputs) ? data.inputs : [];
+    const outputs = Array.isArray(data.outputs) ? data.outputs : (Array.isArray(data.files) ? data.files : []);
+    const misc = Array.isArray(data.misc) ? data.misc : [];
+    const hasAny = !!(inputs.length || outputs.length || misc.length);
+
+    if (!data.done) {
+      setOutputsStatus(true, 'Generating outputs…');
+    } else if (data.done && !data.bundle_ready) {
+      setOutputsStatus(true, 'Generating bundle…');
+    } else if (data.done && data.bundle_ready && genTestState.outputsStablePolls < 1) {
+      setOutputsStatus(true, 'Finalizing file list…');
+    } else {
+      setOutputsStatus(false);
+    }
+
+    // Update the UI as soon as anything exists, or when run completes.
+    if (hasAny || data.done) {
+      await loadTestOutputs(runId);
+    }
+    // Stop polling only once bundle is ready AND the file list is stable.
+    if (data.done && data.bundle_ready && genTestState.outputsStablePolls >= 1) {
+      stopOutputsPolling();
+    }
+  }
+
+  function startOutputsPolling(runId) {
+    stopOutputsPolling();
+    // Poll once immediately, then every second until done.
+    setOutputsStatus(true, 'Generating outputs…');
+    pollOutputsOnce(runId);
+    genTestState.outputsPollTimer = setInterval(() => {
+      pollOutputsOnce(runId);
+    }, 1000);
+  }
+
+  async function fetchJson(url, options) {
+    const resp = await fetch(url, options);
+    const ct = (resp.headers.get('content-type') || '').toLowerCase();
+    const redirectedToLogin = !!(resp.redirected && (resp.url || '').includes('/login'));
+    if (redirectedToLogin || (!ct.includes('application/json') && !ct.includes('+json'))) {
+      return {
+        ok: false,
+        error: 'Login required (your session may have expired). Please reload and sign in at /login.',
+        _nonJson: true,
+        _status: resp.status,
+        _url: resp.url,
+      };
+    }
+    try {
+      return await resp.json();
+    } catch (e) {
+      return { ok: false, error: 'Failed to parse server response.', _parseError: true };
+    }
+  }
+
+  function setGenLog(lines) {
+    document.getElementById('genLog').textContent = (lines || []).join('\n');
+  }
+
+  function renderGenerators() {
+    const body = document.getElementById('genBody');
+    const q = (genState.filter || '').toLowerCase();
+    body.innerHTML = '';
+
+    const filtered = (genState.generators || []).filter((g) => {
+      if (!q) return true;
+      const hay = [g.id, g.name, g.language, (g.source && g.source.path) ? g.source.path : '', g.description || '', g._source_name || ''].join(' ').toLowerCase();
+      return hay.includes(q);
+    });
+
+    filtered.forEach((g) => {
+      const tr = document.createElement('tr');
+      const src = (g.source && g.source.path) ? g.source.path : '';
+      const inCount = Array.isArray(g.inputs) ? g.inputs.length : 0;
+      const outCount = Array.isArray(g.outputs) ? g.outputs.length : 0;
+      const hasCompose = !!(g.compose && typeof g.compose === 'object');
+      const composeService = hasCompose && typeof g.compose.service === 'string' ? g.compose.service : '';
+      const composeLabel = composeService ? `compose: ${composeService}` : 'compose';
+      tr.innerHTML = `
+        <td class="small">${escapeHtml(g.id || '')}</td>
+        <td>
+          <div>
+            <strong>${escapeHtml(g.name || '')}</strong>
+            ${hasCompose ? `<span class="badge bg-secondary ms-2">${escapeHtml(composeLabel)}</span>` : ''}
+          </div>
+          ${g.description ? `<div class="small text-muted">${escapeHtml(g.description)}</div>` : ''}
+        </td>
+        <td class="small">${escapeHtml(g.language || '')}</td>
+        <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(src)}</td>
+        <td class="small">${inCount}</td>
+        <td class="small">${outCount}</td>
+        <td class="small">${escapeHtml(g._source_name || '')}</td>
+        <td>
+          <button class="btn btn-sm btn-outline-primary genTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}">Test</button>
+        </td>
+      `;
+      body.appendChild(tr);
+
+      const btn = tr.querySelector('.genTestBtn');
+      if (btn) {
+        btn.addEventListener('click', () => {
+          openGenTestModal(g);
+        });
+      }
+    });
+  }
+
+  function setTestLogLine(line) {
+    const el = document.getElementById('genTestLog');
+    el.textContent = (el.textContent || '') + (line || '') + '\n';
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function clearTestLog() {
+    document.getElementById('genTestLog').textContent = '';
+  }
+
+  function setOutputsHtml(html) {
+    document.getElementById('genTestOutputs').innerHTML = html || '';
+  }
+
+  function humanFileSize(bytes) {
+    const n = Number(bytes);
+    if (!isFinite(n) || n < 0) return '';
+    if (n < 1024) return `${n} B`;
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let v = n / 1024;
+    let u = 0;
+    while (v >= 1024 && u < units.length - 1) {
+      v /= 1024;
+      u++;
+    }
+    return `${v.toFixed(v < 10 ? 1 : 0)} ${units[u]}`;
+  }
+
+  function describeFile(path, category) {
+    const p = String(path || '');
+    const c = String(category || '').toLowerCase();
+    if (p === 'bundle.zip') return 'Bundle (inputs + outputs)';
+    if (p === 'run.log') return 'Run log';
+    if (p === 'outputs.json') return 'Outputs manifest';
+    if (c === 'inputs') {
+      if (p.endsWith('/config.json') || p === 'inputs/config.json') return 'Generator config';
+      return 'Input file';
+    }
+    if (c === 'logs') return 'Log file';
+    if (c === 'outputs') {
+      // Try to map to declared outputs (even though we no longer display them).
+      const g = genTestState.current || {};
+      const declared = Array.isArray(g.outputs) ? g.outputs : [];
+      const base = p.split('/').pop() || p;
+      const hit = declared.find(o => {
+        if (!o) return false;
+        const name = String(o.name || '').trim();
+        if (!name) return false;
+        return name === base || p.includes(name);
+      });
+      if (hit) return String(hit.description || 'Declared output');
+      return 'Generated output';
+    }
+    return 'File';
+  }
+
+  function renderFilesTable(rows) {
+    const items = Array.isArray(rows) ? rows : [];
+    if (!items.length) {
+      return '<div class="text-muted">No files available.</div>';
+    }
+    const body = items.map(r => {
+      const cat = escapeHtml(r.category || '');
+      const p = escapeHtml(r.path || '');
+      const size = escapeHtml(r.size || '');
+      const desc = escapeHtml(r.desc || '');
+      const href = r.href || '#';
+      return `
+        <tr>
+          <td class="text-muted">${cat}</td>
+          <td style="word-break: break-all;">${p}</td>
+          <td class="text-muted">${size}</td>
+          <td class="text-muted">${desc}</td>
+          <td><a href="${href}">Download</a></td>
+        </tr>
+      `;
+    }).join('');
+    return `
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-0">
+          <thead>
+            <tr>
+              <th style="width: 90px;">Type</th>
+              <th>Path</th>
+              <th style="width: 90px;">Size</th>
+              <th>Description</th>
+              <th style="width: 90px;">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${body}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  function isFileInputType(t) {
+    const v = (t || '').toLowerCase();
+    return v === 'file' || v === 'path' || v === 'artifact' || v === 'binary';
+  }
+
+  function buildInputRow(inp) {
+    const name = inp && inp.name ? String(inp.name) : '';
+    if (!name) return '';
+    const required = !!(inp && inp.required);
+    const type = inp && inp.type ? String(inp.type) : 'string';
+    const desc = inp && inp.description ? String(inp.description) : '';
+    const label = `${name}${required ? ' *' : ''}`;
+    const help = desc ? `<div class="form-text">${escapeHtml(desc)}</div>` : '';
+    if (isFileInputType(type)) {
+      return `
+        <div class="mb-3">
+          <label class="form-label">${escapeHtml(label)}</label>
+          <input class="form-control" type="file" name="${escapeHtml(name)}" ${required ? 'required' : ''} />
+          ${help}
+        </div>
+      `;
+    }
+    return `
+      <div class="mb-3">
+        <label class="form-label">${escapeHtml(label)}</label>
+        <input class="form-control" type="text" name="${escapeHtml(name)}" ${required ? 'required' : ''} />
+        ${help}
+      </div>
+    `;
+  }
+
+  function openGenTestModal(generator) {
+    genTestState.current = generator;
+    genTestState.runId = null;
+    stopOutputsPolling();
+    if (genTestState.eventSource) {
+      try { genTestState.eventSource.close(); } catch (e) {}
+      genTestState.eventSource = null;
+    }
+
+    document.getElementById('genTestName').textContent = generator.name || '';
+    document.getElementById('genTestId').textContent = generator.id || '';
+    document.getElementById('genTestGeneratorId').value = generator.id || '';
+
+    const inputs = Array.isArray(generator.inputs) ? generator.inputs : [];
+    const inputsHtml = inputs.map(buildInputRow).join('') || '<div class="text-muted small">No inputs</div>';
+    document.getElementById('genTestInputs').innerHTML = inputsHtml;
+
+    clearTestLog();
+    setOutputsHtml('');
+    setOutputsStatus(false);
+
+    const btn = document.getElementById('genTestRunBtn');
+    btn.disabled = false;
+    const modal = new bootstrap.Modal(document.getElementById('genTestModal'));
+    modal.show();
+  }
+
+  async function loadTestOutputs(runId) {
+    const data = await fetchJson(`/flag_generators_test/outputs/${encodeURIComponent(runId)}`);
+    if (!data.ok) {
+      setOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Failed loading outputs')}</div>`);
+      setOutputsStatus(false);
+      return;
+    }
+    // Back-compat: older backend returned {files:[...]}
+    const inputs = Array.isArray(data.inputs) ? data.inputs : [];
+    const outputs = Array.isArray(data.outputs) ? data.outputs : (Array.isArray(data.files) ? data.files : []);
+    const misc = Array.isArray(data.misc) ? data.misc : [];
+
+    const bundle = (data && data.bundle && typeof data.bundle === 'object') ? data.bundle : null;
+
+    if (!data.done) {
+      setOutputsStatus(true, 'Generating outputs…');
+    } else if (data.done && !data.bundle_ready) {
+      setOutputsStatus(true, 'Generating bundle…');
+    } else {
+      setOutputsStatus(false);
+    }
+
+    const all = [].concat(bundle ? [bundle] : [], inputs, outputs, misc);
+    if (!all.length) {
+      const rc = (data && (data.returncode === 0 || data.returncode)) ? String(data.returncode) : '';
+      setOutputsHtml(`<div class=\"text-muted\">No outputs found${rc ? ` (returncode=${escapeHtml(rc)})` : ''}.</div>`);
+      return;
+    }
+
+    const rows = [];
+    const pushFiles = (categoryLabel, files, categoryKey) => {
+      (files || []).forEach(f => {
+        const p = f.path || '';
+        const href = (p === 'bundle.zip')
+          ? `/flag_generators_test/bundle/${encodeURIComponent(runId)}`
+          : `/flag_generators_test/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(p)}`;
+        rows.push({
+          category: categoryLabel,
+          path: p,
+          size: humanFileSize(f.size),
+          desc: describeFile(p, categoryKey),
+          href,
+        });
+      });
+    };
+
+    pushFiles('Bundle', bundle ? [bundle] : [], 'bundle');
+    pushFiles('Input', inputs, 'inputs');
+    pushFiles('Output', outputs, 'outputs');
+    pushFiles('Log', misc, 'logs');
+
+    setOutputsHtml(renderFilesTable(rows));
+
+  }
+
+  async function loadTestOutputsWithRetry(runId, attempts = 10) {
+    for (let i = 0; i < attempts; i++) {
+      const data = await fetchJson(`/flag_generators_test/outputs/${encodeURIComponent(runId)}`);
+      if (data && data._nonJson) {
+        setOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Login required')}</div>`);
+        setOutputsStatus(false);
+        return;
+      }
+      const inputs = data && Array.isArray(data.inputs) ? data.inputs : [];
+      const outputs = data && Array.isArray(data.outputs) ? data.outputs : (data && Array.isArray(data.files) ? data.files : []);
+      const misc = data && Array.isArray(data.misc) ? data.misc : [];
+      if (data && data.ok && (inputs.length || outputs.length || misc.length)) {
+        await loadTestOutputs(runId);
+        return;
+      }
+      // If not done yet, wait a bit and retry. If done but no files yet, still retry briefly.
+      await new Promise(r => setTimeout(r, 500));
+    }
+    await loadTestOutputs(runId);
+  }
+
+  async function runCurrentGenTest() {
+    const btn = document.getElementById('genTestRunBtn');
+    btn.disabled = true;
+    clearTestLog();
+    setOutputsHtml('<div class="text-muted">Waiting for outputs…</div>');
+    stopOutputsPolling();
+    setOutputsStatus(true, 'Starting generator…');
+
+    const form = document.getElementById('genTestForm');
+    const fd = new FormData(form);
+    const data = await fetchJson('/flag_generators_test/run', { method: 'POST', body: fd });
+    setTestLogLine(`Started run ${runId}`);
+
+    // Start polling outputs immediately (works even if SSE disconnects).
+    startOutputsPolling(runId);
+
+    const es = new EventSource(`/stream/${encodeURIComponent(runId)}`);
+    genTestState.eventSource = es;
+    es.onmessage = (ev) => {
+      setTestLogLine(ev.data);
+    };
+    es.addEventListener('phase', (ev) => {
+      try {
+        const payload = JSON.parse(ev.data || '{}');
+        if (payload && payload.phase) {
+          setTestLogLine(`[phase] ${payload.phase}`);
+        }
+      } catch (e) {}
+    });
+    es.addEventListener('end', async () => {
+      try { es.close(); } catch (e) {}
+      genTestState.eventSource = null;
+      setTestLogLine('Completed.');
+      await loadTestOutputsWithRetry(runId);
+      // Keep polling until bundle is ready.
+      btn.disabled = false;
+    });
+    es.onerror = () => {
+      // Keep UI responsive; user can retry.
+      setTestLogLine('Log stream disconnected.');
+      try { es.close(); } catch (e) {}
+      genTestState.eventSource = null;
+      // Keep polling outputs so links still appear.
+      startOutputsPolling(runId);
+      btn.disabled = false;
+    };
+  }
+
+  function escapeHtml(str) {
+    return (str || '').replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  async function loadGenerators() {
+    const metaEl = document.getElementById('genMeta');
+    metaEl.textContent = 'Loading…';
+    setGenLog([]);
+    const data = await fetchJson('/flag_generators_data');
+    if (data && data.ok === false) {
+      metaEl.textContent = data.error || 'Failed loading generators.';
+      return;
+    }
+    genState.generators = data.generators || [];
+    genState.errors = data.errors || [];
+    metaEl.textContent = `Loaded ${genState.generators.length} generators from enabled sources.`;
+    const lines = [];
+    (genState.errors || []).forEach(e => lines.push(JSON.stringify(e)));
+    setGenLog(lines);
+    renderGenerators();
+  }
+
+  document.getElementById('genFilter').addEventListener('input', (e) => {
+    genState.filter = e.target.value || '';
+    renderGenerators();
+  });
+
+  // Load generator list when the tab is shown
+  document.getElementById('flagGeneratorsTab').addEventListener('shown.bs.tab', async () => {
+    await loadGenerators();
+  });
+
+  document.getElementById('genTestRunBtn').addEventListener('click', async () => {
+    await runCurrentGenTest();
+  });
+</script>
+{% endblock %}

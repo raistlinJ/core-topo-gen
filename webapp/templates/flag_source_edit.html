@@ -1,0 +1,120 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="container-fluid">
+  <div class="row">
+    <div class="col-12">
+      <div class="d-flex justify-content-between align-items-start">
+        <div>
+          <h3 class="mb-1">Edit Flag Source</h3>
+          <div class="small text-muted">{{ name }}</div>
+          <div class="small text-muted" style="word-break: break-all;">{{ path }}</div>
+        </div>
+        <div class="d-flex gap-2">
+          <a class="btn btn-outline-secondary" href="{{ url_for('flag_catalog_page') }}">Back</a>
+          <button class="btn btn-primary" id="saveBtn">Save</button>
+        </div>
+      </div>
+
+      <div class="alert alert-info mt-3 small">
+        Rows map to JSON objects. Empty rows are ignored. Missing IDs will be auto-generated.
+      </div>
+
+      <div class="card">
+        <div class="card-body">
+          <div class="table-responsive">
+            <table class="table table-sm align-middle" id="editTable">
+              <thead>
+                <tr>
+                  {% for c in columns %}
+                    <th class="small">{{ c }}</th>
+                  {% endfor %}
+                  <th style="width: 60px;"></th>
+                </tr>
+              </thead>
+              <tbody id="editTbody"></tbody>
+            </table>
+          </div>
+          <div class="d-flex gap-2 mt-2">
+            <button class="btn btn-outline-secondary btn-sm" id="addRowBtn">Add Row</button>
+          </div>
+          <pre class="mt-3 small" id="saveLog" style="max-height: 220px; overflow: auto;"></pre>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+  const columns = JSON.parse(document.getElementById('columnsJson').textContent || '[]');
+  const initialItems = JSON.parse(document.getElementById('itemsJson').textContent || '[]');
+
+  function escapeHtml(str) {
+    return (str || '').replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  function setLog(msg) {
+    document.getElementById('saveLog').textContent = msg || '';
+  }
+
+  function addRow(item) {
+    const tbody = document.getElementById('editTbody');
+    const tr = document.createElement('tr');
+    const obj = item || {};
+    const tds = columns.map(c => {
+      const v = (obj[c] !== undefined && obj[c] !== null) ? String(obj[c]) : '';
+      return `<td contenteditable="true" class="small" data-col="${escapeHtml(c)}">${escapeHtml(v)}</td>`;
+    }).join('');
+    tr.innerHTML = `${tds}<td><button class="btn btn-sm btn-outline-danger" data-action="del">Del</button></td>`;
+    tbody.appendChild(tr);
+  }
+
+  function rowsPayload() {
+    const rows = [];
+    rows.push(columns.slice());
+    const tbody = document.getElementById('editTbody');
+    tbody.querySelectorAll('tr').forEach(tr => {
+      const row = [];
+      columns.forEach((c, idx) => {
+        const td = tr.querySelector(`td[data-col="${CSS.escape(c)}"]`);
+        row[idx] = td ? (td.textContent || '') : '';
+      });
+      rows.push(row);
+    });
+    return rows;
+  }
+
+  document.getElementById('addRowBtn').addEventListener('click', () => addRow({}));
+  document.getElementById('editTbody').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-action="del"]');
+    if (!btn) return;
+    const tr = btn.closest('tr');
+    if (tr) tr.remove();
+  });
+
+  document.getElementById('saveBtn').addEventListener('click', async () => {
+    setLog('Saving…');
+    const resp = await fetch('/flag_sources/save/{{ sid }}', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rows: rowsPayload() })
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      setLog('Saved.' + (data.skipped ? ` (skipped ${data.skipped} invalid row(s))` : ''));
+    } else {
+      setLog('Error: ' + (data.error || 'unknown'));
+    }
+  });
+
+  // Initial render
+  (initialItems || []).forEach(it => addRow(it));
+  if (!initialItems || !initialItems.length) addRow({});
+</script>
+
+<script type="application/json" id="columnsJson">{{ columns|tojson }}</script>
+<script type="application/json" id="itemsJson">{{ items|tojson }}</script>
+{% endblock %}
