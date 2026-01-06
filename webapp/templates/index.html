@@ -54,6 +54,9 @@
 <!-- hs-bounds-wrapper styles moved into style block above -->
 {% set is_builder_view = (ui_view_mode == 'builder') %}
 {% block content %}
+    {% set scenario_tab = request.args.get('scenario', '').strip() if request else '' %}
+    {% set scenarios_active_tab = 'topology' %}
+    {% include 'partials/scenarios_tabs.html' with context %}
     <div class="row">
         <div class="col-md-3 mb-3">
             <div class="card shadow-sm h-100 d-flex flex-column">
@@ -189,14 +192,8 @@
                             </div>
                         </div>
                     </div>
-                    <!-- Run form repurposed: Run CLI now triggers Full Preview (no direct execution here) -->
-                    <form class="d-flex gap-2 mt-3 align-items-center" action="javascript:void(0)" id="runLegacyForm">
-                        <input type="hidden" name="xml_path" id="xml_path">
-                        <span class="d-inline-block" tabindex="0" id="runSyncWrap" data-bs-toggle="tooltip" data-bs-title="Runs CLI using current XML">
-                            <button class="btn btn-warning" type="button" id="runSyncBtn" disabled title="Generates a Full Preview (no execution)">Generate</button>
-                        </span>
-                        <button class="btn btn-outline-danger d-none" type="button" id="cancelRunBtn" onclick="cancelRun()">Cancel</button>
-                    </form>
+                    <!-- Keep xml_path hidden input for existing JS; Preview button moved to shared Scenarios header -->
+                    <input type="hidden" name="xml_path" id="xml_path">
                 </div>
             </div>
 
@@ -834,6 +831,7 @@ function setupPreviewCollapsers(){
         const collapseLabel = btn.dataset.labelCollapse || 'Collapse';
         const expandLabel = btn.dataset.labelExpand || 'Expand';
         const hasBootstrap = !!(window.bootstrap && bootstrap.Collapse);
+        const inPreviewDialog = !!(target && target.closest && target.closest('#fullPreviewModal'));
         if(hasBootstrap){
             const instance = bootstrap.Collapse.getOrCreateInstance(target, { toggle: false });
             const updateLabel = () => {
@@ -841,8 +839,15 @@ function setupPreviewCollapsers(){
             };
             target.addEventListener('shown.bs.collapse', updateLabel);
             target.addEventListener('hidden.bs.collapse', updateLabel);
-            if(!target.classList.contains('show')){
-                instance.show();
+            // Default behavior:
+            // - Inside the Full Preview modal, start collapsed.
+            // - Elsewhere, preserve prior behavior (auto-expand).
+            if(inPreviewDialog){
+                try { instance.hide(); } catch(e){}
+            } else {
+                if(!target.classList.contains('show')){
+                    instance.show();
+                }
             }
             updateLabel();
             btn.addEventListener('click', ev => {
@@ -857,7 +862,11 @@ function setupPreviewCollapsers(){
             const updateLabel = () => {
                 btn.textContent = target.classList.contains('d-none') ? expandLabel : collapseLabel;
             };
-            target.classList.remove('d-none');
+            if(inPreviewDialog){
+                target.classList.add('d-none');
+            } else {
+                target.classList.remove('d-none');
+            }
             updateLabel();
             btn.addEventListener('click', ev => {
                 ev.preventDefault();
@@ -4632,14 +4641,39 @@ window.updateCoreStatus = function(success, msg){
 
 document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('planPreviewBtn')?.addEventListener('click', computePlanPreview);
-    // Repurpose Run CLI button to invoke Full Preview logic
-    document.getElementById('runSyncBtn')?.addEventListener('click', ()=>{
-        // Mirror enablement guard from preview button
-        if(document.getElementById('planPreviewBtn')?.disabled){
-            logWarn('Full Preview disabled; cannot run');
-            return;
+    // Scenarios header Preview tab: ensure XML is saved, then navigate to /scenarios/preview.
+    document.getElementById('scenariosPreviewTabLink')?.addEventListener('click', async (ev)=>{
+        try {
+            ev.preventDefault();
+            const ensureXmlPath = async ()=>{
+                const xmlPathVal = (state.result_path || '').trim();
+                if(xmlPathVal) return xmlPathVal;
+                try { await autoSaveXml(); } catch(e){ return ''; }
+                return (state.result_path || '').trim();
+            };
+            const xmlPath = await ensureXmlPath();
+            if(!xmlPath){
+                alert('Save XML first to preview.');
+                return;
+            }
+            const activeIdx = (typeof state.active_index === 'number') ? state.active_index : 0;
+            const scen = (state.scenarios && state.scenarios[activeIdx] && state.scenarios[activeIdx].name) ? String(state.scenarios[activeIdx].name) : '';
+            const baseUrl = String(document.getElementById('scenariosPreviewTabLink')?.dataset?.previewBaseUrl || '/scenarios/preview');
+            const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + (scen ? ('&scenario=' + encodeURIComponent(scen)) : '');
+            window.location.href = url;
+        } catch(e){
+            try { ev.preventDefault(); } catch(_e){}
         }
-        computePlanPreview();
+    });
+
+    // Shared Scenarios Execute button: reuse the existing Topology execute flow.
+    document.getElementById('scenariosExecuteBtn')?.addEventListener('click', (ev)=>{
+        try {
+            ev.preventDefault();
+            const btn = document.getElementById('fpExecuteBtn');
+            if(btn){ btn.click(); return; }
+            alert('Execute is not available on this page yet.');
+        } catch(e){}
     });
     try { updatePlanButtons(); } catch(e){}
 });
@@ -16490,9 +16524,9 @@ function startLogStream(runId) {
         if (showBtn && !showBtn.classList.contains('d-none')) { showBtn.click(); }
     } catch(e){}
     // Toggle buttons
-    document.getElementById('runAsyncBtn').classList.add('d-none');
-    document.getElementById('runSyncBtn').classList.add('disabled');
-    document.getElementById('cancelRunBtn').classList.remove('d-none');
+    try { document.getElementById('runAsyncBtn')?.classList.add('d-none'); } catch(e){}
+    try { document.getElementById('runSyncBtn')?.classList.add('disabled'); } catch(e){}
+    try { document.getElementById('cancelRunBtn')?.classList.remove('d-none'); } catch(e){}
     evtSrc.onmessage = (ev) => {
         const raw = ev.data || '';
         let lvl = 'INFO';
@@ -16510,9 +16544,9 @@ function startLogStream(runId) {
     });
     evtSrc.addEventListener('end', () => {
         evtSrc.close();
-        document.getElementById('runAsyncBtn').classList.remove('d-none');
-        document.getElementById('runSyncBtn').classList.remove('disabled');
-        document.getElementById('cancelRunBtn').classList.add('d-none');
+        try { document.getElementById('runAsyncBtn')?.classList.remove('d-none'); } catch(e){}
+        try { document.getElementById('runSyncBtn')?.classList.remove('disabled'); } catch(e){}
+        try { document.getElementById('cancelRunBtn')?.classList.add('d-none'); } catch(e){}
         logInfo('Async run ended');
     });
 }
@@ -16555,9 +16589,9 @@ async function pollRunStatus(runId) {
             await fetch('/cancel_run/' + runId, { method: 'POST' });
         } catch(e) {}
     try { evtSrc.close(); } catch(e){}
-        document.getElementById('runAsyncBtn').classList.remove('d-none');
-        document.getElementById('runSyncBtn').classList.remove('disabled');
-        document.getElementById('cancelRunBtn').classList.add('d-none');
+        try { document.getElementById('runAsyncBtn')?.classList.remove('d-none'); } catch(e){}
+        try { document.getElementById('runSyncBtn')?.classList.remove('disabled'); } catch(e){}
+        try { document.getElementById('cancelRunBtn')?.classList.add('d-none'); } catch(e){}
     logInfo('Run cancelled by user');
     }
 

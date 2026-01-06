@@ -67,11 +67,20 @@
   {%- endmacro %}
 
   <div class="d-flex align-items-center mb-2 gap-2">
-    <h2 class="me-auto mb-0">Full Preview {{ scenario or '' }}</h2>
-  <button id="executeRunBtn" class="btn btn-sm btn-warning" title="Execute this scenario now (invokes CLI)" data-preview-plan="{{ preview_plan_path or '' }}">Execute</button>
-    <form method="post" action="/plan/full_preview_page" class="d-flex align-items-center" id="rerollForm">
+    {% if not hide_chrome %}
+      <h2 class="me-auto mb-0">Full Preview {{ scenario or '' }}</h2>
+    {% else %}
+      {# In embedded mode, keep controls on the left (no spacer). #}
+    {% endif %}
+  {% if not hide_chrome %}
+    <button id="executeRunBtn" class="btn btn-sm btn-warning" title="Execute this scenario now (invokes CLI)" data-preview-plan="{{ preview_plan_path or '' }}">Execute</button>
+  {% else %}
+    <button id="executeRunBtn" class="d-none" type="button" aria-hidden="true" data-preview-plan="{{ preview_plan_path or '' }}"></button>
+  {% endif %}
+    <form method="post" action="{{ url_for('plan_full_preview_page', embed=1) if hide_chrome else url_for('plan_full_preview_page') }}" class="d-flex align-items-center" id="rerollForm">
       <input type="hidden" name="xml_path" value="{{ xml_path }}" />
       {% if scenario %}<input type="hidden" name="scenario" value="{{ scenario }}" />{% endif %}
+      {% if hide_chrome %}<input type="hidden" name="embed" value="1" />{% endif %}
       <div class="input-group input-group-sm me-2" style="width:160px;">
         <span class="input-group-text">Seed</span>
         <input type="text" class="form-control" name="seed" value="" placeholder="random" />
@@ -616,6 +625,7 @@
 <script id="fpScenarioMetaJson" type="application/json">{{ {'scenario': scenario, 'xml_basename': xml_basename} | tojson }}</script>
 <script>
 (function(){
+  const IS_EMBEDDED = {{ 'true' if hide_chrome else 'false' }};
   let previewData = {};
   function init(){
     const dataEl = document.getElementById('fpDataJson');
@@ -1712,8 +1722,15 @@
           };
           target.addEventListener('shown.bs.collapse', updateLabel);
           target.addEventListener('hidden.bs.collapse', updateLabel);
-          if(!target.classList.contains('show')){
-            instance.show();
+          // Default behavior:
+          // - Embedded (Preview tab): start collapsed.
+          // - Standalone full preview page: preserve prior behavior (auto-expand).
+          if(IS_EMBEDDED){
+            try { instance.hide(); } catch(e){}
+          } else {
+            if(!target.classList.contains('show')){
+              instance.show();
+            }
           }
           updateLabel();
           btn.addEventListener('click', ev => {
@@ -1728,7 +1745,11 @@
           const updateLabel = () => {
             btn.textContent = target.classList.contains('d-none') ? expandLabel : collapseLabel;
           };
-          target.classList.remove('d-none');
+          if(IS_EMBEDDED){
+            target.classList.add('d-none');
+          } else {
+            target.classList.remove('d-none');
+          }
           updateLabel();
           btn.addEventListener('click', ev => {
             ev.preventDefault();

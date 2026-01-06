@@ -1,8 +1,8 @@
 {% extends 'layout.html' %}
-{% block title %}Flow{% endblock %}
-{% block active_page %}{% set active_page='flow' %}{% endblock %}
+{% block title %}Flag Sequencing{% endblock %}
+{% block active_page %}{% set active_page='scenarios' %}{% endblock %}
 {% block header_icon %}<i class="bi bi-bezier2 fs-4"></i>{% endblock %}
-{% block header_title %}Flow{% endblock %}
+{% block header_title %}Flag Sequencing{% endblock %}
 
 {% block extra_head %}
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
@@ -18,6 +18,9 @@
 {% endblock %}
 
 {% block content %}
+{% set scenario_tab = (active_scenario or request.args.get('scenario','')) %}
+{% set scenarios_active_tab = 'flag-sequencing' %}
+{% include 'partials/scenarios_tabs.html' with context %}
 <div class="container-fluid mt-3 d-flex flex-column" id="flowPageWrap">
   <div class="row g-3 flex-grow-1 align-items-stretch" id="flowLayoutRow">
     <div class="col-12 col-lg-3 d-flex">
@@ -42,28 +45,23 @@
       <div class="flex-fill d-flex flex-column">
         <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
           <div class="fw-semibold">Generate an Attack Flow from the latest preview plan</div>
-          <div class="d-flex align-items-center gap-2">
-            <button id="flowExecuteBtn" class="btn btn-sm btn-success" type="button">Execute</button>
-            <a id="flowDownloadLink" class="btn btn-sm btn-outline-primary" href="#" download>Download Attack Flow (JSON)</a>
-          </div>
         </div>
 
         <div class="card mb-3">
           <div class="card-body">
+            <input id="flowScenario" class="form-control d-none" value="{{ active_scenario or request.args.get('scenario','') }}">
             <div class="row g-2 align-items-end">
-              <div class="col-md-4">
-                <div class="small text-muted">Scenario</div>
-                <div class="fw-semibold" id="flowScenarioLabel">{{ active_scenario or '' }}</div>
-                <input id="flowScenario" class="form-control d-none" value="{{ active_scenario or request.args.get('scenario','') }}">
-              </div>
               <div class="col-sm-6 col-md-2">
                 <label class="form-label">Chain Length</label>
                 <input id="flowLength" class="form-control" type="number" min="1" max="50" value="5">
               </div>
-              <div class="col-md-3">
-                <button id="flowGenerateBtn" class="btn btn-primary w-100">Generate</button>
+              <div class="col-md-6">
+                <div class="d-flex gap-2 flex-nowrap">
+                  <button id="flowGenerateBtn" class="btn btn-primary text-nowrap" type="button">Generate</button>
+                  <a id="flowBundleDownloadLink" class="btn btn-outline-primary text-nowrap" href="#" role="button">Download Attack Flow STIX Bundle</a>
+                </div>
               </div>
-              <div class="col-md-3">
+              <div class="col-md-4">
                 <div class="small">
                   <span id="flowStatus" class="text-muted"></span>
                   <a id="flowLoginLink" class="ms-2 d-none" href="/login">Login</a>
@@ -71,6 +69,31 @@
               </div>
             </div>
             <div class="small text-muted mt-2">Current rule: flags are placed on any Docker nodes (scenario Docker role + vulnerability Docker nodes). Default chain order is randomized; you can tweak it below.</div>
+          </div>
+        </div>
+
+        <div class="card mb-3">
+          <div class="card-header d-flex align-items-center justify-content-between">
+            <div class="fw-semibold">Visualization</div>
+          </div>
+          <div class="card-body">
+            <div class="row g-2 small text-muted align-items-center mb-2" id="flowMetaRow">
+              <div class="col-12 col-md-4">
+                <span class="text-secondary">Scenario:</span>
+                <span class="ms-1" id="flowMetaScenario"></span>
+              </div>
+              <div class="col-12 col-md-5">
+                <span class="text-secondary">Preview:</span>
+                <span class="ms-1" id="flowMetaPreview"></span>
+              </div>
+              <div class="col-12 col-md-3">
+                <span class="text-secondary">Docker:</span>
+                <span class="ms-1" id="flowMetaStats"></span>
+              </div>
+            </div>
+            <div id="flowDiagramWrap" class="border rounded p-2" style="min-height: 180px; overflow-x: auto;">
+              <div id="flowDiagram" class="mermaid">graph LR\n  A[Generate] --> B[Flow]</div>
+            </div>
           </div>
         </div>
 
@@ -85,47 +108,6 @@
           </div>
         </div>
 
-        <div class="card mb-3">
-          <div class="card-header d-flex align-items-center justify-content-between">
-            <div class="fw-semibold">Visualization</div>
-            <div class="small text-muted" id="flowMeta"></div>
-          </div>
-          <div class="card-body">
-            <div id="flowDiagramWrap" class="border rounded p-2" style="min-height: 180px; overflow-x: auto;">
-              <div id="flowDiagram" class="mermaid">graph LR\n  A[Generate] --> B[Flow]</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="card mb-3">
-          <div class="card-header fw-semibold">Node Details</div>
-          <div class="card-body">
-            <div class="small text-muted" id="flowNodeDetailsEmpty">Click a node in the chain list or diagram.</div>
-            <div id="flowNodeDetails" class="d-none">
-              <div class="row g-2">
-                <div class="col-md-6">
-                  <div class="small text-muted">Node</div>
-                  <div class="fw-semibold" id="flowNodeName"></div>
-                  <div class="small text-muted" id="flowNodeMeta"></div>
-                </div>
-                <div class="col-md-6">
-                  <div class="small text-muted">Assigned Flag Package</div>
-                  <div class="fw-semibold" id="flowFlagName"></div>
-                  <div class="small text-muted" id="flowFlagPath"></div>
-                  <div class="small text-muted" id="flowFlagIO"></div>
-                  <div class="small" id="flowFlagHint"></div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="card mb-3 flex-grow-1 d-flex flex-column">
-          <div class="card-header fw-semibold">Attack Flow (STIX Bundle)</div>
-          <div class="card-body flex-grow-1" style="min-height:0;">
-            <pre id="flowJson" class="small mb-0" style="max-height: 520px; overflow:auto;"></pre>
-          </div>
-        </div>
       </div>
     </div>
   </div>
@@ -142,10 +124,12 @@
   const scenarioLabelEl = document.getElementById('flowScenarioLabel');
   const lengthEl = document.getElementById('flowLength');
   const btnEl = document.getElementById('flowGenerateBtn');
-  const execEl = document.getElementById('flowExecuteBtn');
+  const execEl = document.getElementById('scenariosExecuteBtn');
   const jsonEl = document.getElementById('flowJson');
-  const metaEl = document.getElementById('flowMeta');
-  const downloadLink = document.getElementById('flowDownloadLink');
+  const metaScenarioEl = document.getElementById('flowMetaScenario');
+  const metaPreviewEl = document.getElementById('flowMetaPreview');
+  const metaStatsEl = document.getElementById('flowMetaStats');
+  const downloadLink = document.getElementById('flowBundleDownloadLink');
   const scenarioListEl = document.getElementById('flowScenarioList');
   const clearScenarioBtn = document.getElementById('flowScenarioFilterClear');
 
@@ -160,15 +144,6 @@
   let lastPreviewPlanPath = '';
   let currentFlagAssignments = [];
   let selectedChainIndex = -1;
-
-  const nodeDetailsWrap = document.getElementById('flowNodeDetails');
-  const nodeDetailsEmpty = document.getElementById('flowNodeDetailsEmpty');
-  const nodeNameEl = document.getElementById('flowNodeName');
-  const nodeMetaEl = document.getElementById('flowNodeMeta');
-  const flagNameEl = document.getElementById('flowFlagName');
-  const flagPathEl = document.getElementById('flowFlagPath');
-  const flagIoEl = document.getElementById('flowFlagIO');
-  const flagHintEl = document.getElementById('flowFlagHint');
 
   function normalizeScenarioNorm(raw){
     return (raw || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
@@ -422,67 +397,29 @@
     selectedChainIndex = Number.isFinite(+idx) ? (+idx) : -1;
     if(selectedChainIndex < 0 || !Array.isArray(currentChain) || selectedChainIndex >= currentChain.length){
       selectedChainIndex = -1;
-      showNodeDetails(null, null);
       renderChainEditor();
       return;
     }
-    const node = currentChain[selectedChainIndex] || null;
-    const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[selectedChainIndex]) ? currentFlagAssignments[selectedChainIndex] : null;
-    showNodeDetails(node, fa);
     renderChainEditor();
   }
 
-  function showNodeDetails(node, fa){
-    try{
-      const has = !!node;
-      if(nodeDetailsEmpty) nodeDetailsEmpty.classList.toggle('d-none', has);
-      if(nodeDetailsWrap) nodeDetailsWrap.classList.toggle('d-none', !has);
-      if(!has){
-        if(nodeNameEl) nodeNameEl.textContent = '';
-        if(nodeMetaEl) nodeMetaEl.textContent = '';
-        if(flagNameEl) flagNameEl.textContent = '';
-        if(flagPathEl) flagPathEl.textContent = '';
-        return;
-      }
-      if(nodeNameEl) nodeNameEl.textContent = String(node && node.name || '');
-      if(nodeMetaEl) nodeMetaEl.textContent = 'id=' + String(node && node.id || '') + (node && node.type ? (' | type=' + String(node.type)) : '');
-      const flagLabel = fa && (fa.name || fa.id) ? String(fa.name || fa.id) : '-';
-      if(flagNameEl) flagNameEl.textContent = flagLabel;
-      const flagPath = fa && fa.path ? String(fa.path) : '';
-      if(flagPathEl) flagPathEl.textContent = flagPath ? ('path: ' + flagPath) : '';
-
-      const req = fa && Array.isArray(fa.inputs) && fa.inputs.length ? fa.inputs.join(', ') : '-';
-      const prov = fa && Array.isArray(fa.outputs) && fa.outputs.length ? fa.outputs.join(', ') : '-';
-      if(flagIoEl) flagIoEl.textContent = 'requires: ' + req + ' | provides: ' + prov;
-
-      const hint = fa && fa.hint ? String(fa.hint) : '';
-      if(flagHintEl) flagHintEl.textContent = hint ? ('Hint: ' + hint) : '';
-    } catch(e) {}
-  }
-
   function updateMeta(){
-    const scenarioText = (activeScenario || '') ? ('Scenario: ' + activeScenario) : '';
-    const previewText = lastPreviewPlanPath ? ('Preview: ' + basenameFromPath(lastPreviewPlanPath)) : '';
-    const statsText = formatStats(lastStats);
-    metaEl.textContent = [scenarioText, previewText, statsText].filter(Boolean).join(' | ');
+    if(metaScenarioEl) metaScenarioEl.textContent = (activeScenario || '') ? String(activeScenario) : '-';
+    if(metaPreviewEl) metaPreviewEl.textContent = lastPreviewPlanPath ? basenameFromPath(lastPreviewPlanPath) : '-';
+    if(metaStatsEl) metaStatsEl.textContent = formatStats(lastStats) || '-';
   }
 
   async function refreshBundleFromChain(){
     if(!Array.isArray(currentChain) || currentChain.length === 0) return;
     setStatus('Updating bundle…', false);
     try{
-      const data = await postJson('/api/flow/bundle_from_chain', { scenario: activeScenario, chain: currentChain });
+      const data = await postJson('/api/flag-sequencing/bundle_from_chain', { scenario: activeScenario, chain: currentChain });
       currentBundle = data.bundle;
       currentFlagAssignments = Array.isArray(data.flag_assignments) ? data.flag_assignments.slice() : currentFlagAssignments;
-      jsonEl.textContent = JSON.stringify(currentBundle, null, 2);
+      if(jsonEl) jsonEl.textContent = JSON.stringify(currentBundle, null, 2);
       const diagram = buildMermaid(currentChain);
       await renderMermaid(diagram);
       updateMeta();
-      if(selectedChainIndex >= 0 && selectedChainIndex < currentChain.length){
-        const node = currentChain[selectedChainIndex] || null;
-        const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[selectedChainIndex]) ? currentFlagAssignments[selectedChainIndex] : null;
-        showNodeDetails(node, fa);
-      }
       setStatus('Ready.', false);
     } catch(err){
       setStatus(String(err && err.message || err), true);
@@ -550,13 +487,15 @@
     if(scenario) params.set('scenario', scenario);
     params.set('length', String(length));
 
-    const apiUrl = '/api/flow/attackflow_preview?' + params.toString();
-    downloadLink.href = '#';
+    const apiUrl = '/api/flag-sequencing/attackflow_preview?' + params.toString();
+    if(downloadLink) downloadLink.href = '#';
 
     setStatus('Generating…', false);
     setLoginLinkVisible(false);
-    metaEl.textContent = '';
-    jsonEl.textContent = '';
+    if(metaScenarioEl) metaScenarioEl.textContent = '';
+    if(metaPreviewEl) metaPreviewEl.textContent = '';
+    if(metaStatsEl) metaStatsEl.textContent = '';
+    if(jsonEl) jsonEl.textContent = '';
 
     try {
       const data = await fetchJson(apiUrl);
@@ -567,10 +506,9 @@
       lastPreviewPlanPath = data.preview_plan_path || '';
       updateMeta();
       selectedChainIndex = -1;
-      showNodeDetails(null, null);
       renderChainEditor();
 
-      jsonEl.textContent = JSON.stringify(currentBundle, null, 2);
+      if(jsonEl) jsonEl.textContent = JSON.stringify(currentBundle, null, 2);
       const diagram = buildMermaid(currentChain);
       await renderMermaid(diagram);
       setStatus('Ready.', false);
@@ -585,7 +523,6 @@
       currentBundle = null;
       currentFlagAssignments = [];
       selectedChainIndex = -1;
-      showNodeDetails(null, null);
       renderChainEditor();
       const diagram = buildMermaid([]);
       await renderMermaid(diagram);
@@ -607,7 +544,7 @@
         throw new Error('Generate a chain first.');
       }
       const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-      const prepData = await postJson('/api/flow/prepare_preview_for_execute', { scenario, length, chain_ids: chainIds });
+      const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length, chain_ids: chainIds });
       const xmlPath = (prepData && prepData.xml_path) ? String(prepData.xml_path) : '';
       const previewPlan = (prepData && prepData.preview_plan_path) ? String(prepData.preview_plan_path) : '';
       if(!xmlPath || !previewPlan){
@@ -700,3 +637,23 @@
 })();
 </script>
 {% endblock %}
+  // Scenarios header Preview tab: route to /scenarios/preview.
+  document.addEventListener('DOMContentLoaded', ()=>{
+    const link = document.getElementById('scenariosPreviewTabLink');
+    if(!link) return;
+    link.addEventListener('click', (ev)=>{
+      try {
+        ev.preventDefault();
+        const xmlPath = (document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
+        const scen = (document.getElementById('flowScenario')?.value || document.getElementById('scenariosPreviewScenario')?.value || '').trim();
+        if(!xmlPath){
+          alert('Save XML first to preview.');
+          return;
+        }
+        const baseUrl = String(link.dataset?.previewBaseUrl || '/scenarios/preview');
+        const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + (scen ? ('&scenario=' + encodeURIComponent(scen)) : '');
+        window.location.href = url;
+      } catch(e){}
+    });
+  });
+

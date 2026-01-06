@@ -7764,7 +7764,7 @@ def logout():
     return redirect(url_for('login'))
 
 
-@app.route('/flow')
+@app.route('/scenarios/flag-sequencing')
 def flow_page():
     history = _load_run_history()
     current_user = _current_user()
@@ -7784,11 +7784,86 @@ def flow_page():
             scenario_norm = _normalize_scenario_label(scenario_names[0])
     active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
 
+    # Best-effort: provide the saved scenario XML path so the shared Preview button can work from this page.
+    active_scenario_xml_path = ''
+    try:
+        if scenario_norm and isinstance(scenario_paths, dict):
+            p = scenario_paths.get(scenario_norm) or scenario_paths.get(active_scenario) or ''
+            p2 = _select_existing_path(p)
+            if p2:
+                active_scenario_xml_path = os.path.abspath(p2)
+    except Exception:
+        active_scenario_xml_path = ''
+
     return render_template(
         'flow.html',
         scenarios=scenario_names,
         active_scenario=active_scenario,
         participant_url_flags=participant_url_flags,
+        preview_xml_path=active_scenario_xml_path,
+    )
+
+
+@app.route('/scenarios/preview')
+def scenarios_preview_page():
+    """Scenarios sub-tab: Preview.
+
+    This page renders a lightweight shell and loads the existing full preview page
+    into an iframe while showing a loading modal.
+    """
+    history = _load_run_history()
+    current_user = _current_user()
+    scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
+
+    scenario_query = (request.args.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_query)
+    if scenario_names:
+        if not scenario_norm or not any(_normalize_scenario_label(n) == scenario_norm for n in scenario_names):
+            scenario_norm = _normalize_scenario_label(scenario_names[0])
+    active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
+
+    # Prefer explicit xml_path (e.g., coming from Topology editor save). Fallback to the catalog path for the active scenario.
+    xml_path = (request.args.get('xml_path') or '').strip()
+    xml_path_abs = ''
+    try:
+        if xml_path:
+            xml_path_abs = os.path.abspath(xml_path)
+            if not os.path.exists(xml_path_abs):
+                xml_path_abs = ''
+    except Exception:
+        xml_path_abs = ''
+    if not xml_path_abs:
+        try:
+            p = ''
+            if scenario_norm and isinstance(scenario_paths, dict):
+                p = scenario_paths.get(scenario_norm) or scenario_paths.get(active_scenario) or ''
+            p2 = _select_existing_path(p)
+            if p2:
+                xml_path_abs = os.path.abspath(p2)
+        except Exception:
+            xml_path_abs = ''
+
+    scenario_xml_by_name: dict[str, str] = {}
+    try:
+        if isinstance(scenario_names, list) and isinstance(scenario_paths, dict):
+            for nm in scenario_names:
+                try:
+                    nm_norm = _normalize_scenario_label(nm)
+                    raw_path = scenario_paths.get(nm_norm) or scenario_paths.get(nm) or ''
+                    chosen = _select_existing_path(raw_path) or ''
+                    scenario_xml_by_name[str(nm)] = os.path.abspath(chosen) if chosen else ''
+                except Exception:
+                    scenario_xml_by_name[str(nm)] = ''
+    except Exception:
+        scenario_xml_by_name = {}
+
+    return render_template(
+        'scenarios_preview.html',
+        scenarios=scenario_names,
+        active_scenario=active_scenario,
+        scenario_xml_by_name=scenario_xml_by_name,
+        scenario_tab=active_scenario,
+        preview_xml_path=xml_path_abs,
     )
 
 
@@ -7952,7 +8027,7 @@ def _build_topology_graph_from_preview_plan(preview: Dict[str, Any]) -> Tuple[li
     return nodes_out, links_out, adj
 
 
-@app.route('/api/flow/latest_preview_plan')
+@app.route('/api/flag-sequencing/latest_preview_plan')
 def api_flow_latest_preview_plan():
     scenario_label = (request.args.get('scenario') or '').strip()
     scenario_norm = _normalize_scenario_label(scenario_label)
@@ -8101,16 +8176,20 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
             },
         ]
 
+    # Deterministic randomness for generator selection.
     try:
         import random as _random
-
-        seed_val = 0
         try:
             seed_val = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
         except Exception:
             seed_val = 0
         rnd = _random.Random(seed_val ^ 0xC0FFEE)
-        rnd.shuffle(eligible_flags)
+    except Exception:
+        rnd = None
+
+    try:
+        if rnd is not None:
+            rnd.shuffle(eligible_flags)
     except Exception:
         pass
 
@@ -8150,8 +8229,62 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
     out: list[dict[str, Any]] = []
     if not eligible_flags:
         return out
+
+    available: set[str] = set()
+    prev_outputs: set[str] = set()
+
+    def _inputs_of(f: dict[str, Any]) -> set[str]:
+        try:
+            raw = f.get('inputs')
+            if isinstance(raw, list):
+                return {str(x).strip() for x in raw if str(x).strip()}
+        except Exception:
+            pass
+        return set()
+
+    def _outputs_of(f: dict[str, Any]) -> set[str]:
+        try:
+            raw = f.get('outputs')
+            if isinstance(raw, list):
+                return {str(x).strip() for x in raw if str(x).strip()}
+        except Exception:
+            pass
+        return set()
+
     for i, cid in enumerate(chain_ids):
-        flag = eligible_flags[i % len(eligible_flags)]
+        # Enforce chainability:
+        # - position 0 should be a seed generator (no inputs) when possible
+        # - later positions should prefer generators whose inputs are satisfied by the
+        #   previous step's outputs; fall back to any previously available outputs.
+        if i == 0:
+            feasible = [f for f in eligible_flags if not _inputs_of(f)]
+        else:
+            feasible = [f for f in eligible_flags if _inputs_of(f) and _inputs_of(f).issubset(prev_outputs)]
+            if not feasible:
+                feasible = [f for f in eligible_flags if _inputs_of(f).issubset(prev_outputs)]
+            if not feasible:
+                feasible = [f for f in eligible_flags if _inputs_of(f).issubset(available)]
+
+        if feasible:
+            if rnd is not None:
+                try:
+                    flag = rnd.choice(feasible)
+                except Exception:
+                    flag = feasible[0]
+            else:
+                flag = feasible[0]
+        else:
+            # If the catalog doesn't contain a seed (or no compatible step exists),
+            # fall back to a stable rotation.
+            flag = eligible_flags[i % len(eligible_flags)]
+
+        # Update outputs for the next hop.
+        try:
+            prev_outputs = _outputs_of(flag)
+            available |= prev_outputs
+        except Exception:
+            pass
+
         next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
         hint_tpl = str(flag.get('hint_template') or '').strip() or (known_hint.get(str(flag.get('id') or '').strip()) or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})')
         out.append({
@@ -8173,7 +8306,7 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
     return out
 
 
-@app.route('/api/flow/attackflow_preview')
+@app.route('/api/flag-sequencing/attackflow_preview')
 def api_flow_attackflow_preview():
     scenario_label = (request.args.get('scenario') or '').strip()
     scenario_norm = _normalize_scenario_label(scenario_label)
@@ -8254,7 +8387,7 @@ def api_flow_attackflow_preview():
     return jsonify(out)
 
 
-@app.route('/api/flow/prepare_preview_for_execute', methods=['POST'])
+@app.route('/api/flag-sequencing/prepare_preview_for_execute', methods=['POST'])
 def api_flow_prepare_preview_for_execute():
     j = request.get_json(silent=True) or {}
     scenario_label = str(j.get('scenario') or '').strip()
@@ -8422,7 +8555,7 @@ def api_flow_prepare_preview_for_execute():
     })
 
 
-@app.route('/api/flow/bundle_from_chain', methods=['POST'])
+@app.route('/api/flag-sequencing/bundle_from_chain', methods=['POST'])
 def api_flow_bundle_from_chain():
     """Build an AttackFlow bundle from a user-specified ordered chain."""
     j = request.get_json(silent=True) or {}
@@ -8476,7 +8609,7 @@ def api_flow_bundle_from_chain():
     })
 
 
-@app.route('/api/flow/attackflow')
+@app.route('/api/flag-sequencing/attackflow')
 def api_flow_attackflow():
     scenario_label = (request.args.get('scenario') or '').strip()
     scenario_norm = _normalize_scenario_label(scenario_label)
@@ -17270,6 +17403,8 @@ def plan_full_preview_page():
     Form fields: xml_path, optional scenario, seed
     """
     try:
+        embed_raw = request.args.get('embed') or request.form.get('embed') or ''
+        embed = str(embed_raw).strip().lower() in ['1', 'true', 'yes', 'y', 'on']
         xml_path = request.form.get('xml_path')
         scenario = request.form.get('scenario') or None
         seed_raw = request.form.get('seed') or ''
@@ -17405,6 +17540,7 @@ def plan_full_preview_page():
             segmentation_artifacts=segmentation_artifacts,
             hitl_config=hitl_config,
             xml_basename=xml_basename,
+            hide_chrome=embed,
         )
     except Exception as e:
         app.logger.exception('[plan.full_preview_page] error: %s', e)

@@ -1,0 +1,42 @@
+{# Shared Scenarios sub-navigation: Topology + Flag Sequencing, with a common Preview button. #}
+{% set scenario_tab = (scenario_tab|default('')|string) %}
+{% set scenarios_active_tab = (scenarios_active_tab|default('topology')|string) %}
+{% set preview_xml_path = (preview_xml_path|default('')|string) %}
+
+<style>
+  /* Reserve space for the shared fixed-bottom Execute bar on all Scenarios sub-tabs. */
+  body { padding-bottom: 64px; }
+</style>
+
+<div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
+  <ul class="nav nav-tabs mb-0">
+    <li class="nav-item">
+      <a class="nav-link {% if scenarios_active_tab == 'topology' %}active{% endif %}" {% if scenarios_active_tab == 'topology' %}aria-current="page"{% endif %} href="{{ url_for('index', scenario=scenario_tab) if scenario_tab else url_for('index') }}">Topology</a>
+    </li>
+    <li class="nav-item">
+      <a class="nav-link {% if scenarios_active_tab == 'flag-sequencing' %}active{% endif %}" {% if scenarios_active_tab == 'flag-sequencing' %}aria-current="page"{% endif %} href="{{ url_for('flow_page', scenario=scenario_tab) if scenario_tab else url_for('flow_page') }}">Flag Sequencing</a>
+    </li>
+    <li class="nav-item">
+      <a
+        class="nav-link {% if scenarios_active_tab == 'preview' %}active{% endif %}"
+        {% if scenarios_active_tab == 'preview' %}aria-current="page"{% endif %}
+        href="{{ url_for('scenarios_preview_page', scenario=scenario_tab, xml_path=preview_xml_path) if scenario_tab else url_for('scenarios_preview_page', xml_path=preview_xml_path) }}"
+        id="scenariosPreviewTabLink"
+        data-preview-base-url="{{ url_for('scenarios_preview_page') }}"
+        title="Generate a full preview for the selected scenario"
+      >Preview</a>
+    </li>
+  </ul>
+
+  {# Defaults used by JS; Preview tab can override with live editor state. #}
+  <input type="hidden" id="scenariosPreviewXmlPath" value="{{ preview_xml_path }}">
+  <input type="hidden" id="scenariosPreviewScenario" value="{{ scenario_tab }}">
+</div>
+
+<div class="position-fixed bottom-0 start-0 end-0 bg-body border-top" style="z-index: 1030;">
+  <div class="container-fluid py-2">
+    <div class="d-flex justify-content-end">
+      <button id="scenariosExecuteBtn" class="btn btn-success px-4 py-2 shadow-sm" type="button">Execute</button>
+    </div>
+  </div>
+</div>

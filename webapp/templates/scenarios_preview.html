@@ -1,0 +1,192 @@
+{% extends "layout.html" %}
+
+{% block title %}Preview{% endblock %}
+{% block active_page %}{% set active_page='scenarios' %}{% endblock %}
+{% block header_icon %}<i class="bi bi-eye fs-4"></i>{% endblock %}
+{% block header_title %}Preview{% endblock %}
+
+{% block extra_head %}
+<style>
+  body { padding-bottom: 0; }
+  #previewLayoutRow { min-height: calc(100vh - 200px); }
+  #previewLayoutRow > [class*='col-'] { min-width: 0; }
+  @media (max-width: 992px) {
+    #previewLayoutRow { min-height: 0; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+{% set scenario_tab = (active_scenario or scenario_tab or request.args.get('scenario','')) %}
+{% set scenarios_active_tab = 'preview' %}
+{% include 'partials/scenarios_tabs.html' with context %}
+
+<div class="container-fluid mt-3 d-flex flex-column" id="previewPageWrap">
+  <div class="row g-3 flex-grow-1 align-items-stretch" id="previewLayoutRow">
+    <div class="col-12 col-lg-3 d-flex">
+      <div class="card shadow-sm mb-3 flex-fill d-flex flex-column">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span class="fw-bold">Scenarios</span>
+          <button class="btn btn-sm btn-outline-secondary {% if not active_scenario %}d-none{% endif %}" id="previewScenarioFilterClear" type="button" title="Clear">Clear</button>
+        </div>
+        <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="previewScenarioList" style="min-height:0;">
+          {% if scenarios %}
+            {% for s in scenarios %}
+            <button
+              type="button"
+              class="list-group-item list-group-item-action py-1 {% if active_scenario and active_scenario==s %}active bg-primary text-white{% endif %}"
+              data-scen-name="{{ s }}"
+              data-xml-path="{{ (scenario_xml_by_name or {}).get(s, '') }}"
+            >{{ s }}</button>
+            {% endfor %}
+          {% else %}
+            <div class="p-3 text-muted small">No scenarios yet</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <div class="col-12 col-lg-9 d-flex">
+      <div class="flex-fill d-flex flex-column">
+        <div class="small text-muted mb-2">Generating a full preview can take a moment.</div>
+        <iframe
+          id="scenariosPreviewFrame"
+          name="scenariosPreviewFrame"
+          title="Full preview"
+          style="width: 100%; height: calc(100vh - 260px); border: 1px solid var(--bs-border-color); border-radius: .25rem; background: white;"
+        ></iframe>
+
+        <form id="scenariosPreviewLoadForm" method="post" action="{{ url_for('plan_full_preview_page', embed=1) }}" target="scenariosPreviewFrame" class="d-none">
+          <input type="hidden" name="xml_path" id="scenariosPreviewLoadXmlPath" value="{{ preview_xml_path or request.args.get('xml_path','') }}">
+          <input type="hidden" name="scenario" id="scenariosPreviewLoadScenario" value="{{ scenario_tab }}">
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal" tabindex="-1" id="scenariosPreviewLoadingModal" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-body d-flex align-items-center gap-3">
+        <div class="spinner-border" role="status" aria-label="Loading"></div>
+        <div>
+          <div class="fw-semibold">Loading preview…</div>
+          <div class="small text-muted">Generating plan and rendering preview page.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block body_container %}
+{{ super() }}
+<script>
+(function(){
+  function showLoading(){
+    try {
+      const el = document.getElementById('scenariosPreviewLoadingModal');
+      if(!el || !window.bootstrap || !window.bootstrap.Modal) return null;
+      const modal = window.bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
+      modal.show();
+      return modal;
+    } catch(e){ return null; }
+  }
+
+  function loadPreview(){
+    const params = new URLSearchParams(window.location.search || '');
+    const xmlPath = (params.get('xml_path') || document.getElementById('scenariosPreviewLoadXmlPath')?.value || '').trim();
+    const scenario = (params.get('scenario') || document.getElementById('scenariosPreviewLoadScenario')?.value || '').trim();
+
+    const frame = document.getElementById('scenariosPreviewFrame');
+    const form = document.getElementById('scenariosPreviewLoadForm');
+    const inXml = document.getElementById('scenariosPreviewLoadXmlPath');
+    const inSc = document.getElementById('scenariosPreviewLoadScenario');
+
+    if(!xmlPath){
+      if(frame){
+        frame.srcdoc = '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">Save XML first to preview.</div>';
+      }
+      return;
+    }
+
+    if(inXml) inXml.value = xmlPath;
+    if(inSc) inSc.value = scenario;
+
+    const modal = showLoading();
+    if(frame){
+      // Clear previous content for immediate feedback.
+      try { frame.srcdoc = '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">Loading preview…</div>'; } catch(e){}
+      frame.addEventListener('load', ()=>{ try { modal && modal.hide(); } catch(e){} }, { once: true });
+    }
+
+    try { form && form.submit(); } catch(e){ try { modal && modal.hide(); } catch(_e){} }
+  }
+
+  document.addEventListener('DOMContentLoaded', ()=>{
+    // Shared Scenarios Execute button: forward to the embedded full preview's Execute.
+    try {
+      document.getElementById('scenariosExecuteBtn')?.addEventListener('click', (ev)=>{
+        try {
+          ev.preventDefault();
+          const frame = document.getElementById('scenariosPreviewFrame');
+          const innerDoc = frame && frame.contentWindow ? frame.contentWindow.document : null;
+          const innerBtn = innerDoc ? innerDoc.getElementById('executeRunBtn') : null;
+          if(innerBtn){ innerBtn.click(); return; }
+          alert('Preview is still loading. Try again in a moment.');
+        } catch(e){}
+      });
+    } catch(e){}
+
+    // Sidebar scenario list: navigate to the selected scenario + known xml_path.
+    try {
+      const listEl = document.getElementById('previewScenarioList');
+      const clearBtn = document.getElementById('previewScenarioFilterClear');
+      const scenarios = {{ (scenarios or [])|tojson }};
+      const xmlByName = {{ (scenario_xml_by_name or {})|tojson }};
+      const baseUrl = '/scenarios/preview';
+      function goScenario(name){
+        const scen = (name || '').toString().trim();
+        const xml = (xmlByName && scen && xmlByName[scen]) ? String(xmlByName[scen]) : '';
+        if(!xml){
+          alert('No saved XML found for that scenario.');
+          return;
+        }
+        window.location.href = baseUrl + '?xml_path=' + encodeURIComponent(xml) + '&scenario=' + encodeURIComponent(scen);
+      }
+      if(listEl){
+        listEl.addEventListener('click', (ev)=>{
+          const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-scen-name]') : null;
+          if(!btn) return;
+          const scen = btn.getAttribute('data-scen-name') || '';
+          goScenario(scen);
+        });
+      }
+      if(clearBtn){
+        clearBtn.addEventListener('click', ()=>{
+          if(Array.isArray(scenarios) && scenarios.length){
+            goScenario(String(scenarios[0] || ''));
+          } else {
+            window.location.href = baseUrl;
+          }
+        });
+      }
+    } catch(e){}
+
+    // Clicking the Preview tab while already on Preview should reload.
+    const previewTab = document.getElementById('scenariosPreviewTabLink');
+    if(previewTab){
+      previewTab.addEventListener('click', (ev)=>{
+        try {
+          ev.preventDefault();
+          loadPreview();
+        } catch(e){}
+      });
+    }
+
+    loadPreview();
+  });
+})();
+</script>
+{% endblock %}
