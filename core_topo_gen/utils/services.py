@@ -269,6 +269,8 @@ def map_role_to_node_type(role: str) -> NodeType:
         return NodeType.HUB
     if low in {"wlan", "wireless", "wireless_lan"}:
         return NodeType.WIRELESS_LAN
+    if low in {"docker", "vulnerability"}:
+        return getattr(NodeType, "DOCKER", NodeType.DEFAULT)
     return NodeType.DEFAULT
 
 def mark_node_as_router(node: object, session: object) -> None:

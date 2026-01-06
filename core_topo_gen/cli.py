@@ -1142,6 +1142,67 @@ def main():
                 logging.info("No vulnerabilities selected (empty catalog or criteria)")
         except Exception as e:
             logging.warning("Vulnerability processing failed: %s", e)
+
+        # Also prepare compose files for explicitly-added Docker role nodes (standard template).
+        # These nodes are not tied to vulnerability selection and should still get the same docker-compose
+        # sanitation + iproute2/ethtool wrapper workflow.
+        try:
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+            standard_compose = os.path.join(repo_root, 'scripts', 'standard-ubuntu-docker-core', 'docker-compose.yml')
+            standard_compose = os.path.abspath(standard_compose)
+            standard_nodes = {}
+            try:
+                if 'docker_by_name' in locals() and isinstance(docker_by_name, dict):
+                    for nm, rec in docker_by_name.items():
+                        if not isinstance(rec, dict):
+                            continue
+                        if (rec.get('Type') or '').strip().lower() != 'docker-compose':
+                            continue
+                        path_val = os.path.abspath(str(rec.get('Path') or '')) if rec.get('Path') else ''
+                        name_val = str(rec.get('Name') or '')
+                        if name_val == 'standard-ubuntu-docker-core' or (path_val and path_val == standard_compose):
+                            standard_nodes[nm] = rec
+            except Exception:
+                standard_nodes = {}
+            if standard_nodes:
+                created = prepare_compose_for_assignments(standard_nodes, out_base="/tmp/vulns")
+                logging.info("Prepared standard docker compose files: %d for %d docker nodes", len(created), len(standard_nodes))
+        except Exception as e2:
+            logging.debug("Standard docker compose prepare skipped or failed: %s", e2)
+
+        # Finally, ensure docker-compose prep runs for any remaining docker nodes (e.g., Flow-injected flag packages).
+        # This is safe to run even if some nodes were already prepared earlier.
+        try:
+            all_docker_nodes = {}
+            if 'docker_by_name' in locals() and isinstance(docker_by_name, dict):
+                for nm, rec in docker_by_name.items():
+                    if not isinstance(rec, dict):
+                        continue
+                    if (rec.get('Type') or '').strip().lower() != 'docker-compose':
+                        continue
+                    all_docker_nodes[nm] = rec
+            if all_docker_nodes:
+                created = prepare_compose_for_assignments(all_docker_nodes, out_base="/tmp/vulns")
+                logging.info("Prepared docker compose files (all docker nodes): %d for %d docker nodes", len(created), len(all_docker_nodes))
+
+                # Sanity logging: show final per-node compose inputs and output file.
+                # Keep detail at DEBUG to avoid noisy logs by default.
+                try:
+                    for nm, rec in sorted(all_docker_nodes.items(), key=lambda x: str(x[0])):
+                        out_path = os.path.join('/tmp/vulns', f"docker-compose-{nm}.yml")
+                        logging.debug(
+                            "Docker node compose assignment node=%s Name=%s Path=%s Vector=%s out=%s exists=%s",
+                            nm,
+                            rec.get('Name'),
+                            rec.get('Path'),
+                            rec.get('Vector'),
+                            out_path,
+                            os.path.exists(out_path),
+                        )
+                except Exception:
+                    pass
+        except Exception as e2:
+            logging.debug("All docker compose prepare skipped or failed: %s", e2)
         seg_out_dir = "/tmp/segmentation"
         seg_summary_path = os.path.join(seg_out_dir, "segmentation_summary.json")
         segmentation_cfg = {

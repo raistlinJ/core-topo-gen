@@ -1,0 +1,1 @@
+flag{ssh_server_with_flag}

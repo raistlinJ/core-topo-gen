@@ -1,0 +1,8 @@
+version: '3.8'
+services:
+  flag_web_token_gate:
+    image: nginx:alpine
+    container_name: flag_web_token_gate
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./html:/usr/share/nginx/html:ro

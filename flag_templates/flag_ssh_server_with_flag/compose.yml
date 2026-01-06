@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  flag_ssh:
+    image: lscr.io/linuxserver/openssh-server:latest
+    container_name: flag_ssh
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+      - PASSWORD_ACCESS=true
+      - USER_NAME=student
+      - USER_PASSWORD=studentpw
+    volumes:
+      - ./flag.txt:/opt/flag.txt:ro
+      - ./hint.txt:/opt/hint.txt:ro

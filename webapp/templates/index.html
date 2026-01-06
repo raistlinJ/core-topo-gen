@@ -3348,7 +3348,7 @@ function normalizeBaseUpload(meta) {
 
 const ROUTER_NODE_TYPES = new Set(['router', 'prouter', 'mdr', 'core-router', 'gateway']);
 const SWITCH_NODE_TYPES = new Set(['switch', 'lanswitch', 'l3switch', 'bridge', 'core-switch']);
-const HOST_NODE_TYPES = new Set(['host', 'pc', 'server', 'workstation', 'client', 'desktop', 'lxc', 'xterm', 'generic', 'terminal', 'laptop']);
+const HOST_NODE_TYPES = new Set(['host', 'pc', 'server', 'workstation', 'docker', 'client', 'desktop', 'lxc', 'xterm', 'generic', 'terminal', 'laptop']);
 const NETWORK_NODE_TYPES = new Set(['network', 'lan', 'wan']);
 const WIRELESS_NODE_TYPES = new Set(['wireless', 'wirelesslan', 'wireless-lan', 'wlan', 'wifi']);
 const RJ45_NODE_TYPES = new Set(['rj45']);
@@ -6491,7 +6491,7 @@ function persistEditorState(){
 persistEditorState();
 
 const dropdownsBySection = {
-    'Node Information': ['Server','Workstation','PC','Random'],
+    'Node Information': ['Server','Workstation','PC','Docker','Random'],
     // Added 'Random' entry so user can explicitly request a random routing protocol.
     'Routing': ['RIP','RIPNG','BGP','OSPFv2','OSPFv3','Random'],
     'Services': ['SSH','HTTP','DHCPClient','Random'],
@@ -12307,7 +12307,7 @@ function renderItemRow(sidx, secName, iidx, it) {
         let options = ['Random'];
         switch (secName) {
             case 'Node Information':
-                options = ['Server', 'Workstation', 'PC', 'Random'];
+                options = ['Server', 'Workstation', 'PC', 'Docker', 'Random'];
                 break;
             case 'Routing':
                 options = ['RIP', 'RIPNG', 'BGP', 'OSPFv2', 'OSPFv3', 'Random'];

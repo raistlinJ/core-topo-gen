@@ -29,6 +29,8 @@ import fnmatch
 import copy
 from urllib.parse import urlparse, parse_qs
 
+from collections import deque
+
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Iterator, TextIO, Iterable
 
@@ -6449,6 +6451,23 @@ def _live_core_session_status_for_scenario(
     # If there are active sessions but none match the selected scenario, prefer
     # Unknown (None) over incorrectly marking the selected scenario as Running.
     if active_sessions:
+        # Conservative fallback: if there is exactly one scenario in scope and
+        # there are active CORE sessions, treat the first active session as the
+        # selected scenario's session. This avoids reporting Unknown in fresh
+        # runs where session->scenario linkage isn't available yet.
+        try:
+            if isinstance(scenario_names, list) and len(scenario_names) == 1:
+                only_norm = _normalize_scenario_label(scenario_names[0])
+                if only_norm and only_norm == scenario_norm:
+                    first = active_sessions[0] if active_sessions else None
+                    if isinstance(first, dict):
+                        return {
+                            'running': True,
+                            'session_id': _session_id_int(first),
+                            'state': str(first.get('state') or '').strip().lower(),
+                        }
+        except Exception:
+            pass
         return {
             'running': None,
             'session_id': None,
@@ -6534,13 +6553,23 @@ def participant_ui_details_api():
 
     vulnerability_ips = _vulnerability_ipv4s_from_session_xml(session_xml_path)
 
-    # Vulnerabilities count: prefer actual session XML-derived value.
+    # Vulnerabilities count:
+    # - Prefer actual session XML-derived value when we can parse a real file.
+    # - Otherwise fall back to the planned additive count from the summary.
     vuln_total: Optional[int] = None
-    if session_xml_path:
+    xml_exists = False
+    try:
+        xml_exists = bool(session_xml_path and os.path.exists(str(session_xml_path)))
+    except Exception:
+        xml_exists = False
+    if xml_exists:
         vuln_total = len(vulnerability_ips)
     else:
-        # Avoid showing "planned" counts as if they were actual.
-        vuln_total = None
+        planned = summary_meta.get('vuln_total_planned_additive') if isinstance(summary_meta, dict) else None
+        try:
+            vuln_total = int(planned) if planned is not None else None
+        except Exception:
+            vuln_total = None
 
     # Gateway: prefer the scenario's last session XML (matches core.html HITL gateway logic)
     gateway = ''
@@ -7266,6 +7295,410 @@ _LOGIN_EXEMPT_ENDPOINTS = {
 }
 
 
+# ---- Attack Flow / Flag Chain (Flow page) ----
+
+
+ATTACK_FLOW_EXTENSION_DEFINITION_ID = "extension-definition--fb9c968a-745b-4ade-9b25-c324172197f4"
+ATTACK_FLOW_SCHEMA_URL = "https://center-for-threat-informed-defense.github.io/attack-flow/stix/attack-flow-schema-2.0.0.json"
+ATTACK_FLOW_SCHEMA_VERSION = "2.0.0"
+
+
+def _iso_now() -> str:
+    try:
+        return datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+    except Exception:
+        return "1970-01-01T00:00:00Z"
+
+
+def _new_stix_id(stix_type: str) -> str:
+    return f"{stix_type}--{uuid.uuid4()}"
+
+
+def _latest_session_xml_for_scenario_norm(scenario_norm: str) -> str | None:
+    try:
+        history = _load_run_history()
+        last_run = _latest_run_history_for_scenario(scenario_norm, history)
+    except Exception:
+        last_run = None
+    if not isinstance(last_run, dict):
+        return None
+    session_xml_path = last_run.get('session_xml_path') or last_run.get('post_xml_path')
+    if not session_xml_path:
+        return None
+    try:
+        ap = os.path.abspath(str(session_xml_path))
+    except Exception:
+        ap = str(session_xml_path)
+    if not ap or not os.path.exists(ap):
+        return None
+    return ap
+
+
+def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, set[str]]]:
+    """Return (nodes, links, adjacency) for the session XML.
+
+    This mirrors the logic in participant_ui_topology_api, including network nodes,
+    so reachability checks align with what the UI can draw.
+    """
+    try:
+        summary = _analyze_core_xml(xml_path)
+    except Exception:
+        summary = {}
+
+    raw_nodes = summary.get('nodes') if isinstance(summary, dict) else None
+    nodes_list: list[dict] = raw_nodes if isinstance(raw_nodes, list) else []
+
+    all_devices = _core_xml_device_summaries(xml_path)
+    all_networks = _core_xml_network_summaries(xml_path)
+    name_map: dict[str, str] = {}
+    type_map: dict[str, str] = {}
+    device_compose_map: dict[str, dict[str, str]] = {}
+    for row in (all_devices or []):
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get('id') or '').strip()
+        if not rid:
+            continue
+        name_map.setdefault(rid, str(row.get('name') or rid))
+        type_map.setdefault(rid, str(row.get('type') or ''))
+        try:
+            comp = str(row.get('compose') or '').strip()
+        except Exception:
+            comp = ''
+        try:
+            comp_name = str(row.get('compose_name') or '').strip()
+        except Exception:
+            comp_name = ''
+        if comp or comp_name:
+            device_compose_map[rid] = {
+                'compose': comp,
+                'compose_name': comp_name,
+            }
+    for row in (all_networks or []):
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get('id') or '').strip()
+        if not rid:
+            continue
+        name_map.setdefault(rid, str(row.get('name') or rid))
+        type_map.setdefault(rid, str(row.get('type') or ''))
+
+    links_list: list[dict] = _core_xml_link_summaries(xml_path, id_to_name=name_map)
+
+    by_id: dict[str, dict] = {}
+    for n in nodes_list:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if nid:
+            by_id[nid] = n
+
+    for dev in all_devices:
+        did = str(dev.get('id') or '').strip()
+        if not did or did in by_id:
+            continue
+        by_id[did] = {
+            'id': did,
+            'name': dev.get('name') or did,
+            'type': dev.get('type') or '',
+            'compose': (device_compose_map.get(did) or {}).get('compose') or '',
+            'compose_name': (device_compose_map.get(did) or {}).get('compose_name') or '',
+            'services': [],
+            'interfaces': [],
+            'linked_nodes': [],
+        }
+
+    for net in all_networks:
+        nid = str(net.get('id') or '').strip()
+        if not nid or nid in by_id:
+            continue
+        raw_type = str(net.get('type') or '').strip()
+        type_hint = (raw_type or '').lower()
+        name_hint = str(net.get('name') or '').strip().lower()
+        is_hitl = False
+        try:
+            name_looks_like_iface = bool(re.match(r'^(ens|enp|eth)\d', name_hint))
+        except Exception:
+            name_looks_like_iface = False
+
+        if name_looks_like_iface or 'rj45' in type_hint or 'rj-45' in type_hint or 'hitl' in type_hint or 'tap' in type_hint:
+            coerced_type = 'hitl'
+            is_hitl = True
+        elif 'wlan' in type_hint or 'wireless' in type_hint:
+            coerced_type = 'wlan'
+        else:
+            coerced_type = 'switch'
+        by_id[nid] = {
+            'id': nid,
+            'name': net.get('name') or nid,
+            'type': coerced_type,
+            'services': [],
+            'interfaces': [],
+            'linked_nodes': [],
+            'is_hitl': bool(is_hitl),
+        }
+
+    out_nodes: list[dict[str, Any]] = []
+    for nid, n in by_id.items():
+        out_nodes.append({
+            'id': nid,
+            'name': str(n.get('name') or nid),
+            'type': (str(n.get('type') or '').strip() or 'node'),
+            'compose': str(n.get('compose') or (device_compose_map.get(nid) or {}).get('compose') or ''),
+            'compose_name': str(n.get('compose_name') or (device_compose_map.get(nid) or {}).get('compose_name') or ''),
+            'interfaces': n.get('interfaces') if isinstance(n.get('interfaces'), list) else [],
+            'services': n.get('services') if isinstance(n.get('services'), list) else [],
+        })
+
+    out_links: list[dict[str, str]] = []
+    for l in links_list:
+        if not isinstance(l, dict):
+            continue
+        a = str(l.get('node1') or '').strip()
+        b = str(l.get('node2') or '').strip()
+        if not a or not b or a == b:
+            continue
+        if a not in by_id or b not in by_id:
+            continue
+        out_links.append({'node1': a, 'node2': b})
+
+    adj: dict[str, set[str]] = {nid: set() for nid in by_id.keys()}
+    for l in out_links:
+        a = str(l.get('node1') or '').strip()
+        b = str(l.get('node2') or '').strip()
+        if not a or not b:
+            continue
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+
+    return out_nodes, out_links, adj
+
+
+def _pick_flag_chain_nodes(nodes: list[dict[str, Any]], adj: dict[str, set[str]], *, length: int) -> list[dict[str, Any]]:
+    """Pick an ordered list of nodes to place flags on.
+
+    The chain is considered solvable if each consecutive pair is connected by
+    at least one path in the topology graph. We build the chain by:
+    - picking two far-apart endpoints (approx. diameter) in the full graph
+    - extracting eligible nodes along that path
+    """
+    length = max(1, min(int(length or 1), 50))
+
+    id_to_node: dict[str, dict[str, Any]] = {}
+    eligible_ids: list[str] = []
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if not nid:
+            continue
+        id_to_node[nid] = n
+        t = (str(n.get('type') or '').strip().lower())
+        # Current rule: any Docker node is eligible (scenario Docker-role nodes + vulnerability Docker nodes).
+        is_docker = ('docker' in t) or (str(n.get('type') or '').strip().upper() == 'DOCKER')
+        if not is_docker:
+            continue
+        eligible_ids.append(nid)
+
+    if not eligible_ids:
+        return []
+
+    def bfs_farthest(start: str) -> tuple[str, dict[str, str | None]]:
+        parent: dict[str, str | None] = {start: None}
+        q = deque([start])
+        last = start
+        while q:
+            cur = q.popleft()
+            last = cur
+            for nb in adj.get(cur, set()):
+                if nb in parent:
+                    continue
+                parent[nb] = cur
+                q.append(nb)
+        return last, parent
+
+    # Choose a start node that is likely connected.
+    start = eligible_ids[0]
+    far1, _p1 = bfs_farthest(start)
+    far2, parents = bfs_farthest(far1)
+
+    # Reconstruct full graph path far1 -> far2.
+    path_ids: list[str] = []
+    cur = far2
+    while cur is not None:
+        path_ids.append(cur)
+        cur = parents.get(cur)
+    path_ids.reverse()
+
+    # Extract eligible nodes along the path.
+    chain_ids: list[str] = [nid for nid in path_ids if nid in eligible_ids]
+
+    # If not enough eligible nodes on that path, fall back to a BFS walk over eligible nodes.
+    if len(chain_ids) < length:
+        seen = set()
+        q = deque([start])
+        chain_ids = []
+        while q and len(chain_ids) < length:
+            cur = q.popleft()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if cur in eligible_ids:
+                chain_ids.append(cur)
+            for nb in sorted(adj.get(cur, set())):
+                if nb not in seen:
+                    q.append(nb)
+
+    chain_ids = chain_ids[:length]
+    # Default ordering: randomize the sequence (user can tweak ordering in the UI).
+    try:
+        import random as _random
+        _random.Random().shuffle(chain_ids)
+    except Exception:
+        pass
+    return [id_to_node[nid] for nid in chain_ids if nid in id_to_node]
+
+
+def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
+    """Return counts for debugging Flow eligibility.
+
+    - docker_total: nodes that look like docker nodes
+    - compose_backed_total: docker nodes that carry compose metadata
+    - eligible_total: docker nodes eligible for chain placement (current eligibility)
+    """
+    docker_total = 0
+    compose_backed_total = 0
+    eligible_total = 0
+    for n in nodes or []:
+        if not isinstance(n, dict):
+            continue
+        t_raw = str(n.get('type') or '')
+        t = t_raw.strip().lower()
+        is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
+        if not is_docker:
+            continue
+        docker_total += 1
+        comp = str(n.get('compose') or '').strip()
+        comp_name = str(n.get('compose_name') or '').strip()
+        if comp or comp_name:
+            compose_backed_total += 1
+        # Eligibility is now any docker node.
+        eligible_total += 1
+    return {
+        'docker_total': docker_total,
+        'compose_backed_total': compose_backed_total,
+        'eligible_total': eligible_total,
+    }
+
+
+def _attack_flow_bundle_for_chain(*, chain_nodes: list[dict[str, Any]], scenario_label: str) -> dict[str, Any]:
+    now = _iso_now()
+
+    identity_id = _new_stix_id('identity')
+    bundle_id = _new_stix_id('bundle')
+    flow_id = _new_stix_id('attack-flow')
+
+    extension_definition = {
+        'type': 'extension-definition',
+        'spec_version': '2.1',
+        'id': ATTACK_FLOW_EXTENSION_DEFINITION_ID,
+        'name': 'Attack Flow',
+        'description': 'Extends STIX 2.1 with features to create Attack Flows.',
+        'created': now,
+        'modified': now,
+        'created_by_ref': identity_id,
+        'schema': ATTACK_FLOW_SCHEMA_URL,
+        'version': ATTACK_FLOW_SCHEMA_VERSION,
+        'extension_types': ['new-sdo'],
+        'external_references': [
+            {
+                'source_name': 'Documentation',
+                'description': 'Documentation for Attack Flow',
+                'url': 'https://center-for-threat-informed-defense.github.io/attack-flow',
+            },
+            {
+                'source_name': 'GitHub',
+                'description': 'Source code repository for Attack Flow',
+                'url': 'https://github.com/center-for-threat-informed-defense/attack-flow',
+            },
+        ],
+    }
+
+    author = {
+        'type': 'identity',
+        'spec_version': '2.1',
+        'id': identity_id,
+        'created': now,
+        'modified': now,
+        'name': 'CORE TopoGen',
+        'identity_class': 'organization',
+    }
+
+    def af_ext() -> dict[str, Any]:
+        return {
+            ATTACK_FLOW_EXTENSION_DEFINITION_ID: {
+                'extension_type': 'new-sdo',
+            }
+        }
+
+    assets: list[dict[str, Any]] = []
+    actions: list[dict[str, Any]] = []
+
+    for idx, node in enumerate(chain_nodes, start=1):
+        node_id = str(node.get('id') or '').strip()
+        node_name = str(node.get('name') or node_id)
+        node_type = str(node.get('type') or '')
+        asset_id = _new_stix_id('attack-asset')
+        action_id = _new_stix_id('attack-action')
+
+        assets.append({
+            'type': 'attack-asset',
+            'spec_version': '2.1',
+            'id': asset_id,
+            'created': now,
+            'modified': now,
+            'name': node_name,
+            'description': f"Topology node ({node_type}) id={node_id}",
+            'extensions': af_ext(),
+        })
+
+        actions.append({
+            'type': 'attack-action',
+            'spec_version': '2.1',
+            'id': action_id,
+            'created': now,
+            'modified': now,
+            'name': f"Capture Flag {idx}: {node_name}",
+            'description': f"Capture the flag placed on node '{node_name}' (id={node_id}).",
+            'asset_refs': [asset_id],
+            'extensions': af_ext(),
+        })
+
+    # Link actions as a chain (effect_refs).
+    for i in range(len(actions) - 1):
+        actions[i]['effect_refs'] = [actions[i + 1]['id']]
+
+    flow_obj = {
+        'type': 'attack-flow',
+        'spec_version': '2.1',
+        'id': flow_id,
+        'created': now,
+        'modified': now,
+        'name': f"Flag Chain" + (f" - {scenario_label}" if scenario_label else ''),
+        'description': 'A linear chain of flags placed on topology nodes.',
+        'scope': 'incident',
+        'start_refs': [actions[0]['id']] if actions else [],
+        'extensions': af_ext(),
+    }
+
+    bundle = {
+        'type': 'bundle',
+        'id': bundle_id,
+        'objects': [extension_definition, author, flow_obj, *assets, *actions],
+    }
+    return bundle
+
+
 @app.before_request
 def _require_login_redirect() -> None | Response:
     try:
@@ -7277,6 +7710,13 @@ def _require_login_redirect() -> None | Response:
         if endpoint in _LOGIN_EXEMPT_ENDPOINTS:
             return None
         if _current_user() is None:
+            # For API routes, return a JSON 401 instead of an HTML redirect.
+            # This prevents frontend fetch() calls from failing with non-JSON responses.
+            try:
+                if (request.path or '').startswith('/api/'):
+                    return jsonify({'ok': False, 'error': 'Login required'}), 401
+            except Exception:
+                pass
             return redirect(url_for('login'))
     except Exception:
         return None
@@ -7322,6 +7762,803 @@ def login():
 def logout():
     _set_current_user(None)
     return redirect(url_for('login'))
+
+
+@app.route('/flow')
+def flow_page():
+    history = _load_run_history()
+    current_user = _current_user()
+    scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
+    scenario_participant_urls = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
+    participant_url_flags = {
+        norm: bool(url)
+        for norm, url in scenario_participant_urls.items()
+        if isinstance(norm, str) and norm
+    }
+
+    scenario_query = request.args.get('scenario', '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_query)
+    # Enforce per-scenario view: default to the first available scenario when unset/invalid.
+    if scenario_names:
+        if not scenario_norm or not any(_normalize_scenario_label(n) == scenario_norm for n in scenario_names):
+            scenario_norm = _normalize_scenario_label(scenario_names[0])
+    active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
+
+    return render_template(
+        'flow.html',
+        scenarios=scenario_names,
+        active_scenario=active_scenario,
+        participant_url_flags=participant_url_flags,
+    )
+
+
+def _latest_preview_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
+    """Return absolute path to newest persisted preview plan for scenario.
+
+    Preview plans are created by /plan/full_preview_page and stored under
+    outputs/plans/plan_from_preview_*.json.
+    """
+    try:
+        scenario_norm = _normalize_scenario_label(scenario_norm)
+        if not scenario_norm:
+            return None
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        if not plans_dir.is_dir():
+            return None
+        candidates = list(plans_dir.glob('plan_from_preview_*.json'))
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        # Cap scan to avoid walking very large directories.
+        for p in candidates[:250]:
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    payload = json.load(f) or {}
+                meta = payload.get('metadata') if isinstance(payload, dict) else None
+                scen = str((meta or {}).get('scenario') or '').strip()
+                if _normalize_scenario_label(scen) == scenario_norm:
+                    return str(p)
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+def _build_topology_graph_from_preview_plan(preview: Dict[str, Any]) -> Tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, set[str]]]:
+    """Build a lightweight graph from a full_preview payload.
+
+    This is used for Flow generation based on persisted preview artifacts
+    (no CORE session XML required).
+    """
+    nodes_out: list[dict[str, Any]] = []
+    links_out: list[dict[str, str]] = []
+    by_id: dict[str, dict[str, Any]] = {}
+
+    def _add_node(nid: str, name: str, ntype: str, *, compose: str = '', compose_name: str = '') -> None:
+        if not nid or nid in by_id:
+            return
+        rec = {
+            'id': nid,
+            'name': name or nid,
+            'type': ntype or 'node',
+            'compose': compose or '',
+            'compose_name': compose_name or '',
+            'interfaces': [],
+            'services': [],
+        }
+        by_id[nid] = rec
+        nodes_out.append(rec)
+
+    def _add_link(a: str, b: str) -> None:
+        a = str(a or '').strip()
+        b = str(b or '').strip()
+        if not a or not b or a == b:
+            return
+        if a not in by_id or b not in by_id:
+            return
+        links_out.append({'node1': a, 'node2': b})
+
+    # Add routers
+    for r in (preview.get('routers') or []):
+        if not isinstance(r, dict):
+            continue
+        rid = str(r.get('node_id') or '').strip()
+        if not rid:
+            continue
+        _add_node(rid, str(r.get('name') or f'router-{rid}'), 'router')
+
+    # Add switches
+    for s in (preview.get('switches') or []):
+        if not isinstance(s, dict):
+            continue
+        sid = str(s.get('node_id') or '').strip()
+        if not sid:
+            continue
+        _add_node(sid, str(s.get('name') or f'switch-{sid}'), 'switch')
+
+    # Add hosts
+    for h in (preview.get('hosts') or []):
+        if not isinstance(h, dict):
+            continue
+        hid = str(h.get('node_id') or '').strip()
+        if not hid:
+            continue
+        role = str(h.get('role') or 'Host')
+        role_norm = role.strip().lower()
+        vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
+        is_vuln = bool(vulns)
+        is_docker_role = role_norm == 'docker'
+        # Flow eligibility logic expects docker nodes to have compose metadata.
+        # In preview artifacts, we approximate:
+        # - role=Dockers => standard compose
+        # - vulnerability-assigned hosts => compose-backed via "preview-vuln" marker
+        node_type = 'docker' if (is_docker_role or is_vuln) else 'host'
+        compose = ''
+        compose_name = ''
+        if is_docker_role:
+            compose_name = 'standard-ubuntu-docker-core'
+            compose = 'scripts/standard-ubuntu-docker-core/docker-compose.yml'
+        elif is_vuln:
+            # Best-effort marker; preview does not currently carry compose paths.
+            compose_name = 'preview-vuln'
+            compose = 'preview'
+        _add_node(hid, str(h.get('name') or f'host-{hid}'), node_type, compose=compose, compose_name=compose_name)
+
+    # Router-to-router links
+    for l in (preview.get('r2r_links_preview') or []):
+        if not isinstance(l, dict):
+            continue
+        routers = l.get('routers')
+        if not isinstance(routers, list) or len(routers) < 2:
+            continue
+        try:
+            a = str((routers[0] or {}).get('id') or '').strip()
+            b = str((routers[1] or {}).get('id') or '').strip()
+        except Exception:
+            continue
+        _add_link(a, b)
+
+    # Router-switch-host grouping
+    try:
+        for detail in (preview.get('switches_detail') or []):
+            if not isinstance(detail, dict):
+                continue
+            sid = str(detail.get('switch_id') or '').strip()
+            rid = str(detail.get('router_id') or '').strip()
+            if sid and rid:
+                _add_link(sid, rid)
+            for hid in (detail.get('hosts') or []):
+                _add_link(sid, str(hid))
+    except Exception:
+        pass
+
+    # Direct host-router attachment (when no switches)
+    try:
+        hrm = preview.get('host_router_map') or {}
+        if isinstance(hrm, dict):
+            for hid, rid in hrm.items():
+                _add_link(str(hid), str(rid))
+    except Exception:
+        pass
+
+    adj: dict[str, set[str]] = {nid: set() for nid in by_id.keys()}
+    for l in links_out:
+        a = str(l.get('node1') or '').strip()
+        b = str(l.get('node2') or '').strip()
+        if not a or not b:
+            continue
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+
+    return nodes_out, links_out, adj
+
+
+@app.route('/api/flow/latest_preview_plan')
+def api_flow_latest_preview_plan():
+    scenario_label = (request.args.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+    plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm)
+    if not plan_path:
+        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview from the Scenarios page first.'}), 404
+    try:
+        with open(plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+        meta = payload.get('metadata') if isinstance(payload, dict) else None
+    except Exception:
+        meta = None
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'preview_plan_path': plan_path,
+        'metadata': meta or {},
+    })
+
+
+def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, Any]], scenario_label: str) -> list[dict[str, Any]]:
+    """Return a per-position list of flag assignments aligned to chain_ids.
+
+    Each item includes node_id plus the fields used for metadata.flow_flag.
+    Deterministic-ish: shuffles eligible flags based on preview.seed.
+    """
+    if not isinstance(preview, dict) or not isinstance(chain_nodes, list) or not chain_nodes:
+        return []
+
+    chain_ids: list[str] = [str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()]
+    if not chain_ids:
+        return []
+
+    try:
+        flag_items, _flag_meta = _flag_catalog_items_from_enabled_sources()
+    except Exception:
+        flag_items, _flag_meta = ([], {})
+
+    def _is_local_path(p: str) -> bool:
+        try:
+            if not p:
+                return False
+            if p.startswith('http://') or p.startswith('https://'):
+                return False
+            return True
+        except Exception:
+            return False
+
+    repo_root = _get_repo_root()
+    eligible_flags: list[dict[str, Any]] = []
+    known_io: dict[str, dict[str, list[str]]] = {
+        'flag_creds_drop': {'inputs': [], 'outputs': ['ssh.username', 'ssh.password']},
+        'flag_ssh_server_with_flag': {'inputs': ['ssh.username', 'ssh.password'], 'outputs': ['flag']},
+        'flag_http_basic_creds_drop': {'inputs': [], 'outputs': ['http.basic.username', 'http.basic.password']},
+        'flag_web_basic_auth_flag': {'inputs': ['http.basic.username', 'http.basic.password'], 'outputs': ['flag']},
+        'flag_token_drop': {'inputs': [], 'outputs': ['api.token']},
+        'flag_web_token_gate_flag': {'inputs': ['api.token'], 'outputs': ['flag']},
+        'flag_ssh_key_drop': {'inputs': [], 'outputs': ['ssh.username', 'ssh.private_key']},
+        'flag_ssh_server_key_auth_with_flag': {'inputs': ['ssh.username', 'ssh.private_key'], 'outputs': ['flag']},
+    }
+    known_hint: dict[str, str] = {
+        'flag_creds_drop': 'Next: SSH to {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}) using ssh.username/ssh.password.',
+        'flag_ssh_server_with_flag': 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}). Read /opt/flag.txt after SSH login.',
+        'flag_http_basic_creds_drop': 'Next: visit {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}) and use HTTP Basic Auth (http.basic.username/http.basic.password).',
+        'flag_web_basic_auth_flag': 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}).',
+        'flag_token_drop': 'Next: visit {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}) with ?token=<api.token>.',
+        'flag_web_token_gate_flag': 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}).',
+        'flag_ssh_key_drop': 'Next: SSH to {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}) using ssh.private_key as student.',
+        'flag_ssh_server_key_auth_with_flag': 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}).',
+    }
+    try:
+        for it in (flag_items or []):
+            if not isinstance(it, dict):
+                continue
+            if (str(it.get('type') or '').strip().lower() != 'docker-compose'):
+                continue
+            raw_path = str(it.get('path') or '').strip()
+            if not _is_local_path(raw_path):
+                continue
+            abs_path = os.path.abspath(os.path.join(repo_root, raw_path)) if not os.path.isabs(raw_path) else os.path.abspath(raw_path)
+            if not os.path.exists(abs_path):
+                continue
+            rel_path = raw_path
+            try:
+                if os.path.commonpath([abs_path, repo_root]) == repo_root:
+                    rel_path = os.path.relpath(abs_path, repo_root)
+            except Exception:
+                rel_path = raw_path
+            eligible_flags.append({
+                'id': str(it.get('id') or '').strip() or str(it.get('name') or '').strip(),
+                'name': str(it.get('name') or '').strip() or str(it.get('id') or '').strip(),
+                'type': 'docker-compose',
+                'path': rel_path,
+                'compose_name': str(it.get('compose_name') or '').strip() or 'docker-compose.yml',
+                'security_profile': str(it.get('security_profile') or '').strip() or 'strict',
+                'enforce_security': bool(it.get('enforce_security', True)),
+                'inputs': list(it.get('inputs') or []) if isinstance(it.get('inputs'), list) else [],
+                'outputs': list(it.get('outputs') or []) if isinstance(it.get('outputs'), list) else [],
+                'hint_template': str(it.get('hint_template') or '').strip() or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})',
+            })
+    except Exception:
+        eligible_flags = []
+
+    # Backfill IO for known built-in templates when catalogs predate inputs/outputs support.
+    try:
+        for f in eligible_flags:
+            fid = str(f.get('id') or '').strip()
+            if not fid or fid not in known_io:
+                continue
+            if not isinstance(f.get('inputs'), list) or not f.get('inputs'):
+                f['inputs'] = list(known_io[fid]['inputs'])
+            if not isinstance(f.get('outputs'), list) or not f.get('outputs'):
+                f['outputs'] = list(known_io[fid]['outputs'])
+            if not str(f.get('hint_template') or '').strip() and fid in known_hint:
+                f['hint_template'] = known_hint[fid]
+    except Exception:
+        pass
+
+    if not eligible_flags:
+        eligible_flags = [
+            {
+                'id': 'flag_creds_drop',
+                'name': 'flag_creds_drop',
+                'type': 'docker-compose',
+                'path': os.path.join('flag_templates', 'flag_creds_drop', 'compose.yml'),
+                'compose_name': 'compose.yml',
+                'security_profile': 'strict',
+                'enforce_security': True,
+                'inputs': [],
+                'outputs': ['ssh.username', 'ssh.password'],
+                'hint_template': known_hint.get('flag_creds_drop') or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})',
+            },
+            {
+                'id': 'flag_ssh_server_with_flag',
+                'name': 'flag_ssh_server_with_flag',
+                'type': 'docker-compose',
+                'path': os.path.join('flag_templates', 'flag_ssh_server_with_flag', 'compose.yml'),
+                'compose_name': 'compose.yml',
+                'security_profile': 'strict',
+                'enforce_security': True,
+                'inputs': ['ssh.username', 'ssh.password'],
+                'outputs': ['flag'],
+                'hint_template': known_hint.get('flag_ssh_server_with_flag') or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})',
+            },
+        ]
+
+    try:
+        import random as _random
+
+        seed_val = 0
+        try:
+            seed_val = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
+        except Exception:
+            seed_val = 0
+        rnd = _random.Random(seed_val ^ 0xC0FFEE)
+        rnd.shuffle(eligible_flags)
+    except Exception:
+        pass
+
+    # Map ids -> names for THIS/NEXT substitution.
+    id_to_name: dict[str, str] = {}
+    for n in chain_nodes:
+        try:
+            nid = str(n.get('id') or '').strip()
+            nm = str(n.get('name') or '').strip()
+            if nid:
+                id_to_name[nid] = nm or nid
+        except Exception:
+            pass
+
+    def _render_hint(tpl: str, *, this_id: str, next_id: str) -> str:
+        try:
+            text = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+            next_id_val = str(next_id or '').strip()
+            next_name_val = (id_to_name.get(next_id_val) or '').strip() if next_id_val else ''
+            if not next_id_val:
+                next_id_val = '(end)'
+            if not next_name_val:
+                next_name_val = '(end)'
+            repl = {
+                '{{SCENARIO}}': str(scenario_label or ''),
+                '{{THIS_NODE_ID}}': this_id,
+                '{{THIS_NODE_NAME}}': id_to_name.get(this_id) or this_id,
+                '{{NEXT_NODE_ID}}': next_id_val,
+                '{{NEXT_NODE_NAME}}': next_name_val,
+            }
+            for k, v in repl.items():
+                text = text.replace(k, str(v))
+            return text
+        except Exception:
+            return ''
+
+    out: list[dict[str, Any]] = []
+    if not eligible_flags:
+        return out
+    for i, cid in enumerate(chain_ids):
+        flag = eligible_flags[i % len(eligible_flags)]
+        next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
+        hint_tpl = str(flag.get('hint_template') or '').strip() or (known_hint.get(str(flag.get('id') or '').strip()) or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})')
+        out.append({
+            'node_id': str(cid),
+            'id': str(flag.get('id') or ''),
+            'name': str(flag.get('name') or ''),
+            'type': 'docker-compose',
+            'path': str(flag.get('path') or ''),
+            'compose_name': str(flag.get('compose_name') or ''),
+            'security_profile': str(flag.get('security_profile') or ''),
+            'enforce_security': bool(flag.get('enforce_security', True)),
+            'inputs': list(flag.get('inputs') or []) if isinstance(flag.get('inputs'), list) else [],
+            'outputs': list(flag.get('outputs') or []) if isinstance(flag.get('outputs'), list) else [],
+            'hint_template': hint_tpl,
+            'hint': _render_hint(hint_tpl, this_id=str(cid), next_id=str(next_id)),
+            'next_node_id': str(next_id),
+            'next_node_name': str(id_to_name.get(str(next_id)) or ''),
+        })
+    return out
+
+
+@app.route('/api/flow/attackflow_preview')
+def api_flow_attackflow_preview():
+    scenario_label = (request.args.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    length_raw = request.args.get('length')
+    try:
+        length = int(length_raw) if length_raw is not None else 5
+    except Exception:
+        length = 5
+    length = max(1, min(length, 50))
+
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    preview_plan_path = (request.args.get('preview_plan') or '').strip() or None
+    if preview_plan_path:
+        try:
+            preview_plan_path = os.path.abspath(preview_plan_path)
+            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
+            if os.path.commonpath([preview_plan_path, plans_dir]) != plans_dir:
+                preview_plan_path = None
+            elif not os.path.exists(preview_plan_path):
+                preview_plan_path = None
+        except Exception:
+            preview_plan_path = None
+    if not preview_plan_path:
+        preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm)
+
+    if not preview_plan_path:
+        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
+
+    try:
+        with open(preview_plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+        preview = payload.get('full_preview') if isinstance(payload, dict) else None
+        if not isinstance(preview, dict):
+            return jsonify({'ok': False, 'error': 'Preview plan is missing full_preview.'}), 422
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
+
+    nodes, _links, adj = _build_topology_graph_from_preview_plan(preview)
+    stats = _flow_compose_docker_stats(nodes)
+    chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
+    flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+
+    if len(chain_nodes) < 1:
+        return jsonify({'ok': False, 'error': 'No eligible Docker nodes found in preview plan.' , 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
+    if len(chain_nodes) < length:
+        return jsonify({
+            'ok': False,
+            'error': f'Only {len(chain_nodes)} eligible Docker nodes found for chain length {length}.',
+            'available': len(chain_nodes),
+            'stats': stats,
+            'preview_plan_path': preview_plan_path,
+        }), 422
+
+    bundle = _attack_flow_bundle_for_chain(chain_nodes=chain_nodes, scenario_label=scenario_label or scenario_norm)
+    out = {
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'length': length,
+        'preview_plan_path': preview_plan_path,
+        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+        'flag_assignments': flag_assignments,
+        'stats': stats,
+        'bundle': bundle,
+    }
+
+    if (request.args.get('download') or '').strip() in {'1', 'true', 'yes'}:
+        payload_b = json.dumps(bundle, ensure_ascii=False, indent=2).encode('utf-8')
+        safe_scenario = secure_filename(scenario_norm or 'scenario') or 'scenario'
+        fname = f"attackflow_preview_{safe_scenario}_{length}.json"
+        return Response(
+            payload_b,
+            mimetype='application/json',
+            headers={'Content-Disposition': f'attachment; filename={fname}'},
+        )
+
+    return jsonify(out)
+
+
+@app.route('/api/flow/prepare_preview_for_execute', methods=['POST'])
+def api_flow_prepare_preview_for_execute():
+    j = request.get_json(silent=True) or {}
+    scenario_label = str(j.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    try:
+        length = int(j.get('length') or 5)
+    except Exception:
+        length = 5
+    length = max(1, min(length, 50))
+
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    base_plan_path = str(j.get('preview_plan') or '').strip() or None
+    if base_plan_path:
+        try:
+            base_plan_path = os.path.abspath(base_plan_path)
+            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
+            if os.path.commonpath([base_plan_path, plans_dir]) != plans_dir:
+                base_plan_path = None
+            elif not os.path.exists(base_plan_path):
+                base_plan_path = None
+        except Exception:
+            base_plan_path = None
+    if not base_plan_path:
+        base_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm)
+
+    if not base_plan_path:
+        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
+
+    try:
+        with open(base_plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+        meta = payload.get('metadata') if isinstance(payload, dict) else {}
+        preview = payload.get('full_preview') if isinstance(payload, dict) else None
+        if not isinstance(preview, dict):
+            return jsonify({'ok': False, 'error': 'Preview plan is missing full_preview.'}), 422
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
+
+    nodes, _links, adj = _build_topology_graph_from_preview_plan(preview)
+    stats = _flow_compose_docker_stats(nodes)
+
+    # Allow caller to provide an explicit ordered chain.
+    chain_ids_in = j.get('chain_ids')
+    chain_ids: list[str] = []
+    if isinstance(chain_ids_in, list) and chain_ids_in:
+        for cid in chain_ids_in:
+            c = str(cid or '').strip()
+            if c:
+                chain_ids.append(c)
+        chain_ids = chain_ids[:length]
+
+    if chain_ids:
+        id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict)}
+        chain_nodes = [id_map[cid] for cid in chain_ids if cid in id_map]
+        if len(chain_nodes) < 1:
+            return jsonify({'ok': False, 'error': 'Provided chain_ids did not match any nodes in the preview plan.', 'stats': stats}), 422
+    else:
+        chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
+        if len(chain_nodes) < length:
+            return jsonify({'ok': False, 'error': 'Not enough eligible Docker nodes in preview plan to build the requested chain.', 'available': len(chain_nodes), 'stats': stats}), 422
+        chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if str(n.get('id') or '').strip()]
+
+    # Apply Flow modifications to the preview payload: promote chain nodes to Docker role.
+    try:
+        hosts = preview.get('hosts') or []
+        if isinstance(hosts, list):
+            for h in hosts:
+                if not isinstance(h, dict):
+                    continue
+                hid = str(h.get('node_id') or '').strip()
+                if hid and hid in chain_ids:
+                    h['role'] = 'Docker'
+    except Exception:
+        pass
+
+    # Inject flag packages into chain nodes by attaching a docker-compose reference in host metadata.
+    # The topology builder + CLI will later generate per-node compose files under /tmp/vulns/docker-compose-<node>.yml.
+    flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+    try:
+        host_by_id: dict[str, dict[str, Any]] = {}
+        hosts = preview.get('hosts') or []
+        if isinstance(hosts, list):
+            for h in hosts:
+                if not isinstance(h, dict):
+                    continue
+                host_by_id[str(h.get('node_id') or '').strip()] = h
+        for fa in (flag_assignments or []):
+            if not isinstance(fa, dict):
+                continue
+            cid = str(fa.get('node_id') or '').strip()
+            h = host_by_id.get(cid)
+            if not h or not isinstance(h, dict):
+                continue
+            meta_h = h.get('metadata')
+            if not isinstance(meta_h, dict):
+                meta_h = {}
+                h['metadata'] = meta_h
+            meta_h['flow_flag'] = {
+                'id': str(fa.get('id') or ''),
+                'name': str(fa.get('name') or ''),
+                'type': 'docker-compose',
+                'path': str(fa.get('path') or ''),
+                'compose_name': str(fa.get('compose_name') or ''),
+                'security_profile': str(fa.get('security_profile') or ''),
+                'enforce_security': bool(fa.get('enforce_security', True)),
+                'inputs': list(fa.get('inputs') or []) if isinstance(fa.get('inputs'), list) else [],
+                'outputs': list(fa.get('outputs') or []) if isinstance(fa.get('outputs'), list) else [],
+                'hint_template': str(fa.get('hint_template') or ''),
+                'hint': str(fa.get('hint') or ''),
+                'next_node_id': str(fa.get('next_node_id') or ''),
+                'next_node_name': str(fa.get('next_node_name') or ''),
+            }
+    except Exception:
+        pass
+
+    try:
+        flow_meta = {
+            'source_preview_plan_path': base_plan_path,
+            'scenario': scenario_label or scenario_norm,
+            'length': length,
+            'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+            'modified_at': _iso_now(),
+        }
+        if isinstance(meta, dict):
+            meta = dict(meta)
+            meta['flow'] = flow_meta
+        else:
+            meta = {'flow': flow_meta}
+    except Exception:
+        pass
+
+    # Persist a new plan artifact in outputs/plans so /run_cli_async can safely consume it.
+    try:
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        seed = None
+        try:
+            seed = int((preview.get('seed') if isinstance(preview, dict) else None) or (meta.get('seed') if isinstance(meta, dict) else None) or 0)
+        except Exception:
+            seed = 0
+        suffix = secrets.token_hex(3)
+        out_name = f"plan_from_flow_{seed}_{int(time.time())}_{suffix}.json"
+        out_path = str(plans_dir / out_name)
+        out_payload = {
+            'full_preview': preview,
+            'metadata': meta,
+        }
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(out_payload, f, indent=2)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to persist flow-modified preview plan: {e}'}), 500
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'length': length,
+        'stats': stats,
+        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+        'flag_assignments': flag_assignments,
+        'xml_path': str((meta or {}).get('xml_path') or ''),
+        'preview_plan_path': out_path,
+        'base_preview_plan_path': base_plan_path,
+    })
+
+
+@app.route('/api/flow/bundle_from_chain', methods=['POST'])
+def api_flow_bundle_from_chain():
+    """Build an AttackFlow bundle from a user-specified ordered chain."""
+    j = request.get_json(silent=True) or {}
+    scenario_label = str(j.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    chain = j.get('chain')
+    if not isinstance(chain, list) or not chain:
+        return jsonify({'ok': False, 'error': 'Missing chain.'}), 400
+
+    chain_nodes: list[dict[str, Any]] = []
+    for n in chain:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if not nid:
+            continue
+        chain_nodes.append({
+            'id': nid,
+            'name': str(n.get('name') or nid),
+            'type': str(n.get('type') or ''),
+            'compose': str(n.get('compose') or ''),
+            'compose_name': str(n.get('compose_name') or ''),
+        })
+    if not chain_nodes:
+        return jsonify({'ok': False, 'error': 'Chain contained no valid nodes.'}), 400
+
+    # Recompute flag generator assignments for this explicit chain order (for UI display).
+    flag_assignments: list[dict[str, Any]] = []
+    try:
+        plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm)
+        if plan_path and os.path.exists(plan_path):
+            with open(plan_path, 'r', encoding='utf-8') as f:
+                payload = json.load(f) or {}
+            preview = payload.get('full_preview') if isinstance(payload, dict) else None
+            if isinstance(preview, dict):
+                flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+    except Exception:
+        flag_assignments = []
+
+    bundle = _attack_flow_bundle_for_chain(chain_nodes=chain_nodes, scenario_label=scenario_label or scenario_norm)
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'length': len(chain_nodes),
+        'chain': chain_nodes,
+        'flag_assignments': flag_assignments,
+        'bundle': bundle,
+    })
+
+
+@app.route('/api/flow/attackflow')
+def api_flow_attackflow():
+    scenario_label = (request.args.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    length_raw = request.args.get('length')
+    try:
+        length = int(length_raw) if length_raw is not None else 5
+    except Exception:
+        length = 5
+    length = max(1, min(length, 50))
+
+    if not scenario_norm:
+        # If scenario not provided, try using the latest scenario in history.
+        try:
+            history = _load_run_history()
+            if isinstance(history, list) and history:
+                first = history[-1]
+                if isinstance(first, dict):
+                    scenario_label = str((first.get('scenario_name') or '').strip())
+                    scenario_norm = _normalize_scenario_label(scenario_label)
+        except Exception:
+            pass
+
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    xml_path = _latest_session_xml_for_scenario_norm(scenario_norm)
+    if not xml_path:
+        return jsonify({'ok': False, 'error': 'No session XML available for this scenario yet. Run the scenario first to generate a session XML (Flow reads the latest built session, not the editor draft).'}), 404
+
+    nodes, _links, adj = _build_topology_graph_from_session_xml(xml_path)
+    stats = _flow_compose_docker_stats(nodes)
+    chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
+
+    # If the editor draft appears newer than the latest session XML, include a hint.
+    stale_hint = ''
+    try:
+        history = _load_run_history()
+        _names, scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(history, user=_current_user())
+        scenario_xml_path = _select_existing_path(scenario_paths.get(scenario_norm)) if scenario_paths else None
+        if scenario_xml_path and os.path.exists(scenario_xml_path) and os.path.exists(xml_path):
+            scen_m = os.path.getmtime(scenario_xml_path)
+            sess_m = os.path.getmtime(xml_path)
+            # Small epsilon to avoid filesystem timestamp quirks.
+            if scen_m > (sess_m + 1.0):
+                stale_hint = ' Your saved scenario XML is newer than the latest session XML; re-run the scenario to regenerate session XML so Flow can see the new Docker/compose-backed nodes.'
+    except Exception:
+        stale_hint = ''
+
+    if len(chain_nodes) < 1:
+        return jsonify({'ok': False, 'error': 'No eligible Docker nodes found to place flags on.' + stale_hint, 'stats': stats}), 422
+    if len(chain_nodes) < length:
+        return jsonify({
+            'ok': False,
+            'error': f'Only {len(chain_nodes)} eligible Docker nodes found for chain length {length}.' + stale_hint,
+            'available': len(chain_nodes),
+            'stats': stats,
+        }), 422
+
+    bundle = _attack_flow_bundle_for_chain(chain_nodes=chain_nodes, scenario_label=scenario_label or scenario_norm)
+
+    out = {
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'length': length,
+        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+        'stats': stats,
+        'bundle': bundle,
+    }
+
+    if (request.args.get('download') or '').strip() in {'1', 'true', 'yes'}:
+        payload = json.dumps(bundle, ensure_ascii=False, indent=2).encode('utf-8')
+        safe_scenario = secure_filename(scenario_norm or 'scenario') or 'scenario'
+        fname = f"attackflow_{safe_scenario}_{length}.json"
+        return Response(
+            payload,
+            mimetype='application/json',
+            headers={
+                'Content-Disposition': f'attachment; filename={fname}',
+            },
+        )
+
+    return jsonify(out)
 
 
 @app.route('/users', methods=['GET'])
@@ -11772,6 +13009,33 @@ def _load_flag_sources_state() -> dict:
             return {'sources': []}
         if 'sources' not in data or not isinstance(data.get('sources'), list):
             data['sources'] = []
+
+        # If we previously auto-seeded from data_sources/flag_catalog.json, keep it in sync
+        # when the repo version changes. This avoids requiring a manual re-upload just to
+        # pick up new built-in generators.
+        try:
+            repo_seed = os.path.abspath(os.path.join(DATA_SOURCES_DIR, 'flag_catalog.json'))
+            if os.path.exists(repo_seed):
+                repo_mtime = os.path.getmtime(repo_seed)
+                for s in data.get('sources', []):
+                    if not isinstance(s, dict):
+                        continue
+                    if (s.get('name') or '') != 'flag_catalog.json':
+                        continue
+                    p = s.get('path')
+                    if not p or not os.path.exists(p):
+                        continue
+                    try:
+                        if os.path.getmtime(p) < repo_mtime:
+                            shutil.copyfile(repo_seed, p)
+                            s['rows'] = 'synced'
+                            s['uploaded'] = datetime.datetime.utcnow().isoformat() + 'Z'
+                            _save_flag_sources_state(data)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         return data
     except Exception:
         return {'sources': []}
@@ -11785,7 +13049,7 @@ def _save_flag_sources_state(state: dict) -> None:
 
 
 FLAG_REQUIRED_FIELDS = ['id', 'name', 'type', 'path']
-FLAG_OPTIONAL_FIELDS = ['compose_name', 'security_profile', 'enforce_security', 'description']
+FLAG_OPTIONAL_FIELDS = ['compose_name', 'security_profile', 'enforce_security', 'description', 'inputs', 'outputs', 'hint_template']
 FLAG_ALL_FIELDS = FLAG_REQUIRED_FIELDS + [f for f in FLAG_OPTIONAL_FIELDS if f not in FLAG_REQUIRED_FIELDS]
 
 
@@ -11815,9 +13079,33 @@ def _validate_and_normalize_flag_source_json(file_path: str, max_bytes: int = 5_
                 if k in item:
                     rec[k] = item.get(k)
             # Normalize required strings
-            for k in ('id', 'name', 'type', 'path', 'compose_name', 'security_profile', 'description'):
+            for k in ('id', 'name', 'type', 'path', 'compose_name', 'security_profile', 'description', 'hint_template'):
                 if k in rec and rec[k] is not None:
                     rec[k] = str(rec[k]).strip()
+
+            # Normalize inputs/outputs to a list of strings.
+            for k in ('inputs', 'outputs'):
+                if k not in rec:
+                    continue
+                v = rec.get(k)
+                if v is None:
+                    rec.pop(k, None)
+                    continue
+                if isinstance(v, str):
+                    raw_items = [p.strip() for p in v.split(',')]
+                    rec[k] = [p for p in raw_items if p]
+                elif isinstance(v, list):
+                    out_list: list[str] = []
+                    for x in v:
+                        if x is None:
+                            continue
+                        s = str(x).strip()
+                        if s:
+                            out_list.append(s)
+                    rec[k] = out_list
+                else:
+                    # Unknown type -> drop rather than fail.
+                    rec.pop(k, None)
             if not rec.get('name'):
                 skipped.append(f"row {idx+1}: missing name")
                 continue
@@ -11832,6 +13120,9 @@ def _validate_and_normalize_flag_source_json(file_path: str, max_bytes: int = 5_
                 rec['compose_name'] = 'docker-compose.yml'
             if not rec.get('security_profile'):
                 rec['security_profile'] = 'strict'
+            if not rec.get('hint_template'):
+                # Default hint: Flow will fill NEXT/THIS placeholders when displaying and when preparing execution.
+                rec['hint_template'] = 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
             # Normalize enforce_security boolean
             if 'enforce_security' in rec:
                 v = rec.get('enforce_security')
@@ -12677,9 +13968,8 @@ def api_proxmox_validate():
     except Exception:
         timeout = 5.0
     timeout = max(1.0, min(timeout, 30.0))
-    # Per requirement: only persist credentials when they are verified.
-    # This endpoint is the verification step, so always store securely on success.
-    remember_credentials = True
+    # Persist credentials only if explicitly requested.
+    remember_credentials = bool(payload.get('remember_credentials', True))
     prox_kwargs = {
         'host': host,
         'user': username,
@@ -12719,21 +14009,32 @@ def api_proxmox_validate():
     }
     summary: Dict[str, Any]
     secret_identifier: Optional[str] = None
-    try:
-        stored_meta = _save_proxmox_credentials(secret_payload)
-    except RuntimeError as exc:
-        return jsonify({'success': False, 'error': str(exc)}), 500
-    except Exception as exc:
-        app.logger.exception('[proxmox] failed to persist credentials: %s', exc)
-        return jsonify({'success': False, 'error': 'Credentials validated but could not be stored'}), 500
-    summary = {
-        'url': stored_meta['url'],
-        'port': stored_meta['port'],
-        'username': stored_meta['username'],
-        'verify_ssl': stored_meta['verify_ssl'],
-        'stored_at': stored_meta['stored_at'],
-    }
-    secret_identifier = stored_meta['identifier']
+    stored_at_val: Optional[str] = None
+    if remember_credentials:
+        try:
+            stored_meta = _save_proxmox_credentials(secret_payload)
+        except RuntimeError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 500
+        except Exception as exc:
+            app.logger.exception('[proxmox] failed to persist credentials: %s', exc)
+            return jsonify({'success': False, 'error': 'Credentials validated but could not be stored'}), 500
+        stored_at_val = stored_meta.get('stored_at')
+        summary = {
+            'url': stored_meta['url'],
+            'port': stored_meta['port'],
+            'username': stored_meta['username'],
+            'verify_ssl': stored_meta['verify_ssl'],
+            'stored_at': stored_at_val,
+        }
+        secret_identifier = stored_meta['identifier']
+    else:
+        summary = {
+            'url': url_raw,
+            'port': port,
+            'username': username,
+            'verify_ssl': verify_ssl,
+            'stored_at': None,
+        }
     message = f"Validated Proxmox access for {username} at {host}:{port}"
     # Persist a safe shared hint so builders/participants can see the validated state.
     # This is the non-secret subset (no password/token material).
@@ -12745,8 +14046,8 @@ def api_proxmox_validate():
                     'url': summary.get('url'),
                     'port': summary.get('port'),
                     'verify_ssl': summary.get('verify_ssl'),
-                    'secret_id': secret_identifier,
-                    'validated': bool(secret_identifier),
+                    'secret_id': secret_identifier if remember_credentials else None,
+                    'validated': bool(secret_identifier) if remember_credentials else False,
                     'last_validated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
                     'stored_at': summary.get('stored_at'),
                     'last_message': message,

@@ -697,6 +697,70 @@ def _apply_docker_compose_meta(node, rec, session=None):
     except Exception:
         logger.debug('Failed to set docker compose metadata for node %s', getattr(node, 'name', None))
 
+
+def _standard_docker_compose_template_path() -> str:
+    """Return absolute path to the repo's standard docker-compose template."""
+    try:
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        return os.path.join(repo_root, 'scripts', 'standard-ubuntu-docker-core', 'docker-compose.yml')
+    except Exception:
+        return 'scripts/standard-ubuntu-docker-core/docker-compose.yml'
+
+
+def _standard_docker_compose_record() -> Dict[str, str]:
+    """Compose record shaped like a vuln docker-compose entry (consumed by prepare_compose_for_assignments)."""
+    return {
+        'Type': 'docker-compose',
+        'Name': 'standard-ubuntu-docker-core',
+        'Path': _standard_docker_compose_template_path(),
+        'Vector': 'standard',
+    }
+
+
+def _repo_root_path() -> str:
+    try:
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+    except Exception:
+        return os.path.abspath('.')
+
+
+def _flow_flag_record_from_host_metadata(hdata: Any) -> Optional[Dict[str, str]]:
+    """Return a docker-compose record for a Flow-injected flag, if present on host metadata."""
+    try:
+        if not isinstance(hdata, dict):
+            return None
+        meta = hdata.get('metadata')
+        if not isinstance(meta, dict):
+            return None
+        flow_flag = meta.get('flow_flag')
+        if not isinstance(flow_flag, dict):
+            return None
+        ftype = str(flow_flag.get('type') or '').strip().lower()
+        if ftype and ftype != 'docker-compose':
+            return None
+        raw_path = str(flow_flag.get('path') or '').strip()
+        if not raw_path:
+            return None
+        resolved = raw_path
+        if not os.path.isabs(resolved):
+            try:
+                resolved = os.path.abspath(os.path.join(_repo_root_path(), resolved))
+            except Exception:
+                resolved = raw_path
+        name = str(flow_flag.get('name') or flow_flag.get('id') or '').strip() or 'flag'
+        hint_text = str(flow_flag.get('hint') or '').strip()
+        rec: Dict[str, str] = {
+            'Type': 'docker-compose',
+            'Name': name,
+            'Path': resolved,
+            'Vector': 'flag',
+        }
+        if hint_text:
+            rec['HintText'] = hint_text
+        return rec
+    except Exception:
+        return None
+
 def _router_node_type():
     """Return router-capable node type (prefer DOCKER if available for richer services)."""
     try:
@@ -765,6 +829,14 @@ def build_star_from_roles(core,
         node_id = idx + 2
         node_type = map_role_to_node_type(role)
         node_name = f"{role.lower()}-{idx+1}"
+
+        # Explicit Docker role: attach the standard compose template record so compose files can be prepared later.
+        try:
+            if _is_docker_node_type(node_type) and role.lower() == 'docker':
+                docker_by_name.setdefault(node_name, _standard_docker_compose_record())
+                created_docker += 1
+        except Exception:
+            pass
         # If this role would be a DEFAULT host, check slot plan to possibly make it a DOCKER node
         if node_type == NodeType.DEFAULT:
             host_slot_idx += 1
@@ -1041,6 +1113,14 @@ def build_multi_switch_topology(core,
 
         node_type = map_role_to_node_type(role)
         name = f"{role.lower()}-{idx+1}"
+
+        # Explicit Docker role: attach the standard compose template record so compose files can be prepared later.
+        try:
+            if _is_docker_node_type(node_type) and role.lower() == 'docker':
+                docker_by_name.setdefault(name, _standard_docker_compose_record())
+                created_docker += 1
+        except Exception:
+            pass
         if node_type == NodeType.DEFAULT:
             host_slot_idx += 1
             slot_key = f"slot-{host_slot_idx}"
@@ -1514,6 +1594,19 @@ def _try_build_segmented_topology_from_preview(
             y = int(base_y + radius * math.sin(angle))
         name = str(hdata.get('name') or f"host-{hid}")
 
+        # Explicit Docker role: attach compose metadata so compose files can be prepared later.
+        # If Flow injected a flag compose reference into host metadata, prefer that over the standard template.
+        try:
+            if _is_docker_node_type(node_type) and str(role).lower() == 'docker':
+                flow_rec = _flow_flag_record_from_host_metadata(hdata)
+                if flow_rec:
+                    docker_by_name[name] = flow_rec
+                else:
+                    docker_by_name.setdefault(name, _standard_docker_compose_record())
+                created_docker += 1
+        except Exception:
+            pass
+
         # If this would be a DEFAULT host, allow the docker slot plan to override it.
         if node_type == NodeType.DEFAULT:
             host_slot_idx += 1
@@ -1579,6 +1672,7 @@ def _try_build_segmented_topology_from_preview(
             switch_name_map[int(sval.get('node_id'))] = sval.get('name')
         except Exception:
             continue
+    declared_switch_ids: Set[int] = set(switch_name_map.keys())
 
     switch_nodes: Dict[int, Any] = {}
     for idx, detail in enumerate(switches_detail):
@@ -1586,9 +1680,8 @@ def _try_build_segmented_topology_from_preview(
             sid = int(detail.get('switch_id'))
         except Exception:
             continue
-        # Defensive: skip creating switches that would have no attached non-router nodes.
-        # This can occur if a persisted preview payload contains empty groups or host IDs
-        # that cannot be resolved in this build.
+        # Skip orphan switch details that have no resolvable hosts unless the
+        # switch was explicitly declared in preview_plan['switches'].
         try:
             raw_hosts = detail.get('hosts') or []
         except Exception:
@@ -1602,7 +1695,7 @@ def _try_build_segmented_topology_from_preview(
             if hid in host_nodes_by_id:
                 has_resolved_host = True
                 break
-        if not has_resolved_host:
+        if (not has_resolved_host) and (sid not in declared_switch_ids):
             continue
         if sid in switch_nodes:
             continue
@@ -1652,8 +1745,7 @@ def _try_build_segmented_topology_from_preview(
         except Exception:
             continue
 
-        # Defensive: if no attached hosts resolve, skip the entire detail.
-        # This avoids creating router-only switches/links from malformed preview payloads.
+        # Skip orphan/empty switch details unless the switch was explicitly declared.
         try:
             raw_hosts = detail.get('hosts') or []
         except Exception:
@@ -1667,7 +1759,7 @@ def _try_build_segmented_topology_from_preview(
             if hid in host_nodes_by_id:
                 has_resolved_host = True
                 break
-        if not has_resolved_host:
+        if (not has_resolved_host) and (sid not in declared_switch_ids):
             continue
 
         sw_node = switch_nodes.get(sid)
@@ -2671,6 +2763,14 @@ def build_segmented_topology(core,
             y = int(ry + r * math.sin(theta) + random.uniform(-20, 20))
             node_type = map_role_to_node_type(role)
             name = f"{role.lower()}-{ridx+1}-1"
+
+            # Explicit Docker role: attach the standard compose template record so compose files can be prepared later.
+            try:
+                if _is_docker_node_type(node_type) and role.lower() == 'docker':
+                    docker_by_name.setdefault(name, _standard_docker_compose_record())
+                    created_docker += 1
+            except Exception:
+                pass
             if node_type == NodeType.DEFAULT:
                 host_slot_idx += 1
                 slot_key = f"slot-{host_slot_idx}"
@@ -2771,6 +2871,14 @@ def build_segmented_topology(core,
                 y = int(ry + r * math.sin(theta) + random.uniform(-30, 30))
                 node_type = map_role_to_node_type(role)
                 name = f"{role.lower()}-{ridx+1}-{j+1}"
+
+                # Explicit Docker role: attach the standard compose template record so compose files can be prepared later.
+                try:
+                    if _is_docker_node_type(node_type) and role.lower() == 'docker':
+                        docker_by_name.setdefault(name, _standard_docker_compose_record())
+                        created_docker += 1
+                except Exception:
+                    pass
                 if node_type == NodeType.DEFAULT:
                     host_slot_idx += 1
                     slot_key = f"slot-{host_slot_idx}"

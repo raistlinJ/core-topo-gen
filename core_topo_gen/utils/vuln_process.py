@@ -689,6 +689,234 @@ def _force_compose_no_network(compose_obj: dict) -> dict:
 		return compose_obj
 
 
+def _iter_bind_sources_from_service(svc: Dict[str, object]) -> List[str]:
+	"""Return candidate host-side bind mount sources referenced by a compose service.
+
+	Only returns non-absolute sources; caller should validate existence.
+	"""
+	results: List[str] = []
+	if not isinstance(svc, dict):
+		return results
+	vols = svc.get('volumes')
+	if isinstance(vols, list):
+		for v in vols:
+			if isinstance(v, str):
+				# Format: source:target[:mode]
+				parts = v.split(':', 2)
+				if not parts:
+					continue
+				src = str(parts[0] or '').strip()
+				if not src or os.path.isabs(src):
+					continue
+				results.append(src)
+			elif isinstance(v, dict):
+				vtype = str(v.get('type') or '').strip().lower()
+				src = str(v.get('source') or '').strip()
+				if vtype and vtype != 'bind':
+					continue
+				if not src or os.path.isabs(src):
+					continue
+				results.append(src)
+	# env_file can be str or list
+	env_file = svc.get('env_file')
+	if isinstance(env_file, str):
+		p = env_file.strip()
+		if p and not os.path.isabs(p):
+			results.append(p)
+	elif isinstance(env_file, list):
+		for p in env_file:
+			if isinstance(p, str):
+				ps = p.strip()
+				if ps and not os.path.isabs(ps):
+					results.append(ps)
+	return results
+
+
+def _copy_support_paths_and_absolutize_binds(compose_obj: dict, src_dir: str, base_dir: str) -> dict:
+	"""Copy referenced relative bind sources into base_dir and rewrite to absolute paths.
+
+	This makes per-node compose files runnable from any working directory.
+	"""
+	try:
+		if not isinstance(compose_obj, dict):
+			return compose_obj
+		services = compose_obj.get('services')
+		if not isinstance(services, dict):
+			return compose_obj
+		# Gather all referenced relative paths that actually exist alongside the source compose.
+		seen: set[str] = set()
+		for _svc_name, svc in services.items():
+			if not isinstance(svc, dict):
+				continue
+			for rel in _iter_bind_sources_from_service(svc):
+				candidate = os.path.normpath(os.path.join(src_dir, rel))
+				# Only treat as support file/dir if it exists next to the source compose.
+				if os.path.exists(candidate):
+					seen.add(rel)
+
+		# Copy support paths into base_dir, preserving relative structure.
+		for rel in sorted(seen):
+			src_path = os.path.normpath(os.path.join(src_dir, rel))
+			dst_path = os.path.normpath(os.path.join(base_dir, rel))
+			try:
+				if os.path.isdir(src_path):
+					shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
+				else:
+					os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+					shutil.copy2(src_path, dst_path)
+			except Exception:
+				# Best-effort: continue even if some optional paths fail.
+				pass
+
+		# Rewrite bind sources to absolute paths rooted in base_dir.
+		for _svc_name, svc in services.items():
+			if not isinstance(svc, dict):
+				continue
+			vols = svc.get('volumes')
+			if isinstance(vols, list):
+				new_vols: List[object] = []
+				for v in vols:
+					if isinstance(v, str):
+						parts = v.split(':', 2)
+						if not parts:
+							new_vols.append(v)
+							continue
+						src = str(parts[0] or '').strip()
+						if src and (not os.path.isabs(src)) and os.path.exists(os.path.join(src_dir, src)):
+							abs_src = os.path.abspath(os.path.join(base_dir, src))
+							parts[0] = abs_src
+							new_vols.append(':'.join(parts))
+						else:
+							new_vols.append(v)
+					elif isinstance(v, dict):
+						v2 = dict(v)
+						vtype = str(v2.get('type') or '').strip().lower()
+						src = str(v2.get('source') or '').strip()
+						if (not vtype or vtype == 'bind') and src and (not os.path.isabs(src)) and os.path.exists(os.path.join(src_dir, src)):
+							v2['source'] = os.path.abspath(os.path.join(base_dir, src))
+						new_vols.append(v2)
+					else:
+						new_vols.append(v)
+				if new_vols != vols:
+					svc['volumes'] = new_vols
+			# env_file rewrite
+			env_file = svc.get('env_file')
+			if isinstance(env_file, str):
+				p = env_file.strip()
+				if p and (not os.path.isabs(p)) and os.path.exists(os.path.join(src_dir, p)):
+					svc['env_file'] = os.path.abspath(os.path.join(base_dir, p))
+			elif isinstance(env_file, list):
+				new_env: List[object] = []
+				changed = False
+				for p in env_file:
+					if isinstance(p, str):
+						ps = p.strip()
+						if ps and (not os.path.isabs(ps)) and os.path.exists(os.path.join(src_dir, ps)):
+							new_env.append(os.path.abspath(os.path.join(base_dir, ps)))
+							changed = True
+							continue
+					new_env.append(p)
+				if changed:
+					svc['env_file'] = new_env
+		return compose_obj
+	except Exception:
+		return compose_obj
+
+
+def _rewrite_abs_paths_from_dir_to_dir(compose_obj: dict, from_dir: str, to_dir: str) -> dict:
+	"""Rewrite absolute bind/env_file sources from from_dir to to_dir.
+
+	Also copies referenced files/dirs from from_dir into to_dir (preserving relative structure).
+	"""
+	try:
+		if not isinstance(compose_obj, dict):
+			return compose_obj
+		if not from_dir or not to_dir:
+			return compose_obj
+		from_dir_abs = os.path.abspath(from_dir)
+		to_dir_abs = os.path.abspath(to_dir)
+		services = compose_obj.get('services')
+		if not isinstance(services, dict):
+			return compose_obj
+
+		def _map_path(p: str) -> str:
+			p_abs = os.path.abspath(p)
+			if not (p_abs == from_dir_abs or p_abs.startswith(from_dir_abs + os.sep)):
+				return p
+			rel = os.path.relpath(p_abs, from_dir_abs)
+			dst = os.path.normpath(os.path.join(to_dir_abs, rel))
+			try:
+				os.makedirs(os.path.dirname(dst), exist_ok=True)
+				if os.path.isdir(p_abs):
+					shutil.copytree(p_abs, dst, dirs_exist_ok=True)
+				elif os.path.exists(p_abs):
+					shutil.copy2(p_abs, dst)
+			except Exception:
+				pass
+			return dst
+
+		for _svc_name, svc in services.items():
+			if not isinstance(svc, dict):
+				continue
+			vols = svc.get('volumes')
+			if isinstance(vols, list):
+				new_vols: List[object] = []
+				changed = False
+				for v in vols:
+					if isinstance(v, str):
+						parts = v.split(':', 2)
+						if not parts:
+							new_vols.append(v)
+							continue
+						src = str(parts[0] or '').strip()
+						if src and os.path.isabs(src):
+							mapped = _map_path(src)
+							if mapped != src:
+								parts[0] = mapped
+								changed = True
+						new_vols.append(':'.join(parts))
+					elif isinstance(v, dict):
+						v2 = dict(v)
+						vtype = str(v2.get('type') or '').strip().lower()
+						src = str(v2.get('source') or '').strip()
+						if (not vtype or vtype == 'bind') and src and os.path.isabs(src):
+							mapped = _map_path(src)
+							if mapped != src:
+								v2['source'] = mapped
+								changed = True
+						new_vols.append(v2)
+					else:
+						new_vols.append(v)
+				if changed:
+					svc['volumes'] = new_vols
+			# env_file rewrite (absolute paths under from_dir)
+			env_file = svc.get('env_file')
+			if isinstance(env_file, str):
+				p = env_file.strip()
+				if p and os.path.isabs(p):
+					mapped = _map_path(p)
+					if mapped != p:
+						svc['env_file'] = mapped
+			elif isinstance(env_file, list):
+				new_env: List[object] = []
+				changed = False
+				for p in env_file:
+					if isinstance(p, str):
+						ps = p.strip()
+						if ps and os.path.isabs(ps):
+							mapped = _map_path(ps)
+							if mapped != ps:
+								new_env.append(mapped)
+								changed = True
+								continue
+					new_env.append(p)
+				if changed:
+					svc['env_file'] = new_env
+		return compose_obj
+	except Exception:
+		return compose_obj
+
+
 def _inject_network_mode_none_text(text: str) -> str:
 	"""Fallback text-level injection of network_mode: none.
 
@@ -1044,7 +1272,7 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 	if not name_to_vuln:
 		return created
 	os.makedirs(out_base, exist_ok=True)
-	cache: Dict[Tuple[str, str], Tuple[Optional[dict], Optional[str]]] = {}
+	cache: Dict[Tuple[str, str], Tuple[Optional[dict], Optional[str], Optional[str], bool]] = {}
 	for node_name, rec in name_to_vuln.items():
 		vtype = (rec.get('Type') or '').strip().lower()
 		if vtype != 'docker-compose':
@@ -1059,10 +1287,13 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 		except Exception:
 			pass
 		key = ((rec.get('Name') or '').strip(), (rec.get('Path') or '').strip())
+		hint_text = str(rec.get('HintText') or '').strip()
 		base_compose_obj: Optional[dict]
 		src_path: Optional[str]
+		base_dir: Optional[str]
+		is_local: bool
 		if key in cache:
-			base_compose_obj, src_path = cache[key]
+			base_compose_obj, src_path, base_dir, is_local = cache[key]
 			try:
 				logger.debug(
 					"[vuln] compose cache hit key=%s src=%s has_yaml=%s",
@@ -1079,14 +1310,16 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			raw_url = _guess_compose_raw_url(key[1], compose_name=compose_name)
 			src_path = os.path.join(base_dir, compose_name)
 			ok = False
+			is_local = False
 			if raw_url:
 				logger.info("[vuln] fetching compose url=%s dest=%s", raw_url, src_path)
 				ok = _download_to(raw_url, src_path)
 			if not ok and key[1] and os.path.exists(key[1]):
 				logger.info("[vuln] copying compose from local path=%s dest=%s", key[1], src_path)
 				ok = _download_to(key[1], src_path)
+				is_local = True
 			if not ok:
-				cache[key] = (None, None)
+				cache[key] = (None, None, None, False)
 				try:
 					logger.warning("[vuln] unable to retrieve compose for key=%s", key)
 				except Exception:
@@ -1097,6 +1330,18 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				try:
 					with open(src_path, 'r', encoding='utf-8') as f:
 						base_compose_obj = yaml.safe_load(f) or {}
+					# If the compose is local, copy referenced support files (e.g., ./flag.txt)
+					# and rewrite relative bind sources to absolute paths under base_dir.
+					try:
+						if key[1] and os.path.exists(key[1]):
+							src_dir = os.path.dirname(os.path.abspath(key[1]))
+							base_compose_obj = _copy_support_paths_and_absolutize_binds(
+								base_compose_obj,
+								src_dir=src_dir,
+								base_dir=base_dir,
+							)
+					except Exception:
+						pass
 					logger.debug(
 						"[vuln] parsed compose yaml key=%s services=%s",
 						key,
@@ -1105,12 +1350,34 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				except Exception:
 					logger.exception("[vuln] yaml parse error for compose path=%s", src_path)
 					base_compose_obj = None
-			cache[key] = (base_compose_obj, src_path)
+			cache[key] = (base_compose_obj, src_path, base_dir, is_local)
 		out_path = os.path.join(out_base, f"docker-compose-{node_name}.yml")
 		wrote = False
 		if base_compose_obj is not None and yaml is not None:
 			prefer = key[0]
 			obj = dict(base_compose_obj)
+			# If this compose comes from a local template, isolate bind mounts per node
+			# so we can materialize per-node hint files without cross-node collisions.
+			try:
+				if is_local and base_dir:
+					node_dir = os.path.join(base_dir, f"node-{_safe_name(node_name)}")
+					os.makedirs(node_dir, exist_ok=True)
+					obj = _rewrite_abs_paths_from_dir_to_dir(obj, from_dir=base_dir, to_dir=node_dir)
+					if hint_text:
+						try:
+							with open(os.path.join(node_dir, 'hint.txt'), 'w', encoding='utf-8') as hf:
+								hf.write(hint_text.strip() + "\n")
+						except Exception:
+							pass
+						try:
+							html_dir = os.path.join(node_dir, 'html')
+							if os.path.isdir(html_dir):
+								with open(os.path.join(html_dir, 'hint.txt'), 'w', encoding='utf-8') as hf2:
+									hf2.write(hint_text.strip() + "\n")
+						except Exception:
+							pass
+			except Exception:
+				pass
 			obj = _set_container_name_one_service(obj, node_name, prefer_service=prefer)
 			# Ensure Docker does not inject its own networking for vuln nodes.
 			obj = _force_compose_no_network(obj)

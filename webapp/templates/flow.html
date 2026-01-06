@@ -1,0 +1,702 @@
+{% extends 'layout.html' %}
+{% block title %}Flow{% endblock %}
+{% block active_page %}{% set active_page='flow' %}{% endblock %}
+{% block header_icon %}<i class="bi bi-bezier2 fs-4"></i>{% endblock %}
+{% block header_title %}Flow{% endblock %}
+
+{% block extra_head %}
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body { padding-bottom: 0; }
+  #flowLayoutRow { min-height: calc(100vh - 200px); }
+  /* Prevent long <pre>/<svg> content from forcing the Bootstrap row to wrap columns. */
+  #flowLayoutRow > [class*='col-'] { min-width: 0; }
+  @media (max-width: 992px) {
+    #flowLayoutRow { min-height: 0; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="container-fluid mt-3 d-flex flex-column" id="flowPageWrap">
+  <div class="row g-3 flex-grow-1 align-items-stretch" id="flowLayoutRow">
+    <div class="col-12 col-lg-3 d-flex">
+      <div class="card shadow-sm mb-3 flex-fill d-flex flex-column">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span class="fw-bold">Scenarios</span>
+          <button class="btn btn-sm btn-outline-secondary {% if not active_scenario %}d-none{% endif %}" id="flowScenarioFilterClear" type="button" title="Clear">Clear</button>
+        </div>
+        <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="flowScenarioList" style="min-height:0;">
+          {% if scenarios %}
+            {% for s in scenarios %}
+            <button type="button" class="list-group-item list-group-item-action py-1 {% if active_scenario and active_scenario==s %}active bg-primary text-white{% endif %}" data-scen-name="{{ s }}">{{ s }}</button>
+            {% endfor %}
+          {% else %}
+            <div class="p-3 text-muted small">No scenarios yet</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <div class="col-12 col-lg-9 d-flex">
+      <div class="flex-fill d-flex flex-column">
+        <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
+          <div class="fw-semibold">Generate an Attack Flow from the latest preview plan</div>
+          <div class="d-flex align-items-center gap-2">
+            <button id="flowExecuteBtn" class="btn btn-sm btn-success" type="button">Execute</button>
+            <a id="flowDownloadLink" class="btn btn-sm btn-outline-primary" href="#" download>Download Attack Flow (JSON)</a>
+          </div>
+        </div>
+
+        <div class="card mb-3">
+          <div class="card-body">
+            <div class="row g-2 align-items-end">
+              <div class="col-md-4">
+                <div class="small text-muted">Scenario</div>
+                <div class="fw-semibold" id="flowScenarioLabel">{{ active_scenario or '' }}</div>
+                <input id="flowScenario" class="form-control d-none" value="{{ active_scenario or request.args.get('scenario','') }}">
+              </div>
+              <div class="col-sm-6 col-md-2">
+                <label class="form-label">Chain Length</label>
+                <input id="flowLength" class="form-control" type="number" min="1" max="50" value="5">
+              </div>
+              <div class="col-md-3">
+                <button id="flowGenerateBtn" class="btn btn-primary w-100">Generate</button>
+              </div>
+              <div class="col-md-3">
+                <div class="small">
+                  <span id="flowStatus" class="text-muted"></span>
+                  <a id="flowLoginLink" class="ms-2 d-none" href="/login">Login</a>
+                </div>
+              </div>
+            </div>
+            <div class="small text-muted mt-2">Current rule: flags are placed on any Docker nodes (scenario Docker role + vulnerability Docker nodes). Default chain order is randomized; you can tweak it below.</div>
+          </div>
+        </div>
+
+        <div class="card mb-3">
+          <div class="card-header d-flex align-items-center justify-content-between">
+            <div class="fw-semibold">Chain Order</div>
+            <div class="small text-muted">Use ↑/↓ to reorder</div>
+          </div>
+          <div class="card-body">
+            <div id="flowChainList" class="list-group"></div>
+            <div class="small text-muted mt-2">Reordering updates the bundle and download.</div>
+          </div>
+        </div>
+
+        <div class="card mb-3">
+          <div class="card-header d-flex align-items-center justify-content-between">
+            <div class="fw-semibold">Visualization</div>
+            <div class="small text-muted" id="flowMeta"></div>
+          </div>
+          <div class="card-body">
+            <div id="flowDiagramWrap" class="border rounded p-2" style="min-height: 180px; overflow-x: auto;">
+              <div id="flowDiagram" class="mermaid">graph LR\n  A[Generate] --> B[Flow]</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card mb-3">
+          <div class="card-header fw-semibold">Node Details</div>
+          <div class="card-body">
+            <div class="small text-muted" id="flowNodeDetailsEmpty">Click a node in the chain list or diagram.</div>
+            <div id="flowNodeDetails" class="d-none">
+              <div class="row g-2">
+                <div class="col-md-6">
+                  <div class="small text-muted">Node</div>
+                  <div class="fw-semibold" id="flowNodeName"></div>
+                  <div class="small text-muted" id="flowNodeMeta"></div>
+                </div>
+                <div class="col-md-6">
+                  <div class="small text-muted">Assigned Flag Package</div>
+                  <div class="fw-semibold" id="flowFlagName"></div>
+                  <div class="small text-muted" id="flowFlagPath"></div>
+                  <div class="small text-muted" id="flowFlagIO"></div>
+                  <div class="small" id="flowFlagHint"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card mb-3 flex-grow-1 d-flex flex-column">
+          <div class="card-header fw-semibold">Attack Flow (STIX Bundle)</div>
+          <div class="card-body flex-grow-1" style="min-height:0;">
+            <pre id="flowJson" class="small mb-0" style="max-height: 520px; overflow:auto;"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block body_container %}
+{{ super() }}
+<script>
+(function(){
+  const statusEl = document.getElementById('flowStatus');
+  const loginLinkEl = document.getElementById('flowLoginLink');
+  const scenarioEl = document.getElementById('flowScenario');
+  const scenarioLabelEl = document.getElementById('flowScenarioLabel');
+  const lengthEl = document.getElementById('flowLength');
+  const btnEl = document.getElementById('flowGenerateBtn');
+  const execEl = document.getElementById('flowExecuteBtn');
+  const jsonEl = document.getElementById('flowJson');
+  const metaEl = document.getElementById('flowMeta');
+  const downloadLink = document.getElementById('flowDownloadLink');
+  const scenarioListEl = document.getElementById('flowScenarioList');
+  const clearScenarioBtn = document.getElementById('flowScenarioFilterClear');
+
+  const participantUrlFlags = {{ (participant_url_flags or {})|tojson }};
+  const scenarioNamesCache = {{ (scenarios or [])|tojson }};
+  const initialScenario = {{ (active_scenario or '')|tojson }};
+  let activeScenario = (initialScenario || (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length ? String(scenarioNamesCache[0]) : '')).trim();
+
+  let currentChain = [];
+  let currentBundle = null;
+  let lastStats = null;
+  let lastPreviewPlanPath = '';
+  let currentFlagAssignments = [];
+  let selectedChainIndex = -1;
+
+  const nodeDetailsWrap = document.getElementById('flowNodeDetails');
+  const nodeDetailsEmpty = document.getElementById('flowNodeDetailsEmpty');
+  const nodeNameEl = document.getElementById('flowNodeName');
+  const nodeMetaEl = document.getElementById('flowNodeMeta');
+  const flagNameEl = document.getElementById('flowFlagName');
+  const flagPathEl = document.getElementById('flowFlagPath');
+  const flagIoEl = document.getElementById('flowFlagIO');
+  const flagHintEl = document.getElementById('flowFlagHint');
+
+  function normalizeScenarioNorm(raw){
+    return (raw || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
+  }
+
+  function defaultScenarioName(){
+    return (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length) ? String(scenarioNamesCache[0]) : null;
+  }
+
+  function updateScenarioQueryParam(){
+    try {
+      const url = new URL(window.location.href);
+      if(activeScenario){
+        url.searchParams.set('scenario', activeScenario);
+      } else {
+        url.searchParams.delete('scenario');
+      }
+      window.history.replaceState({}, '', url.toString());
+    } catch(e) {}
+  }
+
+  function updateScenarioFilterControls(){
+    try {
+      if(clearScenarioBtn){
+        const def = defaultScenarioName();
+        const show = !!activeScenario && !!def && activeScenario !== def;
+        clearScenarioBtn.classList.toggle('d-none', !show);
+      }
+      if(!scenarioListEl) return;
+      scenarioListEl.querySelectorAll('[data-scen-name]').forEach(btn => {
+        const name = btn.getAttribute('data-scen-name');
+        const isActive = !!activeScenario && name === activeScenario;
+        btn.classList.toggle('active', isActive);
+        btn.classList.toggle('bg-primary', isActive);
+        btn.classList.toggle('text-white', isActive);
+      });
+    } catch(e) {}
+  }
+
+  function refreshParticipantNavForScenario(scenarioName){
+    try {
+      const scen = (scenarioName || '').toString().trim();
+      if (typeof window.CORETG_PATCH_SCENARIO_NAV === 'function') {
+        window.CORETG_PATCH_SCENARIO_NAV(scen);
+      }
+      const norm = normalizeScenarioNorm(scen);
+      const hasParticipant = !!participantUrlFlags[norm];
+      if (typeof window.CORETG_SET_PARTICIPANT_NAV_VISIBLE === 'function') {
+        window.CORETG_SET_PARTICIPANT_NAV_VISIBLE(hasParticipant);
+      }
+    } catch(e) {}
+  }
+
+  async function setScenario(value){
+    activeScenario = (value || defaultScenarioName() || '').toString().trim();
+    if(scenarioEl) scenarioEl.value = activeScenario;
+    if(scenarioLabelEl) scenarioLabelEl.textContent = activeScenario;
+    updateScenarioQueryParam();
+    updateScenarioFilterControls();
+    refreshParticipantNavForScenario(activeScenario);
+    await generate();
+  }
+
+  function setStatus(msg, isError){
+    if(!statusEl) return;
+    statusEl.textContent = msg || '';
+    statusEl.classList.toggle('text-danger', !!isError);
+    statusEl.classList.toggle('text-muted', !isError);
+  }
+
+  function setLoginLinkVisible(visible){
+    try{
+      if(!loginLinkEl) return;
+      loginLinkEl.classList.toggle('d-none', !visible);
+    } catch(e) {}
+  }
+
+  function basenameFromPath(p){
+    try{
+      const s = (p||'').toString();
+      const parts = s.split('/');
+      return parts[parts.length-1] || s;
+    } catch(e){
+      return (p||'').toString();
+    }
+  }
+
+  async function fetchJson(url){
+    const res = await fetch(url, { credentials: 'same-origin' });
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if(!ct.includes('application/json')){
+      const text = await res.text();
+      if(res.redirected || (text && text.includes('<html'))){
+        const err = new Error('Login required.');
+        err.loginRequired = true;
+        throw err;
+      }
+      throw new Error('Non-JSON response');
+    }
+    const data = await res.json();
+    if(!res.ok){
+      const err = new Error((data && (data.error || data.message)) || ('HTTP ' + res.status));
+      err.payload = data;
+      if(res.status === 401) err.loginRequired = true;
+      throw err;
+    }
+    return data;
+  }
+
+  async function postJson(url, payload){
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(payload || {})
+    });
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if(!ct.includes('application/json')){
+      const text = await res.text();
+      if(res.redirected || (text && text.includes('<html'))){
+        const err = new Error('Login required.');
+        err.loginRequired = true;
+        throw err;
+      }
+      throw new Error('Non-JSON response');
+    }
+    const data = await res.json();
+    if(!res.ok){
+      const err = new Error((data && (data.error || data.message)) || ('HTTP ' + res.status));
+      err.payload = data;
+      if(res.status === 401) err.loginRequired = true;
+      throw err;
+    }
+    return data;
+  }
+
+  function chainFeasibility(assignments){
+    // Returns per-index {ok:boolean, missing:string[]} based on cumulative outputs.
+    const out = [];
+    const have = new Set();
+    if(!Array.isArray(assignments)) return out;
+    for(let i=0;i<assignments.length;i++){
+      const a = assignments[i] || {};
+      const req = Array.isArray(a.inputs) ? a.inputs.map(String) : [];
+      const missing = req.filter(k => k && !have.has(k));
+      out.push({ ok: missing.length === 0, missing });
+      const prov = Array.isArray(a.outputs) ? a.outputs.map(String) : [];
+      prov.forEach(k => { if(k) have.add(k); });
+    }
+    return out;
+  }
+
+  function renderChainEditor(){
+    const wrap = document.getElementById('flowChainList');
+    if(!wrap) return;
+    wrap.innerHTML = '';
+    if(!Array.isArray(currentChain) || currentChain.length === 0){
+      const empty = document.createElement('div');
+      empty.className = 'text-muted small';
+      empty.textContent = 'Generate a flow to populate the chain.';
+      wrap.appendChild(empty);
+      return;
+    }
+    currentChain.forEach((node, idx) => {
+      const item = document.createElement('div');
+      item.className = 'list-group-item d-flex align-items-center justify-content-between gap-2';
+      item.style.cursor = 'pointer';
+      item.classList.toggle('active', idx === selectedChainIndex);
+
+      const left = document.createElement('div');
+      left.className = 'd-flex flex-column';
+      const title = document.createElement('div');
+      title.className = 'fw-semibold';
+      title.textContent = (node && node.name) ? String(node.name) : ('Node ' + (idx+1));
+      const sub = document.createElement('div');
+      sub.className = 'small text-muted';
+      sub.textContent = 'id=' + String(node && node.id || '') + (node && node.type ? (' | type=' + String(node.type)) : '');
+      left.appendChild(title);
+      left.appendChild(sub);
+
+      const flagSub = document.createElement('div');
+      flagSub.className = 'small text-muted';
+      const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
+      const flagLabel = fa && (fa.name || fa.id) ? String(fa.name || fa.id) : '-';
+      flagSub.textContent = 'flag: ' + flagLabel;
+      left.appendChild(flagSub);
+
+      const hintSub = document.createElement('div');
+      hintSub.className = 'small';
+      const hintText = fa && fa.hint ? String(fa.hint) : '';
+      hintSub.textContent = hintText ? ('hint: ' + hintText) : 'hint: -';
+      left.appendChild(hintSub);
+
+      const feas = chainFeasibility(currentFlagAssignments);
+      const step = feas && feas[idx] ? feas[idx] : null;
+      const ioSub = document.createElement('div');
+      ioSub.className = 'small text-muted';
+      const req = fa && Array.isArray(fa.inputs) && fa.inputs.length ? ('requires: ' + fa.inputs.join(', ')) : 'requires: -';
+      const prov = fa && Array.isArray(fa.outputs) && fa.outputs.length ? ('provides: ' + fa.outputs.join(', ')) : 'provides: -';
+      ioSub.textContent = req + ' | ' + prov;
+      if(step && step.ok === false){
+        ioSub.classList.add('text-danger');
+        ioSub.textContent = req + ' | ' + prov + ' | missing: ' + (step.missing || []).join(', ');
+      }
+      left.appendChild(ioSub);
+
+      const right = document.createElement('div');
+      right.className = 'btn-group btn-group-sm';
+      const up = document.createElement('button');
+      up.type = 'button';
+      up.className = 'btn btn-outline-secondary';
+      up.textContent = '↑';
+      up.disabled = idx === 0;
+      up.addEventListener('click', async () => {
+        if(idx === 0) return;
+        const tmp = currentChain[idx-1];
+        currentChain[idx-1] = currentChain[idx];
+        currentChain[idx] = tmp;
+        renderChainEditor();
+        await refreshBundleFromChain();
+      });
+      const down = document.createElement('button');
+      down.type = 'button';
+      down.className = 'btn btn-outline-secondary';
+      down.textContent = '↓';
+      down.disabled = idx === currentChain.length - 1;
+      down.addEventListener('click', async () => {
+        if(idx === currentChain.length - 1) return;
+        const tmp = currentChain[idx+1];
+        currentChain[idx+1] = currentChain[idx];
+        currentChain[idx] = tmp;
+        renderChainEditor();
+        await refreshBundleFromChain();
+      });
+      right.appendChild(up);
+      right.appendChild(down);
+
+      item.appendChild(left);
+      item.appendChild(right);
+      item.addEventListener('click', (e)=>{
+        // Avoid selecting when clicking reorder buttons.
+        const t = e && e.target;
+        if(t && t.tagName && String(t.tagName).toLowerCase() === 'button') return;
+        selectChainIndex(idx);
+      });
+      wrap.appendChild(item);
+    });
+  }
+
+  function selectChainIndex(idx){
+    selectedChainIndex = Number.isFinite(+idx) ? (+idx) : -1;
+    if(selectedChainIndex < 0 || !Array.isArray(currentChain) || selectedChainIndex >= currentChain.length){
+      selectedChainIndex = -1;
+      showNodeDetails(null, null);
+      renderChainEditor();
+      return;
+    }
+    const node = currentChain[selectedChainIndex] || null;
+    const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[selectedChainIndex]) ? currentFlagAssignments[selectedChainIndex] : null;
+    showNodeDetails(node, fa);
+    renderChainEditor();
+  }
+
+  function showNodeDetails(node, fa){
+    try{
+      const has = !!node;
+      if(nodeDetailsEmpty) nodeDetailsEmpty.classList.toggle('d-none', has);
+      if(nodeDetailsWrap) nodeDetailsWrap.classList.toggle('d-none', !has);
+      if(!has){
+        if(nodeNameEl) nodeNameEl.textContent = '';
+        if(nodeMetaEl) nodeMetaEl.textContent = '';
+        if(flagNameEl) flagNameEl.textContent = '';
+        if(flagPathEl) flagPathEl.textContent = '';
+        return;
+      }
+      if(nodeNameEl) nodeNameEl.textContent = String(node && node.name || '');
+      if(nodeMetaEl) nodeMetaEl.textContent = 'id=' + String(node && node.id || '') + (node && node.type ? (' | type=' + String(node.type)) : '');
+      const flagLabel = fa && (fa.name || fa.id) ? String(fa.name || fa.id) : '-';
+      if(flagNameEl) flagNameEl.textContent = flagLabel;
+      const flagPath = fa && fa.path ? String(fa.path) : '';
+      if(flagPathEl) flagPathEl.textContent = flagPath ? ('path: ' + flagPath) : '';
+
+      const req = fa && Array.isArray(fa.inputs) && fa.inputs.length ? fa.inputs.join(', ') : '-';
+      const prov = fa && Array.isArray(fa.outputs) && fa.outputs.length ? fa.outputs.join(', ') : '-';
+      if(flagIoEl) flagIoEl.textContent = 'requires: ' + req + ' | provides: ' + prov;
+
+      const hint = fa && fa.hint ? String(fa.hint) : '';
+      if(flagHintEl) flagHintEl.textContent = hint ? ('Hint: ' + hint) : '';
+    } catch(e) {}
+  }
+
+  function updateMeta(){
+    const scenarioText = (activeScenario || '') ? ('Scenario: ' + activeScenario) : '';
+    const previewText = lastPreviewPlanPath ? ('Preview: ' + basenameFromPath(lastPreviewPlanPath)) : '';
+    const statsText = formatStats(lastStats);
+    metaEl.textContent = [scenarioText, previewText, statsText].filter(Boolean).join(' | ');
+  }
+
+  async function refreshBundleFromChain(){
+    if(!Array.isArray(currentChain) || currentChain.length === 0) return;
+    setStatus('Updating bundle…', false);
+    try{
+      const data = await postJson('/api/flow/bundle_from_chain', { scenario: activeScenario, chain: currentChain });
+      currentBundle = data.bundle;
+      currentFlagAssignments = Array.isArray(data.flag_assignments) ? data.flag_assignments.slice() : currentFlagAssignments;
+      jsonEl.textContent = JSON.stringify(currentBundle, null, 2);
+      const diagram = buildMermaid(currentChain);
+      await renderMermaid(diagram);
+      updateMeta();
+      if(selectedChainIndex >= 0 && selectedChainIndex < currentChain.length){
+        const node = currentChain[selectedChainIndex] || null;
+        const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[selectedChainIndex]) ? currentFlagAssignments[selectedChainIndex] : null;
+        showNodeDetails(node, fa);
+      }
+      setStatus('Ready.', false);
+    } catch(err){
+      setStatus(String(err && err.message || err), true);
+    }
+  }
+
+  function formatStats(stats){
+    if(!stats || typeof stats !== 'object') return '';
+    const d = Number.isFinite(+stats.docker_total) ? (+stats.docker_total) : null;
+    const c = Number.isFinite(+stats.compose_backed_total) ? (+stats.compose_backed_total) : null;
+    const e = Number.isFinite(+stats.eligible_total) ? (+stats.eligible_total) : null;
+    if(d === null && c === null && e === null) return '';
+    const inner = [];
+    if(c !== null) inner.push('compose-backed: ' + c);
+    if(e !== null) inner.push('eligible: ' + e);
+    if(d !== null && inner.length){
+      return 'Detected docker nodes: ' + d + ' (' + inner.join(', ') + ')';
+    }
+    if(d !== null) return 'Detected docker nodes: ' + d;
+    return inner.length ? inner.join(', ') : '';
+  }
+
+  function buildMermaid(chain){
+    const lines = ['flowchart LR'];
+    if(!Array.isArray(chain) || chain.length === 0){
+      lines.push('  A[No chain available]');
+      return lines.join('\n');
+    }
+    for(let i=0;i<chain.length;i++){
+      const node = chain[i];
+      const safeId = 'N' + i;
+      const label = (node && node.name) ? node.name : ('Node ' + (i+1));
+      lines.push(`  ${safeId}[${label.replace(/\]/g,'')}]`);
+      if(i>0){
+        lines.push(`  N${i-1} --> ${safeId}`);
+      }
+    }
+    for(let i=0;i<chain.length;i++){
+      lines.push(`  click N${i} flowSelectNode "Show details"`);
+    }
+    return lines.join('\n');
+  }
+
+  async function renderMermaid(diagramText){
+    try {
+      if(window.mermaid){
+        mermaid.initialize({ startOnLoad: false, securityLevel: 'loose' });
+        const wrap = document.getElementById('flowDiagram');
+        wrap.textContent = diagramText;
+        wrap.removeAttribute('data-processed');
+        await mermaid.run({ querySelector: '#flowDiagram' });
+      }
+    } catch(e) {
+      // If rendering fails, keep plaintext.
+      const wrap = document.getElementById('flowDiagram');
+      if(wrap) wrap.textContent = diagramText;
+    }
+  }
+
+  async function generate(){
+    const scenario = (scenarioEl && scenarioEl.value || '').trim();
+    const length = parseInt((lengthEl && lengthEl.value) || '5', 10) || 5;
+
+    const params = new URLSearchParams();
+    if(scenario) params.set('scenario', scenario);
+    params.set('length', String(length));
+
+    const apiUrl = '/api/flow/attackflow_preview?' + params.toString();
+    downloadLink.href = '#';
+
+    setStatus('Generating…', false);
+    setLoginLinkVisible(false);
+    metaEl.textContent = '';
+    jsonEl.textContent = '';
+
+    try {
+      const data = await fetchJson(apiUrl);
+      currentChain = Array.isArray(data.chain) ? data.chain.slice() : [];
+      currentBundle = data.bundle || null;
+      currentFlagAssignments = Array.isArray(data.flag_assignments) ? data.flag_assignments.slice() : [];
+      lastStats = data.stats || null;
+      lastPreviewPlanPath = data.preview_plan_path || '';
+      updateMeta();
+      selectedChainIndex = -1;
+      showNodeDetails(null, null);
+      renderChainEditor();
+
+      jsonEl.textContent = JSON.stringify(currentBundle, null, 2);
+      const diagram = buildMermaid(currentChain);
+      await renderMermaid(diagram);
+      setStatus('Ready.', false);
+    } catch(err){
+      setStatus(String(err && err.message || err), true);
+      setLoginLinkVisible(!!(err && err.loginRequired));
+      const payload = err && err.payload ? err.payload : null;
+      lastStats = payload && payload.stats ? payload.stats : null;
+      lastPreviewPlanPath = payload && payload.preview_plan_path ? String(payload.preview_plan_path) : '';
+      updateMeta();
+      currentChain = [];
+      currentBundle = null;
+      currentFlagAssignments = [];
+      selectedChainIndex = -1;
+      showNodeDetails(null, null);
+      renderChainEditor();
+      const diagram = buildMermaid([]);
+      await renderMermaid(diagram);
+    }
+  }
+
+  async function execute(){
+    const scenario = (scenarioEl && scenarioEl.value || '').trim();
+    const length = parseInt((lengthEl && lengthEl.value) || '5', 10) || 5;
+    if(!scenario){
+      setStatus('No scenario selected.', true);
+      return;
+    }
+    if(execEl) execEl.disabled = true;
+    setStatus('Preparing preview for execution…', false);
+    setLoginLinkVisible(false);
+    try{
+      if(!Array.isArray(currentChain) || currentChain.length === 0){
+        throw new Error('Generate a chain first.');
+      }
+      const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+      const prepData = await postJson('/api/flow/prepare_preview_for_execute', { scenario, length, chain_ids: chainIds });
+      const xmlPath = (prepData && prepData.xml_path) ? String(prepData.xml_path) : '';
+      const previewPlan = (prepData && prepData.preview_plan_path) ? String(prepData.preview_plan_path) : '';
+      if(!xmlPath || !previewPlan){
+        throw new Error('Prepare step did not return xml_path/preview_plan_path');
+      }
+      setStatus('Starting async execution…', false);
+      const runData = await postJson('/run_cli_async', { xml_path: xmlPath, preview_plan: previewPlan, scenario });
+      const runId = runData && runData.run_id ? String(runData.run_id) : '';
+      if(runId){
+        setStatus('Run started: ' + runId + ' (see Core/Reports pages).', false);
+      } else {
+        setStatus('Run started (missing run_id).', false);
+      }
+    } catch(err){
+      setStatus(String(err && err.message || err), true);
+      setLoginLinkVisible(!!(err && err.loginRequired));
+    } finally {
+      if(execEl) execEl.disabled = false;
+    }
+  }
+
+  // Expose a mermaid click callback; it receives the nodeId like "N0".
+  window.flowSelectNode = function(nodeId){
+    try{
+      const m = String(nodeId || '').match(/^N(\d+)$/);
+      if(!m) return;
+      const idx = parseInt(m[1], 10);
+      if(Number.isFinite(idx)) selectChainIndex(idx);
+    } catch(e) {}
+  };
+
+  if(btnEl) btnEl.addEventListener('click', (e)=>{ e.preventDefault(); generate(); });
+  if(execEl) execEl.addEventListener('click', (e)=>{ e.preventDefault(); execute(); });
+
+  if(downloadLink){
+    downloadLink.addEventListener('click', (e)=>{
+      try{
+        e.preventDefault();
+        if(!currentBundle){
+          setStatus('Nothing to download yet (generate first).', true);
+          return;
+        }
+        const scenario = (scenarioEl && scenarioEl.value || activeScenario || 'scenario').toString().trim();
+        const norm = normalizeScenarioNorm(scenario).replace(/\s+/g,'_') || 'scenario';
+        const fname = 'attackflow_' + norm + '_' + String(Array.isArray(currentChain)?currentChain.length:0) + '.json';
+        const blob = new Blob([JSON.stringify(currentBundle, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(()=>URL.revokeObjectURL(url), 1000);
+      } catch(err){
+        setStatus(String(err && err.message || err), true);
+      }
+    });
+  }
+
+  // Wire scenario list.
+  if(scenarioListEl){
+    scenarioListEl.querySelectorAll('[data-scen-name]').forEach(btn => {
+      btn.addEventListener('click', async ()=>{
+        const name = btn.getAttribute('data-scen-name') || '';
+        if(!name || name === activeScenario) return;
+        await setScenario(name);
+      });
+    });
+  }
+  if(clearScenarioBtn){
+    clearScenarioBtn.addEventListener('click', async ()=>{
+      const def = defaultScenarioName();
+      if(def && def !== activeScenario) await setScenario(def);
+    });
+  }
+
+  // Auto-generate on load (per-scenario page). If there are no scenarios, disable.
+  if(!activeScenario){
+    setStatus('No scenarios available yet.', true);
+    if(btnEl) btnEl.disabled = true;
+    return;
+  }
+  if(scenarioEl && !scenarioEl.value) scenarioEl.value = activeScenario;
+  if(scenarioLabelEl && !scenarioLabelEl.textContent) scenarioLabelEl.textContent = activeScenario;
+  updateScenarioQueryParam();
+  updateScenarioFilterControls();
+  refreshParticipantNavForScenario(activeScenario);
+  generate();
+})();
+</script>
+{% endblock %}

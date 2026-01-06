@@ -97,6 +97,7 @@
             <li class="nav-item">
               <a class="nav-link {% if active_page == 'flag_catalog' %}active{% endif %}" href="{{ url_for('flag_catalog_page') }}">Flag-Catalog</a>
             </li>
+            <li class="nav-item"><a class="nav-link {% if active_page=='flow' %}active{% endif %}" href="{{ url_for('flow_page', scenario=nav_scenario) if nav_scenario else url_for('flow_page') }}">Flow</a></li>
             <li class="nav-item"><a id="navReportsLink" class="nav-link {% if active_page=='reports' %}active{% endif %}" href="{{ nav_reports_href }}">Reports</a></li>
             <li class="nav-item"><a id="navCoreLink" class="nav-link {% if active_page=='core' %}active{% endif %}" href="{{ nav_core_href }}">CORE-Management</a></li>
             {% endif %}

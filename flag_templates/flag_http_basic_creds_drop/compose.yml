@@ -1,0 +1,7 @@
+version: '3.8'
+services:
+  flag_http_basic_creds_drop:
+    image: nginx:alpine
+    container_name: flag_http_basic_creds_drop
+    volumes:
+      - ./html:/usr/share/nginx/html:ro

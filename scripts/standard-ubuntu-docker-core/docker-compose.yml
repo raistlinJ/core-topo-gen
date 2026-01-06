@@ -1,0 +1,8 @@
+version: '3.8'
+
+services:
+  ubuntu-container:
+    image: ubuntu:22.04
+    container_name: standard-ubuntu
+    tty: true # Allocates a pseudo-TTY so you can interact with the container
+    command: ["bash", "-lc", "sleep infinity"]
