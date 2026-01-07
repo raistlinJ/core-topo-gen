@@ -116,6 +116,8 @@
 
 {% block body_container %}
 {{ super() }}
+{% set xml_preview_enabled = True %}
+{% include 'partials/dock.html' %}
 <script>
 (function(){
   const statusEl = document.getElementById('flowStatus');
@@ -124,7 +126,9 @@
   const scenarioLabelEl = document.getElementById('flowScenarioLabel');
   const lengthEl = document.getElementById('flowLength');
   const btnEl = document.getElementById('flowGenerateBtn');
+  const saveXmlEl = document.getElementById('saveXmlBtn');
   const execEl = document.getElementById('scenariosExecuteBtn');
+  const downloadXmlEl = document.getElementById('downloadXmlBtn');
   const jsonEl = document.getElementById('flowJson');
   const metaScenarioEl = document.getElementById('flowMetaScenario');
   const metaPreviewEl = document.getElementById('flowMetaPreview');
@@ -204,7 +208,8 @@
     updateScenarioQueryParam();
     updateScenarioFilterControls();
     refreshParticipantNavForScenario(activeScenario);
-    await generate();
+    // When switching scenarios (or loading after refresh), prefer any saved Flow state.
+    await generate(false);
   }
 
   function setStatus(msg, isError){
@@ -283,7 +288,8 @@
   function chainFeasibility(assignments){
     // Returns per-index {ok:boolean, missing:string[]} based on cumulative outputs.
     const out = [];
-    const have = new Set();
+    // Keep in sync with server-side synthesized Flow inputs (see _flow_default_generator_config).
+    const have = new Set(['seed','secret','env_name','challenge','flag_prefix','username_prefix','key_len']);
     if(!Array.isArray(assignments)) return out;
     for(let i=0;i<assignments.length;i++){
       const a = assignments[i] || {};
@@ -318,11 +324,7 @@
       const title = document.createElement('div');
       title.className = 'fw-semibold';
       title.textContent = (node && node.name) ? String(node.name) : ('Node ' + (idx+1));
-      const sub = document.createElement('div');
-      sub.className = 'small text-muted';
-      sub.textContent = 'id=' + String(node && node.id || '') + (node && node.type ? (' | type=' + String(node.type)) : '');
       left.appendChild(title);
-      left.appendChild(sub);
 
       const flagSub = document.createElement('div');
       flagSub.className = 'small text-muted';
@@ -330,6 +332,21 @@
       const flagLabel = fa && (fa.name || fa.id) ? String(fa.name || fa.id) : '-';
       flagSub.textContent = 'flag: ' + flagLabel;
       left.appendChild(flagSub);
+
+      const genUsedSub = document.createElement('div');
+      genUsedSub.className = 'small text-muted';
+      const genId = fa && fa.id ? String(fa.id) : '-';
+      const genName = fa && fa.name ? String(fa.name) : '-';
+      genUsedSub.textContent = (genName && genName !== '-' && genName !== genId)
+        ? ('generator: ' + genId + ' | ' + genName)
+        : ('generator: ' + genId);
+      left.appendChild(genUsedSub);
+
+      const genSub = document.createElement('div');
+      genSub.className = 'small text-muted';
+      const genLabel = fa && fa.flag_generator ? String(fa.flag_generator) : '-';
+      genSub.textContent = 'flag-generator: ' + genLabel;
+      left.appendChild(genSub);
 
       const hintSub = document.createElement('div');
       hintSub.className = 'small';
@@ -349,6 +366,23 @@
         ioSub.textContent = req + ' | ' + prov + ' | missing: ' + (step.missing || []).join(', ');
       }
       left.appendChild(ioSub);
+
+      // After prepare_preview_for_execute, the backend may attach runtime validation
+      // fields like outputs_match/outputs_mismatch to help validate generator specs.
+      try {
+        if(fa && fa.outputs_match === false){
+          const mm = fa.outputs_mismatch || {};
+          const missing = Array.isArray(mm.missing) ? mm.missing : [];
+          const extra = Array.isArray(mm.extra) ? mm.extra : [];
+          const warn = document.createElement('div');
+          warn.className = 'small text-danger';
+          const parts = [];
+          if(missing.length) parts.push('missing: ' + missing.join(', '));
+          if(extra.length) parts.push('extra: ' + extra.join(', '));
+          warn.textContent = parts.length ? ('outputs mismatch (' + parts.join(' | ') + ')') : 'outputs mismatch';
+          left.appendChild(warn);
+        }
+      } catch(e) {}
 
       const right = document.createElement('div');
       right.className = 'btn-group btn-group-sm';
@@ -479,13 +513,19 @@
     }
   }
 
-  async function generate(){
+  async function generate(preferPreview){
+    const usePreview = !!preferPreview;
     const scenario = (scenarioEl && scenarioEl.value || '').trim();
     const length = parseInt((lengthEl && lengthEl.value) || '5', 10) || 5;
 
     const params = new URLSearchParams();
     if(scenario) params.set('scenario', scenario);
     params.set('length', String(length));
+    // Only force preview selection when the user explicitly clicks Generate.
+    if(usePreview){
+      params.set('prefer_preview', '1');
+      params.set('force_preview', '1');
+    }
 
     const apiUrl = '/api/flag-sequencing/attackflow_preview?' + params.toString();
     if(downloadLink) downloadLink.href = '#';
@@ -504,6 +544,12 @@
       currentFlagAssignments = Array.isArray(data.flag_assignments) ? data.flag_assignments.slice() : [];
       lastStats = data.stats || null;
       lastPreviewPlanPath = data.preview_plan_path || '';
+      try {
+        // If the backend loaded a saved chain whose effective length differs from the
+        // current input value (e.g. page reload reset to default), keep the UI in sync.
+        const effLen = Number.isFinite(+data.length) ? (+data.length) : null;
+        if (effLen !== null && lengthEl) lengthEl.value = String(effLen);
+      } catch(e) {}
       updateMeta();
       selectedChainIndex = -1;
       renderChainEditor();
@@ -531,7 +577,7 @@
 
   async function execute(){
     const scenario = (scenarioEl && scenarioEl.value || '').trim();
-    const length = parseInt((lengthEl && lengthEl.value) || '5', 10) || 5;
+    const length = (Array.isArray(currentChain) && currentChain.length) ? currentChain.length : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
     if(!scenario){
       setStatus('No scenario selected.', true);
       return;
@@ -545,6 +591,12 @@
       }
       const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
       const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length, chain_ids: chainIds });
+      // Prefer server-returned (possibly enriched) assignments so the UI can show
+      // generator run status/mismatch info before scenario execution.
+      if(prepData && Array.isArray(prepData.flag_assignments)){
+        currentFlagAssignments = prepData.flag_assignments.slice();
+        renderChainEditor();
+      }
       const xmlPath = (prepData && prepData.xml_path) ? String(prepData.xml_path) : '';
       const previewPlan = (prepData && prepData.preview_plan_path) ? String(prepData.preview_plan_path) : '';
       if(!xmlPath || !previewPlan){
@@ -566,6 +618,65 @@
     }
   }
 
+  async function saveXmlOnly(){
+    const scenario = (scenarioEl && scenarioEl.value || '').trim();
+    const length = (Array.isArray(currentChain) && currentChain.length) ? currentChain.length : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
+    if(!scenario){
+      setStatus('No scenario selected.', true);
+      return;
+    }
+    if(saveXmlEl) saveXmlEl.disabled = true;
+    setStatus('Preparing preview and saving XML…', false);
+    setLoginLinkVisible(false);
+    try{
+      if(!Array.isArray(currentChain) || currentChain.length === 0){
+        throw new Error('Generate a chain first.');
+      }
+      const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+      const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length, chain_ids: chainIds });
+      if(prepData && Array.isArray(prepData.flag_assignments)){
+        currentFlagAssignments = prepData.flag_assignments.slice();
+        renderChainEditor();
+      }
+      const xmlPath = (prepData && prepData.xml_path) ? String(prepData.xml_path) : '';
+      const previewPlan = (prepData && prepData.preview_plan_path) ? String(prepData.preview_plan_path) : '';
+      if(!xmlPath || !previewPlan){
+        throw new Error('Prepare step did not return xml_path/preview_plan_path');
+      }
+      lastPreviewPlanPath = previewPlan;
+      updateMeta();
+      try {
+        const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
+        if(xmlPathInput) xmlPathInput.value = xmlPath;
+      } catch(e) {}
+      try {
+        if(downloadXmlEl){
+          downloadXmlEl.disabled = false;
+          downloadXmlEl.removeAttribute('title');
+        }
+      } catch(e) {}
+      setStatus('Saved XML: ' + basenameFromPath(xmlPath), false);
+    } catch(err){
+      setStatus(String(err && err.message || err), true);
+      setLoginLinkVisible(!!(err && err.loginRequired));
+    } finally {
+      if(saveXmlEl) saveXmlEl.disabled = false;
+    }
+  }
+
+  function downloadXml(){
+    try {
+      const xmlPath = (document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
+      if(!xmlPath){
+        setStatus('Save XML first to download.', true);
+        return;
+      }
+      window.location.href = '/download_report?path=' + encodeURIComponent(xmlPath);
+    } catch(err){
+      setStatus(String(err && err.message || err), true);
+    }
+  }
+
   // Expose a mermaid click callback; it receives the nodeId like "N0".
   window.flowSelectNode = function(nodeId){
     try{
@@ -576,8 +687,10 @@
     } catch(e) {}
   };
 
-  if(btnEl) btnEl.addEventListener('click', (e)=>{ e.preventDefault(); generate(); });
+  if(btnEl) btnEl.addEventListener('click', (e)=>{ e.preventDefault(); generate(true); });
+  if(saveXmlEl) saveXmlEl.addEventListener('click', (e)=>{ e.preventDefault(); saveXmlOnly(); });
   if(execEl) execEl.addEventListener('click', (e)=>{ e.preventDefault(); execute(); });
+  if(downloadXmlEl) downloadXmlEl.addEventListener('click', (e)=>{ e.preventDefault(); downloadXml(); });
 
   if(downloadLink){
     downloadLink.addEventListener('click', (e)=>{
@@ -633,7 +746,8 @@
   updateScenarioQueryParam();
   updateScenarioFilterControls();
   refreshParticipantNavForScenario(activeScenario);
-  generate();
+  // Auto-generate on load (prefer any saved Flow state).
+  generate(false);
 })();
 </script>
 {% endblock %}

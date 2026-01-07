@@ -7494,9 +7494,17 @@ def _pick_flag_chain_nodes(nodes: list[dict[str, Any]], adj: dict[str, set[str]]
             continue
         id_to_node[nid] = n
         t = (str(n.get('type') or '').strip().lower())
-        # Current rule: any Docker node is eligible (scenario Docker-role nodes + vulnerability Docker nodes).
+        # New rule: flags from flag-generators are placed on vulnerability docker nodes specifically.
         is_docker = ('docker' in t) or (str(n.get('type') or '').strip().upper() == 'DOCKER')
         if not is_docker:
+            continue
+        # Heuristic: treat compose-backed docker nodes whose compose_name is not the standard template
+        # as "vulnerability nodes".
+        comp_name = str(n.get('compose_name') or '').strip().lower()
+        comp = str(n.get('compose') or '').strip().lower()
+        is_compose_backed = bool(comp_name or comp)
+        is_standard = ('standard-ubuntu-docker-core' in comp_name) or ('standard-ubuntu-docker-core' in comp)
+        if not is_compose_backed or is_standard:
             continue
         eligible_ids.append(nid)
 
@@ -7564,7 +7572,7 @@ def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
 
     - docker_total: nodes that look like docker nodes
     - compose_backed_total: docker nodes that carry compose metadata
-    - eligible_total: docker nodes eligible for chain placement (current eligibility)
+    - eligible_total: docker nodes eligible for chain placement (vulnerability docker nodes)
     """
     docker_total = 0
     compose_backed_total = 0
@@ -7582,8 +7590,10 @@ def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
         comp_name = str(n.get('compose_name') or '').strip()
         if comp or comp_name:
             compose_backed_total += 1
-        # Eligibility is now any docker node.
-        eligible_total += 1
+        # Eligibility is vulnerability docker nodes (compose-backed but not the standard template).
+        is_standard = ('standard-ubuntu-docker-core' in comp_name.lower()) or ('standard-ubuntu-docker-core' in comp.lower())
+        if (comp or comp_name) and not is_standard:
+            eligible_total += 1
     return {
         'docker_total': docker_total,
         'compose_backed_total': compose_backed_total,
@@ -7867,11 +7877,16 @@ def scenarios_preview_page():
     )
 
 
-def _latest_preview_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
-    """Return absolute path to newest persisted preview plan for scenario.
+def _latest_preview_plan_for_scenario_norm(scenario_norm: str, *, prefer_flow: bool = True) -> Optional[str]:
+    """Return absolute path to newest persisted plan for a scenario.
 
-    Preview plans are created by /plan/full_preview_page and stored under
-    outputs/plans/plan_from_preview_*.json.
+    This is primarily used by Flag Sequencing. Two plan types exist:
+    - Preview plans: outputs/plans/plan_from_preview_*.json
+    - Flow-modified plans: outputs/plans/plan_from_flow_*.json
+
+    By default, we prefer flow-modified plans (they represent the user's
+    saved sequencing/assignments). Callers can set prefer_flow=False to
+    prefer the newest preview plan instead.
     """
     try:
         scenario_norm = _normalize_scenario_label(scenario_norm)
@@ -7880,9 +7895,45 @@ def _latest_preview_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
         plans_dir = Path(_outputs_dir()) / 'plans'
         if not plans_dir.is_dir():
             return None
-        candidates = list(plans_dir.glob('plan_from_preview_*.json'))
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         # Cap scan to avoid walking very large directories.
+        globs = (
+            ['plan_from_flow_*.json', 'plan_from_preview_*.json']
+            if prefer_flow
+            else ['plan_from_preview_*.json', 'plan_from_flow_*.json']
+        )
+        scanned = 0
+        for pat in globs:
+            candidates = list(plans_dir.glob(pat))
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            for p in candidates:
+                scanned += 1
+                if scanned > 250:
+                    return None
+                try:
+                    with open(p, 'r', encoding='utf-8') as f:
+                        payload = json.load(f) or {}
+                    meta = payload.get('metadata') if isinstance(payload, dict) else None
+                    scen = str((meta or {}).get('scenario') or '').strip()
+                    if _normalize_scenario_label(scen) == scenario_norm:
+                        return str(p)
+                except Exception:
+                    continue
+        return None
+    except Exception:
+        return None
+
+
+def _latest_flow_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
+    """Return newest flow-modified plan path for scenario (or None)."""
+    try:
+        scenario_norm = _normalize_scenario_label(scenario_norm)
+        if not scenario_norm:
+            return None
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        if not plans_dir.is_dir():
+            return None
+        candidates = list(plans_dir.glob('plan_from_flow_*.json'))
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         for p in candidates[:250]:
             try:
                 with open(p, 'r', encoding='utf-8') as f:
@@ -8063,118 +8114,23 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
     if not chain_ids:
         return []
 
+    # Use generator-catalog entries (flag-generators) instead of docker-compose templates.
     try:
-        flag_items, _flag_meta = _flag_catalog_items_from_enabled_sources()
+        generators, _errors = _flag_generators_from_enabled_sources()
     except Exception:
-        flag_items, _flag_meta = ([], {})
+        generators = []
 
-    def _is_local_path(p: str) -> bool:
-        try:
-            if not p:
-                return False
-            if p.startswith('http://') or p.startswith('https://'):
-                return False
-            return True
-        except Exception:
-            return False
+    eligible_gens: list[dict[str, Any]] = []
+    for g in (generators or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if not gid:
+            continue
+        eligible_gens.append(g)
 
-    repo_root = _get_repo_root()
-    eligible_flags: list[dict[str, Any]] = []
-    known_io: dict[str, dict[str, list[str]]] = {
-        'flag_creds_drop': {'inputs': [], 'outputs': ['ssh.username', 'ssh.password']},
-        'flag_ssh_server_with_flag': {'inputs': ['ssh.username', 'ssh.password'], 'outputs': ['flag']},
-        'flag_http_basic_creds_drop': {'inputs': [], 'outputs': ['http.basic.username', 'http.basic.password']},
-        'flag_web_basic_auth_flag': {'inputs': ['http.basic.username', 'http.basic.password'], 'outputs': ['flag']},
-        'flag_token_drop': {'inputs': [], 'outputs': ['api.token']},
-        'flag_web_token_gate_flag': {'inputs': ['api.token'], 'outputs': ['flag']},
-        'flag_ssh_key_drop': {'inputs': [], 'outputs': ['ssh.username', 'ssh.private_key']},
-        'flag_ssh_server_key_auth_with_flag': {'inputs': ['ssh.username', 'ssh.private_key'], 'outputs': ['flag']},
-    }
-    known_hint: dict[str, str] = {
-        'flag_creds_drop': 'Next: SSH to {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}) using ssh.username/ssh.password.',
-        'flag_ssh_server_with_flag': 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}). Read /opt/flag.txt after SSH login.',
-        'flag_http_basic_creds_drop': 'Next: visit {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}) and use HTTP Basic Auth (http.basic.username/http.basic.password).',
-        'flag_web_basic_auth_flag': 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}).',
-        'flag_token_drop': 'Next: visit {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}) with ?token=<api.token>.',
-        'flag_web_token_gate_flag': 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}).',
-        'flag_ssh_key_drop': 'Next: SSH to {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}) using ssh.private_key as student.',
-        'flag_ssh_server_key_auth_with_flag': 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}).',
-    }
-    try:
-        for it in (flag_items or []):
-            if not isinstance(it, dict):
-                continue
-            if (str(it.get('type') or '').strip().lower() != 'docker-compose'):
-                continue
-            raw_path = str(it.get('path') or '').strip()
-            if not _is_local_path(raw_path):
-                continue
-            abs_path = os.path.abspath(os.path.join(repo_root, raw_path)) if not os.path.isabs(raw_path) else os.path.abspath(raw_path)
-            if not os.path.exists(abs_path):
-                continue
-            rel_path = raw_path
-            try:
-                if os.path.commonpath([abs_path, repo_root]) == repo_root:
-                    rel_path = os.path.relpath(abs_path, repo_root)
-            except Exception:
-                rel_path = raw_path
-            eligible_flags.append({
-                'id': str(it.get('id') or '').strip() or str(it.get('name') or '').strip(),
-                'name': str(it.get('name') or '').strip() or str(it.get('id') or '').strip(),
-                'type': 'docker-compose',
-                'path': rel_path,
-                'compose_name': str(it.get('compose_name') or '').strip() or 'docker-compose.yml',
-                'security_profile': str(it.get('security_profile') or '').strip() or 'strict',
-                'enforce_security': bool(it.get('enforce_security', True)),
-                'inputs': list(it.get('inputs') or []) if isinstance(it.get('inputs'), list) else [],
-                'outputs': list(it.get('outputs') or []) if isinstance(it.get('outputs'), list) else [],
-                'hint_template': str(it.get('hint_template') or '').strip() or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})',
-            })
-    except Exception:
-        eligible_flags = []
-
-    # Backfill IO for known built-in templates when catalogs predate inputs/outputs support.
-    try:
-        for f in eligible_flags:
-            fid = str(f.get('id') or '').strip()
-            if not fid or fid not in known_io:
-                continue
-            if not isinstance(f.get('inputs'), list) or not f.get('inputs'):
-                f['inputs'] = list(known_io[fid]['inputs'])
-            if not isinstance(f.get('outputs'), list) or not f.get('outputs'):
-                f['outputs'] = list(known_io[fid]['outputs'])
-            if not str(f.get('hint_template') or '').strip() and fid in known_hint:
-                f['hint_template'] = known_hint[fid]
-    except Exception:
-        pass
-
-    if not eligible_flags:
-        eligible_flags = [
-            {
-                'id': 'flag_creds_drop',
-                'name': 'flag_creds_drop',
-                'type': 'docker-compose',
-                'path': os.path.join('flag_templates', 'flag_creds_drop', 'compose.yml'),
-                'compose_name': 'compose.yml',
-                'security_profile': 'strict',
-                'enforce_security': True,
-                'inputs': [],
-                'outputs': ['ssh.username', 'ssh.password'],
-                'hint_template': known_hint.get('flag_creds_drop') or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})',
-            },
-            {
-                'id': 'flag_ssh_server_with_flag',
-                'name': 'flag_ssh_server_with_flag',
-                'type': 'docker-compose',
-                'path': os.path.join('flag_templates', 'flag_ssh_server_with_flag', 'compose.yml'),
-                'compose_name': 'compose.yml',
-                'security_profile': 'strict',
-                'enforce_security': True,
-                'inputs': ['ssh.username', 'ssh.password'],
-                'outputs': ['flag'],
-                'hint_template': known_hint.get('flag_ssh_server_with_flag') or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})',
-            },
-        ]
+    if not eligible_gens:
+        return []
 
     # Deterministic randomness for generator selection.
     try:
@@ -8186,12 +8142,6 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
         rnd = _random.Random(seed_val ^ 0xC0FFEE)
     except Exception:
         rnd = None
-
-    try:
-        if rnd is not None:
-            rnd.shuffle(eligible_flags)
-    except Exception:
-        pass
 
     # Map ids -> names for THIS/NEXT substitution.
     id_to_name: dict[str, str] = {}
@@ -8227,77 +8177,105 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
             return ''
 
     out: list[dict[str, Any]] = []
-    if not eligible_flags:
-        return out
 
-    available: set[str] = set()
+    def _required_inputs_of(gen: dict[str, Any]) -> set[str]:
+        required: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get('name') or '').strip()
+                    if not name:
+                        continue
+                    if inp.get('required') is False:
+                        continue
+                    required.add(name)
+        except Exception:
+            pass
+        return required
+
+    def _provides_of(gen: dict[str, Any]) -> set[str]:
+        provides: set[str] = set()
+        try:
+            prov = gen.get('provides')
+            if isinstance(prov, list):
+                for x in prov:
+                    s = str(x).strip()
+                    if s:
+                        provides.add(s)
+        except Exception:
+            pass
+        try:
+            outputs = gen.get('outputs')
+            if isinstance(outputs, list):
+                for outp in outputs:
+                    if not isinstance(outp, dict):
+                        continue
+                    nm = str(outp.get('name') or '').strip()
+                    if nm:
+                        provides.add(nm)
+        except Exception:
+            pass
+        return provides
+
+    # Inputs we can always synthesize deterministically at preview time.
+    # Keep this in sync with _flow_default_generator_config() and common generator conventions.
+    available: set[str] = {
+        'seed',
+        'secret',
+        'env_name',
+        'challenge',
+        'flag_prefix',
+        'username_prefix',
+        'key_len',
+    }
     prev_outputs: set[str] = set()
-
-    def _inputs_of(f: dict[str, Any]) -> set[str]:
-        try:
-            raw = f.get('inputs')
-            if isinstance(raw, list):
-                return {str(x).strip() for x in raw if str(x).strip()}
-        except Exception:
-            pass
-        return set()
-
-    def _outputs_of(f: dict[str, Any]) -> set[str]:
-        try:
-            raw = f.get('outputs')
-            if isinstance(raw, list):
-                return {str(x).strip() for x in raw if str(x).strip()}
-        except Exception:
-            pass
-        return set()
 
     for i, cid in enumerate(chain_ids):
         # Enforce chainability:
-        # - position 0 should be a seed generator (no inputs) when possible
-        # - later positions should prefer generators whose inputs are satisfied by the
-        #   previous step's outputs; fall back to any previously available outputs.
+        # - prefer generators whose required inputs are satisfied by the previous step's outputs
+        #   (plus globally-available synthesized inputs)
         if i == 0:
-            feasible = [f for f in eligible_flags if not _inputs_of(f)]
+            feasible = [g for g in eligible_gens if _required_inputs_of(g).issubset(available)]
         else:
-            feasible = [f for f in eligible_flags if _inputs_of(f) and _inputs_of(f).issubset(prev_outputs)]
+            satisfied_now = prev_outputs | available
+            feasible = [g for g in eligible_gens if _required_inputs_of(g) and _required_inputs_of(g).issubset(satisfied_now)]
             if not feasible:
-                feasible = [f for f in eligible_flags if _inputs_of(f).issubset(prev_outputs)]
-            if not feasible:
-                feasible = [f for f in eligible_flags if _inputs_of(f).issubset(available)]
+                feasible = [g for g in eligible_gens if _required_inputs_of(g).issubset(satisfied_now)]
 
         if feasible:
             if rnd is not None:
                 try:
-                    flag = rnd.choice(feasible)
+                    gen = rnd.choice(feasible)
                 except Exception:
-                    flag = feasible[0]
+                    gen = feasible[0]
             else:
-                flag = feasible[0]
+                gen = feasible[0]
         else:
             # If the catalog doesn't contain a seed (or no compatible step exists),
             # fall back to a stable rotation.
-            flag = eligible_flags[i % len(eligible_flags)]
+            gen = eligible_gens[i % len(eligible_gens)]
 
         # Update outputs for the next hop.
         try:
-            prev_outputs = _outputs_of(flag)
+            prev_outputs = _provides_of(gen)
             available |= prev_outputs
         except Exception:
             pass
 
         next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
-        hint_tpl = str(flag.get('hint_template') or '').strip() or (known_hint.get(str(flag.get('id') or '').strip()) or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})')
+        hint_tpl = str(gen.get('hint_template') or '').strip() or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
         out.append({
             'node_id': str(cid),
-            'id': str(flag.get('id') or ''),
-            'name': str(flag.get('name') or ''),
-            'type': 'docker-compose',
-            'path': str(flag.get('path') or ''),
-            'compose_name': str(flag.get('compose_name') or ''),
-            'security_profile': str(flag.get('security_profile') or ''),
-            'enforce_security': bool(flag.get('enforce_security', True)),
-            'inputs': list(flag.get('inputs') or []) if isinstance(flag.get('inputs'), list) else [],
-            'outputs': list(flag.get('outputs') or []) if isinstance(flag.get('outputs'), list) else [],
+            'id': str(gen.get('id') or ''),
+            'name': str(gen.get('name') or ''),
+            'type': 'flag-generator',
+            'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
+            'language': str(gen.get('language') or ''),
+            'inputs': sorted(list(_required_inputs_of(gen))),
+            'outputs': sorted(list(_provides_of(gen))),
             'hint_template': hint_tpl,
             'hint': _render_hint(hint_tpl, this_id=str(cid), next_id=str(next_id)),
             'next_node_id': str(next_id),
@@ -8316,9 +8294,13 @@ def api_flow_attackflow_preview():
     except Exception:
         length = 5
     length = max(1, min(length, 50))
+    requested_length = length
 
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    prefer_preview = str(request.args.get('prefer_preview') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+    force_preview = str(request.args.get('force_preview') or '').strip().lower() in ('1', 'true', 'yes', 'y')
 
     preview_plan_path = (request.args.get('preview_plan') or '').strip() or None
     if preview_plan_path:
@@ -8332,7 +8314,18 @@ def api_flow_attackflow_preview():
         except Exception:
             preview_plan_path = None
     if not preview_plan_path:
-        preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm)
+        if force_preview:
+            # Explicitly ignore any saved flow plan; used by the Generate button.
+            preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+        elif prefer_preview:
+            # Soft preference: only prefer preview if there is no saved flow plan.
+            flow_plan = _latest_flow_plan_for_scenario_norm(scenario_norm)
+            if flow_plan:
+                preview_plan_path = flow_plan
+            else:
+                preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+        else:
+            preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=True)
 
     if not preview_plan_path:
         return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
@@ -8348,12 +8341,75 @@ def api_flow_attackflow_preview():
 
     nodes, _links, adj = _build_topology_graph_from_preview_plan(preview)
     stats = _flow_compose_docker_stats(nodes)
-    chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
-    flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+
+    # If the latest plan is flow-modified, prefer the saved chain order.
+    chain_nodes: list[dict[str, Any]] = []
+    used_saved_chain = False
+    try:
+        meta = payload.get('metadata') if isinstance(payload, dict) else None
+        flow_meta = meta.get('flow') if isinstance(meta, dict) else None
+        saved_chain = flow_meta.get('chain') if isinstance(flow_meta, dict) else None
+        saved_ids: list[str] = []
+        if isinstance(saved_chain, list) and saved_chain:
+            for entry in saved_chain:
+                if not isinstance(entry, dict):
+                    continue
+                cid = str(entry.get('id') or '').strip()
+                if cid:
+                    saved_ids.append(cid)
+        if saved_ids:
+            id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
+            # Honor requested length (truncate) but do not try to auto-extend.
+            desired = saved_ids[:length]
+            chain_nodes = [id_map[cid] for cid in desired if cid in id_map]
+            if chain_nodes:
+                used_saved_chain = True
+    except Exception:
+        chain_nodes = []
+
+    if not chain_nodes:
+        chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
+
+    # If we loaded a saved chain that is shorter than the requested length (e.g. the UI
+    # reset its length input to the default on refresh), treat the saved chain as
+    # authoritative and respond with its effective length.
+    if used_saved_chain:
+        try:
+            eff = len(chain_nodes)
+            if eff > 0:
+                length = eff
+        except Exception:
+            pass
+    # Prefer persisted assignments when the plan comes from a prior Flow save.
+    flag_assignments: list[dict[str, Any]] = []
+    try:
+        meta = payload.get('metadata') if isinstance(payload, dict) else None
+        flow_meta = meta.get('flow') if isinstance(meta, dict) else None
+        saved_assignments = flow_meta.get('flag_assignments') if isinstance(flow_meta, dict) else None
+        if isinstance(saved_assignments, list) and saved_assignments:
+            chain_id_set = {str(n.get('id') or '').strip() for n in (chain_nodes or []) if isinstance(n, dict)}
+            filtered: list[dict[str, Any]] = []
+            for entry in saved_assignments:
+                if not isinstance(entry, dict):
+                    continue
+                nid = str(entry.get('node_id') or '').strip()
+                if nid and nid in chain_id_set:
+                    filtered.append(entry)
+            # Only accept if we have a complete mapping (one per chain node).
+            if filtered and len(filtered) == len(chain_id_set):
+                # Preserve chain order.
+                by_id = {str(e.get('node_id') or '').strip(): e for e in filtered}
+                flag_assignments = [by_id.get(str(n.get('id') or '').strip()) for n in chain_nodes]
+                flag_assignments = [e for e in flag_assignments if isinstance(e, dict)]
+    except Exception:
+        flag_assignments = []
+
+    if not flag_assignments:
+        flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
 
     if len(chain_nodes) < 1:
         return jsonify({'ok': False, 'error': 'No eligible Docker nodes found in preview plan.' , 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
-    if len(chain_nodes) < length:
+    if (not used_saved_chain) and len(chain_nodes) < length:
         return jsonify({
             'ok': False,
             'error': f'Only {len(chain_nodes)} eligible Docker nodes found for chain length {length}.',
@@ -8367,6 +8423,7 @@ def api_flow_attackflow_preview():
         'ok': True,
         'scenario': scenario_label or scenario_norm,
         'length': length,
+        'requested_length': requested_length,
         'preview_plan_path': preview_plan_path,
         'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
         'flag_assignments': flag_assignments,
@@ -8397,6 +8454,7 @@ def api_flow_prepare_preview_for_execute():
     except Exception:
         length = 5
     length = max(1, min(length, 50))
+    requested_length = length
 
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
@@ -8452,6 +8510,12 @@ def api_flow_prepare_preview_for_execute():
             return jsonify({'ok': False, 'error': 'Not enough eligible Docker nodes in preview plan to build the requested chain.', 'available': len(chain_nodes), 'stats': stats}), 422
         chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if str(n.get('id') or '').strip()]
 
+    # Caller may pass fewer ids than requested length; persist effective length.
+    try:
+        length = len(chain_nodes)
+    except Exception:
+        pass
+
     # Apply Flow modifications to the preview payload: promote chain nodes to Docker role.
     try:
         hosts = preview.get('hosts') or []
@@ -8465,9 +8529,108 @@ def api_flow_prepare_preview_for_execute():
     except Exception:
         pass
 
-    # Inject flag packages into chain nodes by attaching a docker-compose reference in host metadata.
-    # The topology builder + CLI will later generate per-node compose files under /tmp/vulns/docker-compose-<node>.yml.
+    # Inject generator metadata into chain nodes.
+    # Flag-generators should NOT create nodes/services; they generate artifacts/flags that can be
+    # inserted into existing Docker nodes.
     flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+
+    # Load generator catalog once so we can prune config to declared inputs.
+    try:
+        _gens_for_cfg, _ = _flag_generators_from_enabled_sources()
+    except Exception:
+        _gens_for_cfg = []
+    _gen_by_id: dict[str, dict[str, Any]] = {}
+    try:
+        for _g in (_gens_for_cfg or []):
+            if not isinstance(_g, dict):
+                continue
+            _gid = str(_g.get('id') or '').strip()
+            if _gid:
+                _gen_by_id[_gid] = _g
+    except Exception:
+        _gen_by_id = {}
+
+    def _all_input_names_of(gen: dict[str, Any]) -> set[str]:
+        names: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    nm = str(inp.get('name') or '').strip()
+                    if nm:
+                        names.add(nm)
+        except Exception:
+            pass
+        return names
+
+    def _flow_default_generator_config(assignment: dict[str, Any], *, seed_val: Any) -> dict[str, Any]:
+        """Synthesize deterministic default inputs for the seeded generators."""
+        node_id = str(assignment.get('node_id') or '').strip()
+        gen_id = str(assignment.get('id') or '').strip()
+        base_seed = str(seed_val if seed_val not in (None, '') else '0')
+        return {
+            'seed': f"{base_seed}:{scenario_norm}:{node_id}:{gen_id}",
+            'flag_prefix': 'FLAG',
+            'secret': f"FLOWSECRET_{base_seed}_{scenario_norm}_{node_id}",
+            'env_name': f"env_{scenario_norm}_{node_id}",
+            'challenge': f"challenge_{scenario_norm}_{node_id}",
+            'username_prefix': 'user',
+            'key_len': 16,
+        }
+
+    def _flow_try_run_generator(generator_id: str, *, out_dir: str, config: dict[str, Any]) -> tuple[bool, str, str | None]:
+        """Best-effort run of scripts/run_flag_generator.py.
+
+        Returns: (ok, note_or_error, manifest_path)
+        """
+        try:
+            repo_root = _get_repo_root()
+            runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
+            if not os.path.exists(runner_path):
+                return False, 'runner script not found', None
+
+            try:
+                docker_ok = bool(shutil.which('docker'))
+            except Exception:
+                docker_ok = False
+            if not docker_ok:
+                return False, 'docker not found; skipping generator execution', None
+
+            cmd = [
+                sys.executable or 'python',
+                runner_path,
+                '--generator-id',
+                generator_id,
+                '--out-dir',
+                out_dir,
+                '--config',
+                json.dumps(config, ensure_ascii=False),
+                '--repo-root',
+                repo_root,
+            ]
+            p = subprocess.run(
+                cmd,
+                cwd=repo_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            manifest_path = os.path.join(out_dir, 'outputs.json')
+            if p.returncode != 0:
+                err = (p.stderr or p.stdout or '').strip()
+                if err:
+                    err = err[-800:]
+                return False, f'generator failed (rc={p.returncode}): {err}', (manifest_path if os.path.exists(manifest_path) else None)
+            if os.path.exists(manifest_path):
+                return True, 'ok', manifest_path
+            return True, 'ok (no outputs.json)', None
+        except subprocess.TimeoutExpired:
+            return False, 'generator timed out', None
+        except Exception as exc:
+            return False, f'generator exception: {exc}', None
     try:
         host_by_id: dict[str, dict[str, Any]] = {}
         hosts = preview.get('hosts') or []
@@ -8476,6 +8639,9 @@ def api_flow_prepare_preview_for_execute():
                 if not isinstance(h, dict):
                     continue
                 host_by_id[str(h.get('node_id') or '').strip()] = h
+
+        generation_failures: list[dict[str, Any]] = []
+        created_run_dirs: list[str] = []
         for fa in (flag_assignments or []):
             if not isinstance(fa, dict):
                 continue
@@ -8487,21 +8653,202 @@ def api_flow_prepare_preview_for_execute():
             if not isinstance(meta_h, dict):
                 meta_h = {}
                 h['metadata'] = meta_h
+            generator_id = str(fa.get('id') or '').strip()
+            seed_val = preview.get('seed') if isinstance(preview, dict) else None
+
+            cfg_full = _flow_default_generator_config(fa, seed_val=seed_val)
+            cfg = cfg_full
+            try:
+                gen_def = _gen_by_id.get(generator_id)
+                if isinstance(gen_def, dict):
+                    allowed = _all_input_names_of(gen_def)
+                    # If the generator declares inputs, only pass those (keeps Flow configs relevant).
+                    if allowed:
+                        cfg = {k: v for k, v in cfg_full.items() if k in allowed}
+            except Exception:
+                cfg = cfg_full
+
+            flow_out_dir = ''
+            ok_run = False
+            note = ''
+            manifest_path = None
+            actual_output_keys: list[str] = []
+            declared_output_keys: list[str] = []
+            try:
+                declared_output_keys = sorted([str(x) for x in (fa.get('outputs') or []) if str(x).strip()])
+            except Exception:
+                declared_output_keys = []
+            mismatch: dict[str, Any] = {}
+            try:
+                if generator_id:
+                    flow_run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
+                    # IMPORTANT: stage under /tmp/vulns so the existing sync pipeline can ship
+                    # these artifacts to the CORE host (where docker-compose paths resolve).
+                    flow_out_dir = os.path.join('/tmp/vulns', 'flag_generators_runs', f"flow-{scenario_norm}-{flow_run_id}")
+                    os.makedirs(flow_out_dir, exist_ok=True)
+                    try:
+                        created_run_dirs.append(str(flow_out_dir))
+                    except Exception:
+                        pass
+                    ok_run, note, manifest_path = _flow_try_run_generator(generator_id, out_dir=flow_out_dir, config=cfg)
+
+                    if not ok_run:
+                        generation_failures.append({
+                            'node_id': cid,
+                            'node_name': str(h.get('name') or ''),
+                            'generator_id': generator_id,
+                            'error': str(note or 'generator execution failed'),
+                            'run_dir': str(flow_out_dir or ''),
+                        })
+
+                    # Materialize a human-readable hint file in the artifacts directory.
+                    # This is mounted into the target docker node (typically at /flow_artifacts).
+                    # We do this regardless of generator success so the participant can still
+                    # discover the intended next-step instructions from within the node.
+                    try:
+                        hint_text = str(fa.get('hint') or '').strip()
+                        if flow_out_dir and hint_text:
+                            with open(os.path.join(flow_out_dir, 'hint.txt'), 'w', encoding='utf-8') as hf:
+                                hf.write(hint_text + "\n")
+                    except Exception:
+                        pass
+
+                    # If the generator produced a manifest, capture the actual output keys.
+                    if ok_run and manifest_path and os.path.exists(manifest_path):
+                        try:
+                            with open(manifest_path, 'r', encoding='utf-8') as f:
+                                m = json.load(f) or {}
+                            outs = m.get('outputs') if isinstance(m, dict) else None
+                            if isinstance(outs, dict):
+                                actual_output_keys = sorted([str(k) for k in outs.keys() if str(k).strip()])
+
+                                # Substitute output placeholders into the hint (best-effort).
+                                try:
+                                    hint_final = str(fa.get('hint') or '')
+                                    for k, v in outs.items():
+                                        kk = str(k)
+                                        if not kk:
+                                            continue
+                                        placeholder = '{{OUTPUT.' + kk + '}}'
+                                        if placeholder not in hint_final:
+                                            continue
+                                        if isinstance(v, (dict, list)):
+                                            vv = json.dumps(v, ensure_ascii=False)
+                                        else:
+                                            vv = str(v)
+                                        hint_final = hint_final.replace(placeholder, vv)
+                                    if hint_final and hint_final != str(fa.get('hint') or ''):
+                                        fa['hint'] = hint_final
+                                except Exception:
+                                    pass
+
+                                # Best-effort: materialize a human-readable hint file in the artifacts directory.
+                                # Note: hint.txt is always materialized above (even without outputs.json).
+
+                                # Best-effort: if the generator emitted a top-level 'flag' value,
+                                # also write a plain flag.txt for easier participant discovery.
+                                try:
+                                    flag_val = outs.get('flag')
+                                    if ok_run and flow_out_dir and isinstance(flag_val, str) and flag_val.strip():
+                                        with open(os.path.join(flow_out_dir, 'flag.txt'), 'w', encoding='utf-8') as ff:
+                                            ff.write(flag_val.strip() + "\n")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            actual_output_keys = []
+
+                    # Compare declared vs actual output keys (best-effort). We keep chaining logic
+                    # based on declared outputs, but record mismatches to help validate generators.
+                    try:
+                        if ok_run and actual_output_keys:
+                            declared_set = set(declared_output_keys or [])
+                            actual_set = set(actual_output_keys or [])
+                            missing = sorted(list(declared_set - actual_set))
+                            extra = sorted(list(actual_set - declared_set))
+                            mismatch = {
+                                'declared': declared_output_keys,
+                                'actual': actual_output_keys,
+                                'missing': missing,
+                                'extra': extra,
+                                'ok': (not missing and not extra),
+                            }
+                    except Exception:
+                        mismatch = {}
+            except Exception as exc:
+                ok_run, note, manifest_path = False, f'generator exception: {exc}', None
+                if generator_id:
+                    generation_failures.append({
+                        'node_id': cid,
+                        'node_name': str(h.get('name') or ''),
+                        'generator_id': generator_id,
+                        'error': str(note or ''),
+                        'run_dir': str(flow_out_dir or ''),
+                    })
+
             meta_h['flow_flag'] = {
-                'id': str(fa.get('id') or ''),
-                'name': str(fa.get('name') or ''),
-                'type': 'docker-compose',
-                'path': str(fa.get('path') or ''),
-                'compose_name': str(fa.get('compose_name') or ''),
-                'security_profile': str(fa.get('security_profile') or ''),
-                'enforce_security': bool(fa.get('enforce_security', True)),
+                'type': 'flag-generator',
+                'generator_id': generator_id,
+                'generator_name': str(fa.get('name') or ''),
+                'generator_language': str(fa.get('language') or ''),
+                'generator_source': str(fa.get('flag_generator') or ''),
+                'artifacts_dir': str(flow_out_dir or ''),
                 'inputs': list(fa.get('inputs') or []) if isinstance(fa.get('inputs'), list) else [],
                 'outputs': list(fa.get('outputs') or []) if isinstance(fa.get('outputs'), list) else [],
                 'hint_template': str(fa.get('hint_template') or ''),
                 'hint': str(fa.get('hint') or ''),
                 'next_node_id': str(fa.get('next_node_id') or ''),
                 'next_node_name': str(fa.get('next_node_name') or ''),
+                'generated': bool(ok_run),
+                'generation_note': str(note or ''),
+                'run_dir': str(flow_out_dir or ''),
+                'outputs_manifest': str(manifest_path or ''),
+                'actual_outputs': actual_output_keys,
+                'declared_outputs': declared_output_keys,
+                'outputs_match': bool(mismatch.get('ok')) if isinstance(mismatch, dict) and mismatch else True,
+                'outputs_mismatch': mismatch,
+                'config': cfg,
             }
+
+            # Also enrich the assignment itself for the Flow UI response.
+            # This keeps the UI deterministic on declared I/O for chaining, but gives
+            # immediate visibility into schema vs runtime mismatches.
+            try:
+                fa['generated'] = bool(ok_run)
+                fa['generation_note'] = str(note or '')
+                fa['artifacts_dir'] = str(flow_out_dir or '')
+                fa['outputs_manifest'] = str(manifest_path or '')
+                fa['declared_outputs'] = declared_output_keys
+                fa['actual_outputs'] = actual_output_keys
+                fa['outputs_match'] = bool(mismatch.get('ok')) if isinstance(mismatch, dict) and mismatch else True
+                fa['outputs_mismatch'] = mismatch
+            except Exception:
+                pass
+
+        if generation_failures:
+            # Cleanup partial artifacts so we don't leave confusing residues behind.
+            try:
+                base_dir = os.path.abspath(os.path.join('/tmp', 'vulns', 'flag_generators_runs'))
+                for d in (created_run_dirs or []):
+                    try:
+                        dd = os.path.abspath(str(d))
+                        if os.path.commonpath([dd, base_dir]) != base_dir:
+                            continue
+                        shutil.rmtree(dd, ignore_errors=True)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            return jsonify({
+                'ok': False,
+                'error': f"{len(generation_failures)} generator run(s) failed; cannot prepare preview for execute.",
+                'scenario': scenario_label or scenario_norm,
+                'length': length,
+                'stats': stats,
+                'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+                'flag_assignments': flag_assignments,
+                'generation_failures': generation_failures,
+                'base_preview_plan_path': base_plan_path,
+            }), 422
     except Exception:
         pass
 
@@ -8510,7 +8857,11 @@ def api_flow_prepare_preview_for_execute():
             'source_preview_plan_path': base_plan_path,
             'scenario': scenario_label or scenario_norm,
             'length': length,
+            'requested_length': requested_length,
             'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+            # Persist all Flow decisions so returning to Flag Sequencing shows the same
+            # chain and generator selections/hints.
+            'flag_assignments': flag_assignments,
             'modified_at': _iso_now(),
         }
         if isinstance(meta, dict):
@@ -8546,6 +8897,7 @@ def api_flow_prepare_preview_for_execute():
         'ok': True,
         'scenario': scenario_label or scenario_norm,
         'length': length,
+        'requested_length': requested_length,
         'stats': stats,
         'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
         'flag_assignments': flag_assignments,
@@ -12804,8 +13156,63 @@ FLAG_GENERATORS_SOURCES_DIR = os.path.join(DATA_SOURCES_DIR, 'flag_generators')
 FLAG_GENERATORS_STATE_PATH = os.path.join(FLAG_GENERATORS_SOURCES_DIR, '_state.json')
 os.makedirs(FLAG_GENERATORS_SOURCES_DIR, exist_ok=True)
 
+# Flag node-generator sources state (JSON)
+FLAG_NODE_GENERATORS_SOURCES_DIR = os.path.join(DATA_SOURCES_DIR, 'flag_node_generators')
+FLAG_NODE_GENERATORS_STATE_PATH = os.path.join(FLAG_NODE_GENERATORS_SOURCES_DIR, '_state.json')
+os.makedirs(FLAG_NODE_GENERATORS_SOURCES_DIR, exist_ok=True)
+
 
 # ---------------- Flag Generator Schema (v1) -----------------
+
+
+_FLAG_GENERATOR_CATALOG_SCHEMA_PATH = os.path.join(_get_repo_root(), 'validation', 'flag_generator_catalog.schema.json')
+_JSON_SCHEMA_CACHE: dict[str, dict] = {}
+
+
+def _load_json_schema_file(schema_path: str) -> dict | None:
+    try:
+        schema_path = os.path.abspath(schema_path)
+        if schema_path in _JSON_SCHEMA_CACHE:
+            return _JSON_SCHEMA_CACHE[schema_path]
+        if not os.path.exists(schema_path):
+            return None
+        with open(schema_path, 'r', encoding='utf-8') as fh:
+            schema = json.load(fh)
+        if isinstance(schema, dict):
+            _JSON_SCHEMA_CACHE[schema_path] = schema
+            return schema
+        return None
+    except Exception:
+        return None
+
+
+def _validate_json_schema(instance: object, schema_path: str) -> tuple[bool, str | None]:
+    """Best-effort JSON Schema validation.
+
+    Returns (ok, error_message_or_none). If jsonschema isn't installed or schema can't be loaded,
+    validation is skipped (ok=True).
+    """
+    try:
+        import jsonschema  # type: ignore
+        from jsonschema.exceptions import ValidationError  # type: ignore
+    except Exception:
+        return True, None
+
+    schema = _load_json_schema_file(schema_path)
+    if not schema:
+        return True, None
+    try:
+        jsonschema.validate(instance=instance, schema=schema)
+        return True, None
+    except ValidationError as e:
+        try:
+            loc = '/'.join(str(p) for p in list(e.absolute_path))
+        except Exception:
+            loc = ''
+        loc = loc or '(root)'
+        return False, f"Schema validation failed at {loc}: {e.message}"
+    except Exception as e:
+        return False, f"Schema validation failed: {e}"
 
 
 FLAG_GENERATOR_REQUIRED_FIELDS = ['id', 'name', 'language', 'source', 'outputs']
@@ -12814,15 +13221,48 @@ FLAG_GENERATOR_OPTIONAL_FIELDS = [
     'version',
     'tags',
     'compose',
+    'env',
     'build',
     'run',
     'inputs',
     'requirements',
     'provides',
+    'hint_template',
+    'handoff',
 ]
 FLAG_GENERATOR_ALL_FIELDS = FLAG_GENERATOR_REQUIRED_FIELDS + FLAG_GENERATOR_OPTIONAL_FIELDS
 
 FLAG_GENERATOR_LANGUAGES = {'python', 'c', 'cpp'}
+
+
+def _coerce_flaggen_io_type(name: str) -> str:
+    n = (name or '').strip().lower()
+    if not n:
+        return 'text'
+    if 'private_key' in n or n.endswith('.key'):
+        return 'text'
+    if 'password' in n or 'secret' in n:
+        return 'text'
+    if 'token' in n:
+        return 'text'
+    if 'flag' in n:
+        return 'flag'
+    return 'text'
+
+
+def _coerce_flaggen_io_sensitive(name: str, tp: str) -> bool:
+    n = (name or '').strip().lower()
+    t = (tp or '').strip().lower()
+    if t == 'flag':
+        return True
+    if any(k in n for k in ('password', 'secret', 'token', 'private_key', 'ssh.private_key')):
+        return True
+    return False
+
+
+def _generator_defs_from_flag_catalog_items(items: list[dict]) -> list[dict]:
+    """Deprecated: no longer converting flag-catalog templates into generators."""
+    return []
 
 
 def _load_flag_generator_sources_state() -> dict:
@@ -12839,6 +13279,7 @@ def _load_flag_generator_sources_state() -> dict:
                 try:
                     unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
                     dest = os.path.join(FLAG_GENERATORS_SOURCES_DIR, f"{unique}-flag_generators.json")
+                    # Copy seed into managed sources.
                     shutil.copyfile(seed_path, dest)
                     ok, note, _doc, _skipped = _validate_and_normalize_flag_generator_source_json(dest)
                     sources.append({
@@ -12861,6 +13302,38 @@ def _load_flag_generator_sources_state() -> dict:
         sources = state.get('sources')
         if not isinstance(sources, list):
             state['sources'] = []
+        # Keep seeded generator catalog in sync with repo seed.
+        try:
+            repo_seed = os.path.abspath(os.path.join(DATA_SOURCES_DIR, 'flag_generators_seed.json'))
+            if os.path.exists(repo_seed):
+                mutated = False
+                for s in state.get('sources', []):
+                    if not isinstance(s, dict):
+                        continue
+                    if (s.get('name') or '') != 'flag_generators_seed.json':
+                        continue
+                    p = s.get('path')
+                    if not p or not os.path.exists(p):
+                        continue
+                    # Always refresh the managed copy from the repo seed.
+                    try:
+                        shutil.copyfile(repo_seed, p)
+                        ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(p)
+                        if ok and normalized_doc:
+                            tmp = p + '.tmp'
+                            with open(tmp, 'w', encoding='utf-8') as fh:
+                                json.dump(normalized_doc, fh, indent=2)
+                            os.replace(tmp, p)
+                            s['rows'] = note
+                            s['uploaded'] = datetime.datetime.utcnow().isoformat() + 'Z'
+                        mutated = True
+                    except Exception:
+                        pass
+                if mutated:
+                    _save_flag_generator_sources_state(state)
+        except Exception:
+            pass
+
         return state
     except Exception:
         return {'sources': []}
@@ -12929,12 +13402,18 @@ def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool,
             doc = json.load(fh)
         if not isinstance(doc, dict):
             return False, 'Top-level JSON must be an object', None, skipped
+
+        # Validate the raw catalog file against the JSON schema (best-effort).
+        ok_schema, schema_err = _validate_json_schema(doc, _FLAG_GENERATOR_CATALOG_SCHEMA_PATH)
+        if not ok_schema:
+            return False, schema_err or 'Schema validation failed', None, skipped
+
         schema_version = doc.get('schema_version', 1)
         try:
             schema_version = int(schema_version)
         except Exception:
             schema_version = 1
-        if schema_version != 1:
+        if schema_version not in (1, 2):
             return False, f'Unsupported schema_version: {schema_version}', None, skipped
         gens = doc.get('generators')
         if not isinstance(gens, list):
@@ -13002,6 +13481,22 @@ def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool,
             else:
                 gen.pop('compose', None)
 
+            # env: optional dict of string key/value pairs.
+            env = gen.get('env')
+            if isinstance(env, dict):
+                norm_env: dict[str, str] = {}
+                for k, v in env.items():
+                    try:
+                        kk = str(k).strip()
+                        if not kk:
+                            continue
+                        norm_env[kk] = str(v)
+                    except Exception:
+                        continue
+                gen['env'] = norm_env
+            else:
+                gen.pop('env', None)
+
             # inputs/outputs contracts (lists of dict)
             inputs = gen.get('inputs')
             if inputs is None:
@@ -13016,11 +13511,20 @@ def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool,
                 tp = (it.get('type') or '').strip() if isinstance(it.get('type'), str) else ''
                 if not nm or not tp:
                     continue
+                sensitive_in = it.get('sensitive')
+                if sensitive_in is None:
+                    sensitive_val = _coerce_flaggen_io_sensitive(nm, tp)
+                else:
+                    sensitive_val = _coerce_bool(sensitive_in, default=False)
+                default_in = it.get('default')
+                default_ok = isinstance(default_in, (str, int, float, bool)) or default_in is None
                 norm_inputs.append({
                     'name': nm,
                     'type': tp,
                     'description': (it.get('description') or '').strip() if isinstance(it.get('description'), str) else '',
                     'required': _coerce_bool(it.get('required'), default=True),
+                    'sensitive': bool(sensitive_val),
+                    **({'default': default_in} if (default_in is not None and default_ok) else {}),
                 })
             gen['inputs'] = norm_inputs
 
@@ -13033,19 +13537,45 @@ def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool,
                 if not isinstance(ot, dict):
                     continue
                 nm = (ot.get('name') or '').strip() if isinstance(ot.get('name'), str) else ''
-                tp = (ot.get('type') or '').strip() if isinstance(ot.get('type'), str) else ''
+                tp_raw = (ot.get('type') or '').strip() if isinstance(ot.get('type'), str) else ''
+                tp = tp_raw or _coerce_flaggen_io_type(nm)
                 if not nm or not tp:
                     continue
+                sensitive_out = ot.get('sensitive')
+                if sensitive_out is None:
+                    sensitive_val = _coerce_flaggen_io_sensitive(nm, tp)
+                else:
+                    sensitive_val = _coerce_bool(sensitive_out, default=False)
                 norm_outputs.append({
                     'name': nm,
                     'type': tp,
                     'description': (ot.get('description') or '').strip() if isinstance(ot.get('description'), str) else '',
-                    'sensitive': _coerce_bool(ot.get('sensitive'), default=False),
+                    'sensitive': bool(sensitive_val),
                 })
             if not norm_outputs:
                 skipped.append({'reason': 'outputs[] had no valid entries', 'id': gen_id})
                 continue
             gen['outputs'] = norm_outputs
+
+            # hint_template (v2 requires non-empty).
+            hint_template = gen.get('hint_template')
+            if isinstance(hint_template, str):
+                hint_template = hint_template.strip()
+            else:
+                hint_template = ''
+            if schema_version == 2 and not hint_template:
+                skipped.append({'reason': 'schema_version=2 requires hint_template', 'id': gen_id})
+                continue
+            if not hint_template:
+                hint_template = 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+            gen['hint_template'] = hint_template
+
+            # handoff: optional dict (free-form, validated elsewhere)
+            handoff = gen.get('handoff')
+            if isinstance(handoff, dict):
+                gen['handoff'] = handoff
+            else:
+                gen.pop('handoff', None)
 
             # build/run optional: preserve dict-ish
             if isinstance(gen.get('build'), dict):
@@ -13092,7 +13622,7 @@ def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool,
         # Ensure stable order
         normalized_generators.sort(key=lambda g: (g.get('name', '').lower(), g.get('id', '')))
         normalized_doc = {
-            'schema_version': 1,
+            'schema_version': schema_version,
             'generators': normalized_generators,
         }
         note = f"{len(normalized_generators)} generator(s)"
@@ -13292,7 +13822,10 @@ def _flag_catalog_items_from_enabled_sources() -> tuple[list[dict], dict]:
         if not ok:
             continue
         for it in norm_items:
-            items.append(it)
+            it2 = dict(it) if isinstance(it, dict) else {}
+            it2['_source_id'] = str(s.get('id') or '').strip() or None
+            it2['_source_name'] = str(s.get('name') or '').strip() or None
+            items.append(it2)
             try:
                 if it.get('type'):
                     types.add(str(it.get('type')))
@@ -15272,6 +15805,8 @@ def docker_cleanup():
                     arr = json.loads(raw)
                     if isinstance(arr, list):
                         names = [str(x) for x in arr]
+                    else:
+                        names = [str(raw)]
                 except Exception:
                     names = [str(raw)]
         # Use the scenario-selected CORE VM (remote) to cleanup docker containers.
@@ -19790,7 +20325,6 @@ def base_details():
     summary = _analyze_core_xml(xml_path) if ok else {'error': errs}
     return render_template('base_details.html', xml_path=xml_path, valid=ok, errors=errs, summary=summary)
 
-
 # ---------------- CORE Management (sessions and XMLs) ----------------
 
 def _core_sessions_store_path() -> str:
@@ -19807,7 +20341,6 @@ def _load_core_sessions_store() -> dict:
     except Exception:
         pass
     return {}
-
 
 def _session_store_entry_session_id(value: Any) -> Optional[int]:
     candidate: Any
@@ -22974,10 +23507,81 @@ def _flag_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
     return all_gens, errors
 
 
+def _load_flag_node_generator_sources_state() -> dict:
+    """Load flag node-generator sources state.
+
+    This mirrors the flag-generator catalog schema, but is stored separately under
+    data_sources/flag_node_generators/_state.json.
+    """
+    try:
+        if not os.path.exists(FLAG_NODE_GENERATORS_STATE_PATH):
+            state = {'sources': []}
+            try:
+                tmp = FLAG_NODE_GENERATORS_STATE_PATH + '.tmp'
+                with open(tmp, 'w', encoding='utf-8') as fh:
+                    json.dump(state, fh, indent=2)
+                os.replace(tmp, FLAG_NODE_GENERATORS_STATE_PATH)
+            except Exception:
+                pass
+            return state
+        with open(FLAG_NODE_GENERATORS_STATE_PATH, 'r', encoding='utf-8') as fh:
+            state = json.load(fh)
+        if not isinstance(state, dict):
+            return {'sources': []}
+        if not isinstance(state.get('sources'), list):
+            state['sources'] = []
+        return state
+    except Exception:
+        return {'sources': []}
+
+
+def _flag_node_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
+    """Aggregate node-generators from enabled node-generator sources."""
+    state = _load_flag_node_generator_sources_state()
+    sources = state.get('sources') or []
+    all_gens: list[dict] = []
+    errors: list[dict] = []
+    seen_ids: set[str] = set()
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        if not s.get('enabled', False):
+            continue
+        path = s.get('path')
+        ok, note, doc, skipped = _validate_and_normalize_flag_generator_source_json(path)
+        if not ok or not doc:
+            errors.append({'source': s.get('name'), 'path': path, 'error': note})
+            continue
+        for gen in (doc.get('generators') or []):
+            if not isinstance(gen, dict):
+                continue
+            gid = str(gen.get('id') or '')
+            if not gid or gid in seen_ids:
+                continue
+            seen_ids.add(gid)
+            gen2 = dict(gen)
+            gen2['_source_name'] = s.get('name')
+            gen2['_source_path'] = path
+            all_gens.append(gen2)
+        if skipped:
+            errors.append({'source': s.get('name'), 'path': path, 'warning': f"skipped {len(skipped)} invalid generator(s)"})
+    all_gens.sort(key=lambda g: (str(g.get('name') or '').lower(), str(g.get('id') or '')))
+    return all_gens, errors
+
+
 @app.route('/flag_generators_data')
 def flag_generators_data():
     try:
         generators, errors = _flag_generators_from_enabled_sources()
+        return jsonify({'generators': generators, 'errors': errors})
+    except Exception as e:
+        return jsonify({'generators': [], 'errors': [{'error': str(e)}]}), 500
+
+
+@app.route('/flag_node_generators_data')
+def flag_node_generators_data():
+    try:
+        generators, errors = _flag_node_generators_from_enabled_sources()
         return jsonify({'generators': generators, 'errors': errors})
     except Exception as e:
         return jsonify({'generators': [], 'errors': [{'error': str(e)}]}), 500
@@ -23203,6 +23807,35 @@ def _flaggen_run_dir_for_id(run_id: str) -> str:
     return os.path.join(_flag_generators_runs_dir(), rid)
 
 
+def _flag_node_generators_runs_dir() -> str:
+    d = os.path.join(_outputs_dir(), 'flag_node_generators_runs')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _flagnodegen_run_dir_for_id(run_id: str) -> str:
+    rid = (run_id or '').strip()
+    rid = rid.replace('..', '').replace('\\', '/').strip('/').strip()
+    return os.path.join(_flag_node_generators_runs_dir(), rid)
+
+
+def _find_enabled_node_generator_by_id(generator_id: str) -> Optional[dict]:
+    gid = (generator_id or '').strip()
+    if not gid:
+        return None
+    try:
+        generators, _errors = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        return None
+    for g in generators:
+        try:
+            if str(g.get('id') or '').strip() == gid:
+                return g
+        except Exception:
+            continue
+    return None
+
+
 def _find_enabled_generator_by_id(generator_id: str) -> Optional[dict]:
     gid = (generator_id or '').strip()
     if not gid:
@@ -23401,6 +24034,279 @@ def flag_generators_test_run():
     except Exception:
         pass
     return jsonify({'ok': True, 'run_id': run_id})
+
+
+@app.route('/flag_node_generators_test/run', methods=['POST'])
+def flag_node_generators_test_run():
+    """Start a node-generator test run."""
+    t0 = time.time()
+    generator_id = (request.form.get('generator_id') or '').strip()
+    try:
+        app.logger.info("[flagnodegen_test] POST /flag_node_generators_test/run generator_id=%s", generator_id)
+    except Exception:
+        pass
+
+    gen = _find_enabled_node_generator_by_id(generator_id)
+    if not gen:
+        return jsonify({'ok': False, 'error': 'Generator not found (must be in an enabled source).'}), 404
+
+    run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
+    run_dir = os.path.join(_flag_node_generators_runs_dir(), run_id)
+    inputs_dir = os.path.join(run_dir, 'inputs')
+    os.makedirs(inputs_dir, exist_ok=True)
+    log_path = os.path.join(run_dir, 'run.log')
+
+    cfg: dict[str, Any] = {}
+    inputs = gen.get('inputs') if isinstance(gen, dict) else None
+    inputs_list = inputs if isinstance(inputs, list) else []
+    for inp in inputs_list:
+        if not isinstance(inp, dict):
+            continue
+        name = str(inp.get('name') or '').strip()
+        if not name:
+            continue
+        f = request.files.get(name)
+        if f and getattr(f, 'filename', ''):
+            safe_name = secure_filename(f.filename) or 'upload'
+            stored = f"{name}__{safe_name}"
+            dest = os.path.join(inputs_dir, stored)
+            try:
+                f.save(dest)
+                cfg[name] = f"/inputs/{stored}"
+            except Exception:
+                return jsonify({'ok': False, 'error': f"Failed saving file input: {name}"}), 400
+            continue
+        raw_val = request.form.get(name)
+        if raw_val is not None:
+            cfg[name] = raw_val
+
+    missing: list[str] = []
+    for inp in inputs_list:
+        if not isinstance(inp, dict):
+            continue
+        try:
+            if not inp.get('required'):
+                continue
+            name = str(inp.get('name') or '').strip()
+            if not name:
+                continue
+            val = cfg.get(name)
+            if val is None or (isinstance(val, str) and not val.strip()):
+                missing.append(name)
+        except Exception:
+            continue
+    if missing:
+        return jsonify({'ok': False, 'error': f"Missing required input(s): {', '.join(missing)}"}), 400
+
+    repo_root = _get_repo_root()
+    runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
+    cmd = [
+        sys.executable or 'python',
+        runner_path,
+        '--catalog',
+        'flag_node_generators',
+        '--generator-id',
+        generator_id,
+        '--out-dir',
+        run_dir,
+        '--config',
+        json.dumps(cfg, ensure_ascii=False),
+        '--repo-root',
+        repo_root,
+    ]
+
+    try:
+        with open(log_path, 'a', encoding='utf-8') as log_f:
+            log_f.write(f"[flagnodegen] starting {generator_id}\n")
+            _write_sse_marker(log_f, 'phase', {'phase': 'starting', 'generator_id': generator_id, 'run_id': run_id})
+    except Exception:
+        pass
+
+    try:
+        log_handle = open(log_path, 'a', encoding='utf-8')
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=log_handle,
+            stderr=log_handle,
+            text=True,
+        )
+    except Exception as exc:
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_f:
+                log_f.write(f"[flagnodegen] failed to start: {exc}\n")
+                _write_sse_marker(log_f, 'phase', {'phase': 'error', 'error': str(exc)})
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': f"Failed launching generator: {exc}"}), 500
+
+    RUNS[run_id] = {
+        'proc': proc,
+        'log_path': log_path,
+        'done': False,
+        'returncode': None,
+        'run_dir': run_dir,
+        'kind': 'flag_node_generator_test',
+        'generator_id': generator_id,
+    }
+
+    def _finalize(run_id_local: str, log_handle_local: Any):
+        try:
+            meta = RUNS.get(run_id_local)
+            if not meta:
+                return
+            p = meta.get('proc')
+            if not p:
+                return
+            rc = p.wait()
+            meta['done'] = True
+            meta['returncode'] = rc
+            try:
+                with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
+                    _write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
+            except Exception:
+                pass
+        finally:
+            try:
+                log_handle_local.close()
+            except Exception:
+                pass
+
+    threading.Thread(
+        target=_finalize,
+        args=(run_id, log_handle),
+        name=f'flagnodegen-{run_id[:8]}',
+        daemon=True,
+    ).start()
+
+    try:
+        app.logger.info(
+            "[flagnodegen_test] spawned pid=%s run_id=%s run_dir=%s elapsed_ms=%s",
+            getattr(proc, 'pid', None),
+            run_id,
+            run_dir,
+            int((time.time() - t0) * 1000),
+        )
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'run_id': run_id})
+
+
+@app.route('/flag_node_generators_test/outputs/<run_id>')
+def flag_node_generators_test_outputs(run_id: str):
+    meta = RUNS.get(run_id)
+    if meta and meta.get('kind') != 'flag_node_generator_test':
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+    if not isinstance(run_dir, str) or not run_dir:
+        run_dir = _flagnodegen_run_dir_for_id(run_id)
+    if not isinstance(run_dir, str) or not run_dir:
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
+    abs_run_dir = os.path.abspath(run_dir)
+    outputs_root = os.path.abspath(_outputs_dir())
+    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+    if not os.path.isdir(abs_run_dir):
+        done = bool(meta.get('done')) if isinstance(meta, dict) else False
+        returncode = meta.get('returncode') if isinstance(meta, dict) else None
+        return jsonify({'ok': True, 'files': [], 'done': done, 'returncode': returncode}), 200
+
+    input_files: list[dict[str, Any]] = []
+    output_files: list[dict[str, Any]] = []
+    misc_files: list[dict[str, Any]] = []
+    for root, _dirs, filenames in os.walk(abs_run_dir):
+        rel_root = os.path.relpath(root, abs_run_dir).replace('\\', '/')
+        for fn in filenames:
+            abs_path = os.path.join(root, fn)
+            try:
+                st = os.stat(abs_path)
+                rel = os.path.relpath(abs_path, abs_run_dir).replace('\\', '/')
+                entry = {'path': rel, 'name': fn, 'size': st.st_size}
+            except Exception:
+                continue
+            if rel_root == 'inputs' or rel_root.startswith('inputs/'):
+                input_files.append(entry)
+            elif rel == 'run.log':
+                misc_files.append(entry)
+            else:
+                output_files.append(entry)
+
+    input_files.sort(key=lambda x: x.get('path') or '')
+    output_files.sort(key=lambda x: x.get('path') or '')
+    misc_files.sort(key=lambda x: x.get('path') or '')
+    done = bool(meta.get('done')) if isinstance(meta, dict) else True
+    returncode = meta.get('returncode') if isinstance(meta, dict) else None
+    return jsonify({'ok': True, 'inputs': input_files, 'outputs': output_files, 'misc': misc_files, 'done': done, 'returncode': returncode}), 200
+
+
+@app.route('/flag_node_generators_test/download/<run_id>')
+def flag_node_generators_test_download(run_id: str):
+    meta = RUNS.get(run_id)
+    if meta and meta.get('kind') != 'flag_node_generator_test':
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+    if not isinstance(run_dir, str) or not run_dir:
+        run_dir = _flagnodegen_run_dir_for_id(run_id)
+    if not isinstance(run_dir, str) or not run_dir:
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
+    rel = (request.args.get('p') or '').strip().lstrip('/').replace('\\', '/')
+    if not rel:
+        return jsonify({'ok': False, 'error': 'invalid path'}), 400
+    abs_run_dir = os.path.abspath(run_dir)
+    outputs_root = os.path.abspath(_outputs_dir())
+    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+    abs_path = os.path.abspath(os.path.join(abs_run_dir, rel))
+    if not (abs_path == abs_run_dir or abs_path.startswith(abs_run_dir + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+    if not os.path.exists(abs_path) or not os.path.isfile(abs_path):
+        return jsonify({'ok': False, 'error': 'missing file'}), 404
+    return send_file(abs_path, as_attachment=True, download_name=os.path.basename(abs_path))
+
+
+@app.route('/flag_node_generators_test/cleanup/<run_id>', methods=['POST'])
+def flag_node_generators_test_cleanup(run_id: str):
+    """Delete all artifacts for a flag-node-generator test run (scoped to outputs/)."""
+    meta = RUNS.get(run_id)
+    if meta and meta.get('kind') != 'flag_node_generator_test':
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+    if not isinstance(run_dir, str) or not run_dir:
+        run_dir = _flagnodegen_run_dir_for_id(run_id)
+    if not isinstance(run_dir, str) or not run_dir:
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
+    abs_run_dir = os.path.abspath(run_dir)
+    outputs_root = os.path.abspath(_outputs_dir())
+    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+
+    try:
+        proc = meta.get('proc') if isinstance(meta, dict) else None
+        if proc and hasattr(proc, 'poll') and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    removed = False
+    try:
+        if os.path.isdir(abs_run_dir):
+            shutil.rmtree(abs_run_dir, ignore_errors=True)
+        removed = True
+    except Exception:
+        removed = False
+
+    try:
+        RUNS.pop(run_id, None)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'removed': removed}), 200
 
 
 @app.route('/flag_generators_test/outputs/<run_id>')

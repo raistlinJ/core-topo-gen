@@ -82,6 +82,8 @@
 
 {% block body_container %}
 {{ super() }}
+{% set xml_preview_enabled = True %}
+{% include 'partials/dock.html' %}
 <script>
 (function(){
   function showLoading(){

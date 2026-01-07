@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/core-topo-gen/flag_generator_outputs.schema.json",
+  "title": "Flag Generator outputs.json",
+  "description": "Schema for /outputs/outputs.json emitted by both flag-generators and flag-node-generators.",
+  "type": "object",
+  "required": ["generator_id", "outputs"],
+  "properties": {
+    "schema_version": {"type": "integer", "minimum": 1},
+    "generator_id": {"type": "string", "minLength": 1},
+    "outputs": {"type": "object"},
+    "handoff": {
+      "type": "object",
+      "properties": {
+        "hints": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["text"],
+            "properties": {
+              "text": {"type": "string"},
+              "kind": {"type": "string"},
+              "sensitive": {"type": "boolean"}
+            },
+            "additionalProperties": true
+          }
+        },
+        "endpoints": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "protocol": {"type": "string"},
+              "host_hint": {"type": "string"},
+              "port": {"type": "integer"},
+              "path": {"type": "string"},
+              "uri": {"type": "string"}
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

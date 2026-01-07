@@ -1,0 +1,12 @@
+services:
+  generator:
+    image: python:3.12-slim
+    working_dir: /app
+    command: ["python", "/app/generator.py"]
+    environment:
+      INPUTS_DIR: ${INPUTS_DIR}
+      OUTPUTS_DIR: ${OUTPUTS_DIR}
+    volumes:
+      - ./generator.py:/app/generator.py:ro
+      - ${INPUTS_DIR}:/inputs:ro
+      - ${OUTPUTS_DIR}:/outputs

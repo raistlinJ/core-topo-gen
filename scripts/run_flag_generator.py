@@ -14,7 +14,10 @@ def repo_root_from_here() -> Path:
 
 
 def load_enabled_sources(repo_root: Path) -> list[dict[str, Any]]:
-    state_path = repo_root / "data_sources" / "flag_generators" / "_state.json"
+    # Support multiple generator catalogs that share the same schema.
+    # Default remains "flag_generators" to preserve existing behavior.
+    catalog = os.environ.get("FLAG_GENERATOR_CATALOG", "flag_generators").strip() or "flag_generators"
+    state_path = repo_root / "data_sources" / catalog / "_state.json"
     if not state_path.exists():
         return []
     state = json.loads(state_path.read_text("utf-8"))
@@ -159,11 +162,18 @@ def main() -> int:
     ap.add_argument("--out-dir", default="/tmp/flag_generator_out")
     ap.add_argument("--config", default="{}", help="JSON object of inputs")
     ap.add_argument("--repo-root", default="", help="Path to repo root (optional)")
+    ap.add_argument("--catalog", default="flag_generators", help="Catalog directory under data_sources/ (default: flag_generators)")
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve() if args.repo_root else repo_root_from_here()
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Catalog selection (used by load_enabled_sources/find_generator)
+    try:
+        os.environ["FLAG_GENERATOR_CATALOG"] = str(args.catalog or "flag_generators")
+    except Exception:
+        pass
 
     inputs_dir = out_dir / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
@@ -193,6 +203,21 @@ def main() -> int:
     env = {"OUT_DIR": str(out_dir), "CONFIG_PATH": str(config_path)}
     for k, v in config.items():
         env[str(k).upper()] = str(v)
+
+    # Allow generator definitions to include fixed env values.
+    gen_env = gen.get("env")
+    if isinstance(gen_env, dict):
+        for k, v in gen_env.items():
+            try:
+                kk = str(k)
+                if not kk:
+                    continue
+                env.setdefault(kk, str(v))
+            except Exception:
+                continue
+
+    # Needed for compose generators that mount the repo.
+    env.setdefault("REPO_ROOT", str(repo_root))
 
     # Prefer compose execution when present
     compose = gen.get("compose")

@@ -8,7 +8,7 @@
   .dock-panel .tab-content { flex:1 1 auto; min-height:0; overflow:auto; }
   .dock-panel .tab-pane { height:100%; overflow:auto; }
   .dock-panel pre { height:auto; min-height:100%; overflow:auto; }
-  .dock-toggle-btn { position: fixed; right: 12px; bottom: 12px; z-index: 1040; }
+  .dock-toggle-btn { position: fixed; left: 12px; bottom: 12px; z-index: 1040; }
 </style>
 <div class="dock-panel d-none" id="dockPanel">
   <div class="dock-grip" id="dockGrip" title="Drag to resize"></div>
@@ -56,7 +56,7 @@
     {% endif %}
   </div>
 </div>
-<button class="btn btn-primary btn-sm dock-toggle-btn d-none" id="dockShowBtn" type="button">Advanced Information</button>
+<button class="btn btn-primary btn-sm dock-toggle-btn d-none" id="dockShowBtn" type="button">Show Dock ↑</button>
 <script>
 (function(){
   // Shared persistent logs/XML dock behavior with global logging helpers
@@ -167,6 +167,7 @@
     document.getElementById('logFilterInput')?.addEventListener('input', (ev)=>{ filterText = ev.target.value.trim(); try{ localStorage.setItem(LOG_FILTER_TEXT_KEY, filterText);}catch(_e){} compileFilter(); renderLogs(); });
     document.getElementById('logFilterRegex')?.addEventListener('change', (ev)=>{ filterIsRegex = !!ev.target.checked; try{ localStorage.setItem(LOG_FILTER_REGEX_KEY, filterIsRegex?'1':'0');}catch(_e){} compileFilter(); renderLogs(); });
     document.getElementById('logFilterClearBtn')?.addEventListener('click', ()=>{ filterText=''; filterIsRegex=false; const inp=document.getElementById('logFilterInput'); if(inp) inp.value=''; const cb=document.getElementById('logFilterRegex'); if(cb) cb.checked=false; try{ localStorage.removeItem(LOG_FILTER_TEXT_KEY); localStorage.removeItem(LOG_FILTER_REGEX_KEY);}catch(_e){} compileFilter(); renderLogs(); });
+
   }
   if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 })();

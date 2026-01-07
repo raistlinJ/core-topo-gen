@@ -5,4 +5,225 @@ services:
     image: ubuntu:22.04
     container_name: standard-ubuntu
     tty: true # Allocates a pseudo-TTY so you can interact with the container
-    command: ["bash", "-lc", "sleep infinity"]
+    volumes:
+      # Flow may materialize a per-node hint.txt alongside the compose.
+      # When present, show it in /hint.txt inside the container.
+      - ./hint.txt:/hint.txt:ro
+    command:
+      - bash
+      - -lc
+      - |
+        set -e
+        BOOT="$(mktemp)"
+        cat > "$BOOT" <<'EOS'
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        rand_byte() {
+          od -An -N1 -tu1 /dev/urandom 2>/dev/null | tr -d ' '
+        }
+
+        choose_mod() {
+          local mod="${1:-2}"
+          local b
+          b="$(rand_byte || echo 0)"
+          if [ -z "$b" ]; then b=0; fi
+          echo $((b % mod))
+        }
+
+        # Per-container stable seed (no persisted instance-id files).
+        HOST_TAG="$(echo "${HOSTNAME:-unknown}" | tr -dc 'a-zA-Z0-9' | tr 'A-Z' 'a-z' | head -c 32)"
+        INSTANCE_ID="$(printf "%s" "$HOST_TAG" | sha256sum 2>/dev/null | awk '{print $1}' | head -c 16)"
+        if [ -z "$INSTANCE_ID" ]; then
+          INSTANCE_ID="$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 16 || true)"
+        fi
+
+        choose_mod_seeded() {
+          local label="${1:-default}"
+          local mod="${2:-2}"
+          local h
+          h="$(printf "%s-%s" "${INSTANCE_ID:-x}" "$label" | sha256sum 2>/dev/null | awk '{print $1}' | head -c 8)"
+          if [ -z "$h" ]; then
+            choose_mod "$mod"
+            return 0
+          fi
+          local n=$((16#$h))
+          echo $((n % mod))
+        }
+
+        V_APP_VARIANT="$(choose_mod_seeded app 3)"
+        V_HINT_PLACEMENT="$(choose_mod_seeded hint 3)"
+        V_EXTRA_USERS="$(choose_mod_seeded users 3)"
+
+        mkdir -p \
+          /opt/app/conf \
+          /opt/app/bin \
+          /srv/share/public \
+          /var/tmp/cache \
+          /var/tmp/sessions \
+          /var/log/app \
+          /var/log/audit \
+          /etc/skel/Documents \
+          /etc/skel/Downloads \
+          /etc/skel/.ssh
+
+        if [ ! -f /opt/app/conf/app.yml ]; then
+          APP_NAME="inventory"
+          if [ "$V_APP_VARIANT" -eq 1 ]; then APP_NAME="reporting"; fi
+          if [ "$V_APP_VARIANT" -eq 2 ]; then APP_NAME="portal"; fi
+          cat > /opt/app/conf/app.yml <<EOF
+        app:
+          name: "${APP_NAME}"
+          mode: "prod"
+          cache_dir: "/var/tmp/cache"
+          session_dir: "/var/tmp/sessions"
+        logging:
+          file: "/var/log/app/app.log"
+        EOF
+        fi
+
+        if [ ! -f /opt/app/bin/healthcheck.sh ]; then
+          cat > /opt/app/bin/healthcheck.sh <<'EOF'
+        #!/usr/bin/env sh
+        date -u +"%Y-%m-%dT%H:%M:%SZ" && echo "OK"
+        EOF
+          chmod +x /opt/app/bin/healthcheck.sh 2>/dev/null || true
+        fi
+
+        touch /var/log/app/app.log /var/log/audit/auth.log 2>/dev/null || true
+
+        create_user() {
+          local u="$1" uid="$2" gid="$3"
+          if ! grep -q "^${u}:" /etc/passwd 2>/dev/null; then
+            echo "${u}:x:${uid}:${gid}:${u}:/home/${u}:/bin/bash" >> /etc/passwd || true
+          fi
+          if ! grep -q "^${u}:" /etc/group 2>/dev/null; then
+            echo "${u}:x:${gid}:" >> /etc/group || true
+          fi
+          mkdir -p "/home/${u}/Documents" "/home/${u}/Downloads" "/home/${u}/.ssh" "/home/${u}/.config" || true
+          if [ ! -f "/home/${u}/.bash_history" ]; then
+            cat > "/home/${u}/.bash_history" <<EOF
+        ls -la
+        cd ~/Documents
+        cat notes.txt
+        EOF
+          fi
+          if [ ! -f "/home/${u}/Documents/todo.txt" ]; then
+            cat > "/home/${u}/Documents/todo.txt" <<EOF
+        - review logs in /var/log/app
+        - check /srv/share/public
+        - remember: backups are under /var/tmp
+        EOF
+          fi
+          if [ ! -f "/home/${u}/Documents/notes.txt" ]; then
+            cat > "/home/${u}/Documents/notes.txt" <<EOF
+        FYI:
+        - app config: /opt/app/conf/app.yml
+        - public share: /srv/share/public/
+        EOF
+          fi
+          if [ ! -f "/home/${u}/.ssh/known_hosts" ]; then
+            printf "# known_hosts seeded %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)" > "/home/${u}/.ssh/known_hosts" || true
+          fi
+          chown -R "${uid}:${gid}" "/home/${u}" 2>/dev/null || true
+        }
+
+        # Base users always present
+        create_user alice 1001 1001
+        create_user bob 1002 1002
+
+        # Optional extra users vary across containers
+        if [ "$V_EXTRA_USERS" -ge 1 ]; then create_user charlie 1003 1003; fi
+        if [ "$V_EXTRA_USERS" -ge 2 ]; then create_user dana 1004 1004; fi
+
+        copy_hint() {
+          local src="/hint.txt"
+          [ -f "$src" ] || return 0
+          mkdir -p /var/tmp /srv/share/public /opt/app || true
+          cp -f "$src" /var/tmp/README.txt 2>/dev/null || true
+          if [ "$V_HINT_PLACEMENT" -eq 0 ] && [ -d /home/alice ]; then
+            cp -f "$src" /home/alice/Documents/README.txt 2>/dev/null || true
+          elif [ "$V_HINT_PLACEMENT" -eq 1 ]; then
+            cp -f "$src" /srv/share/public/NOTICE.txt 2>/dev/null || true
+          else
+            cp -f "$src" /opt/app/NOTICE.txt 2>/dev/null || true
+          fi
+        }
+
+        place_hint_near_flag() {
+          local hint_src="/hint.txt"
+          [ -f "$hint_src" ] || return 0
+          local candidates="/flow_artifacts/flag.txt /flag.txt /html/flag.txt"
+          local flag_path="" p
+          for p in $candidates; do
+            if [ -f "$p" ]; then flag_path="$p"; break; fi
+          done
+          [ -n "$flag_path" ] || return 0
+          local flag_dir
+          flag_dir="$(dirname "$flag_path")"
+          if ( : > "$flag_dir/.writetest" ) 2>/dev/null; then
+            rm -f "$flag_dir/.writetest" 2>/dev/null || true
+            cp -f "$hint_src" "$flag_dir/hint.txt" 2>/dev/null || true
+            return 0
+          fi
+          local base
+          base="$(basename "$flag_dir")"
+          cp -f "$hint_src" "/${base}_hint.txt" 2>/dev/null || true
+          ln -snf "$flag_path" "/${base}_flag.txt" 2>/dev/null || true
+        }
+
+        copy_hint || true
+        place_hint_near_flag || true
+
+        if [ -d /flow_artifacts ]; then
+          mkdir -p /srv/share || true
+          ln -snf /flow_artifacts /srv/share/flow_artifacts 2>/dev/null || true
+        fi
+
+        if [ -f /hint.txt ]; then
+          echo "==== Hint (/hint.txt) ===="
+          cat /hint.txt || true
+          echo "==========================="
+        fi
+        if [ -d /flow_artifacts ]; then
+          echo "Flow artifacts mounted at /flow_artifacts"
+          ls -la /flow_artifacts 2>/dev/null || true
+        fi
+
+        (
+          while true; do
+            ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown")"
+            act="login"
+            case "$(choose_mod 5)" in
+              0) act="login";;
+              1) act="opened";;
+              2) act="edited";;
+              3) act="downloaded";;
+              4) act="checked";;
+            esac
+            target="/opt/app/conf/app.yml"
+            case "$(choose_mod 4)" in
+              0) target="/opt/app/conf/app.yml";;
+              1) target="/srv/share/public";;
+              2) target="/var/log/app/app.log";;
+              3) target="/var/tmp";;
+            esac
+            who="alice"
+            case "$(choose_mod 3)" in
+              0) who="alice";;
+              1) who="bob";;
+              2) who="charlie";;
+            esac
+            printf "%s user=%s action=%s target=%s\n" "$ts" "$who" "$act" "$target" >> /var/log/app/app.log 2>/dev/null || true
+            if [ "$(choose_mod 5)" -eq 0 ]; then
+              printf "created_at=%s\n" "$ts" > /var/tmp/cache/.session 2>/dev/null || true
+            fi
+            s=$((10 + $(choose_mod 21)))
+            sleep "$s"
+          done
+        ) &
+        EOS
+        chmod +x "$BOOT" 2>/dev/null || true
+        "$BOOT" || true
+        rm -f "$BOOT" 2>/dev/null || true
+        sleep infinity

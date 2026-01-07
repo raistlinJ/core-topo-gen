@@ -1066,6 +1066,42 @@ def _select_service_key(compose_obj: dict, prefer_service: Optional[str] = None)
 		return None
 
 
+def _inject_service_bind_mount(compose_obj: dict, bind: str, prefer_service: Optional[str] = None) -> dict:
+	"""Inject a bind mount into the selected service's volumes list (best-effort)."""
+	try:
+		if not bind or not isinstance(bind, str):
+			return compose_obj
+		if not isinstance(compose_obj, dict):
+			return compose_obj
+		services = compose_obj.get('services')
+		if not isinstance(services, dict) or not services:
+			return compose_obj
+		svc_key = _select_service_key(compose_obj, prefer_service=prefer_service)
+		if not svc_key:
+			return compose_obj
+		svc = services.get(svc_key)
+		if not isinstance(svc, dict):
+			return compose_obj
+		vols = svc.get('volumes')
+		# Normalize to list form.
+		if vols is None:
+			vol_list: List[object] = []
+		elif isinstance(vols, list):
+			vol_list = list(vols)
+		elif isinstance(vols, str):
+			vol_list = [vols]
+		else:
+			# Unknown structure (e.g., dict); don't mutate.
+			return compose_obj
+		# Avoid duplicates (string compare).
+		if bind not in [str(v) for v in vol_list if v is not None]:
+			vol_list.append(bind)
+		svc['volumes'] = vol_list
+		return compose_obj
+	except Exception:
+		return compose_obj
+
+
 def _ensure_list_field_has(value: object, item: str) -> List[str]:
 	"""Normalize a compose field that may be a string/list and ensure item is present."""
 	out: List[str] = []
@@ -1381,6 +1417,15 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			obj = _set_container_name_one_service(obj, node_name, prefer_service=prefer)
 			# Ensure Docker does not inject its own networking for vuln nodes.
 			obj = _force_compose_no_network(obj)
+			# Flow flag-generators: mount generated artifacts into the container.
+			try:
+				art_dir = str(rec.get('ArtifactsDir') or '').strip()
+				mount_path = str(rec.get('ArtifactsMountPath') or '').strip() or '/flow_artifacts'
+				if art_dir:
+					bind = f"{art_dir}:{mount_path}:ro"
+					obj = _inject_service_bind_mount(obj, bind, prefer_service=prefer)
+			except Exception:
+				pass
 			# Ensure the selected service uses a wrapper build that installs iproute2.
 			try:
 				svc_key = _select_service_key(obj, prefer_service=prefer)

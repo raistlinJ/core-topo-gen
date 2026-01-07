@@ -157,10 +157,6 @@
                                 <input type="hidden" name="project_key_hint" id="project_key_hint">
                                 <input type="hidden" name="scenario_query" id="scenario_query_input">
                                 <div id="editorRoot"></div>
-                                <div class="d-flex gap-2 mt-3">
-                                    <button type="submit" class="btn btn-success" id="saveXmlBtn">Save XML</button>
-                                    <button type="button" class="btn btn-outline-info" id="downloadXmlBtn" disabled title="Save XML first">Download XML</button>
-                                </div>
                             </form>
                         </div>
                     </div>
@@ -16387,14 +16383,14 @@ async function saveXmlAjax(){
     } catch(e) { logError('Save threw an exception'); return false; }
 }
 
-let __xmlDockPreviewReq = 0;
 async function refreshXmlDockPreview({ force = false, preferSavedPath = false } = {}) {
     const xmlPre = document.getElementById('xmlPre');
     if (!xmlPre) return;
 
-    const reqId = ++__xmlDockPreviewReq;
+    if (typeof window.__xmlDockPreviewReq !== 'number') window.__xmlDockPreviewReq = 0;
+    const reqId = ++window.__xmlDockPreviewReq;
     const applyIfLatest = (txt, meta = {}) => {
-        if (reqId !== __xmlDockPreviewReq) return;
+        if (reqId !== window.__xmlDockPreviewReq) return;
         try {
             xmlPre.textContent = txt || '';
             if (meta.path !== undefined) {

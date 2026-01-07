@@ -736,28 +736,91 @@ def _flow_flag_record_from_host_metadata(hdata: Any) -> Optional[Dict[str, str]]
         if not isinstance(flow_flag, dict):
             return None
         ftype = str(flow_flag.get('type') or '').strip().lower()
-        if ftype and ftype != 'docker-compose':
+        # Legacy behavior: Flow may inject a docker-compose based flag package.
+        if (not ftype) or ftype == 'docker-compose':
+            raw_path = str(flow_flag.get('path') or '').strip()
+            if not raw_path:
+                return None
+            resolved = raw_path
+            if not os.path.isabs(resolved):
+                try:
+                    resolved = os.path.abspath(os.path.join(_repo_root_path(), resolved))
+                except Exception:
+                    resolved = raw_path
+            name = str(flow_flag.get('name') or flow_flag.get('id') or '').strip() or 'flag'
+            hint_text = str(flow_flag.get('hint') or '').strip()
+            rec: Dict[str, str] = {
+                'Type': 'docker-compose',
+                'Name': name,
+                'Path': resolved,
+                'Vector': 'flag',
+            }
+            if hint_text:
+                rec['HintText'] = hint_text
+            return rec
+
+        # New behavior: flag-generators do NOT create new nodes/services.
+        # They generate artifacts that should be inserted into an existing docker node.
+        if ftype == 'flag-generator':
+            artifacts_dir = str(flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
+            if not artifacts_dir:
+                return None
+            if not os.path.isabs(artifacts_dir):
+                try:
+                    artifacts_dir = os.path.abspath(os.path.join(_repo_root_path(), artifacts_dir))
+                except Exception:
+                    pass
+            hint_text = str(flow_flag.get('hint') or '').strip()
+            rec2: Dict[str, str] = {
+                **_standard_docker_compose_record(),
+                'Vector': 'flag',
+                # Extra fields consumed by prepare_compose_for_assignments to mount artifacts.
+                'ArtifactsDir': artifacts_dir,
+                'ArtifactsMountPath': '/flow_artifacts',
+            }
+            if hint_text:
+                rec2['HintText'] = hint_text
+            return rec2
+
+        return None
+    except Exception:
+        return None
+
+
+def _flow_flag_artifacts_overlay_from_host_metadata(hdata: Any) -> Optional[Dict[str, str]]:
+    """Return a dict overlay for mounting Flow flag-generator artifacts onto an existing docker-compose record.
+
+    This is used for vulnerability docker nodes (slot-based) where we must preserve the base vulnerability compose
+    while injecting an artifacts bind mount.
+    """
+    try:
+        if not isinstance(hdata, dict):
             return None
-        raw_path = str(flow_flag.get('path') or '').strip()
-        if not raw_path:
+        meta = hdata.get('metadata')
+        if not isinstance(meta, dict):
             return None
-        resolved = raw_path
-        if not os.path.isabs(resolved):
+        flow_flag = meta.get('flow_flag')
+        if not isinstance(flow_flag, dict):
+            return None
+        ftype = str(flow_flag.get('type') or '').strip().lower()
+        if ftype != 'flag-generator':
+            return None
+        artifacts_dir = str(flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
+        if not artifacts_dir:
+            return None
+        if not os.path.isabs(artifacts_dir):
             try:
-                resolved = os.path.abspath(os.path.join(_repo_root_path(), resolved))
+                artifacts_dir = os.path.abspath(os.path.join(_repo_root_path(), artifacts_dir))
             except Exception:
-                resolved = raw_path
-        name = str(flow_flag.get('name') or flow_flag.get('id') or '').strip() or 'flag'
+                pass
         hint_text = str(flow_flag.get('hint') or '').strip()
-        rec: Dict[str, str] = {
-            'Type': 'docker-compose',
-            'Name': name,
-            'Path': resolved,
-            'Vector': 'flag',
+        overlay: Dict[str, str] = {
+            'ArtifactsDir': artifacts_dir,
+            'ArtifactsMountPath': '/flow_artifacts',
         }
         if hint_text:
-            rec['HintText'] = hint_text
-        return rec
+            overlay['HintText'] = hint_text
+        return overlay
     except Exception:
         return None
 
@@ -1615,7 +1678,9 @@ def _try_build_segmented_topology_from_preview(
                 if docker_slot_plan and slot_key in docker_slot_plan:
                     if hasattr(NodeType, "DOCKER"):
                         node_type = getattr(NodeType, "DOCKER")
-                        docker_by_name[name] = docker_slot_plan[slot_key]
+                        base_rec = docker_slot_plan[slot_key]
+                        overlay = _flow_flag_artifacts_overlay_from_host_metadata(hdata)
+                        docker_by_name[name] = {**base_rec, **overlay} if overlay else base_rec
                         created_docker += 1
                         docker_slots_used.add(slot_key)
                     else:

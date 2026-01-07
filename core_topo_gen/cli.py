@@ -1164,9 +1164,159 @@ def main():
                             standard_nodes[nm] = rec
             except Exception:
                 standard_nodes = {}
+
+            def _load_enabled_flag_node_generators(repo_root_path: str) -> list[dict]:
+                """Load enabled flag-node-generators from data_sources/flag_node_generators."""
+                try:
+                    state_path = os.path.join(repo_root_path, 'data_sources', 'flag_node_generators', '_state.json')
+                    if not os.path.exists(state_path):
+                        return []
+                    with open(state_path, 'r', encoding='utf-8') as fh:
+                        st = json.load(fh) or {}
+                    sources = st.get('sources') or []
+                    if not isinstance(sources, list):
+                        return []
+                    enabled = [s for s in sources if isinstance(s, dict) and s.get('enabled')]
+                    gens: list[dict] = []
+                    for s in enabled:
+                        p = str(s.get('path') or '').strip()
+                        if not p:
+                            continue
+                        if not os.path.isabs(p):
+                            p = os.path.abspath(os.path.join(repo_root_path, p))
+                        if not os.path.exists(p):
+                            continue
+                        try:
+                            with open(p, 'r', encoding='utf-8') as fh:
+                                doc = json.load(fh) or {}
+                            arr = doc.get('generators') or []
+                            if isinstance(arr, list):
+                                for g in arr:
+                                    if isinstance(g, dict) and str(g.get('id') or '').strip():
+                                        gens.append(g)
+                        except Exception:
+                            continue
+                    return gens
+                except Exception:
+                    return []
+
+            def _run_flag_node_generator(generator_id: str, *, out_dir: str, config: dict) -> tuple[bool, str]:
+                """Best-effort run of scripts/run_flag_generator.py for flag_node_generators catalog."""
+                try:
+                    runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
+                    if not os.path.exists(runner_path):
+                        return False, 'runner script not found'
+                    try:
+                        docker_ok = bool(shutil.which('docker'))
+                    except Exception:
+                        docker_ok = False
+                    if not docker_ok:
+                        return False, 'docker not found'
+                    cmd = [
+                        sys.executable or 'python',
+                        runner_path,
+                        '--generator-id',
+                        generator_id,
+                        '--out-dir',
+                        out_dir,
+                        '--config',
+                        json.dumps(config, ensure_ascii=False),
+                        '--repo-root',
+                        repo_root,
+                        '--catalog',
+                        'flag_node_generators',
+                    ]
+                    p = subprocess.run(
+                        cmd,
+                        cwd=repo_root,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                    if p.returncode != 0:
+                        err = (p.stderr or p.stdout or '').strip()
+                        if err:
+                            err = err[-800:]
+                        return False, f'generator failed (rc={p.returncode}): {err}'
+                    return True, 'ok'
+                except subprocess.TimeoutExpired:
+                    return False, 'generator timed out'
+                except Exception as exc:
+                    return False, f'generator exception: {exc}'
+
             if standard_nodes:
+                # If any flag-node-generators are enabled, use them to generate per-node docker-compose
+                # for the explicit Docker role nodes (these are DOCKER-type nodes, not vulnerability nodes).
+                node_gens = _load_enabled_flag_node_generators(repo_root)
+                usable = [g for g in (node_gens or []) if isinstance(g.get('compose'), dict)]
+
+                if usable:
+                    # Round-robin generator assignment across standard docker nodes.
+                    usable.sort(key=lambda g: str(g.get('id') or ''))
+                    try:
+                        base_seed = int(getattr(args, 'seed', 0) or 0)
+                    except Exception:
+                        base_seed = 0
+                    scenario_tag = str(getattr(args, 'scenario', '') or 'scenario').strip() or 'scenario'
+                    scenario_tag = ''.join([c for c in scenario_tag if c.isalnum() or c in ('-', '_')])[:40] or 'scenario'
+
+                    updated = {}
+                    for idx, (nm, _rec) in enumerate(sorted(standard_nodes.items(), key=lambda x: str(x[0]))):
+                        gen = usable[idx % max(1, len(usable))]
+                        gen_id = str(gen.get('id') or '').strip()
+                        if not gen_id:
+                            continue
+                        flow_run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
+                        out_dir = os.path.join('/tmp/vulns', 'flag_node_generators_runs', f"cli-{scenario_tag}-{nm}-{flow_run_id}")
+                        try:
+                            os.makedirs(out_dir, exist_ok=True)
+                        except Exception:
+                            pass
+                        cfg = {
+                            'seed': f"{base_seed}:{scenario_tag}:{nm}:{gen_id}",
+                            'node_name': nm,
+                        }
+                        ok_run, note = _run_flag_node_generator(gen_id, out_dir=out_dir, config=cfg)
+                        compose_src = os.path.join(out_dir, 'docker-compose.yml')
+                        if ok_run and os.path.exists(compose_src):
+                            updated[nm] = {
+                                'Type': 'docker-compose',
+                                'Name': str(gen.get('name') or gen_id),
+                                'Path': compose_src,
+                                'Vector': 'flag-nodegen',
+                            }
+                        else:
+                            logging.warning("Flag-node-generator failed for node=%s gen=%s: %s", nm, gen_id, note)
+
+                    if updated:
+                        # Replace the standard compose records for those nodes so compose prep uses the generated templates.
+                        for nm, rec in updated.items():
+                            standard_nodes[nm] = rec
+                            try:
+                                if 'docker_by_name' in locals() and isinstance(docker_by_name, dict):
+                                    docker_by_name[nm] = rec
+                            except Exception:
+                                pass
+
                 created = prepare_compose_for_assignments(standard_nodes, out_base="/tmp/vulns")
-                logging.info("Prepared standard docker compose files: %d for %d docker nodes", len(created), len(standard_nodes))
+                logging.info("Prepared docker compose files for explicit Docker role nodes: %d for %d docker nodes", len(created), len(standard_nodes))
+
+                # Best-effort: update compose_name on CORE nodes to reflect the record name.
+                try:
+                    for ni in (hosts or []):
+                        try:
+                            node_obj = session.get_node(ni.node_id)
+                            nm = getattr(node_obj, 'name', None)
+                        except Exception:
+                            nm = None
+                        if nm and nm in standard_nodes:
+                            try:
+                                _apply_docker_compose_meta(node_obj, standard_nodes[nm], session=session)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
         except Exception as e2:
             logging.debug("Standard docker compose prepare skipped or failed: %s", e2)
 

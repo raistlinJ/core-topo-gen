@@ -11,6 +11,9 @@
         <li class="nav-item" role="presentation">
           <button class="nav-link" id="flagGeneratorsTab" data-bs-toggle="tab" data-bs-target="#flagGenerators" type="button" role="tab">Flag-Generators</button>
         </li>
+        <li class="nav-item" role="presentation">
+          <button class="nav-link" id="flagNodeGeneratorsTab" data-bs-toggle="tab" data-bs-target="#flagNodeGenerators" type="button" role="tab">Flag-Node-Generators</button>
+        </li>
       </ul>
 
       <div class="tab-content mt-3">
@@ -101,10 +104,10 @@
                     <tr>
                       <th>ID</th>
                       <th>Name</th>
-                      <th>Language</th>
-                      <th>Source</th>
-                      <th>Input Types</th>
-                      <th>Output Types</th>
+                      <th>Type</th>
+                      <th>Path</th>
+                      <th>Inputs</th>
+                      <th>Outputs</th>
                       <th>From Source</th>
                       <th style="width: 100px;">Test</th>
                     </tr>
@@ -116,6 +119,42 @@
             </div>
           </div>
 
+        </div>
+
+        <div class="tab-pane fade" id="flagNodeGenerators" role="tabpanel">
+          <div class="card mb-3">
+            <div class="card-body">
+              <div class="row g-2 align-items-center">
+                <div class="col-md-6">
+                  <input id="nodeGenFilter" class="form-control" placeholder="Filter node-generators…" />
+                </div>
+              </div>
+              <div class="small text-muted mt-2" id="nodeGenMeta"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-body">
+              <div class="table-responsive">
+                <table class="table table-sm align-middle" id="nodeGenTable">
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>Name</th>
+                      <th>Type</th>
+                      <th>Path</th>
+                      <th>Inputs</th>
+                      <th>Outputs</th>
+                      <th>From Source</th>
+                      <th style="width: 100px;">Test</th>
+                    </tr>
+                  </thead>
+                  <tbody id="nodeGenBody"></tbody>
+                </table>
+              </div>
+              <pre class="mt-3 small" id="nodeGenLog" style="max-height: 240px; overflow: auto;"></pre>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -196,8 +235,15 @@
     filter: '',
   };
 
+  const nodeGenState = {
+    generators: [],
+    errors: [],
+    filter: '',
+  };
+
   const genTestState = {
     current: null,
+    testBase: '/flag_generators_test',
     eventSource: null,
     runId: null,
     outputsPollTimer: null,
@@ -206,6 +252,7 @@
   };
 
   let pendingCleanupRunId = null;
+  let pendingCleanupTestBase = null;
 
   function setOutputsStatus(visible, text) {
     const box = document.getElementById('genTestOutputsStatus');
@@ -237,6 +284,7 @@
     }
     genTestState.runId = null;
     genTestState.current = null;
+    genTestState.testBase = '/flag_generators_test';
     clearTestLog();
     setOutputsHtml('');
     setOutputsStatus(false);
@@ -309,7 +357,7 @@
     setCleanupLogLine(`[ui][cleanup] forceHide end state=${JSON.stringify(st1)}`);
   }
 
-  async function cleanupRunArtifacts(runId) {
+  async function cleanupRunArtifacts(runId, testBase) {
     if (!runId) return { ok: true };
     const cleanupText = document.getElementById('genTestCleanupText');
     const closeBtn = document.getElementById('genTestCleanupCloseBtn');
@@ -327,7 +375,8 @@
     try {
       const timeoutMs = 30000;
       const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-      const url = `/flag_generators_test/cleanup/${encodeURIComponent(runId)}`;
+      const base = testBase || (genTestState && genTestState.testBase ? String(genTestState.testBase) : '/flag_generators_test');
+      const url = `${base}/cleanup/${encodeURIComponent(runId)}`;
       const doReq = async () => {
         setCleanupLogLine(`[ui][cleanup] POST ${url}`);
         return await fetchJson(url, { method: 'POST', signal: controller ? controller.signal : undefined });
@@ -375,7 +424,8 @@
   }
 
   async function pollOutputsOnce(runId) {
-    const data = await fetchJson(`/flag_generators_test/outputs/${encodeURIComponent(runId)}`);
+    const base = genTestState && genTestState.testBase ? String(genTestState.testBase) : '/flag_generators_test';
+    const data = await fetchJson(`${base}/outputs/${encodeURIComponent(runId)}`);
     if (!data) return;
     if (data._nonJson) {
       setOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Login required')}</div>`);
@@ -473,62 +523,112 @@
     document.getElementById('genLog').textContent = (lines || []).join('\n');
   }
 
+  function setNodeGenLog(lines) {
+    document.getElementById('nodeGenLog').textContent = (lines || []).join('\n');
+  }
+
+  function joinPath(a, b) {
+    const aa = String(a || '').trim();
+    const bb = String(b || '').trim();
+    if (!aa) return bb;
+    if (!bb) return aa;
+    return aa.replace(/\/+$/, '') + '/' + bb.replace(/^\/+/, '');
+  }
+
+  function normalizeIOType(t) {
+    const v = String(t || '').trim().toLowerCase();
+    if (!v) return '';
+    const map = {
+      'string': 'text',
+      'text': 'text',
+      'json': 'json',
+      'yaml': 'yaml',
+      'yml': 'yaml',
+      'md': 'markdown',
+      'markdown': 'markdown',
+      'html': 'html',
+      'file': 'file',
+      'path': 'file',
+      'artifact': 'file',
+      'binary': 'binary file',
+      'exe': 'binary file',
+      'image': 'photo',
+      'photo': 'photo',
+      'picture': 'photo',
+    };
+    return map[v] || v;
+  }
+
+  function typeSummary(items) {
+    const arr = Array.isArray(items) ? items : [];
+    const seen = new Set();
+    arr.forEach((it) => {
+      if (!it || typeof it !== 'object') return;
+      const label = normalizeIOType(it.type);
+      if (label) seen.add(label);
+    });
+    const out = Array.from(seen);
+    out.sort();
+    return out.length ? out.join(', ') : '—';
+  }
+
+  function nameSummary(items) {
+    const arr = Array.isArray(items) ? items : [];
+    const out = [];
+    arr.forEach((it) => {
+      if (!it || typeof it !== 'object') return;
+      const nm = String(it.name || '').trim();
+      if (!nm) return;
+      out.push(nm);
+    });
+    out.sort();
+    return out.length ? out.join(', ') : '—';
+  }
+
   function renderGenerators() {
     const body = document.getElementById('genBody');
     const q = (genState.filter || '').toLowerCase();
     body.innerHTML = '';
 
-    const normalizeIOType = (t) => {
-      const v = String(t || '').trim().toLowerCase();
-      if (!v) return '';
-      const map = {
-        'string': 'text',
-        'text': 'text',
-        'json': 'json',
-        'yaml': 'yaml',
-        'yml': 'yaml',
-        'md': 'markdown',
-        'markdown': 'markdown',
-        'html': 'html',
-        'file': 'file',
-        'path': 'file',
-        'artifact': 'file',
-        'binary': 'binary file',
-        'exe': 'binary file',
-        'image': 'photo',
-        'photo': 'photo',
-        'picture': 'photo',
-      };
-      return map[v] || v;
-    };
-
-    const typeSummary = (items) => {
-      const arr = Array.isArray(items) ? items : [];
-      const seen = new Set();
-      arr.forEach((it) => {
-        if (!it || typeof it !== 'object') return;
-        const label = normalizeIOType(it.type);
-        if (label) seen.add(label);
-      });
-      const out = Array.from(seen);
-      out.sort();
-      return out.length ? out.join(', ') : '—';
-    };
-
     const filtered = (genState.generators || []).filter((g) => {
       if (!q) return true;
-      const hay = [g.id, g.name, g.language, (g.source && g.source.path) ? g.source.path : '', g.description || '', g._source_name || ''].join(' ').toLowerCase();
+      const src = (g.source && g.source.path) ? g.source.path : '';
+      const entry = (g.source && g.source.entry) ? g.source.entry : '';
+      const composeFile = (g.compose && typeof g.compose === 'object' && typeof g.compose.file === 'string') ? g.compose.file : '';
+      const composeService = (g.compose && typeof g.compose === 'object' && typeof g.compose.service === 'string') ? g.compose.service : '';
+      const hay = [
+        g.id,
+        g.name,
+        g.language,
+        src,
+        entry,
+        composeFile,
+        composeService,
+        nameSummary(g.inputs),
+        nameSummary(g.outputs),
+        typeSummary(g.inputs),
+        typeSummary(g.outputs),
+        g.description || '',
+        g._source_name || '',
+      ].join(' ').toLowerCase();
       return hay.includes(q);
     });
 
     filtered.forEach((g) => {
       const tr = document.createElement('tr');
       const src = (g.source && g.source.path) ? g.source.path : '';
+      const entry = (g.source && g.source.entry) ? g.source.entry : '';
+      const inNames = nameSummary(g.inputs);
+      const outNames = nameSummary(g.outputs);
       const inTypes = typeSummary(g.inputs);
       const outTypes = typeSummary(g.outputs);
       const hasCompose = !!(g.compose && typeof g.compose === 'object');
       const composeService = hasCompose && typeof g.compose.service === 'string' ? g.compose.service : '';
+      const composeFile = hasCompose && typeof g.compose.file === 'string' ? g.compose.file : '';
       const composeLabel = composeService ? `compose: ${composeService}` : 'compose';
+
+      const typeLabel = String(g.language || '');
+      const pathLabel = composeFile ? joinPath(src, composeFile) : (entry ? joinPath(src, entry) : src);
       tr.innerHTML = `
         <td class="small">${escapeHtml(g.id || '')}</td>
         <td>
@@ -538,10 +638,10 @@
           </div>
           ${g.description ? `<div class="small text-muted">${escapeHtml(g.description)}</div>` : ''}
         </td>
-        <td class="small">${escapeHtml(g.language || '')}</td>
-        <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(src)}</td>
-        <td class="small">${escapeHtml(inTypes)}</td>
-        <td class="small">${escapeHtml(outTypes)}</td>
+        <td class="small">${escapeHtml(typeLabel)}</td>
+        <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(pathLabel)}</td>
+        <td class="small" title="${escapeHtml(inTypes)}">${escapeHtml(inNames)}</td>
+        <td class="small" title="${escapeHtml(outTypes)}">${escapeHtml(outNames)}</td>
         <td class="small">${escapeHtml(g._source_name || '')}</td>
         <td>
           <button class="btn btn-sm btn-outline-primary genTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}">Test</button>
@@ -553,6 +653,79 @@
       if (btn) {
         btn.addEventListener('click', () => {
           openGenTestModal(g);
+        });
+      }
+    });
+  }
+
+  function renderNodeGenerators() {
+    const body = document.getElementById('nodeGenBody');
+    const q = (nodeGenState.filter || '').toLowerCase();
+    body.innerHTML = '';
+
+    const filtered = (nodeGenState.generators || []).filter((g) => {
+      if (!q) return true;
+      const src = (g.source && g.source.path) ? g.source.path : '';
+      const entry = (g.source && g.source.entry) ? g.source.entry : '';
+      const composeFile = (g.compose && typeof g.compose === 'object' && typeof g.compose.file === 'string') ? g.compose.file : '';
+      const composeService = (g.compose && typeof g.compose === 'object' && typeof g.compose.service === 'string') ? g.compose.service : '';
+      const hay = [
+        g.id,
+        g.name,
+        g.language,
+        src,
+        entry,
+        composeFile,
+        composeService,
+        nameSummary(g.inputs),
+        nameSummary(g.outputs),
+        typeSummary(g.inputs),
+        typeSummary(g.outputs),
+        g.description || '',
+        g._source_name || '',
+      ].join(' ').toLowerCase();
+      return hay.includes(q);
+    });
+
+    filtered.forEach((g) => {
+      const tr = document.createElement('tr');
+      const src = (g.source && g.source.path) ? g.source.path : '';
+      const entry = (g.source && g.source.entry) ? g.source.entry : '';
+      const inNames = nameSummary(g.inputs);
+      const outNames = nameSummary(g.outputs);
+      const inTypes = typeSummary(g.inputs);
+      const outTypes = typeSummary(g.outputs);
+      const hasCompose = !!(g.compose && typeof g.compose === 'object');
+      const composeService = hasCompose && typeof g.compose.service === 'string' ? g.compose.service : '';
+      const composeFile = hasCompose && typeof g.compose.file === 'string' ? g.compose.file : '';
+      const composeLabel = composeService ? `compose: ${composeService}` : 'compose';
+
+      const typeLabel = String(g.language || '');
+      const pathLabel = composeFile ? joinPath(src, composeFile) : (entry ? joinPath(src, entry) : src);
+      tr.innerHTML = `
+        <td class="small">${escapeHtml(g.id || '')}</td>
+        <td>
+          <div>
+            <strong>${escapeHtml(g.name || '')}</strong>
+            ${hasCompose ? `<span class="badge bg-secondary ms-2">${escapeHtml(composeLabel)}</span>` : ''}
+          </div>
+          ${g.description ? `<div class="small text-muted">${escapeHtml(g.description)}</div>` : ''}
+        </td>
+        <td class="small">${escapeHtml(typeLabel)}</td>
+        <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(pathLabel)}</td>
+        <td class="small" title="${escapeHtml(inTypes)}">${escapeHtml(inNames)}</td>
+        <td class="small" title="${escapeHtml(outTypes)}">${escapeHtml(outNames)}</td>
+        <td class="small">${escapeHtml(g._source_name || '')}</td>
+        <td>
+          <button class="btn btn-sm btn-outline-primary nodeGenTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}">Test</button>
+        </td>
+      `;
+      body.appendChild(tr);
+
+      const btn = tr.querySelector('.nodeGenTestBtn');
+      if (btn) {
+        btn.addEventListener('click', () => {
+          openGenTestModal(g, '/flag_node_generators_test');
         });
       }
     });
@@ -667,6 +840,8 @@
     const required = !!(inp && inp.required);
     const type = inp && inp.type ? String(inp.type) : 'string';
     const desc = inp && inp.description ? String(inp.description) : '';
+    const hasDefault = !!(inp && Object.prototype.hasOwnProperty.call(inp, 'default'));
+    const defaultVal = hasDefault ? String(inp.default) : '';
     const label = `${name}${required ? ' *' : ''}`;
     const help = desc ? `<div class="form-text">${escapeHtml(desc)}</div>` : '';
     if (isFileInputType(type)) {
@@ -678,17 +853,21 @@
         </div>
       `;
     }
+
+    const inputType = (type || '').toLowerCase() === 'number' ? 'number' : 'text';
+    const valueAttr = hasDefault && defaultVal !== '' ? ` value="${escapeHtml(defaultVal)}"` : '';
     return `
       <div class="mb-3">
         <label class="form-label">${escapeHtml(label)}</label>
-        <input class="form-control" type="text" name="${escapeHtml(name)}" ${required ? 'required' : ''} />
+        <input class="form-control" type="${escapeHtml(inputType)}" name="${escapeHtml(name)}"${valueAttr} ${required ? 'required' : ''} />
         ${help}
       </div>
     `;
   }
 
-  function openGenTestModal(generator) {
+  function openGenTestModal(generator, testBase) {
     genTestState.current = generator;
+    genTestState.testBase = testBase || '/flag_generators_test';
     genTestState.runId = null;
     stopOutputsPolling();
     if (genTestState.eventSource) {
@@ -715,7 +894,8 @@
   }
 
   async function loadTestOutputs(runId) {
-    const data = await fetchJson(`/flag_generators_test/outputs/${encodeURIComponent(runId)}`);
+    const base = genTestState.testBase || '/flag_generators_test';
+    const data = await fetchJson(`${base}/outputs/${encodeURIComponent(runId)}`);
     if (!data.ok) {
       setOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Failed loading outputs')}</div>`);
       setOutputsStatus(false);
@@ -743,7 +923,7 @@
     const pushFiles = (categoryLabel, files, categoryKey) => {
       (files || []).forEach(f => {
         const p = f.path || '';
-        const href = `/flag_generators_test/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(p)}`;
+        const href = `${base}/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(p)}`;
         rows.push({
           category: categoryLabel,
           path: p,
@@ -764,7 +944,8 @@
 
   async function loadTestOutputsWithRetry(runId, attempts = 10) {
     for (let i = 0; i < attempts; i++) {
-      const data = await fetchJson(`/flag_generators_test/outputs/${encodeURIComponent(runId)}`);
+      const base = genTestState.testBase || '/flag_generators_test';
+      const data = await fetchJson(`${base}/outputs/${encodeURIComponent(runId)}`);
       if (data && data._nonJson) {
         setOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Login required')}</div>`);
         setOutputsStatus(false);
@@ -795,8 +976,9 @@
 
     const form = document.getElementById('genTestForm');
     const fd = new FormData(form);
-    setTestLogLine('[ui] POST /flag_generators_test/run …');
-    const data = await fetchJson('/flag_generators_test/run', { method: 'POST', body: fd });
+    const base = genTestState.testBase || '/flag_generators_test';
+    setTestLogLine(`[ui] POST ${base}/run …`);
+    const data = await fetchJson(`${base}/run`, { method: 'POST', body: fd });
     setTestLogLine(`[ui] response received (status unknown; ok=${data && data.ok !== false})`);
 
     if (!data || data.ok === false) {
@@ -894,6 +1076,7 @@
 
     el.addEventListener('hide.bs.modal', () => {
       pendingCleanupRunId = genTestState.runId || null;
+      pendingCleanupTestBase = genTestState.testBase || '/flag_generators_test';
       try { setTestLogLine(`[ui][cleanup] genTestModal hide: pendingCleanupRunId=${pendingCleanupRunId || ''}`); } catch (e) {}
       // Stop background activity immediately to reduce flakiness.
       stopOutputsPolling();
@@ -905,18 +1088,48 @@
 
     el.addEventListener('hidden.bs.modal', async () => {
       const runId = pendingCleanupRunId;
+      const testBase = pendingCleanupTestBase;
       pendingCleanupRunId = null;
+      pendingCleanupTestBase = null;
       try { setTestLogLine(`[ui][cleanup] genTestModal hidden: runId=${runId || ''}`); } catch (e) {}
       resetGenTestUiState();
       if (!runId) return;
       try {
         try { setCleanupLogLine(`[ui][cleanup] invoked from genTestModal hidden (runId=${runId})`); } catch (e) {}
-        await cleanupRunArtifacts(runId);
+        await cleanupRunArtifacts(runId, testBase);
       } catch (e) {
         // Ignore cleanup errors; UI already closed.
       }
     });
   })();
+
+  async function loadNodeGenerators() {
+    const metaEl = document.getElementById('nodeGenMeta');
+    metaEl.textContent = 'Loading…';
+    setNodeGenLog([]);
+    const data = await fetchJson('/flag_node_generators_data');
+    if (data && data.ok === false) {
+      metaEl.textContent = data.error || 'Failed loading node-generators.';
+      return;
+    }
+    nodeGenState.generators = data.generators || [];
+    nodeGenState.errors = data.errors || [];
+    metaEl.textContent = `Loaded ${nodeGenState.generators.length} node-generators from enabled sources.`;
+    const lines = [];
+    (nodeGenState.errors || []).forEach(e => lines.push(JSON.stringify(e)));
+    setNodeGenLog(lines);
+    renderNodeGenerators();
+  }
+
+  document.getElementById('nodeGenFilter').addEventListener('input', (e) => {
+    nodeGenState.filter = e.target.value || '';
+    renderNodeGenerators();
+  });
+
+  // Load node-generator list when the tab is shown
+  document.getElementById('flagNodeGeneratorsTab').addEventListener('shown.bs.tab', async () => {
+    await loadNodeGenerators();
+  });
 
   (function attachCleanupModalHandlers() {
     const el = document.getElementById('genTestCleanupModal');

@@ -35,7 +35,15 @@
 
 <div class="position-fixed bottom-0 start-0 end-0 bg-body border-top" style="z-index: 1030;">
   <div class="container-fluid py-2">
-    <div class="d-flex justify-content-end">
+    <div class="d-flex justify-content-end gap-2">
+      {% if scenarios_active_tab in ['topology', 'flag-sequencing'] %}
+        {% if scenarios_active_tab == 'topology' %}
+        <button id="saveXmlBtn" class="btn btn-outline-success px-4 py-2 shadow-sm" type="submit" form="editorForm">Save XML</button>
+        {% else %}
+        <button id="saveXmlBtn" class="btn btn-outline-success px-4 py-2 shadow-sm" type="button">Save XML</button>
+        {% endif %}
+        <button id="downloadXmlBtn" class="btn btn-outline-info px-4 py-2 shadow-sm" type="button" {% if not preview_xml_path %}disabled title="Save XML first"{% endif %}>Download XML</button>
+      {% endif %}
       <button id="scenariosExecuteBtn" class="btn btn-success px-4 py-2 shadow-sm" type="button">Execute</button>
     </div>
   </div>
