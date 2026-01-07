@@ -7494,19 +7494,12 @@ def _pick_flag_chain_nodes(nodes: list[dict[str, Any]], adj: dict[str, set[str]]
             continue
         id_to_node[nid] = n
         t = (str(n.get('type') or '').strip().lower())
-        # New rule: flags from flag-generators are placed on vulnerability docker nodes specifically.
+        # Flags are placed on any Docker nodes (scenario Docker role + vulnerability Docker nodes).
+        # Note: older implementations restricted eligibility to "vulnerability docker nodes" only.
+        # The UI rule and user expectations are broader, so we treat all docker-like nodes as eligible.
         is_docker = ('docker' in t) or (str(n.get('type') or '').strip().upper() == 'DOCKER')
-        if not is_docker:
-            continue
-        # Heuristic: treat compose-backed docker nodes whose compose_name is not the standard template
-        # as "vulnerability nodes".
-        comp_name = str(n.get('compose_name') or '').strip().lower()
-        comp = str(n.get('compose') or '').strip().lower()
-        is_compose_backed = bool(comp_name or comp)
-        is_standard = ('standard-ubuntu-docker-core' in comp_name) or ('standard-ubuntu-docker-core' in comp)
-        if not is_compose_backed or is_standard:
-            continue
-        eligible_ids.append(nid)
+        if is_docker:
+            eligible_ids.append(nid)
 
     if not eligible_ids:
         return []
@@ -7572,7 +7565,7 @@ def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
 
     - docker_total: nodes that look like docker nodes
     - compose_backed_total: docker nodes that carry compose metadata
-    - eligible_total: docker nodes eligible for chain placement (vulnerability docker nodes)
+    - eligible_total: docker nodes eligible for chain placement
     """
     docker_total = 0
     compose_backed_total = 0
@@ -7590,10 +7583,8 @@ def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
         comp_name = str(n.get('compose_name') or '').strip()
         if comp or comp_name:
             compose_backed_total += 1
-        # Eligibility is vulnerability docker nodes (compose-backed but not the standard template).
-        is_standard = ('standard-ubuntu-docker-core' in comp_name.lower()) or ('standard-ubuntu-docker-core' in comp.lower())
-        if (comp or comp_name) and not is_standard:
-            eligible_total += 1
+        # Eligibility follows the UI rule: any docker node is eligible.
+        eligible_total += 1
     return {
         'docker_total': docker_total,
         'compose_backed_total': compose_backed_total,
@@ -7947,6 +7938,49 @@ def _latest_flow_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
         return None
     except Exception:
         return None
+
+
+def _attach_latest_flow_into_full_preview(full_prev: dict, scenario: Optional[str]) -> None:
+    """Best-effort: merge saved Flag Sequencing (flow) metadata into a full_preview payload.
+
+    Preview plans generated from XML alone do not include flow/chain data; the user's
+    sequencing is stored in outputs/plans/plan_from_flow_*.json.
+
+    The Preview graph expects flow chain data under full_preview.metadata.flow (or
+    sometimes full_preview.flow) to mark sequence nodes.
+    """
+    try:
+        if not isinstance(full_prev, dict):
+            return
+        scenario_norm = _normalize_scenario_label(scenario or '')
+        if not scenario_norm:
+            return
+        flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
+        if not flow_plan_path:
+            return
+        try:
+            with open(flow_plan_path, 'r', encoding='utf-8') as f:
+                flow_payload = json.load(f) or {}
+        except Exception:
+            return
+        flow_meta = None
+        if isinstance(flow_payload, dict):
+            meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
+            flow_meta = (meta or {}).get('flow')
+            if not flow_meta:
+                flow_meta = flow_payload.get('flow')
+        if not isinstance(flow_meta, dict):
+            return
+
+        # Attach in the shape the front-end already understands.
+        full_prev.setdefault('metadata', {})
+        if isinstance(full_prev.get('metadata'), dict):
+            full_prev['metadata']['flow'] = flow_meta
+            full_prev['metadata']['flow_plan_path'] = flow_plan_path
+        # Back-compat: also provide top-level alias.
+        full_prev['flow'] = flow_meta
+    except Exception:
+        return
 
 
 def _build_topology_graph_from_preview_plan(preview: Dict[str, Any]) -> Tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, set[str]]]:
@@ -17926,6 +17960,10 @@ def api_plan_preview_full():
             _merge_hitl_preview_with_full_preview(full_prev, hitl_config)
         except Exception:
             pass
+        try:
+            _attach_latest_flow_into_full_preview(full_prev, scenario)
+        except Exception:
+            pass
         return jsonify({'ok': True, 'full_preview': full_prev, 'plan': plan, 'breakdowns': plan.get('breakdowns')})
     except Exception as e:
         app.logger.exception('[plan.preview_full] error: %s', e)
@@ -18032,6 +18070,10 @@ def plan_full_preview_page():
             pass
         try:
             _merge_hitl_preview_with_full_preview(full_prev, hitl_config)
+        except Exception:
+            pass
+        try:
+            _attach_latest_flow_into_full_preview(full_prev, scenario_name)
         except Exception:
             pass
         # Persist preview payload for downstream execution wiring

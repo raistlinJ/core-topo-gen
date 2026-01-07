@@ -15,7 +15,7 @@ class TrafficService(CoreService):
     # executables that should exist on path, that this service depends on
     executables: list[str] = []
     # other services that this service depends on, defines service start order
-    dependencies: list[str] = []
+    dependencies: list[str] = ["CoreTGPrereqs"]
     # commands to run to start this service
     startup: list[str] = ["/bin/bash runtraffic.sh &"]
     # commands to run to validate this service

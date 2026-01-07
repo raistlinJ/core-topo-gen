@@ -5,6 +5,12 @@ services:
     image: ubuntu:22.04
     container_name: standard-ubuntu
     tty: true # Allocates a pseudo-TTY so you can interact with the container
+    # Required for iptables/NAT and raw socket operations (Segmentation / some traffic patterns)
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      net.ipv4.ip_forward: '1'
     volumes:
       # Flow may materialize a per-node hint.txt alongside the compose.
       # When present, show it in /hint.txt inside the container.
@@ -14,6 +20,31 @@ services:
       - -lc
       - |
         set -e
+
+        # Ensure baseline tooling exists for CORE + core-topo-gen runtime services.
+        # This compose file is treated as a template and may be copied to other hosts,
+        # so avoid relying on a local Docker build context.
+        export DEBIAN_FRONTEND=noninteractive
+        NEED_INSTALL=0
+        for c in python3 ip ethtool iptables; do
+          command -v "$c" >/dev/null 2>&1 || NEED_INSTALL=1
+        done
+        if [ "$NEED_INSTALL" -eq 1 ]; then
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            bash \
+            ca-certificates \
+            curl \
+            ethtool \
+            iproute2 \
+            iptables \
+            iputils-ping \
+            net-tools \
+            procps \
+            python3
+          rm -rf /var/lib/apt/lists/*
+        fi
+
         BOOT="$(mktemp)"
         cat > "$BOOT" <<'EOS'
         #!/usr/bin/env bash

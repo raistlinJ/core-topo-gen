@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import List, Tuple, Dict
 
-ALLOWED_HOST_ROLES = {"Server", "Workstation", "PC"}
+ALLOWED_HOST_ROLES = {"Server", "Workstation", "PC", "Docker"}
 
 def _normalize_role_name(role: str) -> str:
     rl = (role or '').strip()
@@ -32,7 +32,7 @@ def compute_node_plan(density_base: int, weight_items: List[Tuple[str, float]], 
     Rounding: proportional floor then distribute residual by largest fractional remainder.
     """
     import math as _math
-    # Web UI enumeration (excluding 'Random'): ["Server", "Workstation", "PC", "Random"]
+    # Web UI enumeration (excluding 'Random'): ["Server", "Workstation", "PC", "Docker", "Random"]
     DEFAULT_RANDOM_ROLES = ["Server", "Workstation", "PC"]
 
     # --- Expand Random weight items ---
