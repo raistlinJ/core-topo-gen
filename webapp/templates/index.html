@@ -16557,7 +16557,11 @@ async function submitRunCliRequest(buildRequest, options = {}) {
             const autoKillSessions = options && options.autoKillSessions === true;
             let proceed = true;
             if (!autoKillSessions) {
-                proceed = window.confirm(promptText);
+                proceed = await promptRunProgressConfirm(promptText, {
+                    title: 'Active CORE session(s) detected',
+                    confirmLabel: 'Kill sessions & retry',
+                    cancelLabel: 'Cancel',
+                });
             } else {
                 logRunRequestDebug(`Active CORE session(s) detected; auto-kill enabled (${sessionCount}).`);
             }
@@ -16955,6 +16959,90 @@ function runProgressLogLine(s){
     dockLog(line, lvl);
     pre.parentElement?.scrollTo({ top: pre.parentElement.scrollHeight });
     handleExecuteProgressLog(line);
+}
+
+async function promptRunProgressConfirm(message, { title = 'Active CORE session(s) detected', confirmLabel = 'Kill sessions & retry', cancelLabel = 'Cancel' } = {}) {
+    // Prefer an in-page prompt (Bootstrap modal) to avoid browsers suppressing window.confirm
+    // after long async operations.
+    try {
+        if (!window.bootstrap) {
+            return window.confirm(String(message || 'Proceed?'));
+        }
+        ensureRunProgressModal();
+        const modalEl = document.getElementById('runProgressModal');
+        if (!modalEl) {
+            return window.confirm(String(message || 'Proceed?'));
+        }
+        const footerEl = modalEl.querySelector('.modal-footer');
+        const titleEl = modalEl.querySelector('.modal-title');
+        const hideBtn = document.getElementById('runProgressHideBtn');
+        const closeBtn = modalEl.querySelector('.btn-close');
+        const statusEl = document.getElementById('runProgressStatus');
+        const metaEl = document.getElementById('runProgressMeta');
+
+        // Snapshot current state for restore.
+        const prevTitle = titleEl ? titleEl.textContent : '';
+        const prevHideText = hideBtn ? hideBtn.textContent : '';
+        const prevHideDismiss = hideBtn ? hideBtn.getAttribute('data-bs-dismiss') : null;
+        const prevHideOnclick = hideBtn ? hideBtn.onclick : null;
+        const prevCloseDisplay = closeBtn ? closeBtn.style.display : '';
+
+        if (titleEl && title) titleEl.textContent = String(title);
+        if (statusEl) statusEl.textContent = 'Action required';
+        if (metaEl) metaEl.textContent = 'Active CORE session(s) are blocking the run.';
+        try { runProgressLogLine(String(message || '')); } catch (e) {}
+
+        // Ensure visible.
+        try { runProgressModalInst?.show(); } catch (e) {}
+
+        // Hide the top-right close button so the prompt can't disappear without resolving.
+        try { if (closeBtn) closeBtn.style.display = 'none'; } catch (e) {}
+
+        if (!footerEl || !hideBtn) {
+            return window.confirm(String(message || 'Proceed?'));
+        }
+
+        return await new Promise((resolve) => {
+            let resolved = false;
+            let confirmBtn = null;
+
+            const cleanup = (result) => {
+                if (resolved) return;
+                resolved = true;
+                try { confirmBtn?.remove(); } catch (e) {}
+                try {
+                    hideBtn.textContent = prevHideText || 'Hide';
+                    if (prevHideDismiss === null || typeof prevHideDismiss === 'undefined') hideBtn.removeAttribute('data-bs-dismiss');
+                    else hideBtn.setAttribute('data-bs-dismiss', prevHideDismiss);
+                    hideBtn.onclick = prevHideOnclick;
+                } catch (e) {}
+                try { if (closeBtn) closeBtn.style.display = prevCloseDisplay; } catch (e) {}
+                try { if (titleEl) titleEl.textContent = prevTitle; } catch (e) {}
+                try { modalEl.removeEventListener('hidden.bs.modal', onHidden); } catch (e) {}
+                resolve(!!result);
+            };
+
+            const onHidden = () => cleanup(false);
+            try { modalEl.addEventListener('hidden.bs.modal', onHidden); } catch (e) {}
+
+            // Repurpose Hide into Cancel (no dismiss).
+            try {
+                hideBtn.textContent = String(cancelLabel || 'Cancel');
+                hideBtn.removeAttribute('data-bs-dismiss');
+                hideBtn.onclick = () => cleanup(false);
+            } catch (e) {}
+
+            // Add confirm button.
+            confirmBtn = document.createElement('button');
+            confirmBtn.type = 'button';
+            confirmBtn.className = 'btn btn-primary';
+            confirmBtn.textContent = String(confirmLabel || 'OK');
+            confirmBtn.addEventListener('click', () => cleanup(true));
+            footerEl.appendChild(confirmBtn);
+        });
+    } catch (e) {
+        return window.confirm(String(message || 'Proceed?'));
+    }
 }
 function detectLocalEmulation(){
     const normalizeHost = (raw) => {
