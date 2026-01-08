@@ -5,6 +5,7 @@
 
 <style>
   /* Reserve space for the shared fixed-bottom Execute bar on all Scenarios sub-tabs. */
+  :root { --coretg-execbar-height: 64px; }
   body { padding-bottom: 64px; }
 </style>
 
@@ -33,7 +34,7 @@
   <input type="hidden" id="scenariosPreviewScenario" value="{{ scenario_tab }}">
 </div>
 
-<div class="position-fixed bottom-0 start-0 end-0 bg-body border-top" style="z-index: 1030;">
+<div class="position-fixed start-0 end-0 bg-body border-top" style="bottom: var(--coretg-dock-height, 0px); z-index: 1045;">
   <div class="container-fluid py-2">
     <div class="d-flex justify-content-end gap-2">
       {% if scenarios_active_tab in ['topology', 'flag-sequencing'] %}

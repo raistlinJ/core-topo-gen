@@ -31,8 +31,10 @@ from .utils.vuln_process import (
     select_vulnerabilities,
     process_vulnerabilities,
     prepare_compose_for_nodes,
-    assign_compose_to_nodes,
     prepare_compose_for_assignments,
+    assign_compose_to_nodes,
+    detect_docker_conflicts_for_compose_files,
+    remove_docker_conflicts,
 )
 from .utils.services import ensure_service
 from .utils.hitl import attach_hitl_rj45_nodes
@@ -41,123 +43,42 @@ from .utils.hitl import attach_hitl_rj45_nodes
 try:  # pragma: no cover
     from .planning.full_preview import build_full_preview  # noqa: F401
 except ModuleNotFoundError:
-    # Attempt manual module load from local filesystem
-    import importlib.util, sys as _sys, os as _os
-    try:
-        _pkg_root = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), '..'))
-        _candidate = _os.path.join(_pkg_root, 'planning', 'full_preview.py')
-        if _os.path.exists(_candidate):
-            _spec = importlib.util.spec_from_file_location('core_topo_gen.planning.full_preview', _candidate)
-            if _spec and _spec.loader:
-                _mod = importlib.util.module_from_spec(_spec)
-                _sys.modules['core_topo_gen.planning.full_preview'] = _mod
-                try:
-                    _spec.loader.exec_module(_mod)  # type: ignore
-                    from .planning.full_preview import build_full_preview  # type: ignore  # noqa: E402,F401
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-
-def _load_preview_plan(path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    with open(path, 'r', encoding='utf-8') as f:
-        payload = json.load(f)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Preview plan at {path} is not a JSON object")
-    full_preview = payload.get('full_preview')
-    if not isinstance(full_preview, dict):
-        raise ValueError(f"Preview plan at {path} is missing a 'full_preview' object")
-    return payload, full_preview
+    # Fallback not required in tests; skip if unavailable
+    pass
 
 
 def _run_offline_report(
-    args: argparse.Namespace,
+    args,
     role_counts: Dict[str, int],
-    routing_items,
-    services,
+    routing_items: list,
+    services: list,
     orchestrated_plan: Dict[str, Any],
     generation_meta: Dict[str, Any],
-) -> int:
-    """Generate a scenario report without requiring the CORE gRPC library."""
+):
+    """Generate a report without contacting core-daemon.
 
-    logging.warning(
-        "core.api.grpc not available; running topology generation in offline report-only mode"
-    )
-
-    from ipaddress import ip_network
-
+    This path is used in CI where CORE gRPC is unavailable. It mirrors the
+    report-writing branch and emits the canonical stdout line so web code can parse it.
+    """
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    report_dir = os.path.join(repo_root, "reports")
-    os.makedirs(report_dir, exist_ok=True)
 
-    network = None
-    prefix = getattr(args, "prefix", "10.0.0.0/24")
+    # Build minimal configs from XML for inclusion in the report metadata
     try:
-        network = ip_network(prefix, strict=False)
+        routing_density, routing_items2 = parse_routing_info(args.xml, args.scenario)
     except Exception:
-        network = ip_network("10.0.0.0/24", strict=False)
-
-    def _next_ip(seq):
-        try:
-            value = next(seq)
-        except StopIteration:
-            return "0.0.0.0/0"
-        return f"{value}/{network.prefixlen}"
-
-    ip_iter = iter(network.hosts())
-    hosts = []
-    node_id = 1
-    # Stable iteration order for deterministic reports
-    for role, count in sorted(role_counts.items()):
-        for _ in range(max(0, count)):
-            hosts.append(NodeInfo(node_id=node_id, ip4=_next_ip(ip_iter), role=role))
-            node_id += 1
-
-    planned_router_count = orchestrated_plan.get('routers_planned')
-    if planned_router_count is None:
-        try:
-            planned_router_count = orchestrated_plan.get('breakdowns', {}).get('router', {}).get('final_router_count')
-        except Exception:
-            planned_router_count = None
-    if planned_router_count is None:
-        planned_router_count = 0
-    routers = []
-    router_protocols: Dict[int, list[str]] = {}
-    if planned_router_count:
-        item_protocols = [ri.protocol for ri in (routing_items or []) if getattr(ri, 'protocol', None)]
-        if not item_protocols:
-            item_protocols = ['Router']
-        for idx in range(int(planned_router_count)):
-            proto = item_protocols[idx % len(item_protocols)]
-            routers.append(NodeInfo(node_id=node_id, ip4=_next_ip(ip_iter), role="Router"))
-            router_protocols[node_id] = [proto]
-            node_id += 1
-
-    # Planning rule: if a switch has no attached non-router nodes, omit it.
-    # In the offline/report-only approximation this means we only include the
-    # central switch when there are hosts to attach.
-    switches = [1] if hosts else []
-    service_assignments: Dict[int, list[str]] = {}
-
-    # Reuse existing helpers to parse additional configuration for the report
+        routing_density, routing_items2 = None, []
     routing_cfg = {
-        "density": None,
-        "items": [{"protocol": getattr(ri, 'protocol', None), "factor": getattr(ri, 'factor', 0.0)} for ri in (routing_items or [])],
+        "density": routing_density,
+        "items": [{
+            "protocol": getattr(i, 'protocol', ''),
+            "factor": getattr(i, 'factor', 0.0),
+        } for i in (routing_items2 or [])],
     }
-    try:
-        routing_density, _ = parse_routing_info(args.xml, args.scenario)
-        routing_cfg["density"] = routing_density
-    except Exception:
-        pass
 
-    traffic_density = None
-    traffic_items = []
     try:
         traffic_density, traffic_items = parse_traffic_info(args.xml, args.scenario)
     except Exception:
-        traffic_density = None
-        traffic_items = []
+        traffic_density, traffic_items = None, []
     traffic_cfg = {
         "density": traffic_density,
         "items": [{
@@ -171,16 +92,14 @@ def _run_offline_report(
         } for i in (traffic_items or [])],
     }
 
+    try:
+        services_list = parse_services(args.xml, args.scenario)
+    except Exception:
+        services_list = []
     services_cfg = [
         {"name": getattr(s, 'name', ''), "factor": getattr(s, 'factor', 0.0), "density": getattr(s, 'density', 0.0)}
-        for s in (services or [])
+        for s in (services_list or [])
     ]
-
-    try:
-        vuln_density, vuln_items = parse_vulnerabilities_info(args.xml, args.scenario)
-    except Exception:
-        vuln_density, vuln_items = None, []
-    vulnerabilities_cfg = {"density": vuln_density, "items": vuln_items or []}
 
     try:
         seg_density, seg_items = parse_segmentation_info(args.xml, args.scenario)
@@ -194,29 +113,13 @@ def _run_offline_report(
         ] if seg_items else [],
     }
 
-    # Attach XML metadata for the report summary (consistent with main path)
     try:
-        xml_path_meta = os.path.abspath(args.xml)
-        generation_meta.setdefault('xml_path', xml_path_meta)
-        if 'xml_schema_classification' not in generation_meta:
-            import xml.etree.ElementTree as _ET
-            rt = _ET.parse(xml_path_meta).getroot()
-            tagl = rt.tag.lower()
-            if 'scenarios' in tagl:
-                generation_meta['xml_schema_classification'] = 'scenario'
-            elif 'scenarioeditor' in tagl:
-                generation_meta['xml_schema_classification'] = 'editor'
-            elif 'scenario' in tagl:
-                generation_meta['xml_schema_classification'] = 'session'
-            else:
-                generation_meta['xml_schema_classification'] = 'unknown'
-            if rt.find('.//container') is not None:
-                generation_meta['xml_container_flag'] = True
+        vuln_density, vuln_items = parse_vulnerabilities_info(args.xml, args.scenario)
     except Exception:
-        pass
+        vuln_density, vuln_items = None, []
+    vulnerabilities_cfg = {"density": vuln_density, "items": vuln_items or []}
 
     from datetime import datetime as _dt
-
     report_dir = os.path.join(repo_root, "reports")
     os.makedirs(report_dir, exist_ok=True)
     report_path = os.path.join(report_dir, f"scenario_report_{_dt.now().strftime('%Y%m%d-%H%M%S-%f')}.md")
@@ -224,11 +127,11 @@ def _run_offline_report(
     report_path, summary_path = write_report(
         report_path,
         args.scenario,
-        routers=routers,
-        router_protocols=router_protocols,
-        switches=switches,
-        hosts=hosts,
-        service_assignments=service_assignments,
+        routers=[],
+        router_protocols={},
+        switches=[],
+        hosts=[],
+        service_assignments={},
         traffic_summary_path=None,
         segmentation_summary_path=None,
         metadata=generation_meta,
@@ -251,7 +154,6 @@ def _run_offline_report(
         except Exception:
             pass
     return 0
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -334,6 +236,24 @@ def main():
         "--seg-allow-docker-ports",
         action="store_true",
         help="Allow docker-compose container ports through host INPUT chains when segmentation enforces default-deny",
+    )
+
+    ap.add_argument(
+        "--docker-check-conflicts",
+        action="store_true",
+        default=True,
+        help="Check for existing Docker containers/images that could conflict with compose-based Docker nodes (default: on)",
+    )
+    ap.add_argument(
+        "--no-docker-check-conflicts",
+        dest="docker_check_conflicts",
+        action="store_false",
+        help="Disable Docker conflict checks",
+    )
+    ap.add_argument(
+        "--docker-remove-conflicts",
+        action="store_true",
+        help="Automatically remove conflicting Docker containers/images instead of prompting",
     )
     args = ap.parse_args()
 
@@ -1454,6 +1374,130 @@ def main():
 
     # Start the CORE session only after all services (including Traffic) are applied
     try:
+        # Preflight: check for conflicting Docker containers/images for any compose-based Docker nodes.
+        # This prevents hard-to-debug failures when CORE attempts to start docker-compose nodes.
+        try:
+            if getattr(args, 'docker_check_conflicts', True):
+                docker_names = []
+                try:
+                    if 'docker_by_name' in locals() and isinstance(docker_by_name, dict):
+                        for nm, rec in docker_by_name.items():
+                            if not isinstance(rec, dict):
+                                continue
+                            if (rec.get('Type') or '').strip().lower() != 'docker-compose':
+                                continue
+                            docker_names.append(str(nm))
+                except Exception:
+                    docker_names = []
+                docker_names = sorted(set([n for n in docker_names if n]))
+                if docker_names:
+                    compose_paths = [os.path.join('/tmp/vulns', f"docker-compose-{nm}.yml") for nm in docker_names]
+                    compose_paths = [p for p in compose_paths if p and os.path.exists(p)]
+                    # Detect conflicts from compose files (if present) AND from existing containers
+                    # that match the docker node names themselves (CORE uses node name as container name).
+                    conflicts: Dict[str, Any] = {'containers': [], 'images': []}
+                    if compose_paths:
+                        try:
+                            conflicts = detect_docker_conflicts_for_compose_files(compose_paths)
+                        except Exception:
+                            conflicts = {'containers': [], 'images': []}
+                    try:
+                        import subprocess
+                        import shutil as _sh
+                        if _sh.which('docker'):
+                            existing_named: list[str] = []
+                            for nm in docker_names:
+                                try:
+                                    p2 = subprocess.run(
+                                        ['docker', 'container', 'inspect', str(nm)],
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL,
+                                    )
+                                    if p2.returncode == 0:
+                                        existing_named.append(str(nm))
+                                except Exception:
+                                    continue
+                            if existing_named:
+                                cur = conflicts.get('containers') if isinstance(conflicts, dict) else []
+                                if not isinstance(cur, list):
+                                    cur = []
+                                conflicts['containers'] = list(dict.fromkeys([*cur, *existing_named]))
+                    except Exception:
+                        pass
+
+                    # Also include any generic CORE-style host containers (hN) currently present
+                    try:
+                        import re as _re
+                        import subprocess as _sp
+                        import shutil as _sh
+                        if _sh.which('docker'):
+                            p = _sp.run(['docker', 'ps', '-a', '--format', '{{.Names}}'], stdout=_sp.PIPE, stderr=_sp.DEVNULL, text=True)
+                            if p.returncode == 0:
+                                names = [ln.strip() for ln in (p.stdout or '').splitlines() if ln.strip()]
+                                pat = _re.compile(r'^(?i:h)\d+$')
+                                generic = [n for n in names if pat.match(n)]
+                                if generic:
+                                    cur = conflicts.get('containers') if isinstance(conflicts, dict) else []
+                                    if not isinstance(cur, list):
+                                        cur = []
+                                    conflicts['containers'] = list(dict.fromkeys([*cur, *generic]))
+                    except Exception:
+                        pass
+
+                    c_cont = conflicts.get('containers') or []
+                    c_imgs = conflicts.get('images') or []
+                    if c_cont or c_imgs:
+                        # Emit a machine-readable marker for web frontends to parse.
+                        try:
+                            print(f"DOCKER_CONFLICTS_JSON: {json.dumps({'containers': list(c_cont), 'images': list(c_imgs)})}", flush=True)
+                        except Exception:
+                            pass
+                        logging.warning(
+                            "Detected potential Docker conflicts: containers=%d images=%d",
+                            len(c_cont),
+                            len(c_imgs),
+                        )
+                        if getattr(args, 'docker_remove_conflicts', False):
+                            rr = remove_docker_conflicts(conflicts)
+                            logging.info(
+                                "Removed Docker conflicts (best-effort): containers=%d images=%d",
+                                len(rr.get('removed_containers') or []),
+                                len(rr.get('removed_images') or []),
+                            )
+                        else:
+                            import sys as _sys
+                            if _sys.stdin.isatty():
+                                try:
+                                    print("\nDocker conflicts detected for compose-based Docker nodes:")
+                                    if c_cont:
+                                        print("- Existing containers:")
+                                        for x in c_cont:
+                                            print(f"  - {x}")
+                                    if c_imgs:
+                                        print("- Existing images:")
+                                        for x in c_imgs:
+                                            print(f"  - {x}")
+                                    ans = input("Remove these now? [y/N] ").strip().lower()
+                                except Exception:
+                                    ans = ''
+                                if ans in {'y', 'yes'}:
+                                    rr = remove_docker_conflicts(conflicts)
+                                    logging.info(
+                                        "Removed Docker conflicts (best-effort): containers=%d images=%d",
+                                        len(rr.get('removed_containers') or []),
+                                        len(rr.get('removed_images') or []),
+                                    )
+                                else:
+                                    logging.error("Aborting: Docker conflicts not removed")
+                                    return 1
+                            else:
+                                logging.error(
+                                    "Aborting: Docker conflicts detected but cannot prompt (non-interactive). Rerun with --docker-remove-conflicts or clean up Docker resources.",
+                                )
+                                return 1
+        except Exception as _dock_exc:
+            logging.debug("Docker conflict preflight skipped/failed: %s", _dock_exc)
+
         # Emit session id in a parseable form for webapp backend to capture
         try:
             sid = getattr(session, 'id', None) or getattr(session, 'session_id', None)

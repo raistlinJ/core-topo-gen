@@ -186,6 +186,34 @@ _REPO_PUSH_PROGRESS: Dict[str, Dict[str, Any]] = {}
 _REPO_PUSH_PROGRESS_LOCK = threading.Lock()
 _REPO_PUSH_PROGRESS_TTL_SECONDS = 600.0
 
+# Best-effort cancellation context for long-running remote repo finalize.
+# Stored in-memory only; entries are removed when finalize completes/errors/cancels.
+_REPO_PUSH_CANCEL_CTX: Dict[str, Dict[str, Any]] = {}
+_REPO_PUSH_CANCEL_CTX_LOCK = threading.Lock()
+
+
+def _set_repo_push_cancel_ctx(progress_id: Optional[str], ctx: Dict[str, Any]) -> None:
+    if not progress_id:
+        return
+    with _REPO_PUSH_CANCEL_CTX_LOCK:
+        _REPO_PUSH_CANCEL_CTX[progress_id] = dict(ctx or {})
+
+
+def _get_repo_push_cancel_ctx(progress_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not progress_id:
+        return None
+    with _REPO_PUSH_CANCEL_CTX_LOCK:
+        payload = _REPO_PUSH_CANCEL_CTX.get(progress_id)
+        return dict(payload) if isinstance(payload, dict) else None
+
+
+def _pop_repo_push_cancel_ctx(progress_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not progress_id:
+        return None
+    with _REPO_PUSH_CANCEL_CTX_LOCK:
+        payload = _REPO_PUSH_CANCEL_CTX.pop(progress_id, None)
+        return dict(payload) if isinstance(payload, dict) else None
+
 
 def _schedule_repo_push_to_remote(progress_id: str, core_cfg: Dict[str, Any], *, logger: Optional[logging.Logger] = None) -> None:
     log = logger or getattr(app, 'logger', logging.getLogger(__name__))
@@ -618,7 +646,8 @@ def _exec_ssh_command(
     client: Any,
     command: str,
     *,
-    timeout: float = 120.0,
+    timeout: float | None = 120.0,
+    cancel_check: Any = None,
     check: bool = False,
 ) -> tuple[int, str, str]:
     """Execute a command over SSH and capture stdout/stderr.
@@ -647,6 +676,19 @@ def _exec_ssh_command(
             if channel is None:
                 break
             try:
+                if cancel_check is not None and bool(cancel_check()):
+                    try:
+                        if not channel.closed:
+                            channel.close()
+                    except Exception:
+                        pass
+                    raise TimeoutError('SSH command cancelled')
+            except TimeoutError:
+                raise
+            except Exception:
+                # Never allow cancel_check bugs to wedge execution.
+                pass
+            try:
                 if channel.recv_ready():
                     stdout_chunks.append(channel.recv(REMOTE_LOG_CHUNK_SIZE))
                 if channel.recv_stderr_ready():
@@ -663,13 +705,14 @@ def _exec_ssh_command(
             except Exception:
                 break
 
-            if (time.time() - start) >= max(0.1, float(timeout)):
-                try:
-                    if channel is not None and not channel.closed:
-                        channel.close()
-                except Exception:
-                    pass
-                raise TimeoutError(f'SSH command timed out after {timeout:.0f}s')
+            if timeout is not None:
+                if (time.time() - start) >= max(0.1, float(timeout)):
+                    try:
+                        if channel is not None and not channel.closed:
+                            channel.close()
+                    except Exception:
+                        pass
+                    raise TimeoutError(f'SSH command timed out after {timeout:.0f}s')
 
             time.sleep(0.15)
     finally:
@@ -706,6 +749,17 @@ def _exec_ssh_command(
         raise RuntimeError(f'SSH command failed: {detail}')
 
     return exit_code, stdout_text, stderr_text
+
+
+def _is_repo_push_cancel_requested(progress_id: Optional[str]) -> bool:
+    if not progress_id:
+        return False
+    payload = _get_repo_push_progress(progress_id)
+    if not payload:
+        return False
+    if payload.get('status') == 'cancelled':
+        return True
+    return bool(payload.get('cancel_requested'))
 
 
 def _open_ssh_client(core_cfg: Dict[str, Any]) -> Any:
@@ -848,7 +902,7 @@ def _push_repo_to_remote(
             f"rm -f {shlex.quote(remote_archive)}"
         )
         _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=60.0, detail='Extracting snapshot on CORE host…')
-        _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=600.0, check=True)
+        _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=None, check=True)
         _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=95.0, detail='Cleaning temporary archive…')
         log.info('[remote-sync] Repository uploaded to %s', remote_repo)
         _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository ready on remote host.')
@@ -890,7 +944,7 @@ def _schedule_remote_repo_finalize(
         try:
             client = _open_ssh_client(core_cfg)
             try:
-                _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=600.0, check=True)
+                _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=None, check=True)
             finally:
                 client.close()
         except Exception:
@@ -899,24 +953,107 @@ def _schedule_remote_repo_finalize(
 
     def _worker() -> None:
         client: Any | None = None
+        pidfile: Optional[str] = None
         try:
+            if _is_repo_push_cancel_requested(progress_id):
+                _update_repo_push_progress(progress_id, status='cancelled', stage='cancelled', detail='Cancelled by user.')
+                return
             _update_repo_push_progress(progress_id, status='finalizing', stage='cleanup', percent=55.0, detail='Removing previous repository…')
             client = _open_ssh_client(core_cfg)
-            _exec_ssh_command(client, f"mkdir -p {shlex.quote(remote_parent)}", timeout=180.0, check=True)
-            _exec_ssh_command(client, f"rm -rf {shlex.quote(remote_repo)}", timeout=240.0, check=True)
-            _update_repo_push_progress(progress_id, status='finalizing', stage='extract', percent=75.0, detail='Extracting new snapshot on CORE host…')
+
+            # Track the remote tar PID so a cancel request can kill it.
+            try:
+                pidfile = _remote_path_join(
+                    posixpath.dirname(remote_archive.rstrip('/')) or remote_parent or '/',
+                    f"coretg_finalize_{progress_id}.pid" if progress_id else f"coretg_finalize_{uuid.uuid4().hex}.pid",
+                )
+            except Exception:
+                pidfile = _remote_path_join(remote_parent, f"coretg_finalize_{uuid.uuid4().hex}.pid")
+
+            try:
+                _set_repo_push_cancel_ctx(
+                    progress_id,
+                    {
+                        'core_cfg': dict(core_cfg),
+                        'remote_pidfile': pidfile,
+                        'remote_archive': remote_archive,
+                        'remote_parent': remote_parent,
+                        'remote_repo': remote_repo,
+                    },
+                )
+            except Exception:
+                pass
+
             _exec_ssh_command(
                 client,
-                f"tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(remote_parent)}",
-                timeout=900.0,
+                f"mkdir -p {shlex.quote(remote_parent)}",
+                timeout=None,
+                cancel_check=lambda: _is_repo_push_cancel_requested(progress_id),
+                check=True,
+            )
+            _exec_ssh_command(
+                client,
+                f"rm -rf {shlex.quote(remote_repo)}",
+                timeout=None,
+                cancel_check=lambda: _is_repo_push_cancel_requested(progress_id),
+                check=True,
+            )
+            _update_repo_push_progress(progress_id, status='finalizing', stage='extract', percent=75.0, detail='Extracting new snapshot on CORE host…')
+
+            # Run tar under a tracked pidfile.
+            tar_script = (
+                "set -e; "
+                f"pidfile={shlex.quote(pidfile or '')}; "
+                "rm -f -- \"$pidfile\" 2>/dev/null || true; "
+                f"( tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(remote_parent)} ) & "
+                "pid=$!; "
+                "echo \"$pid\" > \"$pidfile\"; "
+                "wait \"$pid\"; "
+                "rc=$?; "
+                "rm -f -- \"$pidfile\" 2>/dev/null || true; "
+                "exit \"$rc\""
+            )
+            _exec_ssh_command(
+                client,
+                f"sh -lc {shlex.quote(tar_script)}",
+                timeout=None,
+                cancel_check=lambda: _is_repo_push_cancel_requested(progress_id),
                 check=True,
             )
             _update_repo_push_progress(progress_id, status='finalizing', stage='cleanup', percent=90.0, detail='Cleaning temporary archive…')
-            _exec_ssh_command(client, f"rm -f {shlex.quote(remote_archive)}", timeout=120.0, check=True)
+            _exec_ssh_command(
+                client,
+                f"rm -f {shlex.quote(remote_archive)}",
+                timeout=None,
+                cancel_check=lambda: _is_repo_push_cancel_requested(progress_id),
+                check=True,
+            )
             _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository ready on remote host.')
             if logger:
                 logger.info('[remote-sync] Repository finalized at %s', remote_repo)
+        except TimeoutError as exc:
+            # Used both for true timeouts and cooperative cancel.
+            if 'cancelled' in str(exc).lower():
+                _update_repo_push_progress(progress_id, status='cancelled', stage='cancelled', detail='Cancelled by user.')
+                try:
+                    if client:
+                        _exec_ssh_command(client, f"rm -f {shlex.quote(remote_archive)}", timeout=30.0)
+                except Exception:
+                    pass
+                return
+            raise
         except Exception as exc:
+            try:
+                if _is_repo_push_cancel_requested(progress_id):
+                    _update_repo_push_progress(progress_id, status='cancelled', stage='cancelled', detail='Cancelled by user.')
+                    try:
+                        if client and pidfile:
+                            _exec_ssh_command(client, f"rm -f {shlex.quote(pidfile)}", timeout=10.0)
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
             if logger:
                 logger.exception('[remote-sync] finalize failed: %s', exc)
             _update_repo_push_progress(progress_id, status='error', stage='error', detail=str(exc))
@@ -926,6 +1063,10 @@ def _schedule_remote_repo_finalize(
             except Exception:
                 pass
         finally:
+            try:
+                _pop_repo_push_cancel_ctx(progress_id)
+            except Exception:
+                pass
             if client:
                 try:
                     client.close()
@@ -3038,6 +3179,7 @@ def _run_core_connection_advanced_checks(
     adv_run_core_cleanup: bool = False,
     adv_check_core_version: bool = False,
     adv_restart_core_daemon: bool = False,
+    adv_start_core_daemon: bool = False,
     adv_auto_kill_sessions: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """Run optional advanced checks against the CORE VM.
@@ -3068,6 +3210,7 @@ def _run_core_connection_advanced_checks(
             adv_run_core_cleanup,
             adv_check_core_version,
             adv_restart_core_daemon,
+            adv_start_core_daemon,
             adv_auto_kill_sessions,
         )
     )
@@ -3077,6 +3220,7 @@ def _run_core_connection_advanced_checks(
         _set('adv_fix_docker_daemon', enabled=False, ok=None, message='')
         _set('adv_run_core_cleanup', enabled=False, ok=None, message='')
         _set('adv_restart_core_daemon', enabled=False, ok=None, message='')
+        _set('adv_start_core_daemon', enabled=False, ok=None, message='')
         _set('adv_auto_kill_sessions', enabled=False, ok=None, message='')
         return results
 
@@ -3089,6 +3233,7 @@ def _run_core_connection_advanced_checks(
             ('adv_fix_docker_daemon', adv_fix_docker_daemon),
             ('adv_run_core_cleanup', adv_run_core_cleanup),
             ('adv_restart_core_daemon', adv_restart_core_daemon),
+            ('adv_start_core_daemon', adv_start_core_daemon),
             ('adv_auto_kill_sessions', adv_auto_kill_sessions),
         ):
             if enabled:
@@ -3284,6 +3429,27 @@ def _run_core_connection_advanced_checks(
                 raise RuntimeError('Restart core-daemon failed: sudo requires a password (none provided).')
             raise RuntimeError('Restart core-daemon failed')
 
+    def _maybe_start_core_daemon(client: Any) -> str:
+        """Try starting core-daemon if not running. Returns status message."""
+        # First check if daemon is running
+        exit_code, out, _err = _sudo_exec(client, 'systemctl is-active core-daemon', timeout=15.0)
+        if exit_code == 0 and (out or '').strip().lower() == 'active':
+            return 'already running'
+        
+        # Try to start it
+        exit_code, _out, err = _sudo_exec(client, 'systemctl start core-daemon', timeout=35.0)
+        if exit_code != 0:
+            err_lower = (err or '').lower()
+            if (not cfg.get('ssh_password')) and ('password' in err_lower or 'sudo' in err_lower):
+                raise RuntimeError('Start core-daemon failed: sudo requires a password (none provided).')
+            raise RuntimeError(f'Start core-daemon failed: {err or "unknown error"}')
+        
+        # Verify it started
+        exit_code, out, _err = _sudo_exec(client, 'systemctl is-active core-daemon', timeout=15.0)
+        if exit_code == 0 and (out or '').strip().lower() == 'active':
+            return 'started successfully'
+        return 'start attempted, status unclear'
+
     def _maybe_kill_active_sessions() -> tuple[list[int], list[str]]:
         deleted: list[int] = []
         errors: list[str] = []
@@ -3373,6 +3539,15 @@ def _run_core_connection_advanced_checks(
                 _set('adv_restart_core_daemon', enabled=True, ok=False, message=str(exc))
         else:
             _set('adv_restart_core_daemon', enabled=False, ok=None, message='')
+
+        if adv_start_core_daemon:
+            try:
+                status_msg = _maybe_start_core_daemon(client)
+                _set('adv_start_core_daemon', enabled=True, ok=True, message=status_msg)
+            except Exception as exc:
+                _set('adv_start_core_daemon', enabled=True, ok=False, message=str(exc))
+        else:
+            _set('adv_start_core_daemon', enabled=False, ok=None, message='')
 
     finally:
         try:
@@ -7796,12 +7971,21 @@ def flow_page():
     except Exception:
         active_scenario_xml_path = ''
 
+    xml_preview = ''
+    try:
+        if active_scenario_xml_path and os.path.isfile(active_scenario_xml_path):
+            with open(active_scenario_xml_path, 'r', encoding='utf-8', errors='ignore') as f:
+                xml_preview = f.read()
+    except Exception:
+        xml_preview = ''
+
     return render_template(
         'flow.html',
         scenarios=scenario_names,
         active_scenario=active_scenario,
         participant_url_flags=participant_url_flags,
         preview_xml_path=active_scenario_xml_path,
+        xml_preview=xml_preview,
     )
 
 
@@ -12504,6 +12688,40 @@ def _extract_summary_path_from_text(text: str, *, require_exists: bool = True) -
     except Exception:
         pass
     return None
+
+
+def _extract_docker_conflicts_from_text(text: str) -> dict | None:
+    """Parse CLI logs for machine-readable Docker conflict info.
+
+    Expected line emitted by core_topo_gen.cli:
+        DOCKER_CONFLICTS_JSON: {"containers": [...], "images": [...]} 
+    """
+
+    if not text:
+        return None
+    try:
+        matches = list(re.finditer(r"DOCKER_CONFLICTS_JSON:\s*(\{.*\})\s*$", text, flags=re.MULTILINE))
+        if not matches:
+            return None
+        raw = matches[-1].group(1)
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return None
+        containers = obj.get('containers')
+        images = obj.get('images')
+        if not isinstance(containers, list):
+            containers = []
+        if not isinstance(images, list):
+            images = []
+        containers = [str(x) for x in containers if str(x).strip()]
+        images = [str(x) for x in images if str(x).strip()]
+        containers = list(dict.fromkeys(containers))
+        images = list(dict.fromkeys(images))
+        if not containers and not images:
+            return None
+        return {'containers': containers, 'images': images}
+    except Exception:
+        return None
 
 
 def _find_latest_summary_path(since_ts: float | None = None) -> str | None:
@@ -18832,7 +19050,9 @@ def run_cli_async():
     adv_run_core_cleanup = False
     adv_check_core_version = False
     adv_restart_core_daemon = False
+    adv_start_core_daemon = False
     adv_auto_kill_sessions = False
+    docker_remove_conflicts = False
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
         xml_path = request.form.get('xml_path')
@@ -18866,7 +19086,9 @@ def run_cli_async():
         adv_run_core_cleanup = _coerce_bool(request.form.get('adv_run_core_cleanup'))
         adv_check_core_version = _coerce_bool(request.form.get('adv_check_core_version'))
         adv_restart_core_daemon = _coerce_bool(request.form.get('adv_restart_core_daemon'))
+        adv_start_core_daemon = _coerce_bool(request.form.get('adv_start_core_daemon'))
         adv_auto_kill_sessions = _coerce_bool(request.form.get('adv_auto_kill_sessions'))
+        docker_remove_conflicts = _coerce_bool(request.form.get('docker_remove_conflicts'))
     if not xml_path:
         try:
             j = request.get_json(silent=True) or {}
@@ -18893,7 +19115,9 @@ def run_cli_async():
             adv_run_core_cleanup = _coerce_bool(j.get('adv_run_core_cleanup'))
             adv_check_core_version = _coerce_bool(j.get('adv_check_core_version'))
             adv_restart_core_daemon = _coerce_bool(j.get('adv_restart_core_daemon'))
+            adv_start_core_daemon = _coerce_bool(j.get('adv_start_core_daemon'))
             adv_auto_kill_sessions = _coerce_bool(j.get('adv_auto_kill_sessions'))
+            docker_remove_conflicts = _coerce_bool(j.get('docker_remove_conflicts'))
         except Exception:
             pass
     if not xml_path:
@@ -19850,6 +20074,8 @@ def run_cli_async():
         str(core_port),
         '--verbose',
     ]
+    if docker_remove_conflicts:
+        cli_args.append('--docker-remove-conflicts')
     if seed is not None:
         cli_args.extend(['--seed', str(seed)])
     if active_scenario_name:
@@ -20262,6 +20488,8 @@ def run_status(run_id: str):
             report_md = _extract_report_path_from_text(txt)
     except Exception:
         report_md = None
+
+    docker_conflicts = _extract_docker_conflicts_from_text(txt)
     summary_json = _extract_summary_path_from_text(txt)
     if not summary_json:
         summary_json = _derive_summary_from_report(report_md)
@@ -20276,6 +20504,7 @@ def run_status(run_id: str):
     return jsonify({
         'done': bool(meta.get('done')),
         'returncode': meta.get('returncode'),
+        'docker_conflicts': docker_conflicts,
         'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
         'summary_path': summary_json if (summary_json and os.path.exists(summary_json)) else None,
         'xml_path': (meta.get('post_xml_path') if meta.get('post_xml_path') and os.path.exists(meta.get('post_xml_path')) else None),
@@ -21790,6 +22019,68 @@ def core_push_repo_status(progress_id: str):
     return jsonify(response)
 
 
+@app.route('/core/push_repo/cancel/<progress_id>', methods=['POST'])
+def core_push_repo_cancel(progress_id: str):
+    payload = _get_repo_push_progress(progress_id)
+    if not payload:
+        return jsonify({'progress_id': progress_id, 'status': 'unknown'}), 404
+    status = (payload.get('status') or '').strip().lower()
+    if status in ('complete', 'error', 'cancelled'):
+        return jsonify({'ok': True, 'progress_id': progress_id, 'status': status})
+    _update_repo_push_progress(
+        progress_id,
+        cancel_requested=True,
+        status='cancelled',
+        stage='cancelled',
+        detail='Cancelled by user.',
+    )
+
+    # Best-effort: attempt to stop any in-flight remote finalize by killing its PID.
+    try:
+        ctx = _get_repo_push_cancel_ctx(progress_id)
+        if isinstance(ctx, dict):
+            core_cfg = ctx.get('core_cfg')
+            pidfile = ctx.get('remote_pidfile')
+            remote_archive = ctx.get('remote_archive')
+            if isinstance(core_cfg, dict) and isinstance(pidfile, str) and pidfile.strip():
+                client = _open_ssh_client(core_cfg)
+                try:
+                    kill_script = (
+                        "set -e; "
+                        f"pidfile={shlex.quote(pidfile)}; "
+                        "if [ -f \"$pidfile\" ]; then "
+                        "pid=$(cat \"$pidfile\" 2>/dev/null || true); "
+                        "if [ -n \"$pid\" ]; then "
+                        "kill -TERM \"$pid\" 2>/dev/null || true; "
+                        "sleep 0.5; "
+                        "kill -KILL \"$pid\" 2>/dev/null || true; "
+                        "fi; "
+                        "rm -f -- \"$pidfile\" || true; "
+                        "fi"
+                    )
+                    _exec_ssh_command(client, f"sh -lc {shlex.quote(kill_script)}", timeout=20.0)
+                finally:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+
+            # Optional cleanup: remove remote archive to free space.
+            if isinstance(core_cfg, dict) and isinstance(remote_archive, str) and remote_archive.strip():
+                client2 = _open_ssh_client(core_cfg)
+                try:
+                    _exec_ssh_command(client2, f"rm -f {shlex.quote(remote_archive)}", timeout=20.0)
+                finally:
+                    try:
+                        client2.close()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return jsonify({'ok': True, 'progress_id': progress_id, 'status': 'cancelled'})
+
+
 @app.route('/core/start', methods=['POST'])
 def core_start():
     xml_path = request.form.get('path')
@@ -22429,6 +22720,7 @@ def test_core():
         adv_run_core_cleanup = bool(cfg.get('adv_run_core_cleanup'))
         adv_check_core_version = bool(cfg.get('adv_check_core_version'))
         adv_restart_core_daemon = bool(cfg.get('adv_restart_core_daemon'))
+        adv_start_core_daemon = bool(cfg.get('adv_start_core_daemon'))
         adv_auto_kill_sessions = bool(cfg.get('adv_auto_kill_sessions'))
         is_pytest = bool(os.environ.get('PYTEST_CURRENT_TEST') or ('pytest' in sys.modules))
         daemon_pids: List[int] = []
@@ -22436,7 +22728,7 @@ def test_core():
 
         advanced_checks: Dict[str, Dict[str, Any]] = {}
         advanced_warnings: List[str] = []
-        if (adv_fix_docker_daemon or adv_run_core_cleanup or adv_check_core_version or adv_restart_core_daemon or adv_auto_kill_sessions):
+        if (adv_fix_docker_daemon or adv_run_core_cleanup or adv_check_core_version or adv_restart_core_daemon or adv_start_core_daemon or adv_auto_kill_sessions):
             # These checks require remote access.
             if is_pytest:
                 app.logger.info('[core] advanced checks enabled but skipping remote execution (pytest)')
@@ -22446,6 +22738,7 @@ def test_core():
                     adv_run_core_cleanup=False,
                     adv_check_core_version=False,
                     adv_restart_core_daemon=False,
+                    adv_start_core_daemon=False,
                     adv_auto_kill_sessions=False,
                 )
             else:
@@ -22455,6 +22748,7 @@ def test_core():
                     adv_run_core_cleanup=adv_run_core_cleanup,
                     adv_check_core_version=adv_check_core_version,
                     adv_restart_core_daemon=adv_restart_core_daemon,
+                    adv_start_core_daemon=adv_start_core_daemon,
                     adv_auto_kill_sessions=adv_auto_kill_sessions,
                 )
                 failures = [

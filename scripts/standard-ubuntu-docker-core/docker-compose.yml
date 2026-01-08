@@ -1,10 +1,8 @@
-version: '3.8'
-
 services:
-  ubuntu-container:
+  standard-ubuntu-docker-core:
     image: ubuntu:22.04
-    container_name: standard-ubuntu
     tty: true # Allocates a pseudo-TTY so you can interact with the container
+    network_mode: "none"
     # Required for iptables/NAT and raw socket operations (Segmentation / some traffic patterns)
     cap_add:
       - NET_ADMIN
@@ -46,39 +44,58 @@ services:
         fi
 
         BOOT="$(mktemp)"
-        cat > "$BOOT" <<'EOS'
-        #!/usr/bin/env bash
-        set -euo pipefail
+        # The heredoc body is indented by YAML. Strip 8 spaces first (common for nested blocks),
+        # then strip 6, so the BOOT script + its inner heredoc terminators land at column 1.
+        cat <<'EOS' | sed -e 's/^        //' -e 's/^      //' > "$BOOT"
+      #!/bin/sh
+      set -eu
 
         rand_byte() {
           od -An -N1 -tu1 /dev/urandom 2>/dev/null | tr -d ' '
         }
 
         choose_mod() {
-          local mod="${1:-2}"
-          local b
-          b="$(rand_byte || echo 0)"
+          mod="$1"
+          if [ -z "$mod" ]; then mod="2"; fi
+          case "$mod" in
+            ''|*[!0-9]*|0) mod="2";;
+          esac
+          b="$(rand_byte 2>/dev/null || echo 0)"
           if [ -z "$b" ]; then b=0; fi
+          case "$b" in
+            ''|*[!0-9]*) b=0;;
+          esac
           echo $((b % mod))
         }
 
         # Per-container stable seed (no persisted instance-id files).
-        HOST_TAG="$(echo "${HOSTNAME:-unknown}" | tr -dc 'a-zA-Z0-9' | tr 'A-Z' 'a-z' | head -c 32)"
+        hn="$(hostname 2>/dev/null || echo unknown)"
+        HOST_TAG="$(echo "$hn" | tr -dc 'a-zA-Z0-9' | tr 'A-Z' 'a-z' | head -c 32)"
         INSTANCE_ID="$(printf "%s" "$HOST_TAG" | sha256sum 2>/dev/null | awk '{print $1}' | head -c 16)"
         if [ -z "$INSTANCE_ID" ]; then
           INSTANCE_ID="$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 16 || true)"
         fi
 
         choose_mod_seeded() {
-          local label="${1:-default}"
-          local mod="${2:-2}"
-          local h
-          h="$(printf "%s-%s" "${INSTANCE_ID:-x}" "$label" | sha256sum 2>/dev/null | awk '{print $1}' | head -c 8)"
+          label="$1"
+          [ -z "$label" ] && label="default"
+          mod="$2"
+          [ -z "$mod" ] && mod="2"
+          case "$mod" in
+            ''|*[!0-9]*|0) mod="2";;
+          esac
+          inst="$INSTANCE_ID"
+          [ -z "$inst" ] && inst="x"
+          h=""
+          h="$(printf "%s-%s" "$inst" "$label" | sha256sum 2>/dev/null | awk '{print $1}' | head -c 8)"
           if [ -z "$h" ]; then
             choose_mod "$mod"
             return 0
           fi
-          local n=$((16#$h))
+          n="$(printf '%d' "0x$h" 2>/dev/null || echo 0)"
+          case "$n" in
+            ''|*[!0-9]*) n=0;;
+          esac
           echo $((n % mod))
         }
 
@@ -104,7 +121,7 @@ services:
           if [ "$V_APP_VARIANT" -eq 2 ]; then APP_NAME="portal"; fi
           cat > /opt/app/conf/app.yml <<EOF
         app:
-          name: "${APP_NAME}"
+          name: "$${APP_NAME}"
           mode: "prod"
           cache_dir: "/var/tmp/cache"
           session_dir: "/var/tmp/sessions"
@@ -124,39 +141,39 @@ services:
         touch /var/log/app/app.log /var/log/audit/auth.log 2>/dev/null || true
 
         create_user() {
-          local u="$1" uid="$2" gid="$3"
-          if ! grep -q "^${u}:" /etc/passwd 2>/dev/null; then
-            echo "${u}:x:${uid}:${gid}:${u}:/home/${u}:/bin/bash" >> /etc/passwd || true
+          u="$1"; uid="$2"; gid="$3"
+          if ! grep -q "^$${u}:" /etc/passwd 2>/dev/null; then
+            echo "$${u}:x:$${uid}:$${gid}:$${u}:/home/$${u}:/bin/bash" >> /etc/passwd || true
           fi
-          if ! grep -q "^${u}:" /etc/group 2>/dev/null; then
-            echo "${u}:x:${gid}:" >> /etc/group || true
+          if ! grep -q "^$${u}:" /etc/group 2>/dev/null; then
+            echo "$${u}:x:$${gid}:" >> /etc/group || true
           fi
-          mkdir -p "/home/${u}/Documents" "/home/${u}/Downloads" "/home/${u}/.ssh" "/home/${u}/.config" || true
-          if [ ! -f "/home/${u}/.bash_history" ]; then
-            cat > "/home/${u}/.bash_history" <<EOF
+          mkdir -p "/home/$${u}/Documents" "/home/$${u}/Downloads" "/home/$${u}/.ssh" "/home/$${u}/.config" || true
+          if [ ! -f "/home/$${u}/.bash_history" ]; then
+            cat > "/home/$${u}/.bash_history" <<EOF
         ls -la
         cd ~/Documents
         cat notes.txt
         EOF
           fi
-          if [ ! -f "/home/${u}/Documents/todo.txt" ]; then
-            cat > "/home/${u}/Documents/todo.txt" <<EOF
+          if [ ! -f "/home/$${u}/Documents/todo.txt" ]; then
+            cat > "/home/$${u}/Documents/todo.txt" <<EOF
         - review logs in /var/log/app
         - check /srv/share/public
         - remember: backups are under /var/tmp
         EOF
           fi
-          if [ ! -f "/home/${u}/Documents/notes.txt" ]; then
-            cat > "/home/${u}/Documents/notes.txt" <<EOF
+          if [ ! -f "/home/$${u}/Documents/notes.txt" ]; then
+            cat > "/home/$${u}/Documents/notes.txt" <<EOF
         FYI:
         - app config: /opt/app/conf/app.yml
         - public share: /srv/share/public/
         EOF
           fi
-          if [ ! -f "/home/${u}/.ssh/known_hosts" ]; then
-            printf "# known_hosts seeded %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)" > "/home/${u}/.ssh/known_hosts" || true
+          if [ ! -f "/home/$${u}/.ssh/known_hosts" ]; then
+            printf "# known_hosts seeded %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)" > "/home/$${u}/.ssh/known_hosts" || true
           fi
-          chown -R "${uid}:${gid}" "/home/${u}" 2>/dev/null || true
+          chown -R "$${uid}:$${gid}" "/home/$${u}" 2>/dev/null || true
         }
 
         # Base users always present
@@ -168,7 +185,7 @@ services:
         if [ "$V_EXTRA_USERS" -ge 2 ]; then create_user dana 1004 1004; fi
 
         copy_hint() {
-          local src="/hint.txt"
+          src="/hint.txt"
           [ -f "$src" ] || return 0
           mkdir -p /var/tmp /srv/share/public /opt/app || true
           cp -f "$src" /var/tmp/README.txt 2>/dev/null || true
@@ -182,25 +199,25 @@ services:
         }
 
         place_hint_near_flag() {
-          local hint_src="/hint.txt"
+          hint_src="/hint.txt"
           [ -f "$hint_src" ] || return 0
-          local candidates="/flow_artifacts/flag.txt /flag.txt /html/flag.txt"
-          local flag_path="" p
+          candidates="/flow_artifacts/flag.txt /flag.txt /html/flag.txt"
+          flag_path=""; p=""
           for p in $candidates; do
             if [ -f "$p" ]; then flag_path="$p"; break; fi
           done
           [ -n "$flag_path" ] || return 0
-          local flag_dir
+          flag_dir=""
           flag_dir="$(dirname "$flag_path")"
           if ( : > "$flag_dir/.writetest" ) 2>/dev/null; then
             rm -f "$flag_dir/.writetest" 2>/dev/null || true
             cp -f "$hint_src" "$flag_dir/hint.txt" 2>/dev/null || true
             return 0
           fi
-          local base
+          base=""
           base="$(basename "$flag_dir")"
-          cp -f "$hint_src" "/${base}_hint.txt" 2>/dev/null || true
-          ln -snf "$flag_path" "/${base}_flag.txt" 2>/dev/null || true
+          cp -f "$hint_src" "/$${base}_hint.txt" 2>/dev/null || true
+          ln -snf "$flag_path" "/$${base}_flag.txt" 2>/dev/null || true
         }
 
         copy_hint || true
@@ -253,8 +270,8 @@ services:
             sleep "$s"
           done
         ) &
-        EOS
+EOS
         chmod +x "$BOOT" 2>/dev/null || true
-        "$BOOT" || true
+        sh "$BOOT" || true
         rm -f "$BOOT" 2>/dev/null || true
         sleep infinity

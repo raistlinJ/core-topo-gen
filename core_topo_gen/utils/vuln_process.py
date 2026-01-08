@@ -265,6 +265,137 @@ def _images_pulled_for_compose(yml_path: str) -> bool:
 		return False
 
 
+def extract_compose_images_and_container_names(yml_path: str) -> tuple[list[str], list[str]]:
+	"""Best-effort parse of docker-compose YAML to extract image and container_name values.
+
+	This intentionally does not require Docker to be installed; it only parses the YAML.
+	"""
+	images: list[str] = []
+	containers: list[str] = []
+	try:
+		if not yml_path or (not os.path.exists(yml_path)):
+			return images, containers
+		try:
+			import yaml  # type: ignore
+		except Exception:
+			return images, containers
+		with open(yml_path, 'r', encoding='utf-8', errors='ignore') as f:
+			doc = yaml.safe_load(f)  # type: ignore
+		if not isinstance(doc, dict):
+			return images, containers
+		svcs = doc.get('services')
+		if not isinstance(svcs, dict):
+			return images, containers
+		for _svc_name, svc in svcs.items():
+			if not isinstance(svc, dict):
+				continue
+			img = svc.get('image')
+			if isinstance(img, str) and img.strip():
+				images.append(img.strip())
+			cn = svc.get('container_name')
+			if isinstance(cn, str) and cn.strip():
+				containers.append(cn.strip())
+		# De-dupe while keeping order
+		images = list(dict.fromkeys(images))
+		containers = list(dict.fromkeys(containers))
+		return images, containers
+	except Exception:
+		return [], []
+
+
+def detect_docker_conflicts_for_compose_files(paths: list[str]) -> dict:
+	"""Check for Docker container/image name conflicts for the given compose file paths.
+
+	Returns a dict with keys: containers (list[str]), images (list[str]).
+	"""
+	conflicting_containers: list[str] = []
+	conflicting_images: list[str] = []
+	try:
+		import subprocess
+		import shutil as _sh
+		if not paths:
+			return {'containers': [], 'images': []}
+		if not _sh.which('docker'):
+			return {'containers': [], 'images': []}
+		all_images: list[str] = []
+		all_container_names: list[str] = []
+		for p in paths:
+			imgs, cns = extract_compose_images_and_container_names(p)
+			all_images.extend(imgs)
+			all_container_names.extend(cns)
+		all_images = list(dict.fromkeys([s for s in all_images if s]))
+		all_container_names = list(dict.fromkeys([s for s in all_container_names if s]))
+
+		for cn in all_container_names:
+			try:
+				p2 = subprocess.run(['docker', 'container', 'inspect', cn], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+				if p2.returncode == 0:
+					conflicting_containers.append(cn)
+			except Exception:
+				continue
+
+		for img in all_images:
+			try:
+				p3 = subprocess.run(['docker', 'image', 'inspect', img], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+				if p3.returncode == 0:
+					conflicting_images.append(img)
+			except Exception:
+				continue
+		return {
+			'containers': list(dict.fromkeys(conflicting_containers)),
+			'images': list(dict.fromkeys(conflicting_images)),
+		}
+	except Exception:
+		return {'containers': [], 'images': []}
+
+
+def remove_docker_conflicts(conflicts: dict) -> dict:
+	"""Best-effort removal of conflicting Docker containers/images.
+
+	Returns a dict with removal results.
+	"""
+	result = {
+		'removed_containers': [],
+		'removed_images': [],
+		'container_errors': {},
+		'image_errors': {},
+	}
+	try:
+		import subprocess
+		import shutil as _sh
+		if not _sh.which('docker'):
+			return result
+		containers = conflicts.get('containers') if isinstance(conflicts, dict) else []
+		images = conflicts.get('images') if isinstance(conflicts, dict) else []
+		if not isinstance(containers, list):
+			containers = []
+		if not isinstance(images, list):
+			images = []
+		for cn in containers:
+			try:
+				p = subprocess.run(['docker', 'rm', '-f', str(cn)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+				if p.returncode == 0:
+					result['removed_containers'].append(str(cn))
+				else:
+					out = (p.stdout or '').strip()[-500:]
+					result['container_errors'][str(cn)] = out or f'rc={p.returncode}'
+			except Exception as exc:
+				result['container_errors'][str(cn)] = str(exc)
+		for img in images:
+			try:
+				p = subprocess.run(['docker', 'image', 'rm', '-f', str(img)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+				if p.returncode == 0:
+					result['removed_images'].append(str(img))
+				else:
+					out = (p.stdout or '').strip()[-500:]
+					result['image_errors'][str(img)] = out or f'rc={p.returncode}'
+			except Exception as exc:
+				result['image_errors'][str(img)] = str(exc)
+		return result
+	except Exception:
+		return result
+
+
 def _eligible_compose_items(catalog: Iterable[Dict[str, str]], v_type: Optional[str], v_vector: Optional[str], out_base: str = "/tmp/vulns") -> List[Dict[str, str]]:
 	"""Filter catalog to docker-compose items matching type/vector and with local compose pulled.
 	v_type/v_vector may be 'Random' or falsy to indicate no filtering on that dimension.
@@ -1009,12 +1140,8 @@ def _strip_port_mappings_from_text(text: str) -> str:
 	return '\n'.join(result)
 
 
-def _set_container_name_one_service(compose_obj: dict, container_name: str, prefer_service: Optional[str] = None) -> dict:
-	"""Set container_name on one service in the compose file.
-
-	Preference order:
-	1) Service whose name matches `prefer_service` (case-insensitive substring)
-	2) The first service in the mapping
+def _remove_container_names_all_services(compose_obj: dict) -> dict:
+	"""Remove any container_name fields from all services to avoid collisions.
 
 	Returns the mutated object. If services are missing, no changes are made.
 	"""
@@ -1024,18 +1151,12 @@ def _set_container_name_one_service(compose_obj: dict, container_name: str, pref
 		services = compose_obj.get('services')
 		if not isinstance(services, dict) or not services:
 			return compose_obj
-		target_key: Optional[str] = None
-		if prefer_service:
-			pref = prefer_service.strip().lower()
-			for svc_key in services.keys():
-				if pref in str(svc_key).strip().lower():
-					target_key = svc_key
-					break
-		if target_key is None:
-			target_key = next(iter(services.keys()))
-		svc = services.get(target_key)
-		if isinstance(svc, dict):
-			svc['container_name'] = container_name
+		for svc_key, svc in list(services.items()):
+			if isinstance(svc, dict) and 'container_name' in svc:
+				try:
+					svc.pop('container_name', None)
+				except Exception:
+					pass
 		return compose_obj
 	except Exception:
 		return compose_obj
@@ -1308,6 +1429,20 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 	if not name_to_vuln:
 		return created
 	os.makedirs(out_base, exist_ok=True)
+
+	def _escape_mako_dollars(text: str) -> str:
+		"""Escape Mako-sensitive `${...}` so they render literally in output.
+
+		Mako treats `${var}` as an expression and will raise NameError if undefined.
+		Escaping to `$${var}` renders a literal `${var}` in the final compose/bash.
+		This function preserves existing `$${...}` and only escapes raw `${...}`.
+		"""
+		try:
+			import re as _re
+			# Replace occurrences of `${` not already escaped (i.e., not preceded by `$`).
+			return _re.sub(r'(?<!\$)\$\{', '$${', text)
+		except Exception:
+			return text
 	cache: Dict[Tuple[str, str], Tuple[Optional[dict], Optional[str], Optional[str], bool]] = {}
 	for node_name, rec in name_to_vuln.items():
 		vtype = (rec.get('Type') or '').strip().lower()
@@ -1414,7 +1549,13 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 							pass
 			except Exception:
 				pass
-			obj = _set_container_name_one_service(obj, node_name, prefer_service=prefer)
+			# Avoid name collisions: ensure no hard-coded container_name remains in any service.
+			obj = _remove_container_names_all_services(obj)
+			# Remove obsolete top-level 'version' key to suppress warnings.
+			try:
+				obj.pop('version', None)
+			except Exception:
+				pass
 			# Ensure Docker does not inject its own networking for vuln nodes.
 			obj = _force_compose_no_network(obj)
 			# Flow flag-generators: mount generated artifacts into the container.
@@ -1446,8 +1587,11 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			except Exception:
 				logger.exception("[vuln] failed injecting iproute2 wrapper for node=%s", node_name)
 			try:
+				# Dump YAML to string first, then escape `${...}` to avoid Mako interpreting variables.
+				text = yaml.safe_dump(obj, sort_keys=False)
+				text = _escape_mako_dollars(text)
 				with open(out_path, 'w', encoding='utf-8') as f:
-					yaml.safe_dump(obj, f, sort_keys=False)
+					f.write(text)
 				services_keys = list((obj.get('services') or {}).keys()) if isinstance(obj, dict) else []
 				logger.info("[vuln] wrote compose yaml node=%s services=%s dest=%s", node_name, services_keys, out_path)
 				wrote = True
@@ -1462,13 +1606,14 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				try:
 					with open(out_path, 'r', encoding='utf-8', errors='ignore') as f:
 						txt = f.read()
-					if 'container_name:' in txt:
-						import re as _re
-						txt = _re.sub(r'container_name\s*:\s*[^\n]+', f'container_name: {node_name}', txt, count=1)
-					else:
-						txt = txt.rstrip() + f"\n\n# injected container_name\ncontainer_name: {node_name}\n"
+					# Remove obsolete 'version' key and all container_name lines to avoid warnings/collisions
+					import re as _re
+					txt = _re.sub(r'^\s*version\s*:\s*[^\n]+\n?', '', txt, flags=_re.MULTILINE)
+					txt = _re.sub(r'^\s*container_name\s*:\s*[^\n]+\n?', '', txt, flags=_re.MULTILINE)
 					text_sanitized = _strip_port_mappings_from_text(txt)
 					text_sanitized = _inject_network_mode_none_text(text_sanitized)
+					# Escape `${...}` to prevent Mako NameError during template rendering.
+					text_sanitized = _escape_mako_dollars(text_sanitized)
 					logger.debug(
 						"[vuln] sanitized compose text node=%s original_len=%s new_len=%s",
 						node_name,

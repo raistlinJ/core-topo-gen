@@ -8,7 +8,7 @@
   .dock-panel .tab-content { flex:1 1 auto; min-height:0; overflow:auto; }
   .dock-panel .tab-pane { height:100%; overflow:auto; }
   .dock-panel pre { height:auto; min-height:100%; overflow:auto; }
-  .dock-toggle-btn { position: fixed; left: 12px; bottom: 12px; z-index: 1040; }
+  .dock-toggle-btn { position: fixed; left: 12px; bottom: 12px; z-index: 1050; }
 </style>
 <div class="dock-panel d-none" id="dockPanel">
   <div class="dock-grip" id="dockGrip" title="Drag to resize"></div>
@@ -128,15 +128,48 @@
   }
   function setupDock(){
     const dock = document.getElementById('dockPanel'); const grip = document.getElementById('dockGrip'); const hideBtn = document.getElementById('dockHideBtn'); const showBtn = document.getElementById('dockShowBtn'); if(!dock||!grip||!hideBtn||!showBtn) return;
-    const setBodyPad = (px) => { document.body.style.paddingBottom = Math.max(px, 0) + 'px'; };
-    const applyHeight = (px) => { dock.style.height = px + 'px'; setBodyPad(px + 12); try{ localStorage.setItem(DOCK_HEIGHT_KEY, String(px)); }catch(e){} };
+    const getExecBarPad = () => {
+      try {
+        const raw = getComputedStyle(document.documentElement).getPropertyValue('--coretg-execbar-height');
+        const v = parseInt((raw || '').toString().trim().replace('px',''), 10);
+        return Number.isFinite(v) ? v : 0;
+      } catch (e) {
+        return 0;
+      }
+    };
+    const setBodyPad = (px) => {
+      const extra = getExecBarPad();
+      document.body.style.paddingBottom = Math.max(px + extra, 0) + 'px';
+    };
+    const setDockCssHeight = (px) => {
+      try { document.documentElement.style.setProperty('--coretg-dock-height', Math.max(px, 0) + 'px'); } catch (e) {}
+    };
+    const applyHeight = (px) => {
+      dock.style.height = px + 'px';
+      setDockCssHeight(px);
+      setBodyPad(px + 12);
+      try{ localStorage.setItem(DOCK_HEIGHT_KEY, String(px)); }catch(e){}
+    };
     const savedH = parseInt(localStorage.getItem(DOCK_HEIGHT_KEY) || '0', 10); const initialH = (savedH > 100 ? savedH : (dock.offsetHeight||300)); applyHeight(initialH);
     let resizing=false, startY=0, startH=initialH;
     const onMove = (e) => { if(!resizing) return; const y = (e.touches? e.touches[0].clientY : e.clientY); const dy = startY - y; const nh = Math.min(Math.max(startH + dy, 120), window.innerHeight - 80); applyHeight(nh); };
     const onUp = () => { resizing=false; document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); document.removeEventListener('touchmove', onMove); document.removeEventListener('touchend', onUp); };
     grip.addEventListener('mousedown', (e)=>{resizing=true; startY=e.clientY; startH=dock.offsetHeight; document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp);});
     grip.addEventListener('touchstart', (e)=>{resizing=true; startY=e.touches[0].clientY; startH=dock.offsetHeight; document.addEventListener('touchmove', onMove); document.addEventListener('touchend', onUp);}, {passive:true});
-  const applyHidden = (hidden) => { if(hidden){ dock.classList.add('d-none'); showBtn.classList.remove('d-none'); setBodyPad(12);} else { dock.classList.remove('d-none'); showBtn.classList.add('d-none'); applyHeight(parseInt(localStorage.getItem(DOCK_HEIGHT_KEY) || String(initialH), 10)); if(followLogs){ if(typeof requestAnimationFrame === 'function'){ requestAnimationFrame(renderLogs); } else { renderLogs(); } } } try{ localStorage.setItem(DOCK_HIDDEN_KEY, hidden?'1':'0'); }catch(e){} };
+  const applyHidden = (hidden) => {
+    if(hidden){
+      dock.classList.add('d-none');
+      showBtn.classList.remove('d-none');
+      setDockCssHeight(0);
+      setBodyPad(12);
+    } else {
+      dock.classList.remove('d-none');
+      showBtn.classList.add('d-none');
+      applyHeight(parseInt(localStorage.getItem(DOCK_HEIGHT_KEY) || String(initialH), 10));
+      if(followLogs){ if(typeof requestAnimationFrame === 'function'){ requestAnimationFrame(renderLogs); } else { renderLogs(); } }
+    }
+    try{ localStorage.setItem(DOCK_HIDDEN_KEY, hidden?'1':'0'); }catch(e){}
+  };
     const savedHidden = localStorage.getItem(DOCK_HIDDEN_KEY); applyHidden(savedHidden ? savedHidden==='1' : true);
     hideBtn.addEventListener('click', () => applyHidden(true)); showBtn.addEventListener('click', () => applyHidden(false));
     // Tab persistence

@@ -840,6 +840,7 @@ def build_star_from_roles(core,
                           ip4_prefix: str = "10.0.0.0/24",
                           ip_mode: str = "private",
                           ip_region: str = "all",
+                          layout_density: str = "normal",
                           docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None):
     logger.info("Creating CORE session and building star topology")
     logger.info("Docker CORE interfaces start at eth%s (CORETG_DOCKER_IFID_START)", _docker_ifid_start())
@@ -1062,7 +1063,12 @@ def build_star_from_roles(core,
         if int(os.getenv('CORETG_LINK_FAIL_HARD','0') not in ('0','false','False','')) and link_counters['success']==0:
             logger.error('[diag.summary.star] No links created; failing hard due to CORETG_LINK_FAIL_HARD')
             raise RuntimeError('No links created in star topology')
-    return session, switch, node_infos, service_assignments, docker_by_name
+    # Normalize return type of switches to a list of IDs to match callers
+    try:
+        switch_ids = [getattr(switch, 'id')]
+    except Exception:
+        switch_ids = []
+    return session, switch_ids, node_infos, service_assignments, docker_by_name
 
 
 def build_multi_switch_topology(core,

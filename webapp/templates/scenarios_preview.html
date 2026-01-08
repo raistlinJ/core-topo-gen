@@ -127,16 +127,24 @@
   }
 
   document.addEventListener('DOMContentLoaded', ()=>{
-    // Shared Scenarios Execute button: forward to the embedded full preview's Execute.
+    // Shared Scenarios Execute button: always use the Topology execute flow.
     try {
       document.getElementById('scenariosExecuteBtn')?.addEventListener('click', (ev)=>{
         try {
           ev.preventDefault();
-          const frame = document.getElementById('scenariosPreviewFrame');
-          const innerDoc = frame && frame.contentWindow ? frame.contentWindow.document : null;
-          const innerBtn = innerDoc ? innerDoc.getElementById('executeRunBtn') : null;
-          if(innerBtn){ innerBtn.click(); return; }
-          alert('Preview is still loading. Try again in a moment.');
+          const params = new URLSearchParams(window.location.search || '');
+          const xmlPath = (params.get('xml_path') || document.getElementById('scenariosPreviewLoadXmlPath')?.value || '').trim();
+          const scen = (params.get('scenario') || document.getElementById('scenariosPreviewLoadScenario')?.value || '').trim();
+          if(!xmlPath){
+            alert('Save XML first to execute.');
+            return;
+          }
+          const baseUrl = '{{ url_for("index") }}';
+          const url = baseUrl
+            + '?auto_execute=1'
+            + '&xml_path=' + encodeURIComponent(xmlPath)
+            + (scen ? ('&scenario=' + encodeURIComponent(scen)) : '');
+          window.location.href = url;
         } catch(e){}
       });
     } catch(e){}

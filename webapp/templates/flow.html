@@ -117,6 +117,7 @@
 {% block body_container %}
 {{ super() }}
 {% set xml_preview_enabled = True %}
+{% set xml_preview_text = xml_preview %}
 {% include 'partials/dock.html' %}
 <script>
 (function(){
@@ -148,6 +149,28 @@
   let lastPreviewPlanPath = '';
   let currentFlagAssignments = [];
   let selectedChainIndex = -1;
+
+  async function refreshXmlDockPreview({ force = false } = {}){
+    const xmlPre = document.getElementById('xmlPre');
+    if(!xmlPre) return;
+    const xmlPath = (document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
+    const lastPath = (xmlPre.dataset.xmlPreviewPath || '').trim();
+    if(!xmlPath){
+      if(force){
+        try { xmlPre.textContent = ''; } catch(e) {}
+        try { xmlPre.dataset.xmlPreviewPath = ''; } catch(e) {}
+      }
+      return;
+    }
+    if(!force && xmlPre.textContent.trim() && lastPath === xmlPath) return;
+    try {
+      const res = await fetch('/download_report?path=' + encodeURIComponent(xmlPath), { credentials: 'same-origin' });
+      if(!res.ok) return;
+      const txt = await res.text();
+      try { xmlPre.textContent = txt || ''; } catch(e) {}
+      try { xmlPre.dataset.xmlPreviewPath = xmlPath; } catch(e) {}
+    } catch(e) {}
+  }
 
   function normalizeScenarioNorm(raw){
     return (raw || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
@@ -656,6 +679,7 @@
         }
       } catch(e) {}
       setStatus('Saved XML: ' + basenameFromPath(xmlPath), false);
+      try { await refreshXmlDockPreview({ force: true }); } catch(e) {}
     } catch(err){
       setStatus(String(err && err.message || err), true);
       setLoginLinkVisible(!!(err && err.loginRequired));
@@ -747,6 +771,7 @@
   updateScenarioFilterControls();
   refreshParticipantNavForScenario(activeScenario);
   // Auto-generate on load (prefer any saved Flow state).
+  try { refreshXmlDockPreview({ force: false }); } catch(e) {}
   generate(false);
 })();
 </script>
