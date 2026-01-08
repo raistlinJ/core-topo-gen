@@ -605,6 +605,12 @@
       setStatus('No scenario selected.', true);
       return;
     }
+    // If the shared Execute button is gated (CORE VM not verified), it won't be clickable,
+    // but keep this guard anyway in case something calls execute() programmatically.
+    if(execEl && execEl.disabled){
+      setStatus('Verify a CORE VM in VM / Access to enable Execute.', true);
+      return;
+    }
     if(execEl) execEl.disabled = true;
     setStatus('Preparing preview for execution…', false);
     setLoginLinkVisible(false);
@@ -637,7 +643,15 @@
       setStatus(String(err && err.message || err), true);
       setLoginLinkVisible(!!(err && err.loginRequired));
     } finally {
-      if(execEl) execEl.disabled = false;
+      try {
+        if (typeof window.coretgRefreshScenariosExecuteButtonState === 'function') {
+          window.coretgRefreshScenariosExecuteButtonState();
+        } else if (execEl) {
+          execEl.disabled = false;
+        }
+      } catch (e) {
+        if (execEl) execEl.disabled = false;
+      }
     }
   }
 

@@ -17574,6 +17574,29 @@ def save_xml():
         client_project_hint = (request.form.get('project_key_hint') or '').strip()
         client_scenario_query = (request.form.get('scenario_query') or '').strip()
         normalized_core = _normalize_core_config(core_meta, include_password=True) if core_meta else None
+        # Enforce unique scenario names (case-insensitive, trimmed) to prevent confusing overwrites.
+        try:
+            scenarios_list = data.get('scenarios') or []
+            seen: set[str] = set()
+            dupes: list[str] = []
+            if isinstance(scenarios_list, list):
+                for idx, sc in enumerate(scenarios_list):
+                    if not isinstance(sc, dict):
+                        continue
+                    raw_name = (sc.get('name') or '').strip()
+                    name = raw_name or f"Scenario {idx + 1}"
+                    key = name.casefold()
+                    if key in seen:
+                        dupes.append(name)
+                    else:
+                        seen.add(key)
+            if dupes:
+                pretty = ', '.join(sorted(set(dupes)))
+                flash(f'Duplicate scenario names are not allowed: {pretty}')
+                return redirect(url_for('index'))
+        except Exception:
+            # If validation fails unexpectedly, fall through to existing error handling.
+            pass
         scenario_count = len(data.get('scenarios') or []) if isinstance(data.get('scenarios'), list) else 0
         scenario_names_desc = []
         try:
@@ -17702,6 +17725,26 @@ def save_xml_api():
             active_index = None
         if not isinstance(scenarios, list):
             return jsonify({ 'ok': False, 'error': 'Invalid payload (scenarios list required)' }), 400
+        # Enforce unique scenario names (case-insensitive, trimmed).
+        try:
+            seen: set[str] = set()
+            dupes: list[str] = []
+            for idx, sc in enumerate(scenarios):
+                if not isinstance(sc, dict):
+                    continue
+                raw_name = (sc.get('name') or '').strip()
+                name = raw_name or f"Scenario {idx + 1}"
+                key = name.casefold()
+                if key in seen:
+                    dupes.append(name)
+                else:
+                    seen.add(key)
+            if dupes:
+                pretty = ', '.join(sorted(set(dupes)))
+                return jsonify({ 'ok': False, 'error': f'Duplicate scenario names are not allowed: {pretty}' }), 400
+        except Exception:
+            # Best-effort validation; if it fails, continue with existing behavior.
+            pass
         scenario_names: list[str] = []
         try:
             scenario_names = [str((s or {}).get('name') or '').strip() for s in scenarios if isinstance(s, dict)]

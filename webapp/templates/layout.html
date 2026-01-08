@@ -191,6 +191,7 @@
               return inst;
             }
           } catch(e) {}
+                  let navLoadingInstance = null;
           return null;
         }
         document.addEventListener('click', (ev)=>{
@@ -205,15 +206,37 @@
 
             const dest = new URL(href, window.location.origin);
             const here = new URL(window.location.href);
-            // If already on the destination, don't block the click.
-            if(dest.pathname === here.pathname && dest.search === here.search) return;
-
+                        const inst = bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
+                        navLoadingInstance = inst;
+                        inst.show();
+                        return inst;
             // Show a lightweight loading indication, but do NOT prevent default navigation.
             // Preventing + delayed location.assign can appear to “hang” if the main thread
             // is busy (e.g., large details graphs) and the timer doesn’t get to run.
             showNavLoading('Loading CORE…');
+
+                  function hideNavLoading(){
+                    try {
+                      const el = document.getElementById('navLoadingModal');
+                      if(!el || !window.bootstrap || !window.bootstrap.Modal) return;
+                      const inst = navLoadingInstance || bootstrap.Modal.getInstance(el);
+                      if(inst && typeof inst.hide === 'function') inst.hide();
+                    } catch(e) {}
+                    navLoadingInstance = null;
+                    // Defensive: if a stale backdrop survived, remove it.
+                    try {
+                      document.querySelectorAll('.modal-backdrop').forEach(b => b.remove());
+                    } catch(e) {}
+                    try { document.body.classList.remove('modal-open'); } catch(e) {}
+                  }
+
+                  // Expose for pages that intercept navigation (e.g., CORE nav guard).
+                  window.CORETG_HIDE_NAV_LOADING = hideNavLoading;
           } catch(e) {}
         }, true);
+
+        // If the page comes back from bfcache, ensure we don't keep the modal up.
+        try { window.addEventListener('pageshow', hideNavLoading); } catch(e) {}
       })();
     </script>
     {% endif %}

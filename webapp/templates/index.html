@@ -1,6 +1,13 @@
 {% extends 'layout.html' %}
 {% block title %}Scenarios - CORE TopoGen{% endblock %}
 {% block active_page %}{% set active_page = 'scenarios' %}{% endblock %}
+{% set scenario_tab = request.args.get('scenario', '').strip() if request else '' %}
+{% set requested_tab = request.args.get('tab', '').strip() if request else '' %}
+{% if requested_tab in ['connection-setup', 'topology'] %}
+    {% set scenarios_active_tab = requested_tab %}
+{% else %}
+    {% set scenarios_active_tab = 'topology' %}
+{% endif %}
 {% block extra_head %}
 <style>
     body { padding-bottom: 42vh; }
@@ -54,8 +61,6 @@
 <!-- hs-bounds-wrapper styles moved into style block above -->
 {% set is_builder_view = (ui_view_mode == 'builder') %}
 {% block content %}
-    {% set scenario_tab = request.args.get('scenario', '').strip() if request else '' %}
-    {% set scenarios_active_tab = 'topology' %}
     {% include 'partials/scenarios_tabs.html' with context %}
     <div class="row">
         <div class="col-md-3 mb-3">
@@ -89,6 +94,8 @@
         <div class="col-md-9">
             <div class="card shadow mt-3">
                 <div class="card-body">
+                    <div id="connectionSetupRoot" class="{% if scenarios_active_tab == 'connection-setup' %}d-block{% else %}d-none{% endif %}"></div>
+                    {% if scenarios_active_tab != 'connection-setup' %}
                     <div class="card mb-3" id="baseCoreScenarioCard">
                         <div class="card-header d-flex justify-content-between align-items-center">
                             <strong>Base CORE Scenario</strong>
@@ -158,10 +165,35 @@
                                 <input type="hidden" name="core_json" id="core_json">
                                 <input type="hidden" name="project_key_hint" id="project_key_hint">
                                 <input type="hidden" name="scenario_query" id="scenario_query_input">
-                                <div id="editorRoot"></div>
+                                <div id="editorRoot" class="{% if scenarios_active_tab == 'connection-setup' %}d-none{% endif %}"></div>
                             </form>
                         </div>
                     </div>
+                    {% else %}
+                    {# Connection Setup tab: keep required DOM hooks, but do not show the Base/Editor cards. #}
+                    <div class="d-none" id="connectionSetupHiddenHooks">
+                        <div id="hitlEntryButtonsWrap" class="d-flex align-items-center gap-2">
+                            {% if not is_builder_view %}
+                            <div class="btn-group btn-group-sm" role="group" aria-label="HITL setup actions">
+                                <button class="btn btn-outline-primary" type="button" id="selectCoreVmBtn">Select CORE VM</button>
+                                <span class="d-inline-block" tabindex="0" id="configHitlBtnWrap">
+                                    <button class="btn btn-primary" type="button" id="configHitlBtn" disabled>Config HITL</button>
+                                </span>
+                            </div>
+                            {% else %}
+                            <span class="badge text-bg-secondary">HITL settings managed by admin</span>
+                            {% endif %}
+                        </div>
+                        <form id="editorForm" action="{{ url_for('save_xml') }}" method="post">
+                            <input type="hidden" name="scenarios_json" id="scenarios_json">
+                            <input type="hidden" name="active_index" id="active_index" value="0">
+                            <input type="hidden" name="core_json" id="core_json">
+                            <input type="hidden" name="project_key_hint" id="project_key_hint">
+                            <input type="hidden" name="scenario_query" id="scenario_query_input">
+                            <div id="editorRoot" class="d-none"></div>
+                        </form>
+                    </div>
+                    {% endif %}
 
                     <!-- Planning Workflow card visually removed but retained (d-none) for underlying JS functionality -->
                     <div class="card mt-3 d-none" id="planWorkflowCard">
@@ -795,6 +827,8 @@ window.CORETG_USERNAME = CORETG_USERNAME;
 window.CORETG_USER_ROLE = CORETG_USER_ROLE;
 const IS_BUILDER_VIEW = (window.CORETG_VIEW_MODE || '') === 'builder';
 const IS_ADMIN_USER = (CORETG_USER_ROLE || '') === 'admin';
+const SCENARIOS_ACTIVE_TAB = '{{ scenarios_active_tab }}';
+window.CORETG_SCENARIOS_ACTIVE_TAB = SCENARIOS_ACTIVE_TAB;
 // Local editor state is only trusted for admins.
 // Builder/participant roles must rely on server-restricted scenario lists.
 const USE_LOCAL_EDITOR_STATE = IS_ADMIN_USER;
@@ -1116,19 +1150,58 @@ if (ALLOW_LOCAL_EDITOR_PERSISTENCE && serverEditorSnapshot && typeof serverEdito
                 || (serverResult && serverResult !== existingResult)
                 || (serverSignature && serverSignature !== existingSignature);
             if (needsSync) {
+                let preferLocalSync = false;
                 try {
                     const localScenarios = existing && Array.isArray(existing.scenarios) ? existing.scenarios : null;
                     const serverScenarios = Array.isArray(sanitized.scenarios) ? sanitized.scenarios : null;
-                    if (localScenarios && serverScenarios) {
+                    // IMPORTANT: On refresh, the server snapshot can lag behind the browser state.
+                    // Never let a stale server snapshot shrink the scenario list and make a newly
+                    // created scenario disappear; instead, prefer the local snapshot and merge
+                    // only validated HITL/core metadata from the server into it.
+                    const localCount = localScenarios ? localScenarios.length : 0;
+                    const serverCount = serverScenarios ? serverScenarios.length : 0;
+                    if (existing && localScenarios && localCount >= serverCount) {
+                        // Merge any validated HITL state from server -> local.
+                        if (serverScenarios) {
+                            mergePersistedHitlStateIntoScenarios(localScenarios, serverScenarios);
+                        }
+                        const merged = JSON.parse(JSON.stringify(existing));
+                        merged.scenarios = localScenarios;
+                        if (serverResult) {
+                            merged.result_path = serverResult;
+                        }
+                        if (sanitized && typeof sanitized.scenario_query === 'string' && sanitized.scenario_query.trim()) {
+                            merged.scenario_query = sanitized.scenario_query.trim();
+                        }
+                        if (sanitized && typeof sanitized.project_key_hint === 'string' && sanitized.project_key_hint.trim()) {
+                            merged.project_key_hint = sanitized.project_key_hint.trim();
+                        }
+                        if (sanitized && sanitized.core && typeof sanitized.core === 'object') {
+                            // Server snapshot only includes validated CORE details; keep local unless missing.
+                            if (!merged.core || typeof merged.core !== 'object') {
+                                merged.core = sanitized.core;
+                            }
+                        }
+                        projectStateMap[candidateKey] = scrubSnapshotTransientErrors(merged);
+                        legacyEditorState = projectStateMap[candidateKey];
+                        writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, legacyEditorState);
+                        writeJsonToLocalStorage(PROJECT_STATE_STORAGE_KEY, projectStateMap);
+                        preferLocalSync = true;
+                    }
+
+                    // Default behavior: server wins; merge local validated HITL into server snapshot.
+                    if (!preferLocalSync && localScenarios && serverScenarios) {
                         mergePersistedHitlStateIntoScenarios(serverScenarios, localScenarios);
                     }
                 } catch (mergeErr) {
                     console.warn('Editor snapshot merge failed; falling back to server snapshot', mergeErr);
                 }
-                projectStateMap[candidateKey] = sanitized;
-                legacyEditorState = sanitized;
-                writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, legacyEditorState);
-                writeJsonToLocalStorage(PROJECT_STATE_STORAGE_KEY, projectStateMap);
+                if (!preferLocalSync) {
+                    projectStateMap[candidateKey] = sanitized;
+                    legacyEditorState = sanitized;
+                    writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, legacyEditorState);
+                    writeJsonToLocalStorage(PROJECT_STATE_STORAGE_KEY, projectStateMap);
+                }
             }
             serverSnapshotKey = candidateKey;
         }
@@ -1224,6 +1297,35 @@ try {
         writeJsonToLocalStorage(PROJECT_STATE_STORAGE_KEY, projectStateMap);
     }
 } catch(e){}
+
+function normalizeScenarioName(value) {
+    if (value === null || value === undefined) return '';
+    return String(value).replace(/\s+/g, ' ').trim();
+}
+
+function scenarioNameKey(value) {
+    const normalized = normalizeScenarioName(value);
+    return normalized ? normalized.toLowerCase() : '';
+}
+
+function ensureUniqueScenarioName(desiredName, scenarios, selfIndex) {
+    const base = normalizeScenarioName(desiredName) || 'Scenario';
+    const existing = new Set();
+    try {
+        (scenarios || []).forEach((sc, idx) => {
+            if (!sc || typeof sc !== 'object') return;
+            if (typeof selfIndex === 'number' && idx === selfIndex) return;
+            const key = scenarioNameKey(sc.name);
+            if (key) existing.add(key);
+        });
+    } catch (e) {}
+    if (!existing.has(scenarioNameKey(base))) return base;
+    for (let n = 2; n < 1000; n++) {
+        const candidate = `${base} (${n})`;
+        if (!existing.has(scenarioNameKey(candidate))) return candidate;
+    }
+    return `${base} (${Date.now()})`;
+}
 
 function defaultScenario(name) {
     return {
@@ -3896,6 +3998,45 @@ if (USE_LOCAL_EDITOR_STATE) {
         }
     } catch (err) {}
 
+    // If the URL explicitly asks for a scenario name (e.g. after clicking tabs), do NOT
+    // allow a filtered server payload/editor_snapshot to shrink the local scenario list.
+    // Instead, pick the richest local snapshot that contains that scenario and use it.
+    try {
+        const url = new URL(window.location.href);
+        const requestedScenarioName = (url.searchParams.get('scenario') || '').trim();
+        if (requestedScenarioName) {
+            let bestKey = '';
+            let bestSnapshot = null;
+            let bestCount = 0;
+            let bestIdx = 0;
+            Object.keys(projectStateMap || {}).forEach((key) => {
+                const entry = projectStateMap[key];
+                if (!entry || typeof entry !== 'object') return;
+                const scenarios = Array.isArray(entry.scenarios) ? entry.scenarios : null;
+                if (!scenarios || !scenarios.length) return;
+                const idx = scenarios.findIndex(s => ((s && typeof s.name === 'string') ? s.name.trim() : '') === requestedScenarioName);
+                if (idx < 0) return;
+                const count = scenarios.length;
+                if (count > bestCount) {
+                    bestCount = count;
+                    bestKey = key;
+                    bestSnapshot = entry;
+                    bestIdx = idx;
+                }
+            });
+
+            const currentCount = Array.isArray(persistedState?.scenarios) ? persistedState.scenarios.length : 0;
+            if (bestSnapshot && bestKey && bestCount >= currentCount && bestCount > 0) {
+                persistedState = bestSnapshot;
+                currentProjectKey = bestKey;
+                activeIdxMap[currentProjectKey] = bestIdx;
+                try { writeJsonToLocalStorage(PROJECT_ACTIVE_IDX_STORAGE_KEY, activeIdxMap); } catch (_) {}
+                try { localStorage.setItem('coretg_active_idx', String(bestIdx || 0)); } catch (_) {}
+                persistedActiveIdx = bestIdx;
+            }
+        }
+    } catch (err) {}
+
     persistedState = scrubSnapshotTransientErrors(persistedState);
     const activeIdxCandidateRaw = activeIdxMap[currentProjectKey];
     if (activeIdxCandidateRaw !== undefined) {
@@ -6510,7 +6651,6 @@ let activeIdx = Math.min(Math.max(0, persistedActiveIdx), (state.scenarios.lengt
 
 function persistEditorState(){
     try {
-        if (!ALLOW_LOCAL_EDITOR_PERSISTENCE) return;
         const baseUploadMeta = normalizeBaseUpload(state.base_upload) || (state.scenarios?.[0]?.base?.filepath || state.scenarios?.[0]?.base?.display_name ? {
             path: state.scenarios?.[0]?.base?.filepath || '',
             display_name: state.scenarios?.[0]?.base?.display_name || (state.scenarios?.[0]?.base?.filepath ? state.scenarios[0].base.filepath.split(/[/\\]/).pop() || '' : '')
@@ -6548,6 +6688,15 @@ function persistEditorState(){
         })();
         snapshot.project_key_hint = stableProjectHint;
         scrubSnapshotTransientErrors(snapshot);
+
+        // Always persist a sanitized snapshot on the server so refresh/back doesn't lose
+        // newly-created state for users who don't use local persistence (e.g. builder view).
+        try { scheduleServerSnapshotPersist(snapshot); } catch (_) {}
+        try { storeCorePasswordInSession(); } catch (_) {}
+
+        // Local persistence is admin-only (and disabled in builder view).
+        if (!ALLOW_LOCAL_EDITOR_PERSISTENCE) return;
+
         writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, snapshot);
         const nextProjectKey = deriveProjectKey(snapshot, currentProjectKey || DEFAULT_PROJECT_KEY);
         currentProjectKey = nextProjectKey || DEFAULT_PROJECT_KEY;
@@ -6557,8 +6706,6 @@ function persistEditorState(){
         writeJsonToLocalStorage(PROJECT_ACTIVE_IDX_STORAGE_KEY, activeIdxMap);
         try { localStorage.setItem(LAST_PROJECT_KEY_STORAGE_KEY, currentProjectKey); } catch (err) {}
         localStorage.setItem('coretg_active_idx', String(activeIdx||0));
-        storeCorePasswordInSession();
-        scheduleServerSnapshotPersist(snapshot);
     } catch(e){}
 }
 // Persist initial merged state so it survives cross-page navigation immediately
@@ -9691,9 +9838,14 @@ function renderSidebar() {
         appendScenarioBtn.onclick = (e) => {
             e.preventDefault();
             logInfo('New scenario created');
-            state.scenarios.push(defaultScenario());
+            const newScenario = defaultScenario();
+            try {
+                newScenario.name = ensureUniqueScenarioName(newScenario.name, state.scenarios);
+            } catch (e) {}
+            state.scenarios.push(newScenario);
             activeIdx = state.scenarios.length - 1;
             persistEditorState();
+            try { if (typeof flushServerSnapshotPersistNow === 'function') flushServerSnapshotPersistNow(); } catch (_) {}
             try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
             render();
         };
@@ -9795,7 +9947,9 @@ function renderMain() {
     } catch (e) {}
 
     const root = document.getElementById('editorRoot');
-    root.innerHTML = '';
+    if (root) {
+        root.innerHTML = '';
+    }
     // Always clear any scenario-specific cards that may have been injected outside
     // the editor root (e.g., above the base card), even when there are no scenarios.
     try {
@@ -9813,7 +9967,24 @@ function renderMain() {
         }
     } catch (e) {}
 
-    if (!state.scenarios.length) { return; }
+    if (!state.scenarios.length) {
+        try { refreshScenariosExecuteButtonState(); } catch (e) {}
+        try {
+            if (SCENARIOS_ACTIVE_TAB === 'connection-setup') {
+                const connectionRoot = document.getElementById('connectionSetupRoot');
+                if (connectionRoot) {
+                    connectionRoot.innerHTML = `
+                        <div class="card mb-3">
+                            <div class="card-body">
+                                <div class="fw-semibold">Connection Setup</div>
+                                <div class="text-muted small mt-1">Create or import a scenario to configure CORE / Participant settings.</div>
+                            </div>
+                        </div>`;
+                }
+            }
+        } catch (e) {}
+        return;
+    }
     const scen = state.scenarios[activeIdx] || state.scenarios[0];
     try { bindHostInterfacesToScenarioCache(activeIdx); } catch (e) {}
     const escapeHtml = (value) => (value ?? '').toString()
@@ -9845,6 +10016,7 @@ function renderMain() {
     const coreParticipantCollapseKey = `${activeIdx}::core_participant_setup`;
     const coreParticipantCollapsed = !!collapseState[coreParticipantCollapseKey];
     const existingMetaCard = document.getElementById('scenarioMetaCard');
+    const existingConnectionCard = document.getElementById('scenarioConnectionSetupCard');
     const hitlEntryWrap = document.getElementById('hitlEntryButtonsWrap');
     // Capture existing button elements BEFORE removing/rebuilding containers.
     const selectCoreVmBtnEl = document.getElementById('selectCoreVmBtn');
@@ -9853,69 +10025,88 @@ function renderMain() {
     if (existingMetaCard && existingMetaCard.parentNode) {
         existingMetaCard.parentNode.removeChild(existingMetaCard);
     }
+    if (existingConnectionCard && existingConnectionCard.parentNode) {
+        existingConnectionCard.parentNode.removeChild(existingConnectionCard);
+    }
 
-    const metaCard = document.createElement('div');
-    metaCard.id = 'scenarioMetaCard';
-    metaCard.className = 'card mb-3';
-    metaCard.innerHTML = `
-        <div class="card-body">
-            <div class="d-flex flex-wrap justify-content-between align-items-end gap-3">
-                <div class="flex-grow-1" style="min-width: 240px;">
-                    <label class="form-label mb-1 small text-muted" for="scenarioNameInput_${activeIdx}">Scenario name</label>
-                    <input type="text" class="form-control" id="scenarioNameInput_${activeIdx}" data-field="name" data-scen-idx="${activeIdx}" value="${safeScenarioName}" placeholder="${defaultScenarioName}">
-                </div>
-            </div>
-            <div id="scenarioNameHitlSection" class="border border-secondary rounded p-2 mt-3 bg-light">
-                <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
-                    <div class="fw-semibold small">CORE / Participant Setup (optional)</div>
-                    <div class="d-flex align-items-center gap-2">
-                        <span id="scenarioNameHitlStatusBadge" class="badge text-bg-secondary">Not configured</span>
-                        ${IS_BUILDER_VIEW ? '' : `<button class="btn btn-sm btn-outline-secondary" type="button" data-action="toggle-collapse" data-target="#collapse-core_participant_setup">${coreParticipantCollapsed ? 'Expand' : 'Collapse'}</button>`}
+    const baseScenarioCard = document.getElementById('baseCoreScenarioCard');
+    const connectionRoot = document.getElementById('connectionSetupRoot');
+
+    // Scenario name card: Connection Setup tab only (do not show on Topology).
+    if (SCENARIOS_ACTIVE_TAB === 'connection-setup') {
+        const metaCard = document.createElement('div');
+        metaCard.id = 'scenarioMetaCard';
+        metaCard.className = 'card mb-3';
+        metaCard.innerHTML = `
+            <div class="card-body">
+                <div class="d-flex flex-wrap justify-content-between align-items-end gap-3">
+                    <div class="flex-grow-1" style="min-width: 240px;">
+                        <label class="form-label mb-1 small text-muted" for="scenarioNameInput_${activeIdx}">Scenario name</label>
+                        <input type="text" class="form-control" id="scenarioNameInput_${activeIdx}" data-field="name" data-scen-idx="${activeIdx}" value="${safeScenarioName}" placeholder="${defaultScenarioName}">
                     </div>
                 </div>
+            </div>`;
+        if (connectionRoot) {
+            connectionRoot.innerHTML = '';
+            connectionRoot.appendChild(metaCard);
+        } else if (root) {
+            root.appendChild(metaCard);
+        }
+    }
+
+    // Connection Setup tab: show CORE / Participant Setup in its own card.
+    if (SCENARIOS_ACTIVE_TAB === 'connection-setup') {
+        const connectionCard = document.createElement('div');
+        connectionCard.id = 'scenarioConnectionSetupCard';
+        connectionCard.className = 'card mb-3';
+        connectionCard.innerHTML = `
+            <div class="card-header d-flex justify-content-between align-items-center gap-2">
+                <strong>CORE / Participant Setup</strong>
+                <span id="scenarioNameHitlStatusBadge" class="badge text-bg-secondary">Not configured</span>
+            </div>
+            <div class="card-body">
                 ${IS_BUILDER_VIEW ? `
                     <div class="small text-body" id="scenarioNameBuilderSetupStatus">Not yet Setup by Admin</div>
                 ` : `
-                    <div id="collapse-core_participant_setup" style="${coreParticipantCollapsed ? 'display:none;' : 'display:block;'}">
-                        <div class="table-responsive">
-                            <table class="table table-sm mb-0 align-middle">
-                                <tbody>
-                                    <tr>
-                                        <td style="width: 240px;">
-                                            <div class="d-flex flex-column gap-2">
-                                                <div id="scenarioNameCoreBtnSlot"></div>
-                                                <button type="button" class="btn btn-outline-secondary hitl-entry-btn" id="scenarioNameCoreVerifyBtn" title="Verify CORE/Proxmox settings">Verify</button>
-                                                <button type="button" class="btn btn-outline-danger hitl-entry-btn" id="scenarioNameCoreClearBtn" title="Clear selected CORE VM and reset HITL mappings/bridge fields">Clear</button>
-                                            </div>
-                                        </td>
-                                        <td>
-                                            <div class="small text-body" id="scenarioNameCoreSummary"></div>
-                                        </td>
-                                    </tr>
-                                    <tr>
-                                        <td style="width: 240px;">
-                                            <div class="d-flex flex-column gap-2">
-                                                <div id="scenarioNameHitlBtnSlot"></div>
-                                                <button type="button" class="btn btn-outline-secondary hitl-entry-btn" id="scenarioNameHitlVerifyBtn" title="Verify HITL bridge settings">Verify</button>
-                                                <button type="button" class="btn btn-outline-danger hitl-entry-btn" id="scenarioNameHitlClearBtn" title="Clear HITL interface mappings and bridge settings" ${metaHitlClearDisabled ? 'disabled' : ''}>Clear</button>
-                                            </div>
-                                        </td>
-                                        <td>
-                                            <div class="small text-body" id="scenarioNameHitlSummary"></div>
-                                        </td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
+                    <div class="table-responsive">
+                        <table class="table table-sm mb-0 align-middle">
+                            <tbody>
+                                <tr>
+                                    <td style="width: 240px;">
+                                        <div class="d-flex flex-column gap-2">
+                                            <div id="scenarioNameCoreBtnSlot"></div>
+                                            <button type="button" class="btn btn-outline-secondary hitl-entry-btn" id="scenarioNameCoreVerifyBtn" title="Verify CORE/Proxmox settings">Verify</button>
+                                            <button type="button" class="btn btn-outline-danger hitl-entry-btn" id="scenarioNameCoreClearBtn" title="Clear selected CORE VM and reset HITL mappings/bridge fields">Clear</button>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <div class="small text-body" id="scenarioNameCoreSummary"></div>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td style="width: 240px;">
+                                        <div class="d-flex flex-column gap-2">
+                                            <div id="scenarioNameHitlBtnSlot"></div>
+                                            <button type="button" class="btn btn-outline-secondary hitl-entry-btn" id="scenarioNameHitlVerifyBtn" title="Verify HITL bridge settings">Verify</button>
+                                            <button type="button" class="btn btn-outline-danger hitl-entry-btn" id="scenarioNameHitlClearBtn" title="Clear HITL interface mappings and bridge settings" ${metaHitlClearDisabled ? 'disabled' : ''}>Clear</button>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <div class="small text-body" id="scenarioNameHitlSummary"></div>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
                     </div>
                 `}
-            </div>
-        </div>`;
-    const baseScenarioCard = document.getElementById('baseCoreScenarioCard');
-    if (baseScenarioCard && baseScenarioCard.parentNode) {
-        baseScenarioCard.parentNode.insertBefore(metaCard, baseScenarioCard);
-    } else {
-        root.appendChild(metaCard);
+            </div>`;
+        if (connectionRoot) {
+            connectionRoot.appendChild(connectionCard);
+        } else if (baseScenarioCard && baseScenarioCard.parentNode) {
+            baseScenarioCard.parentNode.insertBefore(connectionCard, baseScenarioCard);
+        } else {
+            root.appendChild(connectionCard);
+        }
     }
 
     // Render the optional entry buttons in the "CORE / Participant Setup (optional)"
@@ -9965,13 +10156,13 @@ function renderMain() {
     try {
         const selectBtn = document.getElementById('selectCoreVmBtn');
         if (selectBtn) {
-            selectBtn.setAttribute('title', 'Optional: Select a Proxmox resource and remote CORE VM for HITL runs.');
+            selectBtn.setAttribute('title', 'Select a Proxmox resource and remote CORE VM for HITL runs.');
         }
         const cfgBtn = document.getElementById('configHitlBtn');
         if (cfgBtn) {
             // Keep gating tooltip if disabled; otherwise show the purpose.
             if (!cfgBtn.disabled) {
-                cfgBtn.setAttribute('title', 'Optional: Configure HITL interfaces and participant VM mappings for this scenario.');
+                cfgBtn.setAttribute('title', 'Configure HITL interfaces and participant VM mappings for this scenario.');
             } else if (!cfgBtn.getAttribute('title')) {
                 cfgBtn.setAttribute('title', 'CORE VM has to be selected/verified');
             }
@@ -10005,6 +10196,9 @@ function renderMain() {
             });
         }
     } catch (e) {}
+
+    // Shared Execute button: require a verified CORE VM for this project/scenario.
+    try { refreshScenariosExecuteButtonState(); } catch (e) {}
 
 
     const removeExistingCard = (cardId) => {
@@ -11621,8 +11815,15 @@ function renderMain() {
             }
         };
         navLink.addEventListener('click', (event) => {
+            // The navbar click handler shows a global loading modal in capture phase.
+            // If we block navigation here, explicitly hide it so the UI doesn't get trapped.
+            try { if (typeof window.CORETG_HIDE_NAV_LOADING === 'function') window.CORETG_HIDE_NAV_LOADING(); } catch (_) {}
+
             if (!hasCoreVmSelection()) {
                 event.preventDefault();
+                // Persist any newly-created project state before opening the blocked dialog.
+                try { if (typeof persistEditorState === 'function') persistEditorState(); } catch (_) {}
+                try { if (typeof flushServerSnapshotPersistNow === 'function') flushServerSnapshotPersistNow(); } catch (_) {}
                 openCoreNavBlockedModal();
                 return;
             }
@@ -11632,6 +11833,9 @@ function renderMain() {
             }
 
             event.preventDefault();
+            // Persist any newly-created project state before opening the validation flow.
+            try { if (typeof persistEditorState === 'function') persistEditorState(); } catch (_) {}
+            try { if (typeof flushServerSnapshotPersistNow === 'function') flushServerSnapshotPersistNow(); } catch (_) {}
             window._coreNavAwaitingValidation = navLink.href;
             ensureValidationHook();
             openModalForActiveScenario();
@@ -12842,11 +13046,18 @@ function wireHandlers() {
                     if (ev?.type === 'change') {
                         const trimmed = raw.trim();
                         const finalName = trimmed || `Scenario ${sidx + 1}`;
-                        state.scenarios[sidx].name = finalName;
-                        if (el.value !== finalName) {
-                            el.value = finalName;
+                        let uniqueName = finalName;
+                        try {
+                            uniqueName = ensureUniqueScenarioName(finalName, state.scenarios, sidx);
+                        } catch (e) {}
+                        state.scenarios[sidx].name = uniqueName;
+                        if (el.value !== uniqueName) {
+                            el.value = uniqueName;
                         }
-                        try { logInfo(`Scenario renamed to ${finalName}`); } catch(_) {}
+                        if (uniqueName !== finalName) {
+                            try { showToast(`Scenario name already exists. Renamed to "${uniqueName}".`, { autohide: true, delay: 3500 }); } catch (_) {}
+                        }
+                        try { logInfo(`Scenario renamed to ${uniqueName}`); } catch(_) {}
                     } else {
                         state.scenarios[sidx].name = raw;
                     }
@@ -14694,6 +14905,42 @@ function refreshExecuteRemoteToggleState() {
     if (executeAdvancedWrap) {
         const showAdvanced = remoteSelected && !showNotConfigured && !IS_BUILDER_VIEW && !info.shouldFake;
         executeAdvancedWrap.classList.toggle('d-none', !showAdvanced);
+    }
+}
+
+function isActiveScenarioCoreVmVerifiedForProject() {
+    try {
+        const scenarioIdx = Number.isInteger(executeConfirmState?.scenarioIndex)
+            ? executeConfirmState.scenarioIndex
+            : getActiveScenarioContext().idx;
+        if (!Number.isInteger(scenarioIdx)) return false;
+        const scen = state?.scenarios?.[scenarioIdx];
+        if (!scen || typeof scen !== 'object') return false;
+        const hitl = (typeof ensureHitlStateForScenario === 'function')
+            ? ensureHitlStateForScenario(scen)
+            : (scen.hitl || {});
+        const prox = (hitl && typeof hitl === 'object' && hitl.proxmox && typeof hitl.proxmox === 'object') ? hitl.proxmox : {};
+        const core = (hitl && typeof hitl === 'object' && hitl.core && typeof hitl.core === 'object') ? hitl.core : {};
+        const vmKey = (core?.vm_key ?? '').toString().trim();
+        const proxSecretId = (prox?.secret_id ?? '').toString().trim();
+        const coreSecretId = (core?.core_secret_id ?? core?.secret_id ?? '').toString().trim();
+        const proxValidated = !!prox?.validated;
+        const coreValidated = !!core?.validated;
+        return !!(vmKey && proxSecretId && coreSecretId && proxValidated && coreValidated);
+    } catch (err) {
+        return false;
+    }
+}
+
+function refreshScenariosExecuteButtonState() {
+    const btn = document.getElementById('scenariosExecuteBtn');
+    if (!btn) return;
+    const verified = isActiveScenarioCoreVmVerifiedForProject();
+    btn.disabled = !verified;
+    if (!verified) {
+        btn.setAttribute('title', 'Verify a CORE VM in VM / Access to enable Execute.');
+    } else {
+        btn.removeAttribute('title');
     }
 }
 

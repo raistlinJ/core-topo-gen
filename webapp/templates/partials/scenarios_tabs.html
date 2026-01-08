@@ -12,6 +12,9 @@
 <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-3">
   <ul class="nav nav-tabs mb-0">
     <li class="nav-item">
+      <a class="nav-link {% if scenarios_active_tab == 'connection-setup' %}active{% endif %}" {% if scenarios_active_tab == 'connection-setup' %}aria-current="page"{% endif %} href="{{ url_for('index', scenario=scenario_tab, tab='connection-setup') if scenario_tab else url_for('index', tab='connection-setup') }}">VM / Access</a>
+    </li>
+    <li class="nav-item">
       <a class="nav-link {% if scenarios_active_tab == 'topology' %}active{% endif %}" {% if scenarios_active_tab == 'topology' %}aria-current="page"{% endif %} href="{{ url_for('index', scenario=scenario_tab) if scenario_tab else url_for('index') }}">Topology</a>
     </li>
     <li class="nav-item">
@@ -37,8 +40,8 @@
 <div class="position-fixed start-0 end-0 bg-body border-top" style="bottom: var(--coretg-dock-height, 0px); z-index: 1045;">
   <div class="container-fluid py-2">
     <div class="d-flex justify-content-end gap-2">
-      {% if scenarios_active_tab in ['topology', 'flag-sequencing'] %}
-        {% if scenarios_active_tab == 'topology' %}
+      {% if scenarios_active_tab in ['connection-setup', 'topology', 'flag-sequencing'] %}
+        {% if scenarios_active_tab in ['topology', 'connection-setup'] %}
         <button id="saveXmlBtn" class="btn btn-outline-success px-4 py-2 shadow-sm" type="submit" form="editorForm">Save XML</button>
         {% else %}
         <button id="saveXmlBtn" class="btn btn-outline-success px-4 py-2 shadow-sm" type="button">Save XML</button>
@@ -49,3 +52,136 @@
     </div>
   </div>
 </div>
+
+<script>
+(function(){
+  const PROJECT_STATE_STORAGE_KEY = 'coretg_project_state_map_v1';
+  const LAST_PROJECT_KEY_STORAGE_KEY = 'coretg_last_project_key';
+  const PROJECT_ACTIVE_IDX_STORAGE_KEY = 'coretg_project_active_idx_map_v1';
+
+  function readJsonFromLocalStorage(key, fallback){
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) return fallback;
+      const parsed = JSON.parse(raw);
+      return (parsed === null || parsed === undefined) ? fallback : parsed;
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function pickBestLocalSnapshotByScenarioCount(snapshotMap){
+    try {
+      if (!snapshotMap || typeof snapshotMap !== 'object') return null;
+      let best = null;
+      let bestCount = 0;
+      Object.keys(snapshotMap).forEach(key => {
+        const entry = snapshotMap[key];
+        const scenarios = Array.isArray(entry?.scenarios) ? entry.scenarios : null;
+        if (!scenarios || !scenarios.length) return;
+        if (scenarios.length > bestCount) {
+          bestCount = scenarios.length;
+          best = entry;
+        }
+      });
+      return best;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function resolveScenarioNameHint(){
+    try {
+      const params = new URLSearchParams(window.location.search || '');
+      const qp = (params.get('scenario') || '').trim();
+      if (qp) return qp;
+    } catch (e) {}
+    try {
+      const hidden = document.getElementById('scenariosPreviewScenario');
+      const val = (hidden && typeof hidden.value === 'string') ? hidden.value.trim() : '';
+      if (val) return val;
+    } catch (e) {}
+    return '';
+  }
+
+  function getCurrentProjectSnapshot(){
+    const projectStateMap = readJsonFromLocalStorage(PROJECT_STATE_STORAGE_KEY, {});
+    const key = (localStorage.getItem(LAST_PROJECT_KEY_STORAGE_KEY) || '').trim();
+    if (key && projectStateMap && typeof projectStateMap === 'object' && projectStateMap[key]) {
+      return projectStateMap[key];
+    }
+    return pickBestLocalSnapshotByScenarioCount(projectStateMap);
+  }
+
+  function resolveActiveScenarioFromSnapshot(snapshot){
+    const scenarios = Array.isArray(snapshot?.scenarios) ? snapshot.scenarios : [];
+    if (!scenarios.length) return null;
+
+    const hint = resolveScenarioNameHint();
+    if (hint) {
+      const normHint = hint.toLowerCase();
+      const found = scenarios.find(s => (s?.name ?? '').toString().trim().toLowerCase() === normHint);
+      if (found) return found;
+    }
+
+    let idx = Number.isInteger(snapshot?.active_index) ? snapshot.active_index : null;
+    if (!Number.isInteger(idx)) {
+      try {
+        const key = (localStorage.getItem(LAST_PROJECT_KEY_STORAGE_KEY) || '').trim();
+        const idxMap = readJsonFromLocalStorage(PROJECT_ACTIVE_IDX_STORAGE_KEY, {});
+        const mapped = (idxMap && typeof idxMap === 'object' && key) ? idxMap[key] : null;
+        if (Number.isInteger(mapped)) idx = mapped;
+      } catch (e) {}
+    }
+    if (!Number.isInteger(idx)) {
+      const raw = (localStorage.getItem('coretg_active_idx') || '').trim();
+      const parsed = parseInt(raw || '0', 10);
+      idx = Number.isNaN(parsed) ? 0 : parsed;
+    }
+    idx = Math.min(Math.max(0, idx || 0), scenarios.length - 1);
+    return scenarios[idx] || scenarios[0] || null;
+  }
+
+  function isScenarioCoreVmVerifiedForProject(scenario){
+    try {
+      if (!scenario || typeof scenario !== 'object') return false;
+      const hitl = (scenario.hitl && typeof scenario.hitl === 'object') ? scenario.hitl : {};
+      const prox = (hitl.proxmox && typeof hitl.proxmox === 'object') ? hitl.proxmox : {};
+      const core = (hitl.core && typeof hitl.core === 'object') ? hitl.core : {};
+      const vmKey = (core?.vm_key ?? '').toString().trim();
+      const proxSecretId = (prox?.secret_id ?? '').toString().trim();
+      const coreSecretId = (core?.core_secret_id ?? core?.secret_id ?? '').toString().trim();
+      const proxValidated = !!prox?.validated;
+      const coreValidated = !!core?.validated;
+      return !!(vmKey && proxSecretId && coreSecretId && proxValidated && coreValidated);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function refreshScenariosExecuteButtonState(){
+    const btn = document.getElementById('scenariosExecuteBtn');
+    if (!btn) return;
+    const snapshot = getCurrentProjectSnapshot();
+    const scenario = snapshot ? resolveActiveScenarioFromSnapshot(snapshot) : null;
+    const verified = !!(scenario && isScenarioCoreVmVerifiedForProject(scenario));
+    btn.disabled = !verified;
+    if (!verified) {
+      btn.setAttribute('title', 'Verify a CORE VM in VM / Access to enable Execute.');
+    } else {
+      btn.removeAttribute('title');
+    }
+  }
+
+  window.coretgRefreshScenariosExecuteButtonState = refreshScenariosExecuteButtonState;
+  document.addEventListener('DOMContentLoaded', refreshScenariosExecuteButtonState);
+  window.addEventListener('storage', (ev) => {
+    try {
+      if (!ev || !ev.key) return;
+      if (ev.key === PROJECT_STATE_STORAGE_KEY || ev.key === LAST_PROJECT_KEY_STORAGE_KEY || ev.key === PROJECT_ACTIVE_IDX_STORAGE_KEY) {
+        refreshScenariosExecuteButtonState();
+      }
+    } catch (e) {}
+  });
+})();
+</script>
