@@ -14856,7 +14856,23 @@ async function requestExecuteCancel(reason = 'Cancelled') {
         try {
             const handlers = Array.isArray(executeProgressState.cancelHandlers) ? [...executeProgressState.cancelHandlers] : [];
             executeProgressState.cancelHandlers = [];
-            handlers.forEach((fn) => { try { fn(); } catch (e) {} });
+            const promises = [];
+            handlers.forEach((fn) => {
+                try {
+                    const res = fn();
+                    if (res && typeof res.then === 'function') {
+                        promises.push(res);
+                    }
+                } catch (e) {}
+            });
+            if (promises.length) {
+                const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                // Don't block cancellation indefinitely; just wait briefly for best-effort feedback.
+                await Promise.race([
+                    Promise.allSettled(promises),
+                    sleep(900),
+                ]);
+            }
         } catch (e) {}
         try { if (runProgressEvtSrc) runProgressEvtSrc.close(); } catch (e) {}
         try {
@@ -16091,7 +16107,42 @@ async function pushRepoToRemote(xmlPath, options = {}) {
             if (progressId) {
                 const unregister = registerExecuteCancelHandler(() => {
                     try {
-                        fetch('/core/push_repo/cancel/' + encodeURIComponent(progressId), { method: 'POST' });
+                        return fetch('/core/push_repo/cancel/' + encodeURIComponent(progressId), { method: 'POST' })
+                            .then(r => r.json().catch(() => null))
+                            .then(j => {
+                                try {
+                                    const info = j && j.remote ? j.remote : null;
+                                    const pid = info && info.pid ? String(info.pid) : '';
+                                    const found = info && info.pidfile_found ? 'found' : 'not found';
+                                    const killed = (info && (info.kill_sent || info.term_sent)) ? 'kill sent' : 'kill not confirmed';
+                                    const archive = (info && info.archive_existed_before !== null)
+                                        ? (info.archive_existed_before ? 'archive existed' : 'archive missing')
+                                        : '';
+                                    const suffix = [killed, pid ? `pid=${pid}` : null, archive].filter(Boolean).join(', ');
+                                    const line = `[ui] Remote finalize cancel: pidfile ${found}${suffix ? ` (${suffix})` : ''}`;
+                                    if (executeProgressState && executeProgressState.active) appendExecuteProgressLog(line);
+                                    else logInfo(line);
+
+                                    // Update status/meta with a clearer message.
+                                    try {
+                                        if (executeProgressState && executeProgressState.active && !executeProgressState.done) {
+                                            let meta = 'Remote extract stop requested.';
+                                            if (info) {
+                                                const pidPart = pid ? ` (pid=${pid})` : '';
+                                                if (info.pidfile_found) {
+                                                    meta = (info.kill_sent || info.term_sent)
+                                                        ? `Stop signal sent to remote extract${pidPart}.`
+                                                        : 'Remote extract stop not confirmed (no signal sent).';
+                                                } else {
+                                                    meta = 'Remote extract PID not found (may have already finished).';
+                                                }
+                                            }
+                                            setExecuteProgressStatus('Cancelling…', meta);
+                                        }
+                                    } catch (e) {}
+                                } catch (e) {}
+                            })
+                            .catch(() => {});
                     } catch (e) {}
                 });
                 const finalized = await waitForRepoFinalize(progressId, { onProgress: onFinalizeProgress });
@@ -16210,7 +16261,42 @@ async function pushRepoToRemote(xmlPath, options = {}) {
                 if (progressId) {
                     const unregister = registerExecuteCancelHandler(() => {
                         try {
-                            fetch('/core/push_repo/cancel/' + encodeURIComponent(progressId), { method: 'POST' });
+                            return fetch('/core/push_repo/cancel/' + encodeURIComponent(progressId), { method: 'POST' })
+                                .then(r => r.json().catch(() => null))
+                                .then(j => {
+                                    try {
+                                        const info = j && j.remote ? j.remote : null;
+                                        const pid = info && info.pid ? String(info.pid) : '';
+                                        const found = info && info.pidfile_found ? 'found' : 'not found';
+                                        const killed = (info && (info.kill_sent || info.term_sent)) ? 'kill sent' : 'kill not confirmed';
+                                        const archive = (info && info.archive_existed_before !== null)
+                                            ? (info.archive_existed_before ? 'archive existed' : 'archive missing')
+                                            : '';
+                                        const suffix = [killed, pid ? `pid=${pid}` : null, archive].filter(Boolean).join(', ');
+                                        const line = `[ui] Remote finalize cancel: pidfile ${found}${suffix ? ` (${suffix})` : ''}`;
+                                        if (executeProgressState && executeProgressState.active) appendExecuteProgressLog(line);
+                                        else logInfo(line);
+
+                                        // Update status/meta with a clearer message.
+                                        try {
+                                            if (executeProgressState && executeProgressState.active && !executeProgressState.done) {
+                                                let meta = 'Remote extract stop requested.';
+                                                if (info) {
+                                                    const pidPart = pid ? ` (pid=${pid})` : '';
+                                                    if (info.pidfile_found) {
+                                                        meta = (info.kill_sent || info.term_sent)
+                                                            ? `Stop signal sent to remote extract${pidPart}.`
+                                                            : 'Remote extract stop not confirmed (no signal sent).';
+                                                    } else {
+                                                        meta = 'Remote extract PID not found (may have already finished).';
+                                                    }
+                                                }
+                                                setExecuteProgressStatus('Cancelling…', meta);
+                                            }
+                                        } catch (e) {}
+                                    } catch (e) {}
+                                })
+                                .catch(() => {});
                         } catch (e) {}
                     });
                     const finalized = await waitForRepoFinalize(progressId, { onProgress: onFinalizeProgress });
@@ -16296,6 +16382,9 @@ async function waitForRepoFinalize(progressId, options = {}) {
                 return true;
             }
             if (info.status === 'error') {
+                return false;
+            }
+            if (info.status === 'cancelled') {
                 return false;
             }
         } else if (response.status === 404) {

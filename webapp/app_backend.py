@@ -22026,7 +22026,7 @@ def core_push_repo_cancel(progress_id: str):
         return jsonify({'progress_id': progress_id, 'status': 'unknown'}), 404
     status = (payload.get('status') or '').strip().lower()
     if status in ('complete', 'error', 'cancelled'):
-        return jsonify({'ok': True, 'progress_id': progress_id, 'status': status})
+        return jsonify({'ok': True, 'progress_id': progress_id, 'status': status, 'noop': True})
     _update_repo_push_progress(
         progress_id,
         cancel_requested=True,
@@ -22036,49 +22036,91 @@ def core_push_repo_cancel(progress_id: str):
     )
 
     # Best-effort: attempt to stop any in-flight remote finalize by killing its PID.
+    kill_info: Dict[str, Any] = {
+        'attempted': False,
+        'pidfile': None,
+        'pidfile_found': False,
+        'pid': None,
+        'term_sent': False,
+        'kill_sent': False,
+        'pidfile_removed': False,
+        'archive': None,
+        'archive_existed_before': None,
+        'archive_exists_after': None,
+    }
     try:
         ctx = _get_repo_push_cancel_ctx(progress_id)
         if isinstance(ctx, dict):
             core_cfg = ctx.get('core_cfg')
             pidfile = ctx.get('remote_pidfile')
             remote_archive = ctx.get('remote_archive')
-            if isinstance(core_cfg, dict) and isinstance(pidfile, str) and pidfile.strip():
+            if isinstance(core_cfg, dict):
+                kill_info['attempted'] = True
+                if isinstance(pidfile, str) and pidfile.strip():
+                    kill_info['pidfile'] = pidfile
+                if isinstance(remote_archive, str) and remote_archive.strip():
+                    kill_info['archive'] = remote_archive
+
                 client = _open_ssh_client(core_cfg)
                 try:
                     kill_script = (
                         "set -e; "
-                        f"pidfile={shlex.quote(pidfile)}; "
-                        "if [ -f \"$pidfile\" ]; then "
-                        "pid=$(cat \"$pidfile\" 2>/dev/null || true); "
+                        f"pidfile={shlex.quote(pidfile or '')}; "
+                        f"archive={shlex.quote(remote_archive or '')}; "
+                        "pidfile_found=0; pid=''; "
+                        "if [ -n \"$pidfile\" ] && [ -f \"$pidfile\" ]; then pidfile_found=1; pid=$(cat \"$pidfile\" 2>/dev/null || true); fi; "
+                        "term_sent=0; kill_sent=0; "
                         "if [ -n \"$pid\" ]; then "
-                        "kill -TERM \"$pid\" 2>/dev/null || true; "
+                        "kill -TERM \"$pid\" 2>/dev/null && term_sent=1 || term_sent=0; "
                         "sleep 0.5; "
-                        "kill -KILL \"$pid\" 2>/dev/null || true; "
+                        "kill -KILL \"$pid\" 2>/dev/null && kill_sent=1 || kill_sent=0; "
                         "fi; "
-                        "rm -f -- \"$pidfile\" || true; "
-                        "fi"
+                        "pidfile_removed=0; "
+                        "if [ -n \"$pidfile\" ]; then rm -f -- \"$pidfile\" 2>/dev/null && pidfile_removed=1 || pidfile_removed=0; fi; "
+                        "archive_existed_before=''; archive_exists_after=''; "
+                        "if [ -n \"$archive\" ]; then "
+                        "if [ -f \"$archive\" ]; then archive_existed_before=1; else archive_existed_before=0; fi; "
+                        "rm -f -- \"$archive\" 2>/dev/null || true; "
+                        "if [ -f \"$archive\" ]; then archive_exists_after=1; else archive_exists_after=0; fi; "
+                        "fi; "
+                        "echo PIDFILE_FOUND=\"$pidfile_found\"; "
+                        "echo PID=\"$pid\"; "
+                        "echo TERM_SENT=\"$term_sent\"; "
+                        "echo KILL_SENT=\"$kill_sent\"; "
+                        "echo PIDFILE_REMOVED=\"$pidfile_removed\"; "
+                        "echo ARCHIVE_EXISTED_BEFORE=\"$archive_existed_before\"; "
+                        "echo ARCHIVE_EXISTS_AFTER=\"$archive_exists_after\""
                     )
-                    _exec_ssh_command(client, f"sh -lc {shlex.quote(kill_script)}", timeout=20.0)
+                    _code, out, _err = _exec_ssh_command(client, f"sh -lc {shlex.quote(kill_script)}", timeout=25.0)
+                    for line in (out or '').splitlines():
+                        if '=' not in line:
+                            continue
+                        k, v = line.split('=', 1)
+                        k = k.strip().upper()
+                        v = v.strip().strip('"')
+                        if k == 'PIDFILE_FOUND':
+                            kill_info['pidfile_found'] = v == '1'
+                        elif k == 'PID':
+                            kill_info['pid'] = v or None
+                        elif k == 'TERM_SENT':
+                            kill_info['term_sent'] = v == '1'
+                        elif k == 'KILL_SENT':
+                            kill_info['kill_sent'] = v == '1'
+                        elif k == 'PIDFILE_REMOVED':
+                            kill_info['pidfile_removed'] = v == '1'
+                        elif k == 'ARCHIVE_EXISTED_BEFORE':
+                            kill_info['archive_existed_before'] = None if v == '' else (v == '1')
+                        elif k == 'ARCHIVE_EXISTS_AFTER':
+                            kill_info['archive_exists_after'] = None if v == '' else (v == '1')
                 finally:
                     try:
                         client.close()
                     except Exception:
                         pass
-
-            # Optional cleanup: remove remote archive to free space.
-            if isinstance(core_cfg, dict) and isinstance(remote_archive, str) and remote_archive.strip():
-                client2 = _open_ssh_client(core_cfg)
-                try:
-                    _exec_ssh_command(client2, f"rm -f {shlex.quote(remote_archive)}", timeout=20.0)
-                finally:
-                    try:
-                        client2.close()
-                    except Exception:
-                        pass
     except Exception:
         pass
 
-    return jsonify({'ok': True, 'progress_id': progress_id, 'status': 'cancelled'})
+    return jsonify({'ok': True, 'progress_id': progress_id, 'status': 'cancelled', 'remote': kill_info})
 
 
 @app.route('/core/start', methods=['POST'])
