@@ -18250,11 +18250,44 @@ def plan_full_preview_page():
         except Exception:
             seed = None
         if not xml_path:
+            if embed:
+                return Response(
+                    '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">'
+                    'Save XML first to preview (missing xml_path).'
+                    '</div>',
+                    mimetype='text/html',
+                )
             flash('xml_path missing (full preview page)')
             return redirect(url_for('index'))
         xml_path = os.path.abspath(xml_path)
         xml_basename = os.path.splitext(os.path.basename(xml_path))[0] if xml_path else ''
+        # Path fallback: handle container/volume mapping differences (e.g., /app/outputs vs /app/webapp/outputs)
+        if not os.path.exists(xml_path) and '/outputs/' in xml_path:
+            try:
+                alt = xml_path.replace('/app/outputs', '/app/webapp/outputs')
+                if alt != xml_path and os.path.exists(alt):
+                    app.logger.info('[full_preview] remapped xml_path %s -> %s', xml_path, alt)
+                    xml_path = alt
+            except Exception:
+                pass
+        if not os.path.exists(xml_path) and '/outputs/' in xml_path:
+            try:
+                alt = xml_path.replace('/app/webapp/outputs', '/app/outputs')
+                if alt != xml_path and os.path.exists(alt):
+                    app.logger.info('[full_preview] remapped xml_path %s -> %s', xml_path, alt)
+                    xml_path = alt
+            except Exception:
+                pass
         if not os.path.exists(xml_path):
+            if embed:
+                safe = (xml_path or '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                return Response(
+                    '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">'
+                    'Save XML first to preview (XML not found):<br><code style="color:#495057;">'
+                    + safe +
+                    '</code></div>',
+                    mimetype='text/html',
+                )
             flash(f'XML not found: {xml_path}')
             return redirect(url_for('index'))
         from core_topo_gen.planning.orchestrator import compute_full_plan

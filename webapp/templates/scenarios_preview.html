@@ -98,7 +98,10 @@
 
   function loadPreview(){
     const params = new URLSearchParams(window.location.search || '');
-    const xmlPath = (params.get('xml_path') || document.getElementById('scenariosPreviewLoadXmlPath')?.value || '').trim();
+    // Prefer server-validated hidden inputs over query params. If a stale/invalid
+    // xml_path is present in the URL, the backend will intentionally clear it and
+    // provide a safe fallback in the hidden field.
+    const xmlPath = (document.getElementById('scenariosPreviewLoadXmlPath')?.value || params.get('xml_path') || '').trim();
     const scenario = (params.get('scenario') || document.getElementById('scenariosPreviewLoadScenario')?.value || '').trim();
 
     const frame = document.getElementById('scenariosPreviewFrame');
