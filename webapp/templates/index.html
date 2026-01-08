@@ -568,7 +568,7 @@
                             <label class="form-check-label" for="executeAdvFixDockerDaemon">Fix Docker daemon for CORE (disable default bridge + iptables)</label>
                         </div>
                         <div class="form-check">
-                            <input class="form-check-input" type="checkbox" id="executeAdvRunCoreCleanup">
+                            <input class="form-check-input" type="checkbox" id="executeAdvRunCoreCleanup" checked>
                             <label class="form-check-label" for="executeAdvRunCoreCleanup">Run core-cleanup</label>
                         </div>
                         <div class="form-check">
@@ -1449,6 +1449,7 @@ function ensureHitlStateForScenario(scen) {
             last_interfaces_error: null,
             remember_credentials: true,
             auto_start_daemon: false,
+            adv_run_core_cleanup: true,
         };
     } else {
         const core = scen.hitl.core;
@@ -1498,6 +1499,10 @@ function ensureHitlStateForScenario(scen) {
     }
     if (typeof scen.hitl.core.auto_start_daemon !== 'boolean') {
         scen.hitl.core.auto_start_daemon = false;
+    }
+    if (typeof scen.hitl.core.adv_run_core_cleanup !== 'boolean') {
+        // Default to enabled unless the user explicitly disables it.
+        scen.hitl.core.adv_run_core_cleanup = true;
     }
     const coreVmKeyCurrent = (scen.hitl.core?.vm_key ?? '').toString();
     const coreVmNodeCurrent = (scen.hitl.core?.vm_node ?? '').toString().trim();
@@ -15508,6 +15513,9 @@ if (editorForm) {
         if (event) {
             event.preventDefault();
         }
+        const scrollYBeforeSave = (typeof window !== 'undefined')
+            ? (window.scrollY || window.pageYOffset || 0)
+            : 0;
         setSaveXmlBusy(true);
         setSaveXmlToastBusy(true);
         // Yield a frame so the toast/spinner can paint before heavy work.
@@ -15536,6 +15544,13 @@ if (editorForm) {
                 setSaveXmlBusy(false);
                 setSaveXmlToastBusy(false);
                 flashSaveXmlSaved();
+                // Auto-save updates dock preview + layout; restore viewport to where the user was.
+                try {
+                    await new Promise(requestAnimationFrame);
+                    window.scrollTo({ top: scrollYBeforeSave, left: 0, behavior: 'auto' });
+                } catch (_) {
+                    try { window.scrollTo(0, scrollYBeforeSave); } catch (_) {}
+                }
                 try { showToast('XML saved.', { autohide: true, delay: 2200 }); } catch (_) {}
                 return;
             } catch (err) {
@@ -16448,6 +16463,15 @@ async function submitRunCliRequest(buildRequest, options = {}) {
             }
         } catch (e) {}
     };
+    const setAbortReason = (reason, details = {}) => {
+        try {
+            window.__lastRunStartAbort = {
+                ts: Date.now(),
+                reason: String(reason || 'Run start aborted'),
+                ...((details && typeof details === 'object') ? details : {}),
+            };
+        } catch (e) {}
+    };
     const attempts = Math.max(1, options.maxAttempts || 2);
     for (let attempt = 0; attempt < attempts; attempt += 1) {
         let request = null;
@@ -16486,6 +16510,7 @@ async function submitRunCliRequest(buildRequest, options = {}) {
             const canAuto = !!(info && info.can_auto_start);
             const startCommand = (info && info.start_command) || 'sudo systemctl start core-daemon';
             const msg = (info && info.error) || 'core-daemon is not running on the CORE host.';
+            logRunRequestDebug(`Run start blocked (HTTP 428): ${msg}`);
             const prompt = canAuto
                 ? `${msg}\n\nEnable auto-start (runs "${startCommand}") and retry now?`
                 : `${msg}\n\nAuto-start is unavailable. Start core-daemon on the CORE host, then retry.`;
@@ -16507,6 +16532,7 @@ async function submitRunCliRequest(buildRequest, options = {}) {
                 continue;
             }
             try { logWarn(`Daemon check aborted: ${msg}`); } catch (e) {}
+            setAbortReason(msg, { status: 428, kind: 'daemon_missing' });
             return null;
         }
         if (res.status === 423) {
@@ -16528,9 +16554,17 @@ async function submitRunCliRequest(buildRequest, options = {}) {
                 messageParts.push('', 'Active sessions:', detailLines);
             }
             const promptText = messageParts.join('\n') + `\n\nKill the active CORE session(s) and retry now?`;
-            const proceed = window.confirm(promptText);
+            const autoKillSessions = options && options.autoKillSessions === true;
+            let proceed = true;
+            if (!autoKillSessions) {
+                proceed = window.confirm(promptText);
+            } else {
+                logRunRequestDebug(`Active CORE session(s) detected; auto-kill enabled (${sessionCount}).`);
+            }
             if (!proceed) {
-                try { logWarn(`Active CORE session detected; user declined kill (${sessionCount}).`); } catch (e) {}
+                try { logWarn(`Active CORE session detected; kill was not confirmed (${sessionCount}).`); } catch (e) {}
+                logRunRequestDebug(`Run start aborted: active CORE session(s) detected and kill was not confirmed (${sessionCount}).`);
+                setAbortReason('Active CORE session(s) detected; start was cancelled.', { status: 423, kind: 'active_sessions', session_count: sessionCount });
                 return null;
             }
             try {
@@ -16558,6 +16592,8 @@ async function submitRunCliRequest(buildRequest, options = {}) {
                 continue;
             } catch (e) {
                 window.alert('Failed to kill active CORE session(s).');
+                logRunRequestDebug('Run start aborted: failed to kill active CORE session(s).');
+                setAbortReason('Failed to kill active CORE session(s).', { status: 423, kind: 'active_sessions_kill_failed', session_count: sessionCount });
                 return null;
             }
         }
@@ -16567,6 +16603,8 @@ async function submitRunCliRequest(buildRequest, options = {}) {
             if (info && info.daemon_conflict) {
                 const pids = Array.isArray(info.daemon_pids) ? info.daemon_pids.join(', ') : '';
                 const message = `${info.error || 'Multiple core-daemon processes detected.'}${pids ? `\n\nPIDs: ${pids}` : ''}`;
+                logRunRequestDebug(`Run start aborted (daemon conflict): ${info.error || 'Multiple core-daemon processes detected.'}${pids ? ` (pids: ${pids})` : ''}`);
+                setAbortReason(info.error || 'Multiple core-daemon processes detected.', { status: 409, kind: 'daemon_conflict', daemon_pids: Array.isArray(info.daemon_pids) ? info.daemon_pids : [] });
                 alert(message);
                 return null;
             }
@@ -16580,12 +16618,21 @@ async function submitRunCliRequest(buildRequest, options = {}) {
             if (retry) {
                 continue;
             }
+            try {
+                const info = await parseResponseJson(res);
+                const msg = info?.error || 'Remote repository missing on CORE host.';
+                logRunRequestDebug(`Run start aborted (missing repo): ${msg}`);
+                setAbortReason(msg, { status: 409, kind: 'missing_repo', missing_repo: info?.missing_repo || request.repoPath || null });
+            } catch (e) {
+                setAbortReason('Remote repository missing on CORE host.', { status: 409, kind: 'missing_repo' });
+            }
             return null;
         }
         return res;
     }
     logWarn('Exceeded automatic repository sync attempts; aborting run.');
     alert('Unable to start run until the repository is uploaded to the CORE host.');
+    setAbortReason('Exceeded automatic repository sync attempts.', { kind: 'repo_sync_exhausted' });
     return null;
 }
 
@@ -16604,7 +16651,9 @@ async function runAsync() {
     }
     const confirmMsg = 'This action will generate a new CORE scenario and attempt to start it asynchronously using the daemon connection.\n\nProceed?';
     if (!window.confirm(confirmMsg)) { logInfo('Async run cancelled by user at confirmation'); return; }
-    const res = await submitRunCliRequest(() => ({ body: buildRunFormData(rp), xmlPath: rp }));
+    let autoKillSessions = false;
+    try { autoKillSessions = !!getCoreConfig(true)?.adv_auto_kill_sessions; } catch(e) {}
+    const res = await submitRunCliRequest(() => ({ body: buildRunFormData(rp), xmlPath: rp }), { autoKillSessions });
     if (!res) { logWarn('Async run aborted before launch'); return; }
     if (!res.ok) {
         const detail = await extractResponseDetail(res);
@@ -17449,7 +17498,11 @@ async function runSyncWithModal(arg){
         } else if (advancedFromOpts && typeof advancedFromOpts === 'object') {
             formOptions.advanced = advancedFromOpts;
         }
-        const res = await submitRunCliRequest(() => ({ body: buildRunFormData(rp, formOptions), xmlPath: rp, scenarioIndex: scenarioIndexForRun }));
+        const autoKillSessions = !!formOptions?.advanced?.autoKillSessions;
+        const res = await submitRunCliRequest(
+            () => ({ body: buildRunFormData(rp, formOptions), xmlPath: rp, scenarioIndex: scenarioIndexForRun }),
+            { autoKillSessions }
+        );
         if (res) {
             appendExecuteDialogLog(`Remote CLI request completed (HTTP ${res.status}).`);
         }
@@ -17460,7 +17513,14 @@ async function runSyncWithModal(arg){
                     const statusEl = document.getElementById('runProgressStatus');
                     if(statusEl) statusEl.textContent = 'Aborted';
                     const metaEl = document.getElementById('runProgressMeta');
-                    if(metaEl) metaEl.textContent = 'Repository upload required';
+                    let abortReason = 'Run start aborted.';
+                    try {
+                        const last = window.__lastRunStartAbort;
+                        if (last && typeof last === 'object' && last.reason) {
+                            abortReason = String(last.reason);
+                        }
+                    } catch (e) {}
+                    if(metaEl) metaEl.textContent = abortReason;
                     const bar = document.getElementById('runProgressBar');
                     if(bar){ bar.classList.remove('progress-bar-animated'); bar.textContent = 'Aborted'; }
                     markRunProgressComplete();
@@ -17733,7 +17793,8 @@ async function runWithSeedBuild(){
                 scenarioIndex: scenarioIdx,
             };
         };
-        const res = await submitRunCliRequest(buildRequest);
+        const autoKillSessions = !!advancedSelections?.autoKillSessions;
+        const res = await submitRunCliRequest(buildRequest, { autoKillSessions });
         if(res){
             runProgressLogLine(`[ui] Remote CLI request completed (HTTP ${res.status}).`);
         }

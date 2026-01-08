@@ -65,6 +65,85 @@ from ..utils.allocation import compute_counts_by_factor
 logger = logging.getLogger(__name__)
 import os
 
+# Track which docker-node compose files we've prepared this process.
+_PREPARED_DOCKER_NODE_COMPOSES: Set[str] = set()
+
+
+def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str, str]]) -> None:
+    """Best-effort ensure /tmp/vulns/docker-compose-<node>.yml exists and is Mako-safe.
+
+    CORE treats docker compose files as Mako templates. Unescaped `${...}` in compose YAML
+    causes core-daemon startup to fail with NameError("Undefined").
+
+    This is especially important because CORE starts Docker nodes immediately on add_node()
+    (default start=True), and /tmp/vulns may contain stale files from earlier runs.
+    """
+    try:
+        if not node_name:
+            return
+        if node_name in _PREPARED_DOCKER_NODE_COMPOSES:
+            return
+        out_base = "/tmp/vulns"
+        os.makedirs(out_base, exist_ok=True)
+        out_path = os.path.join(out_base, f"docker-compose-{node_name}.yml")
+        # Remove any stale compose file so we don't accidentally reuse an older, unescaped version.
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+        if rec is None:
+            rec = _standard_docker_compose_record()
+        # Ensure downstream helpers know the intended per-node output path.
+        try:
+            if isinstance(rec, dict):
+                rec['compose_path'] = out_path
+        except Exception:
+            pass
+        try:
+            from ..utils.vuln_process import prepare_compose_for_assignments  # type: ignore
+
+            prepare_compose_for_assignments({node_name: rec}, out_base=out_base)
+        except Exception as exc:
+            # Non-fatal: CORE may still succeed if compose is already sanitized,
+            # but log so users can diagnose why docker nodes didn't get rewritten.
+            try:
+                logger.warning("[vuln-node] compose preparation failed for node=%s (%s)", node_name, exc)
+            except Exception:
+                pass
+
+        # Final safety pass: ensure no raw `${...}` remain in the output compose.
+        # This catches cases where upstream generation fails, or where compose_path points
+        # to a source file that couldn't be parsed/rewritten.
+        try:
+            if os.path.exists(out_path):
+                with open(out_path, 'r', encoding='utf-8', errors='ignore') as fh:
+                    txt = fh.read()
+                # Escape only unescaped `${` occurrences.
+                import re as _re
+                # CORE writes rendered compose using a shell `printf "..."`.
+                # Backslash escapes like `\n` inside the content can be interpreted
+                # mid-line, which corrupts YAML indentation. Pre-escape each `\` to
+                # `\\\\` (i.e., 4 backslashes) so the written file keeps a literal `\`.
+                fixed = txt.replace('\\', '\\\\' * 2)
+                # Escape only unescaped `${` occurrences.
+                fixed = _re.sub(r'(?<!\$)\$\{', '$${', fixed)
+                # CORE writes rendered compose using a shell `printf "..."`, so unescaped
+                # percent signs are treated as format directives. Escape single `%` to `%%`.
+                fixed = _re.sub(r'(?<!%)%(?!%)', '%%', fixed)
+                if fixed != txt:
+                    with open(out_path, 'w', encoding='utf-8') as fh:
+                        fh.write(fixed)
+                    try:
+                        logger.info("[vuln-node] compose sanitized for node=%s path=%s", node_name, out_path)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        _PREPARED_DOCKER_NODE_COMPOSES.add(node_name)
+    except Exception:
+        return
+
 
 def _docker_ifid_start() -> int:
     """Return the first interface id to use for CORE-attached DockerNode interfaces.
@@ -484,9 +563,16 @@ def _apply_docker_compose_meta(node, rec, session=None):
         n = getattr(node, 'name', None)
         if not n:
             return
+        # Always prefer the per-node compose path, because CORE's docker node treats
+        # compose files as Mako templates. Many upstream compose files contain `${...}`
+        # (e.g. `${UID:-1000}`), which causes NameError during Mako render unless we
+        # sanitize/escape them. Our pipeline writes sanitized per-node compose files
+        # to this fixed location.
+        default_per_node = f"/tmp/vulns/docker-compose-{n}.yml"
+
         compose_path = None
         try:
-            if rec:
+            if rec and isinstance(rec, dict):
                 compose_path = rec.get('compose_path')
                 logger.info(
                     "[vuln-node] metadata lookup node=%s compose_path=%s record_keys=%s",
@@ -508,20 +594,24 @@ def _apply_docker_compose_meta(node, rec, session=None):
                     pass
         except Exception:
             compose_path = None
-        if not compose_path:
-            compose_path = f"/tmp/vulns/docker-compose-{n}.yml"
-            # This is expected when the caller planned docker assignments but hasn't
-            # generated per-node compose files yet (or when CORE is remote).
-            logger.debug(
-                "[vuln-node] node=%s compose_path missing in record; using default %s",
-                n,
-                compose_path,
-            )
-            try:
-                if rec is not None and isinstance(rec, dict):
-                    rec.setdefault('compose_path', compose_path)
-            except Exception:
-                pass
+
+        # If a record points at a downloaded/shared compose file, override it with
+        # the per-node sanitized compose output path.
+        try:
+            if not compose_path or str(compose_path).strip() != default_per_node:
+                compose_path = default_per_node
+                logger.debug(
+                    "[vuln-node] node=%s using per-node compose path %s",
+                    n,
+                    compose_path,
+                )
+                try:
+                    if rec is not None and isinstance(rec, dict):
+                        rec['compose_path'] = compose_path
+                except Exception:
+                    pass
+        except Exception:
+            compose_path = default_per_node
 
         # NOTE: The compose_path is evaluated on the CORE host (core-daemon). This
         # code often runs on a different machine (e.g., webapp/CLI against remote CORE),
@@ -714,6 +804,9 @@ def _standard_docker_compose_record() -> Dict[str, str]:
         'Name': 'standard-ubuntu-docker-core',
         'Path': _standard_docker_compose_template_path(),
         'Vector': 'standard',
+        # Keep the baseline compose as simple as possible: no Docker builds.
+        # The container installs required tools at runtime via apt.
+        'SkipIproute2Wrapper': 'true',
     }
 
 
@@ -841,7 +934,9 @@ def build_star_from_roles(core,
                           ip_mode: str = "private",
                           ip_region: str = "all",
                           layout_density: str = "normal",
-                          docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None):
+                          docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None,
+                          enable_traffic_mount: bool = False,
+                          enable_segmentation_mount: bool = False):
     logger.info("Creating CORE session and building star topology")
     logger.info("Docker CORE interfaces start at eth%s (CORETG_DOCKER_IFID_START)", _docker_ifid_start())
     mac_alloc = UniqueAllocator(ip4_prefix)
@@ -884,6 +979,14 @@ def build_star_from_roles(core,
     docker_by_name: Dict[str, Dict[str, str]] = {}
     created_docker = 0
 
+    def _apply_mount_overlays(rec: Optional[Dict[str, str]]) -> None:
+        if not isinstance(rec, dict):
+            return
+        if enable_traffic_mount:
+            rec.setdefault('EnableTrafficMount', 'true')
+        if enable_segmentation_mount:
+            rec.setdefault('EnableSegmentationMount', 'true')
+
     docker_slots_used: Set[str] = set()
     for idx, role in enumerate(expanded_roles):
         theta = (2 * math.pi * idx) / max(total_hosts, 1)
@@ -898,6 +1001,7 @@ def build_star_from_roles(core,
         try:
             if _is_docker_node_type(node_type) and role.lower() == 'docker':
                 docker_by_name.setdefault(node_name, _standard_docker_compose_record())
+                _apply_mount_overlays(docker_by_name.get(node_name))
                 created_docker += 1
         except Exception:
             pass
@@ -910,12 +1014,21 @@ def build_star_from_roles(core,
                     if hasattr(NodeType, "DOCKER"):
                         node_type = getattr(NodeType, "DOCKER")
                         docker_by_name[node_name] = docker_slot_plan[slot_key]
+                        _apply_mount_overlays(docker_by_name.get(node_name))
                         created_docker += 1
                         docker_slots_used.add(slot_key)
                     else:
                         logger.warning("NodeType.DOCKER not available in this CORE build; cannot create docker nodes even though a slot plan exists")
             except Exception:
                 pass
+
+        # Prepare per-node compose file BEFORE creating the docker node.
+        # CORE starts Docker nodes immediately on add_node() and will Mako-render the compose file.
+        try:
+            if _is_docker_node_type(node_type):
+                _ensure_docker_node_compose_prepared(node_name, docker_by_name.get(node_name))
+        except Exception:
+            pass
         logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id, node_name, _type_desc(node_type), x, y)
         node_position = Position(x=x, y=y)
         node = session.add_node(node_id, _type=node_type, position=node_position, name=node_name)
@@ -977,7 +1090,13 @@ def build_star_from_roles(core,
 
             dev_ifid = dev_next_ifid.get(node.id, docker_ifid_start if is_docker else 0)
             dev_iface_name = f"eth{dev_ifid}" if is_docker else f"{node_name}-uplink"
-            dev_iface = Interface(id=dev_ifid, name=dev_iface_name)
+            if is_docker:
+                host_ip, host_mask = mac_alloc.next_ip()
+                host_mac = mac_alloc.next_mac()
+                dev_iface = Interface(id=dev_ifid, name=dev_iface_name, ip4=host_ip, ip4_mask=host_mask, mac=host_mac)
+                node_infos.append(NodeInfo(node_id=node.id, ip4=f"{host_ip}/{host_mask}", role=role))
+            else:
+                dev_iface = Interface(id=dev_ifid, name=dev_iface_name)
             dev_next_ifid[node.id] = dev_ifid + 1
 
             sw_iface = Interface(id=sw_ifid, name=f"sw{sw_ifid}", mac=mac_alloc.next_mac())
@@ -1079,7 +1198,9 @@ def build_multi_switch_topology(core,
                                 ip_region: str = "all",
                                 access_switches: int = 3,
                                 layout_density: str = "normal",
-                                docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None):
+                                docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None,
+                                enable_traffic_mount: bool = False,
+                                enable_segmentation_mount: bool = False):
     """Build a simple multi-switch topology with an aggregation switch.
 
     Returns: session, [switch_ids], host NodeInfo list, service assignments
@@ -1169,6 +1290,14 @@ def build_multi_switch_topology(core,
     host_slot_idx = 0
     docker_by_name: Dict[str, Dict[str, str]] = {}
     created_docker = 0
+
+    def _apply_mount_overlays(rec: Optional[Dict[str, str]]) -> None:
+        if not isinstance(rec, dict):
+            return
+        if enable_traffic_mount:
+            rec.setdefault('EnableTrafficMount', 'true')
+        if enable_segmentation_mount:
+            rec.setdefault('EnableSegmentationMount', 'true')
     for idx, role in enumerate(expanded_roles):
         # pick an access switch in round-robin
         sw_index = (idx % access_count) + 1  # skip agg at index 0
@@ -1187,6 +1316,7 @@ def build_multi_switch_topology(core,
         try:
             if _is_docker_node_type(node_type) and role.lower() == 'docker':
                 docker_by_name.setdefault(name, _standard_docker_compose_record())
+                _apply_mount_overlays(docker_by_name.get(name))
                 created_docker += 1
         except Exception:
             pass
@@ -1198,11 +1328,19 @@ def build_multi_switch_topology(core,
                     if hasattr(NodeType, "DOCKER"):
                         node_type = getattr(NodeType, "DOCKER")
                         docker_by_name[name] = docker_slot_plan[slot_key]
+                        _apply_mount_overlays(docker_by_name.get(name))
                         created_docker += 1
                     else:
                         logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan on multi-switch")
             except Exception:
                 pass
+
+        # Prepare per-node compose file BEFORE creating the docker node.
+        try:
+            if _is_docker_node_type(node_type):
+                _ensure_docker_node_compose_prepared(name, docker_by_name.get(name))
+        except Exception:
+            pass
         logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", next_id, name, _type_desc(node_type), x, y)
         node_position = Position(x=x, y=y)
         node = session.add_node(next_id, _type=node_type, position=node_position, name=name)
@@ -1264,10 +1402,15 @@ def build_multi_switch_topology(core,
             sw_if = Interface(id=sw_ifid[sw_node_id], name=f"sw{sw_node_id}-d{node.id}")
             is_docker = _is_docker_node_type(node_type)
             if is_docker:
+                lan = subnet_alloc.next_random_subnet(24)
+                lan_hosts = list(lan.hosts())
+                h_ip = str(lan_hosts[1])
+                h_mac = mac_alloc.next_mac()
                 dev_ifid = dev_next_ifid.get(node.id, docker_ifid_start)
                 dev_next_ifid[node.id] = dev_ifid + 1
-                dev_if = Interface(id=dev_ifid, name=f"eth{dev_ifid}")
+                dev_if = Interface(id=dev_ifid, name=f"eth{dev_ifid}", ip4=h_ip, ip4_mask=lan.prefixlen, mac=h_mac)
                 safe_add_link(session, node, sw_node, iface1=dev_if, iface2=sw_if)
+                node_infos.append(NodeInfo(node_id=node.id, ip4=f"{h_ip}/{lan.prefixlen}", role=role))
                 _ensure_default_route_for_docker(session, node)
             else:
                 safe_add_link(session, node, sw_node, iface2=sw_if)
@@ -1498,6 +1641,8 @@ def _try_build_segmented_topology_from_preview(
     layout_density: str,
     preview_plan: Dict[str, Any],
     docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None,
+    enable_traffic_mount: bool = False,
+    enable_segmentation_mount: bool = False,
 ) -> Optional[Tuple[Any, List[NodeInfo], List[NodeInfo], Dict[int, List[str]], Dict[int, List[str]], Dict[str, Dict[str, str]]]]:
     """Attempt to realize the provided preview plan exactly. Returns None on failure."""
 
@@ -1635,6 +1780,14 @@ def _try_build_segmented_topology_from_preview(
     docker_by_name: Dict[str, Dict[str, str]] = {}
     created_docker = 0
 
+    def _apply_mount_overlays(rec: Optional[Dict[str, str]]) -> None:
+        if not isinstance(rec, dict):
+            return
+        if enable_traffic_mount:
+            rec.setdefault('EnableTrafficMount', 'true')
+        if enable_segmentation_mount:
+            rec.setdefault('EnableSegmentationMount', 'true')
+
     docker_ifid_start = _docker_ifid_start()
 
     sorted_hosts = sorted(hosts_data, key=lambda h: h.get('node_id', 0))
@@ -1672,6 +1825,7 @@ def _try_build_segmented_topology_from_preview(
                     docker_by_name[name] = flow_rec
                 else:
                     docker_by_name.setdefault(name, _standard_docker_compose_record())
+                _apply_mount_overlays(docker_by_name.get(name))
                 created_docker += 1
         except Exception:
             pass
@@ -1687,12 +1841,21 @@ def _try_build_segmented_topology_from_preview(
                         base_rec = docker_slot_plan[slot_key]
                         overlay = _flow_flag_artifacts_overlay_from_host_metadata(hdata)
                         docker_by_name[name] = {**base_rec, **overlay} if overlay else base_rec
+                        _apply_mount_overlays(docker_by_name.get(name))
                         created_docker += 1
                         docker_slots_used.add(slot_key)
                     else:
                         logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan during preview realization")
             except Exception:
                 pass
+
+        # Prepare per-node compose file BEFORE creating the docker node.
+        # CORE starts Docker nodes immediately on add_node() and will Mako-render the compose file.
+        try:
+            if _is_docker_node_type(node_type):
+                _ensure_docker_node_compose_prepared(name, docker_by_name.get(name))
+        except Exception:
+            pass
 
         logger.info("[preview] add_host id=%s name=%s type=%s pos=(%s,%s)", hid, name, _type_desc(node_type), x, y)
         host_position = Position(x=x, y=y)
@@ -1724,7 +1887,7 @@ def _try_build_segmented_topology_from_preview(
             pass
 
         ip_hint = str(hdata.get('ip4') or "")
-        if node_type == NodeType.DEFAULT:
+        if node_type == NodeType.DEFAULT or _is_docker_node_type(node_type):
             hosts_info.append(NodeInfo(node_id=hid, ip4=ip_hint, role=role))
 
     if docker_slot_plan:
@@ -1903,9 +2066,9 @@ def _try_build_segmented_topology_from_preview(
         base_name = f"r{router_id}-rsw{sid}"
         r_iface_name = _ensure_router_iface_name(router_iface_names, router_id, base_name)
         r_iface = Interface(id=r_ifid, name=r_iface_name, ip4=r_ip_val, ip4_mask=r_mask_int, mac=mac_alloc.next_mac())
-        # Force switch-side interface to have no IPv4; some CORE builds auto-assign
-        # addresses unless we explicitly send empty/0 values.
-        sw_iface = Interface(id=0, name=f"{getattr(sw_node, 'name', f'rsw-{sid}')}-r{router_id}", ip4="", ip4_mask=0, mac=mac_alloc.next_mac())
+        # Switches are L2; do not assign IPv4 fields at all on switch interfaces.
+        # Some CORE builds interpret even empty ip4/ip4_mask as an address assignment.
+        sw_iface = Interface(id=0, name=f"{getattr(sw_node, 'name', f'rsw-{sid}')}-r{router_id}", mac=mac_alloc.next_mac())
         safe_add_link(session, router_node, sw_node, iface1=r_iface, iface2=sw_iface)
         link_counters['attempts'] += 1
         link_counters['success'] += 1
@@ -1963,10 +2126,8 @@ def _try_build_segmented_topology_from_preview(
                 hip_mask_int = int(shared_net.prefixlen) if shared_net else 24
             iface_id = host_next_ifid[hid]
             host_iface = Interface(id=iface_id, name=f"eth{iface_id}", ip4=hip_val, ip4_mask=hip_mask_int, mac=mac_alloc.next_mac())
-            # Switches are L2; do not assign a gateway IP on the switch interface.
-            # Switches are L2; do not assign a gateway IP on the switch interface.
-            # Use empty/0 to avoid CORE auto-allocation.
-            sw_host_iface = Interface(id=index + 1, name=f"{getattr(sw_node, 'name', 'rsw')}-h{hid}", ip4="", ip4_mask=0, mac=mac_alloc.next_mac())
+            # Switches are L2; do not assign IPv4 fields at all on switch interfaces.
+            sw_host_iface = Interface(id=index + 1, name=f"{getattr(sw_node, 'name', 'rsw')}-h{hid}", mac=mac_alloc.next_mac())
             if safe_add_link(session, host_node, sw_node, iface1=host_iface, iface2=sw_host_iface):
                 host_next_ifid[hid] += 1
                 link_counters['attempts'] += 1
@@ -2203,7 +2364,9 @@ def build_segmented_topology(core,
                              layout_density: str = "normal",
                              docker_slot_plan: Optional[Dict[str, Dict[str, str]]] = None,
                              router_mesh_style: str = "full",
-                             preview_plan: Optional[Dict[str, Any]] = None):
+                             preview_plan: Optional[Dict[str, Any]] = None,
+                             enable_traffic_mount: bool = False,
+                             enable_segmentation_mount: bool = False):
     logger.info("Docker CORE interfaces start at eth%s (CORETG_DOCKER_IFID_START)", _docker_ifid_start())
     def _preview_payload_present(payload: Optional[Dict[str, Any]]) -> bool:
         """Return True when caller provided a preview-like payload (not just a seed override)."""
@@ -2238,6 +2401,8 @@ def build_segmented_topology(core,
             layout_density=layout_density,
             preview_plan=preview_plan,
             docker_slot_plan=docker_slot_plan,
+            enable_traffic_mount=enable_traffic_mount,
+            enable_segmentation_mount=enable_segmentation_mount,
         )
         if preview_result is not None:
             return preview_result
@@ -2343,6 +2508,8 @@ def build_segmented_topology(core,
             ip_mode=ip_mode,
             ip_region=ip_region,
             docker_slot_plan=docker_slot_plan,
+            enable_traffic_mount=enable_traffic_mount,
+            enable_segmentation_mount=enable_segmentation_mount,
         )
         # Attach empty topo_stats for consistency
         try:
@@ -2818,6 +2985,14 @@ def build_segmented_topology(core,
     docker_by_name: Dict[str, Dict[str, str]] = {}
     created_docker = 0
 
+    def _apply_mount_overlays(rec: Optional[Dict[str, str]]) -> None:
+        if not isinstance(rec, dict):
+            return
+        if enable_traffic_mount:
+            rec.setdefault('EnableTrafficMount', 'true')
+        if enable_segmentation_mount:
+            rec.setdefault('EnableSegmentationMount', 'true')
+
     docker_ifid_start = _docker_ifid_start()
     for ridx, roles in enumerate(buckets):
         rx, ry = r_positions[ridx]
@@ -2839,6 +3014,7 @@ def build_segmented_topology(core,
             try:
                 if _is_docker_node_type(node_type) and role.lower() == 'docker':
                     docker_by_name.setdefault(name, _standard_docker_compose_record())
+                    _apply_mount_overlays(docker_by_name.get(name))
                     created_docker += 1
             except Exception:
                 pass
@@ -2850,12 +3026,21 @@ def build_segmented_topology(core,
                         if hasattr(NodeType, "DOCKER"):
                             node_type = getattr(NodeType, "DOCKER")
                             docker_by_name[name] = docker_slot_plan[slot_key]
+                            _apply_mount_overlays(docker_by_name.get(name))
                             created_docker += 1
                             docker_slots_used.add(slot_key)
                         else:
                             logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan on segmented (single-host)")
                 except Exception:
                     pass
+
+            # Prepare per-node compose file BEFORE creating the docker node.
+            # CORE starts Docker nodes immediately on add_node() and will Mako-render the compose file.
+            try:
+                if _is_docker_node_type(node_type):
+                    _ensure_docker_node_compose_prepared(name, docker_by_name.get(name))
+            except Exception:
+                pass
             logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, name, _type_desc(node_type), x, y)
             host_position = Position(x=x, y=y)
             host = session.add_node(node_id_counter, _type=node_type, position=host_position, name=name)
@@ -2917,7 +3102,7 @@ def build_segmented_topology(core,
             host_router_map[host.id] = router_node.id
             host_direct_link[host.id] = True
             logger.debug("Host %s <-> Router %s LAN /%s", host.id, router_node.id, lan_net.prefixlen)
-            if node_type == NodeType.DEFAULT:
+            if node_type == NodeType.DEFAULT or _is_docker_node_type(node_type):
                 hosts.append(NodeInfo(node_id=host.id, ip4=f"{h_ip}/{lan_net.prefixlen}", role=role))
                 # Ensure default routing service on hosts
                 try:
@@ -2947,6 +3132,7 @@ def build_segmented_topology(core,
                 try:
                     if _is_docker_node_type(node_type) and role.lower() == 'docker':
                         docker_by_name.setdefault(name, _standard_docker_compose_record())
+                        _apply_mount_overlays(docker_by_name.get(name))
                         created_docker += 1
                 except Exception:
                     pass
@@ -2958,12 +3144,21 @@ def build_segmented_topology(core,
                             if hasattr(NodeType, "DOCKER"):
                                 node_type = getattr(NodeType, "DOCKER")
                                 docker_by_name[name] = docker_slot_plan[slot_key]
+                                _apply_mount_overlays(docker_by_name.get(name))
                                 created_docker += 1
                                 docker_slots_used.add(slot_key)
                             else:
                                 logger.warning("NodeType.DOCKER not available; cannot apply docker slot plan on segmented (multi-host deferred)")
                     except Exception:
                         pass
+
+                # Prepare per-node compose file BEFORE creating the docker node.
+                # CORE starts Docker nodes immediately on add_node() and will Mako-render the compose file.
+                try:
+                    if _is_docker_node_type(node_type):
+                        _ensure_docker_node_compose_prepared(name, docker_by_name.get(name))
+                except Exception:
+                    pass
                 logger.info("[grpc] add_node id=%s name=%s type=%s pos=(%s,%s)", node_id_counter, name, _type_desc(node_type), x, y)
                 host_position = Position(x=x, y=y)
                 host = session.add_node(node_id_counter, _type=node_type, position=host_position, name=name)
@@ -3001,7 +3196,7 @@ def build_segmented_topology(core,
                 safe_add_link(session, host, router_node, iface1=host_if, iface2=r_if)
                 host_router_map[host.id] = router_node.id
                 host_direct_link[host.id] = True
-                if node_type == NodeType.DEFAULT:
+                if node_type == NodeType.DEFAULT or _is_docker_node_type(node_type):
                     hosts.append(NodeInfo(node_id=host.id, ip4=f"{h_ip}/{lan_net.prefixlen}", role=role))
                     try:
                         ensure_service(session, host.id, "DefaultRoute", node_obj=host)
@@ -3247,8 +3442,8 @@ def build_segmented_topology(core,
                 base_name = f"r{router_id}-rsw{switch_id}-if{r_ifid}"
                 r_iface_name = _ensure_router_iface_name(router_iface_names, router_id, base_name)
                 r_iface = Interface(id=r_ifid, name=r_iface_name, ip4=r_ip_val, ip4_mask=mask_len, mac=mac_alloc.next_mac())
-                # Switch is L2: no IPv4 on the switch interface (use empty/0 to prevent auto-allocation).
-                sw_iface = Interface(id=0, name=f"{getattr(sw_node, 'name', f'rsw-{switch_id}')}-r{router_id}", ip4="", ip4_mask=0, mac=mac_alloc.next_mac())
+                # Switch is L2: do not assign IPv4 fields on the switch interface.
+                sw_iface = Interface(id=0, name=f"{getattr(sw_node, 'name', f'rsw-{switch_id}')}-r{router_id}", mac=mac_alloc.next_mac())
                 router_link_ok = safe_add_link(session, router_node, sw_node, iface1=r_iface, iface2=sw_iface)
                 if not router_link_ok:
                     # If we cannot link the switch to its router, do not keep the switch and do NOT
@@ -3313,9 +3508,8 @@ def build_segmented_topology(core,
                     hip_mask = lan_net.prefixlen if lan_net else 24
                 next_if = host_next_ifid.get(hid, 1)
                 host_iface = Interface(id=next_if, name=f"eth{next_if}", ip4=hip, ip4_mask=hip_mask, mac=mac_alloc.next_mac())
-                # Switch is L2: no gateway IP on the switch interface.
-                # Switch is L2: no IPv4 on the switch interface (use empty/0 to prevent auto-allocation).
-                sw_iface = Interface(id=idx + 1, name=f"{getattr(created_switch_nodes[switch_id], 'name', f'rsw-{switch_id}')}-h{hid}-{idx+1}", ip4="", ip4_mask=0, mac=mac_alloc.next_mac())
+                # Switch is L2: do not assign IPv4 fields on the switch interface.
+                sw_iface = Interface(id=idx + 1, name=f"{getattr(created_switch_nodes[switch_id], 'name', f'rsw-{switch_id}')}-h{hid}-{idx+1}", mac=mac_alloc.next_mac())
                 host_link_ok = safe_add_link(session, h_obj, created_switch_nodes[switch_id], iface1=host_iface, iface2=sw_iface)
                 if not host_link_ok:
                     # Keep the host's direct router link intact if the rehome link fails.

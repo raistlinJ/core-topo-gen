@@ -1223,6 +1223,61 @@ def _inject_service_bind_mount(compose_obj: dict, bind: str, prefer_service: Opt
 		return compose_obj
 
 
+def _inject_service_environment(compose_obj: dict, env: Dict[str, str], prefer_service: Optional[str] = None) -> dict:
+	"""Inject environment variables into the selected service (best-effort).
+
+	Supports both dict-form and list-form `environment` entries.
+	"""
+	try:
+		if not env or not isinstance(env, dict):
+			return compose_obj
+		if not isinstance(compose_obj, dict):
+			return compose_obj
+		services = compose_obj.get('services')
+		if not isinstance(services, dict) or not services:
+			return compose_obj
+		svc_key = _select_service_key(compose_obj, prefer_service=prefer_service)
+		if not svc_key:
+			return compose_obj
+		svc = services.get(svc_key)
+		if not isinstance(svc, dict):
+			return compose_obj
+
+		cur = svc.get('environment')
+		# Prefer dict form when possible.
+		if cur is None:
+			svc['environment'] = {k: str(v) for k, v in env.items()}
+			return compose_obj
+		if isinstance(cur, dict):
+			new_env = dict(cur)
+			for k, v in env.items():
+				new_env[str(k)] = str(v)
+			svc['environment'] = new_env
+			return compose_obj
+		if isinstance(cur, list):
+			# Normalize list entries to KEY=VAL
+			existing_keys = set()
+			out_list: List[str] = []
+			for item in cur:
+				if item is None:
+					continue
+				text = str(item)
+				out_list.append(text)
+				if '=' in text:
+					existing_keys.add(text.split('=', 1)[0])
+			for k, v in env.items():
+				ks = str(k)
+				if ks in existing_keys:
+					continue
+				out_list.append(f"{ks}={v}")
+			svc['environment'] = out_list
+			return compose_obj
+		# Unknown structure; don't mutate.
+		return compose_obj
+	except Exception:
+		return compose_obj
+
+
 def _ensure_list_field_has(value: object, item: str) -> List[str]:
 	"""Normalize a compose field that may be a string/list and ensure item is present."""
 	out: List[str] = []
@@ -1250,18 +1305,19 @@ def _write_iproute2_wrapper(out_dir: str, base_image: str) -> str:
 
 RUN set -eux; \\
 		if command -v apt-get >/dev/null 2>&1; then \\
-			apt-get update; \\
-			apt-get install -y --no-install-recommends iproute2 ethtool; \\
+			apt-get update || true; \
+			apt-get install -y --no-install-recommends iproute2 ethtool || true; \
 			rm -rf /var/lib/apt/lists/*; \\
 		elif command -v apk >/dev/null 2>&1; then \\
-			apk add --no-cache iproute2 ethtool; \\
+			apk add --no-cache iproute2 ethtool || true; \
 		elif command -v dnf >/dev/null 2>&1; then \\
-			dnf install -y iproute ethtool && dnf clean all; \\
+			dnf install -y iproute ethtool || true; \
+			dnf clean all || true; \
 		elif command -v yum >/dev/null 2>&1; then \\
-			yum install -y iproute ethtool && yum clean all; \\
+			yum install -y iproute ethtool || true; \
+			yum clean all || true; \
     else \\
-			echo "No supported package manager found to install iproute2/ethtool" >&2; \\
-      exit 1; \\
+			echo "No supported package manager found to install iproute2/ethtool (continuing)" >&2; \
     fi
 """
 	with open(dockerfile_path, 'w', encoding='utf-8') as f:
@@ -1430,6 +1486,53 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 		return created
 	os.makedirs(out_base, exist_ok=True)
 
+	def _rec_get(rec: Dict[str, str], *keys: str) -> str:
+		for k in keys:
+			try:
+				v = rec.get(k)
+			except Exception:
+				v = None
+			if v is None:
+				continue
+			try:
+				s = str(v)
+			except Exception:
+				continue
+			if s is not None:
+				return s
+		return ""
+
+	def _is_docker_compose_record(rec: Dict[str, str]) -> bool:
+		try:
+			# Accept multiple key spellings and normalize
+			vtype = _rec_get(rec, 'Type', 'type', 'v_type', 'VType')
+			return _norm_type(vtype) == 'docker-compose'
+		except Exception:
+			return False
+
+	def _set_container_name_for_selected_service(compose_obj: dict, node_name: str, prefer_service: Optional[str] = None) -> dict:
+		"""Set container_name for the selected service to the CORE node name (best-effort).
+
+		CORE's docker node startup path expects a stable container name; if not set,
+		core-daemon may try to inject one itself.
+		"""
+		try:
+			if not isinstance(compose_obj, dict):
+				return compose_obj
+			services = compose_obj.get('services')
+			if not isinstance(services, dict) or not services:
+				return compose_obj
+			svc_key = _select_service_key(compose_obj, prefer_service=prefer_service)
+			if not svc_key:
+				return compose_obj
+			svc = services.get(svc_key)
+			if not isinstance(svc, dict):
+				return compose_obj
+			svc['container_name'] = str(node_name)
+			return compose_obj
+		except Exception:
+			return compose_obj
+
 	def _escape_mako_dollars(text: str) -> str:
 		"""Escape Mako-sensitive `${...}` so they render literally in output.
 
@@ -1443,21 +1546,54 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			return _re.sub(r'(?<!\$)\$\{', '$${', text)
 		except Exception:
 			return text
+
+	def _escape_core_printf_percents(text: str) -> str:
+		"""Escape `%` so CORE's `printf "..." >> docker-compose.yml` writes literal percents.
+
+		CORE (core-daemon) writes rendered docker-compose templates using a shell printf
+		format string. Any unescaped `%` in the compose content is interpreted as a
+		printf directive and can fail (e.g. `%Y` in `date +"%Y-%m-%d"`).
+
+		We rewrite single `%` to `%%` (printf escapes) while preserving existing `%%`.
+		"""
+		try:
+			import re as _re
+			return _re.sub(r'(?<!%)%(?!%)', '%%', text)
+		except Exception:
+			return text
+
+	def _escape_core_printf_backslashes(text: str) -> str:
+		"""Escape backslashes so CORE's host-side printf doesn't interpret sequences like `\n`.
+
+		CORE writes rendered docker-compose templates via a shell `printf "<content>"`.
+		That means both the shell and printf can interpret backslashes, which can inject
+		newlines mid-line (e.g. `\n`) and corrupt YAML indentation.
+
+		We pre-escape each literal backslash (`\\`) to `\\\\` so that after shell double-quote
+		processing and printf escape handling, the written compose contains the original
+		single backslash.
+		"""
+		try:
+			# Replace a single backslash with 4 backslashes.
+			# This prevents CORE's host-side printf from interpreting sequences like `\n`
+			# mid-line, which can corrupt YAML indentation.
+			return text.replace('\\', '\\\\' * 2)
+		except Exception:
+			return text
 	cache: Dict[Tuple[str, str], Tuple[Optional[dict], Optional[str], Optional[str], bool]] = {}
 	for node_name, rec in name_to_vuln.items():
-		vtype = (rec.get('Type') or '').strip().lower()
-		if vtype != 'docker-compose':
+		if not _is_docker_compose_record(rec):
 			continue
 		try:
 			logger.info(
 				"[vuln] preparing docker-compose for node=%s name=%s path=%s",
 				node_name,
-				rec.get('Name'),
-				rec.get('Path'),
+				_rec_get(rec, 'Name', 'name', 'Title', 'title') or None,
+				_rec_get(rec, 'Path', 'path') or None,
 			)
 		except Exception:
 			pass
-		key = ((rec.get('Name') or '').strip(), (rec.get('Path') or '').strip())
+		key = ((_rec_get(rec, 'Name', 'name', 'Title', 'title') or '').strip(), (_rec_get(rec, 'Path', 'path') or '').strip())
 		hint_text = str(rec.get('HintText') or '').strip()
 		base_compose_obj: Optional[dict]
 		src_path: Optional[str]
@@ -1478,17 +1614,27 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			safe = _safe_name(key[0] or 'vuln') or 'vuln'
 			base_dir = os.path.join(out_base, safe)
 			os.makedirs(base_dir, exist_ok=True)
-			raw_url = _guess_compose_raw_url(key[1], compose_name=compose_name)
 			src_path = os.path.join(base_dir, compose_name)
 			ok = False
 			is_local = False
-			if raw_url:
-				logger.info("[vuln] fetching compose url=%s dest=%s", raw_url, src_path)
-				ok = _download_to(raw_url, src_path)
-			if not ok and key[1] and os.path.exists(key[1]):
-				logger.info("[vuln] copying compose from local path=%s dest=%s", key[1], src_path)
-				ok = _download_to(key[1], src_path)
-				is_local = True
+			# Prefer already-downloaded compose artifacts under out_base/<safe_name>/... .
+			# This avoids re-fetching from the network on offline CORE hosts.
+			try:
+				dl_path = _compose_path_from_download(rec, out_base=out_base, compose_name=compose_name)
+				if dl_path and os.path.exists(dl_path):
+					src_path = dl_path
+					ok = True
+			except Exception:
+				pass
+			if not ok:
+				raw_url = _guess_compose_raw_url(key[1], compose_name=compose_name)
+				if raw_url:
+					logger.info("[vuln] fetching compose url=%s dest=%s", raw_url, src_path)
+					ok = _download_to(raw_url, src_path)
+				if not ok and key[1] and os.path.exists(key[1]):
+					logger.info("[vuln] copying compose from local path=%s dest=%s", key[1], src_path)
+					ok = _download_to(key[1], src_path)
+					is_local = True
 			if not ok:
 				cache[key] = (None, None, None, False)
 				try:
@@ -1551,6 +1697,8 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				pass
 			# Avoid name collisions: ensure no hard-coded container_name remains in any service.
 			obj = _remove_container_names_all_services(obj)
+			# Ensure the selected service uses the CORE node name (CORE may attempt to inject otherwise).
+			obj = _set_container_name_for_selected_service(obj, node_name, prefer_service=prefer)
 			# Remove obsolete top-level 'version' key to suppress warnings.
 			try:
 				obj.pop('version', None)
@@ -1567,8 +1715,48 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 					obj = _inject_service_bind_mount(obj, bind, prefer_service=prefer)
 			except Exception:
 				pass
+			# Optional overlays for traffic/segmentation nodes (kept out of baseline template).
+			try:
+				def _truthy(val: object) -> bool:
+					v = str(val or '').strip().lower()
+					return v in ('1', 'true', 'yes', 'y', 'on')
+				enable_traffic = _truthy(rec.get('EnableTrafficMount') or rec.get('traffic_mount') or rec.get('is_traffic_node'))
+				enable_seg = _truthy(rec.get('EnableSegmentationMount') or rec.get('segmentation_mount') or rec.get('is_segmentation_node'))
+				if enable_traffic:
+					obj = _inject_service_bind_mount(obj, '/tmp/traffic:/tmp/traffic:ro', prefer_service=prefer)
+					obj = _inject_service_environment(obj, {'CORETG_TRAFFIC_NODE': '1'}, prefer_service=prefer)
+				if enable_seg:
+					obj = _inject_service_bind_mount(obj, '/tmp/segmentation:/tmp/segmentation:ro', prefer_service=prefer)
+					obj = _inject_service_environment(obj, {'CORETG_SEGMENTATION_NODE': '1'}, prefer_service=prefer)
+			except Exception:
+				pass
+			# Generic compose overlays (intended for flag-sequencer).
+			try:
+				extra_binds = rec.get('ExtraBinds') or rec.get('ExtraVolumes')
+				if isinstance(extra_binds, str):
+					# Allow semicolon-separated list
+					parts = [p.strip() for p in extra_binds.split(';') if p.strip()]
+					for b in parts:
+						obj = _inject_service_bind_mount(obj, b, prefer_service=prefer)
+				elif isinstance(extra_binds, list):
+					for b in extra_binds:
+						if b is None:
+							continue
+						obj = _inject_service_bind_mount(obj, str(b), prefer_service=prefer)
+			except Exception:
+				pass
+			try:
+				extra_env = rec.get('ExtraEnv') or rec.get('ExtraEnvironment')
+				if isinstance(extra_env, dict):
+					obj = _inject_service_environment(obj, {str(k): str(v) for k, v in extra_env.items()}, prefer_service=prefer)
+			except Exception:
+				pass
 			# Ensure the selected service uses a wrapper build that installs iproute2.
 			try:
+				skip_wrap_raw = str(rec.get('SkipIproute2Wrapper') or '').strip().lower()
+				skip_wrapper = skip_wrap_raw in ('1', 'true', 'yes', 'y', 'on')
+				if skip_wrapper:
+					raise RuntimeError('skip_iproute2_wrapper')
 				svc_key = _select_service_key(obj, prefer_service=prefer)
 				services = obj.get('services') if isinstance(obj, dict) else None
 				if svc_key and isinstance(services, dict) and isinstance(services.get(svc_key), dict):
@@ -1578,18 +1766,25 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						wrap_dir = os.path.join(out_base, f"docker-wrap-{_safe_name(node_name)}")
 						_write_iproute2_wrapper(wrap_dir, base_image)
 						# Rewrite service to build the wrapper; keep a tagged image for caching.
-						svc['build'] = {'context': wrap_dir, 'dockerfile': 'Dockerfile'}
+						# NOTE: some CORE VM Docker installs are missing the default "bridge" network,
+						# which causes `docker compose build` to fail with "network bridge not found".
+						# Force host networking for the build to avoid relying on the bridge network.
+						svc['build'] = {'context': wrap_dir, 'dockerfile': 'Dockerfile', 'network': 'host'}
 						svc['image'] = f"coretg/{_safe_name(node_name)}:iproute2"
 						# DefaultRoute needs iproute2 + NET_ADMIN in many images.
 						svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_ADMIN')
 					else:
 						logger.warning("[vuln] compose service has no image; cannot inject iproute2 wrapper for node=%s service=%s", node_name, svc_key)
 			except Exception:
-				logger.exception("[vuln] failed injecting iproute2 wrapper for node=%s", node_name)
+				# Best-effort: wrapper injection is optional.
+				pass
 			try:
-				# Dump YAML to string first, then escape `${...}` to avoid Mako interpreting variables.
+				# Dump YAML to string first, then escape sequences that CORE's host-side printf
+				# would otherwise interpret.
 				text = yaml.safe_dump(obj, sort_keys=False)
+				text = _escape_core_printf_backslashes(text)
 				text = _escape_mako_dollars(text)
+				text = _escape_core_printf_percents(text)
 				with open(out_path, 'w', encoding='utf-8') as f:
 					f.write(text)
 				services_keys = list((obj.get('services') or {}).keys()) if isinstance(obj, dict) else []
@@ -1613,7 +1808,9 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 					text_sanitized = _strip_port_mappings_from_text(txt)
 					text_sanitized = _inject_network_mode_none_text(text_sanitized)
 					# Escape `${...}` to prevent Mako NameError during template rendering.
+					text_sanitized = _escape_core_printf_backslashes(text_sanitized)
 					text_sanitized = _escape_mako_dollars(text_sanitized)
+					text_sanitized = _escape_core_printf_percents(text_sanitized)
 					logger.debug(
 						"[vuln] sanitized compose text node=%s original_len=%s new_len=%s",
 						node_name,

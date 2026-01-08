@@ -1054,6 +1054,24 @@ def main():
                             logging.info("Compose assignments prepared for %d docker nodes; startup deferred to CORE session", len(created))
                         except Exception:
                             pass
+
+                        # Ensure CORE docker nodes point at the per-node sanitized compose output.
+                        # Without this, a node may still reference a downloaded compose (which can
+                        # contain `${...}` and trigger Mako NameError in core-daemon).
+                        try:
+                            for ni in (hosts or []):
+                                try:
+                                    node_obj = session.get_node(ni.node_id)
+                                    nm = getattr(node_obj, 'name', None)
+                                except Exception:
+                                    nm = None
+                                if nm and nm in name_to_vuln:
+                                    try:
+                                        _apply_docker_compose_meta(node_obj, name_to_vuln[nm], session=session)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
                     else:
                         logging.info("No docker nodes present after build; skipping compose prep")
                 except Exception as e2:
