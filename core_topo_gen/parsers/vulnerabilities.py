@@ -36,7 +36,9 @@ def parse_vulnerabilities_info(xml_path: str, scenario_name: Optional[str]) -> T
             logger.warning("Invalid Vulnerabilities density '%s'", den_raw)
             density = 0.0
     for it in section.findall("./item"):
-        selected = (it.get("selected") or "").strip() or "Random"
+        selected_raw = (it.get("selected") or "").strip() or "Random"
+        # Accept UI synonym "Category" for schema label "Type/Vector".
+        selected = "Type/Vector" if selected_raw == "Category" else selected_raw
         try:
             factor = float((it.get("factor") or "0").strip())
         except Exception:
@@ -45,6 +47,14 @@ def parse_vulnerabilities_info(xml_path: str, scenario_name: Optional[str]) -> T
         vm = (it.get("v_metric") or "").strip()
         if vm:
             rec["v_metric"] = vm
+        # v_count applies whenever v_metric == Count (not only Specific)
+        if vm.strip().lower() == 'count':
+            vc_raw = (it.get('v_count') or '').strip()
+            try:
+                if vc_raw:
+                    rec['v_count'] = int(vc_raw)
+            except Exception:
+                pass
         if selected == "Type/Vector":
             vt = (it.get("v_type") or "").strip()
             vv = (it.get("v_vector") or "").strip()
@@ -55,16 +65,10 @@ def parse_vulnerabilities_info(xml_path: str, scenario_name: Optional[str]) -> T
         elif selected == "Specific":
             vn = (it.get("v_name") or "").strip()
             vp = (it.get("v_path") or "").strip()
-            vc_raw = (it.get("v_count") or "").strip()
             if vn:
                 rec["v_name"] = vn
             if vp:
                 rec["v_path"] = vp
-            try:
-                if vc_raw:
-                    rec["v_count"] = int(vc_raw)
-            except Exception:
-                pass
         items.append(rec)
     logger.debug("Parsed vulnerabilities: density=%s items=%s", density, items)
     return density, items

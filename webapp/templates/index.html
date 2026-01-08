@@ -831,7 +831,7 @@ const SCENARIOS_ACTIVE_TAB = '{{ scenarios_active_tab }}';
 window.CORETG_SCENARIOS_ACTIVE_TAB = SCENARIOS_ACTIVE_TAB;
 // Local editor state is only trusted for admins.
 // Builder/participant roles must rely on server-restricted scenario lists.
-const USE_LOCAL_EDITOR_STATE = IS_ADMIN_USER;
+const USE_LOCAL_EDITOR_STATE = IS_ADMIN_USER && !IS_BUILDER_VIEW;
 // Builder view is read-only; never write local snapshots from it.
 const ALLOW_LOCAL_EDITOR_PERSISTENCE = IS_ADMIN_USER && !IS_BUILDER_VIEW;
 const BUILDER_BACKEND_UNAVAILABLE_MESSAGE = 'Backend temporarily unavailable. Please ask an admin.';
@@ -930,6 +930,8 @@ const PROJECT_STATE_STORAGE_KEY = 'coretg_project_state_map_v1';
 const PROJECT_ACTIVE_IDX_STORAGE_KEY = 'coretg_active_idx_map_v1';
 const LAST_PROJECT_KEY_STORAGE_KEY = 'coretg_last_project_key';
 const DEFAULT_PROJECT_KEY = '__default_project__';
+const DELETED_SCENARIO_IDS_STORAGE_KEY = 'coretg_deleted_scenario_ids_v1';
+const DELETED_SCENARIO_NAME_KEYS_STORAGE_KEY = 'coretg_deleted_scenario_name_keys_v1';
 
 function readLastProjectKeyFromStorage() {
     try {
@@ -955,6 +957,76 @@ function writeJsonToLocalStorage(key, value) {
     try {
         localStorage.setItem(key, JSON.stringify(value));
     } catch (err) {}
+}
+
+function readStringSetFromLocalStorage(key) {
+    try {
+        const raw = localStorage.getItem(key);
+        if (!raw) return new Set();
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return new Set();
+        return new Set(parsed.map(v => (v === null || v === undefined) ? '' : String(v)).filter(Boolean));
+    } catch (err) {
+        return new Set();
+    }
+}
+
+function writeStringSetToLocalStorage(key, setValue) {
+    try {
+        const arr = Array.from(setValue || []).map(v => String(v)).filter(Boolean);
+        localStorage.setItem(key, JSON.stringify(arr));
+    } catch (err) {}
+}
+
+let deletedScenarioIds = readStringSetFromLocalStorage(DELETED_SCENARIO_IDS_STORAGE_KEY);
+let deletedScenarioNameKeys = readStringSetFromLocalStorage(DELETED_SCENARIO_NAME_KEYS_STORAGE_KEY);
+
+function rememberDeletedScenarioMarks({ ids, names } = {}) {
+    try {
+        for (const id of (ids || [])) {
+            const sid = (id === null || id === undefined) ? '' : String(id);
+            if (sid) deletedScenarioIds.add(sid);
+        }
+        writeStringSetToLocalStorage(DELETED_SCENARIO_IDS_STORAGE_KEY, deletedScenarioIds);
+
+        for (const nm of (names || [])) {
+            const key = scenarioNameKey(nm);
+            if (key) deletedScenarioNameKeys.add(key);
+        }
+        writeStringSetToLocalStorage(DELETED_SCENARIO_NAME_KEYS_STORAGE_KEY, deletedScenarioNameKeys);
+    } catch (e) {}
+}
+
+function pruneDeletedScenariosInState() {
+    try {
+        const hasIds = !!(deletedScenarioIds && deletedScenarioIds.size);
+        const hasNames = !!(deletedScenarioNameKeys && deletedScenarioNameKeys.size);
+        if (!hasIds && !hasNames) return;
+        if (!state || !Array.isArray(state.scenarios) || !state.scenarios.length) return;
+        const before = state.scenarios.length;
+        state.scenarios = state.scenarios.filter(s => {
+            try {
+                const sid = (s && s._sid !== undefined && s._sid !== null) ? String(s._sid) : '';
+                if (sid && hasIds && deletedScenarioIds.has(sid)) return false;
+                const name = (s && typeof s.name === 'string') ? s.name : '';
+                const nkey = name ? scenarioNameKey(name) : '';
+                if (nkey && hasNames && deletedScenarioNameKeys.has(nkey)) return false;
+                return true;
+            } catch (e) {
+                return true;
+            }
+        });
+        if (!state.scenarios.length) {
+            state.scenarios.push(defaultScenario());
+            activeIdx = 0;
+        } else if (activeIdx >= state.scenarios.length) {
+            activeIdx = Math.max(0, state.scenarios.length - 1);
+        }
+        const after = state.scenarios.length;
+        if (before !== after) {
+            try { logInfo(`Pruned ${before - after} locally-deleted scenarios after restore`); } catch (e) {}
+        }
+    } catch (e) {}
 }
 
 function deriveProjectKey(snapshot, fallbackKey = DEFAULT_PROJECT_KEY) {
@@ -1319,6 +1391,13 @@ function ensureUniqueScenarioName(desiredName, scenarios, selfIndex) {
             if (key) existing.add(key);
         });
     } catch (e) {}
+    // Also treat locally-deleted (tombstoned) names as reserved so newly-created
+    // scenarios don't immediately get pruned on refresh.
+    try {
+        if (deletedScenarioNameKeys && deletedScenarioNameKeys.size) {
+            deletedScenarioNameKeys.forEach(k => { if (k) existing.add(k); });
+        }
+    } catch (e) {}
     if (!existing.has(scenarioNameKey(base))) return base;
     for (let n = 2; n < 1000; n++) {
         const candidate = `${base} (${n})`;
@@ -1327,8 +1406,15 @@ function ensureUniqueScenarioName(desiredName, scenarios, selfIndex) {
     return `${base} (${Date.now()})`;
 }
 
+function generateScenarioSid() {
+    // Stable-ish unique id for client-side selection and snapshot merging.
+    // Use a longer random suffix to keep collisions extremely unlikely.
+    return 'scen_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+}
+
 function defaultScenario(name) {
     return {
+        _sid: generateScenarioSid(),
         name: name || `Scenario ${document.querySelectorAll('.scenario-card').length + 1}`,
         base: { filepath: '' },
         hitl: { enabled: false, interfaces: [] },
@@ -4046,7 +4132,14 @@ if (USE_LOCAL_EDITOR_STATE) {
         try { const v = parseInt(localStorage.getItem('coretg_active_idx')||'0',10); if(!isNaN(v)) persistedActiveIdx = v; } catch(e){}
     }
 } else {
-    persistedState = null;
+    // Non-admin / builder view: rely on server-side snapshot persistence.
+    persistedState = serverEditorSnapshot;
+    try {
+        const idx = (serverEditorSnapshot && serverEditorSnapshot.active_index !== undefined)
+            ? parseInt(serverEditorSnapshot.active_index, 10)
+            : 0;
+        if (!isNaN(idx)) persistedActiveIdx = idx;
+    } catch (e) {}
 }
 
 // Base state is from server payload or default
@@ -4075,8 +4168,49 @@ const persistedHostMeta = USE_LOCAL_EDITOR_STATE ? persistedState : null;
 state.host_interfaces_source = (initialPayload?.host_interfaces_source ?? null) || (persistedHostMeta?.host_interfaces_source ?? null) || state.host_interfaces_source || null;
 state.host_interfaces_metadata = (initialPayload?.host_interfaces_metadata ?? null) || (persistedHostMeta?.host_interfaces_metadata ?? null) || state.host_interfaces_metadata || null;
 state.host_interfaces_fetched_at = (initialPayload?.host_interfaces_fetched_at ?? null) || (persistedHostMeta?.host_interfaces_fetched_at ?? null) || state.host_interfaces_fetched_at || null;
-// If server provided a concrete result_path (save/load/run), prefer server scenarios; else, restore from localStorage if available
+// If server provided a concrete result_path (save/load/run), the server scenarios are authoritative for the
+// catalog/source-of-truth list, but we still want locally-edited fields to survive refresh in admin view.
 const serverHasResult = !!(initialPayload && initialPayload.result_path);
+
+// Builder/participant view: merge server snapshot values into the server-provided
+// scenario list so field edits survive refresh (even if a saved XML/result_path exists).
+if (!USE_LOCAL_EDITOR_STATE && serverEditorSnapshot && typeof serverEditorSnapshot === 'object') {
+    try {
+        const snapScenarios = Array.isArray(serverEditorSnapshot.scenarios) ? serverEditorSnapshot.scenarios : [];
+        const serverScenarios = Array.isArray(state.scenarios) ? state.scenarios : [];
+        if (!serverScenarios.length && snapScenarios.length) {
+            state.scenarios = snapScenarios;
+        } else if (serverScenarios.length && snapScenarios.length) {
+            const snapByKey = new Map();
+            snapScenarios.forEach((snapScen) => {
+                if (!snapScen || typeof snapScen !== 'object') return;
+                const k = _scenarioMatchKey(snapScen.name);
+                if (k && !snapByKey.has(k)) snapByKey.set(k, snapScen);
+            });
+            state.scenarios = serverScenarios.map((serverScen) => {
+                if (!serverScen || typeof serverScen !== 'object') return serverScen;
+                const k = _scenarioMatchKey(serverScen.name);
+                const snapScen = k ? snapByKey.get(k) : null;
+                if (!snapScen || typeof snapScen !== 'object') return serverScen;
+                const out = { ...serverScen, ...snapScen };
+                out.name = (serverScen.name || snapScen.name || '').toString();
+                out.base = { ...(serverScen.base && typeof serverScen.base === 'object' ? serverScen.base : {}), ...(snapScen.base && typeof snapScen.base === 'object' ? snapScen.base : {}) };
+                out.hitl = { ...(serverScen.hitl && typeof serverScen.hitl === 'object' ? serverScen.hitl : {}), ...(snapScen.hitl && typeof snapScen.hitl === 'object' ? snapScen.hitl : {}) };
+                out.sections = { ...(serverScen.sections && typeof serverScen.sections === 'object' ? serverScen.sections : {}), ...(snapScen.sections && typeof snapScen.sections === 'object' ? snapScen.sections : {}) };
+                return out;
+            });
+        }
+
+        // Prefer snapshot result_path/base_upload when the server hasn't provided one.
+        if (!state.result_path && serverEditorSnapshot.result_path) {
+            state.result_path = serverEditorSnapshot.result_path;
+        }
+        const snapBase = normalizeBaseUpload(serverEditorSnapshot.base_upload);
+        if (snapBase && (!state.base_upload || !state.base_upload.path)) {
+            state.base_upload = { ...snapBase };
+        }
+    } catch (e) {}
+}
 const serverScenarioBases = Array.isArray(initialPayload?.scenarios)
     ? initialPayload.scenarios.map(s => {
         if (!s || typeof s !== 'object' || !s.base || typeof s.base !== 'object') return undefined;
@@ -4086,11 +4220,11 @@ const serverScenarioBases = Array.isArray(initialPayload?.scenarios)
         return Object.keys(meta).length ? meta : undefined;
     })
     : [];
-if (USE_LOCAL_EDITOR_STATE && !serverHasResult && persistedState && Array.isArray(persistedState.scenarios) && persistedState.scenarios.length) {
+if (USE_LOCAL_EDITOR_STATE && persistedState && Array.isArray(persistedState.scenarios) && persistedState.scenarios.length) {
     // Admin UX: prefer the server-rendered scenario list (catalog-driven) so scenarios like
     // "Scenario 1b" appear consistently. Then append any local-only scenarios so unsaved
     // work in localStorage isn't lost.
-    if (persistedState.result_path) state.result_path = persistedState.result_path;
+    if (!state.result_path && persistedState.result_path) state.result_path = persistedState.result_path;
 
     try {
         const serverScenarios = Array.isArray(state.scenarios) ? state.scenarios : [];
@@ -4796,6 +4930,11 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('scenariosPreviewTabLink')?.addEventListener('click', async (ev)=>{
         try {
             ev.preventDefault();
+            if (IS_BUILDER_VIEW) {
+                // Builder view: show a preview of the current configuration without saving.
+                try { await computeFullPlanPreview(); } catch(e) { /* ignore */ }
+                return;
+            }
             const ensureXmlPath = async ()=>{
                 const xmlPathVal = (state.result_path || '').trim();
                 if(xmlPathVal) return xmlPathVal;
@@ -4860,16 +4999,25 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 async function computeFullPlanPreview(){
-    const xmlPathVal = (state.result_path || '').trim();
-    if(!xmlPathVal){
-        try { await autoSaveXml(); } catch(e){ alert('Auto-save failed: '+e); return; }
+    let newXmlPath = (state.result_path || '').trim();
+    if (!IS_BUILDER_VIEW) {
+        if(!newXmlPath){
+            try { await autoSaveXml(); } catch(e){ alert('Auto-save failed: '+e); return; }
+        }
+        newXmlPath = (state.result_path || '').trim();
+        if(!newXmlPath){ alert('XML path still unavailable after save.'); return; }
     }
-    const newXmlPath = (state.result_path || '').trim();
-    if(!newXmlPath){ alert('XML path still unavailable after save.'); return; }
     const btn = document.getElementById('planPreviewBtn');
     const pre = document.getElementById('planPreviewJson');
-    btn.disabled = true; btn.dataset.prevLabel = btn.textContent; btn.textContent='Full preview...';
-    pre.classList.remove('d-none'); pre.textContent='Computing full preview...';
+    if (btn) {
+        btn.disabled = true;
+        btn.dataset.prevLabel = btn.textContent;
+        btn.textContent = 'Full preview...';
+    }
+    if (pre) {
+        pre.classList.remove('d-none');
+        pre.textContent = 'Computing full preview...';
+    }
     try {
     // Collect routing row host-per-switch overrides (min/max)
     let r2sHostsMinList = [];
@@ -4889,17 +5037,24 @@ async function computeFullPlanPreview(){
                     coreState.last_validated_at = null;
                     coreState.stored_summary = null;
     } catch(e) { /* ignore */ }
-    const body = enrichPayloadWithScenarioContext({ xml_path: newXmlPath, r2s_hosts_min_list: r2sHostsMinList, r2s_hosts_max_list: r2sHostsMaxList, core: getCoreConfig(true) });
+    const baseBody = IS_BUILDER_VIEW
+        ? { scenarios: state.scenarios, r2s_hosts_min_list: r2sHostsMinList, r2s_hosts_max_list: r2sHostsMaxList, core: getCoreConfig(true) }
+        : { xml_path: newXmlPath, r2s_hosts_min_list: r2sHostsMinList, r2s_hosts_max_list: r2sHostsMaxList, core: getCoreConfig(true) };
+    const body = enrichPayloadWithScenarioContext(baseBody);
         const res = await fetch('/api/plan/preview_full', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
         const data = await res.json();
         try {
             if(window.logLine){ window.logLine('INFO', 'Preview: response received; parsing plan summary'); }
         } catch(e){}
-    if(!data.ok){ pre.textContent='Full preview failed: '+(data.error||''); previewState.fullPreview=null; document.getElementById('fullPreviewStructured')?.classList.add('d-none'); }
+    if(!data.ok){
+            if (pre) pre.textContent='Full preview failed: '+(data.error||'');
+            previewState.fullPreview=null;
+            document.getElementById('fullPreviewStructured')?.classList.add('d-none');
+        }
         else {
             previewState.fullPreview = data.full_preview;
             buildFullPreviewArtifacts(previewState.fullPreview);
-            pre.textContent = JSON.stringify(previewState.fullPreview, null, 2);
+            if (pre) pre.textContent = JSON.stringify(previewState.fullPreview, null, 2);
             renderFullPreviewStructured();
             // Emit detailed calculation logs into dock
             try {
@@ -4933,8 +5088,14 @@ async function computeFullPlanPreview(){
                 saveFullPreviewHistory();
             } catch(e){}
         }
-    } catch(e){ pre.textContent='Error: '+e; previewState.fullPreview=null; }
-    btn.disabled = false; btn.textContent = btn.dataset.prevLabel || 'Full Preview';
+    } catch(e){
+        if (pre) pre.textContent='Error: '+e;
+        previewState.fullPreview=null;
+    }
+    if (btn) {
+        btn.disabled = false;
+        btn.textContent = btn.dataset.prevLabel || 'Full Preview';
+    }
 }
 
 function renderFullPreviewStructured(){
@@ -6168,7 +6329,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
         };
         execBtn.addEventListener('click', async ()=>{
             if(executing) return;
-            if(!state.result_path || !state.result_path.endsWith('.xml')){
+            if(!IS_BUILDER_VIEW && (!state.result_path || !state.result_path.endsWith('.xml'))){
                 alert('Save XML before executing.');
                 return;
             }
@@ -6649,6 +6810,11 @@ if (USE_LOCAL_EDITOR_STATE && persistedState) {
 }
 let activeIdx = Math.min(Math.max(0, persistedActiveIdx), (state.scenarios.length||1)-1);
 
+// Prevent stale local project snapshots from resurrecting scenarios that were
+// previously deleted (identified by stable _sid).
+try { ensureScenarioIds(); } catch (e) {}
+try { pruneDeletedScenariosInState(); } catch (e) {}
+
 function persistEditorState(){
     try {
         const baseUploadMeta = normalizeBaseUpload(state.base_upload) || (state.scenarios?.[0]?.base?.filepath || state.scenarios?.[0]?.base?.display_name ? {
@@ -6710,6 +6876,12 @@ function persistEditorState(){
 }
 // Persist initial merged state so it survives cross-page navigation immediately
 persistEditorState();
+
+// On refresh/navigation, flush any pending server snapshot so edits aren't lost.
+try {
+    window.addEventListener('pagehide', () => { try { flushServerSnapshotPersistNow(); } catch (_) {} }, { capture: true });
+    window.addEventListener('beforeunload', () => { try { flushServerSnapshotPersistNow(); } catch (_) {} }, { capture: true });
+} catch (e) {}
 
 const dropdownsBySection = {
     'Node Information': ['Server','Workstation','PC','Docker','Random'],
@@ -9682,10 +9854,42 @@ function syncExternalIfxModalSaveLabel() {
 
 function ensureScenarioIds() {
     let changed = false;
-    state.scenarios.forEach(s => {
-        if (!s._sid) { s._sid = 'scen_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,8); changed = true; }
-    });
-    if (changed) persistEditorState();
+    const seen = new Set();
+    try {
+        (state.scenarios || []).forEach(s => {
+            if (!s || typeof s !== 'object') return;
+            let sid = (s._sid !== undefined && s._sid !== null) ? String(s._sid) : '';
+            if (!sid || seen.has(sid)) {
+                sid = generateScenarioSid();
+                s._sid = sid;
+                changed = true;
+            }
+            seen.add(sid);
+        });
+    } catch (e) {
+        // Defensive: never block rendering due to SID repair.
+    }
+
+    // Drop stale selections that no longer exist (common after SID repair).
+    try {
+        if (selectedScenarioIds && selectedScenarioIds.size) {
+            let selectionChanged = false;
+            for (const sid of Array.from(selectedScenarioIds)) {
+                if (!seen.has(String(sid))) {
+                    selectedScenarioIds.delete(sid);
+                    selectionChanged = true;
+                }
+            }
+            if (selectionChanged) {
+                persistScenarioSelection();
+                try { updateBulkButtonsState(); } catch (e) {}
+            }
+        }
+    } catch (e) {}
+
+    if (changed) {
+        try { persistEditorState(); } catch (e) {}
+    }
 }
 
 function toggleScenarioSelection(id, checked) {
@@ -9705,22 +9909,71 @@ function selectAllScenarios() {
 }
 
 async function deleteSelectedScenarios() {
+    // Ensure scenario IDs are present/unique and selection doesn't contain stale IDs.
+    try { ensureScenarioIds(); } catch (e) {}
+    try {
+        if (selectedScenarioIds && selectedScenarioIds.size) {
+            const valid = new Set((state.scenarios || []).map(s => (s && s._sid !== undefined && s._sid !== null) ? String(s._sid) : '').filter(Boolean));
+            let changed = false;
+            for (const sid of Array.from(selectedScenarioIds)) {
+                if (!valid.has(String(sid))) {
+                    selectedScenarioIds.delete(sid);
+                    changed = true;
+                }
+            }
+            if (changed) {
+                persistScenarioSelection();
+                try { updateBulkButtonsState(); } catch (e) {}
+            }
+        }
+    } catch (e) {}
+
     if (!selectedScenarioIds.size) return;
     const count = selectedScenarioIds.size;
     if (!confirm(`Delete ${count} selected scenario${count>1?'s':''}? This cannot be undone.`)) return;
     const beforeLen = state.scenarios.length;
     const deletedNames = [];
+    const deletedSids = [];
     try {
         state.scenarios.forEach((s, idx) => {
             try {
-                if (s && selectedScenarioIds.has(s._sid)) {
-                    const display = (s.name && String(s.name).trim()) ? String(s.name).trim() : `Scenario ${idx+1}`;
-                    deletedNames.push(display);
+                if (!s || typeof s !== 'object') return;
+                const sid = (s._sid !== undefined && s._sid !== null) ? String(s._sid) : '';
+                if (!sid) return;
+                if (!selectedScenarioIds.has(sid)) return;
+                deletedSids.push(sid);
+                let name = (s.name && String(s.name).trim()) ? String(s.name).trim() : '';
+                if (!name) {
+                    // Ensure every scenario has a stable name so server-side deletion
+                    // can match against snapshots and saved XML artifacts.
+                    name = `Scenario ${idx+1}`;
+                    s.name = name;
                 }
+                deletedNames.push(name);
             } catch (e) {}
         });
     } catch (e) {}
-    state.scenarios = state.scenarios.filter(s => !selectedScenarioIds.has(s._sid));
+
+    try {
+        if (deletedSids.length || deletedNames.length) {
+            rememberDeletedScenarioMarks({ ids: deletedSids, names: deletedNames });
+            try {
+                const preview = deletedNames.slice(0, 6).join(', ');
+                logInfo(`Marked deleted tombstones: ${preview}${deletedNames.length > 6 ? ' (+more)' : ''}`);
+            } catch (_) {}
+        }
+    } catch (e) {}
+
+    // Filter using string IDs to avoid type mismatches (e.g., number vs string).
+    state.scenarios = (state.scenarios || []).filter(s => {
+        try {
+            const sid = (s && s._sid !== undefined && s._sid !== null) ? String(s._sid) : '';
+            if (!sid) return true;
+            return !selectedScenarioIds.has(sid);
+        } catch (e) {
+            return true;
+        }
+    });
     selectedScenarioIds.clear();
     if (!state.scenarios.length) {
         // Always keep at least one blank scenario to avoid empty editor state hassles
@@ -9729,61 +9982,72 @@ async function deleteSelectedScenarios() {
     } else {
         if (activeIdx >= state.scenarios.length) activeIdx = state.scenarios.length - 1;
     }
-    logInfo(`Deleted ${beforeLen - state.scenarios.length} scenarios`);
+    try {
+        const deletedCount = beforeLen - state.scenarios.length;
+        logInfo(`Deleted ${deletedCount} scenarios`);
+        if (deletedNames.length) {
+            const preview = deletedNames.slice(0, 12).join(', ');
+            const more = deletedNames.length > 12 ? ` (+${deletedNames.length - 12} more)` : '';
+            logInfo(`Delete names sent to server: ${preview}${more}`);
+        }
+    } catch (e) {
+        logInfo(`Deleted ${beforeLen - state.scenarios.length} scenarios`);
+    }
     persistEditorState();
     persistScenarioSelection();
+    // Ensure server-side editor snapshot is updated immediately so a quick refresh
+    // cannot resurrect deleted scenarios.
+    try {
+        if (typeof flushServerSnapshotPersistNow === 'function') {
+            const snapRes = await flushServerSnapshotPersistNow();
+            if (snapRes && snapRes.ok === false) {
+                try { showToast(`Warning: server snapshot not updated (${snapRes.error || 'unknown error'}). Deleted scenarios may reappear on refresh.`, { autohide: true, delay: 5000 }); } catch (_) {}
+            }
+        }
+    } catch (e) {
+        try { showToast('Warning: failed to flush server snapshot; deleted scenarios may reappear on refresh.', { autohide: true, delay: 5000 }); } catch (_) {}
+    }
     try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
     render();
 
     // Persist deletion across refresh: remove from server catalog and save snapshot.
     try {
         if (deletedNames.length) {
-            await fetch('/delete_scenarios', {
+            const res = await fetch('/delete_scenarios', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 credentials: 'same-origin',
                 body: JSON.stringify({ names: deletedNames }),
             });
+            let payload = null;
+            try { payload = await res.clone().json(); } catch (e) { payload = null; }
+            if (!res.ok || (payload && payload.ok === false)) {
+                const detail = (payload && (payload.error || payload.message))
+                    ? String(payload.error || payload.message)
+                    : (() => { try { return res.status ? ('HTTP ' + res.status) : 'HTTP error'; } catch (_) { return 'HTTP error'; } })();
+                try { showToast(`Warning: delete_scenarios failed (${detail}).`, { autohide: true, delay: 6000 }); } catch (_) {}
+            } else if (payload && typeof payload === 'object') {
+                const removed = Number(payload.removed ?? payload.removed_count ?? payload.removedNames ?? payload.removed_names ?? payload.removed_scenarios) || 0;
+                const remaining = Number(payload.remaining ?? payload.remaining_count) || 0;
+                const artifacts = Number(payload.artifacts_removed) || 0;
+                const snapRemoved = Number(payload.snapshot_scenarios_removed) || 0;
+                const snapUpdated = Number(payload.snapshots_updated) || 0;
+                const snapDeleted = Number(payload.snapshots_deleted) || 0;
+                const historyRemoved = Number(payload.history_removed) || 0;
+                const msg = `Server delete persisted: removed=${removed}, remaining=${remaining}, artifacts_removed=${artifacts}, snapshot_scenarios_removed=${snapRemoved}, snapshots_updated=${snapUpdated}, snapshots_deleted=${snapDeleted}, history_removed=${historyRemoved}`;
+                try { logInfo(msg); } catch (e) {}
+                try { showToast(msg, { autohide: true, delay: 6000 }); } catch (_) {}
+            }
         }
     } catch (e) {
         console.warn('delete_scenarios failed', e);
+        try { showToast('Warning: server catalog delete failed. Deleted scenarios may reappear on refresh.', { autohide: true, delay: 5000 }); } catch (_) {}
     }
     try {
         await autoSaveXml();
     } catch (e) {
         console.warn('autoSaveXml after delete failed', e);
         try { showToast('Delete was not persisted (save failed).', { autohide: true, delay: 3500 }); } catch (_) {}
-    }
-
-    // Also purge from any other locally persisted project snapshots.
-    try {
-        const toKey = (v) => String(v || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
-        const targetKeys = new Set((deletedNames || []).map(toKey).filter(Boolean));
-        if (targetKeys.size) {
-            let changed = false;
-            Object.keys(projectStateMap || {}).forEach(pk => {
-                const entry = projectStateMap[pk];
-                if (!entry || typeof entry !== 'object') return;
-                const scenList = Array.isArray(entry.scenarios) ? entry.scenarios : null;
-                if (!scenList || !scenList.length) return;
-                const kept = [];
-                scenList.forEach((sc, idx) => {
-                    if (!sc || typeof sc !== 'object') { kept.push(sc); return; }
-                    const nm = (sc.name && String(sc.name).trim()) ? String(sc.name).trim() : `Scenario ${idx+1}`;
-                    if (targetKeys.has(toKey(nm))) { changed = true; return; }
-                    kept.push(sc);
-                });
-                entry.scenarios = kept;
-                projectStateMap[pk] = entry;
-            });
-            if (changed) {
-                writeJsonToLocalStorage(PROJECT_STATE_STORAGE_KEY, projectStateMap);
-                legacyEditorState = scrubSnapshotTransientErrors(legacyEditorState);
-                writeJsonToLocalStorage(LEGACY_EDITOR_STATE_STORAGE_KEY, legacyEditorState);
-            }
-        }
-    } catch (e) {
-        console.warn('local project snapshot purge failed', e);
     }
 }
 
@@ -9841,6 +10105,14 @@ function renderSidebar() {
             const newScenario = defaultScenario();
             try {
                 newScenario.name = ensureUniqueScenarioName(newScenario.name, state.scenarios);
+            } catch (e) {}
+            try {
+                const nkey = scenarioNameKey(newScenario.name);
+                if (nkey && deletedScenarioNameKeys && deletedScenarioNameKeys.has(nkey)) {
+                    // User is explicitly creating a new scenario; allow this name to persist.
+                    deletedScenarioNameKeys.delete(nkey);
+                    writeStringSetToLocalStorage(DELETED_SCENARIO_NAME_KEYS_STORAGE_KEY, deletedScenarioNameKeys);
+                }
             } catch (e) {}
             state.scenarios.push(newScenario);
             activeIdx = state.scenarios.length - 1;
@@ -12576,7 +12848,8 @@ function renderItemRow(sidx, secName, iidx, it) {
     const weight = ((parseFloat(it.factor) || 0).toFixed(3));
     let opts = '';
     if (secName === 'Vulnerabilities') {
-        const cur = it.selected || 'Category';
+        const curRaw = it.selected || 'Category';
+        const cur = (curRaw === 'Type/Vector') ? 'Category' : curRaw;
         const options = ['Category', 'Specific', 'Random'];
         opts = options.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
     } else {
@@ -12723,7 +12996,8 @@ function renderItemRow(sidx, secName, iidx, it) {
         const disabledAttr = isProtectedRandom ? 'disabled title="Residual Random row is auto-managed"' : '';
         const selectedCtl = `<select class="form-select form-select-sm" ${disabledAttr} data-field="selected" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${opts}</select>`;
         if (secName !== 'Vulnerabilities') return selectedCtl;
-    const mode = it.selected || 'Category';
+    const modeRaw = it.selected || 'Category';
+    const mode = (modeRaw === 'Type/Vector') ? 'Category' : modeRaw;
     if (mode === 'Category') {
             return `
             <div class="d-flex flex-wrap gap-2 align-items-end">
@@ -13107,6 +13381,7 @@ function wireHandlers() {
               // Re-render to refresh totals and labels
                             renderMain();
                             persistEditorState();
+                            try { if (sec === 'Vulnerabilities' && typeof flushServerSnapshotPersistNow === 'function') flushServerSnapshotPersistNow(); } catch (_) {}
                             try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
         };
     });
@@ -13142,6 +13417,7 @@ function wireHandlers() {
             }
                             renderMain();
                             persistEditorState();
+                            try { if (sec === 'Vulnerabilities' && typeof flushServerSnapshotPersistNow === 'function') flushServerSnapshotPersistNow(); } catch (_) {}
                             try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
         };
     });
@@ -14173,6 +14449,15 @@ function wireHandlers() {
             if (!window.confirm(msg)) { return; }
 
             const deletedName = (scen.name && String(scen.name).trim()) ? String(scen.name).trim() : `Scenario ${sidx+1}`;
+            const deletedSid = (scen && scen._sid !== undefined && scen._sid !== null) ? String(scen._sid) : '';
+
+            try {
+                rememberDeletedScenarioMarks({
+                    ids: deletedSid ? [deletedSid] : [],
+                    names: deletedName ? [deletedName] : [],
+                });
+                logInfo(`Marked deleted tombstone: ${deletedName}`);
+            } catch (e) {}
 
             // Remove scenario
             state.scenarios.splice(sidx, 1);
@@ -14183,6 +14468,18 @@ function wireHandlers() {
             if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios });
             persistEditorState();
             logInfo(`Deleted scenario: ${scen.name}`);
+            // Ensure server-side editor snapshot is updated immediately so a quick refresh
+            // cannot resurrect deleted scenarios.
+            try {
+                if (typeof flushServerSnapshotPersistNow === 'function') {
+                    const snapRes = await flushServerSnapshotPersistNow();
+                    if (snapRes && snapRes.ok === false) {
+                        try { showToast(`Warning: server snapshot not updated (${snapRes.error || 'unknown error'}). Deleted scenarios may reappear on refresh.`, { autohide: true, delay: 5000 }); } catch (_) {}
+                    }
+                }
+            } catch (e) {
+                try { showToast('Warning: failed to flush server snapshot; deleted scenarios may reappear on refresh.', { autohide: true, delay: 5000 }); } catch (_) {}
+            }
             // Re-render UI
             render();
             try { showToast(`Scenario "${scen.name}" deleted`); } catch(e){}
@@ -14190,15 +14487,38 @@ function wireHandlers() {
             // Persist deletion across refresh.
             try {
                 if (deletedName) {
-                    await fetch('/delete_scenarios', {
+                    const res = await fetch('/delete_scenarios', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         credentials: 'same-origin',
                         body: JSON.stringify({ names: [deletedName] })
                     });
+                    let payload = null;
+                    try { payload = await res.clone().json(); } catch (e) { payload = null; }
+                    if (!res.ok || (payload && payload.ok === false)) {
+                        const detail = (payload && (payload.error || payload.message))
+                            ? String(payload.error || payload.message)
+                            : (() => { try { return res.status ? ('HTTP ' + res.status) : 'HTTP error'; } catch (_) { return 'HTTP error'; } })();
+                        try { showToast(`Warning: delete_scenarios failed (${detail}).`, { autohide: true, delay: 6000 }); } catch (_) {}
+                    } else if (payload && typeof payload === 'object') {
+                        const artifacts = Number(payload.artifacts_removed) || 0;
+                        const snapRemoved = Number(payload.snapshot_scenarios_removed) || 0;
+                        const snapUpdated = Number(payload.snapshots_updated) || 0;
+                        const snapDeleted = Number(payload.snapshots_deleted) || 0;
+                        const historyRemoved = Number(payload.history_removed) || 0;
+                        const msg = `Server delete persisted: artifacts_removed=${artifacts}, snapshot_scenarios_removed=${snapRemoved}, snapshots_updated=${snapUpdated}, snapshots_deleted=${snapDeleted}, history_removed=${historyRemoved}`;
+                        try { logInfo(msg); } catch (e) {}
+                        try { showToast(msg, { autohide: true, delay: 6000 }); } catch (_) {}
+                    }
                 }
-            } catch (e) {}
-            try { await autoSaveXml(); } catch (e) {}
+            } catch (e) {
+                try { showToast('Warning: server catalog delete failed. Deleted scenarios may reappear on refresh.', { autohide: true, delay: 5000 }); } catch (_) {}
+            }
+            try {
+                await autoSaveXml();
+            } catch (e) {
+                try { showToast('Warning: delete was not persisted (save failed).', { autohide: true, delay: 5000 }); } catch (_) {}
+            }
 
             // Purge matching run history and artifacts in background
             if (runCount > 0) {
@@ -15690,6 +16010,14 @@ let saveXmlToastHandle = null;
 let saveXmlToastStartedAt = 0;
 let saveXmlToastToken = 0;
 
+// Builder view cannot save XML (admin-only). Prevent accidental submits.
+try {
+    if (IS_BUILDER_VIEW && saveXmlBtn) {
+        saveXmlBtn.disabled = true;
+        saveXmlBtn.setAttribute('title', 'Builder view cannot Save XML (admin-only).');
+    }
+} catch (e) {}
+
 function setSaveXmlBusy(busy) {
     if (!saveXmlBtn) return;
     if (!saveXmlBtn.dataset.defaultLabel) {
@@ -15760,6 +16088,13 @@ if (editorForm) {
         if (event) {
             event.preventDefault();
         }
+
+        // Builder view is read-only for Save XML; do not attempt auto-save or fallback form POST.
+        if (IS_BUILDER_VIEW) {
+            try { showToast('Builder view cannot Save XML (admin-only).', { autohide: true, delay: 2600 }); } catch (_) {}
+            return;
+        }
+
         const scrollYBeforeSave = (typeof window !== 'undefined')
             ? (window.scrollY || window.pageYOffset || 0)
             : 0;
@@ -16144,7 +16479,7 @@ function ensureVulnModal(){
                     <div class="text-muted small mb-2" id="vulnFilterMeta"></div>
                     <div class="table-responsive" id="vulnTableWrap" style="max-height:50vh; overflow:auto; display:none;">
                         <table class="table table-sm">
-                            <thead><tr><th>Name</th><th>Type</th><th>Vector</th><th>Path</th></tr></thead>
+                            <thead><tr><th>Name</th><th>Type</th><th>Vector</th><th>Status</th><th>Actions</th><th>Path</th></tr></thead>
                             <tbody id="vulnList"></tbody>
                         </table>
                     </div>
@@ -16155,6 +16490,106 @@ function ensureVulnModal(){
             </div>
         </div>`;
         document.body.appendChild(modal);
+}
+
+function ensureVulnProgressModal(){
+        if(document.getElementById('vulnProgressModal')) return;
+        const m = document.createElement('div');
+        m.className = 'modal fade';
+        m.id = 'vulnProgressModal';
+        m.setAttribute('tabindex', '-1');
+        m.innerHTML = `
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Vulnerability Download/Pull</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="d-flex justify-content-between align-items-center mb-2 small text-muted">
+                        <div id="vulnProgressStatus">Starting…</div>
+                        <div id="vulnProgressMeta"></div>
+                    </div>
+                    <div class="progress mb-2">
+                        <div class="progress-bar progress-bar-striped progress-bar-animated" id="vulnProgressBar" role="progressbar" style="width:0%" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">0%</div>
+                    </div>
+                    <div class="border rounded" style="max-height: 220px; overflow: auto;">
+                        <pre class="m-0 p-2 small" id="vulnProgressLog" style="white-space: pre-wrap;"></pre>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Hide</button>
+                </div>
+            </div>
+        </div>`;
+        document.body.appendChild(m);
+}
+
+function showVulnProgressModal(){
+        ensureVulnProgressModal();
+        const el = document.getElementById('vulnProgressModal');
+        if(!el) return null;
+        try {
+            if(window.bootstrap){
+                const modal = bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false, focus: true });
+                modal.show();
+                // Keep this above other modals/backdrops.
+                el.style.zIndex = '20050';
+                setTimeout(() => {
+                    try {
+                        const backs = document.querySelectorAll('.modal-backdrop');
+                        const back = backs && backs.length ? backs[backs.length - 1] : null;
+                        if(back) back.style.zIndex = '20040';
+                    } catch (e) {}
+                }, 0);
+                return modal;
+            }
+        } catch (e) {}
+        return null;
+}
+
+function setVulnProgress(pct, label){
+        try {
+            const bar = document.getElementById('vulnProgressBar');
+            const status = document.getElementById('vulnProgressStatus');
+            const meta = document.getElementById('vulnProgressMeta');
+            const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
+            if(bar){
+                bar.style.width = clamped.toFixed(0) + '%';
+                bar.setAttribute('aria-valuenow', String(clamped));
+                bar.textContent = clamped.toFixed(0) + '%';
+            }
+            if(status && label) status.textContent = label;
+            if(meta) meta.textContent = '';
+        } catch (e) {}
+}
+
+function clearVulnProgressLog(){
+        try {
+            const pre = document.getElementById('vulnProgressLog');
+            if(pre) pre.textContent = '';
+        } catch (e) {}
+}
+
+function vulnProgressLogLine(line){
+        try {
+            const pre = document.getElementById('vulnProgressLog');
+            if(!pre) return;
+            const text = String(line ?? '');
+            pre.textContent += (pre.textContent ? '\n' : '') + text;
+            // Keep scrolled to bottom
+            const parent = pre.parentElement;
+            if(parent) parent.scrollTop = parent.scrollHeight;
+        } catch (e) {}
+}
+
+function hideVulnProgressModal(){
+        try {
+            const el = document.getElementById('vulnProgressModal');
+            if(!el || !window.bootstrap) return;
+            const modal = bootstrap.Modal.getInstance(el);
+            modal?.hide();
+        } catch (e) {}
 }
 
 async function openVulnPicker(sidx, secName, iidx){
@@ -16183,20 +16618,196 @@ async function openVulnPicker(sidx, secName, iidx){
         const vv = selVector.toLowerCase();
         base = base.filter(it => (it.Vector||'').toLowerCase() === vv);
     }
-    // Do not compute eligibility; show immediately
+    // Status cache keyed by Path (stable) or Name fallback
+    const statusByKey = new Map();
+    const itemKey = (it) => String((it && (it.Path || it.Name)) || '');
+
+    const setProgress = (pct, label) => {
+        try {
+            const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
+            if (loadBar) {
+                loadBar.style.width = clamped.toFixed(0) + '%';
+                loadBar.setAttribute('aria-valuenow', String(clamped));
+                loadBar.textContent = clamped.toFixed(0) + '%';
+            }
+            if (loadMeta && label) loadMeta.textContent = label;
+        } catch (e) {}
+    };
+
+    const fetchStatuses = async (items, phaseLabel = 'Checking images…') => {
+        const list = Array.isArray(items) ? items : [];
+        if (!list.length) return;
+        const chunkSize = 25;
+        const total = list.length;
+        let done = 0;
+        for (let i = 0; i < total; i += chunkSize) {
+            const chunk = list.slice(i, i + chunkSize);
+            setProgress(total ? (done / total) * 100 : 0, `${phaseLabel} (${Math.min(done + chunk.length, total)}/${total})`);
+            let payload = null;
+            try {
+                const res = await fetch('/vuln_compose/status_images', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({
+                        items: chunk.map(it => ({
+                            Name: it.Name,
+                            Path: it.Path,
+                            compose: it.compose || 'docker-compose.yml',
+                        }))
+                    }),
+                });
+                payload = res.ok ? await res.json().catch(() => null) : null;
+            } catch (e) {
+                payload = null;
+            }
+            const got = payload && Array.isArray(payload.items) ? payload.items : [];
+            got.forEach(st => {
+                try {
+                    const key = String((st && (st.Path || st.Name)) || '');
+                    if (key) statusByKey.set(key, st);
+                } catch (e) {}
+            });
+            done += chunk.length;
+        }
+        setProgress(100, 'Done');
+    };
+
+    // Show modal and kick off status check
     let eligible = base;
+    let current = eligible;
     try {
         if (modalObj) modalObj.show();
+    } catch(e){}
+    try {
+        if (tblWrap) tblWrap.style.display = 'none';
+        if (loadWrap) loadWrap.style.display = '';
+        setProgress(0, 'Checking downloaded/pulled status…');
+    } catch (e) {}
+    try {
+        await fetchStatuses(eligible, 'Checking images…');
+    } catch (e) {}
+    try {
         if (loadWrap) loadWrap.style.display = 'none';
         if (tblWrap) tblWrap.style.display = '';
-    } catch(e){}
-    let current = eligible;
+    } catch (e) {}
+
+    const statusBadgeHtml = (st) => {
+        try {
+            if (!st) return '<span class="badge text-bg-secondary">Unknown</span>';
+            if (st.docker_available === false) return '<span class="badge text-bg-secondary" title="Docker not available">No docker</span>';
+            if (!st.exists) return '<span class="badge text-bg-warning" title="Compose not downloaded">Not downloaded</span>';
+            if (!st.pulled) {
+                const missing = Array.isArray(st.missing_images) ? st.missing_images.length : 0;
+                return `<span class="badge text-bg-warning" title="Missing images">Missing ${missing}</span>`;
+            }
+            return '<span class="badge text-bg-success">Ready</span>';
+        } catch (e) {
+            return '<span class="badge text-bg-secondary">Unknown</span>';
+        }
+    };
+
+    const isPickable = (st) => {
+        try {
+            if (!st) return false;
+            if (st.docker_available === false) return false;
+            return !!(st.exists && st.pulled);
+        } catch (e) {
+            return false;
+        }
+    };
+
+    const canDownloadPull = (st) => {
+        try {
+            if (!st) return true;
+            if (st.docker_available === false) return false;
+            return !(st.exists && st.pulled);
+        } catch (e) {
+            return false;
+        }
+    };
+
+    const downloadPullOne = async (it) => {
+        const key = itemKey(it);
+        const payloadItem = { Name: it.Name, Path: it.Path, compose: it.compose || 'docker-compose.yml' };
+        const pm = showVulnProgressModal();
+        try { clearVulnProgressLog(); } catch (e) {}
+        try { vulnProgressLogLine(`Target: ${it.Name}`); } catch (e) {}
+        try { setVulnProgress(0, `Downloading ${it.Name}…`); } catch (e) {}
+
+        // Download best-effort (some may already exist)
+        try {
+            const resDl = await fetch('/vuln_compose/download', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({ items: [payloadItem] }),
+            });
+            try {
+                const data = resDl.ok ? await resDl.json().catch(() => null) : null;
+                if (!resDl.ok) {
+                    vulnProgressLogLine(`Download failed (HTTP ${resDl.status}).`);
+                }
+                if (data && Array.isArray(data.logs)) {
+                    data.logs.forEach(l => vulnProgressLogLine(l));
+                }
+                if (data && Array.isArray(data.items) && data.items.length) {
+                    vulnProgressLogLine(`Download result: ${JSON.stringify(data.items[0])}`);
+                }
+            } catch (e) {}
+        } catch (e) {}
+
+        try { setVulnProgress(45, `Pulling images for ${it.Name}…`); } catch (e) {}
+        try {
+            const resPull = await fetch('/vuln_compose/pull', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'same-origin',
+                body: JSON.stringify({ items: [payloadItem] }),
+            });
+            try {
+                const data = resPull.ok ? await resPull.json().catch(() => null) : null;
+                if (!resPull.ok) {
+                    vulnProgressLogLine(`Pull failed (HTTP ${resPull.status}).`);
+                }
+                if (data && Array.isArray(data.logs)) {
+                    data.logs.forEach(l => vulnProgressLogLine(l));
+                }
+                if (data && Array.isArray(data.items) && data.items.length) {
+                    vulnProgressLogLine(`Pull result: ${JSON.stringify(data.items[0])}`);
+                }
+            } catch (e) {}
+        } catch (e) {}
+
+        try { setVulnProgress(80, `Refreshing status for ${it.Name}…`); } catch (e) {}
+        try {
+            await fetchStatuses([it], 'Refreshing…');
+        } catch (e) {}
+
+        try {
+            // If status endpoint returned Name key but itemKey used Path, reconcile
+            if (!statusByKey.has(key)) {
+                const altKey = String(it.Name || '');
+                if (altKey && statusByKey.has(altKey)) {
+                    statusByKey.set(key, statusByKey.get(altKey));
+                }
+            }
+        } catch (e) {}
+
+        try { setVulnProgress(100, 'Done'); } catch (e) {}
+        try { await new Promise(r => setTimeout(r, 300)); } catch (e) {}
+        try { hideVulnProgressModal(); } catch (e) {}
+        try { pm?.hide?.(); } catch (e) {}
+    };
+
+    const allowDownloadPullActions = (IS_ADMIN_USER && !IS_BUILDER_VIEW);
+
     const renderRows = () => {
         tbody.innerHTML = '';
         if (!current || current.length === 0) {
             const tr = document.createElement('tr');
             const td = document.createElement('td');
-            td.colSpan = 4;
+            td.colSpan = 6;
             td.className = 'text-center text-muted py-3';
             td.textContent = 'No results';
             tr.appendChild(td);
@@ -16204,10 +16815,70 @@ async function openVulnPicker(sidx, secName, iidx){
             return;
         }
         current.forEach((it) => {
+            const st = statusByKey.get(itemKey(it)) || null;
             const tr = document.createElement('tr');
-            tr.innerHTML = `<td>${it.Name}</td><td>${it.Type}</td><td>${it.Vector}</td><td>${it.Path}</td>`;
-            tr.style.cursor = 'pointer';
-            tr.onclick = () => {
+            tr.innerHTML = `<td>${it.Name}</td><td>${it.Type}</td><td>${it.Vector}</td><td>${statusBadgeHtml(st)}</td><td></td><td>${it.Path}</td>`;
+            const pickable = isPickable(st);
+            tr.style.cursor = pickable ? 'pointer' : 'not-allowed';
+            if (!pickable) tr.classList.add('text-muted');
+
+            // Action button (Download/Pull) when not ready
+            try {
+                const actionTd = tr.children[4];
+                if (actionTd) {
+                    const needs = canDownloadPull(st);
+                    if (needs) {
+                        const btn = document.createElement('button');
+                        btn.type = 'button';
+                        btn.className = 'btn btn-sm btn-outline-primary';
+                        btn.textContent = 'Download/Pull';
+                        if (st && st.docker_available === false) {
+                            btn.disabled = true;
+                            btn.title = 'Docker not available';
+                        }
+                        if (!allowDownloadPullActions) {
+                            btn.disabled = true;
+                            btn.className = 'btn btn-sm btn-outline-secondary';
+                            btn.textContent = 'Admin required';
+                            btn.title = 'Download/Pull requires admin access.';
+                        }
+                        btn.onclick = async (ev) => {
+                            try { ev.preventDefault(); ev.stopPropagation(); } catch (e) {}
+                            if (!allowDownloadPullActions) {
+                                try { alert('Download/Pull requires admin access.'); } catch (e) {}
+                                return;
+                            }
+                            try {
+                                const confirmMsg = `Download compose and pull images for “${it.Name}”?`;
+                                if (!confirm(confirmMsg)) return;
+                                btn.disabled = true;
+                                await downloadPullOne(it);
+                                applyFilter();
+                            } catch (e) {
+                                console.warn('Download/Pull failed', e);
+                                alert('Download/Pull failed. Check server logs.');
+                            } finally {
+                                try { btn.disabled = false; } catch (e) {}
+                            }
+                        };
+                        actionTd.appendChild(btn);
+                    } else {
+                        actionTd.innerHTML = '<span class="text-muted small">—</span>';
+                    }
+                }
+            } catch (e) {}
+
+            tr.onclick = async () => {
+                if (!pickable) {
+                    try {
+                        const msg = (!st || st.docker_available === false)
+                            ? 'Docker not available; cannot select this vulnerability.'
+                            : (!st.exists ? 'Compose not downloaded; use Download/Pull.' : 'Images not pulled; use Download/Pull.');
+                        logWarn(msg);
+                        alert(msg);
+                    } catch (e) {}
+                    return;
+                }
                 const item = state.scenarios[sidx].sections[secName].items[iidx];
                 item.v_name = it.Name;
                 item.v_path = it.Path;
@@ -16216,6 +16887,15 @@ async function openVulnPicker(sidx, secName, iidx){
                 if (it.Description) item.v_desc = it.Description;
                 // also set selected to Specific defensively
                 item.selected = 'Specific';
+                try { persistEditorState(); } catch (e) {}
+                try {
+                    if (typeof flushServerSnapshotPersistNow === 'function') {
+                        const res = await flushServerSnapshotPersistNow();
+                        if (res && res.ok === false) {
+                            try { console.warn('Snapshot flush failed', res.error); } catch (_) {}
+                        }
+                    }
+                } catch (e) {}
                 document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
                 try { if(window.bootstrap){ bootstrap.Modal.getInstance(modalEl)?.hide(); } } catch(e) {}
                 renderMain();
@@ -16253,7 +16933,15 @@ async function openVulnPicker(sidx, secName, iidx){
             });
         }
         renderRows();
-        if (filterMeta) filterMeta.textContent = `${current.length}/${eligible.length} shown`;
+        try {
+            const ready = eligible.filter(it => {
+                const st = statusByKey.get(itemKey(it)) || null;
+                return isPickable(st);
+            }).length;
+            if (filterMeta) filterMeta.textContent = `${current.length}/${eligible.length} shown (ready: ${ready})`;
+        } catch (e) {
+            if (filterMeta) filterMeta.textContent = `${current.length}/${eligible.length} shown`;
+        }
     };
     filterInput.oninput = applyFilter;
     filterClearBtn.onclick = () => { filterInput.value = ''; applyFilter(); };
@@ -16890,7 +17578,9 @@ async function submitRunCliRequest(buildRequest, options = {}) {
 
 async function runAsync() {
     let rp = state.result_path || '';
-    if (!rp.endsWith('.xml')) {
+    if (IS_BUILDER_VIEW) {
+        rp = '';
+    } else if (!rp.endsWith('.xml')) {
         const go = window.confirm('Your XML has not been saved. Save now and then run?');
         if (!go) { logInfo('Async run cancelled by user (declined save)'); return; }
         try {
@@ -16902,9 +17592,23 @@ async function runAsync() {
     }
     const confirmMsg = 'This action will generate a new CORE scenario and attempt to start it asynchronously using the daemon connection.\n\nProceed?';
     if (!window.confirm(confirmMsg)) { logInfo('Async run cancelled by user at confirmation'); return; }
+    // Default to prompting when active CORE sessions exist (historical behavior).
+    // Auto-kill is only enabled when explicitly chosen in the Execute flow.
     let autoKillSessions = false;
-    try { autoKillSessions = !!getCoreConfig(true)?.adv_auto_kill_sessions; } catch(e) {}
-    const res = await submitRunCliRequest(() => ({ body: buildRunFormData(rp), xmlPath: rp }), { autoKillSessions });
+    const res = await submitRunCliRequest(() => {
+        if (IS_BUILDER_VIEW) {
+            const payload = enrichPayloadWithScenarioContext({
+                scenarios: state.scenarios,
+                core: getCoreConfig(true),
+            });
+            return {
+                body: JSON.stringify(payload),
+                headers: { 'Content-Type': 'application/json' },
+                xmlPath: null,
+            };
+        }
+        return { body: buildRunFormData(rp), xmlPath: rp };
+    }, { autoKillSessions });
     if (!res) { logWarn('Async run aborted before launch'); return; }
     if (!res.ok) {
         const detail = await extractResponseDetail(res);
@@ -16977,8 +17681,9 @@ async function refreshXmlDockPreview({ force = false, preferSavedPath = false } 
     const hasSaved = rp && rp.endsWith('.xml');
     const lastPath = xmlPre.dataset.xmlPreviewPath || '';
 
-    // Prefer showing the persisted XML when available.
-    if (hasSaved && (preferSavedPath || force || !xmlPre.textContent.trim() || lastPath !== rp)) {
+    // Prefer showing the persisted XML when available (except in builder view, where the
+    // preview should always reflect the current unsaved configuration).
+    if (!IS_BUILDER_VIEW && hasSaved && (preferSavedPath || force || !xmlPre.textContent.trim() || lastPath !== rp)) {
         try {
             const txt = await (await fetch('/download_report?path=' + encodeURIComponent(rp), { credentials: 'same-origin' })).text();
             applyIfLatest(txt, { path: rp });
@@ -17239,8 +17944,41 @@ async function promptRunProgressConfirm(message, { title = 'Active CORE session(
         if (metaEl) metaEl.textContent = 'Active CORE session(s) are blocking the run.';
         try { runProgressLogLine(String(message || '')); } catch (e) {}
 
-        // Ensure visible.
+        const bringModalToFront = () => {
+            try {
+                if (!modalEl) return;
+                // Find the highest z-index among currently visible modals/backdrops.
+                let maxZ = 1055;
+                try {
+                    document.querySelectorAll('.modal.show').forEach((el) => {
+                        if (!el || el === modalEl) return;
+                        const z = parseInt(window.getComputedStyle(el).zIndex || '0', 10);
+                        if (!Number.isNaN(z)) maxZ = Math.max(maxZ, z);
+                    });
+                } catch (e) {}
+                try {
+                    document.querySelectorAll('.modal-backdrop').forEach((el) => {
+                        const z = parseInt(window.getComputedStyle(el).zIndex || '0', 10);
+                        if (!Number.isNaN(z)) maxZ = Math.max(maxZ, z);
+                    });
+                } catch (e) {}
+                const targetZ = Math.max(maxZ + 20, 1075);
+                modalEl.style.zIndex = String(targetZ);
+
+                // After Bootstrap inserts the backdrop, bump the newest one just under the modal.
+                window.setTimeout(() => {
+                    try {
+                        const backdrops = document.querySelectorAll('.modal-backdrop');
+                        const bd = backdrops && backdrops.length ? backdrops[backdrops.length - 1] : null;
+                        if (bd) bd.style.zIndex = String(targetZ - 10);
+                    } catch (e) {}
+                }, 0);
+            } catch (e) {}
+        };
+
+        // Ensure visible and brought to the front (above any other progress/execute dialogs).
         try { runProgressModalInst?.show(); } catch (e) {}
+        bringModalToFront();
 
         // Hide the top-right close button so the prompt can't disappear without resolving.
         try { if (closeBtn) closeBtn.style.display = 'none'; } catch (e) {}
@@ -17710,9 +18448,11 @@ async function runSyncWithModal(arg){
             stopUploadHeartbeat();
         }
     };
-    // Validate saved XML
+    // Validate saved XML (admin view). Builder view runs from current editor state.
     let rp = state.result_path || '';
-    if (!rp.endsWith('.xml')) {
+    if (IS_BUILDER_VIEW) {
+        rp = '';
+    } else if (!rp.endsWith('.xml')) {
         const go = window.confirm('Your XML has not been saved. Save now and then run?');
         if (!go) { logInfo('Run CLI cancelled by user (declined save)'); return false; }
         try {
@@ -17835,7 +18575,33 @@ async function runSyncWithModal(arg){
         }
         const autoKillSessions = !!formOptions?.advanced?.autoKillSessions;
         const res = await submitRunCliRequest(
-            () => ({ body: buildRunFormData(rp, formOptions), xmlPath: rp, scenarioIndex: scenarioIndexForRun }),
+            () => {
+                if (IS_BUILDER_VIEW) {
+                    const payload = enrichPayloadWithScenarioContext({
+                        scenarios: state.scenarios,
+                        core: getCoreConfig(true),
+                    }, { scenarioIndex: scenarioIndexForRun });
+                    if (updateRemoteRepo) {
+                        payload.update_remote_repo = true;
+                    }
+                    try {
+                        const adv = formOptions && typeof formOptions.advanced === 'object' ? formOptions.advanced : null;
+                        if (adv && adv.fixDockerDaemon) payload.adv_fix_docker_daemon = true;
+                        if (adv && adv.runCoreCleanup) payload.adv_run_core_cleanup = true;
+                        if (adv && adv.checkCoreVersion) payload.adv_check_core_version = true;
+                        if (adv && adv.restartCoreDaemon) payload.adv_restart_core_daemon = true;
+                        if (adv && adv.startCoreDaemon) payload.adv_start_core_daemon = true;
+                        if (adv && adv.autoKillSessions) payload.adv_auto_kill_sessions = true;
+                    } catch (e) {}
+                    return {
+                        body: JSON.stringify(payload),
+                        headers: { 'Content-Type': 'application/json' },
+                        xmlPath: null,
+                        scenarioIndex: scenarioIndexForRun,
+                    };
+                }
+                return { body: buildRunFormData(rp, formOptions), xmlPath: rp, scenarioIndex: scenarioIndexForRun };
+            },
             { autoKillSessions }
         );
         if (res) {

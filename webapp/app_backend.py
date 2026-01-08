@@ -4694,6 +4694,43 @@ def _reports_dir() -> str:
     return d
 
 
+def _try_resolve_latest_outputs_xml(xml_path: str) -> Optional[str]:
+    """Best-effort recovery for stale saved XML paths.
+
+    The web UI stores `result_path` pointing to an XML under `outputs/scenarios-<ts>/...`.
+    Those folders can be deleted or moved (e.g., scenario deletion/purge), leaving a stale
+    path in localStorage. When that happens, try to find the newest file with the same
+    basename under `outputs/scenarios-*`.
+
+    Returns an absolute path if found, else None.
+    """
+    try:
+        if not xml_path:
+            return None
+        abs_path = os.path.abspath(xml_path)
+        if os.path.exists(abs_path):
+            return abs_path
+        base = os.path.basename(abs_path)
+        if not base.lower().endswith('.xml'):
+            return None
+        outputs_dir = os.path.abspath(_outputs_dir())
+        import glob
+        candidates = glob.glob(os.path.join(outputs_dir, 'scenarios-*', base))
+        candidates = [p for p in candidates if p and os.path.exists(p)]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        best = os.path.abspath(candidates[0])
+        try:
+            if os.path.commonpath([best, outputs_dir]) != outputs_dir:
+                return None
+        except Exception:
+            return None
+        return best
+    except Exception:
+        return None
+
+
 def _derive_default_seed(xml_hash: str) -> int:
     try:
         seed_val = int(xml_hash[:12], 16)
@@ -10261,30 +10298,42 @@ def _delete_saved_scenario_xml_artifacts(names_to_remove: Iterable[Any]) -> Dict
 
     for _mtime, folder in dirs[:500]:
         # Fast path: attempt stem-based delete when possible.
-        for stem in stems:
-            candidate = os.path.join(folder, f"{stem}.xml")
-            try:
-                if not os.path.isfile(candidate):
+        # NOTE: Some deployments (and some macOS volumes) can be case-sensitive.
+        # The UI typically writes files like "Scenario_1.xml" but secure_filename()
+        # yields "scenario_1". Use a case-insensitive match within the folder.
+        try:
+            folder_entries = os.listdir(folder)
+        except Exception:
+            folder_entries = []
+
+        stem_targets = {f"{stem}.xml".lower() for stem in stems if stem}
+        if stem_targets and folder_entries:
+            for fname in list(folder_entries):
+                try:
+                    if fname.lower() not in stem_targets:
+                        continue
+                    path = os.path.join(folder, fname)
+                    if not os.path.isfile(path):
+                        continue
+                    p_abs = os.path.abspath(path)
+                    if not p_abs.startswith(outputs_root + os.sep):
+                        continue
+                    os.remove(p_abs)
+                    removed += 1
+                except Exception:
                     continue
-                cand_abs = os.path.abspath(candidate)
-                if not cand_abs.startswith(outputs_root + os.sep):
-                    continue
-                os.remove(cand_abs)
-                removed += 1
-            except Exception:
-                continue
 
         # Robust path: scan XML contents and delete any matching scenario(s).
-        if match_keys:
-            try:
-                for fname in os.listdir(folder):
-                    if not fname.endswith('.xml'):
+        if match_keys and folder_entries:
+            for fname in list(folder_entries):
+                try:
+                    if not fname.lower().endswith('.xml'):
                         continue
                     # Skip CORE pre/post captures; only include user-authored scenario XML.
-                    if fname.startswith('core-'):
+                    if fname.lower().startswith('core-'):
                         continue
-                    # Mirror discovery behavior for scenario editor saves.
-                    if not fname.startswith('Scenario_'):
+                    # Mirror discovery behavior for scenario editor saves (case-insensitive).
+                    if not fname.lower().startswith('scenario_'):
                         continue
                     path = os.path.join(folder, fname)
                     if not os.path.isfile(path):
@@ -10293,12 +10342,9 @@ def _delete_saved_scenario_xml_artifacts(names_to_remove: Iterable[Any]) -> Dict
                         names_in_file = _scenario_names_from_xml(path)
                     except Exception:
                         names_in_file = []
-                    hit = False
-                    for nm in names_in_file:
-                        if _scenario_match_key(nm) in match_keys:
-                            hit = True
-                            break
-                    if not hit:
+                    if not names_in_file:
+                        continue
+                    if not any(_scenario_match_key(nm) in match_keys for nm in names_in_file):
                         continue
                     p_abs = os.path.abspath(path)
                     if not p_abs.startswith(outputs_root + os.sep):
@@ -10308,8 +10354,8 @@ def _delete_saved_scenario_xml_artifacts(names_to_remove: Iterable[Any]) -> Dict
                         removed += 1
                     except Exception:
                         continue
-            except Exception:
-                pass
+                except Exception:
+                    continue
         # Best-effort cleanup of empty folders
         try:
             if folder.startswith(outputs_root + os.sep) and os.path.isdir(folder) and not os.listdir(folder):
@@ -10329,10 +10375,17 @@ def _remove_scenarios_from_all_editor_snapshots(names_to_remove: Iterable[Any]) 
     remove_norms: set[str] = set()
     remove_match: set[str] = set()
     for raw in names_to_remove or []:
-        norm = _normalize_scenario_label(raw)
+        try:
+            s = raw if isinstance(raw, str) else str(raw)
+        except Exception:
+            s = ''
+        s = s.strip() if isinstance(s, str) else ''
+        if not s:
+            continue
+        norm = _normalize_scenario_label(s)
         if norm:
             remove_norms.add(norm)
-        mk = _scenario_match_key(raw)
+        mk = _scenario_match_key(s)
         if mk:
             remove_match.add(mk)
     if not remove_norms:
@@ -16491,7 +16544,10 @@ def _parse_scenario_editor(se):
             if name == "Vulnerabilities":
                 # Extra attributes for Vulnerabilities section
                 sel = (d.get("selected") or "").strip()
-                if sel == "Type/Vector":
+                # UI historically uses "Category" while XML schema uses "Type/Vector".
+                # Normalize to UI label "Category" so round-trips are stable.
+                if sel in ("Type/Vector", "Category"):
+                    d["selected"] = "Category"
                     d["v_type"] = item.get("v_type", "Random")
                     d["v_vector"] = item.get("v_vector", "Random")
                 elif sel == "Specific":
@@ -16790,7 +16846,11 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
 
             for item in items_list:
                 it = ET.SubElement(sec_el, "item")
-                it.set("selected", str(item.get('selected', 'Random')))
+                sel_for_xml = str(item.get('selected', 'Random'))
+                # UI label "Category" maps to schema label "Type/Vector".
+                if name == 'Vulnerabilities' and sel_for_xml == 'Category':
+                    sel_for_xml = 'Type/Vector'
+                it.set("selected", sel_for_xml)
                 try:
                     it.set("factor", f"{float(item.get('factor', 1.0)):.3f}")
                 except Exception:
@@ -16854,8 +16914,8 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                     if ct:
                         it.set('content_type', ct)
                 if name == 'Vulnerabilities':
-                    sel = str(item.get('selected', 'Random'))
-                    if sel == 'Type/Vector':
+                    sel = sel_for_xml
+                    if sel in ('Type/Vector', 'Category'):
                         vt = item.get('v_type')
                         vv = item.get('v_vector')
                         if vt:
@@ -17866,6 +17926,14 @@ def run_cli():
         except Exception:
             pass
     if not os.path.exists(xml_path):
+        try:
+            recovered = _try_resolve_latest_outputs_xml(xml_path)
+            if recovered and os.path.exists(recovered):
+                app.logger.warning('[sync] XML path missing; recovered to newest match: %s -> %s', xml_path, recovered)
+                xml_path = recovered
+        except Exception:
+            pass
+    if not os.path.exists(xml_path):
         flash(f'XML path not found: {xml_path}')
         return redirect(url_for('index'))
     # Skip schema validation: format differs from CORE XML
@@ -18170,6 +18238,8 @@ def api_plan_preview_full():
     try:
         payload = request.get_json(silent=True) or {}
         xml_path = payload.get('xml_path')
+        scenarios_inline = payload.get('scenarios')
+        core_inline = payload.get('core')
         scenario = payload.get('scenario') or None
         seed = payload.get('seed')
         r2s_hosts_min_list = payload.get('r2s_hosts_min_list') or []
@@ -18180,7 +18250,41 @@ def api_plan_preview_full():
         except Exception:
             seed = None
         if not xml_path:
-            return jsonify({'ok': False, 'error': 'xml_path missing'}), 400
+            # Builder/participant roles may preview without saving by posting scenarios/core.
+            if isinstance(scenarios_inline, list):
+                try:
+                    normalized_core = _normalize_core_config(core_inline, include_password=True) if isinstance(core_inline, dict) else None
+                    tree = _build_scenarios_xml({ 'scenarios': scenarios_inline, 'core': normalized_core })
+                    ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+                    tag = str(uuid.uuid4())[:8]
+                    out_dir = os.path.join(_outputs_dir(), f'tmp-preview-{ts}-{tag}')
+                    os.makedirs(out_dir, exist_ok=True)
+                    stem_raw = scenario or None
+                    if not stem_raw:
+                        try:
+                            first_name = None
+                            for sc in scenarios_inline:
+                                if isinstance(sc, dict) and sc.get('name'):
+                                    first_name = sc.get('name')
+                                    break
+                            stem_raw = first_name or 'scenarios'
+                        except Exception:
+                            stem_raw = 'scenarios'
+                    stem = secure_filename(str(stem_raw)).strip('_-.') or 'scenarios'
+                    xml_path = os.path.join(out_dir, f"{stem}.xml")
+                    try:
+                        from lxml import etree as LET  # type: ignore
+                        raw = ET.tostring(tree.getroot(), encoding='utf-8')
+                        lroot = LET.fromstring(raw)
+                        pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+                        with open(xml_path, 'wb') as f:
+                            f.write(pretty)
+                    except Exception:
+                        tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+                except Exception as exc:
+                    return jsonify({'ok': False, 'error': f'Failed to render XML for preview: {exc}'}), 400
+            else:
+                return jsonify({'ok': False, 'error': 'xml_path missing'}), 400
         xml_path = os.path.abspath(xml_path)
         if not os.path.exists(xml_path):
             return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
@@ -19129,6 +19233,7 @@ def run_cli_async():
     adv_start_core_daemon = False
     adv_auto_kill_sessions = False
     docker_remove_conflicts = False
+    scenarios_inline = None
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
         xml_path = request.form.get('xml_path')
@@ -19169,6 +19274,7 @@ def run_cli_async():
         try:
             j = request.get_json(silent=True) or {}
             xml_path = j.get('xml_path')
+            scenarios_inline = j.get('scenarios')
             if 'seed' in j:
                 try: seed = int(j.get('seed'))
                 except Exception: seed = None
@@ -19197,7 +19303,50 @@ def run_cli_async():
         except Exception:
             pass
     if not xml_path:
-        return jsonify({"error": "XML path missing. Save XML first."}), 400
+        # Builder/participant roles may execute without saving by posting scenarios/core.
+        if isinstance(scenarios_inline, list):
+            try:
+                # Build a temporary XML for this run.
+                core_meta = core_override if isinstance(core_override, dict) else None
+                normalized_core = _normalize_core_config(core_meta, include_password=True) if core_meta else None
+                tree = _build_scenarios_xml({ 'scenarios': scenarios_inline, 'core': normalized_core })
+                ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+                run_tag = str(uuid.uuid4())[:8]
+                out_dir = os.path.join(_outputs_dir(), f'tmp-exec-{ts}-{run_tag}')
+                os.makedirs(out_dir, exist_ok=True)
+                # Filename hint: active scenario name if available, else generic.
+                stem_raw = None
+                try:
+                    if scenario_name_hint:
+                        stem_raw = str(scenario_name_hint)
+                except Exception:
+                    stem_raw = None
+                if not stem_raw:
+                    try:
+                        first_name = None
+                        for sc in scenarios_inline:
+                            if isinstance(sc, dict) and sc.get('name'):
+                                first_name = sc.get('name')
+                                break
+                        stem_raw = first_name or 'scenarios'
+                    except Exception:
+                        stem_raw = 'scenarios'
+                stem = secure_filename(str(stem_raw)).strip('_-.') or 'scenarios'
+                xml_path = os.path.join(out_dir, f"{stem}.xml")
+                # Pretty print when possible
+                try:
+                    from lxml import etree as LET  # type: ignore
+                    raw = ET.tostring(tree.getroot(), encoding='utf-8')
+                    lroot = LET.fromstring(raw)
+                    pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+                    with open(xml_path, 'wb') as f:
+                        f.write(pretty)
+                except Exception:
+                    tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+            except Exception as exc:
+                return jsonify({"error": f"Failed to render XML for execution: {exc}"}), 400
+        else:
+            return jsonify({"error": "XML path missing. Save XML first."}), 400
     xml_path = os.path.abspath(xml_path)
     if not os.path.exists(xml_path) and '/outputs/' in xml_path:
         try:
@@ -19205,6 +19354,14 @@ def run_cli_async():
             if alt != xml_path and os.path.exists(alt):
                 app.logger.info("[async] Remapped XML path %s -> %s", xml_path, alt)
                 xml_path = alt
+        except Exception:
+            pass
+    if not os.path.exists(xml_path):
+        try:
+            recovered = _try_resolve_latest_outputs_xml(xml_path)
+            if recovered and os.path.exists(recovered):
+                app.logger.warning('[async] XML path missing; recovered to newest match: %s -> %s', xml_path, recovered)
+                xml_path = recovered
         except Exception:
             pass
     if not os.path.exists(xml_path):
@@ -25383,6 +25540,153 @@ def vuln_compose_status():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/vuln_compose/status_images', methods=['POST'])
+def vuln_compose_status_images():
+    """Fast-ish status for a list of catalog items: whether compose is downloaded and images exist locally.
+
+    This endpoint is optimized for UI gating (vuln picker):
+    - Resolve the compose file path similarly to `/vuln_compose/status`.
+    - Prefer parsing docker-compose YAML (`services.*.image`) to avoid invoking `docker compose config`.
+    - Check local images via `docker image inspect`.
+    - Fallback to `docker compose -f <file> config --images` only when YAML parsing yields no images.
+
+    Payload: { items: [{Name, Path}] }
+    Returns: { items: [{Name, Path, exists: bool, pulled: bool, compose_path: str|None, images: [str], missing_images: [str]}] }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        items = data.get('items') or []
+        out: list[dict] = []
+
+        base_out = os.path.abspath(_vuln_base_dir())
+        docker_ok = bool(shutil.which('docker'))
+
+        # Optional dependency (pinned in requirements, but keep best-effort).
+        try:
+            import yaml  # type: ignore
+        except Exception:  # pragma: no cover
+            yaml = None  # type: ignore
+
+        def _resolve_compose_path(name: str, path: str, compose_name: str) -> tuple[bool, str | None]:
+            safe = _safe_name(name or 'vuln')
+            vdir = os.path.join(base_out, safe)
+            gh = _parse_github_url(path)
+            compose_file: str | None = None
+            exists = False
+
+            if gh.get('is_github'):
+                repo_dir = os.path.join(vdir, _vuln_repo_subdir())
+                sub = gh.get('subpath') or ''
+                is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                if is_file_sub:
+                    compose_file = os.path.join(repo_dir, sub)
+                    exists = os.path.exists(compose_file)
+                else:
+                    base_dir = os.path.join(repo_dir, sub) if sub else repo_dir
+                    exists = os.path.isdir(base_dir)
+                    if exists:
+                        preferred = os.path.join(base_dir, compose_name)
+                        if os.path.exists(preferred):
+                            compose_file = preferred
+                        else:
+                            cand = _compose_candidates(base_dir)
+                            compose_file = cand[0] if cand else None
+                return bool(exists and compose_file and os.path.exists(compose_file)), compose_file
+
+            # Non-github: legacy direct download
+            compose_file = os.path.join(vdir, compose_name)
+            exists = os.path.exists(compose_file)
+            return bool(exists), compose_file if exists else compose_file
+
+        def _images_from_compose_yaml(compose_path: str) -> list[str]:
+            if not yaml:
+                return []
+            try:
+                with open(compose_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    doc = yaml.safe_load(f) or {}
+                if not isinstance(doc, dict):
+                    return []
+                services = doc.get('services')
+                if not isinstance(services, dict):
+                    return []
+                images: list[str] = []
+                for _svc_name, svc in services.items():
+                    if not isinstance(svc, dict):
+                        continue
+                    img = svc.get('image')
+                    if isinstance(img, str) and img.strip():
+                        images.append(img.strip())
+                # preserve stable order but dedupe
+                seen: set[str] = set()
+                out_imgs: list[str] = []
+                for img in images:
+                    if img in seen:
+                        continue
+                    seen.add(img)
+                    out_imgs.append(img)
+                return out_imgs
+            except Exception:
+                return []
+
+        for it in items:
+            name = (it.get('Name') or '').strip()
+            path = (it.get('Path') or '').strip()
+            compose_name = (it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
+
+            exists, compose_path = _resolve_compose_path(name, path, compose_name)
+            images: list[str] = []
+            missing: list[str] = []
+            pulled = False
+
+            if exists and compose_path and docker_ok:
+                images = _images_from_compose_yaml(compose_path)
+
+                # Fallback: ask docker compose to render images list (slower).
+                if not images:
+                    try:
+                        proc = subprocess.run(
+                            ['docker', 'compose', '-f', compose_path, 'config', '--images'],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            timeout=20,
+                        )
+                        if proc.returncode == 0:
+                            images = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
+                    except Exception:
+                        images = []
+
+                if images:
+                    for img in images:
+                        try:
+                            p2 = subprocess.run(
+                                ['docker', 'image', 'inspect', img],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                            if p2.returncode != 0:
+                                missing.append(img)
+                        except Exception:
+                            missing.append(img)
+                    pulled = len(missing) == 0
+
+            out.append({
+                'Name': name,
+                'Path': path,
+                'compose': compose_name,
+                'compose_path': compose_path,
+                'exists': bool(exists),
+                'pulled': bool(pulled),
+                'images': images,
+                'missing_images': missing,
+                'docker_available': docker_ok,
+            })
+
+        return jsonify({'items': out})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/vuln_compose/download', methods=['POST'])
 def vuln_compose_download():
     """Download docker-compose.yml for the given catalog items.
@@ -25811,6 +26115,11 @@ def _purge_run_history_for_scenario(scenario_name: str, delete_artifacts: bool =
             return 0
         kept = []
         removed = 0
+        target_key = ''
+        try:
+            target_key = _scenario_match_key(scenario_name)
+        except Exception:
+            target_key = ''
         for entry in hist:
             scen_list = []
             try:
@@ -25820,7 +26129,19 @@ def _purge_run_history_for_scenario(scenario_name: str, delete_artifacts: bool =
                     scen_list = _scenario_names_from_xml(entry.get('xml_path'))
             except Exception:
                 scen_list = []
-            if scenario_name in scen_list:
+            match = False
+            if target_key and scen_list:
+                try:
+                    for nm in scen_list:
+                        if _scenario_match_key(nm) == target_key:
+                            match = True
+                            break
+                except Exception:
+                    match = False
+            else:
+                match = bool(scenario_name in (scen_list or []))
+
+            if match:
                 removed += 1
                 if delete_artifacts:
                     for key in ('xml_path','report_path','pre_xml_path','post_xml_path','scenario_xml_path'):
@@ -25828,7 +26149,7 @@ def _purge_run_history_for_scenario(scenario_name: str, delete_artifacts: bool =
                         if p and isinstance(p,str) and os.path.exists(p):
                             # Only delete if inside outputs directory for safety
                             try:
-                                out_abs = os.path.abspath('outputs')
+                                out_abs = os.path.abspath(_outputs_dir())
                                 p_abs = os.path.abspath(p)
                                 if p_abs.startswith(out_abs):
                                     try: os.remove(p_abs)

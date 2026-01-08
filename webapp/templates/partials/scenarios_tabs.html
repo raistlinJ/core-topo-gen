@@ -40,7 +40,7 @@
 <div class="position-fixed start-0 end-0 bg-body border-top" style="bottom: var(--coretg-dock-height, 0px); z-index: 1045;">
   <div class="container-fluid py-2">
     <div class="d-flex justify-content-end gap-2">
-      {% if scenarios_active_tab in ['connection-setup', 'topology', 'flag-sequencing'] %}
+      {% if (not is_builder_view) and scenarios_active_tab in ['connection-setup', 'topology', 'flag-sequencing'] %}
         {% if scenarios_active_tab in ['topology', 'connection-setup'] %}
         <button id="saveXmlBtn" class="btn btn-outline-success px-4 py-2 shadow-sm" type="submit" form="editorForm">Save XML</button>
         {% else %}
