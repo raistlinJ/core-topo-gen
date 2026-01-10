@@ -1298,7 +1298,12 @@ def _ensure_list_field_has(value: object, item: str) -> List[str]:
 
 
 def _write_iproute2_wrapper(out_dir: str, base_image: str) -> str:
-	"""Write a minimal Dockerfile that installs iproute2 and ethtool (best-effort across distros)."""
+	"""Write a minimal Dockerfile that installs baseline tooling (best-effort across distros).
+
+	Rationale: CORE docker nodes often run with no internet access from inside the container
+	(e.g., network_mode none + CORE-managed interfaces). Installing required tools at build
+	time avoids runtime apt/apk/yum failures.
+	"""
 	os.makedirs(out_dir, exist_ok=True)
 	dockerfile_path = os.path.join(out_dir, 'Dockerfile')
 	content = f"""FROM {base_image}
@@ -1306,18 +1311,18 @@ def _write_iproute2_wrapper(out_dir: str, base_image: str) -> str:
 RUN set -eux; \\
 		if command -v apt-get >/dev/null 2>&1; then \\
 			apt-get update || true; \
-			apt-get install -y --no-install-recommends iproute2 ethtool || true; \
+			apt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps python3 || true; \
 			rm -rf /var/lib/apt/lists/*; \\
 		elif command -v apk >/dev/null 2>&1; then \\
-			apk add --no-cache iproute2 ethtool || true; \
+			apk add --no-cache ca-certificates curl iproute2 ethtool iptables iputils net-tools procps python3 || true; \
 		elif command -v dnf >/dev/null 2>&1; then \\
-			dnf install -y iproute ethtool || true; \
+			dnf install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl || true; \
 			dnf clean all || true; \
 		elif command -v yum >/dev/null 2>&1; then \\
-			yum install -y iproute ethtool || true; \
+			yum install -y iproute ethtool iptables iputils net-tools procps python3 ca-certificates curl || true; \
 			yum clean all || true; \
     else \\
-			echo "No supported package manager found to install iproute2/ethtool (continuing)" >&2; \
+			echo "No supported package manager found to install baseline tools (continuing)" >&2; \
     fi
 """
 	with open(dockerfile_path, 'w', encoding='utf-8') as f:
@@ -1647,6 +1652,7 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				try:
 					with open(src_path, 'r', encoding='utf-8') as f:
 						base_compose_obj = yaml.safe_load(f) or {}
+					# Track that we successfully parsed the chosen src_path.
 					# If the compose is local, copy referenced support files (e.g., ./flag.txt)
 					# and rewrite relative bind sources to absolute paths under base_dir.
 					try:
@@ -1665,8 +1671,45 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						list((base_compose_obj.get('services') or {}).keys()),
 					)
 				except Exception:
+					# If the cached/downloaded compose under out_base is corrupt (eg partial download
+					# or non-YAML error page), fall back to parsing the original local path (key[1])
+					# when available.
 					logger.exception("[vuln] yaml parse error for compose path=%s", src_path)
 					base_compose_obj = None
+					try:
+						fallback_path = key[1] if (key[1] and os.path.exists(key[1])) else None
+						if fallback_path and os.path.abspath(fallback_path) != os.path.abspath(src_path):
+							with open(fallback_path, 'r', encoding='utf-8') as f2:
+								base_compose_obj = yaml.safe_load(f2) or {}
+							# Mark this as a local template so downstream can isolate binds/hints per node.
+							is_local = True
+							src_path_bad = src_path
+							src_path = fallback_path
+							# Best-effort self-heal the cached path for future runs.
+							try:
+								shutil.copy2(fallback_path, src_path_bad)
+							except Exception:
+								pass
+							try:
+								src_dir = os.path.dirname(os.path.abspath(fallback_path))
+								base_compose_obj = _copy_support_paths_and_absolutize_binds(
+									base_compose_obj,
+									src_dir=src_dir,
+									base_dir=base_dir,
+								)
+							except Exception:
+								pass
+							try:
+								logger.warning(
+									"[vuln] recovered compose yaml parse using local path=%s (was=%s)",
+									fallback_path,
+									src_path_bad,
+								)
+							except Exception:
+								pass
+					except Exception:
+						# Keep best-effort behavior: callers may still copy the raw compose.
+						base_compose_obj = None
 			cache[key] = (base_compose_obj, src_path, base_dir, is_local)
 		out_path = os.path.join(out_base, f"docker-compose-{node_name}.yml")
 		wrote = False
@@ -1757,20 +1800,27 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				skip_wrapper = skip_wrap_raw in ('1', 'true', 'yes', 'y', 'on')
 				if skip_wrapper:
 					raise RuntimeError('skip_iproute2_wrapper')
+				scenario_tag_raw = str(
+					rec.get('ScenarioTag')
+					or rec.get('scenario_tag')
+					or os.getenv('CORETG_SCENARIO_TAG')
+					or ''
+				).strip()
+				scenario_tag_safe = _safe_name(scenario_tag_raw) if scenario_tag_raw else 'scenario'
 				svc_key = _select_service_key(obj, prefer_service=prefer)
 				services = obj.get('services') if isinstance(obj, dict) else None
 				if svc_key and isinstance(services, dict) and isinstance(services.get(svc_key), dict):
 					svc = services.get(svc_key)
 					base_image = str(svc.get('image') or '').strip()
 					if base_image:
-						wrap_dir = os.path.join(out_base, f"docker-wrap-{_safe_name(node_name)}")
+						wrap_dir = os.path.join(out_base, f"docker-wrap-{scenario_tag_safe}-{_safe_name(node_name)}")
 						_write_iproute2_wrapper(wrap_dir, base_image)
 						# Rewrite service to build the wrapper; keep a tagged image for caching.
 						# NOTE: some CORE VM Docker installs are missing the default "bridge" network,
 						# which causes `docker compose build` to fail with "network bridge not found".
 						# Force host networking for the build to avoid relying on the bridge network.
 						svc['build'] = {'context': wrap_dir, 'dockerfile': 'Dockerfile', 'network': 'host'}
-						svc['image'] = f"coretg/{_safe_name(node_name)}:iproute2"
+						svc['image'] = f"coretg/{scenario_tag_safe}-{_safe_name(node_name)}:iproute2"
 						# DefaultRoute needs iproute2 + NET_ADMIN in many images.
 						svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_ADMIN')
 					else:

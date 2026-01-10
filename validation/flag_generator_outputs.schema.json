@@ -8,7 +8,14 @@
   "properties": {
     "schema_version": {"type": "integer", "minimum": 1},
     "generator_id": {"type": "string", "minLength": 1},
-    "outputs": {"type": "object"},
+    "outputs": {
+      "type": "object",
+      "required": ["flag"],
+      "properties": {
+        "flag": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": true
+    },
     "handoff": {
       "type": "object",
       "properties": {

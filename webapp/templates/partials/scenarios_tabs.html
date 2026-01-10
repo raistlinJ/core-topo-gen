@@ -41,14 +41,10 @@
   <div class="container-fluid py-2">
     <div class="d-flex justify-content-end gap-2">
       {% if (not is_builder_view) and scenarios_active_tab in ['connection-setup', 'topology', 'flag-sequencing'] %}
-        {% if scenarios_active_tab in ['topology', 'connection-setup'] %}
-        <button id="saveXmlBtn" class="btn btn-outline-success px-4 py-2 shadow-sm" type="submit" form="editorForm">Save XML</button>
-        {% else %}
         <button id="saveXmlBtn" class="btn btn-outline-success px-4 py-2 shadow-sm" type="button">Save XML</button>
-        {% endif %}
         <button id="downloadXmlBtn" class="btn btn-outline-info px-4 py-2 shadow-sm" type="button" {% if not preview_xml_path %}disabled title="Save XML first"{% endif %}>Download XML</button>
       {% endif %}
-      <button id="scenariosExecuteBtn" class="btn btn-success px-4 py-2 shadow-sm" type="button">Execute</button>
+      <button id="scenariosExecuteBtn" class="btn btn-success px-4 py-2 shadow-sm" type="button">{% if scenarios_active_tab == 'preview' %}Execute{% else %}Preview{% endif %}</button>
     </div>
   </div>
 </div>
@@ -162,16 +158,169 @@
   function refreshScenariosExecuteButtonState(){
     const btn = document.getElementById('scenariosExecuteBtn');
     if (!btn) return;
-    const snapshot = getCurrentProjectSnapshot();
-    const scenario = snapshot ? resolveActiveScenarioFromSnapshot(snapshot) : null;
-    const verified = !!(scenario && isScenarioCoreVmVerifiedForProject(scenario));
-    btn.disabled = !verified;
-    if (!verified) {
-      btn.setAttribute('title', 'Verify a CORE VM in VM / Access to enable Execute.');
-    } else {
-      btn.removeAttribute('title');
+    // Preview is always available; CORE VM verification is only required for execution.
+    btn.disabled = false;
+    btn.removeAttribute('title');
+  }
+
+  const FLOW_STATE_STORAGE_KEY = 'coretg_flow_state_by_scenario_v1';
+
+  function normalizeScenarioKey(raw){
+    try {
+      return (raw || '').toString().trim().toLowerCase().replace(/\s+/g, ' ');
+    } catch (e) {
+      return '';
     }
   }
+
+  function readFlowStateMap(){
+    return readJsonFromLocalStorage(FLOW_STATE_STORAGE_KEY, {});
+  }
+
+  function getSavedFlowStateForScenario(scenarioName){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      if (!key) return null;
+      const map = readFlowStateMap();
+      const entry = (map && typeof map === 'object') ? map[key] : null;
+      if (!entry || typeof entry !== 'object') return null;
+      const scenario = (entry.scenario || scenarioName || '').toString();
+      const preset = (entry.preset || '').toString();
+      const length = Number.isFinite(+entry.length) ? (+entry.length) : null;
+      const chain_ids = Array.isArray(entry.chain_ids) ? entry.chain_ids.map(x => String(x || '').trim()).filter(Boolean) : [];
+      if (!chain_ids.length) return null;
+      return { scenario, preset, length: length || chain_ids.length, chain_ids };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function setSavedFlowStateForScenario(scenarioName, state){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      if (!key) return;
+      const map = readFlowStateMap();
+      const next = (map && typeof map === 'object') ? map : {};
+      const s = (state && typeof state === 'object') ? state : {};
+      next[key] = {
+        scenario: (scenarioName || '').toString().trim(),
+        preset: (s.preset || '').toString(),
+        length: Number.isFinite(+s.length) ? (+s.length) : null,
+        chain_ids: Array.isArray(s.chain_ids) ? s.chain_ids.map(x => String(x || '').trim()).filter(Boolean) : [],
+        updated_at: Date.now(),
+      };
+      localStorage.setItem(FLOW_STATE_STORAGE_KEY, JSON.stringify(next));
+    } catch (e) {}
+  }
+
+  async function postJson(url, payload){
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(payload || {}),
+    });
+    let data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!res.ok) {
+      const msg = (data && data.error) ? String(data.error) : ('HTTP ' + res.status);
+      throw new Error(msg);
+    }
+    if (data && data.ok === false) {
+      throw new Error(String(data.error || 'Request failed'));
+    }
+    return data;
+  }
+
+  function resolveScenarioNameForSave(){
+    try {
+      if (window.state && Array.isArray(window.state.scenarios)) {
+        const idx = (typeof window.state.active_index === 'number') ? window.state.active_index : 0;
+        const sc = window.state.scenarios[idx] || window.state.scenarios[0];
+        const nm = (sc && sc.name) ? String(sc.name).trim() : '';
+        if (nm) return nm;
+      }
+    } catch (e) {}
+    try {
+      const snap = getCurrentProjectSnapshot();
+      const active = resolveActiveScenarioFromSnapshot(snap);
+      const nm = (active && active.name) ? String(active.name).trim() : '';
+      if (nm) return nm;
+    } catch (e) {}
+    return resolveScenarioNameHint();
+  }
+
+  function buildSaveXmlApiPayload(){
+    // Prefer in-memory editor state when present (Topology page), else fall back to local snapshot.
+    try {
+      if (window.state && Array.isArray(window.state.scenarios) && window.state.scenarios.length) {
+        const active_index = (typeof window.state.active_index === 'number') ? window.state.active_index : 0;
+        const core = (typeof window.getCoreConfig === 'function') ? window.getCoreConfig(true) : (window.state.core || null);
+        const project_key_hint = (window.currentProjectKey || '').toString().trim();
+        const scenario_query = (typeof window.resolveScenarioQueryHint === 'function') ? window.resolveScenarioQueryHint() : '';
+        return {
+          scenarios: window.state.scenarios,
+          core: core,
+          active_index,
+          project_key_hint,
+          scenario_query,
+        };
+      }
+    } catch (e) {}
+
+    const snap = getCurrentProjectSnapshot();
+    const scenarios = Array.isArray(snap?.scenarios) ? snap.scenarios : [];
+    const core = (snap && typeof snap === 'object') ? (snap.core || null) : null;
+    const active_index = Number.isInteger(snap?.active_index) ? snap.active_index : null;
+    const project_key_hint = (snap && typeof snap === 'object' && snap.project_key_hint) ? String(snap.project_key_hint) : '';
+    const scenario_query = (snap && typeof snap === 'object' && snap.scenario_query) ? String(snap.scenario_query) : '';
+    return { scenarios, core, active_index, project_key_hint, scenario_query };
+  }
+
+  async function saveXmlViaApi(){
+    const payload = buildSaveXmlApiPayload();
+    if (!Array.isArray(payload.scenarios) || !payload.scenarios.length) {
+      throw new Error('No scenarios available to save.');
+    }
+    const data = await postJson('/save_xml_api', payload);
+    const xmlPath = (data && data.result_path) ? String(data.result_path) : '';
+    if (!xmlPath) throw new Error('Save succeeded but returned no result_path.');
+
+    // If the Topology page state is present, keep it in sync.
+    try {
+      if (window.state && typeof window.state === 'object') {
+        window.state.result_path = xmlPath;
+      }
+    } catch (e) {}
+
+    try {
+      const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
+      if (xmlPathInput) xmlPathInput.value = xmlPath;
+    } catch (e) {}
+    try {
+      const dl = document.getElementById('downloadXmlBtn');
+      if (dl) {
+        dl.disabled = false;
+        dl.removeAttribute('title');
+      }
+    } catch (e) {}
+    return xmlPath;
+  }
+
+  async function saveAllAndGoPreview(opts){
+    const options = (opts && typeof opts === 'object') ? opts : {};
+    const xmlPath = await saveXmlViaApi();
+    const scenario = (options.scenarioOverride || '').toString().trim() || resolveScenarioNameForSave();
+    const baseUrl = String(document.getElementById('scenariosPreviewTabLink')?.dataset?.previewBaseUrl || '/scenarios/preview');
+    const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + (scenario ? ('&scenario=' + encodeURIComponent(scenario)) : '');
+    window.location.href = url;
+  }
+
+  window.coretgPostJson = postJson;
+  window.coretgSaveXmlViaApi = saveXmlViaApi;
+  window.coretgSaveAllAndGoPreview = saveAllAndGoPreview;
+  window.coretgGetSavedFlowStateForScenario = getSavedFlowStateForScenario;
+  window.coretgSetSavedFlowStateForScenario = setSavedFlowStateForScenario;
 
   window.coretgRefreshScenariosExecuteButtonState = refreshScenariosExecuteButtonState;
   document.addEventListener('DOMContentLoaded', refreshScenariosExecuteButtonState);

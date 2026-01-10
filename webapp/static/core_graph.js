@@ -32,11 +32,28 @@
     });
 
     // Restore positions
-    const storageKey = 'coretg_graph_positions_' + xmlPath;
+    // Versioned key to avoid inheriting corrupted/legacy saved layouts.
+    const storageKey = 'coretg_graph_positions_v2_' + xmlPath;
     let restoredPositions = {}; try { restoredPositions = JSON.parse(localStorage.getItem(storageKey)||'{}'); } catch(e){}
-    nodes.forEach(n => { const saved = restoredPositions[n.id]; if(saved){ n.x=saved.x; n.y=saved.y; if(saved.pinned){ n.fx=saved.x; n.fy=saved.y; } } });
+    nodes.forEach(n => {
+      const saved = restoredPositions[n.id];
+      if(!saved) return;
+      const sx = Number(saved.x);
+      const sy = Number(saved.y);
+      if(Number.isFinite(sx)) n.x = sx;
+      if(Number.isFinite(sy)) n.y = sy;
+      // Only restore pins that were intentionally created via dragging.
+      // This avoids older persisted "pinned" states from accidental click-release.
+      if(saved.pinned_by_drag === true){
+        if(Number.isFinite(sx)) n.fx = sx;
+        if(Number.isFinite(sy)) n.fy = sy;
+        n.__pinned_by_drag = true;
+      }
+    });
 
     const width = container.clientWidth; const height = container.clientHeight;
+    const __initialContainerSize = { w: width, h: height };
+    let __autoResetOnFirstShowDone = false;
     const svg = d3.select(container).append('svg')
       .attr('width', width)
       .attr('height', height)
@@ -45,10 +62,26 @@
       .on('mouseup mouseleave', ()=> svg.style('cursor','grab'));
 
     const g = svg.append('g');
-    const zoomBehavior = d3.zoom().scaleExtent([0.15,6]).on('zoom', ev=> { g.attr('transform', ev.transform); updateMiniMapViewport(ev.transform); });
+    // Prevent zoom/pan from hijacking node drags.
+    // Allow wheel zoom anywhere, but disable mouse-drag panning when the gesture starts on a node.
+    const zoomBehavior = d3.zoom()
+      .scaleExtent([0.15,6])
+      .filter((ev)=>{
+        try {
+          if(!ev) return true;
+          if(ev.type === 'wheel') return true;
+          const t = (ev && ev.sourceEvent && ev.sourceEvent.target) ? ev.sourceEvent.target : ev.target;
+          if(t && typeof t.closest === 'function' && t.closest('g.node')) return false;
+          return true;
+        } catch(e){
+          return true;
+        }
+      })
+      .on('zoom', ev=> { g.attr('transform', ev.transform); updateMiniMapViewport(ev.transform); });
     svg.call(zoomBehavior);
 
     const vulnerabilityColor = '#ff0000';
+    const sequenceColor = '#ff0000';
     const hitlColor = '#2e7d32';
     const hitlMarkers = ['rj45','rj-45','hitl','tap','bridge','ethernet','physical'];
     const typeColor = d3.scaleOrdinal()
@@ -145,6 +178,31 @@
       return ((node?.type||'').toLowerCase()==='switch') ? '#000' : '#fff';
     }
 
+    function nodeSequenceIndex(node){
+      try {
+        const raw = (node && (node.sequence_index ?? node.sequenceIndex)) ? Number(node.sequence_index ?? node.sequenceIndex) : null;
+        return (raw && Number.isFinite(raw)) ? raw : null;
+      } catch(e){
+        return null;
+      }
+    }
+
+    function toRoman(num){
+      const n = Number(num);
+      if(!Number.isFinite(n) || n <= 0 || n >= 4000) return '';
+      const parts = [
+        [1000,'M'],[900,'CM'],[500,'D'],[400,'CD'],
+        [100,'C'],[90,'XC'],[50,'L'],[40,'XL'],
+        [10,'X'],[9,'IX'],[5,'V'],[4,'IV'],[1,'I'],
+      ];
+      let x = Math.floor(n);
+      let out = '';
+      for(const [v,s] of parts){
+        while(x >= v){ out += s; x -= v; }
+      }
+      return out;
+    }
+
     function displayName(node){
       const raw = String(node?.name || '');
       if(!raw) return '';
@@ -154,14 +212,26 @@
       return raw.replace(/\s*\(([^)]*[\d.:]+[^)]*)\)\s*$/,'').trim();
     }
 
+    function displayNameWithSequence(node){
+      const base = displayName(node);
+      if(!base) return '';
+      if(nodeIsHitl(node)) return base;
+      const seq = nodeSequenceIndex(node);
+      if(!seq) return base;
+      const roman = toRoman(seq);
+      return roman ? (roman + ' ' + base) : base;
+    }
+
     function boxW(node){
       const svc = (node?.services||[]).length;
       const base = 110 + Math.min(120, svc * 10);
-      const nameLen = String(displayName(node) || '').length;
+      const nameLen = String(displayNameWithSequence(node) || '').length;
       const ipLen = nodeIsHitl(node) ? 0 : String(primaryIpv4(node) || '').length;
       // Heuristic text fit: ~6.4px per char at 10px font, plus padding.
       const textNeed = (Math.max(nameLen, ipLen) * 6.4) + 26;
-      return Math.max(base, Math.min(320, textNeed));
+      // Allow wider boxes so the IP line doesn't spill outside the node.
+      // Keep an upper bound to avoid giant boxes from unusually long names.
+      return Math.max(base, Math.min(560, textNeed));
     }
 
     function boxH(node){
@@ -450,6 +520,39 @@
     }
 
     let subnetGroups = buildSubnetGroups();
+    // While a node is being dragged, subnet packing and box resizing can cause
+    // large, surprising shifts (especially when a dragged node expands a subnet
+    // bounding box). Track active drags so we can temporarily freeze these.
+    let __activeDragCount = 0;
+
+    function _freezeOtherNodes(activeNode){
+      try {
+        nodes.forEach(n => {
+          if(!n || n === activeNode) return;
+          if(n.__frozen_by_drag === true) return;
+          n.__frozen_by_drag = true;
+          n.__frozen_prev_fx = (n.fx != null) ? n.fx : null;
+          n.__frozen_prev_fy = (n.fy != null) ? n.fy : null;
+          if(Number.isFinite(n.x)) n.fx = n.x;
+          if(Number.isFinite(n.y)) n.fy = n.y;
+        });
+      } catch(e){}
+    }
+
+    function _unfreezeOtherNodes(){
+      try {
+        nodes.forEach(n => {
+          if(!n || n.__frozen_by_drag !== true) return;
+          const prevFx = n.__frozen_prev_fx;
+          const prevFy = n.__frozen_prev_fy;
+          n.fx = (prevFx != null && Number.isFinite(prevFx)) ? prevFx : null;
+          n.fy = (prevFy != null && Number.isFinite(prevFy)) ? prevFy : null;
+          delete n.__frozen_by_drag;
+          delete n.__frozen_prev_fx;
+          delete n.__frozen_prev_fy;
+        });
+      } catch(e){}
+    }
     const subnetG = subnetLayer.selectAll('g.subnet-group')
       .data(subnetGroups, d => d.cidr)
       .enter()
@@ -492,9 +595,105 @@
       })
       .style('cursor','pointer')
       .call(d3.drag()
-        .on('start', (ev,d)=>{ if(!ev.active) simulation.alphaTarget(0.35).restart(); d.fx = d.x; d.fy = d.y; })
-        .on('drag', (ev,d)=>{ d.fx = ev.x; d.fy = ev.y; })
-        .on('end', (ev)=>{ if(!ev.active) simulation.alphaTarget(0); })
+        .on('start', (ev,d)=>{
+          // Prevent the svg zoom/pan handler from also acting on this gesture.
+          // Without this, dragging a node can simultaneously pan the whole graph,
+          // which feels like the layout is "going haywire".
+          try {
+            if(ev && ev.sourceEvent){
+              if(typeof ev.sourceEvent.preventDefault === 'function') ev.sourceEvent.preventDefault();
+              if(typeof ev.sourceEvent.stopImmediatePropagation === 'function') ev.sourceEvent.stopImmediatePropagation();
+              if(typeof ev.sourceEvent.stopPropagation === 'function') ev.sourceEvent.stopPropagation();
+            }
+          } catch(e) {}
+          // Non-destructive drag: allow moving while held, but snap back on drop.
+          // Freeze subnet boxes while dragging so boxes don't resize/shift.
+          try {
+            // Ensure subnet boxes have cached bounds before we freeze them.
+            if(typeof updateSubnetBoxes === 'function') updateSubnetBoxes();
+          } catch(e) {}
+
+          try {
+            d.__dragging = true;
+            __activeDragCount += 1;
+            if(__activeDragCount === 1){
+              _freezeOtherNodes(d);
+            }
+          } catch(e) {}
+
+          d.__drag_origin = {
+            x: (Number.isFinite(d.x) ? d.x : null),
+            y: (Number.isFinite(d.y) ? d.y : null),
+            fx: (Number.isFinite(d.fx) ? d.fx : null),
+            fy: (Number.isFinite(d.fy) ? d.fy : null),
+          };
+
+          // Ensure ticks keep flowing while dragging (if the sim had cooled/stopped,
+          // otherwise fx/fy updates may not visibly move the node).
+          try {
+            if(!ev.active){
+              simulation.alphaTarget(0.18).restart();
+            }
+          } catch(e) {}
+
+          // Keep pinned during drag, using graph-space coords (accounts for zoom/pan).
+          d.fx = d.x;
+          d.fy = d.y;
+          try { updatePositions(); } catch(e) {}
+        })
+        .on('drag', (ev,d)=>{
+          try {
+            if(ev && ev.sourceEvent){
+              if(typeof ev.sourceEvent.preventDefault === 'function') ev.sourceEvent.preventDefault();
+              if(typeof ev.sourceEvent.stopImmediatePropagation === 'function') ev.sourceEvent.stopImmediatePropagation();
+              if(typeof ev.sourceEvent.stopPropagation === 'function') ev.sourceEvent.stopPropagation();
+            }
+          } catch(e) {}
+          // Always keep the node under the pointer while dragging.
+          // Convert pointer to graph coordinates so dragging works correctly under zoom/pan.
+          try {
+            const pt = d3.pointer(ev.sourceEvent || ev, svg.node());
+            const t = d3.zoomTransform(svg.node());
+            const inv = t && typeof t.invert === 'function' ? t.invert(pt) : pt;
+            d.fx = inv[0];
+            d.fy = inv[1];
+            // Also move the node immediately so it renders even if the simulation is idle.
+            d.x = d.fx;
+            d.y = d.fy;
+          } catch(e) {
+            d.fx = ev.x;
+            d.fy = ev.y;
+            d.x = d.fx;
+            d.y = d.fy;
+          }
+          try { updatePositions(); } catch(e) {}
+        })
+        .on('end', (ev,d)=>{
+          try {
+            // Snap back to where the node originated. Do not create new pins.
+            const o = d.__drag_origin || {};
+            if(Number.isFinite(o.x)) d.x = o.x;
+            if(Number.isFinite(o.y)) d.y = o.y;
+            if(Number.isFinite(o.fx) && Number.isFinite(o.fy)){
+              d.fx = o.fx;
+              d.fy = o.fy;
+            } else {
+              d.fx = null;
+              d.fy = null;
+            }
+            d.__pinned_by_drag = false;
+          } catch(e) {}
+          try {
+            delete d.__drag_origin;
+            d.__dragging = false;
+            __activeDragCount = Math.max(0, (__activeDragCount || 0) - 1);
+            if(__activeDragCount === 0){
+              _unfreezeOtherNodes();
+            }
+          } catch(e) {}
+          try { updatePositions(); } catch(e) {}
+          if(!ev.active) simulation.alphaTarget(0);
+        })
       );
 
     const rects = nodeGroup.append('rect')
@@ -504,15 +703,18 @@
       .attr('y', d => -(boxH(d)) / 2)
       .attr('rx',6).attr('ry',6)
       .attr('fill', d => nodeFillColor(d))
-      .attr('stroke','#222')
-      .attr('stroke-width',1.2)
+      .attr('stroke', d => {
+        const seq = nodeSequenceIndex(d);
+        if(seq) return sequenceColor;
+        return '#222';
+      })
+      .attr('stroke-width', d => {
+        const seq = nodeSequenceIndex(d);
+        if(seq) return 3;
+        return 1.2;
+      })
       .on('click', (ev,d)=>{
-        // Pin/unpin in force layout
-        if(currentLayout==='force') {
-          const pinned = d.fx != null || d.fy != null;
-          if(pinned){ d.fx=null; d.fy=null; } else { d.fx=d.x; d.fy=d.y; }
-          d3.select(ev.currentTarget).attr('stroke-dasharray', pinned? null : '4,3');
-        }
+        // Do not toggle pin/unpin on click; it can destabilize the layout.
         // Expand accordion section for this node if present
         try {
           const accItem = document.querySelector(`.accordion-item[data-node-id="${CSS.escape(String(d.id))}"]`);
@@ -542,7 +744,7 @@
       const svcList = (d.services||[]);
       const ifaceList = Array.isArray(d.interfaces) ? d.interfaces : [];
       const lines = [];
-      lines.push(`<strong>${(displayName(d)||'')} (${d.id})</strong>`);
+      lines.push(`<strong>${(displayNameWithSequence(d)||'')} (${d.id})</strong>`);
       if(svcList.length){
         svcList.forEach(s => lines.push(s));
       } else {
@@ -577,9 +779,51 @@
       .on('mousemove.tooltip', (ev,d)=>{ if(!tooltipEl || tooltipEl.classList.contains('hidden')) return; const [mx,my]=d3.pointer(ev, container); positionTooltip(mx,my); })
       .on('mouseout.tooltip', ()=>{ if(tooltipTimer) { clearTimeout(tooltipTimer); tooltipTimer=null; } hideTooltip(); });
 
-    // Labels (wrapped if needed)
-    const MAX_LABEL_CHARS = 14;
-    function wrapLabel(name){ if(!name) return ''; if(name.length <= MAX_LABEL_CHARS) return name; return name.slice(0, MAX_LABEL_CHARS-1) + '…'; }
+    // Labels: do not truncate with ellipses; keep full text.
+    function wrapLabel(name){ return name ? String(name) : ''; }
+
+    // Sequence index marker (Roman numerals) for sequence nodes.
+    // Mirrors Preview tab graph view behavior.
+    const seqBadgeWidth = (d) => {
+      const seq = nodeSequenceIndex(d);
+      const roman = toRoman(seq);
+      const w = 10 + Math.max(1, String(roman || '').length) * 7;
+      return Math.min(46, Math.max(18, w));
+    };
+    const seqBadge = nodeGroup.append('g')
+      .attr('class','node-seq-badge')
+      .attr('pointer-events','none')
+      .style('display', d => nodeSequenceIndex(d) ? null : 'none');
+    seqBadge.attr('transform', d => {
+      const w = boxW(d);
+      const h = boxH(d);
+      const bx = (w / 2) + 6;
+      const by = -(h / 2) - 22;
+      return `translate(${bx},${by})`;
+    });
+    seqBadge.append('rect')
+      .attr('x', 0)
+      .attr('y', 0)
+      .attr('width', d => seqBadgeWidth(d))
+      .attr('height', 16)
+      .attr('rx', 4)
+      .attr('ry', 4)
+      .attr('fill', '#fff')
+      .attr('stroke', sequenceColor)
+      .attr('stroke-width', 2);
+    seqBadge.append('text')
+      .attr('class','node-seq-badge-text')
+      .attr('text-anchor','start')
+      .attr('x', 5)
+      .attr('y', 12)
+      .attr('font-size','11px')
+      .attr('font-weight','800')
+      .attr('fill', sequenceColor)
+      .text(d => {
+        const seq = nodeSequenceIndex(d);
+        return seq ? toRoman(seq) : '';
+      });
+
     nodeGroup.append('text')
       .attr('text-anchor','middle')
       .attr('y',-2)
@@ -587,7 +831,7 @@
       .attr('pointer-events','none')
       .attr('fill', d => labelFill(d))
       .attr('class','label')
-      .text(d => wrapLabel(displayName(d)||''));
+      .text(d => wrapLabel(displayNameWithSequence(d)||''));
 
     // Explicit HITL callout label.
     const hereLabel = nodeGroup.append('text')
@@ -654,6 +898,7 @@
         inc(l.target.index??l.target);
       });
       const types = Array.from(new Set(nodes.map(n => nodeCategory(n)))).filter(Boolean).sort();
+      const hasSequenceNodes = nodes.some(n => nodeSequenceIndex(n));
       const hasVulnerableHosts = nodes.some(n => {
         const t = (n.type||'').toLowerCase();
         if(!(t === 'host' || t === 'pc' || t === 'server')) return false;
@@ -670,6 +915,12 @@
         const label = typeKey === 'hitl' ? 'HITL' : typeKey;
         return `<span class="d-flex align-items-center gap-1"><span style="${swatchStyle}"></span>${label}<span class="text-muted" style="font-size:.65rem;">(nodes:${nodeCount}, links:${deg})</span></span>`;
       }).join(' ');
+
+      if(hasSequenceNodes){
+        const seqBadge = `<span style="display:inline-flex;align-items:center;justify-content:center;width:18px;height:16px;border:2px solid ${sequenceColor};border-radius:4px;background:#fff;color:${sequenceColor};font-size:11px;font-weight:800;line-height:1;">I</span>`;
+        const seqItem = `<span class="d-flex align-items-center gap-1">${seqBadge}Sequence</span>`;
+        legendHtml = legendHtml ? `${seqItem} ${legendHtml}` : seqItem;
+      }
       if(hasVulnerableHosts){
         const vulnSwatch = `<span class="d-flex align-items-center gap-1"><span style="display:inline-block;width:12px;height:12px;border:1px solid #222;background:${vulnerabilityColor}"></span>host (vulnerable)</span>`;
         legendHtml = legendHtml ? `${legendHtml} ${vulnSwatch}` : vulnSwatch;
@@ -757,11 +1008,96 @@
       }
     }
 
+    function _nodeX(ref){
+      if(ref && typeof ref === 'object' && Number.isFinite(ref.x)) return ref.x;
+      if(typeof ref === 'number' && nodes[ref] && Number.isFinite(nodes[ref].x)) return nodes[ref].x;
+      if(ref && typeof ref === 'object' && typeof ref.index === 'number' && nodes[ref.index] && Number.isFinite(nodes[ref.index].x)) return nodes[ref.index].x;
+      return 0;
+    }
+    function _nodeY(ref){
+      if(ref && typeof ref === 'object' && Number.isFinite(ref.y)) return ref.y;
+      if(typeof ref === 'number' && nodes[ref] && Number.isFinite(nodes[ref].y)) return nodes[ref].y;
+      if(ref && typeof ref === 'object' && typeof ref.index === 'number' && nodes[ref.index] && Number.isFinite(nodes[ref.index].y)) return nodes[ref.index].y;
+      return 0;
+    }
+
     function updatePositions(){
-      packDisjointSubnetGroups();
-      link.attr('x1', d => d.source.x).attr('y1', d => d.source.y).attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+      // Packing subnet groups on every tick works well for a static layout,
+      // but it fights interactive drags (it can shift entire subnet groups while
+      // the user is trying to move a single node).
+      if((__activeDragCount || 0) === 0){
+        packDisjointSubnetGroups();
+      }
+      link
+        .attr('x1', d => _nodeX(d.source))
+        .attr('y1', d => _nodeY(d.source))
+        .attr('x2', d => _nodeX(d.target))
+        .attr('y2', d => _nodeY(d.target));
       nodeGroup.attr('transform', d => `translate(${d.x},${d.y})`);
       updateSubnetBoxes();
+      // While dragging, keep all other nodes static.
+      if((__activeDragCount || 0) === 0){
+        pushRoutersOutOfSubnetBoxes();
+      }
+    }
+
+    function pushRoutersOutOfSubnetBoxes(){
+      try {
+        if(!subnetGroups || subnetGroups.length === 0) return;
+        // Keep routers clearly outside subnet boxes with some clearance so they don't
+        // appear "in" a box or touching its border.
+        const clearance = 22;
+        const boxes = [];
+        subnetGroups.forEach(g => {
+          if(g && g.__bounds && Number.isFinite(g.__bounds.minX) && Number.isFinite(g.__bounds.minY)){
+            boxes.push({
+              minX: g.__bounds.minX - clearance,
+              minY: g.__bounds.minY - clearance,
+              maxX: g.__bounds.maxX + clearance,
+              maxY: g.__bounds.maxY + clearance,
+            });
+          }
+        });
+        if(!boxes.length) return;
+
+        const routers = nodes.filter(n => nodeTier(n) === 0);
+        routers.forEach(r => {
+          if(!r || !Number.isFinite(r.x) || !Number.isFinite(r.y)) return;
+          const halfW = boxW(r) / 2;
+          const halfH = boxH(r) / 2;
+
+          // A router might overlap multiple boxes; resolve a few times.
+          for(let iter = 0; iter < 3; iter++){
+            let moved = false;
+            for(const b of boxes){
+              const rMinX = r.x - halfW;
+              const rMaxX = r.x + halfW;
+              const rMinY = r.y - halfH;
+              const rMaxY = r.y + halfH;
+              const overlapX = !(rMaxX < b.minX || rMinX > b.maxX);
+              const overlapY = !(rMaxY < b.minY || rMinY > b.maxY);
+              if(!overlapX || !overlapY) continue;
+
+              const candidates = [
+                { x: (b.minX - halfW - 2), y: r.y },
+                { x: (b.maxX + halfW + 2), y: r.y },
+                { x: r.x, y: (b.minY - halfH - 2) },
+                { x: r.x, y: (b.maxY + halfH + 2) },
+              ];
+              candidates.sort((a,b2)=> (Math.hypot(a.x - r.x, a.y - r.y)) - (Math.hypot(b2.x - r.x, b2.y - r.y)));
+              const best = candidates[0];
+              if(best && Number.isFinite(best.x) && Number.isFinite(best.y)){
+                r.x = best.x;
+                r.y = best.y;
+                if(r.fx != null) r.fx = best.x;
+                if(r.fy != null) r.fy = best.y;
+                moved = true;
+              }
+            }
+            if(!moved) break;
+          }
+        });
+      } catch(e) {}
     }
 
     function updateSubnetBoxes(){
@@ -770,20 +1106,47 @@
       subnetG.each(function(d){
         const idxs = d.idxs || [];
         if(!idxs.length) return;
+        // While dragging, keep subnet rectangle bounds stable.
+        const freeze = ((__activeDragCount || 0) > 0);
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        idxs.forEach(i => {
-          const n = nodes[i];
-          if(!n || n.x == null || n.y == null) return;
-          const w = boxW(n);
-          const h = boxH(n);
-          minX = Math.min(minX, n.x - w/2);
-          maxX = Math.max(maxX, n.x + w/2);
-          minY = Math.min(minY, n.y - h/2);
-          maxY = Math.max(maxY, n.y + h/2);
-        });
-        if(!Number.isFinite(minX) || !Number.isFinite(minY)) return;
-        minX -= pad; minY -= pad;
-        maxX += pad; maxY += pad;
+        if(!freeze){
+          idxs.forEach(i => {
+            const n = nodes[i];
+            if(!n || n.x == null || n.y == null) return;
+            const w = boxW(n);
+            const h = boxH(n);
+            minX = Math.min(minX, n.x - w/2);
+            maxX = Math.max(maxX, n.x + w/2);
+            minY = Math.min(minY, n.y - h/2);
+            maxY = Math.max(maxY, n.y + h/2);
+          });
+          if(!Number.isFinite(minX) || !Number.isFinite(minY)) return;
+          minX -= pad; minY -= pad;
+          maxX += pad; maxY += pad;
+          d.__bounds = { minX, minY, maxX, maxY };
+        } else if(d.__bounds && Number.isFinite(d.__bounds.minX) && Number.isFinite(d.__bounds.minY)){
+          minX = d.__bounds.minX;
+          minY = d.__bounds.minY;
+          maxX = d.__bounds.maxX;
+          maxY = d.__bounds.maxY;
+        } else {
+          // No cached bounds yet; fall back to computing once.
+          idxs.forEach(i => {
+            const n = nodes[i];
+            if(!n || n.x == null || n.y == null) return;
+            const w = boxW(n);
+            const h = boxH(n);
+            minX = Math.min(minX, n.x - w/2);
+            maxX = Math.max(maxX, n.x + w/2);
+            minY = Math.min(minY, n.y - h/2);
+            maxY = Math.max(maxY, n.y + h/2);
+          });
+          if(!Number.isFinite(minX) || !Number.isFinite(minY)) return;
+          minX -= pad; minY -= pad;
+          maxX += pad; maxY += pad;
+          d.__bounds = { minX, minY, maxX, maxY };
+        }
+
         const w = Math.max(40, maxX - minX);
         const h = Math.max(40, maxY - minY);
         const sel = d3.select(this);
@@ -805,6 +1168,24 @@
     const exportSvgBtn = document.getElementById('graphExportSvgBtn');
     const exportPngBtn = document.getElementById('graphExportPngBtn');
     resetBtn?.addEventListener('click', () => { svg.transition().duration(400).call(zoomBehavior.transform, d3.zoomIdentity); nodes.forEach(n=>{ n.fx=null; n.fy=null; }); simulation.alpha(0.5).restart(); });
+
+    function _resetLayoutImmediate(){
+      try {
+        svg.interrupt();
+        svg.call(zoomBehavior.transform, d3.zoomIdentity);
+      } catch(e){}
+      try {
+        nodes.forEach(n=>{
+          n.fx = null;
+          n.fy = null;
+          n.__pinned_by_drag = false;
+        });
+      } catch(e){}
+      try {
+        simulation.alpha(0.5).restart();
+      } catch(e){}
+      try { updatePositions(); } catch(e){}
+    }
 
   clusterBtn?.addEventListener('click', () => { if(clusterMode==='off') { clusterMode='type'; clusterBtn.textContent='Cluster: Type'; applyClustering(); } else { clusterMode='off'; clusterBtn.textContent='Cluster: Off'; simulation.force('x', null).force('y', null); simulation.alpha(0.5).restart(); } });
 
@@ -855,12 +1236,41 @@
       placeHitlNodes(w, h);
       simulation.force('center', d3.forceCenter(w/2, h/2));
       simulation.alpha(0.15).restart();
+
+      // If we initialized while hidden (e.g., inside a collapsed panel),
+      // the first layout tends to be overly spaced; clicking Reset fixes it.
+      // Do that automatically once when the container becomes visible.
+      try {
+        const wasHidden = (__initialContainerSize.w < 80 || __initialContainerSize.h < 80);
+        const nowVisible = (w >= 160 && h >= 160);
+        if(!__autoResetOnFirstShowDone && wasHidden && nowVisible){
+          __autoResetOnFirstShowDone = true;
+          _resetLayoutImmediate();
+        }
+      } catch(e){}
     }
   });
     ro.observe(container);
 
     // Persist positions on unload
-    window.addEventListener('beforeunload', ()=> { try { const out={}; nodes.forEach(n=> out[n.id]={x:n.x,y:n.y,pinned:(n.fx!=null||n.fy!=null)}); localStorage.setItem(storageKey, JSON.stringify(out)); } catch(e){} });
+    window.addEventListener('beforeunload', ()=> {
+      try {
+        const out = {};
+        nodes.forEach(n => {
+          const nx = Number(n.x);
+          const ny = Number(n.y);
+          out[n.id] = {
+            x: Number.isFinite(nx) ? nx : null,
+            y: Number.isFinite(ny) ? ny : null,
+            // Back-compat field (not used for restore anymore)
+            pinned: (n.fx != null || n.fy != null),
+            // Only restore pins created via drag (avoids click-release pinning)
+            pinned_by_drag: (n.__pinned_by_drag === true),
+          };
+        });
+        localStorage.setItem(storageKey, JSON.stringify(out));
+      } catch(e){}
+    });
 
     return { exportSvg, exportPng, applyClustering, simulation, nodes, links };
   }

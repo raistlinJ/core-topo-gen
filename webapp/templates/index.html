@@ -488,10 +488,46 @@
 </div>
 {% include 'partials/dock.html' %}
 
-<!-- Toasts removed (requested). Keep a no-op helper so legacy call sites don't error. -->
+<!-- Toast container (used only for explicit, forced prompts). -->
+<div id="coretgToastContainer" class="toast-container position-fixed top-0 end-0 p-3" style="z-index: 2000;"></div>
+
+<!-- Toast helper: keep legacy behavior (no toasts) unless explicitly forced. -->
 <script>
-    function showToast(_message, _opts){
-        return null;
+    function showToast(message, opts){
+        try {
+            const options = (opts && typeof opts === 'object') ? opts : {};
+            if(options.force !== true){
+                return null;
+            }
+            if(!window.bootstrap || !bootstrap.Toast){
+                // Best-effort fallback.
+                try { console.log(String(message || '')); } catch (e) {}
+                return null;
+            }
+            const container = document.getElementById('coretgToastContainer');
+            if(!container){
+                return null;
+            }
+            const el = document.createElement('div');
+            el.className = 'toast';
+            el.setAttribute('role','alert');
+            el.setAttribute('aria-live','assertive');
+            el.setAttribute('aria-atomic','true');
+            el.innerHTML = `
+              <div class="toast-header">
+                <strong class="me-auto">${String(options.title || 'Notice')}</strong>
+                <button type="button" class="btn-close" data-bs-dismiss="toast" aria-label="Close"></button>
+              </div>
+              <div class="toast-body" style="white-space: pre-wrap;">${String(message || '')}</div>
+            `;
+            container.appendChild(el);
+            const inst = new bootstrap.Toast(el, { autohide: options.autohide === true, delay: Number(options.delay) || 5000 });
+            el.addEventListener('hidden.bs.toast', ()=>{ try { el.remove(); } catch(e){} });
+            inst.show();
+            return inst;
+        } catch (e) {
+            return null;
+        }
     }
 </script>
 
@@ -602,6 +638,10 @@
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvRunCoreCleanup" checked>
                             <label class="form-check-label" for="executeAdvRunCoreCleanup">Run core-cleanup</label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="executeAdvDockerCleanupBeforeRun" checked>
+                            <label class="form-check-label" for="executeAdvDockerCleanupBeforeRun">Remove old Docker containers/images before run</label>
                         </div>
                         <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvCheckCoreVersion">
@@ -4926,7 +4966,7 @@ window.updateCoreStatus = function(success, msg){
 
 document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('planPreviewBtn')?.addEventListener('click', computePlanPreview);
-    // Scenarios header Preview tab: ensure XML is saved, then navigate to /scenarios/preview.
+    // Scenarios header Preview tab: save XML, then navigate to /scenarios/preview.
     document.getElementById('scenariosPreviewTabLink')?.addEventListener('click', async (ev)=>{
         try {
             ev.preventDefault();
@@ -4935,34 +4975,21 @@ document.addEventListener('DOMContentLoaded', () => {
                 try { await computeFullPlanPreview(); } catch(e) { /* ignore */ }
                 return;
             }
-            const ensureXmlPath = async ()=>{
-                const xmlPathVal = (state.result_path || '').trim();
-                if(xmlPathVal) return xmlPathVal;
-                try { await autoSaveXml(); } catch(e){ return ''; }
-                return (state.result_path || '').trim();
-            };
-            const xmlPath = await ensureXmlPath();
-            if(!xmlPath){
-                alert('Save XML first to preview.');
+            if (typeof window.coretgSaveAllAndGoPreview !== 'function') {
+                alert('Save helper unavailable; refresh and try again.');
                 return;
             }
-            const activeIdx = (typeof state.active_index === 'number') ? state.active_index : 0;
-            const scen = (state.scenarios && state.scenarios[activeIdx] && state.scenarios[activeIdx].name) ? String(state.scenarios[activeIdx].name) : '';
-            const baseUrl = String(document.getElementById('scenariosPreviewTabLink')?.dataset?.previewBaseUrl || '/scenarios/preview');
-            const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + (scen ? ('&scenario=' + encodeURIComponent(scen)) : '');
-            window.location.href = url;
+            await window.coretgSaveAllAndGoPreview();
         } catch(e){
             try { ev.preventDefault(); } catch(_e){}
         }
     });
 
-    // Shared Scenarios Execute button: reuse the existing Topology execute flow.
+    // Shared Scenarios Preview button: save XML, then navigate to /scenarios/preview.
     document.getElementById('scenariosExecuteBtn')?.addEventListener('click', (ev)=>{
         try {
             ev.preventDefault();
-            const btn = document.getElementById('fpExecuteBtn');
-            if(btn){ btn.click(); return; }
-            alert('Execute is not available on this page yet.');
+            document.getElementById('scenariosPreviewTabLink')?.click();
         } catch(e){}
     });
 
@@ -4983,9 +5010,17 @@ document.addEventListener('DOMContentLoaded', () => {
             } catch (e) {}
         }
         if (autoExecute) {
-            // Trigger the same handler the Topology Execute button uses.
+            // Auto-execute comes from the Preview tab's Execute button.
+            // The shared bottom-bar button is now "Preview", so we must call the actual
+            // execution entrypoint.
             setTimeout(() => {
-                try { document.getElementById('scenariosExecuteBtn')?.click(); } catch (e) {}
+                try {
+                    if (typeof runSyncWithModal === 'function') {
+                        runSyncWithModal({ showProgressModal: true, skipConfirm: false });
+                        return;
+                    }
+                } catch (e) {}
+                try { alert('Execute unavailable: runSyncWithModal not found.'); } catch (e) {}
             }, 250);
             // Prevent repeated execution prompts on reload/back.
             params.delete('auto_execute');
@@ -14704,6 +14739,7 @@ let executeAdvCheckCoreVersion = null;
 let executeAdvRestartCoreDaemon = null;
 let executeAdvStartCoreDaemon = null;
 let executeAdvAutoKillSessions = null;
+let executeAdvDockerCleanupBeforeRun = null;
 const EXECUTE_CONFIRM_PREFS_STORAGE_KEY = 'coretg_execute_confirm_prefs';
 
 function loadExecuteConfirmPrefs() {
@@ -14762,6 +14798,7 @@ function getExecuteConfirmSelections() {
     const advanced = {
         fixDockerDaemon: remoteExecution && !!(executeAdvFixDockerDaemon && executeAdvFixDockerDaemon.checked),
         runCoreCleanup: remoteExecution && !!(executeAdvRunCoreCleanup && executeAdvRunCoreCleanup.checked),
+        dockerCleanupBeforeRun: remoteExecution && !!(executeAdvDockerCleanupBeforeRun && executeAdvDockerCleanupBeforeRun.checked),
         checkCoreVersion: remoteExecution && !!(executeAdvCheckCoreVersion && executeAdvCheckCoreVersion.checked),
         restartCoreDaemon: remoteExecution && !!(executeAdvRestartCoreDaemon && executeAdvRestartCoreDaemon.checked),
         startCoreDaemon: remoteExecution && !!(executeAdvStartCoreDaemon && executeAdvStartCoreDaemon.checked),
@@ -14878,6 +14915,9 @@ function ensureExecuteConfirmElements() {
     if (!executeAdvRunCoreCleanup) {
         executeAdvRunCoreCleanup = document.getElementById('executeAdvRunCoreCleanup');
     }
+    if (!executeAdvDockerCleanupBeforeRun) {
+        executeAdvDockerCleanupBeforeRun = document.getElementById('executeAdvDockerCleanupBeforeRun');
+    }
     if (!executeAdvCheckCoreVersion) {
         executeAdvCheckCoreVersion = document.getElementById('executeAdvCheckCoreVersion');
     }
@@ -14901,6 +14941,7 @@ function ensureExecuteConfirmElements() {
                     executeConfirmPushUpdateToggle,
                     executeAdvFixDockerDaemon,
                     executeAdvRunCoreCleanup,
+                    executeAdvDockerCleanupBeforeRun,
                     executeAdvCheckCoreVersion,
                     executeAdvRestartCoreDaemon,
                     executeAdvStartCoreDaemon,
@@ -16151,6 +16192,57 @@ if (editorForm) {
     editorForm.addEventListener('submit', handleEditorFormSubmit);
 }
 
+// Shared bottom-bar Save XML should save and stay on this page.
+document.addEventListener('DOMContentLoaded', () => {
+    try {
+        const saveBtn = document.getElementById('saveXmlBtn');
+        if (!saveBtn) return;
+        saveBtn.addEventListener('click', async (ev) => {
+            try {
+                ev.preventDefault();
+                if (IS_BUILDER_VIEW) {
+                    try { showToast('Builder view cannot Save XML (admin-only).', { autohide: true, delay: 2600 }); } catch (_) {}
+                    return;
+                }
+                if (typeof window.coretgSaveXmlViaApi !== 'function') {
+                    alert('Save helper unavailable; refresh and try again.');
+                    return;
+                }
+                // Mirror existing UX: show busy indicator while saving.
+                try { setSaveXmlBusy(true); } catch (e) {}
+                try { setSaveXmlToastBusy(true); } catch (e) {}
+                const scrollYBeforeSave = (typeof window !== 'undefined')
+                    ? (window.scrollY || window.pageYOffset || 0)
+                    : 0;
+                const xmlPath = await window.coretgSaveXmlViaApi();
+                try { setSaveXmlBusy(false); } catch (e) {}
+                try { setSaveXmlToastBusy(false); } catch (e) {}
+                try { flashSaveXmlSaved(); } catch (e) {}
+                try { showToast('XML saved.', { autohide: true, delay: 2200 }); } catch (_) {}
+                // Keep viewport stable.
+                try {
+                    await new Promise(requestAnimationFrame);
+                    window.scrollTo({ top: scrollYBeforeSave, left: 0, behavior: 'auto' });
+                } catch (_) {
+                    try { window.scrollTo(0, scrollYBeforeSave); } catch (_) {}
+                }
+                // Ensure download button + preview tab have the latest path.
+                try {
+                    if (xmlPath && typeof xmlPath === 'string') {
+                        state.result_path = xmlPath;
+                        try { updateDownloadButtonState(); } catch (e) {}
+                        try { persistEditorState(); } catch (e) {}
+                    }
+                } catch (e) {}
+            } catch (e) {
+                try { setSaveXmlToastBusy(false); } catch (_e) {}
+                try { setSaveXmlBusy(false); } catch (_e) {}
+                try { alert('Save failed: ' + (e && e.message ? e.message : e)); } catch (_e) {}
+            }
+        });
+    } catch (e) {}
+});
+
 // Enable Bootstrap tooltips globally
 document.addEventListener('DOMContentLoaded', () => {
     const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
@@ -16979,6 +17071,7 @@ function buildRunFormData(xmlPath, options = {}) {
         const adv = options && typeof options.advanced === 'object' ? options.advanced : null;
         if (adv && adv.fixDockerDaemon) form.append('adv_fix_docker_daemon', '1');
         if (adv && adv.runCoreCleanup) form.append('adv_run_core_cleanup', '1');
+        if (adv && adv.dockerCleanupBeforeRun) form.append('docker_cleanup_before_run', '1');
         if (adv && adv.checkCoreVersion) form.append('adv_check_core_version', '1');
         if (adv && adv.restartCoreDaemon) form.append('adv_restart_core_daemon', '1');
         if (adv && adv.autoKillSessions) form.append('adv_auto_kill_sessions', '1');
@@ -17792,6 +17885,7 @@ let evtSrc = null;
 function startLogStream(runId) {
     if (evtSrc) { try { evtSrc.close(); } catch(e){} }
     evtSrc = new EventSource('/stream/' + runId);
+    try { localStorage.setItem('coretg_active_run_id', String(runId||'')); } catch(e) {}
     // keep existing logs; do not auto-clear
     // Ensure dock is visible so users can see live logs
     try {
@@ -17819,6 +17913,7 @@ function startLogStream(runId) {
     });
     evtSrc.addEventListener('end', () => {
         evtSrc.close();
+        try { localStorage.removeItem('coretg_active_run_id'); } catch(e) {}
         try { document.getElementById('runAsyncBtn')?.classList.remove('d-none'); } catch(e){}
         try { document.getElementById('runSyncBtn')?.classList.remove('disabled'); } catch(e){}
         try { document.getElementById('cancelRunBtn')?.classList.add('d-none'); } catch(e){}
@@ -17914,116 +18009,58 @@ function runProgressLogLine(s){
 }
 
 async function promptRunProgressConfirm(message, { title = 'Active CORE session(s) detected', confirmLabel = 'Kill sessions & retry', cancelLabel = 'Cancel' } = {}) {
-    // Prefer an in-page prompt (Bootstrap modal) to avoid browsers suppressing window.confirm
-    // after long async operations.
+    // Do not open a second modal/dialog here; keep whatever progress UI is already shown,
+    // and prompt via a toast with explicit actions.
     try {
-        if (!window.bootstrap) {
+        if (!window.bootstrap || !bootstrap.Toast) {
             return window.confirm(String(message || 'Proceed?'));
         }
-        ensureRunProgressModal();
-        const modalEl = document.getElementById('runProgressModal');
-        if (!modalEl) {
-            return window.confirm(String(message || 'Proceed?'));
-        }
-        const footerEl = modalEl.querySelector('.modal-footer');
-        const titleEl = modalEl.querySelector('.modal-title');
-        const hideBtn = document.getElementById('runProgressHideBtn');
-        const closeBtn = modalEl.querySelector('.btn-close');
-        const statusEl = document.getElementById('runProgressStatus');
-        const metaEl = document.getElementById('runProgressMeta');
-
-        // Snapshot current state for restore.
-        const prevTitle = titleEl ? titleEl.textContent : '';
-        const prevHideText = hideBtn ? hideBtn.textContent : '';
-        const prevHideDismiss = hideBtn ? hideBtn.getAttribute('data-bs-dismiss') : null;
-        const prevHideOnclick = hideBtn ? hideBtn.onclick : null;
-        const prevCloseDisplay = closeBtn ? closeBtn.style.display : '';
-
-        if (titleEl && title) titleEl.textContent = String(title);
-        if (statusEl) statusEl.textContent = 'Action required';
-        if (metaEl) metaEl.textContent = 'Active CORE session(s) are blocking the run.';
-        try { runProgressLogLine(String(message || '')); } catch (e) {}
-
-        const bringModalToFront = () => {
-            try {
-                if (!modalEl) return;
-                // Find the highest z-index among currently visible modals/backdrops.
-                let maxZ = 1055;
-                try {
-                    document.querySelectorAll('.modal.show').forEach((el) => {
-                        if (!el || el === modalEl) return;
-                        const z = parseInt(window.getComputedStyle(el).zIndex || '0', 10);
-                        if (!Number.isNaN(z)) maxZ = Math.max(maxZ, z);
-                    });
-                } catch (e) {}
-                try {
-                    document.querySelectorAll('.modal-backdrop').forEach((el) => {
-                        const z = parseInt(window.getComputedStyle(el).zIndex || '0', 10);
-                        if (!Number.isNaN(z)) maxZ = Math.max(maxZ, z);
-                    });
-                } catch (e) {}
-                const targetZ = Math.max(maxZ + 20, 1075);
-                modalEl.style.zIndex = String(targetZ);
-
-                // After Bootstrap inserts the backdrop, bump the newest one just under the modal.
-                window.setTimeout(() => {
-                    try {
-                        const backdrops = document.querySelectorAll('.modal-backdrop');
-                        const bd = backdrops && backdrops.length ? backdrops[backdrops.length - 1] : null;
-                        if (bd) bd.style.zIndex = String(targetZ - 10);
-                    } catch (e) {}
-                }, 0);
-            } catch (e) {}
-        };
-
-        // Ensure visible and brought to the front (above any other progress/execute dialogs).
-        try { runProgressModalInst?.show(); } catch (e) {}
-        bringModalToFront();
-
-        // Hide the top-right close button so the prompt can't disappear without resolving.
-        try { if (closeBtn) closeBtn.style.display = 'none'; } catch (e) {}
-
-        if (!footerEl || !hideBtn) {
+        const container = document.getElementById('coretgToastContainer');
+        if (!container) {
             return window.confirm(String(message || 'Proceed?'));
         }
 
         return await new Promise((resolve) => {
             let resolved = false;
-            let confirmBtn = null;
+            const el = document.createElement('div');
+            el.className = 'toast';
+            el.setAttribute('role','alert');
+            el.setAttribute('aria-live','assertive');
+            el.setAttribute('aria-atomic','true');
+            el.innerHTML = `
+              <div class="toast-header">
+                <strong class="me-auto">${String(title || 'Action required')}</strong>
+                <button type="button" class="btn-close" data-bs-dismiss="toast" aria-label="Close"></button>
+              </div>
+              <div class="toast-body">
+                <div style="white-space: pre-wrap;">${String(message || '')}</div>
+                <div class="d-flex gap-2 mt-2">
+                  <button type="button" class="btn btn-sm btn-primary" data-role="confirm">${String(confirmLabel || 'OK')}</button>
+                  <button type="button" class="btn btn-sm btn-outline-secondary" data-role="cancel">${String(cancelLabel || 'Cancel')}</button>
+                </div>
+              </div>
+            `;
+            container.appendChild(el);
 
+            const inst = new bootstrap.Toast(el, { autohide: false });
             const cleanup = (result) => {
                 if (resolved) return;
                 resolved = true;
-                try { confirmBtn?.remove(); } catch (e) {}
-                try {
-                    hideBtn.textContent = prevHideText || 'Hide';
-                    if (prevHideDismiss === null || typeof prevHideDismiss === 'undefined') hideBtn.removeAttribute('data-bs-dismiss');
-                    else hideBtn.setAttribute('data-bs-dismiss', prevHideDismiss);
-                    hideBtn.onclick = prevHideOnclick;
-                } catch (e) {}
-                try { if (closeBtn) closeBtn.style.display = prevCloseDisplay; } catch (e) {}
-                try { if (titleEl) titleEl.textContent = prevTitle; } catch (e) {}
-                try { modalEl.removeEventListener('hidden.bs.modal', onHidden); } catch (e) {}
+                try { inst.hide(); } catch(e) {}
                 resolve(!!result);
             };
-
-            const onHidden = () => cleanup(false);
-            try { modalEl.addEventListener('hidden.bs.modal', onHidden); } catch (e) {}
-
-            // Repurpose Hide into Cancel (no dismiss).
-            try {
-                hideBtn.textContent = String(cancelLabel || 'Cancel');
-                hideBtn.removeAttribute('data-bs-dismiss');
-                hideBtn.onclick = () => cleanup(false);
-            } catch (e) {}
-
-            // Add confirm button.
-            confirmBtn = document.createElement('button');
-            confirmBtn.type = 'button';
-            confirmBtn.className = 'btn btn-primary';
-            confirmBtn.textContent = String(confirmLabel || 'OK');
-            confirmBtn.addEventListener('click', () => cleanup(true));
-            footerEl.appendChild(confirmBtn);
+            const confirmBtn = el.querySelector('[data-role="confirm"]');
+            const cancelBtn = el.querySelector('[data-role="cancel"]');
+            try { confirmBtn?.addEventListener('click', ()=> cleanup(true)); } catch(e) {}
+            try { cancelBtn?.addEventListener('click', ()=> cleanup(false)); } catch(e) {}
+            el.addEventListener('hidden.bs.toast', ()=>{
+                try { el.remove(); } catch(e) {}
+                if(!resolved){
+                    resolved = true;
+                    resolve(false);
+                }
+            });
+            inst.show();
         });
     } catch (e) {
         return window.confirm(String(message || 'Proceed?'));
@@ -18676,6 +18713,7 @@ async function runSyncWithModal(arg){
         // No Cancel button in modal; runs cannot be cancelled here
         // Start SSE stream into modal
         try { if(runProgressEvtSrc) runProgressEvtSrc.close(); } catch(e){}
+        try { localStorage.setItem('coretg_active_run_id', String(run_id||'')); } catch(e) {}
         runProgressEvtSrc = new EventSource('/stream/' + run_id);
         appendExecuteDialogLog('Subscribed to remote log stream. Awaiting first line…');
         runProgressEvtSrc.addEventListener('phase', (ev) => {
@@ -18695,6 +18733,7 @@ async function runSyncWithModal(arg){
         runProgressEvtSrc.addEventListener('end', ()=>{
             waitingForRemoteLogs = false;
             try { runProgressEvtSrc.close(); } catch(e){}
+            try { localStorage.removeItem('coretg_active_run_id'); } catch(e) {}
             logInfo('Run (modal) ended');
         });
         // Poll for completion and update meta
@@ -18914,6 +18953,7 @@ async function runWithSeedBuild(){
         if(statusMetaEl) statusMetaEl.textContent = 'Waiting for remote logs…';
         // Stream logs
         try { if(runProgressEvtSrc) runProgressEvtSrc.close(); } catch(e){}
+        try { localStorage.setItem('coretg_active_run_id', String(run_id||'')); } catch(e) {}
         runProgressEvtSrc = new EventSource('/stream/' + run_id);
         runProgressLogLine('[ui] Subscribed to remote log stream. Awaiting first line…');
         runProgressEvtSrc.addEventListener('phase', (ev) => {
@@ -18932,7 +18972,7 @@ async function runWithSeedBuild(){
             }
             runProgressLogLine(ev.data||'');
         };
-        runProgressEvtSrc.addEventListener('end', ()=>{ waitingForSeedLogs = false; try { runProgressEvtSrc.close(); } catch(e){} });
+        runProgressEvtSrc.addEventListener('end', ()=>{ waitingForSeedLogs = false; try { runProgressEvtSrc.close(); } catch(e){} try { localStorage.removeItem('coretg_active_run_id'); } catch(e) {} });
         // Poll status similar to runSyncWithModal
         (async function poll(){
             try{

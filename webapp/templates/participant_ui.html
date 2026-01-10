@@ -421,6 +421,44 @@
 
   let _participantGraphInstance = null;
 
+  // Mirror the Preview tab graph view: annotate topology nodes with
+  // sequence_index based on saved flow chain so Roman numerals can render.
+  const _annotateSequenceNodesFromFlow = (nodes, flow) => {
+    try {
+      const list = Array.isArray(nodes) ? nodes : [];
+      if(!list.length) return;
+      const chain = (flow && Array.isArray(flow.chain)) ? flow.chain : null;
+      if(!chain || !chain.length) return;
+
+      const nodeById = new Map();
+      list.forEach(n => { if(n && n.id !== undefined && n.id !== null) nodeById.set(String(n.id), n); });
+      const chainLen = chain.length;
+
+      const resolveNodeForChainEntry = (entry) => {
+        let raw = entry;
+        if(entry && typeof entry === 'object'){
+          raw = entry.id ?? entry.node_id ?? entry.nodeId ?? entry.host_id ?? entry.hostId ?? entry;
+        }
+        if(raw === undefined || raw === null) return null;
+        const key = String(raw);
+        if(nodeById.has(key)) return nodeById.get(key);
+        const m = key.match(/(\d+)/);
+        if(m && nodeById.has(m[1])) return nodeById.get(m[1]);
+        const asNum = Number(key);
+        if(Number.isFinite(asNum) && nodeById.has(String(asNum))) return nodeById.get(String(asNum));
+        return null;
+      };
+
+      chain.forEach((entry, idx) => {
+        const target = resolveNodeForChainEntry(entry);
+        if(!target) return;
+        target.isSequence = true;
+        target.sequence_index = idx + 1;
+        target.sequence_chain_len = chainLen;
+      });
+    } catch(e) {}
+  };
+
   const renderTopologyGraph = (payload) => {
     if(!topologyGraphCard || !topologyGraph) return;
     if(!currentNorm){
@@ -472,6 +510,9 @@
         return { node1: n1, node2: n2, node1_name: n1Name, node2_name: n2Name };
       })
       .filter(l => l.node1 && l.node2 && l.node1 !== l.node2);
+
+    // Add sequencing info (if present) before rendering.
+    try { _annotateSequenceNodesFromFlow(mappedNodes, payload && payload.flow); } catch(e) {}
 
     // Lightweight diagnostics (mirrors Details page graph stats area)
     try {

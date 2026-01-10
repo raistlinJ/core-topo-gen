@@ -18,6 +18,13 @@ def _derive_user_pass(seed: str, node_name: str) -> tuple[str, str]:
     return user, pw
 
 
+def _compute_flag(seed: str, node_name: str, flag_prefix: str) -> str:
+    base = f"{seed}|{node_name}".encode("utf-8", "replace")
+    digest = hashlib.sha256(base).hexdigest()[:16]
+    prefix = (flag_prefix or "FLAG").strip() or "FLAG"
+    return f"{prefix}{{{digest}}}"
+
+
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -32,13 +39,17 @@ def main() -> None:
     seed = str(cfg.get("seed") or "seed")
     node_name = str(cfg.get("node_name") or "docker-node")
     nfs_port = int(cfg.get("nfs_port") or 2049)
+    flag_prefix = str(cfg.get("flag_prefix") or "FLAG")
 
     user, pw = _derive_user_pass(seed=seed, node_name=node_name)
     credential_pair = f"{user}:{pw}"
 
+    flag_value = _compute_flag(seed=seed, node_name=node_name, flag_prefix=flag_prefix)
+
     exports_dir = outputs_dir / "exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
     _write_text(exports_dir / "creds.txt", credential_pair + "\n")
+    _write_text(exports_dir / "flag.txt", flag_value + "\n")
 
     compose_text = (
         "services:\n"
@@ -59,6 +70,7 @@ def main() -> None:
     manifest = {
         "generator_id": str(cfg.get("generator_id") or "sample.nfs_sensitive_file"),
         "outputs": {
+            "flag": flag_value,
             "credential.pair": credential_pair,
             "compose_path": str(compose_path.name),
             "nfs_port": nfs_port,

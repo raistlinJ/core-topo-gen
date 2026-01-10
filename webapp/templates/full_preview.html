@@ -167,6 +167,7 @@
     <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-interfaces" type="button">Interfaces</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-seg" type="button">Segmentation</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-traffic" type="button">Traffic</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-flag-sequence" type="button">Flag-Sequence</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-node-sections" type="button">Node Sections</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-json" type="button">Raw JSON</button></li>
       </ul>
@@ -553,6 +554,13 @@
           {% endif %}
           </div>
         </div>
+
+  <div class="tab-pane fade" id="fp-flag-sequence">
+          <div id="fp-flag-sequence-body">
+            <div class="small text-muted fst-italic">Loading flag sequence…</div>
+          </div>
+        </div>
+
   <div class="tab-pane fade" id="fp-json">
           <div id="fp-json-body">
             <pre class="small bg-light p-2" style="max-height:440px;overflow:auto;">{{ preview_json }}</pre>
@@ -587,6 +595,24 @@
     </div>
   </div>
 </div>
+
+<!-- Flag Sequencing: node click (sequence badge) details modal -->
+<div class="modal fade" id="flowNodeFlagModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="flowNodeFlagModalTitle">Flag Details</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div id="flowNodeFlagModalBody" class="small text-muted">(no data)</div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
 {% block extra_scripts %}
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 <script id="fpDataJson" type="application/json">{{ full_preview | tojson }}</script>
@@ -596,6 +622,365 @@
 (function(){
   const IS_EMBEDDED = {{ 'true' if hide_chrome else 'false' }};
   let previewData = {};
+
+  const flowNodeFlagModalEl = document.getElementById('flowNodeFlagModal');
+  const flowNodeFlagModalTitleEl = document.getElementById('flowNodeFlagModalTitle');
+  const flowNodeFlagModalBodyEl = document.getElementById('flowNodeFlagModalBody');
+
+  function toRoman(num){
+    const n = Number(num);
+    if(!Number.isFinite(n) || n <= 0 || n >= 4000) return '';
+    const parts = [
+      [1000,'M'],[900,'CM'],[500,'D'],[400,'CD'],
+      [100,'C'],[90,'XC'],[50,'L'],[40,'XL'],
+      [10,'X'],[9,'IX'],[5,'V'],[4,'IV'],[1,'I'],
+    ];
+    let x = Math.floor(n);
+    let out = '';
+    for(const [v,s] of parts){
+      while(x >= v){ out += s; x -= v; }
+    }
+    return out;
+  }
+
+  function openFlowNodeFlagModal(node){
+    try {
+      if(!flowNodeFlagModalEl || !flowNodeFlagModalBodyEl) return;
+
+      // Ensure modal isn't clipped by embedded containers.
+      try {
+        if(!flowNodeFlagModalEl.__appendedToBody){
+          document.body.appendChild(flowNodeFlagModalEl);
+          flowNodeFlagModalEl.__appendedToBody = true;
+        }
+      } catch(e) {}
+
+      const nodeId = (node && node.id !== undefined && node.id !== null) ? String(node.id) : '';
+      const nodeName = (node && (node.label || node.name)) ? String(node.label || node.name) : (nodeId || 'Node');
+      const seq = (node && (node.sequence_index ?? node.sequenceIndex)) ? Number(node.sequence_index ?? node.sequenceIndex) : null;
+      const roman = (seq && Number.isFinite(seq)) ? toRoman(seq) : '';
+
+      if(flowNodeFlagModalTitleEl){
+        flowNodeFlagModalTitleEl.textContent = (roman ? (roman + '. ') : '') + nodeName;
+      }
+
+      // Pull flag assignments from flow metadata embedded in the preview plan.
+      const mdFlow = previewData && previewData.metadata && previewData.metadata.flow ? previewData.metadata.flow : null;
+      const flow = mdFlow || (previewData && previewData.flow ? previewData.flow : null) || null;
+      const scenario = (flow && flow.scenario) ? String(flow.scenario)
+        : (previewData && previewData.metadata && previewData.metadata.scenario ? String(previewData.metadata.scenario)
+        : (previewData && previewData.scenario ? String(previewData.scenario) : ''));
+      const fas = (flow && Array.isArray(flow.flag_assignments)) ? flow.flag_assignments : [];
+      const matches = nodeId ? fas.filter(a => a && String(a.node_id ?? a.nodeId ?? '') === nodeId) : [];
+
+      const tbl = document.createElement('table');
+      tbl.className = 'table table-sm table-borderless mb-0';
+      const tbody = document.createElement('tbody');
+      function addRow(label, valueElOrText){
+        const tr = document.createElement('tr');
+        const tdL = document.createElement('td');
+        tdL.className = 'text-muted';
+        tdL.style.whiteSpace = 'nowrap';
+        tdL.style.width = '1%';
+        tdL.textContent = String(label || '').trim() ? (String(label).trim() + ':') : '';
+        const tdV = document.createElement('td');
+        if(valueElOrText && typeof valueElOrText === 'object' && valueElOrText.nodeType){
+          tdV.appendChild(valueElOrText);
+        } else {
+          tdV.textContent = String(valueElOrText || '-');
+        }
+        tr.appendChild(tdL);
+        tr.appendChild(tdV);
+        tbody.appendChild(tr);
+      }
+
+      // Flag generator(s) on this node.
+      if(matches.length > 1){
+        const wrap = document.createElement('div');
+        const ol = document.createElement('ol');
+        ol.className = 'mb-0 ps-3';
+        matches.forEach((fa) => {
+          const li = document.createElement('li');
+          const genId = fa && fa.id ? String(fa.id) : '-';
+          const genName = fa && fa.name ? String(fa.name) : '-';
+          li.textContent = (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId;
+          ol.appendChild(li);
+        });
+        wrap.appendChild(ol);
+        addRow('flags', wrap);
+      } else if(matches.length === 1){
+        const fa = matches[0] || {};
+        const genId = fa && fa.id ? String(fa.id) : '-';
+        const genName = fa && fa.name ? String(fa.name) : '-';
+        addRow('flag', (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId);
+      } else {
+        addRow('flag', '-');
+      }
+
+      // Description hints (flatten if multiple flags).
+      const desc = [];
+      try {
+        matches.forEach((fa) => {
+          const dh = (fa && Array.isArray(fa.description_hints)) ? fa.description_hints : [];
+          dh.forEach((x) => {
+            const s = String(x || '').trim();
+            if(s) desc.push(s);
+          });
+        });
+      } catch(e) {}
+
+      const descUniq = Array.from(new Set(desc));
+      if(descUniq.length > 1){
+        const wrap = document.createElement('div');
+        const ol = document.createElement('ol');
+        ol.className = 'mb-0 ps-3';
+        descUniq.forEach((t) => {
+          const li = document.createElement('li');
+          li.textContent = t;
+          ol.appendChild(li);
+        });
+        wrap.appendChild(ol);
+        addRow('description hints', wrap);
+      } else if(descUniq.length === 1){
+        addRow('description hints', descUniq[0]);
+      } else {
+        addRow('description hints', '-');
+      }
+
+      // Runtime flag value (only if present in the loaded data).
+      const flagValueCell = document.createElement('span');
+      flagValueCell.className = 'text-muted';
+      let fv = '';
+      try {
+        fv = (matches.length === 1 && typeof (matches[0] || {}).flag_value === 'string') ? String((matches[0] || {}).flag_value).trim() : '';
+      } catch(e) { fv = ''; }
+      if(fv){
+        const code = document.createElement('code');
+        code.className = 'font-monospace';
+        code.textContent = fv;
+        addRow('flag value', code);
+      } else {
+        flagValueCell.textContent = '-';
+        addRow('flag value', flagValueCell);
+      }
+
+      tbl.appendChild(tbody);
+      flowNodeFlagModalBodyEl.innerHTML = '';
+      flowNodeFlagModalBodyEl.className = 'small';
+      flowNodeFlagModalBodyEl.appendChild(tbl);
+
+      if(window.bootstrap && window.bootstrap.Modal){
+        const m = (window.bootstrap.Modal.getOrCreateInstance
+          ? window.bootstrap.Modal.getOrCreateInstance(flowNodeFlagModalEl)
+          : new window.bootstrap.Modal(flowNodeFlagModalEl));
+        m.show();
+      }
+
+      // If the flag value isn't in the loaded preview payload, fetch it on-demand.
+      try {
+        if(!fv && scenario && nodeId && matches.length){
+          flagValueCell.textContent = 'Loading…';
+          fetch(`/api/flag-sequencing/flag_values_for_node?scenario=${encodeURIComponent(scenario)}&node_id=${encodeURIComponent(nodeId)}`)
+            .then(r => r.json())
+            .then(d => {
+              if(!d || d.ok !== true){
+                flagValueCell.textContent = '-';
+                return;
+              }
+              const flags = Array.isArray(d.flags) ? d.flags : [];
+              const vals = flags.map(x => (x && typeof x.flag_value === 'string') ? x.flag_value.trim() : '').filter(Boolean);
+              if(!vals.length){
+                flagValueCell.textContent = '-';
+                return;
+              }
+              // If multiple, join with newline for readability.
+              const code = document.createElement('code');
+              code.className = 'font-monospace';
+              code.style.whiteSpace = 'pre-wrap';
+              code.textContent = vals.join('\n');
+              flagValueCell.textContent = '';
+              flagValueCell.replaceWith(code);
+            })
+            .catch(_e => { flagValueCell.textContent = '-'; });
+        }
+      } catch(e) {}
+    } catch(e) {}
+  }
+
+  function renderFlagSequenceTab(){
+    const body = document.getElementById('fp-flag-sequence-body');
+    if(!body) return;
+
+    const mdFlow = previewData && previewData.metadata && previewData.metadata.flow ? previewData.metadata.flow : null;
+    const flow = mdFlow || (previewData && previewData.flow ? previewData.flow : null) || null;
+    const chain = (flow && Array.isArray(flow.chain)) ? flow.chain : [];
+    const fas = (flow && Array.isArray(flow.flag_assignments)) ? flow.flag_assignments : [];
+    const scenario = (flow && flow.scenario) ? String(flow.scenario)
+      : (previewData && previewData.metadata && previewData.metadata.scenario ? String(previewData.metadata.scenario)
+      : (previewData && previewData.scenario ? String(previewData.scenario) : ''));
+
+    body.innerHTML = '';
+    if(!chain.length){
+      const empty = document.createElement('div');
+      empty.className = 'small text-muted fst-italic';
+      empty.textContent = '(no flag sequence found in this preview plan)';
+      body.appendChild(empty);
+      return;
+    }
+
+    const tableWrap = document.createElement('div');
+    tableWrap.className = 'table-responsive';
+    tableWrap.style.maxHeight = '560px';
+    tableWrap.style.overflow = 'auto';
+
+    const tbl = document.createElement('table');
+    tbl.className = 'table table-sm table-bordered small align-middle mb-0';
+    const thead = document.createElement('thead');
+    thead.className = 'table-light';
+    thead.innerHTML = '<tr><th style="width:96px;">Sequence</th><th>Node</th><th style="width:260px;">Flag</th><th>Description hints</th><th style="width:220px;">Flag value</th></tr>';
+    const tbody = document.createElement('tbody');
+
+    const faByNodeId = new Map();
+    fas.forEach(a => {
+      try{
+        if(!a) return;
+        const nid = String(a.node_id ?? a.nodeId ?? '').trim();
+        if(!nid) return;
+        if(!faByNodeId.has(nid)) faByNodeId.set(nid, []);
+        faByNodeId.get(nid).push(a);
+      } catch(e){}
+    });
+
+    chain.forEach((entry, idx) => {
+      const tr = document.createElement('tr');
+      const seq = document.createElement('td');
+      seq.className = 'text-muted fw-semibold';
+      seq.textContent = toRoman(idx + 1);
+
+      let nodeId = '';
+      let nodeName = '';
+      try {
+        if(entry && typeof entry === 'object'){
+          nodeId = String(entry.id ?? entry.node_id ?? entry.nodeId ?? entry.host_id ?? entry.hostId ?? '').trim();
+          nodeName = String(entry.name ?? entry.label ?? '').trim();
+        } else {
+          nodeId = String(entry ?? '').trim();
+        }
+      } catch(e){}
+
+      const nodeTd = document.createElement('td');
+      nodeTd.textContent = nodeName ? `${nodeName} (${nodeId || '-'})` : (nodeId || '-');
+
+      const flagsTd = document.createElement('td');
+      const matches = nodeId ? (faByNodeId.get(nodeId) || []) : [];
+      if(matches.length > 1){
+        const ol = document.createElement('ol');
+        ol.className = 'mb-0 ps-3';
+        matches.forEach((fa) => {
+          const li = document.createElement('li');
+          const genId = fa && fa.id ? String(fa.id) : '-';
+          const genName = fa && fa.name ? String(fa.name) : '-';
+          li.textContent = (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId;
+          ol.appendChild(li);
+        });
+        flagsTd.appendChild(ol);
+      } else if(matches.length === 1){
+        const fa = matches[0] || {};
+        const genId = fa && fa.id ? String(fa.id) : '-';
+        const genName = fa && fa.name ? String(fa.name) : '-';
+        flagsTd.textContent = (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId;
+      } else {
+        flagsTd.textContent = '-';
+      }
+
+      const descTd = document.createElement('td');
+      const desc = [];
+      try {
+        matches.forEach((fa) => {
+          const dh = (fa && Array.isArray(fa.description_hints)) ? fa.description_hints : [];
+          dh.forEach((x) => {
+            const s = String(x || '').trim();
+            if(s) desc.push(s);
+          });
+        });
+      } catch(e){}
+      const descUniq = Array.from(new Set(desc));
+      if(descUniq.length > 1){
+        const ol = document.createElement('ol');
+        ol.className = 'mb-0 ps-3';
+        descUniq.forEach((t) => {
+          const li = document.createElement('li');
+          li.textContent = t;
+          ol.appendChild(li);
+        });
+        descTd.appendChild(ol);
+      } else if(descUniq.length === 1){
+        descTd.textContent = descUniq[0];
+      } else {
+        descTd.textContent = '-';
+      }
+
+      const flagValTd = document.createElement('td');
+      let haveValue = false;
+      try {
+        const valsLocal = matches
+          .map(x => (x && typeof x.flag_value === 'string') ? x.flag_value.trim() : '')
+          .filter(Boolean);
+        if(valsLocal.length){
+          haveValue = true;
+          const code = document.createElement('code');
+          code.className = 'font-monospace';
+          code.style.whiteSpace = 'pre-wrap';
+          code.textContent = Array.from(new Set(valsLocal)).join('\n');
+          flagValTd.appendChild(code);
+        }
+      } catch(e) {}
+
+      if(!haveValue){
+        const status = document.createElement('span');
+        status.className = 'text-muted';
+        status.textContent = '-';
+        flagValTd.appendChild(status);
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-sm btn-outline-secondary ms-2';
+        btn.textContent = 'Fetch';
+        btn.disabled = !(scenario && nodeId && matches.length);
+        btn.addEventListener('click', ()=>{
+          if(btn.disabled) return;
+          status.textContent = 'Loading…';
+          fetch(`/api/flag-sequencing/flag_values_for_node?scenario=${encodeURIComponent(scenario)}&node_id=${encodeURIComponent(nodeId)}`)
+            .then(r => r.json())
+            .then(d => {
+              const flags = d && d.ok === true && Array.isArray(d.flags) ? d.flags : [];
+              const vals = flags.map(x => (x && typeof x.flag_value === 'string') ? x.flag_value.trim() : '').filter(Boolean);
+              if(!vals.length){ status.textContent = '(no flag value)'; return; }
+              const code = document.createElement('code');
+              code.className = 'font-monospace';
+              code.style.whiteSpace = 'pre-wrap';
+              code.textContent = vals.join('\n');
+              flagValTd.innerHTML = '';
+              flagValTd.appendChild(code);
+            })
+            .catch(_e => { status.textContent = '(no flag value)'; });
+        });
+        flagValTd.appendChild(btn);
+      }
+
+      tr.appendChild(seq);
+      tr.appendChild(nodeTd);
+      tr.appendChild(flagsTd);
+      tr.appendChild(descTd);
+      tr.appendChild(flagValTd);
+      tbody.appendChild(tr);
+    });
+
+    tbl.appendChild(thead);
+    tbl.appendChild(tbody);
+    tableWrap.appendChild(tbl);
+    body.appendChild(tableWrap);
+  }
   function init(){
     const dataEl = document.getElementById('fpDataJson');
     try { previewData = JSON.parse(dataEl.textContent); } catch(e) { console.warn('Failed parse preview json', e); previewData = {}; }
@@ -620,6 +1005,8 @@
         }
       }
     } catch(e) {}
+
+    try { renderFlagSequenceTab(); } catch(e) {}
 
     let hitlConfig = { enabled: false, interfaces: [] };
     const hitlEl = document.getElementById('fpHitlConfigJson');
@@ -2524,6 +2911,11 @@ function buildScenarioUrl(basePath){
       .style('display', d => {
         const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
         return (seq && Number.isFinite(seq)) ? null : 'none';
+      })
+      .style('cursor', 'pointer')
+      .on('click', (event, d) => {
+        try { if(event && typeof event.stopPropagation === 'function') event.stopPropagation(); } catch(e) {}
+        try { openFlowNodeFlagModal(d); } catch(e) {}
       });
 
     // Tooltip specifically for the badge (so hovering the Roman numerals shows sequencing info).

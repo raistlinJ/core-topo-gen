@@ -4,6 +4,29 @@
 
 #include "generated.h"
 
+static unsigned long long fnv1a64(const char* s) {
+  const unsigned long long FNV_OFFSET = 1469598103934665603ULL;
+  const unsigned long long FNV_PRIME = 1099511628211ULL;
+  unsigned long long h = FNV_OFFSET;
+  if (!s) {
+    return h;
+  }
+  for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+    h ^= (unsigned long long)(*p);
+    h *= FNV_PRIME;
+  }
+  return h;
+}
+
+static int looks_like_flag(const char* s) {
+  if (!s) return 0;
+  size_t n = strlen(s);
+  if (n < 6) return 0;
+  if (strncmp(s, "FLAG{", 5) != 0) return 0;
+  if (s[n - 1] != '}') return 0;
+  return 1;
+}
+
 static void ensure_out_dir(const char* out_dir) {
   if (!out_dir || out_dir[0] == '\0') {
     out_dir = "out";
@@ -42,16 +65,27 @@ int main(void) {
     return 3;
   }
 
+  char flag_value[64];
+  if (looks_like_flag(hidden)) {
+    // Use embedded flag string directly.
+    snprintf(flag_value, sizeof(flag_value), "%s", hidden);
+  } else {
+    unsigned long long hv = fnv1a64(hidden);
+    snprintf(flag_value, sizeof(flag_value), "FLAG{%016llx}", hv);
+  }
+
   // Emit manifest. The hidden text is marked sensitive at the catalog layer.
   fprintf(fp,
           "{\n"
           "  \"generator_id\": \"gen.c.hidden_text_binary\",\n"
           "  \"outputs\": {\n"
+          "    \"flag\": \"%s\",\n"
           "    \"binary_path\": \"%s\",\n"
           "    \"hidden_text\": \"%s\",\n"
           "    \"hidden_checksum\": %u\n"
           "  }\n"
           "}\n",
+          flag_value,
           bin_path,
           hidden,
           (unsigned int)sink);

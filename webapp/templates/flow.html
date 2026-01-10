@@ -103,6 +103,18 @@
             <div id="flowDiagramWrap" class="border rounded p-2" style="min-height: 180px; overflow-x: auto;">
               <div id="flowDiagram" class="mermaid">graph LR\n  A[Generate] --> B[Flow]</div>
             </div>
+
+            <dialog id="flowNodeDetailsDialog" class="p-0 border rounded" style="max-width: 760px; width: calc(100% - 2rem);">
+              <form method="dialog" class="m-0">
+                <div class="p-3 border-bottom d-flex align-items-center justify-content-between">
+                  <div class="fw-semibold" id="flowNodeDetailsTitle">Node</div>
+                  <button class="btn btn-sm btn-outline-secondary" value="close" type="submit">Close</button>
+                </div>
+                <div class="p-3">
+                  <div id="flowNodeDetailsBody" class="small"></div>
+                </div>
+              </form>
+            </dialog>
           </div>
         </div>
 
@@ -162,6 +174,10 @@
   const metaScenarioEl = document.getElementById('flowMetaScenario');
   const metaPreviewEl = document.getElementById('flowMetaPreview');
   const metaStatsEl = document.getElementById('flowMetaStats');
+
+  const nodeDetailsDialogEl = document.getElementById('flowNodeDetailsDialog');
+  const nodeDetailsTitleEl = document.getElementById('flowNodeDetailsTitle');
+  const nodeDetailsBodyEl = document.getElementById('flowNodeDetailsBody');
   const downloadLink = document.getElementById('flowBundleDownloadLink');
   const scenarioListEl = document.getElementById('flowScenarioList');
   const clearScenarioBtn = document.getElementById('flowScenarioFilterClear');
@@ -183,6 +199,22 @@
   let lastFlowValid = true;
   let lastFlowErrors = [];
   let lastFlagsEnabled = true;
+
+  function persistFlowState(){
+    try {
+      const scenario = (scenarioEl && scenarioEl.value || '').trim();
+      if(!scenario) return;
+      const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
+      const chainIds = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+      if(!chainIds.length) return;
+      if(typeof window.coretgSetSavedFlowStateForScenario !== 'function') return;
+      window.coretgSetSavedFlowStateForScenario(scenario, {
+        preset,
+        length: chainIds.length,
+        chain_ids: chainIds,
+      });
+    } catch(e) {}
+  }
 
   function toRoman(n){
     const num = parseInt(n, 10);
@@ -512,6 +544,18 @@
       const genLabel = fa && fa.flag_generator ? String(fa.flag_generator) : '-';
       addRow('source', genLabel);
 
+      // Realized flag value (populated after prepare_preview_for_execute).
+      try{
+        const fv = (fa && typeof fa.flag_value === 'string') ? fa.flag_value.trim() : '';
+        if(fv){
+          const code = document.createElement('code');
+          code.className = 'font-monospace';
+          code.style.whiteSpace = 'pre-wrap';
+          code.textContent = fv;
+          addRow('flag', code);
+        }
+      } catch(e) {}
+
       const descList = (fa && Array.isArray(fa.description_hints) && fa.description_hints.length)
         ? fa.description_hints.map(x => String(x || '').trim()).filter(Boolean)
         : [];
@@ -641,6 +685,7 @@
         currentChain[idx-1] = currentChain[idx];
         currentChain[idx] = tmp;
         renderChainEditor();
+        persistFlowState();
         await refreshBundleFromChain();
       });
       const down = document.createElement('button');
@@ -654,6 +699,7 @@
         currentChain[idx+1] = currentChain[idx];
         currentChain[idx] = tmp;
         renderChainEditor();
+        persistFlowState();
         await refreshBundleFromChain();
       });
       right.appendChild(up);
@@ -664,6 +710,99 @@
       item.appendChild(right);
       wrap.appendChild(item);
     });
+  }
+
+  function openNodeDetailsDialog(idx){
+    if(!nodeDetailsDialogEl || !nodeDetailsBodyEl) return;
+    const i = Number.isFinite(+idx) ? (+idx) : -1;
+    if(!Array.isArray(currentChain) || i < 0 || i >= currentChain.length) return;
+    const node = currentChain[i] || {};
+    const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[i]) ? currentFlagAssignments[i] : null;
+
+    const seq = toRoman(i + 1);
+    const nodeName = (node && node.name) ? String(node.name) : ('Node ' + (i + 1));
+    if(nodeDetailsTitleEl) nodeDetailsTitleEl.textContent = (seq ? (seq + '. ') : '') + nodeName;
+
+    nodeDetailsBodyEl.innerHTML = '';
+
+    const tbl = document.createElement('table');
+    tbl.className = 'table table-sm table-borderless mb-0';
+    const tbody = document.createElement('tbody');
+
+    function addRow(label, valueElOrText){
+      const tr = document.createElement('tr');
+      const tdL = document.createElement('td');
+      tdL.className = 'text-muted';
+      tdL.style.whiteSpace = 'nowrap';
+      tdL.style.width = '1%';
+      tdL.textContent = String(label || '').trim() ? (String(label).trim() + ':') : '';
+      const tdV = document.createElement('td');
+      if(valueElOrText && typeof valueElOrText === 'object' && valueElOrText.nodeType){
+        tdV.appendChild(valueElOrText);
+      } else {
+        tdV.textContent = String(valueElOrText || '-');
+      }
+      tr.appendChild(tdL);
+      tr.appendChild(tdV);
+      tbody.appendChild(tr);
+    }
+
+    // Flag(s) assigned to this node (currently 1-per-chain-position).
+    if(fa && (fa.id || fa.name)){
+      const genId = fa && fa.id ? String(fa.id) : '-';
+      const genName = fa && fa.name ? String(fa.name) : '-';
+      const label = (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId;
+      addRow('flag', label);
+    } else {
+      addRow('flag', '-');
+    }
+
+    // Runtime flag value(s), only present after prepare_preview_for_execute resolves generators.
+    try{
+      const fv = (fa && typeof fa.flag_value === 'string') ? fa.flag_value.trim() : '';
+      if(fv){
+        const code = document.createElement('code');
+        code.className = 'font-monospace';
+        code.textContent = fv;
+        addRow('flag value', code);
+      } else {
+        addRow('flag value', '-');
+      }
+    } catch(e) {
+      addRow('flag value', '-');
+    }
+
+    // Description hints.
+    const descList = (fa && Array.isArray(fa.description_hints) && fa.description_hints.length)
+      ? fa.description_hints.map(x => String(x || '').trim()).filter(Boolean)
+      : [];
+    if(descList.length > 1){
+      const wrap = document.createElement('div');
+      const ul = document.createElement('ol');
+      ul.className = 'mb-0 ps-3';
+      descList.forEach((ht) => {
+        const li = document.createElement('li');
+        li.textContent = ht;
+        ul.appendChild(li);
+      });
+      wrap.appendChild(ul);
+      addRow('description hints', wrap);
+    } else if(descList.length === 1){
+      addRow('description hints', descList[0]);
+    } else {
+      addRow('description hints', '-');
+    }
+
+    tbl.appendChild(tbody);
+    nodeDetailsBodyEl.appendChild(tbl);
+
+    try{
+      if(typeof nodeDetailsDialogEl.showModal === 'function'){
+        nodeDetailsDialogEl.showModal();
+      }
+    } catch(e) {
+      // If dialog isn't supported, do nothing.
+    }
   }
 
   function selectChainIndex(idx){
@@ -803,6 +942,7 @@
       updateMeta();
       selectedChainIndex = -1;
       renderChainEditor();
+      persistFlowState();
 
       if(jsonEl) jsonEl.textContent = JSON.stringify(currentBundle, null, 2);
       const diagram = buildMermaid(currentChain);
@@ -938,13 +1078,134 @@
     }
   }
 
-  async function saveXmlOnly(){
+  async function preview(){
+    // Save XML, persist a preview plan, persist flow sequencing, then redirect to Preview.
+    try {
+      const scenario = (scenarioEl && scenarioEl.value || '').trim();
+      if(!scenario){
+        setStatus('No scenario selected.', true);
+        return;
+      }
+      persistFlowState();
+      if(typeof window.coretgSaveXmlViaApi !== 'function' || typeof window.coretgPostJson !== 'function'){
+        setStatus('Save helper unavailable; refresh and try again.', true);
+        return;
+      }
+
+      if(execEl) execEl.disabled = true;
+      setStatus('Saving XML…', false);
+      showLoading('Saving XML…');
+      const xmlPath = await window.coretgSaveXmlViaApi();
+      if(!xmlPath){
+        throw new Error('Save did not return xml_path');
+      }
+
+      // Ensure we have a persisted preview plan artifact to base Flow changes on.
+      setStatus('Preparing preview plan…', false);
+      showLoading('Preparing preview plan…');
+      const persisted = await window.coretgPostJson('/api/plan/persist_preview_plan', { xml_path: xmlPath, scenario });
+      const previewPlan = (persisted && persisted.preview_plan_path) ? String(persisted.preview_plan_path) : '';
+      if(!previewPlan){
+        throw new Error('Failed to persist preview plan');
+      }
+
+      // Persist the current chain into a flow-modified plan immediately.
+      const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
+      const chainIds = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+      if(chainIds.length){
+        setStatus('Saving Flag Sequencing…', false);
+        showLoading('Saving Flag Sequencing…');
+        await window.coretgPostJson('/api/flag-sequencing/prepare_preview_for_execute', {
+          scenario,
+          preset,
+          length: chainIds.length,
+          chain_ids: chainIds,
+          preview_plan: previewPlan,
+        });
+      }
+
+      // Navigate to Preview tab.
+      const baseUrl = String(document.getElementById('scenariosPreviewTabLink')?.dataset?.previewBaseUrl || '/scenarios/preview');
+      const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + '&scenario=' + encodeURIComponent(scenario);
+      window.location.href = url;
+    } catch(e) {
+      setStatus('Preview failed: ' + String(e && e.message || e), true);
+    } finally {
+      hideLoading();
+      try {
+        if (typeof window.coretgRefreshScenariosExecuteButtonState === 'function') {
+          window.coretgRefreshScenariosExecuteButtonState();
+        } else if (execEl) {
+          execEl.disabled = false;
+        }
+      } catch (e) {
+        if (execEl) execEl.disabled = false;
+      }
+    }
+  }
+
+  async function saveXmlStay(){
+    try {
+      persistFlowState();
+      if(typeof window.coretgSaveXmlViaApi !== 'function'){
+        setStatus('Save helper unavailable; refresh and try again.', true);
+        return;
+      }
+      if(saveXmlEl) saveXmlEl.disabled = true;
+      showLoading('Saving XML…');
+      const xmlPath = await window.coretgSaveXmlViaApi();
+      if(xmlPath){
+        try {
+          const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
+          if(xmlPathInput) xmlPathInput.value = String(xmlPath);
+        } catch(e) {}
+        try {
+          if(downloadXmlEl){
+            downloadXmlEl.disabled = false;
+            downloadXmlEl.removeAttribute('title');
+          }
+        } catch(e) {}
+        setStatus('Saved XML: ' + basenameFromPath(xmlPath), false);
+        try { await refreshXmlDockPreview({ force: true }); } catch(e) {}
+      } else {
+        setStatus('Saved XML (missing path).', false);
+      }
+    } catch(e){
+      setStatus('Save failed: ' + String(e && e.message || e), true);
+    } finally {
+      hideLoading();
+      if(saveXmlEl) saveXmlEl.disabled = false;
+    }
+  }
+
+  // Bottom-bar buttons: Save XML saves and stays; Preview saves then redirects.
+  document.addEventListener('DOMContentLoaded', () => {
+    try {
+      if(saveXmlEl){
+        saveXmlEl.addEventListener('click', (ev) => {
+          try { ev.preventDefault(); } catch(e) {}
+          saveXmlStay();
+        });
+      }
+    } catch(e) {}
+    try {
+      if(execEl){
+        execEl.addEventListener('click', (ev) => {
+          try { ev.preventDefault(); } catch(e) {}
+          preview();
+        });
+      }
+    } catch(e) {}
+  });
+
+  async function saveXmlOnly(opts){
+    const options = (opts && typeof opts === 'object') ? opts : {};
     const scenario = (scenarioEl && scenarioEl.value || '').trim();
     const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
     const length = (Array.isArray(currentChain) && currentChain.length) ? currentChain.length : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
     if(!scenario){
       setStatus('No scenario selected.', true);
-      return;
+      return '';
     }
     if(saveXmlEl) saveXmlEl.disabled = true;
     setStatus('Preparing preview and saving XML…', false);
@@ -980,9 +1241,13 @@
       } catch(e) {}
       setStatus('Saved XML: ' + basenameFromPath(xmlPath), false);
       try { await refreshXmlDockPreview({ force: true }); } catch(e) {}
+      return xmlPath;
     } catch(err){
       setStatus(String(err && err.message || err), true);
       setLoginLinkVisible(!!(err && err.loginRequired));
+      // If preview requested, surface failure by throwing so caller does not redirect.
+      if (options && options.redirectAfter) throw err;
+      return '';
     } finally {
       hideLoading();
       if(saveXmlEl) saveXmlEl.disabled = false;
@@ -1008,13 +1273,28 @@
       const m = String(nodeId || '').match(/^N(\d+)$/);
       if(!m) return;
       const idx = parseInt(m[1], 10);
-      if(Number.isFinite(idx)) selectChainIndex(idx);
+      if(Number.isFinite(idx)){
+        selectChainIndex(idx);
+        openNodeDetailsDialog(idx);
+      }
     } catch(e) {}
   };
 
+  // Allow clicking the backdrop to close the node dialog.
+  try{
+    if(nodeDetailsDialogEl){
+      nodeDetailsDialogEl.addEventListener('click', (ev)=>{
+        try {
+          if(ev && ev.target === nodeDetailsDialogEl && typeof nodeDetailsDialogEl.close === 'function'){
+            nodeDetailsDialogEl.close();
+          }
+        } catch(e) {}
+      });
+    }
+  } catch(e) {}
+
   if(btnEl) btnEl.addEventListener('click', (e)=>{ e.preventDefault(); generate(true); });
-  if(saveXmlEl) saveXmlEl.addEventListener('click', (e)=>{ e.preventDefault(); saveXmlOnly(); });
-  if(execEl) execEl.addEventListener('click', (e)=>{ e.preventDefault(); execute(); });
+  // Handlers for Save/Preview are registered above.
   if(downloadXmlEl) downloadXmlEl.addEventListener('click', (e)=>{ e.preventDefault(); downloadXml(); });
 
   if(downloadLink){

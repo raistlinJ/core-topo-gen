@@ -6,6 +6,8 @@ import math
 import random
 import logging
 import ipaddress
+import subprocess
+import time
 
 try:  # pragma: no cover - offline mode exercised via CLI tests
     from core.api.grpc import client  # type: ignore
@@ -68,6 +70,117 @@ import os
 # Track which docker-node compose files we've prepared this process.
 _PREPARED_DOCKER_NODE_COMPOSES: Set[str] = set()
 
+# Track which per-node compose files have had docker preflight executed.
+_PREFLIGHTED_DOCKER_NODE_COMPOSES: Set[str] = set()
+
+
+def _docker_compose_cmd() -> List[str]:
+    """Return a docker compose command that works on this host."""
+    try:
+        p = subprocess.run(['docker', 'compose', 'version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if p.returncode == 0:
+            return ['docker', 'compose']
+    except Exception:
+        pass
+    return ['docker-compose']
+
+
+def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
+    """Best-effort prepare docker-compose assets before CORE starts docker nodes.
+
+    This is intended to run on the CORE VM host (when the CLI itself runs there, e.g. via ssh).
+    It makes container start-time independent of internet by:
+    - pulling required images
+    - building wrapper images (iproute2/tooling)
+    - creating containers without starting them (up --no-start)
+    """
+    try:
+        if not compose_path:
+            return
+        key = os.path.abspath(compose_path)
+        if key in _PREFLIGHTED_DOCKER_NODE_COMPOSES:
+            return
+        _PREFLIGHTED_DOCKER_NODE_COMPOSES.add(key)
+    except Exception:
+        return
+
+    cmd = _docker_compose_cmd()
+    start = time.time()
+    try:
+        logger.info('[docker-node] preflight begin node=%s compose=%s cmd=%s', node_name, compose_path, ' '.join(cmd))
+    except Exception:
+        pass
+
+    def _run(args: List[str], timeout: int) -> None:
+        try:
+            proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+            out = (proc.stdout or '').strip()
+            # Avoid flooding logs; keep last few lines.
+            tail = ''
+            if out:
+                lines = out.splitlines()
+                tail = '\n'.join(lines[-12:])
+            try:
+                logger.info('[docker-node] preflight cmd=%s rc=%s%s', ' '.join(args), proc.returncode, (f"\n{tail}" if tail else ''))
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                logger.warning('[docker-node] preflight cmd failed: %s err=%s', ' '.join(args), exc)
+            except Exception:
+                pass
+
+    # Pull images before CORE starts docker nodes.
+    _run(cmd + ['-f', compose_path, 'pull'], timeout=600)
+
+    # Build any services that declare a `build:` stanza using host networking.
+    # This avoids reliance on Docker's default bridge network (which may be disabled
+    # on CORE VMs) and prevents apt/apk installs from failing due to missing DNS.
+    built_any = False
+    try:
+        import yaml  # type: ignore
+
+        with open(compose_path, 'r', encoding='utf-8', errors='ignore') as fh:
+            compose_obj = yaml.safe_load(fh)  # type: ignore
+        services = compose_obj.get('services') if isinstance(compose_obj, dict) else None
+        if isinstance(services, dict):
+            for svc_name, svc in services.items():
+                if not isinstance(svc, dict):
+                    continue
+                build = svc.get('build')
+                if not build:
+                    continue
+                image = str(svc.get('image') or '').strip()
+                context = None
+                dockerfile = None
+                if isinstance(build, str):
+                    context = build
+                elif isinstance(build, dict):
+                    context = build.get('context')
+                    dockerfile = build.get('dockerfile')
+                context = str(context or '').strip()
+                dockerfile = str(dockerfile or 'Dockerfile').strip() or 'Dockerfile'
+                if not context or not image:
+                    continue
+                args = ['docker', 'build', '--network', 'host', '--pull', '-t', image, '-f', os.path.join(context, dockerfile), context]
+                _run(args, timeout=1800)
+                built_any = True
+    except Exception:
+        built_any = False
+
+    if built_any:
+        # Create containers without rebuilding.
+        _run(cmd + ['-f', compose_path, 'up', '--no-start', '--no-build'], timeout=600)
+    else:
+        # Fallback: let compose handle builds (best-effort).
+        _run(cmd + ['-f', compose_path, 'build', '--pull'], timeout=1200)
+        _run(cmd + ['-f', compose_path, 'up', '--no-start'], timeout=600)
+
+    try:
+        logger.info('[docker-node] preflight done node=%s elapsed_ms=%s', node_name, int((time.time() - start) * 1000))
+    except Exception:
+        pass
+
 
 def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str, str]]) -> None:
     """Best-effort ensure /tmp/vulns/docker-compose-<node>.yml exists and is Mako-safe.
@@ -92,12 +205,39 @@ def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str,
                 os.remove(out_path)
         except Exception:
             pass
+        rec_source = "provided"
         if rec is None:
             rec = _standard_docker_compose_record()
+            rec_source = "default"
+
+        try:
+            skip_wrap_raw = str((rec or {}).get('SkipIproute2Wrapper') or '').strip().lower()
+            skip_wrapper = skip_wrap_raw in ('1', 'true', 'yes', 'y', 'on')
+        except Exception:
+            skip_wrapper = False
+        try:
+            logger.info(
+                "[docker-node] compose prep node=%s src=%s out=%s rec_name=%s rec_path=%s skip_iproute2_wrapper=%s",
+                node_name,
+                rec_source,
+                out_path,
+                (rec or {}).get('Name') if isinstance(rec, dict) else None,
+                (rec or {}).get('Path') if isinstance(rec, dict) else None,
+                skip_wrapper,
+            )
+        except Exception:
+            pass
         # Ensure downstream helpers know the intended per-node output path.
         try:
             if isinstance(rec, dict):
                 rec['compose_path'] = out_path
+        except Exception:
+            pass
+        # Pass scenario tag through so vuln wrapper images can be scoped per run/scenario.
+        try:
+            scenario_tag_env = (os.getenv('CORETG_SCENARIO_TAG') or '').strip()
+            if scenario_tag_env and isinstance(rec, dict):
+                rec.setdefault('ScenarioTag', scenario_tag_env)
         except Exception:
             pass
         try:
@@ -141,6 +281,14 @@ def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str,
         except Exception:
             pass
         _PREPARED_DOCKER_NODE_COMPOSES.add(node_name)
+
+        # Preflight: pull/build/create docker containers before CORE starts docker nodes.
+        # This reduces failures when containers have no internet access.
+        try:
+            if os.path.exists(out_path):
+                _docker_compose_preflight(out_path, node_name=node_name)
+        except Exception:
+            pass
     except Exception:
         return
 
@@ -804,9 +952,9 @@ def _standard_docker_compose_record() -> Dict[str, str]:
         'Name': 'standard-ubuntu-docker-core',
         'Path': _standard_docker_compose_template_path(),
         'Vector': 'standard',
-        # Keep the baseline compose as simple as possible: no Docker builds.
-        # The container installs required tools at runtime via apt.
-        'SkipIproute2Wrapper': 'true',
+        # Prefer a wrapper build so iproute2 exists immediately at container start.
+        # This avoids races where CORE's DefaultRoute service runs before a runtime
+        # bootstrap command (apt-get) finishes installing `ip`.
     }
 
 

@@ -2,6 +2,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+static unsigned long long fnv1a64(const char* s) {
+    const unsigned long long FNV_OFFSET = 1469598103934665603ULL;
+    const unsigned long long FNV_PRIME = 1099511628211ULL;
+    unsigned long long h = FNV_OFFSET;
+    if (!s) {
+        return h;
+    }
+    for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+        h ^= (unsigned long long)(*p);
+        h *= FNV_PRIME;
+    }
+    return h;
+}
+
 static void ensure_out_dir(const char* out_dir) {
     if (!out_dir || out_dir[0] == '\0') {
         out_dir = "out";
@@ -32,6 +46,11 @@ int main(int argc, char** argv) {
     }
     ensure_out_dir(out_dir);
 
+    // Deterministic flag derived from SECRET (required input for this generator).
+    unsigned long long hv = fnv1a64(secret);
+    char flag_value[64];
+    snprintf(flag_value, sizeof(flag_value), "FLAG{%016llx}", hv);
+
     char bin_path[1024];
     snprintf(bin_path, sizeof(bin_path), "%s/basicbin", out_dir);
 
@@ -50,9 +69,11 @@ int main(int argc, char** argv) {
         "{\n"
         "  \"generator_id\": \"gen.c.basic_binary\",\n"
         "  \"outputs\": {\n"
+        "    \"flag\": \"%s\",\n"
         "    \"binary_path\": \"%s\"\n"
         "  }\n"
         "}\n",
+        flag_value,
         bin_path
     );
     fclose(fp);

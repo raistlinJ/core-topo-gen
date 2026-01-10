@@ -1209,7 +1209,9 @@ def main():
                         base_seed = int(getattr(args, 'seed', 0) or 0)
                     except Exception:
                         base_seed = 0
-                    scenario_tag = str(getattr(args, 'scenario', '') or 'scenario').strip() or 'scenario'
+                    scenario_tag = str(os.getenv('CORETG_SCENARIO_TAG') or '').strip()
+                    if not scenario_tag:
+                        scenario_tag = str(getattr(args, 'scenario', '') or 'scenario').strip() or 'scenario'
                     scenario_tag = ''.join([c for c in scenario_tag if c.isalnum() or c in ('-', '_')])[:40] or 'scenario'
 
                     updated = {}
@@ -1236,6 +1238,7 @@ def main():
                                 'Name': str(gen.get('name') or gen_id),
                                 'Path': compose_src,
                                 'Vector': 'flag-nodegen',
+                                'ScenarioTag': scenario_tag,
                             }
                         else:
                             logging.warning("Flag-node-generator failed for node=%s gen=%s: %s", nm, gen_id, note)
@@ -1250,6 +1253,13 @@ def main():
                             except Exception:
                                 pass
 
+                # Ensure ScenarioTag is present so wrapper images are scoped.
+                try:
+                    for _nm, _rec in (standard_nodes or {}).items():
+                        if isinstance(_rec, dict):
+                            _rec.setdefault('ScenarioTag', scenario_tag)
+                except Exception:
+                    pass
                 created = prepare_compose_for_assignments(standard_nodes, out_base="/tmp/vulns")
                 logging.info("Prepared docker compose files for explicit Docker role nodes: %d for %d docker nodes", len(created), len(standard_nodes))
 
@@ -1283,6 +1293,17 @@ def main():
                         continue
                     all_docker_nodes[nm] = rec
             if all_docker_nodes:
+                # Ensure ScenarioTag is present so wrapper images are scoped.
+                try:
+                    _scenario_tag = str(os.getenv('CORETG_SCENARIO_TAG') or '').strip()
+                    if not _scenario_tag:
+                        _scenario_tag = str(getattr(args, 'scenario', '') or 'scenario').strip() or 'scenario'
+                    _scenario_tag = ''.join([c for c in _scenario_tag if c.isalnum() or c in ('-', '_')])[:40] or 'scenario'
+                    for _nm, _rec in all_docker_nodes.items():
+                        if isinstance(_rec, dict):
+                            _rec.setdefault('ScenarioTag', _scenario_tag)
+                except Exception:
+                    pass
                 created = prepare_compose_for_assignments(all_docker_nodes, out_base="/tmp/vulns")
                 logging.info("Prepared docker compose files (all docker nodes): %d for %d docker nodes", len(created), len(all_docker_nodes))
 

@@ -23,12 +23,20 @@ def _h(*parts: str) -> str:
     return hashlib.sha256(base).hexdigest()
 
 
+def _derive_flag(seed: str, secret: str, env_name: str, generator_id: str, flag_prefix: str) -> str:
+    base = f"{seed}|{secret}|{env_name}|{generator_id}".encode("utf-8", "replace")
+    digest = hashlib.sha256(base).hexdigest()[:24]
+    prefix = (flag_prefix or "FLAG").strip() or "FLAG"
+    return f"{prefix}{{{digest}}}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate shared network drive configuration info.")
     parser.add_argument("--config", default=os.environ.get("CONFIG_PATH", ""))
     parser.add_argument("--seed", default=os.environ.get("SEED", ""))
     parser.add_argument("--secret", default=os.environ.get("SECRET", ""))
     parser.add_argument("--env-name", default=os.environ.get("ENV_NAME", ""))
+    parser.add_argument("--flag-prefix", default=os.environ.get("FLAG_PREFIX", "FLAG"))
     parser.add_argument("--out-dir", default=os.environ.get("OUT_DIR", "out"))
     args = parser.parse_args()
 
@@ -39,6 +47,8 @@ def main() -> int:
         args.secret = str(cfg.get("secret") or "")
     if not args.env_name:
         args.env_name = str(cfg.get("env_name") or cfg.get("env-name") or "")
+    if args.flag_prefix == "FLAG":
+        args.flag_prefix = str(cfg.get("flag_prefix") or cfg.get("flag-prefix") or args.flag_prefix)
 
     if not args.seed:
         raise SystemExit("Missing --seed (or SEED env var)")
@@ -51,6 +61,8 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     digest = _h(args.seed, args.secret, args.env_name, "shared-drive")
+
+    flag_value = _derive_flag(args.seed, args.secret, args.env_name, "gen.py.shared_drive_config", args.flag_prefix)
 
     # Keep this generic: it's "config info" only.
     share_host = "fileserver"
@@ -77,6 +89,7 @@ def main() -> int:
     outputs = {
         "generator_id": "gen.py.shared_drive_config",
         "outputs": {
+            "flag": flag_value,
             "drive_share_host": share_host,
             "drive_share_name": share_name,
             "drive_share_path": share_path,
@@ -86,6 +99,11 @@ def main() -> int:
             "artifact_path": str(artifact_path.resolve()),
         },
     }
+
+    try:
+        (out_dir / "flag.txt").write_text(flag_value + "\n", encoding="utf-8")
+    except Exception:
+        pass
 
     (out_dir / "outputs.json").write_text(json.dumps(outputs, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(outputs, indent=2))

@@ -123,30 +123,50 @@
     if(frame){
       // Clear previous content for immediate feedback.
       try { frame.srcdoc = '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">Loading preview…</div>'; } catch(e){}
-      frame.addEventListener('load', ()=>{ try { modal && modal.hide(); } catch(e){} }, { once: true });
+      frame.addEventListener('load', async ()=>{
+        try { modal && modal.hide(); } catch(e){}
+        // Best-effort: if the user has a saved Flag Sequencing chain for this scenario,
+        // persist it now that the preview plan has been generated.
+        try {
+          const scenarioNow = (scenario || '').toString().trim();
+          if(!scenarioNow) return;
+          if(typeof window.coretgGetSavedFlowStateForScenario !== 'function') return;
+          if(typeof window.coretgPostJson !== 'function') return;
+          const flow = window.coretgGetSavedFlowStateForScenario(scenarioNow);
+          if(!flow) return;
+          await window.coretgPostJson('/api/flag-sequencing/prepare_preview_for_execute', {
+            scenario: scenarioNow,
+            preset: flow.preset || '',
+            length: flow.length || (Array.isArray(flow.chain_ids) ? flow.chain_ids.length : 5),
+            chain_ids: flow.chain_ids || [],
+          });
+        } catch(e) {
+          // Non-fatal; preview is still usable.
+          try { console.warn('Flow save failed (non-fatal):', e); } catch(_e) {}
+        }
+      }, { once: true });
     }
 
     try { form && form.submit(); } catch(e){ try { modal && modal.hide(); } catch(_e){} }
   }
 
   document.addEventListener('DOMContentLoaded', ()=>{
-    // Shared Scenarios Execute button: always use the Topology execute flow.
+    // Shared Scenarios Execute button: hand off to Topology execution flow.
     try {
       document.getElementById('scenariosExecuteBtn')?.addEventListener('click', (ev)=>{
         try {
           ev.preventDefault();
           const params = new URLSearchParams(window.location.search || '');
-          const xmlPath = (params.get('xml_path') || document.getElementById('scenariosPreviewLoadXmlPath')?.value || '').trim();
-          const scen = (params.get('scenario') || document.getElementById('scenariosPreviewLoadScenario')?.value || '').trim();
+          const xmlPath = (document.getElementById('scenariosPreviewLoadXmlPath')?.value || params.get('xml_path') || '').trim();
+          const scenario = (params.get('scenario') || document.getElementById('scenariosPreviewLoadScenario')?.value || '').trim();
           if(!xmlPath){
             alert('Save XML first to execute.');
             return;
           }
-          const baseUrl = '{{ url_for("index") }}';
-          const url = baseUrl
-            + '?auto_execute=1'
-            + '&xml_path=' + encodeURIComponent(xmlPath)
-            + (scen ? ('&scenario=' + encodeURIComponent(scen)) : '');
+          const base = '/';
+          const url = base + '?xml_path=' + encodeURIComponent(xmlPath)
+            + (scenario ? ('&scenario=' + encodeURIComponent(scenario)) : '')
+            + '&auto_execute=1';
           window.location.href = url;
         } catch(e){}
       });

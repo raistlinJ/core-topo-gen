@@ -13,13 +13,7 @@ services:
       - -lc
       - |
         set -e
-        export DEBIAN_FRONTEND=noninteractive
-
-        # Install minimal tooling required by CORE services + our Traffic/Segmentation helpers.
-        if ! command -v ip >/dev/null 2>&1; then
-          apt-get update -y
-          apt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps python3
-          rm -rf /var/lib/apt/lists/*
-        fi
-
+        # NOTE: CORE docker nodes are typically NOT internet-enabled.
+        # Required tooling must be installed at image build time on the CORE VM host
+        # (via the wrapper build + docker-compose preflight), not here at runtime.
         sleep infinity

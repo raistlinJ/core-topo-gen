@@ -7106,6 +7106,24 @@ def participant_ui_topology_api():
     except Exception:
         summary = {}
 
+    # Best-effort attach flow/chain metadata so the Participant UI graph can
+    # label sequence nodes with Roman numerals (mirrors Preview graph view).
+    flow_meta: Optional[dict] = None
+    try:
+        scenario_norm_for_flow = _normalize_scenario_label(scenario_norm)
+        if scenario_norm_for_flow:
+            flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm_for_flow)
+            if flow_plan_path:
+                with open(flow_plan_path, 'r', encoding='utf-8') as f:
+                    flow_payload = json.load(f) or {}
+                if isinstance(flow_payload, dict):
+                    meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
+                    candidate = (meta or {}).get('flow') or flow_payload.get('flow')
+                    if isinstance(candidate, dict):
+                        flow_meta = candidate
+    except Exception:
+        flow_meta = None
+
     raw_nodes = summary.get('nodes') if isinstance(summary, dict) else None
     nodes_list: list[dict] = raw_nodes if isinstance(raw_nodes, list) else []
 
@@ -7340,7 +7358,7 @@ def participant_ui_topology_api():
     except Exception:
         pass
 
-    return jsonify({
+    out = {
         'ok': True,
         'scenario_norm': scenario_norm,
         'status': '',
@@ -7348,7 +7366,10 @@ def participant_ui_topology_api():
         'links': out_links,
         'subnets': subnets,
         'vulnerability_ips': vuln_ips,
-    })
+    }
+    if isinstance(flow_meta, dict) and flow_meta:
+        out['flow'] = flow_meta
+    return jsonify(out)
 
 
 _PARTICIPANT_UI_STATS_PATH = os.path.join(_outputs_dir(), 'participant_ui_stats.json')
@@ -8724,6 +8745,101 @@ def api_flow_latest_preview_plan():
     })
 
 
+def _flow_read_flag_value_from_artifacts_dir(artifacts_dir: str) -> str:
+    """Read a realized flag value from a generator artifacts directory.
+
+    Only reads from directories under /tmp/vulns to avoid arbitrary file access.
+    Returns empty string when not found.
+    """
+    try:
+        d = str(artifacts_dir or '').strip()
+        if not d:
+            return ''
+        base_dir = os.path.abspath(os.path.join('/tmp', 'vulns'))
+        dd = os.path.abspath(d)
+        if os.path.commonpath([dd, base_dir]) != base_dir:
+            return ''
+        if not os.path.isdir(dd):
+            return ''
+        flag_txt = os.path.join(dd, 'flag.txt')
+        if os.path.isfile(flag_txt):
+            with open(flag_txt, 'r', encoding='utf-8', errors='ignore') as f:
+                val = (f.read() or '').strip()
+                return val[:4096] if val else ''
+        outs_path = os.path.join(dd, 'outputs.json')
+        if os.path.isfile(outs_path):
+            try:
+                with open(outs_path, 'r', encoding='utf-8') as f:
+                    m = json.load(f) or {}
+                outs = m.get('outputs') if isinstance(m, dict) else None
+                if isinstance(outs, dict):
+                    v = outs.get('flag')
+                    if isinstance(v, str) and v.strip():
+                        vv = v.strip()
+                        return vv[:4096]
+            except Exception:
+                return ''
+    except Exception:
+        return ''
+    return ''
+
+
+@app.route('/api/flag-sequencing/flag_values_for_node')
+def api_flow_flag_values_for_node():
+    """Return realized flag value(s) for a sequenced node (runtime-only).
+
+    Used by the Scenarios Preview tab graph popup to fetch flag values on-demand.
+    """
+    scenario_label = (request.args.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    node_id = str((request.args.get('node_id') or '').strip())
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+    if not node_id:
+        return jsonify({'ok': False, 'error': 'No node_id specified.'}), 400
+
+    plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm)
+    if not plan_path or not os.path.exists(plan_path):
+        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario.'}), 404
+
+    try:
+        with open(plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+        meta = payload.get('metadata') if isinstance(payload, dict) else None
+        flow = (meta or {}).get('flow') if isinstance(meta, dict) else None
+        fas = flow.get('flag_assignments') if isinstance(flow, dict) else None
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
+
+    if not isinstance(fas, list) or not fas:
+        return jsonify({'ok': True, 'scenario': scenario_label or scenario_norm, 'node_id': node_id, 'flags': []})
+
+    matches = [a for a in fas if isinstance(a, dict) and str(a.get('node_id') or '').strip() == node_id]
+    out_flags: list[dict[str, Any]] = []
+    for a in (matches or []):
+        try:
+            artifacts_dir = str(a.get('artifacts_dir') or a.get('run_dir') or '').strip()
+            val = _flow_read_flag_value_from_artifacts_dir(artifacts_dir) if artifacts_dir else ''
+            out_flags.append({
+                'generator_id': str(a.get('id') or ''),
+                'generator_name': str(a.get('name') or ''),
+                'flag_value': val,
+            })
+        except Exception:
+            out_flags.append({
+                'generator_id': str(a.get('id') or ''),
+                'generator_name': str(a.get('name') or ''),
+                'flag_value': '',
+            })
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'node_id': node_id,
+        'flags': out_flags,
+    })
+
+
 def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, Any]], scenario_label: str) -> list[dict[str, Any]]:
     """Return a per-position list of flag assignments aligned to chain_ids.
 
@@ -9074,6 +9190,153 @@ def _flow_synthesized_inputs() -> set[str]:
         'key_len',
         'node_name',
     }
+
+
+def _flow_strip_runtime_sensitive_fields(flag_assignments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a copy of assignments safe to persist in preview-plan metadata.
+
+    NOTE: As of the "flags are required outputs" contract, realized flag strings are part
+    of the sequencing contract and are allowed to persist so the UI can display them.
+    """
+    if not isinstance(flag_assignments, list):
+        return flag_assignments
+    out: list[dict[str, Any]] = []
+    for a in (flag_assignments or []):
+        if not isinstance(a, dict):
+            continue
+        a2 = dict(a)
+        a2.pop('runtime_flags', None)
+        a2.pop('runtime_outputs', None)
+        out.append(a2)
+    return out
+
+
+def _flow_enrich_saved_flag_assignments(
+    flag_assignments: list[dict[str, Any]],
+    chain_nodes: list[dict[str, Any]],
+    *,
+    scenario_label: str,
+) -> list[dict[str, Any]]:
+    """Best-effort enrichment for persisted Flow assignments.
+
+    Older preview plans may persist `flag_assignments` that predate newer UI fields
+    (e.g., `description_hints`) or contain hints that still include ids.
+
+    We keep the chosen generator per node, but refresh:
+    - `description_hints` from current enabled catalogs
+    - `hint_templates`/`hint_template` from current enabled catalogs
+    - rendered `hints`/`hint` for the current chain order
+    - `next_node_id`/`next_node_name`
+    """
+    if not isinstance(flag_assignments, list) or not isinstance(chain_nodes, list):
+        return flag_assignments
+
+    # Map ids -> names for THIS/NEXT substitution.
+    id_to_name: dict[str, str] = {}
+    chain_ids: list[str] = []
+    for n in (chain_nodes or []):
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if not nid:
+            continue
+        chain_ids.append(nid)
+        nm = str(n.get('name') or '').strip()
+        id_to_name[nid] = nm or nid
+
+    # Build a by-id view of currently enabled generators.
+    by_id: dict[str, dict[str, Any]] = {}
+    try:
+        gens, _ = _flag_generators_from_enabled_sources()
+        for g in (gens or []):
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get('id') or '').strip()
+            if gid and gid not in by_id:
+                by_id[gid] = g
+    except Exception:
+        pass
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+        for g in (node_gens or []):
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get('id') or '').strip()
+            if gid and gid not in by_id:
+                by_id[gid] = g
+    except Exception:
+        pass
+
+    out: list[dict[str, Any]] = []
+    for i, a in enumerate(flag_assignments or []):
+        if not isinstance(a, dict):
+            continue
+        a2 = dict(a)
+        this_id = str(a2.get('node_id') or '').strip() or (chain_ids[i] if i < len(chain_ids) else '')
+        next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
+        a2['node_id'] = this_id
+        a2['next_node_id'] = str(next_id)
+        a2['next_node_name'] = str(id_to_name.get(str(next_id)) or '')
+
+        gen_id = str(a2.get('id') or '').strip()
+        gen_def = by_id.get(gen_id) if gen_id else None
+
+        # Ensure description hints exist (if the catalog provides them).
+        try:
+            existing = a2.get('description_hints')
+            if not (isinstance(existing, list) and any(str(x or '').strip() for x in existing)):
+                dh = (gen_def or {}).get('description_hints') if isinstance(gen_def, dict) else None
+                if isinstance(dh, list):
+                    a2['description_hints'] = [str(x or '').strip() for x in dh if str(x or '').strip()]
+        except Exception:
+            pass
+
+        # Preserve persisted hint text when present (Flow persistence contract), but
+        # strip ids if they exist. Only regenerate hints from catalogs when missing.
+        has_hints = False
+        try:
+            if isinstance(a2.get('hints'), list) and any(str(x or '').strip() for x in (a2.get('hints') or [])):
+                has_hints = True
+            elif str(a2.get('hint') or '').strip():
+                has_hints = True
+        except Exception:
+            has_hints = False
+
+        if has_hints:
+            try:
+                if isinstance(a2.get('hints'), list) and a2.get('hints'):
+                    raw = [str(x or '') for x in (a2.get('hints') or [])]
+                    # Only mutate if the text actually contains ids/placeholders.
+                    if any(('(id=' in s.lower()) or ('{{NEXT_NODE_ID}}' in s) or ('{{THIS_NODE_ID}}' in s) for s in raw):
+                        a2['hints'] = [_flow_strip_ids_from_hint(s) for s in raw]
+                        a2['hints'] = [x for x in (a2.get('hints') or []) if str(x).strip()]
+                        if a2['hints']:
+                            a2['hint'] = a2['hints'][0]
+                elif a2.get('hint'):
+                    s = str(a2.get('hint') or '')
+                    if ('(id=' in s.lower()) or ('{{NEXT_NODE_ID}}' in s) or ('{{THIS_NODE_ID}}' in s):
+                        a2['hint'] = _flow_strip_ids_from_hint(s)
+            except Exception:
+                pass
+        elif isinstance(gen_def, dict):
+            # No saved hints: fall back to catalog templates and render for current chain order.
+            hint_templates: list[str] = []
+            try:
+                hint_templates = _flow_hint_templates_from_generator(gen_def)
+            except Exception:
+                hint_templates = []
+            hint_tpl = hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}}'
+            a2['hint_templates'] = hint_templates
+            a2['hint_template'] = hint_tpl
+            rendered = [
+                _flow_render_hint_template(t, scenario_label=scenario_label, id_to_name=id_to_name, this_id=str(this_id), next_id=str(next_id))
+                for t in (hint_templates or [hint_tpl])
+            ]
+            a2['hints'] = rendered
+            a2['hint'] = rendered[0] if rendered else _flow_render_hint_template(hint_tpl, scenario_label=scenario_label, id_to_name=id_to_name, this_id=str(this_id), next_id=str(next_id))
+
+        out.append(a2)
+    return out
 
 
 def _flow_parse_bool(value: Any, *, default: bool = False) -> bool:
@@ -9609,6 +9872,15 @@ def api_flow_attackflow_preview():
                 by_id = {str(e.get('node_id') or '').strip(): e for e in filtered}
                 flag_assignments = [by_id.get(str(n.get('id') or '').strip()) for n in chain_nodes]
                 flag_assignments = [e for e in flag_assignments if isinstance(e, dict)]
+                # Backfill new UI fields (e.g., description_hints) and refresh hints for current order.
+                try:
+                    flag_assignments = _flow_enrich_saved_flag_assignments(
+                        flag_assignments,
+                        chain_nodes,
+                        scenario_label=(scenario_label or scenario_norm),
+                    )
+                except Exception:
+                    pass
     except Exception:
         flag_assignments = []
 
@@ -9729,72 +10001,85 @@ def api_flow_prepare_preview_for_execute():
         preview = payload.get('full_preview') if isinstance(payload, dict) else None
         if not isinstance(preview, dict):
             return jsonify({'ok': False, 'error': 'Preview plan is missing full_preview.'}), 422
+    except FileNotFoundError:
+        return jsonify({'ok': False, 'error': 'Preview plan file was not found. Generate a Full Preview again.'}), 404
+    except json.JSONDecodeError as e:
+        return jsonify({'ok': False, 'error': f'Preview plan file is not valid JSON: {e}'}), 422
     except Exception as e:
         return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
 
-    nodes, _links, adj = _build_topology_graph_from_preview_plan(preview)
-    stats = _flow_compose_docker_stats(nodes)
+    # Best-effort guard: the UI expects JSON errors (avoid Flask HTML 500s).
+    try:
+        nodes, _links, adj = _build_topology_graph_from_preview_plan(preview)
+        stats = _flow_compose_docker_stats(nodes)
 
-    # Allow caller to provide an explicit ordered chain.
-    chain_ids_in = j.get('chain_ids')
-    chain_ids: list[str] = []
-    if isinstance(chain_ids_in, list) and chain_ids_in:
-        for cid in chain_ids_in:
-            c = str(cid or '').strip()
-            if c:
-                chain_ids.append(c)
-        chain_ids = chain_ids[:length]
+        # Allow caller to provide an explicit ordered chain.
+        chain_ids_in = j.get('chain_ids')
+        chain_ids: list[str] = []
+        if isinstance(chain_ids_in, list) and chain_ids_in:
+            for cid in chain_ids_in:
+                c = str(cid or '').strip()
+                if c:
+                    chain_ids.append(c)
+            chain_ids = chain_ids[:length]
 
-    explicit_chain = bool(chain_ids)
+        explicit_chain = bool(chain_ids)
 
-    if chain_ids:
-        id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict)}
-        chain_nodes = [id_map[cid] for cid in chain_ids if cid in id_map]
-        # Presets require certain steps to run on non-vulnerability docker nodes.
-        # If the UI provided a chain that violates this (common when many vuln nodes exist),
-        # best-effort swap in an eligible docker node.
-        if preset_steps and chain_nodes:
-            try:
-                used = {str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict)}
-                for i, step in enumerate(preset_steps[:len(chain_nodes)]):
-                    if str((step or {}).get('kind') or '').strip() != 'flag-node-generator':
-                        continue
-                    node = chain_nodes[i] if i < len(chain_nodes) else None
-                    if not isinstance(node, dict):
-                        continue
-                    if not bool(node.get('is_vuln')):
-                        continue
-                    replacement = None
-                    for cand in (nodes or []):
-                        if not isinstance(cand, dict):
+        if chain_ids:
+            id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict)}
+            chain_nodes = [id_map[cid] for cid in chain_ids if cid in id_map]
+            # Presets require certain steps to run on non-vulnerability docker nodes.
+            # If the UI provided a chain that violates this (common when many vuln nodes exist),
+            # best-effort swap in an eligible docker node.
+            if preset_steps and chain_nodes:
+                try:
+                    used = {str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict)}
+                    for i, step in enumerate(preset_steps[:len(chain_nodes)]):
+                        if str((step or {}).get('kind') or '').strip() != 'flag-node-generator':
                             continue
-                        cid = str(cand.get('id') or '').strip()
-                        if not cid or cid in used:
+                        node = chain_nodes[i] if i < len(chain_nodes) else None
+                        if not isinstance(node, dict):
                             continue
-                        t_raw = str(cand.get('type') or '')
-                        t = t_raw.strip().lower()
-                        is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
-                        if is_docker and not bool(cand.get('is_vuln')):
-                            replacement = cand
-                            break
-                    if replacement is not None:
-                        rid = str(replacement.get('id') or '').strip()
-                        if rid:
-                            chain_nodes[i] = replacement
-                            chain_ids[i] = rid
-                            used.add(rid)
-            except Exception:
-                pass
-        if len(chain_nodes) < 1:
-            return jsonify({'ok': False, 'error': 'Provided chain_ids did not match any nodes in the preview plan.', 'stats': stats}), 422
-    else:
-        if preset_steps:
-            chain_nodes = _pick_flag_chain_nodes_for_preset(nodes, adj, steps=preset_steps)
+                        if not bool(node.get('is_vuln')):
+                            continue
+                        replacement = None
+                        for cand in (nodes or []):
+                            if not isinstance(cand, dict):
+                                continue
+                            cid = str(cand.get('id') or '').strip()
+                            if not cid or cid in used:
+                                continue
+                            t_raw = str(cand.get('type') or '')
+                            t = t_raw.strip().lower()
+                            is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
+                            if is_docker and not bool(cand.get('is_vuln')):
+                                replacement = cand
+                                break
+                        if replacement is not None:
+                            rid = str(replacement.get('id') or '').strip()
+                            if rid:
+                                chain_nodes[i] = replacement
+                                chain_ids[i] = rid
+                                used.add(rid)
+                except Exception:
+                    pass
+            if len(chain_nodes) < 1:
+                return jsonify({'ok': False, 'error': 'Provided chain_ids did not match any nodes in the preview plan.', 'stats': stats}), 422
         else:
-            chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
-        if len(chain_nodes) < length:
-            return jsonify({'ok': False, 'error': 'Not enough eligible nodes in preview plan to build the requested chain.', 'available': len(chain_nodes), 'stats': stats}), 422
-        chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if str(n.get('id') or '').strip()]
+            if preset_steps:
+                chain_nodes = _pick_flag_chain_nodes_for_preset(nodes, adj, steps=preset_steps)
+            else:
+                chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
+            if len(chain_nodes) < length:
+                return jsonify({'ok': False, 'error': 'Not enough eligible nodes in preview plan to build the requested chain.', 'available': len(chain_nodes), 'stats': stats}), 422
+            chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if str(n.get('id') or '').strip()]
+    except Exception as e:
+        app.logger.exception('[flow.prepare_preview_for_execute] internal error: %s', e)
+        return jsonify({
+            'ok': False,
+            'error': f'Internal error preparing preview for execution: {e}',
+            'base_preview_plan_path': base_plan_path,
+        }), 500
 
     # Caller may pass fewer ids than requested length; persist effective length.
     try:
@@ -10275,6 +10560,12 @@ def api_flow_prepare_preview_for_execute():
                                         if ok_run and flow_out_dir and isinstance(flag_val, str) and flag_val.strip():
                                             with open(os.path.join(flow_out_dir, 'flag.txt'), 'w', encoding='utf-8') as ff:
                                                 ff.write(flag_val.strip() + "\n")
+                                            # UI convenience: expose the realized flag value (runtime-only).
+                                            # IMPORTANT: this must not be persisted into saved plans.
+                                            try:
+                                                fa['flag_value'] = flag_val.strip()
+                                            except Exception:
+                                                pass
                                     except Exception:
                                         pass
                             except Exception:
@@ -10396,6 +10687,7 @@ def api_flow_prepare_preview_for_execute():
             pass
 
     try:
+        persisted_flag_assignments = _flow_strip_runtime_sensitive_fields(flag_assignments)
         flow_meta = {
             'source_preview_plan_path': base_plan_path,
             'scenario': scenario_label or scenario_norm,
@@ -10404,7 +10696,7 @@ def api_flow_prepare_preview_for_execute():
             'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
             # Persist all Flow decisions so returning to Flag Sequencing shows the same
             # chain and generator selections/hints.
-            'flag_assignments': flag_assignments,
+            'flag_assignments': persisted_flag_assignments,
             'flags_enabled': bool(flags_enabled),
             'flow_valid': bool(flow_valid),
             'flow_errors': list(flow_errors or []),
@@ -17528,6 +17820,77 @@ if __name__ == '__main__':
     ).replace('__NAMES_LITERAL__', names_literal).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
 
 
+def _remote_docker_remove_wrapper_images_script(sudo_password: str | None = None) -> str:
+    sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else "")
+    return (
+        """
+import json, subprocess
+
+SUDO_PASSWORD = __SUDO_PASSWORD_LITERAL__
+
+
+def _run_docker(cmd, timeout=30):
+    try:
+        p = subprocess.run(['sudo', '-n', 'docker'] + list(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        if SUDO_PASSWORD:
+            return subprocess.run(
+                ['sudo', '-S', '-k', '-p', '', 'docker'] + list(cmd),
+                input=str(SUDO_PASSWORD) + "\\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+            )
+        return p
+    except Exception as e:
+        class _P:
+            returncode = 1
+            stdout = str(e)
+        return _P()
+
+
+def main():
+    # List all tool-generated wrapper images. We scope these under the "coretg" repo prefix.
+    # Only remove images whose tag begins with "iproute2" (our wrapper tag).
+    listed = []
+    removed = []
+    errors = []
+    p = _run_docker(['images', '--format', '{{.Repository}}:{{.Tag}}', '--filter', 'reference=coretg/*'], timeout=30)
+    out = (getattr(p, 'stdout', '') or '').strip()
+    if out:
+        for line in out.splitlines():
+            ref = (line or '').strip()
+            if not ref or ':' not in ref:
+                continue
+            listed.append(ref)
+    targets = []
+    for ref in listed:
+        try:
+            repo, tag = ref.rsplit(':', 1)
+        except Exception:
+            continue
+        if tag.startswith('iproute2'):
+            targets.append(ref)
+    for ref in targets:
+        try:
+            pr = _run_docker(['image', 'rm', '-f', ref], timeout=60)
+            if getattr(pr, 'returncode', 1) == 0:
+                removed.append(ref)
+            else:
+                errors.append({'ref': ref, 'output': (getattr(pr, 'stdout', '') or '').strip()})
+        except Exception as e:
+            errors.append({'ref': ref, 'output': str(e)})
+    print(json.dumps({'ok': True, 'listed': listed, 'targets': targets, 'removed': removed, 'errors': errors}))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
+
+
 @app.route('/docker/status', methods=['GET'])
 def docker_status():
     # Use the scenario-selected CORE VM (remote) to populate docker status.
@@ -19415,6 +19778,7 @@ def run_cli():
     except Exception:
         scenario_core_override = None
     scenario_name_hint = request.form.get('scenario') or request.form.get('scenario_name') or None
+    docker_cleanup_before_run = _coerce_bool(request.form.get('docker_cleanup_before_run'))
     scenario_index_hint: Optional[int] = None
     try:
         raw_index = request.form.get('scenario_index')
@@ -19519,6 +19883,20 @@ def run_cli():
                     active_scenario_name = names_for_cli[0]
             except Exception:
                 active_scenario_name = None
+
+        # Scope tool-generated wrapper images by upload/scenario to prevent cross-scenario image reuse.
+        try:
+            out_dir_for_tag = os.path.dirname(xml_path) if xml_path else ''
+            upload_base = os.path.basename(out_dir_for_tag) if out_dir_for_tag else ''
+            parts = []
+            if upload_base:
+                parts.append(upload_base)
+            if active_scenario_name:
+                parts.append(active_scenario_name)
+            scenario_tag = _safe_name('-'.join(parts) if parts else (active_scenario_name or 'scenario'))
+            cli_env.setdefault('CORETG_SCENARIO_TAG', scenario_tag)
+        except Exception:
+            pass
         with _core_connection(core_cfg) as (conn_host, conn_port):
             forwarded_desc = f"{conn_host}:{conn_port}"
             app.logger.info(
@@ -19527,6 +19905,46 @@ def run_cli():
                 forwarded_desc,
                 xml_path,
             )
+
+            # Optional: best-effort cleanup of tool-managed Docker state before execution.
+            # This is conservative: it only targets vuln docker-compose node containers derived
+            # from compose_assignments.json plus tool-generated wrapper images under coretg/*.
+            if docker_cleanup_before_run:
+                try:
+                    app.logger.info('[sync] Pre-run: docker cleanup requested (containers + wrapper images)')
+                    status_payload = _run_remote_python_json(
+                        core_cfg,
+                        _remote_docker_status_script(core_cfg.get('ssh_password')),
+                        logger=app.logger,
+                        label='docker.status(for prerun cleanup)',
+                        timeout=60.0,
+                    )
+                    names: list[str] = []
+                    if isinstance(status_payload, dict) and isinstance(status_payload.get('items'), list):
+                        for it in status_payload.get('items') or []:
+                            if isinstance(it, dict) and it.get('name'):
+                                names.append(str(it.get('name')))
+                    if names:
+                        _run_remote_python_json(
+                            core_cfg,
+                            _remote_docker_cleanup_script(names, core_cfg.get('ssh_password')),
+                            logger=app.logger,
+                            label='docker.cleanup(prerun)',
+                            timeout=120.0,
+                        )
+                    _run_remote_python_json(
+                        core_cfg,
+                        _remote_docker_remove_wrapper_images_script(core_cfg.get('ssh_password')),
+                        logger=app.logger,
+                        label='docker.wrapper_images.cleanup(prerun)',
+                        timeout=180.0,
+                    )
+                except Exception as exc:
+                    try:
+                        app.logger.warning('[sync] Pre-run docker cleanup skipped/failed: %s', exc)
+                    except Exception:
+                        pass
+
             cli_args = [
                 py_exec,
                 '-m',
@@ -19795,6 +20213,91 @@ def api_plan_preview_full():
     except Exception as e:
         app.logger.exception('[plan.preview_full] error: %s', e)
         return jsonify({'ok': False, 'error': str(e) }), 500
+
+
+@app.route('/api/plan/persist_preview_plan', methods=['POST'])
+def api_plan_persist_preview_plan():
+    """Compute a full preview and persist it as a plan artifact under outputs/plans.
+
+    Request JSON: { xml_path: "/abs/path.xml", scenario: "name" (optional), seed: int (optional) }
+    Response JSON: { ok, xml_path, scenario, seed, preview_plan_path }
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        xml_path = (payload.get('xml_path') or '').strip()
+        scenario = (payload.get('scenario') or '').strip() or None
+        seed = payload.get('seed')
+        try:
+            if seed is not None:
+                seed = int(seed)
+        except Exception:
+            seed = None
+
+        if not xml_path:
+            return jsonify({'ok': False, 'error': 'xml_path missing'}), 400
+        xml_path = os.path.abspath(xml_path)
+        if not os.path.exists(xml_path):
+            return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
+
+        from core_topo_gen.planning.orchestrator import compute_full_plan
+        from core_topo_gen.planning.plan_cache import hash_xml_file, try_get_cached_plan, save_plan_to_cache
+
+        xml_hash = hash_xml_file(xml_path)
+        plan = None
+        try:
+            plan = try_get_cached_plan(xml_hash, scenario, seed)
+        except Exception:
+            plan = None
+        if not plan:
+            plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
+            try:
+                save_plan_to_cache(xml_hash, scenario, seed, plan)
+            except Exception:
+                pass
+
+        if seed is None:
+            try:
+                seed = plan.get('seed') or _derive_default_seed(xml_hash)
+            except Exception:
+                seed = None
+
+        full_prev = _build_full_preview_from_plan(plan, seed, [], [])
+        # Keep Flow UI consistent when it later loads the plan.
+        try:
+            _attach_latest_flow_into_full_preview(full_prev, scenario)
+        except Exception:
+            pass
+
+        plans_dir = os.path.join(_outputs_dir(), 'plans')
+        os.makedirs(plans_dir, exist_ok=True)
+        seed_tag = full_prev.get('seed') or (seed if seed is not None else 'preview')
+        unique_tag = f"{seed_tag}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        preview_plan_path = os.path.join(plans_dir, f"plan_from_preview_{unique_tag}.json")
+        plan_payload = {
+            'full_preview': full_prev,
+            'metadata': {
+                'xml_path': xml_path,
+                'scenario': scenario,
+                'seed': full_prev.get('seed'),
+                'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
+            },
+        }
+        with open(preview_plan_path, 'w', encoding='utf-8') as pf:
+            json.dump(plan_payload, pf, indent=2, sort_keys=True)
+
+        return jsonify({
+            'ok': True,
+            'xml_path': xml_path,
+            'scenario': scenario,
+            'seed': full_prev.get('seed'),
+            'preview_plan_path': preview_plan_path,
+        })
+    except Exception as e:
+        try:
+            app.logger.exception('[plan.persist_preview_plan] error: %s', e)
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 @app.route('/plan/full_preview_page', methods=['POST'])
 def plan_full_preview_page():
@@ -20695,6 +21198,7 @@ def run_cli_async():
     adv_start_core_daemon = False
     adv_auto_kill_sessions = False
     docker_remove_conflicts = False
+    docker_cleanup_before_run = False
     scenarios_inline = None
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
@@ -20732,6 +21236,7 @@ def run_cli_async():
         adv_start_core_daemon = _coerce_bool(request.form.get('adv_start_core_daemon'))
         adv_auto_kill_sessions = _coerce_bool(request.form.get('adv_auto_kill_sessions'))
         docker_remove_conflicts = _coerce_bool(request.form.get('docker_remove_conflicts'))
+        docker_cleanup_before_run = _coerce_bool(request.form.get('docker_cleanup_before_run'))
     if not xml_path:
         try:
             j = request.get_json(silent=True) or {}
@@ -20762,6 +21267,7 @@ def run_cli_async():
             adv_start_core_daemon = _coerce_bool(j.get('adv_start_core_daemon'))
             adv_auto_kill_sessions = _coerce_bool(j.get('adv_auto_kill_sessions'))
             docker_remove_conflicts = _coerce_bool(j.get('docker_remove_conflicts'))
+            docker_cleanup_before_run = _coerce_bool(j.get('docker_cleanup_before_run'))
         except Exception:
             pass
     if not xml_path:
@@ -20900,6 +21406,41 @@ def run_cli_async():
         scenario_core_override if isinstance(scenario_core_override, dict) else None,
         include_password=True,
     )
+    # Flag Sequencing (flow.html) invokes /run_cli_async via JSON without sending core config.
+    # In that case, we must honor the "Select CORE VM" dialog (including ssh_port) rather than
+    # defaulting to backend/env values.
+    try:
+        request_provided_core = bool(
+            (isinstance(core_override, dict) and core_override)
+            or (isinstance(scenario_core_override, dict) and scenario_core_override)
+        )
+        history = _load_run_history()
+        scenario_for_secret = None
+        try:
+            scenario_for_secret = _normalize_scenario_label(str(scenario_name_hint or '').strip())
+        except Exception:
+            scenario_for_secret = None
+        if not scenario_for_secret:
+            try:
+                if isinstance(scenario_payload, dict) and isinstance(scenario_payload.get('name'), str):
+                    scenario_for_secret = _normalize_scenario_label(str(scenario_payload.get('name') or '').strip())
+            except Exception:
+                scenario_for_secret = None
+
+        selected_cfg = _select_core_config_for_page(scenario_for_secret or '', history, include_password=True)
+
+        pw_raw = core_cfg.get('ssh_password') if isinstance(core_cfg, dict) else None
+        pw_ok = bool(str(pw_raw).strip()) if pw_raw not in (None, '') else False
+
+        if request_provided_core:
+            # Only fill missing secrets; do not override request-provided host/ports.
+            if not pw_ok:
+                core_cfg = _merge_core_configs(selected_cfg, core_cfg, include_password=True)
+        else:
+            # No explicit core config provided: treat selected VM as authoritative.
+            core_cfg = _merge_core_configs(core_cfg, selected_cfg, include_password=True)
+    except Exception:
+        pass
     try:
         core_cfg = _require_core_ssh_credentials(core_cfg)
     except _SSHTunnelError as exc:
@@ -21756,6 +22297,86 @@ def run_cli_async():
         active_scenario_name = scenario_payload.get('name')
     elif scen_names and len(scen_names) > 0:
         active_scenario_name = scen_names[0]
+
+    # Scope wrapper images by upload/scenario to avoid cross-scenario image reuse.
+    try:
+        out_dir_for_tag = os.path.dirname(xml_path) if xml_path else ''
+        upload_base = os.path.basename(out_dir_for_tag) if out_dir_for_tag else ''
+        parts = []
+        if upload_base:
+            parts.append(upload_base)
+        if active_scenario_name:
+            parts.append(active_scenario_name)
+        if run_id:
+            parts.append(str(run_id)[:8])
+        scenario_tag = _safe_name('-'.join(parts) if parts else (active_scenario_name or 'scenario'))
+    except Exception:
+        scenario_tag = _safe_name(active_scenario_name or 'scenario')
+
+    if docker_cleanup_before_run:
+        try:
+            log_f.write(f"{log_prefix}=== Docker: cleanup before run (containers + wrapper images) ===\n")
+            _write_sse_marker(
+                log_f,
+                'phase',
+                {
+                    'stage': 'docker.cleanup.prerun',
+                    'detail': 'Stopping/removing vuln containers and wrapper images',
+                },
+            )
+        except Exception:
+            pass
+        try:
+            status_payload = _run_remote_python_json(
+                core_cfg,
+                _remote_docker_status_script(core_cfg.get('ssh_password')),
+                logger=app.logger,
+                label='docker.status(for prerun cleanup)',
+                timeout=60.0,
+            )
+            names: list[str] = []
+            if isinstance(status_payload, dict) and isinstance(status_payload.get('items'), list):
+                for it in status_payload.get('items') or []:
+                    if isinstance(it, dict) and it.get('name'):
+                        names.append(str(it.get('name')))
+            if names:
+                try:
+                    log_f.write(f"{log_prefix}Docker containers to cleanup: {', '.join(names[:20])}{' ...' if len(names) > 20 else ''}\n")
+                except Exception:
+                    pass
+                _run_remote_python_json(
+                    core_cfg,
+                    _remote_docker_cleanup_script(names, core_cfg.get('ssh_password')),
+                    logger=app.logger,
+                    label='docker.cleanup(prerun)',
+                    timeout=120.0,
+                )
+            else:
+                try:
+                    log_f.write(f"{log_prefix}No vuln docker-compose node names found for cleanup.\n")
+                except Exception:
+                    pass
+
+            payload = _run_remote_python_json(
+                core_cfg,
+                _remote_docker_remove_wrapper_images_script(core_cfg.get('ssh_password')),
+                logger=app.logger,
+                label='docker.wrapper_images.cleanup(prerun)',
+                timeout=180.0,
+            )
+            try:
+                removed = payload.get('removed') if isinstance(payload, dict) else None
+                if isinstance(removed, list) and removed:
+                    log_f.write(f"{log_prefix}Removed wrapper images: {', '.join(str(x) for x in removed[:12])}{' ...' if len(removed) > 12 else ''}\n")
+                else:
+                    log_f.write(f"{log_prefix}No wrapper images removed (or none found).\n")
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                log_f.write(f"{log_prefix}Pre-run docker cleanup skipped/failed: {exc}\n")
+            except Exception:
+                pass
     cli_args = [
         remote_python,
         '-u',
@@ -21787,7 +22408,7 @@ def run_cli_async():
     if venv_bin_remote:
         activate_path = posixpath.join(venv_bin_remote.rstrip('/'), 'activate')
         activate_prefix = f". {shlex.quote(activate_path)} >/dev/null 2>&1 || true; "
-    remote_command = f"{activate_prefix}cd {shlex.quote(work_dir)} && PYTHONUNBUFFERED=1 {cli_cmd}"
+    remote_command = f"{activate_prefix}cd {shlex.quote(work_dir)} && CORETG_SCENARIO_TAG={shlex.quote(scenario_tag)} PYTHONUNBUFFERED=1 {cli_cmd}"
     try:
         log_f.write(f"{log_prefix}Launching CLI in {work_dir}\n")
         _write_sse_marker(
@@ -21797,6 +22418,7 @@ def run_cli_async():
                 'stage': 'remote.cli.launch',
                 'work_dir': work_dir,
                 'command': cli_cmd,
+                'scenario_tag': scenario_tag,
                 'venv_bin': venv_bin_remote or None,
             },
         )
@@ -23916,7 +24538,64 @@ def core_stop():
     core_cfg = _core_config_for_request(include_password=True)
     try:
         _execute_remote_core_session_action(core_cfg, 'stop', sid_int, logger=app.logger)
-        flash(f'Stopped session {sid_int}.')
+        # Best-effort: cleanup Docker artifacts generated by this tool after stopping a session.
+        # - Containers are derived from compose_assignments.json on the CORE VM (vuln docker-compose nodes).
+        # - Images are limited to tool wrapper images under coretg/*:iproute2*.
+        cleanup_containers = 0
+        cleanup_images = 0
+        cleanup_notes: list[str] = []
+        try:
+            status_payload = _run_remote_python_json(
+                core_cfg,
+                _remote_docker_status_script(core_cfg.get('ssh_password')),
+                logger=app.logger,
+                label='docker.status(for stop cleanup)',
+                timeout=60.0,
+            )
+            names: list[str] = []
+            if isinstance(status_payload, dict) and isinstance(status_payload.get('items'), list):
+                for it in status_payload.get('items') or []:
+                    if isinstance(it, dict) and it.get('name'):
+                        names.append(str(it.get('name')))
+            if names:
+                payload = _run_remote_python_json(
+                    core_cfg,
+                    _remote_docker_cleanup_script(names, core_cfg.get('ssh_password')),
+                    logger=app.logger,
+                    label='docker.cleanup(on stop)',
+                    timeout=120.0,
+                )
+                if isinstance(payload, dict) and isinstance(payload.get('results'), list):
+                    cleanup_containers = len(payload.get('results') or [])
+            else:
+                cleanup_notes.append('no docker-compose node containers to cleanup')
+        except Exception as exc:
+            cleanup_notes.append(f'container cleanup skipped/failed: {exc}')
+
+        try:
+            payload = _run_remote_python_json(
+                core_cfg,
+                _remote_docker_remove_wrapper_images_script(core_cfg.get('ssh_password')),
+                logger=app.logger,
+                label='docker.wrapper_images.cleanup(on stop)',
+                timeout=180.0,
+            )
+            if isinstance(payload, dict) and isinstance(payload.get('removed'), list):
+                cleanup_images = len(payload.get('removed') or [])
+        except Exception as exc:
+            cleanup_notes.append(f'wrapper image cleanup skipped/failed: {exc}')
+
+        msg = f'Stopped session {sid_int}.'
+        extra = []
+        if cleanup_containers:
+            extra.append(f'docker containers cleaned={cleanup_containers}')
+        if cleanup_images:
+            extra.append(f'wrapper images removed={cleanup_images}')
+        if cleanup_notes:
+            extra.append('; '.join(cleanup_notes)[:240])
+        if extra:
+            msg = msg + ' ' + ' · '.join(extra)
+        flash(msg)
     except Exception as exc:
         flash(f'Failed to stop session: {exc}')
     return _redirect_core_page_with_scenario()
