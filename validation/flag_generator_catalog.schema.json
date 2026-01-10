@@ -138,6 +138,11 @@
           "type": "array",
           "items": {"type": "string"}
         },
+        "description_hints": {
+          "description": "Ordered, high-level description hints about the challenge/flag (shown above NEXT-step hints in the Flow chain UI).",
+          "type": "array",
+          "items": {"type": "string"}
+        },
         "handoff": {"$ref": "#/$defs/handoff"}
       },
       "additionalProperties": true

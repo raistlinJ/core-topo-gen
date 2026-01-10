@@ -56,7 +56,6 @@ def main() -> None:
         "outputs": {
             "compose_path": str(compose_path.name),
             "flag": flag_value,
-            "node_name": node_name,
         },
     }
     _write_text(outputs_dir / "outputs.json", json.dumps(manifest, indent=2) + "\n")

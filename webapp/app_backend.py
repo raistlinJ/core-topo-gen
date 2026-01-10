@@ -8008,15 +8008,46 @@ def _attack_flow_bundle_for_chain(*, chain_nodes: list[dict[str, Any]], scenario
     return bundle
 
 
+def _flow_strip_ids_from_hint(text: str) -> str:
+    """Strip any node id fragments from a rendered hint.
+
+    Historically, hints included "(id=...)" to help debugging. For the user-facing
+    experience, we now remove ids from the hint text while still keeping internal
+    next_node_id/this_node_id fields for chaining.
+    """
+    try:
+        s = str(text or '')
+    except Exception:
+        return ''
+    if not s.strip():
+        return ''
+    try:
+        # Remove patterns like " (id=abc123)" (case-insensitive, whitespace tolerant).
+        s = re.sub(r"\s*\(\s*id\s*=\s*[^)]*\)", "", s, flags=re.IGNORECASE)
+    except Exception:
+        pass
+    # Remove any leftover unexpanded id placeholders.
+    for token in ('{{NEXT_NODE_ID}}', '{{THIS_NODE_ID}}'):
+        try:
+            s = s.replace(token, '')
+        except Exception:
+            continue
+    try:
+        s = re.sub(r"[\t ]{2,}", " ", s)
+    except Exception:
+        pass
+    return s.strip()
+
+
 def _flow_render_hint_template(tpl: str, *, scenario_label: str, id_to_name: dict[str, str], this_id: str, next_id: str) -> str:
     try:
-        text = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+        text = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}}'
         next_id_val = str(next_id or '').strip()
         next_name_val = (id_to_name.get(next_id_val) or '').strip() if next_id_val else ''
         if not next_id_val:
-            next_id_val = '(end)'
+            return "You've completed this sequence of challenges!"
         if not next_name_val:
-            next_name_val = '(end)'
+            next_name_val = next_id_val
         repl = {
             '{{SCENARIO}}': str(scenario_label or ''),
             '{{THIS_NODE_ID}}': str(this_id or ''),
@@ -8029,9 +8060,9 @@ def _flow_render_hint_template(tpl: str, *, scenario_label: str, id_to_name: dic
                 text = text.replace(k, str(v))
             except Exception:
                 continue
-        return text
+        return _flow_strip_ids_from_hint(text)
     except Exception:
-        return str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+        return _flow_strip_ids_from_hint(str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}}')
 
 
 def _flow_hint_templates_from_generator(gen: dict[str, Any]) -> list[str]:
@@ -8048,7 +8079,9 @@ def _flow_hint_templates_from_generator(gen: dict[str, Any]) -> list[str]:
             for x in ht:
                 s = str(x or '').strip()
                 if s:
-                    out.append(s)
+                    s2 = _flow_strip_ids_from_hint(s)
+                    if s2:
+                        out.append(s2)
     except Exception:
         pass
     if out:
@@ -8059,15 +8092,19 @@ def _flow_hint_templates_from_generator(gen: dict[str, Any]) -> list[str]:
             for x in ht1:
                 s = str(x or '').strip()
                 if s:
-                    out.append(s)
+                    s2 = _flow_strip_ids_from_hint(s)
+                    if s2:
+                        out.append(s2)
         else:
             s = str(ht1 or '').strip()
             if s:
-                out.append(s)
+                s2 = _flow_strip_ids_from_hint(s)
+                if s2:
+                    out.append(s2)
     except Exception:
         pass
     if not out:
-        out = ['Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})']
+        out = ['Next: {{NEXT_NODE_NAME}}']
     return out
 
 
@@ -8155,7 +8192,7 @@ def _flow_compute_flag_assignments_for_preset(
             return [], f'generator not found/enabled: {gen_id}'
 
         hint_templates = _flow_hint_templates_from_generator(gen)
-        hint_tpl = hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+        hint_tpl = hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}}'
 
         # Runtime IO (generator input/output fields).
         # Show required + optional separately (UI), but only required participates in feasibility.
@@ -8212,6 +8249,7 @@ def _flow_compute_flag_assignments_for_preset(
             'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
             'generator_catalog': catalog,
             'language': str(gen.get('language') or ''),
+            'description_hints': list(gen.get('description_hints') or []) if isinstance(gen.get('description_hints'), list) else [],
             # Effective union (used for chaining feasibility / ordering validation).
             'inputs': inputs_effective,
             'outputs': outputs_effective,
@@ -8792,13 +8830,13 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
 
     def _render_hint(tpl: str, *, this_id: str, next_id: str) -> str:
         try:
-            text = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+            text = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}}'
             next_id_val = str(next_id or '').strip()
             next_name_val = (id_to_name.get(next_id_val) or '').strip() if next_id_val else ''
             if not next_id_val:
-                next_id_val = '(end)'
+                return "You've completed this sequence of challenges!"
             if not next_name_val:
-                next_name_val = '(end)'
+                next_name_val = next_id_val
             repl = {
                 '{{SCENARIO}}': str(scenario_label or ''),
                 '{{THIS_NODE_ID}}': this_id,
@@ -8808,7 +8846,7 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
             }
             for k, v in repl.items():
                 text = text.replace(k, str(v))
-            return text
+            return _flow_strip_ids_from_hint(text)
         except Exception:
             return ''
 
@@ -8978,7 +9016,7 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
 
         next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
         hint_templates = _flow_hint_templates_from_generator(gen)
-        hint_tpl = hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+        hint_tpl = hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}}'
         rendered_hints = [
             _render_hint(t, this_id=str(cid), next_id=str(next_id))
             for t in (hint_templates or [])
@@ -8999,6 +9037,7 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
             'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
             'generator_catalog': str(gen.get('_flow_catalog') or 'flag_generators'),
             'language': str(gen.get('language') or ''),
+            'description_hints': list(gen.get('description_hints') or []) if isinstance(gen.get('description_hints'), list) else [],
             # Effective union (used for chaining feasibility / ordering validation).
             'inputs': sorted(list(_required_inputs_of(gen))),
             'outputs': sorted(list(_provides_of(gen))),
@@ -9400,13 +9439,13 @@ def _flow_reorder_chain_by_generator_dag(
 
         def _render_hint(tpl: str, *, this_id: str, next_id: str) -> str:
             try:
-                text = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+                text = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}}'
                 next_id_val = str(next_id or '').strip()
                 next_name_val = (id_to_name.get(next_id_val) or '').strip() if next_id_val else ''
                 if not next_id_val:
-                    next_id_val = '(end)'
+                    return "You've completed this sequence of challenges!"
                 if not next_name_val:
-                    next_name_val = '(end)'
+                    next_name_val = next_id_val
                 repl = {
                     '{{SCENARIO}}': str(scenario_label or ''),
                     '{{THIS_NODE_ID}}': this_id,
@@ -9416,7 +9455,7 @@ def _flow_reorder_chain_by_generator_dag(
                 }
                 for k, v in repl.items():
                     text = text.replace(k, str(v))
-                return text
+                return _flow_strip_ids_from_hint(text)
             except Exception:
                 return ''
 
@@ -9431,7 +9470,7 @@ def _flow_reorder_chain_by_generator_dag(
                         hint_templates = [str(x or '').strip() for x in ht if str(x or '').strip()]
                 except Exception:
                     hint_templates = []
-                tpl = str(a.get('hint_template') or '').strip() or (hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})')
+                tpl = str(a.get('hint_template') or '').strip() or (hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}}')
                 a['next_node_id'] = str(next_id)
                 a['next_node_name'] = str(id_to_name.get(str(next_id)) or '')
                 rendered = [_render_hint(t, this_id=this_id, next_id=str(next_id)) for t in (hint_templates or [tpl])]
@@ -9863,6 +9902,24 @@ def api_flow_prepare_preview_for_execute():
             pass
         return names
 
+    def _required_input_names_of(gen: dict[str, Any]) -> set[str]:
+        names: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    nm = str(inp.get('name') or '').strip()
+                    if not nm:
+                        continue
+                    if inp.get('required') is False:
+                        continue
+                    names.add(nm)
+        except Exception:
+            pass
+        return names
+
     def _flow_default_generator_config(assignment: dict[str, Any], *, seed_val: Any) -> dict[str, Any]:
         """Synthesize deterministic default inputs for the seeded generators."""
         node_id = str(assignment.get('node_id') or '').strip()
@@ -10033,10 +10090,20 @@ def api_flow_prepare_preview_for_execute():
                     pass
 
                 cfg = cfg_full
+                inputs_mismatch: dict[str, Any] = {}
                 try:
                     gen_def = _gen_by_id.get(generator_id)
                     if isinstance(gen_def, dict):
                         allowed = _all_input_names_of(gen_def)
+
+                        declared_required = None
+                        try:
+                            if isinstance(fa.get('input_fields_required'), list):
+                                declared_required = {str(x).strip() for x in (fa.get('input_fields_required') or []) if str(x).strip()}
+                        except Exception:
+                            declared_required = None
+                        if declared_required is None:
+                            declared_required = _required_input_names_of(gen_def)
 
                         # Inject prior outputs into this generator's config, but only for inputs it declares.
                         try:
@@ -10050,10 +10117,59 @@ def api_flow_prepare_preview_for_execute():
                             pass
 
                         # If the generator declares inputs, only pass those (keeps Flow configs relevant).
+                        cfg_to_pass = cfg_full
                         if allowed:
-                            cfg = {k: v for k, v in cfg_full.items() if k in allowed}
+                            cfg_to_pass = {k: v for k, v in cfg_full.items() if k in allowed}
+                        cfg = cfg_to_pass
+
+                        try:
+                            provided_keys = {str(k).strip() for k in (cfg_to_pass or {}).keys() if str(k).strip()}
+                        except Exception:
+                            provided_keys = set()
+
+                        missing_required = sorted([k for k in (declared_required or set()) if k not in provided_keys])
+
+                        unset_required: list[str] = []
+                        try:
+                            for k in sorted(list(declared_required or set())):
+                                if k not in (cfg_to_pass or {}):
+                                    continue
+                                v = (cfg_to_pass or {}).get(k)
+                                if v is None:
+                                    unset_required.append(k)
+                                elif isinstance(v, str) and (not v.strip()):
+                                    unset_required.append(k)
+                        except Exception:
+                            unset_required = []
+
+                        dropped_keys: list[str] = []
+                        try:
+                            if allowed:
+                                dropped_keys = sorted([k for k in (cfg_full or {}).keys() if k not in (cfg_to_pass or {})])
+                                # Many keys are synthesized by Flow and carried in cfg_full for
+                                # convenience (e.g., hint rendering). Generators only receive
+                                # inputs they declare, so these show up as "dropped" even though
+                                # it's expected. Don't surface them as mismatches.
+                                try:
+                                    synthesized = set(_flow_synthesized_inputs())
+                                except Exception:
+                                    synthesized = set()
+                                dropped_keys = [k for k in dropped_keys if str(k) not in synthesized]
+                        except Exception:
+                            dropped_keys = []
+
+                        inputs_mismatch = {
+                            'declared_required': sorted(list(declared_required or set())),
+                            'provided': sorted(list(provided_keys)),
+                            'missing_required': missing_required,
+                            'unset_required': unset_required,
+                            'dropped': dropped_keys,
+                            # Consider dropped keys a mismatch so the UI can surface it.
+                            'ok': (not missing_required and not unset_required and not dropped_keys),
+                        }
                 except Exception:
                     cfg = cfg_full
+                    inputs_mismatch = {}
 
                 flow_out_dir = ''
                 ok_run = False
@@ -10167,8 +10283,16 @@ def api_flow_prepare_preview_for_execute():
                         # Compare declared vs actual output keys (best-effort).
                         try:
                             if ok_run and actual_output_keys:
+                                # Some generators include metadata echo outputs (e.g., node_name).
+                                # These are not meaningful artifacts for Flow chaining and shouldn't
+                                # trigger contract mismatch warnings.
+                                ignore_actual = {
+                                    'node_name',
+                                    'nodename',
+                                    'nodeName',
+                                }
                                 declared_set = set(declared_output_keys or [])
-                                actual_set = set(actual_output_keys or [])
+                                actual_set = set([k for k in (actual_output_keys or []) if k not in ignore_actual])
                                 missing = sorted(list(declared_set - actual_set))
                                 extra = sorted(list(actual_set - declared_set))
                                 mismatch = {
@@ -10213,6 +10337,8 @@ def api_flow_prepare_preview_for_execute():
                     'declared_outputs': declared_output_keys,
                     'outputs_match': bool(mismatch.get('ok')) if isinstance(mismatch, dict) and mismatch else True,
                     'outputs_mismatch': mismatch,
+                    'inputs_match': bool(inputs_mismatch.get('ok')) if isinstance(inputs_mismatch, dict) and inputs_mismatch else True,
+                    'inputs_mismatch': inputs_mismatch,
                     'config': cfg,
                 }
 
@@ -10226,6 +10352,8 @@ def api_flow_prepare_preview_for_execute():
                     fa['actual_outputs'] = actual_output_keys
                     fa['outputs_match'] = bool(mismatch.get('ok')) if isinstance(mismatch, dict) and mismatch else True
                     fa['outputs_mismatch'] = mismatch
+                    fa['inputs_match'] = bool(inputs_mismatch.get('ok')) if isinstance(inputs_mismatch, dict) and inputs_mismatch else True
+                    fa['inputs_mismatch'] = inputs_mismatch
                 except Exception:
                     pass
 
@@ -15046,9 +15174,25 @@ def _v3_merge_generator_view(plugin: dict, impl: dict) -> dict | None:
         except Exception:
             hint_templates = []
     if not hint_templates:
-        hint_templates = ['Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})']
+        hint_templates = ['Next: {{NEXT_NODE_NAME}}']
     gen['hint_templates'] = hint_templates
     gen['hint_template'] = hint_templates[0]
+
+    # Optional: ordered, high-level description hints about the flag/challenge.
+    # These are shown in the Flow chain UI above the NEXT-step hints.
+    desc_hints: list[str] = []
+    try:
+        dh = impl.get('description_hints')
+        if isinstance(dh, list):
+            desc_hints = [str(x or '').strip() for x in dh if str(x or '').strip()]
+        elif isinstance(dh, str):
+            s = dh.strip()
+            if s:
+                desc_hints = [s]
+    except Exception:
+        desc_hints = []
+    if desc_hints:
+        gen['description_hints'] = desc_hints
 
     handoff = impl.get('handoff')
     if isinstance(handoff, dict):
@@ -15183,9 +15327,26 @@ def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool,
                 except Exception:
                     hint_templates = []
             if not hint_templates:
-                hint_templates = ['Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})']
+                hint_templates = ['Next: {{NEXT_NODE_NAME}}']
             impl2['hint_templates'] = hint_templates
             impl2['hint_template'] = hint_templates[0]
+
+            # Optional ordered, high-level description hints.
+            try:
+                dh = impl2.get('description_hints')
+                desc_hints: list[str] = []
+                if isinstance(dh, list):
+                    desc_hints = [str(x or '').strip() for x in dh if str(x or '').strip()]
+                elif isinstance(dh, str):
+                    s = dh.strip()
+                    if s:
+                        desc_hints = [s]
+                if desc_hints:
+                    impl2['description_hints'] = desc_hints
+                else:
+                    impl2.pop('description_hints', None)
+            except Exception:
+                impl2.pop('description_hints', None)
 
             normalized_impls.append(impl2)
 
@@ -15391,7 +15552,7 @@ def _validate_and_normalize_flag_source_json(file_path: str, max_bytes: int = 5_
                 rec['security_profile'] = 'strict'
             if not rec.get('hint_template'):
                 # Default hint: Flow will fill NEXT/THIS placeholders when displaying and when preparing execution.
-                rec['hint_template'] = 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+                rec['hint_template'] = 'Next: {{NEXT_NODE_NAME}}'
             # Normalize enforce_security boolean
             if 'enforce_security' in rec:
                 v = rec.get('enforce_security')

@@ -86,7 +86,6 @@ def main() -> None:
         "outputs": {
             "compose_path": str(compose_path.name),
             "flag": flag_value,
-            "node_name": node_name,
             "ssh_username": ssh_username,
             "ssh_password": ssh_password,
             "ssh_port": ssh_port,

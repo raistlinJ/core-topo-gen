@@ -66,7 +66,6 @@ def main() -> None:
         "outputs": {
             "compose_path": str(compose_path.name),
             "flag": flag_value,
-            "node_name": node_name,
             "nfs_port": nfs_port,
             "nfs_export": "/exports",
             "mount_hint": f"mount -t nfs <node-ip>:/exports /mnt && cat /mnt/flag.txt",

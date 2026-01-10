@@ -112,6 +112,11 @@
             <div class="small text-muted">Use ↑/↓ to reorder</div>
           </div>
           <div class="card-body">
+            <div class="small text-muted mb-1" aria-hidden="true" style="display:grid;grid-template-columns:84px 1fr 76px;gap:.5rem;align-items:center;">
+              <div class="pe-2" style="border-right: 1px solid var(--bs-border-color, #dee2e6);">Sequence</div>
+              <div>Details</div>
+              <div class="text-end">Reorder</div>
+            </div>
             <div id="flowChainList" class="list-group"></div>
             <div class="small text-muted mt-2">Reordering updates the bundle and download.</div>
           </div>
@@ -178,6 +183,25 @@
   let lastFlowValid = true;
   let lastFlowErrors = [];
   let lastFlagsEnabled = true;
+
+  function toRoman(n){
+    const num = parseInt(n, 10);
+    if(!Number.isFinite(num) || num <= 0) return '';
+    const map = [
+      [1000,'M'], [900,'CM'], [500,'D'], [400,'CD'],
+      [100,'C'], [90,'XC'], [50,'L'], [40,'XL'],
+      [10,'X'], [9,'IX'], [5,'V'], [4,'IV'], [1,'I']
+    ];
+    let x = num;
+    let out = '';
+    for(const [v,s] of map){
+      while(x >= v){
+        out += s;
+        x -= v;
+      }
+    }
+    return out;
+  }
 
   function showLoading(text){
     try{
@@ -428,11 +452,25 @@
     }
     currentChain.forEach((node, idx) => {
       const item = document.createElement('div');
-      item.className = 'list-group-item d-flex align-items-center justify-content-between gap-2';
-      item.style.cursor = 'pointer';
+      item.className = 'list-group-item';
+      item.style.cursor = 'default';
+      item.style.display = 'grid';
+      item.style.gridTemplateColumns = '84px 1fr 76px';
+      item.style.columnGap = '.5rem';
+      item.style.alignItems = 'start';
+
+      const seq = document.createElement('div');
+      seq.className = 'text-muted small fw-semibold';
+      seq.style.width = '84px';
+      seq.style.whiteSpace = 'nowrap';
+      seq.style.borderRight = '1px solid var(--bs-border-color, #dee2e6)';
+      seq.style.paddingRight = '.5rem';
+      seq.textContent = toRoman(idx + 1);
 
       const left = document.createElement('div');
       left.className = 'd-flex flex-column';
+      left.style.minWidth = '0';
+      left.style.justifySelf = 'stretch';
       const title = document.createElement('div');
       title.className = 'fw-semibold';
       title.textContent = (node && node.name) ? String(node.name) : ('Node ' + (idx+1));
@@ -473,6 +511,24 @@
 
       const genLabel = fa && fa.flag_generator ? String(fa.flag_generator) : '-';
       addRow('source', genLabel);
+
+      const descList = (fa && Array.isArray(fa.description_hints) && fa.description_hints.length)
+        ? fa.description_hints.map(x => String(x || '').trim()).filter(Boolean)
+        : [];
+      if(descList.length > 1){
+        const wrap = document.createElement('div');
+        const ul = document.createElement('ol');
+        ul.className = 'mb-0 ps-3';
+        descList.forEach((ht) => {
+          const li = document.createElement('li');
+          li.textContent = ht;
+          ul.appendChild(li);
+        });
+        wrap.appendChild(ul);
+        addRow('description hints', wrap);
+      } else if(descList.length === 1){
+        addRow('description hints', descList[0]);
+      }
 
       const hintList = (fa && Array.isArray(fa.hints) && fa.hints.length)
         ? fa.hints.map(x => String(x || '').trim()).filter(Boolean)
@@ -519,6 +575,33 @@
       // After prepare_preview_for_execute, the backend may attach runtime validation
       // fields like outputs_match/outputs_mismatch to help validate generator specs.
       try {
+        if(fa && fa.inputs_match === false){
+          const mm = fa.inputs_mismatch || {};
+          const missingReq = Array.isArray(mm.missing_required) ? mm.missing_required : [];
+          const unsetReq = Array.isArray(mm.unset_required) ? mm.unset_required : [];
+          const dropped = Array.isArray(mm.dropped) ? mm.dropped : [];
+
+          const parts = [];
+          if(missingReq.length){
+            const msg = missingReq.map(k => String(k || '').trim()).filter(Boolean)
+              .map(k => `${k} (required by catalog inputs, but not provided in generator config)`)
+              .join('; ');
+            parts.push('missing required: ' + (msg || missingReq.join(', ')));
+          }
+          if(unsetReq.length){
+            const msg = unsetReq.map(k => String(k || '').trim()).filter(Boolean)
+              .map(k => `${k} (provided but empty/null)`)
+              .join('; ');
+            parts.push('unset required: ' + (msg || unsetReq.join(', ')));
+          }
+          if(dropped.length){
+            const msg = dropped.map(k => String(k || '').trim()).filter(Boolean)
+              .map(k => `${k} (not declared by generator inputs; not passed)`)
+              .join('; ');
+            parts.push('dropped: ' + (msg || dropped.join(', ')));
+          }
+          addRow('inputs mismatch', parts.length ? parts.join(' | ') : 'inputs mismatch', { danger: true });
+        }
         if(fa && fa.outputs_match === false){
           const mm = fa.outputs_mismatch || {};
           const missing = Array.isArray(mm.missing) ? mm.missing : [];
@@ -546,6 +629,7 @@
 
       const right = document.createElement('div');
       right.className = 'btn-group btn-group-sm';
+      right.style.justifySelf = 'end';
       const up = document.createElement('button');
       up.type = 'button';
       up.className = 'btn btn-outline-secondary';
@@ -575,14 +659,9 @@
       right.appendChild(up);
       right.appendChild(down);
 
+      item.appendChild(seq);
       item.appendChild(left);
       item.appendChild(right);
-      item.addEventListener('click', (e)=>{
-        // Avoid selecting when clicking reorder buttons.
-        const t = e && e.target;
-        if(t && t.tagName && String(t.tagName).toLowerCase() === 'button') return;
-        selectChainIndex(idx);
-      });
       wrap.appendChild(item);
     });
   }
@@ -651,7 +730,9 @@
       const node = chain[i];
       const safeId = 'N' + i;
       const label = (node && node.name) ? node.name : ('Node ' + (i+1));
-      lines.push(`  ${safeId}[${label.replace(/\]/g,'')}]`);
+      const seq = toRoman(i + 1);
+      const prefixed = (seq ? (seq + '. ') : '') + String(label || '');
+      lines.push(`  ${safeId}[${prefixed.replace(/\]/g,'')}]`);
       if(i>0){
         lines.push(`  N${i-1} --> ${safeId}`);
       }

@@ -90,7 +90,6 @@ def main() -> None:
         "outputs": {
             "compose_path": str(compose_path.name),
             "flag": flag_value,
-            "node_name": node_name,
             "https_port": https_port,
             "flag_url_hint": f"https://<node-ip>:{https_port}/flag.txt",
         },
