@@ -430,7 +430,6 @@
       const item = document.createElement('div');
       item.className = 'list-group-item d-flex align-items-center justify-content-between gap-2';
       item.style.cursor = 'pointer';
-      item.classList.toggle('active', idx === selectedChainIndex);
 
       const left = document.createElement('div');
       left.className = 'd-flex flex-column';
@@ -525,8 +524,18 @@
           const missing = Array.isArray(mm.missing) ? mm.missing : [];
           const extra = Array.isArray(mm.extra) ? mm.extra : [];
           const parts = [];
-          if(missing.length) parts.push('missing: ' + missing.join(', '));
-          if(extra.length) parts.push('extra: ' + extra.join(', '));
+          if(missing.length){
+            const msg = missing.map(k => String(k || '').trim()).filter(Boolean)
+              .map(k => `${k} (declared in catalog output_fields, but not present in outputs.json)`)
+              .join('; ');
+            parts.push('missing: ' + (msg || missing.join(', ')));
+          }
+          if(extra.length){
+            const msg = extra.map(k => String(k || '').trim()).filter(Boolean)
+              .map(k => `${k} (present in outputs.json, but not declared in catalog output_fields)`)
+              .join('; ');
+            parts.push('extra: ' + (msg || extra.join(', ')));
+          }
           addRow('outputs mismatch', parts.length ? parts.join(' | ') : 'outputs mismatch', { danger: true });
         }
       } catch(e) {}
