@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Challenge Instance Schema",
+  "type": "object",
+  "required": ["challenge_id", "plugin"],
+  "properties": {
+    "challenge_id": { "type": "string", "pattern": "^[a-z0-9_\\-]+$" },
+    "plugin": { "type": "string" },
+    "requires": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["artifact"],
+        "properties": {
+          "artifact": { "type": "string" },
+          "source": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "overrides": { "type": "object", "additionalProperties": {} },
+    "flag": {
+      "type": "object",
+      "properties": {
+        "validation": {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": { "type": "string", "enum": ["exact", "regex", "hash", "derived"] },
+            "params": { "type": "object" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "points": { "type": "integer" },
+    "optional": { "type": "boolean", "default": false }
+  },
+  "additionalProperties": false
+}

@@ -55,6 +55,13 @@
                 <label class="form-label">Chain Length</label>
                 <input id="flowLength" class="form-control" type="number" min="1" max="50" value="5">
               </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label">Preset</label>
+                <select id="flowPreset" class="form-select">
+                  <option value="">Random (default)</option>
+                  <option value="sample_reverse_nfs_ssh">Sample: reverse_nfs_ssh</option>
+                </select>
+              </div>
               <div class="col-md-6">
                 <div class="d-flex gap-2 flex-nowrap">
                   <button id="flowGenerateBtn" class="btn btn-primary text-nowrap" type="button">Generate</button>
@@ -68,9 +75,11 @@
                 </div>
               </div>
             </div>
-            <div class="small text-muted mt-2">Current rule: flags are placed on any Docker nodes (scenario Docker role + vulnerability Docker nodes). Default chain order is randomized; you can tweak it below.</div>
+            <div class="small text-muted mt-2">Current rule: flags are placed on Docker-role nodes and vulnerability nodes. Vulnerability nodes are only assigned <span class="font-monospace">flag-generator</span> flags (not <span class="font-monospace">flag-node-generator</span>). Default chain order is randomized; you can tweak it below.</div>
           </div>
         </div>
+
+        <div id="flowValidityAlert" class="alert alert-danger d-none" role="alert"></div>
 
         <div class="card mb-3">
           <div class="card-header d-flex align-items-center justify-content-between">
@@ -87,7 +96,7 @@
                 <span class="ms-1" id="flowMetaPreview"></span>
               </div>
               <div class="col-12 col-md-3">
-                <span class="text-secondary">Docker:</span>
+                <span class="text-secondary">Docker/Vuln:</span>
                 <span class="ms-1" id="flowMetaStats"></span>
               </div>
             </div>
@@ -119,6 +128,19 @@
 {% set xml_preview_enabled = True %}
 {% set xml_preview_text = xml_preview %}
 {% include 'partials/dock.html' %}
+
+<!-- Loading overlay shown during slow operations (e.g., resolving hint templates via generator runs). -->
+<div id="flowLoadingOverlay" class="position-fixed top-0 start-0 w-100 h-100 d-none" style="z-index: 2000;">
+  <div class="position-absolute top-0 start-0 w-100 h-100 bg-dark bg-opacity-50"></div>
+  <div class="position-absolute top-50 start-50 translate-middle bg-white rounded shadow p-3" style="min-width: 320px; max-width: 560px;">
+    <div class="d-flex align-items-center gap-2">
+      <div class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></div>
+      <div class="fw-semibold" id="flowLoadingText">Loading…</div>
+    </div>
+    <div class="small text-muted mt-2">This can take a few seconds while generators run and hints resolve.</div>
+  </div>
+</div>
+
 <script>
 (function(){
   const statusEl = document.getElementById('flowStatus');
@@ -126,6 +148,7 @@
   const scenarioEl = document.getElementById('flowScenario');
   const scenarioLabelEl = document.getElementById('flowScenarioLabel');
   const lengthEl = document.getElementById('flowLength');
+  const presetEl = document.getElementById('flowPreset');
   const btnEl = document.getElementById('flowGenerateBtn');
   const saveXmlEl = document.getElementById('saveXmlBtn');
   const execEl = document.getElementById('scenariosExecuteBtn');
@@ -137,6 +160,9 @@
   const downloadLink = document.getElementById('flowBundleDownloadLink');
   const scenarioListEl = document.getElementById('flowScenarioList');
   const clearScenarioBtn = document.getElementById('flowScenarioFilterClear');
+  const validityAlertEl = document.getElementById('flowValidityAlert');
+  const loadingOverlayEl = document.getElementById('flowLoadingOverlay');
+  const loadingTextEl = document.getElementById('flowLoadingText');
 
   const participantUrlFlags = {{ (participant_url_flags or {})|tojson }};
   const scenarioNamesCache = {{ (scenarios or [])|tojson }};
@@ -149,6 +175,44 @@
   let lastPreviewPlanPath = '';
   let currentFlagAssignments = [];
   let selectedChainIndex = -1;
+  let lastFlowValid = true;
+  let lastFlowErrors = [];
+  let lastFlagsEnabled = true;
+
+  function showLoading(text){
+    try{
+      if(!loadingOverlayEl) return;
+      if(loadingTextEl) loadingTextEl.textContent = (text || 'Loading…').toString();
+      loadingOverlayEl.classList.remove('d-none');
+    } catch(e) {}
+  }
+
+  function hideLoading(){
+    try{
+      if(!loadingOverlayEl) return;
+      loadingOverlayEl.classList.add('d-none');
+    } catch(e) {}
+  }
+
+  function setFlowValidityFromPayload(payload){
+    const p = payload && typeof payload === 'object' ? payload : null;
+    const flowValid = p && ('flow_valid' in p) ? !!p.flow_valid : true;
+    const flagsEnabled = p && ('flags_enabled' in p) ? !!p.flags_enabled : true;
+    const flowErrors = (p && Array.isArray(p.flow_errors)) ? p.flow_errors.slice() : [];
+    lastFlowValid = flowValid;
+    lastFlagsEnabled = flagsEnabled;
+    lastFlowErrors = flowErrors;
+    if(!validityAlertEl) return;
+    if(flowValid && flagsEnabled){
+      validityAlertEl.classList.add('d-none');
+      validityAlertEl.textContent = '';
+      return;
+    }
+    const base = 'Invalid flag dependency order: execution will run WITHOUT flags.';
+    const details = flowErrors.length ? (' ' + flowErrors.join(' | ')) : '';
+    validityAlertEl.textContent = base + details;
+    validityAlertEl.classList.remove('d-none');
+  }
 
   async function refreshXmlDockPreview({ force = false } = {}){
     const xmlPre = document.getElementById('xmlPre');
@@ -309,18 +373,44 @@
   }
 
   function chainFeasibility(assignments){
-    // Returns per-index {ok:boolean, missing:string[]} based on cumulative outputs.
+    // Returns per-index feasibility based on cumulative outputs.
+    // Shape: {ok:boolean, missing:string[], missing_artifacts:string[], missing_fields:string[]}
     const out = [];
     // Keep in sync with server-side synthesized Flow inputs (see _flow_default_generator_config).
-    const have = new Set(['seed','secret','env_name','challenge','flag_prefix','username_prefix','key_len']);
+    const synthesizedFields = ['seed','secret','env_name','challenge','flag_prefix','username_prefix','key_len','node_name'];
+    const haveEffective = new Set(synthesizedFields);
+    const haveArtifacts = new Set();
+    const haveFields = new Set(synthesizedFields);
     if(!Array.isArray(assignments)) return out;
     for(let i=0;i<assignments.length;i++){
       const a = assignments[i] || {};
-      const req = Array.isArray(a.inputs) ? a.inputs.map(String) : [];
-      const missing = req.filter(k => k && !have.has(k));
-      out.push({ ok: missing.length === 0, missing });
-      const prov = Array.isArray(a.outputs) ? a.outputs.map(String) : [];
-      prov.forEach(k => { if(k) have.add(k); });
+
+      const reqEffective = Array.isArray(a.inputs) ? a.inputs.map(String) : [];
+      const missing = reqEffective.filter(k => k && !haveEffective.has(k));
+
+      const hasSplit = Array.isArray(a.requires) || Array.isArray(a.input_fields_required) || Array.isArray(a.input_fields);
+      const reqArtifacts = Array.isArray(a.requires) ? a.requires.map(String) : [];
+      const reqFields = Array.isArray(a.input_fields_required)
+        ? a.input_fields_required.map(String)
+        : (Array.isArray(a.input_fields) ? a.input_fields.map(String) : []);
+      const missingArtifacts = hasSplit
+        ? reqArtifacts.filter(k => k && !haveArtifacts.has(k))
+        : [];
+      const missingFields = hasSplit
+        ? reqFields.filter(k => k && !haveFields.has(k))
+        : missing;
+
+      out.push({ ok: missing.length === 0, missing, missing_artifacts: missingArtifacts, missing_fields: missingFields });
+
+      const provEffective = Array.isArray(a.outputs) ? a.outputs.map(String) : [];
+      provEffective.forEach(k => { if(k) haveEffective.add(k); });
+
+      if(Array.isArray(a.produces)){
+        a.produces.map(String).forEach(k => { if(k) haveArtifacts.add(k); });
+      }
+      if(Array.isArray(a.output_fields)){
+        a.output_fields.map(String).forEach(k => { if(k) haveFields.add(k); });
+      }
     }
     return out;
   }
@@ -349,46 +439,83 @@
       title.textContent = (node && node.name) ? String(node.name) : ('Node ' + (idx+1));
       left.appendChild(title);
 
-      const flagSub = document.createElement('div');
-      flagSub.className = 'small text-muted';
-      const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
-      const flagLabel = fa && (fa.name || fa.id) ? String(fa.name || fa.id) : '-';
-      flagSub.textContent = 'flag: ' + flagLabel;
-      left.appendChild(flagSub);
+      // Sub-details: compact table for readability.
+      const details = document.createElement('div');
+      details.className = 'mt-1';
+      const tbl = document.createElement('table');
+      tbl.className = 'table table-sm table-borderless mb-0 small';
+      const tbody = document.createElement('tbody');
 
-      const genUsedSub = document.createElement('div');
-      genUsedSub.className = 'small text-muted';
+      function addRow(label, valueElOrText, { danger = false } = {}){
+        const tr = document.createElement('tr');
+        const tdL = document.createElement('td');
+        tdL.className = 'text-muted';
+        tdL.style.whiteSpace = 'nowrap';
+        tdL.style.width = '1%';
+        tdL.textContent = String(label || '').trim() ? (String(label).trim() + ':') : '';
+        const tdV = document.createElement('td');
+        if(danger) tdV.classList.add('text-danger');
+        if(valueElOrText && typeof valueElOrText === 'object' && valueElOrText.nodeType){
+          tdV.appendChild(valueElOrText);
+        } else {
+          tdV.textContent = String(valueElOrText || '-');
+        }
+        tr.appendChild(tdL);
+        tr.appendChild(tdV);
+        tbody.appendChild(tr);
+      }
+
+      const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
       const genId = fa && fa.id ? String(fa.id) : '-';
       const genName = fa && fa.name ? String(fa.name) : '-';
-      genUsedSub.textContent = (genName && genName !== '-' && genName !== genId)
-        ? ('generator: ' + genId + ' | ' + genName)
-        : ('generator: ' + genId);
-      left.appendChild(genUsedSub);
+      addRow('generator', (genName && genName !== '-' && genName !== genId)
+        ? (genId + ' | ' + genName)
+        : genId);
 
-      const genSub = document.createElement('div');
-      genSub.className = 'small text-muted';
       const genLabel = fa && fa.flag_generator ? String(fa.flag_generator) : '-';
-      genSub.textContent = 'flag-generator: ' + genLabel;
-      left.appendChild(genSub);
+      addRow('source', genLabel);
 
-      const hintSub = document.createElement('div');
-      hintSub.className = 'small';
-      const hintText = fa && fa.hint ? String(fa.hint) : '';
-      hintSub.textContent = hintText ? ('hint: ' + hintText) : 'hint: -';
-      left.appendChild(hintSub);
+      const hintList = (fa && Array.isArray(fa.hints) && fa.hints.length)
+        ? fa.hints.map(x => String(x || '').trim()).filter(Boolean)
+        : [];
+      if(hintList.length > 1){
+        const wrap = document.createElement('div');
+        const ul = document.createElement('ol');
+        ul.className = 'mb-0 ps-3';
+        hintList.forEach((ht) => {
+          const li = document.createElement('li');
+          li.textContent = ht;
+          ul.appendChild(li);
+        });
+        wrap.appendChild(ul);
+        addRow('hints', wrap);
+      } else {
+        const hintText = hintList.length ? hintList[0] : (fa && fa.hint ? String(fa.hint) : '');
+        addRow('hint', hintText || '-');
+      }
 
       const feas = chainFeasibility(currentFlagAssignments);
       const step = feas && feas[idx] ? feas[idx] : null;
-      const ioSub = document.createElement('div');
-      ioSub.className = 'small text-muted';
-      const req = fa && Array.isArray(fa.inputs) && fa.inputs.length ? ('requires: ' + fa.inputs.join(', ')) : 'requires: -';
-      const prov = fa && Array.isArray(fa.outputs) && fa.outputs.length ? ('provides: ' + fa.outputs.join(', ')) : 'provides: -';
-      ioSub.textContent = req + ' | ' + prov;
+        addRow('requires (artifacts)', fa && Array.isArray(fa.requires) && fa.requires.length ? fa.requires.join(', ') : '-');
+        addRow('produces (artifacts)', fa && Array.isArray(fa.produces) && fa.produces.length ? fa.produces.join(', ') : '-');
+        const inReq = (fa && Array.isArray(fa.input_fields_required)) ? fa.input_fields_required.map(String).filter(Boolean) : [];
+        const inOpt = (fa && Array.isArray(fa.input_fields_optional)) ? fa.input_fields_optional.map(String).filter(Boolean) : [];
+        const inAll = (fa && Array.isArray(fa.input_fields)) ? fa.input_fields.map(String).filter(Boolean) : [];
+        const inputsDisplay = (inReq.length || inOpt.length)
+          ? (inReq.concat(inOpt.map(x => x + ' (optional)')).join(', '))
+          : (inAll.length ? inAll.join(', ') : '-');
+        addRow('inputs (fields)', inputsDisplay);
+        addRow('outputs (fields)', fa && Array.isArray(fa.output_fields) && fa.output_fields.length ? fa.output_fields.join(', ') : '-');
       if(step && step.ok === false){
-        ioSub.classList.add('text-danger');
-        ioSub.textContent = req + ' | ' + prov + ' | missing: ' + (step.missing || []).join(', ');
+          const ma = Array.isArray(step.missing_artifacts) ? step.missing_artifacts : [];
+          const mf = Array.isArray(step.missing_fields) ? step.missing_fields : [];
+          if(ma.length || mf.length){
+            addRow('missing artifacts', ma.join(', ') || '-', { danger: true });
+            addRow('missing fields', mf.join(', ') || '-', { danger: true });
+          } else {
+            addRow('missing', (step.missing || []).join(', ') || '-', { danger: true });
+          }
       }
-      left.appendChild(ioSub);
 
       // After prepare_preview_for_execute, the backend may attach runtime validation
       // fields like outputs_match/outputs_mismatch to help validate generator specs.
@@ -397,15 +524,16 @@
           const mm = fa.outputs_mismatch || {};
           const missing = Array.isArray(mm.missing) ? mm.missing : [];
           const extra = Array.isArray(mm.extra) ? mm.extra : [];
-          const warn = document.createElement('div');
-          warn.className = 'small text-danger';
           const parts = [];
           if(missing.length) parts.push('missing: ' + missing.join(', '));
           if(extra.length) parts.push('extra: ' + extra.join(', '));
-          warn.textContent = parts.length ? ('outputs mismatch (' + parts.join(' | ') + ')') : 'outputs mismatch';
-          left.appendChild(warn);
+          addRow('outputs mismatch', parts.length ? parts.join(' | ') : 'outputs mismatch', { danger: true });
         }
       } catch(e) {}
+
+      tbl.appendChild(tbody);
+      details.appendChild(tbl);
+      left.appendChild(details);
 
       const right = document.createElement('div');
       right.className = 'btn-group btn-group-sm';
@@ -473,6 +601,7 @@
       const data = await postJson('/api/flag-sequencing/bundle_from_chain', { scenario: activeScenario, chain: currentChain });
       currentBundle = data.bundle;
       currentFlagAssignments = Array.isArray(data.flag_assignments) ? data.flag_assignments.slice() : currentFlagAssignments;
+      setFlowValidityFromPayload(data);
       if(jsonEl) jsonEl.textContent = JSON.stringify(currentBundle, null, 2);
       const diagram = buildMermaid(currentChain);
       await renderMermaid(diagram);
@@ -486,16 +615,20 @@
   function formatStats(stats){
     if(!stats || typeof stats !== 'object') return '';
     const d = Number.isFinite(+stats.docker_total) ? (+stats.docker_total) : null;
+    const v = Number.isFinite(+stats.vuln_total) ? (+stats.vuln_total) : null;
     const c = Number.isFinite(+stats.compose_backed_total) ? (+stats.compose_backed_total) : null;
     const e = Number.isFinite(+stats.eligible_total) ? (+stats.eligible_total) : null;
-    if(d === null && c === null && e === null) return '';
+    if(d === null && v === null && c === null && e === null) return '';
     const inner = [];
+    if(v !== null) inner.push('vuln: ' + v);
     if(c !== null) inner.push('compose-backed: ' + c);
     if(e !== null) inner.push('eligible: ' + e);
-    if(d !== null && inner.length){
-      return 'Detected docker nodes: ' + d + ' (' + inner.join(', ') + ')';
+    if(d !== null){
+      return String(d) + (inner.length ? (' (' + inner.join(', ') + ')') : '');
     }
-    if(d !== null) return 'Detected docker nodes: ' + d;
+    if(v !== null){
+      return 'vuln: ' + v + (inner.length ? (' (' + inner.join(', ') + ')') : '');
+    }
     return inner.length ? inner.join(', ') : '';
   }
 
@@ -539,11 +672,13 @@
   async function generate(preferPreview){
     const usePreview = !!preferPreview;
     const scenario = (scenarioEl && scenarioEl.value || '').trim();
-    const length = parseInt((lengthEl && lengthEl.value) || '5', 10) || 5;
+    const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
+    const length = preset ? 3 : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
 
     const params = new URLSearchParams();
     if(scenario) params.set('scenario', scenario);
     params.set('length', String(length));
+    if(preset) params.set('preset', preset);
     // Only force preview selection when the user explicitly clicks Generate.
     if(usePreview){
       params.set('prefer_preview', '1');
@@ -555,6 +690,7 @@
 
     setStatus('Generating…', false);
     setLoginLinkVisible(false);
+    showLoading('Generating flow…');
     if(metaScenarioEl) metaScenarioEl.textContent = '';
     if(metaPreviewEl) metaPreviewEl.textContent = '';
     if(metaStatsEl) metaStatsEl.textContent = '';
@@ -565,6 +701,7 @@
       currentChain = Array.isArray(data.chain) ? data.chain.slice() : [];
       currentBundle = data.bundle || null;
       currentFlagAssignments = Array.isArray(data.flag_assignments) ? data.flag_assignments.slice() : [];
+      setFlowValidityFromPayload(data);
       lastStats = data.stats || null;
       lastPreviewPlanPath = data.preview_plan_path || '';
       try {
@@ -580,11 +717,61 @@
       if(jsonEl) jsonEl.textContent = JSON.stringify(currentBundle, null, 2);
       const diagram = buildMermaid(currentChain);
       await renderMermaid(diagram);
+
+      // Optional (user-click only): run the prepare step so generator outputs can resolve
+      // hint templates immediately (e.g., IPs/ports/usernames) without requiring a refresh.
+      if(usePreview){
+        try{
+          if(Array.isArray(currentChain) && currentChain.length){
+            showLoading('Resolving hint values…');
+            setStatus('Resolving hint values…', false);
+            const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+            const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length: currentChain.length, preset, chain_ids: chainIds });
+            setFlowValidityFromPayload(prepData);
+
+            // If the server adjusted the chain (rare, e.g. preset repair), keep UI in sync.
+            const oldIds = chainIds.join('|');
+            const newChain = (prepData && Array.isArray(prepData.chain)) ? prepData.chain.slice() : null;
+            const newIds = (newChain || []).map(n => (n && n.id) ? String(n.id) : '').filter(Boolean).join('|');
+            if(newChain && newChain.length){
+              currentChain = newChain;
+            }
+
+            if(prepData && Array.isArray(prepData.flag_assignments)){
+              currentFlagAssignments = prepData.flag_assignments.slice();
+              renderChainEditor();
+            }
+            if(prepData && prepData.preview_plan_path){
+              lastPreviewPlanPath = String(prepData.preview_plan_path);
+              updateMeta();
+            }
+
+            // If chain changed, regenerate the bundle to match (keep resolved hints in UI).
+            if(newChain && newIds && oldIds !== newIds){
+              await refreshBundleFromChain();
+              if(prepData && Array.isArray(prepData.flag_assignments)){
+                currentFlagAssignments = prepData.flag_assignments.slice();
+                renderChainEditor();
+              }
+              const diagram2 = buildMermaid(currentChain);
+              await renderMermaid(diagram2);
+            }
+          }
+        } catch(e) {
+          // Non-fatal: the flow/bundle is still usable even if hints aren't resolved.
+          try {
+            const msg = (e && e.message) ? String(e.message) : String(e || 'prepare failed');
+            setStatus('Hint resolution failed: ' + msg, true);
+          } catch(_) {}
+        }
+      }
+
       setStatus('Ready.', false);
     } catch(err){
       setStatus(String(err && err.message || err), true);
       setLoginLinkVisible(!!(err && err.loginRequired));
       const payload = err && err.payload ? err.payload : null;
+      setFlowValidityFromPayload(payload);
       lastStats = payload && payload.stats ? payload.stats : null;
       lastPreviewPlanPath = payload && payload.preview_plan_path ? String(payload.preview_plan_path) : '';
       updateMeta();
@@ -595,11 +782,14 @@
       renderChainEditor();
       const diagram = buildMermaid([]);
       await renderMermaid(diagram);
+    } finally {
+      hideLoading();
     }
   }
 
   async function execute(){
     const scenario = (scenarioEl && scenarioEl.value || '').trim();
+    const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
     const length = (Array.isArray(currentChain) && currentChain.length) ? currentChain.length : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
     if(!scenario){
       setStatus('No scenario selected.', true);
@@ -614,12 +804,14 @@
     if(execEl) execEl.disabled = true;
     setStatus('Preparing preview for execution…', false);
     setLoginLinkVisible(false);
+    showLoading('Resolving hint values…');
     try{
       if(!Array.isArray(currentChain) || currentChain.length === 0){
         throw new Error('Generate a chain first.');
       }
       const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-      const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length, chain_ids: chainIds });
+      const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length, preset, chain_ids: chainIds });
+      setFlowValidityFromPayload(prepData);
       // Prefer server-returned (possibly enriched) assignments so the UI can show
       // generator run status/mismatch info before scenario execution.
       if(prepData && Array.isArray(prepData.flag_assignments)){
@@ -643,6 +835,7 @@
       setStatus(String(err && err.message || err), true);
       setLoginLinkVisible(!!(err && err.loginRequired));
     } finally {
+      hideLoading();
       try {
         if (typeof window.coretgRefreshScenariosExecuteButtonState === 'function') {
           window.coretgRefreshScenariosExecuteButtonState();
@@ -657,6 +850,7 @@
 
   async function saveXmlOnly(){
     const scenario = (scenarioEl && scenarioEl.value || '').trim();
+    const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
     const length = (Array.isArray(currentChain) && currentChain.length) ? currentChain.length : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
     if(!scenario){
       setStatus('No scenario selected.', true);
@@ -665,12 +859,14 @@
     if(saveXmlEl) saveXmlEl.disabled = true;
     setStatus('Preparing preview and saving XML…', false);
     setLoginLinkVisible(false);
+    showLoading('Resolving hint values…');
     try{
       if(!Array.isArray(currentChain) || currentChain.length === 0){
         throw new Error('Generate a chain first.');
       }
       const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-      const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length, chain_ids: chainIds });
+      const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length, preset, chain_ids: chainIds });
+      setFlowValidityFromPayload(prepData);
       if(prepData && Array.isArray(prepData.flag_assignments)){
         currentFlagAssignments = prepData.flag_assignments.slice();
         renderChainEditor();
@@ -698,6 +894,7 @@
       setStatus(String(err && err.message || err), true);
       setLoginLinkVisible(!!(err && err.loginRequired));
     } finally {
+      hideLoading();
       if(saveXmlEl) saveXmlEl.disabled = false;
     }
   }

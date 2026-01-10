@@ -7706,11 +7706,13 @@ def _pick_flag_chain_nodes(nodes: list[dict[str, Any]], adj: dict[str, set[str]]
             continue
         id_to_node[nid] = n
         t = (str(n.get('type') or '').strip().lower())
-        # Flags are placed on any Docker nodes (scenario Docker role + vulnerability Docker nodes).
-        # Note: older implementations restricted eligibility to "vulnerability docker nodes" only.
-        # The UI rule and user expectations are broader, so we treat all docker-like nodes as eligible.
+        # Flags can be placed on:
+        # - Docker-role nodes (docker-like types)
+        # - Vulnerability nodes (hosts with vulnerabilities)
+        # Vulnerability nodes do NOT count as Docker nodes.
         is_docker = ('docker' in t) or (str(n.get('type') or '').strip().upper() == 'DOCKER')
-        if is_docker:
+        is_vuln = bool(n.get('is_vuln'))
+        if is_docker or is_vuln:
             eligible_ids.append(nid)
 
     if not eligible_ids:
@@ -7772,14 +7774,105 @@ def _pick_flag_chain_nodes(nodes: list[dict[str, Any]], adj: dict[str, set[str]]
     return [id_to_node[nid] for nid in chain_ids if nid in id_to_node]
 
 
+def _pick_flag_chain_nodes_for_preset(
+    nodes: list[dict[str, Any]],
+    adj: dict[str, set[str]],
+    *,
+    steps: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    """Pick a chain that satisfies preset step constraints.
+
+    Currently enforced:
+    - any step with kind == 'flag-node-generator' must be placed on a non-vulnerability docker node.
+    """
+    try:
+        length = len(steps or [])
+    except Exception:
+        length = 0
+    length = max(1, min(int(length or 1), 50))
+
+    id_to_node: dict[str, dict[str, Any]] = {}
+    eligible_ids: list[str] = []
+    docker_ids: set[str] = set()
+    for n in nodes or []:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if not nid:
+            continue
+        id_to_node[nid] = n
+        t_raw = str(n.get('type') or '')
+        t = t_raw.strip().lower()
+        is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
+        is_vuln = bool(n.get('is_vuln'))
+        if is_docker or is_vuln:
+            eligible_ids.append(nid)
+        if is_docker and not is_vuln:
+            docker_ids.add(nid)
+
+    if not eligible_ids:
+        return []
+    if length > len(set(eligible_ids)):
+        return []
+
+    # Try to keep the chain in a single connected component, starting from a docker node if possible.
+    start = None
+    if docker_ids:
+        start = next(iter(sorted(docker_ids)))
+    else:
+        start = eligible_ids[0]
+
+    visited: list[str] = []
+    try:
+        seen: set[str] = set()
+        q = deque([start])
+        while q:
+            cur = q.popleft()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            visited.append(cur)
+            for nb in sorted(adj.get(cur, set())):
+                if nb not in seen:
+                    q.append(nb)
+    except Exception:
+        visited = list(dict.fromkeys(eligible_ids))
+
+    comp_eligible = [nid for nid in visited if nid in set(eligible_ids)]
+    if len(comp_eligible) < length:
+        # Fallback: allow selecting across components rather than erroring.
+        comp_eligible = list(dict.fromkeys(eligible_ids))
+
+    used: set[str] = set()
+    chosen: list[str] = []
+    for step in (steps or [])[:length]:
+        kind = str((step or {}).get('kind') or '').strip()
+        need_docker = (kind == 'flag-node-generator')
+        pool = [
+            nid for nid in comp_eligible
+            if nid not in used and (not need_docker or nid in docker_ids)
+        ]
+        if not pool:
+            return []
+        pick = pool[0]
+        used.add(pick)
+        chosen.append(pick)
+
+    if len(chosen) < length:
+        return []
+    return [id_to_node[nid] for nid in chosen if nid in id_to_node]
+
+
 def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
     """Return counts for debugging Flow eligibility.
 
     - docker_total: nodes that look like docker nodes
     - compose_backed_total: docker nodes that carry compose metadata
-    - eligible_total: docker nodes eligible for chain placement
+    - vuln_total: nodes that are vulnerability candidates
+    - eligible_total: nodes eligible for chain placement (docker role + vuln nodes)
     """
     docker_total = 0
+    vuln_total = 0
     compose_backed_total = 0
     eligible_total = 0
     for n in nodes or []:
@@ -7788,17 +7881,20 @@ def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
         t_raw = str(n.get('type') or '')
         t = t_raw.strip().lower()
         is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
-        if not is_docker:
-            continue
-        docker_total += 1
-        comp = str(n.get('compose') or '').strip()
-        comp_name = str(n.get('compose_name') or '').strip()
-        if comp or comp_name:
-            compose_backed_total += 1
-        # Eligibility follows the UI rule: any docker node is eligible.
-        eligible_total += 1
+        is_vuln = bool(n.get('is_vuln'))
+        if is_docker:
+            docker_total += 1
+            comp = str(n.get('compose') or '').strip()
+            comp_name = str(n.get('compose_name') or '').strip()
+            if comp or comp_name:
+                compose_backed_total += 1
+        if is_vuln:
+            vuln_total += 1
+        if is_docker or is_vuln:
+            eligible_total += 1
     return {
         'docker_total': docker_total,
+        'vuln_total': vuln_total,
         'compose_backed_total': compose_backed_total,
         'eligible_total': eligible_total,
     }
@@ -7910,6 +8006,232 @@ def _attack_flow_bundle_for_chain(*, chain_nodes: list[dict[str, Any]], scenario
         'objects': [extension_definition, author, flow_obj, *assets, *actions],
     }
     return bundle
+
+
+def _flow_render_hint_template(tpl: str, *, scenario_label: str, id_to_name: dict[str, str], this_id: str, next_id: str) -> str:
+    try:
+        text = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+        next_id_val = str(next_id or '').strip()
+        next_name_val = (id_to_name.get(next_id_val) or '').strip() if next_id_val else ''
+        if not next_id_val:
+            next_id_val = '(end)'
+        if not next_name_val:
+            next_name_val = '(end)'
+        repl = {
+            '{{SCENARIO}}': str(scenario_label or ''),
+            '{{THIS_NODE_ID}}': str(this_id or ''),
+            '{{THIS_NODE_NAME}}': id_to_name.get(str(this_id or '')) or str(this_id or ''),
+            '{{NEXT_NODE_ID}}': next_id_val,
+            '{{NEXT_NODE_NAME}}': next_name_val,
+        }
+        for k, v in repl.items():
+            try:
+                text = text.replace(k, str(v))
+            except Exception:
+                continue
+        return text
+    except Exception:
+        return str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+
+
+def _flow_hint_templates_from_generator(gen: dict[str, Any]) -> list[str]:
+    """Return ordered hint templates from a generator view.
+
+    Accepts:
+    - gen['hint_templates']: list[str]
+    - gen['hint_template']: str or list[str] (legacy / permissive)
+    """
+    out: list[str] = []
+    try:
+        ht = gen.get('hint_templates')
+        if isinstance(ht, list):
+            for x in ht:
+                s = str(x or '').strip()
+                if s:
+                    out.append(s)
+    except Exception:
+        pass
+    if out:
+        return out
+    try:
+        ht1 = gen.get('hint_template')
+        if isinstance(ht1, list):
+            for x in ht1:
+                s = str(x or '').strip()
+                if s:
+                    out.append(s)
+        else:
+            s = str(ht1 or '').strip()
+            if s:
+                out.append(s)
+    except Exception:
+        pass
+    if not out:
+        out = ['Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})']
+    return out
+
+
+def _flow_preset_steps(preset: str) -> list[dict[str, str]]:
+    p = str(preset or '').strip().lower()
+    if p in {'sample_reverse_nfs_ssh', 'sample'}:
+        return [
+            {'id': 'binary_embed_text', 'kind': 'flag-generator', 'catalog': 'flag_generators'},
+            {'id': 'nfs_sensitive_file', 'kind': 'flag-node-generator', 'catalog': 'flag_node_generators'},
+            {'id': 'textfile_username_password', 'kind': 'flag-generator', 'catalog': 'flag_generators'},
+        ]
+    return []
+
+
+def _flow_compute_flag_assignments_for_preset(
+    preview: dict,
+    chain_nodes: list[dict[str, Any]],
+    scenario_label: str,
+    preset: str,
+) -> tuple[list[dict[str, Any]], str | None]:
+    steps = _flow_preset_steps(preset)
+    if not steps:
+        return [], 'unknown preset'
+    if len(chain_nodes) < len(steps):
+        return [], f'preset requires {len(steps)} nodes'
+
+    try:
+        gens, _ = _flag_generators_from_enabled_sources()
+    except Exception:
+        gens = []
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        node_gens = []
+
+    by_id: dict[str, dict[str, Any]] = {}
+    for g in (gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid and gid not in by_id:
+            by_id[gid] = g
+    for g in (node_gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid and gid not in by_id:
+            by_id[gid] = g
+
+    chain_ids: list[str] = [str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()]
+    id_to_name: dict[str, str] = {}
+    for n in chain_nodes:
+        try:
+            nid = str(n.get('id') or '').strip()
+            nm = str(n.get('name') or '').strip()
+            if nid:
+                id_to_name[nid] = nm or nid
+        except Exception:
+            pass
+
+    # Prefer v3 plugin contracts for artifact-level chaining semantics.
+    try:
+        plugins_by_id = _flow_enabled_plugin_contracts_by_id()
+    except Exception:
+        plugins_by_id = {}
+
+    out: list[dict[str, Any]] = []
+    for i, step in enumerate(steps):
+        cid = chain_ids[i] if i < len(chain_ids) else ''
+        next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
+        gen_id = str(step.get('id') or '').strip()
+        kind = str(step.get('kind') or '').strip() or 'flag-generator'
+        catalog = str(step.get('catalog') or '').strip() or ('flag_node_generators' if kind == 'flag-node-generator' else 'flag_generators')
+
+        # Mirror the existing rule: vuln nodes are only assigned flag-generators.
+        try:
+            node = chain_nodes[i] if i < len(chain_nodes) else {}
+            if kind == 'flag-node-generator' and isinstance(node, dict) and bool(node.get('is_vuln')):
+                return [], 'preset requires a non-vulnerability node for the flag-node-generator step'
+        except Exception:
+            pass
+
+        gen = by_id.get(gen_id)
+        if not isinstance(gen, dict):
+            return [], f'generator not found/enabled: {gen_id}'
+
+        hint_templates = _flow_hint_templates_from_generator(gen)
+        hint_tpl = hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+
+        # Runtime IO (generator input/output fields).
+        # Show required + optional separately (UI), but only required participates in feasibility.
+        input_fields_all = sorted([
+            str(x.get('name') or '').strip()
+            for x in (gen.get('inputs') or [])
+            if isinstance(x, dict) and str(x.get('name') or '').strip()
+        ])
+        input_fields_required = sorted([
+            str(x.get('name') or '').strip()
+            for x in (gen.get('inputs') or [])
+            if isinstance(x, dict) and str(x.get('name') or '').strip() and x.get('required') is not False
+        ])
+        input_fields_optional = sorted([x for x in input_fields_all if x and x not in set(input_fields_required)])
+        output_fields = sorted([
+            str(x.get('name') or '').strip()
+            for x in (gen.get('outputs') or [])
+            if isinstance(x, dict) and str(x.get('name') or '').strip()
+        ])
+
+        # Artifact-level contracts (plugin requires/produces).
+        requires_artifacts: list[str] = []
+        produces_artifacts: list[str] = []
+        try:
+            plugin = plugins_by_id.get(gen_id)
+            if isinstance(plugin, dict):
+                req = plugin.get('requires')
+                if isinstance(req, list):
+                    requires_artifacts = sorted([str(x).strip() for x in req if str(x).strip()])
+                prod = plugin.get('produces')
+                if isinstance(prod, list):
+                    produces_artifacts = sorted([
+                        str(it.get('artifact') or '').strip()
+                        for it in prod
+                        if isinstance(it, dict) and str(it.get('artifact') or '').strip()
+                    ])
+        except Exception:
+            requires_artifacts = []
+            produces_artifacts = []
+
+        # Effective chaining semantics used by ordering validation.
+        inputs_effective = sorted(set(requires_artifacts) | set(input_fields_required))
+        outputs_effective = sorted(set(produces_artifacts) | set(output_fields))
+
+        rendered_hints = [
+            _flow_render_hint_template(t, scenario_label=scenario_label, id_to_name=id_to_name, this_id=str(cid), next_id=str(next_id))
+            for t in (hint_templates or [])
+        ]
+        out.append({
+            'node_id': str(cid),
+            'id': gen_id,
+            'name': str(gen.get('name') or ''),
+            'type': kind,
+            'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
+            'generator_catalog': catalog,
+            'language': str(gen.get('language') or ''),
+            # Effective union (used for chaining feasibility / ordering validation).
+            'inputs': inputs_effective,
+            'outputs': outputs_effective,
+
+            # Split-out views for UI transparency.
+            'requires': requires_artifacts,
+            'produces': produces_artifacts,
+            'input_fields': input_fields_all,
+            'input_fields_required': input_fields_required,
+            'input_fields_optional': input_fields_optional,
+            'output_fields': output_fields,
+            'hint_template': hint_tpl,
+            'hint_templates': hint_templates,
+            'hint': rendered_hints[0] if rendered_hints else _flow_render_hint_template(hint_tpl, scenario_label=scenario_label, id_to_name=id_to_name, this_id=str(cid), next_id=str(next_id)),
+            'hints': rendered_hints,
+            'next_node_id': str(next_id),
+            'next_node_name': str(id_to_name.get(str(next_id)) or ''),
+        })
+
+    return out, None
 
 
 @app.before_request
@@ -8214,7 +8536,7 @@ def _build_topology_graph_from_preview_plan(preview: Dict[str, Any]) -> Tuple[li
     links_out: list[dict[str, str]] = []
     by_id: dict[str, dict[str, Any]] = {}
 
-    def _add_node(nid: str, name: str, ntype: str, *, compose: str = '', compose_name: str = '') -> None:
+    def _add_node(nid: str, name: str, ntype: str, *, compose: str = '', compose_name: str = '', is_vuln: bool = False) -> None:
         if not nid or nid in by_id:
             return
         rec = {
@@ -8223,6 +8545,7 @@ def _build_topology_graph_from_preview_plan(preview: Dict[str, Any]) -> Tuple[li
             'type': ntype or 'node',
             'compose': compose or '',
             'compose_name': compose_name or '',
+            'is_vuln': bool(is_vuln),
             'interfaces': [],
             'services': [],
         }
@@ -8256,6 +8579,19 @@ def _build_topology_graph_from_preview_plan(preview: Dict[str, Any]) -> Tuple[li
             continue
         _add_node(sid, str(s.get('name') or f'switch-{sid}'), 'switch')
 
+    vuln_ids: set[str] = set()
+    try:
+        vb = preview.get('vulnerabilities_by_node') if isinstance(preview, dict) else None
+        if isinstance(vb, dict):
+            for k, v in vb.items():
+                if not v:
+                    continue
+                kk = str(k or '').strip()
+                if kk:
+                    vuln_ids.add(kk)
+    except Exception:
+        vuln_ids = set()
+
     # Add hosts
     for h in (preview.get('hosts') or []):
         if not isinstance(h, dict):
@@ -8265,24 +8601,18 @@ def _build_topology_graph_from_preview_plan(preview: Dict[str, Any]) -> Tuple[li
             continue
         role = str(h.get('role') or 'Host')
         role_norm = role.strip().lower()
-        vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
-        is_vuln = bool(vulns)
         is_docker_role = role_norm == 'docker'
-        # Flow eligibility logic expects docker nodes to have compose metadata.
-        # In preview artifacts, we approximate:
-        # - role=Dockers => standard compose
-        # - vulnerability-assigned hosts => compose-backed via "preview-vuln" marker
-        node_type = 'docker' if (is_docker_role or is_vuln) else 'host'
+        vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
+        is_vuln = bool(vulns) or (hid in vuln_ids)
+        # IMPORTANT: vulnerabilities should not "take up" Docker node slots.
+        # Only Docker-role hosts are treated as docker nodes for Flow eligibility.
+        node_type = 'docker' if is_docker_role else 'host'
         compose = ''
         compose_name = ''
         if is_docker_role:
             compose_name = 'standard-ubuntu-docker-core'
             compose = 'scripts/standard-ubuntu-docker-core/docker-compose.yml'
-        elif is_vuln:
-            # Best-effort marker; preview does not currently carry compose paths.
-            compose_name = 'preview-vuln'
-            compose = 'preview'
-        _add_node(hid, str(h.get('name') or f'host-{hid}'), node_type, compose=compose, compose_name=compose_name)
+        _add_node(hid, str(h.get('name') or f'host-{hid}'), node_type, compose=compose, compose_name=compose_name, is_vuln=is_vuln)
 
     # Router-to-router links
     for l in (preview.get('r2r_links_preview') or []):
@@ -8369,11 +8699,34 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
     if not chain_ids:
         return []
 
-    # Use generator-catalog entries (flag-generators) instead of docker-compose templates.
+    vuln_ids: set[str] = set()
+    try:
+        hosts = preview.get('hosts') if isinstance(preview, dict) else None
+        if isinstance(hosts, list):
+            for h in hosts:
+                if not isinstance(h, dict):
+                    continue
+                hid = str(h.get('node_id') or '').strip()
+                if not hid:
+                    continue
+                vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
+                if vulns:
+                    vuln_ids.add(hid)
+    except Exception:
+        vuln_ids = set()
+
+    # Use generator-catalog entries:
+    # - flag-generators: artifact/flag generation
+    # - flag-node-generators: node/docker-compose generation (Docker-role only)
     try:
         generators, _errors = _flag_generators_from_enabled_sources()
     except Exception:
         generators = []
+
+    try:
+        node_generators, _errors2 = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        node_generators = []
 
     eligible_gens: list[dict[str, Any]] = []
     for g in (generators or []):
@@ -8382,7 +8735,21 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
         gid = str(g.get('id') or '').strip()
         if not gid:
             continue
-        eligible_gens.append(g)
+        g2 = dict(g)
+        g2['_flow_kind'] = 'flag-generator'
+        g2['_flow_catalog'] = 'flag_generators'
+        eligible_gens.append(g2)
+
+    for g in (node_generators or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if not gid:
+            continue
+        g2 = dict(g)
+        g2['_flow_kind'] = 'flag-node-generator'
+        g2['_flow_catalog'] = 'flag_node_generators'
+        eligible_gens.append(g2)
 
     if not eligible_gens:
         return []
@@ -8409,6 +8776,20 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
         except Exception:
             pass
 
+    id_to_node: dict[str, dict[str, Any]] = {}
+    for n in chain_nodes:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if nid:
+            id_to_node[nid] = n
+
+    # Prefer v3 plugin contracts for chaining semantics (requires/produces).
+    try:
+        plugins_by_id = _flow_enabled_plugin_contracts_by_id()
+    except Exception:
+        plugins_by_id = {}
+
     def _render_hint(tpl: str, *, this_id: str, next_id: str) -> str:
         try:
             text = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
@@ -8433,7 +8814,21 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
 
     out: list[dict[str, Any]] = []
 
-    def _required_inputs_of(gen: dict[str, Any]) -> set[str]:
+    def _artifact_requires_of(gen: dict[str, Any]) -> set[str]:
+        required: set[str] = set()
+        try:
+            pid = str(gen.get('id') or '').strip()
+            plugin = plugins_by_id.get(pid)
+            if isinstance(plugin, dict) and isinstance(plugin.get('requires'), list):
+                for x in (plugin.get('requires') or []):
+                    xx = str(x).strip()
+                    if xx:
+                        required.add(xx)
+        except Exception:
+            pass
+        return required
+
+    def _required_input_fields_of(gen: dict[str, Any]) -> set[str]:
         required: set[str] = set()
         try:
             inputs = gen.get('inputs')
@@ -8451,8 +8846,68 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
             pass
         return required
 
+    def _all_input_fields_of(gen: dict[str, Any]) -> set[str]:
+        fields: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get('name') or '').strip()
+                    if name:
+                        fields.add(name)
+        except Exception:
+            pass
+        return fields
+
+    def _required_inputs_of(gen: dict[str, Any]) -> set[str]:
+        # Effective union: artifact dependencies + required runtime input fields.
+        try:
+            return _artifact_requires_of(gen) | _required_input_fields_of(gen)
+        except Exception:
+            return set()
+
+    def _artifact_produces_of(gen: dict[str, Any]) -> set[str]:
+        provides: set[str] = set()
+        try:
+            pid = str(gen.get('id') or '').strip()
+            plugin = plugins_by_id.get(pid)
+            if isinstance(plugin, dict) and isinstance(plugin.get('produces'), list):
+                for item in (plugin.get('produces') or []):
+                    if not isinstance(item, dict):
+                        continue
+                    a = str(item.get('artifact') or '').strip()
+                    if a:
+                        provides.add(a)
+        except Exception:
+            pass
+        return provides
+
+    def _output_fields_of(gen: dict[str, Any]) -> set[str]:
+        out_fields: set[str] = set()
+        try:
+            outputs = gen.get('outputs')
+            if isinstance(outputs, list):
+                for outp in outputs:
+                    if not isinstance(outp, dict):
+                        continue
+                    nm = str(outp.get('name') or '').strip()
+                    if nm:
+                        out_fields.add(nm)
+        except Exception:
+            pass
+        return out_fields
+
     def _provides_of(gen: dict[str, Any]) -> set[str]:
         provides: set[str] = set()
+
+        # Plugin-level produces (artifact dependencies).
+        try:
+            provides |= _artifact_produces_of(gen)
+        except Exception:
+            pass
+
         try:
             prov = gen.get('provides')
             if isinstance(prov, list):
@@ -8463,14 +8918,7 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
         except Exception:
             pass
         try:
-            outputs = gen.get('outputs')
-            if isinstance(outputs, list):
-                for outp in outputs:
-                    if not isinstance(outp, dict):
-                        continue
-                    nm = str(outp.get('name') or '').strip()
-                    if nm:
-                        provides.add(nm)
+            provides |= _output_fields_of(gen)
         except Exception:
             pass
         return provides
@@ -8485,20 +8933,28 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
         'flag_prefix',
         'username_prefix',
         'key_len',
+        'node_name',
     }
     prev_outputs: set[str] = set()
 
     for i, cid in enumerate(chain_ids):
+        node = id_to_node.get(str(cid)) or {}
+        is_vuln_node = bool(node.get('is_vuln')) or (str(cid) in vuln_ids)
+        # Vulnerability nodes are candidates for flag sequencing, but only for flag-generator
+        # assignments (not flag-node-generator).
+        pool = [g for g in eligible_gens if (not is_vuln_node) or (str(g.get('_flow_kind') or '') == 'flag-generator')]
+        if not pool:
+            pool = eligible_gens
         # Enforce chainability:
         # - prefer generators whose required inputs are satisfied by the previous step's outputs
         #   (plus globally-available synthesized inputs)
         if i == 0:
-            feasible = [g for g in eligible_gens if _required_inputs_of(g).issubset(available)]
+            feasible = [g for g in pool if _required_inputs_of(g).issubset(available)]
         else:
             satisfied_now = prev_outputs | available
-            feasible = [g for g in eligible_gens if _required_inputs_of(g) and _required_inputs_of(g).issubset(satisfied_now)]
+            feasible = [g for g in pool if _required_inputs_of(g) and _required_inputs_of(g).issubset(satisfied_now)]
             if not feasible:
-                feasible = [g for g in eligible_gens if _required_inputs_of(g).issubset(satisfied_now)]
+                feasible = [g for g in pool if _required_inputs_of(g).issubset(satisfied_now)]
 
         if feasible:
             if rnd is not None:
@@ -8511,7 +8967,7 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
         else:
             # If the catalog doesn't contain a seed (or no compatible step exists),
             # fall back to a stable rotation.
-            gen = eligible_gens[i % len(eligible_gens)]
+            gen = pool[i % len(pool)]
 
         # Update outputs for the next hop.
         try:
@@ -8521,33 +8977,487 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
             pass
 
         next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
-        hint_tpl = str(gen.get('hint_template') or '').strip() or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+        hint_templates = _flow_hint_templates_from_generator(gen)
+        hint_tpl = hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+        rendered_hints = [
+            _render_hint(t, this_id=str(cid), next_id=str(next_id))
+            for t in (hint_templates or [])
+        ]
+
+        requires_artifacts = sorted(list(_artifact_requires_of(gen)))
+        produces_artifacts = sorted(list(_artifact_produces_of(gen)))
+        input_fields_required = sorted(list(_required_input_fields_of(gen)))
+        input_fields_all = sorted(list(_all_input_fields_of(gen)))
+        input_fields_optional = sorted([x for x in input_fields_all if x and x not in set(input_fields_required)])
+        output_fields = sorted(list(_output_fields_of(gen)))
+
         out.append({
             'node_id': str(cid),
             'id': str(gen.get('id') or ''),
             'name': str(gen.get('name') or ''),
-            'type': 'flag-generator',
+            'type': str(gen.get('_flow_kind') or 'flag-generator'),
             'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
+            'generator_catalog': str(gen.get('_flow_catalog') or 'flag_generators'),
             'language': str(gen.get('language') or ''),
+            # Effective union (used for chaining feasibility / ordering validation).
             'inputs': sorted(list(_required_inputs_of(gen))),
             'outputs': sorted(list(_provides_of(gen))),
+
+            # Split-out views for UI transparency.
+            'requires': requires_artifacts,
+            'produces': produces_artifacts,
+            'input_fields': input_fields_all,
+            'input_fields_required': input_fields_required,
+            'input_fields_optional': input_fields_optional,
+            'output_fields': output_fields,
             'hint_template': hint_tpl,
-            'hint': _render_hint(hint_tpl, this_id=str(cid), next_id=str(next_id)),
+            'hint_templates': hint_templates,
+            'hint': rendered_hints[0] if rendered_hints else _render_hint(hint_tpl, this_id=str(cid), next_id=str(next_id)),
+            'hints': rendered_hints,
             'next_node_id': str(next_id),
             'next_node_name': str(id_to_name.get(str(next_id)) or ''),
         })
     return out
 
 
+def _flow_synthesized_inputs() -> set[str]:
+    """Inputs we can always synthesize deterministically at preview time.
+
+    Keep this in sync with _flow_compute_flag_assignments() and _flow_default_generator_config().
+    """
+    return {
+        'seed',
+        'secret',
+        'env_name',
+        'challenge',
+        'flag_prefix',
+        'username_prefix',
+        'key_len',
+        'node_name',
+    }
+
+
+def _flow_parse_bool(value: Any, *, default: bool = False) -> bool:
+    """Parse a truthy/falsey value commonly used in query args/JSON."""
+    if value is None:
+        return default
+    try:
+        if isinstance(value, bool):
+            return bool(value)
+        s = str(value).strip().lower()
+    except Exception:
+        return default
+    if s in ('1', 'true', 'yes', 'y', 'on'):
+        return True
+    if s in ('0', 'false', 'no', 'n', 'off'):
+        return False
+    return default
+
+
+def _flow_validate_chain_order_by_requires_produces(
+    chain_nodes: list[dict[str, Any]],
+    flag_assignments: list[dict[str, Any]],
+    *,
+    scenario_label: str,
+    plugins_by_id_override: dict[str, dict[str, Any]] | None = None,
+) -> tuple[bool, list[str]]:
+    """Validate that the given chain order is solvable by requires/produces.
+
+    This is a strict, linear check in the *current* order:
+    - Each step's effective requires must be satisfied by synthesized inputs or prior produces.
+    - Effective requires/produces are derived from v3 plugin contracts, plus assignment-declared
+      inputs/outputs (best-effort) to support coarse catalogs.
+
+    Returns: (ok, errors)
+    """
+    errors: list[str] = []
+    if not isinstance(chain_nodes, list) or not chain_nodes:
+        return False, ['missing chain nodes']
+    if not isinstance(flag_assignments, list) or not flag_assignments:
+        return False, ['missing flag assignments']
+
+    chain_ids: list[str] = [
+        str(n.get('id') or '').strip()
+        for n in chain_nodes
+        if isinstance(n, dict) and str(n.get('id') or '').strip()
+    ]
+    if not chain_ids:
+        return False, ['empty chain']
+
+    assign_by_node: dict[str, dict[str, Any]] = {}
+    for a in flag_assignments:
+        if not isinstance(a, dict):
+            continue
+        nid = str(a.get('node_id') or '').strip()
+        if nid:
+            assign_by_node[nid] = a
+
+    if any(cid not in assign_by_node for cid in chain_ids):
+        return False, ['missing assignment for at least one chain node']
+
+    if isinstance(plugins_by_id_override, dict) and plugins_by_id_override:
+        plugins_by_id = plugins_by_id_override
+    else:
+        plugins_by_id = _flow_enabled_plugin_contracts_by_id()
+
+    available: set[str] = set(_flow_synthesized_inputs())
+
+    for cid in chain_ids:
+        a = assign_by_node.get(cid) or {}
+        plugin_id = str(a.get('id') or '').strip()
+        if not plugin_id:
+            errors.append(f"{cid}: missing generator id")
+            continue
+
+        plugin = plugins_by_id.get(plugin_id)
+        if not isinstance(plugin, dict):
+            errors.append(f"{cid}: unknown plugin '{plugin_id}'")
+            continue
+
+        inferred_requires = {str(x).strip() for x in (a.get('inputs') or []) if str(x).strip()}
+        inferred_produces = {str(x).strip() for x in (a.get('outputs') or []) if str(x).strip()}
+
+        base_requires = {str(x).strip() for x in (plugin.get('requires') or []) if str(x).strip()} if isinstance(plugin.get('requires'), list) else set()
+        requires = base_requires | inferred_requires
+
+        base_prod: set[str] = set()
+        try:
+            for p in (plugin.get('produces') or []):
+                if not isinstance(p, dict):
+                    continue
+                art = str(p.get('artifact') or '').strip()
+                if art:
+                    base_prod.add(art)
+        except Exception:
+            base_prod = set()
+        produces = base_prod | inferred_produces
+
+        missing = sorted(list({r for r in requires if r not in available}))
+        if missing:
+            errors.append(f"{cid}: requires {missing} before they are produced")
+
+        available |= produces
+
+    if errors:
+        # Include minimal context; callers may surface this in API error details.
+        return False, errors
+    return True, []
+
+
+def _flow_enabled_plugin_contracts_by_id() -> dict[str, dict[str, Any]]:
+    """Return enabled v3 plugin contracts indexed by plugin_id.
+
+    This loads only the plugin contracts (not merged generator views) for both
+    flag-generators and flag-node-generators.
+    """
+    plugins_by_id: dict[str, dict[str, Any]] = {}
+
+    def _ingest_state(state: dict) -> None:
+        try:
+            sources = state.get('sources') or []
+        except Exception:
+            sources = []
+        for s in sources:
+            if not isinstance(s, dict):
+                continue
+            if not s.get('enabled', False):
+                continue
+            path = s.get('path')
+            ok, _note, doc, _skipped = _validate_and_normalize_flag_generator_source_json(path)
+            if not ok or not isinstance(doc, dict):
+                continue
+            for p in (doc.get('plugins') or []):
+                if not isinstance(p, dict):
+                    continue
+                pid = str(p.get('plugin_id') or '').strip()
+                if pid and pid not in plugins_by_id:
+                    plugins_by_id[pid] = p
+
+    try:
+        _ingest_state(_load_flag_generator_sources_state())
+    except Exception:
+        pass
+    try:
+        _ingest_state(_load_flag_node_generator_sources_state())
+    except Exception:
+        pass
+
+    return plugins_by_id
+
+
+def _flow_reorder_chain_by_generator_dag(
+    chain_nodes: list[dict[str, Any]],
+    flag_assignments: list[dict[str, Any]],
+    *,
+    scenario_label: str,
+    plugins_by_id_override: dict[str, dict[str, Any]] | None = None,
+    return_debug: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
+    """Best-effort: reorder the chain using generator artifact dependencies.
+
+    This does not change generator selection; it only reorders the existing
+    chain nodes + assignments so that inputs are satisfied by some producer.
+
+    If the DAG cannot be built, returns inputs unchanged.
+    """
+    try:
+        if not isinstance(chain_nodes, list) or not chain_nodes:
+            return chain_nodes, flag_assignments, None
+        if not isinstance(flag_assignments, list) or not flag_assignments:
+            return chain_nodes, flag_assignments, None
+
+        from core_topo_gen.sequencer.dag import build_dag
+        from core_topo_gen.sequencer.chain import validate_chain_doc, validate_linear_chain
+
+        node_by_id: dict[str, dict[str, Any]] = {}
+        for n in chain_nodes:
+            if not isinstance(n, dict):
+                continue
+            nid = str(n.get('id') or '').strip()
+            if nid:
+                node_by_id[nid] = n
+
+        assign_by_node: dict[str, dict[str, Any]] = {}
+        for a in flag_assignments:
+            if not isinstance(a, dict):
+                continue
+            nid = str(a.get('node_id') or '').strip()
+            if nid:
+                assign_by_node[nid] = a
+
+        # Only reorder when we have a 1:1 mapping.
+        chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()]
+        if not chain_ids:
+            return chain_nodes, flag_assignments, None
+        if any(cid not in assign_by_node for cid in chain_ids):
+            return chain_nodes, flag_assignments, None
+
+        plugins_by_id: dict[str, dict[str, Any]] = {}
+        if isinstance(plugins_by_id_override, dict) and plugins_by_id_override:
+            plugins_by_id = plugins_by_id_override
+        else:
+            plugins_by_id = _flow_enabled_plugin_contracts_by_id()
+
+        # Build a real sequencer chain instance (YAML-shape) from the current Flow chain.
+        #
+        # Important: some catalogs may omit requires/produces details or keep them coarse.
+        # For Flow ordering we also incorporate the assignment-derived inputs/outputs as
+        # additional requires/produces to avoid a no-op DAG.
+        chain_doc: dict[str, Any] = {
+            'ctf': {
+                'id': str(scenario_label or '').strip() or 'flow',
+                'version': 'flow',
+                'difficulty': 'unknown',
+                'description': 'Generated from Flow Sequencing assignments',
+            },
+            'challenges': [],
+        }
+
+        effective_plugins_by_id: dict[str, dict[str, Any]] = dict(plugins_by_id or {})
+        challenges: list[dict[str, Any]] = []
+        for cid in chain_ids:
+            a = assign_by_node.get(cid) or {}
+            plugin_id = str(a.get('id') or '').strip()
+            if not plugin_id:
+                return chain_nodes, flag_assignments, None
+            plugin = plugins_by_id.get(plugin_id)
+            if not isinstance(plugin, dict):
+                # Without the plugin contract we can't build a correct artifact DAG.
+                return chain_nodes, flag_assignments, None
+
+            inferred_requires = [str(x).strip() for x in (a.get('inputs') or []) if str(x).strip()]
+            inferred_produces = [str(x).strip() for x in (a.get('outputs') or []) if str(x).strip()]
+
+            # Build an "effective" plugin contract for DAG purposes.
+            try:
+                eff = dict(plugin)
+            except Exception:
+                eff = plugin
+
+            try:
+                base_req = [str(x).strip() for x in (eff.get('requires') or []) if str(x).strip()] if isinstance(eff, dict) else []
+            except Exception:
+                base_req = []
+            eff_requires = sorted(list({*base_req, *inferred_requires}))
+            if isinstance(eff, dict):
+                eff['requires'] = eff_requires
+
+            base_prod_set: set[str] = set()
+            try:
+                for p in (eff.get('produces') or []) if isinstance(eff, dict) else []:
+                    if not isinstance(p, dict):
+                        continue
+                    art = str(p.get('artifact') or '').strip()
+                    if art:
+                        base_prod_set.add(art)
+            except Exception:
+                base_prod_set = set()
+            eff_prod_set = {*(base_prod_set), *(set(inferred_produces))}
+            if isinstance(eff, dict):
+                eff['produces'] = [{'artifact': x} for x in sorted(list(eff_prod_set))]
+
+            effective_plugins_by_id[plugin_id] = eff
+
+            kind = str(plugin.get('plugin_type') or a.get('type') or 'flag-generator').strip() or 'flag-generator'
+
+            # Populate YAML-chain fields for validation/debug. Note: instance.requires is
+            # intentionally empty; plugin.requires drives dependencies.
+            produces_list: list[dict[str, str]] = []
+            try:
+                for p in (eff.get('produces') or []):
+                    if not isinstance(p, dict):
+                        continue
+                    art = str(p.get('artifact') or '').strip()
+                    if art:
+                        produces_list.append({'name': art, 'artifact': art})
+            except Exception:
+                produces_list = []
+
+            requires_list: list[dict[str, str]] = []
+            try:
+                for art in (eff.get('requires') or []):
+                    a2 = str(art or '').strip()
+                    if a2:
+                        requires_list.append({'artifact': a2})
+            except Exception:
+                requires_list = []
+
+            ch = {
+                'challenge_id': cid,
+                'kind': kind,
+                'generator': {'plugin': plugin_id},
+                'requires': requires_list,
+                'produces': produces_list,
+            }
+            chain_doc['challenges'].append(ch)
+
+            # Also build the challenge instances for build_dag (it reads generator.plugin).
+            challenges.append(ch)
+
+        chain_ok, chain_errors, chain_norm = validate_chain_doc(chain_doc)
+
+        dag, errors = build_dag(challenges, plugins_by_id=effective_plugins_by_id, initial_artifacts=sorted(list(_flow_synthesized_inputs())))
+        debug: dict[str, Any] | None = None
+        if return_debug:
+            try:
+                debug = {
+                    'ok': bool(dag is not None),
+                    'errors': list(errors or []),
+                    'initial_artifacts': sorted(list(_flow_synthesized_inputs())),
+                    'chain_ok': bool(chain_ok),
+                    'chain_errors': list(chain_errors or []),
+                }
+                if dag is not None:
+                    debug['order'] = list(dag.order)
+                    debug['edges'] = [
+                        {'src': e.src, 'dst': e.dst, 'artifact': e.artifact}
+                        for e in (dag.edges or ())
+                    ]
+            except Exception:
+                debug = None
+        if dag is None:
+            return chain_nodes, flag_assignments, debug
+
+        order = [str(x) for x in (dag.order or ()) if str(x).strip()]
+        if not order:
+            return chain_nodes, flag_assignments, debug
+        if set(order) != set(chain_ids):
+            return chain_nodes, flag_assignments, debug
+
+        # Reorder nodes + assignments.
+        new_chain_nodes = [node_by_id[cid] for cid in order if cid in node_by_id]
+        new_assignments = [assign_by_node[cid] for cid in order if cid in assign_by_node]
+        if len(new_chain_nodes) != len(chain_nodes) or len(new_assignments) != len(flag_assignments):
+            return chain_nodes, flag_assignments, debug
+
+        # Optional: validate that the new order is linearly solvable by the chain spec.
+        # This uses only instance produces/requires; since we keep instance.requires empty,
+        # this is expected to succeed (and is primarily a sanity check).
+        if debug is not None:
+            try:
+                reordered_doc = dict(chain_norm or {})
+                reordered_doc['challenges'] = [
+                    next((c for c in (chain_norm.get('challenges') or []) if isinstance(c, dict) and str(c.get('challenge_id') or '') == cid), None)
+                    for cid in order
+                ]
+                reordered_doc['challenges'] = [c for c in reordered_doc['challenges'] if isinstance(c, dict)]
+                lin_ok, lin_errors = validate_linear_chain(reordered_doc, initial_artifacts=sorted(list(_flow_synthesized_inputs())))
+                debug['linear_ok'] = bool(lin_ok)
+                debug['linear_errors'] = list(lin_errors or [])
+            except Exception:
+                pass
+
+        # Update NEXT placeholders in hints for the new order.
+        id_to_name: dict[str, str] = {}
+        for n in new_chain_nodes:
+            try:
+                nid = str(n.get('id') or '').strip()
+                nm = str(n.get('name') or '').strip()
+                if nid:
+                    id_to_name[nid] = nm or nid
+            except Exception:
+                continue
+
+        def _render_hint(tpl: str, *, this_id: str, next_id: str) -> str:
+            try:
+                text = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
+                next_id_val = str(next_id or '').strip()
+                next_name_val = (id_to_name.get(next_id_val) or '').strip() if next_id_val else ''
+                if not next_id_val:
+                    next_id_val = '(end)'
+                if not next_name_val:
+                    next_name_val = '(end)'
+                repl = {
+                    '{{SCENARIO}}': str(scenario_label or ''),
+                    '{{THIS_NODE_ID}}': this_id,
+                    '{{THIS_NODE_NAME}}': id_to_name.get(this_id) or this_id,
+                    '{{NEXT_NODE_ID}}': next_id_val,
+                    '{{NEXT_NODE_NAME}}': next_name_val,
+                }
+                for k, v in repl.items():
+                    text = text.replace(k, str(v))
+                return text
+            except Exception:
+                return ''
+
+        for i, a in enumerate(new_assignments):
+            try:
+                this_id = str(a.get('node_id') or '').strip()
+                next_id = order[i + 1] if (i + 1) < len(order) else ''
+                hint_templates: list[str] = []
+                try:
+                    ht = a.get('hint_templates')
+                    if isinstance(ht, list) and ht:
+                        hint_templates = [str(x or '').strip() for x in ht if str(x or '').strip()]
+                except Exception:
+                    hint_templates = []
+                tpl = str(a.get('hint_template') or '').strip() or (hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})')
+                a['next_node_id'] = str(next_id)
+                a['next_node_name'] = str(id_to_name.get(str(next_id)) or '')
+                rendered = [_render_hint(t, this_id=this_id, next_id=str(next_id)) for t in (hint_templates or [tpl])]
+                a['hint'] = rendered[0] if rendered else _render_hint(tpl, this_id=this_id, next_id=str(next_id))
+                a['hints'] = rendered
+            except Exception:
+                continue
+
+        return new_chain_nodes, new_assignments, debug
+    except Exception:
+        return chain_nodes, flag_assignments, None
+
+
 @app.route('/api/flag-sequencing/attackflow_preview')
 def api_flow_attackflow_preview():
     scenario_label = (request.args.get('scenario') or '').strip()
     scenario_norm = _normalize_scenario_label(scenario_label)
+    preset = str(request.args.get('preset') or '').strip()
     length_raw = request.args.get('length')
     try:
         length = int(length_raw) if length_raw is not None else 5
     except Exception:
         length = 5
+    preset_steps = _flow_preset_steps(preset)
+    if preset_steps:
+        length = len(preset_steps)
     length = max(1, min(length, 50))
     requested_length = length
 
@@ -8600,30 +9510,34 @@ def api_flow_attackflow_preview():
     # If the latest plan is flow-modified, prefer the saved chain order.
     chain_nodes: list[dict[str, Any]] = []
     used_saved_chain = False
-    try:
-        meta = payload.get('metadata') if isinstance(payload, dict) else None
-        flow_meta = meta.get('flow') if isinstance(meta, dict) else None
-        saved_chain = flow_meta.get('chain') if isinstance(flow_meta, dict) else None
-        saved_ids: list[str] = []
-        if isinstance(saved_chain, list) and saved_chain:
-            for entry in saved_chain:
-                if not isinstance(entry, dict):
-                    continue
-                cid = str(entry.get('id') or '').strip()
-                if cid:
-                    saved_ids.append(cid)
-        if saved_ids:
-            id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
-            # Honor requested length (truncate) but do not try to auto-extend.
-            desired = saved_ids[:length]
-            chain_nodes = [id_map[cid] for cid in desired if cid in id_map]
-            if chain_nodes:
-                used_saved_chain = True
-    except Exception:
-        chain_nodes = []
+    if not preset_steps:
+        try:
+            meta = payload.get('metadata') if isinstance(payload, dict) else None
+            flow_meta = meta.get('flow') if isinstance(meta, dict) else None
+            saved_chain = flow_meta.get('chain') if isinstance(flow_meta, dict) else None
+            saved_ids: list[str] = []
+            if isinstance(saved_chain, list) and saved_chain:
+                for entry in saved_chain:
+                    if not isinstance(entry, dict):
+                        continue
+                    cid = str(entry.get('id') or '').strip()
+                    if cid:
+                        saved_ids.append(cid)
+            if saved_ids:
+                id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
+                # Honor requested length (truncate) but do not try to auto-extend.
+                desired = saved_ids[:length]
+                chain_nodes = [id_map[cid] for cid in desired if cid in id_map]
+                if chain_nodes:
+                    used_saved_chain = True
+        except Exception:
+            chain_nodes = []
 
     if not chain_nodes:
-        chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
+        if preset_steps:
+            chain_nodes = _pick_flag_chain_nodes_for_preset(nodes, adj, steps=preset_steps)
+        else:
+            chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
 
     # If we loaded a saved chain that is shorter than the requested length (e.g. the UI
     # reset its length input to the default on refresh), treat the saved chain as
@@ -8660,14 +9574,43 @@ def api_flow_attackflow_preview():
         flag_assignments = []
 
     if not flag_assignments:
-        flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+        if preset_steps and not used_saved_chain:
+            preset_assignments, preset_err = _flow_compute_flag_assignments_for_preset(preview, chain_nodes, scenario_label or scenario_norm, preset)
+            if preset_err:
+                return jsonify({'ok': False, 'error': f'Preset error: {preset_err}', 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
+            flag_assignments = preset_assignments
+        else:
+            flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+
+    # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
+    # Presets force an intended generator order and should not be reordered.
+    if (not used_saved_chain) and (not preset_steps):
+        debug_dag = str(request.args.get('debug_dag') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+        chain_nodes, flag_assignments, dag_debug = _flow_reorder_chain_by_generator_dag(
+            chain_nodes,
+            flag_assignments,
+            scenario_label=(scenario_label or scenario_norm),
+            return_debug=bool(debug_dag),
+        )
+    else:
+        debug_dag = str(request.args.get('debug_dag') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+        dag_debug = None
+
+    # Validate (non-blocking): if invalid, the UI should warn and execution should
+    # proceed without flags.
+    flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
+        chain_nodes,
+        flag_assignments,
+        scenario_label=(scenario_label or scenario_norm),
+    )
+    flags_enabled = bool(flow_valid)
 
     if len(chain_nodes) < 1:
-        return jsonify({'ok': False, 'error': 'No eligible Docker nodes found in preview plan.' , 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
+        return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan (Docker role or vulnerability nodes).', 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
     if (not used_saved_chain) and len(chain_nodes) < length:
         return jsonify({
             'ok': False,
-            'error': f'Only {len(chain_nodes)} eligible Docker nodes found for chain length {length}.',
+            'error': f'Only {len(chain_nodes)} eligible nodes found for chain length {length}.',
             'available': len(chain_nodes),
             'stats': stats,
             'preview_plan_path': preview_plan_path,
@@ -8684,7 +9627,12 @@ def api_flow_attackflow_preview():
         'flag_assignments': flag_assignments,
         'stats': stats,
         'bundle': bundle,
+        'flow_valid': bool(flow_valid),
+        'flow_errors': list(flow_errors or []),
+        'flags_enabled': bool(flags_enabled),
     }
+    if debug_dag:
+        out['sequencer_dag'] = dag_debug or {'ok': False, 'errors': ['not computed (saved chain)']}
 
     if (request.args.get('download') or '').strip() in {'1', 'true', 'yes'}:
         payload_b = json.dumps(bundle, ensure_ascii=False, indent=2).encode('utf-8')
@@ -8704,10 +9652,14 @@ def api_flow_prepare_preview_for_execute():
     j = request.get_json(silent=True) or {}
     scenario_label = str(j.get('scenario') or '').strip()
     scenario_norm = _normalize_scenario_label(scenario_label)
+    preset = str(j.get('preset') or '').strip()
     try:
         length = int(j.get('length') or 5)
     except Exception:
         length = 5
+    preset_steps = _flow_preset_steps(preset)
+    if preset_steps:
+        length = len(preset_steps)
     length = max(1, min(length, 50))
     requested_length = length
 
@@ -8754,15 +9706,55 @@ def api_flow_prepare_preview_for_execute():
                 chain_ids.append(c)
         chain_ids = chain_ids[:length]
 
+    explicit_chain = bool(chain_ids)
+
     if chain_ids:
         id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict)}
         chain_nodes = [id_map[cid] for cid in chain_ids if cid in id_map]
+        # Presets require certain steps to run on non-vulnerability docker nodes.
+        # If the UI provided a chain that violates this (common when many vuln nodes exist),
+        # best-effort swap in an eligible docker node.
+        if preset_steps and chain_nodes:
+            try:
+                used = {str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict)}
+                for i, step in enumerate(preset_steps[:len(chain_nodes)]):
+                    if str((step or {}).get('kind') or '').strip() != 'flag-node-generator':
+                        continue
+                    node = chain_nodes[i] if i < len(chain_nodes) else None
+                    if not isinstance(node, dict):
+                        continue
+                    if not bool(node.get('is_vuln')):
+                        continue
+                    replacement = None
+                    for cand in (nodes or []):
+                        if not isinstance(cand, dict):
+                            continue
+                        cid = str(cand.get('id') or '').strip()
+                        if not cid or cid in used:
+                            continue
+                        t_raw = str(cand.get('type') or '')
+                        t = t_raw.strip().lower()
+                        is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
+                        if is_docker and not bool(cand.get('is_vuln')):
+                            replacement = cand
+                            break
+                    if replacement is not None:
+                        rid = str(replacement.get('id') or '').strip()
+                        if rid:
+                            chain_nodes[i] = replacement
+                            chain_ids[i] = rid
+                            used.add(rid)
+            except Exception:
+                pass
         if len(chain_nodes) < 1:
             return jsonify({'ok': False, 'error': 'Provided chain_ids did not match any nodes in the preview plan.', 'stats': stats}), 422
     else:
-        chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
+        if preset_steps:
+            chain_nodes = _pick_flag_chain_nodes_for_preset(nodes, adj, steps=preset_steps)
+        else:
+            chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
         if len(chain_nodes) < length:
-            return jsonify({'ok': False, 'error': 'Not enough eligible Docker nodes in preview plan to build the requested chain.', 'available': len(chain_nodes), 'stats': stats}), 422
+            return jsonify({'ok': False, 'error': 'Not enough eligible nodes in preview plan to build the requested chain.', 'available': len(chain_nodes), 'stats': stats}), 422
         chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if str(n.get('id') or '').strip()]
 
     # Caller may pass fewer ids than requested length; persist effective length.
@@ -8771,29 +9763,74 @@ def api_flow_prepare_preview_for_execute():
     except Exception:
         pass
 
-    # Apply Flow modifications to the preview payload: promote chain nodes to Docker role.
-    try:
-        hosts = preview.get('hosts') or []
-        if isinstance(hosts, list):
-            for h in hosts:
-                if not isinstance(h, dict):
-                    continue
-                hid = str(h.get('node_id') or '').strip()
-                if hid and hid in chain_ids:
-                    h['role'] = 'Docker'
-    except Exception:
-        pass
-
     # Inject generator metadata into chain nodes.
     # Flag-generators should NOT create nodes/services; they generate artifacts/flags that can be
     # inserted into existing Docker nodes.
-    flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+    if preset_steps:
+        preset_assignments, preset_err = _flow_compute_flag_assignments_for_preset(preview, chain_nodes, scenario_label or scenario_norm, preset)
+        if preset_err:
+            return jsonify({'ok': False, 'error': f'Preset error: {preset_err}'}), 422
+        flag_assignments = preset_assignments
+    else:
+        flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
 
-    # Load generator catalog once so we can prune config to declared inputs.
-    try:
-        _gens_for_cfg, _ = _flag_generators_from_enabled_sources()
-    except Exception:
+    # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
+    # Note: chain_ids is populated for both explicit and auto-picked chains; use explicit_chain.
+    if (not explicit_chain) and (not preset_steps):
+        debug_dag = bool(j.get('debug_dag'))
+        chain_nodes, flag_assignments, dag_debug = _flow_reorder_chain_by_generator_dag(
+            chain_nodes,
+            flag_assignments,
+            scenario_label=(scenario_label or scenario_norm),
+            return_debug=bool(debug_dag),
+        )
+        try:
+            chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()]
+        except Exception:
+            pass
+    else:
+        debug_dag = bool(j.get('debug_dag'))
+        dag_debug = None
+
+    # Validate (non-blocking): if invalid, we still allow execution but we do not
+    # inject or run any flags.
+    flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
+        chain_nodes,
+        flag_assignments,
+        scenario_label=(scenario_label or scenario_norm),
+    )
+    flags_enabled = bool(flow_valid)
+
+    # Apply Flow modifications and run generators only when the flow is valid.
+    if flags_enabled:
+        # Promote chain nodes to Docker role (flag payloads attach to Docker nodes).
+        try:
+            hosts = preview.get('hosts') or []
+            if isinstance(hosts, list):
+                for h in hosts:
+                    if not isinstance(h, dict):
+                        continue
+                    hid = str(h.get('node_id') or '').strip()
+                    if hid and hid in chain_ids:
+                        h['role'] = 'Docker'
+        except Exception:
+            pass
+
+    # Load generator catalogs once so we can prune config to declared inputs.
+    # Only needed when flags are enabled.
+    if flags_enabled:
+        try:
+            _gens_for_cfg, _ = _flag_generators_from_enabled_sources()
+        except Exception:
+            _gens_for_cfg = []
+        try:
+            _node_gens_for_cfg, _ = _flag_node_generators_from_enabled_sources()
+        except Exception:
+            _node_gens_for_cfg = []
+    else:
         _gens_for_cfg = []
+        _node_gens_for_cfg = []
+
     _gen_by_id: dict[str, dict[str, Any]] = {}
     try:
         for _g in (_gens_for_cfg or []):
@@ -8801,6 +9838,12 @@ def api_flow_prepare_preview_for_execute():
                 continue
             _gid = str(_g.get('id') or '').strip()
             if _gid:
+                _gen_by_id[_gid] = _g
+        for _g in (_node_gens_for_cfg or []):
+            if not isinstance(_g, dict):
+                continue
+            _gid = str(_g.get('id') or '').strip()
+            if _gid and _gid not in _gen_by_id:
                 _gen_by_id[_gid] = _g
     except Exception:
         _gen_by_id = {}
@@ -8835,7 +9878,7 @@ def api_flow_prepare_preview_for_execute():
             'key_len': 16,
         }
 
-    def _flow_try_run_generator(generator_id: str, *, out_dir: str, config: dict[str, Any]) -> tuple[bool, str, str | None]:
+    def _flow_try_run_generator(generator_id: str, *, out_dir: str, config: dict[str, Any], catalog: str = 'flag_generators') -> tuple[bool, str, str | None]:
         """Best-effort run of scripts/run_flag_generator.py.
 
         Returns: (ok, note_or_error, manifest_path)
@@ -8846,16 +9889,11 @@ def api_flow_prepare_preview_for_execute():
             if not os.path.exists(runner_path):
                 return False, 'runner script not found', None
 
-            try:
-                docker_ok = bool(shutil.which('docker'))
-            except Exception:
-                docker_ok = False
-            if not docker_ok:
-                return False, 'docker not found; skipping generator execution', None
-
             cmd = [
                 sys.executable or 'python',
                 runner_path,
+                '--catalog',
+                str(catalog or 'flag_generators'),
                 '--generator-id',
                 generator_id,
                 '--out-dir',
@@ -8886,226 +9924,348 @@ def api_flow_prepare_preview_for_execute():
             return False, 'generator timed out', None
         except Exception as exc:
             return False, f'generator exception: {exc}', None
-    try:
-        host_by_id: dict[str, dict[str, Any]] = {}
-        hosts = preview.get('hosts') or []
-        if isinstance(hosts, list):
-            for h in hosts:
-                if not isinstance(h, dict):
+    if flags_enabled:
+        try:
+            host_by_id: dict[str, dict[str, Any]] = {}
+            hosts = preview.get('hosts') or []
+            if isinstance(hosts, list):
+                for h in hosts:
+                    if not isinstance(h, dict):
+                        continue
+                    host_by_id[str(h.get('node_id') or '').strip()] = h
+
+            # Flow has a "god-eye" view of generator outputs across the chain. As we run each
+            # generator, we capture outputs.json and feed those values into subsequent generator
+            # configs when they declare matching input names (e.g. network.ip, credential.pair).
+            flow_context: dict[str, Any] = {}
+
+            def _apply_outputs_to_hint_text(text_in: str, outs: dict[str, Any]) -> str:
+                """Replace {{OUTPUT.key}} and {{OUTPUT.key:transform}} placeholders."""
+                try:
+                    text = str(text_in or '')
+                except Exception:
+                    return str(text_in or '')
+                if not text or not isinstance(outs, dict) or not outs:
+                    return text
+                try:
+                    pattern = re.compile(r"\{\{OUTPUT\.([^}:]+?)(?::([^}]+?))?\}\}")
+                except Exception:
+                    return text
+
+                def _render_value(val: Any) -> str:
+                    if isinstance(val, (dict, list)):
+                        return json.dumps(val, ensure_ascii=False)
+                    return str(val)
+
+                def _transform(val: Any, tf: str) -> str:
+                    t = (tf or '').strip().lower()
+                    s = _render_value(val)
+                    if not t:
+                        return s
+                    if t in {'last_octet', 'octet4'}:
+                        try:
+                            parts = s.strip().split('.')
+                            if len(parts) == 4:
+                                return parts[3]
+                        except Exception:
+                            pass
+                        return s
+                    if t in {'subnet24', 'cidr24'}:
+                        try:
+                            parts = s.strip().split('.')
+                            if len(parts) == 4:
+                                return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+                        except Exception:
+                            pass
+                        return s
+                    if t in {'redact', 'masked'}:
+                        try:
+                            parts = s.strip().split('.')
+                            if len(parts) == 4:
+                                return f"{parts[0]}.{parts[1]}.{parts[2]}.x"
+                        except Exception:
+                            pass
+                        return s
+                    return s
+
+                def _repl(match: re.Match) -> str:
+                    key = (match.group(1) or '').strip()
+                    tf = (match.group(2) or '').strip()
+                    if not key:
+                        return match.group(0)
+                    if key not in outs:
+                        return match.group(0)
+                    return _transform(outs.get(key), tf)
+
+                try:
+                    return pattern.sub(_repl, text)
+                except Exception:
+                    return text
+
+            generation_failures: list[dict[str, Any]] = []
+            created_run_dirs: list[str] = []
+            for fa in (flag_assignments or []):
+                if not isinstance(fa, dict):
                     continue
-                host_by_id[str(h.get('node_id') or '').strip()] = h
+                cid = str(fa.get('node_id') or '').strip()
+                h = host_by_id.get(cid)
+                if not h or not isinstance(h, dict):
+                    continue
 
-        generation_failures: list[dict[str, Any]] = []
-        created_run_dirs: list[str] = []
-        for fa in (flag_assignments or []):
-            if not isinstance(fa, dict):
-                continue
-            cid = str(fa.get('node_id') or '').strip()
-            h = host_by_id.get(cid)
-            if not h or not isinstance(h, dict):
-                continue
-            meta_h = h.get('metadata')
-            if not isinstance(meta_h, dict):
-                meta_h = {}
-                h['metadata'] = meta_h
-            generator_id = str(fa.get('id') or '').strip()
-            seed_val = preview.get('seed') if isinstance(preview, dict) else None
+                meta_h = h.get('metadata')
+                if not isinstance(meta_h, dict):
+                    meta_h = {}
+                    h['metadata'] = meta_h
 
-            cfg_full = _flow_default_generator_config(fa, seed_val=seed_val)
-            cfg = cfg_full
-            try:
-                gen_def = _gen_by_id.get(generator_id)
-                if isinstance(gen_def, dict):
-                    allowed = _all_input_names_of(gen_def)
-                    # If the generator declares inputs, only pass those (keeps Flow configs relevant).
-                    if allowed:
-                        cfg = {k: v for k, v in cfg_full.items() if k in allowed}
-            except Exception:
+                generator_id = str(fa.get('id') or '').strip()
+                assignment_type = str(fa.get('type') or '').strip() or 'flag-generator'
+                generator_catalog = str(fa.get('generator_catalog') or '').strip() or 'flag_generators'
+                seed_val = preview.get('seed') if isinstance(preview, dict) else None
+
+                cfg_full = _flow_default_generator_config(fa, seed_val=seed_val)
+
+                # Provide basic per-node context for generators that want it.
+                try:
+                    node_name_val = str(h.get('name') or '').strip()
+                    if node_name_val:
+                        cfg_full['node_name'] = node_name_val
+                except Exception:
+                    pass
+
                 cfg = cfg_full
+                try:
+                    gen_def = _gen_by_id.get(generator_id)
+                    if isinstance(gen_def, dict):
+                        allowed = _all_input_names_of(gen_def)
 
-            flow_out_dir = ''
-            ok_run = False
-            note = ''
-            manifest_path = None
-            actual_output_keys: list[str] = []
-            declared_output_keys: list[str] = []
-            try:
-                declared_output_keys = sorted([str(x) for x in (fa.get('outputs') or []) if str(x).strip()])
-            except Exception:
-                declared_output_keys = []
-            mismatch: dict[str, Any] = {}
-            try:
-                if generator_id:
-                    flow_run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
-                    # IMPORTANT: stage under /tmp/vulns so the existing sync pipeline can ship
-                    # these artifacts to the CORE host (where docker-compose paths resolve).
-                    flow_out_dir = os.path.join('/tmp/vulns', 'flag_generators_runs', f"flow-{scenario_norm}-{flow_run_id}")
-                    os.makedirs(flow_out_dir, exist_ok=True)
-                    try:
-                        created_run_dirs.append(str(flow_out_dir))
-                    except Exception:
-                        pass
-                    ok_run, note, manifest_path = _flow_try_run_generator(generator_id, out_dir=flow_out_dir, config=cfg)
+                        # Inject prior outputs into this generator's config, but only for inputs it declares.
+                        try:
+                            if allowed and flow_context:
+                                for k in allowed:
+                                    if k in cfg_full:
+                                        continue
+                                    if k in flow_context:
+                                        cfg_full[k] = flow_context[k]
+                        except Exception:
+                            pass
 
-                    if not ok_run:
+                        # If the generator declares inputs, only pass those (keeps Flow configs relevant).
+                        if allowed:
+                            cfg = {k: v for k, v in cfg_full.items() if k in allowed}
+                except Exception:
+                    cfg = cfg_full
+
+                flow_out_dir = ''
+                ok_run = False
+                note = ''
+                manifest_path = None
+                actual_output_keys: list[str] = []
+                declared_output_keys: list[str] = []
+                try:
+                    # IMPORTANT: outputs.json is a runtime manifest of output KEYS.
+                    # Use output_fields (runtime) when available; fall back to legacy outputs.
+                    declared_src = (fa.get('output_fields') if isinstance(fa.get('output_fields'), list) else None)
+                    if declared_src is None:
+                        declared_src = (fa.get('outputs') if isinstance(fa.get('outputs'), list) else [])
+                    declared_output_keys = sorted([str(x) for x in (declared_src or []) if str(x).strip()])
+                except Exception:
+                    declared_output_keys = []
+                mismatch: dict[str, Any] = {}
+
+                try:
+                    if generator_id:
+                        flow_run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
+                        # IMPORTANT: stage under /tmp/vulns so the existing sync pipeline can ship
+                        # these artifacts to the CORE host (where docker-compose paths resolve).
+                        subdir = 'flag_node_generators_runs' if assignment_type == 'flag-node-generator' else 'flag_generators_runs'
+                        flow_out_dir = os.path.join('/tmp/vulns', subdir, f"flow-{scenario_norm}-{flow_run_id}")
+                        os.makedirs(flow_out_dir, exist_ok=True)
+                        try:
+                            created_run_dirs.append(str(flow_out_dir))
+                        except Exception:
+                            pass
+
+                        ok_run, note, manifest_path = _flow_try_run_generator(
+                            generator_id,
+                            out_dir=flow_out_dir,
+                            config=cfg,
+                            catalog=generator_catalog,
+                        )
+
+                        if not ok_run:
+                            generation_failures.append({
+                                'node_id': cid,
+                                'node_name': str(h.get('name') or ''),
+                                'generator_id': generator_id,
+                                'error': str(note or 'generator execution failed'),
+                                'run_dir': str(flow_out_dir or ''),
+                            })
+
+                        # Materialize a human-readable hint file in the artifacts directory.
+                        try:
+                            hint_texts: list[str] = []
+                            if isinstance(fa.get('hints'), list):
+                                hint_texts = [str(x or '').strip() for x in (fa.get('hints') or []) if str(x or '').strip()]
+                            if not hint_texts:
+                                single = str(fa.get('hint') or '').strip()
+                                if single:
+                                    hint_texts = [single]
+                            if flow_out_dir and hint_texts:
+                                with open(os.path.join(flow_out_dir, 'hint.txt'), 'w', encoding='utf-8') as hf:
+                                    if len(hint_texts) == 1:
+                                        hf.write(hint_texts[0] + "\n")
+                                    else:
+                                        for idx, ht in enumerate(hint_texts, start=1):
+                                            hf.write(f"Hint {idx}/{len(hint_texts)}: {ht}\n")
+                        except Exception:
+                            pass
+
+                        # If the generator produced a manifest, capture the actual output keys.
+                        if ok_run and manifest_path and os.path.exists(manifest_path):
+                            try:
+                                with open(manifest_path, 'r', encoding='utf-8') as f:
+                                    m = json.load(f) or {}
+                                outs = m.get('outputs') if isinstance(m, dict) else None
+                                if isinstance(outs, dict):
+                                    actual_output_keys = sorted([str(k) for k in outs.keys() if str(k).strip()])
+
+                                    # Propagate outputs forward so later generators can consume concrete values.
+                                    try:
+                                        for k, v in outs.items():
+                                            kk = str(k)
+                                            if not kk:
+                                                continue
+                                            flow_context[kk] = v
+                                    except Exception:
+                                        pass
+
+                                    # Substitute output placeholders into hints (best-effort).
+                                    try:
+                                        if isinstance(fa.get('hints'), list) and fa.get('hints'):
+                                            new_hints = [_apply_outputs_to_hint_text(str(t), outs) for t in (fa.get('hints') or [])]
+                                            fa['hints'] = new_hints
+                                            fa['hint'] = str(new_hints[0] or '') if new_hints else str(fa.get('hint') or '')
+                                        else:
+                                            hint_final = _apply_outputs_to_hint_text(str(fa.get('hint') or ''), outs)
+                                            if hint_final and hint_final != str(fa.get('hint') or ''):
+                                                fa['hint'] = hint_final
+                                    except Exception:
+                                        pass
+
+                                    # Best-effort: if the generator emitted a top-level 'flag' value,
+                                    # also write a plain flag.txt for easier participant discovery.
+                                    try:
+                                        flag_val = outs.get('flag')
+                                        if ok_run and flow_out_dir and isinstance(flag_val, str) and flag_val.strip():
+                                            with open(os.path.join(flow_out_dir, 'flag.txt'), 'w', encoding='utf-8') as ff:
+                                                ff.write(flag_val.strip() + "\n")
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                actual_output_keys = []
+
+                        # Compare declared vs actual output keys (best-effort).
+                        try:
+                            if ok_run and actual_output_keys:
+                                declared_set = set(declared_output_keys or [])
+                                actual_set = set(actual_output_keys or [])
+                                missing = sorted(list(declared_set - actual_set))
+                                extra = sorted(list(actual_set - declared_set))
+                                mismatch = {
+                                    'declared': declared_output_keys,
+                                    'actual': actual_output_keys,
+                                    'missing': missing,
+                                    'extra': extra,
+                                    'ok': (not missing and not extra),
+                                }
+                        except Exception:
+                            mismatch = {}
+                except Exception as exc:
+                    ok_run, note, manifest_path = False, f'generator exception: {exc}', None
+                    if generator_id:
                         generation_failures.append({
                             'node_id': cid,
                             'node_name': str(h.get('name') or ''),
                             'generator_id': generator_id,
-                            'error': str(note or 'generator execution failed'),
+                            'error': str(note or ''),
                             'run_dir': str(flow_out_dir or ''),
                         })
 
-                    # Materialize a human-readable hint file in the artifacts directory.
-                    # This is mounted into the target docker node (typically at /flow_artifacts).
-                    # We do this regardless of generator success so the participant can still
-                    # discover the intended next-step instructions from within the node.
-                    try:
-                        hint_text = str(fa.get('hint') or '').strip()
-                        if flow_out_dir and hint_text:
-                            with open(os.path.join(flow_out_dir, 'hint.txt'), 'w', encoding='utf-8') as hf:
-                                hf.write(hint_text + "\n")
-                    except Exception:
-                        pass
+                meta_h['flow_flag'] = {
+                    'type': assignment_type,
+                    'generator_catalog': generator_catalog,
+                    'generator_id': generator_id,
+                    'generator_name': str(fa.get('name') or ''),
+                    'generator_language': str(fa.get('language') or ''),
+                    'generator_source': str(fa.get('flag_generator') or ''),
+                    'artifacts_dir': str(flow_out_dir or ''),
+                    'inputs': list(fa.get('inputs') or []) if isinstance(fa.get('inputs'), list) else [],
+                    'outputs': list(fa.get('outputs') or []) if isinstance(fa.get('outputs'), list) else [],
+                    'hint_template': str(fa.get('hint_template') or ''),
+                    'hint': str(fa.get('hint') or ''),
+                    'next_node_id': str(fa.get('next_node_id') or ''),
+                    'next_node_name': str(fa.get('next_node_name') or ''),
+                    'generated': bool(ok_run),
+                    'generation_note': str(note or ''),
+                    'run_dir': str(flow_out_dir or ''),
+                    'outputs_manifest': str(manifest_path or ''),
+                    'actual_outputs': actual_output_keys,
+                    'declared_outputs': declared_output_keys,
+                    'outputs_match': bool(mismatch.get('ok')) if isinstance(mismatch, dict) and mismatch else True,
+                    'outputs_mismatch': mismatch,
+                    'config': cfg,
+                }
 
-                    # If the generator produced a manifest, capture the actual output keys.
-                    if ok_run and manifest_path and os.path.exists(manifest_path):
+                # Also enrich the assignment itself for the Flow UI response.
+                try:
+                    fa['generated'] = bool(ok_run)
+                    fa['generation_note'] = str(note or '')
+                    fa['artifacts_dir'] = str(flow_out_dir or '')
+                    fa['outputs_manifest'] = str(manifest_path or '')
+                    fa['declared_outputs'] = declared_output_keys
+                    fa['actual_outputs'] = actual_output_keys
+                    fa['outputs_match'] = bool(mismatch.get('ok')) if isinstance(mismatch, dict) and mismatch else True
+                    fa['outputs_mismatch'] = mismatch
+                except Exception:
+                    pass
+
+            if generation_failures:
+                # Cleanup partial artifacts so we don't leave confusing residues behind.
+                try:
+                    base_dir = os.path.abspath(os.path.join('/tmp', 'vulns'))
+                    for d in (created_run_dirs or []):
                         try:
-                            with open(manifest_path, 'r', encoding='utf-8') as f:
-                                m = json.load(f) or {}
-                            outs = m.get('outputs') if isinstance(m, dict) else None
-                            if isinstance(outs, dict):
-                                actual_output_keys = sorted([str(k) for k in outs.keys() if str(k).strip()])
-
-                                # Substitute output placeholders into the hint (best-effort).
-                                try:
-                                    hint_final = str(fa.get('hint') or '')
-                                    for k, v in outs.items():
-                                        kk = str(k)
-                                        if not kk:
-                                            continue
-                                        placeholder = '{{OUTPUT.' + kk + '}}'
-                                        if placeholder not in hint_final:
-                                            continue
-                                        if isinstance(v, (dict, list)):
-                                            vv = json.dumps(v, ensure_ascii=False)
-                                        else:
-                                            vv = str(v)
-                                        hint_final = hint_final.replace(placeholder, vv)
-                                    if hint_final and hint_final != str(fa.get('hint') or ''):
-                                        fa['hint'] = hint_final
-                                except Exception:
-                                    pass
-
-                                # Best-effort: materialize a human-readable hint file in the artifacts directory.
-                                # Note: hint.txt is always materialized above (even without outputs.json).
-
-                                # Best-effort: if the generator emitted a top-level 'flag' value,
-                                # also write a plain flag.txt for easier participant discovery.
-                                try:
-                                    flag_val = outs.get('flag')
-                                    if ok_run and flow_out_dir and isinstance(flag_val, str) and flag_val.strip():
-                                        with open(os.path.join(flow_out_dir, 'flag.txt'), 'w', encoding='utf-8') as ff:
-                                            ff.write(flag_val.strip() + "\n")
-                                except Exception:
-                                    pass
+                            dd = os.path.abspath(str(d))
+                            if os.path.commonpath([dd, base_dir]) != base_dir:
+                                continue
+                            shutil.rmtree(dd, ignore_errors=True)
                         except Exception:
-                            actual_output_keys = []
-
-                    # Compare declared vs actual output keys (best-effort). We keep chaining logic
-                    # based on declared outputs, but record mismatches to help validate generators.
-                    try:
-                        if ok_run and actual_output_keys:
-                            declared_set = set(declared_output_keys or [])
-                            actual_set = set(actual_output_keys or [])
-                            missing = sorted(list(declared_set - actual_set))
-                            extra = sorted(list(actual_set - declared_set))
-                            mismatch = {
-                                'declared': declared_output_keys,
-                                'actual': actual_output_keys,
-                                'missing': missing,
-                                'extra': extra,
-                                'ok': (not missing and not extra),
-                            }
-                    except Exception:
-                        mismatch = {}
-            except Exception as exc:
-                ok_run, note, manifest_path = False, f'generator exception: {exc}', None
-                if generator_id:
-                    generation_failures.append({
-                        'node_id': cid,
-                        'node_name': str(h.get('name') or ''),
-                        'generator_id': generator_id,
-                        'error': str(note or ''),
-                        'run_dir': str(flow_out_dir or ''),
-                    })
-
-            meta_h['flow_flag'] = {
-                'type': 'flag-generator',
-                'generator_id': generator_id,
-                'generator_name': str(fa.get('name') or ''),
-                'generator_language': str(fa.get('language') or ''),
-                'generator_source': str(fa.get('flag_generator') or ''),
-                'artifacts_dir': str(flow_out_dir or ''),
-                'inputs': list(fa.get('inputs') or []) if isinstance(fa.get('inputs'), list) else [],
-                'outputs': list(fa.get('outputs') or []) if isinstance(fa.get('outputs'), list) else [],
-                'hint_template': str(fa.get('hint_template') or ''),
-                'hint': str(fa.get('hint') or ''),
-                'next_node_id': str(fa.get('next_node_id') or ''),
-                'next_node_name': str(fa.get('next_node_name') or ''),
-                'generated': bool(ok_run),
-                'generation_note': str(note or ''),
-                'run_dir': str(flow_out_dir or ''),
-                'outputs_manifest': str(manifest_path or ''),
-                'actual_outputs': actual_output_keys,
-                'declared_outputs': declared_output_keys,
-                'outputs_match': bool(mismatch.get('ok')) if isinstance(mismatch, dict) and mismatch else True,
-                'outputs_mismatch': mismatch,
-                'config': cfg,
-            }
-
-            # Also enrich the assignment itself for the Flow UI response.
-            # This keeps the UI deterministic on declared I/O for chaining, but gives
-            # immediate visibility into schema vs runtime mismatches.
-            try:
-                fa['generated'] = bool(ok_run)
-                fa['generation_note'] = str(note or '')
-                fa['artifacts_dir'] = str(flow_out_dir or '')
-                fa['outputs_manifest'] = str(manifest_path or '')
-                fa['declared_outputs'] = declared_output_keys
-                fa['actual_outputs'] = actual_output_keys
-                fa['outputs_match'] = bool(mismatch.get('ok')) if isinstance(mismatch, dict) and mismatch else True
-                fa['outputs_mismatch'] = mismatch
-            except Exception:
-                pass
-
-        if generation_failures:
-            # Cleanup partial artifacts so we don't leave confusing residues behind.
-            try:
-                base_dir = os.path.abspath(os.path.join('/tmp', 'vulns', 'flag_generators_runs'))
-                for d in (created_run_dirs or []):
-                    try:
-                        dd = os.path.abspath(str(d))
-                        if os.path.commonpath([dd, base_dir]) != base_dir:
                             continue
-                        shutil.rmtree(dd, ignore_errors=True)
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-            return jsonify({
-                'ok': False,
-                'error': f"{len(generation_failures)} generator run(s) failed; cannot prepare preview for execute.",
-                'scenario': scenario_label or scenario_norm,
-                'length': length,
-                'stats': stats,
-                'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
-                'flag_assignments': flag_assignments,
-                'generation_failures': generation_failures,
-                'base_preview_plan_path': base_plan_path,
-            }), 422
-    except Exception:
-        pass
+                except Exception:
+                    pass
+                return jsonify({
+                    'ok': False,
+                    'error': f"{len(generation_failures)} generator run(s) failed; cannot prepare preview for execute.",
+                    'scenario': scenario_label or scenario_norm,
+                    'length': length,
+                    'stats': stats,
+                    'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+                    'flag_assignments': flag_assignments,
+                    'generation_failures': generation_failures,
+                    'base_preview_plan_path': base_plan_path,
+                }), 422
+        except Exception:
+            pass
+    else:
+        # Ensure the UI gets a consistent signal when flags are disabled.
+        try:
+            for fa in (flag_assignments or []):
+                if not isinstance(fa, dict):
+                    continue
+                fa['generated'] = False
+                fa['generation_note'] = 'flags disabled (invalid dependency order)'
+        except Exception:
+            pass
 
     try:
         flow_meta = {
@@ -9117,6 +10277,9 @@ def api_flow_prepare_preview_for_execute():
             # Persist all Flow decisions so returning to Flag Sequencing shows the same
             # chain and generator selections/hints.
             'flag_assignments': flag_assignments,
+            'flags_enabled': bool(flags_enabled),
+            'flow_valid': bool(flow_valid),
+            'flow_errors': list(flow_errors or []),
             'modified_at': _iso_now(),
         }
         if isinstance(meta, dict):
@@ -9156,9 +10319,13 @@ def api_flow_prepare_preview_for_execute():
         'stats': stats,
         'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
         'flag_assignments': flag_assignments,
+        'flags_enabled': bool(flags_enabled),
+        'flow_valid': bool(flow_valid),
+        'flow_errors': list(flow_errors or []),
         'xml_path': str((meta or {}).get('xml_path') or ''),
         'preview_plan_path': out_path,
         'base_preview_plan_path': base_plan_path,
+        **({'sequencer_dag': (dag_debug or {'ok': False, 'errors': ['not computed (explicit chain)']})} if debug_dag else {}),
     })
 
 
@@ -9194,6 +10361,7 @@ def api_flow_bundle_from_chain():
 
     # Recompute flag generator assignments for this explicit chain order (for UI display).
     flag_assignments: list[dict[str, Any]] = []
+    preview: dict[str, Any] | None = None
     try:
         plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm)
         if plan_path and os.path.exists(plan_path):
@@ -9205,6 +10373,17 @@ def api_flow_bundle_from_chain():
     except Exception:
         flag_assignments = []
 
+    # Validate the reordered chain (non-blocking): UI should show warning if invalid.
+    try:
+        flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
+            chain_nodes,
+            flag_assignments,
+            scenario_label=(scenario_label or scenario_norm),
+        )
+    except Exception:
+        flow_valid, flow_errors = True, []
+    flags_enabled = bool(flow_valid)
+
     bundle = _attack_flow_bundle_for_chain(chain_nodes=chain_nodes, scenario_label=scenario_label or scenario_norm)
     return jsonify({
         'ok': True,
@@ -9213,6 +10392,9 @@ def api_flow_bundle_from_chain():
         'chain': chain_nodes,
         'flag_assignments': flag_assignments,
         'bundle': bundle,
+        'flow_valid': bool(flow_valid),
+        'flow_errors': list(flow_errors or []),
+        'flags_enabled': bool(flags_enabled),
     })
 
 
@@ -13467,7 +14649,7 @@ FLAG_NODE_GENERATORS_STATE_PATH = os.path.join(FLAG_NODE_GENERATORS_SOURCES_DIR,
 os.makedirs(FLAG_NODE_GENERATORS_SOURCES_DIR, exist_ok=True)
 
 
-# ---------------- Flag Generator Schema (v1) -----------------
+# ---------------- Flag Generator Catalog Schema (v3) -----------------
 
 
 _FLAG_GENERATOR_CATALOG_SCHEMA_PATH = os.path.join(_get_repo_root(), 'validation', 'flag_generator_catalog.schema.json')
@@ -13519,23 +14701,6 @@ def _validate_json_schema(instance: object, schema_path: str) -> tuple[bool, str
     except Exception as e:
         return False, f"Schema validation failed: {e}"
 
-
-FLAG_GENERATOR_REQUIRED_FIELDS = ['id', 'name', 'language', 'source', 'outputs']
-FLAG_GENERATOR_OPTIONAL_FIELDS = [
-    'description',
-    'version',
-    'tags',
-    'compose',
-    'env',
-    'build',
-    'run',
-    'inputs',
-    'requirements',
-    'provides',
-    'hint_template',
-    'handoff',
-]
-FLAG_GENERATOR_ALL_FIELDS = FLAG_GENERATOR_REQUIRED_FIELDS + FLAG_GENERATOR_OPTIONAL_FIELDS
 
 FLAG_GENERATOR_LANGUAGES = {'python', 'c', 'cpp'}
 
@@ -13686,14 +14851,222 @@ def _normalize_generator_id(val: str) -> str:
     return ''.join(out).strip('-')
 
 
+def _coerce_str(val: object, default: str = '') -> str:
+    try:
+        if val is None:
+            return default
+        s = str(val)
+        return s
+    except Exception:
+        return default
+
+
+def _coerce_stripped(val: object, default: str = '') -> str:
+    return _coerce_str(val, default=default).strip()
+
+
+def _normalize_v3_source(source: object) -> dict | None:
+    if not isinstance(source, dict):
+        return None
+    src_type = _coerce_stripped(source.get('type') if isinstance(source, dict) else None, 'local-path') or 'local-path'
+    src_path = _coerce_stripped(source.get('path') if isinstance(source, dict) else None, '')
+    if not src_path:
+        return None
+    return {
+        'type': src_type,
+        'path': src_path,
+        'ref': _coerce_stripped(source.get('ref') if isinstance(source, dict) else None, ''),
+        'subpath': _coerce_stripped(source.get('subpath') if isinstance(source, dict) else None, ''),
+        'entry': _coerce_stripped(source.get('entry') if isinstance(source, dict) else None, ''),
+    }
+
+
+def _normalize_v3_compose(compose: object) -> dict | None:
+    if not isinstance(compose, dict):
+        return None
+    file_val = _coerce_stripped(compose.get('file'), 'docker-compose.yml') or 'docker-compose.yml'
+    service_val = _coerce_stripped(compose.get('service'), 'generator') or 'generator'
+    return {
+        'file': file_val,
+        'service': service_val,
+    }
+
+
+def _normalize_v3_env(env: object) -> dict | None:
+    if not isinstance(env, dict):
+        return None
+    norm_env: dict[str, str] = {}
+    for k, v in env.items():
+        try:
+            kk = str(k).strip()
+            if not kk:
+                continue
+            norm_env[kk] = str(v)
+        except Exception:
+            continue
+    return norm_env or None
+
+
+def _v3_plugin_inputs_to_io_list(plugin: dict) -> list[dict]:
+    """Convert v3 plugin.inputs mapping to the UI/runner IO list format."""
+    requires = plugin.get('requires') if isinstance(plugin.get('requires'), list) else []
+    requires_set = {str(x).strip() for x in requires if str(x).strip()}
+
+    inputs = plugin.get('inputs') if isinstance(plugin.get('inputs'), dict) else {}
+    out: list[dict] = []
+
+    for name, spec in inputs.items():
+        nm = _coerce_stripped(name, '')
+        if not nm:
+            continue
+        if not isinstance(spec, dict):
+            spec = {}
+        tp = _coerce_stripped(spec.get('type'), '') or _coerce_flaggen_io_type(nm)
+        required_val = spec.get('required')
+        if required_val is None:
+            required = nm in requires_set
+        else:
+            required = _coerce_bool(required_val, default=(nm in requires_set))
+        sensitive_in = spec.get('sensitive')
+        if sensitive_in is None:
+            sensitive_val = _coerce_flaggen_io_sensitive(nm, tp)
+        else:
+            sensitive_val = _coerce_bool(sensitive_in, default=False)
+        default_in = spec.get('default')
+        default_ok = isinstance(default_in, (str, int, float, bool)) or default_in is None
+        rec = {
+            'name': nm,
+            'type': tp,
+            'description': _coerce_stripped(spec.get('description'), ''),
+            'required': bool(required),
+            'sensitive': bool(sensitive_val),
+        }
+        if default_in is not None and default_ok:
+            rec['default'] = default_in
+        out.append(rec)
+
+    existing_names = {str(x.get('name') or '').strip() for x in out if isinstance(x, dict)}
+    for req in sorted(requires_set):
+        if req in existing_names:
+            continue
+        tp = _coerce_flaggen_io_type(req)
+        out.append({
+            'name': req,
+            'type': tp,
+            'description': '',
+            'required': True,
+            'sensitive': bool(_coerce_flaggen_io_sensitive(req, tp)),
+        })
+
+    out.sort(key=lambda r: str(r.get('name') or '').lower())
+    return out
+
+
+def _v3_plugin_outputs_to_io_list(plugin: dict) -> list[dict]:
+    produces = plugin.get('produces') if isinstance(plugin.get('produces'), list) else []
+    out: list[dict] = []
+    for item in produces:
+        if not isinstance(item, dict):
+            continue
+        nm = _coerce_stripped(item.get('artifact'), '')
+        if not nm:
+            continue
+        tp = _coerce_flaggen_io_type(nm)
+        out.append({
+            'name': nm,
+            'type': tp,
+            'description': _coerce_stripped(item.get('description'), ''),
+            'sensitive': bool(_coerce_flaggen_io_sensitive(nm, tp)),
+        })
+    return out
+
+
+def _v3_merge_generator_view(plugin: dict, impl: dict) -> dict | None:
+    plugin_id = _normalize_generator_id(_coerce_stripped(impl.get('plugin_id'), ''))
+    if not plugin_id:
+        return None
+
+    language = _coerce_stripped(impl.get('language'), '').lower()
+    if language not in FLAG_GENERATOR_LANGUAGES:
+        return None
+
+    source = _normalize_v3_source(impl.get('source'))
+    if not source:
+        return None
+
+    gen: dict = {
+        'id': plugin_id,
+        'name': _coerce_stripped(impl.get('name'), plugin_id) or plugin_id,
+        'language': language,
+        'source': source,
+    }
+
+    if isinstance(plugin, dict):
+        desc = _coerce_stripped(plugin.get('description'), '')
+        if desc:
+            gen['description'] = desc
+        ver = _coerce_stripped(plugin.get('version'), '')
+        if ver:
+            gen['version'] = ver
+
+    compose = _normalize_v3_compose(impl.get('compose'))
+    if compose:
+        gen['compose'] = compose
+
+    env = _normalize_v3_env(impl.get('env'))
+    if env:
+        gen['env'] = env
+
+    if isinstance(impl.get('build'), dict):
+        gen['build'] = impl.get('build')
+    if isinstance(impl.get('run'), dict):
+        gen['run'] = impl.get('run')
+
+    gen['inputs'] = _v3_plugin_inputs_to_io_list(plugin if isinstance(plugin, dict) else {})
+    gen['outputs'] = _v3_plugin_outputs_to_io_list(plugin if isinstance(plugin, dict) else {})
+    if not gen['outputs']:
+        return None
+
+    hint_templates: list[str] = []
+    try:
+        ht_multi = impl.get('hint_templates')
+        if isinstance(ht_multi, list):
+            hint_templates = [str(x or '').strip() for x in ht_multi if str(x or '').strip()]
+    except Exception:
+        hint_templates = []
+    if not hint_templates:
+        try:
+            ht_legacy = impl.get('hint_template')
+            if isinstance(ht_legacy, list):
+                hint_templates = [str(x or '').strip() for x in ht_legacy if str(x or '').strip()]
+            else:
+                s = _coerce_stripped(ht_legacy, '')
+                if s:
+                    hint_templates = [s]
+        except Exception:
+            hint_templates = []
+    if not hint_templates:
+        hint_templates = ['Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})']
+    gen['hint_templates'] = hint_templates
+    gen['hint_template'] = hint_templates[0]
+
+    handoff = impl.get('handoff')
+    if isinstance(handoff, dict):
+        gen['handoff'] = handoff
+
+    return gen
+
+
 def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool, str, dict | None, list[dict]]:
     """Validate generator catalog source.
 
-    Expected format (v1):
-      {
-        "schema_version": 1,
-        "generators": [ { generatorDef }, ... ]
-      }
+        Expected format (v3):
+            {
+                "schema_version": 3,
+                "plugin_type": "flag-generator" | "flag-node-generator",
+                "plugins": [ { pluginContract }, ... ],
+                "implementations": [ { impl }, ... ]
+            }
 
     Returns: (ok, note, normalized_doc_or_none, skipped_generators)
     """
@@ -13713,229 +15086,157 @@ def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool,
         if not ok_schema:
             return False, schema_err or 'Schema validation failed', None, skipped
 
-        schema_version = doc.get('schema_version', 1)
+        schema_version = doc.get('schema_version', 3)
         try:
             schema_version = int(schema_version)
         except Exception:
-            schema_version = 1
-        if schema_version not in (1, 2):
+            schema_version = 3
+        if schema_version != 3:
             return False, f'Unsupported schema_version: {schema_version}', None, skipped
-        gens = doc.get('generators')
-        if not isinstance(gens, list):
-            return False, 'Missing generators[]', None, skipped
 
-        normalized_generators: list[dict] = []
-        for raw in gens:
-            if not isinstance(raw, dict):
-                skipped.append({'reason': 'not an object', 'raw': raw})
+        plugin_type = _coerce_stripped(doc.get('plugin_type'), '')
+        if plugin_type not in {'flag-generator', 'flag-node-generator'}:
+            return False, f"Invalid plugin_type: {plugin_type or '(missing)'}", None, skipped
+
+        plugins_raw = doc.get('plugins')
+        impls_raw = doc.get('implementations')
+        if not isinstance(plugins_raw, list):
+            return False, 'Missing plugins[]', None, skipped
+        if not isinstance(impls_raw, list):
+            return False, 'Missing implementations[]', None, skipped
+
+        plugins_by_id: dict[str, dict] = {}
+        normalized_plugins: list[dict] = []
+        for p in plugins_raw:
+            if not isinstance(p, dict):
+                skipped.append({'reason': 'plugin not an object', 'raw': p})
                 continue
-            gen: dict = {}
-            # Preserve only known top-level fields for now.
-            for k in FLAG_GENERATOR_ALL_FIELDS:
-                if k in raw:
-                    gen[k] = raw.get(k)
-
-            gen_id = _normalize_generator_id(str(gen.get('id') or ''))
-            if not gen_id:
-                # Derive from name if possible
-                gen_id = _normalize_generator_id(str(gen.get('name') or ''))
-            if not gen_id:
-                skipped.append({'reason': 'missing id/name', 'raw': raw})
+            pid = _normalize_generator_id(_coerce_stripped(p.get('plugin_id'), ''))
+            if not pid:
+                skipped.append({'reason': 'plugin missing plugin_id', 'raw': p})
                 continue
-            gen['id'] = gen_id
+            p2 = dict(p)
+            p2['plugin_id'] = pid
+            # Preserve plugin_type but default to top-level.
+            p2['plugin_type'] = _coerce_stripped(p2.get('plugin_type'), plugin_type) or plugin_type
+            if not isinstance(p2.get('requires'), list):
+                p2['requires'] = []
+            if not isinstance(p2.get('produces'), list):
+                p2['produces'] = []
+            if not isinstance(p2.get('inputs'), dict):
+                p2['inputs'] = {}
+            if pid not in plugins_by_id:
+                plugins_by_id[pid] = p2
+                normalized_plugins.append(p2)
 
-            name = (gen.get('name') or '').strip() if isinstance(gen.get('name'), str) else ''
-            if not name:
-                name = gen_id
-            gen['name'] = name
-
-            lang = (gen.get('language') or '').strip().lower() if isinstance(gen.get('language'), str) else ''
-            if lang not in FLAG_GENERATOR_LANGUAGES:
-                skipped.append({'reason': f'invalid language: {lang}', 'id': gen_id})
+        normalized_impls: list[dict] = []
+        for impl in impls_raw:
+            if not isinstance(impl, dict):
+                skipped.append({'reason': 'implementation not an object', 'raw': impl})
                 continue
-            gen['language'] = lang
-
-            # source: minimal structure, preserved as dict
-            source = gen.get('source')
-            if not isinstance(source, dict):
-                skipped.append({'reason': 'missing/invalid source', 'id': gen_id})
+            pid = _normalize_generator_id(_coerce_stripped(impl.get('plugin_id'), ''))
+            if not pid:
+                skipped.append({'reason': 'implementation missing plugin_id', 'raw': impl})
                 continue
-            src_type = (source.get('type') or 'local-path').strip() if isinstance(source.get('type'), str) else 'local-path'
-            src_path = (source.get('path') or '').strip() if isinstance(source.get('path'), str) else ''
-            if not src_path:
-                skipped.append({'reason': 'source.path required', 'id': gen_id})
+            if pid not in plugins_by_id:
+                skipped.append({'reason': f'implementation references unknown plugin_id: {pid}', 'plugin_id': pid})
                 continue
-            gen['source'] = {
-                'type': src_type,
-                'path': src_path,
-                'ref': (source.get('ref') or '').strip() if isinstance(source.get('ref'), str) else '',
-                'subpath': (source.get('subpath') or '').strip() if isinstance(source.get('subpath'), str) else '',
-                'entry': (source.get('entry') or '').strip() if isinstance(source.get('entry'), str) else '',
-            }
+            impl2 = dict(impl)
+            impl2['plugin_id'] = pid
+            impl2['name'] = _coerce_stripped(impl2.get('name'), pid) or pid
+            impl2['language'] = _coerce_stripped(impl2.get('language'), '').lower()
 
-            # compose execution (preferred for generation):
-            # { "file": "docker-compose.yml", "service": "generator" }
-            compose = gen.get('compose')
-            if isinstance(compose, dict):
-                file_val = (compose.get('file') or 'docker-compose.yml').strip() if isinstance(compose.get('file'), str) else 'docker-compose.yml'
-                service_val = (compose.get('service') or 'generator').strip() if isinstance(compose.get('service'), str) else 'generator'
-                gen['compose'] = {
-                    'file': file_val or 'docker-compose.yml',
-                    'service': service_val or 'generator',
-                }
-            else:
-                gen.pop('compose', None)
-
-            # env: optional dict of string key/value pairs.
-            env = gen.get('env')
-            if isinstance(env, dict):
-                norm_env: dict[str, str] = {}
-                for k, v in env.items():
-                    try:
-                        kk = str(k).strip()
-                        if not kk:
-                            continue
-                        norm_env[kk] = str(v)
-                    except Exception:
-                        continue
-                gen['env'] = norm_env
-            else:
-                gen.pop('env', None)
-
-            # inputs/outputs contracts (lists of dict)
-            inputs = gen.get('inputs')
-            if inputs is None:
-                inputs = []
-            if not isinstance(inputs, list):
-                inputs = []
-            norm_inputs: list[dict] = []
-            for it in inputs:
-                if not isinstance(it, dict):
-                    continue
-                nm = (it.get('name') or '').strip() if isinstance(it.get('name'), str) else ''
-                tp = (it.get('type') or '').strip() if isinstance(it.get('type'), str) else ''
-                if not nm or not tp:
-                    continue
-                sensitive_in = it.get('sensitive')
-                if sensitive_in is None:
-                    sensitive_val = _coerce_flaggen_io_sensitive(nm, tp)
-                else:
-                    sensitive_val = _coerce_bool(sensitive_in, default=False)
-                default_in = it.get('default')
-                default_ok = isinstance(default_in, (str, int, float, bool)) or default_in is None
-                norm_inputs.append({
-                    'name': nm,
-                    'type': tp,
-                    'description': (it.get('description') or '').strip() if isinstance(it.get('description'), str) else '',
-                    'required': _coerce_bool(it.get('required'), default=True),
-                    'sensitive': bool(sensitive_val),
-                    **({'default': default_in} if (default_in is not None and default_ok) else {}),
-                })
-            gen['inputs'] = norm_inputs
-
-            outputs = gen.get('outputs')
-            if not isinstance(outputs, list) or not outputs:
-                skipped.append({'reason': 'missing outputs[]', 'id': gen_id})
+            src = _normalize_v3_source(impl2.get('source'))
+            if not src:
+                skipped.append({'reason': f'missing/invalid source for {pid}', 'plugin_id': pid})
                 continue
-            norm_outputs: list[dict] = []
-            for ot in outputs:
-                if not isinstance(ot, dict):
-                    continue
-                nm = (ot.get('name') or '').strip() if isinstance(ot.get('name'), str) else ''
-                tp_raw = (ot.get('type') or '').strip() if isinstance(ot.get('type'), str) else ''
-                tp = tp_raw or _coerce_flaggen_io_type(nm)
-                if not nm or not tp:
-                    continue
-                sensitive_out = ot.get('sensitive')
-                if sensitive_out is None:
-                    sensitive_val = _coerce_flaggen_io_sensitive(nm, tp)
-                else:
-                    sensitive_val = _coerce_bool(sensitive_out, default=False)
-                norm_outputs.append({
-                    'name': nm,
-                    'type': tp,
-                    'description': (ot.get('description') or '').strip() if isinstance(ot.get('description'), str) else '',
-                    'sensitive': bool(sensitive_val),
-                })
-            if not norm_outputs:
-                skipped.append({'reason': 'outputs[] had no valid entries', 'id': gen_id})
-                continue
-            gen['outputs'] = norm_outputs
+            impl2['source'] = src
 
-            # hint_template (v2 requires non-empty).
-            hint_template = gen.get('hint_template')
-            if isinstance(hint_template, str):
-                hint_template = hint_template.strip()
+            # Normalize compose/env for consistency; keep other fields free-form.
+            comp = _normalize_v3_compose(impl2.get('compose'))
+            if comp:
+                impl2['compose'] = comp
             else:
-                hint_template = ''
-            if schema_version == 2 and not hint_template:
-                skipped.append({'reason': 'schema_version=2 requires hint_template', 'id': gen_id})
-                continue
-            if not hint_template:
-                hint_template = 'Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})'
-            gen['hint_template'] = hint_template
-
-            # handoff: optional dict (free-form, validated elsewhere)
-            handoff = gen.get('handoff')
-            if isinstance(handoff, dict):
-                gen['handoff'] = handoff
+                impl2.pop('compose', None)
+            env = _normalize_v3_env(impl2.get('env'))
+            if env:
+                impl2['env'] = env
             else:
-                gen.pop('handoff', None)
+                impl2.pop('env', None)
 
-            # build/run optional: preserve dict-ish
-            if isinstance(gen.get('build'), dict):
-                gen['build'] = gen['build']
-            else:
-                gen.pop('build', None)
-            if isinstance(gen.get('run'), dict):
-                gen['run'] = gen['run']
-            else:
-                gen.pop('run', None)
+            hint_templates: list[str] = []
+            try:
+                ht_multi = impl2.get('hint_templates')
+                if isinstance(ht_multi, list):
+                    hint_templates = [str(x or '').strip() for x in ht_multi if str(x or '').strip()]
+            except Exception:
+                hint_templates = []
+            if not hint_templates:
+                try:
+                    ht_legacy = impl2.get('hint_template')
+                    if isinstance(ht_legacy, list):
+                        hint_templates = [str(x or '').strip() for x in ht_legacy if str(x or '').strip()]
+                    else:
+                        s = _coerce_stripped(ht_legacy, '')
+                        if s:
+                            hint_templates = [s]
+                except Exception:
+                    hint_templates = []
+            if not hint_templates:
+                hint_templates = ['Next: {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}})']
+            impl2['hint_templates'] = hint_templates
+            impl2['hint_template'] = hint_templates[0]
 
-            # requirements/metadata passthrough (dict-ish)
-            if isinstance(gen.get('requirements'), dict):
-                gen['requirements'] = gen['requirements']
-            else:
-                gen.pop('requirements', None)
+            normalized_impls.append(impl2)
 
-            # provides: optional, list of strings
-            provides = gen.get('provides')
-            if provides is not None and not isinstance(provides, list):
-                provides = None
-            if isinstance(provides, list):
-                gen['provides'] = [str(x).strip() for x in provides if str(x).strip()]
+        normalized_plugins.sort(key=lambda p: str(p.get('plugin_id') or ''))
+        normalized_impls.sort(key=lambda i: (str(i.get('name') or '').lower(), str(i.get('plugin_id') or '')))
 
-            # tags: optional
-            tags = gen.get('tags')
-            if isinstance(tags, list):
-                gen['tags'] = [str(x).strip() for x in tags if str(x).strip()]
-            else:
-                gen.pop('tags', None)
-
-            # version/description normalization
-            if isinstance(gen.get('version'), str):
-                gen['version'] = gen['version'].strip()
-            else:
-                gen.pop('version', None)
-            if isinstance(gen.get('description'), str):
-                gen['description'] = gen['description'].strip()
-            else:
-                gen.pop('description', None)
-
-            normalized_generators.append(gen)
-
-        # Ensure stable order
-        normalized_generators.sort(key=lambda g: (g.get('name', '').lower(), g.get('id', '')))
         normalized_doc = {
-            'schema_version': schema_version,
-            'generators': normalized_generators,
+            'schema_version': 3,
+            'plugin_type': plugin_type,
+            'plugins': normalized_plugins,
+            'implementations': normalized_impls,
         }
-        note = f"{len(normalized_generators)} generator(s)"
+        note = f"{len(normalized_impls)} implementation(s)"
         if skipped:
             note = note + f"; skipped {len(skipped)}"
         return True, note, normalized_doc, skipped
     except Exception as e:
         return False, str(e), None, skipped
+
+
+def _v3_catalog_to_generator_views(doc: dict) -> tuple[list[dict], list[dict]]:
+    """Expand a validated v3 catalog doc into merged generator view objects."""
+    errors: list[dict] = []
+    if not isinstance(doc, dict):
+        return [], [{'error': 'catalog doc is not an object'}]
+    if int(doc.get('schema_version') or 0) != 3:
+        return [], [{'error': f"unsupported schema_version: {doc.get('schema_version')}"}]
+    plugins = doc.get('plugins') if isinstance(doc.get('plugins'), list) else []
+    impls = doc.get('implementations') if isinstance(doc.get('implementations'), list) else []
+    plugins_by_id: dict[str, dict] = {}
+    for p in plugins:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get('plugin_id') or '').strip()
+        if pid and pid not in plugins_by_id:
+            plugins_by_id[pid] = p
+
+    out: list[dict] = []
+    for impl in impls:
+        if not isinstance(impl, dict):
+            continue
+        pid = str(impl.get('plugin_id') or '').strip()
+        plugin = plugins_by_id.get(pid) or {}
+        gen = _v3_merge_generator_view(plugin, impl)
+        if not gen:
+            errors.append({'warning': f'Invalid implementation for plugin_id={pid or "(missing)"}'})
+            continue
+        out.append(gen)
+
+    out.sort(key=lambda g: (str(g.get('name') or '').lower(), str(g.get('id') or '')))
+    return out, errors
 
 
 def _load_flag_sources_state() -> dict:
@@ -14017,7 +15318,7 @@ def _save_flag_sources_state(state: dict) -> None:
 
 
 FLAG_REQUIRED_FIELDS = ['id', 'name', 'type', 'path']
-FLAG_OPTIONAL_FIELDS = ['compose_name', 'security_profile', 'enforce_security', 'description', 'inputs', 'outputs', 'hint_template']
+FLAG_OPTIONAL_FIELDS = ['compose_name', 'security_profile', 'enforce_security', 'description', 'inputs', 'outputs', 'hint_template', 'hint_templates']
 FLAG_ALL_FIELDS = FLAG_REQUIRED_FIELDS + [f for f in FLAG_OPTIONAL_FIELDS if f not in FLAG_REQUIRED_FIELDS]
 
 
@@ -24078,7 +25379,7 @@ def flag_sources_save(sid):
         return jsonify({'ok': False, 'error': str(e)}), 500
 
 
-# ---------------- Flag Generators (generator-first catalog) -----------------
+# ---------------- Flag Generators (v3 plugin catalog) -----------------
 
 
 def _flag_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
@@ -24101,7 +25402,13 @@ def _flag_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
         if not ok or not doc:
             errors.append({'source': s.get('name'), 'path': path, 'error': note})
             continue
-        for gen in (doc.get('generators') or []):
+        gens, gerrs = _v3_catalog_to_generator_views(doc)
+        for e in gerrs:
+            try:
+                errors.append({'source': s.get('name'), 'path': path, **(e if isinstance(e, dict) else {'warning': str(e)})})
+            except Exception:
+                continue
+        for gen in gens:
             if not isinstance(gen, dict):
                 continue
             gid = str(gen.get('id') or '')
@@ -24163,7 +25470,13 @@ def _flag_node_generators_from_enabled_sources() -> tuple[list[dict], list[dict]
         if not ok or not doc:
             errors.append({'source': s.get('name'), 'path': path, 'error': note})
             continue
-        for gen in (doc.get('generators') or []):
+        gens, gerrs = _v3_catalog_to_generator_views(doc)
+        for e in gerrs:
+            try:
+                errors.append({'source': s.get('name'), 'path': path, **(e if isinstance(e, dict) else {'warning': str(e)})})
+            except Exception:
+                continue
+        for gen in gens:
             if not isinstance(gen, dict):
                 continue
             gid = str(gen.get('id') or '')

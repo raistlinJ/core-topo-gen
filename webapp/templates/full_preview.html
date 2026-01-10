@@ -157,6 +157,7 @@
   {% endif %}
     </div>
     <div class="col-md-8">
+      <div id="fpFlowValidityAlert" class="alert alert-danger d-none mb-2" role="alert"></div>
       <ul class="nav nav-tabs" id="fpTabs" role="tablist">
         <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#fp-graph" type="button">Graph</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-routers" type="button">Routers</button></li>
@@ -598,6 +599,27 @@
   function init(){
     const dataEl = document.getElementById('fpDataJson');
     try { previewData = JSON.parse(dataEl.textContent); } catch(e) { console.warn('Failed parse preview json', e); previewData = {}; }
+
+    // Flow validity warning (non-blocking): if Flow recorded an invalid chain,
+    // show a red banner to clarify that no flags will be used.
+    try {
+      const flowAlertEl = document.getElementById('fpFlowValidityAlert');
+      const mdFlow = previewData && previewData.metadata && previewData.metadata.flow ? previewData.metadata.flow : null;
+      const flowValid = mdFlow && ('flow_valid' in mdFlow) ? !!mdFlow.flow_valid : true;
+      const flagsEnabled = mdFlow && ('flags_enabled' in mdFlow) ? !!mdFlow.flags_enabled : true;
+      const flowErrors = (mdFlow && Array.isArray(mdFlow.flow_errors)) ? mdFlow.flow_errors : [];
+      if(flowAlertEl){
+        if(flowValid && flagsEnabled){
+          flowAlertEl.classList.add('d-none');
+          flowAlertEl.textContent = '';
+        } else {
+          const base = 'Invalid flag dependency order: execution will run WITHOUT flags.';
+          const details = flowErrors.length ? (' ' + flowErrors.join(' | ')) : '';
+          flowAlertEl.textContent = base + details;
+          flowAlertEl.classList.remove('d-none');
+        }
+      }
+    } catch(e) {}
 
     let hitlConfig = { enabled: false, interfaces: [] };
     const hitlEl = document.getElementById('fpHitlConfigJson');

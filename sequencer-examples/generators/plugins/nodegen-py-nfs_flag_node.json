@@ -1,0 +1,20 @@
+{
+  "plugin_id": "nodegen-py-nfs_flag_node",
+  "plugin_type": "flag-node-generator",
+  "version": "1.0",
+  "description": "Converted from generator id 'nodegen.py.nfs_flag_node'.",
+  "requires": ["seed", "node_name"],
+  "produces": [
+    {"artifact": "compose_path"},
+    {"artifact": "flag"},
+    {"artifact": "nfs_port"},
+    {"artifact": "nfs_export"},
+    {"artifact": "mount_hint"}
+  ],
+  "inputs": {
+    "seed": {"type": "text", "required": true},
+    "node_name": {"type": "text", "required": true},
+    "flag_prefix": {"type": "text", "required": false},
+    "nfs_port": {"type": "number", "required": false, "default": 2049}
+  }
+}

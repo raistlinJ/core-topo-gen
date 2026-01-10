@@ -1066,7 +1066,11 @@ def build_full_preview(
     vuln_assignments: Dict[int, List[str]] = {}
     if vulnerabilities_plan:
         docker_hosts = [h for h in host_nodes if (getattr(h, 'role', None) or '').strip().lower() == 'docker']
-        ordered = _stable_shuffle([h.node_id for h in docker_hosts], rnd_seed + 101)
+        # Prefer assigning vulnerabilities to Docker-role hosts, but if a scenario has no
+        # Docker hosts, fall back to assigning across all hosts so Preview/Flow can still
+        # reflect selected vulnerabilities.
+        target_hosts = docker_hosts if docker_hosts else host_nodes
+        ordered = _stable_shuffle([h.node_id for h in target_hosts], rnd_seed + 101)
         flat: List[str] = []
         for name, count in vulnerabilities_plan.items():
             for _ in range(int(count)):

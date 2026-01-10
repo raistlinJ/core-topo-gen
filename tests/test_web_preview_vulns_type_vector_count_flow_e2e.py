@@ -111,3 +111,147 @@ def test_type_vector_count_vulns_show_in_preview_and_flow_attackflow_preview(tmp
                 os.remove(plan_path)
             except Exception:
                 pass
+
+
+def test_flow_attackflow_preview_sample_preset_forces_sample_chain(tmp_path):
+    """Preset should force generator ids/types for the 3-step sample chain."""
+    scenario = f"tv_count_flow_preset_{uuid.uuid4().hex[:6]}"
+    xml_path = _write_xml(str(tmp_path), scenario=scenario)
+
+    app.config["TESTING"] = True
+    client = app.test_client()
+
+    login_resp = client.post("/login", data={"username": "coreadmin", "password": "coreadmin"})
+    assert login_resp.status_code in (302, 303)
+
+    full_preview = {
+        "seed": 123,
+        "hosts": [
+            {"node_id": "h1", "name": "docker-1", "role": "Docker", "vulnerabilities": []},
+            {"node_id": "h2", "name": "docker-2", "role": "Docker", "vulnerabilities": []},
+            {"node_id": "h3", "name": "docker-3", "role": "Docker", "vulnerabilities": []},
+        ],
+        "routers": [],
+        "switches": [{"node_id": "s1", "name": "switch-1"}],
+        "switches_detail": [{"switch_id": "s1", "router_id": "", "hosts": ["h1", "h2", "h3"]}],
+    }
+
+    plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
+    os.makedirs(plans_dir, exist_ok=True)
+    plan_path = os.path.join(plans_dir, f"plan_flow_preset_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
+
+    plan_payload = {
+        "full_preview": full_preview,
+        "metadata": {"xml_path": xml_path, "scenario": scenario, "seed": full_preview.get("seed")},
+    }
+
+    with open(plan_path, "w", encoding="utf-8") as f:
+        json.dump(plan_payload, f)
+
+    try:
+        flow = client.get(
+            "/api/flag-sequencing/attackflow_preview",
+            query_string={
+                "scenario": scenario,
+                "length": 10,
+                "preset": "sample_reverse_nfs_ssh",
+                "preview_plan": plan_path,
+            },
+        )
+        assert flow.status_code == 200
+        data = flow.get_json() or {}
+        assert data.get("ok") is True, data
+        chain = data.get("chain") or []
+        assert len(chain) == 3, chain
+        fas = data.get("flag_assignments") or []
+        ids = [str(a.get("id") or "") for a in fas]
+        kinds = [str(a.get("type") or "") for a in fas]
+        assert ids == ["binary_embed_text", "nfs_sensitive_file", "textfile_username_password"]
+        assert kinds == ["flag-generator", "flag-node-generator", "flag-generator"]
+    finally:
+        try:
+            os.remove(plan_path)
+        except Exception:
+            pass
+
+
+def test_pick_flag_chain_nodes_for_preset_avoids_vuln_for_node_generator_step():
+    steps = app_backend._flow_preset_steps('sample_reverse_nfs_ssh')
+    assert steps and len(steps) == 3
+
+    nodes = []
+    for i in range(1, 8):
+        nodes.append({'id': f'd{i}', 'name': f'docker-{i}', 'type': 'DOCKER', 'is_vuln': False})
+    for i in range(1, 6):
+        nodes.append({'id': f'v{i}', 'name': f'vuln-{i}', 'type': 'DOCKER', 'is_vuln': True})
+
+    adj = {n['id']: set() for n in nodes}
+    chain_nodes = app_backend._pick_flag_chain_nodes_for_preset(nodes, adj, steps=steps)
+    assert len(chain_nodes) == 3
+
+    # Middle step is a flag-node-generator; must not be a vuln node.
+    assert bool(chain_nodes[1].get('is_vuln')) is False
+
+
+def test_flow_attackflow_preview_sample_preset_with_many_vulns_does_not_error(tmp_path):
+    """Regression: preset should not fail when many vuln docker nodes exist."""
+    scenario = f"tv_count_flow_preset_many_vulns_{uuid.uuid4().hex[:6]}"
+    xml_path = _write_xml(str(tmp_path), scenario=scenario)
+
+    app.config["TESTING"] = True
+    client = app.test_client()
+
+    login_resp = client.post("/login", data={"username": "coreadmin", "password": "coreadmin"})
+    assert login_resp.status_code in (302, 303)
+
+    hosts = []
+    for i in range(1, 8):
+        hosts.append({"node_id": f"h{i}", "name": f"docker-{i}", "role": "Docker", "vulnerabilities": []})
+    for i in range(1, 6):
+        hosts.append({"node_id": f"v{i}", "name": f"vuln-{i}", "role": "Docker", "vulnerabilities": [{"id": "dummy"}]})
+
+    full_preview = {
+        "seed": 123,
+        "hosts": hosts,
+        "routers": [],
+        "switches": [{"node_id": "s1", "name": "switch-1"}],
+        "switches_detail": [{"switch_id": "s1", "router_id": "", "hosts": [h["node_id"] for h in hosts]}],
+    }
+
+    plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
+    os.makedirs(plans_dir, exist_ok=True)
+    plan_path = os.path.join(plans_dir, f"plan_flow_preset_many_vulns_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
+
+    plan_payload = {
+        "full_preview": full_preview,
+        "metadata": {"xml_path": xml_path, "scenario": scenario, "seed": full_preview.get("seed")},
+    }
+
+    with open(plan_path, "w", encoding="utf-8") as f:
+        json.dump(plan_payload, f)
+
+    try:
+        flow = client.get(
+            "/api/flag-sequencing/attackflow_preview",
+            query_string={
+                "scenario": scenario,
+                "length": 10,
+                "preset": "sample_reverse_nfs_ssh",
+                "preview_plan": plan_path,
+            },
+        )
+        assert flow.status_code == 200
+        data = flow.get_json() or {}
+        assert data.get("ok") is True, data
+        chain = data.get("chain") or []
+        assert len(chain) == 3, chain
+        fas = data.get("flag_assignments") or []
+        ids = [str(a.get("id") or "") for a in fas]
+        kinds = [str(a.get("type") or "") for a in fas]
+        assert ids == ["binary_embed_text", "nfs_sensitive_file", "textfile_username_password"]
+        assert kinds == ["flag-generator", "flag-node-generator", "flag-generator"]
+    finally:
+        try:
+            os.remove(plan_path)
+        except Exception:
+            pass

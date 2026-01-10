@@ -35,10 +35,52 @@ def load_generators_from_source(path: Path) -> list[dict[str, Any]]:
     doc = json.loads(path.read_text("utf-8"))
     if not isinstance(doc, dict):
         return []
-    gens = doc.get("generators")
-    if not isinstance(gens, list):
+    try:
+        schema_version = int(doc.get("schema_version") or 0)
+    except Exception:
+        schema_version = 0
+    if schema_version != 3:
         return []
-    return [g for g in gens if isinstance(g, dict)]
+
+    plugins = doc.get("plugins")
+    if not isinstance(plugins, list):
+        plugins = []
+    plugins_by_id: dict[str, dict[str, Any]] = {}
+    for p in plugins:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("plugin_id") or "").strip()
+        if pid and pid not in plugins_by_id:
+            plugins_by_id[pid] = p
+
+    impls = doc.get("implementations")
+    if not isinstance(impls, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for impl in impls:
+        if not isinstance(impl, dict):
+            continue
+        pid = str(impl.get("plugin_id") or "").strip()
+        if not pid:
+            continue
+        rec: dict[str, Any] = {
+            "id": pid,
+            "plugin_id": pid,
+            "name": impl.get("name") or pid,
+            "language": impl.get("language"),
+            "source": impl.get("source"),
+            "compose": impl.get("compose"),
+            "build": impl.get("build"),
+            "run": impl.get("run"),
+            "env": impl.get("env"),
+            "hint_template": impl.get("hint_template"),
+            "handoff": impl.get("handoff"),
+        }
+        plugin = plugins_by_id.get(pid)
+        if isinstance(plugin, dict):
+            rec["plugin"] = plugin
+        out.append(rec)
+    return out
 
 
 def find_generator(repo_root: Path, generator_id: str) -> tuple[dict[str, Any], Path]:

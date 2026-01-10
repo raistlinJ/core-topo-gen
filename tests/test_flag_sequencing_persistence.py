@@ -35,8 +35,23 @@ def test_flag_sequencing_attackflow_preview_reuses_saved_flow_assignments(tmp_pa
         {'id': 'h1', 'name': 'host-1', 'type': 'docker'},
     ]
     saved_assignments = [
-        {'node_id': 'h2', 'id': 'SAVED_GEN_2', 'name': 'Saved Gen 2', 'type': 'flag-generator', 'hint': 'saved hint 2'},
-        {'node_id': 'h1', 'id': 'SAVED_GEN_1', 'name': 'Saved Gen 1', 'type': 'flag-generator', 'hint': 'saved hint 1'},
+        {
+            'node_id': 'h2',
+            'id': 'binary_embed_text',
+            'name': 'Saved Gen 2',
+            'type': 'flag-generator',
+            'hint': 'saved hint 2',
+            'outputs': ['network.ip'],
+        },
+        {
+            'node_id': 'h1',
+            'id': 'nfs_sensitive_file',
+            'name': 'Saved Gen 1',
+            'type': 'flag-node-generator',
+            'hint': 'saved hint 1',
+            'inputs': ['network.ip'],
+            'outputs': ['credential.pair'],
+        },
     ]
 
     plan_payload = {
@@ -82,7 +97,7 @@ def test_flag_sequencing_attackflow_preview_reuses_saved_flow_assignments(tmp_pa
 
         # Assignments should be the persisted ones (not recomputed).
         fas = data.get('flag_assignments') or []
-        assert [fa.get('id') for fa in fas] == ['SAVED_GEN_2', 'SAVED_GEN_1']
+        assert [fa.get('id') for fa in fas] == ['binary_embed_text', 'nfs_sensitive_file']
         assert [fa.get('hint') for fa in fas] == ['saved hint 2', 'saved hint 1']
     finally:
         try:
@@ -119,8 +134,23 @@ def test_flag_sequencing_reload_with_default_length_does_not_break_saved_chain(t
         {'id': 'h1', 'name': 'host-1', 'type': 'docker'},
     ]
     saved_assignments = [
-        {'node_id': 'h2', 'id': 'SAVED_GEN_2', 'name': 'Saved Gen 2', 'type': 'flag-generator', 'hint': 'saved hint 2'},
-        {'node_id': 'h1', 'id': 'SAVED_GEN_1', 'name': 'Saved Gen 1', 'type': 'flag-generator', 'hint': 'saved hint 1'},
+        {
+            'node_id': 'h2',
+            'id': 'binary_embed_text',
+            'name': 'Saved Gen 2',
+            'type': 'flag-generator',
+            'hint': 'saved hint 2',
+            'outputs': ['network.ip'],
+        },
+        {
+            'node_id': 'h1',
+            'id': 'nfs_sensitive_file',
+            'name': 'Saved Gen 1',
+            'type': 'flag-node-generator',
+            'hint': 'saved hint 1',
+            'inputs': ['network.ip'],
+            'outputs': ['credential.pair'],
+        },
     ]
 
     plan_payload = {

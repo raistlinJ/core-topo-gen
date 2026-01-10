@@ -1,0 +1,28 @@
+{
+  "note": "This directory contains generator plugin contract docs (new schema) converted from existing generator-catalog JSON sources under data_sources/.",
+  "sources": {
+    "flag_generators": [
+      "data_sources/flag_generators/20260105-012906-ef4f4e-flag_generators.json",
+      "data_sources/flag_generators/20260106-flag_generators_creds_drive_xor.json"
+    ],
+    "flag_node_generators": [
+      "data_sources/flag_node_generators/20260106-flag_node_generators_default.json"
+    ]
+  },
+  "plugin_id_by_generator_id": {
+    "gen.cpp.basic_binary": "gen-cpp-basic_binary",
+    "gen.c.basic_binary": "gen-c-basic_binary",
+    "gen.py.basic_artifact": "gen-py-basic_artifact",
+    "gen.py.env_setup": "gen-py-env_setup",
+    "gen.py.chain_output": "gen-py-chain_output",
+    "gen.c.hidden_text_binary": "gen-c-hidden_text_binary",
+    "gen.py.shared_drive_config": "gen-py-shared_drive_config",
+    "gen.py.ssh_creds": "gen-py-ssh_creds",
+    "gen.py.web_creds": "gen-py-web_creds",
+    "gen.py.xor": "gen-py-xor",
+    "nodegen.py.compose_flag_node": "nodegen-py-compose_flag_node",
+    "nodegen.py.ssh_flag_node": "nodegen-py-ssh_flag_node",
+    "nodegen.py.https_flag_node": "nodegen-py-https_flag_node",
+    "nodegen.py.nfs_flag_node": "nodegen-py-nfs_flag_node"
+  }
+}

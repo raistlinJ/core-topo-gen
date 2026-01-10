@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Generator Plugin Schema",
+  "type": "object",
+  "required": ["plugin_id", "plugin_type", "version", "requires", "produces", "inputs"],
+  "properties": {
+    "plugin_id": { "type": "string", "pattern": "^[a-z0-9_\\-]+$" },
+    "plugin_type": { "type": "string", "enum": ["flag-generator", "flag-node-generator"] },
+    "version": { "type": "string" },
+    "description": { "type": "string" },
+    "category": { "type": "array", "items": { "type": "string" } },
+    "requires": { "type": "array", "items": { "type": "string" } },
+    "produces": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["artifact"],
+        "properties": {
+          "artifact": { "type": "string" },
+          "optional": { "type": "boolean", "default": false }
+        },
+        "additionalProperties": false
+      }
+    },
+    "container_requirements": {
+      "type": "object",
+      "properties": {
+        "base_image": { "type": "string" },
+        "service": { "type": "string" },
+        "exposed_ports": { "type": "array", "items": { "type": "integer" } },
+        "tools": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "type": { "type": "string" },
+          "required": { "type": "boolean", "default": false },
+          "default": {},
+          "values": { "type": "array", "items": {} },
+          "artifact_ref": { "type": "boolean", "default": false }
+        },
+        "additionalProperties": false
+      }
+    },
+    "flag_capabilities": {
+      "type": "object",
+      "properties": {
+        "reveal_methods": { "type": "array", "items": { "type": "string" } },
+        "validation_types": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "difficulty": { "type": "string", "enum": ["easy", "medium", "hard"] }
+  },
+  "additionalProperties": false
+}

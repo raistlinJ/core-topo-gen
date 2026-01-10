@@ -1,0 +1,28 @@
+challenge_id: string
+kind: flag-generator | flag-node-generator
+
+requires:
+  - artifact: artifact.type
+    source: optional.challenge_id
+
+produces:
+  - name: output_name
+    artifact: artifact.type
+
+container:
+  image: docker_image
+  service: optional_service
+  exposed_ports: []
+
+generator:
+  plugin: plugin_name
+  inputs: {}
+
+flag:
+  reveal:
+    method: stdout | file | network
+  validation:
+    type: exact | regex | hash | derived
+    params: {}
+
+points: integer

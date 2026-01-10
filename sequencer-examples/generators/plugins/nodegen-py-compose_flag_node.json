@@ -1,0 +1,16 @@
+{
+  "plugin_id": "nodegen-py-compose_flag_node",
+  "plugin_type": "flag-node-generator",
+  "version": "1.0",
+  "description": "Converted from generator id 'nodegen.py.compose_flag_node'.",
+  "requires": ["seed", "node_name"],
+  "produces": [
+    {"artifact": "compose_path"},
+    {"artifact": "flag"}
+  ],
+  "inputs": {
+    "seed": {"type": "text", "required": true},
+    "node_name": {"type": "text", "required": true},
+    "flag_prefix": {"type": "text", "required": false}
+  }
+}

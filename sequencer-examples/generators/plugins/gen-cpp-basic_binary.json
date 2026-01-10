@@ -1,0 +1,13 @@
+{
+  "plugin_id": "gen-cpp-basic_binary",
+  "plugin_type": "flag-generator",
+  "version": "1.0",
+  "description": "Converted from generator id 'gen.cpp.basic_binary'.",
+  "requires": ["seed"],
+  "produces": [
+    {"artifact": "binary_path"}
+  ],
+  "inputs": {
+    "seed": {"type": "string", "required": true}
+  }
+}

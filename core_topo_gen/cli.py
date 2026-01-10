@@ -1127,11 +1127,24 @@ def main():
                         try:
                             with open(p, 'r', encoding='utf-8') as fh:
                                 doc = json.load(fh) or {}
-                            arr = doc.get('generators') or []
+                            try:
+                                schema_version = int(doc.get('schema_version') or 0)
+                            except Exception:
+                                schema_version = 0
+                            if schema_version != 3:
+                                continue
+                            arr = doc.get('implementations') or []
                             if isinstance(arr, list):
-                                for g in arr:
-                                    if isinstance(g, dict) and str(g.get('id') or '').strip():
-                                        gens.append(g)
+                                for impl in arr:
+                                    if not isinstance(impl, dict):
+                                        continue
+                                    pid = str(impl.get('plugin_id') or '').strip()
+                                    if not pid:
+                                        continue
+                                    # Expose plugin_id as id for legacy callers.
+                                    rec = dict(impl)
+                                    rec.setdefault('id', pid)
+                                    gens.append(rec)
                         except Exception:
                             continue
                     return gens
