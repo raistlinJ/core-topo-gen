@@ -585,6 +585,33 @@
     return out.length ? out.join(', ') : '—';
   }
 
+  function groupedNameHtml(items) {
+    const arr = Array.isArray(items) ? items : [];
+    const req = [];
+    const opt = [];
+    arr.forEach((it) => {
+      if (!it || typeof it !== 'object') return;
+      const nm = String(it.name || '').trim();
+      if (!nm) return;
+      const isOptional = it.required === false;
+      (isOptional ? opt : req).push(nm);
+    });
+    req.sort();
+    opt.sort();
+    const hasReq = req.length > 0;
+    const hasOpt = opt.length > 0;
+    if (!hasReq && !hasOpt) return '—';
+
+    const parts = [];
+    if (hasReq) {
+      parts.push(`<div><span class="text-muted">required:</span> ${escapeHtml(req.join(', '))}</div>`);
+    }
+    if (hasOpt) {
+      parts.push(`<div><span class="text-muted">optional:</span> ${escapeHtml(opt.join(', '))}</div>`);
+    }
+    return parts.join('');
+  }
+
   function renderGenerators() {
     const body = document.getElementById('genBody');
     const q = (genState.filter || '').toLowerCase();
@@ -618,8 +645,8 @@
       const tr = document.createElement('tr');
       const src = (g.source && g.source.path) ? g.source.path : '';
       const entry = (g.source && g.source.entry) ? g.source.entry : '';
-      const inNames = nameSummary(g.inputs);
-      const outNames = nameSummary(g.outputs);
+      const inHtml = groupedNameHtml(g.inputs);
+      const outHtml = groupedNameHtml(g.outputs);
       const inTypes = typeSummary(g.inputs);
       const outTypes = typeSummary(g.outputs);
       const hasCompose = !!(g.compose && typeof g.compose === 'object');
@@ -640,8 +667,8 @@
         </td>
         <td class="small">${escapeHtml(typeLabel)}</td>
         <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(pathLabel)}</td>
-        <td class="small" title="${escapeHtml(inTypes)}">${escapeHtml(inNames)}</td>
-        <td class="small" title="${escapeHtml(outTypes)}">${escapeHtml(outNames)}</td>
+        <td class="small" title="${escapeHtml(inTypes)}">${inHtml}</td>
+        <td class="small" title="${escapeHtml(outTypes)}">${outHtml}</td>
         <td class="small">${escapeHtml(g._source_name || '')}</td>
         <td>
           <button class="btn btn-sm btn-outline-primary genTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}">Test</button>
@@ -691,8 +718,8 @@
       const tr = document.createElement('tr');
       const src = (g.source && g.source.path) ? g.source.path : '';
       const entry = (g.source && g.source.entry) ? g.source.entry : '';
-      const inNames = nameSummary(g.inputs);
-      const outNames = nameSummary(g.outputs);
+      const inHtml = groupedNameHtml(g.inputs);
+      const outHtml = groupedNameHtml(g.outputs);
       const inTypes = typeSummary(g.inputs);
       const outTypes = typeSummary(g.outputs);
       const hasCompose = !!(g.compose && typeof g.compose === 'object');
@@ -713,8 +740,8 @@
         </td>
         <td class="small">${escapeHtml(typeLabel)}</td>
         <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(pathLabel)}</td>
-        <td class="small" title="${escapeHtml(inTypes)}">${escapeHtml(inNames)}</td>
-        <td class="small" title="${escapeHtml(outTypes)}">${escapeHtml(outNames)}</td>
+        <td class="small" title="${escapeHtml(inTypes)}">${inHtml}</td>
+        <td class="small" title="${escapeHtml(outTypes)}">${outHtml}</td>
         <td class="small">${escapeHtml(g._source_name || '')}</td>
         <td>
           <button class="btn btn-sm btn-outline-primary nodeGenTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}">Test</button>

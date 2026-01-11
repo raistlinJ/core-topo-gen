@@ -3595,7 +3595,8 @@ function normalizeBaseUpload(meta) {
 
 const ROUTER_NODE_TYPES = new Set(['router', 'prouter', 'mdr', 'core-router', 'gateway']);
 const SWITCH_NODE_TYPES = new Set(['switch', 'lanswitch', 'l3switch', 'bridge', 'core-switch']);
-const HOST_NODE_TYPES = new Set(['host', 'pc', 'server', 'workstation', 'docker', 'client', 'desktop', 'lxc', 'xterm', 'generic', 'terminal', 'laptop']);
+const DOCKER_NODE_TYPES = new Set(['docker']);
+const HOST_NODE_TYPES = new Set(['host', 'pc', 'server', 'workstation', 'client', 'desktop', 'lxc', 'xterm', 'generic', 'terminal', 'laptop']);
 const NETWORK_NODE_TYPES = new Set(['network', 'lan', 'wan']);
 const WIRELESS_NODE_TYPES = new Set(['wireless', 'wirelesslan', 'wireless-lan', 'wlan', 'wifi']);
 const RJ45_NODE_TYPES = new Set(['rj45']);
@@ -3604,7 +3605,9 @@ const HUB_NODE_TYPES = new Set(['hub', 'ethernet', 'tap']);
 const NODE_TYPE_STYLE_PRESETS = {
     router: { label: 'Router', color: '#ff7043', radius: 11 },
     switch: { label: 'Switch', color: '#17a2b8', radius: 8 },
-    host: { label: 'Host', color: '#ffc107', radius: 5 },
+    // Distinguish Docker-role hosts vs non-docker hosts in Preview graph.
+    host: { label: 'Host (non-docker)', color: 'var(--bs-warning-bg-subtle)', radius: 5 },
+    docker: { label: 'Host (Docker)', color: 'var(--bs-warning)', radius: 6 },
     network: { label: 'Network', color: '#6c757d', radius: 7 },
     hub: { label: 'Hub', color: '#7952b3', radius: 6 },
     rj45: { label: 'RJ45', color: '#20c997', radius: 6, shape: 'square' },
@@ -3623,6 +3626,7 @@ function canonicalNodeType(raw) {
     if (WIRELESS_NODE_TYPES.has(key)) return 'wireless';
     if (NETWORK_NODE_TYPES.has(key)) return 'network';
     if (HUB_NODE_TYPES.has(key)) return 'hub';
+    if (DOCKER_NODE_TYPES.has(key)) return 'docker';
     if (HOST_NODE_TYPES.has(key)) return 'host';
     return key;
 }
@@ -5549,6 +5553,10 @@ function buildFullPreviewModalGraph(full){
             legendOffset += Math.max(radius * 2 + 6, 20);
         };
 
+        // Always include host-vs-docker distinction in the legend.
+        ensureLegendEntry('host');
+        ensureLegendEntry('docker');
+
         const registerLegendForNodes = (list) => {
             if(!Array.isArray(list)) return;
             list.forEach(node => {
@@ -5597,7 +5605,9 @@ function buildFullPreviewModalGraph(full){
             const assignment = Array.isArray(hn.vulnerabilities) ? hn.vulnerabilities : vulnerabilitiesByNode[keyStr] || vulnerabilitiesByNode[hostId] || [];
             const vulnList = Array.isArray(assignment) ? assignment : [];
             const hasVuln = vulnList.length > 0;
-            addNode({id:hostId, label:hn.name, type:'host', ip4: hn.ip4 || '', hasVuln: hasVuln, vulnerabilities: vulnList});
+            const roleRaw = (hn && (hn.role || hn.kind || hn.type)) ? String(hn.role || hn.kind || hn.type) : '';
+            const isDockerRole = roleRaw.trim().toLowerCase() === 'docker';
+            addNode({id:hostId, label:hn.name, type: (isDockerRole ? 'docker' : 'host'), role: roleRaw, ip4: hn.ip4 || '', hasVuln: hasVuln, vulnerabilities: vulnList});
         });
         (full.switches_detail||[]).forEach(sw=>{
             if(sw==null) return;
@@ -6073,8 +6083,9 @@ function buildFullPreviewModalGraph(full){
         // Native SVG tooltip on hover
         node.insert('title', ':first-child').text(d => nodeTitle(d));
         const vulnerabilityColor = '#28a745';
-        const hasVulnerableHosts = nodes.some(n => n.type === 'host' && n.hasVuln);
-        const normalNode = node.filter(d => !(d.type === 'host' && d.hasVuln));
+        const isHostLike = (t) => t === 'host' || t === 'docker';
+        const hasVulnerableHosts = nodes.some(n => isHostLike(n.type) && n.hasVuln);
+        const normalNode = node.filter(d => !(isHostLike(d.type) && d.hasVuln));
         normalNode.each(function(d){
             const nodeGroup = d3.select(this);
             const style = nodeStyleForType(d.type);
@@ -6099,7 +6110,7 @@ function buildFullPreviewModalGraph(full){
                     .attr('stroke-width', d.isBaseBridge ? 3 : d.isBase ? 2 : 1.1);
             }
         });
-        const vulnNode = node.filter(d => d.type === 'host' && d.hasVuln);
+        const vulnNode = node.filter(d => isHostLike(d.type) && d.hasVuln);
         const vulnSymbol = d3.symbol().type(d3.symbolStar).size(170);
         vulnNode.append('path')
             .attr('d', vulnSymbol)

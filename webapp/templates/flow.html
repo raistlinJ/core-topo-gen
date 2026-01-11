@@ -104,13 +104,13 @@
               <div id="flowDiagram" class="mermaid">graph LR\n  A[Generate] --> B[Flow]</div>
             </div>
 
-            <dialog id="flowNodeDetailsDialog" class="p-0 border rounded" style="max-width: 920px; width: calc(100% - 2rem);">
-              <form method="dialog" class="m-0">
-                <div class="p-3 border-bottom d-flex align-items-center justify-content-between">
+            <dialog id="flowNodeDetailsDialog" class="p-0 border rounded" style="max-width: 1150px; width: calc(100% - 2rem); max-height: 85vh; overflow: hidden;">
+              <form method="dialog" class="m-0" style="display:flex;flex-direction:column;max-height:85vh;">
+                <div class="p-3 border-bottom d-flex align-items-center justify-content-between" style="flex:0 0 auto;">
                   <div class="fw-semibold" id="flowNodeDetailsTitle">Node</div>
                   <button class="btn btn-sm btn-outline-secondary" value="close" type="submit">Close</button>
                 </div>
-                <div class="p-3">
+                <div class="p-3" style="flex:1 1 auto; overflow: auto;">
                   <div id="flowNodeDetailsBody" class="small"></div>
                 </div>
               </form>
@@ -526,22 +526,24 @@
     for(let i=0;i<assignments.length;i++){
       const a = assignments[i] || {};
 
-      const reqEffective = Array.isArray(a.inputs) ? a.inputs.map(String) : [];
-      const missing = reqEffective.filter(k => k && !haveEffective.has(k));
-
       const hasSplit = Array.isArray(a.requires) || Array.isArray(a.input_fields_required) || Array.isArray(a.input_fields);
-      const reqArtifacts = Array.isArray(a.requires) ? a.requires.map(String) : [];
-      const reqFields = Array.isArray(a.input_fields_required)
-        ? a.input_fields_required.map(String)
-        : (Array.isArray(a.input_fields) ? a.input_fields.map(String) : []);
-      const missingArtifacts = hasSplit
-        ? reqArtifacts.filter(k => k && !haveArtifacts.has(k))
-        : [];
-      const missingFields = hasSplit
-        ? reqFields.filter(k => k && !haveFields.has(k))
-        : missing;
+      if(hasSplit){
+        const reqArtifacts = Array.isArray(a.requires) ? a.requires.map(String) : [];
+        const reqFields = Array.isArray(a.input_fields_required)
+          ? a.input_fields_required.map(String)
+          : (Array.isArray(a.input_fields) ? a.input_fields.map(String) : []);
+        const optFields = Array.isArray(a.input_fields_optional) ? a.input_fields_optional.map(String) : [];
+        const optSet = new Set(optFields.filter(Boolean));
 
-      out.push({ ok: missing.length === 0, missing, missing_artifacts: missingArtifacts, missing_fields: missingFields });
+        const missingArtifacts = reqArtifacts.filter(k => k && !optSet.has(k) && !haveArtifacts.has(k));
+        const missingFields = reqFields.filter(k => k && !haveFields.has(k));
+        const missing = missingArtifacts.concat(missingFields);
+        out.push({ ok: missing.length === 0, missing, missing_artifacts: missingArtifacts, missing_fields: missingFields });
+      } else {
+        const reqEffective = Array.isArray(a.inputs) ? a.inputs.map(String) : [];
+        const missing = reqEffective.filter(k => k && !haveEffective.has(k));
+        out.push({ ok: missing.length === 0, missing, missing_artifacts: [], missing_fields: [] });
+      }
 
       const provEffective = Array.isArray(a.outputs) ? a.outputs.map(String) : [];
       provEffective.forEach(k => { if(k) haveEffective.add(k); });
@@ -694,8 +696,8 @@
           const ma = Array.isArray(step.missing_artifacts) ? step.missing_artifacts : [];
           const mf = Array.isArray(step.missing_fields) ? step.missing_fields : [];
           if(ma.length || mf.length){
-            addRow('missing artifacts', ma.join(', ') || '-', { danger: true });
-            addRow('missing fields', mf.join(', ') || '-', { danger: true });
+            addRow('missing inputs (artifacts)', ma.join(', ') || '-', { danger: true });
+            addRow('missing inputs (fields)', mf.join(', ') || '-', { danger: true });
           } else {
             addRow('missing', (step.missing || []).join(', ') || '-', { danger: true });
           }
@@ -852,57 +854,69 @@
       tbody.appendChild(tr);
     }
 
+    function addFullRow(valueElOrText){
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 2;
+      if(valueElOrText && typeof valueElOrText === 'object' && valueElOrText.nodeType){
+        td.appendChild(valueElOrText);
+      } else {
+        td.textContent = String(valueElOrText || '');
+      }
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    }
+
     // Flag(s) assigned to this node (currently 1-per-chain-position).
     if(fa && (fa.id || fa.name)){
       const genId = fa && fa.id ? String(fa.id) : '-';
       const genName = fa && fa.name ? String(fa.name) : '-';
       const genType = (fa && fa.type) ? String(fa.type) : '';
       const genSource = (fa && fa.flag_generator) ? String(fa.flag_generator) : '';
-      const prefixParts = [];
-      if(genType) prefixParts.push(genType);
-      if(genSource) prefixParts.push(genSource);
-      const prefix = prefixParts.length ? ('[' + prefixParts.join(' | ') + '] ') : '';
-      const label = prefix + ((genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId);
-      addRow('flag', label);
+      // Render a structured summary (more readable than a pipe-delimited string).
+      const flagEl = document.createElement('div');
+      flagEl.className = 'd-flex flex-column';
+
+      const line1 = document.createElement('div');
+      line1.className = 'small';
+      const typeLabel = document.createElement('span');
+      typeLabel.className = 'text-muted';
+      typeLabel.textContent = 'Type:';
+      const typeVal = document.createElement('code');
+      typeVal.className = 'ms-1';
+      typeVal.textContent = genType || '-';
+      line1.appendChild(typeLabel);
+      line1.appendChild(typeVal);
+
+      const sourceLabel = document.createElement('span');
+      sourceLabel.className = 'text-muted ms-2';
+      sourceLabel.textContent = 'Source:';
+      const sourceVal = document.createElement('code');
+      sourceVal.className = 'ms-1';
+      sourceVal.textContent = genSource || '-';
+      line1.appendChild(sourceLabel);
+      line1.appendChild(sourceVal);
+
+      const line2 = document.createElement('div');
+      // Keep the ID visually distinct; name is optional.
+      const idVal = document.createElement('code');
+      idVal.textContent = genId || '-';
+      line2.appendChild(idVal);
+      if(genName && genName !== '-' && genName !== genId){
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'ms-2';
+        nameSpan.textContent = genName;
+        line2.appendChild(nameSpan);
+      }
+
+      flagEl.appendChild(line1);
+      flagEl.appendChild(line2);
+      addRow('flag', flagEl);
     } else {
       addRow('flag', '-');
     }
 
-    // Runtime flag value(s), only present after prepare_preview_for_execute resolves generators.
-    try{
-      const fv = (fa && typeof fa.flag_value === 'string') ? fa.flag_value.trim() : '';
-      if(fv){
-        const code = document.createElement('code');
-        code.className = 'font-monospace';
-        code.textContent = fv;
-        addRow('flag value', code);
-      } else {
-        addRow('flag value', '-');
-      }
-    } catch(e) {
-      addRow('flag value', '-');
-    }
-
-    // Description hints.
-    const descList = (fa && Array.isArray(fa.description_hints) && fa.description_hints.length)
-      ? fa.description_hints.map(x => String(x || '').trim()).filter(Boolean)
-      : [];
-    if(descList.length > 1){
-      const wrap = document.createElement('div');
-      const ul = document.createElement('ol');
-      ul.className = 'mb-0 ps-3';
-      descList.forEach((ht) => {
-        const li = document.createElement('li');
-        li.textContent = ht;
-        ul.appendChild(li);
-      });
-      wrap.appendChild(ul);
-      addRow('description hints', wrap);
-    } else if(descList.length === 1){
-      addRow('description hints', descList[0]);
-    } else {
-      addRow('description hints', '-');
-    }
+    // (Intentionally compact) omit flag value and hint descriptions here.
 
     tbl.appendChild(tbody);
     nodeDetailsBodyEl.appendChild(tbl);
@@ -921,7 +935,7 @@
       const help = document.createElement('div');
       help.className = 'small text-muted';
       help.textContent = isVuln
-        ? 'Vulnerability nodes require a flag-generator.'
+        ? 'Flag generator type (fixed for vulnerabilities)'
         : 'Choose a compatible flag-generator or flag-node-generator.';
       const btn = document.createElement('button');
       btn.type = 'button';
@@ -984,12 +998,33 @@
       const entryErr = document.createElement('div');
       entryErr.className = 'small text-danger d-none';
 
-      const genSel = document.createElement('select');
-      genSel.className = 'form-select form-select-sm';
+      const candWrap = document.createElement('div');
+      candWrap.className = 'border rounded';
+      candWrap.style.maxHeight = '240px';
+      candWrap.style.overflow = 'auto';
+
+      const candTable = document.createElement('table');
+      candTable.className = 'table table-sm mb-0 align-middle';
+      const candHead = document.createElement('thead');
+      const candHeadTr = document.createElement('tr');
+      ;['Pick','Generator','Source','Incompatibility'].forEach((h)=>{
+        const th = document.createElement('th');
+        th.className = 'small text-muted';
+        th.style.whiteSpace = 'nowrap';
+        th.textContent = h;
+        candHeadTr.appendChild(th);
+      });
+      candHead.appendChild(candHeadTr);
+      const candBody = document.createElement('tbody');
+      candTable.appendChild(candHead);
+      candTable.appendChild(candBody);
+      candWrap.appendChild(candTable);
+
+      let selectedCandidateId = '';
 
       row2.appendChild(entryInput);
       row2.appendChild(entryErr);
-      row2.appendChild(genSel);
+      row2.appendChild(candWrap);
       form.appendChild(row2);
 
       const row3 = document.createElement('div');
@@ -1111,38 +1146,140 @@
           }
         }
 
-        filtered.sort((a,b)=>{
-          const an = String((a && a.name) || '').toLowerCase();
-          const bn = String((b && b.name) || '').toLowerCase();
-          if(an < bn) return -1;
-          if(an > bn) return 1;
-          const ai = String((a && a.id) || '');
-          const bi = String((b && b.id) || '');
-          return ai.localeCompare(bi);
-        });
+        // Cap for UI sanity.
+        filtered = filtered.slice(0, 250);
 
-        genSel.innerHTML = '';
-        const ph = document.createElement('option');
-        ph.value = '';
-        ph.textContent = filtered.length ? '(Select generator…)': '(No matches)';
-        genSel.appendChild(ph);
-
-        for(const g of filtered.slice(0, 250)){
-          const gid = String((g && g.id) || '').trim();
-          if(!gid) continue;
-          const gname = String((g && g.name) || '').trim();
-          const sname = String((g && g._source_name) || '').trim();
-          const o = document.createElement('option');
-          o.value = gid;
-          o.textContent = gname ? (gid + ' — ' + gname + (sname ? (' (' + sname + ')') : '')) : (gid + (sname ? (' (' + sname + ')') : ''));
-          genSel.appendChild(o);
-        }
-
-        // Preselect current generator if it exists.
+        // Default selection to current.
         try {
           const curId = (fa && fa.id) ? String(fa.id) : '';
-          if(curId) genSel.value = curId;
-        } catch(e) {}
+          selectedCandidateId = curId || '';
+        } catch(e) {
+          selectedCandidateId = '';
+        }
+
+        // Ask server to compute compatibility against the current chain context.
+        const chainIds = Array.isArray(currentChain)
+          ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean)
+          : [];
+        const reqAssignments = chainIds.map((nid, j)=>{
+          const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
+          const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
+          return { node_id: nid, id: curId };
+        });
+        const candidateIds = filtered.map(g => String((g && g.id) || '').trim()).filter(Boolean);
+
+        // Render optimistic placeholder.
+        candBody.innerHTML = '';
+        if(!candidateIds.length){
+          const tr = document.createElement('tr');
+          const td = document.createElement('td');
+          td.colSpan = 4;
+          td.className = 'text-muted small';
+          td.textContent = 'No matches.';
+          tr.appendChild(td);
+          candBody.appendChild(tr);
+          return;
+        }
+
+        (async ()=>{
+          let candidates = [];
+          try {
+            const res = await postJson('/api/flag-sequencing/substitution_candidates', {
+              scenario: activeScenario,
+              preview_plan: (lastPreviewPlanPath || lastFlowPlanPath || ''),
+              chain_ids: chainIds,
+              flag_assignments: reqAssignments,
+              index: i,
+              kind,
+              candidate_ids: candidateIds,
+            }, { timeoutMs: 45000 });
+            candidates = (res && Array.isArray(res.candidates)) ? res.candidates.slice() : [];
+          } catch(e) {
+            // If this fails, fall back to showing everything as selectable.
+            candidates = candidateIds.map((gid)=>{
+              const g = filtered.find(x => String((x && x.id) || '').trim() === gid) || {};
+              return {
+                id: String(gid),
+                name: String((g && g.name) || ''),
+                source: String((g && g._source_name) || '').trim() || 'unknown',
+                compatible: true,
+                blocked_by: [],
+              };
+            });
+          }
+
+          // Ensure ordering: compatible first (server already does this, but be safe).
+          candidates.sort((a,b)=>{
+            const ak = (a && a.compatible) ? 0 : 1;
+            const bk = (b && b.compatible) ? 0 : 1;
+            if(ak !== bk) return ak - bk;
+            const an = String((a && a.name) || '').toLowerCase();
+            const bn = String((b && b.name) || '').toLowerCase();
+            if(an < bn) return -1;
+            if(an > bn) return 1;
+            return String((a && a.id) || '').localeCompare(String((b && b.id) || ''));
+          });
+
+          candBody.innerHTML = '';
+          for(const c of candidates){
+            const cid = String((c && c.id) || '').trim();
+            if(!cid) continue;
+            const tr = document.createElement('tr');
+            const ok = !!(c && c.compatible);
+            if(!ok){
+              tr.classList.add('text-muted');
+              tr.style.opacity = '0.6';
+            }
+
+            const tdPick = document.createElement('td');
+            tdPick.style.width = '1%';
+            tdPick.style.whiteSpace = 'nowrap';
+            const radio = document.createElement('input');
+            radio.type = 'radio';
+            radio.name = 'flowSubstitutePick';
+            radio.value = cid;
+            radio.checked = !!(selectedCandidateId && selectedCandidateId === cid);
+            radio.addEventListener('change', ()=>{
+              selectedCandidateId = cid;
+            });
+            tdPick.appendChild(radio);
+
+            const tdGen = document.createElement('td');
+            tdGen.style.whiteSpace = 'nowrap';
+            const nm = String((c && c.name) || '').trim();
+            tdGen.textContent = nm ? (cid + ' — ' + nm) : cid;
+
+            const tdSrc = document.createElement('td');
+            tdSrc.style.whiteSpace = 'nowrap';
+            tdSrc.textContent = String((c && c.source) || '').trim() || '-';
+
+            const tdWhy = document.createElement('td');
+            tdWhy.className = 'small';
+            const blocked = (c && Array.isArray(c.blocked_by)) ? c.blocked_by.map(x => String(x || '').trim()).filter(Boolean) : [];
+            tdWhy.textContent = ok ? '' : (blocked.length ? blocked.join(' · ') : 'incompatible');
+
+            tr.appendChild(tdPick);
+            tr.appendChild(tdGen);
+            tr.appendChild(tdSrc);
+            tr.appendChild(tdWhy);
+
+            // Clicking a compatible row selects it.
+            tr.addEventListener('click', ()=>{
+              selectedCandidateId = cid;
+              try { radio.checked = true; } catch(e) {}
+            });
+
+            candBody.appendChild(tr);
+          }
+
+          // If current selection is not present, clear it.
+          if(selectedCandidateId){
+            const found = candidates.find(x => String((x && x.id) || '') === selectedCandidateId);
+            if(!found){
+              selectedCandidateId = '';
+            }
+          }
+        })();
       }
 
       btn.addEventListener('click', async ()=>{
@@ -1152,6 +1289,9 @@
       cancelBtn.addEventListener('click', ()=>{
         form.classList.add('d-none');
         btn.disabled = false;
+        try {
+          if(typeof nodeDetailsDialogEl.close === 'function') nodeDetailsDialogEl.close();
+        } catch(e) {}
       });
 
       kindSel.addEventListener('change', ()=>{
@@ -1167,11 +1307,14 @@
       });
 
       applyBtn.addEventListener('click', async ()=>{
-        const chosenId = String(genSel.value || '').trim();
+        const chosenId = String(selectedCandidateId || '').trim();
         if(!chosenId){
           setStatus('Select a generator first.', true);
           return;
         }
+        // Prevent double submits while we persist + save.
+        try { applyBtn.disabled = true; } catch(e) {}
+        try { cancelBtn.disabled = true; } catch(e) {}
         try{
           if(!Array.isArray(currentChain) || currentChain.length === 0){
             throw new Error('Generate a chain first.');
@@ -1215,6 +1358,11 @@
           btn.disabled = false;
           setStatus('Substitution saved. Saving XML…', false);
 
+          // Close immediately so the user doesn't see the substitute UI while hints resolve.
+          try {
+            if(typeof nodeDetailsDialogEl.close === 'function') nodeDetailsDialogEl.close();
+          } catch(e) {}
+
           // Save XML (this also resolves hints / runs generators) so the UI shows
           // updated flag values and rendered hints immediately.
           try {
@@ -1223,12 +1371,11 @@
             // Non-fatal; substitution was persisted.
             setStatus('Saved substitution, but Save XML failed: ' + String(e && e.message || e), true);
           }
-
-          // Refresh the dialog contents with updated values/hints.
-          openNodeDetailsDialog(i);
         } catch(e){
           setStatus('Failed to save substitution: ' + String(e && e.message || e), true);
         } finally {
+          try { applyBtn.disabled = false; } catch(e) {}
+          try { cancelBtn.disabled = false; } catch(e) {}
           hideLoading();
         }
       });
@@ -1239,7 +1386,8 @@
         try { showSubstituteUI(); } catch(e) {}
       }
 
-      addRow('substitute', box);
+      // Full-width so the substitute box starts at the far left.
+      addFullRow(box);
     } catch(e) {
       // Non-fatal
     }

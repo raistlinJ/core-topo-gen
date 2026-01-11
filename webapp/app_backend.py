@@ -8284,8 +8284,16 @@ def _flow_compute_flag_assignments_for_preset(
             requires_artifacts = []
             produces_artifacts = []
 
+        # If an artifact "requires" token also appears as an optional input field,
+        # treat it as optional (exclude from effective chaining requirements).
+        try:
+            optional_field_set = set(input_fields_optional)
+            requires_effective = sorted([x for x in (requires_artifacts or []) if x and x not in optional_field_set])
+        except Exception:
+            requires_effective = list(requires_artifacts or [])
+
         # Effective chaining semantics used by ordering validation.
-        inputs_effective = sorted(set(requires_artifacts) | set(input_fields_required))
+        inputs_effective = sorted(set(requires_effective) | set(input_fields_required))
         outputs_effective = sorted(set(produces_artifacts) | set(output_fields))
 
         rendered_hints = [
@@ -9107,6 +9115,10 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
         return required
 
     def _required_input_fields_of(gen: dict[str, Any]) -> set[str]:
+        """Return required input field names for a generator.
+
+        Optional inputs (required=False) are intentionally excluded.
+        """
         required: set[str] = set()
         try:
             inputs = gen.get('inputs')
@@ -9139,10 +9151,32 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
             pass
         return fields
 
+    def _all_input_fields_of(gen: dict[str, Any]) -> set[str]:
+        fields: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get('name') or '').strip()
+                    if name:
+                        fields.add(name)
+        except Exception:
+            pass
+        return fields
+
     def _required_inputs_of(gen: dict[str, Any]) -> set[str]:
         # Effective union: artifact dependencies + required runtime input fields.
+        # If a plugin-level "requires" token is also present as an *optional* input
+        # field (required=False), treat it as optional and exclude it.
         try:
-            return _artifact_requires_of(gen) | _required_input_fields_of(gen)
+            req_fields = _required_input_fields_of(gen)
+            opt_fields = _all_input_fields_of(gen) - set(req_fields)
+            req_artifacts = _artifact_requires_of(gen)
+            if opt_fields:
+                req_artifacts = {r for r in req_artifacts if r not in opt_fields}
+            return req_artifacts | set(req_fields)
         except Exception:
             return set()
 
@@ -9268,6 +9302,14 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
         input_fields_all = sorted(list(_all_input_fields_of(gen)))
         input_fields_optional = sorted([x for x in input_fields_all if x and x not in set(input_fields_required)])
         output_fields = sorted(list(_output_fields_of(gen)))
+
+        # If an artifact "requires" token also appears as an optional input field,
+        # treat it as optional (do not block chaining/validation on it).
+        try:
+            optional_field_set = set(input_fields_optional)
+            requires_artifacts = sorted([x for x in requires_artifacts if x and x not in optional_field_set])
+        except Exception:
+            pass
 
         out.append({
             'node_id': str(cid),
@@ -9526,6 +9568,30 @@ def _flow_validate_chain_order_by_requires_produces(
     else:
         plugins_by_id = _flow_enabled_plugin_contracts_by_id()
 
+    # Best-effort: load enabled generator definitions so we can infer optional
+    # input fields even if the assignment payload doesn't include them.
+    gen_defs_by_id: dict[str, dict[str, Any]] = {}
+    try:
+        gens, _ = _flag_generators_from_enabled_sources()
+        for g in (gens or []):
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get('id') or '').strip()
+            if gid and gid not in gen_defs_by_id:
+                gen_defs_by_id[gid] = g
+    except Exception:
+        pass
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+        for g in (node_gens or []):
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get('id') or '').strip()
+            if gid and gid not in gen_defs_by_id:
+                gen_defs_by_id[gid] = g
+    except Exception:
+        pass
+
     available: set[str] = set(_flow_synthesized_inputs())
 
     for cid in chain_ids:
@@ -9543,7 +9609,35 @@ def _flow_validate_chain_order_by_requires_produces(
         inferred_requires = {str(x).strip() for x in (a.get('inputs') or []) if str(x).strip()}
         inferred_produces = {str(x).strip() for x in (a.get('outputs') or []) if str(x).strip()}
 
+        # Optional dependency tokens (do not block ordering). Prefer the assignment
+        # field when present; fall back to the generator catalog schema.
+        opt_set: set[str] = set()
+        try:
+            opt_fields = a.get('input_fields_optional') or []
+            if isinstance(opt_fields, list):
+                opt_set |= {str(x).strip() for x in opt_fields if str(x).strip()}
+        except Exception:
+            pass
+        if not opt_set:
+            try:
+                gen_def = gen_defs_by_id.get(plugin_id)
+                inputs = (gen_def or {}).get('inputs') if isinstance(gen_def, dict) else None
+                if isinstance(inputs, list):
+                    for inp in inputs:
+                        if not isinstance(inp, dict):
+                            continue
+                        if inp.get('required') is False:
+                            nm = str(inp.get('name') or '').strip()
+                            if nm:
+                                opt_set.add(nm)
+            except Exception:
+                pass
+
         base_requires = {str(x).strip() for x in (plugin.get('requires') or []) if str(x).strip()} if isinstance(plugin.get('requires'), list) else set()
+        if opt_set:
+            base_requires = {r for r in base_requires if r not in opt_set}
+            inferred_requires = {r for r in inferred_requires if r not in opt_set}
+
         requires = base_requires | inferred_requires
 
         base_prod: set[str] = set()
@@ -11465,8 +11559,16 @@ def api_flow_save_flow_substitutions():
         input_fields_optional = sorted([x for x in input_fields_all if x and x not in set(input_fields_required)])
         output_fields = sorted(list(_output_fields_of(gen)))
 
+        # If an artifact "requires" token also appears as an optional input field,
+        # treat it as optional (exclude from effective chaining requirements).
+        try:
+            optional_field_set = set(input_fields_optional)
+            requires_effective = [x for x in (requires_artifacts or []) if x and x not in optional_field_set]
+        except Exception:
+            requires_effective = list(requires_artifacts or [])
+
         # Effective union for chaining.
-        inputs_effective = sorted(list(set(requires_artifacts) | set(input_fields_required)))
+        inputs_effective = sorted(list(set(requires_effective) | set(input_fields_required)))
         outputs_effective = sorted(list(_provides_of(gen)))
 
         out_assignments.append({
@@ -11567,6 +11669,304 @@ def api_flow_save_flow_substitutions():
         'preview_plan_path': base_plan_path,
         'flow_plan_path': out_path,
         'base_preview_plan_path': base_plan_path,
+    })
+
+
+@app.route('/api/flag-sequencing/substitution_candidates', methods=['POST'])
+def api_flow_substitution_candidates():
+    """Return candidate generators with per-position compatibility info.
+
+    The client uses this to gray out incompatible generators and show why.
+    Compatibility here means: for the chain *prefix* (positions < index), the
+    candidate's required artifacts/fields are satisfied.
+    """
+    j = request.get_json(silent=True) or {}
+    scenario_label = str(j.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    index_raw = j.get('index')
+    try:
+        index = int(index_raw)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Invalid index.'}), 400
+    if index < 0:
+        return jsonify({'ok': False, 'error': 'Invalid index.'}), 400
+
+    chain_ids_in = j.get('chain_ids')
+    if not isinstance(chain_ids_in, list) or not chain_ids_in:
+        return jsonify({'ok': False, 'error': 'Missing chain_ids.'}), 400
+    chain_ids: list[str] = [str(x or '').strip() for x in chain_ids_in if str(x or '').strip()]
+    if not chain_ids:
+        return jsonify({'ok': False, 'error': 'Missing chain_ids.'}), 400
+    if index >= len(chain_ids):
+        return jsonify({'ok': False, 'error': 'Index out of range.'}), 400
+
+    kind = str(j.get('kind') or 'flag-generator').strip() or 'flag-generator'
+    if kind not in {'flag-generator', 'flag-node-generator'}:
+        kind = 'flag-generator'
+
+    base_plan_path = str(j.get('preview_plan') or '').strip() or None
+    if base_plan_path:
+        try:
+            base_plan_path = os.path.abspath(base_plan_path)
+            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
+            if os.path.commonpath([base_plan_path, plans_dir]) != plans_dir:
+                base_plan_path = None
+            elif not os.path.exists(base_plan_path):
+                base_plan_path = None
+        except Exception:
+            base_plan_path = None
+    if not base_plan_path:
+        base_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+    if not base_plan_path or not os.path.exists(base_plan_path):
+        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
+
+    try:
+        with open(base_plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+        preview = payload.get('full_preview') if isinstance(payload, dict) else None
+        if not isinstance(preview, dict):
+            return jsonify({'ok': False, 'error': 'Preview plan is missing full_preview.'}), 422
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
+
+    # Build chain nodes and check the target node vulnerability.
+    try:
+        nodes, _links, _adj = _build_topology_graph_from_preview_plan(preview)
+    except Exception:
+        nodes = []
+    id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
+    chain_nodes: list[dict[str, Any]] = []
+    for cid in chain_ids:
+        n = id_map.get(str(cid))
+        if not isinstance(n, dict):
+            return jsonify({'ok': False, 'error': f'Chain node not found in preview plan: {cid}'}), 422
+        chain_nodes.append(n)
+    is_vuln_node = bool((chain_nodes[index] if index < len(chain_nodes) else {}).get('is_vuln'))
+    if is_vuln_node:
+        kind = 'flag-generator'
+
+    # Parse the current chain assignments (ids only) so we can compute prefix outputs.
+    fas_in = j.get('flag_assignments')
+    if not isinstance(fas_in, list) or len(fas_in) != len(chain_nodes):
+        return jsonify({'ok': False, 'error': 'flag_assignments must be a list aligned to chain_ids (same length).'}), 400
+    cur_ids_by_node: dict[str, str] = {}
+    for i, cid in enumerate(chain_ids):
+        req = fas_in[i] if i < len(fas_in) else {}
+        if not isinstance(req, dict):
+            continue
+        node_id = str(req.get('node_id') or '').strip()
+        if node_id != str(cid):
+            continue
+        gen_id = str(req.get('id') or req.get('generator_id') or '').strip()
+        if gen_id:
+            cur_ids_by_node[node_id] = gen_id
+
+    # Candidate generator ids (client-filtered).
+    cand_ids_in = j.get('candidate_ids')
+    candidate_ids: list[str] = []
+    if isinstance(cand_ids_in, list) and cand_ids_in:
+        for x in cand_ids_in:
+            s = str(x or '').strip()
+            if s:
+                candidate_ids.append(s)
+    candidate_ids = list(dict.fromkeys(candidate_ids))
+
+    try:
+        gens, _ = _flag_generators_from_enabled_sources()
+    except Exception:
+        gens = []
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        node_gens = []
+
+    # Build generator index by id, annotated with kind.
+    gen_by_id: dict[str, dict[str, Any]] = {}
+    for g in (gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid and gid not in gen_by_id:
+            gg = dict(g)
+            gg['_flow_kind'] = 'flag-generator'
+            gen_by_id[gid] = gg
+    for g in (node_gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid and gid not in gen_by_id:
+            gg = dict(g)
+            gg['_flow_kind'] = 'flag-node-generator'
+            gen_by_id[gid] = gg
+
+    try:
+        plugins_by_id = _flow_enabled_plugin_contracts_by_id()
+    except Exception:
+        plugins_by_id = {}
+
+    def _artifact_requires_of(gen: dict[str, Any]) -> set[str]:
+        required: set[str] = set()
+        try:
+            pid = str(gen.get('id') or '').strip()
+            plugin = plugins_by_id.get(pid)
+            if isinstance(plugin, dict) and isinstance(plugin.get('requires'), list):
+                for x in (plugin.get('requires') or []):
+                    xx = str(x).strip()
+                    if xx:
+                        required.add(xx)
+        except Exception:
+            pass
+        return required
+
+    def _artifact_produces_of(gen: dict[str, Any]) -> set[str]:
+        provides: set[str] = set()
+        try:
+            pid = str(gen.get('id') or '').strip()
+            plugin = plugins_by_id.get(pid)
+            if isinstance(plugin, dict) and isinstance(plugin.get('produces'), list):
+                for item in (plugin.get('produces') or []):
+                    if not isinstance(item, dict):
+                        continue
+                    a = str(item.get('artifact') or '').strip()
+                    if a:
+                        provides.add(a)
+        except Exception:
+            pass
+        return provides
+
+    def _required_input_fields_of(gen: dict[str, Any]) -> set[str]:
+        required: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get('name') or '').strip()
+                    if not name:
+                        continue
+                    if inp.get('required') is False:
+                        continue
+                    required.add(name)
+        except Exception:
+            pass
+        return required
+
+    def _output_fields_of(gen: dict[str, Any]) -> set[str]:
+        out_fields: set[str] = set()
+        try:
+            outputs = gen.get('outputs')
+            if isinstance(outputs, list):
+                for outp in outputs:
+                    if not isinstance(outp, dict):
+                        continue
+                    nm = str(outp.get('name') or '').strip()
+                    if nm:
+                        out_fields.add(nm)
+        except Exception:
+            pass
+        return out_fields
+
+    # Compute prefix availability (artifacts + fields) from current assignments.
+    # Fields the sequencer provides regardless of earlier chain outputs.
+    synthesized_fields = {
+        'seed',
+        'secret',
+        'env_name',
+        'challenge',
+        'flag_prefix',
+        'username_prefix',
+        'key_len',
+        'node_name',
+    }
+    have_artifacts: set[str] = set()
+    have_fields: set[str] = set(synthesized_fields)
+
+    for pos in range(0, max(0, index)):
+        node_id = str(chain_ids[pos])
+        gen_id = cur_ids_by_node.get(node_id)
+        if not gen_id:
+            continue
+        g = gen_by_id.get(gen_id)
+        if not isinstance(g, dict):
+            continue
+        try:
+            have_artifacts |= _artifact_produces_of(g)
+        except Exception:
+            pass
+        try:
+            have_fields |= _output_fields_of(g)
+        except Exception:
+            pass
+
+    def _blocked_reasons(gen: dict[str, Any]) -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        try:
+            gkind = str(gen.get('_flow_kind') or '').strip() or 'flag-generator'
+            if is_vuln_node and gkind != 'flag-generator':
+                reasons.append('Flag-Generator type')
+        except Exception:
+            pass
+        req_a = sorted([x for x in _artifact_requires_of(gen) if x])
+        req_f = sorted([x for x in _required_input_fields_of(gen) if x])
+
+        # If an artifact requirement is also present as an *optional* input field,
+        # treat it as optional (do not block compatibility on it). This helps
+        # avoid flagging things like credential.pair as a hard missing dependency
+        # when the generator can operate without it.
+        try:
+            all_in = _all_input_fields_of(gen)
+            req_in = _required_input_fields_of(gen)
+            optional_in = set(all_in) - set(req_in)
+        except Exception:
+            optional_in = set()
+        req_a_effective = [x for x in req_a if x not in optional_in]
+
+        missing_a = [x for x in req_a_effective if x not in have_artifacts]
+        # Never report sequencer-provided fields as missing.
+        missing_f = [x for x in req_f if x not in have_fields and x not in synthesized_fields]
+        if missing_a:
+            reasons.append('missing inputs (artifacts): ' + ', '.join(missing_a))
+        if missing_f:
+            reasons.append('missing inputs (fields): ' + ', '.join(missing_f))
+        return (len(reasons) == 0), reasons
+
+    out: list[dict[str, Any]] = []
+    ids_to_eval = candidate_ids if candidate_ids else list(gen_by_id.keys())
+    for gid in ids_to_eval:
+        gen = gen_by_id.get(str(gid))
+        if not isinstance(gen, dict):
+            continue
+        gkind = str(gen.get('_flow_kind') or '').strip() or 'flag-generator'
+        if gkind != kind:
+            continue
+        ok, reasons = _blocked_reasons(gen)
+        out.append({
+            'id': str(gen.get('id') or ''),
+            'name': str(gen.get('name') or ''),
+            'type': gkind,
+            'source': str(gen.get('_source_name') or '').strip() or 'unknown',
+            'compatible': bool(ok),
+            'blocked_by': reasons,
+        })
+
+    out.sort(key=lambda e: (
+        0 if bool(e.get('compatible')) else 1,
+        str(e.get('name') or '').lower(),
+        str(e.get('id') or ''),
+    ))
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'kind': kind,
+        'index': index,
+        'is_vuln': bool(is_vuln_node),
+        'candidates': out,
+        'preview_plan_path': base_plan_path,
     })
 
 

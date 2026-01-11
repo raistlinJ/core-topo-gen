@@ -1093,8 +1093,9 @@ function buildScenarioUrl(basePath){
     const NODE_TYPE_STYLE_PRESETS = {
       router: { label: 'Router', color: '#ff7043', radius: 11 },
       switch: { label: 'Switch', color: '#17a2b8', radius: 8 },
-      host: { label: 'Host', color: '#ffc107', radius: 5 },
-      docker: { label: 'Docker', color: '#e35d6a', radius: 6 },
+      // Distinguish Docker-role hosts vs non-docker hosts.
+      host: { label: 'Host (non-docker)', color: 'var(--bs-warning-bg-subtle)', radius: 5 },
+      docker: { label: 'Host (Docker)', color: 'var(--bs-warning)', radius: 6 },
       vulnerability: { label: 'Vulnerability', color: '#ff0000', radius: 6 },
       network: { label: 'Network', color: '#6c757d', radius: 7 },
       hub: { label: 'Hub', color: '#7952b3', radius: 6 },
@@ -2204,6 +2205,10 @@ function buildScenarioUrl(basePath){
         .attr('font-size','11px');
       legendOffset += 20;
     };
+
+    // Always include host-vs-docker distinction in the legend.
+    ensureLegendEntry('host');
+    ensureLegendEntry('docker');
 
     const registerLegendForNodes = (list) => {
       if(!Array.isArray(list)) return;
