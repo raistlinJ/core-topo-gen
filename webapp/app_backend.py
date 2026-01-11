@@ -10281,7 +10281,7 @@ def api_flow_attackflow_preview():
         'length': length,
         'requested_length': requested_length,
         'preview_plan_path': preview_plan_path,
-        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or ''), 'is_vuln': bool(n.get('is_vuln'))} for n in chain_nodes],
         'flag_assignments': flag_assignments,
         'stats': stats,
         'bundle': bundle,
@@ -10289,6 +10289,14 @@ def api_flow_attackflow_preview():
         'flow_errors': list(flow_errors or []),
         'flags_enabled': bool(flags_enabled),
     }
+    try:
+        meta_out = payload.get('metadata') if isinstance(payload, dict) else None
+        if isinstance(meta_out, dict):
+            fp = str(meta_out.get('flow_plan_path') or '').strip()
+            if fp:
+                out['flow_plan_path'] = fp
+    except Exception:
+        pass
     if warning:
         out['warning'] = warning
     if debug_mode:
@@ -10480,13 +10488,44 @@ def api_flow_prepare_preview_for_execute():
     # Inject generator metadata into chain nodes.
     # Flag-generators should NOT create nodes/services; they generate artifacts/flags that can be
     # inserted into existing Docker nodes.
-    if preset_steps:
-        preset_assignments, preset_err = _flow_compute_flag_assignments_for_preset(preview, chain_nodes, scenario_label or scenario_norm, preset)
-        if preset_err:
-            return jsonify({'ok': False, 'error': f'Error: {preset_err}', 'stats': stats}), 422
-        flag_assignments = preset_assignments
-    else:
-        flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+    flag_assignments: list[dict[str, Any]] = []
+    # Prefer saved Flow assignments if the caller passed a flow plan (or a plan payload that
+    # already includes metadata.flow) and it fully covers this chain.
+    try:
+        flow_meta = meta.get('flow') if isinstance(meta, dict) else None
+        saved_assignments = flow_meta.get('flag_assignments') if isinstance(flow_meta, dict) else None
+        if isinstance(saved_assignments, list) and saved_assignments:
+            chain_set = {str(n.get('id') or '').strip() for n in (chain_nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
+            filtered: list[dict[str, Any]] = []
+            for entry in saved_assignments:
+                if not isinstance(entry, dict):
+                    continue
+                nid = str(entry.get('node_id') or '').strip()
+                if nid and nid in chain_set:
+                    filtered.append(entry)
+            if filtered and len(filtered) == len(chain_set):
+                by_id = {str(e.get('node_id') or '').strip(): e for e in filtered}
+                flag_assignments = [by_id.get(str(n.get('id') or '').strip()) for n in chain_nodes]
+                flag_assignments = [e for e in flag_assignments if isinstance(e, dict)]
+                try:
+                    flag_assignments = _flow_enrich_saved_flag_assignments(
+                        flag_assignments,
+                        chain_nodes,
+                        scenario_label=(scenario_label or scenario_norm),
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        flag_assignments = []
+
+    if not flag_assignments:
+        if preset_steps:
+            preset_assignments, preset_err = _flow_compute_flag_assignments_for_preset(preview, chain_nodes, scenario_label or scenario_norm, preset)
+            if preset_err:
+                return jsonify({'ok': False, 'error': f'Error: {preset_err}', 'stats': stats}), 422
+            flag_assignments = preset_assignments
+        else:
+            flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
 
     # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
     # Note: chain_ids is populated for both explicit and auto-picked chains; use explicit_chain.
@@ -11169,7 +11208,7 @@ def api_flow_prepare_preview_for_execute():
         'length': length,
         'requested_length': requested_length,
         'stats': stats,
-        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or ''), 'is_vuln': bool(n.get('is_vuln'))} for n in chain_nodes],
         'flag_assignments': flag_assignments,
         'flags_enabled': bool(flags_enabled),
         'flow_valid': bool(flow_valid),
@@ -11180,6 +11219,354 @@ def api_flow_prepare_preview_for_execute():
         'best_effort': bool(best_effort),
         'elapsed_s': round(float(time.monotonic() - started_at), 3),
         **({'sequencer_dag': (dag_debug or {'ok': False, 'errors': ['not computed (explicit chain)']})} if debug_dag else {}),
+    })
+
+
+@app.route('/api/flag-sequencing/save_flow_substitutions', methods=['POST'])
+def api_flow_save_flow_substitutions():
+    """Persist a user-edited chain + generator assignments (no generator runs).
+
+    This writes a plan_from_flow_*.json that carries metadata.flow.chain and
+    metadata.flow.flag_assignments so future preview/prepare/execute honors the
+    user's substitutions.
+    """
+    j = request.get_json(silent=True) or {}
+    scenario_label = str(j.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    chain_ids_in = j.get('chain_ids')
+    if not isinstance(chain_ids_in, list) or not chain_ids_in:
+        return jsonify({'ok': False, 'error': 'Missing chain_ids.'}), 400
+    chain_ids: list[str] = [str(x or '').strip() for x in chain_ids_in if str(x or '').strip()]
+    if not chain_ids:
+        return jsonify({'ok': False, 'error': 'Missing chain_ids.'}), 400
+
+    base_plan_path = str(j.get('preview_plan') or '').strip() or None
+    if base_plan_path:
+        try:
+            base_plan_path = os.path.abspath(base_plan_path)
+            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
+            if os.path.commonpath([base_plan_path, plans_dir]) != plans_dir:
+                base_plan_path = None
+            elif not os.path.exists(base_plan_path):
+                base_plan_path = None
+        except Exception:
+            base_plan_path = None
+    if not base_plan_path:
+        base_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+    if not base_plan_path or not os.path.exists(base_plan_path):
+        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
+
+    try:
+        with open(base_plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+        meta = payload.get('metadata') if isinstance(payload, dict) else {}
+        preview = payload.get('full_preview') if isinstance(payload, dict) else None
+        if not isinstance(preview, dict):
+            return jsonify({'ok': False, 'error': 'Preview plan is missing full_preview.'}), 422
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
+
+    # Build chain node dicts with vulnerability flags.
+    try:
+        nodes, _links, _adj = _build_topology_graph_from_preview_plan(preview)
+    except Exception:
+        nodes = []
+    id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
+    chain_nodes: list[dict[str, Any]] = []
+    for cid in chain_ids:
+        n = id_map.get(str(cid))
+        if not isinstance(n, dict):
+            return jsonify({'ok': False, 'error': f'Chain node not found in preview plan: {cid}'}), 422
+        chain_nodes.append(n)
+
+    # Parse requested assignments (one per chain position).
+    fas_in = j.get('flag_assignments')
+    if not isinstance(fas_in, list) or len(fas_in) != len(chain_nodes):
+        return jsonify({'ok': False, 'error': 'flag_assignments must be a list aligned to chain_ids (same length).'}), 400
+
+    try:
+        gens, _ = _flag_generators_from_enabled_sources()
+    except Exception:
+        gens = []
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        node_gens = []
+    gen_by_id: dict[str, dict[str, Any]] = {}
+    for g in (gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid and gid not in gen_by_id:
+            gg = dict(g)
+            gg['_flow_kind'] = 'flag-generator'
+            gg['_flow_catalog'] = 'flag_generators'
+            gen_by_id[gid] = gg
+    for g in (node_gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid and gid not in gen_by_id:
+            gg = dict(g)
+            gg['_flow_kind'] = 'flag-node-generator'
+            gg['_flow_catalog'] = 'flag_node_generators'
+            gen_by_id[gid] = gg
+
+    try:
+        plugins_by_id = _flow_enabled_plugin_contracts_by_id()
+    except Exception:
+        plugins_by_id = {}
+
+    id_to_name: dict[str, str] = {}
+    for n in chain_nodes:
+        try:
+            nid = str(n.get('id') or '').strip()
+            nm = str(n.get('name') or '').strip()
+            if nid:
+                id_to_name[nid] = nm or nid
+        except Exception:
+            pass
+
+    def _artifact_requires_of(gen: dict[str, Any]) -> set[str]:
+        required: set[str] = set()
+        try:
+            pid = str(gen.get('id') or '').strip()
+            plugin = plugins_by_id.get(pid)
+            if isinstance(plugin, dict) and isinstance(plugin.get('requires'), list):
+                for x in (plugin.get('requires') or []):
+                    xx = str(x).strip()
+                    if xx:
+                        required.add(xx)
+        except Exception:
+            pass
+        return required
+
+    def _artifact_produces_of(gen: dict[str, Any]) -> set[str]:
+        provides: set[str] = set()
+        try:
+            pid = str(gen.get('id') or '').strip()
+            plugin = plugins_by_id.get(pid)
+            if isinstance(plugin, dict) and isinstance(plugin.get('produces'), list):
+                for item in (plugin.get('produces') or []):
+                    if not isinstance(item, dict):
+                        continue
+                    a = str(item.get('artifact') or '').strip()
+                    if a:
+                        provides.add(a)
+        except Exception:
+            pass
+        return provides
+
+    def _required_input_fields_of(gen: dict[str, Any]) -> set[str]:
+        required: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get('name') or '').strip()
+                    if not name:
+                        continue
+                    if inp.get('required') is False:
+                        continue
+                    required.add(name)
+        except Exception:
+            pass
+        return required
+
+    def _all_input_fields_of(gen: dict[str, Any]) -> set[str]:
+        fields: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get('name') or '').strip()
+                    if name:
+                        fields.add(name)
+        except Exception:
+            pass
+        return fields
+
+    def _output_fields_of(gen: dict[str, Any]) -> set[str]:
+        out_fields: set[str] = set()
+        try:
+            outputs = gen.get('outputs')
+            if isinstance(outputs, list):
+                for outp in outputs:
+                    if not isinstance(outp, dict):
+                        continue
+                    nm = str(outp.get('name') or '').strip()
+                    if nm:
+                        out_fields.add(nm)
+        except Exception:
+            pass
+        return out_fields
+
+    def _provides_of(gen: dict[str, Any]) -> set[str]:
+        provides: set[str] = set()
+        try:
+            provides |= _artifact_produces_of(gen)
+        except Exception:
+            pass
+        try:
+            prov = gen.get('provides')
+            if isinstance(prov, list):
+                for x in prov:
+                    s = str(x).strip()
+                    if s:
+                        provides.add(s)
+        except Exception:
+            pass
+        try:
+            provides |= _output_fields_of(gen)
+        except Exception:
+            pass
+        return provides
+
+    out_assignments: list[dict[str, Any]] = []
+    for i, cid in enumerate(chain_ids):
+        req = fas_in[i] if i < len(fas_in) else {}
+        if not isinstance(req, dict):
+            return jsonify({'ok': False, 'error': 'flag_assignments entries must be objects.'}), 400
+        node_id = str(req.get('node_id') or '').strip()
+        if node_id != str(cid):
+            return jsonify({'ok': False, 'error': 'flag_assignments must align to chain_ids (node_id mismatch).'}), 400
+        gen_id = str(req.get('id') or req.get('generator_id') or '').strip()
+        if not gen_id:
+            return jsonify({'ok': False, 'error': f'Missing generator id for node {node_id}.'}), 400
+        gen = gen_by_id.get(gen_id)
+        if not isinstance(gen, dict):
+            return jsonify({'ok': False, 'error': f'Generator not found/enabled: {gen_id}'}), 422
+
+        node = chain_nodes[i] if i < len(chain_nodes) else {}
+        is_vuln_node = bool(node.get('is_vuln'))
+        kind = str(gen.get('_flow_kind') or 'flag-generator')
+        if is_vuln_node and kind != 'flag-generator':
+            return jsonify({'ok': False, 'error': f'Generator {gen_id} is not compatible with vulnerability node {node_id} (must be flag-generator).'}), 422
+
+        next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
+        hint_templates = _flow_hint_templates_from_generator(gen)
+        hint_tpl = hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}}'
+        rendered_hints = [
+            _flow_render_hint_template(t, scenario_label=(scenario_label or scenario_norm), id_to_name=id_to_name, this_id=str(node_id), next_id=str(next_id))
+            for t in (hint_templates or [])
+        ]
+
+        requires_artifacts = sorted(list(_artifact_requires_of(gen)))
+        produces_artifacts = sorted(list(_artifact_produces_of(gen)))
+        input_fields_required = sorted(list(_required_input_fields_of(gen)))
+        input_fields_all = sorted(list(_all_input_fields_of(gen)))
+        input_fields_optional = sorted([x for x in input_fields_all if x and x not in set(input_fields_required)])
+        output_fields = sorted(list(_output_fields_of(gen)))
+
+        # Effective union for chaining.
+        inputs_effective = sorted(list(set(requires_artifacts) | set(input_fields_required)))
+        outputs_effective = sorted(list(_provides_of(gen)))
+
+        out_assignments.append({
+            'node_id': str(node_id),
+            'id': str(gen.get('id') or ''),
+            'name': str(gen.get('name') or ''),
+            'type': kind,
+            'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
+            'generator_catalog': str(gen.get('_flow_catalog') or 'flag_generators'),
+            'language': str(gen.get('language') or ''),
+            'description_hints': list(gen.get('description_hints') or []) if isinstance(gen.get('description_hints'), list) else [],
+            'inputs': inputs_effective,
+            'outputs': outputs_effective,
+            'requires': requires_artifacts,
+            'produces': produces_artifacts,
+            'input_fields': input_fields_all,
+            'input_fields_required': input_fields_required,
+            'input_fields_optional': input_fields_optional,
+            'output_fields': output_fields,
+            'hint_template': hint_tpl,
+            'hint_templates': hint_templates,
+            'hint': rendered_hints[0] if rendered_hints else _flow_render_hint_template(hint_tpl, scenario_label=(scenario_label or scenario_norm), id_to_name=id_to_name, this_id=str(node_id), next_id=str(next_id)),
+            'hints': rendered_hints,
+            'next_node_id': str(next_id),
+            'next_node_name': str(id_to_name.get(str(next_id)) or ''),
+        })
+
+    # Validate (non-blocking)
+    try:
+        flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
+            chain_nodes,
+            out_assignments,
+            scenario_label=(scenario_label or scenario_norm),
+        )
+    except Exception:
+        flow_valid, flow_errors = True, []
+    flags_enabled = bool(flow_valid)
+
+    # Persist as plan_from_flow_*.json
+    try:
+        persisted_flag_assignments = _flow_strip_runtime_sensitive_fields(out_assignments)
+        flow_meta = {
+            'source_preview_plan_path': base_plan_path,
+            'scenario': scenario_label or scenario_norm,
+            'length': len(chain_nodes),
+            'requested_length': len(chain_nodes),
+            'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+            'flag_assignments': persisted_flag_assignments,
+            'flags_enabled': bool(flags_enabled),
+            'flow_valid': bool(flow_valid),
+            'flow_errors': list(flow_errors or []),
+            'modified_at': _iso_now(),
+        }
+        if isinstance(meta, dict):
+            meta2 = dict(meta)
+            meta2['flow'] = flow_meta
+        else:
+            meta2 = {'flow': flow_meta}
+    except Exception:
+        meta2 = meta
+
+    try:
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        seed = 0
+        try:
+            seed = int((preview.get('seed') if isinstance(preview, dict) else None) or (meta2.get('seed') if isinstance(meta2, dict) else None) or 0)
+        except Exception:
+            seed = 0
+        suffix = secrets.token_hex(3)
+        out_name = f"plan_from_flow_{seed}_{int(time.time())}_{suffix}.json"
+        out_path = str(plans_dir / out_name)
+        out_payload = {
+            'full_preview': preview,
+            'metadata': meta2,
+        }
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(out_payload, f, indent=2)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to persist flow-modified preview plan: {e}'}), 500
+
+    # Stats for UI.
+    try:
+        stats = _flow_compose_docker_stats(nodes)
+    except Exception:
+        stats = {}
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'length': len(chain_nodes),
+        'stats': stats,
+        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or ''), 'is_vuln': bool(n.get('is_vuln'))} for n in chain_nodes],
+        'flag_assignments': out_assignments,
+        'flags_enabled': bool(flags_enabled),
+        'flow_valid': bool(flow_valid),
+        'flow_errors': list(flow_errors or []),
+        'preview_plan_path': base_plan_path,
+        'flow_plan_path': out_path,
+        'base_preview_plan_path': base_plan_path,
     })
 
 

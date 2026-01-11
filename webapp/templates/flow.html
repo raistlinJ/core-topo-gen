@@ -104,7 +104,7 @@
               <div id="flowDiagram" class="mermaid">graph LR\n  A[Generate] --> B[Flow]</div>
             </div>
 
-            <dialog id="flowNodeDetailsDialog" class="p-0 border rounded" style="max-width: 760px; width: calc(100% - 2rem);">
+            <dialog id="flowNodeDetailsDialog" class="p-0 border rounded" style="max-width: 920px; width: calc(100% - 2rem);">
               <form method="dialog" class="m-0">
                 <div class="p-3 border-bottom d-flex align-items-center justify-content-between">
                   <div class="fw-semibold" id="flowNodeDetailsTitle">Node</div>
@@ -194,11 +194,55 @@
   let currentBundle = null;
   let lastStats = null;
   let lastPreviewPlanPath = '';
+  let lastFlowPlanPath = '';
   let currentFlagAssignments = [];
   let selectedChainIndex = -1;
   let lastFlowValid = true;
   let lastFlowErrors = [];
   let lastFlagsEnabled = true;
+
+  let _flagGeneratorsCatalog = null;
+  let _flagNodeGeneratorsCatalog = null;
+
+  async function ensureGeneratorCatalogsLoaded(){
+    if(Array.isArray(_flagGeneratorsCatalog) && Array.isArray(_flagNodeGeneratorsCatalog)) return;
+    try {
+      const [fg, fng] = await Promise.all([
+        fetchJson('/flag_generators_data'),
+        fetchJson('/flag_node_generators_data'),
+      ]);
+      _flagGeneratorsCatalog = (fg && Array.isArray(fg.generators)) ? fg.generators.slice() : [];
+      _flagNodeGeneratorsCatalog = (fng && Array.isArray(fng.generators)) ? fng.generators.slice() : [];
+    } catch(e) {
+      _flagGeneratorsCatalog = Array.isArray(_flagGeneratorsCatalog) ? _flagGeneratorsCatalog : [];
+      _flagNodeGeneratorsCatalog = Array.isArray(_flagNodeGeneratorsCatalog) ? _flagNodeGeneratorsCatalog : [];
+      throw e;
+    }
+  }
+
+  function compileStringOrRegex(input){
+    const raw = String(input || '').trim();
+    if(!raw) return { ok: true, regex: null, isRegex: false, error: '' };
+    // Mirror the vulnerability chooser: accept /regex/ syntax.
+    if(raw.length >= 2 && raw.startsWith('/') && raw.lastIndexOf('/') > 0){
+      const lastSlash = raw.lastIndexOf('/');
+      const body = raw.slice(1, lastSlash);
+      const flags = raw.slice(lastSlash + 1);
+      try {
+        const re = new RegExp(body, flags || 'i');
+        return { ok: true, regex: re, isRegex: true, error: '' };
+      } catch(e) {
+        return { ok: false, regex: null, isRegex: true, error: String(e && e.message || e || 'Invalid regex') };
+      }
+    }
+    // Plain string match (case-insensitive substring).
+    try {
+      const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return { ok: true, regex: new RegExp(escaped, 'i'), isRegex: false, error: '' };
+    } catch(e) {
+      return { ok: false, regex: null, isRegex: false, error: String(e && e.message || e || 'Invalid filter') };
+    }
+  }
 
   function persistFlowState(){
     try {
@@ -264,7 +308,7 @@
       validityAlertEl.textContent = '';
       return;
     }
-    const base = 'Invalid flag dependency order: execution will run WITHOUT flags.';
+    const base = 'Invalid flag dependency order: execution will NOT include flags.';
     const details = flowErrors.length ? (' ' + flowErrors.join(' | ')) : '';
     validityAlertEl.textContent = base + details;
     validityAlertEl.classList.remove('d-none');
@@ -712,6 +756,24 @@
       details.appendChild(tbl);
       left.appendChild(details);
 
+      // Row-level Substitute shortcut (bottom-right of Details column).
+      try {
+        const shortcutRow = document.createElement('div');
+        shortcutRow.className = 'd-flex justify-content-end mt-2';
+        const subBtn = document.createElement('button');
+        subBtn.type = 'button';
+        subBtn.className = 'btn btn-sm btn-outline-primary';
+        subBtn.textContent = 'Substitute';
+        subBtn.addEventListener('click', (ev)=>{
+          try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
+          try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
+          try { selectChainIndex(idx); } catch(e) {}
+          try { openNodeDetailsDialog(idx, { openSubstitute: true }); } catch(e) {}
+        });
+        shortcutRow.appendChild(subBtn);
+        left.appendChild(shortcutRow);
+      } catch(e) {}
+
       const right = document.createElement('div');
       right.className = 'btn-group btn-group-sm';
       right.style.justifySelf = 'end';
@@ -753,8 +815,10 @@
     });
   }
 
-  function openNodeDetailsDialog(idx){
+  function openNodeDetailsDialog(idx, opts){
     if(!nodeDetailsDialogEl || !nodeDetailsBodyEl) return;
+    const options = (opts && typeof opts === 'object') ? opts : {};
+    const openSubstitute = !!options.openSubstitute;
     const i = Number.isFinite(+idx) ? (+idx) : -1;
     if(!Array.isArray(currentChain) || i < 0 || i >= currentChain.length) return;
     const node = currentChain[i] || {};
@@ -792,7 +856,13 @@
     if(fa && (fa.id || fa.name)){
       const genId = fa && fa.id ? String(fa.id) : '-';
       const genName = fa && fa.name ? String(fa.name) : '-';
-      const label = (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId;
+      const genType = (fa && fa.type) ? String(fa.type) : '';
+      const genSource = (fa && fa.flag_generator) ? String(fa.flag_generator) : '';
+      const prefixParts = [];
+      if(genType) prefixParts.push(genType);
+      if(genSource) prefixParts.push(genSource);
+      const prefix = prefixParts.length ? ('[' + prefixParts.join(' | ') + '] ') : '';
+      const label = prefix + ((genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId);
       addRow('flag', label);
     } else {
       addRow('flag', '-');
@@ -836,6 +906,343 @@
 
     tbl.appendChild(tbody);
     nodeDetailsBodyEl.appendChild(tbl);
+
+    // Substitute generator UI.
+    try{
+      const isVuln = !!(node && (node.is_vuln || node.is_vulnerability || node.isVuln));
+      const currentType = (fa && fa.type) ? String(fa.type) : (isVuln ? 'flag-generator' : 'flag-generator');
+      const currentSource = (fa && fa.flag_generator) ? String(fa.flag_generator) : '';
+
+      const box = document.createElement('div');
+      box.className = 'd-flex flex-column gap-2';
+
+      const topRow = document.createElement('div');
+      topRow.className = 'd-flex align-items-center justify-content-between gap-2';
+      const help = document.createElement('div');
+      help.className = 'small text-muted';
+      help.textContent = isVuln
+        ? 'Vulnerability nodes require a flag-generator.'
+        : 'Choose a compatible flag-generator or flag-node-generator.';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn btn-sm btn-outline-primary';
+      btn.textContent = 'Substitute';
+      topRow.appendChild(help);
+      topRow.appendChild(btn);
+      box.appendChild(topRow);
+
+      const form = document.createElement('div');
+      form.className = 'd-none border rounded p-2';
+
+      const row1 = document.createElement('div');
+      row1.className = 'd-flex align-items-center gap-2';
+
+      const kindLabel = document.createElement('div');
+      kindLabel.className = 'small text-muted';
+      kindLabel.textContent = 'Type:';
+      row1.appendChild(kindLabel);
+
+      const kindSel = document.createElement('select');
+      kindSel.className = 'form-select form-select-sm';
+      kindSel.style.width = '220px';
+      const optFg = document.createElement('option');
+      optFg.value = 'flag-generator';
+      optFg.textContent = 'flag-generator';
+      kindSel.appendChild(optFg);
+      const optFng = document.createElement('option');
+      optFng.value = 'flag-node-generator';
+      optFng.textContent = 'flag-node-generator';
+      if(!isVuln){
+        kindSel.appendChild(optFng);
+      }
+      kindSel.value = (currentType === 'flag-node-generator' && !isVuln) ? 'flag-node-generator' : 'flag-generator';
+      if(isVuln){
+        kindSel.disabled = true;
+      }
+      row1.appendChild(kindSel);
+
+      const sourceLabel = document.createElement('div');
+      sourceLabel.className = 'small text-muted ms-1';
+      sourceLabel.textContent = 'Source:';
+      row1.appendChild(sourceLabel);
+
+      const sourceSel = document.createElement('select');
+      sourceSel.className = 'form-select form-select-sm';
+      sourceSel.style.width = '320px';
+      row1.appendChild(sourceSel);
+
+      form.appendChild(row1);
+
+      const row2 = document.createElement('div');
+      row2.className = 'd-flex flex-column gap-1 mt-2';
+
+      const entryInput = document.createElement('input');
+      entryInput.type = 'text';
+      entryInput.className = 'form-control form-control-sm d-none';
+      entryInput.placeholder = 'Filter (string or /regex/)';
+
+      const entryErr = document.createElement('div');
+      entryErr.className = 'small text-danger d-none';
+
+      const genSel = document.createElement('select');
+      genSel.className = 'form-select form-select-sm';
+
+      row2.appendChild(entryInput);
+      row2.appendChild(entryErr);
+      row2.appendChild(genSel);
+      form.appendChild(row2);
+
+      const row3 = document.createElement('div');
+      row3.className = 'd-flex align-items-center justify-content-between gap-2 mt-2';
+
+      const cur = document.createElement('div');
+      cur.className = 'small text-muted';
+      cur.textContent = (fa && (fa.id || fa.name))
+        ? ('Current: ' + String(fa.id || '') + (currentSource ? (' (' + currentSource + ')') : ''))
+        : 'Current: -';
+
+      const actions = document.createElement('div');
+      actions.className = 'd-flex gap-2';
+      const cancelBtn = document.createElement('button');
+      cancelBtn.type = 'button';
+      cancelBtn.className = 'btn btn-sm btn-outline-secondary';
+      cancelBtn.textContent = 'Cancel';
+      const applyBtn = document.createElement('button');
+      applyBtn.type = 'button';
+      applyBtn.className = 'btn btn-sm btn-primary';
+      applyBtn.textContent = 'Apply';
+      actions.appendChild(cancelBtn);
+      actions.appendChild(applyBtn);
+
+      row3.appendChild(cur);
+      row3.appendChild(actions);
+      form.appendChild(row3);
+      box.appendChild(form);
+
+      async function showSubstituteUI(){
+        // Disable while the substitute UI is open.
+        if(!form.classList.contains('d-none')) return;
+        btn.disabled = true;
+        form.classList.remove('d-none');
+        try{
+          showLoading('Loading generator catalog…');
+          await ensureGeneratorCatalogsLoaded();
+          rebuildSourceOptions();
+          rebuildGeneratorOptions();
+        } catch(e){
+          setStatus('Failed to load generator catalog: ' + String(e && e.message || e), true);
+          // If we couldn't load options, close the substitute UI and re-enable.
+          try { form.classList.add('d-none'); } catch(_) {}
+          btn.disabled = false;
+        } finally {
+          hideLoading();
+        }
+      }
+
+      function getCatalogForKind(kind){
+        return (String(kind) === 'flag-node-generator')
+          ? (Array.isArray(_flagNodeGeneratorsCatalog) ? _flagNodeGeneratorsCatalog : [])
+          : (Array.isArray(_flagGeneratorsCatalog) ? _flagGeneratorsCatalog : []);
+      }
+
+      function rebuildSourceOptions(){
+        const kind = String(kindSel.value || 'flag-generator');
+        const cat = getCatalogForKind(kind);
+        const sources = new Set();
+        (cat || []).forEach(g => {
+          try {
+            const s = String((g && g._source_name) || '').trim();
+            if(s) sources.add(s);
+          } catch(e) {}
+        });
+        const sorted = Array.from(sources).sort((a,b)=>String(a).localeCompare(String(b)));
+        sourceSel.innerHTML = '';
+        const anyOpt = document.createElement('option');
+        anyOpt.value = '__any__';
+        anyOpt.textContent = '(Any source)';
+        sourceSel.appendChild(anyOpt);
+        for(const s of sorted){
+          const o = document.createElement('option');
+          o.value = s;
+          o.textContent = s;
+          sourceSel.appendChild(o);
+        }
+        const entryOpt = document.createElement('option');
+        entryOpt.value = '__entry__';
+        entryOpt.textContent = 'Entry…';
+        sourceSel.appendChild(entryOpt);
+
+        // Default selection: keep current source if it exists, else Any.
+        if(currentSource && sorted.includes(currentSource)){
+          sourceSel.value = currentSource;
+        } else {
+          sourceSel.value = '__any__';
+        }
+      }
+
+      function rebuildGeneratorOptions(){
+        const kind = String(kindSel.value || 'flag-generator');
+        const cat = getCatalogForKind(kind);
+        const source = String(sourceSel.value || '__any__');
+
+        entryErr.classList.add('d-none');
+        entryErr.textContent = '';
+
+        let filtered = (cat || []).slice();
+
+        if(source === '__entry__'){
+          entryInput.classList.remove('d-none');
+          const compiled = compileStringOrRegex(entryInput.value);
+          if(!compiled.ok){
+            entryErr.textContent = compiled.error;
+            entryErr.classList.remove('d-none');
+            filtered = [];
+          } else if(compiled.regex){
+            filtered = filtered.filter(g => {
+              const gid = String((g && g.id) || '');
+              const gname = String((g && g.name) || '');
+              return compiled.regex.test(gid) || compiled.regex.test(gname);
+            });
+          }
+        } else {
+          entryInput.classList.add('d-none');
+          if(source !== '__any__'){
+            filtered = filtered.filter(g => String((g && g._source_name) || '').trim() === source);
+          }
+        }
+
+        filtered.sort((a,b)=>{
+          const an = String((a && a.name) || '').toLowerCase();
+          const bn = String((b && b.name) || '').toLowerCase();
+          if(an < bn) return -1;
+          if(an > bn) return 1;
+          const ai = String((a && a.id) || '');
+          const bi = String((b && b.id) || '');
+          return ai.localeCompare(bi);
+        });
+
+        genSel.innerHTML = '';
+        const ph = document.createElement('option');
+        ph.value = '';
+        ph.textContent = filtered.length ? '(Select generator…)': '(No matches)';
+        genSel.appendChild(ph);
+
+        for(const g of filtered.slice(0, 250)){
+          const gid = String((g && g.id) || '').trim();
+          if(!gid) continue;
+          const gname = String((g && g.name) || '').trim();
+          const sname = String((g && g._source_name) || '').trim();
+          const o = document.createElement('option');
+          o.value = gid;
+          o.textContent = gname ? (gid + ' — ' + gname + (sname ? (' (' + sname + ')') : '')) : (gid + (sname ? (' (' + sname + ')') : ''));
+          genSel.appendChild(o);
+        }
+
+        // Preselect current generator if it exists.
+        try {
+          const curId = (fa && fa.id) ? String(fa.id) : '';
+          if(curId) genSel.value = curId;
+        } catch(e) {}
+      }
+
+      btn.addEventListener('click', async ()=>{
+        await showSubstituteUI();
+      });
+
+      cancelBtn.addEventListener('click', ()=>{
+        form.classList.add('d-none');
+        btn.disabled = false;
+      });
+
+      kindSel.addEventListener('change', ()=>{
+        rebuildSourceOptions();
+        rebuildGeneratorOptions();
+      });
+      sourceSel.addEventListener('change', ()=>{
+        rebuildGeneratorOptions();
+      });
+      entryInput.addEventListener('input', ()=>{
+        // live filter for Entry mode
+        if(String(sourceSel.value || '') === '__entry__') rebuildGeneratorOptions();
+      });
+
+      applyBtn.addEventListener('click', async ()=>{
+        const chosenId = String(genSel.value || '').trim();
+        if(!chosenId){
+          setStatus('Select a generator first.', true);
+          return;
+        }
+        try{
+          if(!Array.isArray(currentChain) || currentChain.length === 0){
+            throw new Error('Generate a chain first.');
+          }
+          const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+          if(!chainIds.length) throw new Error('Missing chain ids.');
+
+          const reqAssignments = chainIds.map((nid, j)=>{
+            const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
+            const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
+            const idOut = (j === i) ? chosenId : curId;
+            return { node_id: nid, id: idOut };
+          });
+          // Ensure all entries have ids.
+          const missing = reqAssignments.find(x => !x.id);
+          if(missing){
+            throw new Error('Cannot save substitution because some chain positions have no generator assignment yet. Try Generate again.');
+          }
+
+          showLoading('Saving substitution…');
+          const res = await postJson('/api/flag-sequencing/save_flow_substitutions', {
+            scenario: activeScenario,
+            chain_ids: chainIds,
+            preview_plan: (lastPreviewPlanPath || lastFlowPlanPath || ''),
+            flag_assignments: reqAssignments,
+          }, { timeoutMs: 60000 });
+
+          setFlowValidityFromPayload(res);
+          if(res && Array.isArray(res.chain)){
+            currentChain = res.chain.slice();
+          }
+          if(res && Array.isArray(res.flag_assignments)){
+            currentFlagAssignments = res.flag_assignments.slice();
+          }
+          if(res && res.flow_plan_path){
+            lastFlowPlanPath = String(res.flow_plan_path);
+          }
+          updateMeta();
+          renderChainEditor();
+          form.classList.add('d-none');
+          btn.disabled = false;
+          setStatus('Substitution saved. Saving XML…', false);
+
+          // Save XML (this also resolves hints / runs generators) so the UI shows
+          // updated flag values and rendered hints immediately.
+          try {
+            await saveXmlOnly({});
+          } catch(e) {
+            // Non-fatal; substitution was persisted.
+            setStatus('Saved substitution, but Save XML failed: ' + String(e && e.message || e), true);
+          }
+
+          // Refresh the dialog contents with updated values/hints.
+          openNodeDetailsDialog(i);
+        } catch(e){
+          setStatus('Failed to save substitution: ' + String(e && e.message || e), true);
+        } finally {
+          hideLoading();
+        }
+      });
+
+      // If invoked from the Chain Order row Substitute button, open the substitute
+      // UI immediately.
+      if(openSubstitute){
+        try { showSubstituteUI(); } catch(e) {}
+      }
+
+      addRow('substitute', box);
+    } catch(e) {
+      // Non-fatal
+    }
 
     try{
       if(typeof nodeDetailsDialogEl.showModal === 'function'){
@@ -1003,6 +1410,7 @@
       setFlowValidityFromPayload(data);
       lastStats = data.stats || null;
       lastPreviewPlanPath = data.preview_plan_path || '';
+      lastFlowPlanPath = data.flow_plan_path || lastFlowPlanPath;
       try {
         // If the backend loaded a saved chain whose effective length differs from the
         // current input value (e.g. page reload reset to default), keep the UI in sync.
@@ -1033,7 +1441,7 @@
                 length: currentChain.length,
                 preset,
                 chain_ids: chainIds,
-                preview_plan: (lastPreviewPlanPath || ''),
+                preview_plan: (lastFlowPlanPath || lastPreviewPlanPath || ''),
                 mode: 'hint',
                 best_effort: true,
                 timeout_s: 30
@@ -1057,6 +1465,9 @@
             if(prepData && prepData.preview_plan_path){
               lastPreviewPlanPath = String(prepData.preview_plan_path);
               updateMeta();
+            }
+            if(prepData && prepData.flow_plan_path){
+              lastFlowPlanPath = String(prepData.flow_plan_path);
             }
 
             // If chain changed, regenerate the bundle to match (keep resolved hints in UI).
@@ -1087,6 +1498,7 @@
       setFlowValidityFromPayload(payload);
       lastStats = payload && payload.stats ? payload.stats : null;
       lastPreviewPlanPath = payload && payload.preview_plan_path ? String(payload.preview_plan_path) : '';
+      lastFlowPlanPath = payload && payload.flow_plan_path ? String(payload.flow_plan_path) : lastFlowPlanPath;
       updateMeta();
       currentChain = [];
       currentBundle = null;
@@ -1123,6 +1535,7 @@
         throw new Error('Generate a chain first.');
       }
       const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+      const planPath = (lastFlowPlanPath || lastPreviewPlanPath || '');
       const prepData = await postJson(
         '/api/flag-sequencing/prepare_preview_for_execute',
         {
@@ -1130,7 +1543,7 @@
           length,
           preset,
           chain_ids: chainIds,
-          preview_plan: (lastPreviewPlanPath || '')
+          preview_plan: planPath
         },
         { timeoutMs: 480000 }
       );
@@ -1143,11 +1556,13 @@
       }
       const xmlPath = (prepData && prepData.xml_path) ? String(prepData.xml_path) : '';
       const previewPlan = (prepData && prepData.preview_plan_path) ? String(prepData.preview_plan_path) : '';
+      const flowPlan = (prepData && prepData.flow_plan_path) ? String(prepData.flow_plan_path) : '';
       if(!xmlPath || !previewPlan){
         throw new Error('Prepare step did not return xml_path/preview_plan_path');
       }
+      if(flowPlan) lastFlowPlanPath = flowPlan;
       setStatus('Starting async execution…', false);
-      const runData = await postJson('/run_cli_async', { xml_path: xmlPath, preview_plan: previewPlan, scenario });
+      const runData = await postJson('/run_cli_async', { xml_path: xmlPath, preview_plan: (flowPlan || planPath || previewPlan), scenario });
       const runId = runData && runData.run_id ? String(runData.run_id) : '';
       if(runId){
         setStatus('Run started: ' + runId + ' (see Core/Reports pages).', false);
@@ -1309,7 +1724,8 @@
         throw new Error('Generate a chain first.');
       }
       const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-      const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length, preset, chain_ids: chainIds });
+      const planPath = (lastFlowPlanPath || lastPreviewPlanPath || '');
+      const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length, preset, chain_ids: chainIds, preview_plan: planPath });
       setFlowValidityFromPayload(prepData);
       if(prepData && Array.isArray(prepData.flag_assignments)){
         currentFlagAssignments = prepData.flag_assignments.slice();
@@ -1321,6 +1737,9 @@
         throw new Error('Prepare step did not return xml_path/preview_plan_path');
       }
       lastPreviewPlanPath = previewPlan;
+      try {
+        if(prepData && prepData.flow_plan_path) lastFlowPlanPath = String(prepData.flow_plan_path);
+      } catch(e) {}
       updateMeta();
       try {
         const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');

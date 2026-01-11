@@ -998,7 +998,7 @@
           flowAlertEl.classList.add('d-none');
           flowAlertEl.textContent = '';
         } else {
-          const base = 'Invalid flag dependency order: execution will run WITHOUT flags.';
+          const base = 'Invalid flag dependency order: execution will NOT include flags.';
           const details = flowErrors.length ? (' ' + flowErrors.join(' | ')) : '';
           flowAlertEl.textContent = base + details;
           flowAlertEl.classList.remove('d-none');
