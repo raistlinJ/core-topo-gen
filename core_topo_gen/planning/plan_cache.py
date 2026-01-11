@@ -11,7 +11,7 @@ _lock = threading.Lock()
 
 # Bump this whenever the structure/meaning of the cached plan changes.
 # This ensures older cached plans don't mask code fixes (e.g. vulnerability parsing).
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 
 def _default_cache_path() -> str:
     env = os.environ.get('TOPO_PLAN_CACHE_PATH')

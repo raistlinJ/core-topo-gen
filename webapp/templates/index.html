@@ -17633,12 +17633,47 @@ async function submitRunCliRequest(buildRequest, options = {}) {
         if (res.status === 409) {
             const info = await parseResponseJson(res);
             if (info && info.daemon_conflict) {
-                const pids = Array.isArray(info.daemon_pids) ? info.daemon_pids.join(', ') : '';
-                const message = `${info.error || 'Multiple core-daemon processes detected.'}${pids ? `\n\nPIDs: ${pids}` : ''}`;
-                logRunRequestDebug(`Run start aborted (daemon conflict): ${info.error || 'Multiple core-daemon processes detected.'}${pids ? ` (pids: ${pids})` : ''}`);
-                setAbortReason(info.error || 'Multiple core-daemon processes detected.', { status: 409, kind: 'daemon_conflict', daemon_pids: Array.isArray(info.daemon_pids) ? info.daemon_pids : [] });
-                alert(message);
-                return null;
+                const pidList = Array.isArray(info.daemon_pids) ? info.daemon_pids.map(v => String(v)).filter(Boolean) : [];
+                const pids = pidList.join(', ');
+                const baseMsg = info.error || 'Multiple core-daemon processes are running on the CORE VM.';
+                logRunRequestDebug(`Run start aborted (daemon conflict): ${baseMsg}${pids ? ` (pids: ${pids})` : ''}`);
+                const promptText = `${baseMsg}${pids ? `\n\nPIDs: ${pids}` : ''}\n\nKill all core-daemon processes and start fresh, then retry the run?`;
+
+                const proceed = await promptRunProgressConfirm(promptText, {
+                    title: 'core-daemon conflict detected',
+                    confirmLabel: 'Kill & retry',
+                    cancelLabel: 'Cancel',
+                });
+                if (!proceed) {
+                    setAbortReason(baseMsg, { status: 409, kind: 'daemon_conflict', daemon_pids: Array.isArray(info.daemon_pids) ? info.daemon_pids : [] });
+                    return null;
+                }
+                try {
+                    const fixRes = await fetch('/core/stop_duplicate_daemons_api', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ pids: Array.isArray(info.daemon_pids) ? info.daemon_pids : [] }),
+                    });
+                    const fixInfo = await parseResponseJson(fixRes);
+                    if (!fixRes.ok || !fixInfo || fixInfo.ok === false) {
+                        const errText = (fixInfo && (fixInfo.error || fixInfo.message)) ? String(fixInfo.error || fixInfo.message) : `HTTP ${fixRes.status}`;
+                        window.alert(`Failed to stop duplicate core-daemon processes: ${errText}`);
+                        setAbortReason(baseMsg, { status: 409, kind: 'daemon_conflict_fix_failed', daemon_pids: Array.isArray(info.daemon_pids) ? info.daemon_pids : [] });
+                        return null;
+                    }
+                    logRunRequestDebug('Stopped duplicate core-daemon processes; retrying run start.');
+                    // Do not consume an attempt when we fixed the daemon conflict.
+                    if (attempt > 0) {
+                        attempt -= 1;
+                    } else {
+                        attempt = -1;
+                    }
+                    continue;
+                } catch (e) {
+                    window.alert('Failed to stop duplicate core-daemon processes.');
+                    setAbortReason(baseMsg, { status: 409, kind: 'daemon_conflict_fix_failed', daemon_pids: Array.isArray(info.daemon_pids) ? info.daemon_pids : [] });
+                    return null;
+                }
             }
         }
         if (res.status === 409) {

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import copy
 import logging
 import os
 import csv
@@ -1585,6 +1586,32 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			return text.replace('\\', '\\\\' * 2)
 		except Exception:
 			return text
+
+	def _yaml_dump_literal_multiline(data: object) -> str:
+		"""Dump YAML while forcing literal block style for multiline strings.
+
+		Why: PyYAML often serializes multiline strings using `\n` escape sequences inside
+		double-quoted scalars. Our CORE host-side printf escaping must escape backslashes,
+		which turns `\n` into `\\n`, and that then reaches containers as a literal
+		backslash-n (breaking bash conditionals like `then\\n`).
+
+		By forcing multiline strings to use a literal block scalar (`|`), the dumped YAML
+		contains real newlines instead of `\n` escape sequences, so backslash-escaping
+		does not corrupt the command.
+		"""
+		try:
+			class _CoreTGYamlDumper(yaml.SafeDumper):
+				pass
+
+			def _repr_str(dumper: yaml.SafeDumper, value: str):
+				style = '|' if '\n' in value else None
+				return dumper.represent_scalar('tag:yaml.org,2002:str', value, style=style)
+
+			_CoreTGYamlDumper.add_representer(str, _repr_str)
+			return yaml.dump(data, Dumper=_CoreTGYamlDumper, sort_keys=False)
+		except Exception:
+			# Fall back to PyYAML default behavior.
+			return yaml.safe_dump(data, sort_keys=False)
 	cache: Dict[Tuple[str, str], Tuple[Optional[dict], Optional[str], Optional[str], bool]] = {}
 	for node_name, rec in name_to_vuln.items():
 		if not _is_docker_compose_record(rec):
@@ -1715,7 +1742,11 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 		wrote = False
 		if base_compose_obj is not None and yaml is not None:
 			prefer = key[0]
-			obj = dict(base_compose_obj)
+			# IMPORTANT: deep-copy to avoid mutating cached base YAML across nodes.
+			# A shallow copy here can leak per-node wrapper image/build modifications
+			# into subsequent nodes, which can cause Docker to attempt pulling the
+			# wrapper tag from docker.io (unauthorized) or wrap the wrapper.
+			obj = copy.deepcopy(base_compose_obj)
 			# If this compose comes from a local template, isolate bind mounts per node
 			# so we can materialize per-node hint files without cross-node collisions.
 			try:
@@ -1812,6 +1843,10 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				if svc_key and isinstance(services, dict) and isinstance(services.get(svc_key), dict):
 					svc = services.get(svc_key)
 					base_image = str(svc.get('image') or '').strip()
+					# If this compose already references our wrapper tag, don't wrap again.
+					# Double-wrapping can make Docker try to pull the wrapper tag as a base image.
+					if base_image.startswith('coretg/') and base_image.endswith(':iproute2'):
+						raise RuntimeError('already_wrapped')
 					if base_image:
 						wrap_dir = os.path.join(out_base, f"docker-wrap-{scenario_tag_safe}-{_safe_name(node_name)}")
 						_write_iproute2_wrapper(wrap_dir, base_image)
@@ -1831,7 +1866,7 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			try:
 				# Dump YAML to string first, then escape sequences that CORE's host-side printf
 				# would otherwise interpret.
-				text = yaml.safe_dump(obj, sort_keys=False)
+				text = _yaml_dump_literal_multiline(obj)
 				text = _escape_core_printf_backslashes(text)
 				text = _escape_mako_dollars(text)
 				text = _escape_core_printf_percents(text)

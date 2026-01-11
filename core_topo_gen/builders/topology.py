@@ -1964,10 +1964,19 @@ def _try_build_segmented_topology_from_preview(
             y = int(base_y + radius * math.sin(angle))
         name = str(hdata.get('name') or f"host-{hid}")
 
+        # Increment slot index for every host that could potentially be in the slot plan.
+        # This ensures slot keys remain synchronized with the preview plan (which counts all hosts).
+        was_default_for_slot_plan = (node_type == NodeType.DEFAULT)
+        if was_default_for_slot_plan or (_is_docker_node_type(node_type) and str(role).lower() == 'docker'):
+            host_slot_idx += 1
+            slot_key = f"slot-{host_slot_idx}"
+        else:
+            slot_key = None
+
         # Explicit Docker role: attach compose metadata so compose files can be prepared later.
         # If Flow injected a flag compose reference into host metadata, prefer that over the standard template.
-        try:
-            if _is_docker_node_type(node_type) and str(role).lower() == 'docker':
+        if _is_docker_node_type(node_type) and str(role).lower() == 'docker':
+            try:
                 flow_rec = _flow_flag_record_from_host_metadata(hdata)
                 if flow_rec:
                     docker_by_name[name] = flow_rec
@@ -1975,13 +1984,14 @@ def _try_build_segmented_topology_from_preview(
                     docker_by_name.setdefault(name, _standard_docker_compose_record())
                 _apply_mount_overlays(docker_by_name.get(name))
                 created_docker += 1
-        except Exception:
-            pass
+                # Mark slot as used if this explicit Docker host has a slot key
+                if slot_key and docker_slot_plan and slot_key in docker_slot_plan:
+                    docker_slots_used.add(slot_key)
+            except Exception:
+                pass
 
         # If this would be a DEFAULT host, allow the docker slot plan to override it.
-        if node_type == NodeType.DEFAULT:
-            host_slot_idx += 1
-            slot_key = f"slot-{host_slot_idx}"
+        if was_default_for_slot_plan and slot_key:
             try:
                 if docker_slot_plan and slot_key in docker_slot_plan:
                     if hasattr(NodeType, "DOCKER"):

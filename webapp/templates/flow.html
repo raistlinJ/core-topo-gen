@@ -87,16 +87,16 @@
           </div>
           <div class="card-body">
             <div class="row g-2 small text-muted align-items-center mb-2" id="flowMetaRow">
-              <div class="col-12 col-md-4">
+              <div class="col-12 col-md-3">
                 <span class="text-secondary">Scenario:</span>
                 <span class="ms-1" id="flowMetaScenario"></span>
               </div>
-              <div class="col-12 col-md-5">
+              <div class="col-12 col-md-3" style="min-width: 0;">
                 <span class="text-secondary">Preview:</span>
-                <span class="ms-1" id="flowMetaPreview"></span>
+                <span class="ms-1 text-truncate d-inline-block align-middle" id="flowMetaPreview" style="max-width: 100%;"></span>
               </div>
-              <div class="col-12 col-md-3">
-                <span class="text-secondary">Docker/Vuln:</span>
+              <div class="col-12 col-md-6">
+                <span class="text-secondary">Eligibility:</span>
                 <span class="ms-1" id="flowMetaStats"></span>
               </div>
             </div>
@@ -379,8 +379,28 @@
     }
   }
 
-  async function fetchJson(url){
-    const res = await fetch(url, { credentials: 'same-origin' });
+  async function fetchJson(url, opts){
+    opts = opts || {};
+    const timeoutMs = Number.isFinite(+opts.timeoutMs) ? (+opts.timeoutMs) : 0;
+    const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    const signal = controller ? controller.signal : undefined;
+    let t = null;
+    if(controller && timeoutMs > 0){
+      t = setTimeout(() => { try{ controller.abort(); } catch(e){} }, timeoutMs);
+    }
+    let res;
+    try{
+      res = await fetch(url, { credentials: 'same-origin', signal });
+    } catch(e){
+      if(controller && e && (e.name === 'AbortError')){
+        const err = new Error('Request timed out.');
+        err.isTimeout = true;
+        throw err;
+      }
+      throw e;
+    } finally {
+      if(t) clearTimeout(t);
+    }
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if(!ct.includes('application/json')){
       const text = await res.text();
@@ -401,13 +421,34 @@
     return data;
   }
 
-  async function postJson(url, payload){
-    const res = await fetch(url, {
+  async function postJson(url, payload, opts){
+    opts = opts || {};
+    const timeoutMs = Number.isFinite(+opts.timeoutMs) ? (+opts.timeoutMs) : 0;
+    const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    const signal = controller ? controller.signal : undefined;
+    let t = null;
+    if(controller && timeoutMs > 0){
+      t = setTimeout(() => { try{ controller.abort(); } catch(e){} }, timeoutMs);
+    }
+    let res;
+    try{
+      res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
-      body: JSON.stringify(payload || {})
-    });
+      body: JSON.stringify(payload || {}),
+      signal,
+      });
+    } catch(e){
+      if(controller && e && (e.name === 'AbortError')){
+        const err = new Error('Request timed out.');
+        err.isTimeout = true;
+        throw err;
+      }
+      throw e;
+    } finally {
+      if(t) clearTimeout(t);
+    }
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if(!ct.includes('application/json')){
       const text = await res.text();
@@ -841,22 +882,17 @@
 
   function formatStats(stats){
     if(!stats || typeof stats !== 'object') return '';
-    const d = Number.isFinite(+stats.docker_total) ? (+stats.docker_total) : null;
+    const fg = Number.isFinite(+stats.flag_generator_eligible_total) ? (+stats.flag_generator_eligible_total) : (Number.isFinite(+stats.eligible_total) ? (+stats.eligible_total) : null);
+    const fng = Number.isFinite(+stats.flag_node_generator_eligible_total) ? (+stats.flag_node_generator_eligible_total) : (Number.isFinite(+stats.docker_nonvuln_total) ? (+stats.docker_nonvuln_total) : null);
     const v = Number.isFinite(+stats.vuln_total) ? (+stats.vuln_total) : null;
-    const c = Number.isFinite(+stats.compose_backed_total) ? (+stats.compose_backed_total) : null;
-    const e = Number.isFinite(+stats.eligible_total) ? (+stats.eligible_total) : null;
-    if(d === null && v === null && c === null && e === null) return '';
-    const inner = [];
-    if(v !== null) inner.push('vuln: ' + v);
-    if(c !== null) inner.push('compose-backed: ' + c);
-    if(e !== null) inner.push('eligible: ' + e);
-    if(d !== null){
-      return String(d) + (inner.length ? (' (' + inner.join(', ') + ')') : '');
-    }
-    if(v !== null){
-      return 'vuln: ' + v + (inner.length ? (' (' + inner.join(', ') + ')') : '');
-    }
-    return inner.length ? inner.join(', ') : '';
+    const dOther = Number.isFinite(+stats.docker_nonvuln_total) ? (+stats.docker_nonvuln_total) : null;
+    if(fg === null && fng === null && v === null && dOther === null) return '';
+    const parts = [];
+    if(fg !== null) parts.push('Flag-Generator eligible: ' + fg);
+    if(fng !== null) parts.push('Flag-Node-Generator eligible: ' + fng);
+    if(v !== null) parts.push('Vuln nodes: ' + v);
+    if(dOther !== null) parts.push('Other Docker Nodes: ' + dOther);
+    return parts.join(' · ');
   }
 
   function buildMermaid(chain){
@@ -898,6 +934,19 @@
     }
   }
 
+  function shouldOfferBestEffort(err){
+    try{
+      const p = err && err.payload && typeof err.payload === 'object' ? err.payload : null;
+      const available = p && Number.isFinite(+p.available) ? (+p.available) : null;
+      if(!available || available <= 0) return null;
+      const msg = (p && (p.error || p.message)) ? String(p.error || p.message) : '';
+      if(msg && !msg.toLowerCase().includes('eligible')) return null;
+      return { available, message: msg, requested: p && Number.isFinite(+p.requested_length) ? (+p.requested_length) : null };
+    } catch(e){
+      return null;
+    }
+  }
+
   async function generate(preferPreview){
     const usePreview = !!preferPreview;
     const scenario = (scenarioEl && scenarioEl.value || '').trim();
@@ -914,7 +963,7 @@
       params.set('force_preview', '1');
     }
 
-    const apiUrl = '/api/flag-sequencing/attackflow_preview?' + params.toString();
+    const baseApiUrl = '/api/flag-sequencing/attackflow_preview?' + params.toString();
     if(downloadLink) downloadLink.href = '#';
 
     setStatus('Generating…', false);
@@ -926,7 +975,28 @@
     if(jsonEl) jsonEl.textContent = '';
 
     try {
-      const data = await fetchJson(apiUrl);
+      let data;
+      try{
+        data = await fetchJson(baseApiUrl);
+      } catch(err){
+        // If Generate requested a longer chain than available, ask user whether to
+        // retry in best-effort mode (clamp to available) or cancel.
+        const offer = usePreview ? shouldOfferBestEffort(err) : null;
+        if(offer){
+          const want = confirm(`Only ${offer.available} eligible nodes are available for this scenario.\n\nRun Generate in best-effort mode (use ${offer.available})?`);
+          if(!want){
+            hideLoading();
+            setStatus('Generate cancelled.', false);
+            return;
+          }
+          const params2 = new URLSearchParams(params.toString());
+          params2.set('best_effort', '1');
+          const retryUrl = '/api/flag-sequencing/attackflow_preview?' + params2.toString();
+          data = await fetchJson(retryUrl);
+        } else {
+          throw err;
+        }
+      }
       currentChain = Array.isArray(data.chain) ? data.chain.slice() : [];
       currentBundle = data.bundle || null;
       currentFlagAssignments = Array.isArray(data.flag_assignments) ? data.flag_assignments.slice() : [];
@@ -956,7 +1026,20 @@
             showLoading('Resolving hint values…');
             setStatus('Resolving hint values…', false);
             const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-            const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length: currentChain.length, preset, chain_ids: chainIds });
+            const prepData = await postJson(
+              '/api/flag-sequencing/prepare_preview_for_execute',
+              {
+                scenario,
+                length: currentChain.length,
+                preset,
+                chain_ids: chainIds,
+                preview_plan: (lastPreviewPlanPath || ''),
+                mode: 'hint',
+                best_effort: true,
+                timeout_s: 30
+              },
+              { timeoutMs: 35000 }
+            );
             setFlowValidityFromPayload(prepData);
 
             // If the server adjusted the chain (rare, e.g. preset repair), keep UI in sync.
@@ -1040,7 +1123,17 @@
         throw new Error('Generate a chain first.');
       }
       const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-      const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length, preset, chain_ids: chainIds });
+      const prepData = await postJson(
+        '/api/flag-sequencing/prepare_preview_for_execute',
+        {
+          scenario,
+          length,
+          preset,
+          chain_ids: chainIds,
+          preview_plan: (lastPreviewPlanPath || '')
+        },
+        { timeoutMs: 480000 }
+      );
       setFlowValidityFromPayload(prepData);
       // Prefer server-returned (possibly enriched) assignments so the UI can show
       // generator run status/mismatch info before scenario execution.

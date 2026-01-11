@@ -38,33 +38,6 @@ def compute_full_plan(
     density_base, weight_items, count_items, services_list = parse_node_info(xml_path, scenario)
     role_counts, node_breakdown = compute_node_plan(density_base, weight_items, count_items)
 
-    # --- Routing ---
-    routing_density, routing_items = parse_routing_info(xml_path, scenario)
-    routers_planned, router_breakdown = compute_router_plan(
-        total_hosts=sum(role_counts.values()),
-        base_host_pool=density_base,
-        routing_density=routing_density,
-        routing_items=routing_items,
-    )
-    router_breakdown['routing_density_input'] = routing_density
-    try:
-        router_breakdown['routing_items_count'] = len(routing_items or [])
-    except Exception:
-        pass
-    # lightweight simple plan mapping protocol -> abs_count (for display)
-    simple_routing_plan = {}
-    try:
-        for ri in routing_items:
-            if getattr(ri, 'abs_count', 0) > 0:
-                simple_routing_plan[getattr(ri, 'protocol', 'proto')] = int(getattr(ri, 'abs_count', 0))
-    except Exception:
-        pass
-    router_breakdown['simple_plan'] = simple_routing_plan
-
-    # --- Services ---
-    svc_specs = [ServiceSpec(s.name, density=getattr(s, 'density', 0.0), abs_count=getattr(s, 'abs_count', 0)) for s in services_list]
-    service_plan, service_breakdown = compute_service_plan(svc_specs, density_base)
-
     # --- Vulnerabilities ---
     vuln_density, vuln_items_xml = parse_vulnerabilities_info(xml_path, scenario)
     vuln_items: List[VulnerabilityItem] = []
@@ -104,6 +77,33 @@ def compute_full_plan(
         kind = selected
         vuln_items.append(VulnerabilityItem(name=name, density=vuln_density, abs_count=abs_c, kind=kind, factor=factor_val, metric=vm))
     vulnerability_plan, vuln_breakdown = compute_vulnerability_plan(density_base, vuln_density, vuln_items)
+
+    # --- Routing ---
+    routing_density, routing_items = parse_routing_info(xml_path, scenario)
+    routers_planned, router_breakdown = compute_router_plan(
+        total_hosts=sum(role_counts.values()),
+        base_host_pool=density_base,
+        routing_density=routing_density,
+        routing_items=routing_items,
+    )
+    router_breakdown['routing_density_input'] = routing_density
+    try:
+        router_breakdown['routing_items_count'] = len(routing_items or [])
+    except Exception:
+        pass
+    # lightweight simple plan mapping protocol -> abs_count (for display)
+    simple_routing_plan = {}
+    try:
+        for ri in routing_items:
+            if getattr(ri, 'abs_count', 0) > 0:
+                simple_routing_plan[getattr(ri, 'protocol', 'proto')] = int(getattr(ri, 'abs_count', 0))
+    except Exception:
+        pass
+    router_breakdown['simple_plan'] = simple_routing_plan
+
+    # --- Services ---
+    svc_specs = [ServiceSpec(s.name, density=getattr(s, 'density', 0.0), abs_count=getattr(s, 'abs_count', 0)) for s in services_list]
+    service_plan, service_breakdown = compute_service_plan(svc_specs, density_base)
 
     # --- Segmentation ---
     seg_density, seg_items = parse_segmentation_info(xml_path, scenario)

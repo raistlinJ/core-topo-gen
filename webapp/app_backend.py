@@ -7891,8 +7891,14 @@ def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
     - compose_backed_total: docker nodes that carry compose metadata
     - vuln_total: nodes that are vulnerability candidates
     - eligible_total: nodes eligible for chain placement (docker role + vuln nodes)
+
+    Additional explicit metrics (new; kept alongside legacy keys):
+    - docker_nonvuln_total: docker nodes that are NOT vulnerability candidates
+    - flag_generator_eligible_total: nodes eligible for flag-generator steps
+    - flag_node_generator_eligible_total: nodes eligible for flag-node-generator steps
     """
     docker_total = 0
+    docker_nonvuln_total = 0
     vuln_total = 0
     compose_backed_total = 0
     eligible_total = 0
@@ -7911,13 +7917,18 @@ def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
                 compose_backed_total += 1
         if is_vuln:
             vuln_total += 1
+        if is_docker and (not is_vuln):
+            docker_nonvuln_total += 1
         if is_docker or is_vuln:
             eligible_total += 1
     return {
         'docker_total': docker_total,
+        'docker_nonvuln_total': docker_nonvuln_total,
         'vuln_total': vuln_total,
         'compose_backed_total': compose_backed_total,
         'eligible_total': eligible_total,
+        'flag_generator_eligible_total': eligible_total,
+        'flag_node_generator_eligible_total': docker_nonvuln_total,
     }
 
 
@@ -8149,8 +8160,27 @@ def _flow_compute_flag_assignments_for_preset(
     steps = _flow_preset_steps(preset)
     if not steps:
         return [], 'unknown preset'
-    if len(chain_nodes) < len(steps):
-        return [], f'preset requires {len(steps)} nodes'
+
+    def _preset_stats() -> dict[str, int]:
+        try:
+            _nodes, _links, _adj = _build_topology_graph_from_preview_plan(preview)
+            st = _flow_compose_docker_stats(_nodes)
+            return st if isinstance(st, dict) else {}
+        except Exception:
+            return {}
+
+    def _requirement_message(*, required_total: int, required_nonvuln_docker: int) -> str:
+        st = _preset_stats()
+        docker_total = int(st.get('docker_total') or 0)
+        vuln_total = int(st.get('vuln_total') or 0)
+        required_any = max(0, int(required_total) - int(required_nonvuln_docker))
+        return f"Requires {required_any} Docker/Vuln and {int(required_nonvuln_docker)} Non-Vuln. Current: Docker: {docker_total}, Vuln: {vuln_total}"
+
+    required_total = len(steps)
+    required_nonvuln_docker = sum(1 for s in steps if str((s or {}).get('kind') or '').strip() == 'flag-node-generator')
+
+    if len(chain_nodes) < required_total:
+        return [], _requirement_message(required_total=required_total, required_nonvuln_docker=required_nonvuln_docker)
 
     try:
         gens, _ = _flag_generators_from_enabled_sources()
@@ -8204,7 +8234,7 @@ def _flow_compute_flag_assignments_for_preset(
         try:
             node = chain_nodes[i] if i < len(chain_nodes) else {}
             if kind == 'flag-node-generator' and isinstance(node, dict) and bool(node.get('is_vuln')):
-                return [], 'preset requires a non-vulnerability node for the flag-node-generator step'
+                return [], _requirement_message(required_total=required_total, required_nonvuln_docker=required_nonvuln_docker)
         except Exception:
             pass
 
@@ -8470,16 +8500,22 @@ def scenarios_preview_page():
     )
 
 
-def _latest_preview_plan_for_scenario_norm(scenario_norm: str, *, prefer_flow: bool = True) -> Optional[str]:
+def _latest_preview_plan_for_scenario_norm(scenario_norm: str, *, prefer_flow: bool = False) -> Optional[str]:
     """Return absolute path to newest persisted plan for a scenario.
 
     This is primarily used by Flag Sequencing. Two plan types exist:
     - Preview plans: outputs/plans/plan_from_preview_*.json
     - Flow-modified plans: outputs/plans/plan_from_flow_*.json
 
-    By default, we prefer flow-modified plans (they represent the user's
-    saved sequencing/assignments). Callers can set prefer_flow=False to
-    prefer the newest preview plan instead.
+    By default, we prefer preview plans. Flow-modified plans may include
+    runtime/Flow-only mutations (e.g., promoting nodes to Docker role for
+    attachment) which should not affect the topology/eligibility counts
+    displayed in Flag Sequencing.
+
+    Important nuance: if a newer preview plan exists (scenario topology changed),
+    we return the newer preview plan even when prefer_flow=True. The caller can
+    still merge the latest flow metadata (chain/order/assignments) into the
+    newer preview payload.
     """
     try:
         scenario_norm = _normalize_scenario_label(scenario_norm)
@@ -8488,32 +8524,120 @@ def _latest_preview_plan_for_scenario_norm(scenario_norm: str, *, prefer_flow: b
         plans_dir = Path(_outputs_dir()) / 'plans'
         if not plans_dir.is_dir():
             return None
-        # Cap scan to avoid walking very large directories.
-        globs = (
-            ['plan_from_flow_*.json', 'plan_from_preview_*.json']
-            if prefer_flow
-            else ['plan_from_preview_*.json', 'plan_from_flow_*.json']
-        )
-        scanned = 0
-        for pat in globs:
-            candidates = list(plans_dir.glob(pat))
+        def _created_at_ts(meta: Any, *, fallback_path: Optional[Path] = None) -> float:
+            try:
+                if isinstance(meta, dict):
+                    raw = meta.get('created_at')
+                else:
+                    raw = None
+                s = str(raw or '').strip()
+                if s:
+                    # Handle ISO strings with Z suffix.
+                    if s.endswith('Z'):
+                        s = s[:-1] + '+00:00'
+                    try:
+                        from datetime import datetime as _dt
+                        dt = _dt.fromisoformat(s)
+                        return float(dt.timestamp())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                if fallback_path is not None:
+                    return float(fallback_path.stat().st_mtime)
+            except Exception:
+                pass
+            return 0.0
+
+        def _latest_matching(pattern: str) -> tuple[Optional[Path], float]:
+            scanned = 0
+            candidates = list(plans_dir.glob(pattern))
             candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             for p in candidates:
                 scanned += 1
                 if scanned > 250:
-                    return None
+                    return None, 0.0
                 try:
                     with open(p, 'r', encoding='utf-8') as f:
                         payload = json.load(f) or {}
                     meta = payload.get('metadata') if isinstance(payload, dict) else None
                     scen = str((meta or {}).get('scenario') or '').strip()
                     if _normalize_scenario_label(scen) == scenario_norm:
-                        return str(p)
+                        return p, _created_at_ts(meta, fallback_path=p)
                 except Exception:
                     continue
+            return None, 0.0
+
+        latest_flow, latest_flow_ts = _latest_matching('plan_from_flow_*.json')
+        latest_preview, latest_preview_ts = _latest_matching('plan_from_preview_*.json')
+
+        if prefer_flow:
+            # Prefer flow plan only when no preview exists.
+            if latest_preview is not None:
+                return str(latest_preview)
+            if latest_flow is not None:
+                return str(latest_flow)
+            return None
+
+        # prefer_flow=False (default): always prefer preview when available.
+        if latest_preview is not None:
+            return str(latest_preview)
+        if latest_flow is not None:
+            return str(latest_flow)
         return None
     except Exception:
         return None
+
+
+def _attach_latest_flow_into_plan_payload(payload: dict[str, Any], *, scenario: str) -> None:
+    """Best-effort: merge saved flow metadata into a plan payload.
+
+    This is useful when the newest plan is a preview plan (topology updated) but
+    we still want to honor the user's saved Flow chain/order/assignments.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return
+        scenario_norm = _normalize_scenario_label(scenario or '')
+        if not scenario_norm:
+            return
+
+        full_prev = payload.get('full_preview')
+        if not isinstance(full_prev, dict):
+            return
+
+        flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
+        if not flow_plan_path:
+            return
+        try:
+            with open(flow_plan_path, 'r', encoding='utf-8') as f:
+                flow_payload = json.load(f) or {}
+        except Exception:
+            return
+
+        flow_meta = None
+        if isinstance(flow_payload, dict):
+            meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
+            flow_meta = (meta or {}).get('flow')
+            if not flow_meta:
+                flow_meta = flow_payload.get('flow')
+        if not isinstance(flow_meta, dict):
+            return
+
+        payload.setdefault('metadata', {})
+        if isinstance(payload.get('metadata'), dict):
+            payload['metadata']['flow'] = flow_meta
+            payload['metadata']['flow_plan_path'] = flow_plan_path
+
+        # Keep the same shape expected by the preview graph.
+        full_prev.setdefault('metadata', {})
+        if isinstance(full_prev.get('metadata'), dict):
+            full_prev['metadata']['flow'] = flow_meta
+            full_prev['metadata']['flow_plan_path'] = flow_plan_path
+        full_prev['flow'] = flow_meta
+    except Exception:
+        return
 
 
 def _latest_flow_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
@@ -8728,7 +8852,7 @@ def api_flow_latest_preview_plan():
     scenario_norm = _normalize_scenario_label(scenario_label)
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
-    plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm)
+    plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
     if not plan_path:
         return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview from the Scenarios page first.'}), 404
     try:
@@ -8798,7 +8922,7 @@ def api_flow_flag_values_for_node():
     if not node_id:
         return jsonify({'ok': False, 'error': 'No node_id specified.'}), 400
 
-    plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm)
+    plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
     if not plan_path or not os.path.exists(plan_path):
         return jsonify({'ok': False, 'error': 'No preview plan found for this scenario.'}), 404
 
@@ -9768,6 +9892,15 @@ def api_flow_attackflow_preview():
 
     prefer_preview = str(request.args.get('prefer_preview') or '').strip().lower() in ('1', 'true', 'yes', 'y')
     force_preview = str(request.args.get('force_preview') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+    best_effort_query = str(request.args.get('best_effort') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+    debug_mode = str(request.args.get('debug') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+
+    # When Generate forces preview selection, we still want to use the same *topology*
+    # that refresh would choose (to avoid eligible counts flipping), but we should not
+    # reuse a previously saved chain/assignments.
+    ignore_saved_flow = bool(force_preview)
+
+    selected_by = 'explicit'
 
     preview_plan_path = (request.args.get('preview_plan') or '').strip() or None
     if preview_plan_path:
@@ -9782,17 +9915,16 @@ def api_flow_attackflow_preview():
             preview_plan_path = None
     if not preview_plan_path:
         if force_preview:
-            # Explicitly ignore any saved flow plan; used by the Generate button.
+            # Generate button: use the same topology source as refresh (preview plan)
+            # so stats/topology do not flip, but ignore any saved chain/assignments.
+            selected_by = 'force_preview_best_plan'
             preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
         elif prefer_preview:
-            # Soft preference: only prefer preview if there is no saved flow plan.
-            flow_plan = _latest_flow_plan_for_scenario_norm(scenario_norm)
-            if flow_plan:
-                preview_plan_path = flow_plan
-            else:
-                preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+            selected_by = 'prefer_preview_preview_plan'
+            preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
         else:
-            preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=True)
+            selected_by = 'default_best_plan'
+            preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
 
     if not preview_plan_path:
         return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
@@ -9806,13 +9938,215 @@ def api_flow_attackflow_preview():
     except Exception as e:
         return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
 
+    def _docker_count_from_preview(full_preview: dict) -> int:
+        try:
+            hosts = full_preview.get('hosts') or []
+        except Exception:
+            hosts = []
+        if not isinstance(hosts, list):
+            return 0
+        total = 0
+        for host in hosts:
+            if not isinstance(host, dict):
+                continue
+            role = str(host.get('role') or '').strip().lower()
+            if role == 'docker':
+                total += 1
+        return total
+
+    def _docker_count_from_editor_snapshot(snapshot: dict, scen_norm: str) -> int:
+        try:
+            scenarios = snapshot.get('scenarios') or []
+        except Exception:
+            scenarios = []
+        if not isinstance(scenarios, list):
+            return 0
+        match = None
+        for scen in scenarios:
+            if not isinstance(scen, dict):
+                continue
+            nm = _normalize_scenario_label(scen.get('name') or '')
+            if nm and nm == scen_norm:
+                match = scen
+                break
+        if not isinstance(match, dict):
+            return 0
+        sec = (match.get('sections') or {}).get('Node Information')
+        if not isinstance(sec, dict):
+            return 0
+        items = sec.get('items') or []
+        if not isinstance(items, list):
+            return 0
+        total = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            metric = str(item.get('v_metric') or 'Weight').strip()
+            if metric != 'Count':
+                continue
+            sel = str(item.get('selected') or '').strip().lower()
+            if sel != 'docker':
+                continue
+            try:
+                total += max(0, int(item.get('v_count') or 0))
+            except Exception:
+                continue
+        return total
+
+    def _plan_epoch_seconds(plan_path: str, plan_payload: dict) -> float:
+        try:
+            meta = plan_payload.get('metadata') if isinstance(plan_payload, dict) else None
+            if isinstance(meta, dict):
+                ts = _parse_iso_ts(meta.get('created_at'))
+                if ts > 0:
+                    return ts
+        except Exception:
+            pass
+        try:
+            return float(os.path.getmtime(plan_path))
+        except Exception:
+            return 0.0
+
+    def _editor_snapshot_epoch_seconds(owner: Optional[dict]) -> float:
+        try:
+            snap_path = _editor_state_snapshot_path(owner)
+            if os.path.exists(snap_path):
+                return float(os.path.getmtime(snap_path))
+        except Exception:
+            pass
+        return 0.0
+
+    def _regenerate_preview_plan_from_snapshot(snapshot: dict, *, scenario_name: str, seed: Optional[int] = None) -> Optional[tuple[dict, str]]:
+        """Best-effort: render XML from snapshot, compute plan, persist new preview plan."""
+        try:
+            scenarios = snapshot.get('scenarios')
+            if not isinstance(scenarios, list) or not scenarios:
+                return None
+            core_meta = snapshot.get('core') if isinstance(snapshot.get('core'), dict) else None
+            tree = _build_scenarios_xml({'scenarios': scenarios, 'core': _normalize_core_config(core_meta, include_password=True) if core_meta else None})
+            ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+            out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
+            os.makedirs(out_dir, exist_ok=True)
+            stem = secure_filename((scenario_name or 'scenarios')).strip('_-.') or 'scenarios'
+            xml_path = os.path.join(out_dir, f"{stem}.xml")
+            # Pretty print if lxml available else fallback
+            try:
+                from lxml import etree as LET  # type: ignore
+                raw = ET.tostring(tree.getroot(), encoding='utf-8')
+                lroot = LET.fromstring(raw)
+                pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+                with open(xml_path, 'wb') as handle:
+                    handle.write(pretty)
+            except Exception:
+                tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+
+            from core_topo_gen.planning.orchestrator import compute_full_plan
+            from core_topo_gen.planning.plan_cache import hash_xml_file, try_get_cached_plan, save_plan_to_cache
+
+            xml_hash = hash_xml_file(xml_path)
+            plan = None
+            try:
+                plan = try_get_cached_plan(xml_hash, scenario_name, seed)
+            except Exception:
+                plan = None
+            if not plan:
+                plan = compute_full_plan(xml_path, scenario=scenario_name, seed=seed, include_breakdowns=True)
+                try:
+                    save_plan_to_cache(xml_hash, scenario_name, seed, plan)
+                except Exception:
+                    pass
+            if seed is None:
+                try:
+                    seed = plan.get('seed') or _derive_default_seed(xml_hash)
+                except Exception:
+                    seed = None
+            full_prev = _build_full_preview_from_plan(plan, seed, [], [])
+            try:
+                _attach_latest_flow_into_full_preview(full_prev, scenario_name)
+            except Exception:
+                pass
+            plans_dir = os.path.join(_outputs_dir(), 'plans')
+            os.makedirs(plans_dir, exist_ok=True)
+            seed_tag = full_prev.get('seed') or (seed if seed is not None else 'preview')
+            unique_tag = f"{seed_tag}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+            new_plan_path = os.path.join(plans_dir, f"plan_from_preview_{unique_tag}.json")
+            plan_payload = {
+                'full_preview': full_prev,
+                'metadata': {
+                    'xml_path': xml_path,
+                    'scenario': scenario_name,
+                    'seed': full_prev.get('seed'),
+                    'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
+                },
+            }
+            with open(new_plan_path, 'w', encoding='utf-8') as handle:
+                json.dump(plan_payload, handle, indent=2, sort_keys=True)
+            return plan_payload, new_plan_path
+        except Exception:
+            return None
+
+    # If the editor snapshot requests Docker hosts but the selected plan has zero Docker hosts,
+    # regenerate a preview plan from the snapshot so Flag Sequencer reflects current edits.
+    try:
+        owner = _current_user()
+        snapshot = _load_editor_state_snapshot(owner)
+        if not snapshot and owner is None:
+            # Conservative fallback: if there is exactly one editor snapshot on disk,
+            # use it even without an authenticated session. This avoids Generate
+            # flipping to stale plans in single-user deployments.
+            try:
+                snap_dir = _editor_state_snapshot_dir()
+                candidates = [
+                    os.path.join(snap_dir, fn)
+                    for fn in (os.listdir(snap_dir) if os.path.isdir(snap_dir) else [])
+                    if fn.endswith('.json') and not fn.startswith('.')
+                ]
+                if len(candidates) == 1 and os.path.exists(candidates[0]):
+                    with open(candidates[0], 'r', encoding='utf-8') as handle:
+                        maybe = json.load(handle)
+                    if isinstance(maybe, dict) and isinstance(maybe.get('scenarios'), list):
+                        snapshot = maybe
+            except Exception:
+                snapshot = snapshot
+        if snapshot:
+            desired_docker = _docker_count_from_editor_snapshot(snapshot, scenario_norm)
+            have_docker = _docker_count_from_preview(preview)
+            if desired_docker > 0 and have_docker == 0:
+                seed_hint = None
+                try:
+                    meta = payload.get('metadata') if isinstance(payload, dict) else None
+                    if isinstance(meta, dict) and meta.get('seed') is not None:
+                        seed_hint = int(meta.get('seed'))
+                except Exception:
+                    seed_hint = None
+                regenerated = _regenerate_preview_plan_from_snapshot(
+                    snapshot,
+                    scenario_name=(scenario_label or scenario_norm),
+                    seed=seed_hint,
+                )
+                if regenerated:
+                    payload, preview_plan_path = regenerated
+                    preview = payload.get('full_preview') if isinstance(payload, dict) else preview
+    except Exception:
+        pass
+
+    # If we loaded a preview plan (topology) but the user has a saved Flow plan,
+    # merge that Flow metadata into this payload so saved chain/assignments still apply.
+    try:
+        meta0 = payload.get('metadata') if isinstance(payload, dict) else None
+        flow0 = (meta0 or {}).get('flow') if isinstance(meta0, dict) else None
+        if (not ignore_saved_flow) and (not isinstance(flow0, dict)):
+            _attach_latest_flow_into_plan_payload(payload, scenario=(scenario_label or scenario_norm))
+    except Exception:
+        pass
+
     nodes, _links, adj = _build_topology_graph_from_preview_plan(preview)
     stats = _flow_compose_docker_stats(nodes)
 
     # If the latest plan is flow-modified, prefer the saved chain order.
     chain_nodes: list[dict[str, Any]] = []
     used_saved_chain = False
-    if not preset_steps:
+    if (not ignore_saved_flow) and (not preset_steps):
         try:
             meta = payload.get('metadata') if isinstance(payload, dict) else None
             flow_meta = meta.get('flow') if isinstance(meta, dict) else None
@@ -9841,6 +10175,8 @@ def api_flow_attackflow_preview():
         else:
             chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
 
+    warning: str | None = None
+
     # If we loaded a saved chain that is shorter than the requested length (e.g. the UI
     # reset its length input to the default on refresh), treat the saved chain as
     # authoritative and respond with its effective length.
@@ -9851,13 +10187,24 @@ def api_flow_attackflow_preview():
                 length = eff
         except Exception:
             pass
+
+    # Optional best-effort mode: if the user requests a longer chain than we can
+    # build from eligible nodes, clamp to available rather than returning 422.
+    if (not used_saved_chain) and (not preset_steps) and best_effort_query:
+        try:
+            available = len(chain_nodes)
+        except Exception:
+            available = 0
+        if available > 0 and available < length:
+            warning = f"Only {available} eligible nodes found; using chain length {available} instead of requested {length}."
+            length = available
     # Prefer persisted assignments when the plan comes from a prior Flow save.
     flag_assignments: list[dict[str, Any]] = []
     try:
         meta = payload.get('metadata') if isinstance(payload, dict) else None
         flow_meta = meta.get('flow') if isinstance(meta, dict) else None
         saved_assignments = flow_meta.get('flag_assignments') if isinstance(flow_meta, dict) else None
-        if isinstance(saved_assignments, list) and saved_assignments:
+        if (not ignore_saved_flow) and isinstance(saved_assignments, list) and saved_assignments:
             chain_id_set = {str(n.get('id') or '').strip() for n in (chain_nodes or []) if isinstance(n, dict)}
             filtered: list[dict[str, Any]] = []
             for entry in saved_assignments:
@@ -9888,7 +10235,7 @@ def api_flow_attackflow_preview():
         if preset_steps and not used_saved_chain:
             preset_assignments, preset_err = _flow_compute_flag_assignments_for_preset(preview, chain_nodes, scenario_label or scenario_norm, preset)
             if preset_err:
-                return jsonify({'ok': False, 'error': f'Preset error: {preset_err}', 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
+                return jsonify({'ok': False, 'error': f'Error: {preset_err}', 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
             flag_assignments = preset_assignments
         else:
             flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
@@ -9942,6 +10289,22 @@ def api_flow_attackflow_preview():
         'flow_errors': list(flow_errors or []),
         'flags_enabled': bool(flags_enabled),
     }
+    if warning:
+        out['warning'] = warning
+    if debug_mode:
+        try:
+            meta_dbg = payload.get('metadata') if isinstance(payload, dict) else None
+        except Exception:
+            meta_dbg = None
+        out['debug'] = {
+            'selected_by': selected_by,
+            'prefer_preview': bool(prefer_preview),
+            'force_preview': bool(force_preview),
+            'ignore_saved_flow': bool(ignore_saved_flow),
+            'used_saved_chain': bool(used_saved_chain),
+            'preview_plan_path': preview_plan_path,
+            'metadata': (meta_dbg if isinstance(meta_dbg, dict) else {}),
+        }
     if debug_dag:
         out['sequencer_dag'] = dag_debug or {'ok': False, 'errors': ['not computed (saved chain)']}
 
@@ -9964,6 +10327,18 @@ def api_flow_prepare_preview_for_execute():
     scenario_label = str(j.get('scenario') or '').strip()
     scenario_norm = _normalize_scenario_label(scenario_label)
     preset = str(j.get('preset') or '').strip()
+    mode = str(j.get('mode') or '').strip().lower()
+    best_effort = bool(j.get('best_effort')) or (mode in {'hint', 'hint_only', 'resolve_hints', 'preview'})
+    total_timeout_s: int | None = None
+    try:
+        total_timeout_s = int(j.get('timeout_s') or 0)
+    except Exception:
+        total_timeout_s = None
+    if total_timeout_s is not None and total_timeout_s <= 0:
+        total_timeout_s = None
+    if best_effort and total_timeout_s is None:
+        # UI hint resolution is optional; keep it bounded by default.
+        total_timeout_s = 30
     try:
         length = int(j.get('length') or 5)
     except Exception:
@@ -9993,6 +10368,21 @@ def api_flow_prepare_preview_for_execute():
 
     if not base_plan_path:
         return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
+
+    started_at = time.monotonic()
+    try:
+        plan_basename = os.path.basename(base_plan_path)
+    except Exception:
+        plan_basename = str(base_plan_path or '')
+    app.logger.info(
+        '[flow.prepare_preview_for_execute] start scenario=%s requested_length=%s preset=%s best_effort=%s timeout_s=%s base_plan=%s',
+        scenario_norm,
+        requested_length,
+        (preset or ''),
+        bool(best_effort),
+        (total_timeout_s if total_timeout_s is not None else 'none'),
+        plan_basename,
+    )
 
     try:
         with open(base_plan_path, 'r', encoding='utf-8') as f:
@@ -10093,7 +10483,7 @@ def api_flow_prepare_preview_for_execute():
     if preset_steps:
         preset_assignments, preset_err = _flow_compute_flag_assignments_for_preset(preview, chain_nodes, scenario_label or scenario_norm, preset)
         if preset_err:
-            return jsonify({'ok': False, 'error': f'Preset error: {preset_err}'}), 422
+            return jsonify({'ok': False, 'error': f'Error: {preset_err}', 'stats': stats}), 422
         flag_assignments = preset_assignments
     else:
         flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
@@ -10220,7 +10610,14 @@ def api_flow_prepare_preview_for_execute():
             'key_len': 16,
         }
 
-    def _flow_try_run_generator(generator_id: str, *, out_dir: str, config: dict[str, Any], catalog: str = 'flag_generators') -> tuple[bool, str, str | None]:
+    def _flow_try_run_generator(
+        generator_id: str,
+        *,
+        out_dir: str,
+        config: dict[str, Any],
+        catalog: str = 'flag_generators',
+        timeout_s: int = 120,
+    ) -> tuple[bool, str, str | None]:
         """Best-effort run of scripts/run_flag_generator.py.
 
         Returns: (ok, note_or_error, manifest_path)
@@ -10251,7 +10648,7 @@ def api_flow_prepare_preview_for_execute():
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=max(1, int(timeout_s or 120)),
             )
             manifest_path = os.path.join(out_dir, 'outputs.json')
             if p.returncode != 0:
@@ -10345,7 +10742,11 @@ def api_flow_prepare_preview_for_execute():
                     return text
 
             generation_failures: list[dict[str, Any]] = []
+            generation_skipped: list[dict[str, Any]] = []
             created_run_dirs: list[str] = []
+            failed_run_dirs: list[str] = []
+
+            deadline = (started_at + float(total_timeout_s)) if total_timeout_s is not None else None
             for fa in (flag_assignments or []):
                 if not isinstance(fa, dict):
                     continue
@@ -10475,6 +10876,15 @@ def api_flow_prepare_preview_for_execute():
 
                 try:
                     if generator_id:
+                        if deadline is not None and time.monotonic() >= deadline:
+                            generation_skipped.append({
+                                'node_id': cid,
+                                'node_name': str(h.get('name') or ''),
+                                'generator_id': generator_id,
+                                'reason': 'time budget exceeded',
+                            })
+                            break
+
                         flow_run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
                         # IMPORTANT: stage under /tmp/vulns so the existing sync pipeline can ship
                         # these artifacts to the CORE host (where docker-compose paths resolve).
@@ -10486,11 +10896,22 @@ def api_flow_prepare_preview_for_execute():
                         except Exception:
                             pass
 
+                        remaining = None
+                        if deadline is not None:
+                            try:
+                                remaining = int(max(1.0, deadline - time.monotonic()))
+                            except Exception:
+                                remaining = 1
+                        gen_timeout_s = 120
+                        if remaining is not None:
+                            gen_timeout_s = min(gen_timeout_s, remaining)
+
                         ok_run, note, manifest_path = _flow_try_run_generator(
                             generator_id,
                             out_dir=flow_out_dir,
                             config=cfg,
                             catalog=generator_catalog,
+                            timeout_s=gen_timeout_s,
                         )
 
                         if not ok_run:
@@ -10501,6 +10922,11 @@ def api_flow_prepare_preview_for_execute():
                                 'error': str(note or 'generator execution failed'),
                                 'run_dir': str(flow_out_dir or ''),
                             })
+                            try:
+                                if flow_out_dir:
+                                    failed_run_dirs.append(str(flow_out_dir))
+                            except Exception:
+                                pass
 
                         # Materialize a human-readable hint file in the artifacts directory.
                         try:
@@ -10652,7 +11078,10 @@ def api_flow_prepare_preview_for_execute():
                 # Cleanup partial artifacts so we don't leave confusing residues behind.
                 try:
                     base_dir = os.path.abspath(os.path.join('/tmp', 'vulns'))
-                    for d in (created_run_dirs or []):
+                    to_rm = (created_run_dirs or [])
+                    if best_effort:
+                        to_rm = (failed_run_dirs or [])
+                    for d in to_rm:
                         try:
                             dd = os.path.abspath(str(d))
                             if os.path.commonpath([dd, base_dir]) != base_dir:
@@ -10662,17 +11091,20 @@ def api_flow_prepare_preview_for_execute():
                             continue
                 except Exception:
                     pass
-                return jsonify({
-                    'ok': False,
-                    'error': f"{len(generation_failures)} generator run(s) failed; cannot prepare preview for execute.",
-                    'scenario': scenario_label or scenario_norm,
-                    'length': length,
-                    'stats': stats,
-                    'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
-                    'flag_assignments': flag_assignments,
-                    'generation_failures': generation_failures,
-                    'base_preview_plan_path': base_plan_path,
-                }), 422
+                if not best_effort:
+                    return jsonify({
+                        'ok': False,
+                        'error': f"{len(generation_failures)} generator run(s) failed; cannot prepare preview for execute.",
+                        'scenario': scenario_label or scenario_norm,
+                        'length': length,
+                        'stats': stats,
+                        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+                        'flag_assignments': flag_assignments,
+                        'generation_failures': generation_failures,
+                        'generation_skipped': generation_skipped,
+                        'base_preview_plan_path': base_plan_path,
+                        'best_effort': bool(best_effort),
+                    }), 422
         except Exception:
             pass
     else:
@@ -10745,6 +11177,8 @@ def api_flow_prepare_preview_for_execute():
         'xml_path': str((meta or {}).get('xml_path') or ''),
         'preview_plan_path': out_path,
         'base_preview_plan_path': base_plan_path,
+        'best_effort': bool(best_effort),
+        'elapsed_s': round(float(time.monotonic() - started_at), 3),
         **({'sequencer_dag': (dag_debug or {'ok': False, 'errors': ['not computed (explicit chain)']})} if debug_dag else {}),
     })
 
@@ -21427,18 +21861,21 @@ def run_cli_async():
             except Exception:
                 scenario_for_secret = None
 
-        selected_cfg = _select_core_config_for_page(scenario_for_secret or '', history, include_password=True)
+        selected_cfg = None
+        if scenario_for_secret:
+            selected_cfg = _select_core_config_for_page(scenario_for_secret, history, include_password=True)
 
         pw_raw = core_cfg.get('ssh_password') if isinstance(core_cfg, dict) else None
         pw_ok = bool(str(pw_raw).strip()) if pw_raw not in (None, '') else False
 
         if request_provided_core:
             # Only fill missing secrets; do not override request-provided host/ports.
-            if not pw_ok:
+            if selected_cfg and not pw_ok:
                 core_cfg = _merge_core_configs(selected_cfg, core_cfg, include_password=True)
         else:
-            # No explicit core config provided: treat selected VM as authoritative.
-            core_cfg = _merge_core_configs(core_cfg, selected_cfg, include_password=True)
+            # Only auto-select a saved CORE config when we have a scenario label.
+            if selected_cfg:
+                core_cfg = _merge_core_configs(core_cfg, selected_cfg, include_password=True)
     except Exception:
         pass
     try:
@@ -24667,6 +25104,82 @@ def core_kill_active_sessions_api():
         'core_host': core_host,
         'core_port': core_port,
     }), 200
+
+
+@app.route('/core/stop_duplicate_daemons_api', methods=['POST'])
+def core_stop_duplicate_daemons_api():
+    """Stop duplicate core-daemon processes and restart core-daemon.
+
+    Intended for the Execute flow: when a run is blocked due to multiple core-daemon
+    processes, the UI can prompt the user to stop them and retry.
+
+    Notes:
+    - Requires SSH access and sudo privileges on the CORE VM.
+    - If specific PIDs are provided, they are targeted first, but we still
+      perform a best-effort cleanup (systemctl stop + pkill) to ensure a single daemon.
+    """
+    payload = request.get_json(silent=True) or {}
+    pids_raw = payload.get('pids')
+    requested_pids: list[int] = []
+    if isinstance(pids_raw, list):
+        for item in pids_raw:
+            try:
+                requested_pids.append(int(str(item).strip()))
+            except Exception:
+                continue
+
+    core_cfg = _core_config_for_request(include_password=True)
+    ssh_password = core_cfg.get('ssh_password')
+    if not ssh_password:
+        return jsonify({
+            'ok': False,
+            'error': 'Stopping core-daemon requires sudo; provide an SSH password.',
+            'can_stop_daemons': False,
+        }), 400
+    if paramiko is None:
+        return jsonify({'ok': False, 'error': 'Paramiko unavailable; cannot SSH to CORE VM.'}), 500
+    _ensure_paramiko_available()
+
+    ssh_client = paramiko.SSHClient()  # type: ignore[assignment]
+    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # type: ignore[attr-defined]
+    try:
+        ssh_client.connect(
+            hostname=str(core_cfg.get('ssh_host') or core_cfg.get('host') or 'localhost'),
+            port=int(core_cfg.get('ssh_port') or 22),
+            username=str(core_cfg.get('ssh_username') or ''),
+            password=ssh_password,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=10.0,
+            banner_timeout=10.0,
+            auth_timeout=10.0,
+        )
+        before = _collect_remote_core_daemon_pids(ssh_client)
+        # Prefer requested pids (e.g. from conflict error), else operate on what we see.
+        target = requested_pids or before
+        _stop_remote_core_daemon_conflict(
+            ssh_client,
+            sudo_password=ssh_password,
+            pids=target,
+            logger=app.logger,
+        )
+        try:
+            time.sleep(1.0)
+        except Exception:
+            pass
+        after = _collect_remote_core_daemon_pids(ssh_client)
+        return jsonify({
+            'ok': True,
+            'daemon_pids_before': before,
+            'daemon_pids_after': after,
+        }), 200
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+    finally:
+        try:
+            ssh_client.close()
+        except Exception:
+            pass
 
 
 @app.route('/core/start_session', methods=['POST'])
