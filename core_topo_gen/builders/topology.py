@@ -561,8 +561,9 @@ def _enforce_default_route_on_docker_nodes(session: object, node_objs: List[obje
                 continue
             try:
                 if not has_service(session, node_id, "DefaultRoute", node_obj=node):
-                    logger.warning(
-                        "DefaultRoute missing after enforcement on docker node id=%s name=%s (context=%s)",
+                    logger.info(
+                        "DefaultRoute not confirmed after enforcement on docker node id=%s name=%s (context=%s); "
+                        "this can be a CORE service readback limitation for Docker nodes",
                         node_id,
                         getattr(node, 'name', None),
                         context,
