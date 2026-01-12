@@ -632,12 +632,12 @@
       const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
       const genId = fa && fa.id ? String(fa.id) : '-';
       const genName = fa && fa.name ? String(fa.name) : '-';
-      addRow('generator', (genName && genName !== '-' && genName !== genId)
+      addRow('Generator', (genName && genName !== '-' && genName !== genId)
         ? (genId + ' | ' + genName)
         : genId);
 
       const genLabel = fa && fa.flag_generator ? String(fa.flag_generator) : '-';
-      addRow('source', genLabel);
+      addRow('Source', genLabel);
 
       // Realized flag value (populated after prepare_preview_for_execute).
       try{
@@ -647,7 +647,7 @@
           code.className = 'font-monospace';
           code.style.whiteSpace = 'pre-wrap';
           code.textContent = fv;
-          addRow('flag', code);
+          addRow('Flag', code);
         }
       } catch(e) {}
 
@@ -664,9 +664,9 @@
           ul.appendChild(li);
         });
         wrap.appendChild(ul);
-        addRow('description hints', wrap);
+        addRow('Description Hints', wrap);
       } else if(descList.length === 1){
-        addRow('description hints', descList[0]);
+        addRow('Description Hints', descList[0]);
       }
 
       const hintList = (fa && Array.isArray(fa.hints) && fa.hints.length)
@@ -682,32 +682,33 @@
           ul.appendChild(li);
         });
         wrap.appendChild(ul);
-        addRow('hints', wrap);
+        addRow('Hints', wrap);
       } else {
         const hintText = hintList.length ? hintList[0] : (fa && fa.hint ? String(fa.hint) : '');
-        addRow('hint', hintText || '-');
+        addRow('Hint', hintText || '-');
       }
 
       const feas = chainFeasibility(currentFlagAssignments);
       const step = feas && feas[idx] ? feas[idx] : null;
-        addRow('requires (artifacts)', fa && Array.isArray(fa.requires) && fa.requires.length ? fa.requires.join(', ') : '-');
-        addRow('produces (artifacts)', fa && Array.isArray(fa.produces) && fa.produces.length ? fa.produces.join(', ') : '-');
+        addRow('Chain Item Providing', fa && Array.isArray(fa.requires) && fa.requires.length ? fa.requires.join(', ') : '-');
+        addRow('Providing to Chain', fa && Array.isArray(fa.produces) && fa.produces.length ? fa.produces.join(', ') : '-');
         const inReq = (fa && Array.isArray(fa.input_fields_required)) ? fa.input_fields_required.map(String).filter(Boolean) : [];
         const inOpt = (fa && Array.isArray(fa.input_fields_optional)) ? fa.input_fields_optional.map(String).filter(Boolean) : [];
         const inAll = (fa && Array.isArray(fa.input_fields)) ? fa.input_fields.map(String).filter(Boolean) : [];
         const inputsDisplay = (inReq.length || inOpt.length)
           ? (inReq.concat(inOpt.map(x => x + ' (optional)')).join(', '))
           : (inAll.length ? inAll.join(', ') : '-');
-        addRow('inputs (fields)', inputsDisplay);
-        addRow('outputs (fields)', fa && Array.isArray(fa.output_fields) && fa.output_fields.length ? fa.output_fields.join(', ') : '-');
+        const isNodeGen = String((fa && fa.type) || '').trim() === 'flag-node-generator';
+        addRow(isNodeGen ? 'Flag-Node-Generator Defined Input' : 'Flag-Generator Defined Input', inputsDisplay);
+        addRow(isNodeGen ? 'Flag-Node-Generator Defined Output' : 'Flag-Generator Defined Output', fa && Array.isArray(fa.output_fields) && fa.output_fields.length ? fa.output_fields.join(', ') : '-');
       if(step && step.ok === false){
           const ma = Array.isArray(step.missing_artifacts) ? step.missing_artifacts : [];
           const mf = Array.isArray(step.missing_fields) ? step.missing_fields : [];
           if(ma.length || mf.length){
-            addRow('missing inputs (artifacts)', ma.join(', ') || '-', { danger: true });
-            addRow('missing inputs (fields)', mf.join(', ') || '-', { danger: true });
+            addRow('Missing Inputs (Artifacts)', ma.join(', ') || '-', { danger: true });
+            addRow('Missing Inputs (Fields)', mf.join(', ') || '-', { danger: true });
           } else {
-            addRow('missing', (step.missing || []).join(', ') || '-', { danger: true });
+            addRow('Missing', (step.missing || []).join(', ') || '-', { danger: true });
           }
       }
 
@@ -739,7 +740,7 @@
               .join('; ');
             parts.push('dropped: ' + (msg || dropped.join(', ')));
           }
-          addRow('inputs mismatch', parts.length ? parts.join(' | ') : 'inputs mismatch', { danger: true });
+          addRow('Inputs Mismatch', parts.length ? parts.join(' | ') : 'inputs mismatch', { danger: true });
         }
         if(fa && fa.outputs_match === false){
           const mm = fa.outputs_mismatch || {};
@@ -758,7 +759,7 @@
               .join('; ');
             parts.push('extra: ' + (msg || extra.join(', ')));
           }
-          addRow('outputs mismatch', parts.length ? parts.join(' | ') : 'outputs mismatch', { danger: true });
+          addRow('Outputs Mismatch', parts.length ? parts.join(' | ') : 'outputs mismatch', { danger: true });
         }
       } catch(e) {}
 
@@ -919,9 +920,9 @@
 
       flagEl.appendChild(line1);
       flagEl.appendChild(line2);
-      addRow('flag', flagEl);
+      addRow('Flag', flagEl);
     } else {
-      addRow('flag', '-');
+      addRow('Flag', '-');
     }
 
     // (Intentionally compact) omit flag value and hint descriptions here.
