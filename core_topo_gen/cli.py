@@ -47,6 +47,33 @@ except ModuleNotFoundError:
     pass
 
 
+def _load_preview_plan(preview_plan_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Load a persisted preview/flow plan JSON.
+
+    The web UI persists plans with the outer shape:
+      {"full_preview": {...}, "metadata": {...}}
+
+    For backward compatibility, we also accept a raw full_preview dict.
+    Returns (plan_payload, full_preview).
+    """
+    with open(preview_plan_path, 'r', encoding='utf-8') as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError('preview plan must be a JSON object')
+
+    full_preview = payload.get('full_preview')
+    if isinstance(full_preview, dict):
+        return payload, full_preview
+
+    # Backward-compat: treat the whole JSON object as a full_preview payload.
+    # Heuristic: full_preview is expected to have node/link collections and/or display artifacts.
+    if any(k in payload for k in ('nodes', 'links', 'display_artifacts', 'flow', 'metadata')):
+        wrapped = {'full_preview': payload, 'metadata': {}}
+        return wrapped, payload
+
+    raise ValueError('unrecognized preview plan format (expected {"full_preview": {...}})')
+
+
 def _run_offline_report(
     args,
     role_counts: Dict[str, int],

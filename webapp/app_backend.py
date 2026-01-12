@@ -1079,6 +1079,138 @@ def _schedule_remote_repo_finalize(
         _update_repo_push_progress(progress_id, status='error', stage='error', detail='Failed to schedule remote finalization')
 
 
+def _iter_values_by_key(obj: Any, keys: set[str]) -> Iterator[Any]:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in keys:
+                yield v
+            yield from _iter_values_by_key(v, keys)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _iter_values_by_key(item, keys)
+
+
+def _extract_flow_artifact_dirs_from_plan(preview_plan_path: str) -> List[str]:
+    """Extract local artifact directories referenced by the plan.
+
+    We currently support Flow flag generators by looking for `artifacts_dir` keys.
+    """
+    try:
+        with open(preview_plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+    except Exception:
+        return []
+
+    full = payload.get('full_preview') if isinstance(payload, dict) else None
+    root = full if isinstance(full, dict) else payload
+
+    dirs: List[str] = []
+    for v in _iter_values_by_key(root, {'artifacts_dir'}):
+        if isinstance(v, str) and v:
+            dirs.append(v)
+
+    seen: set[str] = set()
+    out: List[str] = []
+    for d in dirs:
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def _upload_flow_artifacts_for_plan_to_remote(
+    *,
+    client: Any,
+    sftp: Any,
+    preview_plan_path: str,
+    log_handle: Any,
+) -> None:
+    """Upload any locally-generated flow artifacts to the CORE VM.
+
+    The preview plan references absolute paths (typically under /tmp/vulns/...).
+    When running the CLI on a remote CORE VM, those directories must exist on
+    the remote filesystem or bind mounts / docker cp will see nothing.
+    """
+    artifact_dirs = _extract_flow_artifact_dirs_from_plan(preview_plan_path)
+    if not artifact_dirs:
+        try:
+            log_handle.write('[remote] No flow artifact dirs referenced in preview plan\n')
+        except Exception:
+            pass
+        return
+
+    allowed_prefixes = ('/tmp/vulns',)
+    upload_dirs = [d for d in artifact_dirs if any(d == p or d.startswith(p + '/') for p in allowed_prefixes)]
+    skipped = [d for d in artifact_dirs if d not in upload_dirs]
+    if skipped:
+        try:
+            log_handle.write(f"[remote] Skipping {len(skipped)} artifact dirs (outside /tmp/vulns)\n")
+        except Exception:
+            pass
+    if not upload_dirs:
+        return
+
+    made_dirs: set[str] = set()
+    copied_files = 0
+    copied_bytes = 0
+    for local_dir in upload_dirs:
+        if not os.path.isdir(local_dir):
+            try:
+                log_handle.write(f"[remote] flow.artifacts.upload skip (missing): {local_dir}\n")
+            except Exception:
+                pass
+            continue
+
+        for root, dirs, files in os.walk(local_dir):
+            rel = os.path.relpath(root, local_dir)
+            rel = '' if rel == '.' else rel
+            remote_root = local_dir if not rel else _remote_path_join(local_dir, rel)
+            if remote_root not in made_dirs:
+                try:
+                    _remote_mkdirs(client, remote_root)
+                    made_dirs.add(remote_root)
+                except Exception:
+                    pass
+
+            for dn in dirs:
+                rp_dir = _remote_path_join(remote_root, dn)
+                if rp_dir in made_dirs:
+                    continue
+                try:
+                    _remote_mkdirs(client, rp_dir)
+                    made_dirs.add(rp_dir)
+                except Exception:
+                    pass
+
+            for fn in files:
+                lp = os.path.join(root, fn)
+                if not os.path.isfile(lp):
+                    continue
+                rp = _remote_path_join(remote_root, fn)
+                try:
+                    sftp.put(lp, rp)
+                    copied_files += 1
+                    try:
+                        copied_bytes += int(os.path.getsize(lp))
+                    except Exception:
+                        pass
+                except Exception:
+                    try:
+                        log_handle.write(f"[remote] flow.artifacts.upload failed: {lp} -> {rp}\n")
+                    except Exception:
+                        pass
+
+        try:
+            log_handle.write(f"[remote] flow.artifacts.uploaded dir={local_dir}\n")
+        except Exception:
+            pass
+
+    try:
+        log_handle.write(f"[remote] flow.artifacts.upload complete files={copied_files} bytes={copied_bytes}\n")
+    except Exception:
+        pass
+
+
 def _prepare_remote_cli_context(
     *,
     client: Any,
@@ -1119,6 +1251,14 @@ def _prepare_remote_cli_context(
         if preview_plan_path:
             remote_preview_plan = _remote_path_join(run_dir, os.path.basename(preview_plan_path))
             sftp.put(preview_plan_path, remote_preview_plan)
+            # If the preview/flow plan references local /tmp/vulns artifact directories,
+            # upload them to the CORE VM so the remote run can use them.
+            _upload_flow_artifacts_for_plan_to_remote(
+                client=client,
+                sftp=sftp,
+                preview_plan_path=preview_plan_path,
+                log_handle=log_handle,
+            )
         context = {
             'base_dir': base_dir,
             'run_dir': run_dir,
@@ -23084,6 +23224,446 @@ def _close_async_run_tunnel(meta: Dict[str, Any]) -> None:
             pass
 
 
+def _append_async_run_log_line(meta: Dict[str, Any] | None, line: str) -> None:
+    if not meta:
+        return
+    lp = meta.get('log_path')
+    if not lp:
+        return
+    try:
+        with open(lp, 'a', encoding='utf-8', buffering=1) as _f:
+            _f.write(line.rstrip('\n') + "\n")
+    except Exception:
+        pass
+
+
+def _maybe_copy_flow_artifacts_into_containers(meta: Dict[str, Any] | None, *, stage: str, log_prefix: str = '[remote] ') -> None:
+    if not meta:
+        return
+    if not meta.get('remote'):
+        return
+    if meta.get('flow_artifacts_copied'):
+        return
+    cfg = meta.get('core_cfg')
+    if not isinstance(cfg, dict):
+        return
+
+    try:
+        _log_remote_vulns_inventory(meta, stage=f'before_copy.{stage}', log_prefix=log_prefix)
+    except Exception:
+        pass
+
+    _append_async_run_log_line(meta, f"{log_prefix}=== docker.copy_flow_artifacts({stage}) ===")
+    try:
+        payload = _run_remote_python_json(
+            cfg,
+            _remote_copy_flow_artifacts_into_containers_script(cfg.get('ssh_password')),
+            logger=app.logger,
+            label=f'docker.copy_flow_artifacts({stage})',
+            timeout=180.0,
+        )
+        items = payload.get('items') if isinstance(payload, dict) else None
+        copied_total = len(items or []) if isinstance(items, list) else 0
+        copied_ok = (
+            sum(1 for it in (items or []) if isinstance(it, dict) and it.get('ok'))
+            if isinstance(items, list)
+            else 0
+        )
+        _append_async_run_log_line(
+            meta,
+            f"{log_prefix}docker.copy_flow_artifacts({stage}) complete ok={int(copied_ok)} total={int(copied_total)}",
+        )
+        if isinstance(items, list) and items:
+            for it in items[:25]:
+                if not isinstance(it, dict):
+                    continue
+                node = it.get('node')
+                ok = bool(it.get('ok'))
+                src = it.get('src')
+                dest = it.get('dest')
+                targets = it.get('targets')
+                err = it.get('error') or ''
+                errs = it.get('errors') or []
+                err_tail = ''
+                try:
+                    if err:
+                        err_tail = str(err)
+                    elif isinstance(errs, list) and errs:
+                        err_tail = _summarize_for_log(str(errs[0]))
+                except Exception:
+                    err_tail = ''
+                target_desc = None
+                try:
+                    if isinstance(targets, list) and targets:
+                        target_desc = ','.join(str(x) for x in targets[:3])
+                except Exception:
+                    target_desc = None
+                detail = f"node={node} ok={ok} src={src} dest={dest}"
+                if target_desc:
+                    detail += f" targets={target_desc}"
+                if err_tail:
+                    detail += f" error={err_tail}"
+                _append_async_run_log_line(meta, f"{log_prefix}{detail}")
+
+        # Verify: list /flow_artifacts inside target container(s) so logs prove the copy worked.
+        try:
+            verify_targets: List[str] = []
+            if isinstance(items, list):
+                for it in items:
+                    if not isinstance(it, dict) or not it.get('ok'):
+                        continue
+                    targets = it.get('targets')
+                    if isinstance(targets, list):
+                        for t in targets:
+                            name = str(t or '').strip()
+                            if name:
+                                verify_targets.append(name)
+            seen: set[str] = set()
+            uniq: List[str] = []
+            for t in verify_targets:
+                if t in seen:
+                    continue
+                seen.add(t)
+                uniq.append(t)
+                if len(uniq) >= 5:
+                    break
+
+            if uniq:
+                _append_async_run_log_line(meta, f"{log_prefix}=== docker.exec.verify_flow_artifacts({stage}) ===")
+                verify_payload = _run_remote_python_json(
+                    cfg,
+                    _remote_docker_exec_flow_artifacts_listing_script(
+                        containers=uniq,
+                        sudo_password=cfg.get('ssh_password'),
+                        max_find=200,
+                    ),
+                    logger=app.logger,
+                    label=f'docker.exec.verify_flow_artifacts({stage})',
+                    timeout=90.0,
+                )
+                vitems = verify_payload.get('items') if isinstance(verify_payload, dict) else None
+                if isinstance(vitems, list):
+                    for vit in vitems[:5]:
+                        if not isinstance(vit, dict):
+                            continue
+                        container = vit.get('container')
+                        ok2 = bool(vit.get('ok'))
+                        rc2 = vit.get('rc')
+                        out2 = vit.get('output') or ''
+                        _append_async_run_log_line(meta, f"{log_prefix}docker.exec.verify container={container} ok={ok2} rc={rc2}")
+                        for line in str(out2).splitlines()[:60]:
+                            _append_async_run_log_line(meta, f"{log_prefix}{line}")
+        except Exception as exc_verify:
+            _append_async_run_log_line(meta, f"{log_prefix}docker.exec.verify_flow_artifacts({stage}) failed: {exc_verify}")
+        meta['flow_artifacts_copied'] = True
+    except Exception as exc:
+        _append_async_run_log_line(meta, f"{log_prefix}docker.copy_flow_artifacts({stage}) failed: {exc}")
+
+
+def _remote_vulns_inventory_script(base_dir: str | None) -> str:
+    base_dir_literal = json.dumps(str(base_dir) if base_dir else '')
+    return (
+        r"""
+import glob, json, os
+
+BASE_DIR = __BASE_DIR_LITERAL__
+
+
+def _safe_exists(p: str) -> bool:
+    try:
+        return bool(p) and os.path.exists(p)
+    except Exception:
+        return False
+
+
+def _first_existing(paths):
+    for p in paths:
+        if not p:
+            continue
+        if _safe_exists(p):
+            return p
+    return None
+
+
+def _list_dirs(pattern: str, limit: int = 10):
+    out = []
+    try:
+        for p in sorted(glob.glob(pattern)):
+            try:
+                if os.path.isdir(p):
+                    out.append(p)
+            except Exception:
+                continue
+            if len(out) >= limit:
+                break
+    except Exception:
+        return []
+    return out
+
+
+def _count_files_under(path: str, limit: int = 2000) -> int:
+    count = 0
+    try:
+        for _, _, files in os.walk(path):
+            count += len(files or [])
+            if count >= limit:
+                return limit
+    except Exception:
+        return -1
+    return count
+
+
+def main():
+    base = BASE_DIR or os.environ.get('CORE_REMOTE_BASE_DIR') or '/tmp/core-topo-gen'
+    base = os.path.abspath(base)
+    candidates = {
+        'base_dir': base,
+        'tmp_vulns': '/tmp/vulns',
+        'base_vulns': os.path.join(base, 'vulns'),
+        'base_outputs_vulns': os.path.join(base, 'outputs', 'vulns'),
+    }
+
+    assignments_candidates = [
+        os.path.join(base, 'vulns', 'compose_assignments.json'),
+        os.path.join(base, 'outputs', 'vulns', 'compose_assignments.json'),
+        os.path.join(base, 'compose_assignments.json'),
+        '/tmp/vulns/compose_assignments.json',
+    ]
+    assignments_path = _first_existing(assignments_candidates)
+
+    run_dirs = []
+    for root in (candidates.get('tmp_vulns'), candidates.get('base_vulns'), candidates.get('base_outputs_vulns')):
+        if not root:
+            continue
+        run_dirs.extend(_list_dirs(os.path.join(root, 'flag_generators_runs', '*'), limit=10))
+        run_dirs.extend(_list_dirs(os.path.join(root, 'flag_node_generators_runs', '*'), limit=10))
+
+    run_dir_summaries = []
+    for p in run_dirs[:10]:
+        run_dir_summaries.append({
+            'path': p,
+            'files': _count_files_under(p, limit=2000),
+        })
+
+    payload = {
+        'ok': True,
+        'base_dir': base,
+        'paths': {k: {'path': v, 'exists': _safe_exists(v)} for k, v in candidates.items()},
+        'compose_assignments': {
+            'candidates': assignments_candidates,
+            'found': assignments_path,
+            'found_exists': bool(assignments_path and _safe_exists(assignments_path)),
+        },
+        'run_dirs': run_dir_summaries,
+    }
+    print(json.dumps(payload))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__BASE_DIR_LITERAL__', base_dir_literal)
+
+
+def _log_remote_vulns_inventory(meta: Dict[str, Any] | None, *, stage: str, log_prefix: str = '[remote] ') -> None:
+    if not meta or not meta.get('remote'):
+        return
+    cfg = meta.get('core_cfg')
+    if not isinstance(cfg, dict):
+        return
+    base_dir = meta.get('remote_base_dir') or (meta.get('remote_context') or {}).get('base_dir')
+
+    _append_async_run_log_line(meta, f"{log_prefix}=== remote.vulns_inventory({stage}) ===")
+    try:
+        payload = _run_remote_python_json(
+            cfg,
+            _remote_vulns_inventory_script(str(base_dir) if base_dir else None),
+            logger=app.logger,
+            label=f'remote.vulns_inventory({stage})',
+            timeout=60.0,
+        )
+    except Exception as exc:
+        _append_async_run_log_line(meta, f"{log_prefix}remote.vulns_inventory({stage}) failed: {exc}")
+        return
+
+    try:
+        base = payload.get('base_dir') if isinstance(payload, dict) else None
+        if base:
+            _append_async_run_log_line(meta, f"{log_prefix}CORE_REMOTE_BASE_DIR={base}")
+    except Exception:
+        pass
+    try:
+        paths = payload.get('paths') if isinstance(payload, dict) else None
+        if isinstance(paths, dict):
+            for key in ('tmp_vulns', 'base_vulns', 'base_outputs_vulns'):
+                entry = paths.get(key)
+                if isinstance(entry, dict):
+                    _append_async_run_log_line(
+                        meta,
+                        f"{log_prefix}{key} path={entry.get('path')} exists={bool(entry.get('exists'))}",
+                    )
+    except Exception:
+        pass
+    try:
+        ca = payload.get('compose_assignments') if isinstance(payload, dict) else None
+        if isinstance(ca, dict):
+            _append_async_run_log_line(
+                meta,
+                f"{log_prefix}compose_assignments found={ca.get('found')} exists={bool(ca.get('found_exists'))}",
+            )
+    except Exception:
+        pass
+    try:
+        runs = payload.get('run_dirs') if isinstance(payload, dict) else None
+        if isinstance(runs, list) and runs:
+            _append_async_run_log_line(meta, f"{log_prefix}run_dirs found={len(runs)} (showing up to 10)")
+            for it in runs[:10]:
+                if not isinstance(it, dict):
+                    continue
+                _append_async_run_log_line(meta, f"{log_prefix}run_dir path={it.get('path')} files={it.get('files')}")
+        else:
+            _append_async_run_log_line(meta, f"{log_prefix}run_dirs found=0")
+    except Exception:
+        pass
+
+
+def _log_remote_vulns_inventory_to_handle(
+    *,
+    core_cfg: Dict[str, Any],
+    log_handle: Any,
+    stage: str,
+    base_dir: str | None = None,
+    log_prefix: str = '[remote] ',
+) -> None:
+    """Write the same inventory info as _log_remote_vulns_inventory, but without requiring RUNS meta.
+
+    This is useful for early-run diagnostics before RUNS[run_id] is populated, or
+    in failure paths where we never reach the postrun copy stage.
+    """
+    try:
+        log_handle.write(f"{log_prefix}=== remote.vulns_inventory({stage}) ===\n")
+    except Exception:
+        return
+
+    try:
+        payload = _run_remote_python_json(
+            core_cfg,
+            _remote_vulns_inventory_script(str(base_dir) if base_dir else None),
+            logger=app.logger,
+            label=f'remote.vulns_inventory({stage})',
+            timeout=60.0,
+        )
+    except Exception as exc:
+        try:
+            log_handle.write(f"{log_prefix}remote.vulns_inventory({stage}) failed: {exc}\n")
+        except Exception:
+            pass
+        return
+
+    def _w(line: str) -> None:
+        try:
+            log_handle.write(line.rstrip('\n') + "\n")
+        except Exception:
+            pass
+
+    try:
+        base = payload.get('base_dir') if isinstance(payload, dict) else None
+        if base:
+            _w(f"{log_prefix}CORE_REMOTE_BASE_DIR={base}")
+    except Exception:
+        pass
+    try:
+        paths = payload.get('paths') if isinstance(payload, dict) else None
+        if isinstance(paths, dict):
+            for key in ('tmp_vulns', 'base_vulns', 'base_outputs_vulns'):
+                entry = paths.get(key)
+                if isinstance(entry, dict):
+                    _w(f"{log_prefix}{key} path={entry.get('path')} exists={bool(entry.get('exists'))}")
+    except Exception:
+        pass
+    try:
+        ca = payload.get('compose_assignments') if isinstance(payload, dict) else None
+        if isinstance(ca, dict):
+            _w(f"{log_prefix}compose_assignments found={ca.get('found')} exists={bool(ca.get('found_exists'))}")
+    except Exception:
+        pass
+    try:
+        runs = payload.get('run_dirs') if isinstance(payload, dict) else None
+        if isinstance(runs, list) and runs:
+            _w(f"{log_prefix}run_dirs found={len(runs)} (showing up to 10)")
+            for it in runs[:10]:
+                if not isinstance(it, dict):
+                    continue
+                _w(f"{log_prefix}run_dir path={it.get('path')} files={it.get('files')}")
+        else:
+            _w(f"{log_prefix}run_dirs found=0")
+    except Exception:
+        pass
+
+
+def _remote_docker_exec_flow_artifacts_listing_script(
+    *,
+    containers: List[str],
+    sudo_password: str | None = None,
+    max_find: int = 200,
+) -> str:
+    containers_literal = json.dumps([str(x) for x in (containers or [])])
+    sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else "")
+    max_find_literal = json.dumps(int(max_find))
+    return (
+        r"""
+import json, subprocess
+
+CONTAINERS = __CONTAINERS_LITERAL__
+SUDO_PASSWORD = __SUDO_PASSWORD_LITERAL__
+MAX_FIND = __MAX_FIND_LITERAL__
+
+
+def _run(cmd, timeout=25):
+    try:
+        p = subprocess.run(['sudo', '-n'] + list(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        if SUDO_PASSWORD:
+            return subprocess.run(
+                ['sudo', '-S', '-k', '-p', ''] + list(cmd),
+                input=str(SUDO_PASSWORD) + "\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+            )
+        return p
+    except Exception as e:
+        return subprocess.CompletedProcess(cmd, 127, stdout=str(e))
+
+
+def main():
+    items = []
+    for c in CONTAINERS:
+        c = str(c or '').strip()
+        if not c:
+            continue
+        shell = (
+            'set -e; '
+            'echo "--- ls -la /flow_artifacts ---"; '
+            'ls -la /flow_artifacts 2>&1 || true; '
+            'echo "--- find /flow_artifacts (files) ---"; '
+            f"find /flow_artifacts -maxdepth 3 -type f -print 2>/dev/null | head -n {MAX_FIND} || true; "
+        )
+        p = _run(['docker', 'exec', c, 'sh', '-lc', shell], timeout=25)
+        items.append({'container': c, 'ok': p.returncode == 0, 'rc': int(p.returncode), 'output': (p.stdout or '')})
+    print(json.dumps({'ok': True, 'items': items}))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__CONTAINERS_LITERAL__', containers_literal) \
+     .replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal) \
+     .replace('__MAX_FIND_LITERAL__', max_find_literal)
+
+
 @app.route('/run_cli_async', methods=['POST'])
 def run_cli_async():
     seed = None
@@ -23254,12 +23834,41 @@ def run_cli_async():
             plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
             if os.path.commonpath([preview_plan_path, plans_dir]) != plans_dir:
                 app.logger.warning('[async] preview plan outside allowed directory: %s', preview_plan_path)
+                try:
+                    log_f.write(f"[async] preview plan rejected (outside outputs/plans): {preview_plan_path}\n")
+                except Exception:
+                    pass
                 preview_plan_path = None
             elif not os.path.exists(preview_plan_path):
                 app.logger.warning('[async] preview plan path missing: %s', preview_plan_path)
+                try:
+                    log_f.write(f"[async] preview plan rejected (missing): {preview_plan_path}\n")
+                except Exception:
+                    pass
                 preview_plan_path = None
         except Exception:
             preview_plan_path = None
+
+    # If no preview plan path was provided (or it was rejected), but the user has
+    # saved a Flag Sequencing (flow) plan for this scenario, use it automatically.
+    # Without a plan, the CLI will execute with 0 flows (no flags/generators).
+    if not preview_plan_path:
+        try:
+            scenario_norm = None
+            if scenario_name_hint:
+                scenario_norm = _normalize_scenario_label(str(scenario_name_hint))
+            if not scenario_norm and isinstance(scenario_payload, dict) and isinstance(scenario_payload.get('name'), str):
+                scenario_norm = _normalize_scenario_label(str(scenario_payload.get('name') or ''))
+            if scenario_norm:
+                flow_plan = _latest_flow_plan_for_scenario_norm(scenario_norm)
+                if flow_plan and os.path.exists(flow_plan):
+                    preview_plan_path = os.path.abspath(flow_plan)
+                    try:
+                        log_f.write(f"[async] Auto-selected flow plan for scenario={scenario_norm}: {preview_plan_path}\n")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     # Skip schema validation: format differs from CORE XML
     run_id = str(uuid.uuid4())
     out_dir = os.path.dirname(xml_path)
@@ -24349,6 +24958,13 @@ def run_cli_async():
             }
             return jsonify(payload), 423
 
+    # Always emit a remote filesystem inventory early so Execute logs show whether
+    # /tmp/vulns artifacts exist on the CORE VM even if the run fails before postrun.
+    try:
+        _log_remote_vulns_inventory_to_handle(core_cfg=core_cfg, log_handle=log_f, stage='pre_run')
+    except Exception:
+        pass
+
     try:
         remote_ctx = _prepare_remote_cli_context(
             client=remote_client,
@@ -24511,12 +25127,26 @@ def run_cli_async():
     except Exception:
         docker_env_parts = []
     docker_env_prefix = (' '.join(docker_env_parts) + ' ') if docker_env_parts else ''
+    flow_env_parts: list[str] = []
+    # Deliver Flow generator artifacts into vuln containers by copying files in,
+    # rather than bind-mounting directories from the host.
+    flow_env_parts.append('CORETG_FLOW_ARTIFACTS_MODE=copy')
+    try:
+        if remote_ctx and remote_ctx.get('base_dir'):
+            flow_env_parts.append(f"CORE_REMOTE_BASE_DIR={shlex.quote(str(remote_ctx.get('base_dir')))}")
+    except Exception:
+        pass
+    flow_env_prefix = (' '.join(flow_env_parts) + ' ') if flow_env_parts else ''
     remote_command = (
         f"{activate_prefix}cd {shlex.quote(work_dir)} && "
-        f"CORETG_SCENARIO_TAG={shlex.quote(scenario_tag)} {docker_env_prefix}PYTHONUNBUFFERED=1 {cli_cmd}"
+        f"CORETG_SCENARIO_TAG={shlex.quote(scenario_tag)} {flow_env_prefix}{docker_env_prefix}PYTHONUNBUFFERED=1 {cli_cmd}"
     )
     try:
         log_f.write(f"{log_prefix}Launching CLI in {work_dir}\n")
+        try:
+            log_f.write(f"{log_prefix}Flow artifacts mode: copy (docker cp into containers)\n")
+        except Exception:
+            pass
         _write_sse_marker(
             log_f,
             'phase',
@@ -24603,6 +25233,7 @@ def run_cli_async():
         'remote_xml_path': (remote_ctx or {}).get('xml_path'),
         'remote_base_dir': (remote_ctx or {}).get('base_dir'),
         'remote_preview_plan_path': (remote_ctx or {}).get('preview_plan_path'),
+        'flow_artifacts_copied': False,
     }
     # Start a background finalizer so history is appended even if the UI does not poll /run_status
     def _wait_and_finalize_async(run_id_local: str):
@@ -24617,6 +25248,11 @@ def run_cli_async():
             rc = p.wait()
             meta['done'] = True
             meta['returncode'] = rc
+
+            try:
+                _maybe_copy_flow_artifacts_into_containers(meta, stage='postrun')
+            except Exception:
+                pass
             try:
                 _sync_remote_artifacts(meta)
             except Exception:
@@ -24768,6 +25404,10 @@ def run_status(run_id: str):
         if rc is not None:
             meta['done'] = True
             meta['returncode'] = rc
+            try:
+                _maybe_copy_flow_artifacts_into_containers(meta, stage='postrun')
+            except Exception:
+                pass
             try:
                 _sync_remote_artifacts(meta)
             except Exception:
