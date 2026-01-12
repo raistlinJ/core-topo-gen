@@ -17524,6 +17524,7 @@ async function submitRunCliRequest(buildRequest, options = {}) {
         } catch (e) {}
     };
     const attempts = Math.max(1, options.maxAttempts || 2);
+    let overwriteExistingImages = options && options.overwriteExistingImages === true;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
         let request = null;
         try {
@@ -17535,6 +17536,29 @@ async function submitRunCliRequest(buildRequest, options = {}) {
         if (!request || !request.body) {
             throw new Error('buildRequest must return an object with a body property');
         }
+
+        // If the user confirmed overwrite of existing scenario-scoped images, inject the flag.
+        try {
+            if (overwriteExistingImages) {
+                if (request.body instanceof FormData) {
+                    // Avoid duplicating values on retries.
+                    if (typeof request.body.set === 'function') {
+                        request.body.set('overwrite_existing_images', '1');
+                    } else {
+                        request.body.append('overwrite_existing_images', '1');
+                    }
+                } else if (typeof request.body === 'string') {
+                    const ct = (request.headers && (request.headers['Content-Type'] || request.headers['content-type'])) || '';
+                    if (String(ct).toLowerCase().includes('application/json')) {
+                        const obj = JSON.parse(request.body);
+                        if (obj && typeof obj === 'object') {
+                            obj.overwrite_existing_images = true;
+                            request.body = JSON.stringify(obj);
+                        }
+                    }
+                }
+            }
+        } catch (e) {}
         const init = { method: 'POST', body: request.body };
         if (request.headers) {
             init.headers = request.headers;
@@ -17585,6 +17609,38 @@ async function submitRunCliRequest(buildRequest, options = {}) {
             try { logWarn(`Daemon check aborted: ${msg}`); } catch (e) {}
             setAbortReason(msg, { status: 428, kind: 'daemon_missing' });
             return null;
+        }
+
+        // Handle existing scenario-scoped images on CORE VM (412 precondition).
+        if (res.status === 412) {
+            const info = await parseResponseJson(res);
+            if (info && info.kind === 'existing_images') {
+                const tag = info.scenario_tag ? String(info.scenario_tag) : '(unknown)';
+                const imgs = Array.isArray(info.existing_images) ? info.existing_images.map(x => String(x)).filter(Boolean) : [];
+                const preview = imgs.slice(0, 10).map(x => `• ${x}`).join('\n');
+                const msg = `Existing scenario-scoped Docker images were found on the CORE VM for tag: ${tag}`
+                    + (preview ? `\n\nImages:\n${preview}${imgs.length > 10 ? `\n… (+${imgs.length - 10} more)` : ''}` : '')
+                    + `\n\nOverwrite will remove these images (and any containers using them) before starting the run.\n\nOverwrite and continue?`;
+                const proceed = await promptRunProgressConfirm(msg, {
+                    title: 'Existing scenario images detected',
+                    confirmLabel: 'Overwrite & retry',
+                    cancelLabel: 'Abort',
+                });
+                if (!proceed) {
+                    logRunRequestDebug('Run start aborted: user declined overwriting existing scenario images.');
+                    setAbortReason('Existing scenario images detected; overwrite declined.', { status: 412, kind: 'existing_images', scenario_tag: tag });
+                    return null;
+                }
+                overwriteExistingImages = true;
+                logRunRequestDebug('Overwrite confirmed; retrying run launch with overwrite_existing_images=1.');
+                // Do not consume an attempt for the confirmation round-trip.
+                if (attempt > 0) {
+                    attempt -= 1;
+                } else {
+                    attempt = -1;
+                }
+                continue;
+            }
         }
         if (res.status === 423) {
             const info = await parseResponseJson(res);

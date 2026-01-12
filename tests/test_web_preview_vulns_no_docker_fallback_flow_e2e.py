@@ -32,7 +32,7 @@ def _write_xml(tmpdir: str, *, scenario: str) -> str:
     return path
 
 
-def test_vulns_show_in_preview_when_no_docker_hosts_and_flow_can_use_vuln_nodes(tmp_path):
+def test_vulns_show_in_preview_when_no_docker_hosts_and_flow_allows_vuln_nodes(tmp_path):
     app.config["TESTING"] = True
     client = app.test_client()
 
@@ -60,8 +60,8 @@ def test_vulns_show_in_preview_when_no_docker_hosts_and_flow_can_use_vuln_nodes(
         assert vuln_by_node, "expected vulnerabilities_by_node to be non-empty even without docker hosts"
 
         # Persist a connected preview plan artifact.
-        # Docker slot semantics: vulnerabilities should not make a host "docker-like",
-        # but vulnerability nodes ARE eligible for flag sequencing.
+        # Docker slot semantics: vulnerabilities should not make a host "docker-like".
+        # Flow flag sequencing should still work by using vulnerability nodes for flag-generators.
         host_ids = [str(h.get("node_id")) for h in hosts if str(h.get("node_id") or "")]
         assert len(host_ids) >= 2
 
@@ -90,11 +90,17 @@ def test_vulns_show_in_preview_when_no_docker_hosts_and_flow_can_use_vuln_nodes(
             assert flow.status_code == 200
             data = flow.get_json() or {}
             assert data.get("ok") is True, data
-            assert int(data.get("length") or 0) == 2
             stats = data.get("stats") or {}
             assert int(stats.get("docker_total") or 0) == 0
             assert int(stats.get("vuln_total") or 0) >= 1
-            assert int(stats.get("eligible_total") or 0) >= 1
+            assert int(stats.get("eligible_total") or 0) >= 2
+
+            chain = data.get("chain") or []
+            assert len(chain) == 2
+            assert all(bool(n.get("is_vuln")) for n in chain)
+
+            assignments = data.get("flag_assignments") or []
+            assert not [a for a in assignments if str(a.get("type") or "").strip() == "flag-node-generator"], assignments
         finally:
             try:
                 os.remove(plan_path)

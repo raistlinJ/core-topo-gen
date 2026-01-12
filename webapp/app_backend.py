@@ -7727,10 +7727,9 @@ def _pick_flag_chain_nodes(nodes: list[dict[str, Any]], adj: dict[str, set[str]]
             continue
         id_to_node[nid] = n
         t = (str(n.get('type') or '').strip().lower())
-        # Flags can be placed on:
-        # - Docker-role nodes (docker-like types)
-        # - Vulnerability nodes (hosts with vulnerabilities)
-        # Vulnerability nodes do NOT count as Docker nodes.
+        # Flow placement eligibility:
+        # - flag-generators may be placed on vulnerability nodes and docker-role nodes
+        # - flag-node-generators require docker-role slots (enforced elsewhere)
         is_docker = ('docker' in t) or (str(n.get('type') or '').strip().upper() == 'DOCKER')
         is_vuln = bool(n.get('is_vuln'))
         if is_docker or is_vuln:
@@ -7804,7 +7803,8 @@ def _pick_flag_chain_nodes_for_preset(
     """Pick a chain that satisfies preset step constraints.
 
     Currently enforced:
-    - any step with kind == 'flag-node-generator' must be placed on a non-vulnerability docker node.
+    - flag-generator steps: may be placed on vulnerability nodes OR docker-role nodes
+    - flag-node-generator steps: must be placed on a non-vulnerability docker-role node
     """
     try:
         length = len(steps or [])
@@ -7894,8 +7894,8 @@ def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
 
     Additional explicit metrics (new; kept alongside legacy keys):
     - docker_nonvuln_total: docker nodes that are NOT vulnerability candidates
-    - flag_generator_eligible_total: nodes eligible for flag-generator steps
-    - flag_node_generator_eligible_total: nodes eligible for flag-node-generator steps
+    - flag_generator_eligible_total: nodes eligible for flag-generator steps (docker role + vuln nodes)
+    - flag_node_generator_eligible_total: nodes eligible for flag-node-generator steps (non-vuln docker role only)
     """
     docker_total = 0
     docker_nonvuln_total = 0
@@ -8633,6 +8633,17 @@ def _attach_latest_flow_into_plan_payload(payload: dict[str, Any], *, scenario: 
         if not isinstance(flow_meta, dict):
             return
 
+        # Repair saved Flow metadata against the *current* full_preview topology.
+        # This prevents stale chains/assignments from pointing at nodes that are no
+        # longer eligible (e.g., non-docker/non-vuln hosts).
+        try:
+            repaired = _flow_repair_saved_flow_for_preview(full_prev, flow_meta)
+            if not isinstance(repaired, dict):
+                return
+            flow_meta = repaired
+        except Exception:
+            return
+
         payload.setdefault('metadata', {})
         if isinstance(payload.get('metadata'), dict):
             payload['metadata']['flow'] = flow_meta
@@ -8706,6 +8717,17 @@ def _attach_latest_flow_into_full_preview(full_prev: dict, scenario: Optional[st
         if not isinstance(flow_meta, dict):
             return
 
+        # Repair saved Flow metadata against the *current* full_preview topology.
+        # Preview plans can change over time; keep the UI from marking/assigning
+        # flags to nodes that are no longer eligible.
+        try:
+            repaired = _flow_repair_saved_flow_for_preview(full_prev, flow_meta)
+            if not isinstance(repaired, dict):
+                return
+            flow_meta = repaired
+        except Exception:
+            return
+
         # Attach in the shape the front-end already understands.
         full_prev.setdefault('metadata', {})
         if isinstance(full_prev.get('metadata'), dict):
@@ -8715,6 +8737,143 @@ def _attach_latest_flow_into_full_preview(full_prev: dict, scenario: Optional[st
         full_prev['flow'] = flow_meta
     except Exception:
         return
+
+
+def _flow_node_is_docker_role(node: dict[str, Any] | None) -> bool:
+    try:
+        if not isinstance(node, dict):
+            return False
+        t_raw = str(node.get('type') or '')
+        t = t_raw.strip().lower()
+        if ('docker' in t) or (t_raw.strip().upper() == 'DOCKER'):
+            return True
+        # Preview graph nodes also carry compose metadata for docker-role hosts.
+        comp = str(node.get('compose') or '').strip()
+        comp_name = str(node.get('compose_name') or '').strip()
+        return bool(comp or comp_name)
+    except Exception:
+        return False
+
+
+def _flow_node_is_vuln(node: dict[str, Any] | None) -> bool:
+    try:
+        if not isinstance(node, dict):
+            return False
+        return bool(node.get('is_vuln'))
+    except Exception:
+        return False
+
+
+def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dict | None:
+    """Best-effort: repair a persisted Flow chain/assignments against the current preview.
+
+    This is intentionally conservative: if we cannot build a valid chain of the same
+    length, we return None and the caller should skip attaching Flow.
+
+    Placement rules enforced:
+    - flag-generator: allowed on vuln nodes OR docker-role nodes
+    - flag-node-generator: allowed only on non-vuln docker-role nodes
+    """
+    if not isinstance(full_prev, dict) or not isinstance(flow_meta, dict):
+        return None
+
+    chain_in = flow_meta.get('chain')
+    if not isinstance(chain_in, list) or not chain_in:
+        return None
+
+    assignments_in = flow_meta.get('flag_assignments')
+    assignments: list[dict[str, Any]] | None = None
+    if isinstance(assignments_in, list) and assignments_in:
+        assignments = [a for a in assignments_in if isinstance(a, dict)]
+
+    nodes, _links, _adj = _build_topology_graph_from_preview_plan(full_prev)
+    id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
+    if not id_map:
+        return None
+
+    # Candidate pools.
+    eligible_any: list[dict[str, Any]] = []
+    eligible_nonvuln_docker: list[dict[str, Any]] = []
+    for n in nodes or []:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if not nid:
+            continue
+        is_docker = _flow_node_is_docker_role(n)
+        is_vuln = _flow_node_is_vuln(n)
+        if is_docker or is_vuln:
+            eligible_any.append(n)
+        if is_docker and (not is_vuln):
+            eligible_nonvuln_docker.append(n)
+    eligible_any.sort(key=lambda x: str(x.get('id') or ''))
+    eligible_nonvuln_docker.sort(key=lambda x: str(x.get('id') or ''))
+
+    used: set[str] = set()
+    chain_out: list[dict[str, str]] = []
+    assignments_out: list[dict[str, Any]] | None = [] if assignments is not None else None
+
+    for i, step in enumerate(chain_in):
+        step_id = str((step or {}).get('id') or '').strip() if isinstance(step, dict) else ''
+
+        kind = 'flag-generator'
+        if assignments is not None and i < len(assignments):
+            try:
+                kind = str((assignments[i] or {}).get('type') or '').strip() or 'flag-generator'
+            except Exception:
+                kind = 'flag-generator'
+
+        need_nonvuln_docker = (kind == 'flag-node-generator')
+
+        cand = id_map.get(step_id) if step_id else None
+        if cand is not None:
+            nid = str(cand.get('id') or '').strip()
+            ok = bool(nid) and (nid not in used)
+            if ok:
+                is_docker = _flow_node_is_docker_role(cand)
+                is_vuln = _flow_node_is_vuln(cand)
+                if need_nonvuln_docker:
+                    ok = bool(is_docker and (not is_vuln))
+                else:
+                    ok = bool(is_docker or is_vuln)
+            if not ok:
+                cand = None
+
+        if cand is None:
+            pool = eligible_nonvuln_docker if need_nonvuln_docker else eligible_any
+            pick = None
+            for n in pool:
+                nid = str(n.get('id') or '').strip()
+                if nid and nid not in used:
+                    pick = n
+                    break
+            cand = pick
+
+        if not isinstance(cand, dict):
+            return None
+
+        nid = str(cand.get('id') or '').strip()
+        if not nid:
+            return None
+        used.add(nid)
+
+        chain_out.append({
+            'id': nid,
+            'name': str(cand.get('name') or nid),
+            'type': str(cand.get('type') or 'node'),
+        })
+
+        if assignments is not None and assignments_out is not None and i < len(assignments):
+            a2 = dict(assignments[i] or {})
+            a2['node_id'] = nid
+            assignments_out.append(a2)
+
+    out = dict(flow_meta)
+    out['chain'] = chain_out
+    out['length'] = len(chain_out)
+    if assignments_out is not None:
+        out['flag_assignments'] = assignments_out
+    return out
 
 
 def _build_topology_graph_from_preview_plan(preview: Dict[str, Any]) -> Tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, set[str]]]:
@@ -9151,21 +9310,6 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
             pass
         return fields
 
-    def _all_input_fields_of(gen: dict[str, Any]) -> set[str]:
-        fields: set[str] = set()
-        try:
-            inputs = gen.get('inputs')
-            if isinstance(inputs, list):
-                for inp in inputs:
-                    if not isinstance(inp, dict):
-                        continue
-                    name = str(inp.get('name') or '').strip()
-                    if name:
-                        fields.add(name)
-        except Exception:
-            pass
-        return fields
-
     def _required_inputs_of(gen: dict[str, Any]) -> set[str]:
         # Effective union: artifact dependencies + required runtime input fields.
         # If a plugin-level "requires" token is also present as an *optional* input
@@ -9252,9 +9396,17 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
     for i, cid in enumerate(chain_ids):
         node = id_to_node.get(str(cid)) or {}
         is_vuln_node = bool(node.get('is_vuln')) or (str(cid) in vuln_ids)
-        # Vulnerability nodes are candidates for flag sequencing, but only for flag-generator
-        # assignments (not flag-node-generator).
-        pool = [g for g in eligible_gens if (not is_vuln_node) or (str(g.get('_flow_kind') or '') == 'flag-generator')]
+        is_docker_node = _flow_node_is_docker_role(node)
+        # Enforce placement policy per node:
+        # - flag-generator: allowed on docker-role OR vuln nodes
+        # - flag-node-generator: allowed only on non-vuln docker-role nodes
+        def _eligible_for_node(g: dict[str, Any]) -> bool:
+            k = str(g.get('_flow_kind') or '').strip() or 'flag-generator'
+            if k == 'flag-node-generator':
+                return bool(is_docker_node and (not is_vuln_node))
+            return bool(is_docker_node or is_vuln_node)
+
+        pool = [g for g in eligible_gens if _eligible_for_node(g)]
         if not pool:
             pool = eligible_gens
         # Enforce chainability:
@@ -10259,6 +10411,21 @@ def api_flow_attackflow_preview():
                 desired = saved_ids[:length]
                 chain_nodes = [id_map[cid] for cid in desired if cid in id_map]
                 if chain_nodes:
+                    # Drop saved chains that contain nodes that are neither docker-role nor vuln nodes.
+                    try:
+                        for n in chain_nodes:
+                            if not isinstance(n, dict):
+                                continue
+                            t_raw = str(n.get('type') or '')
+                            t = t_raw.strip().lower()
+                            is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
+                            is_vuln = bool(n.get('is_vuln'))
+                            if (not is_docker) and (not is_vuln):
+                                chain_nodes = []
+                                break
+                    except Exception:
+                        chain_nodes = []
+                if chain_nodes:
                     used_saved_chain = True
         except Exception:
             chain_nodes = []
@@ -10555,6 +10722,70 @@ def api_flow_prepare_preview_for_execute():
                                 used.add(rid)
                 except Exception:
                     pass
+
+            # Enforce Flow placement rules:
+            # - flag-generators may be placed on vulnerability nodes OR docker-role nodes
+            # - flag-node-generators must be placed on non-vulnerability docker-role nodes
+            # If the caller provided a chain that violates this, best-effort replace nodes
+            # with unused eligible nodes; otherwise fail with a clear error.
+            if chain_nodes:
+                try:
+                    used = {str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()}
+                    for i, node in enumerate(chain_nodes):
+                        if not isinstance(node, dict):
+                            continue
+                        t_raw = str(node.get('type') or '')
+                        t = t_raw.strip().lower()
+                        is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
+                        is_vuln = bool(node.get('is_vuln'))
+
+                        need_nonvuln_docker = False
+                        if preset_steps and i < len(preset_steps):
+                            need_nonvuln_docker = (str((preset_steps[i] or {}).get('kind') or '').strip() == 'flag-node-generator')
+
+                        if need_nonvuln_docker:
+                            if is_docker and (not is_vuln):
+                                continue
+                        else:
+                            if is_docker or is_vuln:
+                                continue
+
+                        replacement = None
+                        for cand in (nodes or []):
+                            if not isinstance(cand, dict):
+                                continue
+                            cid = str(cand.get('id') or '').strip()
+                            if not cid or cid in used:
+                                continue
+                            ct_raw = str(cand.get('type') or '')
+                            ct = ct_raw.strip().lower()
+                            cand_is_docker = ('docker' in ct) or (ct_raw.strip().upper() == 'DOCKER')
+                            cand_is_vuln = bool(cand.get('is_vuln'))
+                            if need_nonvuln_docker:
+                                if not cand_is_docker:
+                                    continue
+                                if cand_is_vuln:
+                                    continue
+                            else:
+                                if not (cand_is_docker or cand_is_vuln):
+                                    continue
+                            replacement = cand
+                            break
+
+                        if replacement is None:
+                            return jsonify({
+                                'ok': False,
+                                'error': 'Not enough eligible nodes for the provided chain. Flag-generators require docker-role or vulnerability nodes; flag-node-generators require non-vulnerability docker-role nodes.',
+                                'stats': stats,
+                            }), 422
+
+                        rid = str(replacement.get('id') or '').strip()
+                        if rid:
+                            chain_nodes[i] = replacement
+                            chain_ids[i] = rid
+                            used.add(rid)
+                except Exception:
+                    pass
             if len(chain_nodes) < 1:
                 return jsonify({'ok': False, 'error': 'Provided chain_ids did not match any nodes in the preview plan.', 'stats': stats}), 422
         else:
@@ -10609,6 +10840,31 @@ def api_flow_prepare_preview_for_execute():
                     )
                 except Exception:
                     pass
+
+                # Do not reuse saved assignments if they violate placement rules for
+                # the current chain nodes (prevents Preview from showing flags on
+                # non-docker/non-vuln nodes or flag-node-generators on vuln nodes).
+                try:
+                    if flag_assignments and len(flag_assignments) == len(chain_nodes):
+                        for i, n in enumerate(chain_nodes):
+                            a = flag_assignments[i] if i < len(flag_assignments) else {}
+                            if not isinstance(n, dict) or not isinstance(a, dict):
+                                raise ValueError('invalid chain/assignment')
+                            nid = str(n.get('id') or '').strip()
+                            aid = str(a.get('node_id') or '').strip()
+                            if nid and aid and nid != aid:
+                                raise ValueError('assignment node mismatch')
+                            is_docker = _flow_node_is_docker_role(n)
+                            is_vuln = bool(n.get('is_vuln'))
+                            kind = str(a.get('type') or '').strip() or 'flag-generator'
+                            if kind == 'flag-node-generator':
+                                if not (is_docker and (not is_vuln)):
+                                    raise ValueError('flag-node-generator on ineligible node')
+                            else:
+                                if not (is_docker or is_vuln):
+                                    raise ValueError('flag-generator on ineligible node')
+                except Exception:
+                    flag_assignments = []
     except Exception:
         flag_assignments = []
 
@@ -11854,6 +12110,21 @@ def api_flow_substitution_candidates():
         except Exception:
             pass
         return required
+
+    def _all_input_fields_of(gen: dict[str, Any]) -> set[str]:
+        fields: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get('name') or '').strip()
+                    if name:
+                        fields.add(name)
+        except Exception:
+            pass
+        return fields
 
     def _output_fields_of(gen: dict[str, Any]) -> set[str]:
         out_fields: set[str] = set()
@@ -18891,6 +19162,184 @@ if __name__ == '__main__':
     ).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
 
 
+def _remote_copy_flow_artifacts_into_containers_script(sudo_password: str | None = None) -> str:
+    """Remote script to copy Flow generator artifacts into vuln containers.
+
+    This supports CORETG_FLOW_ARTIFACTS_MODE=copy where compose files contain
+    labels describing src/dest paths instead of bind mounts.
+    """
+    sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else "")
+    return (
+        r"""
+import json, os, re, subprocess, time
+
+SUDO_PASSWORD = __SUDO_PASSWORD_LITERAL__
+
+
+def _run_docker(cmd, timeout=30, capture=True):
+    stdout = subprocess.PIPE if capture else subprocess.DEVNULL
+    stderr = subprocess.STDOUT if capture else subprocess.DEVNULL
+    try:
+        p = subprocess.run(['sudo', '-n', 'docker'] + list(cmd), stdout=stdout, stderr=stderr, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        if SUDO_PASSWORD:
+            return subprocess.run(
+                ['sudo', '-S', '-k', '-p', '', 'docker'] + list(cmd),
+                input=str(SUDO_PASSWORD) + "\n",
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+                timeout=timeout,
+            )
+        return p
+    except Exception as e:
+        class _P:
+            returncode = 1
+            stdout = str(e)
+        return _P()
+
+
+def _first_existing(path_candidates):
+    for p in path_candidates:
+        if not p:
+            continue
+        try:
+            if os.path.exists(p):
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def _read_json(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _docker_names():
+    p = _run_docker(['ps', '-a', '--format', '{{.Names}}'], timeout=20, capture=True)
+    if getattr(p, 'returncode', 1) != 0:
+        return set(), (getattr(p, 'stdout', '') or '').strip()
+    return set(ln.strip() for ln in (p.stdout or '').splitlines() if ln.strip()), ''
+
+
+def _parse_flow_labels(txt: str):
+    # YAML-ish key:value, possibly quoted.
+    src = None
+    dest = None
+    m1 = re.search(r"coretg\.flow_artifacts\.src\s*:\s*(['\"]?)([^\n'\"]+)\1", txt)
+    if m1:
+        src = (m1.group(2) or '').strip()
+    m2 = re.search(r"coretg\.flow_artifacts\.dest\s*:\s*(['\"]?)([^\n'\"]+)\1", txt)
+    if m2:
+        dest = (m2.group(2) or '').strip()
+    return src, dest
+
+
+def _parse_flow_bind_mount(txt: str):
+    # Fallback: parse a volumes entry like /tmp/vulns/flag_generators_runs/...:/flow_artifacts:ro
+    m = re.search(r"(/tmp/vulns/(?:flag_generators_runs|flag_node_generators_runs)/[^:\s\"\']+)\s*:\s*([^:\s\"\']+)", txt)
+    if not m:
+        return None, None
+    return (m.group(1) or '').strip(), (m.group(2) or '').strip()
+
+
+def _compose_container_ids(project: str, yml: str):
+    p = _run_docker(['compose', '-p', project, '-f', yml, 'ps', '-q'], timeout=25, capture=True)
+    if getattr(p, 'returncode', 1) != 0:
+        return []
+    return [ln.strip() for ln in (p.stdout or '').splitlines() if ln.strip()]
+
+
+def main():
+    base = os.environ.get('CORE_REMOTE_BASE_DIR', '/tmp/core-topo-gen')
+    candidates = [
+        os.path.join(base, 'vulns', 'compose_assignments.json'),
+        os.path.join(base, 'outputs', 'vulns', 'compose_assignments.json'),
+        os.path.join(base, 'compose_assignments.json'),
+        '/tmp/vulns/compose_assignments.json',
+    ]
+    assignments_path = _first_existing(candidates)
+    if not assignments_path:
+        print(json.dumps({'ok': False, 'items': [], 'error': 'compose_assignments.json not found on CORE VM'}))
+        return
+
+    try:
+        data = _read_json(assignments_path)
+    except Exception as e:
+        print(json.dumps({'ok': False, 'items': [], 'error': f'failed reading assignments: {e}'}))
+        return
+
+    assignments = data.get('assignments', {}) if isinstance(data, dict) else {}
+    if not isinstance(assignments, dict):
+        assignments = {}
+
+    assign_dir = os.path.dirname(assignments_path)
+    items = []
+    for node_name in sorted(assignments.keys()):
+        yml = os.path.join(assign_dir, f'docker-compose-{node_name}.yml')
+        if not os.path.exists(yml):
+            continue
+        try:
+            txt = open(yml, 'r', encoding='utf-8', errors='ignore').read()
+        except Exception:
+            txt = ''
+
+        src, dest = _parse_flow_labels(txt)
+        if not src or not dest:
+            src2, dest2 = _parse_flow_bind_mount(txt)
+            src = src or src2
+            dest = dest or dest2
+
+        if not src or not dest:
+            continue
+
+        if not os.path.isdir(src):
+            items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'ok': False, 'error': 'src dir missing'})
+            continue
+
+        # Find container targets: prefer container named node_name; else use compose project containers.
+        targets = []
+        last_err = ''
+        for _ in range(6):
+            names, err = _docker_names()
+            last_err = err or last_err
+            if node_name in names:
+                targets = [node_name]
+                break
+            project = f"{node_name}conf" if node_name else 'coretg'
+            ids = _compose_container_ids(project, yml)
+            if ids:
+                targets = ids
+                break
+            time.sleep(2)
+
+        if not targets:
+            items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'ok': False, 'error': 'container not found', 'docker_error': last_err})
+            continue
+
+        copied_any = False
+        errs = []
+        for t in targets:
+            # Copy directory contents into dest.
+            p = _run_docker(['cp', src.rstrip('/') + '/.', f"{t}:{dest}"], timeout=60, capture=True)
+            if getattr(p, 'returncode', 1) == 0:
+                copied_any = True
+            else:
+                out = (getattr(p, 'stdout', '') or '').strip()
+                errs.append(out)
+        items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'targets': targets, 'ok': bool(copied_any), 'errors': errs})
+
+    print(json.dumps({'ok': True, 'items': items, 'timestamp': int(time.time())}))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
+
+
 def _sync_local_vulns_to_remote(
     core_cfg: Dict[str, Any],
     *,
@@ -18930,6 +19379,29 @@ def _sync_local_vulns_to_remote(
         if os.path.exists(yml):
             local_files.append(yml)
 
+    # Flow flag artifacts: bind-mounted into docker-compose services (e.g., to /flow_artifacts).
+    # These directories live under /tmp/vulns/* on the webapp host and must be present on the
+    # CORE VM too; otherwise the container sees an empty mount.
+    local_dirs: List[str] = []
+    try:
+        import re
+
+        for yml in [p for p in local_files if p.endswith('.yml') or p.endswith('.yaml')]:
+            try:
+                txt = ''
+                with open(yml, 'r', encoding='utf-8', errors='ignore') as f:
+                    txt = f.read()
+                # Match the source side of a bind mount that points into /tmp/vulns.
+                # Example: /tmp/vulns/flag_generators_runs/flow-...:/flow_artifacts:ro
+                for m in re.findall(r'(/tmp/vulns/(?:flag_generators_runs|flag_node_generators_runs)/[^:\s\"\']+)', txt):
+                    pth = str(m).strip().strip('"').strip("'")
+                    if pth and os.path.isdir(pth):
+                        local_dirs.append(pth)
+            except Exception:
+                continue
+    except Exception:
+        local_dirs = []
+
     if not local_files:
         return False
 
@@ -18941,6 +19413,7 @@ def _sync_local_vulns_to_remote(
         sftp = client.open_sftp()
         remote_dir_resolved = _remote_expand_path(sftp, remote_dir)
         _remote_mkdirs(client, remote_dir_resolved)
+        made_dirs: set[str] = set()
         for lp in local_files:
             rp = _remote_path_join(remote_dir_resolved, os.path.basename(lp))
             try:
@@ -18948,6 +19421,63 @@ def _sync_local_vulns_to_remote(
                 uploaded += 1
             except Exception:
                 log.exception("[sync] Failed uploading %s -> %s", lp, rp)
+
+        # Upload any referenced Flow generator run directories, preserving relative paths.
+        # Example local:  /tmp/vulns/flag_generators_runs/flow-.../outputs.json
+        # Example remote: /tmp/vulns/flag_generators_runs/flow-.../outputs.json
+        for d in sorted(set(local_dirs)):
+            try:
+                rel = os.path.relpath(d, local_dir)
+            except Exception:
+                rel = None
+            if not rel or rel.startswith('..'):
+                continue
+            remote_d = _remote_path_join(remote_dir_resolved, rel)
+            try:
+                if remote_d not in made_dirs:
+                    _remote_mkdirs(client, remote_d)
+                    made_dirs.add(remote_d)
+            except Exception:
+                pass
+            for root, dirs, files in os.walk(d):
+                # Create directories first.
+                for dn in dirs:
+                    lp_dir = os.path.join(root, dn)
+                    try:
+                        rel_dir = os.path.relpath(lp_dir, local_dir)
+                    except Exception:
+                        continue
+                    if not rel_dir or rel_dir.startswith('..'):
+                        continue
+                    rp_dir = _remote_path_join(remote_dir_resolved, rel_dir)
+                    if rp_dir in made_dirs:
+                        continue
+                    try:
+                        _remote_mkdirs(client, rp_dir)
+                        made_dirs.add(rp_dir)
+                    except Exception:
+                        pass
+                for fn in files:
+                    lp_file = os.path.join(root, fn)
+                    try:
+                        rel_file = os.path.relpath(lp_file, local_dir)
+                    except Exception:
+                        continue
+                    if not rel_file or rel_file.startswith('..'):
+                        continue
+                    rp_file = _remote_path_join(remote_dir_resolved, rel_file)
+                    rp_parent = os.path.dirname(rp_file)
+                    try:
+                        if rp_parent and rp_parent not in made_dirs:
+                            _remote_mkdirs(client, rp_parent)
+                            made_dirs.add(rp_parent)
+                    except Exception:
+                        pass
+                    try:
+                        sftp.put(lp_file, rp_file)
+                        uploaded += 1
+                    except Exception:
+                        log.exception("[sync] Failed uploading %s -> %s", lp_file, rp_file)
         if uploaded:
             log.info("[sync] Uploaded %d vuln artifact(s) to CORE host dir=%s", uploaded, remote_dir_resolved)
         return uploaded > 0
@@ -21187,6 +21717,9 @@ def run_cli():
         py_exec = _select_python_interpreter(cli_venv_bin)
         cli_env = _prepare_cli_env(preferred_venv_bin=cli_venv_bin)
         cli_env.setdefault('PYTHONUNBUFFERED', '1')
+        # Deliver Flow generator artifacts into vuln containers by copying files in,
+        # rather than bind-mounting directories from the host.
+        cli_env.setdefault('CORETG_FLOW_ARTIFACTS_MODE', 'copy')
         app.logger.info("[sync] Using python interpreter: %s", py_exec)
         # Determine active scenario name (prefer explicit hint, fallback to first in XML)
         active_scenario_name = None
@@ -21301,10 +21834,44 @@ def run_cli():
 
         # If the CLI generated vulnerability compose artifacts locally, copy them to the CORE VM
         # so the remote Docker Compose card and DockerComposeService can access them.
+        uploaded_vuln_artifacts = False
         try:
-            _sync_local_vulns_to_remote(core_cfg, logger=app.logger)
+            uploaded_vuln_artifacts = bool(_sync_local_vulns_to_remote(core_cfg, logger=app.logger))
+        except Exception as exc:
+            uploaded_vuln_artifacts = False
+            try:
+                app.logger.warning('[sync] Vuln artifact upload failed: %s', exc)
+            except Exception:
+                pass
+        try:
+            app.logger.info('[sync] Vuln artifact upload complete uploaded=%s', bool(uploaded_vuln_artifacts))
         except Exception:
             pass
+
+        # Flow flag artifacts: copy them into running/stopped vuln containers on the CORE VM.
+        # This is used when CORETG_FLOW_ARTIFACTS_MODE=copy (no bind mounts).
+        try:
+            payload = _run_remote_python_json(
+                core_cfg,
+                _remote_copy_flow_artifacts_into_containers_script(core_cfg.get('ssh_password')),
+                logger=app.logger,
+                label='docker.copy_flow_artifacts(postrun)',
+                timeout=180.0,
+            )
+            try:
+                copied_ok = 0
+                copied_total = 0
+                if isinstance(payload, dict) and isinstance(payload.get('items'), list):
+                    copied_total = len(payload.get('items') or [])
+                    copied_ok = sum(1 for it in (payload.get('items') or []) if isinstance(it, dict) and it.get('ok'))
+                app.logger.info('[sync] docker cp flow artifacts results ok=%s total=%s', int(copied_ok), int(copied_total))
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                app.logger.warning('[sync] docker cp flow artifacts skipped/failed: %s', exc)
+            except Exception:
+                pass
 
         # Report path (if generated by CLI): parse logs or fallback to latest under reports/
         report_md = _extract_report_path_from_text(logs) or _find_latest_report_path()
@@ -22536,6 +23103,7 @@ def run_cli_async():
     docker_remove_conflicts = False
     docker_cleanup_before_run = False
     docker_remove_all_containers = False
+    overwrite_existing_images = False
     scenarios_inline = None
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
@@ -22577,6 +23145,7 @@ def run_cli_async():
         docker_remove_all_containers = _coerce_bool(
             request.form.get('docker_remove_all_containers')
         ) or _coerce_bool(request.form.get('docker_nuke_all'))
+        overwrite_existing_images = _coerce_bool(request.form.get('overwrite_existing_images'))
     if not xml_path:
         try:
             j = request.get_json(silent=True) or {}
@@ -22611,6 +23180,7 @@ def run_cli_async():
             docker_remove_all_containers = _coerce_bool(
                 j.get('docker_remove_all_containers')
             ) or _coerce_bool(j.get('docker_nuke_all'))
+            overwrite_existing_images = _coerce_bool(j.get('overwrite_existing_images'))
         except Exception:
             pass
     if not xml_path:
@@ -22895,43 +23465,10 @@ def run_cli_async():
             blocking.append(entry)
         return blocking
 
-    blocking_sessions = _collect_blocking_sessions()
-    if blocking_sessions and not adv_auto_kill_sessions:
-        count = len(blocking_sessions)
-        message = (
-            f"CORE VM {remote_desc} already has {count} active session(s); finish or stop the running scenario before starting another."
-        )
-        try:
-            log_f.write(f"[remote] {message}\n")
-        except Exception:
-            pass
-        try:
-            log_f.close()
-        except Exception:
-            pass
-        payload = {
-            "error": message,
-            "session_count": count,
-            "core_host": core_host,
-            "core_port": core_port,
-            "active_sessions": [
-                {
-                    "id": entry.get('id'),
-                    "state": entry.get('state'),
-                    "nodes": entry.get('nodes'),
-                    "file": entry.get('file'),
-                }
-                for entry in blocking_sessions[:5]
-            ],
-        }
-        return jsonify(payload), 423
-    if blocking_sessions and adv_auto_kill_sessions:
-        try:
-            log_f.write(
-                f"[remote] NOTE: CORE VM {remote_desc} has {len(blocking_sessions)} active session(s); Advanced option will attempt to delete them before running.\n"
-            )
-        except Exception:
-            pass
+    # Check for active session conflicts early so we can block quickly without requiring SSH
+    # tunnel or remote docker access.
+    # NOTE: Active-session checks are performed later, after SSH is confirmed and any
+    # selected cleanup actions are executed.
     app.logger.info("[async] CORE remote=%s (ssh_enabled=%s)", remote_desc, core_cfg.get('ssh_enabled'))
     pre_saved = None
     # Establish SSH tunnel so CLI subprocess can reach CORE
@@ -23079,6 +23616,7 @@ def run_cli_async():
             except Exception:
                 pass
 
+    # (Scenario tag + Docker existing-image precheck runs later, after cleanup actions.)
     def _check_core_version(required: str = '9.2.1') -> None:
         candidates = [
             "sh -c 'timeout 6s core-daemon --version 2>/dev/null || true'",
@@ -23334,6 +23872,10 @@ def run_cli_async():
             except Exception as exc:
                 errors.append(f"Failed deleting session {sid}: {exc}")
         return deleted, errors
+
+    # These are populated during preflight; initialize so later code can safely reference them.
+    active_scenario_name = None
+    scenario_tag = _safe_name('scenario')
     try:
         log_f.write(f"{log_prefix}=== CORE services startup (core-daemon) ===\n")
         _write_sse_marker(
@@ -23359,17 +23901,7 @@ def run_cli_async():
             )
         except Exception:
             pass
-        if adv_check_core_version:
-            try:
-                log_f.write(f"{log_prefix}=== Advanced: Check CORE version (expected 9.2.1) ===\n")
-            except Exception:
-                pass
-            _check_core_version('9.2.1')
-            try:
-                log_f.write(f"{log_prefix}CORE version check passed.\n")
-            except Exception:
-                pass
-
+        # Cleanup actions MUST run before any checks.
         if adv_fix_docker_daemon:
             try:
                 log_f.write(f"{log_prefix}=== Advanced: Fix docker daemon for CORE ===\n")
@@ -23389,6 +23921,303 @@ def run_cli_async():
             _maybe_core_cleanup()
             try:
                 log_f.write(f"{log_prefix}CORE cleanup complete.\n")
+            except Exception:
+                pass
+
+        if docker_remove_all_containers:
+            try:
+                log_f.write(f"{log_prefix}=== Docker: REMOVE ALL containers (DANGEROUS) ===\n")
+                _write_sse_marker(
+                    log_f,
+                    'phase',
+                    {
+                        'stage': 'docker.remove_all_containers.prerun',
+                        'detail': 'Removing ALL docker containers',
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                payload = _run_remote_python_json(
+                    core_cfg,
+                    _remote_docker_remove_all_containers_script(core_cfg.get('ssh_password')),
+                    logger=app.logger,
+                    label='docker.remove_all_containers(prerun)',
+                    timeout=900.0,
+                )
+                try:
+                    if isinstance(payload, dict):
+                        c = payload.get('containers') or {}
+                        log_f.write(
+                            f"{log_prefix}Remove-all summary: containers_found={c.get('found')} removed_attempted={c.get('removed_attempted')}\n"
+                        )
+                except Exception:
+                    pass
+            except Exception as exc:
+                try:
+                    log_f.write(f"{log_prefix}Docker remove-all-containers skipped/failed: {exc}\n")
+                except Exception:
+                    pass
+
+        if docker_cleanup_before_run:
+            try:
+                log_f.write(f"{log_prefix}=== Docker: cleanup before run (containers + wrapper images) ===\n")
+                _write_sse_marker(
+                    log_f,
+                    'phase',
+                    {
+                        'stage': 'docker.cleanup.prerun',
+                        'detail': 'Stopping/removing vuln containers and wrapper images',
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                status_payload = _run_remote_python_json(
+                    core_cfg,
+                    _remote_docker_status_script(core_cfg.get('ssh_password')),
+                    logger=app.logger,
+                    label='docker.status(for prerun cleanup)',
+                    timeout=60.0,
+                )
+                names: list[str] = []
+                if isinstance(status_payload, dict) and isinstance(status_payload.get('items'), list):
+                    for it in status_payload.get('items') or []:
+                        if isinstance(it, dict) and it.get('name'):
+                            names.append(str(it.get('name')))
+                if names:
+                    try:
+                        log_f.write(f"{log_prefix}Docker containers to cleanup: {', '.join(names[:20])}{' ...' if len(names) > 20 else ''}\n")
+                    except Exception:
+                        pass
+                    _run_remote_python_json(
+                        core_cfg,
+                        _remote_docker_cleanup_script(names, core_cfg.get('ssh_password')),
+                        logger=app.logger,
+                        label='docker.cleanup(prerun)',
+                        timeout=120.0,
+                    )
+                else:
+                    try:
+                        log_f.write(f"{log_prefix}No vuln docker-compose node names found for cleanup.\n")
+                    except Exception:
+                        pass
+
+                payload = _run_remote_python_json(
+                    core_cfg,
+                    _remote_docker_remove_wrapper_images_script(core_cfg.get('ssh_password')),
+                    logger=app.logger,
+                    label='docker.wrapper_images.cleanup(prerun)',
+                    timeout=180.0,
+                )
+                try:
+                    removed = payload.get('removed') if isinstance(payload, dict) else None
+                    if isinstance(removed, list) and removed:
+                        log_f.write(f"{log_prefix}Removed wrapper images: {', '.join(str(x) for x in removed[:12])}{' ...' if len(removed) > 12 else ''}\n")
+                    else:
+                        log_f.write(f"{log_prefix}No wrapper images removed (or none found).\n")
+                except Exception:
+                    pass
+            except Exception as exc:
+                try:
+                    log_f.write(f"{log_prefix}Pre-run docker cleanup skipped/failed: {exc}\n")
+                except Exception:
+                    pass
+
+        # Determine active scenario name for tag scoping and CLI args.
+        active_scenario_name = None
+        if scenario_name_hint:
+            active_scenario_name = scenario_name_hint
+        elif scen_names and len(scen_names) > 0:
+            active_scenario_name = scen_names[0]
+
+        # Scope wrapper images by upload/scenario to avoid cross-scenario image reuse.
+        try:
+            out_dir_for_tag = os.path.dirname(xml_path) if xml_path else ''
+            upload_base = os.path.basename(out_dir_for_tag) if out_dir_for_tag else ''
+            parts = []
+            if upload_base:
+                parts.append(upload_base)
+            if active_scenario_name:
+                parts.append(active_scenario_name)
+            if run_id:
+                parts.append(str(run_id)[:8])
+            scenario_tag = _safe_name('-'.join(parts) if parts else (active_scenario_name or 'scenario'))
+        except Exception:
+            scenario_tag = _safe_name(active_scenario_name or 'scenario')
+
+        # Pre-run safety check: existing scenario-scoped images -> prompt abort/overwrite.
+        existing_images: list[str] = []
+        try:
+            prefix_repo = f"coretg/{scenario_tag}-"
+            cmd = "docker images --format '{{.Repository}}:{{.Tag}}'"
+            rc, out, _err = _exec_sudo(cmd, timeout=35.0, stage='docker.images.check')
+            if rc == 0:
+                for ln in (out or '').splitlines():
+                    ln = (ln or '').strip()
+                    if not ln or ln.startswith('<none>:'):
+                        continue
+                    if ln.startswith(prefix_repo):
+                        existing_images.append(ln)
+        except Exception:
+            existing_images = []
+        if existing_images:
+            try:
+                log_f.write(
+                    f"{log_prefix}Found {len(existing_images)} existing scenario image(s) on CORE VM for tag '{scenario_tag}'.\n"
+                )
+                log_f.write(
+                    f"{log_prefix}Existing images: {', '.join(existing_images[:8])}{' ...' if len(existing_images) > 8 else ''}\n"
+                )
+            except Exception:
+                pass
+            if not overwrite_existing_images:
+                try:
+                    _write_sse_marker(
+                        log_f,
+                        'phase',
+                        {
+                            'stage': 'docker.images.precheck',
+                            'detail': 'Existing scenario images detected; awaiting overwrite confirmation',
+                            'scenario_tag': scenario_tag,
+                            'existing_images': existing_images[:25],
+                        },
+                    )
+                except Exception:
+                    pass
+                try:
+                    remote_client.close()
+                except Exception:
+                    pass
+                try:
+                    log_f.close()
+                except Exception:
+                    pass
+                _close_async_run_tunnel({'ssh_tunnel': ssh_tunnel})
+                return jsonify({
+                    'error': 'Existing scenario-scoped Docker images detected on the CORE VM.',
+                    'kind': 'existing_images',
+                    'scenario_tag': scenario_tag,
+                    'existing_images': existing_images,
+                    'can_overwrite': True,
+                }), 412
+
+            # Overwrite: remove any containers using these images, then remove the images.
+            try:
+                log_f.write(f"{log_prefix}Overwrite confirmed; removing existing scenario images…\n")
+                _write_sse_marker(
+                    log_f,
+                    'phase',
+                    {
+                        'stage': 'docker.images.overwrite',
+                        'detail': 'Removing existing scenario images before execution',
+                        'scenario_tag': scenario_tag,
+                        'count': len(existing_images),
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                images_json = json.dumps(existing_images)
+                py_rm = (
+                    "import os, json, subprocess\n"
+                    "imgs=json.loads(os.environ.get('IMAGES_JSON','[]'))\n"
+                    "removed=[]\nfailed=[]\n"
+                    "for img in imgs:\n"
+                    "  if not img or '<none>' in img: continue\n"
+                    "  try:\n"
+                    "    ids=subprocess.check_output(['docker','ps','-aq','--filter',f'ancestor={img}'], text=True, stderr=subprocess.STDOUT).split()\n"
+                    "  except Exception:\n"
+                    "    ids=[]\n"
+                    "  if ids:\n"
+                    "    try:\n"
+                    "      subprocess.run(['docker','rm','-f']+ids, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\n"
+                    "    except Exception:\n"
+                    "      pass\n"
+                    "  p=subprocess.run(['docker','rmi','-f',img], check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\n"
+                    "  if int(p.returncode or 0)==0:\n"
+                    "    removed.append(img)\n"
+                    "  else:\n"
+                    "    failed.append({'image':img,'out':(p.stdout or '').strip()})\n"
+                    "print('removed=' + str(len(removed)) + ' failed=' + str(len(failed)))\n"
+                    "for item in failed[:5]:\n"
+                    "  print('FAIL ' + item.get('image','') + ' ' + (item.get('out','')[:200]))\n"
+                )
+                cmd = f"IMAGES_JSON={shlex.quote(images_json)} python3 -c {shlex.quote(py_rm)}"
+                _exec_sudo(cmd, timeout=180.0, stage='docker.images.overwrite')
+            except Exception as exc:
+                try:
+                    log_f.write(f"{log_prefix}Failed removing existing scenario images: {exc}\n")
+                except Exception:
+                    pass
+                try:
+                    remote_client.close()
+                except Exception:
+                    pass
+                try:
+                    log_f.close()
+                except Exception:
+                    pass
+                _close_async_run_tunnel({'ssh_tunnel': ssh_tunnel})
+                return jsonify({
+                    'error': f'Failed removing existing scenario images on CORE VM: {exc}',
+                    'kind': 'existing_images_overwrite_failed',
+                    'scenario_tag': scenario_tag,
+                }), 500
+
+        # Now that SSH is confirmed and cleanup has run, block on active session conflicts.
+        blocking_sessions = _collect_blocking_sessions()
+        if blocking_sessions and not adv_auto_kill_sessions:
+            count = len(blocking_sessions)
+            message = (
+                f"CORE VM {remote_desc} already has {count} active session(s); finish or stop the running scenario before starting another."
+            )
+            try:
+                log_f.write(f"[remote] {message}\n")
+            except Exception:
+                pass
+            try:
+                remote_client.close()
+            except Exception:
+                pass
+            try:
+                log_f.close()
+            except Exception:
+                pass
+            _close_async_run_tunnel({'ssh_tunnel': ssh_tunnel})
+            payload = {
+                "error": message,
+                "session_count": count,
+                "core_host": core_host,
+                "core_port": core_port,
+                "active_sessions": [
+                    {
+                        "id": entry.get('id'),
+                        "state": entry.get('state'),
+                        "nodes": entry.get('nodes'),
+                        "file": entry.get('file'),
+                    }
+                    for entry in blocking_sessions[:5]
+                ],
+            }
+            return jsonify(payload), 423
+        if blocking_sessions and adv_auto_kill_sessions:
+            try:
+                log_f.write(
+                    f"[remote] NOTE: CORE VM {remote_desc} has {len(blocking_sessions)} active session(s); Advanced option will attempt to delete them before running.\n"
+                )
+            except Exception:
+                pass
+
+        # Checks run after cleanup actions.
+        if adv_check_core_version:
+            try:
+                log_f.write(f"{log_prefix}=== Advanced: Check CORE version (expected 9.2.1) ===\n")
+            except Exception:
+                pass
+            _check_core_version('9.2.1')
+            try:
+                log_f.write(f"{log_prefix}CORE version check passed.\n")
             except Exception:
                 pass
 
@@ -23635,129 +24464,7 @@ def run_cli_async():
             pass
         _close_async_run_tunnel({'ssh_tunnel': ssh_tunnel})
         return jsonify({"error": str(exc)}), 500
-    # Determine active scenario name and pass to CLI
-    active_scenario_name = None
-    if scenario_name_hint:
-        active_scenario_name = scenario_name_hint
-    elif scenario_payload and isinstance(scenario_payload.get('name'), str):
-        active_scenario_name = scenario_payload.get('name')
-    elif scen_names and len(scen_names) > 0:
-        active_scenario_name = scen_names[0]
-
-    # Scope wrapper images by upload/scenario to avoid cross-scenario image reuse.
-    try:
-        out_dir_for_tag = os.path.dirname(xml_path) if xml_path else ''
-        upload_base = os.path.basename(out_dir_for_tag) if out_dir_for_tag else ''
-        parts = []
-        if upload_base:
-            parts.append(upload_base)
-        if active_scenario_name:
-            parts.append(active_scenario_name)
-        if run_id:
-            parts.append(str(run_id)[:8])
-        scenario_tag = _safe_name('-'.join(parts) if parts else (active_scenario_name or 'scenario'))
-    except Exception:
-        scenario_tag = _safe_name(active_scenario_name or 'scenario')
-
-    if docker_remove_all_containers:
-        try:
-            log_f.write(f"{log_prefix}=== Docker: REMOVE ALL containers (DANGEROUS) ===\n")
-            _write_sse_marker(
-                log_f,
-                'phase',
-                {
-                    'stage': 'docker.remove_all_containers.prerun',
-                    'detail': 'Removing ALL docker containers',
-                },
-            )
-        except Exception:
-            pass
-        try:
-            payload = _run_remote_python_json(
-                core_cfg,
-                _remote_docker_remove_all_containers_script(core_cfg.get('ssh_password')),
-                logger=app.logger,
-                label='docker.remove_all_containers(prerun)',
-                timeout=900.0,
-            )
-            try:
-                if isinstance(payload, dict):
-                    c = payload.get('containers') or {}
-                    log_f.write(
-                        f"{log_prefix}Remove-all summary: containers_found={c.get('found')} removed_attempted={c.get('removed_attempted')}\n"
-                    )
-            except Exception:
-                pass
-        except Exception as exc:
-            try:
-                log_f.write(f"{log_prefix}Docker remove-all-containers skipped/failed: {exc}\n")
-            except Exception:
-                pass
-
-    if docker_cleanup_before_run:
-        try:
-            log_f.write(f"{log_prefix}=== Docker: cleanup before run (containers + wrapper images) ===\n")
-            _write_sse_marker(
-                log_f,
-                'phase',
-                {
-                    'stage': 'docker.cleanup.prerun',
-                    'detail': 'Stopping/removing vuln containers and wrapper images',
-                },
-            )
-        except Exception:
-            pass
-        try:
-            status_payload = _run_remote_python_json(
-                core_cfg,
-                _remote_docker_status_script(core_cfg.get('ssh_password')),
-                logger=app.logger,
-                label='docker.status(for prerun cleanup)',
-                timeout=60.0,
-            )
-            names: list[str] = []
-            if isinstance(status_payload, dict) and isinstance(status_payload.get('items'), list):
-                for it in status_payload.get('items') or []:
-                    if isinstance(it, dict) and it.get('name'):
-                        names.append(str(it.get('name')))
-            if names:
-                try:
-                    log_f.write(f"{log_prefix}Docker containers to cleanup: {', '.join(names[:20])}{' ...' if len(names) > 20 else ''}\n")
-                except Exception:
-                    pass
-                _run_remote_python_json(
-                    core_cfg,
-                    _remote_docker_cleanup_script(names, core_cfg.get('ssh_password')),
-                    logger=app.logger,
-                    label='docker.cleanup(prerun)',
-                    timeout=120.0,
-                )
-            else:
-                try:
-                    log_f.write(f"{log_prefix}No vuln docker-compose node names found for cleanup.\n")
-                except Exception:
-                    pass
-
-            payload = _run_remote_python_json(
-                core_cfg,
-                _remote_docker_remove_wrapper_images_script(core_cfg.get('ssh_password')),
-                logger=app.logger,
-                label='docker.wrapper_images.cleanup(prerun)',
-                timeout=180.0,
-            )
-            try:
-                removed = payload.get('removed') if isinstance(payload, dict) else None
-                if isinstance(removed, list) and removed:
-                    log_f.write(f"{log_prefix}Removed wrapper images: {', '.join(str(x) for x in removed[:12])}{' ...' if len(removed) > 12 else ''}\n")
-                else:
-                    log_f.write(f"{log_prefix}No wrapper images removed (or none found).\n")
-            except Exception:
-                pass
-        except Exception as exc:
-            try:
-                log_f.write(f"{log_prefix}Pre-run docker cleanup skipped/failed: {exc}\n")
-            except Exception:
-                pass
+    # NOTE: docker cleanup steps are executed earlier in the run (before checks).
     cli_args = [
         remote_python,
         '-u',
@@ -23797,6 +24504,8 @@ def run_cli_async():
     try:
         if _coerce_bool(core_cfg.get('ssh_enabled')):
             docker_env_parts.append('CORETG_DOCKER_USE_SUDO=1')
+            # Fail fast if docker compose pull fails (we surface the error and cancel the run).
+            docker_env_parts.append('CORETG_DOCKER_STRICT_PULL=1')
             if core_cfg.get('ssh_password'):
                 docker_env_parts.append('CORETG_DOCKER_SUDO_PASSWORD_STDIN=1')
     except Exception:

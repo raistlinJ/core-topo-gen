@@ -2,12 +2,6 @@
 	"version": "2.0.0",
 	"tasks": [
 		{
-			"label": "Restart Web UI (9090)",
-			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 python -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\"",
-			"isBackground": false
-		},
-		{
 			"label": "Check Web UI health (9090)",
 			"type": "shell",
 			"command": "cd /Users/jcacosta/Documents/core-topo-gen && curl -fsS -I http://127.0.0.1:9090/healthz | head",
@@ -28,7 +22,7 @@
 		{
 			"label": "Start Web UI foreground (9090)",
 			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 python -m main",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main",
 			"isBackground": false
 		},
 		{
@@ -44,45 +38,9 @@
 			"isBackground": false
 		},
 		{
-			"label": "Start Web UI detached (9090)",
-			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\"",
-			"isBackground": false
-		},
-		{
-			"label": "Healthz 9090",
-			"type": "shell",
-			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
-			"isBackground": false
-		},
-		{
 			"label": "Restart Web UI detached (9090)",
 			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\"",
-			"isBackground": false
-		},
-		{
-			"label": "Healthz 9090 (after restart)",
-			"type": "shell",
-			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
-			"isBackground": false
-		},
-		{
-			"label": "Inspect webui pid/log",
-			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ps -p 1365 -o pid,ppid,command || echo 'not running' && tail -n 80 outputs/logs/webui-9090.log | cat",
-			"isBackground": false
-		},
-		{
-			"label": "Web UI (9090)",
-			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
-			"isBackground": true
-		},
-		{
-			"label": "Healthz check",
-			"type": "shell",
-			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\"",
 			"isBackground": false
 		},
 		{
@@ -90,78 +48,6 @@
 			"type": "shell",
 			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
 			"isBackground": false
-		},
-		{
-			"label": "Web UI (9090)",
-			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
-			"isBackground": true
-		},
-		{
-			"label": "Healthz check",
-			"type": "shell",
-			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
-			"isBackground": false
-		},
-		{
-			"label": "Web UI (9090)",
-			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
-			"isBackground": true
-		},
-		{
-			"label": "Web UI (9090)",
-			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
-			"isBackground": true
-		},
-		{
-			"label": "Web UI (9090)",
-			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
-			"isBackground": true
-		},
-		{
-			"label": "Web UI (9090)",
-			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
-			"isBackground": true
-		},
-		{
-			"label": "Healthz check",
-			"type": "shell",
-			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
-			"isBackground": false
-		},
-		{
-			"label": "Web UI (9090)",
-			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
-			"isBackground": true
-		},
-		{
-			"label": "Web UI (9090)",
-			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
-			"isBackground": true
-		},
-		{
-			"label": "Web UI (9090)",
-			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
-			"isBackground": true
-		},
-		{
-			"label": "Healthz check",
-			"type": "shell",
-			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
-			"isBackground": false
-		},
-		{
-			"label": "Web UI (9090)",
-			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
-			"isBackground": true
 		}
 	]
 }

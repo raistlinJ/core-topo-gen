@@ -70,7 +70,7 @@
               </div>
               <div class="col-md-4">
                 <div class="small">
-                  <span id="flowStatus" class="text-muted"></span>
+                  <span id="flowStatus" class="text-muted" style="white-space: pre-line;"></span>
                   <a id="flowLoginLink" class="ms-2 d-none" href="/login">Login</a>
                 </div>
               </div>
@@ -401,7 +401,15 @@
 
   function setStatus(msg, isError){
     if(!statusEl) return;
-    statusEl.textContent = msg || '';
+    let out = msg || '';
+    // Improve readability of eligibility errors:
+    // "Requires … Current: …" -> put "Current:" on the next line.
+    try{
+      if(out && typeof out === 'string' && out.includes('Requires') && out.includes('Current:')){
+        out = out.replace(/\s+Current:/, '\nCurrent:');
+      }
+    } catch(e) {}
+    statusEl.textContent = out;
     statusEl.classList.toggle('text-danger', !!isError);
     statusEl.classList.toggle('text-muted', !isError);
   }

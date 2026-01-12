@@ -208,7 +208,15 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
     except Exception:
         pass
 
-    def _run(args: List[str], timeout: int) -> None:
+    strict_pull = False
+    try:
+        strict_pull = str(os.getenv('CORETG_DOCKER_STRICT_PULL') or '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+    except Exception:
+        strict_pull = False
+
+    def _run(args: List[str], timeout: int) -> tuple[int, str]:
+        returncode = 1
+        tail = ''
         try:
             sudo_pw = _docker_sudo_password()
             use_sudo_stdin = bool(sudo_pw) and len(args) >= 1 and args[0] == 'sudo' and ('-S' in args)
@@ -220,14 +228,14 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
                 timeout=timeout,
                 input=(sudo_pw + '\n') if use_sudo_stdin else None,
             )
+            returncode = int(proc.returncode or 0)
             out = (proc.stdout or '').strip()
             # Avoid flooding logs; keep last few lines.
-            tail = ''
             if out:
                 lines = out.splitlines()
                 tail = '\n'.join(lines[-12:])
             try:
-                logger.info('[docker-node] preflight cmd=%s rc=%s%s', ' '.join(args), proc.returncode, (f"\n{tail}" if tail else ''))
+                logger.info('[docker-node] preflight cmd=%s rc=%s%s', ' '.join(args), returncode, (f"\n{tail}" if tail else ''))
             except Exception:
                 pass
         except Exception as exc:
@@ -235,6 +243,7 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
                 logger.warning('[docker-node] preflight cmd failed: %s err=%s', ' '.join(args), exc)
             except Exception:
                 pass
+        return returncode, tail
 
     # IMPORTANT: Use the same docker compose project name that core-daemon will use.
     # core-daemon typically runs compose from a directory named "<node>conf" (e.g. h7conf),
@@ -247,8 +256,27 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
     project = f"{node_name}conf" if node_name else "coretg"
     compose_base = cmd + ['-p', project, '-f', compose_path]
 
-    # Pull images before CORE starts docker nodes.
-    _run(compose_base + ['pull'], timeout=600)
+    # Determine which services are buildable vs pull-only.
+    # `docker compose pull` fails for buildable services with scenario-scoped tags
+    # (e.g., `coretg/scenarios-...`) because those are expected to be built locally.
+    pull_services: List[str] = []
+    try:
+        import yaml  # type: ignore
+
+        with open(compose_path, 'r', encoding='utf-8', errors='ignore') as fh:
+            compose_obj = yaml.safe_load(fh)  # type: ignore
+        services = compose_obj.get('services') if isinstance(compose_obj, dict) else None
+        if isinstance(services, dict):
+            for svc_name, svc in services.items():
+                if not isinstance(svc, dict):
+                    continue
+                if svc.get('build'):
+                    continue
+                # pull-only service
+                pull_services.append(str(svc_name))
+    except Exception:
+        # If parsing fails, fall back to best-effort pulls with flags that avoid buildables when available.
+        pull_services = []
 
     # Build any services that declare a `build:` stanza using host networking.
     # This avoids reliance on Docker's default bridge network (which may be disabled
@@ -257,6 +285,7 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
     try:
         import yaml  # type: ignore
 
+        compose_dir = os.path.dirname(os.path.abspath(compose_path))
         with open(compose_path, 'r', encoding='utf-8', errors='ignore') as fh:
             compose_obj = yaml.safe_load(fh)  # type: ignore
         services = compose_obj.get('services') if isinstance(compose_obj, dict) else None
@@ -279,20 +308,63 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
                 dockerfile = str(dockerfile or 'Dockerfile').strip() or 'Dockerfile'
                 if not context or not image:
                     continue
-                args = docker_cmd + ['build', '--network', 'host', '--pull', '-t', image, '-f', os.path.join(context, dockerfile), context]
-                _run(args, timeout=1800)
-                built_any = True
+                # Resolve compose-relative paths. Compose interprets build.context and build.dockerfile
+                # relative to the compose file directory, not our current working directory.
+                ctx_path = context
+                if not os.path.isabs(ctx_path):
+                    ctx_path = os.path.join(compose_dir, ctx_path)
+                df_path = dockerfile
+                if not os.path.isabs(df_path):
+                    df_path = os.path.join(ctx_path, df_path)
+
+                try:
+                    logger.info(
+                        '[docker-node] preflight build service=%s image=%s context=%s dockerfile=%s',
+                        svc_name,
+                        image,
+                        ctx_path,
+                        df_path,
+                    )
+                except Exception:
+                    pass
+
+                args = docker_cmd + ['build', '--network', 'host', '--pull', '-t', image, '-f', df_path, ctx_path]
+                rc, _tail = _run(args, timeout=1800)
+                if rc == 0:
+                    built_any = True
     except Exception:
         built_any = False
 
+    if not built_any:
+        # Fallback: let compose handle builds (best-effort). This will pull base images.
+        _run(compose_base + ['build', '--pull'], timeout=1200)
+
+    # Pull only non-build services (if any). This avoids pulling scenario-scoped build targets.
+    if pull_services:
+        # In strict mode, any pull failure should abort the run.
+        pull_args = compose_base + ['pull'] + pull_services
+        if not strict_pull:
+            pull_args = compose_base + ['pull', '--ignore-pull-failures'] + pull_services
+        rc, tail = _run(pull_args, timeout=600)
+        if strict_pull and rc != 0:
+            raise RuntimeError(f"docker compose pull failed (node={node_name} rc={rc})\n{tail}".strip())
+    else:
+        # If we couldn't parse services, try to avoid buildables when supported by this compose version.
+        # Strict mode: do not ignore failures.
+        if strict_pull:
+            rc, tail = _run(compose_base + ['pull', '--ignore-buildable'], timeout=600)
+            if rc != 0:
+                raise RuntimeError(f"docker compose pull failed (node={node_name} rc={rc})\n{tail}".strip())
+        else:
+            rc, _tail = _run(compose_base + ['pull', '--ignore-buildable'], timeout=600)
+            if rc != 0:
+                _run(compose_base + ['pull', '--ignore-pull-failures'], timeout=600)
+
+    # Create containers without rebuilding. This allows any one-time initialization that
+    # occurs at container create/start to run ahead of CORE isolating networks.
     if built_any:
-        # Create containers without rebuilding. This allows any one-time
-        # initialization that occurs at container create/start to run ahead of
-        # CORE isolating networks.
         _run(compose_base + ['up', '--no-start', '--no-build'], timeout=600)
     else:
-        # Fallback: let compose handle builds (best-effort).
-        _run(compose_base + ['build', '--pull'], timeout=1200)
         _run(compose_base + ['up', '--no-start'], timeout=600)
 
     try:
@@ -406,8 +478,19 @@ def _ensure_docker_node_compose_prepared(node_name: str, rec: Optional[Dict[str,
         try:
             if os.path.exists(out_path):
                 _docker_compose_preflight(out_path, node_name=node_name)
-        except Exception:
-            pass
+        except Exception as exc:
+            # When strict pull mode is enabled (used by the Web UI Execute flow), treat
+            # preflight failures as fatal so the run is cancelled and the user sees the error.
+            try:
+                strict_pull = str(os.getenv('CORETG_DOCKER_STRICT_PULL') or '').strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+            except Exception:
+                strict_pull = False
+            if strict_pull:
+                raise
+            try:
+                logger.warning('[docker-node] preflight skipped/failed node=%s err=%s', node_name, exc)
+            except Exception:
+                pass
     except Exception:
         return
 

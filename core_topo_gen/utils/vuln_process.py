@@ -1463,6 +1463,73 @@ def _inject_service_environment(compose_obj: dict, env: Dict[str, str], prefer_s
 		return compose_obj
 
 
+def _inject_service_labels(compose_obj: dict, labels: Dict[str, str], prefer_service: Optional[str] = None) -> dict:
+	"""Inject labels into the selected service (best-effort).
+
+	Supports both dict-form and list-form `labels` entries.
+	"""
+	try:
+		if not labels or not isinstance(labels, dict):
+			return compose_obj
+		if not isinstance(compose_obj, dict):
+			return compose_obj
+		services = compose_obj.get('services')
+		if not isinstance(services, dict) or not services:
+			return compose_obj
+		svc_key = _select_service_key(compose_obj, prefer_service=prefer_service)
+		if not svc_key:
+			return compose_obj
+		svc = services.get(svc_key)
+		if not isinstance(svc, dict):
+			return compose_obj
+
+		cur = svc.get('labels')
+		if cur is None:
+			svc['labels'] = {str(k): str(v) for k, v in labels.items()}
+			return compose_obj
+		if isinstance(cur, dict):
+			new_labels = dict(cur)
+			for k, v in labels.items():
+				new_labels[str(k)] = str(v)
+			svc['labels'] = new_labels
+			return compose_obj
+		if isinstance(cur, list):
+			existing_keys = set()
+			out_list: List[str] = []
+			for item in cur:
+				if item is None:
+					continue
+				text = str(item)
+				out_list.append(text)
+				if '=' in text:
+					existing_keys.add(text.split('=', 1)[0])
+			for k, v in labels.items():
+				ks = str(k)
+				if ks in existing_keys:
+					continue
+				out_list.append(f"{ks}={v}")
+			svc['labels'] = out_list
+			return compose_obj
+		return compose_obj
+	except Exception:
+		return compose_obj
+
+
+def _flow_artifacts_mode() -> str:
+	"""How Flow generator artifacts should be delivered into compose services.
+
+	- mount: bind-mount ArtifactsDir into the service (default)
+	- copy: do not mount; emit labels so a caller can docker-cp the directory in
+	"""
+	try:
+		val = str(os.getenv('CORETG_FLOW_ARTIFACTS_MODE') or '').strip().lower()
+		if val in ('copy', 'cp'):
+			return 'copy'
+		return 'mount'
+	except Exception:
+		return 'mount'
+
+
 def _ensure_list_field_has(value: object, item: str) -> List[str]:
 	"""Normalize a compose field that may be a string/list and ensure item is present."""
 	out: List[str] = []
@@ -1800,7 +1867,7 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			class _CoreTGYamlDumper(yaml.SafeDumper):
 				pass
 
-			def _repr_str(dumper: yaml.SafeDumper, value: str):
+			def _repr_str(dumper, value: str):
 				style = '|' if '\n' in value else None
 				return dumper.represent_scalar('tag:yaml.org,2002:str', value, style=style)
 
@@ -2001,8 +2068,18 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				art_dir = str(rec.get('ArtifactsDir') or '').strip()
 				mount_path = str(rec.get('ArtifactsMountPath') or '').strip() or '/flow_artifacts'
 				if art_dir:
-					bind = f"{art_dir}:{mount_path}:ro"
-					obj = _inject_service_bind_mount(obj, bind, prefer_service=prefer)
+					# Always emit labels so callers can inspect/copy artifacts even when mounting.
+					obj = _inject_service_labels(
+						obj,
+						{
+							'coretg.flow_artifacts.src': art_dir,
+							'coretg.flow_artifacts.dest': mount_path,
+						},
+						prefer_service=prefer,
+					)
+					if _flow_artifacts_mode() != 'copy':
+						bind = f"{art_dir}:{mount_path}:ro"
+						obj = _inject_service_bind_mount(obj, bind, prefer_service=prefer)
 			except Exception:
 				pass
 			# Optional overlays for traffic/segmentation nodes (kept out of baseline template).
