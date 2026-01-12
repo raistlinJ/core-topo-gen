@@ -44,10 +44,14 @@ services:
         yaml = None  # type: ignore
     if yaml is not None:
         obj = yaml.safe_load(open(expected_path, encoding="utf-8"))
-        assert obj.get("networks") in (None, {}), "top-level networks should be removed when using network_mode none"
         svc = obj["services"]["app"]
+
+        # Option B: no Docker-managed networking, so no docker eth0/default route.
         assert svc.get("network_mode") == "none"
-        assert "networks" not in svc
+        # With network_mode none we should not be publishing ports at all.
+        assert "ports" not in svc
+        # CORE services may chmod/create files using relative paths; ensure root workdir.
+        assert svc.get("working_dir") == "/"
         assert "build" in svc
         assert svc["build"]["dockerfile"] == "Dockerfile"
         assert "cap_add" in svc and "NET_ADMIN" in (svc["cap_add"] or [])

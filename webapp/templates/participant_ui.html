@@ -430,8 +430,24 @@
       const chain = (flow && Array.isArray(flow.chain)) ? flow.chain : null;
       if(!chain || !chain.length) return;
 
+      const canonical = (t) => String(t || '').trim().toLowerCase();
+      const isSequenceEligible = (node) => {
+        const t = canonical(node && (node.type ?? node.kind ?? node.role));
+        return t === 'host' || t === 'docker' || t === 'vulnerability' || t === 'vuln';
+      };
+
       const nodeById = new Map();
       list.forEach(n => { if(n && n.id !== undefined && n.id !== null) nodeById.set(String(n.id), n); });
+      const nodeByName = new Map();
+      const nameCounts = new Map();
+      list.forEach(n => {
+        if(!n || !isSequenceEligible(n)) return;
+        const nm = String(n.name ?? n.label ?? '').trim();
+        if(!nm) return;
+        const k = nm.toLowerCase();
+        nameCounts.set(k, (nameCounts.get(k) || 0) + 1);
+        nodeByName.set(k, n);
+      });
       const chainLen = chain.length;
 
       const resolveNodeForChainEntry = (entry) => {
@@ -440,12 +456,20 @@
           raw = entry.id ?? entry.node_id ?? entry.nodeId ?? entry.host_id ?? entry.hostId ?? entry;
         }
         if(raw === undefined || raw === null) return null;
-        const key = String(raw);
-        if(nodeById.has(key)) return nodeById.get(key);
-        const m = key.match(/(\d+)/);
-        if(m && nodeById.has(m[1])) return nodeById.get(m[1]);
-        const asNum = Number(key);
-        if(Number.isFinite(asNum) && nodeById.has(String(asNum))) return nodeById.get(String(asNum));
+
+        const key = String(raw).trim();
+        if(key && nodeById.has(key)){
+          const node = nodeById.get(key);
+          return (node && isSequenceEligible(node)) ? node : null;
+        }
+        if(/^\d+$/.test(key)){
+          const node = nodeById.get(String(Number(key)));
+          return (node && isSequenceEligible(node)) ? node : null;
+        }
+        const nameKey = key.toLowerCase();
+        if(nameCounts.get(nameKey) === 1 && nodeByName.has(nameKey)){
+          return nodeByName.get(nameKey);
+        }
         return null;
       };
 

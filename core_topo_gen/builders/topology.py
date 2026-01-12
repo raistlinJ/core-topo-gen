@@ -8,6 +8,8 @@ import logging
 import ipaddress
 import subprocess
 import time
+import sys
+import select
 
 try:  # pragma: no cover - offline mode exercised via CLI tests
     from core.api.grpc import client  # type: ignore
@@ -74,15 +76,109 @@ _PREPARED_DOCKER_NODE_COMPOSES: Set[str] = set()
 _PREFLIGHTED_DOCKER_NODE_COMPOSES: Set[str] = set()
 
 
-def _docker_compose_cmd() -> List[str]:
-    """Return a docker compose command that works on this host."""
+_DOCKER_SUDO_PASSWORD_CACHE: Optional[str] = None
+
+
+def _docker_sudo_password() -> Optional[str]:
+    """Return sudo password for docker commands, if configured.
+
+    Supports:
+    - `CORETG_DOCKER_SUDO_PASSWORD`: explicit password (not recommended for shared environments)
+    - `CORETG_DOCKER_SUDO_PASSWORD_STDIN=1`: read a single line from stdin once
+
+    This is primarily used for remote execution via SSH where the caller can securely
+    write the password to stdin without placing it on the process command line.
+    """
+    global _DOCKER_SUDO_PASSWORD_CACHE
+    if _DOCKER_SUDO_PASSWORD_CACHE is not None:
+        return _DOCKER_SUDO_PASSWORD_CACHE
     try:
-        p = subprocess.run(['docker', 'compose', 'version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if p.returncode == 0:
-            return ['docker', 'compose']
+        pw = os.getenv('CORETG_DOCKER_SUDO_PASSWORD')
+        if pw is not None and str(pw).strip() != '':
+            _DOCKER_SUDO_PASSWORD_CACHE = str(pw).rstrip('\n')
+            return _DOCKER_SUDO_PASSWORD_CACHE
     except Exception:
         pass
-    return ['docker-compose']
+    try:
+        flag = os.getenv('CORETG_DOCKER_SUDO_PASSWORD_STDIN')
+        if flag is not None and str(flag).strip().lower() in ('1', 'true', 'yes', 'y', 'on'):
+            # Avoid hanging indefinitely if stdin is not connected (common in remote exec).
+            line = ''
+            try:
+                r, _w, _x = select.select([sys.stdin], [], [], 2.0)
+                if r:
+                    line = sys.stdin.readline()
+                else:
+                    # No data available; don't block.
+                    return None
+            except Exception:
+                return None
+            pw2 = (line or '').rstrip('\n')
+            if pw2.strip() != '':
+                _DOCKER_SUDO_PASSWORD_CACHE = pw2
+                try:
+                    # Make available to other modules without additional stdin reads.
+                    os.environ['CORETG_DOCKER_SUDO_PASSWORD'] = pw2
+                except Exception:
+                    pass
+                return _DOCKER_SUDO_PASSWORD_CACHE
+            _DOCKER_SUDO_PASSWORD_CACHE = ''
+            return None
+    except Exception:
+        pass
+    _DOCKER_SUDO_PASSWORD_CACHE = ''
+    return None
+
+
+def _docker_compose_cmd() -> List[str]:
+    """Return a docker compose command that works on this host."""
+    def _sudo_prefix() -> List[str]:
+        # Default OFF. When enabled, use non-interactive sudo so web/CLI doesn't hang.
+        # Requires NOPASSWD for docker commands, or run the process with sufficient privileges.
+        try:
+            val = os.getenv('CORETG_DOCKER_USE_SUDO')
+            if val is None:
+                return []
+            if str(val).strip().lower() in ('0', 'false', 'no', 'off', ''):
+                return []
+            pw = _docker_sudo_password()
+            if pw:
+                return ['sudo', '-S', '-p', '']
+            return ['sudo', '-n']
+        except Exception:
+            return []
+
+    prefix = _sudo_prefix()
+    try:
+        sudo_pw = _docker_sudo_password()
+        use_sudo_stdin = bool(sudo_pw) and ('-S' in prefix)
+        p = subprocess.run(
+            prefix + ['docker', 'compose', 'version'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            text=True,
+            input=(sudo_pw + '\n') if use_sudo_stdin else None,
+        )
+        if p.returncode == 0:
+            return prefix + ['docker', 'compose']
+    except Exception:
+        pass
+    return prefix + ['docker-compose']
+
+
+def _docker_cmd() -> List[str]:
+    """Return a docker engine command, optionally via sudo."""
+    try:
+        val = os.getenv('CORETG_DOCKER_USE_SUDO')
+        if val is None or str(val).strip().lower() in ('0', 'false', 'no', 'off', ''):
+            return ['docker']
+        pw = _docker_sudo_password()
+        if pw:
+            return ['sudo', '-S', '-p', '', 'docker']
+        return ['sudo', '-n', 'docker']
+    except Exception:
+        return ['docker']
 
 
 def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
@@ -105,6 +201,7 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
         return
 
     cmd = _docker_compose_cmd()
+    docker_cmd = _docker_cmd()
     start = time.time()
     try:
         logger.info('[docker-node] preflight begin node=%s compose=%s cmd=%s', node_name, compose_path, ' '.join(cmd))
@@ -113,7 +210,16 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
 
     def _run(args: List[str], timeout: int) -> None:
         try:
-            proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+            sudo_pw = _docker_sudo_password()
+            use_sudo_stdin = bool(sudo_pw) and len(args) >= 1 and args[0] == 'sudo' and ('-S' in args)
+            proc = subprocess.run(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+                input=(sudo_pw + '\n') if use_sudo_stdin else None,
+            )
             out = (proc.stdout or '').strip()
             # Avoid flooding logs; keep last few lines.
             tail = ''
@@ -130,8 +236,19 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
             except Exception:
                 pass
 
+    # IMPORTANT: Use the same docker compose project name that core-daemon will use.
+    # core-daemon typically runs compose from a directory named "<node>conf" (e.g. h7conf),
+    # which becomes the default project name. If we preflight from a different cwd without
+    # `-p`, docker will create a container named `container_name: h7` under a different
+    # project, and core-daemon will later fail with:
+    #   "Conflict. The container name \"/h7\" is already in use"
+    # By forcing `-p <node>conf` here, preflight creates the same project resources
+    # (network `h7conf_default`, container `h7`) that core-daemon will manage.
+    project = f"{node_name}conf" if node_name else "coretg"
+    compose_base = cmd + ['-p', project, '-f', compose_path]
+
     # Pull images before CORE starts docker nodes.
-    _run(cmd + ['-f', compose_path, 'pull'], timeout=600)
+    _run(compose_base + ['pull'], timeout=600)
 
     # Build any services that declare a `build:` stanza using host networking.
     # This avoids reliance on Docker's default bridge network (which may be disabled
@@ -162,19 +279,21 @@ def _docker_compose_preflight(compose_path: str, *, node_name: str) -> None:
                 dockerfile = str(dockerfile or 'Dockerfile').strip() or 'Dockerfile'
                 if not context or not image:
                     continue
-                args = ['docker', 'build', '--network', 'host', '--pull', '-t', image, '-f', os.path.join(context, dockerfile), context]
+                args = docker_cmd + ['build', '--network', 'host', '--pull', '-t', image, '-f', os.path.join(context, dockerfile), context]
                 _run(args, timeout=1800)
                 built_any = True
     except Exception:
         built_any = False
 
     if built_any:
-        # Create containers without rebuilding.
-        _run(cmd + ['-f', compose_path, 'up', '--no-start', '--no-build'], timeout=600)
+        # Create containers without rebuilding. This allows any one-time
+        # initialization that occurs at container create/start to run ahead of
+        # CORE isolating networks.
+        _run(compose_base + ['up', '--no-start', '--no-build'], timeout=600)
     else:
         # Fallback: let compose handle builds (best-effort).
-        _run(cmd + ['-f', compose_path, 'build', '--pull'], timeout=1200)
-        _run(cmd + ['-f', compose_path, 'up', '--no-start'], timeout=600)
+        _run(compose_base + ['build', '--pull'], timeout=1200)
+        _run(compose_base + ['up', '--no-start'], timeout=600)
 
     try:
         logger.info('[docker-node] preflight done node=%s elapsed_ms=%s', node_name, int((time.time() - start) * 1000))

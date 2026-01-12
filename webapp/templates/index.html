@@ -644,6 +644,11 @@
                             <label class="form-check-label" for="executeAdvDockerCleanupBeforeRun">Remove old Docker containers/images before run</label>
                         </div>
                         <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="executeAdvDockerNukeAll">
+                            <label class="form-check-label" for="executeAdvDockerNukeAll">Delete all docker containers (use with caution!)</label>
+                            <div class="form-text">This will stop and remove all containers (does not remove images).</div>
+                        </div>
+                        <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvCheckCoreVersion">
                             <label class="form-check-label" for="executeAdvCheckCoreVersion">Check CORE version is 9.2.1</label>
                         </div>
@@ -6143,7 +6148,7 @@ function buildFullPreviewModalGraph(full){
             .attr('x', 0)
             .attr('y', 21)
             .attr('font-size', '10px')
-            .attr('fill', '#212529')
+            .attr('fill', '#000')
             .text(d => d.label || d.name || String(d.id));
 
         const simulation = d3.forceSimulation(nodes)
@@ -14751,6 +14756,7 @@ let executeAdvRestartCoreDaemon = null;
 let executeAdvStartCoreDaemon = null;
 let executeAdvAutoKillSessions = null;
 let executeAdvDockerCleanupBeforeRun = null;
+let executeAdvDockerNukeAll = null;
 const EXECUTE_CONFIRM_PREFS_STORAGE_KEY = 'coretg_execute_confirm_prefs';
 
 function loadExecuteConfirmPrefs() {
@@ -14810,6 +14816,7 @@ function getExecuteConfirmSelections() {
         fixDockerDaemon: remoteExecution && !!(executeAdvFixDockerDaemon && executeAdvFixDockerDaemon.checked),
         runCoreCleanup: remoteExecution && !!(executeAdvRunCoreCleanup && executeAdvRunCoreCleanup.checked),
         dockerCleanupBeforeRun: remoteExecution && !!(executeAdvDockerCleanupBeforeRun && executeAdvDockerCleanupBeforeRun.checked),
+        dockerNukeAll: remoteExecution && !!(executeAdvDockerNukeAll && executeAdvDockerNukeAll.checked),
         checkCoreVersion: remoteExecution && !!(executeAdvCheckCoreVersion && executeAdvCheckCoreVersion.checked),
         restartCoreDaemon: remoteExecution && !!(executeAdvRestartCoreDaemon && executeAdvRestartCoreDaemon.checked),
         startCoreDaemon: remoteExecution && !!(executeAdvStartCoreDaemon && executeAdvStartCoreDaemon.checked),
@@ -14929,6 +14936,9 @@ function ensureExecuteConfirmElements() {
     if (!executeAdvDockerCleanupBeforeRun) {
         executeAdvDockerCleanupBeforeRun = document.getElementById('executeAdvDockerCleanupBeforeRun');
     }
+    if (!executeAdvDockerNukeAll) {
+        executeAdvDockerNukeAll = document.getElementById('executeAdvDockerNukeAll');
+    }
     if (!executeAdvCheckCoreVersion) {
         executeAdvCheckCoreVersion = document.getElementById('executeAdvCheckCoreVersion');
     }
@@ -14953,6 +14963,7 @@ function ensureExecuteConfirmElements() {
                     executeAdvFixDockerDaemon,
                     executeAdvRunCoreCleanup,
                     executeAdvDockerCleanupBeforeRun,
+                    executeAdvDockerNukeAll,
                     executeAdvCheckCoreVersion,
                     executeAdvRestartCoreDaemon,
                     executeAdvStartCoreDaemon,
@@ -17083,6 +17094,7 @@ function buildRunFormData(xmlPath, options = {}) {
         if (adv && adv.fixDockerDaemon) form.append('adv_fix_docker_daemon', '1');
         if (adv && adv.runCoreCleanup) form.append('adv_run_core_cleanup', '1');
         if (adv && adv.dockerCleanupBeforeRun) form.append('docker_cleanup_before_run', '1');
+        if (adv && adv.dockerNukeAll) form.append('docker_remove_all_containers', '1');
         if (adv && adv.checkCoreVersion) form.append('adv_check_core_version', '1');
         if (adv && adv.restartCoreDaemon) form.append('adv_restart_core_daemon', '1');
         if (adv && adv.autoKillSessions) form.append('adv_auto_kill_sessions', '1');

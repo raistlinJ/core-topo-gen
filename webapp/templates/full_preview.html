@@ -128,24 +128,7 @@
   <div id="fp-side-services" class="collapse">
     <pre class="small bg-light p-2">{{ full_preview.services_preview | tojson(indent=2) }}</pre>
   </div>
-  <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
-    <h6 class="mb-0">Vulnerabilities Preview</h6>
-    <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-side-vuln" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
-  </div>
-  <div id="fp-side-vuln" class="collapse">
-  {% set vuln_prev = full_preview.vulnerabilities_preview or {} %}
-    {% set vuln_by_node = full_preview.vulnerabilities_by_node or {} %}
-  {% if vuln_prev %}
-  <pre class="small bg-light p-2">{
-{% set first = True %}
-{% for k,v in vuln_prev.items() %}
-{# '__density_pool__' legacy key no longer produced; conditional retained for backward safety #}
-{% if k != '__density_pool__' %}{% if not first %},\n{% endif %}"{{ k }}": {{ v }}{% set first = False %}{% endif %}
-{% endfor %}
-{% if first %}"_note": "(none)"{% endif %}
-}</pre>
-  {% else %}<div class="small text-muted fst-italic">(none)</div>{% endif %}
-  </div>
+  {% set vuln_by_node = full_preview.vulnerabilities_by_node or {} %}
   {% if vuln_by_node %}
   <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
     <h6 class="mb-0">Vulnerabilities by Host</h6>
@@ -2458,6 +2441,28 @@ function buildScenarioUrl(basePath){
       const nodeById = new Map();
       nodes.forEach(n => { if(n && n.id !== undefined && n.id !== null) nodeById.set(String(n.id), n); });
 
+      // Only these node types should ever be considered sequence nodes.
+      const isSequenceEligible = (node) => {
+        try {
+          const t = canonicalNodeType(node && (node.type ?? node.kind ?? node.role));
+          return t === 'host' || t === 'docker' || t === 'vulnerability';
+        } catch(e){
+          return false;
+        }
+      };
+
+      // Secondary lookup by display name (only among eligible nodes, and only if unique).
+      const nodeByName = new Map();
+      const nameCounts = new Map();
+      nodes.forEach(n => {
+        if(!n || !isSequenceEligible(n)) return;
+        const nm = String(n.label ?? n.name ?? '').trim();
+        if(!nm) return;
+        const key = nm.toLowerCase();
+        nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
+        nodeByName.set(key, n);
+      });
+
       const readChain = () => {
         const mdFlow = previewData && previewData.metadata && previewData.metadata.flow ? previewData.metadata.flow : null;
         const flow = previewData && previewData.flow ? previewData.flow : null;
@@ -2480,12 +2485,23 @@ function buildScenarioUrl(basePath){
             raw = entry.id ?? entry.node_id ?? entry.nodeId ?? entry.host_id ?? entry.hostId ?? entry;
           }
           if(raw === undefined || raw === null) return null;
-          const key = String(raw);
-          if(nodeById.has(key)) return nodeById.get(key);
-          const m = key.match(/(\d+)/);
-          if(m && nodeById.has(m[1])) return nodeById.get(m[1]);
-          const asNum = Number(key);
-          if(Number.isFinite(asNum) && nodeById.has(String(asNum))) return nodeById.get(String(asNum));
+
+          // Prefer exact node id matches (avoid guessing by digits, which can mis-map to switches).
+          const key = String(raw).trim();
+          if(key && nodeById.has(key)){
+            const node = nodeById.get(key);
+            return (node && isSequenceEligible(node)) ? node : null;
+          }
+          if(/^\d+$/.test(key)){
+            const node = nodeById.get(String(Number(key)));
+            return (node && isSequenceEligible(node)) ? node : null;
+          }
+
+          // Fallback: match by label/name if unique.
+          const nameKey = key.toLowerCase();
+          if(nameCounts.get(nameKey) === 1 && nodeByName.has(nameKey)){
+            return nodeByName.get(nameKey);
+          }
           return null;
         };
 
@@ -2973,7 +2989,7 @@ function buildScenarioUrl(basePath){
       .attr('y', -2)
       .attr('font-size','10px')
       .attr('pointer-events','none')
-      .attr('fill', '#fff')
+      .attr('fill', '#000')
       .style('display', shouldShowLabels ? null : 'none')
       .text(d => {
         const label = (d && (d.label || d.name)) ? String(d.label || d.name) : String(d && d.id !== undefined ? d.id : '');
@@ -2989,7 +3005,7 @@ function buildScenarioUrl(basePath){
       .attr('y', 12)
       .attr('font-size','9px')
       .attr('pointer-events','none')
-      .attr('fill', '#fff')
+      .attr('fill', '#000')
       .style('display', shouldShowLabels ? null : 'none')
       .text(d => primaryIp(d) || '');
 

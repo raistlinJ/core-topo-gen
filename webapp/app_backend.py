@@ -19112,6 +19112,100 @@ if __name__ == '__main__':
     ).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
 
 
+def _remote_docker_remove_all_containers_script(sudo_password: str | None = None) -> str:
+    """Remote script to delete ALL docker containers on the CORE VM (does not remove images)."""
+
+    sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else "")
+    return (
+        """
+import json, subprocess
+
+SUDO_PASSWORD = __SUDO_PASSWORD_LITERAL__
+
+
+def _run_docker(cmd, timeout=60):
+    try:
+        p = subprocess.run(['sudo', '-n', 'docker'] + list(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        if SUDO_PASSWORD:
+            return subprocess.run(
+                ['sudo', '-S', '-k', '-p', '', 'docker'] + list(cmd),
+                input=str(SUDO_PASSWORD) + "\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+            )
+        return p
+    except Exception as e:
+        class _P:
+            returncode = 1
+            stdout = str(e)
+        return _P()
+
+
+def _list_ids(args, timeout=30):
+    p = _run_docker(args, timeout=timeout)
+    if getattr(p, 'returncode', 1) != 0:
+        return [], (getattr(p, 'stdout', '') or '').strip()
+    out = (getattr(p, 'stdout', '') or '').strip()
+    ids = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    return ids, ''
+
+
+def _chunks(seq, n=40):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def main():
+    errors = []
+
+    container_ids, cerr = _list_ids(['ps', '-aq'], timeout=30)
+    if cerr:
+        errors.append({'stage': 'list_containers', 'output': cerr})
+    stopped_attempted = 0
+    removed_attempted = 0
+    if container_ids:
+        for chunk in _chunks(container_ids, 25):
+            p = _run_docker(['stop'] + list(chunk), timeout=120)
+            if getattr(p, 'returncode', 1) != 0:
+                out = (getattr(p, 'stdout', '') or '').strip()
+                if out:
+                    errors.append({'stage': 'stop_containers', 'output': out[:4000]})
+            else:
+                stopped_attempted += len(chunk)
+        for chunk in _chunks(container_ids, 25):
+            p = _run_docker(['rm', '-f'] + list(chunk), timeout=120)
+            if getattr(p, 'returncode', 1) != 0:
+                out = (getattr(p, 'stdout', '') or '').strip()
+                if out:
+                    errors.append({'stage': 'rm_containers', 'output': out[:4000]})
+            else:
+                removed_attempted += len(chunk)
+
+    print(json.dumps({
+        'ok': True,
+        'containers': {
+            'found': len(container_ids),
+            'stopped_attempted': stopped_attempted,
+            'removed_attempted': removed_attempted,
+        },
+        'images': {
+            'removed_attempted': 0,
+            'skipped': True,
+        },
+        'errors': errors,
+    }))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
+
+
 @app.route('/docker/status', methods=['GET'])
 def docker_status():
     # Use the scenario-selected CORE VM (remote) to populate docker status.
@@ -21000,6 +21094,9 @@ def run_cli():
         scenario_core_override = None
     scenario_name_hint = request.form.get('scenario') or request.form.get('scenario_name') or None
     docker_cleanup_before_run = _coerce_bool(request.form.get('docker_cleanup_before_run'))
+    docker_remove_all_containers = _coerce_bool(
+        request.form.get('docker_remove_all_containers')
+    ) or _coerce_bool(request.form.get('docker_nuke_all'))
     scenario_index_hint: Optional[int] = None
     try:
         raw_index = request.form.get('scenario_index')
@@ -21130,6 +21227,24 @@ def run_cli():
             # Optional: best-effort cleanup of tool-managed Docker state before execution.
             # This is conservative: it only targets vuln docker-compose node containers derived
             # from compose_assignments.json plus tool-generated wrapper images under coretg/*.
+
+            # Optional: very destructive cleanup.
+            # Stops/removes ALL containers on the remote CORE VM.
+            if docker_remove_all_containers:
+                try:
+                    app.logger.warning('[sync] Pre-run: docker remove-all-containers requested')
+                    _run_remote_python_json(
+                        core_cfg,
+                        _remote_docker_remove_all_containers_script(core_cfg.get('ssh_password')),
+                        logger=app.logger,
+                        label='docker.remove_all_containers(prerun)',
+                        timeout=900.0,
+                    )
+                except Exception as exc:
+                    try:
+                        app.logger.warning('[sync] Pre-run docker remove-all-containers skipped/failed: %s', exc)
+                    except Exception:
+                        pass
             if docker_cleanup_before_run:
                 try:
                     app.logger.info('[sync] Pre-run: docker cleanup requested (containers + wrapper images)')
@@ -22420,6 +22535,7 @@ def run_cli_async():
     adv_auto_kill_sessions = False
     docker_remove_conflicts = False
     docker_cleanup_before_run = False
+    docker_remove_all_containers = False
     scenarios_inline = None
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
@@ -22458,6 +22574,9 @@ def run_cli_async():
         adv_auto_kill_sessions = _coerce_bool(request.form.get('adv_auto_kill_sessions'))
         docker_remove_conflicts = _coerce_bool(request.form.get('docker_remove_conflicts'))
         docker_cleanup_before_run = _coerce_bool(request.form.get('docker_cleanup_before_run'))
+        docker_remove_all_containers = _coerce_bool(
+            request.form.get('docker_remove_all_containers')
+        ) or _coerce_bool(request.form.get('docker_nuke_all'))
     if not xml_path:
         try:
             j = request.get_json(silent=True) or {}
@@ -22489,6 +22608,9 @@ def run_cli_async():
             adv_auto_kill_sessions = _coerce_bool(j.get('adv_auto_kill_sessions'))
             docker_remove_conflicts = _coerce_bool(j.get('docker_remove_conflicts'))
             docker_cleanup_before_run = _coerce_bool(j.get('docker_cleanup_before_run'))
+            docker_remove_all_containers = _coerce_bool(
+                j.get('docker_remove_all_containers')
+            ) or _coerce_bool(j.get('docker_nuke_all'))
         except Exception:
             pass
     if not xml_path:
@@ -23537,6 +23659,41 @@ def run_cli_async():
     except Exception:
         scenario_tag = _safe_name(active_scenario_name or 'scenario')
 
+    if docker_remove_all_containers:
+        try:
+            log_f.write(f"{log_prefix}=== Docker: REMOVE ALL containers (DANGEROUS) ===\n")
+            _write_sse_marker(
+                log_f,
+                'phase',
+                {
+                    'stage': 'docker.remove_all_containers.prerun',
+                    'detail': 'Removing ALL docker containers',
+                },
+            )
+        except Exception:
+            pass
+        try:
+            payload = _run_remote_python_json(
+                core_cfg,
+                _remote_docker_remove_all_containers_script(core_cfg.get('ssh_password')),
+                logger=app.logger,
+                label='docker.remove_all_containers(prerun)',
+                timeout=900.0,
+            )
+            try:
+                if isinstance(payload, dict):
+                    c = payload.get('containers') or {}
+                    log_f.write(
+                        f"{log_prefix}Remove-all summary: containers_found={c.get('found')} removed_attempted={c.get('removed_attempted')}\n"
+                    )
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                log_f.write(f"{log_prefix}Docker remove-all-containers skipped/failed: {exc}\n")
+            except Exception:
+                pass
+
     if docker_cleanup_before_run:
         try:
             log_f.write(f"{log_prefix}=== Docker: cleanup before run (containers + wrapper images) ===\n")
@@ -23632,7 +23789,23 @@ def run_cli_async():
     if venv_bin_remote:
         activate_path = posixpath.join(venv_bin_remote.rstrip('/'), 'activate')
         activate_prefix = f". {shlex.quote(activate_path)} >/dev/null 2>&1 || true; "
-    remote_command = f"{activate_prefix}cd {shlex.quote(work_dir)} && CORETG_SCENARIO_TAG={shlex.quote(scenario_tag)} PYTHONUNBUFFERED=1 {cli_cmd}"
+    # In remote CORE VM mode, docker operations happen on the remote host.
+    # Many CORE VMs require sudo for docker access (no docker group membership).
+    # We enable sudo mode for docker commands and, when a password is available,
+    # provide it via stdin to avoid leaking secrets in the command line.
+    docker_env_parts: list[str] = []
+    try:
+        if _coerce_bool(core_cfg.get('ssh_enabled')):
+            docker_env_parts.append('CORETG_DOCKER_USE_SUDO=1')
+            if core_cfg.get('ssh_password'):
+                docker_env_parts.append('CORETG_DOCKER_SUDO_PASSWORD_STDIN=1')
+    except Exception:
+        docker_env_parts = []
+    docker_env_prefix = (' '.join(docker_env_parts) + ' ') if docker_env_parts else ''
+    remote_command = (
+        f"{activate_prefix}cd {shlex.quote(work_dir)} && "
+        f"CORETG_SCENARIO_TAG={shlex.quote(scenario_tag)} {docker_env_prefix}PYTHONUNBUFFERED=1 {cli_cmd}"
+    )
     try:
         log_f.write(f"{log_prefix}Launching CLI in {work_dir}\n")
         _write_sse_marker(
@@ -23655,6 +23828,14 @@ def run_cli_async():
         channel = transport.open_session()
         channel.set_combine_stderr(True)
         channel.exec_command(f"bash -lc {shlex.quote(remote_command)}")
+
+        # If configured, send sudo password for docker helpers via stdin (single line).
+        try:
+            pw = core_cfg.get('ssh_password')
+            if pw and _coerce_bool(core_cfg.get('ssh_enabled')):
+                channel.send(str(pw) + "\n")
+        except Exception:
+            pass
         output_thread = threading.Thread(
             target=_relay_remote_channel_to_log,
             args=(channel, log_f),

@@ -9,6 +9,8 @@ import re
 from typing import Iterable, Tuple, List, Dict, Optional, Set
 import urllib.request
 import shutil
+import sys
+import select
 
 try:
 	import yaml  # type: ignore
@@ -19,6 +21,55 @@ except Exception:  # pragma: no cover - optional dependency handled at runtime
 logger = logging.getLogger(__name__)
 
 _COMPOSE_PORT_CACHE: Dict[Tuple[str, str], List[Dict[str, object]]] = {}
+
+
+_DOCKER_SUDO_PASSWORD_CACHE: Optional[str] = None
+
+
+def _docker_sudo_password() -> Optional[str]:
+	"""Return sudo password for docker commands, if configured.
+
+	Supports:
+	- `CORETG_DOCKER_SUDO_PASSWORD`: explicit password
+	- `CORETG_DOCKER_SUDO_PASSWORD_STDIN=1`: read one line from stdin once
+	"""
+	global _DOCKER_SUDO_PASSWORD_CACHE
+	if _DOCKER_SUDO_PASSWORD_CACHE is not None:
+		return _DOCKER_SUDO_PASSWORD_CACHE or None
+	try:
+		pw = os.getenv('CORETG_DOCKER_SUDO_PASSWORD')
+		if pw is not None and str(pw).strip() != '':
+			_DOCKER_SUDO_PASSWORD_CACHE = str(pw).rstrip('\n')
+			return _DOCKER_SUDO_PASSWORD_CACHE
+	except Exception:
+		pass
+	try:
+		flag = os.getenv('CORETG_DOCKER_SUDO_PASSWORD_STDIN')
+		if flag is not None and str(flag).strip().lower() in ('1', 'true', 'yes', 'y', 'on'):
+			# Avoid hanging indefinitely if stdin is not connected (common in remote exec).
+			line = ''
+			try:
+				r, _w, _x = select.select([sys.stdin], [], [], 2.0)
+				if r:
+					line = sys.stdin.readline()
+				else:
+					return None
+			except Exception:
+				return None
+			pw2 = (line or '').rstrip('\n')
+			if pw2.strip() != '':
+				_DOCKER_SUDO_PASSWORD_CACHE = pw2
+				try:
+					os.environ['CORETG_DOCKER_SUDO_PASSWORD'] = pw2
+				except Exception:
+					pass
+				return _DOCKER_SUDO_PASSWORD_CACHE
+			_DOCKER_SUDO_PASSWORD_CACHE = ''
+			return None
+	except Exception:
+		pass
+	_DOCKER_SUDO_PASSWORD_CACHE = ''
+	return None
 
 
 def _read_csv(path: str) -> List[Dict[str, str]]:
@@ -812,10 +863,68 @@ def _force_compose_no_network(compose_obj: dict) -> dict:
 		for _svc_name, svc in services.items():
 			if isinstance(svc, dict):
 				_force_service_network_mode_none(svc)
-				# If a compose file had published host ports, strip the publishing
-				# so running multiple stacks on the CORE VM doesn't collide.
-				_prune_service_ports(svc)
+				# With network_mode none, host port publishing is meaningless and can
+				# create collisions or validation errors. Drop ports entirely.
+				svc.pop('ports', None)
 		compose_obj.pop('networks', None)
+		return compose_obj
+	except Exception:
+		return compose_obj
+
+
+def _compose_force_no_network_enabled() -> bool:
+	"""Whether generated vuln docker-compose stacks should run with network_mode: none.
+
+	Default: enabled (Option B). Disable by setting `CORETG_COMPOSE_FORCE_NO_NETWORK=0/false/off`.
+	"""
+	val = os.getenv('CORETG_COMPOSE_FORCE_NO_NETWORK')
+	if val is None:
+		return True
+	return str(val).strip().lower() not in ('0', 'false', 'no', 'off', '')
+
+
+def _compose_force_root_workdir_enabled() -> bool:
+	"""Whether to force `working_dir: /` on generated vuln docker-compose services.
+
+	Rationale: CORE services (e.g., DefaultRoute) can create/chmod relative paths inside
+	Docker nodes. Docker exec defaults to the container's WORKDIR, while docker cp uses
+	paths relative to the container filesystem root. For images with non-root WORKDIR,
+	this can cause CORE to fail to chmod service files that were copied into `/`.
+
+	Default: enabled. Disable by setting `CORETG_COMPOSE_FORCE_ROOT_WORKDIR=0/false/off`.
+	"""
+	val = os.getenv('CORETG_COMPOSE_FORCE_ROOT_WORKDIR')
+	if val is None:
+		return True
+	return str(val).strip().lower() not in ('0', 'false', 'no', 'off', '')
+
+
+def _force_service_workdir_root(service: Dict[str, object]) -> None:
+	"""Force a compose service to run with working_dir: / (best-effort)."""
+	if not isinstance(service, dict):
+		return
+	service['working_dir'] = '/'
+
+
+def _prune_compose_published_ports(compose_obj: dict) -> dict:
+	"""Best-effort: strip *published* host ports from all services.
+
+	This preserves the compose networking definition (networks/network_mode) but
+	removes fixed host port publishing to avoid collisions when many docker-compose
+	stacks run on the same CORE host.
+
+	Note: This does not remove container-side ports; it rewrites mappings like
+	`"8080:80"` to `"80"` and removes `published/host_ip` from long-syntax entries.
+	"""
+	try:
+		if not isinstance(compose_obj, dict):
+			return compose_obj
+		services = compose_obj.get('services')
+		if not isinstance(services, dict):
+			return compose_obj
+		for _svc_name, svc in services.items():
+			if isinstance(svc, dict):
+				_prune_service_ports(svc)
 		return compose_obj
 	except Exception:
 		return compose_obj
@@ -1086,6 +1195,39 @@ def _inject_network_mode_none_text(text: str) -> str:
 	return '\n'.join(result)
 
 
+def _inject_working_dir_root_text(text: str) -> str:
+	"""Fallback text-level injection of `working_dir: /` under each service.
+
+	Only used when YAML parsing isn't available; conservative best-effort.
+	"""
+	if 'working_dir:' in text:
+		return text
+	lines = text.splitlines()
+	result: List[str] = []
+	in_services = False
+	services_indent: Optional[int] = None
+	for line in lines:
+		stripped = line.lstrip()
+		indent = len(line) - len(stripped)
+		if not in_services and stripped.startswith('services:'):
+			in_services = True
+			services_indent = indent
+			result.append(line)
+			continue
+		if in_services and stripped and services_indent is not None and indent <= services_indent and not stripped.startswith('#'):
+			in_services = False
+			services_indent = None
+		if in_services and services_indent is not None:
+			if stripped.endswith(':') and not stripped.startswith(('-', '#')) and indent == services_indent + 2 and ' ' not in stripped[:-1]:
+				result.append(line)
+				result.append(' ' * (indent + 2) + 'working_dir: /')
+				continue
+		result.append(line)
+	if text.endswith('\n'):
+		return '\n'.join(result) + '\n'
+	return '\n'.join(result)
+
+
 def _strip_port_mappings_from_text(text: str) -> str:
 	"""Best-effort removal of host->container port mappings in compose YAML text."""
 	lines = text.splitlines()
@@ -1139,6 +1281,48 @@ def _strip_port_mappings_from_text(text: str) -> str:
 	if text.endswith('\n'):
 		return '\n'.join(result) + '\n'
 	return '\n'.join(result)
+
+
+def _drop_key_block_from_text(text: str, key: str) -> str:
+	"""Best-effort removal of a YAML mapping key block from compose YAML text.
+
+	This is only used in the fallback (text) path when YAML parsing failed.
+	It removes blocks like:
+	  ports:\n    - ...
+	  networks:\n    default: ...
+	at any indentation level.
+	"""
+	try:
+		key = str(key or '').strip()
+		if not key:
+			return text
+		lines = text.splitlines()
+		result: List[str] = []
+		in_block = False
+		block_indent: Optional[int] = None
+		for line in lines:
+			stripped = line.lstrip()
+			indent = len(line) - len(stripped)
+			if in_block:
+				# End block when indentation returns to parent level (or lower)
+				# and the line is not a list continuation.
+				if stripped and (block_indent is not None) and indent <= block_indent and not stripped.startswith('-'):
+					in_block = False
+					block_indent = None
+				else:
+					# Skip lines within the removed block
+					continue
+			# Start block
+			if not in_block and stripped.startswith(f'{key}:'):
+				in_block = True
+				block_indent = indent
+				continue
+			result.append(line)
+		if text.endswith('\n'):
+			return '\n'.join(result) + '\n'
+		return '\n'.join(result)
+	except Exception:
+		return text
 
 
 def _remove_container_names_all_services(compose_obj: dict) -> dict:
@@ -1519,8 +1703,10 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 	def _set_container_name_for_selected_service(compose_obj: dict, node_name: str, prefer_service: Optional[str] = None) -> dict:
 		"""Set container_name for the selected service to the CORE node name (best-effort).
 
-		CORE's docker node startup path expects a stable container name; if not set,
-		core-daemon may try to inject one itself.
+		NOTE: Some COREEMU deployments require container_name to match the CORE node
+		name for docker-node management to work reliably.
+
+		You can opt out by setting `CORETG_COMPOSE_SET_CONTAINER_NAME=0`.
 		"""
 		try:
 			if not isinstance(compose_obj, dict):
@@ -1538,6 +1724,17 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			return compose_obj
 		except Exception:
 			return compose_obj
+
+	def _compose_set_container_name_enabled() -> bool:
+		"""Whether to inject container_name into generated docker-compose files.
+
+		Default: enabled.
+		Disable by setting `CORETG_COMPOSE_SET_CONTAINER_NAME=0/false/off`.
+		"""
+		val = os.getenv('CORETG_COMPOSE_SET_CONTAINER_NAME')
+		if val is None:
+			return True
+		return str(val).strip().lower() not in ('0', 'false', 'no', 'off', '')
 
 	def _escape_mako_dollars(text: str) -> str:
 		"""Escape Mako-sensitive `${...}` so they render literally in output.
@@ -1739,6 +1936,9 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						base_compose_obj = None
 			cache[key] = (base_compose_obj, src_path, base_dir, is_local)
 		out_path = os.path.join(out_base, f"docker-compose-{node_name}.yml")
+		# For troubleshooting: keep a copy of the source compose used for this node.
+		# This makes it easy to diff what CORE receives vs the original vulnerability compose.
+		orig_copy_path = os.path.join(out_base, f"docker-compose-{node_name}.orig.yml")
 		wrote = False
 		if base_compose_obj is not None and yaml is not None:
 			prefer = key[0]
@@ -1769,17 +1969,33 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 							pass
 			except Exception:
 				pass
+			# Best-effort: copy the original compose file for diffing.
+			try:
+				if src_path and os.path.exists(src_path) and (not os.path.exists(orig_copy_path)):
+					shutil.copy2(src_path, orig_copy_path)
+			except Exception:
+				pass
 			# Avoid name collisions: ensure no hard-coded container_name remains in any service.
 			obj = _remove_container_names_all_services(obj)
-			# Ensure the selected service uses the CORE node name (CORE may attempt to inject otherwise).
-			obj = _set_container_name_for_selected_service(obj, node_name, prefer_service=prefer)
+			# Optional: set container_name for the selected service.
+			# Default OFF because it can interfere with CORE's service execution on docker nodes.
+			if _compose_set_container_name_enabled():
+				obj = _set_container_name_for_selected_service(obj, node_name, prefer_service=prefer)
+			# Record which service was selected (useful when a compose has multiple services).
+			try:
+				svc_key_selected = _select_service_key(obj, prefer_service=prefer)
+				if svc_key_selected:
+					rec['compose_service'] = str(svc_key_selected)
+					logger.info("[vuln] compose selected service node=%s service=%s", node_name, svc_key_selected)
+			except Exception:
+				pass
 			# Remove obsolete top-level 'version' key to suppress warnings.
 			try:
 				obj.pop('version', None)
 			except Exception:
 				pass
-			# Ensure Docker does not inject its own networking for vuln nodes.
-			obj = _force_compose_no_network(obj)
+			# Preserve original compose networking as-authored, but strip published host
+			# ports to avoid host-level collisions when multiple stacks run on the CORE VM.
 			# Flow flag-generators: mount generated artifacts into the container.
 			try:
 				art_dir = str(rec.get('ArtifactsDir') or '').strip()
@@ -1858,10 +2074,34 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 						svc['image'] = f"coretg/{scenario_tag_safe}-{_safe_name(node_name)}:iproute2"
 						# DefaultRoute needs iproute2 + NET_ADMIN in many images.
 						svc['cap_add'] = _ensure_list_field_has(svc.get('cap_add'), 'NET_ADMIN')
+						# CORE services often manipulate files using relative paths; force root workdir.
+						try:
+							if _compose_force_root_workdir_enabled():
+								_force_service_workdir_root(svc)
+						except Exception:
+							pass
 					else:
 						logger.warning("[vuln] compose service has no image; cannot inject iproute2 wrapper for node=%s service=%s", node_name, svc_key)
 			except Exception:
 				# Best-effort: wrapper injection is optional.
+				pass
+				# Even if wrapper injection is skipped, force root workdir when enabled.
+				try:
+					if _compose_force_root_workdir_enabled():
+						svc_key = _select_service_key(obj, prefer_service=prefer)
+						services = obj.get('services') if isinstance(obj, dict) else None
+						if svc_key and isinstance(services, dict) and isinstance(services.get(svc_key), dict):
+							_force_service_workdir_root(services.get(svc_key))
+				except Exception:
+					pass
+			# Apply published-port pruning late so overlays/wrappers can't reintroduce
+			# fixed host port publishing.
+			try:
+				if _compose_force_no_network_enabled():
+					obj = _force_compose_no_network(obj)
+				else:
+					obj = _prune_compose_published_ports(obj)
+			except Exception:
 				pass
 			try:
 				# Dump YAML to string first, then escape sequences that CORE's host-side printf
@@ -1883,6 +2123,12 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 			except Exception:
 				logger.exception("[vuln] failed copying compose for node=%s", node_name)
 			else:
+				# Best-effort: copy the original compose file for diffing.
+				try:
+					if src_path and os.path.exists(src_path) and (not os.path.exists(orig_copy_path)):
+						shutil.copy2(src_path, orig_copy_path)
+				except Exception:
+					pass
 				try:
 					with open(out_path, 'r', encoding='utf-8', errors='ignore') as f:
 						txt = f.read()
@@ -1890,8 +2136,34 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 					import re as _re
 					txt = _re.sub(r'^\s*version\s*:\s*[^\n]+\n?', '', txt, flags=_re.MULTILINE)
 					txt = _re.sub(r'^\s*container_name\s*:\s*[^\n]+\n?', '', txt, flags=_re.MULTILINE)
-					text_sanitized = _strip_port_mappings_from_text(txt)
-					text_sanitized = _inject_network_mode_none_text(text_sanitized)
+					# COREEMU: best-effort ensure container_name matches CORE node name.
+					try:
+						val = os.getenv('CORETG_COMPOSE_SET_CONTAINER_NAME')
+						enabled = True if val is None else (str(val).strip().lower() not in ('0', 'false', 'no', 'off', ''))
+					except Exception:
+						enabled = True
+					if enabled:
+						# Insert `container_name: <node>` under the first service definition.
+						# This is a fallback path (YAML parsing failed), so keep it simple.
+						m = _re.search(r'^(\s*services\s*:\s*\n)([ \t]+)([^\n:]+)\s*:\s*\n', txt, flags=_re.MULTILINE)
+						if m:
+							indent_svc = m.group(2)
+							inject = f"{indent_svc}container_name: {node_name}\n"
+							insert_at = m.end(0)
+							txt = txt[:insert_at] + inject + txt[insert_at:]
+					if _compose_force_no_network_enabled():
+						# Option B: ensure no Docker-managed network (no docker eth0/default route).
+						# Also drop ports/networks blocks to avoid compose validation conflicts.
+						text_sanitized = _inject_network_mode_none_text(txt)
+						if _compose_force_root_workdir_enabled():
+							text_sanitized = _inject_working_dir_root_text(text_sanitized)
+						text_sanitized = _drop_key_block_from_text(text_sanitized, 'ports')
+						text_sanitized = _drop_key_block_from_text(text_sanitized, 'networks')
+					else:
+						# Strip published host port mappings while preserving networks.
+						text_sanitized = _strip_port_mappings_from_text(txt)
+						if _compose_force_root_workdir_enabled():
+							text_sanitized = _inject_working_dir_root_text(text_sanitized)
 					# Escape `${...}` to prevent Mako NameError during template rendering.
 					text_sanitized = _escape_core_printf_backslashes(text_sanitized)
 					text_sanitized = _escape_mako_dollars(text_sanitized)
@@ -1963,13 +2235,33 @@ def start_compose_files(paths: List[str]) -> int:
 		return ok
 	try:
 		import subprocess, shutil as _sh
+		def _docker_cmd() -> List[str]:
+			try:
+				val = os.getenv('CORETG_DOCKER_USE_SUDO')
+				if val is None or str(val).strip().lower() in ('0', 'false', 'no', 'off', ''):
+					return ['docker']
+				pw = _docker_sudo_password()
+				if pw:
+					return ['sudo', '-S', '-p', '', 'docker']
+				return ['sudo', '-n', 'docker']
+			except Exception:
+				return ['docker']
 		if not _sh.which('docker'):
 			return 0
+		docker_cmd = _docker_cmd()
+		sudo_pw = _docker_sudo_password()
 		for p in paths:
 			try:
 				if not p or not os.path.exists(p):
 					continue
-				proc = subprocess.run(['docker', 'compose', '-f', p, 'up', '-d'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+				use_sudo_stdin = bool(sudo_pw) and len(docker_cmd) >= 1 and docker_cmd[0] == 'sudo' and ('-S' in docker_cmd)
+				proc = subprocess.run(
+					docker_cmd + ['compose', '-f', p, 'up', '-d'],
+					stdout=subprocess.PIPE,
+					stderr=subprocess.STDOUT,
+					text=True,
+					input=(sudo_pw + '\n') if use_sudo_stdin else None,
+				)
 				if proc.returncode == 0:
 					ok += 1
 			except Exception:
