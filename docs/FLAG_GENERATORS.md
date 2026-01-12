@@ -54,6 +54,14 @@ Files:
 - `validation/flag_generator_catalog.schema.json` — schema for generator-catalog JSON sources under `data_sources/flag_generators/` and `data_sources/flag_node_generators/`.
 - `validation/flag_generator_outputs.schema.json` — schema for the runtime `/outputs/outputs.json` manifest emitted by a generator.
 
+### v3 Contract Notes (`requires` vs `inputs`)
+
+In schema version 3 catalogs:
+
+- `plugins[].requires` is **artifacts-only**: keys that must be produced by earlier chain steps.
+- Flow-synthesized runtime fields **must not** appear in `requires` (they belong in `plugins[].inputs`).
+	- Currently enforced forbidden names: `seed`, `secret`, `env_name`, `challenge`, `flag_prefix`, `username_prefix`, `key_len`, `node_name`.
+
 ### Output Placeholder Substitution
 
 In addition to `{{THIS_*}}`/`{{NEXT_*}}` placeholders, Flow supports substituting runtime generator outputs into the hint:

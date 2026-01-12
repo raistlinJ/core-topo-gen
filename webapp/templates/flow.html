@@ -65,7 +65,7 @@
               <div class="col-md-6">
                 <div class="d-flex gap-2 flex-nowrap">
                   <button id="flowGenerateBtn" class="btn btn-primary text-nowrap" type="button">Generate</button>
-                  <a id="flowBundleDownloadLink" class="btn btn-outline-primary text-nowrap" href="#" role="button">Download Attack Flow STIX Bundle</a>
+                  <a id="flowAfbDownloadLink" class="btn btn-outline-secondary text-nowrap" href="#" role="button">Download Attack Flow Builder (.afb)</a>
                 </div>
               </div>
               <div class="col-md-4">
@@ -86,19 +86,25 @@
             <div class="fw-semibold">Visualization</div>
           </div>
           <div class="card-body">
-            <div class="row g-2 small text-muted align-items-center mb-2" id="flowMetaRow">
-              <div class="col-12 col-md-3">
-                <span class="text-secondary">Scenario:</span>
-                <span class="ms-1" id="flowMetaScenario"></span>
-              </div>
-              <div class="col-12 col-md-3" style="min-width: 0;">
-                <span class="text-secondary">Preview:</span>
-                <span class="ms-1 text-truncate d-inline-block align-middle" id="flowMetaPreview" style="max-width: 100%;"></span>
-              </div>
-              <div class="col-12 col-md-6">
-                <span class="text-secondary">Eligibility:</span>
-                <span class="ms-1" id="flowMetaStats"></span>
-              </div>
+            <div class="small mb-2" id="flowMetaRow">
+              <table class="table table-sm table-borderless mb-0 align-middle">
+                <thead>
+                  <tr class="text-secondary">
+                    <th scope="col" class="fw-normal" style="width: 18%;">Scenario</th>
+                    <th scope="col" class="fw-normal" style="width: 32%;">Preview</th>
+                    <th scope="col" class="fw-normal">Eligibility</th>
+                  </tr>
+                </thead>
+                <tbody class="text-muted">
+                  <tr>
+                    <td id="flowMetaScenario"></td>
+                    <td style="min-width: 0; max-width: 0;">
+                      <div id="flowMetaPreview" class="text-truncate" style="max-width: 100%;"></div>
+                    </td>
+                    <td id="flowMetaStats"></td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
             <div id="flowDiagramWrap" class="border rounded p-2" style="min-height: 180px; overflow-x: auto;">
               <div id="flowDiagram" class="mermaid">graph LR\n  A[Generate] --> B[Flow]</div>
@@ -130,7 +136,7 @@
               <div class="text-end">Reorder</div>
             </div>
             <div id="flowChainList" class="list-group"></div>
-            <div class="small text-muted mt-2">Reordering updates the bundle and download.</div>
+            <div class="small text-muted mt-2">Reordering updates the export and download.</div>
           </div>
         </div>
 
@@ -178,7 +184,7 @@
   const nodeDetailsDialogEl = document.getElementById('flowNodeDetailsDialog');
   const nodeDetailsTitleEl = document.getElementById('flowNodeDetailsTitle');
   const nodeDetailsBodyEl = document.getElementById('flowNodeDetailsBody');
-  const downloadLink = document.getElementById('flowBundleDownloadLink');
+  const afbDownloadLink = document.getElementById('flowAfbDownloadLink');
   const scenarioListEl = document.getElementById('flowScenarioList');
   const clearScenarioBtn = document.getElementById('flowScenarioFilterClear');
   const validityAlertEl = document.getElementById('flowValidityAlert');
@@ -191,7 +197,6 @@
   let activeScenario = (initialScenario || (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length ? String(scenarioNamesCache[0]) : '')).trim();
 
   let currentChain = [];
-  let currentBundle = null;
   let lastStats = null;
   let lastPreviewPlanPath = '';
   let lastFlowPlanPath = '';
@@ -527,7 +532,13 @@
     const out = [];
     // Keep in sync with server-side synthesized Flow inputs (see _flow_default_generator_config).
     const synthesizedFields = ['seed','secret','env_name','challenge','flag_prefix','username_prefix','key_len','node_name'];
+    const synthesizedSet = new Set(synthesizedFields);
     const haveEffective = new Set(synthesizedFields);
+    // Track origin so UI can show "Provided by Chain" vs "Provided by Sequencer".
+    const haveArtifactsChain = new Set();
+    const haveArtifactsSequencer = new Set();
+    const haveFieldsChain = new Set();
+    const haveFieldsSequencer = new Set(synthesizedFields);
     const haveArtifacts = new Set();
     const haveFields = new Set(synthesizedFields);
     if(!Array.isArray(assignments)) return out;
@@ -536,31 +547,68 @@
 
       const hasSplit = Array.isArray(a.requires) || Array.isArray(a.input_fields_required) || Array.isArray(a.input_fields);
       if(hasSplit){
-        const reqArtifacts = Array.isArray(a.requires) ? a.requires.map(String) : [];
-        const reqFields = Array.isArray(a.input_fields_required)
+        const reqArtifactsRaw = Array.isArray(a.requires) ? a.requires.map(String) : [];
+        // Some generator definitions historically mixed synthesized "fields" into
+        // `requires` (artifacts). Normalize those back into the Fields bucket.
+        const reqArtifacts = reqArtifactsRaw.filter(k => k && !synthesizedSet.has(k));
+        const reqFieldsBase = Array.isArray(a.input_fields_required)
           ? a.input_fields_required.map(String)
           : (Array.isArray(a.input_fields) ? a.input_fields.map(String) : []);
+        const reqFields = reqFieldsBase.concat(reqArtifactsRaw.filter(k => k && synthesizedSet.has(k)));
         const optFields = Array.isArray(a.input_fields_optional) ? a.input_fields_optional.map(String) : [];
         const optSet = new Set(optFields.filter(Boolean));
 
-        const missingArtifacts = reqArtifacts.filter(k => k && !optSet.has(k) && !haveArtifacts.has(k));
+        const reqArtifactsEffective = reqArtifacts.filter(k => k && !optSet.has(k));
+        const providedByChainArtifacts = reqArtifactsEffective.filter(k => k && haveArtifactsChain.has(k));
+        const providedBySequencerArtifacts = reqArtifactsEffective.filter(k => k && haveArtifactsSequencer.has(k));
+        const missingArtifacts = reqArtifactsEffective.filter(k => k && !haveArtifacts.has(k));
+
+        const providedByChainFields = reqFields.filter(k => k && haveFieldsChain.has(k));
+        const providedBySequencerFields = reqFields.filter(k => k && haveFieldsSequencer.has(k));
         const missingFields = reqFields.filter(k => k && !haveFields.has(k));
+
         const missing = missingArtifacts.concat(missingFields);
-        out.push({ ok: missing.length === 0, missing, missing_artifacts: missingArtifacts, missing_fields: missingFields });
+        out.push({
+          ok: missing.length === 0,
+          missing,
+          missing_artifacts: missingArtifacts,
+          missing_fields: missingFields,
+          providing_artifacts_chain: providedByChainArtifacts,
+          providing_artifacts_sequencer: providedBySequencerArtifacts,
+          providing_fields_chain: providedByChainFields,
+          providing_fields_sequencer: providedBySequencerFields,
+        });
       } else {
         const reqEffective = Array.isArray(a.inputs) ? a.inputs.map(String) : [];
+        const providingChain = reqEffective.filter(k => k && (haveArtifactsChain.has(k) || haveFieldsChain.has(k)));
+        const providingSequencer = reqEffective.filter(k => k && (haveArtifactsSequencer.has(k) || haveFieldsSequencer.has(k)));
         const missing = reqEffective.filter(k => k && !haveEffective.has(k));
-        out.push({ ok: missing.length === 0, missing, missing_artifacts: [], missing_fields: [] });
+        out.push({
+          ok: missing.length === 0,
+          missing,
+          missing_artifacts: [],
+          missing_fields: [],
+          providing_effective_chain: providingChain,
+          providing_effective_sequencer: providingSequencer,
+        });
       }
 
       const provEffective = Array.isArray(a.outputs) ? a.outputs.map(String) : [];
       provEffective.forEach(k => { if(k) haveEffective.add(k); });
 
       if(Array.isArray(a.produces)){
-        a.produces.map(String).forEach(k => { if(k) haveArtifacts.add(k); });
+        a.produces.map(String).forEach(k => {
+          if(!k) return;
+          haveArtifacts.add(k);
+          haveArtifactsChain.add(k);
+        });
       }
       if(Array.isArray(a.output_fields)){
-        a.output_fields.map(String).forEach(k => { if(k) haveFields.add(k); });
+        a.output_fields.map(String).forEach(k => {
+          if(!k) return;
+          haveFields.add(k);
+          haveFieldsChain.add(k);
+        });
       }
     }
     return out;
@@ -690,8 +738,6 @@
 
       const feas = chainFeasibility(currentFlagAssignments);
       const step = feas && feas[idx] ? feas[idx] : null;
-        addRow('Chain Item Providing', fa && Array.isArray(fa.requires) && fa.requires.length ? fa.requires.join(', ') : '-');
-        addRow('Providing to Chain', fa && Array.isArray(fa.produces) && fa.produces.length ? fa.produces.join(', ') : '-');
         const inReq = (fa && Array.isArray(fa.input_fields_required)) ? fa.input_fields_required.map(String).filter(Boolean) : [];
         const inOpt = (fa && Array.isArray(fa.input_fields_optional)) ? fa.input_fields_optional.map(String).filter(Boolean) : [];
         const inAll = (fa && Array.isArray(fa.input_fields)) ? fa.input_fields.map(String).filter(Boolean) : [];
@@ -699,18 +745,145 @@
           ? (inReq.concat(inOpt.map(x => x + ' (optional)')).join(', '))
           : (inAll.length ? inAll.join(', ') : '-');
         const isNodeGen = String((fa && fa.type) || '').trim() === 'flag-node-generator';
-        addRow(isNodeGen ? 'Flag-Node-Generator Defined Input' : 'Flag-Generator Defined Input', inputsDisplay);
-        addRow(isNodeGen ? 'Flag-Node-Generator Defined Output' : 'Flag-Generator Defined Output', fa && Array.isArray(fa.output_fields) && fa.output_fields.length ? fa.output_fields.join(', ') : '-');
-      if(step && step.ok === false){
-          const ma = Array.isArray(step.missing_artifacts) ? step.missing_artifacts : [];
-          const mf = Array.isArray(step.missing_fields) ? step.missing_fields : [];
-          if(ma.length || mf.length){
-            addRow('Missing Inputs (Artifacts)', ma.join(', ') || '-', { danger: true });
-            addRow('Missing Inputs (Fields)', mf.join(', ') || '-', { danger: true });
-          } else {
-            addRow('Missing', (step.missing || []).join(', ') || '-', { danger: true });
+        // Inputs/Outputs: tabular view with Providing/Missing side-by-side.
+        try{
+          const reqArtifacts = (fa && Array.isArray(fa.requires)) ? fa.requires.map(String).filter(Boolean) : [];
+          const providedArtifactsChain = (step && Array.isArray(step.providing_artifacts_chain)) ? step.providing_artifacts_chain.map(String).filter(Boolean) : [];
+          const providedArtifactsSeq = (step && Array.isArray(step.providing_artifacts_sequencer)) ? step.providing_artifacts_sequencer.map(String).filter(Boolean) : [];
+          const missingArtifacts = (step && Array.isArray(step.missing_artifacts)) ? step.missing_artifacts.map(String).filter(Boolean) : [];
+
+          const reqFields = inReq;
+          const defFields = (inReq.length || inOpt.length)
+            ? inReq.concat(inOpt.map(x => x + ' (optional)'))
+            : inAll;
+          const providedFieldsChain = (step && Array.isArray(step.providing_fields_chain)) ? step.providing_fields_chain.map(String).filter(Boolean) : [];
+          const providedFieldsSeq = (step && Array.isArray(step.providing_fields_sequencer)) ? step.providing_fields_sequencer.map(String).filter(Boolean) : [];
+          const missingFields = (step && Array.isArray(step.missing_fields)) ? step.missing_fields.map(String).filter(Boolean) : [];
+
+          const showMissingCol = (missingArtifacts.length + missingFields.length) > 0;
+
+          const outFields = (fa && Array.isArray(fa.output_fields)) ? fa.output_fields.map(String).filter(Boolean) : [];
+          const outArtifacts = (fa && Array.isArray(fa.produces)) ? fa.produces.map(String).filter(Boolean) : [];
+
+          // For outputs, show what is *required by downstream steps* (subset of this step's defined outputs).
+          const synthesizedFields = ['seed','secret','env_name','challenge','flag_prefix','username_prefix','key_len','node_name'];
+          const synthesizedSet = new Set(synthesizedFields);
+          const downstreamReqArtifacts = new Set();
+          const downstreamReqFields = new Set();
+          try{
+            for(let j = idx + 1; j < (Array.isArray(currentFlagAssignments) ? currentFlagAssignments.length : 0); j++){
+              const a2 = currentFlagAssignments[j] || {};
+              const reqArtRaw = Array.isArray(a2.requires) ? a2.requires.map(String).filter(Boolean) : [];
+              reqArtRaw.filter(k => k && !synthesizedSet.has(k)).forEach(k => downstreamReqArtifacts.add(k));
+
+              const reqFld = Array.isArray(a2.input_fields_required)
+                ? a2.input_fields_required.map(String).filter(Boolean)
+                : (Array.isArray(a2.input_fields) ? a2.input_fields.map(String).filter(Boolean) : []);
+              reqFld.forEach(k => downstreamReqFields.add(k));
+            }
+          } catch(e) {}
+          const outArtifactsReq = outArtifacts.filter(k => downstreamReqArtifacts.has(k));
+          const outFieldsReq = outFields.filter(k => downstreamReqFields.has(k));
+
+          const inputsTbl = document.createElement('table');
+          inputsTbl.className = 'table table-sm mb-0';
+          const itHead = document.createElement('thead');
+          itHead.innerHTML = showMissingCol
+            ? '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Inputs</th><th>Required</th><th>Defined</th><th>Provided by Chain</th><th>Provided by Sequencer</th><th>Missing</th></tr>'
+            : '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Inputs</th><th>Required</th><th>Defined</th><th>Provided by Chain</th><th>Provided by Sequencer</th></tr>';
+          inputsTbl.appendChild(itHead);
+          const itBody = document.createElement('tbody');
+          function addIoRow(label, requiredList, definedList, byChainList, bySeqList, missingList){
+            const tr = document.createElement('tr');
+            const td0 = document.createElement('td');
+            td0.className = 'text-muted';
+            td0.style.whiteSpace = 'nowrap';
+            td0.textContent = label;
+            const td1 = document.createElement('td');
+            td1.textContent = (requiredList && requiredList.length) ? requiredList.join(', ') : '-';
+            const td2 = document.createElement('td');
+            td2.textContent = (definedList && definedList.length) ? definedList.join(', ') : '-';
+            const td3 = document.createElement('td');
+            td3.textContent = (byChainList && byChainList.length) ? byChainList.join(', ') : '-';
+            const td4 = document.createElement('td');
+            td4.textContent = (bySeqList && bySeqList.length) ? bySeqList.join(', ') : '-';
+            tr.appendChild(td0);
+            tr.appendChild(td1);
+            tr.appendChild(td2);
+            tr.appendChild(td3);
+            tr.appendChild(td4);
+            if(showMissingCol){
+              const td5 = document.createElement('td');
+              if(missingList && missingList.length) td5.classList.add('text-danger');
+              td5.textContent = (missingList && missingList.length) ? missingList.join(', ') : '-';
+              tr.appendChild(td5);
+            }
+            itBody.appendChild(tr);
           }
-      }
+          addIoRow('Artifacts', reqArtifacts, reqArtifacts, providedArtifactsChain, providedArtifactsSeq, missingArtifacts);
+          addIoRow('Fields', reqFields, defFields, providedFieldsChain, providedFieldsSeq, missingFields);
+          inputsTbl.appendChild(itBody);
+
+          // Full-width row so the Inputs table is flush-left (no empty label column indentation).
+          {
+            const tr = document.createElement('tr');
+            const td = document.createElement('td');
+            td.colSpan = 2;
+            td.style.paddingLeft = '0';
+            td.appendChild(inputsTbl);
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+          }
+
+          const outputsTbl = document.createElement('table');
+          outputsTbl.className = 'table table-sm mb-0';
+          const otHead = document.createElement('thead');
+          otHead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Outputs</th><th>Required</th><th>Defined</th><th>Provided to Chain</th></tr>';
+          outputsTbl.appendChild(otHead);
+          const otBody = document.createElement('tbody');
+          function addOutRow(label, requiredList, definedList, toChainList){
+            const tr = document.createElement('tr');
+            const td0 = document.createElement('td');
+            td0.className = 'text-muted';
+            td0.style.whiteSpace = 'nowrap';
+            td0.textContent = label;
+            const td1 = document.createElement('td');
+            td1.textContent = (requiredList && requiredList.length) ? requiredList.join(', ') : '-';
+            const td2 = document.createElement('td');
+            td2.textContent = (definedList && definedList.length) ? definedList.join(', ') : '-';
+            const td3 = document.createElement('td');
+            td3.textContent = (toChainList && toChainList.length) ? toChainList.join(', ') : '-';
+            tr.appendChild(td0);
+            tr.appendChild(td1);
+            tr.appendChild(td2);
+            tr.appendChild(td3);
+            otBody.appendChild(tr);
+          }
+          // Generator outputs are provided to the chain; sequencer does not provide outputs here.
+          addOutRow('Artifacts', outArtifactsReq, outArtifacts, outArtifacts);
+          addOutRow('Fields', outFieldsReq, outFields, outFields);
+          outputsTbl.appendChild(otBody);
+
+          // Full-width row so the Outputs table is flush-left (no empty label column indentation).
+          {
+            const tr = document.createElement('tr');
+            const td = document.createElement('td');
+            td.colSpan = 2;
+            td.style.paddingLeft = '0';
+            td.appendChild(outputsTbl);
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+          }
+        } catch(e) {
+          // If anything goes wrong, fall back to the old simple rows.
+          addRow(isNodeGen ? 'Flag-Node-Generator Defined Input' : 'Flag-Generator Defined Input', inputsDisplay);
+          addRow(isNodeGen ? 'Flag-Node-Generator Defined Output' : 'Flag-Generator Defined Output', fa && Array.isArray(fa.output_fields) && fa.output_fields.length ? fa.output_fields.join(', ') : '-');
+          addRow('Chain Item Providing', fa && Array.isArray(fa.requires) && fa.requires.length ? fa.requires.join(', ') : '-');
+          addRow('Providing to Chain', fa && Array.isArray(fa.produces) && fa.produces.length ? fa.produces.join(', ') : '-');
+          if(step && step.ok === false){
+            addRow('Missing Inputs', (step.missing || []).join(', ') || '-', { danger: true });
+          }
+        }
 
       // After prepare_preview_for_execute, the backend may attach runtime validation
       // fields like outputs_match/outputs_mismatch to help validate generator specs.
@@ -800,7 +973,7 @@
         currentChain[idx] = tmp;
         renderChainEditor();
         persistFlowState();
-        await refreshBundleFromChain();
+        await refreshAssignmentsFromChain();
       });
       const down = document.createElement('button');
       down.type = 'button';
@@ -814,7 +987,7 @@
         currentChain[idx] = tmp;
         renderChainEditor();
         persistFlowState();
-        await refreshBundleFromChain();
+        await refreshAssignmentsFromChain();
       });
       right.appendChild(up);
       right.appendChild(down);
@@ -1426,15 +1599,25 @@
     if(metaStatsEl) metaStatsEl.textContent = formatStats(lastStats) || '-';
   }
 
-  async function refreshBundleFromChain(){
+  async function refreshAssignmentsFromChain(){
     if(!Array.isArray(currentChain) || currentChain.length === 0) return;
-    setStatus('Updating bundle…', false);
+    setStatus('Updating…', false);
     try{
-      const data = await postJson('/api/flag-sequencing/bundle_from_chain', { scenario: activeScenario, chain: currentChain });
-      currentBundle = data.bundle;
+      // Recompute assignments + validity based on the current chain order.
+      const data = await postJson('/api/flag-sequencing/afb_from_chain', { scenario: activeScenario, chain: currentChain });
       currentFlagAssignments = Array.isArray(data.flag_assignments) ? data.flag_assignments.slice() : currentFlagAssignments;
       setFlowValidityFromPayload(data);
-      if(jsonEl) jsonEl.textContent = JSON.stringify(currentBundle, null, 2);
+      if(jsonEl){
+        jsonEl.textContent = JSON.stringify({
+          scenario: (data && data.scenario) ? data.scenario : activeScenario,
+          length: (data && Number.isFinite(+data.length)) ? (+data.length) : (Array.isArray(currentChain) ? currentChain.length : 0),
+          chain: Array.isArray(currentChain) ? currentChain : [],
+          flag_assignments: Array.isArray(currentFlagAssignments) ? currentFlagAssignments : [],
+          flow_valid: !!(data && data.flow_valid),
+          flow_errors: Array.isArray(data && data.flow_errors) ? data.flow_errors : [],
+          flags_enabled: !!(data && data.flags_enabled),
+        }, null, 2);
+      }
       const diagram = buildMermaid(currentChain);
       await renderMermaid(diagram);
       updateMeta();
@@ -1528,7 +1711,7 @@
     }
 
     const baseApiUrl = '/api/flag-sequencing/attackflow_preview?' + params.toString();
-    if(downloadLink) downloadLink.href = '#';
+    if(afbDownloadLink) afbDownloadLink.href = '#';
 
     setStatus('Generating…', false);
     setLoginLinkVisible(false);
@@ -1562,12 +1745,13 @@
         }
       }
       currentChain = Array.isArray(data.chain) ? data.chain.slice() : [];
-      currentBundle = data.bundle || null;
       currentFlagAssignments = Array.isArray(data.flag_assignments) ? data.flag_assignments.slice() : [];
       setFlowValidityFromPayload(data);
       lastStats = data.stats || null;
       lastPreviewPlanPath = data.preview_plan_path || '';
-      lastFlowPlanPath = data.flow_plan_path || lastFlowPlanPath;
+      // IMPORTANT: never carry a stale flow-plan path across runs.
+      // If the backend doesn't return a flow plan path for this preview, clear it.
+      lastFlowPlanPath = data.flow_plan_path || '';
       try {
         // If the backend loaded a saved chain whose effective length differs from the
         // current input value (e.g. page reload reset to default), keep the UI in sync.
@@ -1579,7 +1763,17 @@
       renderChainEditor();
       persistFlowState();
 
-      if(jsonEl) jsonEl.textContent = JSON.stringify(currentBundle, null, 2);
+      if(jsonEl){
+        jsonEl.textContent = JSON.stringify({
+          scenario: (data && data.scenario) ? data.scenario : activeScenario,
+          length: (data && Number.isFinite(+data.length)) ? (+data.length) : (Array.isArray(currentChain) ? currentChain.length : 0),
+          chain: Array.isArray(currentChain) ? currentChain : [],
+          flag_assignments: Array.isArray(currentFlagAssignments) ? currentFlagAssignments : [],
+          flow_valid: !!(data && data.flow_valid),
+          flow_errors: Array.isArray(data && data.flow_errors) ? data.flow_errors : [],
+          flags_enabled: !!(data && data.flags_enabled),
+        }, null, 2);
+      }
       const diagram = buildMermaid(currentChain);
       await renderMermaid(diagram);
 
@@ -1598,7 +1792,9 @@
                 length: currentChain.length,
                 preset,
                 chain_ids: chainIds,
-                preview_plan: (lastFlowPlanPath || lastPreviewPlanPath || ''),
+                // Use the preview plan that produced the current chain.
+                // Using a stale flow plan can cause chain_ids to mismatch and collapse.
+                preview_plan: (lastPreviewPlanPath || ''),
                 mode: 'hint',
                 best_effort: true,
                 timeout_s: 30
@@ -1627,9 +1823,9 @@
               lastFlowPlanPath = String(prepData.flow_plan_path);
             }
 
-            // If chain changed, regenerate the bundle to match (keep resolved hints in UI).
+            // If chain changed, regenerate computed assignments to match (keep resolved hints in UI).
             if(newChain && newIds && oldIds !== newIds){
-              await refreshBundleFromChain();
+              await refreshAssignmentsFromChain();
               if(prepData && Array.isArray(prepData.flag_assignments)){
                 currentFlagAssignments = prepData.flag_assignments.slice();
                 renderChainEditor();
@@ -1639,7 +1835,7 @@
             }
           }
         } catch(e) {
-          // Non-fatal: the flow/bundle is still usable even if hints aren't resolved.
+          // Non-fatal: the flow UI is still usable even if hints aren't resolved.
           try {
             const msg = (e && e.message) ? String(e.message) : String(e || 'prepare failed');
             setStatus('Hint resolution failed: ' + msg, true);
@@ -1658,7 +1854,6 @@
       lastFlowPlanPath = payload && payload.flow_plan_path ? String(payload.flow_plan_path) : lastFlowPlanPath;
       updateMeta();
       currentChain = [];
-      currentBundle = null;
       currentFlagAssignments = [];
       selectedChainIndex = -1;
       renderChainEditor();
@@ -1966,18 +2161,30 @@
   // Handlers for Save/Preview are registered above.
   if(downloadXmlEl) downloadXmlEl.addEventListener('click', (e)=>{ e.preventDefault(); downloadXml(); });
 
-  if(downloadLink){
-    downloadLink.addEventListener('click', (e)=>{
+  if(afbDownloadLink){
+    afbDownloadLink.addEventListener('click', async (e)=>{
       try{
         e.preventDefault();
-        if(!currentBundle){
+        if(!Array.isArray(currentChain) || currentChain.length === 0){
           setStatus('Nothing to download yet (generate first).', true);
+          return;
+        }
+
+        // Keep UI validity state in sync before exporting.
+        try{ await refreshAssignmentsFromChain(); } catch(err) {}
+
+        setStatus('Building .afb…', false);
+        const data = await postJson('/api/flag-sequencing/afb_from_chain', { scenario: activeScenario, chain: currentChain });
+        setFlowValidityFromPayload(data);
+        const afb = data && data.afb ? data.afb : null;
+        if(!afb){
+          setStatus('No .afb returned by server.', true);
           return;
         }
         const scenario = (scenarioEl && scenarioEl.value || activeScenario || 'scenario').toString().trim();
         const norm = normalizeScenarioNorm(scenario).replace(/\s+/g,'_') || 'scenario';
-        const fname = 'attackflow_' + norm + '_' + String(Array.isArray(currentChain)?currentChain.length:0) + '.json';
-        const blob = new Blob([JSON.stringify(currentBundle, null, 2)], { type: 'application/json' });
+        const fname = 'attackflow_builder_' + norm + '_' + String(Array.isArray(currentChain)?currentChain.length:0) + '.afb';
+        const blob = new Blob([JSON.stringify(afb, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -1986,6 +2193,7 @@
         a.click();
         a.remove();
         setTimeout(()=>URL.revokeObjectURL(url), 1000);
+        setStatus('Ready.', false);
       } catch(err){
         setStatus(String(err && err.message || err), true);
       }

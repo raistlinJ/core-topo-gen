@@ -7672,13 +7672,17 @@ _LOGIN_EXEMPT_ENDPOINTS = {
 
 
 ATTACK_FLOW_EXTENSION_DEFINITION_ID = "extension-definition--fb9c968a-745b-4ade-9b25-c324172197f4"
-ATTACK_FLOW_SCHEMA_URL = "https://center-for-threat-informed-defense.github.io/attack-flow/stix/attack-flow-schema-2.0.0.json"
+# NOTE: Some tools (including Attack Flow Builder) try to fetch `extension-definition.schema`.
+# The GitHub *web* URL returns HTML; use raw content so the URL is directly fetchable as JSON.
+# (The GitHub Pages URL referenced in the schema `$id` has been observed to 404.)
+ATTACK_FLOW_SCHEMA_URL = "https://raw.githubusercontent.com/center-for-threat-informed-defense/attack-flow/main/stix/attack-flow-schema-2.0.0.json"
 ATTACK_FLOW_SCHEMA_VERSION = "2.0.0"
 
 
 def _iso_now() -> str:
     try:
-        return datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+        # Attack Flow / STIX 2.1 common properties require timestamps with at least millisecond precision.
+        return datetime.datetime.now(datetime.UTC).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
     except Exception:
         return "1970-01-01T00:00:00Z"
 
@@ -7687,24 +7691,55 @@ def _new_stix_id(stix_type: str) -> str:
     return f"{stix_type}--{uuid.uuid4()}"
 
 
+def _new_uuid() -> str:
+    return str(uuid.uuid4())
+
+
 def _latest_session_xml_for_scenario_norm(scenario_norm: str) -> str | None:
     try:
         history = _load_run_history()
         last_run = _latest_run_history_for_scenario(scenario_norm, history)
     except Exception:
         last_run = None
-    if not isinstance(last_run, dict):
-        return None
-    session_xml_path = last_run.get('session_xml_path') or last_run.get('post_xml_path')
-    if not session_xml_path:
-        return None
+
+    if isinstance(last_run, dict):
+        session_xml_path = last_run.get('session_xml_path') or last_run.get('post_xml_path')
+        if session_xml_path:
+            try:
+                ap = os.path.abspath(str(session_xml_path))
+            except Exception:
+                ap = str(session_xml_path)
+            if ap and os.path.exists(ap):
+                return ap
+
+    # Fallback: run history can become stale if artifacts under outputs/ are purged.
+    # Best-effort: pick the newest matching session XML under outputs/core-sessions/.
     try:
-        ap = os.path.abspath(str(session_xml_path))
+        base = os.path.join(_outputs_dir(), 'core-sessions')
+        if os.path.isdir(base) and scenario_norm:
+            prefix = str(scenario_norm).strip().lower() + '-'
+            best_path: str | None = None
+            best_mtime: float = -1.0
+            for name in os.listdir(base):
+                if not isinstance(name, str):
+                    continue
+                low = name.lower()
+                if not (low.startswith(prefix) and low.endswith('.xml')):
+                    continue
+                p = os.path.join(base, name)
+                try:
+                    m = os.path.getmtime(p)
+                except Exception:
+                    continue
+                if m > best_mtime:
+                    best_mtime = m
+                    best_path = p
+            if best_path and os.path.exists(best_path):
+                return os.path.abspath(best_path)
     except Exception:
-        ap = str(session_xml_path)
-    if not ap or not os.path.exists(ap):
-        return None
-    return ap
+        pass
+
+    return None
 
 
 def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, set[str]]]:
@@ -8072,112 +8107,264 @@ def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
-def _attack_flow_bundle_for_chain(*, chain_nodes: list[dict[str, Any]], scenario_label: str) -> dict[str, Any]:
+def _attack_flow_builder_afb_for_chain(
+    *,
+    chain_nodes: list[dict[str, Any]],
+    scenario_label: str,
+    flag_assignments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build an Attack Flow Builder .afb document for a linear chain.
+
+    Attack Flow Builder's native format is a UI graph JSON (".afb") with explicit
+    edge objects (e.g., dynamic_line source/target). This avoids tool warnings like
+    "edges must connect on both sides" when importing a STIX bundle.
+    """
     now = _iso_now()
 
-    identity_id = _new_stix_id('identity')
-    bundle_id = _new_stix_id('bundle')
-    flow_id = _new_stix_id('attack-flow')
+    assignment_by_node_id: dict[str, dict[str, Any]] = {}
+    try:
+        for fa in (flag_assignments or []):
+            if not isinstance(fa, dict):
+                continue
+            nid = str(fa.get('node_id') or '').strip()
+            if nid and nid not in assignment_by_node_id:
+                assignment_by_node_id[nid] = fa
+    except Exception:
+        assignment_by_node_id = {}
 
-    extension_definition = {
-        'type': 'extension-definition',
-        'spec_version': '2.1',
-        'id': ATTACK_FLOW_EXTENSION_DEFINITION_ID,
-        'name': 'Attack Flow',
-        'description': 'Extends STIX 2.1 with features to create Attack Flows.',
-        'created': now,
-        'modified': now,
-        'created_by_ref': identity_id,
-        'schema': ATTACK_FLOW_SCHEMA_URL,
-        'version': ATTACK_FLOW_SCHEMA_VERSION,
-        'extension_types': ['new-sdo'],
-        'external_references': [
-            {
-                'source_name': 'Documentation',
-                'description': 'Documentation for Attack Flow',
-                'url': 'https://center-for-threat-informed-defense.github.io/attack-flow',
-            },
-            {
-                'source_name': 'GitHub',
-                'description': 'Source code repository for Attack Flow',
-                'url': 'https://github.com/center-for-threat-informed-defense/attack-flow',
-            },
-        ],
-    }
+    # Attack Flow Builder v3 expects an OpenChart DiagramViewExport:
+    # - root {schema, objects, (optional) theme/layout/camera}
+    # - a single root canvas/group export (id="flow") with an `objects` list of child instances
+    # - actions are blocks (id="action") and MUST include an `anchors` map (can be empty)
+    flow_instance = _new_uuid()
+    objects: list[dict[str, Any]] = []
+    layout: dict[str, list[int]] = {}
 
-    author = {
-        'type': 'identity',
-        'spec_version': '2.1',
-        'id': identity_id,
-        'created': now,
-        'modified': now,
-        'name': 'CORE TopoGen',
-        'identity_class': 'organization',
-    }
+    flow_name = f"Flag Chain" + (f" - {scenario_label}" if scenario_label else '')
+    flow_children: list[str] = []
 
-    def af_ext() -> dict[str, Any]:
-        return {
-            ATTACK_FLOW_EXTENSION_DEFINITION_ID: {
-                'extension_type': 'new-sdo',
-            }
-        }
+    # Track per-action anchors so we can wire lines between actions.
+    action_left_anchor: dict[str, str] = {}
+    action_right_anchor: dict[str, str] = {}
+    # Keep references to anchor export dicts so we can append latch instances.
+    anchor_obj_by_instance: dict[str, dict[str, Any]] = {}
 
-    assets: list[dict[str, Any]] = []
-    actions: list[dict[str, Any]] = []
-
+    # Create one action node per chain step.
     for idx, node in enumerate(chain_nodes, start=1):
         node_id = str(node.get('id') or '').strip()
         node_name = str(node.get('name') or node_id)
-        node_type = str(node.get('type') or '')
-        asset_id = _new_stix_id('attack-asset')
-        action_id = _new_stix_id('attack-action')
 
-        assets.append({
-            'type': 'attack-asset',
-            'spec_version': '2.1',
-            'id': asset_id,
-            'created': now,
-            'modified': now,
-            'name': node_name,
-            'description': f"Topology node ({node_type}) id={node_id}",
-            'extensions': af_ext(),
+        fa = assignment_by_node_id.get(node_id)
+        gen_id = str((fa or {}).get('id') or '').strip()
+        gen_name = str((fa or {}).get('name') or '').strip()
+        gen_kind = str((fa or {}).get('type') or '').strip()
+        gen_source = str((fa or {}).get('flag_generator') or '').strip()
+        gen_catalog = str((fa or {}).get('generator_catalog') or '').strip()
+
+        output_files: list[str] = ['outputs.json', 'hint.txt']
+        try:
+            outs = (fa or {}).get('outputs')
+            if isinstance(outs, list) and any(str(x).strip() == 'flag' for x in outs):
+                output_files.append('flag.txt')
+        except Exception:
+            pass
+        try:
+            actual = (fa or {}).get('actual_outputs')
+            if isinstance(actual, list) and any(str(x).strip() == 'flag' for x in actual):
+                if 'flag.txt' not in output_files:
+                    output_files.append('flag.txt')
+        except Exception:
+            pass
+
+        desc_lines: list[str] = [f"Capture the flag placed on node '{node_name}' (id={node_id})."]
+        if fa:
+            try:
+                gen_desc = str((fa or {}).get('description') or '').strip()
+            except Exception:
+                gen_desc = ''
+            if gen_desc:
+                desc_lines.append('')
+                desc_lines.append(gen_desc)
+            try:
+                dh = (fa or {}).get('description_hints')
+                if isinstance(dh, list):
+                    hints = [str(x or '').strip() for x in dh if str(x or '').strip()]
+                    if hints:
+                        desc_lines.extend(hints)
+            except Exception:
+                pass
+            if gen_name or gen_id:
+                desc_lines.append(
+                    "Generator: "
+                    + (gen_name if gen_name else gen_id)
+                    + (f" ({gen_id})" if (gen_name and gen_id) else '')
+                )
+            if gen_kind:
+                desc_lines.append(f"Kind: {gen_kind}")
+            if gen_source:
+                desc_lines.append(f"Source: {gen_source}")
+            if gen_catalog:
+                desc_lines.append(f"Catalog: {gen_catalog}")
+            try:
+                outs = (fa or {}).get('outputs')
+                if isinstance(outs, list) and outs:
+                    out_keys = [str(x).strip() for x in outs if str(x).strip()]
+                    if out_keys:
+                        desc_lines.append("Outputs: " + ", ".join(out_keys))
+            except Exception:
+                pass
+            try:
+                produces = (fa or {}).get('produces')
+                if isinstance(produces, list) and produces:
+                    prod_keys = [str(x).strip() for x in produces if str(x).strip()]
+                    if prod_keys:
+                        desc_lines.append("Artifacts: " + ", ".join(prod_keys))
+            except Exception:
+                pass
+            if output_files:
+                desc_lines.append("Output files: " + ", ".join(output_files))
+            try:
+                hint = str((fa or {}).get('hint') or '').strip()
+                if hint:
+                    desc_lines.append("Hint: " + hint)
+            except Exception:
+                pass
+
+        description = "\n".join([x for x in desc_lines if x is not None])
+
+        action_instance = _new_uuid()
+        flow_children.append(action_instance)
+
+        # Create two anchors for this action, used for incoming/outgoing edges.
+        left_anchor_instance = _new_uuid()
+        right_anchor_instance = _new_uuid()
+        action_left_anchor[action_instance] = left_anchor_instance
+        action_right_anchor[action_instance] = right_anchor_instance
+
+        # Builder uses angle-keyed anchors (e.g., "0", "180") that refer to
+        # template IDs like horizontal_anchor/vertical_anchor.
+        left_anchor_obj = {
+            'id': 'horizontal_anchor',
+            'instance': left_anchor_instance,
+            'latches': [],
+        }
+        right_anchor_obj = {
+            'id': 'horizontal_anchor',
+            'instance': right_anchor_instance,
+            'latches': [],
+        }
+        anchor_obj_by_instance[left_anchor_instance] = left_anchor_obj
+        anchor_obj_by_instance[right_anchor_instance] = right_anchor_obj
+        objects.append(left_anchor_obj)
+        objects.append(right_anchor_obj)
+
+        objects.append({
+            'id': 'action',
+            'instance': action_instance,
+            # NOTE: OpenChart uses ordered entries (JsonEntries) not dicts.
+            'properties': [
+                ['name', f"Capture Flag {idx}: {node_name}"],
+                # The builder template exposes a nested "ttp" mapping. Keep it present
+                # but empty so the file loads without requiring ATT&CK mappings.
+                ['ttp', [['tactic', None], ['technique', None]]],
+                ['description', description],
+            ],
+            # Required for BlockExport; an empty map lets the importer create
+            # default anchors from the template.
+            # We provide anchors for the positions we actually use so the semantic
+            # analyzer can discover edges (via anchor -> latch -> line).
+            'anchors': {
+                # Keys must match Builder's expected anchor keys (angle degrees).
+                # "180" ≈ left, "0" ≈ right.
+                '180': left_anchor_instance,
+                '0': right_anchor_instance,
+            },
         })
 
-        actions.append({
-            'type': 'attack-action',
-            'spec_version': '2.1',
-            'id': action_id,
-            'created': now,
-            'modified': now,
-            'name': f"Capture Flag {idx}: {node_name}",
-            'description': f"Capture the flag placed on node '{node_name}' (id={node_id}).",
-            'asset_refs': [asset_id],
-            'extensions': af_ext(),
+        # Lay actions left-to-right.
+        layout[action_instance] = [220 + (idx - 1) * 260, 320]
+
+    # Create explicit edges between consecutive actions.
+    # In OpenChart exports, a line references its source/target latches, and an
+    # anchor references linked latches. This is how Builder derives the graph.
+    for i in range(len(flow_children) - 1):
+        src_action = flow_children[i]
+        trg_action = flow_children[i + 1]
+
+        src_anchor = action_right_anchor.get(src_action)
+        trg_anchor = action_left_anchor.get(trg_action)
+        if not src_anchor or not trg_anchor:
+            continue
+
+        line_instance = _new_uuid()
+        src_latch_instance = _new_uuid()
+        trg_latch_instance = _new_uuid()
+        handle_instance = _new_uuid()
+
+        # Link latches to anchors.
+        try:
+            anchor_obj_by_instance[src_anchor]['latches'].append(src_latch_instance)
+        except Exception:
+            pass
+        try:
+            anchor_obj_by_instance[trg_anchor]['latches'].append(trg_latch_instance)
+        except Exception:
+            pass
+
+        # Create latches and handle.
+        objects.append({'id': 'generic_latch', 'instance': src_latch_instance})
+        objects.append({'id': 'generic_latch', 'instance': trg_latch_instance})
+        objects.append({'id': 'generic_handle', 'instance': handle_instance})
+
+        # Builder's exported layout includes latch positions (but not anchors/lines).
+        # Place latches near their respective actions.
+        try:
+            src_pos = layout.get(src_action)
+            trg_pos = layout.get(trg_action)
+            if isinstance(src_pos, list) and len(src_pos) == 2 and isinstance(trg_pos, list) and len(trg_pos) == 2:
+                src_x, src_y = int(src_pos[0]), int(src_pos[1])
+                trg_x, trg_y = int(trg_pos[0]), int(trg_pos[1])
+                layout[src_latch_instance] = [src_x + 140, src_y]
+                layout[trg_latch_instance] = [trg_x - 140, trg_y]
+        except Exception:
+            pass
+
+        # Create line connecting the two latches.
+        objects.append({
+            'id': 'dynamic_line',
+            'instance': line_instance,
+            'source': src_latch_instance,
+            'target': trg_latch_instance,
+            'handles': [handle_instance],
         })
+        flow_children.append(line_instance)
 
-    # Link actions as a chain (effect_refs).
-    for i in range(len(actions) - 1):
-        actions[i]['effect_refs'] = [actions[i + 1]['id']]
+    # Root flow canvas/group export. Must reference children via `objects`.
+    objects.append({
+        'id': 'flow',
+        'instance': flow_instance,
+        'properties': [
+            ['name', flow_name],
+            ['description', 'A linear chain of flags placed on topology nodes.'],
+            ['author', [
+                ['name', 'CORE TopoGen'],
+                ['identity_class', 'organization'],
+                ['contact_information', ''],
+            ]],
+            ['scope', 'incident'],
+            ['external_references', []],
+            ['created', now],
+        ],
+        'objects': flow_children,
+    })
+    layout[flow_instance] = [160, 120]
 
-    flow_obj = {
-        'type': 'attack-flow',
-        'spec_version': '2.1',
-        'id': flow_id,
-        'created': now,
-        'modified': now,
-        'name': f"Flag Chain" + (f" - {scenario_label}" if scenario_label else ''),
-        'description': 'A linear chain of flags placed on topology nodes.',
-        'scope': 'incident',
-        'start_refs': [actions[0]['id']] if actions else [],
-        'extensions': af_ext(),
+    return {
+        'schema': 'attack_flow_v2',
+        'theme': 'dark_theme',
+        'objects': objects,
+        'layout': layout,
     }
-
-    bundle = {
-        'type': 'bundle',
-        'id': bundle_id,
-        'objects': [extension_definition, author, flow_obj, *assets, *actions],
-    }
-    return bundle
 
 
 def _flow_strip_ids_from_hint(text: str) -> str:
@@ -8444,6 +8631,7 @@ def _flow_compute_flag_assignments_for_preset(
             'node_id': str(cid),
             'id': gen_id,
             'name': str(gen.get('name') or ''),
+            'description': str(gen.get('description') or ''),
             'type': kind,
             'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
             'generator_catalog': catalog,
@@ -9411,6 +9599,12 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
                         required.add(xx)
         except Exception:
             pass
+        # Synthesized inputs (e.g., seed/node_name) are *fields*, not chain artifacts.
+        # Filter them out even if a plugin contract mistakenly lists them in `requires`.
+        try:
+            required = {x for x in required if x not in _flow_synthesized_inputs()}
+        except Exception:
+            pass
         return required
 
     def _required_input_fields_of(gen: dict[str, Any]) -> set[str]:
@@ -9607,6 +9801,7 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
             'node_id': str(cid),
             'id': str(gen.get('id') or ''),
             'name': str(gen.get('name') or ''),
+            'description': str(gen.get('description') or ''),
             'type': str(gen.get('_flow_kind') or 'flag-generator'),
             'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
             'generator_catalog': str(gen.get('_flow_catalog') or 'flag_generators'),
@@ -9738,6 +9933,17 @@ def _flow_enrich_saved_flag_assignments(
 
         gen_id = str(a2.get('id') or '').strip()
         gen_def = by_id.get(gen_id) if gen_id else None
+
+        # Ensure generator description exists (if the catalog provides it).
+        try:
+            existing_desc = str(a2.get('description') or '').strip()
+        except Exception:
+            existing_desc = ''
+        if (not existing_desc) and isinstance(gen_def, dict):
+            try:
+                a2['description'] = str(gen_def.get('description') or '')
+            except Exception:
+                pass
 
         # Ensure description hints exist (if the catalog provides them).
         try:
@@ -10675,7 +10881,6 @@ def api_flow_attackflow_preview():
             'preview_plan_path': preview_plan_path,
         }), 422
 
-    bundle = _attack_flow_bundle_for_chain(chain_nodes=chain_nodes, scenario_label=scenario_label or scenario_norm)
     out = {
         'ok': True,
         'scenario': scenario_label or scenario_norm,
@@ -10685,7 +10890,6 @@ def api_flow_attackflow_preview():
         'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or ''), 'is_vuln': bool(n.get('is_vuln'))} for n in chain_nodes],
         'flag_assignments': flag_assignments,
         'stats': stats,
-        'bundle': bundle,
         'flow_valid': bool(flow_valid),
         'flow_errors': list(flow_errors or []),
         'flags_enabled': bool(flags_enabled),
@@ -10717,15 +10921,12 @@ def api_flow_attackflow_preview():
     if debug_dag:
         out['sequencer_dag'] = dag_debug or {'ok': False, 'errors': ['not computed (saved chain)']}
 
+    # STIX/AttackFlow bundle export has been removed; keep this endpoint for chain preview only.
     if (request.args.get('download') or '').strip() in {'1', 'true', 'yes'}:
-        payload_b = json.dumps(bundle, ensure_ascii=False, indent=2).encode('utf-8')
-        safe_scenario = secure_filename(scenario_norm or 'scenario') or 'scenario'
-        fname = f"attackflow_preview_{safe_scenario}_{length}.json"
-        return Response(
-            payload_b,
-            mimetype='application/json',
-            headers={'Content-Disposition': f'attachment; filename={fname}'},
-        )
+        return jsonify({
+            'ok': False,
+            'error': 'STIX bundle export has been removed. Use /api/flag-sequencing/afb_from_chain.',
+        }), 410
 
     return jsonify(out)
 
@@ -10826,7 +11027,88 @@ def api_flow_prepare_preview_for_execute():
 
         if chain_ids:
             id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict)}
-            chain_nodes = [id_map[cid] for cid in chain_ids if cid in id_map]
+            # Preserve positional intent: keep placeholders for missing ids.
+            chain_nodes: list[Any] = []
+            missing_chain_ids: list[str] = []
+            for cid in chain_ids:
+                if cid in id_map:
+                    chain_nodes.append(id_map[cid])
+                else:
+                    chain_nodes.append(None)
+                    missing_chain_ids.append(cid)
+
+            # Best-effort repair: if some ids don't exist in the selected plan (common when a
+            # stale plan path is passed), fill missing positions with unused eligible nodes.
+            # If we cannot repair fully, fail loudly (prevents UI from collapsing chain length).
+            if missing_chain_ids:
+                try:
+                    used = {
+                        str(n.get('id') or '').strip()
+                        for n in chain_nodes
+                        if isinstance(n, dict) and str(n.get('id') or '').strip()
+                    }
+
+                    def _needs_nonvuln_docker(pos: int) -> bool:
+                        if not preset_steps:
+                            return False
+                        if pos < 0 or pos >= len(preset_steps):
+                            return False
+                        return (str((preset_steps[pos] or {}).get('kind') or '').strip() == 'flag-node-generator')
+
+                    def _eligible(cand: dict, pos: int) -> bool:
+                        try:
+                            cid0 = str(cand.get('id') or '').strip()
+                            if not cid0 or cid0 in used:
+                                return False
+                            is_docker = _flow_node_is_docker_role(cand)
+                            is_vuln = bool(cand.get('is_vuln'))
+                            if _needs_nonvuln_docker(pos):
+                                return bool(is_docker) and (not is_vuln)
+                            return bool(is_docker) or bool(is_vuln)
+                        except Exception:
+                            return False
+
+                    for i, node in enumerate(chain_nodes):
+                        if isinstance(node, dict):
+                            continue
+                        replacement = None
+                        for cand in (nodes or []):
+                            if not isinstance(cand, dict):
+                                continue
+                            if not _eligible(cand, i):
+                                continue
+                            replacement = cand
+                            break
+                        if replacement is not None:
+                            rid = str(replacement.get('id') or '').strip()
+                            if rid:
+                                chain_nodes[i] = replacement
+                                chain_ids[i] = rid
+                                used.add(rid)
+
+                    # Drop any unrepaired placeholders.
+                    chain_nodes = [n for n in chain_nodes if isinstance(n, dict)]
+                    if len(chain_nodes) < length:
+                        return jsonify({
+                            'ok': False,
+                            'error': 'Provided chain_ids do not match the selected preview plan (stale preview_plan?) and could not be fully repaired.',
+                            'requested_length': requested_length,
+                            'matched_length': len(chain_nodes),
+                            'missing_chain_ids': missing_chain_ids,
+                            'stats': stats,
+                            'best_effort': bool(best_effort),
+                        }), 422
+                except Exception:
+                    # Conservative: don't silently shrink.
+                    return jsonify({
+                        'ok': False,
+                        'error': 'Provided chain_ids did not match the selected preview plan and repair failed.',
+                        'requested_length': requested_length,
+                        'missing_chain_ids': missing_chain_ids,
+                        'stats': stats,
+                        'best_effort': bool(best_effort),
+                    }), 422
+
             # Presets require certain steps to run on non-vulnerability docker nodes.
             # If the UI provided a chain that violates this (common when many vuln nodes exist),
             # best-effort swap in an eligible docker node.
@@ -11332,9 +11614,16 @@ def api_flow_prepare_preview_for_execute():
                             pass
 
                         # If the generator declares inputs, only pass those (keeps Flow configs relevant).
+                        # HOWEVER: some catalogs/definitions can drift; if the assignment marks an input as
+                        # required (e.g., seed, node_name), ensure it is passed even if not in `allowed`.
                         cfg_to_pass = cfg_full
                         if allowed:
-                            cfg_to_pass = {k: v for k, v in cfg_full.items() if k in allowed}
+                            keep = set(allowed)
+                            try:
+                                keep |= set(declared_required or set())
+                            except Exception:
+                                pass
+                            cfg_to_pass = {k: v for k, v in cfg_full.items() if k in keep}
                         cfg = cfg_to_pass
 
                         try:
@@ -11457,25 +11746,6 @@ def api_flow_prepare_preview_for_execute():
                             except Exception:
                                 pass
 
-                        # Materialize a human-readable hint file in the artifacts directory.
-                        try:
-                            hint_texts: list[str] = []
-                            if isinstance(fa.get('hints'), list):
-                                hint_texts = [str(x or '').strip() for x in (fa.get('hints') or []) if str(x or '').strip()]
-                            if not hint_texts:
-                                single = str(fa.get('hint') or '').strip()
-                                if single:
-                                    hint_texts = [single]
-                            if flow_out_dir and hint_texts:
-                                with open(os.path.join(flow_out_dir, 'hint.txt'), 'w', encoding='utf-8') as hf:
-                                    if len(hint_texts) == 1:
-                                        hf.write(hint_texts[0] + "\n")
-                                    else:
-                                        for idx, ht in enumerate(hint_texts, start=1):
-                                            hf.write(f"Hint {idx}/{len(hint_texts)}: {ht}\n")
-                        except Exception:
-                            pass
-
                         # If the generator produced a manifest, capture the actual output keys.
                         if ok_run and manifest_path and os.path.exists(manifest_path):
                             try:
@@ -11525,6 +11795,27 @@ def api_flow_prepare_preview_for_execute():
                                         pass
                             except Exception:
                                 actual_output_keys = []
+
+                        # Materialize a human-readable hint file in the artifacts directory.
+                        # IMPORTANT: do this after outputs.json has been applied to hints so
+                        # the CORE VM sees resolved template values.
+                        try:
+                            hint_texts: list[str] = []
+                            if isinstance(fa.get('hints'), list):
+                                hint_texts = [str(x or '').strip() for x in (fa.get('hints') or []) if str(x or '').strip()]
+                            if not hint_texts:
+                                single = str(fa.get('hint') or '').strip()
+                                if single:
+                                    hint_texts = [single]
+                            if flow_out_dir and hint_texts:
+                                with open(os.path.join(flow_out_dir, 'hint.txt'), 'w', encoding='utf-8') as hf:
+                                    if len(hint_texts) == 1:
+                                        hf.write(hint_texts[0] + "\n")
+                                    else:
+                                        for idx, ht in enumerate(hint_texts, start=1):
+                                            hf.write(f"Hint {idx}/{len(hint_texts)}: {ht}\n")
+                        except Exception:
+                            pass
 
                         # Compare declared vs actual output keys (best-effort).
                         try:
@@ -11830,6 +12121,12 @@ def api_flow_save_flow_substitutions():
                     xx = str(x).strip()
                     if xx:
                         required.add(xx)
+        except Exception:
+            pass
+        # Synthesized inputs (e.g., seed/node_name) are *fields*, not chain artifacts.
+        # Filter them out even if a plugin contract mistakenly lists them in `requires`.
+        try:
+            required = {x for x in required if x not in _flow_synthesized_inputs()}
         except Exception:
             pass
         return required
@@ -12215,6 +12512,12 @@ def api_flow_substitution_candidates():
                         required.add(xx)
         except Exception:
             pass
+        # Synthesized inputs (e.g., seed/node_name) are *fields*, not chain artifacts.
+        # Filter them out even if a plugin contract mistakenly lists them in `requires`.
+        try:
+            required = {x for x in required if x not in _flow_synthesized_inputs()}
+        except Exception:
+            pass
         return required
 
     def _artifact_produces_of(gen: dict[str, Any]) -> set[str]:
@@ -12383,7 +12686,16 @@ def api_flow_substitution_candidates():
 
 @app.route('/api/flag-sequencing/bundle_from_chain', methods=['POST'])
 def api_flow_bundle_from_chain():
-    """Build an AttackFlow bundle from a user-specified ordered chain."""
+    """Deprecated: STIX bundle export has been removed in favor of .afb."""
+    return jsonify({
+        'ok': False,
+        'error': 'STIX bundle export has been removed. Use /api/flag-sequencing/afb_from_chain.',
+    }), 410
+
+
+@app.route('/api/flag-sequencing/afb_from_chain', methods=['POST'])
+def api_flow_afb_from_chain():
+    """Build an Attack Flow Builder .afb document from a user-specified ordered chain."""
     j = request.get_json(silent=True) or {}
     scenario_label = str(j.get('scenario') or '').strip()
     scenario_norm = _normalize_scenario_label(scenario_label)
@@ -12411,7 +12723,6 @@ def api_flow_bundle_from_chain():
     if not chain_nodes:
         return jsonify({'ok': False, 'error': 'Chain contained no valid nodes.'}), 400
 
-    # Recompute flag generator assignments for this explicit chain order (for UI display).
     flag_assignments: list[dict[str, Any]] = []
     preview: dict[str, Any] | None = None
     try:
@@ -12425,7 +12736,6 @@ def api_flow_bundle_from_chain():
     except Exception:
         flag_assignments = []
 
-    # Validate the reordered chain (non-blocking): UI should show warning if invalid.
     try:
         flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
             chain_nodes,
@@ -12436,14 +12746,18 @@ def api_flow_bundle_from_chain():
         flow_valid, flow_errors = True, []
     flags_enabled = bool(flow_valid)
 
-    bundle = _attack_flow_bundle_for_chain(chain_nodes=chain_nodes, scenario_label=scenario_label or scenario_norm)
+    afb = _attack_flow_builder_afb_for_chain(
+        chain_nodes=chain_nodes,
+        scenario_label=scenario_label or scenario_norm,
+        flag_assignments=flag_assignments,
+    )
     return jsonify({
         'ok': True,
         'scenario': scenario_label or scenario_norm,
         'length': len(chain_nodes),
         'chain': chain_nodes,
         'flag_assignments': flag_assignments,
-        'bundle': bundle,
+        'afb': afb,
         'flow_valid': bool(flow_valid),
         'flow_errors': list(flow_errors or []),
         'flags_enabled': bool(flags_enabled),
@@ -12452,87 +12766,10 @@ def api_flow_bundle_from_chain():
 
 @app.route('/api/flag-sequencing/attackflow')
 def api_flow_attackflow():
-    scenario_label = (request.args.get('scenario') or '').strip()
-    scenario_norm = _normalize_scenario_label(scenario_label)
-    length_raw = request.args.get('length')
-    try:
-        length = int(length_raw) if length_raw is not None else 5
-    except Exception:
-        length = 5
-    length = max(1, min(length, 50))
-
-    if not scenario_norm:
-        # If scenario not provided, try using the latest scenario in history.
-        try:
-            history = _load_run_history()
-            if isinstance(history, list) and history:
-                first = history[-1]
-                if isinstance(first, dict):
-                    scenario_label = str((first.get('scenario_name') or '').strip())
-                    scenario_norm = _normalize_scenario_label(scenario_label)
-        except Exception:
-            pass
-
-    if not scenario_norm:
-        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
-
-    xml_path = _latest_session_xml_for_scenario_norm(scenario_norm)
-    if not xml_path:
-        return jsonify({'ok': False, 'error': 'No session XML available for this scenario yet. Run the scenario first to generate a session XML (Flow reads the latest built session, not the editor draft).'}), 404
-
-    nodes, _links, adj = _build_topology_graph_from_session_xml(xml_path)
-    stats = _flow_compose_docker_stats(nodes)
-    chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
-
-    # If the editor draft appears newer than the latest session XML, include a hint.
-    stale_hint = ''
-    try:
-        history = _load_run_history()
-        _names, scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(history, user=_current_user())
-        scenario_xml_path = _select_existing_path(scenario_paths.get(scenario_norm)) if scenario_paths else None
-        if scenario_xml_path and os.path.exists(scenario_xml_path) and os.path.exists(xml_path):
-            scen_m = os.path.getmtime(scenario_xml_path)
-            sess_m = os.path.getmtime(xml_path)
-            # Small epsilon to avoid filesystem timestamp quirks.
-            if scen_m > (sess_m + 1.0):
-                stale_hint = ' Your saved scenario XML is newer than the latest session XML; re-run the scenario to regenerate session XML so Flow can see the new Docker/compose-backed nodes.'
-    except Exception:
-        stale_hint = ''
-
-    if len(chain_nodes) < 1:
-        return jsonify({'ok': False, 'error': 'No eligible Docker nodes found to place flags on.' + stale_hint, 'stats': stats}), 422
-    if len(chain_nodes) < length:
-        return jsonify({
-            'ok': False,
-            'error': f'Only {len(chain_nodes)} eligible Docker nodes found for chain length {length}.' + stale_hint,
-            'available': len(chain_nodes),
-            'stats': stats,
-        }), 422
-
-    bundle = _attack_flow_bundle_for_chain(chain_nodes=chain_nodes, scenario_label=scenario_label or scenario_norm)
-
-    out = {
-        'ok': True,
-        'scenario': scenario_label or scenario_norm,
-        'length': length,
-        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
-        'stats': stats,
-        'bundle': bundle,
-    }
-
-    if (request.args.get('download') or '').strip() in {'1', 'true', 'yes'}:
-        payload = json.dumps(bundle, ensure_ascii=False, indent=2).encode('utf-8')
-        safe_scenario = secure_filename(scenario_norm or 'scenario') or 'scenario'
-        fname = f"attackflow_{safe_scenario}_{length}.json"
-        return Response(
-            payload,
-            mimetype='application/json',
-            headers={
-                'Content-Disposition': f'attachment; filename={fname}',
-            },
-        )
-
-    return jsonify(out)
+    return jsonify({
+        'ok': False,
+        'error': 'STIX/AttackFlow bundle export has been removed. Use /api/flag-sequencing/attackflow_preview for chain preview and /api/flag-sequencing/afb_from_chain for Attack Flow Builder export.',
+    }), 410
 
 
 @app.route('/users', methods=['GET'])
@@ -17193,6 +17430,23 @@ def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool,
                 p2['produces'] = []
             if not isinstance(p2.get('inputs'), dict):
                 p2['inputs'] = {}
+
+            # STRICT contract validation:
+            # - plugin.requires is reserved for *artifact* dependencies (produced/consumed across steps)
+            # - runtime input fields belong in plugin.inputs (or generator implementation inputs)
+            # - synthesized Flow fields (seed/node_name/etc) must never appear in requires
+            try:
+                requires_vals = [str(x or '').strip() for x in (p2.get('requires') or []) if str(x or '').strip()]
+                p2['requires'] = requires_vals
+
+                synth = set(_flow_synthesized_inputs())
+                bad_synth = sorted([x for x in requires_vals if x in synth])
+                if bad_synth:
+                    return False, f"Strict schema: plugin {pid} has synthesized field(s) in requires: {bad_synth}. Move these into inputs.", None, skipped
+            except Exception:
+                # If validation itself fails, treat it as a hard error under strict mode.
+                return False, f"Strict schema: failed validating requires/inputs for plugin {pid}.", None, skipped
+
             if pid not in plugins_by_id:
                 plugins_by_id[pid] = p2
                 normalized_plugins.append(p2)
