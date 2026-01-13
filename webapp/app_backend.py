@@ -12988,6 +12988,13 @@ def healthz():
     return Response('ok', mimetype='text/plain')
 
 
+@app.route('/favicon.ico')
+def favicon():
+    # The UI uses an inline data-URL favicon in the base template, but some browsers
+    # still request /favicon.ico. Return a no-content response to avoid noisy 404s.
+    return ('', 204)
+
+
 # Environment-configurable CORE daemon location (useful inside Docker)
 CORE_HOST = os.environ.get('CORE_HOST', 'localhost')
 try:
@@ -17109,6 +17116,17 @@ def _save_flag_generator_sources_state(state: dict) -> None:
         pass
 
 
+def _save_flag_node_generator_sources_state(state: dict) -> None:
+    try:
+        os.makedirs(FLAG_NODE_GENERATORS_SOURCES_DIR, exist_ok=True)
+        tmp = FLAG_NODE_GENERATORS_STATE_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(state, fh, indent=2)
+        os.replace(tmp, FLAG_NODE_GENERATORS_STATE_PATH)
+    except Exception:
+        pass
+
+
 def _coerce_bool(val, default: bool = False) -> bool:
     try:
         if isinstance(val, bool):
@@ -17124,6 +17142,104 @@ def _coerce_bool(val, default: bool = False) -> bool:
     except Exception:
         pass
     return default
+
+
+def _find_existing_generator_source(plugin_type: str, plugin_id: str) -> tuple[bool, str | None]:
+    try:
+        if plugin_type == 'flag-node-generator':
+            gens, _errors = _flag_node_generators_from_enabled_sources()
+        else:
+            gens, _errors = _flag_generators_from_enabled_sources()
+        for g in gens:
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get('id') or '').strip()
+            if gid and gid == plugin_id:
+                return True, str(g.get('_source_path') or '') or None
+    except Exception:
+        pass
+    return False, None
+
+
+def _register_generator_catalog_source(
+    *,
+    plugin_type: str,
+    plugin_id: str,
+    catalog_source: dict[str, Any],
+    source_name: str | None = None,
+    enabled: bool = True,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    if plugin_type not in {'flag-generator', 'flag-node-generator'}:
+        raise ValueError('Invalid plugin_type')
+    if not plugin_id:
+        raise ValueError('plugin_id is required')
+    if not isinstance(catalog_source, dict):
+        raise ValueError('catalog_source must be an object')
+
+    # Write into managed catalog sources directories (under data_sources/...).
+    base_dir = FLAG_GENERATORS_SOURCES_DIR if plugin_type == 'flag-generator' else FLAG_NODE_GENERATORS_SOURCES_DIR
+    os.makedirs(base_dir, exist_ok=True)
+    stamp = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    safe_pid = _sanitize_id(plugin_id) or 'generator'
+    filename = f"{stamp}-builder-{safe_pid}.json"
+    dest = os.path.join(base_dir, filename)
+    dest = os.path.abspath(dest)
+
+    if os.path.exists(dest) and not overwrite:
+        raise FileExistsError(f"Catalog source already exists: {dest}")
+
+    tmp = dest + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(catalog_source, fh, indent=2)
+    os.replace(tmp, dest)
+
+    ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(dest)
+    if not ok or not normalized_doc:
+        try:
+            os.remove(dest)
+        except Exception:
+            pass
+        raise ValueError(note or 'Invalid generator catalog source')
+
+    # Persist normalized doc
+    tmp2 = dest + '.tmp'
+    with open(tmp2, 'w', encoding='utf-8') as fh:
+        json.dump(normalized_doc, fh, indent=2)
+    os.replace(tmp2, dest)
+
+    # Update state
+    uploaded = datetime.datetime.utcnow().isoformat() + 'Z'
+    entry = {
+        'id': uuid.uuid4().hex[:12],
+        'name': source_name or f"builder-{plugin_id}",
+        'path': dest,
+        'enabled': bool(enabled),
+        'rows': note,
+        'uploaded': uploaded,
+    }
+
+    if plugin_type == 'flag-generator':
+        state = _load_flag_generator_sources_state()
+        sources = state.get('sources') if isinstance(state.get('sources'), list) else []
+        sources.append(entry)
+        state['sources'] = sources
+        _save_flag_generator_sources_state(state)
+        state_path = FLAG_GENERATORS_STATE_PATH
+    else:
+        state = _load_flag_node_generator_sources_state()
+        sources = state.get('sources') if isinstance(state.get('sources'), list) else []
+        sources.append(entry)
+        state['sources'] = sources
+        _save_flag_node_generator_sources_state(state)
+        state_path = FLAG_NODE_GENERATORS_STATE_PATH
+
+    return {
+        'catalog_path': dest,
+        'state_path': os.path.abspath(state_path),
+        'source': entry,
+        'note': note,
+    }
 
 
 def _normalize_generator_id(val: str) -> str:
@@ -29059,6 +29175,555 @@ def data_sources_export_all():
 
 
 # ---------------- Flag Catalog (mirror of Vulnerability Catalog) -----------------
+
+
+def _require_builder_or_admin() -> None:
+    user = _current_user()
+    if not user or not _is_admin_view_role(user.get('role')):
+        abort(403)
+
+
+def _split_lines(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out: list[str] = []
+        for v in value:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s:
+                out.append(s)
+        return out
+    text = str(value)
+    return [s.strip() for s in text.splitlines() if s.strip()]
+
+
+def _split_artifact_list(value: Any) -> list[str]:
+    """Coerce an artifact list.
+
+    Accepts:
+      - list[str]
+      - list[dict] with {'artifact': '...'}
+      - newline-delimited str
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, dict):
+                s = str(item.get('artifact') or '').strip()
+            else:
+                s = str(item).strip()
+            if s:
+                out.append(s)
+        return out
+    return _split_lines(value)
+
+
+def _normalize_requires_with_optional(payload: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Return (required_requires, optional_requires)."""
+    # New UI shape: requires = [{artifact, optional}, ...]
+    req_items = payload.get('requires')
+    if isinstance(req_items, list) and any(isinstance(x, dict) for x in req_items):
+        required: list[str] = []
+        optional: list[str] = []
+        for item in req_items:
+            if not isinstance(item, dict):
+                s = str(item or '').strip()
+                if s:
+                    required.append(s)
+                continue
+            art = str(item.get('artifact') or '').strip()
+            if not art:
+                continue
+            is_opt = _coerce_bool(item.get('optional'), False)
+            if is_opt:
+                optional.append(art)
+            else:
+                required.append(art)
+        # De-dupe, prefer required if both appear.
+        required_set = {x for x in required if x}
+        optional_set = {x for x in optional if x and x not in required_set}
+        return sorted(required_set), sorted(optional_set)
+
+    # Back-compat: requires is a list of strings or textarea; optional_requires may be provided separately.
+    required2 = _split_artifact_list(payload.get('requires'))
+    optional2 = _split_artifact_list(payload.get('optional_requires'))
+    required_set2 = {x for x in required2 if x}
+    optional_set2 = {x for x in optional2 if x and x not in required_set2}
+    return sorted(required_set2), sorted(optional_set2)
+
+
+def _normalize_plugin_type(raw: Any) -> str:
+    value = (str(raw or '')).strip()
+    if value not in {'flag-generator', 'flag-node-generator'}:
+        return 'flag-generator'
+    return value
+
+
+def _sanitize_id(raw: Any) -> str:
+    value = (str(raw or '')).strip()
+    value = re.sub(r'[^a-zA-Z0-9_.\-]+', '_', value)
+    value = re.sub(r'_+', '_', value).strip('_')
+    return value
+
+
+def _sanitize_folder(raw: Any) -> str:
+    value = (str(raw or '')).strip()
+    value = value.replace('\\', '/').strip('/')
+    value = re.sub(r'[^a-zA-Z0-9_\-/\.]+', '_', value)
+    value = value.split('/', 1)[0]
+    value = value.strip().strip('.')
+    value = re.sub(r'_+', '_', value)
+    return value
+
+
+def _inputs_schema_from_flags(flags: dict[str, Any], *, plugin_type: str) -> dict[str, Any]:
+    inputs: dict[str, Any] = {}
+
+    def _add(name: str, *, sensitive: bool = False, required: bool = True) -> None:
+        inputs[name] = {'type': 'text', 'required': bool(required)}
+        if sensitive:
+            inputs[name]['sensitive'] = True
+
+    if flags.get('seed'):
+        _add('seed', required=True)
+    if flags.get('secret') and plugin_type == 'flag-generator':
+        _add('secret', sensitive=True, required=True)
+    if flags.get('node_name') and plugin_type == 'flag-node-generator':
+        _add('node_name', required=True)
+    if flags.get('flag_prefix'):
+        _add('flag_prefix', required=False)
+    return inputs
+
+
+def _build_generator_scaffold(payload: dict[str, Any]) -> tuple[dict[str, str], dict[str, Any], str]:
+    plugin_type = _normalize_plugin_type(payload.get('plugin_type'))
+    plugin_id = _sanitize_id(payload.get('plugin_id'))
+    if not plugin_id:
+        raise ValueError('plugin_id is required')
+
+    folder_name = _sanitize_folder(payload.get('folder_name'))
+    if not folder_name:
+        folder_name = f"py_{plugin_id}"
+    if folder_name.startswith('py__'):
+        folder_name = folder_name.replace('py__', 'py_', 1)
+    if folder_name == 'py_':
+        folder_name = f"py_{plugin_id}"
+
+    display_name = str(payload.get('name') or '').strip() or plugin_id
+    description = str(payload.get('description') or '').strip() or f"Generator {plugin_id}"
+
+    requires, optional_requires = _normalize_requires_with_optional(payload)
+    produces = _split_artifact_list(payload.get('produces'))
+    hint_templates = _split_lines(payload.get('hint_templates'))
+
+    if 'flag' not in produces:
+        produces = ['flag'] + produces
+
+    inputs_flags = payload.get('inputs') if isinstance(payload.get('inputs'), dict) else {}
+    inputs_schema = _inputs_schema_from_flags(inputs_flags, plugin_type=plugin_type)
+
+    base_dir = 'flag_generators' if plugin_type == 'flag-generator' else 'flag_node_generators'
+    folder_path = f"{base_dir}/{folder_name}"
+
+    compose_yaml = (
+        "services:\n"
+        "  generator:\n"
+        "    image: python:3.12-slim\n"
+        "    working_dir: /app\n"
+        "    command: [\"python\", \"/app/generator.py\"]\n"
+        "    environment:\n"
+        "      INPUTS_DIR: ${INPUTS_DIR}\n"
+        "      OUTPUTS_DIR: ${OUTPUTS_DIR}\n"
+        "    volumes:\n"
+        "      - ./generator.py:/app/generator.py:ro\n"
+        "      - ${INPUTS_DIR}:/inputs:ro\n"
+        "      - ${OUTPUTS_DIR}:/outputs\n"
+    )
+
+    compose_override = str(payload.get('compose_text') or '').strip('\n')
+    if compose_override.strip():
+        compose_yaml = compose_override + ("\n" if not compose_override.endswith("\n") else "")
+
+    if plugin_type == 'flag-generator':
+        generator_py = f"""import hashlib
+import json
+from pathlib import Path
+
+
+def _read_config() -> dict:
+    try:
+        return json.loads(Path('/inputs/config.json').read_text('utf-8'))
+    except Exception:
+        return {{}}
+
+
+def _flag(seed: str, secret: str, flag_prefix: str = 'FLAG') -> str:
+    digest = hashlib.sha256(f"{{seed}}|{{secret}}|flag".encode('utf-8', 'replace')).hexdigest()[:24]
+    prefix = (flag_prefix or 'FLAG').strip() or 'FLAG'
+    return f"{{prefix}}{{{{{{digest}}}}}}"
+
+
+def main() -> None:
+    cfg = _read_config()
+    seed = str(cfg.get('seed') or '').strip()
+    secret = str(cfg.get('secret') or '').strip()
+    flag_prefix = str(cfg.get('flag_prefix') or 'FLAG').strip() or 'FLAG'
+
+    if not seed:
+        raise SystemExit('Missing seed in /inputs/config.json')
+    if not secret:
+        raise SystemExit('Missing secret in /inputs/config.json')
+
+    # TODO: implement your generator logic and add additional outputs.
+    flag_value = _flag(seed, secret, flag_prefix)
+
+    out_dir = Path('/outputs')
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    outputs = {{
+        'generator_id': {json.dumps(plugin_id)},
+        'outputs': {{
+            'flag': flag_value,
+        }},
+    }}
+
+    (out_dir / 'outputs.json').write_text(json.dumps(outputs, indent=2) + '\n', encoding='utf-8')
+    (out_dir / 'hint.txt').write_text('TODO: write a next-step hint here\n', encoding='utf-8')
+
+
+if __name__ == '__main__':
+    main()
+"""
+    else:
+        generator_py = f"""import hashlib
+import json
+from pathlib import Path
+
+
+def _read_config() -> dict:
+    try:
+        return json.loads(Path('/inputs/config.json').read_text('utf-8'))
+    except Exception:
+        return {{}}
+
+
+def _flag(seed: str, node_name: str, flag_prefix: str = 'FLAG') -> str:
+    digest = hashlib.sha256(f"{{seed}}|{{node_name}}|flag".encode('utf-8', 'replace')).hexdigest()[:16]
+    prefix = (flag_prefix or 'FLAG').strip() or 'FLAG'
+    return f"{{prefix}}{{{{{{digest}}}}}}"
+
+
+def main() -> None:
+    cfg = _read_config()
+    seed = str(cfg.get('seed') or '').strip()
+    node_name = str(cfg.get('node_name') or '').strip()
+    flag_prefix = str(cfg.get('flag_prefix') or 'FLAG').strip() or 'FLAG'
+
+    if not seed:
+        raise SystemExit('Missing seed in /inputs/config.json')
+    if not node_name:
+        raise SystemExit('Missing node_name in /inputs/config.json')
+
+    # TODO: implement your per-node compose generation.
+    flag_value = _flag(seed, node_name, flag_prefix)
+    compose_text = (
+        "services:\n"
+        "  node:\n"
+        "    image: alpine:3.19\n"
+        "    command: [\\"sh\\", \\"-lc\\", \\"echo \\\\\"$FLAG\\\\\" > /flag.txt && tail -f /dev/null\\"]\n"
+        "    environment:\n"
+        f"      FLAG: {{json.dumps(flag_value)}}\n"
+    )
+
+    out_dir = Path('/outputs')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / 'docker-compose.yml').write_text(compose_text, encoding='utf-8')
+
+    outputs = {{
+        'generator_id': {json.dumps(plugin_id)},
+        'outputs': {{
+            'compose_path': 'docker-compose.yml',
+            'flag': flag_value,
+        }},
+    }}
+    (out_dir / 'outputs.json').write_text(json.dumps(outputs, indent=2) + '\n', encoding='utf-8')
+
+
+if __name__ == '__main__':
+    main()
+"""
+
+    plugins_entry: dict[str, Any] = {
+        'plugin_id': plugin_id,
+        'plugin_type': plugin_type,
+        'version': '1.0',
+        'description': description,
+        'requires': requires,
+        'produces': [{'artifact': a} for a in produces if a],
+    }
+    if optional_requires:
+        plugins_entry['optional_requires'] = optional_requires
+    if inputs_schema:
+        plugins_entry['inputs'] = inputs_schema
+    readme_override = str(payload.get('readme_text') or '')
+    if readme_override and not readme_override.endswith('\n'):
+        readme_override = readme_override + '\n'
+
+    impl_entry: dict[str, Any] = {
+        'plugin_id': plugin_id,
+        'name': display_name,
+        'language': 'python',
+        'source': {'type': 'local-path', 'path': folder_path},
+        'compose': {'file': 'docker-compose.yml', 'service': 'generator'},
+    }
+    if hint_templates:
+        impl_entry['hint_templates'] = hint_templates
+        impl_entry['hint_template'] = hint_templates[0]
+
+    catalog_source = {
+        'schema_version': 3,
+        'plugin_type': plugin_type,
+        'plugins': [plugins_entry],
+        'implementations': [impl_entry],
+    }
+
+    scaffold_files: dict[str, str] = {
+        f"{folder_path}/docker-compose.yml": compose_yaml,
+        f"{folder_path}/generator.py": generator_py,
+        f"{folder_path}/README.md": readme_override or f"# {display_name}\n\nTODO: describe this generator.\n\n- plugin_id: `{plugin_id}`\n- type: `{plugin_type}`\n",
+        f"{folder_path}/catalog_source.json": json.dumps(catalog_source, indent=2) + "\n",
+    }
+
+    return scaffold_files, catalog_source, folder_path
+
+
+@app.route('/generator_builder')
+def generator_builder_page():
+    _require_builder_or_admin()
+    return render_template('generator_builder.html', active_page='generator_builder')
+
+
+def _custom_artifacts_path() -> str:
+    return os.path.abspath(os.path.join(_outputs_dir(), 'artifacts_custom.json'))
+
+
+def _load_custom_artifacts() -> dict[str, dict[str, Any]]:
+    """Load persisted custom artifact definitions.
+
+    Stored as a mapping artifact -> {type?: str}.
+    """
+    path = _custom_artifacts_path()
+    try:
+        if not os.path.exists(path):
+            return {}
+        with open(path, 'r', encoding='utf-8') as fh:
+            doc = json.load(fh)
+        if not isinstance(doc, dict):
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for k, v in doc.items():
+            art = str(k or '').strip()
+            if not art:
+                continue
+            meta: dict[str, Any] = {}
+            if isinstance(v, dict):
+                tp = str(v.get('type') or '').strip()
+                if tp:
+                    meta['type'] = tp
+            out[art] = meta
+        return out
+    except Exception:
+        return {}
+
+
+def _save_custom_artifacts(doc: dict[str, dict[str, Any]]) -> None:
+    path = _custom_artifacts_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(doc, fh, indent=2)
+        fh.write('\n')
+    os.replace(tmp, path)
+
+
+def _upsert_custom_artifact(artifact: str, *, type_value: str | None = None) -> dict[str, Any]:
+    art = str(artifact or '').strip()
+    if not art:
+        raise ValueError('artifact is required')
+    if len(art) > 200:
+        raise ValueError('artifact too long')
+
+    tp = str(type_value or '').strip()
+    custom = _load_custom_artifacts()
+    meta = dict(custom.get(art) or {})
+    if tp:
+        meta['type'] = tp
+    custom[art] = meta
+    _save_custom_artifacts(custom)
+    return {'artifact': art, **meta}
+
+
+@app.route('/api/generators/artifacts_index')
+def api_generators_artifacts_index():
+    """Return known artifact keys (from enabled generator sources) + producer metadata."""
+    _require_builder_or_admin()
+    try:
+        flag_gens, _errs1 = _flag_generators_from_enabled_sources()
+        node_gens, _errs2 = _flag_node_generators_from_enabled_sources()
+
+        idx: dict[str, dict[str, Any]] = {}
+
+        def _add_from(gens: list[dict], plugin_type: str) -> None:
+            for g in gens:
+                if not isinstance(g, dict):
+                    continue
+                gid = str(g.get('id') or '').strip()
+                gname = str(g.get('name') or '').strip() or gid
+                outs = g.get('outputs') if isinstance(g.get('outputs'), list) else []
+                for o in outs:
+                    if not isinstance(o, dict):
+                        continue
+                    art = str(o.get('name') or '').strip()
+                    if not art:
+                        continue
+                    tp = str(o.get('type') or '').strip()
+                    entry = idx.get(art)
+                    if not entry:
+                        entry = {'artifact': art, 'type': tp, 'producers': []}
+                        idx[art] = entry
+                    if not entry.get('type') and tp:
+                        entry['type'] = tp
+                    producers = entry.get('producers') if isinstance(entry.get('producers'), list) else []
+                    if not any((p.get('plugin_id') == gid and p.get('plugin_type') == plugin_type) for p in producers if isinstance(p, dict)):
+                        producers.append({'plugin_id': gid, 'plugin_type': plugin_type, 'name': gname})
+                    entry['producers'] = producers
+
+        _add_from(flag_gens, 'flag-generator')
+        _add_from(node_gens, 'flag-node-generator')
+
+        # Merge in persisted custom artifacts (no producers).
+        try:
+            custom = _load_custom_artifacts()
+            for art, meta in custom.items():
+                if art not in idx:
+                    idx[art] = {'artifact': art, 'type': str(meta.get('type') or '').strip(), 'producers': []}
+                else:
+                    # Prefer existing type; fill missing type from custom.
+                    if not str(idx[art].get('type') or '').strip() and str(meta.get('type') or '').strip():
+                        idx[art]['type'] = str(meta.get('type') or '').strip()
+        except Exception:
+            pass
+
+        artifacts = sorted(idx.values(), key=lambda x: str(x.get('artifact') or ''))
+        return jsonify({'ok': True, 'artifacts': artifacts})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+
+
+@app.route('/api/generators/artifacts_index/custom', methods=['POST'])
+def api_generators_artifacts_index_custom_add():
+    """Persist a custom artifact key so it appears in the selector going forward."""
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    try:
+        artifact = str(payload.get('artifact') or '').strip()
+        type_value = str(payload.get('type') or '').strip() or None
+        item = _upsert_custom_artifact(artifact, type_value=type_value)
+        return jsonify({'ok': True, 'artifact': item})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+
+
+@app.route('/api/generators/scaffold_meta', methods=['POST'])
+def api_generators_scaffold_meta():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    try:
+        scaffold_files, catalog_source, _folder_path = _build_generator_scaffold(payload)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+    return jsonify({
+        'ok': True,
+        'catalog_source': catalog_source,
+        'scaffold_paths': sorted(scaffold_files.keys()),
+    })
+
+
+@app.route('/api/generators/scaffold_zip', methods=['POST'])
+def api_generators_scaffold_zip():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    try:
+        scaffold_files, _catalog_source, _folder_path = _build_generator_scaffold(payload)
+        plugin_id = _sanitize_id(payload.get('plugin_id')) or 'generator'
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for path, content in scaffold_files.items():
+            zf.writestr(path, content)
+    mem.seek(0)
+    return send_file(
+        mem,
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name=f'generator_scaffold_{plugin_id}.zip',
+    )
+
+
+@app.route('/api/generators/register_catalog', methods=['POST'])
+def api_generators_register_catalog():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    try:
+        scaffold_files, catalog_source, _folder_path = _build_generator_scaffold(payload)
+        plugin_type = _normalize_plugin_type(payload.get('plugin_type'))
+        plugin_id = _sanitize_id(payload.get('plugin_id'))
+        if not plugin_id:
+            raise ValueError('plugin_id is required')
+
+        force = _coerce_bool(payload.get('force'), False)
+        overwrite = _coerce_bool(payload.get('overwrite'), False)
+        enabled = _coerce_bool(payload.get('enabled'), True)
+        source_name = str(payload.get('source_name') or '').strip() or None
+
+        exists, src_path = _find_existing_generator_source(plugin_type, plugin_id)
+        if exists and not force:
+            return jsonify({
+                'ok': False,
+                'error': f"Generator '{plugin_id}' already exists" + (f" (source: {src_path})" if src_path else ''),
+                'existing_source_path': src_path,
+            }), 409
+
+        result = _register_generator_catalog_source(
+            plugin_type=plugin_type,
+            plugin_id=plugin_id,
+            catalog_source=catalog_source,
+            source_name=source_name,
+            enabled=enabled,
+            overwrite=overwrite,
+        )
+    except FileExistsError as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 409
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+
+    return jsonify({
+        'ok': True,
+        'catalog_path': result.get('catalog_path'),
+        'state_path': result.get('state_path'),
+        'source': result.get('source'),
+        'note': result.get('note'),
+        'scaffold_paths': sorted(scaffold_files.keys()),
+        'catalog_source': catalog_source,
+    })
 
 
 @app.route('/flag_catalog')

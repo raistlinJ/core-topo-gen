@@ -40,11 +40,13 @@ The web UI uses cookie sessions. Script clients must authenticate once and reuse
 - [Health](#health)
 - [Scenario Lifecycle](#scenario-lifecycle)
 - [Planning Preview](#planning-preview)
+- [Flag Sequencing (Flow)](#flag-sequencing-flow)
 - [Run Execution & Reports](#run-execution--reports)
 - [Script Inspection](#script-inspection)
 - [Docker Helpers](#docker-helpers)
 - [CORE Session Management](#core-session-management)
 - [Data Sources & Vulnerability Catalog](#data-sources--vulnerability-catalog)
+- [Generator Builder](#generator-builder)
 - [Diagnostics & Maintenance](#diagnostics--maintenance)
 - [User Administration](#user-administration)
 
@@ -137,6 +139,98 @@ Generates a deterministic planning preview without starting a CORE session.
 - `r2s_policy_preview.per_router_bounds` includes min/max bounds when NonUniform host grouping is requested via XML attributes (`r2s_hosts_min`/`r2s_hosts_max`).
 - Exact aggregation (`r2s_mode=Exact` and `r2s_edges=1`) collapses hosts behind a single switch and ignores bounds.
 - Preview responses are cached; purge `outputs/plan_cache.json` to invalidate.
+
+### Flag Sequencing (Flow)
+
+These endpoints power the **Flow** page (Flag Sequencing) in the Web UI.
+
+Important notes:
+- **STIX/AttackFlow bundle export has been removed.** Legacy STIX endpoints now return HTTP `410 Gone`.
+- The supported export format is **Attack Flow Builder native `.afb`**.
+
+`GET /api/flag-sequencing/attackflow_preview`
+: Returns a chain preview derived from the latest preview plan for the scenario. Response includes `chain`, `flag_assignments`, and validity metadata (`flow_valid`, `flow_errors`, `flags_enabled`).
+
+Common query params:
+- `scenario=<name>` (optional; best to provide explicitly)
+- `length=<int>` (default 5)
+- `preset=<name>` (optional; forces a fixed chain)
+- `best_effort=1` (optional; clamps to available eligible nodes)
+
+`POST /api/flag-sequencing/prepare_preview_for_execute`
+: Resolves hint placeholders and materializes generator outputs for a chain (used for “Resolve hint values…” in the Flow UI).
+
+Request JSON (typical):
+```json
+{
+	"scenario": "My Scenario",
+	"length": 5,
+	"preset": "",
+	"chain_ids": ["n1", "n2"],
+	"preview_plan": "/abs/path/to/outputs/plans/plan_from_preview_....json",
+	"mode": "hint",
+	"best_effort": true,
+	"timeout_s": 30
+}
+```
+
+`POST /api/flag-sequencing/afb_from_chain`
+: Generates an Attack Flow Builder export for a user-specified ordered chain.
+
+Request JSON:
+```json
+{
+	"scenario": "My Scenario",
+	"chain": [{"id": "n1", "name": "Node 1"}, {"id": "n2", "name": "Node 2"}]
+}
+```
+
+Response JSON includes `afb` (the export document) plus `flag_assignments` and validity metadata.
+
+Deprecated endpoints (removed):
+- `POST /api/flag-sequencing/bundle_from_chain` → returns `410 Gone`
+- `GET /api/flag-sequencing/attackflow` → returns `410 Gone`
+
+### Generator Builder
+
+These endpoints power the **Generator-Builder** page in the Web UI.
+
+`GET /generator_builder`
+: HTML page that helps scaffold new generators.
+
+`POST /api/generators/scaffold_meta`
+: JSON request describing the generator you want. Returns `{ ok, catalog_source, scaffold_paths }`.
+
+Example request:
+
+```json
+{
+	"plugin_type": "flag-generator",
+	"plugin_id": "my_ssh_creds",
+	"folder_name": "py_my_ssh_creds",
+	"name": "SSH Credentials",
+	"description": "Emits deterministic SSH credentials.",
+	"requires": [],
+	"produces": ["flag", "ssh_username", "ssh_password"],
+	"inputs": {"seed": true, "secret": true, "flag_prefix": true},
+	"hint_templates": ["Next: SSH using {{OUTPUT.ssh_username}} / {{OUTPUT.ssh_password}}"]
+}
+```
+
+`POST /api/generators/scaffold_zip`
+: Same JSON request body as `/api/generators/scaffold_meta`, but returns a ZIP you can unzip into the repo root.
+
+Registering the scaffolded generator:
+- Unzip the archive into the repo root (it creates `flag_generators/<folder>/...` or `flag_node_generators/<folder>/...`).
+- Copy the generated `catalog_source.json` into a catalog source file under `data_sources/flag_generators/` or `data_sources/flag_node_generators/`.
+- Enable that new source in `data_sources/flag_generators/_state.json` or `data_sources/flag_node_generators/_state.json`.
+
+`POST /api/generators/register_catalog`
+: Convenience endpoint that writes the generated catalog source JSON to `data_sources/flag_generators/` or `data_sources/flag_node_generators/` and enables it in the corresponding `_state.json`. Returns `{ ok, catalog_path, state_path, source, note }`.
+
+Notes:
+- By default it refuses to register if a generator with the same `plugin_id` already exists in enabled sources (HTTP 409).
+- Set request JSON fields `force=true` to bypass the duplicate check, and `overwrite=true` to overwrite the generated catalog source filename if it already exists.
 
 ### Run Execution & Reports
 

@@ -63,6 +63,15 @@ def _plugin_requires(plugin: Dict[str, Any]) -> Set[str]:
     req = plugin.get("requires")
     if not isinstance(req, list):
         return set()
+    required = {str(x).strip() for x in req if str(x).strip()}
+    optional = _plugin_optional_requires(plugin)
+    return {x for x in required if x not in optional}
+
+
+def _plugin_optional_requires(plugin: Dict[str, Any]) -> Set[str]:
+    req = plugin.get("optional_requires")
+    if not isinstance(req, list):
+        return set()
     return {str(x).strip() for x in req if str(x).strip()}
 
 
@@ -136,8 +145,8 @@ def build_dag(
         # (We allow instances to declare fewer requires than the plugin; plugin.requires still applies.)
         # Also validate that instance doesn't claim requirements the plugin doesn't list.
         inst_only = _required_artifacts_from_instance(ch)
-        plugin_req = _plugin_requires(plugin)
-        unknown = sorted(list(inst_only - plugin_req))
+        plugin_declared = _plugin_requires(plugin) | _plugin_optional_requires(plugin)
+        unknown = sorted(list(inst_only - plugin_declared))
         if unknown:
             errors.append(f"{cid}: instance requires artifacts not declared by plugin '{plugin_id}': {unknown}")
 

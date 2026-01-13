@@ -50,15 +50,86 @@
 			"isBackground": false
 		},
 		{
-			"label": "Restart Web UI (9090) [copilot]",
+			"label": "Smoke test register_catalog",
 			"type": "shell",
-			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 python -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\"",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie3.txt /tmp/cg_payload3.json /tmp/cg_register3.json && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport json\npayload = {\n  'plugin_type': 'flag-generator',\n  'plugin_id': 'my_register_catalog_smoke',\n  'folder_name': 'py_my_register_catalog_smoke',\n  'name': 'Register Catalog Smoke',\n  'description': 'Smoke test for register_catalog.',\n  'requires': [],\n  'produces': ['flag','ssh_username','ssh_password'],\n  'inputs': {'seed': True, 'secret': True, 'node_name': False, 'flag_prefix': True},\n  'hint_templates': ['Next: SSH using {{OUTPUT.ssh_username}} / {{OUTPUT.ssh_password}}'],\n}\nopen('/tmp/cg_payload3.json','w',encoding='utf-8').write(json.dumps(payload))\nprint('wrote payload')\nPY\n\ncurl -sS -c /tmp/cg_cookie3.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin'\n\ncurl -sS -b /tmp/cg_cookie3.txt -H 'Content-Type: application/json' -o /tmp/cg_register3.json http://127.0.0.1:9090/api/generators/register_catalog --data-binary @/tmp/cg_payload3.json\n\n/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport json\nobj=json.load(open('/tmp/cg_register3.json','r',encoding='utf-8'))\nprint('ok=', obj.get('ok'))\nprint('catalog_path=', obj.get('catalog_path'))\nprint('state_path=', obj.get('state_path'))\nprint('note=', obj.get('note'))\nprint('source=', obj.get('source'))\nPY"
+		},
+		{
+			"label": "Fetch Generator Builder (auth)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie_gb.txt /tmp/cg_gb.html && curl -sS -c /tmp/cg_cookie_gb.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_gb.txt -o /tmp/cg_gb.html -w 'HTTP=%{http_code}\\n' http://127.0.0.1:9090/generator_builder && head -n 25 /tmp/cg_gb.html | cat",
 			"isBackground": false
 		},
 		{
-			"label": "Healthz (9090) [copilot]",
+			"label": "Tail Web UI log (after 500)",
 			"type": "shell",
-			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && tail -n 120 outputs/logs/webui-9090.log | cat",
+			"isBackground": false
+		},
+		{
+			"label": "Fetch Generator Builder (auth)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie_gb.txt /tmp/cg_gb.html && curl -sS -c /tmp/cg_cookie_gb.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_gb.txt -o /tmp/cg_gb.html -w 'HTTP=%{http_code}\\n' http://127.0.0.1:9090/generator_builder && head -n 25 /tmp/cg_gb.html | cat",
+			"isBackground": false
+		},
+		{
+			"label": "Fetch Generator Builder (auth)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie_gb.txt /tmp/cg_gb.html && curl -sS -c /tmp/cg_cookie_gb.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_gb.txt -o /tmp/cg_gb.html -w 'HTTP=%{http_code}\\n' http://127.0.0.1:9090/generator_builder && head -n 20 /tmp/cg_gb.html | cat",
+			"isBackground": false
+		},
+		{
+			"label": "HTTP status generator_builder (auth)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie_gb.txt && curl -sS -c /tmp/cg_cookie_gb.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_gb.txt -o /dev/null -w 'HTTP=%{http_code}\\n' http://127.0.0.1:9090/generator_builder",
+			"isBackground": false
+		},
+		{
+			"label": "Check detached webui pid",
+			"type": "shell",
+			"command": "ps -p 13794 -o pid,ppid,command || echo 'not running'",
+			"isBackground": false
+		},
+		{
+			"label": "Web UI (9090) background",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m main",
+			"isBackground": true
+		},
+		{
+			"label": "Smoke: Generator Builder 200",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie_gb.txt && curl -sS -c /tmp/cg_cookie_gb.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_gb.txt -o /dev/null -w 'HTTP=%{http_code}\\n' http://127.0.0.1:9090/generator_builder",
+			"isBackground": false
+		},
+		{
+			"label": "Restart Web UI (9090) - manual",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\"",
+			"isBackground": false
+		},
+		{
+			"label": "Health + ai_prompt check",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && sleep 0.8 && curl -fsS http://127.0.0.1:9090/healthz && echo && code=$(curl -s -o /dev/null -w \"%{http_code}\" -X POST http://127.0.0.1:9090/api/generators/ai_prompt -H \"Content-Type: application/json\" -d \"{}\") && echo \"ai_prompt_status=$code\"",
+			"isBackground": false
+		},
+		{
+			"label": "Health + scaffold_meta sanity",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && sleep 0.8 && curl -fsS http://127.0.0.1:9090/healthz && echo && rm -f /tmp/cg_cookie_meta.txt /tmp/cg_meta.json && curl -sS -c /tmp/cg_cookie_meta.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_meta.txt -H 'Content-Type: application/json' -o /tmp/cg_meta.json http://127.0.0.1:9090/api/generators/scaffold_meta --data-binary '{\"plugin_type\":\"flag-generator\",\"plugin_id\":\"meta_smoke\",\"folder_name\":\"py_meta_smoke\",\"requires\":[],\"produces\":[\"flag\"],\"inputs\":{\"seed\":true,\"secret\":true,\"flag_prefix\":true},\"hint_templates\":[]}' && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport json\nobj=json.load(open('/tmp/cg_meta.json','r',encoding='utf-8'))\nprint('ok=', obj.get('ok'))\nprint('paths=', len(obj.get('scaffold_paths') or []))\nprint('has_catalog=', isinstance(obj.get('catalog_source'), dict))\nPY",
+			"isBackground": false
+		},
+		{
+			"label": "Restart Web UI detached (9090) - fresh log",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && rm -f outputs/logs/webui-9090.log && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\" && sleep 0.8 && lsof -nP -iTCP:9090 -sTCP:LISTEN | head || true && tail -n 30 outputs/logs/webui-9090.log | cat",
+			"isBackground": false
+		},
+		{
+			"label": "Smoke scaffold_meta (auth)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie_meta.txt /tmp/cg_meta.json && curl -sS -c /tmp/cg_cookie_meta.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_meta.txt -H 'Content-Type: application/json' -o /tmp/cg_meta.json http://127.0.0.1:9090/api/generators/scaffold_meta --data-binary '{\"plugin_type\":\"flag-generator\",\"plugin_id\":\"meta_smoke\",\"folder_name\":\"py_meta_smoke\",\"requires\":[],\"produces\":[\"flag\"],\"inputs\":{\"seed\":true,\"secret\":true,\"flag_prefix\":true},\"hint_templates\":[]}' && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport json\nobj=json.load(open('/tmp/cg_meta.json','r',encoding='utf-8'))\nprint('ok=', obj.get('ok'))\nprint('paths=', len(obj.get('scaffold_paths') or []))\nprint('has_catalog=', isinstance(obj.get('catalog_source'), dict))\nPY",
 			"isBackground": false
 		}
 	]

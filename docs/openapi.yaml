@@ -20,6 +20,8 @@ tags:
     description: Uploading, downloading, and saving Scenario Editor XML payloads.
   - name: Planning
     description: Deterministic plan previews and related planning helpers.
+  - name: Flag Sequencing
+    description: Flag sequencing (Flow) endpoints for generating a chain and exporting Attack Flow Builder (.afb).
   - name: Runs
     description: Synchronous and asynchronous CLI execution routes.
   - name: Reports
@@ -36,6 +38,8 @@ tags:
     description: Administrative helpers and cleanup tasks.
   - name: Data Sources
     description: Vulnerability/data source CSV management endpoints.
+  - name: Generator Builder
+    description: Helpers for scaffolding new flag-generators and flag-node-generators.
   - name: Vulnerabilities
     description: Compose download/pull helpers for vulnerability catalog entries.
   - name: Users
@@ -49,6 +53,171 @@ tags:
 security:
   - sessionCookie: []
 paths:
+  /generator_builder:
+    get:
+      tags:
+        - Generator Builder
+        - UI Pages
+      summary: Render the Generator Builder page
+      description: >-
+        HTML page for downloading a scaffold ZIP for new generator implementations.
+      responses:
+        '200':
+          description: Generator Builder HTML.
+          content:
+            text/html:
+              schema:
+                type: string
+        '302':
+          description: Redirect to /login when not authenticated.
+
+  /api/generators/scaffold_meta:
+    post:
+      tags:
+        - Generator Builder
+      summary: Generate scaffold metadata
+      description: >-
+        Returns the schema v3 catalog source JSON payload plus the list of scaffold file paths
+        for the requested generator. Used by the Generator Builder UI to preview the generated
+        catalog JSON and file list.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GeneratorBuilderRequest'
+      responses:
+        '200':
+          description: Scaffold metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeneratorScaffoldMetaResponse'
+        '400':
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Login required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Builder/admin role required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/generators/scaffold_zip:
+    post:
+      tags:
+        - Generator Builder
+      summary: Download a scaffold ZIP for a generator
+      description: >-
+        Returns a ZIP archive containing a ready-to-unzip scaffold.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GeneratorBuilderRequest'
+      responses:
+        '200':
+          description: ZIP archive.
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Login required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Builder/admin role required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/generators/register_catalog:
+    post:
+      tags:
+        - Generator Builder
+      summary: Register a generator catalog source
+      description: >-
+        Convenience endpoint that writes the generated schema v3 catalog source JSON into
+        `data_sources/flag_generators/` or `data_sources/flag_node_generators/` and updates
+        the corresponding `_state.json` to enable it.
+
+        By default this endpoint refuses to register if a generator with the same `plugin_id`
+        already exists in enabled sources (HTTP 409). Use `force=true` to bypass the duplicate check.
+
+        Example request:
+
+        ```json
+        {
+          "plugin_type": "flag-generator",
+          "plugin_id": "my_ssh_creds",
+          "folder_name": "py_my_ssh_creds",
+          "name": "SSH Credentials",
+          "description": "Emits deterministic SSH credentials.",
+          "requires": [],
+          "produces": ["flag", "ssh_username", "ssh_password"],
+          "inputs": {"seed": true, "secret": true, "flag_prefix": true},
+          "hint_templates": ["Next: SSH using {{OUTPUT.ssh_username}} / {{OUTPUT.ssh_password}}"],
+          "enabled": true
+        }
+        ```
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GeneratorRegisterRequest'
+      responses:
+        '200':
+          description: Catalog source registered and state updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeneratorRegisterResponse'
+        '400':
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Login required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Builder/admin role required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Duplicate generator id or catalog file exists.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /login:
     get:
       tags:
@@ -313,6 +482,213 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PlanPreviewResponse'
+
+  /api/flag-sequencing/attackflow_preview:
+    get:
+      tags:
+        - Flag Sequencing
+      summary: Generate a flag-sequencing chain preview
+      description: >-
+        Computes an ordered chain of eligible nodes (Docker/vulnerability candidates) from the latest
+        preview plan and returns flag generator assignments plus validity metadata used by the Flow UI.
+
+        Note: legacy STIX/AttackFlow bundle export has been removed. The `download=1` query parameter
+        returns HTTP 410.
+      parameters:
+        - name: scenario
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Scenario label (defaults to latest run-history scenario when omitted).
+        - name: length
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 5
+        - name: preset
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional preset (forces a fixed chain shape/length).
+        - name: prefer_preview
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['0', '1']
+        - name: force_preview
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['0', '1']
+        - name: best_effort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['0', '1']
+          description: Clamp to available eligible nodes instead of returning 422.
+        - name: debug
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['0', '1']
+        - name: debug_dag
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['0', '1']
+        - name: download
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['0', '1', 'true', 'false', 'yes', 'no']
+          description: Deprecated legacy STIX export toggle (always returns 410).
+      responses:
+        '200':
+          description: Chain preview.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttackflowPreviewResponse'
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No preview plan available.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Legacy STIX export removed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Not enough eligible nodes to satisfy requested length.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/flag-sequencing/prepare_preview_for_execute:
+    post:
+      tags:
+        - Flag Sequencing
+      summary: Prepare a preview plan for hint resolution/execution
+      description: >-
+        Runs best-effort preparation steps (e.g., resolving hint placeholders) using the provided chain
+        and preview plan path. This endpoint is used by the Flow UI to materialize `hint.txt` after
+        generator outputs are available.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PreparePreviewForExecuteRequest'
+      responses:
+        '200':
+          description: Preparation results.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreparePreviewForExecuteResponse'
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Missing preview plan.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Preparation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/flag-sequencing/afb_from_chain:
+    post:
+      tags:
+        - Flag Sequencing
+      summary: Export Attack Flow Builder (.afb) from a chain
+      description: >-
+        Returns an Attack Flow Builder native export document (OpenChart DiagramViewExport) for the
+        ordered chain. This is the supported export format.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AfbFromChainRequest'
+      responses:
+        '200':
+          description: AFB export.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AfbFromChainResponse'
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid chain or generator assignment error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/flag-sequencing/bundle_from_chain:
+    post:
+      tags:
+        - Flag Sequencing
+      summary: (Deprecated) STIX bundle export from a chain
+      description: STIX bundle export has been removed in favor of the Attack Flow Builder (.afb) export.
+      deprecated: true
+      responses:
+        '410':
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/flag-sequencing/attackflow:
+    get:
+      tags:
+        - Flag Sequencing
+      summary: (Deprecated) STIX AttackFlow export
+      description: STIX/AttackFlow bundle export has been removed in favor of the Attack Flow Builder (.afb) export.
+      deprecated: true
+      responses:
+        '410':
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /api/open_scripts:
     get:
       tags:
@@ -2151,8 +2527,322 @@ components:
     ErrorResponse:
       type: object
       properties:
+        ok:
+          type: boolean
+          nullable: true
         error:
           type: string
+
+    GeneratorBuilderInputsFlags:
+      type: object
+      description: Convenience flags indicating which standard inputs to include in the generated catalog schema.
+      additionalProperties: false
+      properties:
+        seed:
+          type: boolean
+        secret:
+          type: boolean
+        node_name:
+          type: boolean
+        flag_prefix:
+          type: boolean
+
+    GeneratorBuilderRequest:
+      type: object
+      required:
+        - plugin_type
+        - plugin_id
+      properties:
+        plugin_type:
+          type: string
+          enum: ['flag-generator', 'flag-node-generator']
+        plugin_id:
+          type: string
+          description: Unique generator plugin identifier.
+        folder_name:
+          type: string
+          nullable: true
+          description: Folder to scaffold under flag_generators/ or flag_node_generators/.
+        name:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+        requires:
+          type: array
+          items:
+            type: string
+        produces:
+          type: array
+          items:
+            type: string
+        inputs:
+          $ref: '#/components/schemas/GeneratorBuilderInputsFlags'
+        hint_templates:
+          type: array
+          items:
+            type: string
+
+    GeneratorScaffoldMetaResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        catalog_source:
+          type: object
+          description: Schema v3 catalog source JSON document.
+          additionalProperties: true
+        scaffold_paths:
+          type: array
+          items:
+            type: string
+
+    GeneratorCatalogSourceEntry:
+      type: object
+      description: Entry appended to the enabled catalog sources state file.
+      additionalProperties: true
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        path:
+          type: string
+        enabled:
+          type: boolean
+        rows:
+          type: string
+          nullable: true
+        uploaded:
+          type: string
+          nullable: true
+
+    GeneratorRegisterRequest:
+      allOf:
+        - $ref: '#/components/schemas/GeneratorBuilderRequest'
+        - type: object
+          description: >-
+            Extends GeneratorBuilderRequest with registration controls. When omitted,
+            `enabled` defaults to true and `force`/`overwrite` default to false.
+          properties:
+            force:
+              type: boolean
+              nullable: true
+              description: Bypass duplicate generator id check.
+            overwrite:
+              type: boolean
+              nullable: true
+              description: Allow overwriting the generated catalog source file if the destination path already exists.
+            enabled:
+              type: boolean
+              nullable: true
+              description: Whether to enable the new catalog source in the state file.
+            source_name:
+              type: string
+              nullable: true
+              description: Human-friendly name for the catalog source entry.
+
+    GeneratorRegisterResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        catalog_path:
+          type: string
+          nullable: true
+        state_path:
+          type: string
+          nullable: true
+        source:
+          $ref: '#/components/schemas/GeneratorCatalogSourceEntry'
+        note:
+          type: string
+          nullable: true
+        scaffold_paths:
+          type: array
+          items:
+            type: string
+        catalog_source:
+          type: object
+          description: Schema v3 catalog source JSON document written to disk.
+          additionalProperties: true
+        existing_source_path:
+          type: string
+          nullable: true
+          description: When present (typically with HTTP 409), indicates the source file that already provides the generator.
+      additionalProperties: true
+
+    FlowChainNode:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+          nullable: true
+        type:
+          type: string
+          nullable: true
+        is_vuln:
+          type: boolean
+          nullable: true
+      additionalProperties: true
+
+    FlagAssignment:
+      type: object
+      description: Flag generator assignment metadata (best-effort, UI-oriented).
+      additionalProperties: true
+
+    AttackflowPreviewResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        scenario:
+          type: string
+          nullable: true
+        length:
+          type: integer
+          nullable: true
+        requested_length:
+          type: integer
+          nullable: true
+        preview_plan_path:
+          type: string
+          nullable: true
+        chain:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlowChainNode'
+        flag_assignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlagAssignment'
+        stats:
+          type: object
+          nullable: true
+          additionalProperties: true
+        flow_valid:
+          type: boolean
+          nullable: true
+        flow_errors:
+          type: array
+          items:
+            type: string
+        flags_enabled:
+          type: boolean
+          nullable: true
+        warning:
+          type: string
+          nullable: true
+        debug:
+          type: object
+          nullable: true
+          additionalProperties: true
+        sequencer_dag:
+          type: object
+          nullable: true
+          additionalProperties: true
+      additionalProperties: true
+
+    PreparePreviewForExecuteRequest:
+      type: object
+      required:
+        - scenario
+      properties:
+        scenario:
+          type: string
+        length:
+          type: integer
+          nullable: true
+        preset:
+          type: string
+          nullable: true
+        chain_ids:
+          type: array
+          items:
+            type: string
+        preview_plan:
+          type: string
+          nullable: true
+        mode:
+          type: string
+          nullable: true
+        best_effort:
+          type: boolean
+          nullable: true
+        timeout_s:
+          type: integer
+          nullable: true
+      additionalProperties: true
+
+    PreparePreviewForExecuteResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+      additionalProperties: true
+
+    AfbFromChainRequest:
+      type: object
+      required:
+        - scenario
+        - chain
+      properties:
+        scenario:
+          type: string
+        chain:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlowChainNode'
+      additionalProperties: true
+
+    AfbFromChainResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        scenario:
+          type: string
+          nullable: true
+        length:
+          type: integer
+          nullable: true
+        chain:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        flag_assignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlagAssignment'
+        afb:
+          type: object
+          description: Attack Flow Builder .afb export document.
+          additionalProperties: true
+        flow_valid:
+          type: boolean
+          nullable: true
+        flow_errors:
+          type: array
+          items:
+            type: string
+        flags_enabled:
+          type: boolean
+          nullable: true
+      additionalProperties: true
     DataSourceSaveResponse:
       type: object
       properties:
