@@ -7,6 +7,9 @@ This repo supports **two generator families** used by the Flag Sequencing (Flow)
 
 Both families share the same runtime output contract: a machine-readable `outputs.json`.
 
+AI prompt templates (copy/paste):
+- `docs/AI_PROMPT_TEMPLATES.md`
+
 ---
 
 ## 1) Concepts and file layout
