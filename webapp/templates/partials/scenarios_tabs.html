@@ -54,6 +54,9 @@
   const PROJECT_STATE_STORAGE_KEY = 'coretg_project_state_map_v1';
   const LAST_PROJECT_KEY_STORAGE_KEY = 'coretg_last_project_key';
   const PROJECT_ACTIVE_IDX_STORAGE_KEY = 'coretg_project_active_idx_map_v1';
+  const LATEST_XML_BY_SCENARIO_STORAGE_KEY = 'coretg_latest_xml_by_scenario_v1';
+  const SEED_BY_SCENARIO_STORAGE_KEY = 'coretg_seed_by_scenario_v1';
+  const PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY = 'coretg_preview_plan_by_scenario_v1';
 
   function readJsonFromLocalStorage(key, fallback){
     try {
@@ -64,6 +67,144 @@
     } catch (e) {
       return fallback;
     }
+  }
+
+  function readLatestXmlMap(){
+    return readJsonFromLocalStorage(LATEST_XML_BY_SCENARIO_STORAGE_KEY, {});
+  }
+
+  function readSeedMap(){
+    return readJsonFromLocalStorage(SEED_BY_SCENARIO_STORAGE_KEY, {});
+  }
+
+  function readPreviewPlanMap(){
+    return readJsonFromLocalStorage(PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY, {});
+  }
+
+  function getPreviewPlanPathForScenario(scenarioName){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      if (!key) return '';
+      const map = readPreviewPlanMap();
+      const entry = (map && typeof map === 'object') ? map[key] : null;
+      const path = entry && typeof entry === 'object' ? (entry.preview_plan_path || entry.previewPlanPath || '') : '';
+      return (path || '').toString().trim();
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function setPreviewPlanPathForScenario(scenarioName, previewPlanPath){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      const path = (previewPlanPath || '').toString().trim();
+      if (!key || !path) return;
+      const map = readPreviewPlanMap();
+      const next = (map && typeof map === 'object') ? map : {};
+      next[key] = {
+        scenario: (scenarioName || '').toString().trim(),
+        preview_plan_path: path,
+        updated_at: Date.now(),
+      };
+      localStorage.setItem(PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY, JSON.stringify(next));
+    } catch (e) {}
+  }
+
+  function stableSeedFromScenario(scenarioName){
+    try {
+      // Prefer project key if available so seeds are stable within a project.
+      const projKey = (localStorage.getItem(LAST_PROJECT_KEY_STORAGE_KEY) || '').trim();
+      const scenKey = normalizeScenarioKey(scenarioName) || '__default__';
+      const base = (projKey ? (projKey + '|') : '') + scenKey;
+
+      // Small deterministic hash -> 31-bit positive int.
+      let h = 2166136261;
+      for (let i = 0; i < base.length; i++) {
+        h ^= base.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      const seed = (h >>> 0) % 2147483647;
+      return seed || 1;
+    } catch (e) {
+      return 1;
+    }
+  }
+
+  function getSeedForScenario(scenarioName){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      if (!key) return null;
+      const map = readSeedMap();
+      const entry = (map && typeof map === 'object') ? map[key] : null;
+      const raw = entry && typeof entry === 'object' ? (entry.seed ?? null) : null;
+      if (raw === null || raw === undefined || raw === '') {
+        return null;
+      }
+      const n = parseInt(String(raw), 10);
+      return Number.isFinite(n) ? n : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function ensureSeedForScenario(scenarioName){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      if (!key) return null;
+      const existing = getSeedForScenario(scenarioName);
+      if (existing !== null) return existing;
+      const seed = stableSeedFromScenario(scenarioName);
+      setSeedForScenario(scenarioName, seed);
+      return seed;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function setSeedForScenario(scenarioName, seed){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      if (!key) return;
+      const n = parseInt(String(seed ?? ''), 10);
+      if (!Number.isFinite(n)) return;
+      const map = readSeedMap();
+      const next = (map && typeof map === 'object') ? map : {};
+      next[key] = {
+        scenario: (scenarioName || '').toString().trim(),
+        seed: n,
+        updated_at: Date.now(),
+      };
+      localStorage.setItem(SEED_BY_SCENARIO_STORAGE_KEY, JSON.stringify(next));
+    } catch (e) {}
+  }
+
+  function getLatestXmlPathForScenario(scenarioName){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      if (!key) return '';
+      const map = readLatestXmlMap();
+      const entry = (map && typeof map === 'object') ? map[key] : null;
+      const path = entry && typeof entry === 'object' ? (entry.xml_path || entry.xmlPath || '') : '';
+      return (path || '').toString().trim();
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function setLatestXmlPathForScenario(scenarioName, xmlPath){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      const path = (xmlPath || '').toString().trim();
+      if (!key || !path) return;
+      const map = readLatestXmlMap();
+      const next = (map && typeof map === 'object') ? map : {};
+      next[key] = {
+        scenario: (scenarioName || '').toString().trim(),
+        xml_path: path,
+        updated_at: Date.now(),
+      };
+      localStorage.setItem(LATEST_XML_BY_SCENARIO_STORAGE_KEY, JSON.stringify(next));
+    } catch (e) {}
   }
 
   function pickBestLocalSnapshotByScenarioCount(snapshotMap){
@@ -286,6 +427,20 @@
     const xmlPath = (data && data.result_path) ? String(data.result_path) : '';
     if (!xmlPath) throw new Error('Save succeeded but returned no result_path.');
 
+    // Remember the latest saved XML path for this scenario so other tabs (Preview/Flow)
+    // can refer to the same snapshot.
+    try {
+      const scenarioName = resolveScenarioNameForSave();
+      if (scenarioName) setLatestXmlPathForScenario(scenarioName, xmlPath);
+    } catch (e) {}
+
+    // Preserve a stable per-scenario seed across saves so Preview/Flow do not "re-roll"
+    // just because the XML path changes.
+    try {
+      const scenarioName = resolveScenarioNameForSave();
+      if (scenarioName) ensureSeedForScenario(scenarioName);
+    } catch (e) {}
+
     // If the Topology page state is present, keep it in sync.
     try {
       if (window.state && typeof window.state === 'object') {
@@ -321,6 +476,13 @@
   window.coretgSaveAllAndGoPreview = saveAllAndGoPreview;
   window.coretgGetSavedFlowStateForScenario = getSavedFlowStateForScenario;
   window.coretgSetSavedFlowStateForScenario = setSavedFlowStateForScenario;
+  window.coretgGetLatestXmlPathForScenario = getLatestXmlPathForScenario;
+  window.coretgSetLatestXmlPathForScenario = setLatestXmlPathForScenario;
+  window.coretgGetSeedForScenario = getSeedForScenario;
+  window.coretgEnsureSeedForScenario = ensureSeedForScenario;
+  window.coretgSetSeedForScenario = setSeedForScenario;
+  window.coretgGetPreviewPlanPathForScenario = getPreviewPlanPathForScenario;
+  window.coretgSetPreviewPlanPathForScenario = setPreviewPlanPathForScenario;
 
   window.coretgRefreshScenariosExecuteButtonState = refreshScenariosExecuteButtonState;
   document.addEventListener('DOMContentLoaded', refreshScenariosExecuteButtonState);

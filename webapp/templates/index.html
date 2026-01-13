@@ -6690,6 +6690,52 @@ async function autoSaveXml(){
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+    const hitlSnapshotForScenarioIndex = (sidx) => {
+        try {
+            const scen = Number.isInteger(sidx) ? (state && Array.isArray(state.scenarios) ? state.scenarios[sidx] : null) : null;
+            const hitl = (scen && typeof scen === 'object') ? (scen.hitl || null) : null;
+            return JSON.stringify(hitl || null);
+        } catch (e) {
+            return '';
+        }
+    };
+
+    const scenarioNameForIndex = (sidx) => {
+        try {
+            const scen = Number.isInteger(sidx) ? (state && Array.isArray(state.scenarios) ? state.scenarios[sidx] : null) : null;
+            const name = scen && typeof scen === 'object' ? String(scen.name || '').trim() : '';
+            return name;
+        } catch (e) {
+            return '';
+        }
+    };
+
+    const bindHitlSnapshotToModal = (modalId) => {
+        try {
+            const modalEl = document.getElementById(modalId);
+            if (!modalEl) return;
+            if (modalEl.dataset.hitlSnapshotBound === '1') return;
+            const capture = () => {
+                try {
+                    const { idx } = getActiveScenarioContext();
+                    modalEl.dataset.hitlSnapshot = hitlSnapshotForScenarioIndex(idx);
+                } catch (e) {}
+            };
+            if (window.bootstrap) {
+                modalEl.addEventListener('show.bs.modal', capture);
+            }
+            // Fallback: if bootstrap events aren't available, capture on first interaction.
+            modalEl.addEventListener('click', () => {
+                try {
+                    if (!modalEl.dataset.hitlSnapshot) capture();
+                } catch (e) {}
+            }, { capture: true });
+            modalEl.dataset.hitlSnapshotBound = '1';
+        } catch (e) {}
+    };
+    bindHitlSnapshotToModal('coreVmModal');
+    bindHitlSnapshotToModal('externalIfxModal');
+
     const bindModalSaveButton = (buttonId, options = {}) => {
         const btn = document.getElementById(buttonId);
         if (!btn || btn.dataset.modalSaveBound === '1') return;
@@ -6736,6 +6782,37 @@ document.addEventListener('DOMContentLoaded', () => {
         btn.addEventListener('click', async () => {
             if (btn.disabled) return;
             const originalHtml = btn.innerHTML;
+
+            // VM / Access: warn if HITL settings were changed since modal open.
+            try {
+                if ((buttonId === 'coreVmModalSaveBtn' || buttonId === 'externalIfxModalSaveBtn')
+                    && (typeof SCENARIOS_ACTIVE_TAB === 'string' && SCENARIOS_ACTIVE_TAB === 'connection-setup')) {
+                    const modalEl = btn.closest('.modal');
+                    if (modalEl) {
+                        const before = String(modalEl.dataset.hitlSnapshot || '');
+                        const nowSnap = (() => {
+                            try {
+                                const { idx } = getActiveScenarioContext();
+                                return hitlSnapshotForScenarioIndex(idx);
+                            } catch (e) {
+                                return '';
+                            }
+                        })();
+                        if (before && nowSnap && before !== nowSnap) {
+                            let scenarioName = '';
+                            try {
+                                const { idx } = getActiveScenarioContext();
+                                scenarioName = scenarioNameForIndex(idx);
+                            } catch (e) {}
+                            const msg = scenarioName
+                                ? ('These VM / Access (HITL) changes will invalidate Flag Sequencing for scenario "' + scenarioName + '".\n\nYou may need to re-run Generate on the Flag Sequencing page.\n\nContinue?')
+                                : 'These VM / Access (HITL) changes will invalidate Flag Sequencing for this project.\n\nYou may need to re-run Generate on the Flag Sequencing page.\n\nContinue?';
+                            const proceed = window.confirm(msg);
+                            if (!proceed) return;
+                        }
+                    }
+                }
+            } catch (e) {}
 
             // CORE VM select modal: verify first; only close on success.
             if (buttonId === 'coreVmModalSaveBtn') {
@@ -16226,6 +16303,22 @@ document.addEventListener('DOMContentLoaded', () => {
                     try { showToast('Builder view cannot Save XML (admin-only).', { autohide: true, delay: 2600 }); } catch (_) {}
                     return;
                 }
+                // Topology tab: warn that saving invalidates Flag Sequencing.
+                try {
+                    if (typeof SCENARIOS_ACTIVE_TAB === 'string' && SCENARIOS_ACTIVE_TAB === 'topology') {
+                        let scenName = '';
+                        try {
+                            scenName = (state && Array.isArray(state.scenarios) && state.scenarios[activeIdx])
+                                ? String(state.scenarios[activeIdx].name || '').trim()
+                                : '';
+                        } catch (e) {}
+                        const msg = scenName
+                            ? ('Saving XML from the Topology page will invalidate Flag Sequencing for scenario "' + scenName + '".\n\nYou may need to re-run Generate on the Flag Sequencing page.\n\nContinue?')
+                            : 'Saving XML from the Topology page will invalidate Flag Sequencing for this project.\n\nYou may need to re-run Generate on the Flag Sequencing page.\n\nContinue?';
+                        const proceed = window.confirm(msg);
+                        if (!proceed) return;
+                    }
+                } catch (e) {}
                 if (typeof window.coretgSaveXmlViaApi !== 'function') {
                     alert('Save helper unavailable; refresh and try again.');
                     return;

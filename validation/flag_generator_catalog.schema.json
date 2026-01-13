@@ -53,19 +53,7 @@
         "requires": {
           "type": "array",
           "items": {
-            "type": "string",
-            "not": {
-              "enum": [
-                "seed",
-                "secret",
-                "env_name",
-                "challenge",
-                "flag_prefix",
-                "username_prefix",
-                "key_len",
-                "node_name"
-              ]
-            }
+            "type": "string"
           }
         },
         "produces": {"type": "array", "items": {"$ref": "#/$defs/artifactRef"}},

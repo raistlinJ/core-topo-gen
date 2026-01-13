@@ -81,9 +81,10 @@
       <input type="hidden" name="xml_path" value="{{ xml_path }}" />
       {% if scenario %}<input type="hidden" name="scenario" value="{{ scenario }}" />{% endif %}
       {% if hide_chrome %}<input type="hidden" name="embed" value="1" />{% endif %}
+      <input type="hidden" name="force" value="1" />
       <div class="input-group input-group-sm me-2" style="width:160px;">
         <span class="input-group-text">Seed</span>
-        <input type="text" class="form-control" name="seed" value="" placeholder="random" />
+        <input type="text" class="form-control" name="seed" value="{{ seed }}" placeholder="random" />
       </div>
       <button class="btn btn-sm btn-outline-secondary" type="submit" title="Re-run preview with new / provided seed">Re-roll</button>
     </form>
@@ -3895,6 +3896,55 @@ function buildScenarioUrl(basePath){
       }
     });
   }
+})();
+</script>
+
+<script>
+(function(){
+  try {
+    const form = document.getElementById('rerollForm');
+    if(!form) return;
+    // Guard against duplicate bindings (e.g., embedded HTML re-injected).
+    if (form.dataset.rerollConfirmBound === '1') return;
+    form.dataset.rerollConfirmBound = '1';
+    const seedInput = form.querySelector('input[name="seed"]');
+    const currentSeed = String({{ seed|tojson }} || '').trim();
+    const scenarioName = String({{ (scenario or '')|tojson }} || '').trim();
+
+    form.addEventListener('submit', (ev)=>{
+      // If multiple submit listeners exist for any reason, ensure the confirm
+      // prompt is only shown once per submission.
+      if (form.dataset.rerollConfirmInFlight === '1') return;
+      form.dataset.rerollConfirmInFlight = '1';
+      try {
+        const nextSeed = (seedInput && typeof seedInput.value === 'string') ? seedInput.value.trim() : '';
+        if(nextSeed && currentSeed && nextSeed !== currentSeed){
+          const ok = confirm('Changing the seed will re-roll the preview (IPs, node assignments, and derived values may change).\n\nContinue?');
+          if(!ok){
+            ev.preventDefault();
+            return;
+          }
+        }
+        if(scenarioName && nextSeed){
+          const n = parseInt(nextSeed, 10);
+          if(Number.isFinite(n)){
+            try {
+              const p = (window.parent && window.parent !== window) ? window.parent : null;
+              if(p && typeof p.coretgSetSeedForScenario === 'function'){
+                p.coretgSetSeedForScenario(scenarioName, n);
+              }
+            } catch(e) {}
+          }
+        }
+      } catch(e) {}
+      finally {
+        // Clear on next tick so future submissions still prompt as expected.
+        try { window.setTimeout(() => { try { delete form.dataset.rerollConfirmInFlight; } catch (_) { form.dataset.rerollConfirmInFlight = '0'; } }, 0); } catch (_) {
+          try { delete form.dataset.rerollConfirmInFlight; } catch (_) { form.dataset.rerollConfirmInFlight = '0'; }
+        }
+      }
+    });
+  } catch(e) {}
 })();
 </script>
 {% endblock %} {# end extra_scripts #}

@@ -1694,11 +1694,16 @@
     }
   }
 
-  async function generate(preferPreview){
+  async function generate(preferPreview, opts){
+    const options = (opts && typeof opts === 'object') ? opts : {};
     const usePreview = !!preferPreview;
     const scenario = (scenarioEl && scenarioEl.value || '').trim();
     const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
     const length = preset ? 3 : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
+
+    // User-click Generate should be deterministic: save current settings, produce a fresh
+    // preview plan, then build + resolve the flow from that exact snapshot.
+    const runSavePreviewResolve = !!(usePreview && options && options.savePreviewResolve);
 
     const params = new URLSearchParams();
     if(scenario) params.set('scenario', scenario);
@@ -1710,7 +1715,7 @@
       params.set('force_preview', '1');
     }
 
-    const baseApiUrl = '/api/flag-sequencing/attackflow_preview?' + params.toString();
+    const buildAttackflowPreviewUrl = (p) => '/api/flag-sequencing/attackflow_preview?' + (p ? p.toString() : params.toString());
     if(afbDownloadLink) afbDownloadLink.href = '#';
 
     setStatus('Generating…', false);
@@ -1722,9 +1727,63 @@
     if(jsonEl) jsonEl.textContent = '';
 
     try {
+      if(runSavePreviewResolve){
+        const scenLabel = (scenario || activeScenario || '').toString().trim();
+        const msg = scenLabel
+          ? ('Generate will save current Topology / VM Access settings for scenario "' + scenLabel + '" and then resolve Flag Sequencing hints.\n\nContinue?')
+          : 'Generate will save current Topology / VM Access settings and then resolve Flag Sequencing hints.\n\nContinue?';
+        const ok = confirm(msg);
+        if(!ok){
+          hideLoading();
+          setStatus('Generate cancelled.', false);
+          return;
+        }
+        if(typeof window.coretgSaveXmlViaApi !== 'function' || typeof window.coretgPostJson !== 'function'){
+          throw new Error('Save helper unavailable; refresh and try again.');
+        }
+
+        setStatus('Saving XML…', false);
+        showLoading('Saving XML…');
+        const xmlPath = await window.coretgSaveXmlViaApi();
+        if(!xmlPath){
+          throw new Error('Save did not return xml_path');
+        }
+
+        setStatus('Preparing preview plan…', false);
+        showLoading('Preparing preview plan…');
+        let seed = null;
+        try {
+          if (scenario && typeof window.coretgEnsureSeedForScenario === 'function') {
+            seed = window.coretgEnsureSeedForScenario(scenario);
+          }
+        } catch(e) { seed = null; }
+        const persisted = await window.coretgPostJson('/api/plan/persist_preview_plan', { xml_path: xmlPath, scenario, seed });
+        try {
+          if (scenario && persisted && persisted.seed !== undefined && typeof window.coretgSetSeedForScenario === 'function') {
+            window.coretgSetSeedForScenario(scenario, persisted.seed);
+          }
+        } catch(e) {}
+        const previewPlan = (persisted && persisted.preview_plan_path) ? String(persisted.preview_plan_path) : '';
+        if(!previewPlan){
+          throw new Error('Failed to persist preview plan');
+        }
+        try {
+          if (scenario && typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
+            window.coretgSetPreviewPlanPathForScenario(scenario, previewPlan);
+          }
+        } catch(e) {}
+        try {
+          if (scenario && typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
+            window.coretgSetPreviewPlanPathForScenario(scenario, previewPlan);
+          }
+        } catch(e) {}
+        lastPreviewPlanPath = previewPlan;
+        params.set('preview_plan', previewPlan);
+      }
+
       let data;
       try{
-        data = await fetchJson(baseApiUrl);
+        data = await fetchJson(buildAttackflowPreviewUrl(params));
       } catch(err){
         // If Generate requested a longer chain than available, ask user whether to
         // retry in best-effort mode (clamp to available) or cancel.
@@ -1738,7 +1797,7 @@
           }
           const params2 = new URLSearchParams(params.toString());
           params2.set('best_effort', '1');
-          const retryUrl = '/api/flag-sequencing/attackflow_preview?' + params2.toString();
+          const retryUrl = buildAttackflowPreviewUrl(params2);
           data = await fetchJson(retryUrl);
         } else {
           throw err;
@@ -1963,7 +2022,18 @@
       // Ensure we have a persisted preview plan artifact to base Flow changes on.
       setStatus('Preparing preview plan…', false);
       showLoading('Preparing preview plan…');
-      const persisted = await window.coretgPostJson('/api/plan/persist_preview_plan', { xml_path: xmlPath, scenario });
+      let seed = null;
+      try {
+        if (scenario && typeof window.coretgEnsureSeedForScenario === 'function') {
+          seed = window.coretgEnsureSeedForScenario(scenario);
+        }
+      } catch(e) { seed = null; }
+      const persisted = await window.coretgPostJson('/api/plan/persist_preview_plan', { xml_path: xmlPath, scenario, seed });
+      try {
+        if (scenario && persisted && persisted.seed !== undefined && typeof window.coretgSetSeedForScenario === 'function') {
+          window.coretgSetSeedForScenario(scenario, persisted.seed);
+        }
+      } catch(e) {}
       const previewPlan = (persisted && persisted.preview_plan_path) ? String(persisted.preview_plan_path) : '';
       if(!previewPlan){
         throw new Error('Failed to persist preview plan');
@@ -2157,7 +2227,7 @@
     }
   } catch(e) {}
 
-  if(btnEl) btnEl.addEventListener('click', (e)=>{ e.preventDefault(); generate(true); });
+  if(btnEl) btnEl.addEventListener('click', (e)=>{ e.preventDefault(); generate(true, { savePreviewResolve: true }); });
   // Handlers for Save/Preview are registered above.
   if(downloadXmlEl) downloadXmlEl.addEventListener('click', (e)=>{ e.preventDefault(); downloadXml(); });
 

@@ -3941,9 +3941,17 @@ def _enrich_hitl_interfaces_with_ips(hitl_cfg: Dict[str, Any]) -> None:
             iface['rj45_ip4'] = ip_info.get('rj45_ip4')
             ipv4_current = iface.get('ipv4') if isinstance(iface.get('ipv4'), list) else []
             rj45_ip = iface.get('rj45_ip4')
+            # Keep any user-provided (real) interface IPs first; append predicted RJ45 IP as a fallback.
+            # This makes downstream "first valid ipv4" selection match what users typically expect
+            # (their actual interface IP), while still retaining the predicted link IP.
             if rj45_ip:
-                ordered = [rj45_ip] + [ip for ip in ipv4_current if ip != rj45_ip]
-                iface['ipv4'] = ordered
+                if not ipv4_current:
+                    iface['ipv4'] = [rj45_ip]
+                else:
+                    if rj45_ip not in ipv4_current:
+                        iface['ipv4'] = list(ipv4_current) + [rj45_ip]
+                    else:
+                        iface['ipv4'] = ipv4_current
         if attachment != 'new_router':
             continue
         if not ip_info:
@@ -8142,6 +8150,15 @@ def _attack_flow_builder_afb_for_chain(
 
     flow_name = f"Flag Chain" + (f" - {scenario_label}" if scenario_label else '')
     flow_children: list[str] = []
+    action_instances: list[str] = []
+
+    # Layout constants (tuned for non-overlap in Builder).
+    action_x = 600
+    action_y_cursor = 220
+    action_step_min = 260
+    side_x_offset = 340
+    side_y_offset = 150
+    side_row_gap = 110
 
     # Track per-action anchors so we can wire lines between actions.
     action_left_anchor: dict[str, str] = {}
@@ -8153,6 +8170,8 @@ def _attack_flow_builder_afb_for_chain(
     for idx, node in enumerate(chain_nodes, start=1):
         node_id = str(node.get('id') or '').strip()
         node_name = str(node.get('name') or node_id)
+
+        node_ipv4 = _first_valid_ipv4((node or {}).get('ipv4'))
 
         fa = assignment_by_node_id.get(node_id)
         gen_id = str((fa or {}).get('id') or '').strip()
@@ -8176,64 +8195,52 @@ def _attack_flow_builder_afb_for_chain(
         except Exception:
             pass
 
-        desc_lines: list[str] = [f"Capture the flag placed on node '{node_name}' (id={node_id})."]
+        # Keep action description mostly human text; outputs are represented as asset nodes.
+        # Exception: when a realized flag value exists, include it here for convenience.
+        desc_lines: list[str] = []
+        artifacts_dir = ''
         if fa:
             try:
                 gen_desc = str((fa or {}).get('description') or '').strip()
             except Exception:
                 gen_desc = ''
             if gen_desc:
-                desc_lines.append('')
                 desc_lines.append(gen_desc)
+
+            # If the generator has already been executed (Flow runtime), embed the
+            # realized flag value (when present) directly in the action description.
             try:
-                dh = (fa or {}).get('description_hints')
-                if isinstance(dh, list):
-                    hints = [str(x or '').strip() for x in dh if str(x or '').strip()]
-                    if hints:
-                        desc_lines.extend(hints)
+                artifacts_dir = str((fa or {}).get('artifacts_dir') or (fa or {}).get('run_dir') or '').strip()
             except Exception:
-                pass
-            if gen_name or gen_id:
-                desc_lines.append(
-                    "Generator: "
-                    + (gen_name if gen_name else gen_id)
-                    + (f" ({gen_id})" if (gen_name and gen_id) else '')
-                )
-            if gen_kind:
-                desc_lines.append(f"Kind: {gen_kind}")
-            if gen_source:
-                desc_lines.append(f"Source: {gen_source}")
-            if gen_catalog:
-                desc_lines.append(f"Catalog: {gen_catalog}")
+                artifacts_dir = ''
             try:
-                outs = (fa or {}).get('outputs')
-                if isinstance(outs, list) and outs:
-                    out_keys = [str(x).strip() for x in outs if str(x).strip()]
-                    if out_keys:
-                        desc_lines.append("Outputs: " + ", ".join(out_keys))
+                flag_val = _flow_read_flag_value_from_artifacts_dir(artifacts_dir) if artifacts_dir else ''
             except Exception:
-                pass
-            try:
-                produces = (fa or {}).get('produces')
-                if isinstance(produces, list) and produces:
-                    prod_keys = [str(x).strip() for x in produces if str(x).strip()]
-                    if prod_keys:
-                        desc_lines.append("Artifacts: " + ", ".join(prod_keys))
-            except Exception:
-                pass
-            if output_files:
-                desc_lines.append("Output files: " + ", ".join(output_files))
-            try:
-                hint = str((fa or {}).get('hint') or '').strip()
-                if hint:
-                    desc_lines.append("Hint: " + hint)
-            except Exception:
-                pass
+                flag_val = ''
+            if flag_val:
+                if desc_lines:
+                    desc_lines.append('')
+                desc_lines.append(f"Flag: {flag_val}")
+
+        # Preload resolved output values for asset descriptions (best-effort).
+        try:
+            outputs_map = _flow_read_outputs_map_from_artifacts_dir(artifacts_dir) if artifacts_dir else {}
+        except Exception:
+            outputs_map = {}
+        if not desc_lines:
+            desc_lines = [f"Capture the flag on node '{node_name}'."]
 
         description = "\n".join([x for x in desc_lines if x is not None])
 
+        # Action title: "<flag-*generator name>: <node-name>"
+        gen_label = (gen_name or gen_id or '').strip()
+        if not gen_label:
+            gen_label = 'Unassigned generator'
+        action_title = f"{gen_label}: {node_name}"
+
         action_instance = _new_uuid()
         flow_children.append(action_instance)
+        action_instances.append(action_instance)
 
         # Create two anchors for this action, used for incoming/outgoing edges.
         left_anchor_instance = _new_uuid()
@@ -8263,7 +8270,7 @@ def _attack_flow_builder_afb_for_chain(
             'instance': action_instance,
             # NOTE: OpenChart uses ordered entries (JsonEntries) not dicts.
             'properties': [
-                ['name', f"Capture Flag {idx}: {node_name}"],
+                ['name', action_title],
                 # The builder template exposes a nested "ttp" mapping. Keep it present
                 # but empty so the file loads without requiring ATT&CK mappings.
                 ['ttp', [['tactic', None], ['technique', None]]],
@@ -8281,15 +8288,260 @@ def _attack_flow_builder_afb_for_chain(
             },
         })
 
-        # Lay actions left-to-right.
-        layout[action_instance] = [220 + (idx - 1) * 260, 320]
+        # Lay actions top-to-bottom.
+        action_y = int(action_y_cursor)
+        layout[action_instance] = [int(action_x), action_y]
+
+        # Add an IPV4_ADDR node (if available) and connect action -> IPV4_ADDR.
+        if node_ipv4:
+            ipv4_instance = _new_uuid()
+            flow_children.append(ipv4_instance)
+
+            ipv4_left_anchor_instance = _new_uuid()
+            ipv4_right_anchor_instance = _new_uuid()
+            ipv4_left_anchor_obj = {
+                'id': 'horizontal_anchor',
+                'instance': ipv4_left_anchor_instance,
+                'latches': [],
+            }
+            ipv4_right_anchor_obj = {
+                'id': 'horizontal_anchor',
+                'instance': ipv4_right_anchor_instance,
+                'latches': [],
+            }
+            anchor_obj_by_instance[ipv4_left_anchor_instance] = ipv4_left_anchor_obj
+            anchor_obj_by_instance[ipv4_right_anchor_instance] = ipv4_right_anchor_obj
+            objects.append(ipv4_left_anchor_obj)
+            objects.append(ipv4_right_anchor_obj)
+
+            objects.append({
+                'id': 'ipv4_addr',
+                'instance': ipv4_instance,
+                'properties': [
+                    # Use the actual IP in both name + description to ensure it is visible
+                    # regardless of which fields the Builder UI chooses to render.
+                    ['name', node_ipv4],
+                    ['description', node_ipv4],
+                    ['value', node_ipv4],
+                    ['address', node_ipv4],
+                ],
+                'anchors': {
+                    '180': ipv4_left_anchor_instance,
+                    '0': ipv4_right_anchor_instance,
+                },
+            })
+
+            # Place to the right of the action (slightly above the asset rows).
+            layout[ipv4_instance] = [int(action_x) + side_x_offset, int(action_y) - 60]
+
+            src_anchor = action_right_anchor.get(action_instance)
+            trg_anchor = ipv4_left_anchor_instance
+            if src_anchor and trg_anchor:
+                line_instance = _new_uuid()
+                src_latch_instance = _new_uuid()
+                trg_latch_instance = _new_uuid()
+                handle_instance = _new_uuid()
+
+                try:
+                    anchor_obj_by_instance[src_anchor]['latches'].append(src_latch_instance)
+                except Exception:
+                    pass
+                try:
+                    anchor_obj_by_instance[trg_anchor]['latches'].append(trg_latch_instance)
+                except Exception:
+                    pass
+
+                objects.append({'id': 'generic_latch', 'instance': src_latch_instance})
+                objects.append({'id': 'generic_latch', 'instance': trg_latch_instance})
+                objects.append({'id': 'generic_handle', 'instance': handle_instance})
+
+                try:
+                    src_pos = layout.get(action_instance)
+                    trg_pos = layout.get(ipv4_instance)
+                    if isinstance(src_pos, list) and len(src_pos) == 2 and isinstance(trg_pos, list) and len(trg_pos) == 2:
+                        src_x, src_y = int(src_pos[0]), int(src_pos[1])
+                        trg_x, trg_y = int(trg_pos[0]), int(trg_pos[1])
+                        layout[src_latch_instance] = [src_x + 140, src_y]
+                        layout[trg_latch_instance] = [trg_x - 140, trg_y]
+                except Exception:
+                    pass
+
+                objects.append({
+                    'id': 'dynamic_line',
+                    'instance': line_instance,
+                    'source': src_latch_instance,
+                    'target': trg_latch_instance,
+                    'handles': [handle_instance],
+                })
+                flow_children.append(line_instance)
+
+        # Add asset nodes for outputs that are provided to the chain.
+        # These correspond to the Flow UI "Outputs -> Provided to Chain".
+        provided: list[str] = []
+        try:
+            prod = (fa or {}).get('produces')
+            if isinstance(prod, list):
+                provided.extend([str(x or '').strip() for x in prod if str(x or '').strip()])
+        except Exception:
+            pass
+        try:
+            out_fields = (fa or {}).get('output_fields')
+            if isinstance(out_fields, list):
+                provided.extend([str(x or '').strip() for x in out_fields if str(x or '').strip()])
+        except Exception:
+            pass
+        # De-dupe while preserving order.
+        seen_out: set[str] = set()
+        provided2: list[str] = []
+        for k in provided:
+            if not k or k in seen_out:
+                continue
+            seen_out.add(k)
+            provided2.append(k)
+
+        left_rows = 0
+        right_rows = 0
+        if provided2:
+            for out_idx, out_key in enumerate(provided2):
+                asset_instance = _new_uuid()
+                flow_children.append(asset_instance)
+
+                # Anchors for the asset.
+                asset_left_anchor_instance = _new_uuid()
+                asset_right_anchor_instance = _new_uuid()
+
+                asset_left_anchor_obj = {
+                    'id': 'horizontal_anchor',
+                    'instance': asset_left_anchor_instance,
+                    'latches': [],
+                }
+                asset_right_anchor_obj = {
+                    'id': 'horizontal_anchor',
+                    'instance': asset_right_anchor_instance,
+                    'latches': [],
+                }
+                anchor_obj_by_instance[asset_left_anchor_instance] = asset_left_anchor_obj
+                anchor_obj_by_instance[asset_right_anchor_instance] = asset_right_anchor_obj
+                objects.append(asset_left_anchor_obj)
+                objects.append(asset_right_anchor_obj)
+
+                objects.append({
+                    'id': 'asset',
+                    'instance': asset_instance,
+                    'properties': [
+                        ['name', out_key],
+                        ['description', ''],
+                    ],
+                    'anchors': {
+                        '180': asset_left_anchor_instance,
+                        '0': asset_right_anchor_instance,
+                    },
+                })
+
+                # Populate asset description with resolved output values (best-effort).
+                try:
+                    resolved = None
+                    if isinstance(outputs_map, dict):
+                        if out_key in outputs_map:
+                            resolved = outputs_map.get(out_key)
+                        elif out_key == 'artifact.flag' and 'flag' in outputs_map:
+                            resolved = outputs_map.get('flag')
+
+                    if resolved is not None:
+                        if isinstance(resolved, str):
+                            resolved_text = resolved.strip()
+                        else:
+                            resolved_text = json.dumps(resolved, ensure_ascii=False)
+                        if resolved_text:
+                            if len(resolved_text) > 4096:
+                                resolved_text = resolved_text[:4096]
+                            props = objects[-1].get('properties')
+                            if isinstance(props, list):
+                                for pair in props:
+                                    if isinstance(pair, list) and len(pair) == 2 and pair[0] == 'description':
+                                        pair[1] = resolved_text
+                except Exception:
+                    pass
+
+                # Place assets alternating left/right, in rows, below the action.
+                side = 'left' if (out_idx % 2 == 0) else 'right'
+                if side == 'left':
+                    row = left_rows
+                    left_rows += 1
+                    asset_x = int(action_x) - side_x_offset
+                else:
+                    row = right_rows
+                    right_rows += 1
+                    asset_x = int(action_x) + side_x_offset
+
+                asset_y = int(action_y) + side_y_offset + (row * side_row_gap)
+                layout[asset_instance] = [asset_x, asset_y]
+
+                # Create an explicit edge (dynamic_line) from action -> asset.
+                if side == 'left':
+                    src_anchor = action_left_anchor.get(action_instance)
+                    trg_anchor = asset_right_anchor_instance
+                else:
+                    src_anchor = action_right_anchor.get(action_instance)
+                    trg_anchor = asset_left_anchor_instance
+                if not src_anchor or not trg_anchor:
+                    continue
+
+                line_instance = _new_uuid()
+                src_latch_instance = _new_uuid()
+                trg_latch_instance = _new_uuid()
+                handle_instance = _new_uuid()
+
+                try:
+                    anchor_obj_by_instance[src_anchor]['latches'].append(src_latch_instance)
+                except Exception:
+                    pass
+                try:
+                    anchor_obj_by_instance[trg_anchor]['latches'].append(trg_latch_instance)
+                except Exception:
+                    pass
+
+                objects.append({'id': 'generic_latch', 'instance': src_latch_instance})
+                objects.append({'id': 'generic_latch', 'instance': trg_latch_instance})
+                objects.append({'id': 'generic_handle', 'instance': handle_instance})
+
+                try:
+                    src_pos = layout.get(action_instance)
+                    trg_pos = layout.get(asset_instance)
+                    if isinstance(src_pos, list) and len(src_pos) == 2 and isinstance(trg_pos, list) and len(trg_pos) == 2:
+                        src_x, src_y = int(src_pos[0]), int(src_pos[1])
+                        trg_x, trg_y = int(trg_pos[0]), int(trg_pos[1])
+                        if side == 'left':
+                            layout[src_latch_instance] = [src_x - 140, src_y]
+                            layout[trg_latch_instance] = [trg_x + 140, trg_y]
+                        else:
+                            layout[src_latch_instance] = [src_x + 140, src_y]
+                            layout[trg_latch_instance] = [trg_x - 140, trg_y]
+                except Exception:
+                    pass
+
+                objects.append({
+                    'id': 'dynamic_line',
+                    'instance': line_instance,
+                    'source': src_latch_instance,
+                    'target': trg_latch_instance,
+                    'handles': [handle_instance],
+                })
+                flow_children.append(line_instance)
+
+        # Advance cursor by enough to avoid overlap with the widest side.
+        max_rows = max(left_rows, right_rows)
+        span = action_step_min
+        if max_rows:
+            span = max(span, side_y_offset + (max_rows * side_row_gap) + 80)
+        action_y_cursor += span
 
     # Create explicit edges between consecutive actions.
     # In OpenChart exports, a line references its source/target latches, and an
     # anchor references linked latches. This is how Builder derives the graph.
-    for i in range(len(flow_children) - 1):
-        src_action = flow_children[i]
-        trg_action = flow_children[i + 1]
+    for i in range(len(action_instances) - 1):
+        src_action = action_instances[i]
+        trg_action = action_instances[i + 1]
 
         src_anchor = action_right_anchor.get(src_action)
         trg_anchor = action_left_anchor.get(trg_action)
@@ -8926,6 +9178,44 @@ def _latest_preview_plan_for_scenario_norm(scenario_norm: str, *, prefer_flow: b
         return None
 
 
+def _latest_preview_plan_for_scenario_norm_origin(scenario_norm: str, *, origin: str) -> Optional[str]:
+    """Return newest preview-plan path for scenario with a specific metadata.origin."""
+    try:
+        scenario_norm = _normalize_scenario_label(scenario_norm)
+        origin_norm = str(origin or '').strip().lower()
+        if not scenario_norm or not origin_norm:
+            return None
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        if not plans_dir.is_dir():
+            return None
+
+        scanned = 0
+        candidates = list(plans_dir.glob('plan_from_preview_*.json'))
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for p in candidates:
+            scanned += 1
+            if scanned > 250:
+                return None
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    payload = json.load(f) or {}
+                meta = payload.get('metadata') if isinstance(payload, dict) else None
+                if not isinstance(meta, dict):
+                    continue
+                scen = str(meta.get('scenario') or '').strip()
+                if _normalize_scenario_label(scen) != scenario_norm:
+                    continue
+                o = str(meta.get('origin') or '').strip().lower()
+                if o != origin_norm:
+                    continue
+                return str(p)
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
 def _attach_latest_flow_into_plan_payload(payload: dict[str, Any], *, scenario: str) -> None:
     """Best-effort: merge saved flow metadata into a plan payload.
 
@@ -9403,6 +9693,63 @@ def _flow_read_flag_value_from_artifacts_dir(artifacts_dir: str) -> str:
     return ''
 
 
+def _flow_read_outputs_map_from_artifacts_dir(artifacts_dir: str) -> dict[str, Any]:
+    """Read realized output values from a generator artifacts directory.
+
+    Only reads from directories under /tmp/vulns to avoid arbitrary file access.
+    Returns an empty dict when not found.
+
+    Expected shape (best-effort): outputs.json contains {"outputs": {k: v, ...}}.
+    """
+    try:
+        d = str(artifacts_dir or '').strip()
+        if not d:
+            return {}
+        base_dir = os.path.abspath(os.path.join('/tmp', 'vulns'))
+        dd = os.path.abspath(d)
+        if os.path.commonpath([dd, base_dir]) != base_dir:
+            return {}
+        if not os.path.isdir(dd):
+            return {}
+        outs_path = os.path.join(dd, 'outputs.json')
+        if not os.path.isfile(outs_path):
+            return {}
+        with open(outs_path, 'r', encoding='utf-8') as f:
+            m = json.load(f) or {}
+        outs = m.get('outputs') if isinstance(m, dict) else None
+        return outs if isinstance(outs, dict) else {}
+    except Exception:
+        return {}
+
+
+def _first_valid_ipv4(value: Any) -> str:
+    """Return a best-effort IPv4 address string (no CIDR), or '' if not found."""
+    try:
+        import ipaddress
+
+        def _norm_one(v: Any) -> str:
+            s = str(v or '').strip()
+            if not s:
+                return ''
+            if '/' in s:
+                s = s.split('/', 1)[0].strip()
+            try:
+                ip = ipaddress.ip_address(s)
+            except Exception:
+                return ''
+            return s if ip.version == 4 else ''
+
+        if isinstance(value, list):
+            for item in value:
+                out = _norm_one(item)
+                if out:
+                    return out
+            return ''
+        return _norm_one(value)
+    except Exception:
+        return ''
+
+
 @app.route('/api/flag-sequencing/flag_values_for_node')
 def api_flow_flag_values_for_node():
     """Return realized flag value(s) for a sequenced node (runtime-only).
@@ -9842,6 +10189,17 @@ def _flow_synthesized_inputs() -> set[str]:
         'username_prefix',
         'key_len',
         'node_name',
+
+        # Optional per-node context injected by Flow (may not be declared by a generator).
+        # These are safe to ignore in "dropped" input reporting.
+        'network.ip',
+        'host.ip',
+        'host_ip',
+        'target_ip',
+        'ip',
+        'ip4',
+        'ipv4',
+        'address',
     }
 
 
@@ -10655,6 +11013,32 @@ def api_flow_attackflow_preview():
             full_prev = _build_full_preview_from_plan(plan, seed, [], [])
             try:
                 _attach_latest_flow_into_full_preview(full_prev, scenario_name)
+            except Exception:
+                pass
+
+            # Mirror Preview tab behavior: apply HITL sanitize/merge to keep topology/IP context consistent.
+            try:
+                xml_basename = os.path.basename(xml_path)
+            except Exception:
+                xml_basename = None
+            try:
+                raw_hitl_config = parse_hitl_info(xml_path, scenario_name)
+            except Exception:
+                raw_hitl_config = {"enabled": False, "interfaces": []}
+            try:
+                hitl_config = _sanitize_hitl_config(raw_hitl_config, scenario_name, xml_basename)
+            except Exception:
+                hitl_config = {"enabled": False, "interfaces": []}
+            try:
+                full_prev['hitl_interfaces'] = hitl_config.get('interfaces', [])
+                full_prev['hitl_enabled'] = bool(hitl_config.get('enabled'))
+                full_prev['hitl_scenario_key'] = hitl_config.get('scenario_key')
+                if hitl_config.get('core'):
+                    full_prev['hitl_core'] = hitl_config.get('core')
+            except Exception:
+                pass
+            try:
+                _merge_hitl_preview_with_full_preview(full_prev, hitl_config)
             except Exception:
                 pass
             plans_dir = os.path.join(_outputs_dir(), 'plans')
@@ -11552,6 +11936,21 @@ def api_flow_prepare_preview_for_execute():
                 except Exception:
                     return text
 
+            def _apply_node_placeholders(text_in: str, *, node_ip4: str) -> str:
+                """Replace legacy placeholders like <node-ip> with the preview host IP."""
+                try:
+                    text = str(text_in or '')
+                except Exception:
+                    return str(text_in or '')
+                if not text or not node_ip4:
+                    return text
+                for token in ('<node-ip>', '<node_ip>', '<host-ip>', '<host_ip>', '<target-ip>', '<target_ip>'):
+                    try:
+                        text = text.replace(token, node_ip4)
+                    except Exception:
+                        continue
+                return text
+
             generation_failures: list[dict[str, Any]] = []
             generation_skipped: list[dict[str, Any]] = []
             created_run_dirs: list[str] = []
@@ -11566,6 +11965,26 @@ def api_flow_prepare_preview_for_execute():
                 if not h or not isinstance(h, dict):
                     continue
 
+                def _preview_host_ip4(host: dict) -> str:
+                    """Best-effort: return the primary IPv4 address for a preview host."""
+                    try:
+                        ip4 = host.get('ip4')
+                        if isinstance(ip4, str) and _first_valid_ipv4(ip4):
+                            return _first_valid_ipv4(ip4)
+                    except Exception:
+                        pass
+                    for key in ('ipv4', 'ip', 'ip_addr', 'address'):
+                        try:
+                            v = host.get(key)
+                        except Exception:
+                            v = None
+                        ip_str = _first_valid_ipv4(v)
+                        if ip_str:
+                            return ip_str
+                    return ''
+
+                preview_ip4 = _preview_host_ip4(h)
+
                 meta_h = h.get('metadata')
                 if not isinstance(meta_h, dict):
                     meta_h = {}
@@ -11577,6 +11996,18 @@ def api_flow_prepare_preview_for_execute():
                 seed_val = preview.get('seed') if isinstance(preview, dict) else None
 
                 cfg_full = _flow_default_generator_config(fa, seed_val=seed_val)
+
+                # Provide per-node network context. Some generators output network.ip and then
+                # hint templates reference it via {{OUTPUT.network.ip}}; make it match Preview.
+                try:
+                    if preview_ip4:
+                        cfg_full.setdefault('network.ip', preview_ip4)
+                        cfg_full.setdefault('target_ip', preview_ip4)
+                        cfg_full.setdefault('host_ip', preview_ip4)
+                        cfg_full.setdefault('ip4', preview_ip4)
+                        cfg_full.setdefault('ipv4', preview_ip4)
+                except Exception:
+                    pass
 
                 # Provide basic per-node context for generators that want it.
                 try:
@@ -11753,6 +12184,42 @@ def api_flow_prepare_preview_for_execute():
                                     m = json.load(f) or {}
                                 outs = m.get('outputs') if isinstance(m, dict) else None
                                 if isinstance(outs, dict):
+                                    # Ensure any IP-like outputs align with the preview host IP.
+                                    # This prevents resolved hints from drifting away from Preview
+                                    # even if a generator invents its own network.ip.
+                                    try:
+                                        if preview_ip4:
+                                            ip_keys = {
+                                                'network.ip',
+                                                'host.ip',
+                                                'host_ip',
+                                                'target_ip',
+                                                'ip',
+                                                'ip4',
+                                                'ipv4',
+                                                'address',
+                                            }
+                                            for k in list(outs.keys()):
+                                                kk = str(k)
+                                                if kk not in ip_keys:
+                                                    continue
+                                                old = outs.get(k)
+                                                old_ip = _first_valid_ipv4(old)
+                                                if old_ip and old_ip != preview_ip4:
+                                                    outs[k] = preview_ip4
+                                                    try:
+                                                        app.logger.info(
+                                                            '[flow.prepare_preview_for_execute] clamped %s=%s -> %s for node=%s',
+                                                            kk,
+                                                            old_ip,
+                                                            preview_ip4,
+                                                            cid,
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                    except Exception:
+                                        pass
+
                                     actual_output_keys = sorted([str(k) for k in outs.keys() if str(k).strip()])
 
                                     # Propagate outputs forward so later generators can consume concrete values.
@@ -11769,10 +12236,12 @@ def api_flow_prepare_preview_for_execute():
                                     try:
                                         if isinstance(fa.get('hints'), list) and fa.get('hints'):
                                             new_hints = [_apply_outputs_to_hint_text(str(t), outs) for t in (fa.get('hints') or [])]
+                                            new_hints = [_apply_node_placeholders(str(t), node_ip4=preview_ip4) for t in new_hints]
                                             fa['hints'] = new_hints
                                             fa['hint'] = str(new_hints[0] or '') if new_hints else str(fa.get('hint') or '')
                                         else:
                                             hint_final = _apply_outputs_to_hint_text(str(fa.get('hint') or ''), outs)
+                                            hint_final = _apply_node_placeholders(str(hint_final), node_ip4=preview_ip4)
                                             if hint_final and hint_final != str(fa.get('hint') or ''):
                                                 fa['hint'] = hint_final
                                     except Exception:
@@ -12730,9 +13199,58 @@ def api_flow_afb_from_chain():
         if plan_path and os.path.exists(plan_path):
             with open(plan_path, 'r', encoding='utf-8') as f:
                 payload = json.load(f) or {}
+
+            # Merge latest Flow metadata (including runtime artifacts_dir) into the
+            # preview payload so export can include realized flag values.
+            try:
+                if isinstance(payload, dict):
+                    _attach_latest_flow_into_plan_payload(payload, scenario=(scenario_label or scenario_norm))
+            except Exception:
+                pass
+
+            # Prefer saved flow assignments if present (they may include artifacts_dir).
+            try:
+                meta = payload.get('metadata') if isinstance(payload, dict) else None
+                flow = (meta or {}).get('flow') if isinstance(meta, dict) else None
+                fas = flow.get('flag_assignments') if isinstance(flow, dict) else None
+                if isinstance(fas, list) and fas:
+                    flag_assignments = fas
+            except Exception:
+                pass
+
             preview = payload.get('full_preview') if isinstance(payload, dict) else None
             if isinstance(preview, dict):
-                flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+                # Enrich chain_nodes with resolved IPv4 (if present in preview hosts).
+                try:
+                    id_to_ipv4: dict[str, str] = {}
+                    hosts = preview.get('hosts') if isinstance(preview.get('hosts'), list) else []
+                    for h in hosts:
+                        if not isinstance(h, dict):
+                            continue
+                        hid = str(h.get('node_id') or h.get('id') or '').strip()
+                        if not hid:
+                            continue
+                        ip_val = h.get('ipv4')
+                        if ip_val is None:
+                            ip_val = h.get('ip4')
+                        if ip_val is None:
+                            ip_val = h.get('ip')
+                        ip_str = _first_valid_ipv4(ip_val)
+                        if ip_str:
+                            id_to_ipv4[hid] = ip_str
+                    if id_to_ipv4:
+                        for n in chain_nodes:
+                            if not isinstance(n, dict):
+                                continue
+                            nid2 = str(n.get('id') or '').strip()
+                            if not nid2:
+                                continue
+                            if not str(n.get('ipv4') or '').strip() and nid2 in id_to_ipv4:
+                                n['ipv4'] = id_to_ipv4[nid2]
+                except Exception:
+                    pass
+                if not flag_assignments:
+                    flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
     except Exception:
         flag_assignments = []
 
@@ -17547,21 +18065,22 @@ def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool,
             if not isinstance(p2.get('inputs'), dict):
                 p2['inputs'] = {}
 
-            # STRICT contract validation:
+            # Contract normalization:
             # - plugin.requires is reserved for *artifact* dependencies (produced/consumed across steps)
             # - runtime input fields belong in plugin.inputs (or generator implementation inputs)
-            # - synthesized Flow fields (seed/node_name/etc) must never appear in requires
+            # - if a catalog mistakenly puts Flow-synthesized/runtime fields (seed/node_name/network.ip/etc)
+            #   into requires, strip them here (best-effort) rather than hard-failing.
             try:
                 requires_vals = [str(x or '').strip() for x in (p2.get('requires') or []) if str(x or '').strip()]
-                p2['requires'] = requires_vals
-
                 synth = set(_flow_synthesized_inputs())
                 bad_synth = sorted([x for x in requires_vals if x in synth])
                 if bad_synth:
-                    return False, f"Strict schema: plugin {pid} has synthesized field(s) in requires: {bad_synth}. Move these into inputs.", None, skipped
+                    requires_vals = [x for x in requires_vals if x not in synth]
+                    skipped.append({'reason': 'stripped synthesized fields from requires', 'plugin_id': pid, 'removed': bad_synth})
+                p2['requires'] = requires_vals
             except Exception:
-                # If validation itself fails, treat it as a hard error under strict mode.
-                return False, f"Strict schema: failed validating requires/inputs for plugin {pid}.", None, skipped
+                # Be conservative: if normalization itself fails, treat it as a hard error.
+                return False, f"Schema: failed normalizing requires/inputs for plugin {pid}.", None, skipped
 
             if pid not in plugins_by_id:
                 plugins_by_id[pid] = p2
@@ -22681,6 +23200,45 @@ def api_plan_persist_preview_plan():
         except Exception:
             pass
 
+        # Mirror Preview tab behavior: merge HITL-derived preview routers/links into full_preview
+        # so any downstream Flow IP/node selection reflects Topology/HITL rules.
+        try:
+            xml_basename = os.path.basename(xml_path)
+        except Exception:
+            xml_basename = None
+        scenario_name = scenario or None
+        if not scenario_name:
+            try:
+                names_for_cli = _scenario_names_from_xml(xml_path)
+                if names_for_cli:
+                    scenario_name = names_for_cli[0]
+            except Exception:
+                scenario_name = None
+        try:
+            raw_hitl_config = parse_hitl_info(xml_path, scenario_name)
+        except Exception as hitl_exc:
+            try:
+                app.logger.debug('[plan.persist_preview_plan] hitl parse failed: %s', hitl_exc)
+            except Exception:
+                pass
+            raw_hitl_config = {"enabled": False, "interfaces": []}
+        try:
+            hitl_config = _sanitize_hitl_config(raw_hitl_config, scenario_name, xml_basename)
+        except Exception:
+            hitl_config = {"enabled": False, "interfaces": []}
+        try:
+            full_prev['hitl_interfaces'] = hitl_config.get('interfaces', [])
+            full_prev['hitl_enabled'] = bool(hitl_config.get('enabled'))
+            full_prev['hitl_scenario_key'] = hitl_config.get('scenario_key')
+            if hitl_config.get('core'):
+                full_prev['hitl_core'] = hitl_config.get('core')
+        except Exception:
+            pass
+        try:
+            _merge_hitl_preview_with_full_preview(full_prev, hitl_config)
+        except Exception:
+            pass
+
         plans_dir = os.path.join(_outputs_dir(), 'plans')
         os.makedirs(plans_dir, exist_ok=True)
         seed_tag = full_prev.get('seed') or (seed if seed is not None else 'preview')
@@ -22690,8 +23248,9 @@ def api_plan_persist_preview_plan():
             'full_preview': full_prev,
             'metadata': {
                 'xml_path': xml_path,
-                'scenario': scenario,
+                'scenario': scenario_name or scenario,
                 'seed': full_prev.get('seed'),
+                'origin': 'flow',
                 'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
             },
         }
@@ -22701,7 +23260,7 @@ def api_plan_persist_preview_plan():
         return jsonify({
             'ok': True,
             'xml_path': xml_path,
-            'scenario': scenario,
+            'scenario': scenario_name or scenario,
             'seed': full_prev.get('seed'),
             'preview_plan_path': preview_plan_path,
         })
@@ -22723,6 +23282,8 @@ def plan_full_preview_page():
         embed = str(embed_raw).strip().lower() in ['1', 'true', 'yes', 'y', 'on']
         xml_path = request.form.get('xml_path')
         scenario = request.form.get('scenario') or None
+        force_raw = request.form.get('force') or request.form.get('force_recompute') or ''
+        force_recompute = str(force_raw).strip().lower() in ['1', 'true', 'yes', 'y', 'on']
         seed_raw = request.form.get('seed') or ''
         seed = None
         try:
@@ -22731,6 +23292,89 @@ def plan_full_preview_page():
                 if s>0: seed = s
         except Exception:
             seed = None
+        # Prefer the most recent Flow-generated snapshot for this scenario so Preview matches
+        # Flag Sequencing (which persists the preview plan before resolving).
+        try:
+            scen_norm = _normalize_scenario_label(scenario or '')
+        except Exception:
+            scen_norm = ''
+        if (not force_recompute) and scen_norm:
+            try:
+                flow_plan = _latest_preview_plan_for_scenario_norm_origin(scen_norm, origin='flow')
+            except Exception:
+                flow_plan = None
+            if flow_plan:
+                try:
+                    with open(flow_plan, 'r', encoding='utf-8') as f:
+                        payload = json.load(f) or {}
+                    full_prev = payload.get('full_preview') if isinstance(payload, dict) else None
+                    meta = payload.get('metadata') if isinstance(payload, dict) else None
+                    if isinstance(full_prev, dict):
+                        if not isinstance(meta, dict):
+                            meta = {}
+                        xml_path0 = str(meta.get('xml_path') or '')
+                        scenario0 = str(meta.get('scenario') or '') or (scenario or None)
+                        seed0 = meta.get('seed')
+                        try:
+                            seed0 = int(seed0) if seed0 is not None else full_prev.get('seed')
+                        except Exception:
+                            seed0 = full_prev.get('seed')
+
+                        display_artifacts = full_prev.get('display_artifacts')
+                        if not display_artifacts:
+                            try:
+                                display_artifacts = _attach_display_artifacts(full_prev)
+                            except Exception:
+                                display_artifacts = {
+                                    'segmentation': {
+                                        'rows': [],
+                                        'table_rows': [],
+                                        'tableRows': [],
+                                        'json': {'rules_count': 0, 'types_summary': {}, 'rules': [], 'metadata': None},
+                                    },
+                                    '__version': FULL_PREVIEW_ARTIFACT_VERSION,
+                                }
+                        segmentation_artifacts = (display_artifacts or {}).get('segmentation')
+
+                        # Reconstruct hitl_config for template display from embedded full_preview fields.
+                        hitl_config = {
+                            'enabled': bool(full_prev.get('hitl_enabled')),
+                            'interfaces': full_prev.get('hitl_interfaces') or [],
+                            'scenario_key': full_prev.get('hitl_scenario_key') or (scenario0 or None),
+                        }
+                        try:
+                            if full_prev.get('hitl_core'):
+                                hitl_config['core'] = full_prev.get('hitl_core')
+                        except Exception:
+                            pass
+
+                        import json as _json
+                        preview_json_str = _json.dumps(full_prev, indent=2, default=str)
+                        xml_basename = None
+                        try:
+                            if xml_path0:
+                                xml_basename = os.path.basename(xml_path0)
+                        except Exception:
+                            xml_basename = None
+
+                        app.logger.info('[plan.full_preview_page] using flow snapshot plan=%s scenario=%s', os.path.basename(flow_plan), scen_norm)
+                        return render_template(
+                            'full_preview.html',
+                            full_preview=full_prev,
+                            preview_json=preview_json_str,
+                            xml_path=xml_path0,
+                            scenario=scenario0,
+                            seed=seed0,
+                            preview_plan_path=flow_plan,
+                            display_artifacts=display_artifacts,
+                            segmentation_artifacts=segmentation_artifacts,
+                            hitl_config=hitl_config,
+                            xml_basename=xml_basename,
+                            hide_chrome=embed,
+                        )
+                except Exception:
+                    pass
+
         if not xml_path:
             if embed:
                 return Response(
@@ -22867,6 +23511,7 @@ def plan_full_preview_page():
                     'xml_path': xml_path,
                     'scenario': scenario_name,
                     'seed': full_prev.get('seed'),
+                    'origin': 'preview',
                     'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
                 },
             }
@@ -22898,6 +23543,111 @@ def plan_full_preview_page():
     except Exception as e:
         app.logger.exception('[plan.full_preview_page] error: %s', e)
         flash(f'Full preview page error: {e}')
+        return redirect(url_for('index'))
+
+
+@app.route('/plan/full_preview_from_plan', methods=['POST'])
+def plan_full_preview_from_plan():
+    """Render Full Preview from an existing persisted preview plan under outputs/plans.
+
+    Form fields: preview_plan (absolute or relative path), optional embed=1
+    """
+    try:
+        embed_raw = request.args.get('embed') or request.form.get('embed') or ''
+        embed = str(embed_raw).strip().lower() in ['1', 'true', 'yes', 'y', 'on']
+        plan_path = (request.form.get('preview_plan') or '').strip()
+        if not plan_path:
+            return redirect(url_for('index'))
+        try:
+            plan_path = os.path.abspath(plan_path)
+            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
+            if os.path.commonpath([plan_path, plans_dir]) != plans_dir:
+                flash('Invalid preview plan path')
+                return redirect(url_for('index'))
+            if not os.path.exists(plan_path):
+                flash('Preview plan not found')
+                return redirect(url_for('index'))
+        except Exception:
+            flash('Invalid preview plan path')
+            return redirect(url_for('index'))
+
+        try:
+            with open(plan_path, 'r', encoding='utf-8') as f:
+                payload = json.load(f) or {}
+        except Exception as e:
+            flash(f'Failed to load preview plan: {e}')
+            return redirect(url_for('index'))
+
+        full_prev = payload.get('full_preview') if isinstance(payload, dict) else None
+        if not isinstance(full_prev, dict):
+            flash('Preview plan missing full_preview')
+            return redirect(url_for('index'))
+        meta = payload.get('metadata') if isinstance(payload, dict) else None
+        if not isinstance(meta, dict):
+            meta = {}
+
+        xml_path = str(meta.get('xml_path') or '')
+        scenario_name = str(meta.get('scenario') or '') or None
+        seed_val = meta.get('seed')
+        try:
+            seed_val = int(seed_val) if seed_val is not None else full_prev.get('seed')
+        except Exception:
+            seed_val = full_prev.get('seed')
+
+        # Reconstruct hitl_config for template display from embedded full_preview fields.
+        hitl_config = {
+            'enabled': bool(full_prev.get('hitl_enabled')),
+            'interfaces': full_prev.get('hitl_interfaces') or [],
+            'scenario_key': full_prev.get('hitl_scenario_key') or (scenario_name or None),
+        }
+        try:
+            if full_prev.get('hitl_core'):
+                hitl_config['core'] = full_prev.get('hitl_core')
+        except Exception:
+            pass
+
+        display_artifacts = full_prev.get('display_artifacts')
+        if not display_artifacts:
+            try:
+                display_artifacts = _attach_display_artifacts(full_prev)
+            except Exception:
+                display_artifacts = {
+                    'segmentation': {
+                        'rows': [],
+                        'table_rows': [],
+                        'tableRows': [],
+                        'json': {'rules_count': 0, 'types_summary': {}, 'rules': [], 'metadata': None},
+                    },
+                    '__version': FULL_PREVIEW_ARTIFACT_VERSION,
+                }
+        segmentation_artifacts = (display_artifacts or {}).get('segmentation')
+
+        import json as _json
+        preview_json_str = _json.dumps(full_prev, indent=2, default=str)
+        xml_basename = None
+        try:
+            if xml_path:
+                xml_basename = os.path.basename(xml_path)
+        except Exception:
+            xml_basename = None
+
+        return render_template(
+            'full_preview.html',
+            full_preview=full_prev,
+            preview_json=preview_json_str,
+            xml_path=xml_path,
+            scenario=scenario_name,
+            seed=seed_val,
+            preview_plan_path=plan_path,
+            display_artifacts=display_artifacts,
+            segmentation_artifacts=segmentation_artifacts,
+            hitl_config=hitl_config,
+            xml_basename=xml_basename,
+            hide_chrome=embed,
+        )
+    except Exception as e:
+        app.logger.exception('[plan.full_preview_from_plan] error: %s', e)
+        flash(f'Full preview error: {e}')
         return redirect(url_for('index'))
 
 def _plan_summary_from_full_preview(full_prev: dict) -> dict:
