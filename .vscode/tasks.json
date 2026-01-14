@@ -9,7 +9,7 @@
 		},
 		{
 			"label": "Tail Web UI log",
-			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie_ai.txt /tmp/cg_artifacts_index.json /tmp/cg_check_artifacts_index.py && curl -sS -c /tmp/cg_cookie_ai.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_ai.txt -H 'Content-Type: application/json' -o /tmp/cg_artifacts_index.json -X POST http://127.0.0.1:9090/api/generators/artifacts_index --data-binary '{}' && cat > /tmp/cg_check_artifacts_index.py <<'PY'\nimport json\n\nwith open('/tmp/cg_artifacts_index.json','r',encoding='utf-8') as f:\n    obj = json.load(f)\n\nidx = obj.get('artifacts_index') or {}\nprint('ok=', obj.get('ok'))\nprint('keys=', len(idx))\nfor k in [\n    'service.url',\n    'credential.username',\n    'web.login_url',\n    'cloud.aws.access_key_id',\n    'monitoring.grafana.api_key',\n]:\n    meta = idx.get(k) or {}\n    print(k, 'present=', k in idx, 'type=', meta.get('type'))\nPY\n/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python /tmp/cg_check_artifacts_index.py",
 			"command": "cd /Users/jcacosta/Documents/core-topo-gen && tail -n 80 outputs/logs/webui-9090.log | cat",
 			"isBackground": false
 		},
@@ -130,6 +130,12 @@
 			"label": "Smoke scaffold_meta (auth)",
 			"type": "shell",
 			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie_meta.txt /tmp/cg_meta.json && curl -sS -c /tmp/cg_cookie_meta.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_meta.txt -H 'Content-Type: application/json' -o /tmp/cg_meta.json http://127.0.0.1:9090/api/generators/scaffold_meta --data-binary '{\"plugin_type\":\"flag-generator\",\"plugin_id\":\"meta_smoke\",\"folder_name\":\"py_meta_smoke\",\"requires\":[],\"produces\":[\"flag\"],\"inputs\":{\"seed\":true,\"secret\":true,\"flag_prefix\":true},\"hint_templates\":[]}' && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport json\nobj=json.load(open('/tmp/cg_meta.json','r',encoding='utf-8'))\nprint('ok=', obj.get('ok'))\nprint('paths=', len(obj.get('scaffold_paths') or []))\nprint('has_catalog=', isinstance(obj.get('catalog_source'), dict))\nPY",
+			"isBackground": false
+		},
+		{
+			"label": "Fetch artifacts_index count (auth)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie_ai.txt /tmp/cg_artifacts_index.json && curl -sS -c /tmp/cg_cookie_ai.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_ai.txt -H 'Content-Type: application/json' -o /tmp/cg_artifacts_index.json http://127.0.0.1:9090/api/generators/artifacts_index --data-binary '{}' && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -c 'import json; obj=json.load(open("/tmp/cg_artifacts_index.json","r",encoding="utf-8")); idx=obj.get("artifacts_index") or {}; print("ok=", obj.get("ok")); print("keys=", len(idx)); keys=["service.url","credential.username","web.login_url","cloud.aws.access_key_id","monitoring.grafana.api_key"]; [print(k, "present=", (k in idx), "type=", (idx.get(k) or {}).get("type")) for k in keys]'",
 			"isBackground": false
 		}
 	]
