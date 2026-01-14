@@ -856,6 +856,9 @@
           ? (inReq.concat(inOpt.map(x => x + ' (optional)')).join(', '))
           : (inAll.length ? inAll.join(', ') : '-');
         const isNodeGen = String((fa && fa.type) || '').trim() === 'flag-node-generator';
+        const injectedFiles = (fa && Array.isArray(fa.inject_files))
+          ? fa.inject_files.map(x => String(x || '').trim()).filter(Boolean)
+          : [];
         // Inputs/Outputs: tabular view with Providing/Missing side-by-side.
         try{
           const reqArtifacts = (fa && Array.isArray(fa.requires)) ? fa.requires.map(String).filter(Boolean) : [];
@@ -949,10 +952,10 @@
           const outputsTbl = document.createElement('table');
           outputsTbl.className = 'table table-sm mb-0';
           const otHead = document.createElement('thead');
-          otHead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Outputs</th><th>Required</th><th>Defined</th><th>Provided to Chain</th></tr>';
+          otHead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Outputs</th><th>Required</th><th>Defined</th><th>Injects</th><th>Provided to Chain</th></tr>';
           outputsTbl.appendChild(otHead);
           const otBody = document.createElement('tbody');
-          function addOutRow(label, requiredList, definedList, toChainList){
+          function addOutRow(label, requiredList, definedList, injectedList, toChainList){
             const tr = document.createElement('tr');
             const td0 = document.createElement('td');
             td0.className = 'text-muted';
@@ -963,16 +966,19 @@
             const td2 = document.createElement('td');
             td2.textContent = (definedList && definedList.length) ? definedList.join(', ') : '-';
             const td3 = document.createElement('td');
-            td3.textContent = (toChainList && toChainList.length) ? toChainList.join(', ') : '-';
+            td3.textContent = (injectedList && injectedList.length) ? injectedList.join(', ') : '-';
+            const td4 = document.createElement('td');
+            td4.textContent = (toChainList && toChainList.length) ? toChainList.join(', ') : '-';
             tr.appendChild(td0);
             tr.appendChild(td1);
             tr.appendChild(td2);
             tr.appendChild(td3);
+            tr.appendChild(td4);
             otBody.appendChild(tr);
           }
           // Generator outputs are provided to the chain; sequencer does not provide outputs here.
-          addOutRow('Artifacts', outArtifactsReq, outArtifacts, outArtifacts);
-          addOutRow('Fields', outFieldsReq, outFields, outFields);
+          addOutRow('Artifacts', outArtifactsReq, outArtifacts, injectedFiles, outArtifacts);
+          addOutRow('Fields', outFieldsReq, outFields, [], outFields);
           outputsTbl.appendChild(otBody);
 
           // Full-width row so the Outputs table is flush-left (no empty label column indentation).

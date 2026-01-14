@@ -1206,7 +1206,7 @@ def _flow_flag_record_from_host_metadata(hdata: Any) -> Optional[Dict[str, str]]
         # New behavior: flag-generators do NOT create new nodes/services.
         # They generate artifacts that should be inserted into an existing docker node.
         if ftype == 'flag-generator':
-            artifacts_dir = str(flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
+            artifacts_dir = str(flow_flag.get('mount_dir') or flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
             if not artifacts_dir:
                 return None
             if not os.path.isabs(artifacts_dir):
@@ -1249,7 +1249,7 @@ def _flow_flag_artifacts_overlay_from_host_metadata(hdata: Any) -> Optional[Dict
         ftype = str(flow_flag.get('type') or '').strip().lower()
         if ftype != 'flag-generator':
             return None
-        artifacts_dir = str(flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
+        artifacts_dir = str(flow_flag.get('mount_dir') or flow_flag.get('artifacts_dir') or flow_flag.get('run_dir') or '').strip()
         if not artifacts_dir:
             return None
         if not os.path.isabs(artifacts_dir):

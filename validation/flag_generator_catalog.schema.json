@@ -26,7 +26,36 @@
       "type": "object",
       "required": ["artifact"],
       "properties": {
-        "artifact": {"type": "string", "minLength": 1},
+        "artifact": {
+          "type": "string",
+          "minLength": 1,
+          "examples": [
+            "flag",
+            "filesystem.file",
+            "filesystem.dir",
+            "filesystem.path",
+            "network.ip",
+            "network.port",
+            "network.subnet",
+            "web.url",
+            "credential.username",
+            "credential.password",
+            "ssh.host",
+            "ssh.port",
+            "ssh.username",
+            "ssh.private_key",
+            "tls.ca",
+            "tls.cert",
+            "tls.key",
+            "db.host",
+            "db.port",
+            "db.name",
+            "db.username",
+            "db.password",
+            "api.base_url",
+            "api.token"
+          ]
+        },
         "description": {"type": "string"}
       },
       "additionalProperties": true
@@ -147,6 +176,11 @@
           "description": "Ordered, high-level description hints about the challenge/flag (shown above NEXT-step hints in the Flow chain UI).",
           "type": "array",
           "items": {"type": "string"}
+        },
+        "inject_files": {
+          "description": "Allowlist of files/dirs this generator injects (staged into an injected directory for mounting/copying into containers). Entries can be relative paths (leading 'artifacts/' and '/flow_artifacts/' are ignored) or an output artifact key (e.g., 'filesystem.file') which will be resolved via outputs.json.",
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
         },
         "handoff": {"$ref": "#/$defs/handoff"}
       },

@@ -105,12 +105,12 @@
                 <table class="table table-sm align-middle" id="genTable">
                   <thead>
                     <tr>
-                      <th>ID</th>
+                      <th style="width: 60px;">#</th>
                       <th>Name</th>
                       <th>Type</th>
-                      <th>Path</th>
                       <th>Inputs</th>
                       <th>Outputs</th>
+                      <th>Injects</th>
                       <th>From Source</th>
                       <th style="width: 100px;">Test</th>
                     </tr>
@@ -142,12 +142,12 @@
                 <table class="table table-sm align-middle" id="nodeGenTable">
                   <thead>
                     <tr>
-                      <th>ID</th>
+                      <th style="width: 60px;">#</th>
                       <th>Name</th>
                       <th>Type</th>
-                      <th>Path</th>
                       <th>Inputs</th>
                       <th>Outputs</th>
+                      <th>Injects</th>
                       <th>From Source</th>
                       <th style="width: 100px;">Test</th>
                     </tr>
@@ -607,12 +607,24 @@
 
     const parts = [];
     if (hasReq) {
-      parts.push(`<div><span class="text-muted">required:</span> ${escapeHtml(req.join(', '))}</div>`);
+      parts.push(`<div><strong>Required:</strong> ${escapeHtml(req.join(', '))}</div>`);
     }
     if (hasOpt) {
-      parts.push(`<div><span class="text-muted">optional:</span> ${escapeHtml(opt.join(', '))}</div>`);
+      parts.push(`<div><strong>Optional:</strong> ${escapeHtml(opt.join(', '))}</div>`);
     }
     return parts.join('');
+  }
+
+  function injectedSummary(items) {
+    const arr = Array.isArray(items) ? items : [];
+    const out = [];
+    arr.forEach((x) => {
+      const s = String(x || '').trim();
+      if (!s) return;
+      out.push(s);
+    });
+    out.sort();
+    return out.length ? out.join(', ') : '—';
   }
 
   function renderGenerators() {
@@ -644,12 +656,13 @@
       return hay.includes(q);
     });
 
-    filtered.forEach((g) => {
+    filtered.forEach((g, idx) => {
       const tr = document.createElement('tr');
       const src = (g.source && g.source.path) ? g.source.path : '';
       const entry = (g.source && g.source.entry) ? g.source.entry : '';
       const inHtml = groupedNameHtml(g.inputs);
       const outHtml = groupedNameHtml(g.outputs);
+      const injected = injectedSummary(g.inject_files);
       const inTypes = typeSummary(g.inputs);
       const outTypes = typeSummary(g.outputs);
       const hasCompose = !!(g.compose && typeof g.compose === 'object');
@@ -658,9 +671,8 @@
       const composeLabel = composeService ? `compose: ${composeService}` : 'compose';
 
       const typeLabel = String(g.language || '');
-      const pathLabel = composeFile ? joinPath(src, composeFile) : (entry ? joinPath(src, entry) : src);
       tr.innerHTML = `
-        <td class="small">${escapeHtml(g.id || '')}</td>
+        <td class="text-muted">${idx + 1}</td>
         <td>
           <div>
             <strong>${escapeHtml(g.name || '')}</strong>
@@ -669,9 +681,9 @@
           ${g.description ? `<div class="small text-muted">${escapeHtml(g.description)}</div>` : ''}
         </td>
         <td class="small">${escapeHtml(typeLabel)}</td>
-        <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(pathLabel)}</td>
         <td class="small" title="${escapeHtml(inTypes)}">${inHtml}</td>
         <td class="small" title="${escapeHtml(outTypes)}">${outHtml}</td>
+        <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(injected)}</td>
         <td class="small">${escapeHtml(g._source_name || '')}</td>
         <td>
           <button class="btn btn-sm btn-outline-primary genTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}">Test</button>
@@ -717,12 +729,13 @@
       return hay.includes(q);
     });
 
-    filtered.forEach((g) => {
+    filtered.forEach((g, idx) => {
       const tr = document.createElement('tr');
       const src = (g.source && g.source.path) ? g.source.path : '';
       const entry = (g.source && g.source.entry) ? g.source.entry : '';
       const inHtml = groupedNameHtml(g.inputs);
       const outHtml = groupedNameHtml(g.outputs);
+      const injected = injectedSummary(g.inject_files);
       const inTypes = typeSummary(g.inputs);
       const outTypes = typeSummary(g.outputs);
       const hasCompose = !!(g.compose && typeof g.compose === 'object');
@@ -731,9 +744,8 @@
       const composeLabel = composeService ? `compose: ${composeService}` : 'compose';
 
       const typeLabel = String(g.language || '');
-      const pathLabel = composeFile ? joinPath(src, composeFile) : (entry ? joinPath(src, entry) : src);
       tr.innerHTML = `
-        <td class="small">${escapeHtml(g.id || '')}</td>
+        <td class="text-muted">${idx + 1}</td>
         <td>
           <div>
             <strong>${escapeHtml(g.name || '')}</strong>
@@ -742,9 +754,9 @@
           ${g.description ? `<div class="small text-muted">${escapeHtml(g.description)}</div>` : ''}
         </td>
         <td class="small">${escapeHtml(typeLabel)}</td>
-        <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(pathLabel)}</td>
         <td class="small" title="${escapeHtml(inTypes)}">${inHtml}</td>
         <td class="small" title="${escapeHtml(outTypes)}">${outHtml}</td>
+        <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(injected)}</td>
         <td class="small">${escapeHtml(g._source_name || '')}</td>
         <td>
           <button class="btn btn-sm btn-outline-primary nodeGenTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}">Test</button>

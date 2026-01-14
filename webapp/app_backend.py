@@ -1092,10 +1092,13 @@ def _iter_values_by_key(obj: Any, keys: set[str]) -> Iterator[Any]:
             yield from _iter_values_by_key(item, keys)
 
 
-def _extract_flow_artifact_dirs_from_plan(preview_plan_path: str) -> List[str]:
+def _extract_flow_artifact_dirs_from_plan(preview_plan_path: str, *, prefer_mount_dir: bool = False) -> List[str]:
     """Extract local artifact directories referenced by the plan.
 
-    We currently support Flow flag generators by looking for `artifacts_dir` keys.
+    By default we look for `artifacts_dir` keys.
+    When `prefer_mount_dir` is True, we first look for `mount_dir` keys (typically
+    pointing at a filtered `.../injected` directory). If none are found, we
+    fall back to `artifacts_dir` to preserve backwards compatibility.
     """
     try:
         with open(preview_plan_path, 'r', encoding='utf-8') as f:
@@ -1107,9 +1110,18 @@ def _extract_flow_artifact_dirs_from_plan(preview_plan_path: str) -> List[str]:
     root = full if isinstance(full, dict) else payload
 
     dirs: List[str] = []
-    for v in _iter_values_by_key(root, {'artifacts_dir'}):
-        if isinstance(v, str) and v:
-            dirs.append(v)
+    if prefer_mount_dir:
+        for v in _iter_values_by_key(root, {'mount_dir'}):
+            if isinstance(v, str) and v:
+                dirs.append(v)
+        if not dirs:
+            for v in _iter_values_by_key(root, {'artifacts_dir'}):
+                if isinstance(v, str) and v:
+                    dirs.append(v)
+    else:
+        for v in _iter_values_by_key(root, {'artifacts_dir'}):
+            if isinstance(v, str) and v:
+                dirs.append(v)
 
     seen: set[str] = set()
     out: List[str] = []
@@ -1126,6 +1138,7 @@ def _upload_flow_artifacts_for_plan_to_remote(
     sftp: Any,
     preview_plan_path: str,
     log_handle: Any,
+    upload_only_injected_artifacts: bool = False,
 ) -> None:
     """Upload any locally-generated flow artifacts to the CORE VM.
 
@@ -1133,13 +1146,22 @@ def _upload_flow_artifacts_for_plan_to_remote(
     When running the CLI on a remote CORE VM, those directories must exist on
     the remote filesystem or bind mounts / docker cp will see nothing.
     """
-    artifact_dirs = _extract_flow_artifact_dirs_from_plan(preview_plan_path)
+    artifact_dirs = _extract_flow_artifact_dirs_from_plan(
+        preview_plan_path,
+        prefer_mount_dir=bool(upload_only_injected_artifacts),
+    )
     if not artifact_dirs:
         try:
             log_handle.write('[remote] No flow artifact dirs referenced in preview plan\n')
         except Exception:
             pass
         return
+
+    try:
+        if upload_only_injected_artifacts:
+            log_handle.write('[remote] Flow artifacts upload mode: mount_dir only (prefer injected)\n')
+    except Exception:
+        pass
 
     allowed_prefixes = ('/tmp/vulns',)
     upload_dirs = [d for d in artifact_dirs if any(d == p or d.startswith(p + '/') for p in allowed_prefixes)]
@@ -1220,6 +1242,7 @@ def _prepare_remote_cli_context(
     xml_path: str,
     preview_plan_path: str | None,
     log_handle: Any,
+    upload_only_injected_artifacts: bool = False,
 ) -> Dict[str, Any]:
     """Upload required artifacts before starting the remote CLI."""
 
@@ -1260,6 +1283,7 @@ def _prepare_remote_cli_context(
                 sftp=sftp,
                 preview_plan_path=preview_plan_path,
                 log_handle=log_handle,
+                upload_only_injected_artifacts=bool(upload_only_injected_artifacts),
             )
         context = {
             'base_dir': base_dir,
@@ -8550,8 +8574,113 @@ def _attack_flow_builder_afb_for_chain(
             seen_out.add(k)
             provided2.append(k)
 
+        # Injected files (inject_files allowlist) are represented as explicit artifact nodes.
+        injected2: list[str] = []
+        try:
+            inj = (fa or {}).get('inject_files')
+            if isinstance(inj, list):
+                seen_inj: set[str] = set()
+                for raw in inj:
+                    s = str(raw or '').strip()
+                    if not s or s in seen_inj:
+                        continue
+                    seen_inj.add(s)
+                    injected2.append(s)
+        except Exception:
+            injected2 = []
+
         left_rows = 0
         right_rows = 0
+
+        # Place injected artifacts to the left of the action.
+        if injected2:
+            for inj_idx, inj_path in enumerate(injected2):
+                art_instance = _new_uuid()
+                flow_children.append(art_instance)
+
+                # Anchors for the artifact.
+                art_left_anchor_instance = _new_uuid()
+                art_right_anchor_instance = _new_uuid()
+                art_left_anchor_obj = {
+                    'id': 'horizontal_anchor',
+                    'instance': art_left_anchor_instance,
+                    'latches': [],
+                }
+                art_right_anchor_obj = {
+                    'id': 'horizontal_anchor',
+                    'instance': art_right_anchor_instance,
+                    'latches': [],
+                }
+                anchor_obj_by_instance[art_left_anchor_instance] = art_left_anchor_obj
+                anchor_obj_by_instance[art_right_anchor_instance] = art_right_anchor_obj
+                objects.append(art_left_anchor_obj)
+                objects.append(art_right_anchor_obj)
+
+                objects.append({
+                    # Attack Flow Builder supports STIX cyber-observable style nodes;
+                    # represent injected files as explicit artifacts.
+                    'id': 'artifact',
+                    'instance': art_instance,
+                    'properties': [
+                        ['name', inj_path],
+                        ['description', 'Injected into container'],
+                    ],
+                    'anchors': {
+                        '180': art_left_anchor_instance,
+                        '0': art_right_anchor_instance,
+                    },
+                })
+
+                # Place in rows on the left side.
+                art_x = int(action_x) - side_x_offset - 220
+                art_y = int(action_y) + 60 + (inj_idx * side_row_gap)
+                layout[art_instance] = [art_x, art_y]
+                left_rows += 1
+
+                # Connect artifact -> action (inputs).
+                src_anchor = art_right_anchor_instance
+                trg_anchor = action_left_anchor.get(action_instance)
+                if not src_anchor or not trg_anchor:
+                    continue
+
+                line_instance = _new_uuid()
+                src_latch_instance = _new_uuid()
+                trg_latch_instance = _new_uuid()
+                handle_instance = _new_uuid()
+
+                try:
+                    anchor_obj_by_instance[src_anchor]['latches'].append(src_latch_instance)
+                except Exception:
+                    pass
+                try:
+                    anchor_obj_by_instance[trg_anchor]['latches'].append(trg_latch_instance)
+                except Exception:
+                    pass
+
+                objects.append({'id': 'generic_latch', 'instance': src_latch_instance})
+                objects.append({'id': 'generic_latch', 'instance': trg_latch_instance})
+                objects.append({'id': 'generic_handle', 'instance': handle_instance})
+
+                try:
+                    src_pos = layout.get(art_instance)
+                    trg_pos = layout.get(action_instance)
+                    if isinstance(src_pos, list) and len(src_pos) == 2 and isinstance(trg_pos, list) and len(trg_pos) == 2:
+                        src_x, src_y = int(src_pos[0]), int(src_pos[1])
+                        trg_x, trg_y = int(trg_pos[0]), int(trg_pos[1])
+                        layout[src_latch_instance] = [src_x + 140, src_y]
+                        layout[trg_latch_instance] = [trg_x - 140, trg_y]
+                except Exception:
+                    pass
+
+                objects.append({
+                    'id': 'dynamic_line',
+                    'instance': line_instance,
+                    'source': src_latch_instance,
+                    'target': trg_latch_instance,
+                    'handles': [handle_instance],
+                })
+                flow_children.append(line_instance)
+
         if provided2:
             for out_idx, out_key in enumerate(provided2):
                 asset_instance = _new_uuid()
@@ -10324,6 +10453,7 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
             'generator_catalog': str(gen.get('_flow_catalog') or 'flag_generators'),
             'language': str(gen.get('language') or ''),
             'description_hints': list(gen.get('description_hints') or []) if isinstance(gen.get('description_hints'), list) else [],
+            'inject_files': list(gen.get('inject_files') or []) if isinstance(gen.get('inject_files'), list) else [],
             # Effective union (used for chaining feasibility / ordering validation).
             'inputs': sorted(list(_required_inputs_of(gen))),
             'outputs': sorted(list(_provides_of(gen))),
@@ -12519,6 +12649,42 @@ def api_flow_prepare_preview_for_execute():
                         # IMPORTANT: do this after outputs.json has been applied to hints so
                         # the CORE VM sees resolved template values.
                         try:
+                            # Prefer staged injected artifacts when present (inject_files allowlist).
+                            # Fall back to artifacts/, then the run dir.
+                            flow_mount_dir = str(flow_out_dir or '')
+                            allow_hint_file = True
+                            try:
+                                if flow_out_dir:
+                                    injected = os.path.join(flow_out_dir, 'injected')
+                                    artifacts = os.path.join(flow_out_dir, 'artifacts')
+                                    if os.path.isdir(injected):
+                                        flow_mount_dir = injected
+                                    elif os.path.isdir(artifacts):
+                                        flow_mount_dir = artifacts
+                            except Exception:
+                                flow_mount_dir = str(flow_out_dir or '')
+
+                            # Respect inject_files allowlist: only place hint.txt into the
+                            # injected mount dir if the allowlist appears to include it.
+                            try:
+                                inj_list = fa.get('inject_files') if isinstance(fa, dict) else None
+                                if isinstance(inj_list, list) and inj_list:
+                                    allow_hint = False
+                                    for raw in inj_list:
+                                        s = str(raw or '').strip().replace('\\', '/')
+                                        if not s:
+                                            continue
+                                        if s == 'hint.txt' or s.endswith('/hint.txt'):
+                                            allow_hint = True
+                                            break
+                                    if not allow_hint:
+                                        allow_hint_file = False
+                            except Exception:
+                                pass
+
+                            if not allow_hint_file:
+                                raise RuntimeError('hint.txt not allowlisted')
+
                             hint_texts: list[str] = []
                             if isinstance(fa.get('hints'), list):
                                 hint_texts = [str(x or '').strip() for x in (fa.get('hints') or []) if str(x or '').strip()]
@@ -12526,8 +12692,8 @@ def api_flow_prepare_preview_for_execute():
                                 single = str(fa.get('hint') or '').strip()
                                 if single:
                                     hint_texts = [single]
-                            if flow_out_dir and hint_texts:
-                                with open(os.path.join(flow_out_dir, 'hint.txt'), 'w', encoding='utf-8') as hf:
+                            if flow_mount_dir and hint_texts:
+                                with open(os.path.join(flow_mount_dir, 'hint.txt'), 'w', encoding='utf-8') as hf:
                                     if len(hint_texts) == 1:
                                         hf.write(hint_texts[0] + "\n")
                                     else:
@@ -12579,6 +12745,16 @@ def api_flow_prepare_preview_for_execute():
                     'generator_language': str(fa.get('language') or ''),
                     'generator_source': str(fa.get('flag_generator') or ''),
                     'artifacts_dir': str(flow_out_dir or ''),
+                    'mount_dir': str(
+                        os.path.join(flow_out_dir, 'injected')
+                        if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'injected'))
+                        else (
+                            os.path.join(flow_out_dir, 'artifacts')
+                            if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'artifacts'))
+                            else (flow_out_dir or '')
+                        )
+                    ),
+                    'inject_files': list(fa.get('inject_files') or []) if isinstance(fa.get('inject_files'), list) else [],
                     'inputs': list(fa.get('inputs') or []) if isinstance(fa.get('inputs'), list) else [],
                     'outputs': list(fa.get('outputs') or []) if isinstance(fa.get('outputs'), list) else [],
                     'hint_template': str(fa.get('hint_template') or ''),
@@ -12603,6 +12779,16 @@ def api_flow_prepare_preview_for_execute():
                     fa['generated'] = bool(ok_run)
                     fa['generation_note'] = str(note or '')
                     fa['artifacts_dir'] = str(flow_out_dir or '')
+                    fa['mount_dir'] = str(
+                        os.path.join(flow_out_dir, 'injected')
+                        if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'injected'))
+                        else (
+                            os.path.join(flow_out_dir, 'artifacts')
+                            if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'artifacts'))
+                            else (flow_out_dir or '')
+                        )
+                    )
+                    fa['inject_files'] = list(fa.get('inject_files') or []) if isinstance(fa.get('inject_files'), list) else []
                     fa['outputs_manifest'] = str(manifest_path or '')
                     fa['declared_outputs'] = declared_output_keys
                     fa['actual_outputs'] = actual_output_keys
@@ -14993,10 +15179,6 @@ def _load_scenario_hitl_validation_from_disk() -> dict[str, Dict[str, Any]]:
         core = _sanitize_hitl_validation_hint(scen_val.get('core'))
         if prox:
             entry['proxmox'] = prox
-        if core:
-            entry['core'] = core
-        if entry:
-            out[norm] = entry
     return out
 
 
@@ -17902,10 +18084,118 @@ def _validate_json_schema(instance: object, schema_path: str) -> tuple[bool, str
 FLAG_GENERATOR_LANGUAGES = {'python', 'c', 'cpp'}
 
 
+# Reserved artifact keys (starter set). These are always offered in the Generator
+# Builder artifact picker to encourage consistent naming, while still allowing
+# custom artifact keys.
+_RESERVED_ARTIFACTS: dict[str, dict[str, Any]] = {
+    # Core contract
+    'flag': {'type': 'flag', 'description': 'Captured flag value.', 'sensitive': True},
+
+    # Filesystem
+    'filesystem.file': {'type': 'file', 'description': 'Relative path to a file a participant should inspect.'},
+    'filesystem.dir': {'type': 'dir', 'description': 'Relative path to a directory a participant should inspect.'},
+    'filesystem.path': {'type': 'path', 'description': 'Generic filesystem path (file or directory).'},
+    'filesystem.filename': {'type': 'text', 'description': 'Filename only (no directory).'},
+    'filesystem.sha256': {'type': 'text', 'description': 'SHA-256 of a file (hex).'},
+    'filesystem.md5': {'type': 'text', 'description': 'MD5 of a file (hex).'},
+
+    # Network
+    'network.ip': {'type': 'ip', 'description': 'IP address (usually IPv4) relevant to the next step.'},
+    'network.ipv4': {'type': 'ip', 'description': 'IPv4 address relevant to the next step.'},
+    'network.ipv6': {'type': 'ip', 'description': 'IPv6 address relevant to the next step.'},
+    'network.host': {'type': 'host', 'description': 'Hostname or node identifier.'},
+    'network.hostname': {'type': 'host', 'description': 'Hostname (DNS label).'},
+    'network.port': {'type': 'port', 'description': 'TCP/UDP port number.'},
+    'network.proto': {'type': 'text', 'description': 'Transport/application protocol name (e.g., tcp, udp, http, ssh).'},
+    'network.subnet': {'type': 'subnet', 'description': 'Subnet/CIDR (e.g., 10.0.0.0/24).'},
+    'network.cidr': {'type': 'subnet', 'description': 'CIDR (alias for network.subnet).'},
+    'network.url': {'type': 'url', 'description': 'Network URL/URI (generic).'},
+
+    # Web
+    'web.url': {'type': 'url', 'description': 'HTTP(S) URL (e.g., a login page).'},
+    'web.base_url': {'type': 'url', 'description': 'Base URL (scheme://host[:port]).'},
+    'web.path': {'type': 'text', 'description': 'HTTP path (e.g., /login).'},
+    'web.username': {'type': 'text', 'description': 'Web username.'},
+    'web.password': {'type': 'text', 'description': 'Web password.', 'sensitive': True},
+    'web.token': {'type': 'text', 'description': 'Web/API bearer token.', 'sensitive': True},
+    'web.cookie': {'type': 'text', 'description': 'Cookie header value.', 'sensitive': True},
+
+    # Credentials (generic)
+    'credential.pair': {'type': 'credential', 'description': 'Combined credential pair (format defined by the generator).', 'sensitive': True},
+    'credential.username': {'type': 'text', 'description': 'Username value.'},
+    'credential.password': {'type': 'text', 'description': 'Password value.', 'sensitive': True},
+    'credential.token': {'type': 'text', 'description': 'Token value.', 'sensitive': True},
+    'credential.secret': {'type': 'text', 'description': 'Secret value.', 'sensitive': True},
+
+    # SSH
+    'ssh.host': {'type': 'host', 'description': 'SSH host (hostname/IP).'},
+    'ssh.port': {'type': 'port', 'description': 'SSH port.'},
+    'ssh.username': {'type': 'text', 'description': 'SSH username.'},
+    'ssh.password': {'type': 'text', 'description': 'SSH password.', 'sensitive': True},
+    'ssh.private_key': {'type': 'text', 'description': 'SSH private key (PEM/OpenSSH).', 'sensitive': True},
+    'ssh.public_key': {'type': 'text', 'description': 'SSH public key (OpenSSH format).'},
+    'ssh.known_hosts': {'type': 'file', 'description': 'Known hosts file path.'},
+
+    # TLS
+    'tls.ca': {'type': 'file', 'description': 'CA certificate bundle path.'},
+    'tls.cert': {'type': 'file', 'description': 'Certificate path.'},
+    'tls.key': {'type': 'file', 'description': 'Private key path.', 'sensitive': True},
+    'tls.fingerprint': {'type': 'text', 'description': 'Certificate fingerprint (e.g., SHA-256).'},
+
+    # Database
+    'db.host': {'type': 'host', 'description': 'Database host (hostname/IP).'},
+    'db.port': {'type': 'port', 'description': 'Database port.'},
+    'db.name': {'type': 'text', 'description': 'Database name.'},
+    'db.username': {'type': 'text', 'description': 'Database username.'},
+    'db.password': {'type': 'text', 'description': 'Database password.', 'sensitive': True},
+    'db.uri': {'type': 'url', 'description': 'Database connection URI.', 'sensitive': True},
+
+    # Service discovery / endpoints
+    'service.name': {'type': 'text', 'description': 'Service name identifier.'},
+    'service.protocol': {'type': 'text', 'description': 'Protocol name (e.g., http, ssh, nfs).'},
+    'service.endpoint': {'type': 'text', 'description': 'Service endpoint identifier or URI.'},
+    'service.url': {'type': 'url', 'description': 'Service URL.'},
+
+    # API
+    'api.base_url': {'type': 'url', 'description': 'Base URL for an API.'},
+    'api.key': {'type': 'text', 'description': 'API key.', 'sensitive': True},
+    'api.token': {'type': 'text', 'description': 'API token.', 'sensitive': True},
+}
+
+
 def _coerce_flaggen_io_type(name: str) -> str:
     n = (name or '').strip().lower()
     if not n:
         return 'text'
+    try:
+        meta = _RESERVED_ARTIFACTS.get(n)
+        if isinstance(meta, dict):
+            tp0 = str(meta.get('type') or '').strip()
+            if tp0:
+                return tp0
+    except Exception:
+        pass
+    if n.startswith('filesystem.'):
+        if n.endswith('.dir'):
+            return 'dir'
+        if n.endswith('.file'):
+            return 'file'
+        if n.endswith('.path'):
+            return 'path'
+        return 'file'
+    if n.startswith('network.'):
+        if n.endswith('.port') or n == 'port':
+            return 'port'
+        if 'subnet' in n or 'cidr' in n:
+            return 'subnet'
+        if n.endswith('.ip') or n.endswith('.ipv4') or n.endswith('.ipv6') or '.ip' in n:
+            return 'ip'
+        if n.endswith('.host') or n.endswith('.hostname'):
+            return 'host'
+    if n.endswith('.url') or 'url' in n or n.startswith('web.') or n.startswith('http.'):
+        return 'url'
+    if n.startswith('credential.'):
+        return 'credential'
     if 'private_key' in n or n.endswith('.key'):
         return 'text'
     if 'password' in n or 'secret' in n:
@@ -17920,6 +18210,12 @@ def _coerce_flaggen_io_type(name: str) -> str:
 def _coerce_flaggen_io_sensitive(name: str, tp: str) -> bool:
     n = (name or '').strip().lower()
     t = (tp or '').strip().lower()
+    try:
+        meta = _RESERVED_ARTIFACTS.get(n)
+        if isinstance(meta, dict) and meta.get('sensitive') is True:
+            return True
+    except Exception:
+        pass
     if t == 'flag':
         return True
     if any(k in n for k in ('password', 'secret', 'token', 'private_key', 'ssh.private_key')):
@@ -18356,6 +18652,21 @@ def _v3_merge_generator_view(plugin: dict, impl: dict) -> dict | None:
     gen['hint_templates'] = hint_templates
     gen['hint_template'] = hint_templates[0]
 
+    # Optional: allowlist of files/dirs to stage into an injected mount directory.
+    try:
+        inj = impl.get('inject_files')
+        inj_list: list[str] = []
+        if isinstance(inj, list):
+            inj_list = [str(x or '').strip() for x in inj if str(x or '').strip()]
+        elif isinstance(inj, str):
+            s = inj.strip()
+            if s:
+                inj_list = [s]
+        if inj_list:
+            gen['inject_files'] = inj_list
+    except Exception:
+        pass
+
     # Optional: ordered, high-level description hints about the flag/challenge.
     # These are shown in the Flow chain UI above the NEXT-step hints.
     desc_hints: list[str] = []
@@ -18503,6 +18814,23 @@ def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool,
                 impl2['env'] = env
             else:
                 impl2.pop('env', None)
+
+            # Optional allowlist of files/dirs to stage into an injected mount directory.
+            try:
+                inj = impl2.get('inject_files')
+                inj_list: list[str] = []
+                if isinstance(inj, list):
+                    inj_list = [str(x or '').strip() for x in inj if str(x or '').strip()]
+                elif isinstance(inj, str):
+                    s = inj.strip()
+                    if s:
+                        inj_list = [s]
+                if inj_list:
+                    impl2['inject_files'] = inj_list
+                else:
+                    impl2.pop('inject_files', None)
+            except Exception:
+                impl2.pop('inject_files', None)
 
             hint_templates: list[str] = []
             try:
@@ -25187,6 +25515,7 @@ def run_cli_async():
     docker_cleanup_before_run = False
     docker_remove_all_containers = False
     overwrite_existing_images = False
+    upload_only_injected_artifacts = False
     scenarios_inline = None
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
@@ -25229,6 +25558,10 @@ def run_cli_async():
             request.form.get('docker_remove_all_containers')
         ) or _coerce_bool(request.form.get('docker_nuke_all'))
         overwrite_existing_images = _coerce_bool(request.form.get('overwrite_existing_images'))
+        upload_only_injected_artifacts = _coerce_bool(
+            request.form.get('upload_only_injected_artifacts')
+            or request.form.get('upload_only_injected')
+        )
     if not xml_path:
         try:
             j = request.get_json(silent=True) or {}
@@ -25264,6 +25597,10 @@ def run_cli_async():
                 j.get('docker_remove_all_containers')
             ) or _coerce_bool(j.get('docker_nuke_all'))
             overwrite_existing_images = _coerce_bool(j.get('overwrite_existing_images'))
+            upload_only_injected_artifacts = _coerce_bool(
+                j.get('upload_only_injected_artifacts')
+                or j.get('upload_only_injected')
+            )
         except Exception:
             pass
     if not xml_path:
@@ -26475,6 +26812,7 @@ def run_cli_async():
             xml_path=xml_path,
             preview_plan_path=preview_plan_path,
             log_handle=log_f,
+            upload_only_injected_artifacts=bool(upload_only_injected_artifacts),
         )
         try:
             log_f.write(f"{log_prefix}Workspace: repo={remote_ctx.get('repo_dir')} run_dir={remote_ctx.get('run_dir')}\n")
@@ -30848,12 +31186,18 @@ def api_generators_artifacts_index():
                     if not art:
                         continue
                     tp = str(o.get('type') or '').strip()
+                    desc = str(o.get('description') or '').strip()
+                    sensitive = o.get('sensitive') is True
                     entry = idx.get(art)
                     if not entry:
-                        entry = {'artifact': art, 'type': tp, 'producers': []}
+                        entry = {'artifact': art, 'type': tp, 'description': desc, 'sensitive': sensitive, 'producers': []}
                         idx[art] = entry
                     if not entry.get('type') and tp:
                         entry['type'] = tp
+                    if not str(entry.get('description') or '').strip() and desc:
+                        entry['description'] = desc
+                    if entry.get('sensitive') is not True and sensitive is True:
+                        entry['sensitive'] = True
                     producers = entry.get('producers') if isinstance(entry.get('producers'), list) else []
                     if not any((p.get('plugin_id') == gid and p.get('plugin_type') == plugin_type) for p in producers if isinstance(p, dict)):
                         producers.append({'plugin_id': gid, 'plugin_type': plugin_type, 'name': gname})
@@ -30861,6 +31205,29 @@ def api_generators_artifacts_index():
 
         _add_from(flag_gens, 'flag-generator')
         _add_from(node_gens, 'flag-node-generator')
+
+        # Always include reserved artifact keys as a starting point.
+        # These can be used in Requires/Produces even if no generator currently
+        # advertises them in enabled sources.
+        try:
+            for art, meta in _RESERVED_ARTIFACTS.items():
+                if art not in idx:
+                    idx[art] = {
+                        'artifact': art,
+                        'type': str(meta.get('type') or '').strip(),
+                        'description': str(meta.get('description') or '').strip(),
+                        'sensitive': meta.get('sensitive') is True,
+                        'producers': [{'plugin_id': '(reserved)', 'plugin_type': 'reserved', 'name': 'Reserved'}],
+                    }
+                else:
+                    if not str(idx[art].get('type') or '').strip() and str(meta.get('type') or '').strip():
+                        idx[art]['type'] = str(meta.get('type') or '').strip()
+                    if not str(idx[art].get('description') or '').strip() and str(meta.get('description') or '').strip():
+                        idx[art]['description'] = str(meta.get('description') or '').strip()
+                    if idx[art].get('sensitive') is not True and meta.get('sensitive') is True:
+                        idx[art]['sensitive'] = True
+        except Exception:
+            pass
 
         # Merge in persisted custom artifacts (no producers).
         try:

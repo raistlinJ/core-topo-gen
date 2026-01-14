@@ -206,6 +206,7 @@
                 <th style="width: 56px;">Pick</th>
                 <th>Artifact</th>
                 <th style="width: 160px;">Type</th>
+                <th>Description</th>
                 <th>Produced by</th>
               </tr>
             </thead>
@@ -440,7 +441,7 @@
       try {
         const re = new RegExp(q, 'i');
         return {
-          items: all.filter(a=>re.test(String(a.artifact||'')) || re.test(String((a.type||''))) || re.test(String((a.producers_text||'')))),
+          items: all.filter(a=>re.test(String(a.artifact||'')) || re.test(String((a.type||''))) || re.test(String((a.description||''))) || re.test(String((a.producers_text||'')))),
           error: null,
         };
       } catch(e){
@@ -452,8 +453,9 @@
       items: all.filter(a=>{
         const art = String(a.artifact||'').toLowerCase();
         const typ = String(a.type||'').toLowerCase();
+        const desc = String(a.description||'').toLowerCase();
         const prod = String(a.producers_text||'').toLowerCase();
-        return art.includes(low) || typ.includes(low) || prod.includes(low);
+        return art.includes(low) || typ.includes(low) || desc.includes(low) || prod.includes(low);
       }),
       error: null,
     };
@@ -491,6 +493,7 @@
         <td><input class="form-check-input" type="checkbox" id="${checkboxId}" data-artifact="${escapeHtml(a.artifact)}"></td>
         <td class="font-monospace">${escapeHtml(a.artifact || '')}</td>
         <td>${escapeHtml(a.type || '')}</td>
+        <td class="small">${escapeHtml(a.description || '')}</td>
         <td class="small">${escapeHtml(a.producers_text || '')}</td>
       `;
       body.appendChild(tr);

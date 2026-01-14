@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import time
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,9 @@ def load_generators_from_source(path: Path) -> list[dict[str, Any]]:
         pid = str(impl.get("plugin_id") or "").strip()
         if not pid:
             continue
+        inject_files = impl.get("inject_files")
+        if not isinstance(inject_files, list):
+            inject_files = []
         rec: dict[str, Any] = {
             "id": pid,
             "plugin_id": pid,
@@ -75,12 +79,181 @@ def load_generators_from_source(path: Path) -> list[dict[str, Any]]:
             "env": impl.get("env"),
             "hint_template": impl.get("hint_template"),
             "handoff": impl.get("handoff"),
+            "inject_files": [str(x) for x in inject_files if x is not None and str(x).strip()],
         }
         plugin = plugins_by_id.get(pid)
         if isinstance(plugin, dict):
             rec["plugin"] = plugin
         out.append(rec)
     return out
+
+
+def _norm_inject_path(raw: str) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    s = s.replace('\\', '/')
+    while s.startswith('./'):
+        s = s[2:]
+    while s.startswith('/'):
+        s = s[1:]
+    if s.startswith('flow_artifacts/'):
+        s = s[len('flow_artifacts/'):]
+    if s.startswith('artifacts/'):
+        s = s[len('artifacts/'):]
+    while s.startswith('./'):
+        s = s[2:]
+    return s.strip('/')
+
+
+def _copy_tree_or_file(src: Path, dest: Path) -> None:
+    if src.is_dir():
+        shutil.copytree(src, dest, dirs_exist_ok=True)
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+
+
+def _stage_injected_dir(out_dir: Path, inject_files: list[str]) -> Path | None:
+    """Create/refresh out_dir/injected with only allowlisted paths.
+
+    Paths are treated as relative to the injected root. We accept a few common
+    prefixes (artifacts/, /flow_artifacts/) and strip them.
+    """
+    cleaned = []
+    for raw in inject_files or []:
+        p = _norm_inject_path(str(raw))
+        if p:
+            cleaned.append(p)
+    cleaned = sorted(set(cleaned))
+    if not cleaned:
+        return None
+
+    injected_dir = (out_dir / 'injected').resolve()
+    injected_dir.mkdir(parents=True, exist_ok=True)
+
+    # Rebuild injected dir from scratch to guarantee no extra files remain.
+    for child in injected_dir.iterdir():
+        try:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        except Exception:
+            pass
+
+    artifacts_dir = (out_dir / 'artifacts').resolve()
+
+    missing: list[str] = []
+    for rel in cleaned:
+        dest = (injected_dir / rel).resolve()
+        try:
+            src1 = (artifacts_dir / rel).resolve()
+            src2 = (out_dir / rel).resolve()
+            src = None
+            if src1.exists():
+                src = src1
+            elif src2.exists():
+                src = src2
+            if src is None:
+                missing.append(rel)
+                continue
+            _copy_tree_or_file(src, dest)
+        except Exception:
+            missing.append(rel)
+
+    if missing:
+        missing_set = set(missing)
+        # hint.txt is commonly materialized after generator execution (e.g., by Flow)
+        # and may not exist at staging time.
+        if missing_set != {'hint.txt'}:
+            print(f"[inject_files] warning: missing {len(missing)} paths: {missing[:8]}{'...' if len(missing) > 8 else ''}")
+    return injected_dir
+
+
+def _rewrite_compose_relative_binds_to_injected(out_dir: Path, compose_path: Path) -> None:
+    """Rewrite bind mount sources that are relative to './injected/<src>'.
+
+    Strict: any relative bind becomes injected-relative. This enforces that only
+    staged files are accessible in the container.
+    """
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        print('[inject_files] warning: PyYAML unavailable; cannot rewrite docker-compose.yml binds')
+        return
+
+    try:
+        obj = yaml.safe_load(compose_path.read_text('utf-8', errors='ignore')) or {}
+    except Exception as exc:
+        print(f"[inject_files] warning: failed to parse compose yaml: {exc}")
+        return
+
+    services = obj.get('services') if isinstance(obj, dict) else None
+    if not isinstance(services, dict):
+        return
+
+    def _is_relative_bind_src(src: str) -> bool:
+        s = (src or '').strip()
+        if not s:
+            return False
+        if s.startswith('/'):
+            return False
+        # named volume: no slashes, no dot prefix
+        if '/' not in s and not s.startswith('.'):
+            return False
+        return True
+
+    for _svc_name, svc in services.items():
+        if not isinstance(svc, dict):
+            continue
+        vols = svc.get('volumes')
+        if not vols:
+            continue
+        if not isinstance(vols, list):
+            vols = [vols]
+        new_vols: list[Any] = []
+        for v in vols:
+            if isinstance(v, str):
+                text = v.strip()
+                if not text:
+                    new_vols.append(v)
+                    continue
+                parts = text.split(':')
+                if len(parts) < 2:
+                    new_vols.append(v)
+                    continue
+                src = parts[0]
+                if _is_relative_bind_src(src):
+                    src_norm = src
+                    while src_norm.startswith('./'):
+                        src_norm = src_norm[2:]
+                    parts[0] = f"./injected/{src_norm}".rstrip('/')
+                    new_vols.append(':'.join(parts))
+                else:
+                    new_vols.append(v)
+                continue
+            if isinstance(v, dict):
+                # long syntax
+                typ = str(v.get('type') or '').strip().lower()
+                src = v.get('source')
+                if (typ in ('', 'bind')) and isinstance(src, str) and _is_relative_bind_src(src):
+                    src_norm = src
+                    while src_norm.startswith('./'):
+                        src_norm = src_norm[2:]
+                    v2 = dict(v)
+                    v2['source'] = f"./injected/{src_norm}".rstrip('/')
+                    new_vols.append(v2)
+                else:
+                    new_vols.append(v)
+                continue
+            new_vols.append(v)
+        svc['volumes'] = new_vols
+
+    try:
+        compose_path.write_text(yaml.safe_dump(obj, sort_keys=False), encoding='utf-8')
+    except Exception as exc:
+        print(f"[inject_files] warning: failed to write rewritten compose: {exc}")
 
 
 def find_generator(repo_root: Path, generator_id: str) -> tuple[dict[str, Any], Path]:
@@ -107,6 +280,85 @@ def substitute_vars(value: Any, mapping: dict[str, str]) -> Any:
     if isinstance(value, dict):
         return {k: substitute_vars(v, mapping) for k, v in value.items()}
     return value
+
+
+def expand_inject_files(inject_files: list[str], env: dict[str, str]) -> list[str]:
+    """Expand ${VARNAME} placeholders in inject_files using env.
+
+    This allows generator catalogs to declare injected file allowlists that
+    depend on runtime inputs (e.g., ${CHALLENGE} for per-node filenames).
+    """
+    out: list[str] = []
+    for raw in inject_files or []:
+        try:
+            expanded = substitute_vars(raw, env)
+        except Exception:
+            expanded = raw
+        if isinstance(expanded, list):
+            for x in expanded:
+                s = str(x or '').strip()
+                if s:
+                    out.append(s)
+            continue
+        s = str(expanded or '').strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def expand_inject_files_from_outputs(out_dir: Path, inject_files: list[str]) -> list[str]:
+    """Expand inject_files entries that reference output artifact keys.
+
+    If an inject_files entry matches a key in outputs.json (doc['outputs']), we
+    expand it to the corresponding output value(s) when they look like paths.
+
+    Example:
+        inject_files: ['filesystem.file']
+        outputs.json: {"outputs": {"filesystem.file": "artifacts/challenge"}}
+        -> expanded inject_files includes 'artifacts/challenge'
+    """
+    manifest = (out_dir / 'outputs.json').resolve()
+    if not manifest.exists():
+        return list(inject_files or [])
+
+    try:
+        doc = json.loads(manifest.read_text('utf-8', errors='ignore'))
+    except Exception:
+        return list(inject_files or [])
+
+    outputs = doc.get('outputs') if isinstance(doc, dict) else None
+    if not isinstance(outputs, dict):
+        return list(inject_files or [])
+
+    def _looks_like_path(s: str) -> bool:
+        # Heuristic: treat slash-containing values as paths.
+        return '/' in (s or '')
+
+    out: list[str] = []
+    for raw in inject_files or []:
+        key = str(raw or '').strip()
+        if not key:
+            continue
+        if key in outputs:
+            v = outputs.get(key)
+            if isinstance(v, str):
+                vv = v.strip()
+                if vv and _looks_like_path(vv):
+                    out.append(vv)
+                    continue
+            if isinstance(v, list):
+                vals: list[str] = []
+                for item in v:
+                    s = str(item or '').strip()
+                    if s and _looks_like_path(s):
+                        vals.append(s)
+                if vals:
+                    out.extend(vals)
+                    continue
+            # If the output value doesn't look like a path, fall through and
+            # treat the entry as a literal path.
+        out.append(key)
+    return out
 
 
 def run_cmd(cmd: list[str], workdir: Path, env: dict[str, str]) -> None:
@@ -228,6 +480,9 @@ def main() -> int:
         raise SystemExit("--config must be a JSON object")
 
     gen, _src_path = find_generator(repo_root, args.generator_id)
+    inject_files = gen.get('inject_files')
+    if not isinstance(inject_files, list):
+        inject_files = []
     source = gen.get("source") or {}
     src_path = source.get("path") or ""
     source_dir = (repo_root / src_path).resolve() if not Path(src_path).is_absolute() else Path(src_path).resolve()
@@ -281,6 +536,16 @@ def main() -> int:
             },
         )
 
+        # If this generator declares inject_files, stage and enforce that only
+        # staged files can be mounted into the generated compose container.
+        expanded_inject = expand_inject_files([str(x) for x in inject_files if x is not None], env)
+        expanded_inject = expand_inject_files_from_outputs(out_dir, expanded_inject)
+        injected_dir = _stage_injected_dir(out_dir, expanded_inject)
+        if injected_dir is not None:
+            compose_out = out_dir / 'docker-compose.yml'
+            if compose_out.exists():
+                _rewrite_compose_relative_binds_to_injected(out_dir, compose_out)
+
         manifest = out_dir / "outputs.json"
         if manifest.exists():
             print(manifest.read_text("utf-8"))
@@ -299,6 +564,14 @@ def main() -> int:
         cmd = substitute_vars(run.get("cmd"), mapping)
         workdir = substitute_vars(run.get("workdir", "${source.path}"), mapping)
         run_cmd([str(x) for x in cmd], Path(str(workdir)), env)
+
+    expanded_inject = expand_inject_files([str(x) for x in inject_files if x is not None], env)
+    expanded_inject = expand_inject_files_from_outputs(out_dir, expanded_inject)
+    injected_dir = _stage_injected_dir(out_dir, expanded_inject)
+    if injected_dir is not None:
+        compose_out = out_dir / 'docker-compose.yml'
+        if compose_out.exists():
+            _rewrite_compose_relative_binds_to_injected(out_dir, compose_out)
 
     # Print manifest if present
     manifest = out_dir / "outputs.json"

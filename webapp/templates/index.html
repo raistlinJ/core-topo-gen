@@ -632,6 +632,11 @@
                     <div class="small text-muted mt-2">Applies to remote execution only.</div>
                     <div class="mt-3 d-grid gap-2">
                         <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="executeAdvUploadOnlyInjectedArtifacts" checked>
+                            <label class="form-check-label" for="executeAdvUploadOnlyInjectedArtifacts">Upload only injected artifacts (inject_files allowlist)</label>
+                            <div class="form-text">Uploads only the plan's <span class="font-monospace">mount_dir</span> (typically <span class="font-monospace">.../injected</span>) instead of the full <span class="font-monospace">artifacts_dir</span>.</div>
+                        </div>
+                        <div class="form-check">
                             <input class="form-check-input" type="checkbox" id="executeAdvFixDockerDaemon">
                             <label class="form-check-label" for="executeAdvFixDockerDaemon">Fix Docker daemon for CORE (disable default bridge + iptables)</label>
                         </div>
@@ -14834,6 +14839,7 @@ let executeAdvStartCoreDaemon = null;
 let executeAdvAutoKillSessions = null;
 let executeAdvDockerCleanupBeforeRun = null;
 let executeAdvDockerNukeAll = null;
+let executeAdvUploadOnlyInjectedArtifacts = null;
 const EXECUTE_CONFIRM_PREFS_STORAGE_KEY = 'coretg_execute_confirm_prefs';
 
 function loadExecuteConfirmPrefs() {
@@ -14875,6 +14881,25 @@ function setExecuteConfirmUpdateRemotePref(value) {
     persistExecuteConfirmPrefs();
 }
 
+function getExecuteConfirmUploadOnlyInjectedArtifactsPref() {
+    // Default to true to minimize remote uploads.
+    if (!executeConfirmPrefs || typeof executeConfirmPrefs !== 'object') {
+        return true;
+    }
+    if (executeConfirmPrefs.uploadOnlyInjectedArtifacts === undefined) {
+        return true;
+    }
+    return !!executeConfirmPrefs.uploadOnlyInjectedArtifacts;
+}
+
+function setExecuteConfirmUploadOnlyInjectedArtifactsPref(value) {
+    if (!executeConfirmPrefs || typeof executeConfirmPrefs !== 'object') {
+        executeConfirmPrefs = {};
+    }
+    executeConfirmPrefs.uploadOnlyInjectedArtifacts = !!value;
+    persistExecuteConfirmPrefs();
+}
+
 function isRemoteExecutionSelected() {
     // Execute Confirm modal no longer provides a remote/local toggle.
     // Executions from this dialog always target the configured remote CORE VM.
@@ -14898,6 +14923,11 @@ function getExecuteConfirmSelections() {
         restartCoreDaemon: remoteExecution && !!(executeAdvRestartCoreDaemon && executeAdvRestartCoreDaemon.checked),
         startCoreDaemon: remoteExecution && !!(executeAdvStartCoreDaemon && executeAdvStartCoreDaemon.checked),
         autoKillSessions: remoteExecution && !!(executeAdvAutoKillSessions && executeAdvAutoKillSessions.checked),
+        uploadOnlyInjectedArtifacts: remoteExecution && (
+            executeAdvUploadOnlyInjectedArtifacts
+                ? !!executeAdvUploadOnlyInjectedArtifacts.checked
+                : getExecuteConfirmUploadOnlyInjectedArtifactsPref()
+        ),
     };
     return {
         remoteExecution,
@@ -15028,6 +15058,9 @@ function ensureExecuteConfirmElements() {
     if (!executeAdvAutoKillSessions) {
         executeAdvAutoKillSessions = document.getElementById('executeAdvAutoKillSessions');
     }
+    if (!executeAdvUploadOnlyInjectedArtifacts) {
+        executeAdvUploadOnlyInjectedArtifacts = document.getElementById('executeAdvUploadOnlyInjectedArtifacts');
+    }
     // Make dialog controls togglable (global function)
     if (typeof window.setExecuteDialogControlsEnabled !== 'function') {
         window.setExecuteDialogControlsEnabled = function(enabled) {
@@ -15045,6 +15078,7 @@ function ensureExecuteConfirmElements() {
                     executeAdvRestartCoreDaemon,
                     executeAdvStartCoreDaemon,
                     executeAdvAutoKillSessions,
+                    executeAdvUploadOnlyInjectedArtifacts,
                 ];
                 controls.forEach(el => { if (el) { el.disabled = disable; } });
                 ['executeCoreTestRow', 'executeCoreNotConfiguredRow', 'executeAdvancedWrap', 'executePushUpdateToggleWrap']
@@ -15093,6 +15127,13 @@ function ensureExecuteConfirmElements() {
             refreshExecuteRemoteToggleState();
         });
         executeConfirmPushUpdateToggle.dataset.execBound = '1';
+    }
+    if (executeAdvUploadOnlyInjectedArtifacts && !executeAdvUploadOnlyInjectedArtifacts.dataset.execBound) {
+        executeAdvUploadOnlyInjectedArtifacts.checked = getExecuteConfirmUploadOnlyInjectedArtifactsPref();
+        executeAdvUploadOnlyInjectedArtifacts.addEventListener('change', () => {
+            setExecuteConfirmUploadOnlyInjectedArtifactsPref(executeAdvUploadOnlyInjectedArtifacts.checked);
+        });
+        executeAdvUploadOnlyInjectedArtifacts.dataset.execBound = '1';
     }
     if (executeCoreTestBtn && !executeCoreTestBtn.dataset.execBound) {
         executeCoreTestBtn.addEventListener('click', () => {
@@ -17191,6 +17232,7 @@ function buildRunFormData(xmlPath, options = {}) {
         if (adv && adv.checkCoreVersion) form.append('adv_check_core_version', '1');
         if (adv && adv.restartCoreDaemon) form.append('adv_restart_core_daemon', '1');
         if (adv && adv.autoKillSessions) form.append('adv_auto_kill_sessions', '1');
+        if (adv && adv.uploadOnlyInjectedArtifacts) form.append('upload_only_injected_artifacts', '1');
     } catch (err) { /* ignore */ }
     return form;
 }
@@ -18817,6 +18859,10 @@ async function runSyncWithModal(arg){
         } else if (advancedFromOpts && typeof advancedFromOpts === 'object') {
             formOptions.advanced = advancedFromOpts;
         }
+        try {
+            const injectedOnly = !!formOptions?.advanced?.uploadOnlyInjectedArtifacts;
+            appendExecuteDialogLog(`Remote upload mode: ${injectedOnly ? 'injected-only (mount_dir)' : 'full artifacts_dir'}`);
+        } catch (e) {}
         const autoKillSessions = !!formOptions?.advanced?.autoKillSessions;
         const res = await submitRunCliRequest(
             () => {
@@ -18836,6 +18882,7 @@ async function runSyncWithModal(arg){
                         if (adv && adv.restartCoreDaemon) payload.adv_restart_core_daemon = true;
                         if (adv && adv.startCoreDaemon) payload.adv_start_core_daemon = true;
                         if (adv && adv.autoKillSessions) payload.adv_auto_kill_sessions = true;
+                        if (adv && adv.uploadOnlyInjectedArtifacts) payload.upload_only_injected_artifacts = true;
                     } catch (e) {}
                     return {
                         body: JSON.stringify(payload),
@@ -19114,6 +19161,10 @@ async function runWithSeedBuild(){
         // Show dock logs
         try { const showBtn=document.getElementById('dockShowBtn'); if(showBtn && !showBtn.classList.contains('d-none')) showBtn.click(); } catch(e){}
         runProgressLogLine('[ui] Requesting remote CLI run…');
+        try {
+            const injectedOnly = !!advancedSelections?.uploadOnlyInjectedArtifacts;
+            runProgressLogLine(`[ui] Remote upload mode: ${injectedOnly ? 'injected-only (mount_dir)' : 'full artifacts_dir'}`);
+        } catch (e) {}
         const seededStatusEl = document.getElementById('runProgressStatus');
         if(seededStatusEl) seededStatusEl.textContent = 'Preparing remote workspace…';
         const statusMetaEl = document.getElementById('runProgressMeta');
@@ -19131,6 +19182,7 @@ async function runWithSeedBuild(){
                     if (advancedSelections.restartCoreDaemon) payload.adv_restart_core_daemon = true;
                     if (advancedSelections.startCoreDaemon) payload.adv_start_core_daemon = true;
                     if (advancedSelections.autoKillSessions) payload.adv_auto_kill_sessions = true;
+                    if (advancedSelections.uploadOnlyInjectedArtifacts) payload.upload_only_injected_artifacts = true;
                 }
             } catch (e) {}
             return {
