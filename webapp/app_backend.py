@@ -10435,6 +10435,41 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
         input_fields_optional = sorted([x for x in input_fields_all if x and x not in set(input_fields_required)])
         output_fields = sorted(list(_output_fields_of(gen)))
 
+        raw_overrides = req.get('config_overrides')
+        if not isinstance(raw_overrides, dict):
+            raw_overrides = req.get('inputs_overrides')
+        if not isinstance(raw_overrides, dict):
+            raw_overrides = req.get('input_overrides')
+
+        allowed_override_keys: set[str] = set(input_fields_all)
+        try:
+            allowed_override_keys |= set(_flow_synthesized_inputs())
+        except Exception:
+            pass
+
+        config_overrides: dict[str, Any] = {}
+        if isinstance(raw_overrides, dict):
+            for k, v in (raw_overrides or {}).items():
+                kk = str(k or '').strip()
+                if kk and kk in allowed_override_keys:
+                    config_overrides[kk] = v
+
+        config_overrides: dict[str, Any] = {}
+        try:
+            raw_overrides = req.get('config_overrides') or req.get('inputs_overrides') or req.get('input_overrides')
+            if isinstance(raw_overrides, dict) and raw_overrides:
+                allowed_override_keys = set(input_fields_all) | set(_flow_synthesized_inputs())
+                for k, v in raw_overrides.items():
+                    kk = str(k or '').strip()
+                    if not kk:
+                        continue
+                    if allowed_override_keys and kk not in allowed_override_keys:
+                        continue
+                    # Preserve explicit clears (None/empty) as an override.
+                    config_overrides[kk] = v
+        except Exception:
+            config_overrides = {}
+
         # If an artifact "requires" token also appears as an optional input field,
         # treat it as optional (do not block chaining/validation on it).
         try:
@@ -10534,6 +10569,8 @@ def _flow_strip_runtime_sensitive_fields(flag_assignments: list[dict[str, Any]])
         a2 = dict(a)
         a2.pop('runtime_flags', None)
         a2.pop('runtime_outputs', None)
+        # Effective generator config may include secrets and should not be persisted.
+        a2.pop('config', None)
         out.append(a2)
     return out
 
@@ -12397,6 +12434,21 @@ def api_flow_prepare_preview_for_execute():
                 except Exception:
                     pass
 
+                # Apply any user-provided input overrides persisted in Flow metadata.
+                try:
+                    raw_overrides = fa.get('config_overrides') or fa.get('inputs_overrides') or fa.get('input_overrides')
+                    if isinstance(raw_overrides, dict) and raw_overrides:
+                        for k, v in raw_overrides.items():
+                            kk = str(k or '').strip()
+                            if not kk:
+                                continue
+                            # Preserve explicit clears; generators may treat empty/null specially.
+                            cfg_full[kk] = v
+                        # Ensure the UI sees a normalized dict.
+                        fa['config_overrides'] = dict(raw_overrides)
+                except Exception:
+                    pass
+
                 cfg = cfg_full
                 inputs_mismatch: dict[str, Any] = {}
                 try:
@@ -12796,6 +12848,7 @@ def api_flow_prepare_preview_for_execute():
                     fa['outputs_mismatch'] = mismatch
                     fa['inputs_match'] = bool(inputs_mismatch.get('ok')) if isinstance(inputs_mismatch, dict) and inputs_mismatch else True
                     fa['inputs_mismatch'] = inputs_mismatch
+                    fa['config'] = cfg
                 except Exception:
                     pass
 
@@ -13183,6 +13236,25 @@ def api_flow_save_flow_substitutions():
         input_fields_optional = sorted([x for x in input_fields_all if x and x not in set(input_fields_required)])
         output_fields = sorted(list(_output_fields_of(gen)))
 
+        raw_overrides = req.get('config_overrides')
+        if not isinstance(raw_overrides, dict):
+            raw_overrides = req.get('inputs_overrides')
+        if not isinstance(raw_overrides, dict):
+            raw_overrides = req.get('input_overrides')
+
+        allowed_override_keys: set[str] = set(input_fields_all)
+        try:
+            allowed_override_keys |= set(_flow_synthesized_inputs())
+        except Exception:
+            pass
+
+        config_overrides: dict[str, Any] = {}
+        if isinstance(raw_overrides, dict):
+            for k, v in (raw_overrides or {}).items():
+                kk = str(k or '').strip()
+                if kk and kk in allowed_override_keys:
+                    config_overrides[kk] = v
+
         # If an artifact "requires" token also appears as an optional input field,
         # treat it as optional (exclude from effective chaining requirements).
         try:
@@ -13204,6 +13276,7 @@ def api_flow_save_flow_substitutions():
             'generator_catalog': str(gen.get('_flow_catalog') or 'flag_generators'),
             'language': str(gen.get('language') or ''),
             'description_hints': list(gen.get('description_hints') or []) if isinstance(gen.get('description_hints'), list) else [],
+            'config_overrides': dict(config_overrides),
             'inputs': inputs_effective,
             'outputs': outputs_effective,
             'requires': requires_artifacts,

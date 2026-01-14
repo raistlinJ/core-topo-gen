@@ -121,6 +121,30 @@
                 </div>
               </form>
             </dialog>
+
+            <dialog id="flowInputsDialog" class="p-0 border rounded" style="max-width: 1150px; width: calc(100% - 2rem); max-height: 85vh; overflow: hidden;">
+              <form method="dialog" class="m-0" style="display:flex;flex-direction:column;max-height:85vh;">
+                <div class="p-3 border-bottom d-flex align-items-center justify-content-between" style="flex:0 0 auto;">
+                  <div class="fw-semibold" id="flowInputsTitle">Inputs</div>
+                  <button class="btn btn-sm btn-outline-secondary" value="close" type="submit">Close</button>
+                </div>
+                <div class="p-3" style="flex:1 1 auto; overflow: auto;">
+                  <div id="flowInputsBody" class="small"></div>
+                </div>
+              </form>
+            </dialog>
+
+            <dialog id="flowSubstituteDialog" class="p-0 border rounded" style="max-width: 1150px; width: calc(100% - 2rem); max-height: 85vh; overflow: hidden;">
+              <form method="dialog" class="m-0" style="display:flex;flex-direction:column;max-height:85vh;">
+                <div class="p-3 border-bottom d-flex align-items-center justify-content-between" style="flex:0 0 auto;">
+                  <div class="fw-semibold" id="flowSubstituteTitle">Substitute</div>
+                  <button class="btn btn-sm btn-outline-secondary" value="close" type="submit">Close</button>
+                </div>
+                <div class="p-3" style="flex:1 1 auto; overflow: auto;">
+                  <div id="flowSubstituteBody" class="small"></div>
+                </div>
+              </form>
+            </dialog>
           </div>
         </div>
 
@@ -207,6 +231,12 @@
   const nodeDetailsDialogEl = document.getElementById('flowNodeDetailsDialog');
   const nodeDetailsTitleEl = document.getElementById('flowNodeDetailsTitle');
   const nodeDetailsBodyEl = document.getElementById('flowNodeDetailsBody');
+  const inputsDialogEl = document.getElementById('flowInputsDialog');
+  const inputsTitleEl = document.getElementById('flowInputsTitle');
+  const inputsBodyEl = document.getElementById('flowInputsBody');
+  const substituteDialogEl = document.getElementById('flowSubstituteDialog');
+  const substituteTitleEl = document.getElementById('flowSubstituteTitle');
+  const substituteBodyEl = document.getElementById('flowSubstituteBody');
   const afbDownloadLink = document.getElementById('flowAfbDownloadLink');
   const scenarioListEl = document.getElementById('flowScenarioList');
   const clearScenarioBtn = document.getElementById('flowScenarioFilterClear');
@@ -1061,17 +1091,34 @@
       try {
         const shortcutRow = document.createElement('div');
         shortcutRow.className = 'd-flex justify-content-end mt-2';
+        const btnGroup = document.createElement('div');
+        btnGroup.className = 'btn-group btn-group-sm';
+
+        const inputsBtn = document.createElement('button');
+        inputsBtn.type = 'button';
+        inputsBtn.className = 'btn btn-outline-secondary';
+        inputsBtn.textContent = 'Inputs';
+        inputsBtn.addEventListener('click', (ev)=>{
+          try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
+          try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
+          try { selectChainIndex(idx); } catch(e) {}
+          try { openInputsDialog(idx); } catch(e) {}
+        });
+
         const subBtn = document.createElement('button');
         subBtn.type = 'button';
-        subBtn.className = 'btn btn-sm btn-outline-primary';
+        subBtn.className = 'btn btn-outline-primary';
         subBtn.textContent = 'Substitute';
         subBtn.addEventListener('click', (ev)=>{
           try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
           try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
           try { selectChainIndex(idx); } catch(e) {}
-          try { openNodeDetailsDialog(idx, { openSubstitute: true }); } catch(e) {}
+          try { openSubstituteDialog(idx); } catch(e) {}
         });
-        shortcutRow.appendChild(subBtn);
+
+        btnGroup.appendChild(inputsBtn);
+        btnGroup.appendChild(subBtn);
+        shortcutRow.appendChild(btnGroup);
         left.appendChild(shortcutRow);
       } catch(e) {}
 
@@ -1118,8 +1165,6 @@
 
   function openNodeDetailsDialog(idx, opts){
     if(!nodeDetailsDialogEl || !nodeDetailsBodyEl) return;
-    const options = (opts && typeof opts === 'object') ? opts : {};
-    const openSubstitute = !!options.openSubstitute;
     const i = Number.isFinite(+idx) ? (+idx) : -1;
     if(!Array.isArray(currentChain) || i < 0 || i >= currentChain.length) return;
     const node = currentChain[i] || {};
@@ -1153,26 +1198,13 @@
       tbody.appendChild(tr);
     }
 
-    function addFullRow(valueElOrText){
-      const tr = document.createElement('tr');
-      const td = document.createElement('td');
-      td.colSpan = 2;
-      if(valueElOrText && typeof valueElOrText === 'object' && valueElOrText.nodeType){
-        td.appendChild(valueElOrText);
-      } else {
-        td.textContent = String(valueElOrText || '');
-      }
-      tr.appendChild(td);
-      tbody.appendChild(tr);
-    }
-
     // Flag(s) assigned to this node (currently 1-per-chain-position).
     if(fa && (fa.id || fa.name)){
       const genId = fa && fa.id ? String(fa.id) : '-';
       const genName = fa && fa.name ? String(fa.name) : '-';
       const genType = (fa && fa.type) ? String(fa.type) : '';
       const genSource = (fa && fa.flag_generator) ? String(fa.flag_generator) : '';
-      // Render a structured summary (more readable than a pipe-delimited string).
+
       const flagEl = document.createElement('div');
       flagEl.className = 'd-flex flex-column';
 
@@ -1197,7 +1229,6 @@
       line1.appendChild(sourceVal);
 
       const line2 = document.createElement('div');
-      // Keep the ID visually distinct; name is optional.
       const idVal = document.createElement('code');
       idVal.textContent = genId || '-';
       line2.appendChild(idVal);
@@ -1215,37 +1246,340 @@
       addRow('Flag', '-');
     }
 
-    // (Intentionally compact) omit flag value and hint descriptions here.
-
     tbl.appendChild(tbody);
     nodeDetailsBodyEl.appendChild(tbl);
 
-    // Substitute generator UI.
+    try{
+      if(typeof nodeDetailsDialogEl.showModal === 'function'){
+        nodeDetailsDialogEl.showModal();
+      }
+    } catch(e) {}
+  }
+
+  function openInputsDialog(idx){
+    if(!inputsDialogEl || !inputsBodyEl) return;
+    const i = Number.isFinite(+idx) ? (+idx) : -1;
+    if(!Array.isArray(currentChain) || i < 0 || i >= currentChain.length) return;
+    const node = currentChain[i] || {};
+    const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[i]) ? currentFlagAssignments[i] : null;
+
+    const seq = toRoman(i + 1);
+    const nodeName = (node && node.name) ? String(node.name) : ('Node ' + (i + 1));
+    if(inputsTitleEl) inputsTitleEl.textContent = 'Inputs — ' + (seq ? (seq + '. ') : '') + nodeName;
+
+    inputsBodyEl.innerHTML = '';
+
+    // Header summary (generator id/type/source).
+    try{
+      const genId = fa && fa.id ? String(fa.id) : '-';
+      const genType = (fa && fa.type) ? String(fa.type) : '-';
+      const genSource = (fa && fa.flag_generator) ? String(fa.flag_generator) : '-';
+      const hdr = document.createElement('div');
+      hdr.className = 'mb-2';
+      const label = document.createElement('div');
+      label.className = 'small text-muted';
+      label.textContent = 'Generator';
+      hdr.appendChild(label);
+
+      const row = document.createElement('div');
+      row.className = 'd-flex flex-wrap gap-2 align-items-center';
+      const idCode = document.createElement('code');
+      idCode.textContent = genId;
+      row.appendChild(idCode);
+
+      const typeLabel = document.createElement('span');
+      typeLabel.className = 'text-muted small';
+      typeLabel.textContent = 'type';
+      row.appendChild(typeLabel);
+      const typeCode = document.createElement('code');
+      typeCode.textContent = genType;
+      row.appendChild(typeCode);
+
+      const srcLabel = document.createElement('span');
+      srcLabel.className = 'text-muted small';
+      srcLabel.textContent = 'source';
+      row.appendChild(srcLabel);
+      const srcCode = document.createElement('code');
+      srcCode.textContent = genSource;
+      row.appendChild(srcCode);
+
+      hdr.appendChild(row);
+      inputsBodyEl.appendChild(hdr);
+    } catch(e) {}
+
+    // Inputs override UI (always expanded).
+    try{
+      const box = document.createElement('div');
+      box.className = 'd-flex flex-column gap-2';
+
+      const help = document.createElement('div');
+      help.className = 'small text-muted';
+      help.textContent = 'Override generator input values for this chain step.';
+      box.appendChild(help);
+
+      const form = document.createElement('div');
+      form.className = 'border rounded p-2';
+
+      const cfg = (fa && typeof fa.config === 'object' && fa.config && !Array.isArray(fa.config)) ? fa.config : null;
+      const overrides0 = (fa && typeof fa.config_overrides === 'object' && fa.config_overrides && !Array.isArray(fa.config_overrides)) ? fa.config_overrides : null;
+      const inputNames = [];
+      try{
+        const req = (fa && Array.isArray(fa.input_fields_required)) ? fa.input_fields_required.map(String) : [];
+        const opt = (fa && Array.isArray(fa.input_fields_optional)) ? fa.input_fields_optional.map(String) : [];
+        const all = (req.length || opt.length) ? req.concat(opt) : ((fa && Array.isArray(fa.input_fields)) ? fa.input_fields.map(String) : []);
+        const seen = new Set();
+        for(const k of all){
+          const kk = String(k || '').trim();
+          if(!kk || seen.has(kk)) continue;
+          seen.add(kk);
+          inputNames.push(kk);
+        }
+      } catch(e) {}
+
+      const note = document.createElement('div');
+      note.className = 'small text-muted';
+      note.textContent = cfg
+        ? 'Effective config is shown below. Overrides persist into Execute and Save.'
+        : 'No effective config yet. Click Generate (with hint resolution) or Execute to compute defaults, then override.';
+      form.appendChild(note);
+
+      const tableWrap = document.createElement('div');
+      tableWrap.className = 'mt-2';
+      const t = document.createElement('table');
+      t.className = 'table table-sm mb-0 align-middle';
+      const thead = document.createElement('thead');
+      thead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Input</th><th>Effective</th><th>Override</th></tr>';
+      t.appendChild(thead);
+      const tb = document.createElement('tbody');
+
+      const inputElsByKey = {};
+      function renderVal(v){
+        if(v === undefined) return '';
+        if(v === null) return 'null';
+        if(typeof v === 'string') return v;
+        try { return JSON.stringify(v); } catch(e) { return String(v); }
+      }
+
+      function tryParseInputValue(raw){
+        const s = String(raw ?? '').trim();
+        if(!s) return '';
+        const looksJson = s.startsWith('{') || s.startsWith('[') || s.startsWith('"') || s === 'true' || s === 'false' || s === 'null' || /^-?\d+(?:\.\d+)?$/.test(s);
+        if(!looksJson) return s;
+        try { return JSON.parse(s); } catch(e) { return s; }
+      }
+
+      function setInputRow(k){
+        const tr = document.createElement('tr');
+        const tdK = document.createElement('td');
+        tdK.className = 'text-muted';
+        tdK.style.whiteSpace = 'nowrap';
+        const code = document.createElement('code');
+        code.textContent = k;
+        tdK.appendChild(code);
+
+        const tdEff = document.createElement('td');
+        tdEff.className = 'small';
+        const eff = cfg ? cfg[k] : undefined;
+        tdEff.textContent = (eff === undefined) ? '-' : renderVal(eff);
+
+        const tdOvr = document.createElement('td');
+        const inp = document.createElement('input');
+        inp.type = 'text';
+        inp.className = 'form-control form-control-sm font-monospace';
+        inp.placeholder = 'leave blank to use default';
+        inp.value = (overrides0 && (k in overrides0)) ? renderVal(overrides0[k]) : '';
+        inputElsByKey[k] = inp;
+        tdOvr.appendChild(inp);
+
+        tr.appendChild(tdK);
+        tr.appendChild(tdEff);
+        tr.appendChild(tdOvr);
+        tb.appendChild(tr);
+      }
+
+      if(inputNames.length){
+        inputNames.forEach(setInputRow);
+      } else {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 3;
+        td.className = 'text-muted small';
+        td.textContent = 'This generator declares no inputs.';
+        tr.appendChild(td);
+        tb.appendChild(tr);
+      }
+
+      t.appendChild(tb);
+      tableWrap.appendChild(t);
+      form.appendChild(tableWrap);
+
+      const actions = document.createElement('div');
+      actions.className = 'd-flex justify-content-end gap-2 mt-2';
+      const clearBtn = document.createElement('button');
+      clearBtn.type = 'button';
+      clearBtn.className = 'btn btn-sm btn-outline-secondary';
+      clearBtn.textContent = 'Clear overrides';
+      const saveBtn = document.createElement('button');
+      saveBtn.type = 'button';
+      saveBtn.className = 'btn btn-sm btn-primary';
+      saveBtn.textContent = 'Save overrides';
+      actions.appendChild(clearBtn);
+      actions.appendChild(saveBtn);
+      form.appendChild(actions);
+
+      async function persistOverridesForIndex(){
+        if(!Array.isArray(currentChain) || !currentChain.length) throw new Error('Generate a chain first.');
+        const scenario = (scenarioEl && scenarioEl.value || '').trim();
+        if(!scenario) throw new Error('No scenario selected.');
+        const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+        if(!chainIds.length) throw new Error('Missing chain ids.');
+
+        const reqAssignments = chainIds.map((nid, j)=>{
+          const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
+          const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
+          const ovr = (curA && typeof curA.config_overrides === 'object' && curA.config_overrides && !Array.isArray(curA.config_overrides))
+            ? curA.config_overrides
+            : undefined;
+          return { node_id: nid, id: curId, config_overrides: ovr };
+        });
+        const missing = reqAssignments.find(x => !x.id);
+        if(missing) throw new Error('Some chain positions have no generator assignment yet. Try Generate again.');
+
+        showLoading('Saving input overrides…');
+        const res = await postJson('/api/flag-sequencing/save_flow_substitutions', {
+          scenario: activeScenario,
+          chain_ids: chainIds,
+          preview_plan: (lastPreviewPlanPath || lastFlowPlanPath || ''),
+          flag_assignments: reqAssignments,
+          allow_node_duplicates: !!allowNodeDuplicates,
+        }, { timeoutMs: 60000 });
+        setFlowValidityFromPayload(res);
+        if(res && Array.isArray(res.chain)) currentChain = res.chain.slice();
+        if(res && Array.isArray(res.flag_assignments)) currentFlagAssignments = res.flag_assignments.slice();
+        if(res && res.flow_plan_path) lastFlowPlanPath = String(res.flow_plan_path);
+        updateMeta();
+        renderChainEditor();
+        return res;
+      }
+
+      clearBtn.addEventListener('click', async ()=>{
+        try { clearBtn.disabled = true; saveBtn.disabled = true; } catch(e) {}
+        try {
+          if(!Array.isArray(currentFlagAssignments) || !currentFlagAssignments[i]) throw new Error('No assignment for this step.');
+          currentFlagAssignments[i].config_overrides = {};
+          await persistOverridesForIndex();
+          for(const k of Object.keys(inputElsByKey)){
+            try { inputElsByKey[k].value = ''; } catch(e) {}
+          }
+          setStatus('Input overrides cleared.', false);
+        } catch(e) {
+          setStatus('Failed to clear overrides: ' + String(e && e.message || e), true);
+        } finally {
+          hideLoading();
+          try { clearBtn.disabled = false; saveBtn.disabled = false; } catch(e) {}
+        }
+      });
+
+      saveBtn.addEventListener('click', async ()=>{
+        try { clearBtn.disabled = true; saveBtn.disabled = true; } catch(e) {}
+        try {
+          if(!Array.isArray(currentFlagAssignments) || !currentFlagAssignments[i]) throw new Error('No assignment for this step.');
+          const newOverrides = {};
+          for(const k of Object.keys(inputElsByKey)){
+            const el = inputElsByKey[k];
+            const raw = (el && el.value !== undefined) ? String(el.value) : '';
+            const trimmed = raw.trim();
+            if(!trimmed) continue;
+            newOverrides[k] = tryParseInputValue(trimmed);
+          }
+          currentFlagAssignments[i].config_overrides = newOverrides;
+          await persistOverridesForIndex();
+          setStatus('Input overrides saved.', false);
+        } catch(e) {
+          setStatus('Failed to save overrides: ' + String(e && e.message || e), true);
+        } finally {
+          hideLoading();
+          try { clearBtn.disabled = false; saveBtn.disabled = false; } catch(e) {}
+        }
+      });
+
+      box.appendChild(form);
+      inputsBodyEl.appendChild(box);
+    } catch(e) {
+      // Non-fatal
+    }
+
+    try{
+      if(typeof inputsDialogEl.showModal === 'function') inputsDialogEl.showModal();
+    } catch(e) {}
+  }
+
+  function openSubstituteDialog(idx){
+    if(!substituteDialogEl || !substituteBodyEl) return;
+    const i = Number.isFinite(+idx) ? (+idx) : -1;
+    if(!Array.isArray(currentChain) || i < 0 || i >= currentChain.length) return;
+    const node = currentChain[i] || {};
+    const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[i]) ? currentFlagAssignments[i] : null;
+
+    const seq = toRoman(i + 1);
+    const nodeName = (node && node.name) ? String(node.name) : ('Node ' + (i + 1));
+    if(substituteTitleEl) substituteTitleEl.textContent = 'Substitute — ' + (seq ? (seq + '. ') : '') + nodeName;
+
+    substituteBodyEl.innerHTML = '';
+
+    // Header summary.
+    try{
+      const genId = fa && fa.id ? String(fa.id) : '-';
+      const genType = (fa && fa.type) ? String(fa.type) : '-';
+      const genSource = (fa && fa.flag_generator) ? String(fa.flag_generator) : '-';
+      const hdr = document.createElement('div');
+      hdr.className = 'mb-2';
+      const label = document.createElement('div');
+      label.className = 'small text-muted';
+      label.textContent = 'Current generator';
+      hdr.appendChild(label);
+
+      const row = document.createElement('div');
+      row.className = 'd-flex flex-wrap gap-2 align-items-center';
+      const idCode = document.createElement('code');
+      idCode.textContent = genId;
+      row.appendChild(idCode);
+
+      const typeLabel = document.createElement('span');
+      typeLabel.className = 'text-muted small';
+      typeLabel.textContent = 'type';
+      row.appendChild(typeLabel);
+      const typeCode = document.createElement('code');
+      typeCode.textContent = genType;
+      row.appendChild(typeCode);
+
+      const srcLabel = document.createElement('span');
+      srcLabel.className = 'text-muted small';
+      srcLabel.textContent = 'source';
+      row.appendChild(srcLabel);
+      const srcCode = document.createElement('code');
+      srcCode.textContent = genSource;
+      row.appendChild(srcCode);
+
+      hdr.appendChild(row);
+      substituteBodyEl.appendChild(hdr);
+    } catch(e) {}
+
+    // Substitute generator UI (always expanded).
     try{
       const isVuln = !!(node && (node.is_vuln || node.is_vulnerability || node.isVuln));
       const currentType = (fa && fa.type) ? String(fa.type) : (isVuln ? 'flag-generator' : 'flag-generator');
       const currentSource = (fa && fa.flag_generator) ? String(fa.flag_generator) : '';
 
-      const box = document.createElement('div');
-      box.className = 'd-flex flex-column gap-2';
-
-      const topRow = document.createElement('div');
-      topRow.className = 'd-flex align-items-center justify-content-between gap-2';
       const help = document.createElement('div');
       help.className = 'small text-muted';
       help.textContent = isVuln
         ? 'Flag generator type (fixed for vulnerabilities)'
         : 'Choose a compatible flag-generator or flag-node-generator.';
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'btn btn-sm btn-outline-primary';
-      btn.textContent = 'Substitute';
-      topRow.appendChild(help);
-      topRow.appendChild(btn);
-      box.appendChild(topRow);
+      substituteBodyEl.appendChild(help);
 
       const form = document.createElement('div');
-      form.className = 'd-none border rounded p-2';
+      form.className = 'border rounded p-2 mt-2';
 
       const row1 = document.createElement('div');
       row1.className = 'd-flex align-items-center gap-2';
@@ -1347,7 +1681,6 @@
         const list = (resp && Array.isArray(resp.node_candidates)) ? resp.node_candidates.slice() : [];
         nodeCandidatesCache = list;
         const curId = (Array.isArray(currentChain) && currentChain[i] && currentChain[i].id) ? String(currentChain[i].id) : '';
-        // Default selection to current node unless user already picked one.
         if(!selectedNodeId){
           selectedNodeId = curId;
         }
@@ -1377,10 +1710,8 @@
           opt.disabled = !ok;
           nodeSel.appendChild(opt);
         }
-        // Clamp selection to available options.
         const hasSelected = Array.from(nodeSel.options).some(o => o.value === selectedNodeId && !o.disabled);
         if(!hasSelected){
-          // Prefer current if it's enabled, else first enabled.
           const curOk = Array.from(nodeSel.options).find(o => o.value === curId && !o.disabled);
           const firstOk = Array.from(nodeSel.options).find(o => !o.disabled);
           const pick = curOk || firstOk;
@@ -1396,11 +1727,9 @@
         const isVuln = !!(info && info.is_vuln);
         const isDocker = !!(info && info.is_docker);
         const allowNodeGen = (!!isDocker && !isVuln);
-        // If the chosen node can't support flag-node-generator, force flag-generator.
         if(!allowNodeGen){
           kindSel.value = 'flag-generator';
         }
-        // Disable the flag-node-generator option when not allowed.
         try {
           const opt = Array.from(kindSel.options).find(o => String(o.value) === 'flag-node-generator');
           if(opt){
@@ -1440,27 +1769,8 @@
       row3.appendChild(cur);
       row3.appendChild(actions);
       form.appendChild(row3);
-      box.appendChild(form);
 
-      async function showSubstituteUI(){
-        // Disable while the substitute UI is open.
-        if(!form.classList.contains('d-none')) return;
-        btn.disabled = true;
-        form.classList.remove('d-none');
-        try{
-          showLoading('Loading generator catalog…');
-          await ensureGeneratorCatalogsLoaded();
-          rebuildSourceOptions();
-          rebuildGeneratorOptions();
-        } catch(e){
-          setStatus('Failed to load generator catalog: ' + String(e && e.message || e), true);
-          // If we couldn't load options, close the substitute UI and re-enable.
-          try { form.classList.add('d-none'); } catch(_) {}
-          btn.disabled = false;
-        } finally {
-          hideLoading();
-        }
-      }
+      substituteBodyEl.appendChild(form);
 
       function getCatalogForKind(kind){
         return (String(kind) === 'flag-node-generator')
@@ -1494,8 +1804,6 @@
         entryOpt.value = '__entry__';
         entryOpt.textContent = 'Entry…';
         sourceSel.appendChild(entryOpt);
-
-        // Default selection: keep current source if it exists, else Any.
         if(currentSource && sorted.includes(currentSource)){
           sourceSel.value = currentSource;
         } else {
@@ -1597,7 +1905,7 @@
             });
           }
 
-          // Ensure ordering: compatible first (server already does this, but be safe).
+          // Ensure ordering: compatible first.
           candidates.sort((a,b)=>{
             const ak = (a && a.compatible) ? 0 : 1;
             const bk = (b && b.compatible) ? 0 : 1;
@@ -1628,9 +1936,7 @@
             radio.name = 'flowSubstitutePick';
             radio.value = cid;
             radio.checked = !!(selectedCandidateId && selectedCandidateId === cid);
-            radio.addEventListener('change', ()=>{
-              selectedCandidateId = cid;
-            });
+            radio.addEventListener('change', ()=>{ selectedCandidateId = cid; });
             tdPick.appendChild(radio);
 
             const tdGen = document.createElement('td');
@@ -1652,7 +1958,6 @@
             tr.appendChild(tdSrc);
             tr.appendChild(tdWhy);
 
-            // Clicking a compatible row selects it.
             tr.addEventListener('click', ()=>{
               selectedCandidateId = cid;
               try { radio.checked = true; } catch(e) {}
@@ -1661,32 +1966,17 @@
             candBody.appendChild(tr);
           }
 
-          // If current selection is not present, clear it.
           if(selectedCandidateId){
             const found = candidates.find(x => String((x && x.id) || '') === selectedCandidateId);
-            if(!found){
-              selectedCandidateId = '';
-            }
+            if(!found) selectedCandidateId = '';
           }
         })();
       }
-
-      btn.addEventListener('click', async ()=>{
-        await showSubstituteUI();
-      });
 
       nodeSel.addEventListener('change', ()=>{
         try { syncKindAvailabilityForSelectedNode(); } catch(e) {}
         rebuildSourceOptions();
         rebuildGeneratorOptions();
-      });
-
-      cancelBtn.addEventListener('click', ()=>{
-        form.classList.add('d-none');
-        btn.disabled = false;
-        try {
-          if(typeof nodeDetailsDialogEl.close === 'function') nodeDetailsDialogEl.close();
-        } catch(e) {}
       });
 
       kindSel.addEventListener('change', ()=>{
@@ -1698,8 +1988,13 @@
         rebuildGeneratorOptions();
       });
       entryInput.addEventListener('input', ()=>{
-        // live filter for Entry mode
         if(String(sourceSel.value || '') === '__entry__') rebuildGeneratorOptions();
+      });
+
+      cancelBtn.addEventListener('click', ()=>{
+        try {
+          if(typeof substituteDialogEl.close === 'function') substituteDialogEl.close();
+        } catch(e) {}
       });
 
       applyBtn.addEventListener('click', async ()=>{
@@ -1708,7 +2003,6 @@
           setStatus('Select a generator first.', true);
           return;
         }
-        // Prevent double submits while we persist + save.
         try { applyBtn.disabled = true; } catch(e) {}
         try { cancelBtn.disabled = true; } catch(e) {}
         try{
@@ -1718,13 +2012,22 @@
           const chainIds = chainIdsWithSelectedNode();
           if(!chainIds.length) throw new Error('Missing chain ids.');
 
+          const currentNodeId = (Array.isArray(currentChain) && currentChain[i] && currentChain[i].id) ? String(currentChain[i].id) : '';
           const reqAssignments = chainIds.map((nid, j)=>{
             const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
             const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
             const idOut = (j === i) ? chosenId : curId;
-            return { node_id: nid, id: idOut };
+
+            let ovr = (curA && typeof curA.config_overrides === 'object' && curA.config_overrides && !Array.isArray(curA.config_overrides))
+              ? curA.config_overrides
+              : undefined;
+            if(j === i){
+              if(String(nid) !== String(currentNodeId) || String(idOut) !== String(curId)){
+                ovr = undefined;
+              }
+            }
+            return { node_id: nid, id: idOut, config_overrides: ovr };
           });
-          // Ensure all entries have ids.
           const missing = reqAssignments.find(x => !x.id);
           if(missing){
             throw new Error('Cannot save substitution because some chain positions have no generator assignment yet. Try Generate again.');
@@ -1739,32 +2042,20 @@
           }, { timeoutMs: 60000 });
 
           setFlowValidityFromPayload(res);
-          if(res && Array.isArray(res.chain)){
-            currentChain = res.chain.slice();
-          }
-          if(res && Array.isArray(res.flag_assignments)){
-            currentFlagAssignments = res.flag_assignments.slice();
-          }
-          if(res && res.flow_plan_path){
-            lastFlowPlanPath = String(res.flow_plan_path);
-          }
+          if(res && Array.isArray(res.chain)) currentChain = res.chain.slice();
+          if(res && Array.isArray(res.flag_assignments)) currentFlagAssignments = res.flag_assignments.slice();
+          if(res && res.flow_plan_path) lastFlowPlanPath = String(res.flow_plan_path);
           updateMeta();
           renderChainEditor();
-          form.classList.add('d-none');
-          btn.disabled = false;
           setStatus('Substitution saved. Saving XML…', false);
 
-          // Close immediately so the user doesn't see the substitute UI while hints resolve.
           try {
-            if(typeof nodeDetailsDialogEl.close === 'function') nodeDetailsDialogEl.close();
+            if(typeof substituteDialogEl.close === 'function') substituteDialogEl.close();
           } catch(e) {}
 
-          // Save XML (this also resolves hints / runs generators) so the UI shows
-          // updated flag values and rendered hints immediately.
           try {
             await saveXmlOnly({});
           } catch(e) {
-            // Non-fatal; substitution was persisted.
             setStatus('Saved substitution, but Save XML failed: ' + String(e && e.message || e), true);
           }
         } catch(e){
@@ -1776,25 +2067,26 @@
         }
       });
 
-      // If invoked from the Chain Order row Substitute button, open the substitute
-      // UI immediately.
-      if(openSubstitute){
-        try { showSubstituteUI(); } catch(e) {}
-      }
-
-      // Full-width so the substitute box starts at the far left.
-      addFullRow(box);
+      // Load generator catalogs immediately.
+      (async ()=>{
+        try{
+          showLoading('Loading generator catalog…');
+          await ensureGeneratorCatalogsLoaded();
+          rebuildSourceOptions();
+          rebuildGeneratorOptions();
+        } catch(e){
+          setStatus('Failed to load generator catalog: ' + String(e && e.message || e), true);
+        } finally {
+          hideLoading();
+        }
+      })();
     } catch(e) {
       // Non-fatal
     }
 
     try{
-      if(typeof nodeDetailsDialogEl.showModal === 'function'){
-        nodeDetailsDialogEl.showModal();
-      }
-    } catch(e) {
-      // If dialog isn't supported, do nothing.
-    }
+      if(typeof substituteDialogEl.showModal === 'function') substituteDialogEl.showModal();
+    } catch(e) {}
   }
 
   function selectChainIndex(idx){
