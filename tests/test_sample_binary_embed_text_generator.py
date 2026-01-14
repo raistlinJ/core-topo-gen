@@ -19,21 +19,17 @@ def _load_generator_module():
     return mod
 
 
-def test_sample_binary_embed_text_outputs_and_optional_input_file(tmp_path: Path, monkeypatch):
+def test_sample_binary_embed_text_outputs_and_optional_filename_and_flag(tmp_path: Path, monkeypatch):
     gen = _load_generator_module()
 
     out_dir = tmp_path / "out"
     inputs_dir = out_dir / "inputs"
     inputs_dir.mkdir(parents=True)
 
-    # Create an optional input file under inputs/.
-    (inputs_dir / "seed_material.txt").write_text("hello world\n", encoding="utf-8")
-
     cfg = {
         "seed": "seed-1",
-        "flag_prefix": "FLAG",
-        "bin_name": "challengeA",
-        "input_file": "seed_material.txt",
+        "filename": "challengeA",
+        "flag": "FLAG{TEST_FLAG_VALUE}",
         "generator_id": "sample.binary_embed_text",
     }
     config_path = inputs_dir / "config.json"
@@ -67,26 +63,25 @@ def test_sample_binary_embed_text_outputs_and_optional_input_file(tmp_path: Path
     assert isinstance(outputs, dict)
 
     # Per catalog spec: must emit these outputs.
-    assert isinstance(outputs.get("flag"), str) and outputs["flag"].startswith("FLAG{")
-    assert outputs.get("network.ip", "").startswith("10.")
+    assert outputs.get("flag") == "FLAG{TEST_FLAG_VALUE}"
     assert outputs.get("filesystem.file") == "artifacts/challengeA"
 
     # And the injected artifact must exist at the referenced path.
     bin_path = out_dir / "artifacts" / "challengeA"
     assert bin_path.exists()
+    assert b"FLAG{TEST_FLAG_VALUE}" in bin_path.read_bytes()
 
 
 def test_sample_binary_embed_text_binary_changes_with_seed(tmp_path: Path, monkeypatch):
     gen = _load_generator_module()
 
-    def run(seed: str) -> bytes:
+    def run(seed: str) -> tuple[str, bytes]:
         out_dir = tmp_path / f"out_{seed}"
         inputs_dir = out_dir / "inputs"
         inputs_dir.mkdir(parents=True)
         cfg = {
             "seed": seed,
-            "flag_prefix": "FLAG",
-            "bin_name": "challenge",
+            # Deliberately omit filename so it is derived from seed.
             "generator_id": "sample.binary_embed_text",
         }
         config_path = inputs_dir / "config.json"
@@ -101,16 +96,21 @@ def test_sample_binary_embed_text_binary_changes_with_seed(tmp_path: Path, monke
                 str(config_path),
                 "--out-dir",
                 str(out_dir),
-                "--bin-name",
-                "challenge",
             ]
             rc = gen.main()
             assert rc == 0
         finally:
             sys.argv = argv0
 
-        return (out_dir / "artifacts" / "challenge").read_bytes()
+        doc = json.loads((out_dir / "outputs.json").read_text("utf-8"))
+        outp = doc.get("outputs")
+        assert isinstance(outp, dict)
+        rel = outp.get("filesystem.file")
+        assert isinstance(rel, str) and rel.startswith("artifacts/")
+        name = rel.split("/", 1)[1]
+        return name, (out_dir / "artifacts" / name).read_bytes()
 
-    b1 = run("seed-1")
-    b2 = run("seed-2")
+    n1, b1 = run("seed-1")
+    n2, b2 = run("seed-2")
+    assert n1 != n2
     assert b1 != b2
