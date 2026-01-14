@@ -31205,6 +31205,13 @@ def _build_generator_scaffold(payload: dict[str, Any]) -> tuple[dict[str, str], 
     requires, optional_requires = _normalize_requires_with_optional(payload)
     produces = _split_artifact_list(payload.get('produces'))
     hint_templates = _split_lines(payload.get('hint_templates'))
+    inject_files_raw = payload.get('inject_files')
+    inject_files = []
+    if isinstance(inject_files_raw, list):
+        for x in inject_files_raw:
+            s = str(x or '').strip()
+            if s:
+                inject_files.append(s)
 
     if 'flag' not in produces:
         produces = ['flag'] + produces
@@ -31278,7 +31285,8 @@ def main() -> None:
     }}
 
     (out_dir / 'outputs.json').write_text(json.dumps(outputs, indent=2) + '\n', encoding='utf-8')
-    (out_dir / 'hint.txt').write_text('TODO: write a next-step hint here\n', encoding='utf-8')
+    # Optional: write /outputs/hint.txt if you need a standalone hint file.
+    # Prefer hint_templates in the catalog for Flow.
 
 
 if __name__ == '__main__':
@@ -31369,6 +31377,9 @@ if __name__ == '__main__':
     if hint_templates:
         impl_entry['hint_templates'] = hint_templates
         impl_entry['hint_template'] = hint_templates[0]
+
+    if inject_files:
+        impl_entry['inject_files'] = inject_files
 
     catalog_source = {
         'schema_version': 3,
@@ -32307,9 +32318,37 @@ def flag_generators_test_run():
     log_path = os.path.join(run_dir, 'run.log')
 
     # Build config object from declared inputs.
+    # Two-pass: load all text fields first, then save uploads (so uploads can
+    # consult optional filename inputs).
     cfg: dict[str, Any] = {}
+    saved_uploads: dict[str, dict[str, Any]] = {}
     inputs = gen.get('inputs') if isinstance(gen, dict) else None
     inputs_list = inputs if isinstance(inputs, list) else []
+
+    for inp in inputs_list:
+        if not isinstance(inp, dict):
+            continue
+        name = str(inp.get('name') or '').strip()
+        if not name:
+            continue
+        # Only record text values in pass 1.
+        raw_val = request.form.get(name)
+        if raw_val is not None:
+            cfg[name] = raw_val
+
+    def _unique_dest_filename(dir_path: str, filename: str) -> str:
+        base = secure_filename(filename) or 'upload'
+        # Ensure a stable file name but avoid overwriting.
+        cand = base
+        root, ext = os.path.splitext(base)
+        i = 1
+        while os.path.exists(os.path.join(dir_path, cand)):
+            cand = f"{root}_{i}{ext}"
+            i += 1
+            if i > 5000:
+                break
+        return cand
+
     for inp in inputs_list:
         if not isinstance(inp, dict):
             continue
@@ -32317,20 +32356,49 @@ def flag_generators_test_run():
         if not name:
             continue
         f = request.files.get(name)
-        if f and getattr(f, 'filename', ''):
-            safe_name = secure_filename(f.filename) or 'upload'
-            stored = f"{name}__{safe_name}"
-            dest = os.path.join(inputs_dir, stored)
-            try:
-                f.save(dest)
-                # Expose the in-container path.
-                cfg[name] = f"/inputs/{stored}"
-            except Exception:
-                return jsonify({'ok': False, 'error': f"Failed saving file input: {name}"}), 400
+        if not (f and getattr(f, 'filename', '')):
             continue
-        raw_val = request.form.get(name)
-        if raw_val is not None:
-            cfg[name] = raw_val
+
+        original_filename = str(getattr(f, 'filename', '') or '')
+
+        # Default behavior: store under <name>__<original>
+        safe_uploaded = secure_filename(original_filename) or 'upload'
+        stored = f"{name}__{safe_uploaded}"
+
+        # Special-case convenience: if the user provides a desired filename
+        # for an uploaded file, respect it. This is primarily used by the
+        # sample generator (binary_embed_text) where the input file's name is
+        # meaningful.
+        desired = None
+        try:
+            if name == 'input_file':
+                desired = cfg.get('filesystem.filename')
+        except Exception:
+            desired = None
+        requested_filename = None
+        used_requested = False
+        if isinstance(desired, str) and desired.strip():
+            requested_filename = desired.strip()
+            stored = _unique_dest_filename(inputs_dir, requested_filename)
+            used_requested = True
+        else:
+            stored = _unique_dest_filename(inputs_dir, stored)
+
+        dest = os.path.join(inputs_dir, stored)
+        try:
+            f.save(dest)
+            # Expose the in-container path.
+            cfg[name] = f"/inputs/{stored}"
+            saved_uploads[name] = {
+                'original_filename': original_filename,
+                'requested_filename': requested_filename,
+                'stored_filename': stored,
+                'stored_path': f"inputs/{stored}",
+                'container_path': f"/inputs/{stored}",
+                'used_requested_filename': used_requested,
+            }
+        except Exception:
+            return jsonify({'ok': False, 'error': f"Failed saving file input: {name}"}), 400
 
     try:
         app.logger.info("[flaggen_test] inputs keys=%s", sorted(list(cfg.keys())))
@@ -32459,7 +32527,7 @@ def flag_generators_test_run():
         )
     except Exception:
         pass
-    return jsonify({'ok': True, 'run_id': run_id})
+    return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads})
 
 
 @app.route('/flag_node_generators_test/run', methods=['POST'])
@@ -32483,6 +32551,7 @@ def flag_node_generators_test_run():
     log_path = os.path.join(run_dir, 'run.log')
 
     cfg: dict[str, Any] = {}
+    saved_uploads: dict[str, dict[str, Any]] = {}
     inputs = gen.get('inputs') if isinstance(gen, dict) else None
     inputs_list = inputs if isinstance(inputs, list) else []
     for inp in inputs_list:
@@ -32493,12 +32562,21 @@ def flag_node_generators_test_run():
             continue
         f = request.files.get(name)
         if f and getattr(f, 'filename', ''):
-            safe_name = secure_filename(f.filename) or 'upload'
+            original_filename = str(getattr(f, 'filename', '') or '')
+            safe_name = secure_filename(original_filename) or 'upload'
             stored = f"{name}__{safe_name}"
             dest = os.path.join(inputs_dir, stored)
             try:
                 f.save(dest)
                 cfg[name] = f"/inputs/{stored}"
+                saved_uploads[name] = {
+                    'original_filename': original_filename,
+                    'requested_filename': None,
+                    'stored_filename': stored,
+                    'stored_path': f"inputs/{stored}",
+                    'container_path': f"/inputs/{stored}",
+                    'used_requested_filename': False,
+                }
             except Exception:
                 return jsonify({'ok': False, 'error': f"Failed saving file input: {name}"}), 400
             continue
@@ -32615,7 +32693,7 @@ def flag_node_generators_test_run():
         )
     except Exception:
         pass
-    return jsonify({'ok': True, 'run_id': run_id})
+    return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads})
 
 
 @app.route('/flag_node_generators_test/outputs/<run_id>')

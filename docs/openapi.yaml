@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Core Topology Generator Web API
-  version: "2026-01-01"
+  version: "2026-01-13"
   description: >-
     OpenAPI specification for the CORE topology generator web backend. The API
     combines JSON endpoints used by the web UI with a set of HTML form
@@ -2573,6 +2573,12 @@ components:
           type: array
           items:
             type: string
+        optional_requires:
+          type: array
+          nullable: true
+          description: Optional artifact keys that may be present in the chain if available.
+          items:
+            type: string
         produces:
           type: array
           items:
@@ -2583,6 +2589,20 @@ components:
           type: array
           items:
             type: string
+        inject_files:
+          type: array
+          nullable: true
+          description: Allowlist of injected files/dirs (or output keys) to stage into injected/.
+          items:
+            type: string
+        compose_text:
+          type: string
+          nullable: true
+          description: Optional full docker-compose.yml override used in the scaffold.
+        readme_text:
+          type: string
+          nullable: true
+          description: Optional full README.md override used in the scaffold.
 
     GeneratorScaffoldMetaResponse:
       type: object

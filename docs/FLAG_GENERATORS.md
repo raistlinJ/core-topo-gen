@@ -27,6 +27,16 @@ Use these keys consistently so chains can be validated and composed.
 - `next.node_id`
 - `flag`
 
+### Filesystem / Files
+- `filesystem.file` (path to a generated file, typically under `artifacts/...`)
+- `filesystem.dir`
+- `filesystem.path`
+
+### Networking
+- `network.ip`
+- `network.port`
+- `network.subnet`
+
 ## Hint Templates
 
 Every generator should include a `hint_template`.
@@ -72,4 +82,20 @@ Where `<key>` is a key inside `outputs.json` under the `outputs` object.
 
 Example hint template:
 
-`Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.ssh_username}} / {{OUTPUT.ssh_password}}`
+`Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}`
+
+## Injected artifacts (`inject_files`)
+
+Some generators need to deliver a file/binary that will be mounted/copied into other containers (or uploaded for remote execution). Use the `implementations[].inject_files` allowlist.
+
+Key rules:
+
+- Write the generated file under `/outputs/artifacts/...` and reference it from `outputs.json`.
+- Prefer declaring `inject_files` using an output key, not a path.
+
+Example:
+
+- `outputs.json.outputs.filesystem.file = "artifacts/challenge"`
+- `implementations[].inject_files = ["filesystem.file"]`
+
+The runner will stage only allowlisted items into `<out_dir>/injected/`.

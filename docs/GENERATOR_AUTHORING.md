@@ -36,7 +36,7 @@ Enable/disable catalog sources via:
 Every generator run writes to an output directory (host path), typically:
 
 - `outputs.json` (required)
-- `hint.txt` (optional but recommended)
+- `hint.txt` (optional; prefer `hint_templates` in the catalog)
 - `flag.txt` (optional, but many generators write it)
 - other artifacts (e.g., `ssh_creds.json`, binaries, configs)
 
@@ -53,6 +53,23 @@ Minimum valid `outputs.json`:
   }
 }
 ```
+
+### Injected artifacts (`inject_files` allowlist)
+
+If a generator produces a file/binary that should be staged for mounting/copying into other containers, use `implementations[].inject_files`.
+
+How it works:
+
+- Generators should write files under `/outputs/artifacts/...` (host: `<out_dir>/artifacts/...`).
+- After the generator finishes, `scripts/run_flag_generator.py` stages **only** allowlisted items into `<out_dir>/injected/`.
+- `inject_files` entries can be:
+  - A relative path like `artifacts/my_binary` (prefix `artifacts/` is optional), or
+  - An **output artifact key** like `filesystem.file` which is resolved via `outputs.json`.
+
+Example (recommended):
+
+- `outputs.json.outputs.filesystem.file = "artifacts/challenge"`
+- `implementations[].inject_files = ["filesystem.file"]`
 
 ---
 
@@ -202,15 +219,13 @@ def main():
         'generator_id': 'my_ssh_creds',
         'outputs': {
             'flag': flag,
-            'ssh_username': ssh_username,
-            'ssh_password': ssh_password,
+        'ssh.username': ssh_username,
+        'ssh.password': ssh_password,
         },
     }
     (out_dir / 'outputs.json').write_text(json.dumps(outputs, indent=2) + '\n', encoding='utf-8')
-    (out_dir / 'hint.txt').write_text(
-        f"Next: SSH using {ssh_username} / {ssh_password}\n",
-        encoding='utf-8',
-    )
+    # Optional: write /outputs/hint.txt if you want a standalone hint file.
+    # Prefer hint_templates in the catalog for Flow.
 
 
 if __name__ == '__main__':
@@ -237,8 +252,8 @@ Skeleton:
       "requires": [],
       "produces": [
         {"artifact": "flag"},
-        {"artifact": "ssh_username"},
-        {"artifact": "ssh_password"}
+        {"artifact": "ssh.username"},
+        {"artifact": "ssh.password"}
       ],
       "inputs": {
         "seed": {"type": "text", "required": true},
@@ -254,7 +269,7 @@ Skeleton:
       "source": {"type": "local-path", "path": "flag_generators/py_my_ssh_creds"},
       "compose": {"file": "docker-compose.yml", "service": "generator"},
       "hint_templates": [
-        "Next: use {{OUTPUT.ssh_username}} / {{OUTPUT.ssh_password}}"
+        "Next: use {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}"
       ]
     }
   ]

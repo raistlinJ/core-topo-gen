@@ -249,6 +249,7 @@
     testBase: '/flag_generators_test',
     eventSource: null,
     runId: null,
+    savedUploads: {},
     outputsPollTimer: null,
     outputsLastSig: null,
     outputsStablePolls: 0,
@@ -288,6 +289,7 @@
     genTestState.runId = null;
     genTestState.current = null;
     genTestState.testBase = '/flag_generators_test';
+    genTestState.savedUploads = {};
     clearTestLog();
     setOutputsHtml('');
     setOutputsStatus(false);
@@ -808,6 +810,25 @@
     if (p === 'outputs.json') return 'Outputs manifest';
     if (c === 'inputs') {
       if (p.endsWith('/config.json') || p === 'inputs/config.json') return 'Generator config';
+      try {
+        const saved = (genTestState && genTestState.savedUploads) ? genTestState.savedUploads : {};
+        const rel = p.startsWith('inputs/') ? p : `inputs/${p}`;
+
+        for (const key of Object.keys(saved || {})) {
+          const meta = saved[key] || {};
+          const storedPath = String(meta.stored_path || '');
+          const storedFilename = String(meta.stored_filename || '');
+          if (!storedPath && !storedFilename) continue;
+          const hit = (storedPath && storedPath === rel) || (storedFilename && rel.endsWith('/' + storedFilename));
+          if (!hit) continue;
+
+          const containerPath = String(meta.container_path || '');
+          const orig = String(meta.original_filename || '');
+          const req = String(meta.requested_filename || '');
+          if (req) return `Upload for ${key} → ${containerPath} (requested: ${req}; orig: ${orig || '—'})`;
+          return `Upload for ${key} → ${containerPath}${orig ? ` (orig: ${orig})` : ''}`;
+        }
+      } catch (e) {}
       return 'Input file';
     }
     if (c === 'logs') return 'Log file';
@@ -911,6 +932,7 @@
     genTestState.current = generator;
     genTestState.testBase = testBase || '/flag_generators_test';
     genTestState.runId = null;
+    genTestState.savedUploads = {};
     stopOutputsPolling();
     if (genTestState.eventSource) {
       try { genTestState.eventSource.close(); } catch (e) {}
@@ -1032,8 +1054,23 @@
 
     const runId = data.run_id;
     genTestState.runId = runId;
+    genTestState.savedUploads = (data && data.saved_uploads) ? data.saved_uploads : {};
     setTestLogLine(`[ui] run_id=${runId}`);
     setTestLogLine(`Started run ${runId}`);
+
+    try {
+      const saved = genTestState.savedUploads || {};
+      const keys = Object.keys(saved);
+      if (keys.length) {
+        keys.forEach((k) => {
+          const m = saved[k] || {};
+          const orig = String(m.original_filename || '');
+          const dst = String(m.container_path || '');
+          const req = String(m.requested_filename || '');
+          setTestLogLine(`[ui] saved upload ${k}: ${orig || 'upload'} → ${dst || '(unknown)'}${req ? ` (requested: ${req})` : ''}`);
+        });
+      }
+    } catch (e) {}
 
     // Start polling outputs immediately (works even if SSE disconnects).
     startOutputsPolling(runId);

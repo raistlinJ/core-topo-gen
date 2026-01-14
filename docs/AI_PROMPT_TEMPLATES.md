@@ -37,9 +37,16 @@ Tell the AI these are strict requirements:
 
 - `generator_id` **must exactly match** the catalog’s `plugin_id`.
 - Outputs should be **deterministic** for the same inputs.
-- Write `/outputs/hint.txt` (recommended) with a “next step” hint.
+- `hint.txt` is optional. Prefer `hint_templates` in the catalog; only write `/outputs/hint.txt` if you explicitly need a standalone hint file.
 - Treat Flow-synthesized values as **inputs**, not artifacts:
   - Never put `seed`, `secret`, `node_name`, `flag_prefix` into `requires`.
+
+If the generator needs to deliver a file/binary to participants:
+
+- Write the file(s) under `/outputs/artifacts/...` (so they appear under `<out_dir>/artifacts/...`).
+- In the catalog implementation, declare `inject_files` as an allowlist.
+  - Prefer referencing an **output artifact key** so the allowlist stays stable, e.g. `inject_files: ["filesystem.file"]`.
+  - `inject_files` supports resolving output keys via `outputs.json` (e.g. `filesystem.file` -> `artifacts/my_binary`).
 
 ---
 
@@ -64,9 +71,13 @@ Hard requirements (do not violate):
     }
   }
 - generator_id MUST exactly match PLUGIN_ID.
-- Also write /outputs/hint.txt with a short next-step hint.
+- Do NOT write /outputs/hint.txt unless I explicitly ask; prefer hint_templates in the catalog.
 - Deterministic outputs: same (seed, secret, flag_prefix) => same outputs.
 - Inputs (NOT artifacts): seed (required), secret (required), flag_prefix (optional).
+
+If this generator outputs a file/binary:
+- Write it under /outputs/artifacts/<name>
+- Put a path to it in outputs.json.outputs (example key: filesystem.file => artifacts/<name>)
 
 Catalog intent:
 - requires artifacts: <list artifacts or '(none)'>
@@ -163,3 +174,4 @@ If you add new outputs, tell me what catalog changes I should make.
 - Ensure `outputs.json` is always written even on “success with minimal outputs”.
 - Always include `flag` in produced outputs.
 - Keep file paths exactly `/inputs/config.json` and `/outputs/...`.
+- Prefer namespaced artifact keys (e.g., `ssh.username`, `network.ip`, `filesystem.file`) over ad-hoc keys (e.g., `user`, `ip`).

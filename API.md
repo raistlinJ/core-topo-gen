@@ -211,11 +211,19 @@ Example request:
 	"name": "SSH Credentials",
 	"description": "Emits deterministic SSH credentials.",
 	"requires": [],
+	"optional_requires": [],
 	"produces": ["flag", "ssh_username", "ssh_password"],
 	"inputs": {"seed": true, "secret": true, "flag_prefix": true},
-	"hint_templates": ["Next: SSH using {{OUTPUT.ssh_username}} / {{OUTPUT.ssh_password}}"]
+	"hint_templates": ["Next: SSH using {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}"],
+	"inject_files": ["filesystem.file"],
+	"compose_text": "(optional full docker-compose.yml override)",
+	"readme_text": "(optional full README.md override)"
 }
 ```
+
+Notes:
+- `inputs` is a convenience flags object that adds standard entries (seed/secret/node_name/flag_prefix) to `plugins[].inputs` in the generated schema v3 catalog.
+- `inject_files` is optional; when present it is written into `implementations[].inject_files`.
 
 `POST /api/generators/scaffold_zip`
 : Same JSON request body as `/api/generators/scaffold_meta`, but returns a ZIP you can unzip into the repo root.

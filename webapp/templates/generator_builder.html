@@ -30,6 +30,14 @@
           <div class="alert alert-info small mb-3">
             Builds a ready-to-unzip scaffold for creating new generators.
             Output follows the existing <code>scripts/run_flag_generator.py</code> contract.
+            <div class="mt-2">
+              <div class="fw-semibold">Conventions</div>
+              <ul class="mb-0">
+                <li><span class="font-monospace">hint.txt</span> is optional; prefer <span class="font-monospace">hint_templates</span> in the catalog.</li>
+                <li>For file outputs: write under <span class="font-monospace">/outputs/artifacts/...</span> and reference in <span class="font-monospace">outputs.json</span> as <span class="font-monospace">artifacts/&lt;name&gt;</span>.</li>
+                <li>To stage files into scenarios, set <span class="font-monospace">inject_files</span> (prefer output keys like <span class="font-monospace">filesystem.file</span>).</li>
+              </ul>
+            </div>
           </div>
 
           <div class="mb-2">
@@ -81,6 +89,16 @@
             </div>
             <div class="form-text">These are artifact keys the generator will write into <code>outputs.json</code>.</div>
             <div class="mt-2" id="gbProducesList"></div>
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label">Inject files (allowlist)</label>
+            <div class="d-flex gap-2">
+              <button class="btn btn-sm btn-outline-primary" type="button" id="gbInjAddBtn"><i class="bi bi-plus-circle"></i> Add inject_files</button>
+              <button class="btn btn-sm btn-outline-secondary" type="button" id="gbInjClearBtn">Clear</button>
+            </div>
+            <div class="form-text">Artifacts staged into scenarios under <code>injected/</code>. Prefer output keys (e.g. <code>filesystem.file</code>).</div>
+            <div class="mt-2" id="gbInjectFilesList"></div>
           </div>
 
           <div class="mb-2">
@@ -261,6 +279,7 @@
 
     const requires = state.requires.slice();
     const produces = state.produces.slice();
+    const inject_files = state.inject_files.slice();
 
     const hint_templates = String(document.getElementById('gbHintTemplates').value || '')
       .split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
@@ -275,14 +294,16 @@
       flag_prefix: document.getElementById('gbInFlagPrefix').checked,
     };
 
-    return { plugin_type, plugin_id, folder_name, name, description, requires, produces, inputs, hint_templates, compose_text, readme_text };
+    return { plugin_type, plugin_id, folder_name, name, description, requires, produces, inject_files, inputs, hint_templates, compose_text, readme_text };
   }
 
   const state = {
     artifacts: [],
     requires: [], // [{artifact, optional}]
     produces: [], // ["artifact", ...]
-    modalMode: null, // 'requires'|'produces'
+    inject_files: [], // ["artifact_or_output_key", ...]
+    modalMode: null, // 'requires'|'produces'|'inject_files'
+    artifactMeta: new Map(),
   };
 
   function escapeHtml(s){
@@ -303,6 +324,33 @@
     return out;
   }
 
+  function refreshTooltips(root){
+    try {
+      if(!root || !window.bootstrap || !bootstrap.Tooltip) return;
+      const els = root.querySelectorAll('[data-bs-toggle="tooltip"]');
+      els.forEach((el)=>{
+        try { bootstrap.Tooltip.getInstance(el)?.dispose(); } catch(e) {}
+        try { new bootstrap.Tooltip(el, { trigger: 'hover', container: 'body' }); } catch(e) {}
+      });
+    } catch(e) {
+      // ignore
+    }
+  }
+
+  function tooltipTitleForMeta(meta){
+    const m = meta || {};
+    const desc = String(m.description || '').trim();
+    const tp = String(m.type || '').trim();
+    const parts = [];
+    if(desc) parts.push(desc);
+    if(tp) parts.push(`Type: ${tp}`);
+    if(m.sensitive === true) parts.push('Sensitive: yes');
+    else if(m.sensitive === false) parts.push('Sensitive: no');
+    const prodTxt = String(m.producers_text || '').trim();
+    if(prodTxt) parts.push(`Produced by: ${prodTxt}`);
+    return parts.join(' • ');
+  }
+
   function renderRequires(){
     const host = document.getElementById('gbRequiresList');
     host.innerHTML = '';
@@ -316,7 +364,11 @@
       const li = document.createElement('li');
       li.className = 'list-group-item d-flex align-items-center justify-content-between';
       const left = document.createElement('div');
-      left.innerHTML = `<span class="font-monospace">${escapeHtml(item.artifact)}</span>`;
+      const meta = state.artifactMeta.get(item.artifact);
+      const title = tooltipTitleForMeta(meta);
+      left.innerHTML = title
+        ? `<span class="font-monospace" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(title)}">${escapeHtml(item.artifact)}</span>`
+        : `<span class="font-monospace">${escapeHtml(item.artifact)}</span>`;
       const right = document.createElement('div');
       right.className = 'd-flex align-items-center gap-2';
 
@@ -347,6 +399,7 @@
       ul.appendChild(li);
     });
     host.appendChild(ul);
+    refreshTooltips(host);
   }
 
   function renderProduces(){
@@ -361,7 +414,11 @@
     state.produces.forEach((artifact, idx)=>{
       const li = document.createElement('li');
       li.className = 'list-group-item d-flex align-items-center justify-content-between';
-      li.innerHTML = `<span class="font-monospace">${escapeHtml(artifact)}</span>`;
+      const meta = state.artifactMeta.get(artifact);
+      const title = tooltipTitleForMeta(meta);
+      li.innerHTML = title
+        ? `<span class="font-monospace" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(title)}">${escapeHtml(artifact)}</span>`
+        : `<span class="font-monospace">${escapeHtml(artifact)}</span>`;
       const rm = document.createElement('button');
       rm.className = 'btn btn-sm btn-outline-danger';
       rm.type = 'button';
@@ -374,6 +431,39 @@
       ul.appendChild(li);
     });
     host.appendChild(ul);
+    refreshTooltips(host);
+  }
+
+  function renderInjectFiles(){
+    const host = document.getElementById('gbInjectFilesList');
+    host.innerHTML = '';
+    if(!state.inject_files.length){
+      host.innerHTML = '<div class="small text-muted">(none)</div>';
+      return;
+    }
+    const ul = document.createElement('ul');
+    ul.className = 'list-group';
+    state.inject_files.forEach((artifact, idx)=>{
+      const li = document.createElement('li');
+      li.className = 'list-group-item d-flex align-items-center justify-content-between';
+      const meta = state.artifactMeta.get(artifact);
+      const title = tooltipTitleForMeta(meta);
+      li.innerHTML = title
+        ? `<span class="font-monospace" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(title)}">${escapeHtml(artifact)}</span>`
+        : `<span class="font-monospace">${escapeHtml(artifact)}</span>`;
+      const rm = document.createElement('button');
+      rm.className = 'btn btn-sm btn-outline-danger';
+      rm.type = 'button';
+      rm.textContent = 'Remove';
+      rm.addEventListener('click', ()=>{
+        state.inject_files.splice(idx, 1);
+        renderInjectFiles();
+      });
+      li.appendChild(rm);
+      ul.appendChild(li);
+    });
+    host.appendChild(ul);
+    refreshTooltips(host);
   }
 
   function normalizeSelected(){
@@ -389,6 +479,7 @@
     });
     state.requires = Array.from(map.values()).sort((a,b)=>a.artifact.localeCompare(b.artifact));
     state.produces = uniq(state.produces).sort((a,b)=>a.localeCompare(b));
+    state.inject_files = uniq(state.inject_files).sort((a,b)=>a.localeCompare(b));
   }
 
   async function loadArtifacts(){
@@ -396,6 +487,12 @@
     const data = await res.json().catch(()=>({ok:false, error:'Non-JSON response'}));
     if(!res.ok || !data.ok) throw new Error((data && data.error) ? data.error : ('HTTP ' + res.status));
     state.artifacts = Array.isArray(data.artifacts) ? data.artifacts : [];
+    state.artifactMeta = new Map();
+    (state.artifacts || []).forEach((a)=>{
+      const key = String(a && a.artifact || '').trim();
+      if(!key) return;
+      state.artifactMeta.set(key, a);
+    });
   }
 
   async function addCustomArtifact(){
@@ -425,7 +522,11 @@
 
   function openArtifactModal(mode){
     state.modalMode = mode;
-    document.getElementById('gbArtifactModalTitle').textContent = (mode === 'requires') ? 'Select required artifacts' : 'Select produced artifacts';
+    document.getElementById('gbArtifactModalTitle').textContent = (mode === 'requires')
+      ? 'Select required artifacts'
+      : (mode === 'produces')
+        ? 'Select produced artifacts'
+        : 'Select injected artifacts';
     document.getElementById('gbArtifactFilter').value = '';
     document.getElementById('gbArtifactFilterRegex').checked = false;
     document.getElementById('gbArtifactRegexError').classList.add('d-none');
@@ -489,15 +590,17 @@
     items.forEach((a, idx)=>{
       const tr = document.createElement('tr');
       const checkboxId = `gbArtPick_${idx}`;
+      const title = tooltipTitleForMeta(a);
       tr.innerHTML = `
         <td><input class="form-check-input" type="checkbox" id="${checkboxId}" data-artifact="${escapeHtml(a.artifact)}"></td>
-        <td class="font-monospace">${escapeHtml(a.artifact || '')}</td>
+        <td class="font-monospace">${title ? `<span data-bs-toggle=\"tooltip\" data-bs-title=\"${escapeHtml(title)}\">${escapeHtml(a.artifact || '')}</span>` : escapeHtml(a.artifact || '')}</td>
         <td>${escapeHtml(a.type || '')}</td>
         <td class="small">${escapeHtml(a.description || '')}</td>
         <td class="small">${escapeHtml(a.producers_text || '')}</td>
       `;
       body.appendChild(tr);
     });
+    refreshTooltips(body);
   }
 
   function applyArtifactSelections(){
@@ -510,10 +613,13 @@
       picks.forEach(a=>state.requires.push({artifact: a, optional: false}));
     } else if(state.modalMode === 'produces'){
       picks.forEach(a=>state.produces.push(a));
+    } else if(state.modalMode === 'inject_files'){
+      picks.forEach(a=>state.inject_files.push(a));
     }
     normalizeSelected();
     renderRequires();
     renderProduces();
+    renderInjectFiles();
     bootstrap.Modal.getOrCreateInstance(document.getElementById('gbArtifactModal')).hide();
   }
 
@@ -592,8 +698,13 @@
     try { if(!state.artifacts.length) await loadArtifacts(); } catch(e){ alert('Failed loading artifacts: ' + e.message); return; }
     openArtifactModal('produces');
   });
+  document.getElementById('gbInjAddBtn').addEventListener('click', async ()=>{
+    try { if(!state.artifacts.length) await loadArtifacts(); } catch(e){ alert('Failed loading artifacts: ' + e.message); return; }
+    openArtifactModal('inject_files');
+  });
   document.getElementById('gbReqClearBtn').addEventListener('click', ()=>{ state.requires = []; renderRequires(); });
   document.getElementById('gbProdClearBtn').addEventListener('click', ()=>{ state.produces = []; renderProduces(); });
+  document.getElementById('gbInjClearBtn').addEventListener('click', ()=>{ state.inject_files = []; renderInjectFiles(); });
   document.getElementById('gbArtifactFilter').addEventListener('input', renderArtifactTable);
   document.getElementById('gbArtifactFilterRegex').addEventListener('change', renderArtifactTable);
   document.getElementById('gbArtifactApplyBtn').addEventListener('click', applyArtifactSelections);
@@ -615,6 +726,7 @@
   normalizeSelected();
   renderRequires();
   renderProduces();
+  renderInjectFiles();
 
   document.getElementById('gbBtnZip').addEventListener('click', async ()=>{
     try {
