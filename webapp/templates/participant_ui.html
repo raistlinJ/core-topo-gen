@@ -150,7 +150,7 @@
                 <div class="fw-semibold text-white" id="participantStatSwitches">-</div>
               </div>
               <div class="col-12 col-md-3">
-                <div class="text-secondary">Vulnerabilities</div>
+                <div class="text-secondary">Key Nodes</div>
                 <div class="fw-semibold text-white" id="participantStatVulns">-</div>
               </div>
               <div class="col-12">
@@ -163,9 +163,9 @@
               </div>
               <div class="col-12">
                 <details id="participantVulnIpsDetails">
-                  <summary class="text-secondary" id="participantVulnIpsSummary">Vulnerability IP addresses (0)</summary>
+                  <summary class="text-secondary" id="participantVulnIpsSummary">Key Nodes IP Addresses (0)</summary>
                   <div class="mt-2">
-                    <div class="row g-2" id="participantVulnIpsList" aria-label="Vulnerability IP addresses"></div>
+                    <div class="row g-2" id="participantVulnIpsList" aria-label="Key Nodes IP Addresses"></div>
                   </div>
                 </details>
               </div>
@@ -195,6 +195,37 @@
                   <div id="topologyGraph" style="width:100%; height:460px; position:relative; border:1px solid #e0e0e0; border-radius:4px; background:#fafafa; overflow:hidden;"></div>
                   <div class="form-text mt-1">Drag nodes to reposition (they’ll stay pinned), scroll or pinch to zoom, and drag the background to pan. Hover highlights neighbors. Use Reset to clear zoom & unpin positions; Cluster groups by type; SVG/PNG export the view.</div>
                   <div class="text-secondary small mt-2" id="participantTopologyStatus"></div>
+                </div>
+              </div>
+            </div>
+
+            <div id="topologyDetailsCard" style="display:none;">
+              <hr class="border-secondary my-3" />
+              <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                <div class="d-flex align-items-center gap-2">
+                  <strong class="text-white">Details View</strong>
+                  <div class="btn-group btn-group-sm" role="group">
+                    <button type="button" class="btn btn-outline-secondary" id="detailsCollapseBtn" data-bs-toggle="collapse" data-bs-target="#topologyDetailsCollapse" aria-expanded="false">Show</button>
+                  </div>
+                </div>
+                <div class="small text-secondary" id="detailsStats"></div>
+              </div>
+              <div class="collapse" id="topologyDetailsCollapse">
+                <div class="pt-2">
+                  <div class="row g-2 align-items-center">
+                    <div class="col-md-7">
+                      <input type="search" class="form-control form-control-sm" id="participantNodeFilter" placeholder="Filter nodes by name, id, type, service, or linked node">
+                      <div class="form-text text-secondary small" id="participantVisibleCount">&nbsp;</div>
+                    </div>
+                    <div class="col-md-5 d-flex justify-content-end gap-2">
+                      <button class="btn btn-sm btn-outline-secondary" id="participantClearFilterBtn" type="button">Clear</button>
+                      <button class="btn btn-sm btn-outline-secondary" id="participantExpandAllBtn" type="button">Expand All</button>
+                      <button class="btn btn-sm btn-outline-secondary" id="participantCollapseAllBtn" type="button">Collapse All</button>
+                    </div>
+                  </div>
+
+                  <div class="accordion mt-2" id="participantNodesAccordion"></div>
+                  <div id="participantNoMatches" class="text-secondary fst-italic d-none small">No nodes match the filter.</div>
                 </div>
               </div>
             </div>
@@ -241,6 +272,17 @@
   const topologyStatus = document.getElementById('participantTopologyStatus');
   const graphCollapseBtn = document.getElementById('graphCollapseBtn');
   const topologyGraphCollapse = document.getElementById('topologyGraphCollapse');
+  const topologyDetailsCard = document.getElementById('topologyDetailsCard');
+  const detailsCollapseBtn = document.getElementById('detailsCollapseBtn');
+  const topologyDetailsCollapse = document.getElementById('topologyDetailsCollapse');
+  const detailsStats = document.getElementById('detailsStats');
+  const participantNodeFilter = document.getElementById('participantNodeFilter');
+  const participantClearFilterBtn = document.getElementById('participantClearFilterBtn');
+  const participantExpandAllBtn = document.getElementById('participantExpandAllBtn');
+  const participantCollapseAllBtn = document.getElementById('participantCollapseAllBtn');
+  const participantNodesAccordion = document.getElementById('participantNodesAccordion');
+  const participantNoMatches = document.getElementById('participantNoMatches');
+  const participantVisibleCount = document.getElementById('participantVisibleCount');
   const scenarioItems = Array.from(document.querySelectorAll('[data-participant-scenario]'));
   const toggleSidebarBtn = document.querySelector('[data-participant-toggle-sidebar]');
   const showSidebarBtn = document.querySelector('[data-participant-show-sidebar]');
@@ -348,7 +390,7 @@
         if(b.ipInt !== null) return 1;
         return a.ip.localeCompare(b.ip);
       });
-    vulnIpsSummary.textContent = `Vulnerability IP addresses (${uniq.length})`;
+    vulnIpsSummary.textContent = `Key Nodes IP Addresses (${uniq.length})`;
     vulnIpsList.innerHTML = '';
     sorted.forEach((row) => {
       const col = document.createElement('div');
@@ -420,6 +462,56 @@
   };
 
   let _participantGraphInstance = null;
+
+  // Basic helpers for the Details View (keep in sync with core_graph.js behavior).
+  const _toRoman = (num) => {
+    const n = Number(num);
+    if(!Number.isFinite(n) || n <= 0 || n >= 4000) return '';
+    const parts = [
+      [1000,'M'],[900,'CM'],[500,'D'],[400,'CD'],
+      [100,'C'],[90,'XC'],[50,'L'],[40,'XL'],
+      [10,'X'],[9,'IX'],[5,'V'],[4,'IV'],[1,'I'],
+    ];
+    let x = Math.floor(n);
+    let out = '';
+    for(const [v,s] of parts){
+      while(x >= v){ out += s; x -= v; }
+    }
+    return out;
+  };
+
+  const _nodeIsHitl = (node) => {
+    try {
+      if(!node) return false;
+      if(node.is_hitl === true || node.is_hitl === 'true' || node.is_hitl === 'True') return true;
+      const hitlMarkers = ['rj45','rj-45','hitl','tap','bridge','ethernet','physical'];
+      const typeVal = String(node.type || '').toLowerCase();
+      if(typeVal && hitlMarkers.some(m => typeVal.includes(m))) return true;
+      const nameVal = String(node.name || '').toLowerCase();
+      if(nameVal && hitlMarkers.some(m => nameVal.includes(m))) return true;
+      return false;
+    } catch(e){
+      return false;
+    }
+  };
+
+  const _displayNameForDetails = (node) => {
+    const raw = String((node && node.name) ? node.name : '').trim();
+    if(!raw) return '';
+    if(!_nodeIsHitl(node)) return raw;
+    // Match core_graph.js: strip trailing "(10.0.0.0/24)"-like suffixes.
+    return raw.replace(/\s*\(([^)]*[\d.:]+[^)]*)\)\s*$/,'').trim();
+  };
+
+  const _displayNameWithSequenceForDetails = (node) => {
+    const base = _displayNameForDetails(node);
+    if(!base) return '';
+    if(_nodeIsHitl(node)) return base;
+    const seq = (node && (node.sequence_index ?? node.sequenceIndex)) ? Number(node.sequence_index ?? node.sequenceIndex) : null;
+    if(!seq || !Number.isFinite(seq)) return base;
+    const roman = _toRoman(seq);
+    return roman ? `${roman} ${base}` : base;
+  };
 
   // Mirror the Preview tab graph view: annotate topology nodes with
   // sequence_index based on saved flow chain so Roman numerals can render.
@@ -580,6 +672,335 @@
     }
   };
 
+  const renderTopologyDetails = (payload) => {
+    if(!topologyDetailsCard || !participantNodesAccordion) return;
+    if(!currentNorm){
+      topologyDetailsCard.style.display = 'none';
+      return;
+    }
+
+    topologyDetailsCard.style.display = '';
+    participantNodesAccordion.innerHTML = '';
+    if(participantNoMatches) participantNoMatches.classList.add('d-none');
+    if(participantVisibleCount) participantVisibleCount.textContent = '';
+
+    const nodesRaw = Array.isArray(payload && payload.nodes) ? payload.nodes : [];
+    const linksRaw = Array.isArray(payload && payload.links) ? payload.links : [];
+
+    const nodes = nodesRaw
+      .filter(n => n && n.id !== null && n.id !== undefined)
+      .map(n => {
+        const idVal = String(n.id);
+        const nameVal = (n.name !== null && n.name !== undefined) ? String(n.name) : idVal;
+        const typeVal = (n.type !== null && n.type !== undefined) ? String(n.type) : 'node';
+        const servicesVal = Array.isArray(n.services) ? n.services : [];
+        const ifacesVal = Array.isArray(n.interfaces) ? n.interfaces : [];
+        const ipv4sVal = Array.isArray(n.ipv4s) ? n.ipv4s : [];
+        const subnetsVal = Array.isArray(n.subnets) ? n.subnets : [];
+        return {
+          id: idVal,
+          name: nameVal || idVal,
+          type: typeVal || 'node',
+          services: servicesVal,
+          interfaces: ifacesVal,
+          ipv4s: ipv4sVal,
+          subnets: subnetsVal,
+          is_hitl: !!n.is_hitl,
+          hasVuln: !!n.is_vulnerability,
+        };
+      });
+
+    const links = linksRaw
+      .map(l => {
+        const n1 = (l && (l.node1 ?? l.source)) !== null && (l && (l.node1 ?? l.source)) !== undefined ? String(l.node1 ?? l.source) : '';
+        const n2 = (l && (l.node2 ?? l.target)) !== null && (l && (l.node2 ?? l.target)) !== undefined ? String(l.node2 ?? l.target) : '';
+        const n1Name = (l && l.node1_name) !== null && (l && l.node1_name) !== undefined ? String(l.node1_name) : '';
+        const n2Name = (l && l.node2_name) !== null && (l && l.node2_name) !== undefined ? String(l.node2_name) : '';
+        return { node1: n1, node2: n2, node1_name: n1Name, node2_name: n2Name };
+      })
+      .filter(l => l.node1 && l.node2 && l.node1 !== l.node2);
+
+    // Apply the same flow annotation used by the graph.
+    try { _annotateSequenceNodesFromFlow(nodes, payload && payload.flow); } catch(e) {}
+
+    // Build adjacency so linked nodes mirror what the graph shows.
+    const byId = new Map();
+    nodes.forEach(n => { byId.set(String(n.id), n); });
+    const neighbors = new Map();
+    const addNeighbor = (a, b) => {
+      if(!a || !b) return;
+      const k = String(a);
+      const arr = neighbors.get(k) || [];
+      if(!arr.includes(String(b))) arr.push(String(b));
+      neighbors.set(k, arr);
+    };
+    links.forEach(l => {
+      addNeighbor(l.node1, l.node2);
+      addNeighbor(l.node2, l.node1);
+    });
+
+    // Sort: sequence nodes first by sequence_index, then by type/name.
+    const canonicalType = (t) => String(t || '').trim().toLowerCase();
+    const tier = (n) => {
+      const t = canonicalType(n && n.type);
+      if(t === 'router') return 1;
+      if(t === 'switch' || t === 'hub' || t === 'wlan') return 2;
+      if(_nodeIsHitl(n)) return 3;
+      return 4;
+    };
+
+    const sorted = nodes.slice().sort((a, b) => {
+      const aSeq = Number(a.sequence_index || 0);
+      const bSeq = Number(b.sequence_index || 0);
+      const aHasSeq = Number.isFinite(aSeq) && aSeq > 0;
+      const bHasSeq = Number.isFinite(bSeq) && bSeq > 0;
+      if(aHasSeq && bHasSeq && aSeq !== bSeq) return aSeq - bSeq;
+      if(aHasSeq !== bHasSeq) return aHasSeq ? -1 : 1;
+      const ta = tier(a);
+      const tb = tier(b);
+      if(ta !== tb) return ta - tb;
+      return _displayNameWithSequenceForDetails(a).localeCompare(_displayNameWithSequenceForDetails(b));
+    });
+
+    if(detailsStats){
+      detailsStats.textContent = `Nodes: ${sorted.length} • Links: ${links.length}`;
+    }
+
+    if(sorted.length === 0){
+      participantNodesAccordion.innerHTML = '<div class="text-secondary small">No nodes available.</div>';
+      return;
+    }
+
+    const makeBadge = (text, klass) => {
+      const span = document.createElement('span');
+      span.className = klass;
+      span.textContent = text;
+      return span;
+    };
+
+    sorted.forEach((node, idx) => {
+      const nodeId = String(node.id);
+      const title = _displayNameWithSequenceForDetails(node) || nodeId;
+      const item = document.createElement('div');
+      item.className = 'accordion-item bg-black text-light border border-secondary';
+      item.setAttribute('data-node-id', nodeId);
+
+      const linkedIds = neighbors.get(nodeId) || [];
+      const linkedNames = linkedIds.map(id => {
+        const n = byId.get(String(id));
+        return n ? (_displayNameWithSequenceForDetails(n) || String(n.name || id)) : String(id);
+      });
+
+      const ifaces = Array.isArray(node.interfaces) ? node.interfaces : [];
+      const services = Array.isArray(node.services) ? node.services : [];
+      const searchBits = [
+        title, nodeId, String(node.type || ''),
+        ...(services.map(s => String(s || ''))),
+        ...(linkedNames.map(s => String(s || ''))),
+      ];
+      ifaces.forEach(iface => {
+        if(!iface || typeof iface !== 'object') return;
+        searchBits.push(String(iface.name || ''));
+        searchBits.push(String(iface.mac || ''));
+        if(!_nodeIsHitl(node)){
+          searchBits.push(String(iface.ipv4 || iface.ip4 || ''));
+          searchBits.push(String(iface.ipv6 || ''));
+        }
+      });
+      item.setAttribute('data-search', searchBits.join(' ').toLowerCase());
+
+      const headerId = `pui-heading-${idx+1}`;
+      const collapseId = `pui-collapse-${idx+1}`;
+
+      const h2 = document.createElement('h2');
+      h2.className = 'accordion-header';
+      h2.id = headerId;
+
+      const btn = document.createElement('button');
+      btn.className = 'accordion-button collapsed bg-black text-light';
+      btn.type = 'button';
+      btn.setAttribute('data-bs-toggle', 'collapse');
+      btn.setAttribute('data-bs-target', `#${collapseId}`);
+      btn.setAttribute('aria-expanded', 'false');
+      btn.setAttribute('aria-controls', collapseId);
+
+      const headerWrap = document.createElement('div');
+      headerWrap.className = 'd-flex flex-wrap align-items-center gap-2';
+      const titleEl = document.createElement('span');
+      titleEl.className = 'fw-semibold';
+      titleEl.textContent = `${title} (ID: ${nodeId})`;
+      headerWrap.appendChild(titleEl);
+
+      const typeBadge = makeBadge(String(node.type || 'node'), 'badge bg-secondary');
+      headerWrap.appendChild(typeBadge);
+      if(_nodeIsHitl(node)) headerWrap.appendChild(makeBadge('YOU ARE HERE', 'badge bg-success'));
+      if(services.length) headerWrap.appendChild(makeBadge(`${services.length} svc`, 'badge bg-info text-dark'));
+      btn.appendChild(headerWrap);
+
+      h2.appendChild(btn);
+      item.appendChild(h2);
+
+      const collapse = document.createElement('div');
+      collapse.className = 'accordion-collapse collapse';
+      collapse.id = collapseId;
+      collapse.setAttribute('aria-labelledby', headerId);
+
+      const body = document.createElement('div');
+      body.className = 'accordion-body';
+
+      const row = document.createElement('div');
+      row.className = 'row g-3';
+
+      const colType = document.createElement('div');
+      colType.className = 'col-lg-3 col-md-6';
+      colType.innerHTML = `
+        <div class="card h-100 bg-black text-light border border-secondary">
+          <div class="card-header"><strong>Node Type</strong></div>
+          <div class="card-body"><span class="badge bg-secondary">${String(node.type || 'N/A')}</span></div>
+        </div>
+      `;
+
+      const colLinked = document.createElement('div');
+      colLinked.className = 'col-lg-3 col-md-6';
+      const linkedHtml = linkedNames.length
+        ? `<ul class="mb-0 small">${linkedNames.map(nm => `<li>${String(nm)}</li>`).join('')}</ul>`
+        : '<em class="text-secondary">None</em>';
+      colLinked.innerHTML = `
+        <div class="card h-100 bg-black text-light border border-secondary">
+          <div class="card-header"><strong>Linked Nodes</strong></div>
+          <div class="card-body">${linkedHtml}</div>
+        </div>
+      `;
+
+      const colServices = document.createElement('div');
+      colServices.className = 'col-lg-3 col-md-6';
+      const servicesHtml = services.length
+        ? `<div class="d-flex flex-wrap gap-2">${services.map(s => `<span class="badge bg-info text-dark">${String(s)}</span>`).join('')}</div>`
+        : '<em class="text-secondary">None</em>';
+      colServices.innerHTML = `
+        <div class="card h-100 bg-black text-light border border-secondary">
+          <div class="card-header"><strong>Services</strong></div>
+          <div class="card-body">${servicesHtml}</div>
+        </div>
+      `;
+
+      const colIfaces = document.createElement('div');
+      colIfaces.className = 'col-lg-3 col-md-6';
+      let ifaceHtml = '<em class="text-secondary">None</em>';
+      if(ifaces.length){
+        const rows = ifaces.slice(0, 6).map(iface => {
+          if(!iface || typeof iface !== 'object') return '';
+          const parts = [];
+          if(iface.name) parts.push(String(iface.name));
+          if(iface.mac) parts.push(String(iface.mac));
+          if(!_nodeIsHitl(node)){
+            const addrParts = [];
+            if(iface.ipv4){ addrParts.push(String(iface.ipv4) + (iface.ipv4_mask ? '/' + String(iface.ipv4_mask) : '')); }
+            if(iface.ipv6){ addrParts.push(String(iface.ipv6) + (iface.ipv6_mask ? '/' + String(iface.ipv6_mask) : '')); }
+            if(addrParts.length) parts.push(addrParts.join(' | '));
+          }
+          return parts.length ? `<div class="small font-monospace">${parts.join(' • ')}</div>` : '';
+        }).filter(Boolean);
+        ifaceHtml = rows.join('') || ifaceHtml;
+        if(ifaces.length > 6){
+          ifaceHtml += `<div class="text-secondary small mt-1">(+${ifaces.length - 6} more)</div>`;
+        }
+      }
+      colIfaces.innerHTML = `
+        <div class="card h-100 bg-black text-light border border-secondary">
+          <div class="card-header"><strong>Interfaces</strong></div>
+          <div class="card-body">${ifaceHtml}</div>
+        </div>
+      `;
+
+      row.appendChild(colType);
+      row.appendChild(colLinked);
+      row.appendChild(colServices);
+      row.appendChild(colIfaces);
+      body.appendChild(row);
+      collapse.appendChild(body);
+      item.appendChild(collapse);
+      participantNodesAccordion.appendChild(item);
+    });
+
+    // Filter + expand/collapse helpers.
+    const items = Array.from(participantNodesAccordion.querySelectorAll('.accordion-item'));
+    const totalNodes = items.length;
+    const applyFilter = () => {
+      const q = String(participantNodeFilter?.value || '').trim().toLowerCase();
+      let shown = 0;
+      items.forEach(item => {
+        const hay = String(item.getAttribute('data-search') || '');
+        const match = !q || hay.includes(q);
+        item.classList.toggle('d-none', !match);
+        if(!match){
+          const col = item.querySelector('.accordion-collapse');
+          try { if (col && col.classList.contains('show')) new bootstrap.Collapse(col, { toggle: false }).hide(); } catch(e) {}
+        } else {
+          shown += 1;
+        }
+      });
+      if(participantNoMatches) participantNoMatches.classList.toggle('d-none', shown !== 0);
+      if(participantVisibleCount) participantVisibleCount.textContent = `Showing ${shown} of ${totalNodes} nodes`;
+    };
+    const expandAll = () => {
+      items.forEach(item => {
+        if(item.classList.contains('d-none')) return;
+        const col = item.querySelector('.accordion-collapse');
+        try { if(col && !col.classList.contains('show')) new bootstrap.Collapse(col, { toggle: false }).show(); } catch(e) {}
+      });
+    };
+    const collapseAll = () => {
+      items.forEach(item => {
+        const col = item.querySelector('.accordion-collapse');
+        try { if(col && col.classList.contains('show')) new bootstrap.Collapse(col, { toggle: false }).hide(); } catch(e) {}
+      });
+    };
+
+    if(participantNodeFilter){
+      participantNodeFilter.__puiApplyFilter = applyFilter;
+      if(!participantNodeFilter.dataset.bound){
+        participantNodeFilter.dataset.bound = '1';
+        participantNodeFilter.addEventListener('input', ()=>{
+          try { participantNodeFilter.__puiApplyFilter && participantNodeFilter.__puiApplyFilter(); } catch(e) {}
+        });
+      }
+    }
+
+    if(participantClearFilterBtn){
+      participantClearFilterBtn.__puiClear = () => { if(participantNodeFilter) participantNodeFilter.value = ''; applyFilter(); };
+      if(!participantClearFilterBtn.dataset.bound){
+        participantClearFilterBtn.dataset.bound = '1';
+        participantClearFilterBtn.addEventListener('click', ()=>{
+          try { participantClearFilterBtn.__puiClear && participantClearFilterBtn.__puiClear(); } catch(e) {}
+        });
+      }
+    }
+
+    if(participantExpandAllBtn){
+      participantExpandAllBtn.__puiExpandAll = expandAll;
+      if(!participantExpandAllBtn.dataset.bound){
+        participantExpandAllBtn.dataset.bound = '1';
+        participantExpandAllBtn.addEventListener('click', ()=>{
+          try { participantExpandAllBtn.__puiExpandAll && participantExpandAllBtn.__puiExpandAll(); } catch(e) {}
+        });
+      }
+    }
+
+    if(participantCollapseAllBtn){
+      participantCollapseAllBtn.__puiCollapseAll = collapseAll;
+      if(!participantCollapseAllBtn.dataset.bound){
+        participantCollapseAllBtn.dataset.bound = '1';
+        participantCollapseAllBtn.addEventListener('click', ()=>{
+          try { participantCollapseAllBtn.__puiCollapseAll && participantCollapseAllBtn.__puiCollapseAll(); } catch(e) {}
+        });
+      }
+    }
+
+    // Initialize
+    applyFilter();
+  };
+
   const renderScenarioDetails = (payload) => {
     const gw = payload && typeof payload.gateway === 'string' ? payload.gateway : '';
     if(statGateway) statGateway.textContent = gw || '-';
@@ -644,10 +1065,13 @@
     const topo = await fetchScenarioTopology(currentNorm);
     if(topo) {
       renderTopologyGraph(topo);
+      renderTopologyDetails(topo);
     } else {
       if(topologyGraphCard && currentNorm) topologyGraphCard.style.display = '';
       if(topologyGraph && currentNorm) topologyGraph.innerHTML = `<div class="p-3 text-muted small">Loading topology…</div>`;
       if(topologyStatus && currentNorm) topologyStatus.textContent = '';
+      if(topologyDetailsCard && currentNorm) topologyDetailsCard.style.display = '';
+      if(participantNodesAccordion && currentNorm) participantNodesAccordion.innerHTML = `<div class="p-3 text-muted small">Loading details…</div>`;
     }
   };
 
@@ -791,6 +1215,14 @@
         graphCollapseBtn.textContent = 'Hide'; graphCollapseBtn.setAttribute('aria-expanded','true');
         try { setTimeout(()=>{ _participantGraphInstance?.simulation?.alpha(0.15).restart(); }, 50); } catch(e) {}
       });
+    }
+  } catch(e) {}
+
+  // Details collapse button label.
+  try {
+    if(topologyDetailsCollapse && detailsCollapseBtn){
+      topologyDetailsCollapse.addEventListener('hidden.bs.collapse', ()=>{ detailsCollapseBtn.textContent = 'Show'; detailsCollapseBtn.setAttribute('aria-expanded','false'); });
+      topologyDetailsCollapse.addEventListener('shown.bs.collapse', ()=>{ detailsCollapseBtn.textContent = 'Hide'; detailsCollapseBtn.setAttribute('aria-expanded','true'); });
     }
   } catch(e) {}
 })();

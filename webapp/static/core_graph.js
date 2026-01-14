@@ -85,14 +85,32 @@
     const hitlColor = '#2e7d32';
     const hitlMarkers = ['rj45','rj-45','hitl','tap','bridge','ethernet','physical'];
     const typeColor = d3.scaleOrdinal()
-      .domain(['router','switch','hub','wlan','host','pc','server','vulnerability','node','hitl'])
-      .range(['#d9534f','#f0ad4e','#5bc0de','#5cb85c','#0275d8','#6610f2','#6f42c1', vulnerabilityColor,'#607d8b', hitlColor]);
+      // Note: docker and vulnerability intentionally share fill color; docker is distinguished via dashed outline.
+      .domain(['router','switch','hub','wlan','host','pc','server','docker','vulnerability','node','hitl'])
+      .range(['#d9534f','#f0ad4e','#5bc0de','#5cb85c','#0275d8','#6610f2','#6f42c1', vulnerabilityColor, vulnerabilityColor,'#607d8b', hitlColor]);
+
+    function nodeTypeNormalized(node){
+      try { return String(node?.type || '').trim().toLowerCase(); } catch(e){ return ''; }
+    }
+
+    function nodeIsDocker(node){
+      const t = nodeTypeNormalized(node);
+      if(!t) return false;
+      if(t === 'docker' || t.includes('docker')) return true;
+      try {
+        const comp = String(node?.compose || '').trim();
+        const compName = String(node?.compose_name || '').trim();
+        return !!(comp || compName);
+      } catch(e){
+        return false;
+      }
+    }
 
     function nodeHasVulnerabilities(node){
       if(!node) return false;
       const vulnList = Array.isArray(node.vulnerabilities) ? node.vulnerabilities
         : (node.metadata && Array.isArray(node.metadata.vulnerabilities) ? node.metadata.vulnerabilities : []);
-      return (Array.isArray(vulnList) && vulnList.length > 0) || !!node.hasVuln;
+      return (Array.isArray(vulnList) && vulnList.length > 0) || !!node.hasVuln || node.is_vulnerability === true || node.is_vuln === true;
     }
 
     function nodeIsHitl(node){
@@ -144,15 +162,16 @@
 
     function nodeCategory(node){
       if(nodeIsHitl(node)){ return 'hitl'; }
-      const t = (node && node.type) ? node.type.toLowerCase() : '';
-      if(t === 'docker') return 'vulnerability';
+      if(nodeIsDocker(node)) return 'docker';
+      const t = nodeTypeNormalized(node);
       return t || 'node';
     }
 
     function nodeFillColor(node){
       if(nodeIsHitl(node)){ return hitlColor; }
-      if(nodeCategory(node) === 'vulnerability') return vulnerabilityColor;
-      const typeVal = (node.type||'').toLowerCase();
+      const cat = nodeCategory(node);
+      if(cat === 'vulnerability' || cat === 'docker') return vulnerabilityColor;
+      const typeVal = nodeTypeNormalized(node);
       if(nodeHasVulnerabilities(node) && (typeVal === 'host' || typeVal === 'pc' || typeVal === 'server')){
         return vulnerabilityColor;
       }
@@ -245,10 +264,10 @@
 
     // Network-diagram-like tiering (keeps it readable vs. pure force soup)
     function nodeTier(node){
-      const t = (node && node.type) ? String(node.type).toLowerCase() : '';
+      const t = nodeTypeNormalized(node);
       if(t === 'router') return 0;
       if(t === 'switch' || t === 'hub' || t === 'wlan') return 1;
-      if(t === 'host' || t === 'pc' || t === 'server' || t === 'docker' || t === 'vulnerability' || t === 'node') return 2;
+      if(t === 'host' || t === 'pc' || t === 'server' || nodeIsDocker(node) || t === 'vulnerability' || t === 'node') return 2;
       if(nodeIsHitl(node)) return 2;
       return 2;
     }
@@ -588,8 +607,14 @@
       .enter().append('g')
       .attr('class', d => {
         const classes = ['node'];
-        const typeVal = (d.type||'').toLowerCase();
+        const typeVal = nodeTypeNormalized(d);
         if(typeVal === 'switch'){ classes.push('switch-node'); }
+        if(nodeIsDocker(d)){ classes.push('docker-node'); }
+        if(typeVal === 'host' || typeVal === 'pc' || typeVal === 'server'){
+          classes.push('host-node');
+          if(nodeHasVulnerabilities(d)) classes.push('vuln-host-node');
+          else classes.push('plain-host-node');
+        }
         if(nodeIsHitl(d)){ classes.push('hitl-node'); }
         return classes.join(' ');
       })
@@ -712,6 +737,14 @@
         const seq = nodeSequenceIndex(d);
         if(seq) return 3;
         return 1.2;
+      })
+      .attr('stroke-dasharray', d => {
+        try {
+          // Distinguish docker nodes from other vulnerable nodes.
+          return nodeIsDocker(d) ? '6,4' : null;
+        } catch(e){
+          return null;
+        }
       })
       .on('click', (ev,d)=>{
         // Do not toggle pin/unpin on click; it can destabilize the layout.
@@ -900,7 +933,7 @@
       const types = Array.from(new Set(nodes.map(n => nodeCategory(n)))).filter(Boolean).sort();
       const hasSequenceNodes = nodes.some(n => nodeSequenceIndex(n));
       const hasVulnerableHosts = nodes.some(n => {
-        const t = (n.type||'').toLowerCase();
+        const t = nodeTypeNormalized(n);
         if(!(t === 'host' || t === 'pc' || t === 'server')) return false;
         return nodeHasVulnerabilities(n);
       });
@@ -909,9 +942,12 @@
         const deg = degreePerType.get(typeKey)||0;
         const isSwitch = typeKey === 'switch';
         const colorSwatch = typeKey==='hitl' ? hitlColor : typeColor(typeKey);
+        const isDocker = typeKey === 'docker';
         const swatchStyle = isSwitch
           ? `display:inline-block;width:12px;height:12px;border:2px solid #ff9800;background:${colorSwatch};box-shadow:0 0 0 1px #222 inset;`
-          : `display:inline-block;width:12px;height:12px;border:1px solid #222;background:${colorSwatch}`;
+          : (isDocker
+            ? `display:inline-block;width:12px;height:12px;border:2px dashed #222;background:${colorSwatch}`
+            : `display:inline-block;width:12px;height:12px;border:1px solid #222;background:${colorSwatch}`);
         const label = typeKey === 'hitl' ? 'HITL' : typeKey;
         return `<span class="d-flex align-items-center gap-1"><span style="${swatchStyle}"></span>${label}<span class="text-muted" style="font-size:.65rem;">(nodes:${nodeCount}, links:${deg})</span></span>`;
       }).join(' ');

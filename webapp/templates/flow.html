@@ -164,6 +164,29 @@
   </div>
 </div>
 
+<!-- Generate options (minimal) -->
+<dialog id="flowGenerateOptionsDialog" class="p-0 border rounded" style="max-width: 520px; width: calc(100% - 2rem);">
+  <form method="dialog" class="m-0">
+    <div class="p-3 border-bottom d-flex align-items-center justify-content-between">
+      <div class="fw-semibold">Generate options</div>
+      <button class="btn btn-sm btn-outline-secondary" value="cancel" type="submit">Close</button>
+    </div>
+    <div class="p-3">
+      <div class="form-check">
+        <input class="form-check-input" type="checkbox" id="flowGenerateNoDuplicates" checked>
+        <label class="form-check-label" for="flowGenerateNoDuplicates">No duplicates allowed</label>
+      </div>
+      <div class="small text-muted mt-2">
+        If unchecked, the chain may repeat nodes; repeated rows are highlighted and generator seeds will differ per occurrence.
+      </div>
+    </div>
+    <div class="p-3 border-top d-flex justify-content-end gap-2">
+      <button class="btn btn-outline-secondary" value="cancel" type="submit">Cancel</button>
+      <button class="btn btn-primary" value="generate" type="submit">Generate</button>
+    </div>
+  </form>
+</dialog>
+
 <script>
 (function(){
   const statusEl = document.getElementById('flowStatus');
@@ -190,6 +213,8 @@
   const validityAlertEl = document.getElementById('flowValidityAlert');
   const loadingOverlayEl = document.getElementById('flowLoadingOverlay');
   const loadingTextEl = document.getElementById('flowLoadingText');
+  const generateOptionsDialogEl = document.getElementById('flowGenerateOptionsDialog');
+  const generateNoDuplicatesEl = document.getElementById('flowGenerateNoDuplicates');
 
   const participantUrlFlags = {{ (participant_url_flags or {})|tojson }};
   const scenarioNamesCache = {{ (scenarios or [])|tojson }};
@@ -205,6 +230,7 @@
   let lastFlowValid = true;
   let lastFlowErrors = [];
   let lastFlagsEnabled = true;
+  let allowNodeDuplicates = false;
 
   let _flagGeneratorsCatalog = null;
   let _flagNodeGeneratorsCatalog = null;
@@ -625,9 +651,55 @@
       wrap.appendChild(empty);
       return;
     }
+
+    const idCounts = {};
+    const idFirstIdx = {};
+    const genCounts = {};
+    const genFirstIdx = {};
+    try{
+      currentChain.forEach((n, idx) => {
+        const id = (n && n.id) ? String(n.id).trim() : '';
+        if(!id) return;
+        idCounts[id] = (idCounts[id] || 0) + 1;
+        if(idFirstIdx[id] === undefined) idFirstIdx[id] = idx;
+      });
+
+      // Generator ids by position.
+      currentChain.forEach((_n, idx) => {
+        const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
+        const gid = fa && (fa.id || fa.generator_id) ? String(fa.id || fa.generator_id).trim() : '';
+        if(!gid) return;
+        genCounts[gid] = (genCounts[gid] || 0) + 1;
+        if(genFirstIdx[gid] === undefined) genFirstIdx[gid] = idx;
+      });
+    } catch(e) {}
+
     currentChain.forEach((node, idx) => {
       const item = document.createElement('div');
       item.className = 'list-group-item';
+      let isDupNode = false;
+      let isDupGen = false;
+      let dupNodeFirstIdx = -1;
+      let dupGenFirstIdx = -1;
+      try{
+        const nid = (node && node.id) ? String(node.id).trim() : '';
+        if(nid && idCounts[nid] > 1){
+          item.classList.add('list-group-item-warning');
+          isDupNode = true;
+          dupNodeFirstIdx = (idFirstIdx[nid] !== undefined) ? parseInt(String(idFirstIdx[nid]), 10) : -1;
+        }
+      } catch(e) {}
+
+      // Generator duplication is informational but still flagged.
+      try{
+        const fa0 = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
+        const gid0 = fa0 && (fa0.id || fa0.generator_id) ? String(fa0.id || fa0.generator_id).trim() : '';
+        if(gid0 && genCounts[gid0] > 1){
+          item.classList.add('list-group-item-warning');
+          isDupGen = true;
+          dupGenFirstIdx = (genFirstIdx[gid0] !== undefined) ? parseInt(String(genFirstIdx[gid0]), 10) : -1;
+        }
+      } catch(e) {}
       item.style.cursor = 'default';
       item.style.display = 'grid';
       item.style.gridTemplateColumns = '84px 1fr 76px';
@@ -646,10 +718,29 @@
       left.className = 'd-flex flex-column';
       left.style.minWidth = '0';
       left.style.justifySelf = 'stretch';
+      const titleRow = document.createElement('div');
+      titleRow.className = 'd-flex align-items-center gap-2';
       const title = document.createElement('div');
       title.className = 'fw-semibold';
       title.textContent = (node && node.name) ? String(node.name) : ('Node ' + (idx+1));
-      left.appendChild(title);
+      titleRow.appendChild(title);
+      if(isDupNode){
+        const badge = document.createElement('span');
+        badge.className = 'badge text-bg-warning';
+        const isFirst = (dupNodeFirstIdx >= 0 && dupNodeFirstIdx === idx);
+        const sameAs = (!isFirst && dupNodeFirstIdx >= 0) ? (' (same as ' + toRoman(dupNodeFirstIdx + 1) + ')') : '';
+        badge.textContent = 'Duplicate node' + sameAs;
+        titleRow.appendChild(badge);
+      }
+      if(isDupGen){
+        const badge = document.createElement('span');
+        badge.className = 'badge text-bg-warning';
+        const isFirst = (dupGenFirstIdx >= 0 && dupGenFirstIdx === idx);
+        const sameAs = (!isFirst && dupGenFirstIdx >= 0) ? (' (same as ' + toRoman(dupGenFirstIdx + 1) + ')') : '';
+        badge.textContent = 'Duplicate generator' + sameAs;
+        titleRow.appendChild(badge);
+      }
+      left.appendChild(titleRow);
 
       // Sub-details: compact table for readability.
       const details = document.createElement('div');
@@ -686,6 +777,26 @@
 
       const genLabel = fa && fa.flag_generator ? String(fa.flag_generator) : '-';
       addRow('Source', genLabel);
+
+      try{
+        const nid = (node && node.id) ? String(node.id).trim() : '';
+        if(nid && idCounts[nid] > 1){
+          const firstIdx = (idFirstIdx[nid] !== undefined) ? parseInt(String(idFirstIdx[nid]), 10) : -1;
+          const isFirst = (firstIdx >= 0 && firstIdx === idx);
+          const sameAs = (!isFirst && firstIdx >= 0) ? ('same as ' + toRoman(firstIdx + 1) + '; ') : '';
+          addRow('Notice', 'Duplicate node in chain (' + sameAs + 'allowed; reseeded per occurrence).');
+        }
+      } catch(e) {}
+
+      try{
+        const gid = fa && (fa.id || fa.generator_id) ? String(fa.id || fa.generator_id).trim() : '';
+        if(gid && genCounts[gid] > 1){
+          const firstIdx = (genFirstIdx[gid] !== undefined) ? parseInt(String(genFirstIdx[gid]), 10) : -1;
+          const isFirst = (firstIdx >= 0 && firstIdx === idx);
+          const sameAs = (!isFirst && firstIdx >= 0) ? ('same as ' + toRoman(firstIdx + 1)) : 'reused in chain';
+          addRow('Notice', 'Duplicate generator assignment (' + sameAs + ').');
+        }
+      } catch(e) {}
 
       // Realized flag value (populated after prepare_preview_for_execute).
       try{
@@ -1133,6 +1244,16 @@
       const row1 = document.createElement('div');
       row1.className = 'd-flex align-items-center gap-2';
 
+      const nodeLabel = document.createElement('div');
+      nodeLabel.className = 'small text-muted';
+      nodeLabel.textContent = 'Node:';
+      row1.appendChild(nodeLabel);
+
+      const nodeSel = document.createElement('select');
+      nodeSel.className = 'form-select form-select-sm';
+      nodeSel.style.width = '360px';
+      row1.appendChild(nodeSel);
+
       const kindLabel = document.createElement('div');
       kindLabel.className = 'small text-muted';
       kindLabel.textContent = 'Type:';
@@ -1203,6 +1324,85 @@
       candWrap.appendChild(candTable);
 
       let selectedCandidateId = '';
+      let selectedNodeId = '';
+      let nodeCandidatesCache = [];
+
+      function chainIdsWithSelectedNode(){
+        const base = Array.isArray(currentChain)
+          ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean)
+          : [];
+        if(!base.length) return [];
+        const chosen = String(selectedNodeId || '').trim();
+        if(!chosen) return base;
+        return base.map((cid, j) => (j === i ? chosen : cid));
+      }
+
+      function refreshNodeOptionsFromResponse(resp){
+        const list = (resp && Array.isArray(resp.node_candidates)) ? resp.node_candidates.slice() : [];
+        nodeCandidatesCache = list;
+        const curId = (Array.isArray(currentChain) && currentChain[i] && currentChain[i].id) ? String(currentChain[i].id) : '';
+        // Default selection to current node unless user already picked one.
+        if(!selectedNodeId){
+          selectedNodeId = curId;
+        }
+        nodeSel.innerHTML = '';
+        if(!list.length){
+          const opt = document.createElement('option');
+          opt.value = curId || '';
+          opt.textContent = curId ? ('Current: ' + curId) : '(no nodes)';
+          nodeSel.appendChild(opt);
+          nodeSel.value = opt.value;
+          return;
+        }
+        for(const n of list){
+          const nid = String((n && n.id) || '').trim();
+          if(!nid) continue;
+          const nm = String((n && n.name) || '').trim();
+          const isDocker = !!(n && n.is_docker);
+          const isVuln = !!(n && n.is_vuln);
+          const ok = !!(n && n.compatible);
+          const label = (nm ? (nid + ' — ' + nm) : nid)
+            + (isDocker ? ' [docker]' : '')
+            + (isVuln ? ' [vuln]' : '')
+            + (!ok ? ' (incompatible)' : '');
+          const opt = document.createElement('option');
+          opt.value = nid;
+          opt.textContent = label;
+          opt.disabled = !ok;
+          nodeSel.appendChild(opt);
+        }
+        // Clamp selection to available options.
+        const hasSelected = Array.from(nodeSel.options).some(o => o.value === selectedNodeId && !o.disabled);
+        if(!hasSelected){
+          // Prefer current if it's enabled, else first enabled.
+          const curOk = Array.from(nodeSel.options).find(o => o.value === curId && !o.disabled);
+          const firstOk = Array.from(nodeSel.options).find(o => !o.disabled);
+          const pick = curOk || firstOk;
+          selectedNodeId = pick ? pick.value : (curId || '');
+        }
+        nodeSel.value = selectedNodeId;
+      }
+
+      function syncKindAvailabilityForSelectedNode(){
+        const nid = String(nodeSel.value || '').trim();
+        selectedNodeId = nid;
+        const info = (nodeCandidatesCache || []).find(x => String((x && x.id) || '').trim() === nid) || null;
+        const isVuln = !!(info && info.is_vuln);
+        const isDocker = !!(info && info.is_docker);
+        const allowNodeGen = (!!isDocker && !isVuln);
+        // If the chosen node can't support flag-node-generator, force flag-generator.
+        if(!allowNodeGen){
+          kindSel.value = 'flag-generator';
+        }
+        // Disable the flag-node-generator option when not allowed.
+        try {
+          const opt = Array.from(kindSel.options).find(o => String(o.value) === 'flag-node-generator');
+          if(opt){
+            opt.disabled = !allowNodeGen;
+            if(!allowNodeGen && kindSel.value === 'flag-node-generator') kindSel.value = 'flag-generator';
+          }
+        } catch(e) {}
+      }
 
       row2.appendChild(entryInput);
       row2.appendChild(entryErr);
@@ -1340,9 +1540,7 @@
         }
 
         // Ask server to compute compatibility against the current chain context.
-        const chainIds = Array.isArray(currentChain)
-          ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean)
-          : [];
+        const chainIds = chainIdsWithSelectedNode();
         const reqAssignments = chainIds.map((nid, j)=>{
           const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
           const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
@@ -1374,7 +1572,10 @@
               index: i,
               kind,
               candidate_ids: candidateIds,
+              allow_node_duplicates: !!allowNodeDuplicates,
             }, { timeoutMs: 45000 });
+            try { refreshNodeOptionsFromResponse(res); } catch(e) {}
+            try { syncKindAvailabilityForSelectedNode(); } catch(e) {}
             candidates = (res && Array.isArray(res.candidates)) ? res.candidates.slice() : [];
           } catch(e) {
             // If this fails, fall back to showing everything as selectable.
@@ -1468,6 +1669,12 @@
         await showSubstituteUI();
       });
 
+      nodeSel.addEventListener('change', ()=>{
+        try { syncKindAvailabilityForSelectedNode(); } catch(e) {}
+        rebuildSourceOptions();
+        rebuildGeneratorOptions();
+      });
+
       cancelBtn.addEventListener('click', ()=>{
         form.classList.add('d-none');
         btn.disabled = false;
@@ -1477,6 +1684,7 @@
       });
 
       kindSel.addEventListener('change', ()=>{
+        try { syncKindAvailabilityForSelectedNode(); } catch(e) {}
         rebuildSourceOptions();
         rebuildGeneratorOptions();
       });
@@ -1501,7 +1709,7 @@
           if(!Array.isArray(currentChain) || currentChain.length === 0){
             throw new Error('Generate a chain first.');
           }
-          const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+          const chainIds = chainIdsWithSelectedNode();
           if(!chainIds.length) throw new Error('Missing chain ids.');
 
           const reqAssignments = chainIds.map((nid, j)=>{
@@ -1715,6 +1923,11 @@
       params.set('force_preview', '1');
     }
 
+    const allowDupes = !!options.allow_node_duplicates;
+    if(allowDupes){
+      params.set('allow_node_duplicates', '1');
+    }
+
     const buildAttackflowPreviewUrl = (p) => '/api/flag-sequencing/attackflow_preview?' + (p ? p.toString() : params.toString());
     if(afbDownloadLink) afbDownloadLink.href = '#';
 
@@ -1854,6 +2067,7 @@
                 // Use the preview plan that produced the current chain.
                 // Using a stale flow plan can cause chain_ids to mismatch and collapse.
                 preview_plan: (lastPreviewPlanPath || ''),
+                allow_node_duplicates: !!allowDupes,
                 mode: 'hint',
                 best_effort: true,
                 timeout_s: 30
@@ -1954,7 +2168,8 @@
           length,
           preset,
           chain_ids: chainIds,
-          preview_plan: planPath
+          preview_plan: planPath,
+          allow_node_duplicates: !!allowNodeDuplicates,
         },
         { timeoutMs: 480000 }
       );
@@ -2051,6 +2266,7 @@
           length: chainIds.length,
           chain_ids: chainIds,
           preview_plan: previewPlan,
+          allow_node_duplicates: !!allowNodeDuplicates,
         });
       }
 
@@ -2083,8 +2299,14 @@
       }
       if(saveXmlEl) saveXmlEl.disabled = true;
       showLoading('Saving XML…');
+
+      const scenario = (scenarioEl && scenarioEl.value || activeScenario || '').trim();
+      const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
+      const length = (Array.isArray(currentChain) && currentChain.length) ? currentChain.length : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
+
       const xmlPath = await window.coretgSaveXmlViaApi();
       if(xmlPath){
+        let hintResolveFailed = false;
         try {
           const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
           if(xmlPathInput) xmlPathInput.value = String(xmlPath);
@@ -2095,7 +2317,60 @@
             downloadXmlEl.removeAttribute('title');
           }
         } catch(e) {}
-        setStatus('Saved XML: ' + basenameFromPath(xmlPath), false);
+
+        // Pull the fresh preview plan path produced during Save XML so subsequent
+        // hint resolution uses the latest snapshot.
+        try {
+          if(scenario && typeof window.coretgGetPreviewPlanPathForScenario === 'function'){
+            const p = (window.coretgGetPreviewPlanPathForScenario(scenario) || '').toString().trim();
+            if(p) lastPreviewPlanPath = p;
+          }
+        } catch(e) {}
+
+        // Best-effort: if a chain is already generated, resolve templates/hints now.
+        // This mirrors Generate's "save + resolve" behavior.
+        try {
+          if(scenario && Array.isArray(currentChain) && currentChain.length){
+            const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+            const planPath = (lastPreviewPlanPath || '');
+            if(chainIds.length && planPath){
+              showLoading('Resolving hint values…');
+              const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', {
+                scenario,
+                length,
+                preset,
+                chain_ids: chainIds,
+                preview_plan: planPath,
+                allow_node_duplicates: !!allowNodeDuplicates,
+              });
+              setFlowValidityFromPayload(prepData);
+              if(prepData && Array.isArray(prepData.flag_assignments)){
+                currentFlagAssignments = prepData.flag_assignments.slice();
+              }
+              try {
+                if(scenario && typeof window.coretgSetFlowDirtyForScenario === 'function') {
+                  window.coretgSetFlowDirtyForScenario(scenario, false);
+                }
+              } catch(e) {}
+              try {
+                if(prepData && prepData.preview_plan_path) lastPreviewPlanPath = String(prepData.preview_plan_path);
+              } catch(e) {}
+              try {
+                if(prepData && prepData.flow_plan_path) lastFlowPlanPath = String(prepData.flow_plan_path);
+              } catch(e) {}
+              updateMeta();
+              renderChainEditor();
+            }
+          }
+        } catch(e) {
+          // Non-fatal: XML save succeeded.
+          hintResolveFailed = true;
+          setStatus('Saved XML, but hint resolution failed: ' + String(e && e.message || e), true);
+        }
+
+        if(!hintResolveFailed){
+          setStatus('Saved XML: ' + basenameFromPath(xmlPath), false);
+        }
         try { await refreshXmlDockPreview({ force: true }); } catch(e) {}
       } else {
         setStatus('Saved XML (missing path).', false);
@@ -2147,7 +2422,7 @@
       }
       const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
       const planPath = (lastFlowPlanPath || lastPreviewPlanPath || '');
-      const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length, preset, chain_ids: chainIds, preview_plan: planPath });
+      const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length, preset, chain_ids: chainIds, preview_plan: planPath, allow_node_duplicates: !!allowNodeDuplicates });
       setFlowValidityFromPayload(prepData);
       if(prepData && Array.isArray(prepData.flag_assignments)){
         currentFlagAssignments = prepData.flag_assignments.slice();
@@ -2227,7 +2502,33 @@
     }
   } catch(e) {}
 
-  if(btnEl) btnEl.addEventListener('click', (e)=>{ e.preventDefault(); generate(true, { savePreviewResolve: true }); });
+  // Generate options dialog.
+  try{
+    if(generateOptionsDialogEl){
+      generateOptionsDialogEl.addEventListener('close', ()=>{
+        try{
+          const rv = String(generateOptionsDialogEl.returnValue || '');
+          if(rv !== 'generate') return;
+          const noDupes = generateNoDuplicatesEl ? !!generateNoDuplicatesEl.checked : true;
+          allowNodeDuplicates = !noDupes;
+          generate(true, { savePreviewResolve: true, allow_node_duplicates: !!allowNodeDuplicates });
+        } catch(e) {}
+      });
+    }
+  } catch(e) {}
+
+  if(btnEl) btnEl.addEventListener('click', (e)=>{
+    try { e.preventDefault(); } catch(_) {}
+    try{
+      if(generateOptionsDialogEl && typeof generateOptionsDialogEl.showModal === 'function'){
+        generateOptionsDialogEl.showModal();
+        return;
+      }
+    } catch(_) {}
+    // Fallback: behave like old Generate (no duplicates).
+    allowNodeDuplicates = false;
+    generate(true, { savePreviewResolve: true, allow_node_duplicates: false });
+  });
   // Handlers for Save/Preview are registered above.
   if(downloadXmlEl) downloadXmlEl.addEventListener('click', (e)=>{ e.preventDefault(); downloadXml(); });
 

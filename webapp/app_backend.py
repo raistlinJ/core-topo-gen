@@ -34,6 +34,8 @@ from collections import deque
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Iterator, TextIO, Iterable
 
+from core_topo_gen.utils.flow_seed import flow_generator_seed as _flow_generator_seed_impl
+
 try:
     import psutil  # type: ignore
 except ImportError:  # pragma: no cover - psutil is optional for tests
@@ -6084,21 +6086,31 @@ def _inject_nav_participant_link() -> dict:
             return {
                 'nav_participant_url': url_value or '',
                 'nav_participant_scenario': scenario_label or '',
+                'nav_participant_enabled': bool(url_value),
             }
 
         # If the page is not scoped to a scenario (no `?scenario=`), avoid "guessing" a participant URL
         # for admin/builder views. Otherwise CORE/Reports can show Participant UI for an unrelated scenario.
         view_mode = getattr(g, 'ui_view_mode', _UI_VIEW_DEFAULT)
         if view_mode != 'participant':
-            return {'nav_participant_url': '', 'nav_participant_scenario': ''}
+            user = _current_user()
+            scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(None, user=user)
+            mapping = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
+            any_enabled = any(bool(v) for v in (mapping or {}).values())
+            return {
+                'nav_participant_url': '',
+                'nav_participant_scenario': '',
+                'nav_participant_enabled': bool(any_enabled),
+            }
 
         url_value, scenario_label = _resolve_participant_ui_target()
         return {
             'nav_participant_url': url_value,
             'nav_participant_scenario': scenario_label,
+            'nav_participant_enabled': bool(url_value),
         }
     except Exception:
-        return {'nav_participant_url': '', 'nav_participant_scenario': ''}
+        return {'nav_participant_url': '', 'nav_participant_scenario': '', 'nav_participant_enabled': False}
 
 
 @app.context_processor
@@ -7751,10 +7763,12 @@ def _latest_session_xml_for_scenario_norm(scenario_norm: str) -> str | None:
 
 
 def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, set[str]]]:
-    """Return (nodes, links, adjacency) for the session XML.
+    """Return (nodes, links, adjacency) for a session XML.
 
-    This mirrors the logic in participant_ui_topology_api, including network nodes,
-    so reachability checks align with what the UI can draw.
+    Intended to mirror Participant UI topology semantics:
+    - includes network nodes (so host↔LAN links are visible)
+    - tags vulnerability nodes via ipv4 match
+    - preserves HITL nodes for distinct styling
     """
     try:
         summary = _analyze_core_xml(xml_path)
@@ -7766,8 +7780,8 @@ def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str
 
     all_devices = _core_xml_device_summaries(xml_path)
     all_networks = _core_xml_network_summaries(xml_path)
+
     name_map: dict[str, str] = {}
-    type_map: dict[str, str] = {}
     device_compose_map: dict[str, dict[str, str]] = {}
     for row in (all_devices or []):
         if not isinstance(row, dict):
@@ -7776,7 +7790,6 @@ def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str
         if not rid:
             continue
         name_map.setdefault(rid, str(row.get('name') or rid))
-        type_map.setdefault(rid, str(row.get('type') or ''))
         try:
             comp = str(row.get('compose') or '').strip()
         except Exception:
@@ -7786,10 +7799,7 @@ def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str
         except Exception:
             comp_name = ''
         if comp or comp_name:
-            device_compose_map[rid] = {
-                'compose': comp,
-                'compose_name': comp_name,
-            }
+            device_compose_map[rid] = {'compose': comp, 'compose_name': comp_name}
     for row in (all_networks or []):
         if not isinstance(row, dict):
             continue
@@ -7797,11 +7807,12 @@ def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str
         if not rid:
             continue
         name_map.setdefault(rid, str(row.get('name') or rid))
-        type_map.setdefault(rid, str(row.get('type') or ''))
 
+    # IMPORTANT: do NOT use summary.links_detail here (it can be pruned).
     links_list: list[dict] = _core_xml_link_summaries(xml_path, id_to_name=name_map)
 
-    by_id: dict[str, dict] = {}
+    # Start with nodes from analysis, then ensure all devices & networks exist.
+    by_id: dict[str, dict[str, Any]] = {}
     for n in nodes_list:
         if not isinstance(n, dict):
             continue
@@ -7809,7 +7820,7 @@ def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str
         if nid:
             by_id[nid] = n
 
-    for dev in all_devices:
+    for dev in (all_devices or []):
         did = str(dev.get('id') or '').strip()
         if not did or did in by_id:
             continue
@@ -7824,7 +7835,7 @@ def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str
             'linked_nodes': [],
         }
 
-    for net in all_networks:
+    for net in (all_networks or []):
         nid = str(net.get('id') or '').strip()
         if not nid or nid in by_id:
             continue
@@ -7833,6 +7844,7 @@ def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str
         name_hint = str(net.get('name') or '').strip().lower()
         is_hitl = False
         try:
+            import re
             name_looks_like_iface = bool(re.match(r'^(ens|enp|eth)\d', name_hint))
         except Exception:
             name_looks_like_iface = False
@@ -7844,6 +7856,7 @@ def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str
             coerced_type = 'wlan'
         else:
             coerced_type = 'switch'
+
         by_id[nid] = {
             'id': nid,
             'name': net.get('name') or nid,
@@ -7854,16 +7867,68 @@ def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str
             'is_hitl': bool(is_hitl),
         }
 
+    vuln_ips = _vulnerability_ipv4s_from_session_xml(xml_path)
+    vuln_set = {str(ip).strip() for ip in (vuln_ips or []) if ip}
+    subnets = _subnet_cidrs_from_session_xml(xml_path)
+
+    try:
+        import ipaddress
+    except Exception:
+        ipaddress = None
+
     out_nodes: list[dict[str, Any]] = []
     for nid, n in by_id.items():
+        name_val = str(n.get('name') or nid)
+        type_val = (str(n.get('type') or '').strip() or 'node')
+        ifaces = n.get('interfaces') if isinstance(n.get('interfaces'), list) else []
+        services_val = n.get('services') if isinstance(n.get('services'), list) else []
+
+        ipv4s: list[str] = []
+        subnet_hits: set[str] = set()
+        for iface in ifaces:
+            if not isinstance(iface, dict):
+                continue
+            ip4 = (iface.get('ipv4') or '').strip() if isinstance(iface.get('ipv4'), str) else ''
+            mask = (iface.get('ipv4_mask') or '').strip() if isinstance(iface.get('ipv4_mask'), str) else ''
+            if ip4:
+                ip4_clean = ip4.split('/', 1)[0].strip()
+                if ip4_clean:
+                    ipv4s.append(ip4_clean)
+            if ipaddress is not None and ip4:
+                try:
+                    if '/' in ip4:
+                        net_obj = ipaddress.ip_interface(ip4).network
+                    elif mask:
+                        net_obj = ipaddress.ip_interface(f"{ip4}/{mask}").network
+                    else:
+                        net_obj = None
+                    if net_obj is not None and getattr(net_obj, 'prefixlen', 32) < 32:
+                        subnet_hits.add(str(net_obj))
+                except Exception:
+                    pass
+
+        # stable unique ipv4s
+        seen_ip: set[str] = set()
+        ipv4s_u: list[str] = []
+        for ip in ipv4s:
+            if not ip or ip in seen_ip:
+                continue
+            seen_ip.add(ip)
+            ipv4s_u.append(ip)
+        is_vuln = any(ip in vuln_set for ip in ipv4s_u)
+
         out_nodes.append({
             'id': nid,
-            'name': str(n.get('name') or nid),
-            'type': (str(n.get('type') or '').strip() or 'node'),
+            'name': name_val,
+            'type': type_val,
+            'services': services_val,
+            'interfaces': ifaces,
+            'ipv4s': ipv4s_u,
+            'subnets': sorted(subnet_hits) if subnet_hits else [],
+            'is_vulnerability': bool(is_vuln),
+            'is_hitl': bool(n.get('is_hitl')),
             'compose': str(n.get('compose') or (device_compose_map.get(nid) or {}).get('compose') or ''),
             'compose_name': str(n.get('compose_name') or (device_compose_map.get(nid) or {}).get('compose_name') or ''),
-            'interfaces': n.get('interfaces') if isinstance(n.get('interfaces'), list) else [],
-            'services': n.get('services') if isinstance(n.get('services'), list) else [],
         })
 
     out_links: list[dict[str, str]] = []
@@ -7876,7 +7941,12 @@ def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str
             continue
         if a not in by_id or b not in by_id:
             continue
-        out_links.append({'node1': a, 'node2': b})
+        out_links.append({
+            'node1': a,
+            'node2': b,
+            'node1_name': str(l.get('node1_name') or name_map.get(a) or a),
+            'node2_name': str(l.get('node2_name') or name_map.get(b) or b),
+        })
 
     adj: dict[str, set[str]] = {nid: set() for nid in by_id.keys()}
     for l in out_links:
@@ -7886,6 +7956,15 @@ def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str
             continue
         adj.setdefault(a, set()).add(b)
         adj.setdefault(b, set()).add(a)
+
+    # Attach top-level subnets for any caller that wants them later.
+    # (kept off the node objects to avoid bloating graph payload)
+    try:
+        for n in out_nodes:
+            if isinstance(subnets, list) and subnets:
+                n.setdefault('__subnets_all', subnets)
+    except Exception:
+        pass
 
     return out_nodes, out_links, adj
 
@@ -7974,6 +8053,78 @@ def _pick_flag_chain_nodes(nodes: list[dict[str, Any]], adj: dict[str, set[str]]
         _random.Random().shuffle(chain_ids)
     except Exception:
         pass
+    return [id_to_node[nid] for nid in chain_ids if nid in id_to_node]
+
+
+def _pick_flag_chain_nodes_allow_duplicates(
+    nodes: list[dict[str, Any]],
+    adj: dict[str, set[str]],
+    *,
+    length: int,
+    seed: int = 0,
+) -> list[dict[str, Any]]:
+    """Pick an ordered list of eligible nodes, allowing repeats.
+
+    Used only when the caller explicitly opts into duplicates.
+    """
+    length = max(1, min(int(length or 1), 50))
+
+    id_to_node: dict[str, dict[str, Any]] = {}
+    eligible_ids: list[str] = []
+    for n in nodes or []:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if not nid:
+            continue
+        id_to_node[nid] = n
+        t = (str(n.get('type') or '').strip().lower())
+        is_docker = ('docker' in t) or (str(n.get('type') or '').strip().upper() == 'DOCKER')
+        is_vuln = bool(n.get('is_vuln'))
+        if is_docker or is_vuln:
+            eligible_ids.append(nid)
+
+    if not eligible_ids:
+        return []
+
+    # Start with a best-effort unique chain (keeps prior behavior when possible).
+    unique_target = min(length, len(list(dict.fromkeys(eligible_ids))))
+    base = _pick_flag_chain_nodes(nodes, adj, length=unique_target)
+    chain_ids: list[str] = [
+        str(n.get('id') or '').strip()
+        for n in (base or [])
+        if isinstance(n, dict) and str(n.get('id') or '').strip()
+    ]
+
+    if len(chain_ids) < length:
+        # Extend with repeats, deterministically when a seed is available.
+        try:
+            import random as _random
+            rnd = _random.Random(int(seed or 0) ^ 0xD00DCAFE)
+        except Exception:
+            rnd = None
+
+        pool = list(dict.fromkeys([x for x in eligible_ids if x]))
+        if not pool:
+            return []
+
+        while len(chain_ids) < length:
+            try:
+                pick = (rnd.choice(pool) if rnd is not None else pool[0])
+            except Exception:
+                pick = pool[0]
+            chain_ids.append(str(pick))
+
+        # Shuffle final order.
+        try:
+            if rnd is not None:
+                rnd.shuffle(chain_ids)
+            else:
+                import random as _random
+                _random.Random().shuffle(chain_ids)
+        except Exception:
+            pass
+
     return [id_to_node[nid] for nid in chain_ids if nid in id_to_node]
 
 
@@ -9022,6 +9173,7 @@ def flow_page():
         participant_url_flags=participant_url_flags,
         preview_xml_path=active_scenario_xml_path,
         xml_preview=xml_preview,
+        active_page='scenarios',
     )
 
 
@@ -9085,6 +9237,7 @@ def scenarios_preview_page():
         scenario_xml_by_name=scenario_xml_by_name,
         scenario_tab=active_scenario,
         preview_xml_path=xml_path_abs,
+        active_page='scenarios',
     )
 
 
@@ -9427,6 +9580,19 @@ def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dic
     eligible_any.sort(key=lambda x: str(x.get('id') or ''))
     eligible_nonvuln_docker.sort(key=lambda x: str(x.get('id') or ''))
 
+    # Saved chains may intentionally include duplicate nodes (e.g., when the user
+    # allows duplicates with different generator seeds). Only enforce uniqueness
+    # when the saved chain is itself unique.
+    try:
+        chain_in_ids = [
+            str((step or {}).get('id') or '').strip()
+            for step in (chain_in or [])
+            if isinstance(step, dict) and str((step or {}).get('id') or '').strip()
+        ]
+        enforce_unique = len(set(chain_in_ids)) == len(chain_in_ids)
+    except Exception:
+        enforce_unique = True
+
     used: set[str] = set()
     chain_out: list[dict[str, str]] = []
     assignments_out: list[dict[str, Any]] | None = [] if assignments is not None else None
@@ -9446,7 +9612,7 @@ def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dic
         cand = id_map.get(step_id) if step_id else None
         if cand is not None:
             nid = str(cand.get('id') or '').strip()
-            ok = bool(nid) and (nid not in used)
+            ok = bool(nid) and ((not enforce_unique) or (nid not in used))
             if ok:
                 is_docker = _flow_node_is_docker_role(cand)
                 is_vuln = _flow_node_is_vuln(cand)
@@ -9462,7 +9628,10 @@ def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dic
             pick = None
             for n in pool:
                 nid = str(n.get('id') or '').strip()
-                if nid and nid not in used:
+                if not nid:
+                    continue
+                if enforce_unique and nid in used:
+                    continue
                     pick = n
                     break
             cand = pick
@@ -9473,7 +9642,8 @@ def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dic
         nid = str(cand.get('id') or '').strip()
         if not nid:
             return None
-        used.add(nid)
+        if enforce_unique:
+            used.add(nid)
 
         chain_out.append({
             'id': nid,
@@ -10203,6 +10373,22 @@ def _flow_synthesized_inputs() -> set[str]:
     }
 
 
+def _flow_generator_seed(*, base_seed: Any, scenario_norm: str, node_id: str, gen_id: str, occurrence_idx: int = 0) -> str:
+    """Build the deterministic generator seed for Flow.
+
+    NOTE: This seed intentionally includes an occurrence index so a Flow chain may repeat the
+    same (node_id, generator_id) without producing an *exact* duplicate configuration.
+    """
+    return _flow_generator_seed_impl(
+        base_seed=base_seed,
+        scenario_norm=scenario_norm,
+        node_id=node_id,
+        gen_id=gen_id,
+        occurrence_idx=occurrence_idx,
+    )
+
+
+
 def _flow_strip_runtime_sensitive_fields(flag_assignments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return a copy of assignments safe to persist in preview-plan metadata.
 
@@ -10843,6 +11029,7 @@ def api_flow_attackflow_preview():
     prefer_preview = str(request.args.get('prefer_preview') or '').strip().lower() in ('1', 'true', 'yes', 'y')
     force_preview = str(request.args.get('force_preview') or '').strip().lower() in ('1', 'true', 'yes', 'y')
     best_effort_query = str(request.args.get('best_effort') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+    allow_node_duplicates = str(request.args.get('allow_node_duplicates') or request.args.get('allow_duplicates') or '').strip().lower() in ('1', 'true', 'yes', 'y')
     debug_mode = str(request.args.get('debug') or '').strip().lower() in ('1', 'true', 'yes', 'y')
 
     # When Generate forces preview selection, we still want to use the same *topology*
@@ -11164,7 +11351,14 @@ def api_flow_attackflow_preview():
         if preset_steps:
             chain_nodes = _pick_flag_chain_nodes_for_preset(nodes, adj, steps=preset_steps)
         else:
-            chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
+            if allow_node_duplicates:
+                try:
+                    seed_val = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
+                except Exception:
+                    seed_val = 0
+                chain_nodes = _pick_flag_chain_nodes_allow_duplicates(nodes, adj, length=length, seed=seed_val)
+            else:
+                chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
 
     warning: str | None = None
 
@@ -11196,29 +11390,35 @@ def api_flow_attackflow_preview():
         flow_meta = meta.get('flow') if isinstance(meta, dict) else None
         saved_assignments = flow_meta.get('flag_assignments') if isinstance(flow_meta, dict) else None
         if (not ignore_saved_flow) and isinstance(saved_assignments, list) and saved_assignments:
-            chain_id_set = {str(n.get('id') or '').strip() for n in (chain_nodes or []) if isinstance(n, dict)}
-            filtered: list[dict[str, Any]] = []
-            for entry in saved_assignments:
-                if not isinstance(entry, dict):
-                    continue
-                nid = str(entry.get('node_id') or '').strip()
-                if nid and nid in chain_id_set:
-                    filtered.append(entry)
-            # Only accept if we have a complete mapping (one per chain node).
-            if filtered and len(filtered) == len(chain_id_set):
-                # Preserve chain order.
-                by_id = {str(e.get('node_id') or '').strip(): e for e in filtered}
-                flag_assignments = [by_id.get(str(n.get('id') or '').strip()) for n in chain_nodes]
-                flag_assignments = [e for e in flag_assignments if isinstance(e, dict)]
-                # Backfill new UI fields (e.g., description_hints) and refresh hints for current order.
-                try:
-                    flag_assignments = _flow_enrich_saved_flag_assignments(
-                        flag_assignments,
-                        chain_nodes,
-                        scenario_label=(scenario_label or scenario_norm),
-                    )
-                except Exception:
-                    pass
+            # Saved assignments are persisted positionally, aligned to the saved chain.
+            # Do not re-key by node_id; chains may intentionally contain duplicates.
+            try:
+                desired_len = len(chain_nodes or [])
+            except Exception:
+                desired_len = 0
+            if desired_len and len(saved_assignments) >= desired_len:
+                ordered: list[dict[str, Any]] = []
+                for i in range(desired_len):
+                    a = saved_assignments[i]
+                    if not isinstance(a, dict):
+                        ordered.append({})
+                        continue
+                    a2 = dict(a)
+                    try:
+                        a2['node_id'] = str((chain_nodes[i] or {}).get('id') or '').strip()
+                    except Exception:
+                        pass
+                    ordered.append(a2)
+                if all(isinstance(a, dict) and str(a.get('id') or '').strip() for a in ordered):
+                    flag_assignments = ordered
+                    try:
+                        flag_assignments = _flow_enrich_saved_flag_assignments(
+                            flag_assignments,
+                            chain_nodes,
+                            scenario_label=(scenario_label or scenario_norm),
+                        )
+                    except Exception:
+                        pass
     except Exception:
         flag_assignments = []
 
@@ -11233,7 +11433,13 @@ def api_flow_attackflow_preview():
 
     # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
     # Presets force an intended generator order and should not be reordered.
-    if (not used_saved_chain) and (not preset_steps):
+    try:
+        _ids = [str(n.get('id') or '').strip() for n in (chain_nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()]
+        has_dupes = len(set(_ids)) != len(_ids)
+    except Exception:
+        has_dupes = False
+
+    if (not used_saved_chain) and (not preset_steps) and (not has_dupes):
         debug_dag = str(request.args.get('debug_dag') or '').strip().lower() in ('1', 'true', 'yes', 'y')
         chain_nodes, flag_assignments, dag_debug = _flow_reorder_chain_by_generator_dag(
             chain_nodes,
@@ -11256,7 +11462,7 @@ def api_flow_attackflow_preview():
 
     if len(chain_nodes) < 1:
         return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan (Docker role or vulnerability nodes).', 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
-    if (not used_saved_chain) and len(chain_nodes) < length:
+    if (not used_saved_chain) and (not allow_node_duplicates) and len(chain_nodes) < length:
         return jsonify({
             'ok': False,
             'error': f'Only {len(chain_nodes)} eligible nodes found for chain length {length}.',
@@ -11277,6 +11483,7 @@ def api_flow_attackflow_preview():
         'flow_valid': bool(flow_valid),
         'flow_errors': list(flow_errors or []),
         'flags_enabled': bool(flags_enabled),
+        'allow_node_duplicates': bool(allow_node_duplicates),
     }
     try:
         meta_out = payload.get('metadata') if isinstance(payload, dict) else None
@@ -11323,6 +11530,7 @@ def api_flow_prepare_preview_for_execute():
     preset = str(j.get('preset') or '').strip()
     mode = str(j.get('mode') or '').strip().lower()
     best_effort = bool(j.get('best_effort')) or (mode in {'hint', 'hint_only', 'resolve_hints', 'preview'})
+    allow_node_duplicates = str(j.get('allow_node_duplicates') or j.get('allow_duplicates') or '').strip().lower() in ('1', 'true', 'yes', 'y')
     total_timeout_s: int | None = None
     try:
         total_timeout_s = int(j.get('timeout_s') or 0)
@@ -11442,7 +11650,9 @@ def api_flow_prepare_preview_for_execute():
                     def _eligible(cand: dict, pos: int) -> bool:
                         try:
                             cid0 = str(cand.get('id') or '').strip()
-                            if not cid0 or cid0 in used:
+                            if not cid0:
+                                return False
+                            if (not allow_node_duplicates) and cid0 in used:
                                 return False
                             is_docker = _flow_node_is_docker_role(cand)
                             is_vuln = bool(cand.get('is_vuln'))
@@ -11512,7 +11722,9 @@ def api_flow_prepare_preview_for_execute():
                             if not isinstance(cand, dict):
                                 continue
                             cid = str(cand.get('id') or '').strip()
-                            if not cid or cid in used:
+                            if not cid:
+                                continue
+                            if (not allow_node_duplicates) and cid in used:
                                 continue
                             t_raw = str(cand.get('type') or '')
                             t = t_raw.strip().lower()
@@ -11561,7 +11773,9 @@ def api_flow_prepare_preview_for_execute():
                             if not isinstance(cand, dict):
                                 continue
                             cid = str(cand.get('id') or '').strip()
-                            if not cid or cid in used:
+                            if not cid:
+                                continue
+                            if (not allow_node_duplicates) and cid in used:
                                 continue
                             ct_raw = str(cand.get('type') or '')
                             ct = ct_raw.strip().lower()
@@ -11598,8 +11812,17 @@ def api_flow_prepare_preview_for_execute():
             if preset_steps:
                 chain_nodes = _pick_flag_chain_nodes_for_preset(nodes, adj, steps=preset_steps)
             else:
-                chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
-            if len(chain_nodes) < length:
+                if allow_node_duplicates:
+                    try:
+                        seed_val = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
+                    except Exception:
+                        seed_val = 0
+                    chain_nodes = _pick_flag_chain_nodes_allow_duplicates(nodes, adj, length=length, seed=seed_val)
+                else:
+                    chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
+            if len(chain_nodes) < 1:
+                return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan (Docker role or vulnerability nodes).', 'available': len(chain_nodes), 'stats': stats}), 422
+            if (not allow_node_duplicates) and len(chain_nodes) < length:
                 return jsonify({'ok': False, 'error': 'Not enough eligible nodes in preview plan to build the requested chain.', 'available': len(chain_nodes), 'stats': stats}), 422
             chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if str(n.get('id') or '').strip()]
     except Exception as e:
@@ -11626,18 +11849,27 @@ def api_flow_prepare_preview_for_execute():
         flow_meta = meta.get('flow') if isinstance(meta, dict) else None
         saved_assignments = flow_meta.get('flag_assignments') if isinstance(flow_meta, dict) else None
         if isinstance(saved_assignments, list) and saved_assignments:
-            chain_set = {str(n.get('id') or '').strip() for n in (chain_nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
-            filtered: list[dict[str, Any]] = []
-            for entry in saved_assignments:
-                if not isinstance(entry, dict):
-                    continue
-                nid = str(entry.get('node_id') or '').strip()
-                if nid and nid in chain_set:
-                    filtered.append(entry)
-            if filtered and len(filtered) == len(chain_set):
-                by_id = {str(e.get('node_id') or '').strip(): e for e in filtered}
-                flag_assignments = [by_id.get(str(n.get('id') or '').strip()) for n in chain_nodes]
-                flag_assignments = [e for e in flag_assignments if isinstance(e, dict)]
+            # Saved assignments are persisted positionally, aligned with the saved chain.
+            # Do not re-key by node_id; chains may intentionally contain duplicates.
+            try:
+                desired_len = len(chain_nodes or [])
+            except Exception:
+                desired_len = 0
+            if desired_len and len(saved_assignments) >= desired_len:
+                ordered: list[dict[str, Any]] = []
+                for i in range(desired_len):
+                    a = saved_assignments[i]
+                    if not isinstance(a, dict):
+                        ordered.append({})
+                        continue
+                    a2 = dict(a)
+                    try:
+                        a2['node_id'] = str((chain_nodes[i] or {}).get('id') or '').strip()
+                    except Exception:
+                        pass
+                    ordered.append(a2)
+                if all(isinstance(a, dict) and str(a.get('id') or '').strip() for a in ordered):
+                    flag_assignments = ordered
                 try:
                     flag_assignments = _flow_enrich_saved_flag_assignments(
                         flag_assignments,
@@ -11685,7 +11917,13 @@ def api_flow_prepare_preview_for_execute():
 
     # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
     # Note: chain_ids is populated for both explicit and auto-picked chains; use explicit_chain.
-    if (not explicit_chain) and (not preset_steps):
+    try:
+        _ids = [str(n.get('id') or '').strip() for n in (chain_nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()]
+        has_dupes = len(set(_ids)) != len(_ids)
+    except Exception:
+        has_dupes = False
+
+    if (not explicit_chain) and (not preset_steps) and (not has_dupes):
         debug_dag = bool(j.get('debug_dag'))
         chain_nodes, flag_assignments, dag_debug = _flow_reorder_chain_by_generator_dag(
             chain_nodes,
@@ -11790,13 +12028,20 @@ def api_flow_prepare_preview_for_execute():
             pass
         return names
 
-    def _flow_default_generator_config(assignment: dict[str, Any], *, seed_val: Any) -> dict[str, Any]:
+    def _flow_default_generator_config(assignment: dict[str, Any], *, seed_val: Any, occurrence_idx: int = 0) -> dict[str, Any]:
         """Synthesize deterministic default inputs for the seeded generators."""
         node_id = str(assignment.get('node_id') or '').strip()
         gen_id = str(assignment.get('id') or '').strip()
         base_seed = str(seed_val if seed_val not in (None, '') else '0')
         return {
-            'seed': f"{base_seed}:{scenario_norm}:{node_id}:{gen_id}",
+            # Allow duplicates only when seeds differ per occurrence.
+            'seed': _flow_generator_seed(
+                base_seed=base_seed,
+                scenario_norm=scenario_norm,
+                node_id=node_id,
+                gen_id=gen_id,
+                occurrence_idx=int(occurrence_idx or 0),
+            ),
             'flag_prefix': 'FLAG',
             'secret': f"FLOWSECRET_{base_seed}_{scenario_norm}_{node_id}",
             'env_name': f"env_{scenario_norm}_{node_id}",
@@ -11957,6 +12202,7 @@ def api_flow_prepare_preview_for_execute():
             failed_run_dirs: list[str] = []
 
             deadline = (started_at + float(total_timeout_s)) if total_timeout_s is not None else None
+            occurrence_ctr: dict[tuple[str, str], int] = {}
             for fa in (flag_assignments or []):
                 if not isinstance(fa, dict):
                     continue
@@ -11995,7 +12241,11 @@ def api_flow_prepare_preview_for_execute():
                 generator_catalog = str(fa.get('generator_catalog') or '').strip() or 'flag_generators'
                 seed_val = preview.get('seed') if isinstance(preview, dict) else None
 
-                cfg_full = _flow_default_generator_config(fa, seed_val=seed_val)
+                occ_key = (cid, generator_id)
+                occ = int(occurrence_ctr.get(occ_key, 0) or 0)
+                occurrence_ctr[occ_key] = occ + 1
+
+                cfg_full = _flow_default_generator_config(fa, seed_val=seed_val, occurrence_idx=occ)
 
                 # Provide per-node network context. Some generators output network.ip and then
                 # hint templates reference it via {{OUTPUT.network.ip}}; make it match Preview.
@@ -12486,6 +12736,14 @@ def api_flow_save_flow_substitutions():
     if not scenario_norm:
         return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
 
+    allow_node_duplicates = False
+    try:
+        allow_node_duplicates = str(j.get('allow_node_duplicates') or '').strip().lower() in {
+            '1', 'true', 't', 'yes', 'y', 'on'
+        }
+    except Exception:
+        allow_node_duplicates = False
+
     chain_ids_in = j.get('chain_ids')
     if not isinstance(chain_ids_in, list) or not chain_ids_in:
         return jsonify({'ok': False, 'error': 'Missing chain_ids.'}), 400
@@ -12702,9 +12960,27 @@ def api_flow_save_flow_substitutions():
 
         node = chain_nodes[i] if i < len(chain_nodes) else {}
         is_vuln_node = bool(node.get('is_vuln'))
+        is_docker_node = False
+        try:
+            is_docker_node = bool(_flow_node_is_docker_role(node))
+        except Exception:
+            try:
+                t_raw = str(node.get('type') or '')
+                t = t_raw.strip().lower()
+                is_docker_node = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
+            except Exception:
+                is_docker_node = False
+
         kind = str(gen.get('_flow_kind') or 'flag-generator')
         if is_vuln_node and kind != 'flag-generator':
             return jsonify({'ok': False, 'error': f'Generator {gen_id} is not compatible with vulnerability node {node_id} (must be flag-generator).'}), 422
+        if kind == 'flag-node-generator':
+            if is_vuln_node or (not is_docker_node):
+                return jsonify({'ok': False, 'error': f'Generator {gen_id} is not compatible with node {node_id} (flag-node-generator requires docker-role, non-vulnerability node).'}), 422
+        else:
+            # flag-generator
+            if not (is_docker_node or is_vuln_node):
+                return jsonify({'ok': False, 'error': f'Generator {gen_id} is not compatible with node {node_id} (flag-generator requires docker-role or vulnerability node).'}), 422
 
         next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
         hint_templates = _flow_hint_templates_from_generator(gen)
@@ -12777,6 +13053,7 @@ def api_flow_save_flow_substitutions():
             'scenario': scenario_label or scenario_norm,
             'length': len(chain_nodes),
             'requested_length': len(chain_nodes),
+            'allow_node_duplicates': bool(allow_node_duplicates),
             'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
             'flag_assignments': persisted_flag_assignments,
             'flags_enabled': bool(flags_enabled),
@@ -12831,6 +13108,7 @@ def api_flow_save_flow_substitutions():
         'preview_plan_path': base_plan_path,
         'flow_plan_path': out_path,
         'base_preview_plan_path': base_plan_path,
+        'allow_node_duplicates': bool(allow_node_duplicates),
     })
 
 
@@ -12868,6 +13146,14 @@ def api_flow_substitution_candidates():
     kind = str(j.get('kind') or 'flag-generator').strip() or 'flag-generator'
     if kind not in {'flag-generator', 'flag-node-generator'}:
         kind = 'flag-generator'
+
+    allow_node_duplicates = False
+    try:
+        allow_node_duplicates = str(j.get('allow_node_duplicates') or '').strip().lower() in {
+            '1', 'true', 't', 'yes', 'y', 'on'
+        }
+    except Exception:
+        allow_node_duplicates = False
 
     base_plan_path = str(j.get('preview_plan') or '').strip() or None
     if base_plan_path:
@@ -12910,21 +13196,117 @@ def api_flow_substitution_candidates():
     if is_vuln_node:
         kind = 'flag-generator'
 
+    # Node candidates for the selected chain position.
+    # The Flow UI can optionally allow changing the *node* at this step, but only to nodes
+    # compatible with the selected generator kind.
+    def _node_is_docker_role(n: dict[str, Any]) -> bool:
+        try:
+            t_raw = str(n.get('type') or '')
+            t = t_raw.strip().lower()
+            return ('docker' in t) or (t_raw.strip().upper() == 'DOCKER') or bool(_flow_node_is_docker_role(n))
+        except Exception:
+            try:
+                return bool(_flow_node_is_docker_role(n))
+            except Exception:
+                return False
+
+    def _node_compatible_for_kind(n: dict[str, Any], desired_kind: str) -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        try:
+            is_vuln = bool(n.get('is_vuln'))
+            is_docker = _node_is_docker_role(n)
+            if desired_kind == 'flag-node-generator':
+                if not is_docker:
+                    reasons.append('requires docker-role node')
+                if is_vuln:
+                    reasons.append('requires non-vulnerability node')
+                return (bool(is_docker) and (not is_vuln)), reasons
+            # flag-generator
+            if not (is_docker or is_vuln):
+                reasons.append('requires docker-role or vulnerability node')
+                return False, reasons
+            return True, []
+        except Exception:
+            return False, ['compatibility check failed']
+
+    node_candidates: list[dict[str, Any]] = []
+    try:
+        cur_node = chain_nodes[index] if index < len(chain_nodes) else None
+        cur_id = str((cur_node or {}).get('id') or '').strip() if isinstance(cur_node, dict) else ''
+        used: set[str] = set()
+        if not allow_node_duplicates:
+            used = {str(cid).strip() for cid in (chain_ids or []) if str(cid).strip()}
+            # Allow re-selecting the current node.
+            if cur_id and cur_id in used:
+                used.remove(cur_id)
+
+        desired_kind = kind
+        # If the current node is vuln, force flag-generator regardless.
+        if isinstance(cur_node, dict) and bool(cur_node.get('is_vuln')):
+            desired_kind = 'flag-generator'
+
+        # Include current node (even if incompatible) so the UI can show it.
+        if isinstance(cur_node, dict) and cur_id:
+            ok, blocked = _node_compatible_for_kind(cur_node, desired_kind)
+            node_candidates.append({
+                'id': cur_id,
+                'name': str(cur_node.get('name') or '').strip(),
+                'type': str(cur_node.get('type') or '').strip(),
+                'is_vuln': bool(cur_node.get('is_vuln')),
+                'is_docker': bool(_node_is_docker_role(cur_node)),
+                'compatible': bool(ok),
+                'blocked_by': blocked,
+                'current': True,
+            })
+
+        # Add other eligible nodes not already in the chain.
+        for n in (nodes or []):
+            if not isinstance(n, dict):
+                continue
+            nid = str(n.get('id') or '').strip()
+            if not nid or nid in used:
+                continue
+            ok, blocked = _node_compatible_for_kind(n, desired_kind)
+            if not ok:
+                continue
+            node_candidates.append({
+                'id': nid,
+                'name': str(n.get('name') or '').strip(),
+                'type': str(n.get('type') or '').strip(),
+                'is_vuln': bool(n.get('is_vuln')),
+                'is_docker': bool(_node_is_docker_role(n)),
+                'compatible': True,
+                'blocked_by': [],
+                'current': False,
+            })
+
+        # Sort: current first, then name/id.
+        def _node_sort_key(x: dict[str, Any]) -> tuple[int, str, str]:
+            cur = 0 if bool(x.get('current')) else 1
+            name = str(x.get('name') or '').lower()
+            nid = str(x.get('id') or '')
+            return (cur, name, nid)
+
+        node_candidates.sort(key=_node_sort_key)
+    except Exception:
+        node_candidates = []
+
     # Parse the current chain assignments (ids only) so we can compute prefix outputs.
     fas_in = j.get('flag_assignments')
     if not isinstance(fas_in, list) or len(fas_in) != len(chain_nodes):
         return jsonify({'ok': False, 'error': 'flag_assignments must be a list aligned to chain_ids (same length).'}), 400
-    cur_ids_by_node: dict[str, str] = {}
-    for i, cid in enumerate(chain_ids):
-        req = fas_in[i] if i < len(fas_in) else {}
-        if not isinstance(req, dict):
-            continue
-        node_id = str(req.get('node_id') or '').strip()
-        if node_id != str(cid):
-            continue
-        gen_id = str(req.get('id') or req.get('generator_id') or '').strip()
-        if gen_id:
-            cur_ids_by_node[node_id] = gen_id
+    try:
+        from core_topo_gen.utils.flow_substitution import flow_assignment_ids_by_position
+        cur_ids_by_pos = flow_assignment_ids_by_position(fas_in)
+    except Exception:
+        cur_ids_by_pos = ['' for _ in range(len(chain_ids))]
+        for pos in range(len(chain_ids)):
+            req = fas_in[pos] if pos < len(fas_in) else {}
+            if not isinstance(req, dict):
+                continue
+            gen_id = str(req.get('id') or req.get('generator_id') or '').strip()
+            if gen_id:
+                cur_ids_by_pos[pos] = gen_id
 
     # Candidate generator ids (client-filtered).
     cand_ids_in = j.get('candidate_ids')
@@ -13069,8 +13451,7 @@ def api_flow_substitution_candidates():
     have_fields: set[str] = set(synthesized_fields)
 
     for pos in range(0, max(0, index)):
-        node_id = str(chain_ids[pos])
-        gen_id = cur_ids_by_node.get(node_id)
+        gen_id = cur_ids_by_pos[pos] if pos < len(cur_ids_by_pos) else ''
         if not gen_id:
             continue
         g = gen_by_id.get(gen_id)
@@ -13149,7 +13530,9 @@ def api_flow_substitution_candidates():
         'index': index,
         'is_vuln': bool(is_vuln_node),
         'candidates': out,
+        'node_candidates': node_candidates,
         'preview_plan_path': base_plan_path,
+        'allow_node_duplicates': bool(allow_node_duplicates),
     })
 
 
@@ -28705,6 +29088,9 @@ def core_details():
     classification = None  # 'scenario' | 'session' | 'unknown' | 'planner'
     container_flag = False
     planner_bundle = False
+    graph_nodes: list[dict[str, Any]] | None = None
+    graph_links: list[dict[str, Any]] | None = None
+    flow_meta: dict[str, Any] | None = None
     # If no XML path given but we have a session id, attempt to export the session XML so we can show details
     if not xml_path and sid:
         try:
@@ -28783,6 +29169,29 @@ def core_details():
                     xml_summary = xml_summary or None
         except Exception as _e:
             errors = errors or f'XML inspection failed: {_e}'
+
+    # For session XML exports, prefer the full topology payload (includes networks + vuln tagging).
+    if xml_path and os.path.exists(xml_path) and classification == 'session':
+        try:
+            graph_nodes, graph_links, _adj = _build_topology_graph_from_session_xml(xml_path)
+        except Exception:
+            graph_nodes, graph_links = None, None
+
+    # Best-effort attach saved Flow chain metadata so we can annotate sequence nodes.
+    try:
+        scenario_norm_for_flow = _normalize_scenario_label(scenario_norm)
+        if scenario_norm_for_flow:
+            flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm_for_flow)
+            if flow_plan_path:
+                with open(flow_plan_path, 'r', encoding='utf-8') as f:
+                    flow_payload = json.load(f) or {}
+                if isinstance(flow_payload, dict):
+                    meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
+                    candidate = (meta or {}).get('flow') or flow_payload.get('flow')
+                    if isinstance(candidate, dict):
+                        flow_meta = candidate
+    except Exception:
+        flow_meta = None
     session_info = None
     if sid:
         try:
@@ -28822,7 +29231,103 @@ def core_details():
         classification=classification,
         container_flag=container_flag,
         scenario_label=scenario_label,
+        scenario_norm=scenario_norm,
+        graph_nodes=graph_nodes,
+        graph_links=graph_links,
+        flow_meta=flow_meta,
     )
+
+
+@app.route('/api/core-details/topology')
+def api_core_details_topology():
+    """Best-effort topology payload for Scenario Details.
+
+    Priority:
+    1) Latest session XML for scenario (most enriched: interfaces/ipv4 + vuln tagging)
+    2) Latest preview plan for scenario (pre-execute: docker/vuln role semantics)
+    """
+    scenario_norm = _normalize_scenario_label(request.args.get('scenario') or '')
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'Missing scenario.'}), 400
+
+    # Enforce assignment-based access for restricted roles.
+    try:
+        allowed_norms = _builder_allowed_norms(_current_user())
+        if allowed_norms is not None and scenario_norm not in allowed_norms:
+            return jsonify({'ok': False, 'error': 'Scenario not assigned.'}), 403
+    except Exception:
+        pass
+
+    nodes: list[dict[str, Any]] = []
+    links: list[dict[str, Any]] = []
+    status = ''
+    source = ''
+
+    # 1) Prefer latest session XML for the scenario.
+    session_xml_path = _latest_session_xml_for_scenario_norm(scenario_norm)
+    if session_xml_path and os.path.exists(session_xml_path):
+        try:
+            nodes, links, _adj = _build_topology_graph_from_session_xml(session_xml_path)
+            status = 'ok'
+            source = 'session_xml'
+        except Exception as e:
+            status = f'Failed building session topology: {e}'
+            nodes, links = [], []
+
+    # 2) Fallback: build from latest preview plan.
+    if not nodes:
+        try:
+            plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+        except Exception:
+            plan_path = None
+        if plan_path and os.path.exists(plan_path):
+            try:
+                with open(plan_path, 'r', encoding='utf-8') as f:
+                    payload = json.load(f) or {}
+                full_prev = None
+                if isinstance(payload, dict):
+                    full_prev = payload.get('full_preview') if isinstance(payload.get('full_preview'), dict) else None
+                    if full_prev is None and isinstance(payload.get('preview'), dict):
+                        full_prev = payload.get('preview')
+                if isinstance(full_prev, dict):
+                    nodes2, links2, _adj2 = _build_topology_graph_from_preview_plan(full_prev)
+                    # Normalize vuln hint field to what core_graph.js understands.
+                    for n in nodes2 or []:
+                        if not isinstance(n, dict):
+                            continue
+                        if n.get('is_vulnerability') is None:
+                            n['is_vulnerability'] = bool(n.get('is_vuln'))
+                    nodes = nodes2 or []
+                    links = links2 or []
+                    status = 'ok'
+                    source = 'preview_plan'
+            except Exception as e:
+                status = f'Failed building preview topology: {e}'
+
+    # Best-effort attach flow metadata for sequence indices.
+    flow_meta: dict[str, Any] | None = None
+    try:
+        flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
+        if flow_plan_path and os.path.exists(flow_plan_path):
+            with open(flow_plan_path, 'r', encoding='utf-8') as f:
+                flow_payload = json.load(f) or {}
+            if isinstance(flow_payload, dict):
+                meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
+                candidate = (meta or {}).get('flow') or flow_payload.get('flow')
+                if isinstance(candidate, dict):
+                    flow_meta = candidate
+    except Exception:
+        flow_meta = None
+
+    return jsonify({
+        'ok': True,
+        'scenario_norm': scenario_norm,
+        'status': status,
+        'source': source,
+        'nodes': nodes,
+        'links': links,
+        'flow': flow_meta or None,
+    })
 
 
 @app.route('/admin/cleanup_pycore', methods=['POST'])

@@ -30,6 +30,11 @@
         title="Generate a full preview for the selected scenario"
       >Preview</a>
     </li>
+    {% if nav_participant_url %}
+    <li class="nav-item">
+      <a class="nav-link" href="{{ url_for('participant_ui_page', scenario=scenario_tab) if scenario_tab else url_for('participant_ui_page') }}" title="Participant-UI">Participant-UI</a>
+    </li>
+    {% endif %}
   </ul>
 
   {# Defaults used by JS; Preview tab can override with live editor state. #}
@@ -57,6 +62,7 @@
   const LATEST_XML_BY_SCENARIO_STORAGE_KEY = 'coretg_latest_xml_by_scenario_v1';
   const SEED_BY_SCENARIO_STORAGE_KEY = 'coretg_seed_by_scenario_v1';
   const PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY = 'coretg_preview_plan_by_scenario_v1';
+  const FLOW_DIRTY_BY_SCENARIO_STORAGE_KEY = 'coretg_flow_dirty_by_scenario_v1';
 
   function readJsonFromLocalStorage(key, fallback){
     try {
@@ -81,6 +87,10 @@
     return readJsonFromLocalStorage(PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY, {});
   }
 
+  function readFlowDirtyMap(){
+    return readJsonFromLocalStorage(FLOW_DIRTY_BY_SCENARIO_STORAGE_KEY, {});
+  }
+
   function getPreviewPlanPathForScenario(scenarioName){
     try {
       const key = normalizeScenarioKey(scenarioName);
@@ -98,15 +108,56 @@
     try {
       const key = normalizeScenarioKey(scenarioName);
       const path = (previewPlanPath || '').toString().trim();
-      if (!key || !path) return;
+      if (!key) return;
       const map = readPreviewPlanMap();
       const next = (map && typeof map === 'object') ? map : {};
+
+      // Allow clearing the stored preview plan.
+      if (!path) {
+        try { delete next[key]; } catch (e) {}
+        localStorage.setItem(PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY, JSON.stringify(next));
+        return;
+      }
       next[key] = {
         scenario: (scenarioName || '').toString().trim(),
         preview_plan_path: path,
         updated_at: Date.now(),
       };
       localStorage.setItem(PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY, JSON.stringify(next));
+    } catch (e) {}
+  }
+
+  function isFlowDirtyForScenario(scenarioName){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      if (!key) return false;
+      const map = readFlowDirtyMap();
+      const entry = (map && typeof map === 'object') ? map[key] : null;
+      return !!(entry && typeof entry === 'object' && entry.dirty);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function setFlowDirtyForScenario(scenarioName, dirty, reason, xmlPath){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      if (!key) return;
+      const map = readFlowDirtyMap();
+      const next = (map && typeof map === 'object') ? map : {};
+      if (!dirty) {
+        try { delete next[key]; } catch (e) {}
+        localStorage.setItem(FLOW_DIRTY_BY_SCENARIO_STORAGE_KEY, JSON.stringify(next));
+        return;
+      }
+      next[key] = {
+        scenario: (scenarioName || '').toString().trim(),
+        dirty: true,
+        reason: (reason || 'topology_changed').toString(),
+        xml_path: (xmlPath || '').toString(),
+        updated_at: Date.now(),
+      };
+      localStorage.setItem(FLOW_DIRTY_BY_SCENARIO_STORAGE_KEY, JSON.stringify(next));
     } catch (e) {}
   }
 
@@ -441,6 +492,62 @@
       if (scenarioName) ensureSeedForScenario(scenarioName);
     } catch (e) {}
 
+    // Always persist a fresh preview plan after Save XML so the Preview tab cannot
+    // display stale cached results from an older XML snapshot.
+    try {
+      const scenarioName = resolveScenarioNameForSave();
+      if (scenarioName && typeof window.coretgPostJson === 'function') {
+        let seed = null;
+        try {
+          if (typeof window.coretgGetSeedForScenario === 'function') {
+            seed = window.coretgGetSeedForScenario(scenarioName);
+          }
+        } catch (e) { seed = null; }
+
+        const persisted = await window.coretgPostJson('/api/plan/persist_preview_plan', {
+          xml_path: xmlPath,
+          scenario: scenarioName,
+          seed,
+        });
+
+        try {
+          if (persisted && persisted.seed !== undefined && typeof window.coretgSetSeedForScenario === 'function') {
+            window.coretgSetSeedForScenario(scenarioName, persisted.seed);
+          }
+        } catch (e) {}
+
+        const previewPlan = (persisted && persisted.preview_plan_path) ? String(persisted.preview_plan_path) : '';
+        if (typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
+          window.coretgSetPreviewPlanPathForScenario(scenarioName, previewPlan);
+        }
+      }
+    } catch (e) {
+      // Best-effort: if preview-plan persistence failed, clear any stored preview plan
+      // path so Preview will fall back to re-rendering from the latest XML path.
+      try {
+        const scenarioName = resolveScenarioNameForSave();
+        if (scenarioName && typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
+          window.coretgSetPreviewPlanPathForScenario(scenarioName, '');
+        }
+      } catch (_) {}
+    }
+
+    // If a saved Flag Sequencing chain exists for this scenario, changing and saving
+    // topology/VM settings can make the chain stale. Mark it dirty so Preview can
+    // warn before showing potentially confusing results.
+    try {
+      const scenarioName = resolveScenarioNameForSave();
+      const onFlowPage = String(window.location.pathname || '').includes('/scenarios/flag-sequencing');
+      if (scenarioName && !onFlowPage) {
+        const flowState = (typeof window.coretgGetSavedFlowStateForScenario === 'function')
+          ? window.coretgGetSavedFlowStateForScenario(scenarioName)
+          : null;
+        if (flowState && typeof flowState === 'object') {
+          setFlowDirtyForScenario(scenarioName, true, 'topology_saved_after_flow', xmlPath);
+        }
+      }
+    } catch (e) {}
+
     // If the Topology page state is present, keep it in sync.
     try {
       if (window.state && typeof window.state === 'object') {
@@ -466,6 +573,19 @@
     const options = (opts && typeof opts === 'object') ? opts : {};
     const xmlPath = await saveXmlViaApi();
     const scenario = (options.scenarioOverride || '').toString().trim() || resolveScenarioNameForSave();
+
+    // If Flow is dirty, steer the user to Flag Sequencing to review/update first.
+    try {
+      if (scenario && isFlowDirtyForScenario(scenario)) {
+        const msg = 'Topology was saved after a Flag Sequencing chain was created for this scenario.\n\nOpen Flag Sequencing to review/update the chain before Preview?';
+        const goFlow = confirm(msg);
+        if (goFlow) {
+          window.location.href = '/scenarios/flag-sequencing?scenario=' + encodeURIComponent(scenario);
+          return;
+        }
+      }
+    } catch (e) {}
+
     const baseUrl = String(document.getElementById('scenariosPreviewTabLink')?.dataset?.previewBaseUrl || '/scenarios/preview');
     const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + (scenario ? ('&scenario=' + encodeURIComponent(scenario)) : '');
     window.location.href = url;
@@ -483,6 +603,8 @@
   window.coretgSetSeedForScenario = setSeedForScenario;
   window.coretgGetPreviewPlanPathForScenario = getPreviewPlanPathForScenario;
   window.coretgSetPreviewPlanPathForScenario = setPreviewPlanPathForScenario;
+  window.coretgIsFlowDirtyForScenario = isFlowDirtyForScenario;
+  window.coretgSetFlowDirtyForScenario = setFlowDirtyForScenario;
 
   window.coretgRefreshScenariosExecuteButtonState = refreshScenariosExecuteButtonState;
   document.addEventListener('DOMContentLoaded', refreshScenariosExecuteButtonState);

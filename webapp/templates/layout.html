@@ -102,7 +102,7 @@
             <li class="nav-item"><a id="navReportsLink" class="nav-link {% if active_page=='reports' %}active{% endif %}" href="{{ nav_reports_href }}">Reports</a></li>
             <li class="nav-item"><a id="navCoreLink" class="nav-link {% if active_page=='core' %}active{% endif %}" href="{{ nav_core_href }}">CORE-Management</a></li>
             {% endif %}
-            {% set show_participant_nav_anyway = false %}
+            {% set show_participant_nav_anyway = (nav_participant_enabled|default(false)) %}
             <li class="nav-item{% if (not nav_participant_available) and (not show_participant_nav_anyway) %} d-none{% endif %}" id="navParticipantLinkWrap" data-force-visible="{{ '1' if show_participant_nav_anyway else '' }}">
               <a id="navParticipantLink" class="nav-link {% if active_page=='participant_ui' %}active{% endif %}" data-initial-participant-url="{{ nav_participant_available }}" href="{{ nav_participant_link }}" title="Participant-UI">Participant-UI</a>
             </li>
