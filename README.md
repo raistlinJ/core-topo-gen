@@ -16,6 +16,7 @@ Generate reproducible CORE network topologies from scenario XML files using a ri
 	- [Router connectivity & aggregation](#router-connectivity--aggregation)
 	- [Traffic, segmentation, and services](#traffic-segmentation-and-services)
 	- [Reports & artifacts](#reports--artifacts)
+	- [Generator packs & catalogs](#generator-packs--catalogs)
 - [Architecture overview](#architecture-overview)
 - [Troubleshooting](#troubleshooting)
 - [Additional documentation](#additional-documentation)
@@ -102,6 +103,14 @@ Popular options:
 - Markdown reports (`./reports/scenario_report_<timestamp>.md`) enumerate topology stats, planning metadata, segmentation results, and runtime artefacts. Each run also emits a JSON summary alongside the Markdown file (`scenario_report_<timestamp>.json`) plus per-run connectivity CSVs when router degree data is available.
 - Run history is persisted in `outputs/run_history.json` for the Reports page.
 - Safe deletion keeps reports while purging associated outputs under `outputs/` when scenarios are removed via the GUI.
+
+### Generator packs & catalogs
+- The Web UI treats **installed generators** as the source of truth: it discovers generators from `manifest.yaml`/`manifest.yml` under `outputs/installed_generators/`.
+- Installed generators are managed as **Generator Packs** (ZIP files). You can upload/import packs from the Flag Catalog page.
+- Disable semantics:
+	- Packs and individual generators can be disabled.
+	- Disabled generators are hidden from Flow substitution and are rejected at preview/execute time.
+- Legacy note: the repository still contains legacy v3 JSON catalog sources under `data_sources/` (and enablement via `_state.json`) for older workflows and the runner script, but the Web UI/Flow selection is driven by installed manifests.
 
 ## Architecture overview
 | Folder | Purpose |

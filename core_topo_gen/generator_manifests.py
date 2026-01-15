@@ -144,6 +144,15 @@ def discover_generator_manifests(
     errors: list[ManifestLoadError] = []
 
     for base_dir in base_dirs:
+        is_installed_base = False
+        try:
+            is_installed_base = base_dir.resolve().is_relative_to(installed_root.resolve())  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                is_installed_base = str(base_dir.resolve()).startswith(str(installed_root.resolve()))
+            except Exception:
+                is_installed_base = False
+
         for child in sorted(base_dir.iterdir()):
             if not child.is_dir():
                 continue
@@ -197,8 +206,14 @@ def discover_generator_manifests(
             runtime = doc.get('runtime') if isinstance(doc.get('runtime'), dict) else {}
             runtime_type = str(runtime.get('type') or 'docker-compose').strip().lower()
 
-            # Source: default to this directory.
-            source_path = str(doc.get('source_path') or doc.get('source', {}).get('path') if isinstance(doc.get('source'), dict) else '')
+            # Source: for installed generators, always point at the installed directory.
+            # This avoids manifests overriding source_path to a repo path, which breaks deletion/runtime.
+            source_path = ''
+            if not is_installed_base:
+                source_path = str(
+                    doc.get('source_path')
+                    or (doc.get('source', {}).get('path') if isinstance(doc.get('source'), dict) else '')
+                )
             if not source_path:
                 try:
                     source_path = str(child.relative_to(repo_root_p)).replace('\\', '/')

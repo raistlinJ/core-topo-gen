@@ -29,9 +29,9 @@
                 Packs are validated (YAML syntax, compose service, Python syntax) and installed under <code>outputs/installed_generators/</code>.
               </div>
 
-              <form class="row g-2 align-items-center" action="{{ url_for('generator_packs_upload') }}" method="post" enctype="multipart/form-data">
+              <form id="packUploadForm" class="row g-2 align-items-center" action="{{ url_for('generator_packs_upload') }}" method="post" enctype="multipart/form-data">
                 <div class="col-auto">
-                  <input class="form-control" type="file" name="zip_file" accept="application/zip,.zip" required>
+                  <input id="packZipInput" class="form-control" type="file" name="zip_file" accept="application/zip,.zip" required>
                 </div>
                 <div class="col-auto">
                   <button class="btn btn-primary" type="submit">Upload ZIP</button>
@@ -67,15 +67,27 @@
                   </thead>
                   <tbody>
                     {% for p in packs %}
-                    <tr>
+                    <tr class="{{ 'table-secondary' if p.disabled else '' }}">
                       <td>
-                        <div><strong>{{ p.label or p.id }}</strong></div>
+                        <div>
+                          <strong>{{ p.label or p.id }}</strong>
+                          {% if p.disabled %}
+                            <span class="badge bg-warning text-dark ms-2">Disabled</span>
+                          {% endif %}
+                        </div>
                         <div class="small text-muted">{{ p.id }}</div>
                       </td>
                       <td class="small">{{ p.origin or '' }}</td>
                       <td class="small">{{ p.installed_at or '' }}</td>
                       <td class="small" style="max-width: 720px; word-break: break-word;">
-                        {% if p.installed %}
+                        {% if p.installed_grouped %}
+                          {% for grp in p.installed_grouped %}
+                            <div>
+                              {{ grp.kind }}{% if grp.count %} ({{ grp.count }}){% endif %}:
+                              <code>{{ (grp.ids or []) | join(', ') }}</code>
+                            </div>
+                          {% endfor %}
+                        {% elif p.installed %}
                           {% for g in p.installed %}
                             <div>{{ g.kind }}: <code>{{ g.id }}</code></div>
                           {% endfor %}
@@ -86,6 +98,10 @@
                       <td>
                         <div class="d-flex gap-2 flex-wrap">
                           <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('generator_packs_download', pack_id=p.id) }}">Download ZIP</a>
+                          <form action="{{ url_for('generator_packs_set_disabled', pack_id=p.id) }}" method="post">
+                            <input type="hidden" name="disabled" value="{{ 0 if p.disabled else 1 }}" />
+                            <button class="btn btn-sm btn-outline-warning" type="submit">{{ 'Enable' if p.disabled else 'Disable' }}</button>
+                          </form>
                           <form action="{{ url_for('generator_packs_delete', pack_id=p.id) }}" method="post" onsubmit="return confirm('Uninstall this pack?');">
                             <button class="btn btn-sm btn-outline-danger" type="submit">Uninstall</button>
                           </form>
@@ -128,7 +144,7 @@
                       <th>Outputs</th>
                       <th>Injects</th>
                       <th>From Source</th>
-                      <th style="width: 100px;">Test</th>
+                      <th style="width: 160px;">Actions</th>
                     </tr>
                   </thead>
                   <tbody id="genBody"></tbody>
@@ -165,7 +181,7 @@
                       <th>Outputs</th>
                       <th>Injects</th>
                       <th>From Source</th>
-                      <th style="width: 100px;">Test</th>
+                      <th style="width: 160px;">Actions</th>
                     </tr>
                   </thead>
                   <tbody id="nodeGenBody"></tbody>
@@ -221,6 +237,29 @@
       <div class="modal-footer">
         <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
         <button type="button" class="btn btn-primary" id="genTestRunBtn">Run</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Generator Pack Upload Progress Modal -->
+<div class="modal fade" id="packUploadProgressModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Uploading Generator Pack…</h5>
+      </div>
+      <div class="modal-body">
+        <div class="small text-muted mb-2" id="packUploadProgressText">Preparing upload…</div>
+        <div class="progress" role="progressbar" aria-label="Upload progress" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-bar progress-bar-striped progress-bar-animated" id="packUploadProgressBar" style="width: 0%">0%</div>
+        </div>
+        <div class="small text-muted mt-2" id="packUploadProgressBytes"></div>
+        <pre class="small bg-light p-2 mt-3" id="packUploadResult" style="max-height: 180px; overflow: auto; display:none;"></pre>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" id="packUploadCancelBtn">Cancel</button>
+        <button type="button" class="btn btn-primary" id="packUploadCloseBtn" data-bs-dismiss="modal" style="display:none;">Close</button>
       </div>
     </div>
   </div>
@@ -797,6 +836,12 @@
       const composeService = hasCompose && typeof g.compose.service === 'string' ? g.compose.service : '';
       const composeFile = hasCompose && typeof g.compose.file === 'string' ? g.compose.file : '';
       const composeLabel = composeService ? `compose: ${composeService}` : 'compose';
+      const isInstalled = isInstalledGeneratorSourcePath(src);
+      const isDisabled = !!(g && typeof g === 'object' && g._disabled);
+
+      if (isDisabled) {
+        tr.classList.add('table-secondary');
+      }
 
       const typeLabel = String(g.language || '');
       tr.innerHTML = `
@@ -804,6 +849,7 @@
         <td>
           <div>
             <strong>${escapeHtml(g.name || '')}</strong>
+            ${isDisabled ? `<span class="badge bg-warning text-dark ms-2">Disabled</span>` : ''}
             ${hasCompose ? `<span class="badge bg-secondary ms-2">${escapeHtml(composeLabel)}</span>` : ''}
           </div>
           ${g.description ? `<div class="small text-muted">${escapeHtml(g.description)}</div>` : ''}
@@ -814,7 +860,11 @@
         <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(injected)}</td>
         <td class="small">${escapeHtml(g._source_name || '')}</td>
         <td>
-          <button class="btn btn-sm btn-outline-primary genTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}">Test</button>
+          <div class="btn-group btn-group-sm" role="group">
+            <button class="btn btn-sm btn-outline-primary genTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isDisabled ? 'disabled' : ''} title="${isDisabled ? 'Disabled' : 'Test generator'}">Test</button>
+            <button class="btn btn-sm btn-outline-warning genDisableBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? (isDisabled ? 'Enable generator' : 'Disable generator') : 'Only installed generators can be disabled'}">${isDisabled ? 'Enable' : 'Disable'}</button>
+            <button class="btn btn-sm btn-outline-danger genDeleteBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? 'Delete installed generator' : 'Only installed generators can be deleted'}">Delete</button>
+          </div>
         </td>
       `;
       body.appendChild(tr);
@@ -823,6 +873,38 @@
       if (btn) {
         btn.addEventListener('click', () => {
           openGenTestModal(g);
+        });
+      }
+
+      const delBtn = tr.querySelector('.genDeleteBtn');
+      if (delBtn && isInstalled) {
+        delBtn.addEventListener('click', async () => {
+          delBtn.disabled = true;
+          try {
+            await deleteInstalledGenerator('/api/flag_generators/delete', g, {
+              logPreId: 'genLog',
+              reloadFn: loadGenerators,
+              itemLabel: 'generator'
+            });
+          } finally {
+            delBtn.disabled = false;
+          }
+        });
+      }
+
+      const disBtn = tr.querySelector('.genDisableBtn');
+      if (disBtn && isInstalled) {
+        disBtn.addEventListener('click', async () => {
+          disBtn.disabled = true;
+          try {
+            await setInstalledGeneratorDisabled('/api/flag_generators/set_disabled', g, !isDisabled, {
+              logPreId: 'genLog',
+              reloadFn: loadGenerators,
+              itemLabel: 'generator'
+            });
+          } finally {
+            disBtn.disabled = false;
+          }
         });
       }
     });
@@ -883,6 +965,12 @@
       const composeService = hasCompose && typeof g.compose.service === 'string' ? g.compose.service : '';
       const composeFile = hasCompose && typeof g.compose.file === 'string' ? g.compose.file : '';
       const composeLabel = composeService ? `compose: ${composeService}` : 'compose';
+      const isInstalled = isInstalledGeneratorSourcePath(src);
+      const isDisabled = !!(g && typeof g === 'object' && g._disabled);
+
+      if (isDisabled) {
+        tr.classList.add('table-secondary');
+      }
 
       const typeLabel = String(g.language || '');
       tr.innerHTML = `
@@ -890,6 +978,7 @@
         <td>
           <div>
             <strong>${escapeHtml(g.name || '')}</strong>
+            ${isDisabled ? `<span class="badge bg-warning text-dark ms-2">Disabled</span>` : ''}
             ${hasCompose ? `<span class="badge bg-secondary ms-2">${escapeHtml(composeLabel)}</span>` : ''}
           </div>
           ${g.description ? `<div class="small text-muted">${escapeHtml(g.description)}</div>` : ''}
@@ -900,7 +989,11 @@
         <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(injected)}</td>
         <td class="small">${escapeHtml(g._source_name || '')}</td>
         <td>
-          <button class="btn btn-sm btn-outline-primary nodeGenTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}">Test</button>
+          <div class="btn-group btn-group-sm" role="group">
+            <button class="btn btn-sm btn-outline-primary nodeGenTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isDisabled ? 'disabled' : ''} title="${isDisabled ? 'Disabled' : 'Test node-generator'}">Test</button>
+            <button class="btn btn-sm btn-outline-warning nodeGenDisableBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? (isDisabled ? 'Enable node-generator' : 'Disable node-generator') : 'Only installed node-generators can be disabled'}">${isDisabled ? 'Enable' : 'Disable'}</button>
+            <button class="btn btn-sm btn-outline-danger nodeGenDeleteBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? 'Delete installed node-generator' : 'Only installed node-generators can be deleted'}">Delete</button>
+          </div>
         </td>
       `;
       body.appendChild(tr);
@@ -909,6 +1002,38 @@
       if (btn) {
         btn.addEventListener('click', () => {
           openGenTestModal(g, '/flag_node_generators_test');
+        });
+      }
+
+      const delBtn = tr.querySelector('.nodeGenDeleteBtn');
+      if (delBtn && isInstalled) {
+        delBtn.addEventListener('click', async () => {
+          delBtn.disabled = true;
+          try {
+            await deleteInstalledGenerator('/api/flag_node_generators/delete', g, {
+              logPreId: 'nodeGenLog',
+              reloadFn: loadNodeGenerators,
+              itemLabel: 'node-generator'
+            });
+          } finally {
+            delBtn.disabled = false;
+          }
+        });
+      }
+
+      const disBtn = tr.querySelector('.nodeGenDisableBtn');
+      if (disBtn && isInstalled) {
+        disBtn.addEventListener('click', async () => {
+          disBtn.disabled = true;
+          try {
+            await setInstalledGeneratorDisabled('/api/flag_node_generators/set_disabled', g, !isDisabled, {
+              logPreId: 'nodeGenLog',
+              reloadFn: loadNodeGenerators,
+              itemLabel: 'node-generator'
+            });
+          } finally {
+            disBtn.disabled = false;
+          }
         });
       }
     });
@@ -1253,6 +1378,97 @@
     }[c]));
   }
 
+  function isInstalledGeneratorSourcePath(srcPath) {
+    const raw = String(srcPath || '').trim();
+    if (!raw) return false;
+    const norm = raw.replace(/\\/g, '/').toLowerCase();
+    // Manifests commonly report relative paths like "outputs/installed_generators/...".
+    // Accept both absolute and relative forms.
+    return norm.includes('outputs/installed_generators') || norm.includes('/installed_generators/');
+  }
+
+  function appendPreLine(preId, line) {
+    const el = document.getElementById(preId);
+    if (!el) return;
+    const cur = el.textContent || '';
+    const next = cur ? (cur + '\n' + String(line || '')) : String(line || '');
+    el.textContent = next;
+  }
+
+  async function deleteInstalledGenerator(apiPath, generator, opts) {
+    const genId = String(generator && generator.id ? generator.id : '').trim();
+    const genName = String(generator && generator.name ? generator.name : genId).trim();
+    const logPreId = opts && opts.logPreId ? opts.logPreId : null;
+    const reloadFn = opts && typeof opts.reloadFn === 'function' ? opts.reloadFn : null;
+    const itemLabel = opts && opts.itemLabel ? opts.itemLabel : 'generator';
+
+    if (!genId) {
+      if (logPreId) appendPreLine(logPreId, '[ui] Missing generator id; cannot delete.');
+      return;
+    }
+
+    const ok = confirm(`Delete ${itemLabel} “${genName}” (id ${genId})?\n\nThis removes it from outputs/installed_generators.`);
+    if (!ok) return;
+
+    if (logPreId) appendPreLine(logPreId, `[ui] Deleting ${itemLabel} id=${genId}…`);
+
+    const resp = await fetchJson(apiPath, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: JSON.stringify({ generator_id: genId }),
+    });
+
+    if (resp && resp.ok === false) {
+      if (logPreId) appendPreLine(logPreId, `[error] ${resp.error || 'Delete failed.'}`);
+      return;
+    }
+
+    if (reloadFn) {
+      await reloadFn();
+    }
+    if (logPreId) appendPreLine(logPreId, `[ok] ${resp && resp.message ? resp.message : 'Deleted.'}`);
+  }
+
+  async function setInstalledGeneratorDisabled(apiPath, generator, disabled, opts) {
+    const genId = String(generator && generator.id ? generator.id : '').trim();
+    const genName = String(generator && generator.name ? generator.name : genId).trim();
+    const logPreId = opts && opts.logPreId ? opts.logPreId : null;
+    const reloadFn = opts && typeof opts.reloadFn === 'function' ? opts.reloadFn : null;
+    const itemLabel = opts && opts.itemLabel ? opts.itemLabel : 'generator';
+
+    if (!genId) {
+      if (logPreId) appendPreLine(logPreId, '[ui] Missing generator id; cannot update disabled state.');
+      return;
+    }
+
+    const verb = disabled ? 'Disable' : 'Enable';
+    if (logPreId) appendPreLine(logPreId, `[ui] ${verb.toLowerCase()} ${itemLabel} id=${genId}…`);
+
+    const resp = await fetchJson(apiPath, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: JSON.stringify({ generator_id: genId, disabled: !!disabled }),
+    });
+
+    if (resp && resp.ok === false) {
+      if (logPreId) appendPreLine(logPreId, `[error] ${resp.error || 'Update failed.'}`);
+      return;
+    }
+
+    if (reloadFn) {
+      await reloadFn();
+    }
+    if (logPreId) appendPreLine(logPreId, `[ok] ${resp && resp.message ? resp.message : 'Updated.'}`);
+  }
+
   async function loadGenerators() {
     const metaEl = document.getElementById('genMeta');
     metaEl.textContent = 'Loading…';
@@ -1264,7 +1480,7 @@
     }
     genState.generators = data.generators || [];
     genState.errors = data.errors || [];
-    metaEl.textContent = `Loaded ${genState.generators.length} generators from enabled sources.`;
+    metaEl.textContent = `Loaded ${genState.generators.length} installed generators.`;
     const lines = [];
     (genState.errors || []).forEach(e => lines.push(JSON.stringify(e)));
     setGenLog(lines);
@@ -1332,7 +1548,7 @@
     }
     nodeGenState.generators = data.generators || [];
     nodeGenState.errors = data.errors || [];
-    metaEl.textContent = `Loaded ${nodeGenState.generators.length} node-generators from enabled sources.`;
+    metaEl.textContent = `Loaded ${nodeGenState.generators.length} installed node-generators.`;
     const lines = [];
     (nodeGenState.errors || []).forEach(e => lines.push(JSON.stringify(e)));
     setNodeGenLog(lines);
@@ -1358,7 +1574,7 @@
     { key: 'outputs', label: 'Outputs' },
     { key: 'injects', label: 'Injects' },
     { key: 'source', label: 'From Source' },
-    { key: null, label: 'Test' },
+    { key: null, label: 'Actions' },
   ], renderGenerators);
 
   enableTableSorting('nodeGenTable', nodeGenState, [
@@ -1369,7 +1585,7 @@
     { key: 'outputs', label: 'Outputs' },
     { key: 'injects', label: 'Injects' },
     { key: 'source', label: 'From Source' },
-    { key: null, label: 'Test' },
+    { key: null, label: 'Actions' },
   ], renderNodeGenerators);
 
   (function attachCleanupModalHandlers() {
@@ -1383,6 +1599,194 @@
     }
     el.addEventListener('hidden.bs.modal', () => {
       try { clearCleanupLog(); } catch (e) {}
+    });
+  })();
+
+  (function attachGeneratorPackUploadProgress() {
+    const form = document.getElementById('packUploadForm');
+    const fileInput = document.getElementById('packZipInput');
+    const modalEl = document.getElementById('packUploadProgressModal');
+    const barEl = document.getElementById('packUploadProgressBar');
+    const textEl = document.getElementById('packUploadProgressText');
+    const bytesEl = document.getElementById('packUploadProgressBytes');
+    const cancelBtn = document.getElementById('packUploadCancelBtn');
+    const resultEl = document.getElementById('packUploadResult');
+    const closeBtn = document.getElementById('packUploadCloseBtn');
+
+    if (!form || !fileInput || !modalEl || !barEl || !textEl || !bytesEl || !cancelBtn || !resultEl || !closeBtn) return;
+
+    function fmtBytes(n) {
+      const num = Number(n) || 0;
+      const units = ['B', 'KB', 'MB', 'GB'];
+      let i = 0;
+      let v = num;
+      while (v >= 1024 && i < units.length - 1) {
+        v = v / 1024;
+        i += 1;
+      }
+      const digits = i === 0 ? 0 : (i === 1 ? 1 : 2);
+      return `${v.toFixed(digits)} ${units[i]}`;
+    }
+
+    function setProgress(pct, loaded, total) {
+      const p = Math.max(0, Math.min(100, Math.round(pct || 0)));
+      barEl.style.width = `${p}%`;
+      barEl.textContent = `${p}%`;
+      barEl.setAttribute('aria-valuenow', String(p));
+      if (total && total > 0) {
+        bytesEl.textContent = `${fmtBytes(loaded)} / ${fmtBytes(total)}`;
+      } else if (loaded) {
+        bytesEl.textContent = `${fmtBytes(loaded)}`;
+      } else {
+        bytesEl.textContent = '';
+      }
+    }
+
+    function setBarStyle(kind) {
+      barEl.classList.remove('bg-danger', 'bg-success', 'bg-secondary');
+      barEl.classList.add('progress-bar-striped', 'progress-bar-animated');
+      if (kind === 'error') {
+        barEl.classList.remove('progress-bar-animated');
+        barEl.classList.remove('progress-bar-striped');
+        barEl.classList.add('bg-danger');
+      } else if (kind === 'success') {
+        barEl.classList.remove('progress-bar-animated');
+        barEl.classList.remove('progress-bar-striped');
+        barEl.classList.add('bg-success');
+      } else if (kind === 'cancel') {
+        barEl.classList.remove('progress-bar-animated');
+        barEl.classList.remove('progress-bar-striped');
+        barEl.classList.add('bg-secondary');
+      }
+    }
+
+    function showResult(text) {
+      const t = String(text || '').trim();
+      if (!t) {
+        resultEl.style.display = 'none';
+        resultEl.textContent = '';
+        return;
+      }
+      resultEl.textContent = t;
+      resultEl.style.display = '';
+    }
+
+    function enterTerminalState() {
+      try { cancelBtn.disabled = true; } catch (e) {}
+      try { cancelBtn.style.display = 'none'; } catch (e) {}
+      try { closeBtn.style.display = ''; } catch (e) {}
+    }
+
+    form.addEventListener('submit', (ev) => {
+      try {
+        const file = (fileInput.files && fileInput.files[0]) ? fileInput.files[0] : null;
+        if (!file) return; // let browser validation handle it
+
+        ev.preventDefault();
+
+        const modal = bootstrap.Modal.getOrCreateInstance(modalEl, { backdrop: 'static', keyboard: false });
+        textEl.textContent = `Uploading ${file.name}…`;
+        showResult('');
+        setBarStyle('working');
+        setProgress(0, 0, file.size);
+        cancelBtn.disabled = false;
+        cancelBtn.style.display = '';
+        closeBtn.style.display = 'none';
+        modal.show();
+
+        const xhr = new XMLHttpRequest();
+        let cancelled = false;
+        let finished = false;
+
+        const onCancel = () => {
+          if (finished) return;
+          cancelled = true;
+          try { xhr.abort(); } catch (e) {}
+          textEl.textContent = 'Upload cancelled.';
+          setBarStyle('cancel');
+          showResult('Request aborted by user.');
+          enterTerminalState();
+        };
+        cancelBtn.addEventListener('click', onCancel, { once: true });
+
+        xhr.upload.onprogress = (e) => {
+          if (!e) return;
+          const total = e.total || file.size || 0;
+          const loaded = e.loaded || 0;
+          const pct = total ? (loaded / total) * 100 : 0;
+          setProgress(pct, loaded, total);
+        };
+
+        xhr.onload = () => {
+          try {
+            if (cancelled) return;
+            finished = true;
+            const status = xhr.status || 0;
+            const respText = xhr.responseText || '';
+            const contentType = (xhr.getResponseHeader && xhr.getResponseHeader('Content-Type')) ? (xhr.getResponseHeader('Content-Type') || '') : '';
+            let payload = null;
+            try { payload = respText ? JSON.parse(respText) : null; } catch (e) { payload = null; }
+
+            // Upload finished; server-side validation/install may still be happening.
+            setProgress(100, file.size, file.size);
+
+            if (status >= 200 && status < 300) {
+              if (contentType && contentType.indexOf('application/json') === -1) {
+                setBarStyle('error');
+                textEl.textContent = 'Upload failed (unexpected response).';
+                showResult(respText || 'Expected JSON response but got something else.');
+                enterTerminalState();
+                return;
+              }
+              setBarStyle('success');
+              textEl.textContent = 'Installed.';
+              showResult((payload && (payload.message || payload.detail)) ? (payload.message || payload.detail) : 'Upload succeeded.');
+              enterTerminalState();
+              // Reload the catalog to show the updated pack table.
+              window.setTimeout(() => { window.location.href = '{{ url_for('flag_catalog_page') }}'; }, 1200);
+              return;
+            }
+
+            setBarStyle('error');
+            textEl.textContent = `Upload failed (HTTP ${status || 'error'}).`;
+            const err = (payload && (payload.error || payload.message)) ? (payload.error || payload.message) : respText;
+            showResult(err || 'Upload failed.');
+            enterTerminalState();
+          } catch (e) {
+            setBarStyle('error');
+            textEl.textContent = 'Upload failed (unexpected error).';
+            showResult(String(e || 'Unexpected error'));
+            enterTerminalState();
+          }
+        };
+
+        xhr.onerror = () => {
+          if (cancelled) return;
+          finished = true;
+          textEl.textContent = 'Upload failed (network error).';
+          setBarStyle('error');
+          showResult('Network error while uploading. Check the Web UI server logs and your browser console.');
+          enterTerminalState();
+        };
+
+        xhr.onabort = () => {
+          if (cancelled) return;
+          // Abort that wasn't initiated via our Cancel button.
+          finished = true;
+          setBarStyle('error');
+          textEl.textContent = 'Upload aborted.';
+          showResult('Upload was aborted (not by user). If this repeats, check server logs and browser console.');
+          enterTerminalState();
+        };
+
+        const data = new FormData(form);
+        xhr.open('POST', form.action, true);
+        xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+        xhr.setRequestHeader('Accept', 'application/json');
+        xhr.send(data);
+      } catch (e) {
+        // Fall back to normal form submit
+      }
     });
   })();
 </script>

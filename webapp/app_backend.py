@@ -10619,18 +10619,49 @@ def _flow_enabled_plugin_contracts_by_id() -> dict[str, dict[str, Any]]:
     Strict: contracts are derived from per-generator YAML manifests.
     """
     plugins_by_id: dict[str, dict[str, Any]] = {}
+
+    # Important: Flow sequencing must NOT consider disabled generators.
+    # We filter plugin contracts to installed+enabled generators only.
     try:
-        _gens, fg_plugins, _errs = _flag_generators_from_manifests(kind='flag-generator')
-        plugins_by_id.update({k: v for k, v in (fg_plugins or {}).items() if isinstance(k, str) and isinstance(v, dict)})
-    except Exception:
-        pass
-    try:
-        _gens2, ng_plugins, _errs2 = _flag_generators_from_manifests(kind='flag-node-generator')
-        for k, v in (ng_plugins or {}).items():
-            if isinstance(k, str) and k not in plugins_by_id and isinstance(v, dict):
+        gens, fg_plugins, _errs = _flag_generators_from_manifests(kind='flag-generator')
+        allowed: set[str] = set()
+        for g in (gens or []):
+            if not isinstance(g, dict):
+                continue
+            if not _is_installed_generator_view(g):
+                continue
+            gid = str(g.get('id') or '').strip()
+            if not gid:
+                continue
+            if _is_installed_generator_disabled(kind='flag-generator', generator_id=gid):
+                continue
+            allowed.add(gid)
+        for k, v in (fg_plugins or {}).items():
+            if isinstance(k, str) and k in allowed and isinstance(v, dict):
                 plugins_by_id[k] = v
     except Exception:
         pass
+
+    try:
+        gens2, ng_plugins, _errs2 = _flag_generators_from_manifests(kind='flag-node-generator')
+        allowed2: set[str] = set()
+        for g in (gens2 or []):
+            if not isinstance(g, dict):
+                continue
+            if not _is_installed_generator_view(g):
+                continue
+            gid = str(g.get('id') or '').strip()
+            if not gid:
+                continue
+            if _is_installed_generator_disabled(kind='flag-node-generator', generator_id=gid):
+                continue
+            allowed2.add(gid)
+        for k, v in (ng_plugins or {}).items():
+            if isinstance(k, str) and k in allowed2 and k not in plugins_by_id and isinstance(v, dict):
+                plugins_by_id[k] = v
+    except Exception:
+        pass
+
     return plugins_by_id
 
 
@@ -11345,6 +11376,47 @@ def api_flow_attackflow_preview():
         flag_assignments,
         scenario_label=(scenario_label or scenario_norm),
     )
+
+    # Additional validation: any referenced generator must exist and be enabled.
+    # If not, disable flags and surface a clear error.
+    try:
+        gens_enabled, _ = _flag_generators_from_enabled_sources()
+    except Exception:
+        gens_enabled = []
+    try:
+        node_gens_enabled, _ = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        node_gens_enabled = []
+    enabled_ids: set[str] = set()
+    for g in (gens_enabled or []):
+        if isinstance(g, dict):
+            gid = str(g.get('id') or '').strip()
+            if gid:
+                enabled_ids.add(gid)
+    for g in (node_gens_enabled or []):
+        if isinstance(g, dict):
+            gid = str(g.get('id') or '').strip()
+            if gid:
+                enabled_ids.add(gid)
+
+    missing_refs: list[str] = []
+    try:
+        for fa in (flag_assignments or []):
+            if not isinstance(fa, dict):
+                continue
+            gid = str(fa.get('id') or fa.get('generator_id') or '').strip()
+            if not gid:
+                continue
+            if gid not in enabled_ids:
+                missing_refs.append(gid)
+    except Exception:
+        missing_refs = []
+
+    missing_refs = sorted(list(dict.fromkeys(missing_refs)))
+    if missing_refs:
+        flow_errors = list(flow_errors or []) + [f"generator not found/enabled: {gid}" for gid in missing_refs]
+        flow_valid = False
+
     flags_enabled = bool(flow_valid)
 
     if len(chain_nodes) < 1:
@@ -11850,7 +11922,7 @@ def api_flow_prepare_preview_for_execute():
         except Exception:
             pass
 
-    # Load generator catalogs once so we can prune config to declared inputs.
+    # Load enabled generator catalogs once so we can prune config to declared inputs.
     # Only needed when flags are enabled.
     if flags_enabled:
         try:
@@ -11881,6 +11953,69 @@ def api_flow_prepare_preview_for_execute():
                 _gen_by_id[_gid] = _g
     except Exception:
         _gen_by_id = {}
+
+    # Hard validation: if flags are enabled, every referenced generator must exist and be enabled.
+    # If not, fail with a clear error so the user can fix assignments.
+    if flags_enabled:
+        missing_or_disabled: list[dict[str, Any]] = []
+        try:
+            for i, fa in enumerate(flag_assignments or []):
+                if not isinstance(fa, dict):
+                    continue
+                generator_id = str(fa.get('id') or fa.get('generator_id') or '').strip()
+                if not generator_id:
+                    continue
+                assignment_type = str(fa.get('type') or '').strip() or 'flag-generator'
+                # Map assignment type to disable-kind.
+                kind = 'flag-node-generator' if assignment_type == 'flag-node-generator' else 'flag-generator'
+                exists_enabled = generator_id in _gen_by_id
+                disabled = _is_installed_generator_disabled(kind=kind, generator_id=generator_id)
+                if (not exists_enabled) or disabled:
+                    node_id = ''
+                    node_name = ''
+                    try:
+                        node_id = str(fa.get('node_id') or '').strip()
+                    except Exception:
+                        node_id = ''
+                    try:
+                        if i < len(chain_nodes or []):
+                            n = chain_nodes[i] if isinstance(chain_nodes[i], dict) else {}
+                            node_name = str(n.get('name') or '').strip()
+                    except Exception:
+                        node_name = ''
+                    reason = 'disabled' if disabled else 'not found/enabled'
+                    missing_or_disabled.append({
+                        'index': i,
+                        'node_id': node_id,
+                        'node_name': node_name,
+                        'generator_id': generator_id,
+                        'type': assignment_type,
+                        'reason': reason,
+                    })
+        except Exception:
+            missing_or_disabled = []
+
+        if missing_or_disabled:
+            bad = missing_or_disabled[0]
+            msg = f"Generator {bad.get('generator_id')} ({bad.get('type')}) is {bad.get('reason')}."
+            try:
+                nid = str(bad.get('node_id') or '').strip()
+                if nid:
+                    msg += f" Node: {nid}"
+                nm = str(bad.get('node_name') or '').strip()
+                if nm:
+                    msg += f" ({nm})"
+            except Exception:
+                pass
+            return jsonify({
+                'ok': False,
+                'error': msg,
+                'details': missing_or_disabled,
+                'scenario': scenario_label or scenario_norm,
+                'length': len(chain_nodes or []),
+                'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in (chain_nodes or []) if isinstance(n, dict)],
+                'flag_assignments': flag_assignments,
+            }), 422
 
     def _all_input_names_of(gen: dict[str, Any]) -> set[str]:
         names: set[str] = set()
@@ -30786,6 +30921,96 @@ def _build_generator_scaffold(payload: dict[str, Any]) -> tuple[dict[str, str], 
     inputs_flags = payload.get('inputs') if isinstance(payload.get('inputs'), dict) else {}
     inputs_schema = _inputs_schema_from_flags(inputs_flags, plugin_type=plugin_type)
 
+    # Manifest v1: preferred workflow for installed Generator Packs.
+    inputs_manifest: list[dict[str, Any]] = []
+    try:
+        for name, meta in (inputs_schema or {}).items():
+            nm = str(name or '').strip()
+            if not nm:
+                continue
+            rec: dict[str, Any] = {'name': nm, 'type': str((meta or {}).get('type') or 'text')}
+            if isinstance(meta, dict):
+                if 'required' in meta:
+                    rec['required'] = bool(meta.get('required'))
+                if meta.get('sensitive') is True:
+                    rec['sensitive'] = True
+            inputs_manifest.append(rec)
+    except Exception:
+        inputs_manifest = []
+
+    manifest_yaml = (
+        "manifest_version: 1\n"
+        f"id: {plugin_id}\n"
+        f"kind: {plugin_type}\n"
+        f"name: {display_name}\n"
+        f"description: {description}\n"
+        "version: 1.0\n"
+        "\n"
+        "runtime:\n"
+        "  type: docker-compose\n"
+        "  compose_file: docker-compose.yml\n"
+        "  service: generator\n"
+    )
+    if inputs_manifest:
+        manifest_yaml += "\ninputs:\n"
+        for inp in inputs_manifest:
+            try:
+                nm = str(inp.get('name') or '').strip()
+                if not nm:
+                    continue
+                manifest_yaml += f"  - name: {nm}\n"
+                tp = str(inp.get('type') or 'text').strip() or 'text'
+                manifest_yaml += f"    type: {tp}\n"
+                if 'required' in inp:
+                    manifest_yaml += f"    required: {'true' if bool(inp.get('required')) else 'false'}\n"
+                if inp.get('sensitive') is True:
+                    manifest_yaml += "    sensitive: true\n"
+            except Exception:
+                continue
+
+    # Artifacts for Flow chaining.
+    manifest_yaml += "\nartifacts:\n"
+    manifest_yaml += "  requires:\n"
+    for a in (requires or []):
+        s = str(a or '').strip()
+        if s:
+            manifest_yaml += f"    - {s}\n"
+    manifest_yaml += "  produces:\n"
+    for a in (produces or []):
+        s = str(a or '').strip()
+        if s:
+            manifest_yaml += f"    - {s}\n"
+
+    # Hints
+    if hint_templates:
+        manifest_yaml += "\nhint_templates:\n"
+        for t in hint_templates:
+            s = str(t or '').strip()
+            if not s:
+                continue
+            s2 = s.replace('"', '\\"')
+            manifest_yaml += f"  - \"{s2}\"\n"
+
+    # Injected artifacts allowlist for safe mounting.
+    if inject_files:
+        manifest_yaml += "\ninjects:\n"
+        for x in inject_files:
+            s = str(x or '').strip()
+            if s:
+                manifest_yaml += f"  - {s}\n"
+
+    # Fixed env vars.
+    gen_env = payload.get('env')
+    if isinstance(gen_env, dict) and gen_env:
+        manifest_yaml += "\nenv:\n"
+        for k, v in gen_env.items():
+            kk = str(k or '').strip()
+            if not kk:
+                continue
+            vv = str(v if v is not None else '')
+            vv2 = vv.replace('"', '\\"')
+            manifest_yaml += f"  {kk}: \"{vv2}\"\n"
+
     base_dir = 'flag_generators' if plugin_type == 'flag-generator' else 'flag_node_generators'
     folder_path = f"{base_dir}/{folder_name}"
 
@@ -30959,6 +31184,7 @@ if __name__ == '__main__':
         f"{folder_path}/docker-compose.yml": compose_yaml,
         f"{folder_path}/generator.py": generator_py,
         f"{folder_path}/README.md": readme_override or f"# {display_name}\n\nTODO: describe this generator.\n\n- plugin_id: `{plugin_id}`\n- type: `{plugin_type}`\n",
+        f"{folder_path}/manifest.yaml": manifest_yaml,
         f"{folder_path}/catalog_source.json": json.dumps(catalog_source, indent=2) + "\n",
     }
 
@@ -31172,6 +31398,41 @@ def api_generators_scaffold_zip():
 @app.route('/flag_catalog')
 def flag_catalog_page():
     packs_state = _load_installed_generator_packs_state()
+    # Render-time quality-of-life: group installed entries by kind so the UI
+    # doesn't repeat labels like "flag-generator" multiple times.
+    try:
+        packs = packs_state.get('packs', []) if isinstance(packs_state, dict) else []
+        for p in packs:
+            if not isinstance(p, dict):
+                continue
+            installed = p.get('installed')
+            if not isinstance(installed, list):
+                continue
+            grouped: dict[str, list[str]] = {}
+            for it in installed:
+                if not isinstance(it, dict):
+                    continue
+                kind = str(it.get('kind') or '').strip()
+                gid = str(it.get('id') or '').strip()
+                if not kind or not gid:
+                    continue
+                grouped.setdefault(kind, []).append(gid)
+            installed_grouped = []
+            for kind, ids in grouped.items():
+                # Preserve original order from the installed list.
+                uniq_ids = []
+                seen = set()
+                for x in ids:
+                    if x in seen:
+                        continue
+                    seen.add(x)
+                    uniq_ids.append(x)
+                installed_grouped.append({'kind': kind, 'ids': uniq_ids, 'count': len(uniq_ids)})
+            if installed_grouped:
+                p['installed_grouped'] = installed_grouped
+    except Exception:
+        # Never fail page render due to cosmetic grouping.
+        pass
     return render_template(
         'flag_catalog.html',
         packs=packs_state.get('packs', []),
@@ -31444,21 +31705,57 @@ def _flag_generators_from_manifests(*, kind: str) -> tuple[list[dict], dict[str,
 
 
 def _flag_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
-    """Strict: load generator definitions from YAML manifests in the repo."""
+    """Return enabled flag-generators.
+
+    Enabled means:
+      - installed under outputs/installed_generators (installed-only policy)
+      - not disabled (pack-level or generator-level)
+    """
     gens, _plugins_by_id, errors = _flag_generators_from_manifests(kind='flag-generator')
-    return gens, errors
+    out: list[dict] = []
+    for g in (gens or []):
+        if not isinstance(g, dict):
+            continue
+        if not _is_installed_generator_view(g):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if not gid:
+            continue
+        if _is_installed_generator_disabled(kind='flag-generator', generator_id=gid):
+            continue
+        out.append(g)
+    return out, errors
 
 
 def _flag_node_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
-    """Strict: load node-generator definitions from YAML manifests in the repo."""
+    """Return enabled flag-node-generators.
+
+    Enabled means:
+      - installed under outputs/installed_generators (installed-only policy)
+      - not disabled (pack-level or generator-level)
+    """
     gens, _plugins_by_id, errors = _flag_generators_from_manifests(kind='flag-node-generator')
-    return gens, errors
+    out: list[dict] = []
+    for g in (gens or []):
+        if not isinstance(g, dict):
+            continue
+        if not _is_installed_generator_view(g):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if not gid:
+            continue
+        if _is_installed_generator_disabled(kind='flag-node-generator', generator_id=gid):
+            continue
+        out.append(g)
+    return out, errors
 
 
 @app.route('/flag_generators_data')
 def flag_generators_data():
     try:
         generators, errors = _flag_generators_from_enabled_sources()
+        generators = [g for g in (generators or []) if isinstance(g, dict) and _is_installed_generator_view(g)]
+        generators = _annotate_disabled_state(generators, kind='flag-generator')
         return jsonify({'generators': generators, 'errors': errors})
     except Exception as e:
         return jsonify({'generators': [], 'errors': [{'error': str(e)}]}), 500
@@ -31468,6 +31765,8 @@ def flag_generators_data():
 def flag_node_generators_data():
     try:
         generators, errors = _flag_node_generators_from_enabled_sources()
+        generators = [g for g in (generators or []) if isinstance(g, dict) and _is_installed_generator_view(g)]
+        generators = _annotate_disabled_state(generators, kind='flag-node-generator')
         return jsonify({'generators': generators, 'errors': errors})
     except Exception as e:
         return jsonify({'generators': [], 'errors': [{'error': str(e)}]}), 500
@@ -31526,6 +31825,104 @@ def _save_installed_generator_packs_state(state: dict) -> None:
         os.replace(tmp, path)
     except Exception:
         pass
+
+
+def _normalize_installed_source_path(p: str) -> str:
+    return str(p or '').replace('\\', '/').strip().lower()
+
+
+def _is_installed_generator_view(gen: dict) -> bool:
+    """Best-effort check that a generator came from outputs/installed_generators."""
+    try:
+        src = ''
+        if isinstance(gen.get('source'), dict):
+            src = str(gen.get('source', {}).get('path') or '')
+        norm = _normalize_installed_source_path(src)
+        if 'outputs/installed_generators' in norm:
+            return True
+
+        mp = str(gen.get('_source_path') or '').strip()
+        if mp:
+            installed_root = os.path.abspath(_installed_generators_root())
+            abs_mp = os.path.abspath(mp)
+            return os.path.commonpath([installed_root, abs_mp]) == installed_root
+    except Exception:
+        return False
+    return False
+
+
+def _build_installed_disable_maps() -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
+    """Return (pack_by_id, gen_by_kind_id) maps from the installed packs state."""
+    state = _load_installed_generator_packs_state()
+    packs = state.get('packs') if isinstance(state, dict) else None
+    if not isinstance(packs, list):
+        packs = []
+
+    pack_by_id: dict[str, dict[str, Any]] = {}
+    gen_by_kind_id: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for p in packs:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get('id') or '').strip()
+        if not pid:
+            continue
+        pack_disabled = bool(p.get('disabled') is True)
+        pack_label = str(p.get('label') or '').strip() or pid
+        pack_by_id[pid] = {
+            'id': pid,
+            'label': pack_label,
+            'disabled': pack_disabled,
+            'origin': str(p.get('origin') or '').strip(),
+        }
+        for it in (p.get('installed') or []):
+            if not isinstance(it, dict):
+                continue
+            gid = str(it.get('id') or '').strip()
+            kind = str(it.get('kind') or '').strip()
+            if not gid or not kind:
+                continue
+            item_disabled = bool(it.get('disabled') is True)
+            gen_by_kind_id[(kind, gid)] = {
+                'pack_id': pid,
+                'pack_label': pack_label,
+                'pack_disabled': pack_disabled,
+                'disabled': pack_disabled or item_disabled,
+                'item_disabled': item_disabled,
+            }
+
+    return pack_by_id, gen_by_kind_id
+
+
+def _annotate_disabled_state(generators: list[dict], *, kind: str) -> list[dict]:
+    """Annotate generator views with _disabled/_pack_* fields using pack state."""
+    _pack_by_id, gen_by_kind_id = _build_installed_disable_maps()
+    out: list[dict] = []
+    for g in (generators or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        info = gen_by_kind_id.get((kind, gid)) if gid else None
+        g['_installed'] = True
+        if info:
+            g['_pack_id'] = info.get('pack_id')
+            g['_pack_label'] = info.get('pack_label')
+            g['_pack_disabled'] = bool(info.get('pack_disabled'))
+            g['_disabled'] = bool(info.get('disabled'))
+            g['_item_disabled'] = bool(info.get('item_disabled'))
+        else:
+            g['_disabled'] = False
+        out.append(g)
+    return out
+
+
+def _is_installed_generator_disabled(*, kind: str, generator_id: str) -> bool:
+    gid = str(generator_id or '').strip()
+    if not gid:
+        return False
+    _pack_by_id, gen_by_kind_id = _build_installed_disable_maps()
+    info = gen_by_kind_id.get((str(kind or '').strip(), gid))
+    return bool(info and info.get('disabled') is True)
 
 
 def _is_safe_remote_zip_url(url: str) -> tuple[bool, str]:
@@ -31694,10 +32091,16 @@ def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[d
         if mv != 1:
             errors.append(f'{mp}: manifest_version must be 1')
             continue
-        gen_id = str(doc.get('id') or '').strip()
+        source_id = str(doc.get('id') or '').strip()
+        # Allow packs to omit ids; we will assign numeric ids on install.
+        gen_id = source_id
         if not gen_id:
-            errors.append(f'{mp}: missing id')
-            continue
+            try:
+                import uuid
+
+                gen_id = f"gen-{uuid.uuid4().hex[:10]}"
+            except Exception:
+                gen_id = 'gen-unknown'
         kind = str(doc.get('kind') or '').strip()
         if kind not in ('flag-generator', 'flag-node-generator'):
             errors.append(f'{mp}: kind must be flag-generator or flag-node-generator')
@@ -31738,7 +32141,7 @@ def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[d
             errors.append(f'{mp}: python syntax error: {exc}')
             continue
 
-        items.append({'id': gen_id, 'kind': kind, 'path': str(gen_dir)})
+        items.append({'id': gen_id, 'kind': kind, 'path': str(gen_dir), 'source_id': source_id, 'manifest_path': str(mp)})
 
     if errors:
         # Show first few errors.
@@ -31746,15 +32149,47 @@ def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[d
     return True, f'Validated {len(items)} generator(s)', items
 
 
-def _install_generator_pack(*, zip_path: str, pack_label: str, pack_origin: str) -> tuple[bool, str]:
+def _compute_next_numeric_generator_id(*, repo_root: str) -> int:
+    """Return the next numeric generator id across both catalogs."""
+    try:
+        from core_topo_gen.generator_manifests import discover_generator_manifests
+    except Exception:
+        return 1
+
+    existing_flag, _, _ = discover_generator_manifests(repo_root=repo_root, kind='flag-generator')
+    existing_node, _, _ = discover_generator_manifests(repo_root=repo_root, kind='flag-node-generator')
+    existing_ids = {str(g.get('id') or '').strip() for g in (existing_flag + existing_node) if isinstance(g, dict)}
+    max_numeric = 0
+    for eid in existing_ids:
+        s = str(eid or '').strip()
+        if s.isdigit():
+            try:
+                max_numeric = max(max_numeric, int(s))
+            except Exception:
+                continue
+    return max_numeric + 1
+
+
+def _install_generator_pack_payload(
+    *,
+    zip_path: str,
+    pack_id: str,
+    safe_label: str,
+    pack_origin: str,
+    next_numeric: int,
+) -> tuple[bool, str, list[dict[str, Any]], int]:
+    """Install a pack zip payload and return installed items.
+
+    This does not write to the packs state file; callers decide how to record grouping.
+    """
     import shutil
     import tempfile
     from pathlib import Path
 
     try:
-        from core_topo_gen.generator_manifests import discover_generator_manifests
+        import yaml  # type: ignore
     except Exception as exc:
-        return False, f'Failed importing manifest discovery: {exc}'
+        return False, f'Pack install requires PyYAML: {exc}', [], next_numeric
 
     root = _installed_generators_root()
     tmp_dir = tempfile.mkdtemp(prefix='coretg_pack_')
@@ -31762,39 +32197,24 @@ def _install_generator_pack(*, zip_path: str, pack_label: str, pack_origin: str)
         _safe_extract_zip_to_dir(zip_path, tmp_dir)
         ok, note, items = _validate_generator_pack_tree(tmp_dir)
         if not ok:
-            return False, note
-
-        try:
-            repo_root = _get_repo_root()
-        except Exception:
-            repo_root = os.getcwd()
-
-        # Reject collisions with existing ids.
-        existing_flag, _, _ = discover_generator_manifests(repo_root=repo_root, kind='flag-generator')
-        existing_node, _, _ = discover_generator_manifests(repo_root=repo_root, kind='flag-node-generator')
-        existing_ids = {str(g.get('id') or '').strip().lower() for g in (existing_flag + existing_node) if isinstance(g, dict)}
-        for it in items:
-            gid = str(it.get('id') or '').strip().lower()
-            if gid and gid in existing_ids:
-                return False, f'Generator id already exists: {gid}'
-
-        pack_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
-        safe_label = secure_filename(pack_label or 'pack') or 'pack'
+            return False, note, [], next_numeric
 
         installed: list[dict[str, Any]] = []
         for it in items:
             kind = str(it.get('kind') or '')
-            gid = str(it.get('id') or '')
             src_dir = str(it.get('path') or '')
+            source_gid = str(it.get('source_id') or it.get('id') or '')
+            assigned_gid = str(next_numeric)
+            next_numeric += 1
+
             if kind == 'flag-node-generator':
                 dest_base = os.path.join(root, 'flag_node_generators')
             else:
                 dest_base = os.path.join(root, 'flag_generators')
             os.makedirs(dest_base, exist_ok=True)
 
-            dir_name = secure_filename(f"p_{pack_id}__{gid}") or f"p_{pack_id}__generator"
+            dir_name = secure_filename(f"p_{pack_id}__{assigned_gid}") or f"p_{pack_id}__generator"
             dest_dir = os.path.join(dest_base, dir_name)
-            # Ensure unique
             suffix = 2
             while os.path.exists(dest_dir):
                 dest_dir = os.path.join(dest_base, f"{dir_name}_{suffix}")
@@ -31802,24 +32222,85 @@ def _install_generator_pack(*, zip_path: str, pack_label: str, pack_origin: str)
 
             shutil.copytree(src_dir, dest_dir)
 
-            # Store pack marker for humans.
+            # Rewrite installed manifest id and avoid overriding installed source path.
+            try:
+                manifest_path = None
+                for nm in ('manifest.yaml', 'manifest.yml'):
+                    p = os.path.join(dest_dir, nm)
+                    if os.path.exists(p) and os.path.isfile(p):
+                        manifest_path = p
+                        break
+                if manifest_path is None:
+                    for rp in Path(dest_dir).rglob('manifest.yaml'):
+                        if '__MACOSX' in str(rp):
+                            continue
+                        manifest_path = str(rp)
+                        break
+                if manifest_path is None:
+                    for rp in Path(dest_dir).rglob('manifest.yml'):
+                        if '__MACOSX' in str(rp):
+                            continue
+                        manifest_path = str(rp)
+                        break
+
+                if manifest_path:
+                    doc = yaml.safe_load(Path(manifest_path).read_text('utf-8', errors='ignore'))
+                    if isinstance(doc, dict):
+                        doc['id'] = assigned_gid
+                        doc.pop('source_path', None)
+                        if isinstance(doc.get('source'), dict):
+                            doc.pop('source', None)
+                        Path(manifest_path).write_text(yaml.safe_dump(doc, sort_keys=False), encoding='utf-8')
+            except Exception:
+                pass
+
+            # Marker for debugging/traceability.
             try:
                 marker = {
                     'pack_id': pack_id,
                     'pack_label': safe_label,
                     'origin': pack_origin,
                     'installed_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
-                    'generator_id': gid,
+                    'generator_id': assigned_gid,
                     'kind': kind,
+                    'source_generator_id': source_gid,
                 }
                 with open(os.path.join(dest_dir, '.coretg_pack.json'), 'w', encoding='utf-8') as fh:
                     json.dump(marker, fh, indent=2)
             except Exception:
                 pass
 
-            installed.append({'id': gid, 'kind': kind, 'path': dest_dir})
+            installed.append({'id': assigned_gid, 'kind': kind, 'path': dest_dir})
 
-        # Record pack state
+        return True, note, installed, next_numeric
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _install_generator_pack(*, zip_path: str, pack_label: str, pack_origin: str) -> tuple[bool, str]:
+    try:
+        try:
+            repo_root = _get_repo_root()
+        except Exception:
+            repo_root = os.getcwd()
+
+        safe_label = secure_filename(pack_label or 'pack') or 'pack'
+        pack_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+        next_numeric = _compute_next_numeric_generator_id(repo_root=repo_root)
+
+        ok, note, installed, _next = _install_generator_pack_payload(
+            zip_path=zip_path,
+            pack_id=pack_id,
+            safe_label=safe_label,
+            pack_origin=pack_origin,
+            next_numeric=next_numeric,
+        )
+        if not ok:
+            return False, note
+
         state = _load_installed_generator_packs_state()
         state.setdefault('packs', [])
         state['packs'].append({
@@ -31836,17 +32317,14 @@ def _install_generator_pack(*, zip_path: str, pack_label: str, pack_origin: str)
         return False, str(ve)
     except Exception as exc:
         return False, str(exc)
-    finally:
-        try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
 
 
 def _install_generator_pack_or_bundle(*, zip_path: str, pack_label: str, pack_origin: str) -> tuple[bool, str]:
     """Install either a single generator-pack ZIP, or a bundle ZIP produced by export_all.
 
-    A bundle is a ZIP that contains one or more nested pack ZIPs under packs/*.zip.
+    A bundle is a ZIP that contains one or more nested pack ZIPs. By convention,
+    export_all writes them under packs/*.zip, but we also accept nested *.zip files
+    anywhere in the archive.
     """
     import tempfile
     import zipfile
@@ -31856,11 +32334,29 @@ def _install_generator_pack_or_bundle(*, zip_path: str, pack_label: str, pack_or
             names = [str(n or '') for n in z.namelist()]
 
             has_manifest = any(n.endswith('/manifest.yaml') or n.endswith('/manifest.yml') for n in names)
-            nested = [n for n in names if n.startswith('packs/') and n.lower().endswith('.zip') and not n.endswith('/')]
+            nested_all = [
+                n for n in names
+                if n and (not n.endswith('/')) and n.lower().endswith('.zip') and (not n.startswith('__MACOSX/'))
+            ]
+            # Prefer the export_all convention, but accept bundles created by users too.
+            nested = [n for n in nested_all if n.startswith('packs/')]
+            if not nested:
+                nested = nested_all
 
             if (not has_manifest) and nested:
+                # Bundle import: install all nested pack ZIPs under a single pack label/state row.
+                safe_label = secure_filename(pack_label or 'bundle') or 'bundle'
+                pack_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+                try:
+                    repo_root = _get_repo_root()
+                except Exception:
+                    repo_root = os.getcwd()
+                next_numeric = _compute_next_numeric_generator_id(repo_root=repo_root)
+
                 successes = 0
                 failures: list[str] = []
+                installed_all: list[dict[str, Any]] = []
+
                 for inner_name in sorted(set(nested)):
                     try:
                         inner_bytes = z.read(inner_name)
@@ -31873,21 +32369,44 @@ def _install_generator_pack_or_bundle(*, zip_path: str, pack_label: str, pack_or
                     try:
                         with open(inner_tmp, 'wb') as fh:
                             fh.write(inner_bytes)
-                        inner_label = os.path.basename(inner_name) or inner_name
-                        ok, note = _install_generator_pack(zip_path=inner_tmp, pack_label=inner_label, pack_origin=pack_origin)
-                        if ok:
+
+                        ok_inner, note_inner, installed_inner, next_numeric = _install_generator_pack_payload(
+                            zip_path=inner_tmp,
+                            pack_id=pack_id,
+                            safe_label=safe_label,
+                            pack_origin=pack_origin,
+                            next_numeric=next_numeric,
+                        )
+                        if ok_inner:
+                            installed_all.extend(installed_inner)
                             successes += 1
                         else:
-                            failures.append(f'{inner_name}: {note}')
+                            failures.append(f'{inner_name}: {note_inner}')
                     finally:
                         try:
                             os.remove(inner_tmp)
                         except Exception:
                             pass
 
+                # Record one combined bundle pack state row.
+                try:
+                    state = _load_installed_generator_packs_state()
+                    state.setdefault('packs', [])
+                    state['packs'].append({
+                        'id': pack_id,
+                        'label': safe_label,
+                        'origin': pack_origin,
+                        'note': f'Imported {successes} pack(s) from bundle' + (f'; {failures[0]}' if failures else ''),
+                        'installed_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                        'installed': installed_all,
+                    })
+                    _save_installed_generator_packs_state(state)
+                except Exception:
+                    pass
+
                 if failures:
-                    return successes > 0, f'Imported {successes} pack(s) from bundle; {failures[0]}'
-                return True, f'Imported {successes} pack(s) from bundle'
+                    return successes > 0, f'Imported {successes} pack(s) from bundle as {safe_label}; {failures[0]}'
+                return True, f'Imported {successes} pack(s) from bundle as {safe_label}'
 
     except Exception as exc:
         return False, f'Invalid zip: {exc}'
@@ -31897,12 +32416,17 @@ def _install_generator_pack_or_bundle(*, zip_path: str, pack_label: str, pack_or
 
 @app.route('/generator_packs/upload', methods=['POST'])
 def generator_packs_upload():
+    is_xhr = (request.headers.get('X-Requested-With') == 'XMLHttpRequest')
     f = request.files.get('zip_file')
     if not f or f.filename == '':
+        if is_xhr:
+            return jsonify({'ok': False, 'error': 'No zip selected.'}), 400
         flash('No zip selected.')
         return redirect(url_for('flag_catalog_page'))
     filename = secure_filename(f.filename)
     if not filename.lower().endswith('.zip'):
+        if is_xhr:
+            return jsonify({'ok': False, 'error': 'Only .zip allowed.'}), 400
         flash('Only .zip allowed.')
         return redirect(url_for('flag_catalog_page'))
 
@@ -31912,7 +32436,15 @@ def generator_packs_upload():
     os.close(fd)
     try:
         f.save(tmp_path)
-        ok, note = _install_generator_pack_or_bundle(zip_path=tmp_path, pack_label=filename, pack_origin='upload')
+        label = filename
+        if label.lower().endswith('.zip'):
+            label = label[:-4]
+        ok, note = _install_generator_pack_or_bundle(zip_path=tmp_path, pack_label=label, pack_origin='upload')
+        if is_xhr:
+            if ok:
+                return jsonify({'ok': True, 'message': note}), 200
+            return jsonify({'ok': False, 'error': f'Pack install failed: {note}'}), 400
+
         flash(note if ok else f'Pack install failed: {note}')
     finally:
         try:
@@ -32021,6 +32553,69 @@ def generator_packs_delete(pack_id: str):
     return redirect(url_for('flag_catalog_page'))
 
 
+def _set_pack_disabled_state(*, pack_id: str, disabled: bool) -> tuple[bool, str]:
+    pid = str(pack_id or '').strip()
+    if not pid:
+        return False, 'Missing pack id'
+    state = _load_installed_generator_packs_state()
+    packs = state.get('packs') if isinstance(state, dict) else None
+    if not isinstance(packs, list):
+        packs = []
+    for p in packs:
+        if not isinstance(p, dict):
+            continue
+        if str(p.get('id') or '').strip() != pid:
+            continue
+        p['disabled'] = bool(disabled)
+        state['packs'] = packs
+        _save_installed_generator_packs_state(state)
+        return True, ('Disabled' if disabled else 'Enabled') + f' pack {pid}'
+    return False, 'Pack not found'
+
+
+def _set_generator_disabled_state(*, kind: str, generator_id: str, disabled: bool) -> tuple[bool, str]:
+    gid = str(generator_id or '').strip()
+    if not gid:
+        return False, 'Missing generator id'
+    k = str(kind or '').strip().lower().replace('_', '-')
+    if k not in ('flag-generator', 'flag-node-generator'):
+        return False, f'Invalid kind: {kind}'
+
+    state = _load_installed_generator_packs_state()
+    packs = state.get('packs') if isinstance(state, dict) else None
+    if not isinstance(packs, list):
+        packs = []
+
+    for p in packs:
+        if not isinstance(p, dict):
+            continue
+        items = p.get('installed')
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            if str(it.get('kind') or '').strip().lower().replace('_', '-') != k:
+                continue
+            if str(it.get('id') or '').strip() != gid:
+                continue
+            it['disabled'] = bool(disabled)
+            state['packs'] = packs
+            _save_installed_generator_packs_state(state)
+            return True, ('Disabled' if disabled else 'Enabled') + f' {k} {gid}'
+
+    return False, 'Installed generator not found'
+
+
+@app.route('/generator_packs/set_disabled/<pack_id>', methods=['POST'])
+def generator_packs_set_disabled(pack_id: str):
+    _require_builder_or_admin()
+    disabled = str(request.form.get('disabled') or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+    ok, msg = _set_pack_disabled_state(pack_id=pack_id, disabled=disabled)
+    flash(msg if ok else f'Failed: {msg}')
+    return redirect(url_for('flag_catalog_page'))
+
+
 def _pack_to_zip_bytes(pack: dict) -> bytes:
     """Build a ZIP archive for a single installed pack."""
     import io
@@ -32068,6 +32663,165 @@ def _pack_to_zip_bytes(pack: dict) -> bytes:
 
     mem.seek(0)
     return mem.read()
+
+
+def _delete_installed_generator(*, kind: str, generator_id: str) -> tuple[bool, str]:
+    """Delete a single installed generator directory by manifest id.
+
+    Safety: only deletes directories under outputs/installed_generators.
+    """
+    import shutil
+    from pathlib import Path
+
+    try:
+        import yaml  # type: ignore
+    except Exception as exc:
+        return False, f'PyYAML required: {exc}'
+
+    gid = str(generator_id or '').strip()
+    if not gid:
+        return False, 'Missing generator_id'
+
+    k = str(kind or '').strip().lower().replace('_', '-')
+    if k not in ('flag-generator', 'flag-node-generator'):
+        return False, f'Invalid kind: {kind}'
+
+    installed_root = os.path.abspath(_installed_generators_root())
+    base = os.path.join(installed_root, 'flag_node_generators' if k == 'flag-node-generator' else 'flag_generators')
+    if not os.path.isdir(base):
+        return False, 'No installed generators directory'
+
+    target_dir: str | None = None
+    for child in sorted(Path(base).iterdir()):
+        if not child.is_dir():
+            continue
+        manifest_path = None
+        for nm in ('manifest.yaml', 'manifest.yml'):
+            p = child / nm
+            if p.exists() and p.is_file():
+                manifest_path = p
+                break
+        if manifest_path is None:
+            continue
+        try:
+            doc = yaml.safe_load(manifest_path.read_text('utf-8', errors='ignore'))
+        except Exception:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        mid = str(doc.get('id') or '').strip()
+        if mid == gid:
+            target_dir = str(child)
+            break
+
+    if not target_dir:
+        return False, f'Installed generator not found: {gid}'
+
+    abs_target = os.path.abspath(target_dir)
+    try:
+        if os.path.commonpath([installed_root, abs_target]) != installed_root:
+            return False, f'Refused to delete outside installed root: {abs_target}'
+    except Exception:
+        return False, f'Refused to delete path: {abs_target}'
+
+    try:
+        shutil.rmtree(abs_target, ignore_errors=False)
+    except Exception as exc:
+        return False, f'Failed deleting {abs_target}: {exc}'
+
+    # Update pack state: remove references to this generator.
+    try:
+        state = _load_installed_generator_packs_state()
+        packs = state.get('packs') or []
+        if not isinstance(packs, list):
+            packs = []
+        kept_packs = []
+        removed_refs = 0
+        for p in packs:
+            if not isinstance(p, dict):
+                continue
+            installed = p.get('installed') or []
+            if not isinstance(installed, list):
+                installed = []
+            new_installed = []
+            for it in installed:
+                if not isinstance(it, dict):
+                    continue
+                it_id = str(it.get('id') or '').strip()
+                it_kind = str(it.get('kind') or '').strip().lower().replace('_', '-')
+                it_path = str(it.get('path') or '').strip()
+                if it_id == gid and it_kind == k:
+                    removed_refs += 1
+                    continue
+                if it_path and os.path.abspath(it_path) == abs_target:
+                    removed_refs += 1
+                    continue
+                new_installed.append(it)
+
+            if new_installed:
+                p2 = dict(p)
+                p2['installed'] = new_installed
+                kept_packs.append(p2)
+            else:
+                # Drop pack row if no installed generators remain.
+                continue
+        state['packs'] = kept_packs
+        _save_installed_generator_packs_state(state)
+    except Exception:
+        removed_refs = 0
+
+    note = f'Deleted installed {k} {gid}'
+    if removed_refs:
+        note += f' (updated {removed_refs} pack reference(s))'
+    return True, note
+
+
+@app.route('/api/flag_generators/delete', methods=['POST'])
+def api_flag_generators_delete():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    gid = str(payload.get('generator_id') or payload.get('id') or '').strip()
+    ok, note = _delete_installed_generator(kind='flag-generator', generator_id=gid)
+    return jsonify({'ok': ok, 'message': note} if ok else {'ok': False, 'error': note}), (200 if ok else 400)
+
+
+@app.route('/api/flag_node_generators/delete', methods=['POST'])
+def api_flag_node_generators_delete():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    gid = str(payload.get('generator_id') or payload.get('id') or '').strip()
+    ok, note = _delete_installed_generator(kind='flag-node-generator', generator_id=gid)
+    return jsonify({'ok': ok, 'message': note} if ok else {'ok': False, 'error': note}), (200 if ok else 400)
+
+
+@app.route('/api/generator_packs/set_disabled', methods=['POST'])
+def api_generator_packs_set_disabled():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    pid = str(payload.get('pack_id') or '').strip()
+    disabled = bool(payload.get('disabled') is True)
+    ok, note = _set_pack_disabled_state(pack_id=pid, disabled=disabled)
+    return jsonify({'ok': ok, 'message': note} if ok else {'ok': False, 'error': note}), (200 if ok else 400)
+
+
+@app.route('/api/flag_generators/set_disabled', methods=['POST'])
+def api_flag_generators_set_disabled():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    gid = str(payload.get('generator_id') or payload.get('id') or '').strip()
+    disabled = bool(payload.get('disabled') is True)
+    ok, note = _set_generator_disabled_state(kind='flag-generator', generator_id=gid, disabled=disabled)
+    return jsonify({'ok': ok, 'message': note} if ok else {'ok': False, 'error': note}), (200 if ok else 400)
+
+
+@app.route('/api/flag_node_generators/set_disabled', methods=['POST'])
+def api_flag_node_generators_set_disabled():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    gid = str(payload.get('generator_id') or payload.get('id') or '').strip()
+    disabled = bool(payload.get('disabled') is True)
+    ok, note = _set_generator_disabled_state(kind='flag-node-generator', generator_id=gid, disabled=disabled)
+    return jsonify({'ok': ok, 'message': note} if ok else {'ok': False, 'error': note}), (200 if ok else 400)
 
 
 @app.route('/generator_packs/download/<pack_id>')
@@ -32210,6 +32964,13 @@ def flag_generators_test_run():
         except Exception:
             pass
         return jsonify({'ok': False, 'error': 'Generator not found (must be in an enabled source).'}), 404
+
+    # Respect disabled state for installed generators.
+    try:
+        if isinstance(gen, dict) and _is_installed_generator_view(gen) and _is_installed_generator_disabled(kind='flag-generator', generator_id=generator_id):
+            return jsonify({'ok': False, 'error': f'Generator {generator_id} is disabled.'}), 400
+    except Exception:
+        pass
 
     run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
     run_dir = os.path.join(_flag_generators_runs_dir(), run_id)
@@ -32443,6 +33204,12 @@ def flag_node_generators_test_run():
     gen = _find_enabled_node_generator_by_id(generator_id)
     if not gen:
         return jsonify({'ok': False, 'error': 'Generator not found (must be in an enabled source).'}), 404
+
+    try:
+        if isinstance(gen, dict) and _is_installed_generator_view(gen) and _is_installed_generator_disabled(kind='flag-node-generator', generator_id=generator_id):
+            return jsonify({'ok': False, 'error': f'Node-generator {generator_id} is disabled.'}), 400
+    except Exception:
+        pass
 
     run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
     run_dir = os.path.join(_flag_node_generators_runs_dir(), run_id)

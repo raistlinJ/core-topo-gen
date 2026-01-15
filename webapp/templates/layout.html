@@ -142,6 +142,18 @@
     {% block body_container %}
     <div class="row">
       <div class="col-12">
+        {% with messages = get_flashed_messages() %}
+          {% if messages %}
+            <div class="mt-2">
+              {% for msg in messages %}
+                <div class="alert alert-info alert-dismissible fade show" role="alert">
+                  {{ msg }}
+                  <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                </div>
+              {% endfor %}
+            </div>
+          {% endif %}
+        {% endwith %}
         {% block content %}{% endblock %}
       </div>
     </div>

@@ -1,36 +1,157 @@
 {
-  "version": "2.0.0",
-  "tasks": [
-    {
-      "label": "Restart Web UI detached (9090)",
-      "type": "shell",
-      "command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\"",
-      "isBackground": false
-    },
-    {
-      "label": "Healthz 9090",
-      "type": "shell",
-      "command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
-      "isBackground": false
-    },
-    {
-      "label": "Check Web UI health (9090)",
-      "type": "shell",
-      "command": "cd /Users/jcacosta/Documents/core-topo-gen && curl -fsS -I http://127.0.0.1:9090/healthz | head",
-      "isBackground": false
-    },
-    {
-      "label": "Tail Web UI log",
-      "type": "shell",
-      "command": "cd /Users/jcacosta/Documents/core-topo-gen && tail -n 80 outputs/logs/webui-9090.log | cat",
-      "isBackground": false
-    },
-    {
-      "label": "Smoke Generator Packs (auth)",
-      "type": "shell",
-      "command": "cd /Users/jcacosta/Documents/core-topo-gen && set -e && rm -f /tmp/cg_cookie_pack.txt /tmp/cg_pack.zip /tmp/cg_pack_dl.zip /tmp/cg_pack_export_all.zip /tmp/cg_pack_id.txt /tmp/cg_fg.json && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport zipfile, shutil\nfrom pathlib import Path\nbase = Path('/tmp/cg_pack_src')\nzip_path = Path('/tmp/cg_pack.zip')\nshutil.rmtree(base, ignore_errors=True)\nzip_path.unlink(missing_ok=True)\n\ngen_dir = base / 'flag_generators' / 'smoke_test_gen'\ngen_dir.mkdir(parents=True, exist_ok=True)\n(gen_dir / 'manifest.yaml').write_text(\n    'manifest_version: 1\\n'\n    'id: smoke-test-gen\\n'\n    'kind: flag-generator\\n'\n    'name: Smoke Test Generator\\n'\n    'runtime:\\n'\n    '  type: docker-compose\\n'\n    '  compose_file: docker-compose.yml\\n'\n    '  service: generator\\n',\n    encoding='utf-8',\n)\n(gen_dir / 'docker-compose.yml').write_text(\n    'version: \"3.8\"\\n'\n    'services:\\n'\n    '  generator:\\n'\n    '    image: alpine:3.19\\n'\n    '    command: [\"sh\", \"-lc\", \"echo smoke\"]\\n',\n    encoding='utf-8',\n)\n(gen_dir / 'run.py').write_text('print(\"smoke\")\\n', encoding='utf-8')\n\nwith zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:\n    for p in base.rglob('*'):\n        if p.is_file():\n            z.write(p, p.relative_to(base))\nprint(zip_path)\nPY\n\ncurl -sS -c /tmp/cg_cookie_pack.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin'\n\n# Upload the pack zip\ncurl -sS -b /tmp/cg_cookie_pack.txt -c /tmp/cg_cookie_pack.txt -o /dev/null -X POST http://127.0.0.1:9090/generator_packs/upload -F zip_file=@/tmp/cg_pack.zip\n\n# Read the newest pack id from state (best-effort ordering by installed_at)\n/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport json\nfrom pathlib import Path\nstate_path = Path('outputs/installed_generators/_packs_state.json')\ndata = json.loads(state_path.read_text('utf-8')) if state_path.exists() else {}\npacks = [p for p in (data.get('packs') or []) if isinstance(p, dict)]\npacks.sort(key=lambda p: p.get('installed_at') or '')\nprint((packs[-1].get('id') if packs else '') or '')\nPY > /tmp/cg_pack_id.txt\nPACK_ID=$(cat /tmp/cg_pack_id.txt | tr -d '\\n' | tr -d '\\r')\necho \"PACK_ID=$PACK_ID\"\nif [ -z \"$PACK_ID\" ]; then echo 'ERROR: no pack id found' && exit 2; fi\n\n# Ensure the installed generator is discoverable\ncurl -sS -b /tmp/cg_cookie_pack.txt -o /tmp/cg_fg.json http://127.0.0.1:9090/flag_generators_data\n/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport json\nobj=json.load(open('/tmp/cg_fg.json','r',encoding='utf-8'))\ngens=obj.get('generators') or []\nids=set((g.get('id') or '') for g in gens if isinstance(g,dict))\nprint('has_smoke_test_gen=', 'smoke-test-gen' in ids)\nassert 'smoke-test-gen' in ids\nPY\n\n# Download the pack and sanity-check zip contents\ncurl -sS -b /tmp/cg_cookie_pack.txt -o /tmp/cg_pack_dl.zip http://127.0.0.1:9090/generator_packs/download/$PACK_ID\n/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport zipfile\nz=zipfile.ZipFile('/tmp/cg_pack_dl.zip','r')\nnames=set(z.namelist())\nassert any(n.endswith('manifest.yaml') for n in names), sorted(list(names))[:20]\nassert any(n.endswith('docker-compose.yml') for n in names), sorted(list(names))[:20]\nprint('download_zip_ok=1')\nPY\n\n# Export all should include at least one packs/*.zip when installed\ncurl -sS -b /tmp/cg_cookie_pack.txt -o /tmp/cg_pack_export_all.zip http://127.0.0.1:9090/generator_packs/export_all\n/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport zipfile\nz=zipfile.ZipFile('/tmp/cg_pack_export_all.zip','r')\nnames=z.namelist()\nassert any(n.startswith('packs/') and n.endswith('.zip') for n in names), names\nprint('export_all_ok=1')\nPY\n\n# Uninstall pack\ncurl -sS -b /tmp/cg_cookie_pack.txt -o /dev/null -X POST http://127.0.0.1:9090/generator_packs/delete/$PACK_ID\n\n# Ensure state no longer contains the pack id\n/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport json\nfrom pathlib import Path\npack_id = open('/tmp/cg_pack_id.txt','r',encoding='utf-8').read().strip()\nstate_path = Path('outputs/installed_generators/_packs_state.json')\ndata = json.loads(state_path.read_text('utf-8')) if state_path.exists() else {}\npacks = [p for p in (data.get('packs') or []) if isinstance(p, dict)]\nassert all((p.get('id') or '') != pack_id for p in packs)\nprint('uninstall_state_ok=1')\nPY\n\necho 'SMOKE_GENERATOR_PACKS_OK=1'\n",
-      "isBackground": false
-    }
-
-  ]
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Restart Web UI detached (9090)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\"",
+			"isBackground": false
+		},
+		{
+			"label": "Healthz 9090",
+			"type": "shell",
+			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"isBackground": false
+		},
+		{
+			"label": "Check Web UI health (9090)",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && curl -fsS -I http://127.0.0.1:9090/healthz | head",
+			"isBackground": false
+		},
+		{
+			"label": "Tail Web UI log",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && tail -n 80 outputs/logs/webui-9090.log | cat",
+			"isBackground": false
+		},
+		{
+			"label": "Smoke Generator Packs (auth)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && set -e && rm -f /tmp/cg_cookie_pack.txt /tmp/cg_pack.zip /tmp/cg_pack_dl.zip /tmp/cg_pack_export_all.zip /tmp/cg_pack_id.txt /tmp/cg_fg.json && /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport zipfile, shutil\nfrom pathlib import Path\nbase = Path('/tmp/cg_pack_src')\nzip_path = Path('/tmp/cg_pack.zip')\nshutil.rmtree(base, ignore_errors=True)\nzip_path.unlink(missing_ok=True)\n\ngen_dir = base / 'flag_generators' / 'smoke_test_gen'\ngen_dir.mkdir(parents=True, exist_ok=True)\n(gen_dir / 'manifest.yaml').write_text(\n    'manifest_version: 1\\n'\n    'id: smoke-test-gen\\n'\n    'kind: flag-generator\\n'\n    'name: Smoke Test Generator\\n'\n    'runtime:\\n'\n    '  type: docker-compose\\n'\n    '  compose_file: docker-compose.yml\\n'\n    '  service: generator\\n',\n    encoding='utf-8',\n)\n(gen_dir / 'docker-compose.yml').write_text(\n    'version: \"3.8\"\\n'\n    'services:\\n'\n    '  generator:\\n'\n    '    image: alpine:3.19\\n'\n    '    command: [\"sh\", \"-lc\", \"echo smoke\"]\\n',\n    encoding='utf-8',\n)\n(gen_dir / 'run.py').write_text('print(\"smoke\")\\n', encoding='utf-8')\n\nwith zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:\n    for p in base.rglob('*'):\n        if p.is_file():\n            z.write(p, p.relative_to(base))\nprint(zip_path)\nPY\n\ncurl -sS -c /tmp/cg_cookie_pack.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin'\n\n# Upload the pack zip\ncurl -sS -b /tmp/cg_cookie_pack.txt -c /tmp/cg_cookie_pack.txt -o /dev/null -X POST http://127.0.0.1:9090/generator_packs/upload -F zip_file=@/tmp/cg_pack.zip\n\n# Read the newest pack id from state (best-effort ordering by installed_at)\n/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport json\nfrom pathlib import Path\nstate_path = Path('outputs/installed_generators/_packs_state.json')\ndata = json.loads(state_path.read_text('utf-8')) if state_path.exists() else {}\npacks = [p for p in (data.get('packs') or []) if isinstance(p, dict)]\npacks.sort(key=lambda p: p.get('installed_at') or '')\nprint((packs[-1].get('id') if packs else '') or '')\nPY > /tmp/cg_pack_id.txt\nPACK_ID=$(cat /tmp/cg_pack_id.txt | tr -d '\\n' | tr -d '\\r')\necho \"PACK_ID=$PACK_ID\"\nif [ -z \"$PACK_ID\" ]; then echo 'ERROR: no pack id found' && exit 2; fi\n\n# Ensure the installed generator is discoverable\ncurl -sS -b /tmp/cg_cookie_pack.txt -o /tmp/cg_fg.json http://127.0.0.1:9090/flag_generators_data\n/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport json\nobj=json.load(open('/tmp/cg_fg.json','r',encoding='utf-8'))\ngens=obj.get('generators') or []\nids=set((g.get('id') or '') for g in gens if isinstance(g,dict))\nprint('has_smoke_test_gen=', 'smoke-test-gen' in ids)\nassert 'smoke-test-gen' in ids\nPY\n\n# Download the pack and sanity-check zip contents\ncurl -sS -b /tmp/cg_cookie_pack.txt -o /tmp/cg_pack_dl.zip http://127.0.0.1:9090/generator_packs/download/$PACK_ID\n/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport zipfile\nz=zipfile.ZipFile('/tmp/cg_pack_dl.zip','r')\nnames=set(z.namelist())\nassert any(n.endswith('manifest.yaml') for n in names), sorted(list(names))[:20]\nassert any(n.endswith('docker-compose.yml') for n in names), sorted(list(names))[:20]\nprint('download_zip_ok=1')\nPY\n\n# Export all should include at least one packs/*.zip when installed\ncurl -sS -b /tmp/cg_cookie_pack.txt -o /tmp/cg_pack_export_all.zip http://127.0.0.1:9090/generator_packs/export_all\n/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport zipfile\nz=zipfile.ZipFile('/tmp/cg_pack_export_all.zip','r')\nnames=z.namelist()\nassert any(n.startswith('packs/') and n.endswith('.zip') for n in names), names\nprint('export_all_ok=1')\nPY\n\n# Uninstall pack\ncurl -sS -b /tmp/cg_cookie_pack.txt -o /dev/null -X POST http://127.0.0.1:9090/generator_packs/delete/$PACK_ID\n\n# Ensure state no longer contains the pack id\n/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python - <<'PY'\nimport json\nfrom pathlib import Path\npack_id = open('/tmp/cg_pack_id.txt','r',encoding='utf-8').read().strip()\nstate_path = Path('outputs/installed_generators/_packs_state.json')\ndata = json.loads(state_path.read_text('utf-8')) if state_path.exists() else {}\npacks = [p for p in (data.get('packs') or []) if isinstance(p, dict)]\nassert all((p.get('id') or '') != pack_id for p in packs)\nprint('uninstall_state_ok=1')\nPY\n\necho 'SMOKE_GENERATOR_PACKS_OK=1'\n",
+			"isBackground": false
+		},
+		{
+			"label": "Start Web UI (9090) via .venv",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && mkdir -p outputs/logs && env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main",
+			"isBackground": true
+		},
+		{
+			"label": "Debug: webui pid+port",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ps -p 95734 -o pid,ppid,command || echo 'not running' && lsof -nP -iTCP:9090 -sTCP:LISTEN | head -n 5 || true",
+			"isBackground": false
+		},
+		{
+			"label": "Debug: upload endpoint returns JSON",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && curl -sS -i -X POST http://127.0.0.1:9090/generator_packs/upload -H 'X-Requested-With: XMLHttpRequest' -H 'Accept: application/json' | head -n 20",
+			"isBackground": false
+		},
+		{
+			"label": "Debug: upload JSON (authed)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie_pack2.txt && curl -sS -c /tmp/cg_cookie_pack2.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_pack2.txt -i -X POST http://127.0.0.1:9090/generator_packs/upload -H 'X-Requested-With: XMLHttpRequest' -H 'Accept: application/json' | head -n 30",
+			"isBackground": false
+		},
+		{
+			"label": "Restart Web UI foreground (9090)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main",
+			"isBackground": true
+		},
+		{
+			"label": "Healthz 9090",
+			"type": "shell",
+			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"isBackground": false
+		},
+		{
+			"label": "Locate sample bundle zip",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && ls -1 outputs/downloaded_sample_packs/*/sample_packs_bundle.zip 2>/dev/null | tail -n 1",
+			"isBackground": false
+		},
+		{
+			"label": "Upload bundle via JSON (authed)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie_pack3.txt && curl -sS -c /tmp/cg_cookie_pack3.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_pack3.txt -i -X POST http://127.0.0.1:9090/generator_packs/upload -H 'X-Requested-With: XMLHttpRequest' -H 'Accept: application/json' -F zip_file=@outputs/downloaded_sample_packs/20260115-042607/sample_packs_bundle.zip | head -n 60",
+			"isBackground": false
+		},
+		{
+			"label": "Tail server log file",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && tail -n 120 outputs/logs/webui-9090.log | cat",
+			"isBackground": false
+		},
+		{
+			"label": "Restart Web UI (9090) to pick up changes",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\"",
+			"isBackground": false
+		},
+		{
+			"label": "Healthz after restart",
+			"type": "shell",
+			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"isBackground": false
+		},
+		{
+			"label": "Upload bundle after auto-id change",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie_pack4.txt && curl -sS -c /tmp/cg_cookie_pack4.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_pack4.txt -i -X POST http://127.0.0.1:9090/generator_packs/upload -H 'X-Requested-With: XMLHttpRequest' -H 'Accept: application/json' -F zip_file=@outputs/downloaded_sample_packs/20260115-042607/sample_packs_bundle.zip | head -n 80",
+			"isBackground": false
+		},
+		{
+			"label": "Confirm generators now discoverable",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && rm -f /tmp/cg_cookie_pack5.txt /tmp/cg_fg2.json && curl -sS -c /tmp/cg_cookie_pack5.txt -o /dev/null -X POST http://127.0.0.1:9090/login -d 'username=coreadmin' -d 'password=coreadmin' && curl -sS -b /tmp/cg_cookie_pack5.txt -o /tmp/cg_fg2.json http://127.0.0.1:9090/flag_generators_data && python - <<'PY'\nimport json\nobj=json.load(open('/tmp/cg_fg2.json','r',encoding='utf-8'))\ngens=obj.get('generators') or []\nerrs=obj.get('errors') or []\nprint('errors_count', len(errs))\nprint('gens_count', len(gens))\n# Show numeric ids from installed packs (best-effort: ids that are all digits)\nnums=sorted([g.get('id') for g in gens if isinstance(g,dict) and str(g.get('id') or '').isdigit()], key=lambda x:int(x))\nprint('numeric_ids', nums[-15:])\nPY",
+			"isBackground": false
+		},
+		{
+			"label": "Confirm node generators discoverable",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && curl -sS http://127.0.0.1:9090/flag_node_generators_data | python - <<'PY'\nimport json,sys\nobj=json.load(sys.stdin)\ngens=obj.get('generators') or []\nerrs=obj.get('errors') or []\nprint('errors_count', len(errs))\nprint('gens_count', len(gens))\nnums=sorted([g.get('id') for g in gens if isinstance(g,dict) and str(g.get('id') or '').isdigit()], key=lambda x:int(x))\nprint('numeric_ids', nums)\nPY",
+			"isBackground": false
+		},
+		{
+			"label": "Restart Web UI detached (9090) via .venv312",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\""
+		},
+		{
+			"label": "Healthz 9090 (after venv312 restart)",
+			"type": "shell",
+			"command": "sleep 1 && curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"isBackground": false
+		},
+		{
+			"label": "Tail webui-9090.log (debug)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && tail -n 200 outputs/logs/webui-9090.log | cat"
+		},
+		{
+			"label": "Stat webui-9090.log",
+			"type": "shell",
+			"command": "ls -la /Users/jcacosta/Documents/core-topo-gen/outputs/logs/webui-9090.log && wc -c /Users/jcacosta/Documents/core-topo-gen/outputs/logs/webui-9090.log"
+		},
+		{
+			"label": "Debug: pid 39894 + port 9090",
+			"type": "shell",
+			"command": "ps -p 39894 -o pid,ppid,command || echo 'pid not running' ; lsof -nP -iTCP:9090 -sTCP:LISTEN | head -n 10 || true",
+			"isBackground": false
+		},
+		{
+			"label": "Start Web UI foreground (debug, venv312)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main",
+			"isBackground": false
+		},
+		{
+			"label": "Healthz 9090 (after foreground start)",
+			"type": "shell",
+			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"isBackground": false
+		}
+	]
 }

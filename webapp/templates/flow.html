@@ -1773,9 +1773,10 @@
       substituteBodyEl.appendChild(form);
 
       function getCatalogForKind(kind){
-        return (String(kind) === 'flag-node-generator')
+        const cat = (String(kind) === 'flag-node-generator')
           ? (Array.isArray(_flagNodeGeneratorsCatalog) ? _flagNodeGeneratorsCatalog : [])
           : (Array.isArray(_flagGeneratorsCatalog) ? _flagGeneratorsCatalog : []);
+        return (cat || []).filter(g => !(g && g._disabled));
       }
 
       function rebuildSourceOptions(){

@@ -1,4 +1,4 @@
-# Generator Authoring Guide (Tutorial + Templates)
+# Generator Authoring Guide (Manifests + Generator Packs)
 
 This repo supports **two generator families** used by the Flag Sequencing (Flow) system:
 
@@ -8,37 +8,120 @@ This repo supports **two generator families** used by the Flag Sequencing (Flow)
 Both families share the same runtime output contract: a machine-readable `outputs.json`.
 
 AI prompt templates (copy/paste):
-- `docs/AI_PROMPT_TEMPLATES.md`
+- [docs/AI_PROMPT_TEMPLATES.md](AI_PROMPT_TEMPLATES.md)
 
 ---
 
-## 1) Concepts and file layout
+## 1) How generators are discovered
 
-### Catalog files (what Flow loads)
-Generators are described in JSON “catalog source” files under:
+### Installed generators (Web UI + Flow)
+The Web UI treats **installed generators** as the source of truth.
+
+- Install location: `outputs/installed_generators/`
+- Discovery: `manifest.yaml` / `manifest.yml` inside each generator directory
+- Disable semantics:
+  - Packs and individual generators can be disabled.
+  - Disabled generators are hidden from Flow substitution and rejected at preview/execute time.
+
+Installed generators are managed as **Generator Packs** (ZIP files) uploaded/imported from the Flag Catalog page.
+
+### Repo-local manifests (developer workflow)
+For local development you can also place manifests directly under:
+
+- `flag_generators/<your_generator_dir>/manifest.yaml`
+- `flag_node_generators/<your_generator_dir>/manifest.yaml`
+
+The runner and discovery logic will pick these up (in addition to installed generators).
+
+### Legacy v3 JSON catalogs (still supported, but not the primary workflow)
+Older generators may still be described as schema v3 catalog sources under:
 
 - `data_sources/flag_generators/*.json`
 - `data_sources/flag_node_generators/*.json`
 
-Each catalog file contains:
+and enabled via:
 
-- `plugins[]`: the *contract* (`requires`, `produces`, `inputs`)
-- `implementations[]`: how to run it (`source.path`, `compose.file/service`, `hint_templates`, etc.)
-
-Schema:
-- `validation/flag_generator_catalog.schema.json`
-
-Enable/disable catalog sources via:
 - `data_sources/flag_generators/_state.json`
 - `data_sources/flag_node_generators/_state.json`
 
-### Runtime output files (what the generator writes)
-Every generator run writes to an output directory (host path), typically:
+This legacy mechanism remains for backwards compatibility and ad-hoc experiments, but the Web UI/Flow selection is driven by installed manifests.
 
-- `outputs.json` (required)
-- `hint.txt` (optional; prefer `hint_templates` in the catalog)
-- `flag.txt` (optional, but many generators write it)
-- other artifacts (e.g., `ssh_creds.json`, binaries, configs)
+---
+
+## 2) The manifest format (`manifest_version: 1`)
+
+Each generator directory contains a manifest file:
+
+- `manifest.yaml` (preferred) or `manifest.yml`
+
+Minimum viable manifest (flag-generator):
+
+```yaml
+manifest_version: 1
+id: my_source_id
+kind: flag-generator
+name: My Generator
+description: Emits deterministic SSH credentials.
+
+runtime:
+  type: docker-compose
+  compose_file: docker-compose.yml
+  service: generator
+
+inputs:
+  - name: seed
+    type: text
+    required: true
+  - name: secret
+    type: text
+    required: true
+    sensitive: true
+
+artifacts:
+  requires: []
+  produces:
+    - flag
+    - ssh.username
+    - ssh.password
+
+hint_templates:
+  - "Next: use {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}"
+
+# If you produce files/binaries that should be safe to mount into other containers.
+injects:
+  - filesystem.file
+
+# Optional fixed env vars passed to the runtime.
+env:
+  SOME_FIXED_ENV: "value"
+```
+
+Notes:
+- `kind` must be `flag-generator` or `flag-node-generator`.
+- `inputs` is a list of input descriptors (used by UI forms and Flow).
+- `artifacts.requires` / `artifacts.produces` drive Flow dependency chaining.
+
+### Important: IDs are rewritten on install
+When you install a Generator Pack via the Web UI, each generator is assigned a **new numeric** `id` (as a string) and the installed manifest is rewritten to use that numeric ID.
+
+- The installed generator directory also contains `.coretg_pack.json` with:
+  - `source_generator_id` (your original manifest `id`)
+  - `generator_id` (the assigned installed numeric ID)
+
+This means:
+- Treat the manifest `id` in your source pack as a *source identifier*.
+- Don’t assume it will remain stable after installation.
+
+---
+
+## 3) Runtime contract (what the generator writes)
+
+Generators run with:
+
+- `/inputs/config.json` mounted read-only
+- `/outputs/` mounted read-write
+
+Every run must write an `outputs.json` file in the output directory.
 
 Schema:
 - `validation/flag_generator_outputs.schema.json`
@@ -47,105 +130,88 @@ Minimum valid `outputs.json`:
 
 ```json
 {
-  "generator_id": "my.plugin_id",
+  "generator_id": "<some string>",
   "outputs": {
     "flag": "FLAG{...}"
   }
 }
 ```
 
-### Injected artifacts (`inject_files` allowlist)
+Practical guidance on `generator_id`:
+- The schema requires it, but it is currently treated as provenance/metadata.
+- If your generator can know the invoked generator ID, write that.
+- Otherwise, writing your source manifest ID is acceptable.
 
-If a generator produces a file/binary that should be staged for mounting/copying into other containers, use `implementations[].inject_files`.
+---
+
+## 4) Injected artifacts (`injects` allowlist)
+
+If a generator produces files that should be safely mountable/copiable into other containers, use `injects` in the manifest.
 
 How it works:
 
-- Generators should write files under `/outputs/artifacts/...` (host: `<out_dir>/artifacts/...`).
+- Generators should write files under `/outputs/artifacts/...`.
 - After the generator finishes, `scripts/run_flag_generator.py` stages **only** allowlisted items into `<out_dir>/injected/`.
-- `inject_files` entries can be:
-  - A relative path like `artifacts/my_binary` (prefix `artifacts/` is optional), or
-  - An **output artifact key** like `filesystem.file` which is resolved via `outputs.json`.
+- If the generator produces a `docker-compose.yml`, the runner rewrites relative bind mounts to go through `./injected/...`.
 
-Example (recommended):
+`injects` entries can be:
 
-- `outputs.json.outputs.filesystem.file = "artifacts/challenge"`
-- `implementations[].inject_files = ["filesystem.file"]`
+- A relative path like `artifacts/my_binary` (prefix `artifacts/` is optional), or
+- An **output artifact key** like `filesystem.file` which is resolved via `outputs.json.outputs`.
 
 ---
 
-## 2) Key vocabulary (artifacts)
+## 5) Hint templates and substitution
 
-Artifacts are the “typed keys” that let generators chain.
-
-Common examples (from `docs/FLAG_GENERATORS.md`):
-- `ssh.username`, `ssh.password`, `ssh.private_key`
-- `http.basic.username`, `http.basic.password`, `api.token`
-- `next.node_name`, `next.node_id`
-- `flag`
-
-Guidelines:
-- Prefer stable, namespaced keys (`ssh.username` not `user`).
-- Put **Flow-synthesized** runtime values in `plugins[].inputs`, not `plugins[].requires`.
-  - Forbidden in `requires`: `seed`, `secret`, `env_name`, `challenge`, `flag_prefix`, `username_prefix`, `key_len`, `node_name`.
-
----
-
-## 3) Hint templates and substitution
-
-Catalog implementations can define:
+Manifests can declare:
 
 - `hint_template` (single string)
 - `hint_templates` (list of strings; typically least → most revealing)
 
-Flow substitutions:
+Flow substitutions include:
+
 - `{{THIS_NODE_NAME}}`, `{{THIS_NODE_ID}}`
 - `{{NEXT_NODE_NAME}}`, `{{NEXT_NODE_ID}}`
 - `{{SCENARIO}}`
-- `{{OUTPUT.<key>}}` where `<key>` comes from `outputs.json.outputs`.
+- `{{OUTPUT.<key>}}` where `<key>` comes from `outputs.json.outputs`
 
 Example:
 
 ```
-Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.ssh_username}} / {{OUTPUT.ssh_password}}
+Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}
 ```
-
-Best practice:
-- Include 2–4 `hint_templates` that progressively reveal more detail.
-- Write a `hint.txt` at runtime with the resolved hint content (Flow materializes this after output substitution).
 
 ---
 
-## 4) How generators run (local testing)
+## 6) Local testing
 
 The canonical runner is:
 
 - `scripts/run_flag_generator.py`
 
-It:
-- Reads enabled catalog sources (`data_sources/<catalog>/_state.json`)
-- Finds an implementation by `--generator-id`
-- Writes `/inputs/config.json` and mounts it into the container
-- Mounts the output directory to `/outputs`
-- Runs `docker compose run --rm <service>`
+It can run:
 
-### Test a flag-generator locally
+- Legacy enabled v3 JSON catalogs (via `data_sources/<catalog>/_state.json`), and
+- Manifest-based generators (repo-local or installed).
+
+### Test a flag-generator
 
 ```bash
 python scripts/run_flag_generator.py \
   --catalog flag_generators \
-  --generator-id binary_embed_text \
+  --generator-id <generator_id> \
   --out-dir /tmp/fg_test \
   --config '{"seed":"123","secret":"demo"}'
 
 cat /tmp/fg_test/outputs.json
 ```
 
-### Test a flag-node-generator locally
+### Test a flag-node-generator
 
 ```bash
 python scripts/run_flag_generator.py \
   --catalog flag_node_generators \
-  --generator-id nodegen-py-ssh_flag_node \
+  --generator-id <generator_id> \
   --out-dir /tmp/nodegen_test \
   --config '{"seed":"123","node_name":"node1","flag_prefix":"FLAG"}'
 
@@ -155,197 +221,34 @@ cat /tmp/nodegen_test/outputs.json
 
 ---
 
-## 5) Tutorial: create a new **flag-generator**
+## 7) Packaging a Generator Pack (ZIP)
 
-Goal: create `my_ssh_creds` that produces `ssh_username` + `ssh_password`.
+A Generator Pack ZIP is a zip archive containing one or more generator directories under either (or both):
 
-### Step A — create implementation folder
+- `flag_generators/<generator_dir>/...`
+- `flag_node_generators/<generator_dir>/...`
 
-Create a folder:
-- `flag_generators/py_my_ssh_creds/`
+Each generator dir must include a `manifest.yaml`/`manifest.yml`.
 
-Add `generator.py` and `docker-compose.yml`.
+Example:
 
-Minimal `docker-compose.yml` pattern (matches existing generators):
-
-```yaml
-services:
-  generator:
-    image: python:3.12-slim
-    working_dir: /app
-    command: ["python", "/app/generator.py"]
-    environment:
-      INPUTS_DIR: ${INPUTS_DIR}
-      OUTPUTS_DIR: ${OUTPUTS_DIR}
-    volumes:
-      - ./generator.py:/app/generator.py:ro
-      - ${INPUTS_DIR}:/inputs:ro
-      - ${OUTPUTS_DIR}:/outputs
+```text
+flag_generators/
+  py_my_ssh_creds/
+    manifest.yaml
+    docker-compose.yml
+    generator.py
+flag_node_generators/
+  py_my_node_challenge/
+    manifest.yaml
+    docker-compose.yml
+    generator.py
 ```
 
-Minimal `generator.py` pattern:
+Create a ZIP (example):
 
-```py
-import json
-import hashlib
-from pathlib import Path
-
-
-def read_config() -> dict:
-    try:
-        return json.loads(Path('/inputs/config.json').read_text('utf-8'))
-    except Exception:
-        return {}
-
-
-def main():
-    cfg = read_config()
-    seed = str(cfg.get('seed') or '')
-    secret = str(cfg.get('secret') or '')
-    if not seed:
-        raise SystemExit('Missing seed')
-    if not secret:
-        raise SystemExit('Missing secret')
-
-    digest = hashlib.sha256(f"{seed}|{secret}|ssh".encode('utf-8')).hexdigest()
-    ssh_username = 'user_' + digest[:8]
-    ssh_password = 'P@' + digest[8:20]
-    flag = 'FLAG{' + digest[20:36] + '}'
-
-    out_dir = Path('/outputs')
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    outputs = {
-        'generator_id': 'my_ssh_creds',
-        'outputs': {
-            'flag': flag,
-        'ssh.username': ssh_username,
-        'ssh.password': ssh_password,
-        },
-    }
-    (out_dir / 'outputs.json').write_text(json.dumps(outputs, indent=2) + '\n', encoding='utf-8')
-    # Optional: write /outputs/hint.txt if you want a standalone hint file.
-    # Prefer hint_templates in the catalog for Flow.
-
-
-if __name__ == '__main__':
-    main()
+```bash
+zip -r my_generator_pack.zip flag_generators/py_my_ssh_creds flag_node_generators/py_my_node_challenge
 ```
 
-### Step B — add a catalog source JSON
-
-Create a new catalog source file:
-- `data_sources/flag_generators/2026xxxx-my_generators.json`
-
-Skeleton:
-
-```json
-{
-  "schema_version": 3,
-  "plugin_type": "flag-generator",
-  "plugins": [
-    {
-      "plugin_id": "my_ssh_creds",
-      "plugin_type": "flag-generator",
-      "version": "1.0",
-      "description": "Emits deterministic SSH credentials.",
-      "requires": [],
-      "produces": [
-        {"artifact": "flag"},
-        {"artifact": "ssh.username"},
-        {"artifact": "ssh.password"}
-      ],
-      "inputs": {
-        "seed": {"type": "text", "required": true},
-        "secret": {"type": "text", "required": true, "sensitive": true}
-      }
-    }
-  ],
-  "implementations": [
-    {
-      "plugin_id": "my_ssh_creds",
-      "name": "SSH Credentials",
-      "language": "python",
-      "source": {"type": "local-path", "path": "flag_generators/py_my_ssh_creds"},
-      "compose": {"file": "docker-compose.yml", "service": "generator"},
-      "hint_templates": [
-        "Next: use {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}"
-      ]
-    }
-  ]
-}
-```
-
-Enable it by adding it to `data_sources/flag_generators/_state.json` as an enabled source.
-
----
-
-## 6) Tutorial: create a new **flag-node-generator**
-
-Goal: create a per-node compose that runs an SSH server and drops `/flag.txt`.
-
-Pattern:
-- Your generator writes `/outputs/docker-compose.yml`.
-- Your `outputs.json.outputs.compose_path` points to that file name.
-
-Use the existing reference:
-- `flag_node_generators/py_compose_ssh_flag_node/`
-
----
-
-## 7) Templates
-
-Ready-to-copy templates live under:
-- `generator_templates/`
-
-Each template folder includes:
-- `generator.py`
-- `docker-compose.yml`
-- `catalog_source.json` (a full schema v3 catalog file you can drop into `data_sources/...`)
-
----
-
-## 8) AI-assisted workflow
-
-Use the Web UI page:
-- `GET /generator_builder`
-
-It can:
-- Generate a **prompt** you can paste into an AI assistant
-- Download a **scaffold zip** you can unzip into the repo
-- Produce a **catalog JSON snippet** to register the generator
-
-Important: the Generator Builder does **not** automatically install/register the generator into the catalog. You still need to add a catalog source file and enable it.
-
-### Step-by-step: ZIP → repo → catalog
-
-1) Download the scaffold ZIP and unzip it into the repo root.
-
-This creates a folder under one of:
-- `flag_generators/<your_folder>/...` (for `flag-generator`)
-- `flag_node_generators/<your_folder>/...` (for `flag-node-generator`)
-
-2) Register the generated `catalog_source.json` as a catalog source.
-
-The scaffold includes `catalog_source.json` inside the new folder. You must copy its contents into a catalog source JSON file under:
-- `data_sources/flag_generators/*.json` (for `flag-generator`)
-- `data_sources/flag_node_generators/*.json` (for `flag-node-generator`)
-
-Example (flag-generators):
-- Create: `data_sources/flag_generators/20260112-my_generators.json`
-- Paste the full `catalog_source.json` content into it (or merge multiple generators into one source file).
-
-3) Enable the new source in the corresponding `_state.json`.
-
-Update one of:
-- `data_sources/flag_generators/_state.json`
-- `data_sources/flag_node_generators/_state.json`
-
-Add a `sources[]` entry with `enabled: true` pointing at your new catalog file path.
-
-4) Verify it shows up.
-
-- In the Web UI: open **Flag-Catalog** and confirm the new generator appears.
-- Or locally: run `python scripts/run_flag_generator.py ...` using your `--generator-id`.
-
-Tip: ask the AI to keep the generator deterministic from `(seed, secret, node_name)` and always write `outputs.json`.
+Install it in the Web UI via the Flag Catalog page (upload/import URL).

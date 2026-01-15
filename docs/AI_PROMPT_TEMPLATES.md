@@ -11,8 +11,9 @@ These prompts assume you start from the **Generator Builder scaffold** (or the e
 For best results, paste:
 
 - Your target **generator type**: `flag-generator` or `flag-node-generator`
-- Your intended `plugin_id`
+- Your intended generator **source id** (the `id` in `manifest.yaml`)
 - Your intended `requires` and `produces` artifacts
+- Your `manifest.yaml` (or at least the relevant fields: `id`, `kind`, `runtime`, `inputs`, `artifacts`, `hint_templates`, `injects`)
 - The current scaffolded `generator.py` (and optionally your `docker-compose.yml` / README)
 - A short description of the generator behavior you want
 
@@ -27,7 +28,7 @@ Tell the AI these are strict requirements:
 
 ```json
 {
-  "generator_id": "<PLUGIN_ID>",
+  "generator_id": "<SOME STABLE STRING>",
   "outputs": {
     "flag": "FLAG{...}",
     "<other_artifact_keys>": "..."
@@ -35,7 +36,9 @@ Tell the AI these are strict requirements:
 }
 ```
 
-- `generator_id` **must exactly match** the catalog’s `plugin_id`.
+- `generator_id` is required by schema and used as provenance.
+  - If you are using a legacy v3 JSON catalog, set `generator_id` to the catalog `plugin_id`.
+  - If you are using `manifest.yaml` / Generator Packs, the Web UI assigns a *new numeric installed ID* at install time, so don’t hardcode the installed ID into your generator; using your source manifest `id` is acceptable.
 - Outputs should be **deterministic** for the same inputs.
 - `hint.txt` is optional. Prefer `hint_templates` in the catalog; only write `/outputs/hint.txt` if you explicitly need a standalone hint file.
 - Treat Flow-synthesized values as **inputs**, not artifacts:
@@ -44,7 +47,9 @@ Tell the AI these are strict requirements:
 If the generator needs to deliver a file/binary to participants:
 
 - Write the file(s) under `/outputs/artifacts/...` (so they appear under `<out_dir>/artifacts/...`).
-- In the catalog implementation, declare `inject_files` as an allowlist.
+- Allowlist injected files:
+  - Manifest workflow: declare `injects` in `manifest.yaml`.
+  - Legacy v3 JSON workflow: declare `inject_files` in the implementation.
   - Prefer referencing an **output artifact key** so the allowlist stays stable, e.g. `inject_files: ["filesystem.file"]`.
   - `inject_files` supports resolving output keys via `outputs.json` (e.g. `filesystem.file` -> `artifacts/my_binary`).
 
@@ -58,19 +63,21 @@ Paste this, then fill in the placeholders.
 You are helping me implement a CORE TopoGen generator.
 
 TYPE: flag-generator
-PLUGIN_ID: <my.plugin_id>
+SOURCE_ID: <my_source_id>
 
 Hard requirements (do not violate):
 - Read /inputs/config.json (JSON).
 - Write /outputs/outputs.json with:
   {
-    "generator_id": "<PLUGIN_ID>",
+    "generator_id": "<SOME STABLE STRING>",
     "outputs": {
       "flag": "FLAG{...}",
       "...": "..."
     }
   }
-- generator_id MUST exactly match PLUGIN_ID.
+- generator_id requirements:
+  - If using legacy v3 JSON catalogs, set generator_id == plugin_id.
+  - If using manifest/packs, do not assume the installed numeric ID is stable; using SOURCE_ID is acceptable.
 - Do NOT write /outputs/hint.txt unless I explicitly ask; prefer hint_templates in the catalog.
 - Deterministic outputs: same (seed, secret, flag_prefix) => same outputs.
 - Inputs (NOT artifacts): seed (required), secret (required), flag_prefix (optional).
@@ -106,21 +113,23 @@ Paste this, then fill in the placeholders.
 You are helping me implement a CORE TopoGen generator.
 
 TYPE: flag-node-generator
-PLUGIN_ID: <my.plugin_id>
+SOURCE_ID: <my_source_id>
 
 Hard requirements (do not violate):
 - Read /inputs/config.json (JSON).
 - Write a per-node docker compose file to /outputs/docker-compose.yml.
 - Write /outputs/outputs.json with:
   {
-    "generator_id": "<PLUGIN_ID>",
+    "generator_id": "<SOME STABLE STRING>",
     "outputs": {
       "compose_path": "docker-compose.yml",
       "flag": "FLAG{...}",
       "...": "..."
     }
   }
-- generator_id MUST exactly match PLUGIN_ID.
+- generator_id requirements:
+  - If using legacy v3 JSON catalogs, set generator_id == plugin_id.
+  - If using manifest/packs, do not assume the installed numeric ID is stable; using SOURCE_ID is acceptable.
 - Deterministic outputs: same (seed, node_name, flag_prefix) => same outputs and compose.
 - Inputs (NOT artifacts): seed (required), node_name (required), flag_prefix (optional).
 

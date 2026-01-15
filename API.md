@@ -47,6 +47,7 @@ The web UI uses cookie sessions. Script clients must authenticate once and reuse
 - [CORE Session Management](#core-session-management)
 - [Data Sources & Vulnerability Catalog](#data-sources--vulnerability-catalog)
 - [Generator Builder](#generator-builder)
+- [Generator Packs & Installed Generators](#generator-packs--installed-generators)
 - [Diagnostics & Maintenance](#diagnostics--maintenance)
 - [User Administration](#user-administration)
 
@@ -229,16 +230,70 @@ Notes:
 : Same JSON request body as `/api/generators/scaffold_meta`, but returns a ZIP you can unzip into the repo root.
 
 Registering the scaffolded generator:
-- Unzip the archive into the repo root (it creates `flag_generators/<folder>/...` or `flag_node_generators/<folder>/...`).
-- Copy the generated `catalog_source.json` into a catalog source file under `data_sources/flag_generators/` or `data_sources/flag_node_generators/`.
-- Enable that new source in `data_sources/flag_generators/_state.json` or `data_sources/flag_node_generators/_state.json`.
+- The scaffold ZIP creates a folder under `flag_generators/<folder>/...` or `flag_node_generators/<folder>/...`.
+- **Legacy workflow (v3 JSON catalogs):** copy the generated `catalog_source.json` into a catalog source file under `data_sources/flag_generators/` or `data_sources/flag_node_generators/`, then enable that source in the corresponding `_state.json`.
+- **Recommended workflow (manifests + packs):** add a `manifest.yaml` to the generator folder, zip it as a Generator Pack, and install it via the Flag Catalog page.
 
 `POST /api/generators/register_catalog`
-: Convenience endpoint that writes the generated catalog source JSON to `data_sources/flag_generators/` or `data_sources/flag_node_generators/` and enables it in the corresponding `_state.json`. Returns `{ ok, catalog_path, state_path, source, note }`.
+: **Legacy convenience endpoint** that writes the generated schema v3 catalog source JSON to `data_sources/flag_generators/` or `data_sources/flag_node_generators/` and enables it in the corresponding `_state.json`. Returns `{ ok, catalog_path, state_path, source, note }`.
 
 Notes:
 - By default it refuses to register if a generator with the same `plugin_id` already exists in enabled sources (HTTP 409).
 - Set request JSON fields `force=true` to bypass the duplicate check, and `overwrite=true` to overwrite the generated catalog source filename if it already exists.
+
+### Generator Packs & Installed Generators
+
+These endpoints support Generator Packs (ZIP files) and the installed generator set used by the Web UI + Flow.
+
+Important behavior:
+- Installed generators live under `outputs/installed_generators/`.
+- On install, each generator is assigned a **new numeric ID** (string) and the installed `manifest.yaml` is rewritten to that ID.
+- Packs and generators can be disabled; disabled generators are rejected by Flow preview/execute.
+
+#### Pack lifecycle (HTML form endpoints)
+
+`POST /generator_packs/upload`
+: Multipart form with `zip_file` (a `.zip`). Installs a pack and redirects back to the Flag Catalog page. If called with `X-Requested-With: XMLHttpRequest`, returns JSON `{ ok, message|error }`.
+
+`POST /generator_packs/import_url`
+: Form field `zip_url` (HTTP/HTTPS URL to a `.zip`). Downloads and installs the pack.
+
+`POST /generator_packs/delete/<pack_id>`
+: Uninstalls the pack. Deletes installed generator directories recorded in the pack state (scoped to the installed-generators root).
+
+`POST /generator_packs/set_disabled/<pack_id>`
+: Toggles pack disabled state (form endpoint).
+
+`GET /generator_packs/download/<pack_id>`
+: Downloads a ZIP representing the installed pack (including installed manifests).
+
+`GET /generator_packs/export_all`
+: Downloads a bundle ZIP containing one ZIP per installed pack under `packs/<pack_id>.zip`.
+
+#### Pack/generator disable + delete (JSON endpoints)
+
+`POST /api/generator_packs/set_disabled`
+: JSON `{ "pack_id": "...", "disabled": true|false }`.
+
+`POST /api/flag_generators/set_disabled`
+: JSON `{ "generator_id": "...", "disabled": true|false }`.
+
+`POST /api/flag_node_generators/set_disabled`
+: JSON `{ "generator_id": "...", "disabled": true|false }`.
+
+`POST /api/flag_generators/delete`
+: JSON `{ "generator_id": "..." }`. Deletes an installed flag-generator.
+
+`POST /api/flag_node_generators/delete`
+: JSON `{ "generator_id": "..." }`. Deletes an installed flag-node-generator.
+
+#### Installed generator listings
+
+`GET /flag_generators_data`
+: Returns `{ "generators": [...], "errors": [...] }` for installed flag-generators (manifest-based). Generator entries may include `_pack_id`, `_pack_label`, and `_disabled`.
+
+`GET /flag_node_generators_data`
+: Returns `{ "generators": [...], "errors": [...] }` for installed flag-node-generators (manifest-based).
 
 ### Run Execution & Reports
 

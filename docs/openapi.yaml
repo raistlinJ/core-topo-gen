@@ -40,6 +40,8 @@ tags:
     description: Vulnerability/data source CSV management endpoints.
   - name: Generator Builder
     description: Helpers for scaffolding new flag-generators and flag-node-generators.
+  - name: Generator Packs
+    description: Install/manage Generator Packs and installed generators (manifest-based).
   - name: Vulnerabilities
     description: Compose download/pull helpers for vulnerability catalog entries.
   - name: Users
@@ -158,9 +160,12 @@ paths:
         - Generator Builder
       summary: Register a generator catalog source
       description: >-
-        Convenience endpoint that writes the generated schema v3 catalog source JSON into
+        Legacy convenience endpoint that writes the generated schema v3 catalog source JSON into
         `data_sources/flag_generators/` or `data_sources/flag_node_generators/` and updates
         the corresponding `_state.json` to enable it.
+
+        Recommended workflow for the Web UI / Flow is manifest-based generators installed via
+        Generator Packs (see the Generator Packs endpoints).
 
         By default this endpoint refuses to register if a generator with the same `plugin_id`
         already exists in enabled sources (HTTP 409). Use `force=true` to bypass the duplicate check.
@@ -218,6 +223,299 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+
+  /generator_packs/upload:
+    post:
+      tags:
+        - Generator Packs
+        - UI Pages
+      summary: Upload and install a Generator Pack ZIP
+      description: >-
+        Upload a `.zip` file containing one or more generators under `flag_generators/` and/or
+        `flag_node_generators/`. Installs them under `outputs/installed_generators/`.
+
+        When called as an XMLHttpRequest (`X-Requested-With: XMLHttpRequest`), responds with JSON.
+        Otherwise, redirects back to the Flag Catalog page.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                zip_file:
+                  type: string
+                  format: binary
+      responses:
+        '302':
+          description: Redirect back to catalog page (HTML form submission).
+        '200':
+          description: JSON response (XHR).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  message:
+                    type: string
+                  error:
+                    type: string
+
+  /generator_packs/import_url:
+    post:
+      tags:
+        - Generator Packs
+        - UI Pages
+      summary: Install a Generator Pack from a URL
+      description: Downloads a `.zip` from the provided URL and installs it.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                zip_url:
+                  type: string
+      responses:
+        '302':
+          description: Redirect back to catalog page.
+
+  /generator_packs/delete/{pack_id}:
+    post:
+      tags:
+        - Generator Packs
+        - UI Pages
+      summary: Uninstall a Generator Pack
+      parameters:
+        - name: pack_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect back to catalog page.
+
+  /generator_packs/set_disabled/{pack_id}:
+    post:
+      tags:
+        - Generator Packs
+        - UI Pages
+      summary: Toggle disabled state for a pack (form endpoint)
+      parameters:
+        - name: pack_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                disabled:
+                  type: string
+                  description: Treats 'true' as disabled.
+      responses:
+        '302':
+          description: Redirect back to catalog page.
+
+  /api/generator_packs/set_disabled:
+    post:
+      tags:
+        - Generator Packs
+      summary: Toggle disabled state for a pack (JSON endpoint)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pack_id]
+              properties:
+                pack_id:
+                  type: string
+                disabled:
+                  type: boolean
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  message:
+                    type: string
+                  error:
+                    type: string
+
+  /api/flag_generators/set_disabled:
+    post:
+      tags:
+        - Generator Packs
+      summary: Toggle disabled state for an installed flag-generator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [generator_id]
+              properties:
+                generator_id:
+                  type: string
+                disabled:
+                  type: boolean
+      responses:
+        '200':
+          description: OK.
+
+  /api/flag_node_generators/set_disabled:
+    post:
+      tags:
+        - Generator Packs
+      summary: Toggle disabled state for an installed flag-node-generator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [generator_id]
+              properties:
+                generator_id:
+                  type: string
+                disabled:
+                  type: boolean
+      responses:
+        '200':
+          description: OK.
+
+  /api/flag_generators/delete:
+    post:
+      tags:
+        - Generator Packs
+      summary: Delete an installed flag-generator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [generator_id]
+              properties:
+                generator_id:
+                  type: string
+      responses:
+        '200':
+          description: OK.
+
+  /api/flag_node_generators/delete:
+    post:
+      tags:
+        - Generator Packs
+      summary: Delete an installed flag-node-generator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [generator_id]
+              properties:
+                generator_id:
+                  type: string
+      responses:
+        '200':
+          description: OK.
+
+  /generator_packs/download/{pack_id}:
+    get:
+      tags:
+        - Generator Packs
+        - UI Pages
+      summary: Download a ZIP for an installed pack
+      parameters:
+        - name: pack_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: ZIP archive.
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+
+  /generator_packs/export_all:
+    get:
+      tags:
+        - Generator Packs
+        - UI Pages
+      summary: Export all installed packs as a bundle ZIP
+      responses:
+        '200':
+          description: ZIP archive containing one ZIP per pack under packs/*.zip.
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+
+  /flag_generators_data:
+    get:
+      tags:
+        - Generator Packs
+      summary: List installed flag-generators (manifest-based)
+      responses:
+        '200':
+          description: Generator list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  generators:
+                    type: array
+                    items:
+                      type: object
+                  errors:
+                    type: array
+                    items:
+                      type: object
+
+  /flag_node_generators_data:
+    get:
+      tags:
+        - Generator Packs
+      summary: List installed flag-node-generators (manifest-based)
+      responses:
+        '200':
+          description: Generator list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  generators:
+                    type: array
+                    items:
+                      type: object
+                  errors:
+                    type: array
+                    items:
+                      type: object
   /login:
     get:
       tags:

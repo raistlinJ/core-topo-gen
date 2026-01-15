@@ -24,18 +24,18 @@
       <div class="card shadow-sm mb-3">
         <div class="card-header d-flex align-items-center justify-content-between">
           <div class="fw-semibold"><i class="bi bi-wrench-adjustable"></i> Generator Builder</div>
-          <span class="badge text-bg-secondary">Scaffold + catalog</span>
+          <span class="badge text-bg-secondary">Scaffold + manifest</span>
         </div>
         <div class="card-body">
           <div class="alert alert-info small mb-3">
-            Builds a ready-to-unzip scaffold for creating new generators.
-            Output follows the existing <code>scripts/run_flag_generator.py</code> contract.
+            Builds a ready-to-zip scaffold for creating new generators.
+            The scaffold includes <span class="font-monospace">manifest.yaml</span> for Generator Packs and follows the existing <code>scripts/run_flag_generator.py</code> runtime contract.
             <div class="mt-2">
               <div class="fw-semibold">Conventions</div>
               <ul class="mb-0">
                 <li><span class="font-monospace">hint.txt</span> is optional; prefer <span class="font-monospace">hint_templates</span> in the catalog.</li>
                 <li>For file outputs: write under <span class="font-monospace">/outputs/artifacts/...</span> and reference in <span class="font-monospace">outputs.json</span> as <span class="font-monospace">artifacts/&lt;name&gt;</span>.</li>
-                <li>To stage files into scenarios, set <span class="font-monospace">inject_files</span> (prefer output keys like <span class="font-monospace">filesystem.file</span>).</li>
+                <li>To stage files into scenarios, set an allowlist (prefer output keys like <span class="font-monospace">filesystem.file</span>): <span class="font-monospace">injects</span> (manifest) and <span class="font-monospace">inject_files</span> (legacy catalog JSON).</li>
               </ul>
             </div>
           </div>
@@ -50,9 +50,9 @@
 
           <div class="row g-2">
             <div class="col-12 col-md-6">
-              <label class="form-label">plugin_id</label>
+              <label class="form-label">Source ID</label>
               <input class="form-control" id="gbPluginId" placeholder="e.g. my_ssh_creds">
-              <div class="form-text">Must match <code>outputs.json.generator_id</code>.</div>
+              <div class="form-text">Used as the source <span class="font-monospace">manifest.yaml</span> <code>id</code> and as the legacy catalog <code>plugin_id</code>. Installed Generator Packs are assigned a new numeric id at install time.</div>
             </div>
             <div class="col-12 col-md-6">
               <label class="form-label">Folder name</label>
@@ -72,19 +72,19 @@
           </div>
 
           <div class="mb-2">
-            <label class="form-label">Requires</label>
+            <label class="form-label">Inputs (artifacts)</label>
             <div class="d-flex gap-2">
-              <button class="btn btn-sm btn-outline-primary" type="button" id="gbReqAddBtn"><i class="bi bi-plus-circle"></i> Add requires</button>
+              <button class="btn btn-sm btn-outline-primary" type="button" id="gbReqAddBtn"><i class="bi bi-plus-circle"></i> Add inputs</button>
               <button class="btn btn-sm btn-outline-secondary" type="button" id="gbReqClearBtn">Clear</button>
             </div>
-            <div class="form-text">Select artifact keys; synthesized values (seed/node_name/secret) belong under Inputs.</div>
+            <div class="form-text">Select artifact keys the generator reads. Mark any selected input as <span class="fw-semibold">required</span>; others default to optional.</div>
             <div class="mt-2" id="gbRequiresList"></div>
           </div>
 
           <div class="mb-2">
-            <label class="form-label">Produces</label>
+            <label class="form-label">Outputs (artifacts)</label>
             <div class="d-flex gap-2">
-              <button class="btn btn-sm btn-outline-primary" type="button" id="gbProdAddBtn"><i class="bi bi-plus-circle"></i> Add produces</button>
+              <button class="btn btn-sm btn-outline-primary" type="button" id="gbProdAddBtn"><i class="bi bi-plus-circle"></i> Add outputs</button>
               <button class="btn btn-sm btn-outline-secondary" type="button" id="gbProdClearBtn">Clear</button>
             </div>
             <div class="form-text">These are artifact keys the generator will write into <code>outputs.json</code>.</div>
@@ -102,7 +102,7 @@
           </div>
 
           <div class="mb-2">
-            <label class="form-label">Inputs (included in schema)</label>
+            <label class="form-label">Runtime inputs (config schema)</label>
             <div class="d-flex flex-wrap gap-2">
               <div class="form-check">
                 <input class="form-check-input" type="checkbox" id="gbInSeed" checked>
@@ -121,7 +121,7 @@
                 <label class="form-check-label" for="gbInFlagPrefix">flag_prefix</label>
               </div>
             </div>
-            <div class="form-text">Flow-synthesized values must be modeled as inputs, not requires.</div>
+            <div class="form-text">Flow-synthesized values must be modeled as runtime inputs, not artifact inputs.</div>
           </div>
 
           <div class="mb-3">
@@ -146,6 +146,7 @@
 
           <div class="mt-2 small text-muted">
             To install a generator, upload the ZIP as a Generator Pack on the <a href="{{ url_for('flag_catalog_page') }}" class="text-muted">Flag-Catalog</a> page.
+            For local dev, you can also unzip into the repo and run <span class="font-monospace">scripts/run_flag_generator.py</span> against it.
           </div>
 
           <div class="mt-3 small text-muted">
@@ -155,8 +156,11 @@
       </div>
 
       <div class="card shadow-sm mb-3">
-        <div class="card-header fw-semibold"><i class="bi bi-braces"></i> Catalog JSON (generated)</div>
+        <div class="card-header fw-semibold"><i class="bi bi-braces"></i> Legacy Catalog JSON (generated)</div>
         <div class="card-body">
+          <div class="small text-muted mb-2">
+            This is the legacy schema v3 catalog format. The recommended workflow is <span class="font-monospace">manifest.yaml</span> + Generator Packs.
+          </div>
           <textarea class="form-control font-monospace" id="gbCatalogJson" rows="10" readonly></textarea>
         </div>
       </div>
@@ -225,6 +229,7 @@
             <thead>
               <tr>
                 <th style="width: 56px;">Pick</th>
+                <th style="width: 110px;" id="gbArtifactRequiredHeader" class="d-none">Required</th>
                 <th>Artifact</th>
                 <th style="width: 160px;">Type</th>
                 <th>Description</th>
@@ -379,11 +384,12 @@
       optWrap.className = 'form-check form-switch mb-0';
       const optId = `gbReqOpt_${idx}`;
       optWrap.innerHTML = `
-        <input class="form-check-input" type="checkbox" id="${optId}" ${item.optional ? 'checked' : ''}>
-        <label class="form-check-label small" for="${optId}">optional</label>
+        <input class="form-check-input" type="checkbox" id="${optId}" ${(!item.optional) ? 'checked' : ''}>
+        <label class="form-check-label small" for="${optId}">required</label>
       `;
       optWrap.querySelector('input').addEventListener('change', (ev)=>{
-        state.requires[idx].optional = !!ev.target.checked;
+        // UI is "required" but state stores "optional".
+        state.requires[idx].optional = !ev.target.checked;
       });
 
       const rm = document.createElement('button');
@@ -526,10 +532,16 @@
   function openArtifactModal(mode){
     state.modalMode = mode;
     document.getElementById('gbArtifactModalTitle').textContent = (mode === 'requires')
-      ? 'Select required artifacts'
+      ? 'Select input artifacts'
       : (mode === 'produces')
-        ? 'Select produced artifacts'
+        ? 'Select output artifacts'
         : 'Select injected artifacts';
+    // Show/hide "Required" column only for Inputs.
+    const reqHeader = document.getElementById('gbArtifactRequiredHeader');
+    if(reqHeader){
+      if(mode === 'requires') reqHeader.classList.remove('d-none');
+      else reqHeader.classList.add('d-none');
+    }
     document.getElementById('gbArtifactFilter').value = '';
     document.getElementById('gbArtifactFilterRegex').checked = false;
     document.getElementById('gbArtifactRegexError').classList.add('d-none');
@@ -593,31 +605,57 @@
     items.forEach((a, idx)=>{
       const tr = document.createElement('tr');
       const checkboxId = `gbArtPick_${idx}`;
+      const reqId = `gbArtReq_${idx}`;
       const title = tooltipTitleForMeta(a);
+      const showRequired = (state.modalMode === 'requires');
       tr.innerHTML = `
-        <td><input class="form-check-input" type="checkbox" id="${checkboxId}" data-artifact="${escapeHtml(a.artifact)}"></td>
+        <td><input class="form-check-input" type="checkbox" id="${checkboxId}" data-role="pick" data-artifact="${escapeHtml(a.artifact)}"></td>
+        <td class="${showRequired ? '' : 'd-none'}">
+          <input class="form-check-input" type="checkbox" id="${reqId}" data-role="required" data-artifact="${escapeHtml(a.artifact)}" disabled>
+        </td>
         <td class="font-monospace">${title ? `<span data-bs-toggle=\"tooltip\" data-bs-title=\"${escapeHtml(title)}\">${escapeHtml(a.artifact || '')}</span>` : escapeHtml(a.artifact || '')}</td>
         <td>${escapeHtml(a.type || '')}</td>
         <td class="small">${escapeHtml(a.description || '')}</td>
         <td class="small">${escapeHtml(a.producers_text || '')}</td>
       `;
       body.appendChild(tr);
+
+      // Required checkbox only makes sense when picked.
+      try {
+        const pickEl = tr.querySelector('input[data-role="pick"]');
+        const reqEl = tr.querySelector('input[data-role="required"]');
+        if(pickEl && reqEl){
+          pickEl.addEventListener('change', ()=>{
+            const on = !!pickEl.checked;
+            reqEl.disabled = !on;
+            if(!on) reqEl.checked = false;
+          });
+        }
+      } catch(e) {}
     });
     refreshTooltips(body);
   }
 
   function applyArtifactSelections(){
-    const picks = Array.from(document.querySelectorAll('#gbArtifactBody input[type="checkbox"]'))
-      .filter(el=>el && el.checked)
-      .map(el=>String(el.getAttribute('data-artifact') || '').trim())
-      .filter(Boolean);
+    const rows = Array.from(document.querySelectorAll('#gbArtifactBody tr'));
+    const picked = [];
+    rows.forEach((tr)=>{
+      const pickEl = tr.querySelector('input[data-role="pick"]');
+      if(!pickEl || !pickEl.checked) return;
+      const artifact = String(pickEl.getAttribute('data-artifact') || '').trim();
+      if(!artifact) return;
+      const reqEl = tr.querySelector('input[data-role="required"]');
+      const required = !!(reqEl && reqEl.checked);
+      picked.push({artifact, required});
+    });
 
     if(state.modalMode === 'requires'){
-      picks.forEach(a=>state.requires.push({artifact: a, optional: false}));
+      // Default to optional unless explicitly marked required.
+      picked.forEach(({artifact, required})=>state.requires.push({artifact, optional: !required}));
     } else if(state.modalMode === 'produces'){
-      picks.forEach(a=>state.produces.push(a));
+      picked.forEach(({artifact})=>state.produces.push(artifact));
     } else if(state.modalMode === 'inject_files'){
-      picks.forEach(a=>state.inject_files.push(a));
+      picked.forEach(({artifact})=>state.inject_files.push(artifact));
     }
     normalizeSelected();
     renderRequires();
