@@ -9375,7 +9375,7 @@ def _latest_preview_plan_for_scenario_norm(scenario_norm: str, *, prefer_flow: b
 
     This is primarily used by Flag Sequencing. Two plan types exist:
     - Preview plans: outputs/plans/plan_from_preview_*.json
-    - Flow-modified plans: outputs/plans/plan_from_flow_*.json
+    - Flow-modified plans: outputs/plans/plan_from_flow*.json
 
     By default, we prefer preview plans. Flow-modified plans may include
     runtime/Flow-only mutations (e.g., promoting nodes to Docker role for
@@ -9439,7 +9439,7 @@ def _latest_preview_plan_for_scenario_norm(scenario_norm: str, *, prefer_flow: b
                     continue
             return None, 0.0
 
-        latest_flow, latest_flow_ts = _latest_matching('plan_from_flow_*.json')
+        latest_flow, latest_flow_ts = _latest_matching('plan_from_flow*.json')
         latest_preview, latest_preview_ts = _latest_matching('plan_from_preview_*.json')
 
         if prefer_flow:
@@ -9568,7 +9568,7 @@ def _latest_flow_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
         plans_dir = Path(_outputs_dir()) / 'plans'
         if not plans_dir.is_dir():
             return None
-        candidates = list(plans_dir.glob('plan_from_flow_*.json'))
+        candidates = list(plans_dir.glob('plan_from_flow*.json'))
         candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         for p in candidates[:250]:
             try:
@@ -9761,8 +9761,8 @@ def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dic
                     continue
                 if enforce_unique and nid in used:
                     continue
-                    pick = n
-                    break
+                pick = n
+                break
             cand = pick
 
         if not isinstance(cand, dict):
@@ -10435,11 +10435,13 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
         input_fields_optional = sorted([x for x in input_fields_all if x and x not in set(input_fields_required)])
         output_fields = sorted(list(_output_fields_of(gen)))
 
-        raw_overrides = req.get('config_overrides')
+        # Preview-level input overrides are optional; these are primarily relevant
+        # for UI preview and are filtered to known inputs + synthesized fields.
+        raw_overrides = preview.get('config_overrides')
         if not isinstance(raw_overrides, dict):
-            raw_overrides = req.get('inputs_overrides')
+            raw_overrides = preview.get('inputs_overrides')
         if not isinstance(raw_overrides, dict):
-            raw_overrides = req.get('input_overrides')
+            raw_overrides = preview.get('input_overrides')
 
         allowed_override_keys: set[str] = set(input_fields_all)
         try:
@@ -10449,26 +10451,14 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
 
         config_overrides: dict[str, Any] = {}
         if isinstance(raw_overrides, dict):
-            for k, v in (raw_overrides or {}).items():
+            for k, v in raw_overrides.items():
                 kk = str(k or '').strip()
-                if kk and kk in allowed_override_keys:
-                    config_overrides[kk] = v
-
-        config_overrides: dict[str, Any] = {}
-        try:
-            raw_overrides = req.get('config_overrides') or req.get('inputs_overrides') or req.get('input_overrides')
-            if isinstance(raw_overrides, dict) and raw_overrides:
-                allowed_override_keys = set(input_fields_all) | set(_flow_synthesized_inputs())
-                for k, v in raw_overrides.items():
-                    kk = str(k or '').strip()
-                    if not kk:
-                        continue
-                    if allowed_override_keys and kk not in allowed_override_keys:
-                        continue
-                    # Preserve explicit clears (None/empty) as an override.
-                    config_overrides[kk] = v
-        except Exception:
-            config_overrides = {}
+                if not kk:
+                    continue
+                if allowed_override_keys and kk not in allowed_override_keys:
+                    continue
+                # Preserve explicit clears (None/empty) as an override.
+                config_overrides[kk] = v
 
         # If an artifact "requires" token also appears as an optional input field,
         # treat it as optional (do not block chaining/validation on it).
@@ -10874,43 +10864,23 @@ def _flow_validate_chain_order_by_requires_produces(
 
 
 def _flow_enabled_plugin_contracts_by_id() -> dict[str, dict[str, Any]]:
-    """Return enabled v3 plugin contracts indexed by plugin_id.
+    """Return generator plugin contracts indexed by plugin_id.
 
-    This loads only the plugin contracts (not merged generator views) for both
-    flag-generators and flag-node-generators.
+    Strict: contracts are derived from per-generator YAML manifests.
     """
     plugins_by_id: dict[str, dict[str, Any]] = {}
-
-    def _ingest_state(state: dict) -> None:
-        try:
-            sources = state.get('sources') or []
-        except Exception:
-            sources = []
-        for s in sources:
-            if not isinstance(s, dict):
-                continue
-            if not s.get('enabled', False):
-                continue
-            path = s.get('path')
-            ok, _note, doc, _skipped = _validate_and_normalize_flag_generator_source_json(path)
-            if not ok or not isinstance(doc, dict):
-                continue
-            for p in (doc.get('plugins') or []):
-                if not isinstance(p, dict):
-                    continue
-                pid = str(p.get('plugin_id') or '').strip()
-                if pid and pid not in plugins_by_id:
-                    plugins_by_id[pid] = p
-
     try:
-        _ingest_state(_load_flag_generator_sources_state())
+        _gens, fg_plugins, _errs = _flag_generators_from_manifests(kind='flag-generator')
+        plugins_by_id.update({k: v for k, v in (fg_plugins or {}).items() if isinstance(k, str) and isinstance(v, dict)})
     except Exception:
         pass
     try:
-        _ingest_state(_load_flag_node_generator_sources_state())
+        _gens2, ng_plugins, _errs2 = _flag_generators_from_manifests(kind='flag-node-generator')
+        for k, v in (ng_plugins or {}).items():
+            if isinstance(k, str) and k not in plugins_by_id and isinstance(v, dict):
+                plugins_by_id[k] = v
     except Exception:
         pass
-
     return plugins_by_id
 
 
@@ -15252,6 +15222,10 @@ def _load_scenario_hitl_validation_from_disk() -> dict[str, Dict[str, Any]]:
         core = _sanitize_hitl_validation_hint(scen_val.get('core'))
         if prox:
             entry['proxmox'] = prox
+        if core:
+            entry['core'] = core
+        if entry:
+            out[norm] = entry
     return out
 
 
@@ -31726,7 +31700,13 @@ def api_generators_register_catalog():
 @app.route('/flag_catalog')
 def flag_catalog_page():
     state = _load_flag_generator_sources_state()
-    return render_template('flag_catalog.html', sources=state.get('sources', []), active_page='flag_catalog')
+    node_state = _load_flag_node_generator_sources_state()
+    return render_template(
+        'flag_catalog.html',
+        sources=state.get('sources', []),
+        node_sources=node_state.get('sources', []),
+        active_page='flag_catalog',
+    )
 
 
 @app.route('/flag_catalog_data')
@@ -31968,47 +31948,114 @@ def flag_sources_save(sid):
 # ---------------- Flag Generators (v3 plugin catalog) -----------------
 
 
-def _flag_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
-    """Aggregate generators from enabled generator sources.
+def _flag_generators_from_manifests(*, kind: str) -> tuple[list[dict], dict[str, dict[str, Any]], list[dict]]:
+    """Load generators + plugin contracts from strict YAML manifests.
 
-    Returns: (generators, errors)
+    Returns: (generator_views, plugins_by_id, errors)
     """
-    state = _load_flag_generator_sources_state()
-    sources = state.get('sources') or []
-    all_gens: list[dict] = []
+    try:
+        from core_topo_gen.generator_manifests import discover_generator_manifests
+    except Exception as exc:
+        return [], {}, [{'error': f'failed to import manifest loader: {exc}'}]
+
+    try:
+        repo_root = _get_repo_root()
+    except Exception:
+        repo_root = os.getcwd()
+
+    gens, plugins_by_id, errs = discover_generator_manifests(repo_root=repo_root, kind=kind)
     errors: list[dict] = []
-    seen_ids: set[str] = set()
-    for s in sources:
-        if not isinstance(s, dict):
+    for e in (errs or []):
+        try:
+            errors.append({'path': getattr(e, 'path', ''), 'error': getattr(e, 'error', str(e))})
+        except Exception:
             continue
-        if not s.get('enabled', False):
-            continue
-        path = s.get('path')
-        ok, note, doc, skipped = _validate_and_normalize_flag_generator_source_json(path)
-        if not ok or not doc:
-            errors.append({'source': s.get('name'), 'path': path, 'error': note})
-            continue
-        gens, gerrs = _v3_catalog_to_generator_views(doc)
-        for e in gerrs:
-            try:
-                errors.append({'source': s.get('name'), 'path': path, **(e if isinstance(e, dict) else {'warning': str(e)})})
-            except Exception:
+    return gens, plugins_by_id, errors
+
+
+def _generator_collection_membership_by_id(*, plugin_type: str) -> dict[str, list[str]]:
+    """Return mapping plugin_id -> [source_name, ...] for enabled Generator Sources.
+
+    Note: generator definitions are loaded from manifests, but generator *collections*
+    are managed as uploaded v3 catalog JSON files. We use those catalogs only to
+    label generators with a human-friendly "source" name.
+    """
+
+    def _normalize_collection_label(name: str) -> str:
+        n = (name or '').strip()
+        if not n:
+            return ''
+        # If the name is a filename (common when it came from an upload),
+        # strip the extension for display.
+        low = n.lower()
+        if low.endswith('.json'):
+            n = n[:-5]
+        return n
+
+    out: dict[str, list[str]] = {}
+    try:
+        if plugin_type == 'flag-node-generator':
+            state = _load_flag_node_generator_sources_state()
+        else:
+            state = _load_flag_generator_sources_state()
+
+        for s in (state.get('sources') or []):
+            if not isinstance(s, dict) or not s.get('enabled'):
                 continue
-        for gen in gens:
-            if not isinstance(gen, dict):
+            src_name = _normalize_collection_label(str(s.get('name') or '').strip())
+            src_path = str(s.get('path') or '').strip()
+            if not src_name or not src_path or not os.path.exists(src_path):
                 continue
-            gid = str(gen.get('id') or '')
-            if not gid or gid in seen_ids:
+            ok, _note, doc, _skipped = _validate_and_normalize_flag_generator_source_json(src_path)
+            if not ok or not isinstance(doc, dict):
                 continue
-            seen_ids.add(gid)
-            gen2 = dict(gen)
-            gen2['_source_name'] = s.get('name')
-            gen2['_source_path'] = path
-            all_gens.append(gen2)
-        if skipped:
-            errors.append({'source': s.get('name'), 'path': path, 'warning': f"skipped {len(skipped)} invalid generator(s)"})
-    all_gens.sort(key=lambda g: (str(g.get('name') or '').lower(), str(g.get('id') or '')))
-    return all_gens, errors
+            if str(doc.get('plugin_type') or '').strip() != plugin_type:
+                continue
+
+            plugin_ids: set[str] = set()
+            for p in (doc.get('plugins') or []):
+                if not isinstance(p, dict):
+                    continue
+                pid = _normalize_generator_id(_coerce_stripped(p.get('plugin_id'), ''))
+                if pid:
+                    plugin_ids.add(pid)
+            for impl in (doc.get('implementations') or []):
+                if not isinstance(impl, dict):
+                    continue
+                pid = _normalize_generator_id(_coerce_stripped(impl.get('plugin_id'), ''))
+                if pid:
+                    plugin_ids.add(pid)
+
+            for pid in sorted(plugin_ids):
+                out.setdefault(pid, []).append(src_name)
+    except Exception:
+        return out
+    return out
+
+
+def _flag_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
+    """Strict: load generator definitions from YAML manifests in the repo."""
+    gens, _plugins_by_id, errors = _flag_generators_from_manifests(kind='flag-generator')
+
+    # Label generators by any enabled "Generator Sources" collection(s) that
+    # include their id.
+    membership = _generator_collection_membership_by_id(plugin_type='flag-generator')
+    try:
+        for g in gens:
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get('id') or '').strip().lower()
+            if not gid:
+                continue
+            srcs = membership.get(gid) or []
+            if srcs:
+                g['_source_name'] = ', '.join([s for s in srcs if s])
+                g['_source_type'] = 'collection'
+            else:
+                g.setdefault('_source_type', 'manifest')
+    except Exception:
+        pass
+    return gens, errors
 
 
 def _load_flag_node_generator_sources_state() -> dict:
@@ -32040,43 +32087,26 @@ def _load_flag_node_generator_sources_state() -> dict:
 
 
 def _flag_node_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
-    """Aggregate node-generators from enabled node-generator sources."""
-    state = _load_flag_node_generator_sources_state()
-    sources = state.get('sources') or []
-    all_gens: list[dict] = []
-    errors: list[dict] = []
-    seen_ids: set[str] = set()
-    for s in sources:
-        if not isinstance(s, dict):
-            continue
-        if not s.get('enabled', False):
-            continue
-        path = s.get('path')
-        ok, note, doc, skipped = _validate_and_normalize_flag_generator_source_json(path)
-        if not ok or not doc:
-            errors.append({'source': s.get('name'), 'path': path, 'error': note})
-            continue
-        gens, gerrs = _v3_catalog_to_generator_views(doc)
-        for e in gerrs:
-            try:
-                errors.append({'source': s.get('name'), 'path': path, **(e if isinstance(e, dict) else {'warning': str(e)})})
-            except Exception:
+    """Strict: load node-generator definitions from YAML manifests in the repo."""
+    gens, _plugins_by_id, errors = _flag_generators_from_manifests(kind='flag-node-generator')
+
+    membership = _generator_collection_membership_by_id(plugin_type='flag-node-generator')
+    try:
+        for g in gens:
+            if not isinstance(g, dict):
                 continue
-        for gen in gens:
-            if not isinstance(gen, dict):
+            gid = str(g.get('id') or '').strip().lower()
+            if not gid:
                 continue
-            gid = str(gen.get('id') or '')
-            if not gid or gid in seen_ids:
-                continue
-            seen_ids.add(gid)
-            gen2 = dict(gen)
-            gen2['_source_name'] = s.get('name')
-            gen2['_source_path'] = path
-            all_gens.append(gen2)
-        if skipped:
-            errors.append({'source': s.get('name'), 'path': path, 'warning': f"skipped {len(skipped)} invalid generator(s)"})
-    all_gens.sort(key=lambda g: (str(g.get('name') or '').lower(), str(g.get('id') or '')))
-    return all_gens, errors
+            srcs = membership.get(gid) or []
+            if srcs:
+                g['_source_name'] = ', '.join([s for s in srcs if s])
+                g['_source_type'] = 'collection'
+            else:
+                g.setdefault('_source_type', 'manifest')
+    except Exception:
+        pass
+    return gens, errors
 
 
 @app.route('/flag_generators_data')
@@ -32294,6 +32324,209 @@ def flag_generators_sources_save(sid):
         os.replace(tmp, path)
         target['rows'] = note
         _save_flag_generator_sources_state(state)
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/flag_node_generators_sources/upload', methods=['POST'])
+def flag_node_generators_sources_upload():
+    f = request.files.get('json_file')
+    if not f or f.filename == '':
+        flash('No file selected.')
+        return redirect(url_for('flag_catalog_page'))
+    filename = secure_filename(f.filename)
+    if not filename.lower().endswith('.json'):
+        flash('Only .json allowed.')
+        return redirect(url_for('flag_catalog_page'))
+    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+    os.makedirs(FLAG_NODE_GENERATORS_SOURCES_DIR, exist_ok=True)
+    path = os.path.join(FLAG_NODE_GENERATORS_SOURCES_DIR, f"{unique}-{filename}")
+    path = os.path.abspath(path)
+    f.save(path)
+    ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(path)
+    if not ok or not normalized_doc or str(normalized_doc.get('plugin_type') or '') != 'flag-node-generator':
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        flash(f'Invalid node-generator JSON: {note}')
+        return redirect(url_for('flag_catalog_page'))
+    try:
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(normalized_doc, fh, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+    state = _load_flag_node_generator_sources_state()
+    state.setdefault('sources', [])
+    state['sources'].append({
+        'id': uuid.uuid4().hex[:12],
+        'name': filename,
+        'path': path,
+        'enabled': True,
+        'rows': note,
+        'uploaded': datetime.datetime.utcnow().isoformat() + 'Z',
+    })
+    _save_flag_node_generator_sources_state(state)
+    flash('Node-generator JSON imported.')
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_node_generators_sources/toggle/<sid>', methods=['POST'])
+def flag_node_generators_sources_toggle(sid):
+    state = _load_flag_node_generator_sources_state()
+    for s in state.get('sources', []):
+        if isinstance(s, dict) and s.get('id') == sid:
+            s['enabled'] = not s.get('enabled', False)
+            break
+    _save_flag_node_generator_sources_state(state)
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_node_generators_sources/delete/<sid>', methods=['POST'])
+def flag_node_generators_sources_delete(sid):
+    state = _load_flag_node_generator_sources_state()
+    kept = []
+    for s in state.get('sources', []):
+        if isinstance(s, dict) and s.get('id') == sid:
+            try:
+                p = s.get('path')
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+            continue
+        kept.append(s)
+    state['sources'] = kept
+    _save_flag_node_generator_sources_state(state)
+    flash('Deleted.')
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_node_generators_sources/refresh/<sid>', methods=['POST'])
+def flag_node_generators_sources_refresh(sid):
+    state = _load_flag_node_generator_sources_state()
+    for s in state.get('sources', []):
+        if isinstance(s, dict) and s.get('id') == sid:
+            path = s.get('path')
+            ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(path)
+            if ok and normalized_doc and str(normalized_doc.get('plugin_type') or '') == 'flag-node-generator':
+                try:
+                    tmp = path + '.tmp'
+                    with open(tmp, 'w', encoding='utf-8') as fh:
+                        json.dump(normalized_doc, fh, indent=2)
+                    os.replace(tmp, path)
+                except Exception:
+                    pass
+            s['rows'] = note if ok else f"ERR: {note}"
+            break
+    _save_flag_node_generator_sources_state(state)
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_node_generators_sources/download/<sid>')
+def flag_node_generators_sources_download(sid):
+    state = _load_flag_node_generator_sources_state()
+    for s in state.get('sources', []):
+        if isinstance(s, dict) and s.get('id') == sid:
+            p = s.get('path')
+            if p and os.path.exists(p):
+                download_name = s.get('name') or os.path.basename(p)
+                return send_file(p, as_attachment=True, download_name=download_name)
+    flash('Not found')
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/flag_node_generators_sources/export_all')
+def flag_node_generators_sources_export_all():
+    import io, zipfile
+    state = _load_flag_node_generator_sources_state()
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+        for s in state.get('sources', []):
+            if not isinstance(s, dict):
+                continue
+            p = s.get('path')
+            if p and os.path.exists(p):
+                z.write(p, arcname=os.path.basename(p))
+    mem.seek(0)
+    return send_file(mem, as_attachment=True, download_name='flag_node_generators_sources.zip')
+
+
+@app.route('/flag_node_generators_sources/edit/<sid>')
+def flag_node_generators_sources_edit(sid):
+    state = _load_flag_node_generator_sources_state()
+    target = None
+    for s in state.get('sources', []):
+        if isinstance(s, dict) and s.get('id') == sid:
+            target = s
+            break
+    if not target:
+        flash('Source not found')
+        return redirect(url_for('flag_catalog_page'))
+    path = target.get('path')
+    if not path or not os.path.exists(path):
+        flash('File missing')
+        return redirect(url_for('flag_catalog_page'))
+    try:
+        raw_text = open(path, 'r', encoding='utf-8').read()
+    except Exception:
+        raw_text = ''
+    return render_template(
+        'flag_node_generator_source_edit.html',
+        sid=sid,
+        name=target.get('name') or os.path.basename(path),
+        path=path,
+        raw_text=raw_text,
+        active_page='flag_catalog',
+    )
+
+
+@app.route('/flag_node_generators_sources/save/<sid>', methods=['POST'])
+def flag_node_generators_sources_save(sid):
+    """Save raw node-generator source JSON.
+
+    Payload: {"raw": "{...}"}
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        raw = data.get('raw')
+        if not isinstance(raw, str):
+            return jsonify({'ok': False, 'error': 'Missing raw JSON'}), 400
+        state = _load_flag_node_generator_sources_state()
+        target = None
+        for s in state.get('sources', []):
+            if isinstance(s, dict) and s.get('id') == sid:
+                target = s
+                break
+        if not target:
+            return jsonify({'ok': False, 'error': 'Source not found'}), 404
+        path = target.get('path')
+        if not path:
+            return jsonify({'ok': False, 'error': 'Missing file path'}), 400
+
+        # Validate using a temp file
+        tmp_preview = path + '.editpreview'
+        try:
+            with open(tmp_preview, 'w', encoding='utf-8') as fh:
+                fh.write(raw)
+            ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(tmp_preview)
+        finally:
+            try:
+                os.remove(tmp_preview)
+            except Exception:
+                pass
+        if not ok or not normalized_doc or str(normalized_doc.get('plugin_type') or '') != 'flag-node-generator':
+            return jsonify({'ok': False, 'error': note}), 200
+
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(normalized_doc, fh, indent=2)
+        os.replace(tmp, path)
+        target['rows'] = note
+        _save_flag_node_generator_sources_state(state)
         return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500

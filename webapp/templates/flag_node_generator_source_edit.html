@@ -6,7 +6,7 @@
     <div class="col-12">
       <div class="d-flex justify-content-between align-items-start">
         <div>
-          <h3 class="mb-1">Edit Flag-Generator Source</h3>
+          <h3 class="mb-1">Edit Flag-Node-Generator Source</h3>
           <div class="small text-muted">{{ name }}</div>
           <div class="small text-muted" style="word-break: break-all;">{{ path }}</div>
         </div>
@@ -20,11 +20,11 @@
         Expected format (v3 generator catalog):
         <pre class="mb-0">{
   "schema_version": 3,
-  "plugin_type": "flag-generator",
+  "plugin_type": "flag-node-generator",
   "plugins": [
     {
-      "plugin_id": "gen.example",
-      "plugin_type": "flag-generator",
+      "plugin_id": "nodegen.example",
+      "plugin_type": "flag-node-generator",
       "requires": [],
       "produces": [{"artifact": "filesystem.flag.file"}],
       "inputs": {}
@@ -32,10 +32,10 @@
   ],
   "implementations": [
     {
-      "plugin_id": "gen.example",
-      "name": "Example Generator",
+      "plugin_id": "nodegen.example",
+      "name": "Example Node Generator",
       "language": "python",
-      "source": {"type": "local-path", "path": "flag_generators/py_example"},
+      "source": {"type": "local-path", "path": "flag_node_generators/py_example"},
       "compose": {"file": "docker-compose.yml", "service": "generator"}
     }
   ]
@@ -61,7 +61,7 @@
   document.getElementById('saveBtn').addEventListener('click', async () => {
     setLog('Saving…');
     const raw = document.getElementById('rawJson').value || '';
-    const resp = await fetch('/flag_generators_sources/save/{{ sid }}', {
+    const resp = await fetch('/flag_node_generators_sources/save/{{ sid }}', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ raw })

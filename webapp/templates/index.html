@@ -983,6 +983,19 @@ const DEFAULT_PROJECT_KEY = '__default_project__';
 const DELETED_SCENARIO_IDS_STORAGE_KEY = 'coretg_deleted_scenario_ids_v1';
 const DELETED_SCENARIO_NAME_KEYS_STORAGE_KEY = 'coretg_deleted_scenario_name_keys_v1';
 
+// HITL attachment constants must be defined early because the editor can merge
+// persisted snapshots during initial load, and that merge path calls
+// normalizeHitlAttachment()/prettyHitlAttachment().
+const HITL_ATTACHMENT_CHOICES = [
+    { value: 'existing_router', label: 'Existing Router' },
+    { value: 'existing_switch', label: 'Existing Switch' },
+    { value: 'new_router', label: 'New Router' },
+];
+const HITL_ATTACHMENT_ALLOWED = new Set(HITL_ATTACHMENT_CHOICES.map(opt => opt.value));
+const DEFAULT_HITL_ATTACHMENT = 'existing_router';
+
+const NULLISH_TEXT_SENTINELS = new Set(['none', 'null', 'undefined', 'no error', 'ok', 'success']);
+
 function readLastProjectKeyFromStorage() {
     try {
         const raw = localStorage.getItem(LAST_PROJECT_KEY_STORAGE_KEY);
@@ -1482,17 +1495,6 @@ function defaultScenario(name) {
         notes: ''
     };
 }
-
-const HITL_ATTACHMENT_CHOICES = [
-    { value: 'existing_router', label: 'Existing Router' },
-    { value: 'existing_switch', label: 'Existing Switch' },
-    { value: 'new_router', label: 'New Router' },
-];
-
-const HITL_ATTACHMENT_ALLOWED = new Set(HITL_ATTACHMENT_CHOICES.map(opt => opt.value));
-const DEFAULT_HITL_ATTACHMENT = 'existing_router';
-
-const NULLISH_TEXT_SENTINELS = new Set(['none', 'null', 'undefined', 'no error', 'ok', 'success']);
 
 function normalizeOptionalMessage(value) {
     if (typeof value !== 'string') return null;

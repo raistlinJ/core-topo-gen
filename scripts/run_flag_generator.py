@@ -257,6 +257,7 @@ def _rewrite_compose_relative_binds_to_injected(out_dir: Path, compose_path: Pat
 
 
 def find_generator(repo_root: Path, generator_id: str) -> tuple[dict[str, Any], Path]:
+    # 1) Legacy: enabled v3 JSON catalogs
     for src in load_enabled_sources(repo_root):
         p = Path(src.get("path") or "")
         if not p.is_absolute():
@@ -266,6 +267,25 @@ def find_generator(repo_root: Path, generator_id: str) -> tuple[dict[str, Any], 
         for g in load_generators_from_source(p):
             if str(g.get("id")) == generator_id:
                 return g, p
+
+    # 2) Strict: per-generator YAML manifests in the repo
+    try:
+        from core_topo_gen.generator_manifests import discover_generator_manifests
+
+        catalog = os.environ.get("FLAG_GENERATOR_CATALOG", "flag_generators").strip() or "flag_generators"
+        kind = 'flag-node-generator' if catalog == 'flag_node_generators' else 'flag-generator'
+
+        gens, _plugins_by_id, errs = discover_generator_manifests(repo_root=repo_root, kind=kind)
+        if errs:
+            # Keep this noisy but non-fatal; generator lookup can still succeed.
+            print(f"[manifest] warnings: {len(errs)}")
+        for g in gens:
+            if str(g.get('id') or '') == generator_id:
+                # Return the generator view dict and the manifest path as a hint.
+                return g, Path(str(g.get('_source_path') or ''))
+    except Exception as exc:
+        print(f"[manifest] failed to load manifests: {exc}")
+
     raise SystemExit(f"Generator not found: {generator_id}")
 
 

@@ -1,0 +1,31 @@
+manifest_version: 1
+id: binary_embed_text
+kind: flag-generator
+name: "Sample: Binary Embed Text"
+description: "Produce an x64 binary that contains an embedded flag string."
+runtime:
+  type: docker-compose
+  compose_file: docker-compose.yml
+  service: generator
+inputs:
+  - name: seed
+    type: text
+    required: false
+  - name: filename
+    type: text
+    required: false
+    description: "Optional output binary filename."
+  - name: flag
+    type: text
+    required: false
+    sensitive: true
+  - name: flag_prefix
+    type: text
+    required: false
+artifacts:
+  requires: []
+  produces:
+    - flag
+    - filesystem.file
+injects:
+  - filesystem.file

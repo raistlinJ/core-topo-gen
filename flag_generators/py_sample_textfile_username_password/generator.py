@@ -47,17 +47,20 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    artifacts_dir = out_dir / 'artifacts'
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
     user, pw = _derive_user_pass(seed)
     generator_id = str(cfg.get("generator_id") or "sample.textfile_username_password")
     flag_value = _derive_flag(seed, generator_id, flag_prefix)
-    secrets_path = out_dir / "secrets.txt"
+    secrets_path = artifacts_dir / "secrets.txt"
     secrets_path.write_text(f"username={user}\npassword={pw}\n", encoding="utf-8")
 
     outputs = {
         "generator_id": generator_id,
         "outputs": {
             "flag": flag_value,
-            "filesystem.file": str(secrets_path.name),
+            "filesystem.file": "artifacts/secrets.txt",
         },
     }
 

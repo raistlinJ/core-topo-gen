@@ -1,0 +1,33 @@
+manifest_version: 1
+id: nfs_sensitive_file
+kind: flag-node-generator
+name: "Sample: NFS Sensitive File"
+description: "Generates an NFS export containing creds.txt and flag.txt."
+runtime:
+  type: docker-compose
+  compose_file: docker-compose.yml
+  service: generator
+inputs:
+  - name: seed
+    type: text
+    required: true
+  - name: node_name
+    type: text
+    required: true
+  - name: flag_prefix
+    type: text
+    required: false
+  - name: nfs_port
+    type: number
+    required: false
+    default: 2049
+artifacts:
+  requires: []
+  produces:
+    - flag
+    - credential.pair
+    - compose_path
+    - nfs_port
+    - nfs_export
+injects:
+  - exports

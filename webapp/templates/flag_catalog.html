@@ -21,6 +21,7 @@
 
       <div class="tab-content mt-3">
         <div class="tab-pane fade show active" id="flagGenSources" role="tabpanel">
+          <h5 class="mb-2">Flag-Generator Sources</h5>
           <div class="card mb-3">
             <div class="card-body">
               <form class="row g-2" action="{{ url_for('flag_generators_sources_upload') }}" method="post" enctype="multipart/form-data">
@@ -34,7 +35,7 @@
                   <a class="btn btn-outline-secondary" href="{{ url_for('flag_generators_sources_export_all') }}">Export All</a>
                 </div>
               </form>
-              <div class="mt-2 small text-muted">Expected format: generator-catalog JSON ({"schema_version": 1, "generators": [...]})</div>
+              <div class="mt-2 small text-muted">Expected format: v3 generator-catalog JSON (schema_version=3, plugin_type=flag-generator)</div>
             </div>
           </div>
 
@@ -78,6 +79,72 @@
                     </tr>
                     {% endfor %}
                     {% if not sources %}
+                    <tr><td colspan="4" class="text-muted">No sources uploaded yet.</td></tr>
+                    {% endif %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <h5 class="mb-2 mt-4">Flag-Node-Generator Sources</h5>
+          <div class="card mb-3">
+            <div class="card-body">
+              <form class="row g-2" action="{{ url_for('flag_node_generators_sources_upload') }}" method="post" enctype="multipart/form-data">
+                <div class="col-auto">
+                  <input class="form-control" type="file" name="json_file" accept="application/json,.json" required>
+                </div>
+                <div class="col-auto">
+                  <button class="btn btn-primary" type="submit">Upload JSON</button>
+                </div>
+                <div class="col-auto">
+                  <a class="btn btn-outline-secondary" href="{{ url_for('flag_node_generators_sources_export_all') }}">Export All</a>
+                </div>
+              </form>
+              <div class="mt-2 small text-muted">Expected format: v3 generator-catalog JSON (schema_version=3, plugin_type=flag-node-generator)</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-body">
+              <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                  <thead>
+                    <tr>
+                      <th style="width: 80px;">Enabled</th>
+                      <th>Name</th>
+                      <th>Rows</th>
+                      <th style="width: 360px;">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for s in node_sources %}
+                    <tr>
+                      <td>
+                        <form action="{{ url_for('flag_node_generators_sources_toggle', sid=s.id) }}" method="post">
+                          <button class="btn btn-sm {{ 'btn-success' if s.enabled else 'btn-outline-secondary' }}" type="submit">{{ 'On' if s.enabled else 'Off' }}</button>
+                        </form>
+                      </td>
+                      <td>
+                        <div><strong>{{ s.name }}</strong></div>
+                        <div class="small text-muted" style="max-width: 760px; word-break: break-all;">{{ s.path }}</div>
+                      </td>
+                      <td class="small">{{ s.rows }}</td>
+                      <td>
+                        <div class="d-flex gap-2 flex-wrap">
+                          <form action="{{ url_for('flag_node_generators_sources_refresh', sid=s.id) }}" method="post">
+                            <button class="btn btn-sm btn-outline-primary" type="submit">Refresh</button>
+                          </form>
+                          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('flag_node_generators_sources_download', sid=s.id) }}">Download</a>
+                          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('flag_node_generators_sources_edit', sid=s.id) }}">Edit</a>
+                          <form action="{{ url_for('flag_node_generators_sources_delete', sid=s.id) }}" method="post" onsubmit="return confirm('Delete this source?');">
+                            <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+                          </form>
+                        </div>
+                      </td>
+                    </tr>
+                    {% endfor %}
+                    {% if not node_sources %}
                     <tr><td colspan="4" class="text-muted">No sources uploaded yet.</td></tr>
                     {% endif %}
                   </tbody>
@@ -236,12 +303,16 @@
     generators: [],
     errors: [],
     filter: '',
+    sortKey: 'name',
+    sortDir: 'asc',
   };
 
   const nodeGenState = {
     generators: [],
     errors: [],
     filter: '',
+    sortKey: 'name',
+    sortDir: 'asc',
   };
 
   const genTestState = {
@@ -257,6 +328,82 @@
 
   let pendingCleanupRunId = null;
   let pendingCleanupTestBase = null;
+
+  function normalizeForSort(v) {
+    try {
+      const s = String(v ?? '');
+      return s.toLowerCase();
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function compareForSort(a, b) {
+    const ax = normalizeForSort(a);
+    const bx = normalizeForSort(b);
+    if (ax < bx) return -1;
+    if (ax > bx) return 1;
+    return 0;
+  }
+
+  function stableSorted(items, keyFn, dir) {
+    const direction = (dir === 'desc') ? -1 : 1;
+    const decorated = (Array.isArray(items) ? items : []).map((item, idx) => ({ item, idx }));
+    decorated.sort((x, y) => {
+      const c = compareForSort(keyFn(x.item), keyFn(y.item));
+      if (c !== 0) return c * direction;
+      return x.idx - y.idx;
+    });
+    return decorated.map(d => d.item);
+  }
+
+  function updateSortIndicators(tableId, state, columns) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+    const ths = table.querySelectorAll('thead th');
+    ths.forEach((th, idx) => {
+      const col = columns[idx];
+      if (!col) return;
+      const base = col.label || th.getAttribute('data-base-label') || th.textContent || '';
+      if (!th.getAttribute('data-base-label')) {
+        th.setAttribute('data-base-label', base);
+      }
+      if (col.key && state.sortKey === col.key) {
+        const arrow = (state.sortDir === 'desc') ? '▼' : '▲';
+        th.textContent = `${base} ${arrow}`;
+      } else {
+        th.textContent = base;
+      }
+    });
+  }
+
+  function enableTableSorting(tableId, state, columns, renderFn) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+    const ths = table.querySelectorAll('thead th');
+    ths.forEach((th, idx) => {
+      const col = columns[idx];
+      if (!col || !col.key) return;
+      if (th.getAttribute('data-sort-init') === '1') return;
+      th.setAttribute('data-sort-init', '1');
+      th.style.cursor = 'pointer';
+      th.title = 'Click to sort';
+      th.classList.add('user-select-none');
+      th.addEventListener('click', () => {
+        if (state.sortKey === col.key) {
+          state.sortDir = (state.sortDir === 'asc') ? 'desc' : 'asc';
+        } else {
+          state.sortKey = col.key;
+          state.sortDir = 'asc';
+        }
+        try {
+          renderFn();
+        } catch (e) {}
+        updateSortIndicators(tableId, state, columns);
+      });
+    });
+    updateSortIndicators(tableId, state, columns);
+  }
 
   function setOutputsStatus(visible, text) {
     const box = document.getElementById('genTestOutputsStatus');
@@ -634,7 +781,7 @@
     const q = (genState.filter || '').toLowerCase();
     body.innerHTML = '';
 
-    const filtered = (genState.generators || []).filter((g) => {
+    let filtered = (genState.generators || []).filter((g) => {
       if (!q) return true;
       const src = (g.source && g.source.path) ? g.source.path : '';
       const entry = (g.source && g.source.entry) ? g.source.entry : '';
@@ -657,6 +804,19 @@
       ].join(' ').toLowerCase();
       return hay.includes(q);
     });
+
+    const sortKey = genState.sortKey || 'name';
+    const sortDir = genState.sortDir || 'asc';
+    filtered = stableSorted(filtered, (g) => {
+      if (!g || typeof g !== 'object') return '';
+      if (sortKey === 'name') return g.name || '';
+      if (sortKey === 'type') return g.language || '';
+      if (sortKey === 'inputs') return nameSummary(g.inputs);
+      if (sortKey === 'outputs') return nameSummary(g.outputs);
+      if (sortKey === 'injects') return injectedSummary(g.inject_files);
+      if (sortKey === 'source') return g._source_name || '';
+      return g[sortKey] || '';
+    }, sortDir);
 
     filtered.forEach((g, idx) => {
       const tr = document.createElement('tr');
@@ -707,7 +867,7 @@
     const q = (nodeGenState.filter || '').toLowerCase();
     body.innerHTML = '';
 
-    const filtered = (nodeGenState.generators || []).filter((g) => {
+    let filtered = (nodeGenState.generators || []).filter((g) => {
       if (!q) return true;
       const src = (g.source && g.source.path) ? g.source.path : '';
       const entry = (g.source && g.source.entry) ? g.source.entry : '';
@@ -730,6 +890,19 @@
       ].join(' ').toLowerCase();
       return hay.includes(q);
     });
+
+    const sortKey = nodeGenState.sortKey || 'name';
+    const sortDir = nodeGenState.sortDir || 'asc';
+    filtered = stableSorted(filtered, (g) => {
+      if (!g || typeof g !== 'object') return '';
+      if (sortKey === 'name') return g.name || '';
+      if (sortKey === 'type') return g.language || '';
+      if (sortKey === 'inputs') return nameSummary(g.inputs);
+      if (sortKey === 'outputs') return nameSummary(g.outputs);
+      if (sortKey === 'injects') return injectedSummary(g.inject_files);
+      if (sortKey === 'source') return g._source_name || '';
+      return g[sortKey] || '';
+    }, sortDir);
 
     filtered.forEach((g, idx) => {
       const tr = document.createElement('tr');
@@ -1209,6 +1382,29 @@
   document.getElementById('flagNodeGeneratorsTab').addEventListener('shown.bs.tab', async () => {
     await loadNodeGenerators();
   });
+
+  // Enable sorting (click any header) for both generator tables.
+  enableTableSorting('genTable', genState, [
+    { key: null, label: '#' },
+    { key: 'name', label: 'Name' },
+    { key: 'type', label: 'Type' },
+    { key: 'inputs', label: 'Inputs' },
+    { key: 'outputs', label: 'Outputs' },
+    { key: 'injects', label: 'Injects' },
+    { key: 'source', label: 'From Source' },
+    { key: null, label: 'Test' },
+  ], renderGenerators);
+
+  enableTableSorting('nodeGenTable', nodeGenState, [
+    { key: null, label: '#' },
+    { key: 'name', label: 'Name' },
+    { key: 'type', label: 'Type' },
+    { key: 'inputs', label: 'Inputs' },
+    { key: 'outputs', label: 'Outputs' },
+    { key: 'injects', label: 'Injects' },
+    { key: 'source', label: 'From Source' },
+    { key: null, label: 'Test' },
+  ], renderNodeGenerators);
 
   (function attachCleanupModalHandlers() {
     const el = document.getElementById('genTestCleanupModal');
