@@ -79,6 +79,22 @@ def _norm_artifact_list(value: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _artifact_kind(artifact: str) -> str:
+    """Best-effort classification for UI (file vs folder vs other).
+
+    Manifests declare artifacts by key (e.g., "filesystem.file"). We only need
+    a lightweight hint so the UI can distinguish file vs folder.
+    """
+    a = str(artifact or '').strip().lower()
+    if not a:
+        return ''
+    if a == 'filesystem.file' or a.endswith('.file'):
+        return 'file'
+    if a == 'filesystem.dir' or a.endswith('.dir'):
+        return 'dir'
+    return ''
+
+
 def discover_generator_manifests(
     *,
     repo_root: str | os.PathLike[str] | Path,
@@ -102,155 +118,172 @@ def discover_generator_manifests(
 
     repo_root_p = Path(repo_root).resolve()
     k = _norm_kind(kind)
+
+    installed_root_env = str(os.environ.get('CORETG_INSTALLED_GENERATORS_DIR') or '').strip()
+    if installed_root_env:
+        installed_root = Path(installed_root_env).expanduser().resolve()
+    else:
+        installed_root = repo_root_p / 'outputs' / 'installed_generators'
+
     if k == 'flag-node-generator':
-        base_dir = repo_root_p / 'flag_node_generators'
+        base_dirs = [repo_root_p / 'flag_node_generators', installed_root / 'flag_node_generators']
         flow_catalog = 'flag_node_generators'
         plugin_type = 'flag-node-generator'
     else:
-        base_dir = repo_root_p / 'flag_generators'
+        base_dirs = [repo_root_p / 'flag_generators', installed_root / 'flag_generators']
         flow_catalog = 'flag_generators'
         plugin_type = 'flag-generator'
 
-    if not base_dir.exists() or not base_dir.is_dir():
+    # Filter to existing directories.
+    base_dirs = [p for p in base_dirs if p.exists() and p.is_dir()]
+    if not base_dirs:
         return [], {}, []
 
     generators: list[dict[str, Any]] = []
     plugins_by_id: dict[str, dict[str, Any]] = {}
     errors: list[ManifestLoadError] = []
 
-    for child in sorted(base_dir.iterdir()):
-        if not child.is_dir():
-            continue
+    for base_dir in base_dirs:
+        for child in sorted(base_dir.iterdir()):
+            if not child.is_dir():
+                continue
 
-        manifest_path = None
-        for nm in ('manifest.yaml', 'manifest.yml'):
-            p = child / nm
-            if p.exists() and p.is_file():
-                manifest_path = p
-                break
-        if manifest_path is None:
-            continue
+            manifest_path = None
+            for nm in ('manifest.yaml', 'manifest.yml'):
+                p = child / nm
+                if p.exists() and p.is_file():
+                    manifest_path = p
+                    break
+            if manifest_path is None:
+                continue
 
-        try:
-            doc = yaml.safe_load(manifest_path.read_text('utf-8', errors='ignore'))
-        except Exception as exc:
-            errors.append(ManifestLoadError(path=str(manifest_path), error=f'failed to parse yaml: {exc}'))
-            continue
-
-        if not isinstance(doc, dict):
-            errors.append(ManifestLoadError(path=str(manifest_path), error='manifest must be a mapping/object'))
-            continue
-
-        try:
-            mv = int(doc.get('manifest_version') or 0)
-        except Exception:
-            mv = 0
-        if mv != 1:
-            errors.append(ManifestLoadError(path=str(manifest_path), error='manifest_version must be 1'))
-            continue
-
-        gen_id = str(doc.get('id') or '').strip()
-        if not gen_id:
-            errors.append(ManifestLoadError(path=str(manifest_path), error='missing id'))
-            continue
-
-        name = str(doc.get('name') or gen_id).strip() or gen_id
-        description = str(doc.get('description') or '').strip()
-
-        declared_kind = _norm_kind(doc.get('kind') or plugin_type)
-        if declared_kind != plugin_type:
-            # Skip mismatched manifests to avoid mixing catalogs.
-            errors.append(
-                ManifestLoadError(
-                    path=str(manifest_path),
-                    error=f"kind mismatch: expected {plugin_type}, got {declared_kind}",
-                )
-            )
-            continue
-
-        runtime = doc.get('runtime') if isinstance(doc.get('runtime'), dict) else {}
-        runtime_type = str(runtime.get('type') or 'docker-compose').strip().lower()
-
-        # Source: default to this directory.
-        source_path = str(doc.get('source_path') or doc.get('source', {}).get('path') if isinstance(doc.get('source'), dict) else '')
-        if not source_path:
             try:
-                source_path = str(child.relative_to(repo_root_p)).replace('\\', '/')
+                doc = yaml.safe_load(manifest_path.read_text('utf-8', errors='ignore'))
+            except Exception as exc:
+                errors.append(ManifestLoadError(path=str(manifest_path), error=f'failed to parse yaml: {exc}'))
+                continue
+
+            if not isinstance(doc, dict):
+                errors.append(ManifestLoadError(path=str(manifest_path), error='manifest must be a mapping/object'))
+                continue
+
+            try:
+                mv = int(doc.get('manifest_version') or 0)
             except Exception:
-                source_path = str(child)
+                mv = 0
+            if mv != 1:
+                errors.append(ManifestLoadError(path=str(manifest_path), error='manifest_version must be 1'))
+                continue
 
-        gen: dict[str, Any] = {
-            'id': gen_id,
-            'name': name,
-            'description': description,
-            'language': str(doc.get('language') or 'python'),
-            'source': {
-                'type': 'local-path',
-                'path': source_path,
-                'ref': '',
-                'subpath': '',
-                'entry': '',
-            },
-            '_source_name': 'manifest',
-            '_source_path': str(manifest_path),
-            '_flow_kind': plugin_type,
-            '_flow_catalog': flow_catalog,
-            'description_hints': list(doc.get('description_hints') or []) if isinstance(doc.get('description_hints'), list) else [],
-            'hint_templates': list(doc.get('hint_templates') or []) if isinstance(doc.get('hint_templates'), list) else [],
-            'hint_template': str(doc.get('hint_template') or ''),
-            'env': dict(doc.get('env') or {}) if isinstance(doc.get('env'), dict) else {},
-        }
+            gen_id = str(doc.get('id') or '').strip()
+            if not gen_id:
+                errors.append(ManifestLoadError(path=str(manifest_path), error='missing id'))
+                continue
 
-        # Runtime
-        if runtime_type in {'docker-compose', 'compose'}:
-            gen['compose'] = {
-                'file': str(runtime.get('compose_file') or runtime.get('file') or 'docker-compose.yml'),
-                'service': str(runtime.get('service') or 'generator'),
+            name = str(doc.get('name') or gen_id).strip() or gen_id
+            description = str(doc.get('description') or '').strip()
+
+            declared_kind = _norm_kind(doc.get('kind') or plugin_type)
+            if declared_kind != plugin_type:
+                # Skip mismatched manifests to avoid mixing catalogs.
+                errors.append(
+                    ManifestLoadError(
+                        path=str(manifest_path),
+                        error=f"kind mismatch: expected {plugin_type}, got {declared_kind}",
+                    )
+                )
+                continue
+
+            runtime = doc.get('runtime') if isinstance(doc.get('runtime'), dict) else {}
+            runtime_type = str(runtime.get('type') or 'docker-compose').strip().lower()
+
+            # Source: default to this directory.
+            source_path = str(doc.get('source_path') or doc.get('source', {}).get('path') if isinstance(doc.get('source'), dict) else '')
+            if not source_path:
+                try:
+                    source_path = str(child.relative_to(repo_root_p)).replace('\\', '/')
+                except Exception:
+                    source_path = str(child)
+
+            gen: dict[str, Any] = {
+                'id': gen_id,
+                'name': name,
+                'description': description,
+                'language': str(doc.get('language') or 'python'),
+                'source': {
+                    'type': 'local-path',
+                    'path': source_path,
+                    'ref': '',
+                    'subpath': '',
+                    'entry': '',
+                },
+                '_source_name': 'manifest',
+                '_source_path': str(manifest_path),
+                '_flow_kind': plugin_type,
+                '_flow_catalog': flow_catalog,
+                'description_hints': list(doc.get('description_hints') or []) if isinstance(doc.get('description_hints'), list) else [],
+                'hint_templates': list(doc.get('hint_templates') or []) if isinstance(doc.get('hint_templates'), list) else [],
+                'hint_template': str(doc.get('hint_template') or ''),
+                'env': dict(doc.get('env') or {}) if isinstance(doc.get('env'), dict) else {},
             }
-        elif runtime_type in {'run', 'command'}:
-            cmd = runtime.get('cmd')
-            if isinstance(cmd, list):
-                gen['run'] = {'cmd': [str(x) for x in cmd if x is not None], 'workdir': str(runtime.get('workdir') or '${source.path}')}
 
-        gen['inputs'] = _norm_inputs(doc.get('inputs'))
+            # Runtime
+            if runtime_type in {'docker-compose', 'compose'}:
+                gen['compose'] = {
+                    'file': str(runtime.get('compose_file') or runtime.get('file') or 'docker-compose.yml'),
+                    'service': str(runtime.get('service') or 'generator'),
+                }
+            elif runtime_type in {'run', 'command'}:
+                cmd = runtime.get('cmd')
+                if isinstance(cmd, list):
+                    gen['run'] = {'cmd': [str(x) for x in cmd if x is not None], 'workdir': str(runtime.get('workdir') or '${source.path}')}
 
-        # Provide "outputs" list for UI convenience (matches existing view shape).
-        artifacts = doc.get('artifacts') if isinstance(doc.get('artifacts'), dict) else {}
-        produces_list = _norm_artifact_list(artifacts.get('produces'))
-        gen['outputs'] = [{'name': str(x.get('artifact') or '')} for x in produces_list if str(x.get('artifact') or '').strip()]
+            gen['inputs'] = _norm_inputs(doc.get('inputs'))
 
-        injects = doc.get('injects')
-        inject_files: list[str] = []
-        for x in _as_list(injects):
-            s = str(x or '').strip()
-            if s:
-                inject_files.append(s)
-        gen['inject_files'] = inject_files
+            # Provide "outputs" list for UI convenience (matches existing view shape).
+            artifacts = doc.get('artifacts') if isinstance(doc.get('artifacts'), dict) else {}
+            produces_list = _norm_artifact_list(artifacts.get('produces'))
+            gen['outputs'] = [
+                {
+                    'name': str(x.get('artifact') or ''),
+                    'type': _artifact_kind(str(x.get('artifact') or '')),
+                }
+                for x in produces_list
+                if str(x.get('artifact') or '').strip()
+            ]
 
-        # Build Flow plugin contract.
-        requires = []
-        for x in _as_list(artifacts.get('requires')):
-            s = str(x or '').strip()
-            if s:
-                requires.append(s)
+            injects = doc.get('injects')
+            inject_files: list[str] = []
+            for x in _as_list(injects):
+                s = str(x or '').strip()
+                if s:
+                    inject_files.append(s)
+            gen['inject_files'] = inject_files
 
-        plugin_contract: dict[str, Any] = {
-            'plugin_id': gen_id,
-            'plugin_type': plugin_type,
-            'version': str(doc.get('version') or '1.0'),
-            'description': description,
-            'requires': requires,
-            'produces': produces_list,
-            # Optional convenience mirror.
-            'inputs': {i.get('name'): i for i in (gen.get('inputs') or []) if isinstance(i, dict) and i.get('name')},
-        }
+            # Build Flow plugin contract.
+            requires = []
+            for x in _as_list(artifacts.get('requires')):
+                s = str(x or '').strip()
+                if s:
+                    requires.append(s)
 
-        if gen_id in plugins_by_id:
-            errors.append(ManifestLoadError(path=str(manifest_path), error=f'duplicate generator id: {gen_id}'))
-            continue
+            plugin_contract: dict[str, Any] = {
+                'plugin_id': gen_id,
+                'plugin_type': plugin_type,
+                'version': str(doc.get('version') or '1.0'),
+                'description': description,
+                'requires': requires,
+                'produces': produces_list,
+                # Optional convenience mirror.
+                'inputs': {i.get('name'): i for i in (gen.get('inputs') or []) if isinstance(i, dict) and i.get('name')},
+            }
 
-        plugins_by_id[gen_id] = plugin_contract
-        generators.append(gen)
+            if gen_id in plugins_by_id:
+                errors.append(ManifestLoadError(path=str(manifest_path), error=f'duplicate generator id: {gen_id}'))
+                continue
+
+            plugins_by_id[gen_id] = plugin_contract
+            generators.append(gen)
 
     generators.sort(key=lambda g: (str(g.get('name') or '').lower(), str(g.get('id') or '')))
     return generators, plugins_by_id, errors

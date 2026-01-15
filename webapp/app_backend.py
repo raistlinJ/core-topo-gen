@@ -7117,16 +7117,28 @@ def _core_xml_device_summaries(xml_path: str) -> list[dict[str, str]]:
                     type_val = str(type_el.text).strip()
             except Exception:
                 type_val = ''
+
+        try:
+            compose_val = str(dev.get('compose') or '').strip()
+        except Exception:
+            compose_val = ''
+        try:
+            compose_name_val = str(dev.get('compose_name') or '').strip()
+        except Exception:
+            compose_name_val = ''
+
         out.append({
             'id': did,
             'name': name_val or did,
             'type': type_val or '',
+            'compose': compose_val,
+            'compose_name': compose_name_val,
         })
     return out
 
 
 def _core_xml_network_summaries(xml_path: str) -> list[dict[str, str]]:
-    """Return a best-effort list of CORE network objects as {id,name,type} from CORE XML."""
+    """Return a best-effort list of {id,name,type} networks from CORE XML."""
     try:
         root = LET.parse(xml_path).getroot()
     except Exception:
@@ -7141,36 +7153,44 @@ def _core_xml_network_summaries(xml_path: str) -> list[dict[str, str]]:
 
     out: list[dict[str, str]] = []
     seen: set[str] = set()
-    for el in list(root.iter()):
+    for net in list(root.iter()):
         try:
-            lname = _local(getattr(el, 'tag', '')).lower()
+            lname = _local(getattr(net, 'tag', '')).lower()
         except Exception:
             lname = ''
         if lname != 'network':
             continue
-        nid = (el.get('id') or el.get('name') or '').strip()
+        nid = (net.get('id') or net.get('name') or '').strip()
         if not nid or nid in seen:
             continue
         seen.add(nid)
-        name_val = (el.get('name') or '').strip() or nid
-        type_val = (el.get('type') or '').strip()
+        name_val = (net.get('name') or '').strip()
+        if not name_val:
+            try:
+                name_el = net.find('./name')
+                if name_el is not None and getattr(name_el, 'text', None):
+                    name_val = str(name_el.text).strip()
+            except Exception:
+                name_val = ''
+        type_val = (net.get('type') or '').strip()
         if not type_val:
             try:
-                type_el = el.find('./type') or el.find('./model')
+                type_el = net.find('./type') or net.find('./model')
                 if type_el is not None and getattr(type_el, 'text', None):
                     type_val = str(type_el.text).strip()
             except Exception:
                 type_val = ''
-        out.append({'id': nid, 'name': name_val, 'type': type_val or ''})
+        out.append({'id': nid, 'name': name_val or nid, 'type': type_val or ''})
     return out
 
 
-def _core_xml_link_summaries(xml_path: str, id_to_name: dict[str, str] | None = None) -> list[dict[str, str]]:
-    """Return a best-effort list of link endpoints from CORE XML.
+def _core_xml_link_summaries(xml_path: str, *, id_to_name: dict[str, str] | None = None) -> list[dict[str, str]]:
+    """Return best-effort link endpoints from CORE XML.
 
-    Important: CORE often represents host↔LAN connections as node↔network links.
-    This helper keeps those endpoints rather than filtering to only device IDs.
+    Expected CORE session shape:
+      <links><link node1="1" node2="51">...</link></links>
     """
+    id_to_name = id_to_name or {}
     try:
         root = LET.parse(xml_path).getroot()
     except Exception:
@@ -7183,52 +7203,35 @@ def _core_xml_link_summaries(xml_path: str, id_to_name: dict[str, str] | None = 
             return tag.split('}', 1)[1]
         return tag
 
-    def _norm(value: Any) -> str:
-        return str(value).strip() if value is not None else ''
-
-    name_map = id_to_name or {}
     out: list[dict[str, str]] = []
     seen_pairs: set[tuple[str, str]] = set()
-
-    for link in list(root.iter()):
+    for el in list(root.iter()):
         try:
-            lname = _local(getattr(link, 'tag', '')).lower()
+            lname = _local(getattr(el, 'tag', '')).lower()
         except Exception:
             lname = ''
         if lname != 'link':
             continue
-
-        n1 = _norm(getattr(link, 'get', lambda *_: None)('node1') or getattr(link, 'get', lambda *_: None)('node1_id'))
-        n2 = _norm(getattr(link, 'get', lambda *_: None)('node2') or getattr(link, 'get', lambda *_: None)('node2_id'))
-        if not n1 or not n2:
-            try:
-                if not n1 and hasattr(link, 'find'):
-                    iface1 = link.find('.//iface1') or link.find('.//interface1')
-                    if iface1 is not None:
-                        n1 = _norm(iface1.get('node') or iface1.get('device') or iface1.get('node_id'))
-                if not n2 and hasattr(link, 'find'):
-                    iface2 = link.find('.//iface2') or link.find('.//interface2')
-                    if iface2 is not None:
-                        n2 = _norm(iface2.get('node') or iface2.get('device') or iface2.get('node_id'))
-            except Exception:
-                pass
-        if not n1 or not n2 or n1 == n2:
+        a = str(el.get('node1') or '').strip()
+        b = str(el.get('node2') or '').strip()
+        if not a or not b or a == b:
             continue
-        ordered = tuple(sorted((n1, n2)))
+        ordered = tuple(sorted((a, b)))
         if ordered in seen_pairs:
             continue
         seen_pairs.add(ordered)
         out.append({
             'node1': ordered[0],
             'node2': ordered[1],
-            'node1_name': str(name_map.get(ordered[0], ordered[0])),
-            'node2_name': str(name_map.get(ordered[1], ordered[1])),
+            'node1_name': id_to_name.get(ordered[0]) or ordered[0],
+            'node2_name': id_to_name.get(ordered[1]) or ordered[1],
         })
     return out
 
 
 @app.route('/participant-ui/topology')
 def participant_ui_topology_api():
+    """Return a graph-friendly topology summary for the Participant UI."""
     state = _participant_ui_state()
     scenario_norm = _normalize_scenario_label(request.args.get('scenario') or '')
     if not scenario_norm:
@@ -7237,317 +7240,64 @@ def participant_ui_topology_api():
     # Enforce assignment-based access for restricted users.
     try:
         if state.get('restrict_to_assigned'):
-            allowed_norms = {row.get('norm') for row in (state.get('listing') or []) if isinstance(row, dict) and row.get('norm')}
+            allowed_norms = {
+                row.get('norm')
+                for row in (state.get('listing') or [])
+                if isinstance(row, dict) and row.get('norm')
+            }
             if scenario_norm and scenario_norm not in allowed_norms:
                 return jsonify({'ok': False, 'error': 'Scenario not assigned.'}), 403
     except Exception:
         pass
 
-    # Resolve latest session XML.
+    flow_meta: dict[str, Any] | None = None
     try:
-        history = _load_run_history()
-        last_run = _latest_run_history_for_scenario(scenario_norm, history)
-    except Exception:
-        last_run = None
-    session_xml_path = None
-    if isinstance(last_run, dict):
-        session_xml_path = last_run.get('session_xml_path') or last_run.get('post_xml_path')
-
-    if not session_xml_path:
-        return jsonify({
-            'ok': True,
-            'scenario_norm': scenario_norm,
-            'status': 'No session XML available for this scenario yet.',
-            'nodes': [],
-            'links': [],
-            'subnets': [],
-            'vulnerability_ips': [],
-        })
-
-    try:
-        ap = os.path.abspath(str(session_xml_path))
-    except Exception:
-        ap = str(session_xml_path)
-
-    try:
-        app.logger.info("[participant-ui.topology] scenario=%s session_xml=%s", scenario_norm, ap)
-    except Exception:
-        pass
-    if not ap or not os.path.exists(ap):
-        return jsonify({
-            'ok': True,
-            'scenario_norm': scenario_norm,
-            'status': 'Session XML path missing on disk.',
-            'nodes': [],
-            'links': [],
-            'subnets': [],
-            'vulnerability_ips': [],
-        })
-
-    # Parse topology summary (used for enriched node details like services/interfaces).
-    try:
-        summary = _analyze_core_xml(ap)
-    except Exception:
-        summary = {}
-
-    # Best-effort attach flow/chain metadata so the Participant UI graph can
-    # label sequence nodes with Roman numerals (mirrors Preview graph view).
-    flow_meta: Optional[dict] = None
-    try:
-        scenario_norm_for_flow = _normalize_scenario_label(scenario_norm)
-        if scenario_norm_for_flow:
-            flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm_for_flow)
-            if flow_plan_path:
-                with open(flow_plan_path, 'r', encoding='utf-8') as f:
-                    flow_payload = json.load(f) or {}
-                if isinstance(flow_payload, dict):
-                    meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
-                    candidate = (meta or {}).get('flow') or flow_payload.get('flow')
-                    if isinstance(candidate, dict):
-                        flow_meta = candidate
+        if scenario_norm:
+            flow_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
+        else:
+            flow_path = None
+        if flow_path:
+            with open(flow_path, 'r', encoding='utf-8') as f:
+                flow_payload = json.load(f) or {}
+            if isinstance(flow_payload, dict):
+                meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
+                fm = (meta or {}).get('flow') or flow_payload.get('flow')
+                if isinstance(fm, dict):
+                    flow_meta = fm
     except Exception:
         flow_meta = None
 
-    raw_nodes = summary.get('nodes') if isinstance(summary, dict) else None
-    nodes_list: list[dict] = raw_nodes if isinstance(raw_nodes, list) else []
+    xml_path = None
+    try:
+        if scenario_norm:
+            xml_path = _latest_session_xml_for_scenario_norm(scenario_norm)
+    except Exception:
+        xml_path = None
 
-    # IMPORTANT: do NOT use summary.links_detail here.
-    # The summary path intentionally filters/prunes to "important" nodes and can
-    # drop host↔LAN/switch edges, making it look like only routers are connected.
-    # Instead, extract raw links directly from the XML (including network nodes).
-    all_devices = _core_xml_device_summaries(ap)
-    all_networks = _core_xml_network_summaries(ap)
-    name_map: dict[str, str] = {}
-    type_map: dict[str, str] = {}
-    for row in (all_devices or []):
-        if not isinstance(row, dict):
-            continue
-        rid = str(row.get('id') or '').strip()
-        if not rid:
-            continue
-        name_map.setdefault(rid, str(row.get('name') or rid))
-        type_map.setdefault(rid, str(row.get('type') or ''))
-    for row in (all_networks or []):
-        if not isinstance(row, dict):
-            continue
-        rid = str(row.get('id') or '').strip()
-        if not rid:
-            continue
-        name_map.setdefault(rid, str(row.get('name') or rid))
-        type_map.setdefault(rid, str(row.get('type') or ''))
-    links_list: list[dict] = _core_xml_link_summaries(ap, id_to_name=name_map)
-
-    # Ensure we include *all* devices AND networks from the XML (even if filtered from summary).
-    by_id: dict[str, dict] = {}
-    for n in nodes_list:
-        if not isinstance(n, dict):
-            continue
-        nid = str(n.get('id') or '').strip()
-        if nid:
-            by_id[nid] = n
-    for dev in all_devices:
-        did = str(dev.get('id') or '').strip()
-        if not did or did in by_id:
-            continue
-        by_id[did] = {
-            'id': did,
-            'name': dev.get('name') or did,
-            'type': dev.get('type') or '',
-            'services': [],
-            'interfaces': [],
-            'linked_nodes': [],
+    if not xml_path or not os.path.exists(str(xml_path)):
+        out = {
+            'ok': True,
+            'scenario_norm': scenario_norm,
+            'status': 'No session XML found',
+            'nodes': [],
+            'links': [],
+            'subnets': [],
+            'vulnerability_ips': [],
         }
+        if isinstance(flow_meta, dict) and flow_meta:
+            out['flow'] = flow_meta
+        return jsonify(out)
 
-    # Add networks as graph nodes so node↔network links can be drawn.
-    for net in all_networks:
-        nid = str(net.get('id') or '').strip()
-        if not nid or nid in by_id:
-            continue
-        raw_type = str(net.get('type') or '').strip()
-        # Render network objects as "switch" by default to match graph styling.
-        type_hint = (raw_type or '').lower()
-        name_hint = str(net.get('name') or '').strip().lower()
-        is_hitl = False
-        # Preserve RJ45/HITL network objects so the graph can style them correctly.
-        # The Details page exposes these via summary.hitl_network_nodes.
-        try:
-            import re
-            name_looks_like_iface = bool(re.match(r'^(ens|enp|eth)\d', name_hint))
-        except Exception:
-            name_looks_like_iface = False
-
-        if name_looks_like_iface or 'rj45' in type_hint or 'rj-45' in type_hint or 'hitl' in type_hint or 'tap' in type_hint:
-            coerced_type = 'hitl'
-            is_hitl = True
-        elif 'wlan' in type_hint or 'wireless' in type_hint:
-            coerced_type = 'wlan'
-        else:
-            coerced_type = 'switch'
-        by_id[nid] = {
-            'id': nid,
-            'name': net.get('name') or nid,
-            'type': coerced_type,
-            'services': [],
-            'interfaces': [],
-            'linked_nodes': [],
-            'is_hitl': bool(is_hitl),
-        }
-
-    # Vulnerability tagging: mark nodes whose ipv4 matches vulnerability IPs.
-    vuln_ips = _vulnerability_ipv4s_from_session_xml(ap)
-    vuln_set = {str(ip).strip() for ip in vuln_ips if ip}
-
-    # Subnet tagging.
-    subnets = _subnet_cidrs_from_session_xml(ap)
-
-    out_nodes: list[dict[str, Any]] = []
-    network_ids: set[str] = set()
-    try:
-        for net in (all_networks or []):
-            if isinstance(net, dict) and net.get('id'):
-                network_ids.add(str(net.get('id')).strip())
-    except Exception:
-        network_ids = set()
-    try:
-        import ipaddress
-    except Exception:
-        ipaddress = None
-
-    for nid, n in by_id.items():
-        name_val = str(n.get('name') or nid)
-        type_val = str(n.get('type') or '')
-        services_val = n.get('services') if isinstance(n.get('services'), list) else []
-        ifaces = n.get('interfaces') if isinstance(n.get('interfaces'), list) else []
-        ipv4s: list[str] = []
-        subnet_hits: set[str] = set()
-        for iface in ifaces:
-            if not isinstance(iface, dict):
-                continue
-            ip4 = (iface.get('ipv4') or '').strip() if isinstance(iface.get('ipv4'), str) else ''
-            mask = (iface.get('ipv4_mask') or '').strip() if isinstance(iface.get('ipv4_mask'), str) else ''
-            if ip4:
-                ip4_clean = ip4.split('/', 1)[0].strip()
-                if ip4_clean:
-                    ipv4s.append(ip4_clean)
-            if ipaddress is not None and ip4:
-                try:
-                    if '/' in ip4:
-                        net = ipaddress.ip_interface(ip4).network
-                    elif mask:
-                        net = ipaddress.ip_interface(f"{ip4}/{mask}").network
-                    else:
-                        net = None
-                    if net is not None and getattr(net, 'prefixlen', 32) < 32:
-                        subnet_hits.add(str(net))
-                except Exception:
-                    pass
-        ipv4s = [ip for ip in ipv4s if ip]
-        # stable unique
-        seen_ip: set[str] = set()
-        ipv4s_u: list[str] = []
-        for ip in ipv4s:
-            if ip in seen_ip:
-                continue
-            seen_ip.add(ip)
-            ipv4s_u.append(ip)
-        is_vuln = any(ip in vuln_set for ip in ipv4s_u)
-        out_nodes.append({
-            'id': nid,
-            'name': name_val,
-            'type': (type_val or '').strip() or 'node',
-            'services': services_val,
-            'interfaces': ifaces,
-            'ipv4s': ipv4s_u,
-            'subnets': sorted(subnet_hits) if subnet_hits else [],
-            'is_vulnerability': bool(is_vuln),
-            'is_hitl': bool(n.get('is_hitl')),
-        })
-
-    # Sort nodes for stable output.
-    def _type_rank(t: str) -> int:
-        tt = (t or '').lower()
-        if tt == 'router':
-            return 0
-        if tt == 'switch':
-            return 1
-        return 2
-
-    out_nodes.sort(key=lambda r: (_type_rank(str(r.get('type') or '')), str(r.get('name') or '').lower(), str(r.get('id') or '')))
-
-    out_links: list[dict[str, str]] = []
-    for l in links_list:
-        if not isinstance(l, dict):
-            continue
-        a = str(l.get('node1') or '').strip()
-        b = str(l.get('node2') or '').strip()
-        if not a or not b:
-            continue
-        # Only keep links whose endpoints exist in our node set.
-        if a not in by_id or b not in by_id:
-            continue
-        out_links.append({
-            'node1': a,
-            'node2': b,
-            'node1_name': str(l.get('node1_name') or name_map.get(a) or a),
-            'node2_name': str(l.get('node2_name') or name_map.get(b) or b),
-        })
-
-    # Improve readability: rename network/LAN nodes to their most common subnet (if any).
-    try:
-        id_to_node: dict[str, dict[str, Any]] = {str(n.get('id')): n for n in out_nodes if isinstance(n, dict) and n.get('id') is not None}
-        adj: dict[str, set[str]] = {}
-        for l in out_links:
-            a = str(l.get('node1') or '').strip()
-            b = str(l.get('node2') or '').strip()
-            if not a or not b:
-                continue
-            adj.setdefault(a, set()).add(b)
-            adj.setdefault(b, set()).add(a)
-        for net_id in (network_ids or set()):
-            if net_id not in id_to_node:
-                continue
-            # Never rename HITL/RJ45 network nodes to a subnet; keep interface label (e.g., ens19).
-            try:
-                if str(id_to_node[net_id].get('type') or '').strip().lower() == 'hitl':
-                    continue
-            except Exception:
-                pass
-            neighbor_ids = list(adj.get(net_id, set()))
-            if not neighbor_ids:
-                continue
-            counts: dict[str, int] = {}
-            for nbr in neighbor_ids:
-                node_obj = id_to_node.get(nbr)
-                if not node_obj:
-                    continue
-                # Routers often have interfaces in many subnets and are excluded from subnet boxes.
-                # If we use router subnets to rename LAN/switch nodes, the UI can show confusing
-                # "CIDR switch" nodes that appear to be alone in their subnet.
-                try:
-                    if str(node_obj.get('type') or '').strip().lower() == 'router':
-                        continue
-                except Exception:
-                    pass
-                for cidr in (node_obj.get('subnets') or []):
-                    c = str(cidr).strip()
-                    if not c:
-                        continue
-                    counts[c] = counts.get(c, 0) + 1
-            if not counts:
-                continue
-            best = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
-            net_obj = id_to_node[net_id]
-            net_obj['name'] = best
-            net_obj['subnets'] = [best]
-    except Exception:
-        pass
+    nodes, links, _adj = _build_topology_graph_from_session_xml(str(xml_path))
+    subnets = _subnet_cidrs_from_session_xml(str(xml_path))
+    vuln_ips = _vulnerability_ipv4s_from_session_xml(str(xml_path))
 
     out = {
         'ok': True,
         'scenario_norm': scenario_norm,
         'status': '',
-        'nodes': out_nodes,
-        'links': out_links,
+        'nodes': nodes,
+        'links': links,
         'subnets': subnets,
         'vulnerability_ips': vuln_ips,
     }
@@ -18064,69 +17814,6 @@ FLAG_SOURCES_DIR = os.path.join(DATA_SOURCES_DIR, 'flags')
 FLAG_STATE_PATH = os.path.join(FLAG_SOURCES_DIR, '_state.json')
 os.makedirs(FLAG_SOURCES_DIR, exist_ok=True)
 
-# Flag generator sources state (JSON)
-FLAG_GENERATORS_SOURCES_DIR = os.path.join(DATA_SOURCES_DIR, 'flag_generators')
-FLAG_GENERATORS_STATE_PATH = os.path.join(FLAG_GENERATORS_SOURCES_DIR, '_state.json')
-os.makedirs(FLAG_GENERATORS_SOURCES_DIR, exist_ok=True)
-
-# Flag node-generator sources state (JSON)
-FLAG_NODE_GENERATORS_SOURCES_DIR = os.path.join(DATA_SOURCES_DIR, 'flag_node_generators')
-FLAG_NODE_GENERATORS_STATE_PATH = os.path.join(FLAG_NODE_GENERATORS_SOURCES_DIR, '_state.json')
-os.makedirs(FLAG_NODE_GENERATORS_SOURCES_DIR, exist_ok=True)
-
-
-# ---------------- Flag Generator Catalog Schema (v3) -----------------
-
-
-_FLAG_GENERATOR_CATALOG_SCHEMA_PATH = os.path.join(_get_repo_root(), 'validation', 'flag_generator_catalog.schema.json')
-_JSON_SCHEMA_CACHE: dict[str, dict] = {}
-
-
-def _load_json_schema_file(schema_path: str) -> dict | None:
-    try:
-        schema_path = os.path.abspath(schema_path)
-        if schema_path in _JSON_SCHEMA_CACHE:
-            return _JSON_SCHEMA_CACHE[schema_path]
-        if not os.path.exists(schema_path):
-            return None
-        with open(schema_path, 'r', encoding='utf-8') as fh:
-            schema = json.load(fh)
-        if isinstance(schema, dict):
-            _JSON_SCHEMA_CACHE[schema_path] = schema
-            return schema
-        return None
-    except Exception:
-        return None
-
-
-def _validate_json_schema(instance: object, schema_path: str) -> tuple[bool, str | None]:
-    """Best-effort JSON Schema validation.
-
-    Returns (ok, error_message_or_none). If jsonschema isn't installed or schema can't be loaded,
-    validation is skipped (ok=True).
-    """
-    try:
-        import jsonschema  # type: ignore
-        from jsonschema.exceptions import ValidationError  # type: ignore
-    except Exception:
-        return True, None
-
-    schema = _load_json_schema_file(schema_path)
-    if not schema:
-        return True, None
-    try:
-        jsonschema.validate(instance=instance, schema=schema)
-        return True, None
-    except ValidationError as e:
-        try:
-            loc = '/'.join(str(p) for p in list(e.absolute_path))
-        except Exception:
-            loc = ''
-        loc = loc or '(root)'
-        return False, f"Schema validation failed at {loc}: {e.message}"
-    except Exception as e:
-        return False, f"Schema validation failed: {e}"
-
 
 FLAG_GENERATOR_LANGUAGES = {'python', 'c', 'cpp'}
 
@@ -18566,102 +18253,6 @@ def _generator_defs_from_flag_catalog_items(items: list[dict]) -> list[dict]:
     return []
 
 
-def _load_flag_generator_sources_state() -> dict:
-    """Load flag generator sources state.
-
-    Mirrors the flag sources registry, but stores generator-catalog sources.
-    Auto-seeds a default generator catalog from data_sources/flag_generators_seed.json when present.
-    """
-    try:
-        if not os.path.exists(FLAG_GENERATORS_STATE_PATH):
-            seed_path = os.path.join(DATA_SOURCES_DIR, 'flag_generators_seed.json')
-            sources: list[dict] = []
-            if os.path.exists(seed_path):
-                try:
-                    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
-                    dest = os.path.join(FLAG_GENERATORS_SOURCES_DIR, f"{unique}-flag_generators.json")
-                    # Copy seed into managed sources.
-                    shutil.copyfile(seed_path, dest)
-                    ok, note, _doc, _skipped = _validate_and_normalize_flag_generator_source_json(dest)
-                    sources.append({
-                        'id': uuid.uuid4().hex[:12],
-                        'name': 'flag_generators_seed.json',
-                        'path': dest,
-                        'enabled': True,
-                        'rows': note if ok else f"ERR: {note}",
-                        'uploaded': datetime.datetime.utcnow().isoformat() + 'Z',
-                    })
-                except Exception:
-                    pass
-            state = {'sources': sources}
-            _save_flag_generator_sources_state(state)
-            return state
-        with open(FLAG_GENERATORS_STATE_PATH, 'r', encoding='utf-8') as fh:
-            state = json.load(fh)
-        if not isinstance(state, dict):
-            return {'sources': []}
-        sources = state.get('sources')
-        if not isinstance(sources, list):
-            state['sources'] = []
-        # Keep seeded generator catalog in sync with repo seed.
-        try:
-            repo_seed = os.path.abspath(os.path.join(DATA_SOURCES_DIR, 'flag_generators_seed.json'))
-            if os.path.exists(repo_seed):
-                mutated = False
-                for s in state.get('sources', []):
-                    if not isinstance(s, dict):
-                        continue
-                    if (s.get('name') or '') != 'flag_generators_seed.json':
-                        continue
-                    p = s.get('path')
-                    if not p or not os.path.exists(p):
-                        continue
-                    # Always refresh the managed copy from the repo seed.
-                    try:
-                        shutil.copyfile(repo_seed, p)
-                        ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(p)
-                        if ok and normalized_doc:
-                            tmp = p + '.tmp'
-                            with open(tmp, 'w', encoding='utf-8') as fh:
-                                json.dump(normalized_doc, fh, indent=2)
-                            os.replace(tmp, p)
-                            s['rows'] = note
-                            s['uploaded'] = datetime.datetime.utcnow().isoformat() + 'Z'
-                        mutated = True
-                    except Exception:
-                        pass
-                if mutated:
-                    _save_flag_generator_sources_state(state)
-        except Exception:
-            pass
-
-        return state
-    except Exception:
-        return {'sources': []}
-
-
-def _save_flag_generator_sources_state(state: dict) -> None:
-    try:
-        os.makedirs(FLAG_GENERATORS_SOURCES_DIR, exist_ok=True)
-        tmp = FLAG_GENERATORS_STATE_PATH + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as fh:
-            json.dump(state, fh, indent=2)
-        os.replace(tmp, FLAG_GENERATORS_STATE_PATH)
-    except Exception:
-        pass
-
-
-def _save_flag_node_generator_sources_state(state: dict) -> None:
-    try:
-        os.makedirs(FLAG_NODE_GENERATORS_SOURCES_DIR, exist_ok=True)
-        tmp = FLAG_NODE_GENERATORS_STATE_PATH + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as fh:
-            json.dump(state, fh, indent=2)
-        os.replace(tmp, FLAG_NODE_GENERATORS_STATE_PATH)
-    except Exception:
-        pass
-
-
 def _coerce_bool(val, default: bool = False) -> bool:
     try:
         if isinstance(val, bool):
@@ -18677,104 +18268,6 @@ def _coerce_bool(val, default: bool = False) -> bool:
     except Exception:
         pass
     return default
-
-
-def _find_existing_generator_source(plugin_type: str, plugin_id: str) -> tuple[bool, str | None]:
-    try:
-        if plugin_type == 'flag-node-generator':
-            gens, _errors = _flag_node_generators_from_enabled_sources()
-        else:
-            gens, _errors = _flag_generators_from_enabled_sources()
-        for g in gens:
-            if not isinstance(g, dict):
-                continue
-            gid = str(g.get('id') or '').strip()
-            if gid and gid == plugin_id:
-                return True, str(g.get('_source_path') or '') or None
-    except Exception:
-        pass
-    return False, None
-
-
-def _register_generator_catalog_source(
-    *,
-    plugin_type: str,
-    plugin_id: str,
-    catalog_source: dict[str, Any],
-    source_name: str | None = None,
-    enabled: bool = True,
-    overwrite: bool = False,
-) -> dict[str, Any]:
-    if plugin_type not in {'flag-generator', 'flag-node-generator'}:
-        raise ValueError('Invalid plugin_type')
-    if not plugin_id:
-        raise ValueError('plugin_id is required')
-    if not isinstance(catalog_source, dict):
-        raise ValueError('catalog_source must be an object')
-
-    # Write into managed catalog sources directories (under data_sources/...).
-    base_dir = FLAG_GENERATORS_SOURCES_DIR if plugin_type == 'flag-generator' else FLAG_NODE_GENERATORS_SOURCES_DIR
-    os.makedirs(base_dir, exist_ok=True)
-    stamp = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')
-    safe_pid = _sanitize_id(plugin_id) or 'generator'
-    filename = f"{stamp}-builder-{safe_pid}.json"
-    dest = os.path.join(base_dir, filename)
-    dest = os.path.abspath(dest)
-
-    if os.path.exists(dest) and not overwrite:
-        raise FileExistsError(f"Catalog source already exists: {dest}")
-
-    tmp = dest + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as fh:
-        json.dump(catalog_source, fh, indent=2)
-    os.replace(tmp, dest)
-
-    ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(dest)
-    if not ok or not normalized_doc:
-        try:
-            os.remove(dest)
-        except Exception:
-            pass
-        raise ValueError(note or 'Invalid generator catalog source')
-
-    # Persist normalized doc
-    tmp2 = dest + '.tmp'
-    with open(tmp2, 'w', encoding='utf-8') as fh:
-        json.dump(normalized_doc, fh, indent=2)
-    os.replace(tmp2, dest)
-
-    # Update state
-    uploaded = datetime.datetime.utcnow().isoformat() + 'Z'
-    entry = {
-        'id': uuid.uuid4().hex[:12],
-        'name': source_name or f"builder-{plugin_id}",
-        'path': dest,
-        'enabled': bool(enabled),
-        'rows': note,
-        'uploaded': uploaded,
-    }
-
-    if plugin_type == 'flag-generator':
-        state = _load_flag_generator_sources_state()
-        sources = state.get('sources') if isinstance(state.get('sources'), list) else []
-        sources.append(entry)
-        state['sources'] = sources
-        _save_flag_generator_sources_state(state)
-        state_path = FLAG_GENERATORS_STATE_PATH
-    else:
-        state = _load_flag_node_generator_sources_state()
-        sources = state.get('sources') if isinstance(state.get('sources'), list) else []
-        sources.append(entry)
-        state['sources'] = sources
-        _save_flag_node_generator_sources_state(state)
-        state_path = FLAG_NODE_GENERATORS_STATE_PATH
-
-    return {
-        'catalog_path': dest,
-        'state_path': os.path.abspath(state_path),
-        'source': entry,
-        'note': note,
-    }
 
 
 def _normalize_generator_id(val: str) -> str:
@@ -19026,6 +18519,33 @@ def _v3_merge_generator_view(plugin: dict, impl: dict) -> dict | None:
         gen['handoff'] = handoff
 
     return gen
+
+
+try:
+    _FLAG_GENERATOR_CATALOG_SCHEMA_PATH = str(Path(_get_repo_root()) / 'validation' / 'flag_generator_catalog.schema.json')
+except Exception:
+    _FLAG_GENERATOR_CATALOG_SCHEMA_PATH = ''
+
+
+def _validate_json_schema(doc: Any, schema_path: str) -> tuple[bool, str]:
+    """Best-effort JSON schema validation.
+
+    Returns (ok, error_message). If schema or jsonschema isn't available, this
+    is a no-op and returns ok.
+    """
+    try:
+        if not schema_path or not os.path.exists(schema_path):
+            return True, ''
+        try:
+            import jsonschema  # type: ignore
+        except Exception:
+            return True, ''
+        with open(schema_path, 'r', encoding='utf-8') as f:
+            schema = json.load(f)
+        jsonschema.validate(instance=doc, schema=schema)
+        return True, ''
+    except Exception as exc:
+        return False, str(exc)
 
 
 def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool, str, dict | None, list[dict]]:
@@ -31649,62 +31169,12 @@ def api_generators_scaffold_zip():
     )
 
 
-@app.route('/api/generators/register_catalog', methods=['POST'])
-def api_generators_register_catalog():
-    _require_builder_or_admin()
-    payload = request.get_json(silent=True) or {}
-    try:
-        scaffold_files, catalog_source, _folder_path = _build_generator_scaffold(payload)
-        plugin_type = _normalize_plugin_type(payload.get('plugin_type'))
-        plugin_id = _sanitize_id(payload.get('plugin_id'))
-        if not plugin_id:
-            raise ValueError('plugin_id is required')
-
-        force = _coerce_bool(payload.get('force'), False)
-        overwrite = _coerce_bool(payload.get('overwrite'), False)
-        enabled = _coerce_bool(payload.get('enabled'), True)
-        source_name = str(payload.get('source_name') or '').strip() or None
-
-        exists, src_path = _find_existing_generator_source(plugin_type, plugin_id)
-        if exists and not force:
-            return jsonify({
-                'ok': False,
-                'error': f"Generator '{plugin_id}' already exists" + (f" (source: {src_path})" if src_path else ''),
-                'existing_source_path': src_path,
-            }), 409
-
-        result = _register_generator_catalog_source(
-            plugin_type=plugin_type,
-            plugin_id=plugin_id,
-            catalog_source=catalog_source,
-            source_name=source_name,
-            enabled=enabled,
-            overwrite=overwrite,
-        )
-    except FileExistsError as exc:
-        return jsonify({'ok': False, 'error': str(exc)}), 409
-    except Exception as exc:
-        return jsonify({'ok': False, 'error': str(exc)}), 400
-
-    return jsonify({
-        'ok': True,
-        'catalog_path': result.get('catalog_path'),
-        'state_path': result.get('state_path'),
-        'source': result.get('source'),
-        'note': result.get('note'),
-        'scaffold_paths': sorted(scaffold_files.keys()),
-        'catalog_source': catalog_source,
-    })
-
-
 @app.route('/flag_catalog')
 def flag_catalog_page():
-    state = _load_flag_generator_sources_state()
-    node_state = _load_flag_node_generator_sources_state()
+    packs_state = _load_installed_generator_packs_state()
     return render_template(
         'flag_catalog.html',
-        sources=state.get('sources', []),
-        node_sources=node_state.get('sources', []),
+        packs=packs_state.get('packs', []),
         active_page='flag_catalog',
     )
 
@@ -31973,139 +31443,15 @@ def _flag_generators_from_manifests(*, kind: str) -> tuple[list[dict], dict[str,
     return gens, plugins_by_id, errors
 
 
-def _generator_collection_membership_by_id(*, plugin_type: str) -> dict[str, list[str]]:
-    """Return mapping plugin_id -> [source_name, ...] for enabled Generator Sources.
-
-    Note: generator definitions are loaded from manifests, but generator *collections*
-    are managed as uploaded v3 catalog JSON files. We use those catalogs only to
-    label generators with a human-friendly "source" name.
-    """
-
-    def _normalize_collection_label(name: str) -> str:
-        n = (name or '').strip()
-        if not n:
-            return ''
-        # If the name is a filename (common when it came from an upload),
-        # strip the extension for display.
-        low = n.lower()
-        if low.endswith('.json'):
-            n = n[:-5]
-        return n
-
-    out: dict[str, list[str]] = {}
-    try:
-        if plugin_type == 'flag-node-generator':
-            state = _load_flag_node_generator_sources_state()
-        else:
-            state = _load_flag_generator_sources_state()
-
-        for s in (state.get('sources') or []):
-            if not isinstance(s, dict) or not s.get('enabled'):
-                continue
-            src_name = _normalize_collection_label(str(s.get('name') or '').strip())
-            src_path = str(s.get('path') or '').strip()
-            if not src_name or not src_path or not os.path.exists(src_path):
-                continue
-            ok, _note, doc, _skipped = _validate_and_normalize_flag_generator_source_json(src_path)
-            if not ok or not isinstance(doc, dict):
-                continue
-            if str(doc.get('plugin_type') or '').strip() != plugin_type:
-                continue
-
-            plugin_ids: set[str] = set()
-            for p in (doc.get('plugins') or []):
-                if not isinstance(p, dict):
-                    continue
-                pid = _normalize_generator_id(_coerce_stripped(p.get('plugin_id'), ''))
-                if pid:
-                    plugin_ids.add(pid)
-            for impl in (doc.get('implementations') or []):
-                if not isinstance(impl, dict):
-                    continue
-                pid = _normalize_generator_id(_coerce_stripped(impl.get('plugin_id'), ''))
-                if pid:
-                    plugin_ids.add(pid)
-
-            for pid in sorted(plugin_ids):
-                out.setdefault(pid, []).append(src_name)
-    except Exception:
-        return out
-    return out
-
-
 def _flag_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
     """Strict: load generator definitions from YAML manifests in the repo."""
     gens, _plugins_by_id, errors = _flag_generators_from_manifests(kind='flag-generator')
-
-    # Label generators by any enabled "Generator Sources" collection(s) that
-    # include their id.
-    membership = _generator_collection_membership_by_id(plugin_type='flag-generator')
-    try:
-        for g in gens:
-            if not isinstance(g, dict):
-                continue
-            gid = str(g.get('id') or '').strip().lower()
-            if not gid:
-                continue
-            srcs = membership.get(gid) or []
-            if srcs:
-                g['_source_name'] = ', '.join([s for s in srcs if s])
-                g['_source_type'] = 'collection'
-            else:
-                g.setdefault('_source_type', 'manifest')
-    except Exception:
-        pass
     return gens, errors
-
-
-def _load_flag_node_generator_sources_state() -> dict:
-    """Load flag node-generator sources state.
-
-    This mirrors the flag-generator catalog schema, but is stored separately under
-    data_sources/flag_node_generators/_state.json.
-    """
-    try:
-        if not os.path.exists(FLAG_NODE_GENERATORS_STATE_PATH):
-            state = {'sources': []}
-            try:
-                tmp = FLAG_NODE_GENERATORS_STATE_PATH + '.tmp'
-                with open(tmp, 'w', encoding='utf-8') as fh:
-                    json.dump(state, fh, indent=2)
-                os.replace(tmp, FLAG_NODE_GENERATORS_STATE_PATH)
-            except Exception:
-                pass
-            return state
-        with open(FLAG_NODE_GENERATORS_STATE_PATH, 'r', encoding='utf-8') as fh:
-            state = json.load(fh)
-        if not isinstance(state, dict):
-            return {'sources': []}
-        if not isinstance(state.get('sources'), list):
-            state['sources'] = []
-        return state
-    except Exception:
-        return {'sources': []}
 
 
 def _flag_node_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
     """Strict: load node-generator definitions from YAML manifests in the repo."""
     gens, _plugins_by_id, errors = _flag_generators_from_manifests(kind='flag-node-generator')
-
-    membership = _generator_collection_membership_by_id(plugin_type='flag-node-generator')
-    try:
-        for g in gens:
-            if not isinstance(g, dict):
-                continue
-            gid = str(g.get('id') or '').strip().lower()
-            if not gid:
-                continue
-            srcs = membership.get(gid) or []
-            if srcs:
-                g['_source_name'] = ', '.join([s for s in srcs if s])
-                g['_source_type'] = 'collection'
-            else:
-                g.setdefault('_source_type', 'manifest')
-    except Exception:
-        pass
     return gens, errors
 
 
@@ -32127,409 +31473,657 @@ def flag_node_generators_data():
         return jsonify({'generators': [], 'errors': [{'error': str(e)}]}), 500
 
 
-@app.route('/flag_generators_sources/upload', methods=['POST'])
-def flag_generators_sources_upload():
-    f = request.files.get('json_file')
-    if not f or f.filename == '':
-        flash('No file selected.')
-        return redirect(url_for('flag_catalog_page'))
-    filename = secure_filename(f.filename)
-    if not filename.lower().endswith('.json'):
-        flash('Only .json allowed.')
-        return redirect(url_for('flag_catalog_page'))
-    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
-    os.makedirs(FLAG_GENERATORS_SOURCES_DIR, exist_ok=True)
-    path = os.path.join(FLAG_GENERATORS_SOURCES_DIR, f"{unique}-{filename}")
-    f.save(path)
-    ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(path)
-    if not ok or not normalized_doc:
+def _installed_generators_root() -> str:
+    """Root directory for installed generator packs.
+
+    Defaults to ./outputs/installed_generators under repo root.
+    Overridable via CORETG_INSTALLED_GENERATORS_DIR for tests/dev.
+    """
+    env = str(os.environ.get('CORETG_INSTALLED_GENERATORS_DIR') or '').strip()
+    if env:
+        root = os.path.abspath(os.path.expanduser(env))
+    else:
         try:
-            os.remove(path)
+            repo_root = _get_repo_root()
         except Exception:
-            pass
-        flash(f'Invalid generator JSON: {note}')
-        return redirect(url_for('flag_catalog_page'))
+            repo_root = os.getcwd()
+        root = os.path.join(repo_root, 'outputs', 'installed_generators')
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _installed_generator_packs_state_path() -> str:
+    return os.path.join(_installed_generators_root(), '_packs_state.json')
+
+
+def _load_installed_generator_packs_state() -> dict:
+    path = _installed_generator_packs_state_path()
+    try:
+        if not os.path.exists(path):
+            state = {'packs': []}
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(state, fh, indent=2)
+            os.replace(tmp, path)
+            return state
+        with open(path, 'r', encoding='utf-8') as fh:
+            state = json.load(fh)
+        if not isinstance(state, dict):
+            return {'packs': []}
+        if not isinstance(state.get('packs'), list):
+            state['packs'] = []
+        return state
+    except Exception:
+        return {'packs': []}
+
+
+def _save_installed_generator_packs_state(state: dict) -> None:
+    path = _installed_generator_packs_state_path()
     try:
         tmp = path + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as fh:
-            json.dump(normalized_doc, fh, indent=2)
+            json.dump(state if isinstance(state, dict) else {'packs': []}, fh, indent=2)
         os.replace(tmp, path)
     except Exception:
         pass
-    state = _load_flag_generator_sources_state()
-    state.setdefault('sources', [])
-    state['sources'].append({
-        'id': uuid.uuid4().hex[:12],
-        'name': filename,
-        'path': path,
-        'enabled': True,
-        'rows': note,
-        'uploaded': datetime.datetime.utcnow().isoformat() + 'Z',
-    })
-    _save_flag_generator_sources_state(state)
-    flash('Generator JSON imported.')
-    return redirect(url_for('flag_catalog_page'))
 
 
-@app.route('/flag_generators_sources/toggle/<sid>', methods=['POST'])
-def flag_generators_sources_toggle(sid):
-    state = _load_flag_generator_sources_state()
-    for s in state.get('sources', []):
-        if isinstance(s, dict) and s.get('id') == sid:
-            s['enabled'] = not s.get('enabled', False)
-            break
-    _save_flag_generator_sources_state(state)
-    return redirect(url_for('flag_catalog_page'))
-
-
-@app.route('/flag_generators_sources/delete/<sid>', methods=['POST'])
-def flag_generators_sources_delete(sid):
-    state = _load_flag_generator_sources_state()
-    kept = []
-    for s in state.get('sources', []):
-        if isinstance(s, dict) and s.get('id') == sid:
-            try:
-                p = s.get('path')
-                if p and os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
-            continue
-        kept.append(s)
-    state['sources'] = kept
-    _save_flag_generator_sources_state(state)
-    flash('Deleted.')
-    return redirect(url_for('flag_catalog_page'))
-
-
-@app.route('/flag_generators_sources/refresh/<sid>', methods=['POST'])
-def flag_generators_sources_refresh(sid):
-    state = _load_flag_generator_sources_state()
-    for s in state.get('sources', []):
-        if isinstance(s, dict) and s.get('id') == sid:
-            path = s.get('path')
-            ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(path)
-            if ok and normalized_doc:
-                try:
-                    tmp = path + '.tmp'
-                    with open(tmp, 'w', encoding='utf-8') as fh:
-                        json.dump(normalized_doc, fh, indent=2)
-                    os.replace(tmp, path)
-                except Exception:
-                    pass
-            s['rows'] = note if ok else f"ERR: {note}"
-            break
-    _save_flag_generator_sources_state(state)
-    return redirect(url_for('flag_catalog_page'))
-
-
-@app.route('/flag_generators_sources/download/<sid>')
-def flag_generators_sources_download(sid):
-    state = _load_flag_generator_sources_state()
-    for s in state.get('sources', []):
-        if isinstance(s, dict) and s.get('id') == sid:
-            p = s.get('path')
-            if p and os.path.exists(p):
-                download_name = s.get('name') or os.path.basename(p)
-                return send_file(p, as_attachment=True, download_name=download_name)
-    flash('Not found')
-    return redirect(url_for('flag_catalog_page'))
-
-
-@app.route('/flag_generators_sources/export_all')
-def flag_generators_sources_export_all():
-    import io, zipfile
-    state = _load_flag_generator_sources_state()
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
-        for s in state.get('sources', []):
-            if not isinstance(s, dict):
-                continue
-            p = s.get('path')
-            if p and os.path.exists(p):
-                z.write(p, arcname=os.path.basename(p))
-    mem.seek(0)
-    return send_file(mem, as_attachment=True, download_name='flag_generators_sources.zip')
-
-
-@app.route('/flag_generators_sources/edit/<sid>')
-def flag_generators_sources_edit(sid):
-    state = _load_flag_generator_sources_state()
-    target = None
-    for s in state.get('sources', []):
-        if isinstance(s, dict) and s.get('id') == sid:
-            target = s
-            break
-    if not target:
-        flash('Source not found')
-        return redirect(url_for('flag_catalog_page'))
-    path = target.get('path')
-    if not path or not os.path.exists(path):
-        flash('File missing')
-        return redirect(url_for('flag_catalog_page'))
+def _is_safe_remote_zip_url(url: str) -> tuple[bool, str]:
+    """Basic SSRF guard: only allow http(s) and block private/reserved IPs."""
     try:
-        raw_text = open(path, 'r', encoding='utf-8').read()
+        from urllib.parse import urlparse
+        import ipaddress
+        import socket
+
+        u = str(url or '').strip()
+        if not u:
+            return False, 'Missing URL'
+        parsed = urlparse(u)
+        if parsed.scheme not in ('http', 'https'):
+            return False, 'Only http(s) URLs are allowed'
+        host = parsed.hostname
+        if not host:
+            return False, 'Invalid URL host'
+        if host.lower() in ('localhost',):
+            return False, 'Blocked host'
+
+        infos = socket.getaddrinfo(host, None)
+        ips: set[str] = set()
+        for info in infos:
+            try:
+                ips.add(str(info[4][0]))
+            except Exception:
+                continue
+        if not ips:
+            return False, 'Could not resolve host'
+        for ip_s in ips:
+            try:
+                ip = ipaddress.ip_address(ip_s)
+            except Exception:
+                return False, f'Invalid resolved IP: {ip_s}'
+            if (
+                ip.is_loopback
+                or ip.is_private
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                return False, f'Blocked IP: {ip}'
+        return True, ''
     except Exception:
-        raw_text = ''
-    return render_template(
-        'flag_generator_source_edit.html',
-        sid=sid,
-        name=target.get('name') or os.path.basename(path),
-        path=path,
-        raw_text=raw_text,
-        active_page='flag_catalog',
-    )
+        # Fail closed.
+        return False, 'URL validation failed'
 
 
-@app.route('/flag_generators_sources/save/<sid>', methods=['POST'])
-def flag_generators_sources_save(sid):
-    """Save raw generator source JSON.
+def _download_zip_from_url(url: str, *, max_bytes: int = 50_000_000) -> bytes:
+    ok, reason = _is_safe_remote_zip_url(url)
+    if not ok:
+        raise ValueError(reason)
 
-    Payload: {"raw": "{...}"}
+    u = str(url or '').strip()
+    try:
+        import requests  # type: ignore
+
+        resp = requests.get(u, stream=True, timeout=20)
+        resp.raise_for_status()
+        buf = bytearray()
+        for chunk in resp.iter_content(chunk_size=1024 * 64):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if len(buf) > max_bytes:
+                raise ValueError('Download too large')
+        return bytes(buf)
+    except Exception:
+        # Fallback to urllib
+        from urllib.request import urlopen
+
+        with urlopen(u, timeout=20) as r:  # nosec - guarded by _is_safe_remote_zip_url
+            buf = r.read(max_bytes + 1)
+        if len(buf) > max_bytes:
+            raise ValueError('Download too large')
+        return buf
+
+
+def _zip_entry_is_symlink(info) -> bool:
+    try:
+        # ZipInfo.external_attr: upper 16 bits are unix mode if created on unix.
+        import stat
+
+        mode = (int(getattr(info, 'external_attr', 0)) >> 16) & 0o170000
+        return mode == stat.S_IFLNK
+    except Exception:
+        return False
+
+
+def _safe_extract_zip_to_dir(zip_path: str, dest_dir: str) -> None:
+    import zipfile
+
+    os.makedirs(dest_dir, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        for info in z.infolist():
+            name = str(info.filename or '')
+            if not name:
+                continue
+            if name.startswith('/') or name.startswith('\\'):
+                raise ValueError('Zip contains absolute paths')
+            parts = [p for p in name.replace('\\', '/').split('/') if p not in ('', '.')]
+            if any(p == '..' for p in parts):
+                raise ValueError('Zip contains parent directory traversal')
+            if _zip_entry_is_symlink(info):
+                raise ValueError('Zip contains symlinks (not allowed)')
+            out_path = os.path.abspath(os.path.join(dest_dir, *parts))
+            if not out_path.startswith(os.path.abspath(dest_dir) + os.sep):
+                raise ValueError('Zip extraction escaped destination')
+            if name.endswith('/'):
+                os.makedirs(out_path, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with z.open(info, 'r') as src, open(out_path, 'wb') as dst:
+                dst.write(src.read())
+
+
+def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[dict[str, Any]]]:
+    """Validate generator pack contents.
+
+    Returns (ok, note, items) where items are generator dirs to install.
+    Validation includes:
+      - manifest.yaml syntax and required fields
+      - docker-compose.yml yaml syntax + referenced service exists
+      - python file syntax checks via ast.parse
     """
     try:
-        data = request.get_json(silent=True) or {}
-        raw = data.get('raw')
-        if not isinstance(raw, str):
-            return jsonify({'ok': False, 'error': 'Missing raw JSON'}), 400
-        state = _load_flag_generator_sources_state()
-        target = None
-        for s in state.get('sources', []):
-            if isinstance(s, dict) and s.get('id') == sid:
-                target = s
-                break
-        if not target:
-            return jsonify({'ok': False, 'error': 'Source not found'}), 404
-        path = target.get('path')
-        if not path:
-            return jsonify({'ok': False, 'error': 'Missing file path'}), 400
+        from pathlib import Path
+        import ast
+        import yaml  # type: ignore
+    except Exception as exc:
+        return False, f'Missing validator dependency: {exc}', []
 
-        # Validate using a temp file
-        tmp_preview = path + '.editpreview'
+    root = Path(extracted_dir)
+    if not root.exists() or not root.is_dir():
+        return False, 'Empty pack', []
+
+    # Find all manifest files.
+    manifests: list[Path] = []
+    for p in root.rglob('manifest.yaml'):
+        if '__MACOSX' in str(p):
+            continue
+        manifests.append(p)
+    for p in root.rglob('manifest.yml'):
+        if '__MACOSX' in str(p):
+            continue
+        manifests.append(p)
+    # De-dupe
+    manifests = sorted({m.resolve() for m in manifests})
+    if not manifests:
+        return False, 'No manifest.yaml found in zip', []
+
+    items: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for mp in manifests:
         try:
-            with open(tmp_preview, 'w', encoding='utf-8') as fh:
-                fh.write(raw)
-            ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(tmp_preview)
-        finally:
+            doc = yaml.safe_load(mp.read_text('utf-8', errors='ignore'))
+        except Exception as exc:
+            errors.append(f'{mp}: invalid yaml: {exc}')
+            continue
+        if not isinstance(doc, dict):
+            errors.append(f'{mp}: manifest must be a mapping')
+            continue
+        mv = int(doc.get('manifest_version') or 0)
+        if mv != 1:
+            errors.append(f'{mp}: manifest_version must be 1')
+            continue
+        gen_id = str(doc.get('id') or '').strip()
+        if not gen_id:
+            errors.append(f'{mp}: missing id')
+            continue
+        kind = str(doc.get('kind') or '').strip()
+        if kind not in ('flag-generator', 'flag-node-generator'):
+            errors.append(f'{mp}: kind must be flag-generator or flag-node-generator')
+            continue
+
+        gen_dir = mp.parent
+        runtime = doc.get('runtime') if isinstance(doc.get('runtime'), dict) else {}
+        runtime_type = str(runtime.get('type') or 'docker-compose').strip().lower()
+        if runtime_type in ('docker-compose', 'compose'):
+            compose_file = str(runtime.get('compose_file') or runtime.get('file') or 'docker-compose.yml')
+            compose_service = str(runtime.get('service') or 'generator')
+            compose_path = (gen_dir / compose_file).resolve()
+            if not compose_path.exists() or not compose_path.is_file():
+                errors.append(f'{mp}: missing compose file: {compose_file}')
+                continue
             try:
-                os.remove(tmp_preview)
+                compose_doc = yaml.safe_load(compose_path.read_text('utf-8', errors='ignore'))
+            except Exception as exc:
+                errors.append(f'{compose_path}: invalid yaml: {exc}')
+                continue
+            if not isinstance(compose_doc, dict):
+                errors.append(f'{compose_path}: compose must be a mapping')
+                continue
+            services = compose_doc.get('services')
+            if not isinstance(services, dict) or not services:
+                errors.append(f'{compose_path}: compose missing services')
+                continue
+            if compose_service not in services:
+                errors.append(f'{compose_path}: missing service "{compose_service}"')
+                continue
+
+        # Basic Python syntax check for any .py file in the generator dir.
+        try:
+            for py in gen_dir.rglob('*.py'):
+                if py.is_file():
+                    ast.parse(py.read_text('utf-8', errors='ignore'))
+        except Exception as exc:
+            errors.append(f'{mp}: python syntax error: {exc}')
+            continue
+
+        items.append({'id': gen_id, 'kind': kind, 'path': str(gen_dir)})
+
+    if errors:
+        # Show first few errors.
+        return False, '; '.join(errors[:4]) + (f' (+{len(errors)-4} more)' if len(errors) > 4 else ''), []
+    return True, f'Validated {len(items)} generator(s)', items
+
+
+def _install_generator_pack(*, zip_path: str, pack_label: str, pack_origin: str) -> tuple[bool, str]:
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    try:
+        from core_topo_gen.generator_manifests import discover_generator_manifests
+    except Exception as exc:
+        return False, f'Failed importing manifest discovery: {exc}'
+
+    root = _installed_generators_root()
+    tmp_dir = tempfile.mkdtemp(prefix='coretg_pack_')
+    try:
+        _safe_extract_zip_to_dir(zip_path, tmp_dir)
+        ok, note, items = _validate_generator_pack_tree(tmp_dir)
+        if not ok:
+            return False, note
+
+        try:
+            repo_root = _get_repo_root()
+        except Exception:
+            repo_root = os.getcwd()
+
+        # Reject collisions with existing ids.
+        existing_flag, _, _ = discover_generator_manifests(repo_root=repo_root, kind='flag-generator')
+        existing_node, _, _ = discover_generator_manifests(repo_root=repo_root, kind='flag-node-generator')
+        existing_ids = {str(g.get('id') or '').strip().lower() for g in (existing_flag + existing_node) if isinstance(g, dict)}
+        for it in items:
+            gid = str(it.get('id') or '').strip().lower()
+            if gid and gid in existing_ids:
+                return False, f'Generator id already exists: {gid}'
+
+        pack_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+        safe_label = secure_filename(pack_label or 'pack') or 'pack'
+
+        installed: list[dict[str, Any]] = []
+        for it in items:
+            kind = str(it.get('kind') or '')
+            gid = str(it.get('id') or '')
+            src_dir = str(it.get('path') or '')
+            if kind == 'flag-node-generator':
+                dest_base = os.path.join(root, 'flag_node_generators')
+            else:
+                dest_base = os.path.join(root, 'flag_generators')
+            os.makedirs(dest_base, exist_ok=True)
+
+            dir_name = secure_filename(f"p_{pack_id}__{gid}") or f"p_{pack_id}__generator"
+            dest_dir = os.path.join(dest_base, dir_name)
+            # Ensure unique
+            suffix = 2
+            while os.path.exists(dest_dir):
+                dest_dir = os.path.join(dest_base, f"{dir_name}_{suffix}")
+                suffix += 1
+
+            shutil.copytree(src_dir, dest_dir)
+
+            # Store pack marker for humans.
+            try:
+                marker = {
+                    'pack_id': pack_id,
+                    'pack_label': safe_label,
+                    'origin': pack_origin,
+                    'installed_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                    'generator_id': gid,
+                    'kind': kind,
+                }
+                with open(os.path.join(dest_dir, '.coretg_pack.json'), 'w', encoding='utf-8') as fh:
+                    json.dump(marker, fh, indent=2)
             except Exception:
                 pass
-        if not ok or not normalized_doc:
-            return jsonify({'ok': False, 'error': note}), 200
 
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as fh:
-            json.dump(normalized_doc, fh, indent=2)
-        os.replace(tmp, path)
-        target['rows'] = note
-        _save_flag_generator_sources_state(state)
-        return jsonify({'ok': True})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+            installed.append({'id': gid, 'kind': kind, 'path': dest_dir})
 
-
-@app.route('/flag_node_generators_sources/upload', methods=['POST'])
-def flag_node_generators_sources_upload():
-    f = request.files.get('json_file')
-    if not f or f.filename == '':
-        flash('No file selected.')
-        return redirect(url_for('flag_catalog_page'))
-    filename = secure_filename(f.filename)
-    if not filename.lower().endswith('.json'):
-        flash('Only .json allowed.')
-        return redirect(url_for('flag_catalog_page'))
-    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
-    os.makedirs(FLAG_NODE_GENERATORS_SOURCES_DIR, exist_ok=True)
-    path = os.path.join(FLAG_NODE_GENERATORS_SOURCES_DIR, f"{unique}-{filename}")
-    path = os.path.abspath(path)
-    f.save(path)
-    ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(path)
-    if not ok or not normalized_doc or str(normalized_doc.get('plugin_type') or '') != 'flag-node-generator':
+        # Record pack state
+        state = _load_installed_generator_packs_state()
+        state.setdefault('packs', [])
+        state['packs'].append({
+            'id': pack_id,
+            'label': safe_label,
+            'origin': pack_origin,
+            'note': note,
+            'installed_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+            'installed': installed,
+        })
+        _save_installed_generator_packs_state(state)
+        return True, f"Installed {len(installed)} generator(s) from {safe_label}"
+    except ValueError as ve:
+        return False, str(ve)
+    except Exception as exc:
+        return False, str(exc)
+    finally:
         try:
-            os.remove(path)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
-        flash(f'Invalid node-generator JSON: {note}')
-        return redirect(url_for('flag_catalog_page'))
-    try:
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as fh:
-            json.dump(normalized_doc, fh, indent=2)
-        os.replace(tmp, path)
-    except Exception:
-        pass
-    state = _load_flag_node_generator_sources_state()
-    state.setdefault('sources', [])
-    state['sources'].append({
-        'id': uuid.uuid4().hex[:12],
-        'name': filename,
-        'path': path,
-        'enabled': True,
-        'rows': note,
-        'uploaded': datetime.datetime.utcnow().isoformat() + 'Z',
-    })
-    _save_flag_node_generator_sources_state(state)
-    flash('Node-generator JSON imported.')
-    return redirect(url_for('flag_catalog_page'))
 
 
-@app.route('/flag_node_generators_sources/toggle/<sid>', methods=['POST'])
-def flag_node_generators_sources_toggle(sid):
-    state = _load_flag_node_generator_sources_state()
-    for s in state.get('sources', []):
-        if isinstance(s, dict) and s.get('id') == sid:
-            s['enabled'] = not s.get('enabled', False)
-            break
-    _save_flag_node_generator_sources_state(state)
-    return redirect(url_for('flag_catalog_page'))
+def _install_generator_pack_or_bundle(*, zip_path: str, pack_label: str, pack_origin: str) -> tuple[bool, str]:
+    """Install either a single generator-pack ZIP, or a bundle ZIP produced by export_all.
 
-
-@app.route('/flag_node_generators_sources/delete/<sid>', methods=['POST'])
-def flag_node_generators_sources_delete(sid):
-    state = _load_flag_node_generator_sources_state()
-    kept = []
-    for s in state.get('sources', []):
-        if isinstance(s, dict) and s.get('id') == sid:
-            try:
-                p = s.get('path')
-                if p and os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
-            continue
-        kept.append(s)
-    state['sources'] = kept
-    _save_flag_node_generator_sources_state(state)
-    flash('Deleted.')
-    return redirect(url_for('flag_catalog_page'))
-
-
-@app.route('/flag_node_generators_sources/refresh/<sid>', methods=['POST'])
-def flag_node_generators_sources_refresh(sid):
-    state = _load_flag_node_generator_sources_state()
-    for s in state.get('sources', []):
-        if isinstance(s, dict) and s.get('id') == sid:
-            path = s.get('path')
-            ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(path)
-            if ok and normalized_doc and str(normalized_doc.get('plugin_type') or '') == 'flag-node-generator':
-                try:
-                    tmp = path + '.tmp'
-                    with open(tmp, 'w', encoding='utf-8') as fh:
-                        json.dump(normalized_doc, fh, indent=2)
-                    os.replace(tmp, path)
-                except Exception:
-                    pass
-            s['rows'] = note if ok else f"ERR: {note}"
-            break
-    _save_flag_node_generator_sources_state(state)
-    return redirect(url_for('flag_catalog_page'))
-
-
-@app.route('/flag_node_generators_sources/download/<sid>')
-def flag_node_generators_sources_download(sid):
-    state = _load_flag_node_generator_sources_state()
-    for s in state.get('sources', []):
-        if isinstance(s, dict) and s.get('id') == sid:
-            p = s.get('path')
-            if p and os.path.exists(p):
-                download_name = s.get('name') or os.path.basename(p)
-                return send_file(p, as_attachment=True, download_name=download_name)
-    flash('Not found')
-    return redirect(url_for('flag_catalog_page'))
-
-
-@app.route('/flag_node_generators_sources/export_all')
-def flag_node_generators_sources_export_all():
-    import io, zipfile
-    state = _load_flag_node_generator_sources_state()
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
-        for s in state.get('sources', []):
-            if not isinstance(s, dict):
-                continue
-            p = s.get('path')
-            if p and os.path.exists(p):
-                z.write(p, arcname=os.path.basename(p))
-    mem.seek(0)
-    return send_file(mem, as_attachment=True, download_name='flag_node_generators_sources.zip')
-
-
-@app.route('/flag_node_generators_sources/edit/<sid>')
-def flag_node_generators_sources_edit(sid):
-    state = _load_flag_node_generator_sources_state()
-    target = None
-    for s in state.get('sources', []):
-        if isinstance(s, dict) and s.get('id') == sid:
-            target = s
-            break
-    if not target:
-        flash('Source not found')
-        return redirect(url_for('flag_catalog_page'))
-    path = target.get('path')
-    if not path or not os.path.exists(path):
-        flash('File missing')
-        return redirect(url_for('flag_catalog_page'))
-    try:
-        raw_text = open(path, 'r', encoding='utf-8').read()
-    except Exception:
-        raw_text = ''
-    return render_template(
-        'flag_node_generator_source_edit.html',
-        sid=sid,
-        name=target.get('name') or os.path.basename(path),
-        path=path,
-        raw_text=raw_text,
-        active_page='flag_catalog',
-    )
-
-
-@app.route('/flag_node_generators_sources/save/<sid>', methods=['POST'])
-def flag_node_generators_sources_save(sid):
-    """Save raw node-generator source JSON.
-
-    Payload: {"raw": "{...}"}
+    A bundle is a ZIP that contains one or more nested pack ZIPs under packs/*.zip.
     """
-    try:
-        data = request.get_json(silent=True) or {}
-        raw = data.get('raw')
-        if not isinstance(raw, str):
-            return jsonify({'ok': False, 'error': 'Missing raw JSON'}), 400
-        state = _load_flag_node_generator_sources_state()
-        target = None
-        for s in state.get('sources', []):
-            if isinstance(s, dict) and s.get('id') == sid:
-                target = s
-                break
-        if not target:
-            return jsonify({'ok': False, 'error': 'Source not found'}), 404
-        path = target.get('path')
-        if not path:
-            return jsonify({'ok': False, 'error': 'Missing file path'}), 400
+    import tempfile
+    import zipfile
 
-        # Validate using a temp file
-        tmp_preview = path + '.editpreview'
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            names = [str(n or '') for n in z.namelist()]
+
+            has_manifest = any(n.endswith('/manifest.yaml') or n.endswith('/manifest.yml') for n in names)
+            nested = [n for n in names if n.startswith('packs/') and n.lower().endswith('.zip') and not n.endswith('/')]
+
+            if (not has_manifest) and nested:
+                successes = 0
+                failures: list[str] = []
+                for inner_name in sorted(set(nested)):
+                    try:
+                        inner_bytes = z.read(inner_name)
+                    except Exception as exc:
+                        failures.append(f'{inner_name}: read failed ({exc})')
+                        continue
+
+                    fd, inner_tmp = tempfile.mkstemp(prefix='coretg_pack_bundle_', suffix='-' + os.path.basename(inner_name))
+                    os.close(fd)
+                    try:
+                        with open(inner_tmp, 'wb') as fh:
+                            fh.write(inner_bytes)
+                        inner_label = os.path.basename(inner_name) or inner_name
+                        ok, note = _install_generator_pack(zip_path=inner_tmp, pack_label=inner_label, pack_origin=pack_origin)
+                        if ok:
+                            successes += 1
+                        else:
+                            failures.append(f'{inner_name}: {note}')
+                    finally:
+                        try:
+                            os.remove(inner_tmp)
+                        except Exception:
+                            pass
+
+                if failures:
+                    return successes > 0, f'Imported {successes} pack(s) from bundle; {failures[0]}'
+                return True, f'Imported {successes} pack(s) from bundle'
+
+    except Exception as exc:
+        return False, f'Invalid zip: {exc}'
+
+    return _install_generator_pack(zip_path=zip_path, pack_label=pack_label, pack_origin=pack_origin)
+
+
+@app.route('/generator_packs/upload', methods=['POST'])
+def generator_packs_upload():
+    f = request.files.get('zip_file')
+    if not f or f.filename == '':
+        flash('No zip selected.')
+        return redirect(url_for('flag_catalog_page'))
+    filename = secure_filename(f.filename)
+    if not filename.lower().endswith('.zip'):
+        flash('Only .zip allowed.')
+        return redirect(url_for('flag_catalog_page'))
+
+    import tempfile
+
+    fd, tmp_path = tempfile.mkstemp(prefix='coretg_pack_', suffix='-' + filename)
+    os.close(fd)
+    try:
+        f.save(tmp_path)
+        ok, note = _install_generator_pack_or_bundle(zip_path=tmp_path, pack_label=filename, pack_origin='upload')
+        flash(note if ok else f'Pack install failed: {note}')
+    finally:
         try:
-            with open(tmp_preview, 'w', encoding='utf-8') as fh:
-                fh.write(raw)
-            ok, note, normalized_doc, _skipped = _validate_and_normalize_flag_generator_source_json(tmp_preview)
+            os.remove(tmp_path)
+        except Exception:
+            pass
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/generator_packs/import_url', methods=['POST'])
+def generator_packs_import_url():
+    url = str(request.form.get('zip_url') or '').strip()
+    if not url:
+        flash('Missing URL.')
+        return redirect(url_for('flag_catalog_page'))
+
+    import tempfile
+
+    try:
+        data = _download_zip_from_url(url)
+        fd, tmp_path = tempfile.mkstemp(prefix='coretg_pack_url_', suffix='.zip')
+        os.close(fd)
+        try:
+            with open(tmp_path, 'wb') as fh:
+                fh.write(data)
+            ok, note = _install_generator_pack_or_bundle(zip_path=tmp_path, pack_label=url, pack_origin='url')
+            flash(note if ok else f'Pack install failed: {note}')
         finally:
             try:
-                os.remove(tmp_preview)
+                os.remove(tmp_path)
             except Exception:
                 pass
-        if not ok or not normalized_doc or str(normalized_doc.get('plugin_type') or '') != 'flag-node-generator':
-            return jsonify({'ok': False, 'error': note}), 200
+    except Exception as exc:
+        flash(f'URL import failed: {exc}')
 
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as fh:
-            json.dump(normalized_doc, fh, indent=2)
-        os.replace(tmp, path)
-        target['rows'] = note
-        _save_flag_node_generator_sources_state(state)
-        return jsonify({'ok': True})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/generator_packs/delete/<pack_id>', methods=['POST'])
+def generator_packs_delete(pack_id: str):
+    """Uninstall a previously installed generator pack.
+
+    Deletes the installed generator directories recorded in the pack state,
+    but only if they reside under the installed-generators root.
+    """
+    import shutil
+
+    pid = str(pack_id or '').strip()
+    if not pid:
+        flash('Missing pack id')
+        return redirect(url_for('flag_catalog_page'))
+
+    installed_root = os.path.abspath(_installed_generators_root())
+    state = _load_installed_generator_packs_state()
+    packs = state.get('packs') or []
+    if not isinstance(packs, list):
+        packs = []
+
+    target = None
+    kept = []
+    for p in packs:
+        if isinstance(p, dict) and str(p.get('id') or '') == pid:
+            target = p
+            continue
+        kept.append(p)
+
+    if not target:
+        flash('Pack not found')
+        return redirect(url_for('flag_catalog_page'))
+
+    removed = 0
+    failures: list[str] = []
+    for it in (target.get('installed') or []):
+        if not isinstance(it, dict):
+            continue
+        path = str(it.get('path') or '').strip()
+        if not path:
+            continue
+        abs_path = os.path.abspath(path)
+        try:
+            # Ensure deletion stays within the installed root.
+            if os.path.commonpath([installed_root, abs_path]) != installed_root:
+                failures.append(f"refused to delete outside installed root: {abs_path}")
+                continue
+        except Exception:
+            failures.append(f"refused to delete path: {abs_path}")
+            continue
+
+        try:
+            if os.path.isdir(abs_path):
+                shutil.rmtree(abs_path, ignore_errors=False)
+                removed += 1
+            elif os.path.exists(abs_path):
+                os.remove(abs_path)
+                removed += 1
+        except Exception as exc:
+            failures.append(f"failed deleting {abs_path}: {exc}")
+
+    state['packs'] = kept
+    _save_installed_generator_packs_state(state)
+
+    if failures:
+        flash(f"Uninstalled pack {pid} with warnings: removed={removed}; {failures[0]}")
+    else:
+        flash(f"Uninstalled pack {pid} (removed {removed} item(s))")
+    return redirect(url_for('flag_catalog_page'))
+
+
+def _pack_to_zip_bytes(pack: dict) -> bytes:
+    """Build a ZIP archive for a single installed pack."""
+    import io
+    import zipfile
+
+    mem = io.BytesIO()
+    installed = pack.get('installed') if isinstance(pack, dict) else []
+    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+        # Pack metadata
+        try:
+            meta = json.dumps(pack, indent=2)
+        except Exception:
+            meta = '{}'
+        z.writestr('pack.json', meta + '\n')
+
+        for it in (installed or []):
+            if not isinstance(it, dict):
+                continue
+            kind = str(it.get('kind') or '').strip()
+            src = str(it.get('path') or '').strip()
+            if not src or not os.path.exists(src):
+                continue
+
+            base = 'flag_generators'
+            if kind == 'flag-node-generator':
+                base = 'flag_node_generators'
+
+            root_name = os.path.basename(src.rstrip('/')) or 'generator'
+            if os.path.isdir(src):
+                for dirpath, _dirnames, filenames in os.walk(src):
+                    for fn in filenames:
+                        abs_p = os.path.join(dirpath, fn)
+                        rel_p = os.path.relpath(abs_p, src)
+                        arc = '/'.join([base, root_name, rel_p.replace('\\', '/')])
+                        try:
+                            z.write(abs_p, arcname=arc)
+                        except Exception:
+                            continue
+            else:
+                arc = '/'.join([base, root_name])
+                try:
+                    z.write(src, arcname=arc)
+                except Exception:
+                    pass
+
+    mem.seek(0)
+    return mem.read()
+
+
+@app.route('/generator_packs/download/<pack_id>')
+def generator_packs_download(pack_id: str):
+    pid = str(pack_id or '').strip()
+    state = _load_installed_generator_packs_state()
+    packs = state.get('packs') or []
+    if not isinstance(packs, list):
+        packs = []
+    target = None
+    for p in packs:
+        if isinstance(p, dict) and str(p.get('id') or '') == pid:
+            target = p
+            break
+    if not target:
+        flash('Pack not found')
+        return redirect(url_for('flag_catalog_page'))
+
+    data = _pack_to_zip_bytes(target)
+    label = secure_filename(str(target.get('label') or '')).strip() or 'pack'
+    download_name = f"generator-pack-{pid}-{label}.zip"
+    import io
+
+    return send_file(io.BytesIO(data), as_attachment=True, download_name=download_name)
+
+
+@app.route('/generator_packs/export_all')
+def generator_packs_export_all():
+    """Export all installed packs.
+
+    Returns a ZIP containing one ZIP per pack under packs/<pack_id>.zip.
+    """
+    import io
+    import zipfile
+
+    state = _load_installed_generator_packs_state()
+    packs = state.get('packs') or []
+    if not isinstance(packs, list):
+        packs = []
+
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+        for p in packs:
+            if not isinstance(p, dict):
+                continue
+            pid = str(p.get('id') or '').strip()
+            if not pid:
+                continue
+            label = secure_filename(str(p.get('label') or '')).strip() or 'pack'
+            arcname = f"packs/{pid}-{label}.zip"
+            try:
+                z.writestr(arcname, _pack_to_zip_bytes(p))
+            except Exception:
+                continue
+    mem.seek(0)
+    return send_file(mem, as_attachment=True, download_name='generator_packs.zip')
 
 
 def _flag_generators_runs_dir() -> str:

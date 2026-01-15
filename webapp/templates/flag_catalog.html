@@ -6,7 +6,7 @@
     <div class="col-12">
       <ul class="nav nav-tabs" id="flagTabs" role="tablist">
         <li class="nav-item" role="presentation">
-          <button class="nav-link active" id="flagGenSourcesTab" data-bs-toggle="tab" data-bs-target="#flagGenSources" type="button" role="tab">Generator Sources</button>
+          <button class="nav-link active" id="flagGenSourcesTab" data-bs-toggle="tab" data-bs-target="#flagGenSources" type="button" role="tab">Generator Packs</button>
         </li>
         <li class="nav-item" role="presentation">
           <button class="nav-link" id="flagGeneratorsTab" data-bs-toggle="tab" data-bs-target="#flagGenerators" type="button" role="tab">Flag-Generators</button>
@@ -21,87 +21,34 @@
 
       <div class="tab-content mt-3">
         <div class="tab-pane fade show active" id="flagGenSources" role="tabpanel">
-          <h5 class="mb-2">Flag-Generator Sources</h5>
+          <h5 class="mb-2">Generator Packs (ZIP)</h5>
           <div class="card mb-3">
             <div class="card-body">
-              <form class="row g-2" action="{{ url_for('flag_generators_sources_upload') }}" method="post" enctype="multipart/form-data">
-                <div class="col-auto">
-                  <input class="form-control" type="file" name="json_file" accept="application/json,.json" required>
-                </div>
-                <div class="col-auto">
-                  <button class="btn btn-primary" type="submit">Upload JSON</button>
-                </div>
-                <div class="col-auto">
-                  <a class="btn btn-outline-secondary" href="{{ url_for('flag_generators_sources_export_all') }}">Export All</a>
-                </div>
-              </form>
-              <div class="mt-2 small text-muted">Expected format: v3 generator-catalog JSON (schema_version=3, plugin_type=flag-generator)</div>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-body">
-              <div class="table-responsive">
-                <table class="table table-sm align-middle">
-                  <thead>
-                    <tr>
-                      <th style="width: 80px;">Enabled</th>
-                      <th>Name</th>
-                      <th>Rows</th>
-                      <th style="width: 360px;">Actions</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {% for s in sources %}
-                    <tr>
-                      <td>
-                        <form action="{{ url_for('flag_generators_sources_toggle', sid=s.id) }}" method="post">
-                          <button class="btn btn-sm {{ 'btn-success' if s.enabled else 'btn-outline-secondary' }}" type="submit">{{ 'On' if s.enabled else 'Off' }}</button>
-                        </form>
-                      </td>
-                      <td>
-                        <div><strong>{{ s.name }}</strong></div>
-                        <div class="small text-muted" style="max-width: 760px; word-break: break-all;">{{ s.path }}</div>
-                      </td>
-                      <td class="small">{{ s.rows }}</td>
-                      <td>
-                        <div class="d-flex gap-2 flex-wrap">
-                          <form action="{{ url_for('flag_generators_sources_refresh', sid=s.id) }}" method="post">
-                            <button class="btn btn-sm btn-outline-primary" type="submit">Refresh</button>
-                          </form>
-                          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('flag_generators_sources_download', sid=s.id) }}">Download</a>
-                          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('flag_generators_sources_edit', sid=s.id) }}">Edit</a>
-                          <form action="{{ url_for('flag_generators_sources_delete', sid=s.id) }}" method="post" onsubmit="return confirm('Delete this source?');">
-                            <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
-                          </form>
-                        </div>
-                      </td>
-                    </tr>
-                    {% endfor %}
-                    {% if not sources %}
-                    <tr><td colspan="4" class="text-muted">No sources uploaded yet.</td></tr>
-                    {% endif %}
-                  </tbody>
-                </table>
+              <div class="small text-muted mb-2">
+                Upload a ZIP (or import from a URL) containing generator directories with <code>manifest.yaml</code>.
+                Packs are validated (YAML syntax, compose service, Python syntax) and installed under <code>outputs/installed_generators/</code>.
               </div>
-            </div>
-          </div>
 
-          <h5 class="mb-2 mt-4">Flag-Node-Generator Sources</h5>
-          <div class="card mb-3">
-            <div class="card-body">
-              <form class="row g-2" action="{{ url_for('flag_node_generators_sources_upload') }}" method="post" enctype="multipart/form-data">
+              <form class="row g-2 align-items-center" action="{{ url_for('generator_packs_upload') }}" method="post" enctype="multipart/form-data">
                 <div class="col-auto">
-                  <input class="form-control" type="file" name="json_file" accept="application/json,.json" required>
+                  <input class="form-control" type="file" name="zip_file" accept="application/zip,.zip" required>
                 </div>
                 <div class="col-auto">
-                  <button class="btn btn-primary" type="submit">Upload JSON</button>
+                  <button class="btn btn-primary" type="submit">Upload ZIP</button>
                 </div>
                 <div class="col-auto">
-                  <a class="btn btn-outline-secondary" href="{{ url_for('flag_node_generators_sources_export_all') }}">Export All</a>
+                  <a class="btn btn-outline-secondary" href="{{ url_for('generator_packs_export_all') }}">Export All Packs</a>
                 </div>
               </form>
-              <div class="mt-2 small text-muted">Expected format: v3 generator-catalog JSON (schema_version=3, plugin_type=flag-node-generator)</div>
+
+              <form class="row g-2 mt-2 align-items-center" action="{{ url_for('generator_packs_import_url') }}" method="post">
+                <div class="col-md-6">
+                  <input class="form-control" type="url" name="zip_url" placeholder="https://example.com/generator-pack.zip" required>
+                </div>
+                <div class="col-auto">
+                  <button class="btn btn-outline-primary" type="submit">Import from URL</button>
+                </div>
+              </form>
             </div>
           </div>
 
@@ -111,41 +58,43 @@
                 <table class="table table-sm align-middle">
                   <thead>
                     <tr>
-                      <th style="width: 80px;">Enabled</th>
-                      <th>Name</th>
-                      <th>Rows</th>
-                      <th style="width: 360px;">Actions</th>
+                      <th>Label</th>
+                      <th>Origin</th>
+                      <th>Installed</th>
+                      <th>Generators</th>
+                      <th style="width: 160px;">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {% for s in node_sources %}
+                    {% for p in packs %}
                     <tr>
                       <td>
-                        <form action="{{ url_for('flag_node_generators_sources_toggle', sid=s.id) }}" method="post">
-                          <button class="btn btn-sm {{ 'btn-success' if s.enabled else 'btn-outline-secondary' }}" type="submit">{{ 'On' if s.enabled else 'Off' }}</button>
-                        </form>
+                        <div><strong>{{ p.label or p.id }}</strong></div>
+                        <div class="small text-muted">{{ p.id }}</div>
                       </td>
-                      <td>
-                        <div><strong>{{ s.name }}</strong></div>
-                        <div class="small text-muted" style="max-width: 760px; word-break: break-all;">{{ s.path }}</div>
+                      <td class="small">{{ p.origin or '' }}</td>
+                      <td class="small">{{ p.installed_at or '' }}</td>
+                      <td class="small" style="max-width: 720px; word-break: break-word;">
+                        {% if p.installed %}
+                          {% for g in p.installed %}
+                            <div>{{ g.kind }}: <code>{{ g.id }}</code></div>
+                          {% endfor %}
+                        {% else %}
+                          <span class="text-muted">—</span>
+                        {% endif %}
                       </td>
-                      <td class="small">{{ s.rows }}</td>
                       <td>
                         <div class="d-flex gap-2 flex-wrap">
-                          <form action="{{ url_for('flag_node_generators_sources_refresh', sid=s.id) }}" method="post">
-                            <button class="btn btn-sm btn-outline-primary" type="submit">Refresh</button>
-                          </form>
-                          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('flag_node_generators_sources_download', sid=s.id) }}">Download</a>
-                          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('flag_node_generators_sources_edit', sid=s.id) }}">Edit</a>
-                          <form action="{{ url_for('flag_node_generators_sources_delete', sid=s.id) }}" method="post" onsubmit="return confirm('Delete this source?');">
-                            <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+                          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('generator_packs_download', pack_id=p.id) }}">Download ZIP</a>
+                          <form action="{{ url_for('generator_packs_delete', pack_id=p.id) }}" method="post" onsubmit="return confirm('Uninstall this pack?');">
+                            <button class="btn btn-sm btn-outline-danger" type="submit">Uninstall</button>
                           </form>
                         </div>
                       </td>
                     </tr>
                     {% endfor %}
-                    {% if not node_sources %}
-                    <tr><td colspan="4" class="text-muted">No sources uploaded yet.</td></tr>
+                    {% if not packs %}
+                    <tr><td colspan="5" class="text-muted">No packs installed yet.</td></tr>
                     {% endif %}
                   </tbody>
                 </table>
@@ -702,6 +651,9 @@
       'file': 'file',
       'path': 'file',
       'artifact': 'file',
+      'dir': 'folder',
+      'directory': 'folder',
+      'folder': 'folder',
       'binary': 'binary file',
       'exe': 'binary file',
       'image': 'photo',
@@ -709,6 +661,17 @@
       'picture': 'photo',
     };
     return map[v] || v;
+  }
+
+  function formatNameWithKind(item) {
+    if (!item || typeof item !== 'object') return '';
+    const nm = String(item.name || '').trim();
+    if (!nm) return '';
+    const kind = normalizeIOType(item.type);
+    if (kind === 'file' || kind === 'folder' || kind === 'binary file') {
+      return `${nm} (${kind})`;
+    }
+    return nm;
   }
 
   function typeSummary(items) {
@@ -743,7 +706,7 @@
     const opt = [];
     arr.forEach((it) => {
       if (!it || typeof it !== 'object') return;
-      const nm = String(it.name || '').trim();
+      const nm = formatNameWithKind(it);
       if (!nm) return;
       const isOptional = it.required === false;
       (isOptional ? opt : req).push(nm);
@@ -770,7 +733,10 @@
     arr.forEach((x) => {
       const s = String(x || '').trim();
       if (!s) return;
-      out.push(s);
+      // Best-effort: label common injected artifact keys.
+      if (s === 'filesystem.file') out.push('filesystem.file (file)');
+      else if (s === 'filesystem.dir') out.push('filesystem.dir (folder)');
+      else out.push(s);
     });
     out.sort();
     return out.length ? out.join(', ') : '—';

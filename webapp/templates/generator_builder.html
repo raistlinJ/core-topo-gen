@@ -142,7 +142,10 @@
 
           <div class="d-flex gap-2">
             <button class="btn btn-outline-primary" id="gbBtnZip"><i class="bi bi-file-earmark-zip"></i> Download scaffold zip</button>
-            <button class="btn btn-outline-success" id="gbBtnRegister"><i class="bi bi-check2-circle"></i> Register in catalog</button>
+          </div>
+
+          <div class="mt-2 small text-muted">
+            To install a generator, upload the ZIP as a Generator Pack on the <a href="{{ url_for('flag_catalog_page') }}" class="text-muted">Flag-Catalog</a> page.
           </div>
 
           <div class="mt-3 small text-muted">
@@ -755,25 +758,6 @@
       // Refresh derived metadata view (catalog JSON + scaffold paths)
       const data = await postJson('/api/generators/scaffold_meta', payload);
       renderResult(data);
-    } catch (e){
-      alert('Failed: ' + (e && e.message ? e.message : e));
-    }
-  });
-
-  document.getElementById('gbBtnRegister').addEventListener('click', async ()=>{
-    try {
-      const payload = buildPayload();
-      // default safe behavior: don't overwrite; don't force duplicates.
-      const data = await postJson('/api/generators/register_catalog', payload);
-      renderResult(data);
-      const src = data && data.source ? data.source : null;
-      const msg = [
-        'Registered generator catalog source.',
-        (data.catalog_path ? ('Catalog: ' + data.catalog_path) : ''),
-        (data.state_path ? ('State: ' + data.state_path) : ''),
-        (src && src.id ? ('Source id: ' + src.id) : ''),
-      ].filter(Boolean).join('\n');
-      alert(msg);
     } catch (e){
       alert('Failed: ' + (e && e.message ? e.message : e));
     }
