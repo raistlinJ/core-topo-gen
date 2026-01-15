@@ -139,13 +139,13 @@
             <div class="card-body">
               <div class="table-responsive">
                 <table class="table table-sm align-middle" id="vulnCatalogTable">
-                  <thead>
+                  <thead class="fw-semibold">
                     <tr>
                       <th style="width: 60px;">#</th>
                       <th>Name</th>
                       <th>Type</th>
                       <th>From Source</th>
-                      <th style="width: 180px;">Actions</th>
+                      <th style="width: 160px;">Actions</th>
                     </tr>
                   </thead>
                   <tbody id="vulnCatalogBody"></tbody>
@@ -157,6 +157,28 @@
         </div>
       </div>
 
+    </div>
+  </div>
+</div>
+
+<!-- Vulnerability Pack Upload Progress Modal -->
+<div class="modal fade" id="vulnPackUploadProgressModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Uploading Vulnerability Pack…</h5>
+      </div>
+      <div class="modal-body">
+        <div class="small text-muted mb-2" id="vulnPackUploadProgressText">Preparing upload…</div>
+        <div class="progress" role="progressbar" aria-label="Upload progress" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-bar progress-bar-striped progress-bar-animated" id="vulnPackUploadProgressBar" style="width: 0%">0%</div>
+        </div>
+        <div class="small text-muted mt-2" id="vulnPackUploadProgressBytes"></div>
+        <pre class="small bg-light p-2 mt-3" id="vulnPackUploadResult" style="max-height: 180px; overflow: auto; display:none;"></pre>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" id="vulnPackUploadCloseBtn" data-bs-dismiss="modal" style="display:none;">Close</button>
+      </div>
     </div>
   </div>
 </div>
@@ -192,7 +214,105 @@
     active: null,
     items: [],
     selectedItem: null,
+    sortKey: 'name',
+    sortDir: 'asc',
   };
+
+  function escapeHtml(s) {
+    try {
+      return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function normalizeForSort(v) {
+    try {
+      return String(v ?? '').toLowerCase();
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function compareForSort(a, b) {
+    const ax = normalizeForSort(a);
+    const bx = normalizeForSort(b);
+    if (ax < bx) return -1;
+    if (ax > bx) return 1;
+    return 0;
+  }
+
+  function stableSorted(items, keyFn, dir) {
+    const direction = (dir === 'desc') ? -1 : 1;
+    const decorated = (Array.isArray(items) ? items : []).map((item, idx) => ({ item, idx }));
+    decorated.sort((x, y) => {
+      const c = compareForSort(keyFn(x.item), keyFn(y.item));
+      if (c !== 0) return c * direction;
+      return x.idx - y.idx;
+    });
+    return decorated.map(d => d.item);
+  }
+
+  function updateSortIndicators(tableId, state, columns) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+    const ths = table.querySelectorAll('thead th');
+    ths.forEach((th, idx) => {
+      const col = columns[idx];
+      if (!col) return;
+      const base = col.label || th.getAttribute('data-base-label') || th.textContent || '';
+      if (!th.getAttribute('data-base-label')) {
+        th.setAttribute('data-base-label', base);
+      }
+      if (col.key && state.sortKey === col.key) {
+        const arrow = (state.sortDir === 'desc') ? '▼' : '▲';
+        th.textContent = `${base} ${arrow}`;
+      } else {
+        th.textContent = base;
+      }
+    });
+  }
+
+  function enableTableSorting(tableId, state, columns, renderFn) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+    const ths = table.querySelectorAll('thead th');
+    ths.forEach((th, idx) => {
+      const col = columns[idx];
+      if (!col || !col.key) return;
+      if (th.getAttribute('data-sort-init') === '1') return;
+      th.setAttribute('data-sort-init', '1');
+      th.style.cursor = 'pointer';
+      th.title = 'Click to sort';
+      th.classList.add('user-select-none');
+      th.addEventListener('click', () => {
+        if (state.sortKey === col.key) {
+          state.sortDir = (state.sortDir === 'asc') ? 'desc' : 'asc';
+        } else {
+          state.sortKey = col.key;
+          state.sortDir = 'asc';
+        }
+        try { renderFn(); } catch (e) {}
+        updateSortIndicators(tableId, state, columns);
+      });
+    });
+    updateSortIndicators(tableId, state, columns);
+  }
+
+  function _fmtBytes(n) {
+    const v = Number(n || 0);
+    if (!isFinite(v) || v <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let idx = 0;
+    let cur = v;
+    while (cur >= 1024 && idx < units.length - 1) { cur /= 1024; idx++; }
+    return `${cur.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`;
+  }
 
   function _qs(id) { return document.getElementById(id); }
 
@@ -247,22 +367,36 @@
       return nm.includes(filter) || src.includes(filter) || String(it.id || '').includes(filter);
     });
 
-    for (const it of rows) {
+    const sortKey = _vulnCatalogState.sortKey || 'name';
+    const sortDir = _vulnCatalogState.sortDir || 'asc';
+    const sorted = stableSorted(rows, (it) => {
+      if (!it || typeof it !== 'object') return '';
+      if (sortKey === 'name') return it.name || '';
+      if (sortKey === 'type') return it.type || '';
+      if (sortKey === 'from_source') return it.from_source || '';
+      if (sortKey === 'id') return String(it.id || '');
+      return it[sortKey] || '';
+    }, sortDir);
+
+    sorted.forEach((it, idx) => {
       const tr = document.createElement('tr');
       if (it.disabled) tr.classList.add('table-secondary');
       tr.innerHTML = `
-        <td class="small">${String(it.id ?? '')}</td>
+        <td class="text-muted">${idx + 1}</td>
         <td>
-          <div><strong>${String(it.name || '')}</strong></div>
-          ${it.disabled ? '<div class="small text-muted">Disabled</div>' : ''}
+          <div>
+            <strong>${escapeHtml(it.name || '')}</strong>
+            ${it.disabled ? `<span class="badge bg-warning text-dark ms-2">Disabled</span>` : ''}
+          </div>
+          <div class="small text-muted">ID: ${escapeHtml(it.id ?? '')}</div>
         </td>
-        <td class="small">${String(it.type || 'docker-compose')}</td>
-        <td class="small" style="max-width: 420px; word-break: break-word;">${String(it.from_source || '')}</td>
+        <td class="small">${escapeHtml(it.type || 'docker-compose')}</td>
+        <td class="small">${escapeHtml(it.from_source || '')}</td>
         <td>
-          <div class="d-flex gap-2 flex-wrap">
-            <button class="btn btn-sm btn-outline-primary" data-action="test">Test</button>
-            <button class="btn btn-sm btn-outline-warning" data-action="toggle">${it.disabled ? 'Enable' : 'Disable'}</button>
-            <button class="btn btn-sm btn-outline-danger" data-action="delete">Delete</button>
+          <div class="btn-group btn-group-sm" role="group">
+            <button class="btn btn-sm btn-outline-primary" data-action="test" type="button" ${it.disabled ? 'disabled' : ''} title="${it.disabled ? 'Disabled' : 'Test vulnerability'}">Test</button>
+            <button class="btn btn-sm btn-outline-warning" data-action="toggle" type="button" title="${it.disabled ? 'Enable vulnerability' : 'Disable vulnerability'}">${it.disabled ? 'Enable' : 'Disable'}</button>
+            <button class="btn btn-sm btn-outline-danger" data-action="delete" type="button" title="Delete vulnerability">Delete</button>
           </div>
         </td>
       `;
@@ -291,7 +425,7 @@
       });
 
       body.appendChild(tr);
-    }
+    });
 
     if (!rows.length) {
       const tr = document.createElement('tr');
@@ -345,8 +479,94 @@
   }
 
   document.addEventListener('DOMContentLoaded', () => {
+    // Vulnerability Pack ZIP upload progress
+    const packsPane = document.getElementById('vulnPacks');
+    const uploadForm = packsPane ? packsPane.querySelector('form[action$="/vuln_catalog_packs/upload"]') : null;
+    const uploadModalEl = document.getElementById('vulnPackUploadProgressModal');
+    const uploadModal = uploadModalEl ? new bootstrap.Modal(uploadModalEl) : null;
+
+    async function runVulnPackUploadWithProgress(form) {
+      if (!form || !uploadModal) return;
+      const fileInput = form.querySelector('input[type="file"][name="zip_file"]');
+      const file = fileInput && fileInput.files ? fileInput.files[0] : null;
+      if (!file) return;
+
+      const progressText = document.getElementById('vulnPackUploadProgressText');
+      const progressBar = document.getElementById('vulnPackUploadProgressBar');
+      const progressBytes = document.getElementById('vulnPackUploadProgressBytes');
+      const resultPre = document.getElementById('vulnPackUploadResult');
+      const closeBtn = document.getElementById('vulnPackUploadCloseBtn');
+
+      if (resultPre) { resultPre.style.display = 'none'; resultPre.textContent = ''; }
+      if (closeBtn) closeBtn.style.display = 'none';
+      if (progressText) progressText.textContent = `Uploading ${file.name}…`;
+      if (progressBytes) progressBytes.textContent = `0 / ${_fmtBytes(file.size)}`;
+      if (progressBar) { progressBar.style.width = '0%'; progressBar.textContent = '0%'; }
+
+      uploadModal.show();
+
+      const fd = new FormData(form);
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', form.action, true);
+      xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+
+      xhr.upload.onprogress = (ev) => {
+        if (!ev.lengthComputable) return;
+        const pct = Math.max(0, Math.min(100, Math.round((ev.loaded / ev.total) * 100)));
+        if (progressBar) { progressBar.style.width = `${pct}%`; progressBar.textContent = `${pct}%`; }
+        if (progressBytes) progressBytes.textContent = `${_fmtBytes(ev.loaded)} / ${_fmtBytes(ev.total)}`;
+      };
+
+      xhr.onreadystatechange = () => {
+        if (xhr.readyState !== 4) return;
+        const ok = xhr.status >= 200 && xhr.status < 300;
+        let msg = '';
+        try {
+          const obj = JSON.parse(xhr.responseText || '{}');
+          if (obj && obj.message) msg = String(obj.message);
+          else if (obj && obj.error) msg = String(obj.error);
+        } catch (e) {
+          msg = (xhr.responseText || '').trim();
+        }
+        if (!msg) msg = ok ? 'Upload complete.' : `Upload failed (HTTP ${xhr.status}).`;
+        if (progressText) progressText.textContent = msg;
+        if (progressBar) {
+          progressBar.classList.remove('progress-bar-animated');
+          progressBar.classList.remove('progress-bar-striped');
+        }
+        if (resultPre) {
+          const txt = (xhr.responseText || '').trim();
+          if (txt) {
+            resultPre.style.display = 'block';
+            resultPre.textContent = txt.length > 6000 ? (txt.slice(0, 6000) + '\n…(truncated)…') : txt;
+          }
+        }
+        if (closeBtn) closeBtn.style.display = 'inline-block';
+        // Refresh to show newly installed pack + flash messages.
+        setTimeout(() => { window.location.reload(); }, ok ? 700 : 1200);
+      };
+
+      xhr.send(fd);
+    }
+
+    if (uploadForm) {
+      uploadForm.addEventListener('submit', (ev) => {
+        ev.preventDefault();
+        runVulnPackUploadWithProgress(uploadForm);
+      });
+    }
+
     const filter = _qs('vulnCatalogFilter');
     if (filter) filter.addEventListener('input', _renderVulnCatalogTable);
+
+    // Mirror Flag-Generators: click header to sort + arrows
+    enableTableSorting('vulnCatalogTable', _vulnCatalogState, [
+      { label: '#', key: null },
+      { label: 'Name', key: 'name' },
+      { label: 'Type', key: 'type' },
+      { label: 'From Source', key: 'from_source' },
+      { label: 'Actions', key: null },
+    ], _renderVulnCatalogTable);
     const tab = _qs('vulnCatalogTab');
     if (tab) tab.addEventListener('shown.bs.tab', async () => {
       try { await loadVulnCatalogItems(); } catch (e) { _setText('vulnCatalogMeta', String(e)); }

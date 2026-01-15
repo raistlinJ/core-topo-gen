@@ -30852,9 +30852,15 @@ def _install_vuln_catalog_zip_bytes(*, zip_bytes: bytes, label: str, origin: str
         norm_label = str(label or '').strip()
         for idx, (rel_name, compose_path) in enumerate(sorted(compose_paths, key=lambda t: t[0]), start=1):
             rel_dir = rel_name
-            display_name = os.path.basename(rel_dir.rstrip('/')) if rel_dir not in ('', '.', 'root') else 'root'
-            if not display_name:
-                display_name = rel_dir or 'root'
+            # Display name should include the parent folder when nested: <parent>/<leaf>.
+            if rel_dir in ('', '.', 'root'):
+                display_name = 'root'
+            else:
+                parts = [p for p in str(rel_dir).replace('\\', '/').split('/') if p]
+                if len(parts) >= 2:
+                    display_name = f"{parts[-2]}/{parts[-1]}"
+                else:
+                    display_name = parts[-1] if parts else 'root'
             compose_rel = os.path.relpath(compose_path, content_dir).replace('\\', '/')
             dir_rel = os.path.relpath(os.path.dirname(compose_path), content_dir).replace('\\', '/')
             compose_items.append({
@@ -30947,15 +30953,22 @@ def vuln_catalog_page():
 def vuln_catalog_packs_upload():
     _require_builder_or_admin()
     f = request.files.get('zip_file')
+    is_ajax = str(request.headers.get('X-Requested-With') or '').lower() == 'xmlhttprequest' or 'application/json' in str(request.headers.get('Accept') or '')
     if not f:
+        if is_ajax:
+            return jsonify({'ok': False, 'error': 'Missing zip_file'}), 400
         flash('Missing zip_file')
         return redirect(url_for('vuln_catalog_page'))
     try:
         data = f.read() or b''
         label = secure_filename(getattr(f, 'filename', '') or '') or 'vuln-catalog'
-        _install_vuln_catalog_zip_bytes(zip_bytes=data, label=label, origin='upload')
+        entry = _install_vuln_catalog_zip_bytes(zip_bytes=data, label=label, origin='upload')
+        if is_ajax:
+            return jsonify({'ok': True, 'message': 'Vulnerability catalog pack installed.', 'catalog_id': str(entry.get('id') or '')})
         flash('Vulnerability catalog pack installed.')
     except Exception as exc:
+        if is_ajax:
+            return jsonify({'ok': False, 'error': f'Failed to install vulnerability catalog pack: {exc}'}), 400
         flash(f'Failed to install vulnerability catalog pack: {exc}')
     return redirect(url_for('vuln_catalog_page'))
 
@@ -31067,6 +31080,69 @@ def vuln_catalog_packs_file(catalog_id: str, subpath: str):
     return send_file(abs_p, as_attachment=True, download_name=os.path.basename(abs_p))
 
 
+@app.route('/vuln_catalog_packs/item_files/<catalog_id>/<int:item_id>')
+def vuln_catalog_pack_item_files(catalog_id: str, item_id: int):
+    """Return a list of files for a single vulnerability item directory.
+
+    Used by the Topology "Select Vulnerability" modal to populate a Files dropdown.
+    """
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    if not cid:
+        return jsonify({'ok': False, 'error': 'Missing catalog id'}), 404
+
+    state = _load_vuln_catalogs_state()
+    entry = None
+    for c in (state.get('catalogs') or []):
+        if isinstance(c, dict) and str(c.get('id') or '').strip() == cid:
+            entry = c
+            break
+    if not entry:
+        return jsonify({'ok': False, 'error': 'Unknown catalog id'}), 404
+
+    items = _normalize_vuln_catalog_items(entry)
+    target = None
+    for it in items:
+        try:
+            if int(it.get('id') or 0) == int(item_id):
+                target = it
+                break
+        except Exception:
+            continue
+    if not target:
+        return jsonify({'ok': False, 'error': 'Unknown item id'}), 404
+
+    base_dir = _vuln_catalog_pack_content_dir(cid)
+    if not os.path.isdir(base_dir):
+        return jsonify({'ok': False, 'error': 'Pack content missing'}), 404
+
+    rel_dir = str(target.get('rel_dir') or target.get('dir_rel') or '').strip().replace('\\', '/')
+    try:
+        abs_dir = _safe_path_under(base_dir, rel_dir)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Invalid item path'}), 400
+    if not os.path.isdir(abs_dir):
+        return jsonify({'ok': False, 'error': 'Item directory missing'}), 404
+
+    files: list[dict[str, str]] = []
+    try:
+        for nm in sorted(os.listdir(abs_dir)):
+            if nm in ('.', '..'):
+                continue
+            ap = os.path.join(abs_dir, nm)
+            if not os.path.isfile(ap):
+                continue
+            rel = os.path.relpath(ap, base_dir).replace('\\', '/')
+            files.append({
+                'name': nm,
+                'url': url_for('vuln_catalog_packs_file', catalog_id=cid, subpath=rel),
+            })
+    except Exception:
+        files = []
+
+    return jsonify({'ok': True, 'catalog_id': cid, 'item_id': int(item_id), 'files': files})
+
+
 @app.route('/vuln_catalog_packs/set_active/<catalog_id>', methods=['POST'])
 def vuln_catalog_packs_set_active(catalog_id: str):
     _require_builder_or_admin()
@@ -31128,6 +31204,9 @@ def _normalize_vuln_catalog_items(entry: dict) -> list[dict[str, Any]]:
         it['id'] = iid_int
         it['disabled'] = bool(it.get('disabled', False))
         it['name'] = str(it.get('name') or '').strip() or 'root'
+        it['rel_dir'] = str(it.get('rel_dir') or '').strip()
+        it['dir_rel'] = str(it.get('dir_rel') or '').strip()
+        it['compose_rel'] = str(it.get('compose_rel') or '').strip()
         out.append(it)
     out.sort(key=lambda d: int(d.get('id') or 0))
     return out
@@ -31178,11 +31257,22 @@ def vuln_catalog_items_data():
     cid = str(entry.get('id') or '').strip()
     items = _normalize_vuln_catalog_items(entry)
     from_source = str(entry.get('from_source') or entry.get('label') or '').strip()
+    def _display_name(it: dict[str, Any]) -> str:
+        # Prefer stored name, but for deeper folders compute <parent>/<leaf> from rel_dir/dir_rel.
+        base = str(it.get('name') or '').strip() or 'root'
+        rel_dir = str(it.get('rel_dir') or it.get('dir_rel') or '').strip()
+        if not rel_dir or rel_dir in ('', '.', 'root'):
+            return base
+        parts = [p for p in rel_dir.replace('\\', '/').split('/') if p]
+        if len(parts) >= 2:
+            return f"{parts[-2]}/{parts[-1]}"
+        return parts[-1] if parts else base
+
     out_items: list[dict[str, Any]] = []
     for it in items:
         out_items.append({
             'id': int(it.get('id') or 0),
-            'name': str(it.get('name') or '').strip() or 'root',
+            'name': _display_name(it),
             'type': 'docker-compose',
             'from_source': from_source,
             'disabled': bool(it.get('disabled', False)),
@@ -33228,14 +33318,81 @@ def flag_compose_remove():
 def vuln_catalog():
     """Return vulnerability catalog.
 
-    Latest-only policy: the web UI reads the repo-shipped raw datasource CSVs
-    (same source as the CLI).
+    The Topology tab uses this for the "Select Vulnerability" modal.
+
+    Source priority:
+    1) Active installed Vulnerability Pack (Web UI state in outputs/installed_vuln_catalogs)
+       - respects disabled/deleted items
+       - uses UI-style display names (e.g. <parent>/<leaf>)
+    2) Fallback to repo/CLI CSV loader (raw_datasources)
     """
     try:
-        from core_topo_gen.utils.vuln_process import load_vuln_catalog
+        # Prefer the new vulnerability-pack-backed catalog when present.
+        try:
+            state = _load_vuln_catalogs_state()
+            entry = _get_active_vuln_catalog_entry(state)
+        except Exception:
+            state = {}
+            entry = None
 
-        repo_root = _get_repo_root()
-        items = load_vuln_catalog(repo_root)
+        if entry and isinstance(entry, dict):
+            cid = str(entry.get('id') or '').strip()
+            norm_items = _normalize_vuln_catalog_items(entry)
+            from_source = str(entry.get('from_source') or entry.get('label') or '').strip()
+
+            def _display_name(it: dict[str, Any]) -> str:
+                base = str(it.get('name') or '').strip() or 'root'
+                rel_dir = str(it.get('rel_dir') or it.get('dir_rel') or '').strip()
+                if not rel_dir or rel_dir in ('', '.', 'root'):
+                    return base
+                parts = [p for p in rel_dir.replace('\\', '/').split('/') if p]
+                if len(parts) >= 2:
+                    return f"{parts[-2]}/{parts[-1]}"
+                return parts[-1] if parts else base
+
+            items: list[dict[str, str]] = []
+            for it in norm_items:
+                if bool(it.get('disabled', False)):
+                    continue
+                try:
+                    abs_compose = _vuln_catalog_item_abs_compose_path(catalog_id=cid, item=it)
+                except Exception:
+                    continue
+                rel_dir = str(it.get('rel_dir') or it.get('dir_rel') or '').strip().replace('\\', '/')
+                files_api_url = ''
+                try:
+                    files_api_url = url_for('vuln_catalog_pack_item_files', catalog_id=cid, item_id=int(it.get('id') or 0))
+                except Exception:
+                    files_api_url = ''
+                items.append({
+                    'Name': _display_name(it),
+                    'Path': os.path.abspath(abs_compose),
+                    'Type': 'docker-compose',
+                    'Vector': '',
+                    'Startup': '',
+                    'CVE': '',
+                    'Description': '',
+                    'References': '',
+                    'id': str(it.get('id') or '').strip(),
+                    'from_source': from_source,
+                    'files_api_url': files_api_url,
+                })
+        else:
+            from core_topo_gen.utils.vuln_process import load_vuln_catalog
+
+            repo_root = _get_repo_root()
+            items = load_vuln_catalog(repo_root)
+
+            # Provide optional fields used by some UIs; safe no-ops for older clients.
+            try:
+                for it in items:
+                    if isinstance(it, dict):
+                        it.setdefault('id', '')
+                        it.setdefault('from_source', 'raw_datasources')
+                        it.setdefault('files_api_url', '')
+            except Exception:
+                pass
+
         types = sorted({str(it.get('Type') or '').strip() for it in items if str(it.get('Type') or '').strip()})
         vectors = sorted({str(it.get('Vector') or '').strip() for it in items if str(it.get('Vector') or '').strip()})
         return jsonify({'types': types, 'vectors': vectors, 'items': items})
@@ -33580,6 +33737,10 @@ def vuln_compose_status_images():
                         except Exception:
                             missing.append(img)
                     pulled = len(missing) == 0
+                else:
+                    # No images declared (common with build-only compose files). Treat as ready
+                    # so the UI doesn't perpetually show Download/Pull.
+                    pulled = True
 
             out.append({
                 'Name': name,

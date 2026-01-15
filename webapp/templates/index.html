@@ -16671,10 +16671,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
 // Vulnerability catalog and UI helpers
 async function setupVulnCatalog(){
-        try {
-                const res = await fetch('/vuln_catalog');
-        if(res.ok){ window.VULN_CATALOG = await res.json(); }
+    try {
+        const res = await fetch('/vuln_catalog', { credentials: 'same-origin' });
+    if(res.ok){ window.VULN_CATALOG = await res.json(); }
     } catch(e) { window.VULN_CATALOG = { types: [], vectors: [], items: [] }; }
+    // Refresh any already-rendered selects once the catalog loads.
+    try { if (typeof populateVulnSelects === 'function') populateVulnSelects(); } catch (e) {}
+    return window.VULN_CATALOG;
 }
 
 function populateVulnSelects() {
@@ -16682,17 +16685,26 @@ function populateVulnSelects() {
                 const sidx = parseInt(sel.getAttribute('data-scen-idx'));
                 const sec = sel.getAttribute('data-sec');
                 const iidx = parseInt(sel.getAttribute('data-item-idx'));
-                const cur = (state.scenarios[sidx].sections[sec].items[iidx].v_type) || 'Random';
-                const opts = ['Random', ...(window.VULN_CATALOG?.types || [])];
-                sel.innerHTML = opts.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
+        const rawCur = (state.scenarios[sidx].sections[sec].items[iidx].v_type) || 'Random';
+        const opts = ['Random', ...(window.VULN_CATALOG?.types || [])];
+        const cur = opts.includes(rawCur) ? rawCur : 'Random';
+        // Coerce stale values to Random so downstream filters don't zero-out.
+        if (cur !== rawCur) {
+            try { state.scenarios[sidx].sections[sec].items[iidx].v_type = cur; } catch (e) {}
+        }
+        sel.innerHTML = opts.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
         });
         document.querySelectorAll('.vuln-vector').forEach(sel => {
                 const sidx = parseInt(sel.getAttribute('data-scen-idx'));
                 const sec = sel.getAttribute('data-sec');
                 const iidx = parseInt(sel.getAttribute('data-item-idx'));
-                const cur = (state.scenarios[sidx].sections[sec].items[iidx].v_vector) || 'Random';
-                const opts = ['Random', ...(window.VULN_CATALOG?.vectors || [])];
-                sel.innerHTML = opts.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
+        const rawCur = (state.scenarios[sidx].sections[sec].items[iidx].v_vector) || 'Random';
+        const opts = ['Random', ...(window.VULN_CATALOG?.vectors || [])];
+        const cur = opts.includes(rawCur) ? rawCur : 'Random';
+        if (cur !== rawCur) {
+            try { state.scenarios[sidx].sections[sec].items[iidx].v_vector = cur; } catch (e) {}
+        }
+        sel.innerHTML = opts.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
         });
 }
 
@@ -16729,7 +16741,7 @@ function ensureVulnModal(){
                     <div class="text-muted small mb-2" id="vulnFilterMeta"></div>
                     <div class="table-responsive" id="vulnTableWrap" style="max-height:50vh; overflow:auto; display:none;">
                         <table class="table table-sm">
-                            <thead><tr><th>Name</th><th>Type</th><th>Vector</th><th>Status</th><th>Actions</th><th>Path</th></tr></thead>
+                            <thead class="fw-bold"><tr><th style="width:4rem;">#</th><th>Name</th><th style="width:10rem;">Status</th><th style="width:10rem;">Actions</th><th style="width:6rem;">Files</th></tr></thead>
                             <tbody id="vulnList"></tbody>
                         </table>
                     </div>
@@ -16843,6 +16855,7 @@ function hideVulnProgressModal(){
 }
 
 async function openVulnPicker(sidx, secName, iidx){
+    try { await setupVulnCatalog(); } catch (e) {}
     ensureVulnModal();
     const modalEl = document.getElementById('vulnModal');
     if (!modalEl) {
@@ -16860,13 +16873,23 @@ async function openVulnPicker(sidx, secName, iidx){
     const loadBar = modalEl.querySelector('#vulnLoadProgressBar');
     const loadMeta = modalEl.querySelector('#vulnLoadMeta');
     const row = state.scenarios[sidx].sections[secName].items[iidx] || {};
-    const selVector = (row.v_vector || 'Random');
+    const vectorsLower = new Set((window.VULN_CATALOG?.vectors || []).map(v => String(v || '').toLowerCase()));
+    const rawSelVector = (row.v_vector || 'Random');
+    const selVector = (rawSelVector && rawSelVector !== 'Random' && vectorsLower.has(String(rawSelVector).toLowerCase()))
+        ? rawSelVector
+        : 'Random';
     // Base: docker-compose only
     const all = (window.VULN_CATALOG?.items || []);
     let base = all.filter(it => (it.Type||'').toLowerCase() === 'docker-compose');
     if (selVector && selVector !== 'Random') {
         const vv = selVector.toLowerCase();
         base = base.filter(it => (it.Vector||'').toLowerCase() === vv);
+    }
+    // If the catalog didn't have this vector (stale scenario state), don't hide everything.
+    if (rawSelVector && rawSelVector !== 'Random' && selVector === 'Random') {
+        try {
+            if (loadMeta) loadMeta.textContent = `Loading eligible items… (ignoring stale vector “${rawSelVector}”)`;
+        } catch (e) {}
     }
     // Status cache keyed by Path (stable) or Name fallback
     const statusByKey = new Map();
@@ -17030,8 +17053,15 @@ async function openVulnPicker(sidx, secName, iidx){
         } catch (e) {}
 
         try { setVulnProgress(80, `Refreshing status for ${it.Name}…`); } catch (e) {}
+        // Poll a few times since image pulls can finish asynchronously.
         try {
-            await fetchStatuses([it], 'Refreshing…');
+            const maxAttempts = 6;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                await fetchStatuses([it], `Refreshing… (${attempt}/${maxAttempts})`);
+                const st = statusByKey.get(key) || null;
+                if (st && st.exists && st.pulled) break;
+                await new Promise(r => setTimeout(r, 450));
+            }
         } catch (e) {}
 
         try {
@@ -17053,28 +17083,108 @@ async function openVulnPicker(sidx, secName, iidx){
     const allowDownloadPullActions = (IS_ADMIN_USER && !IS_BUILDER_VIEW);
 
     const renderRows = () => {
+        const esc = (value) => (value ?? '').toString()
+            .replace(/&/g,'&amp;')
+            .replace(/</g,'&lt;')
+            .replace(/>/g,'&gt;')
+            .replace(/"/g,'&quot;')
+            .replace(/'/g,'&#39;');
         tbody.innerHTML = '';
         if (!current || current.length === 0) {
             const tr = document.createElement('tr');
             const td = document.createElement('td');
-            td.colSpan = 6;
+            td.colSpan = 5;
             td.className = 'text-center text-muted py-3';
             td.textContent = 'No results';
             tr.appendChild(td);
             tbody.appendChild(tr);
             return;
         }
-        current.forEach((it) => {
+        current.forEach((it, idx) => {
             const st = statusByKey.get(itemKey(it)) || null;
             const tr = document.createElement('tr');
-            tr.innerHTML = `<td>${it.Name}</td><td>${it.Type}</td><td>${it.Vector}</td><td>${statusBadgeHtml(st)}</td><td></td><td>${it.Path}</td>`;
+            const nameHtml = (() => {
+                const name = esc(it?.Name || '');
+                const badge = (it && it.disabled) ? ' <span class="badge text-bg-secondary">Disabled</span>' : '';
+
+                const metaParts = [];
+                const idVal = (it && (it.id ?? it.Id ?? it.ID)) ? String(it.id ?? it.Id ?? it.ID) : '';
+                const srcVal = (it && (it.from_source ?? it.From_Source ?? it.fromSource)) ? String(it.from_source ?? it.From_Source ?? it.fromSource) : '';
+                if (idVal) metaParts.push(`ID: ${esc(idVal)}`);
+                if (srcVal) metaParts.push(`From: ${esc(srcVal)}`);
+                if (it && it.Type) metaParts.push(`Type: ${esc(it.Type)}`);
+                if (it && it.Vector) metaParts.push(`Vector: ${esc(it.Vector)}`);
+                const meta = metaParts.length ? `<div class="text-muted small">${metaParts.join(' • ')}</div>` : '';
+                return `<div class="fw-semibold">${name}${badge}</div>${meta}`;
+            })();
+            const filesApiUrl = (it && (it.files_api_url || it.filesApiUrl)) ? String(it.files_api_url || it.filesApiUrl) : '';
+            const allowFilesBrowse = (IS_ADMIN_USER && !IS_BUILDER_VIEW);
+            const filesHtml = (() => {
+                if (!filesApiUrl) return '<span class="text-muted small">—</span>';
+                if (!allowFilesBrowse) return '<span class="text-muted small">Admin required</span>';
+                return `
+                    <select class="form-select form-select-sm" data-files-api="${esc(filesApiUrl)}" aria-label="Files">
+                        <option value="" selected>Files…</option>
+                    </select>
+                `;
+            })();
+            tr.innerHTML = `<td class="text-muted">${idx + 1}</td><td>${nameHtml}</td><td>${statusBadgeHtml(st)}</td><td></td><td>${filesHtml}</td>`;
             const pickable = isPickable(st);
             tr.style.cursor = pickable ? 'pointer' : 'not-allowed';
             if (!pickable) tr.classList.add('text-muted');
 
+            // Files dropdown behavior: lazy-load files and open selection in a new tab.
+            try {
+                const filesTd = tr.children[4];
+                const sel = filesTd ? filesTd.querySelector('select[data-files-api]') : null;
+                if (sel) {
+                    sel.addEventListener('click', (ev) => { try { ev.stopPropagation(); } catch (e) {} });
+                    sel.addEventListener('focus', async (ev) => {
+                        try { ev.stopPropagation(); } catch (e) {}
+                        // Load only once.
+                        if (sel.getAttribute('data-loaded') === '1') return;
+                        sel.setAttribute('data-loaded', '1');
+                        const api = sel.getAttribute('data-files-api') || '';
+                        if (!api) return;
+                        // Temporary loading option
+                        try {
+                            sel.innerHTML = '<option value="" selected>Loading…</option>';
+                        } catch (e) {}
+                        let payload = null;
+                        try {
+                            const resp = await fetch(api, { credentials: 'same-origin' });
+                            payload = resp.ok ? await resp.json().catch(() => null) : null;
+                        } catch (e) {
+                            payload = null;
+                        }
+                        const files = payload && Array.isArray(payload.files) ? payload.files : [];
+                        if (!files.length) {
+                            sel.innerHTML = '<option value="" selected>(no files)</option>';
+                            return;
+                        }
+                        const opts = ['<option value="" selected>Files…</option>'];
+                        files.forEach(f => {
+                            const nm = esc((f && f.name) ? f.name : 'file');
+                            const url = esc((f && f.url) ? f.url : '');
+                            if (!url) return;
+                            opts.push(`<option value="${url}">${nm}</option>`);
+                        });
+                        sel.innerHTML = opts.join('');
+                    });
+                    sel.addEventListener('change', (ev) => {
+                        try { ev.stopPropagation(); } catch (e) {}
+                        const v = String(sel.value || '');
+                        if (v) {
+                            try { window.open(v, '_blank', 'noopener'); } catch (e) {}
+                        }
+                        try { sel.value = ''; } catch (e) {}
+                    });
+                }
+            } catch (e) {}
+
             // Action button (Download/Pull) when not ready
             try {
-                const actionTd = tr.children[4];
+                const actionTd = tr.children[3];
                 if (actionTd) {
                     const needs = canDownloadPull(st);
                     if (needs) {
@@ -17102,13 +17212,16 @@ async function openVulnPicker(sidx, secName, iidx){
                                 const confirmMsg = `Download compose and pull images for “${it.Name}”?`;
                                 if (!confirm(confirmMsg)) return;
                                 btn.disabled = true;
+                                try { btn.textContent = 'Working…'; } catch (e) {}
                                 await downloadPullOne(it);
+                                // Re-render now that status cache is updated.
                                 applyFilter();
                             } catch (e) {
                                 console.warn('Download/Pull failed', e);
                                 alert('Download/Pull failed. Check server logs.');
                             } finally {
                                 try { btn.disabled = false; } catch (e) {}
+                                try { btn.textContent = 'Download/Pull'; } catch (e) {}
                             }
                         };
                         actionTd.appendChild(btn);
@@ -17120,13 +17233,6 @@ async function openVulnPicker(sidx, secName, iidx){
 
             tr.onclick = async () => {
                 if (!pickable) {
-                    try {
-                        const msg = (!st || st.docker_available === false)
-                            ? 'Docker not available; cannot select this vulnerability.'
-                            : (!st.exists ? 'Compose not downloaded; use Download/Pull.' : 'Images not pulled; use Download/Pull.');
-                        logWarn(msg);
-                        alert(msg);
-                    } catch (e) {}
                     return;
                 }
                 const item = state.scenarios[sidx].sections[secName].items[iidx];
