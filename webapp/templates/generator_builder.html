@@ -29,13 +29,13 @@
         <div class="card-body">
           <div class="alert alert-info small mb-3">
             Builds a ready-to-zip scaffold for creating new generators.
-            The scaffold includes <span class="font-monospace">manifest.yaml</span> for Generator Packs and follows the existing <code>scripts/run_flag_generator.py</code> runtime contract.
+            The scaffold includes <span class="font-monospace">manifest.yaml</span> for Generator Packs and follows the runtime contract used by the generator runner.
             <div class="mt-2">
               <div class="fw-semibold">Conventions</div>
               <ul class="mb-0">
-                <li><span class="font-monospace">hint.txt</span> is optional; prefer <span class="font-monospace">hint_templates</span> in the catalog.</li>
+                <li><span class="font-monospace">hint.txt</span> is optional; prefer <span class="font-monospace">hint_templates</span> in <span class="font-monospace">manifest.yaml</span>.</li>
                 <li>For file outputs: write under <span class="font-monospace">/outputs/artifacts/...</span> and reference in <span class="font-monospace">outputs.json</span> as <span class="font-monospace">artifacts/&lt;name&gt;</span>.</li>
-                <li>To stage files into scenarios, set an allowlist (prefer output keys like <span class="font-monospace">filesystem.file</span>): <span class="font-monospace">injects</span> (manifest) and <span class="font-monospace">inject_files</span> (legacy catalog JSON).</li>
+                <li>To stage files into scenarios, set an allowlist (prefer output keys like <span class="font-monospace">filesystem.file</span>) in <span class="font-monospace">manifest.yaml</span> under <span class="font-monospace">injects</span>.</li>
               </ul>
             </div>
           </div>
@@ -52,7 +52,7 @@
             <div class="col-12 col-md-6">
               <label class="form-label">Source ID</label>
               <input class="form-control" id="gbPluginId" placeholder="e.g. my_ssh_creds">
-              <div class="form-text">Used as the source <span class="font-monospace">manifest.yaml</span> <code>id</code> and as the legacy catalog <code>plugin_id</code>. Installed Generator Packs are assigned a new numeric id at install time.</div>
+              <div class="form-text">Used as the <span class="font-monospace">manifest.yaml</span> <code>id</code>. Installed Generator Packs are assigned a new numeric id at install time.</div>
             </div>
             <div class="col-12 col-md-6">
               <label class="form-label">Folder name</label>
@@ -156,12 +156,12 @@
       </div>
 
       <div class="card shadow-sm mb-3">
-        <div class="card-header fw-semibold"><i class="bi bi-braces"></i> Legacy Catalog JSON (generated)</div>
+        <div class="card-header fw-semibold"><i class="bi bi-braces"></i> manifest.yaml (generated)</div>
         <div class="card-body">
           <div class="small text-muted mb-2">
-            This is the legacy schema v3 catalog format. The recommended workflow is <span class="font-monospace">manifest.yaml</span> + Generator Packs.
+            This is the pack manifest generated from the form.
           </div>
-          <textarea class="form-control font-monospace" id="gbCatalogJson" rows="10" readonly></textarea>
+          <textarea class="form-control font-monospace" id="gbManifestYaml" rows="12" readonly></textarea>
         </div>
       </div>
     </div>
@@ -679,7 +679,7 @@
   }
 
   function renderResult(data){
-    document.getElementById('gbCatalogJson').value = JSON.stringify(data.catalog_source || {}, null, 2);
+    document.getElementById('gbManifestYaml').value = String(data.manifest_yaml || '').trim() + '\n';
     const ul = document.getElementById('gbFiles');
     ul.innerHTML = '';
     (data.scaffold_paths || []).forEach(p=>{

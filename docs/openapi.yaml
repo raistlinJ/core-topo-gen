@@ -36,8 +36,6 @@ tags:
     description: Introspection and health endpoints.
   - name: Admin
     description: Administrative helpers and cleanup tasks.
-  - name: Data Sources
-    description: Vulnerability/data source CSV management endpoints.
   - name: Generator Builder
     description: Helpers for scaffolding new flag-generators and flag-node-generators.
   - name: Generator Packs
@@ -79,9 +77,8 @@ paths:
         - Generator Builder
       summary: Generate scaffold metadata
       description: >-
-        Returns the schema v3 catalog source JSON payload plus the list of scaffold file paths
-        for the requested generator. Used by the Generator Builder UI to preview the generated
-        catalog JSON and file list.
+        Returns the generated manifest YAML plus the list of scaffold file paths for the requested
+        generator. Used by the Generator Builder UI to preview the manifest and file list.
       requestBody:
         required: true
         content:
@@ -149,76 +146,6 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         '403':
           description: Builder/admin role required.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/generators/register_catalog:
-    post:
-      tags:
-        - Generator Builder
-      summary: Register a generator catalog source
-      description: >-
-        Legacy convenience endpoint that writes the generated schema v3 catalog source JSON into
-        `data_sources/flag_generators/` or `data_sources/flag_node_generators/` and updates
-        the corresponding `_state.json` to enable it.
-
-        Recommended workflow for the Web UI / Flow is manifest-based generators installed via
-        Generator Packs (see the Generator Packs endpoints).
-
-        By default this endpoint refuses to register if a generator with the same `plugin_id`
-        already exists in enabled sources (HTTP 409). Use `force=true` to bypass the duplicate check.
-
-        Example request:
-
-        ```json
-        {
-          "plugin_type": "flag-generator",
-          "plugin_id": "my_ssh_creds",
-          "folder_name": "py_my_ssh_creds",
-          "name": "SSH Credentials",
-          "description": "Emits deterministic SSH credentials.",
-          "requires": [],
-          "produces": ["flag", "ssh_username", "ssh_password"],
-          "inputs": {"seed": true, "secret": true, "flag_prefix": true},
-          "hint_templates": ["Next: SSH using {{OUTPUT.ssh_username}} / {{OUTPUT.ssh_password}}"],
-          "enabled": true
-        }
-        ```
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/GeneratorRegisterRequest'
-      responses:
-        '200':
-          description: Catalog source registered and state updated.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/GeneratorRegisterResponse'
-        '400':
-          description: Invalid request.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '401':
-          description: Login required.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '403':
-          description: Builder/admin role required.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '409':
-          description: Duplicate generator id or catalog file exists.
           content:
             application/json:
               schema:
@@ -1758,140 +1685,6 @@ paths:
       responses:
         '302':
           description: Redirect to index with flash status.
-  /data_sources:
-    get:
-      tags:
-        - Data Sources
-        - UI Pages
-      summary: Render the data sources dashboard
-      responses:
-        '200':
-          description: Data sources HTML page.
-          content:
-            text/html:
-              schema:
-                type: string
-  /data_sources/upload:
-    post:
-      tags:
-        - Data Sources
-      summary: Upload a new vulnerability/data source CSV file
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required:
-                - csv_file
-              properties:
-                csv_file:
-                  type: string
-                  format: binary
-      responses:
-        '302':
-          description: Redirect to data sources page with flash status.
-  /data_sources/toggle/{sid}:
-    post:
-      tags:
-        - Data Sources
-      summary: Toggle enabled/disabled state for a data source
-      parameters:
-        - name: sid
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '302':
-          description: Redirect to data sources page.
-  /data_sources/delete/{sid}:
-    post:
-      tags:
-        - Data Sources
-      summary: Delete a data source and its CSV file
-      parameters:
-        - name: sid
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '302':
-          description: Redirect with flash status.
-  /data_sources/refresh/{sid}:
-    post:
-      tags:
-        - Data Sources
-      summary: Re-validate a data source CSV
-      parameters:
-        - name: sid
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '302':
-          description: Redirect with flash message summarizing refresh.
-  /data_sources/download/{sid}:
-    get:
-      tags:
-        - Data Sources
-      summary: Download a data source CSV file
-      parameters:
-        - name: sid
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: CSV stream.
-          content:
-            text/csv:
-              schema:
-                type: string
-                format: binary
-        '404':
-          description: Data source not found.
-          content:
-            text/plain:
-              schema:
-                type: string
-  /data_sources/export_all:
-    get:
-      tags:
-        - Data Sources
-      summary: Download all data sources as a combined archive
-      responses:
-        '200':
-          description: CSV bundle download.
-          content:
-            application/zip:
-              schema:
-                type: string
-                format: binary
-  /data_sources/edit/{sid}:
-    get:
-      tags:
-        - Data Sources
-        - UI Pages
-      summary: Render the inline CSV editor
-      parameters:
-        - name: sid
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: CSV editor HTML page.
-          content:
-            text/html:
-              schema:
-                type: string
-        '302':
-          description: Redirect when source not found.
   /vuln_catalog:
     get:
       tags:
@@ -2026,55 +1819,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AdminCleanupPycoreResponse'
-  /data_sources/save/{sid}:
-    post:
-      tags:
-        - Data Sources
-      summary: Persist edited data source CSV rows
-      parameters:
-        - name: sid
-          in: path
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                rows:
-                  type: array
-                  items:
-                    type: array
-                    items:
-                      type: string
-      responses:
-        '200':
-          description: Save result with optional skipped count.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DataSourceSaveResponse'
-        '400':
-          description: Invalid payload.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
-          description: Data source id not found.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '500':
-          description: Failed to persist edited CSV.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DataSourceSaveResponse'
   /vuln_compose/status:
     post:
       tags:
@@ -2845,6 +2589,18 @@ components:
         flag_prefix:
           type: boolean
 
+    GeneratorArtifactRequirement:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact
+      properties:
+        artifact:
+          type: string
+        optional:
+          type: boolean
+          description: When true, the artifact is treated as optional input.
+
     GeneratorBuilderRequest:
       type: object
       required:
@@ -2868,9 +2624,14 @@ components:
           type: string
           nullable: true
         requires:
-          type: array
-          items:
-            type: string
+          description: Artifact inputs. Accepts either legacy string list (all required) or the UI object list (per-artifact optional flag).
+          oneOf:
+            - type: array
+              items:
+                type: string
+            - type: array
+              items:
+                $ref: '#/components/schemas/GeneratorArtifactRequirement'
         optional_requires:
           type: array
           nullable: true
@@ -2909,91 +2670,13 @@ components:
       properties:
         ok:
           type: boolean
-        catalog_source:
-          type: object
-          description: Schema v3 catalog source JSON document.
-          additionalProperties: true
+        manifest_yaml:
+          type: string
+          description: Generated `manifest.yaml` (YAML text).
         scaffold_paths:
           type: array
           items:
             type: string
-
-    GeneratorCatalogSourceEntry:
-      type: object
-      description: Entry appended to the enabled catalog sources state file.
-      additionalProperties: true
-      properties:
-        id:
-          type: string
-        name:
-          type: string
-        path:
-          type: string
-        enabled:
-          type: boolean
-        rows:
-          type: string
-          nullable: true
-        uploaded:
-          type: string
-          nullable: true
-
-    GeneratorRegisterRequest:
-      allOf:
-        - $ref: '#/components/schemas/GeneratorBuilderRequest'
-        - type: object
-          description: >-
-            Extends GeneratorBuilderRequest with registration controls. When omitted,
-            `enabled` defaults to true and `force`/`overwrite` default to false.
-          properties:
-            force:
-              type: boolean
-              nullable: true
-              description: Bypass duplicate generator id check.
-            overwrite:
-              type: boolean
-              nullable: true
-              description: Allow overwriting the generated catalog source file if the destination path already exists.
-            enabled:
-              type: boolean
-              nullable: true
-              description: Whether to enable the new catalog source in the state file.
-            source_name:
-              type: string
-              nullable: true
-              description: Human-friendly name for the catalog source entry.
-
-    GeneratorRegisterResponse:
-      type: object
-      required:
-        - ok
-      properties:
-        ok:
-          type: boolean
-        catalog_path:
-          type: string
-          nullable: true
-        state_path:
-          type: string
-          nullable: true
-        source:
-          $ref: '#/components/schemas/GeneratorCatalogSourceEntry'
-        note:
-          type: string
-          nullable: true
-        scaffold_paths:
-          type: array
-          items:
-            type: string
-        catalog_source:
-          type: object
-          description: Schema v3 catalog source JSON document written to disk.
-          additionalProperties: true
-        existing_source_path:
-          type: string
-          nullable: true
-          description: When present (typically with HTTP 409), indicates the source file that already provides the generator.
-      additionalProperties: true
 
     FlowChainNode:
       type: object

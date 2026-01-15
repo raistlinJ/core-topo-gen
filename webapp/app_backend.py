@@ -12077,7 +12077,7 @@ def api_flow_prepare_preview_for_execute():
         *,
         out_dir: str,
         config: dict[str, Any],
-        catalog: str = 'flag_generators',
+        kind: str = 'flag-generator',
         timeout_s: int = 120,
     ) -> tuple[bool, str, str | None]:
         """Best-effort run of scripts/run_flag_generator.py.
@@ -12093,8 +12093,8 @@ def api_flow_prepare_preview_for_execute():
             cmd = [
                 sys.executable or 'python',
                 runner_path,
-                '--catalog',
-                str(catalog or 'flag_generators'),
+                '--kind',
+                str(kind or 'flag-generator'),
                 '--generator-id',
                 generator_id,
                 '--out-dir',
@@ -12446,7 +12446,7 @@ def api_flow_prepare_preview_for_execute():
                             generator_id,
                             out_dir=flow_out_dir,
                             config=cfg,
-                            catalog=generator_catalog,
+                            kind=assignment_type,
                             timeout_s=gen_timeout_s,
                         )
 
@@ -17939,20 +17939,6 @@ def _build_full_scenario_archive(out_dir: str, scenario_xml_path: str | None, re
     except Exception:
         return None
 
-# Data sources state
-DATA_SOURCES_DIR = os.path.join(_get_repo_root(), 'data_sources')
-DATA_STATE_PATH = os.path.join(DATA_SOURCES_DIR, '_state.json')
-os.makedirs(DATA_SOURCES_DIR, exist_ok=True)
-
-# Flag catalog sources state (JSON)
-FLAG_SOURCES_DIR = os.path.join(DATA_SOURCES_DIR, 'flags')
-FLAG_STATE_PATH = os.path.join(FLAG_SOURCES_DIR, '_state.json')
-os.makedirs(FLAG_SOURCES_DIR, exist_ok=True)
-
-
-FLAG_GENERATOR_LANGUAGES = {'python', 'c', 'cpp'}
-
-
 # Reserved artifact keys (starter set). These are always offered in the Generator
 # Builder artifact picker to encourage consistent naming, while still allowing
 # custom artifact keys.
@@ -18431,699 +18417,6 @@ def _coerce_str(val: object, default: str = '') -> str:
 
 def _coerce_stripped(val: object, default: str = '') -> str:
     return _coerce_str(val, default=default).strip()
-
-
-def _normalize_v3_source(source: object) -> dict | None:
-    if not isinstance(source, dict):
-        return None
-    src_type = _coerce_stripped(source.get('type') if isinstance(source, dict) else None, 'local-path') or 'local-path'
-    src_path = _coerce_stripped(source.get('path') if isinstance(source, dict) else None, '')
-    if not src_path:
-        return None
-    return {
-        'type': src_type,
-        'path': src_path,
-        'ref': _coerce_stripped(source.get('ref') if isinstance(source, dict) else None, ''),
-        'subpath': _coerce_stripped(source.get('subpath') if isinstance(source, dict) else None, ''),
-        'entry': _coerce_stripped(source.get('entry') if isinstance(source, dict) else None, ''),
-    }
-
-
-def _normalize_v3_compose(compose: object) -> dict | None:
-    if not isinstance(compose, dict):
-        return None
-    file_val = _coerce_stripped(compose.get('file'), 'docker-compose.yml') or 'docker-compose.yml'
-    service_val = _coerce_stripped(compose.get('service'), 'generator') or 'generator'
-    return {
-        'file': file_val,
-        'service': service_val,
-    }
-
-
-def _normalize_v3_env(env: object) -> dict | None:
-    if not isinstance(env, dict):
-        return None
-    norm_env: dict[str, str] = {}
-    for k, v in env.items():
-        try:
-            kk = str(k).strip()
-            if not kk:
-                continue
-            norm_env[kk] = str(v)
-        except Exception:
-            continue
-    return norm_env or None
-
-
-def _v3_plugin_inputs_to_io_list(plugin: dict) -> list[dict]:
-    """Convert v3 plugin.inputs mapping to the UI/runner IO list format."""
-    requires = plugin.get('requires') if isinstance(plugin.get('requires'), list) else []
-    requires_set = {str(x).strip() for x in requires if str(x).strip()}
-
-    inputs = plugin.get('inputs') if isinstance(plugin.get('inputs'), dict) else {}
-    out: list[dict] = []
-
-    for name, spec in inputs.items():
-        nm = _coerce_stripped(name, '')
-        if not nm:
-            continue
-        if not isinstance(spec, dict):
-            spec = {}
-        tp = _coerce_stripped(spec.get('type'), '') or _coerce_flaggen_io_type(nm)
-        required_val = spec.get('required')
-        if required_val is None:
-            required = nm in requires_set
-        else:
-            required = _coerce_bool(required_val, default=(nm in requires_set))
-        sensitive_in = spec.get('sensitive')
-        if sensitive_in is None:
-            sensitive_val = _coerce_flaggen_io_sensitive(nm, tp)
-        else:
-            sensitive_val = _coerce_bool(sensitive_in, default=False)
-        default_in = spec.get('default')
-        default_ok = isinstance(default_in, (str, int, float, bool)) or default_in is None
-        rec = {
-            'name': nm,
-            'type': tp,
-            'description': _coerce_stripped(spec.get('description'), ''),
-            'required': bool(required),
-            'sensitive': bool(sensitive_val),
-        }
-        if default_in is not None and default_ok:
-            rec['default'] = default_in
-        out.append(rec)
-
-    existing_names = {str(x.get('name') or '').strip() for x in out if isinstance(x, dict)}
-    for req in sorted(requires_set):
-        if req in existing_names:
-            continue
-        tp = _coerce_flaggen_io_type(req)
-        out.append({
-            'name': req,
-            'type': tp,
-            'description': '',
-            'required': True,
-            'sensitive': bool(_coerce_flaggen_io_sensitive(req, tp)),
-        })
-
-    out.sort(key=lambda r: str(r.get('name') or '').lower())
-    return out
-
-
-def _v3_plugin_outputs_to_io_list(plugin: dict) -> list[dict]:
-    produces = plugin.get('produces') if isinstance(plugin.get('produces'), list) else []
-    out: list[dict] = []
-    for item in produces:
-        if not isinstance(item, dict):
-            continue
-        nm = _coerce_stripped(item.get('artifact'), '')
-        if not nm:
-            continue
-        tp = _coerce_flaggen_io_type(nm)
-        out.append({
-            'name': nm,
-            'type': tp,
-            'description': _coerce_stripped(item.get('description'), ''),
-            'sensitive': bool(_coerce_flaggen_io_sensitive(nm, tp)),
-        })
-    return out
-
-
-def _v3_merge_generator_view(plugin: dict, impl: dict) -> dict | None:
-    plugin_id = _normalize_generator_id(_coerce_stripped(impl.get('plugin_id'), ''))
-    if not plugin_id:
-        return None
-
-    language = _coerce_stripped(impl.get('language'), '').lower()
-    if language not in FLAG_GENERATOR_LANGUAGES:
-        return None
-
-    source = _normalize_v3_source(impl.get('source'))
-    if not source:
-        return None
-
-    gen: dict = {
-        'id': plugin_id,
-        'name': _coerce_stripped(impl.get('name'), plugin_id) or plugin_id,
-        'language': language,
-        'source': source,
-    }
-
-    if isinstance(plugin, dict):
-        desc = _coerce_stripped(plugin.get('description'), '')
-        if desc:
-            gen['description'] = desc
-        ver = _coerce_stripped(plugin.get('version'), '')
-        if ver:
-            gen['version'] = ver
-
-    compose = _normalize_v3_compose(impl.get('compose'))
-    if compose:
-        gen['compose'] = compose
-
-    env = _normalize_v3_env(impl.get('env'))
-    if env:
-        gen['env'] = env
-
-    if isinstance(impl.get('build'), dict):
-        gen['build'] = impl.get('build')
-    if isinstance(impl.get('run'), dict):
-        gen['run'] = impl.get('run')
-
-    gen['inputs'] = _v3_plugin_inputs_to_io_list(plugin if isinstance(plugin, dict) else {})
-    gen['outputs'] = _v3_plugin_outputs_to_io_list(plugin if isinstance(plugin, dict) else {})
-    if not gen['outputs']:
-        return None
-
-    hint_templates: list[str] = []
-    try:
-        ht_multi = impl.get('hint_templates')
-        if isinstance(ht_multi, list):
-            hint_templates = [str(x or '').strip() for x in ht_multi if str(x or '').strip()]
-    except Exception:
-        hint_templates = []
-    if not hint_templates:
-        try:
-            ht_legacy = impl.get('hint_template')
-            if isinstance(ht_legacy, list):
-                hint_templates = [str(x or '').strip() for x in ht_legacy if str(x or '').strip()]
-            else:
-                s = _coerce_stripped(ht_legacy, '')
-                if s:
-                    hint_templates = [s]
-        except Exception:
-            hint_templates = []
-    if not hint_templates:
-        hint_templates = ['Next: {{NEXT_NODE_NAME}}']
-    gen['hint_templates'] = hint_templates
-    gen['hint_template'] = hint_templates[0]
-
-    # Optional: allowlist of files/dirs to stage into an injected mount directory.
-    try:
-        inj = impl.get('inject_files')
-        inj_list: list[str] = []
-        if isinstance(inj, list):
-            inj_list = [str(x or '').strip() for x in inj if str(x or '').strip()]
-        elif isinstance(inj, str):
-            s = inj.strip()
-            if s:
-                inj_list = [s]
-        if inj_list:
-            gen['inject_files'] = inj_list
-    except Exception:
-        pass
-
-    # Optional: ordered, high-level description hints about the flag/challenge.
-    # These are shown in the Flow chain UI above the NEXT-step hints.
-    desc_hints: list[str] = []
-    try:
-        dh = impl.get('description_hints')
-        if isinstance(dh, list):
-            desc_hints = [str(x or '').strip() for x in dh if str(x or '').strip()]
-        elif isinstance(dh, str):
-            s = dh.strip()
-            if s:
-                desc_hints = [s]
-    except Exception:
-        desc_hints = []
-    if desc_hints:
-        gen['description_hints'] = desc_hints
-
-    handoff = impl.get('handoff')
-    if isinstance(handoff, dict):
-        gen['handoff'] = handoff
-
-    return gen
-
-
-try:
-    _FLAG_GENERATOR_CATALOG_SCHEMA_PATH = str(Path(_get_repo_root()) / 'validation' / 'flag_generator_catalog.schema.json')
-except Exception:
-    _FLAG_GENERATOR_CATALOG_SCHEMA_PATH = ''
-
-
-def _validate_json_schema(doc: Any, schema_path: str) -> tuple[bool, str]:
-    """Best-effort JSON schema validation.
-
-    Returns (ok, error_message). If schema or jsonschema isn't available, this
-    is a no-op and returns ok.
-    """
-    try:
-        if not schema_path or not os.path.exists(schema_path):
-            return True, ''
-        try:
-            import jsonschema  # type: ignore
-        except Exception:
-            return True, ''
-        with open(schema_path, 'r', encoding='utf-8') as f:
-            schema = json.load(f)
-        jsonschema.validate(instance=doc, schema=schema)
-        return True, ''
-    except Exception as exc:
-        return False, str(exc)
-
-
-def _validate_and_normalize_flag_generator_source_json(path: str) -> tuple[bool, str, dict | None, list[dict]]:
-    """Validate generator catalog source.
-
-        Expected format (v3):
-            {
-                "schema_version": 3,
-                "plugin_type": "flag-generator" | "flag-node-generator",
-                "plugins": [ { pluginContract }, ... ],
-                "implementations": [ { impl }, ... ]
-            }
-
-    Returns: (ok, note, normalized_doc_or_none, skipped_generators)
-    """
-    skipped: list[dict] = []
-    try:
-        if not path or not os.path.exists(path):
-            return False, 'File not found', None, skipped
-        if os.path.getsize(path) > 5_000_000:
-            return False, 'File too large (>5MB)', None, skipped
-        with open(path, 'r', encoding='utf-8') as fh:
-            doc = json.load(fh)
-        if not isinstance(doc, dict):
-            return False, 'Top-level JSON must be an object', None, skipped
-
-        # Validate the raw catalog file against the JSON schema (best-effort).
-        ok_schema, schema_err = _validate_json_schema(doc, _FLAG_GENERATOR_CATALOG_SCHEMA_PATH)
-        if not ok_schema:
-            return False, schema_err or 'Schema validation failed', None, skipped
-
-        schema_version = doc.get('schema_version', 3)
-        try:
-            schema_version = int(schema_version)
-        except Exception:
-            schema_version = 3
-        if schema_version != 3:
-            return False, f'Unsupported schema_version: {schema_version}', None, skipped
-
-        plugin_type = _coerce_stripped(doc.get('plugin_type'), '')
-        if plugin_type not in {'flag-generator', 'flag-node-generator'}:
-            return False, f"Invalid plugin_type: {plugin_type or '(missing)'}", None, skipped
-
-        plugins_raw = doc.get('plugins')
-        impls_raw = doc.get('implementations')
-        if not isinstance(plugins_raw, list):
-            return False, 'Missing plugins[]', None, skipped
-        if not isinstance(impls_raw, list):
-            return False, 'Missing implementations[]', None, skipped
-
-        plugins_by_id: dict[str, dict] = {}
-        normalized_plugins: list[dict] = []
-        for p in plugins_raw:
-            if not isinstance(p, dict):
-                skipped.append({'reason': 'plugin not an object', 'raw': p})
-                continue
-            pid = _normalize_generator_id(_coerce_stripped(p.get('plugin_id'), ''))
-            if not pid:
-                skipped.append({'reason': 'plugin missing plugin_id', 'raw': p})
-                continue
-            p2 = dict(p)
-            p2['plugin_id'] = pid
-            # Preserve plugin_type but default to top-level.
-            p2['plugin_type'] = _coerce_stripped(p2.get('plugin_type'), plugin_type) or plugin_type
-            if not isinstance(p2.get('requires'), list):
-                p2['requires'] = []
-            if not isinstance(p2.get('produces'), list):
-                p2['produces'] = []
-            if not isinstance(p2.get('inputs'), dict):
-                p2['inputs'] = {}
-
-            # Contract normalization:
-            # - plugin.requires is reserved for *artifact* dependencies (produced/consumed across steps)
-            # - runtime input fields belong in plugin.inputs (or generator implementation inputs)
-            # - if a catalog mistakenly puts Flow-synthesized/runtime fields (seed/node_name/network.ip/etc)
-            #   into requires, strip them here (best-effort) rather than hard-failing.
-            try:
-                requires_vals = [str(x or '').strip() for x in (p2.get('requires') or []) if str(x or '').strip()]
-                synth = set(_flow_synthesized_inputs())
-                bad_synth = sorted([x for x in requires_vals if x in synth])
-                if bad_synth:
-                    requires_vals = [x for x in requires_vals if x not in synth]
-                    skipped.append({'reason': 'stripped synthesized fields from requires', 'plugin_id': pid, 'removed': bad_synth})
-                p2['requires'] = requires_vals
-            except Exception:
-                # Be conservative: if normalization itself fails, treat it as a hard error.
-                return False, f"Schema: failed normalizing requires/inputs for plugin {pid}.", None, skipped
-
-            if pid not in plugins_by_id:
-                plugins_by_id[pid] = p2
-                normalized_plugins.append(p2)
-
-        normalized_impls: list[dict] = []
-        for impl in impls_raw:
-            if not isinstance(impl, dict):
-                skipped.append({'reason': 'implementation not an object', 'raw': impl})
-                continue
-            pid = _normalize_generator_id(_coerce_stripped(impl.get('plugin_id'), ''))
-            if not pid:
-                skipped.append({'reason': 'implementation missing plugin_id', 'raw': impl})
-                continue
-            if pid not in plugins_by_id:
-                skipped.append({'reason': f'implementation references unknown plugin_id: {pid}', 'plugin_id': pid})
-                continue
-            impl2 = dict(impl)
-            impl2['plugin_id'] = pid
-            impl2['name'] = _coerce_stripped(impl2.get('name'), pid) or pid
-            impl2['language'] = _coerce_stripped(impl2.get('language'), '').lower()
-
-            src = _normalize_v3_source(impl2.get('source'))
-            if not src:
-                skipped.append({'reason': f'missing/invalid source for {pid}', 'plugin_id': pid})
-                continue
-            impl2['source'] = src
-
-            # Normalize compose/env for consistency; keep other fields free-form.
-            comp = _normalize_v3_compose(impl2.get('compose'))
-            if comp:
-                impl2['compose'] = comp
-            else:
-                impl2.pop('compose', None)
-            env = _normalize_v3_env(impl2.get('env'))
-            if env:
-                impl2['env'] = env
-            else:
-                impl2.pop('env', None)
-
-            # Optional allowlist of files/dirs to stage into an injected mount directory.
-            try:
-                inj = impl2.get('inject_files')
-                inj_list: list[str] = []
-                if isinstance(inj, list):
-                    inj_list = [str(x or '').strip() for x in inj if str(x or '').strip()]
-                elif isinstance(inj, str):
-                    s = inj.strip()
-                    if s:
-                        inj_list = [s]
-                if inj_list:
-                    impl2['inject_files'] = inj_list
-                else:
-                    impl2.pop('inject_files', None)
-            except Exception:
-                impl2.pop('inject_files', None)
-
-            hint_templates: list[str] = []
-            try:
-                ht_multi = impl2.get('hint_templates')
-                if isinstance(ht_multi, list):
-                    hint_templates = [str(x or '').strip() for x in ht_multi if str(x or '').strip()]
-            except Exception:
-                hint_templates = []
-            if not hint_templates:
-                try:
-                    ht_legacy = impl2.get('hint_template')
-                    if isinstance(ht_legacy, list):
-                        hint_templates = [str(x or '').strip() for x in ht_legacy if str(x or '').strip()]
-                    else:
-                        s = _coerce_stripped(ht_legacy, '')
-                        if s:
-                            hint_templates = [s]
-                except Exception:
-                    hint_templates = []
-            if not hint_templates:
-                hint_templates = ['Next: {{NEXT_NODE_NAME}}']
-            impl2['hint_templates'] = hint_templates
-            impl2['hint_template'] = hint_templates[0]
-
-            # Optional ordered, high-level description hints.
-            try:
-                dh = impl2.get('description_hints')
-                desc_hints: list[str] = []
-                if isinstance(dh, list):
-                    desc_hints = [str(x or '').strip() for x in dh if str(x or '').strip()]
-                elif isinstance(dh, str):
-                    s = dh.strip()
-                    if s:
-                        desc_hints = [s]
-                if desc_hints:
-                    impl2['description_hints'] = desc_hints
-                else:
-                    impl2.pop('description_hints', None)
-            except Exception:
-                impl2.pop('description_hints', None)
-
-            normalized_impls.append(impl2)
-
-        normalized_plugins.sort(key=lambda p: str(p.get('plugin_id') or ''))
-        normalized_impls.sort(key=lambda i: (str(i.get('name') or '').lower(), str(i.get('plugin_id') or '')))
-
-        normalized_doc = {
-            'schema_version': 3,
-            'plugin_type': plugin_type,
-            'plugins': normalized_plugins,
-            'implementations': normalized_impls,
-        }
-        note = f"{len(normalized_impls)} implementation(s)"
-        if skipped:
-            note = note + f"; skipped {len(skipped)}"
-        return True, note, normalized_doc, skipped
-    except Exception as e:
-        return False, str(e), None, skipped
-
-
-def _v3_catalog_to_generator_views(doc: dict) -> tuple[list[dict], list[dict]]:
-    """Expand a validated v3 catalog doc into merged generator view objects."""
-    errors: list[dict] = []
-    if not isinstance(doc, dict):
-        return [], [{'error': 'catalog doc is not an object'}]
-    if int(doc.get('schema_version') or 0) != 3:
-        return [], [{'error': f"unsupported schema_version: {doc.get('schema_version')}"}]
-    plugins = doc.get('plugins') if isinstance(doc.get('plugins'), list) else []
-    impls = doc.get('implementations') if isinstance(doc.get('implementations'), list) else []
-    plugins_by_id: dict[str, dict] = {}
-    for p in plugins:
-        if not isinstance(p, dict):
-            continue
-        pid = str(p.get('plugin_id') or '').strip()
-        if pid and pid not in plugins_by_id:
-            plugins_by_id[pid] = p
-
-    out: list[dict] = []
-    for impl in impls:
-        if not isinstance(impl, dict):
-            continue
-        pid = str(impl.get('plugin_id') or '').strip()
-        plugin = plugins_by_id.get(pid) or {}
-        gen = _v3_merge_generator_view(plugin, impl)
-        if not gen:
-            errors.append({'warning': f'Invalid implementation for plugin_id={pid or "(missing)"}'})
-            continue
-        out.append(gen)
-
-    out.sort(key=lambda g: (str(g.get('name') or '').lower(), str(g.get('id') or '')))
-    return out, errors
-
-
-def _load_flag_sources_state() -> dict:
-    """Load flag sources state.
-
-    Mirrors _load_data_sources_state(), but for JSON-based flag sources.
-    Auto-seeds a default source from data_sources/flag_catalog.json when present.
-    """
-    try:
-        if not os.path.exists(FLAG_STATE_PATH):
-            # Seed from repo-provided catalog if present.
-            seed_path = os.path.abspath(os.path.join(DATA_SOURCES_DIR, 'flag_catalog.json'))
-            if os.path.exists(seed_path):
-                try:
-                    # Copy into the managed sources dir to keep edits isolated.
-                    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
-                    dest = os.path.join(FLAG_SOURCES_DIR, f"{unique}-flag_catalog.json")
-                    shutil.copyfile(seed_path, dest)
-                    state = {
-                        'sources': [
-                            {
-                                'id': uuid.uuid4().hex[:12],
-                                'name': 'flag_catalog.json',
-                                'path': dest,
-                                'enabled': True,
-                                'rows': 'seeded',
-                                'uploaded': datetime.datetime.utcnow().isoformat() + 'Z',
-                            }
-                        ]
-                    }
-                    _save_flag_sources_state(state)
-                    return state
-                except Exception:
-                    pass
-            return {'sources': []}
-        with open(FLAG_STATE_PATH, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return {'sources': []}
-        if 'sources' not in data or not isinstance(data.get('sources'), list):
-            data['sources'] = []
-
-        # If we previously auto-seeded from data_sources/flag_catalog.json, keep it in sync
-        # when the repo version changes. This avoids requiring a manual re-upload just to
-        # pick up new built-in generators.
-        try:
-            repo_seed = os.path.abspath(os.path.join(DATA_SOURCES_DIR, 'flag_catalog.json'))
-            if os.path.exists(repo_seed):
-                repo_mtime = os.path.getmtime(repo_seed)
-                for s in data.get('sources', []):
-                    if not isinstance(s, dict):
-                        continue
-                    if (s.get('name') or '') != 'flag_catalog.json':
-                        continue
-                    p = s.get('path')
-                    if not p or not os.path.exists(p):
-                        continue
-                    try:
-                        if os.path.getmtime(p) < repo_mtime:
-                            shutil.copyfile(repo_seed, p)
-                            s['rows'] = 'synced'
-                            s['uploaded'] = datetime.datetime.utcnow().isoformat() + 'Z'
-                            _save_flag_sources_state(data)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        return data
-    except Exception:
-        return {'sources': []}
-
-
-def _save_flag_sources_state(state: dict) -> None:
-    tmp = FLAG_STATE_PATH + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp, FLAG_STATE_PATH)
-
-
-FLAG_REQUIRED_FIELDS = ['id', 'name', 'type', 'path']
-FLAG_OPTIONAL_FIELDS = ['compose_name', 'security_profile', 'enforce_security', 'description', 'inputs', 'outputs', 'hint_template', 'hint_templates']
-FLAG_ALL_FIELDS = FLAG_REQUIRED_FIELDS + [f for f in FLAG_OPTIONAL_FIELDS if f not in FLAG_REQUIRED_FIELDS]
-
-
-def _validate_and_normalize_flag_source_json(file_path: str, max_bytes: int = 5_000_000) -> tuple[bool, str, list[dict], list[str]]:
-    """Validate and normalize a flag catalog JSON file.
-
-    Expected format: a JSON list of objects with keys in FLAG_ALL_FIELDS.
-    Unknown keys are ignored.
-    Returns: (ok, note, items, skipped_reasons)
-    """
-    skipped: list[str] = []
-    try:
-        st = os.stat(file_path)
-        if st.st_size > max_bytes:
-            return False, f"File too large (> {max_bytes} bytes)", [], []
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            raw = json.load(f)
-        if not isinstance(raw, list):
-            return False, 'JSON must be a list of flag objects', [], []
-        out: list[dict] = []
-        for idx, item in enumerate(raw):
-            if not isinstance(item, dict):
-                skipped.append(f"row {idx+1}: not an object")
-                continue
-            rec = {}
-            for k in FLAG_ALL_FIELDS:
-                if k in item:
-                    rec[k] = item.get(k)
-            # Normalize required strings
-            for k in ('id', 'name', 'type', 'path', 'compose_name', 'security_profile', 'description', 'hint_template'):
-                if k in rec and rec[k] is not None:
-                    rec[k] = str(rec[k]).strip()
-
-            # Normalize inputs/outputs to a list of strings.
-            for k in ('inputs', 'outputs'):
-                if k not in rec:
-                    continue
-                v = rec.get(k)
-                if v is None:
-                    rec.pop(k, None)
-                    continue
-                if isinstance(v, str):
-                    raw_items = [p.strip() for p in v.split(',')]
-                    rec[k] = [p for p in raw_items if p]
-                elif isinstance(v, list):
-                    out_list: list[str] = []
-                    for x in v:
-                        if x is None:
-                            continue
-                        s = str(x).strip()
-                        if s:
-                            out_list.append(s)
-                    rec[k] = out_list
-                else:
-                    # Unknown type -> drop rather than fail.
-                    rec.pop(k, None)
-            if not rec.get('name'):
-                skipped.append(f"row {idx+1}: missing name")
-                continue
-            if not rec.get('id'):
-                rec['id'] = _safe_name(rec.get('name') or f"flag-{idx+1}")
-            if not rec.get('type'):
-                rec['type'] = 'docker-compose'
-            if not rec.get('path'):
-                skipped.append(f"row {idx+1}: missing path")
-                continue
-            if not rec.get('compose_name'):
-                rec['compose_name'] = 'docker-compose.yml'
-            if not rec.get('security_profile'):
-                rec['security_profile'] = 'strict'
-            if not rec.get('hint_template'):
-                # Default hint: Flow will fill NEXT/THIS placeholders when displaying and when preparing execution.
-                rec['hint_template'] = 'Next: {{NEXT_NODE_NAME}}'
-            # Normalize enforce_security boolean
-            if 'enforce_security' in rec:
-                v = rec.get('enforce_security')
-                if isinstance(v, bool):
-                    rec['enforce_security'] = v
-                elif isinstance(v, (int, float)):
-                    rec['enforce_security'] = bool(v)
-                elif isinstance(v, str):
-                    rec['enforce_security'] = v.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
-                else:
-                    rec['enforce_security'] = True
-            else:
-                rec['enforce_security'] = True
-            out.append(rec)
-        note = f"{len(out)} items" + (f" (skipped {len(skipped)})" if skipped else '')
-        return True, note, out, skipped
-    except Exception as e:
-        return False, str(e), [], []
-
-
-def _flag_catalog_items_from_enabled_sources() -> tuple[list[dict], dict]:
-    """Aggregate flag catalog items from enabled flag sources."""
-    state = _load_flag_sources_state()
-    types: set[str] = set()
-    profiles: set[str] = set()
-    items: list[dict] = []
-    for s in state.get('sources', []):
-        if not s.get('enabled'):
-            continue
-        p = s.get('path')
-        if not p or not os.path.exists(p):
-            continue
-        ok, note, norm_items, _skipped = _validate_and_normalize_flag_source_json(p)
-        if not ok:
-            continue
-        for it in norm_items:
-            it2 = dict(it) if isinstance(it, dict) else {}
-            it2['_source_id'] = str(s.get('id') or '').strip() or None
-            it2['_source_name'] = str(s.get('name') or '').strip() or None
-            items.append(it2)
-            try:
-                if it.get('type'):
-                    types.add(str(it.get('type')))
-                if it.get('security_profile'):
-                    profiles.add(str(it.get('security_profile')))
-            except Exception:
-                pass
-    meta = {
-        'types': sorted(types),
-        'security_profiles': sorted(profiles),
-    }
-    return items, meta
-
-
 def _flag_base_dir() -> str:
     """Base directory for downloaded flag compose assets."""
     try:
@@ -19131,180 +18424,6 @@ def _flag_base_dir() -> str:
     except Exception:
         return os.path.abspath(os.path.join('outputs', 'flags'))
 
-def _load_data_sources_state():
-    try:
-        if not os.path.exists(DATA_STATE_PATH):
-            return {"sources": []}
-        with open(DATA_STATE_PATH, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        # Legacy format
-        if isinstance(data, dict) and 'enabled' in data and 'sources' not in data:
-            return {"sources": []}
-        if 'sources' not in data:
-            data['sources'] = []
-        return data
-    except Exception:
-        return {"sources": []}
-
-def _save_data_sources_state(state):
-    tmp = DATA_STATE_PATH + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp, DATA_STATE_PATH)
-
-def _validate_csv(file_path: str, max_bytes: int = 2_000_000):
-    try:
-        st = os.stat(file_path)
-        if st.st_size > max_bytes:
-            return False, f"File too large (> {max_bytes} bytes)"
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            reader = csv.reader(f)
-            rows = []
-            for i, row in enumerate(reader):
-                if i > 10000:
-                    break
-                rows.append(row)
-        if len(rows) < 2:
-            return False, "CSV must have header + at least one data row"
-        widths = {len(r) for r in rows}
-        if len(widths) != 1:
-            return False, "Inconsistent column counts"
-        return True, f"{len(rows)-1} rows"
-    except Exception as e:
-        return False, str(e)
-
-# --- Data Source CSV schema enforcement ---
-REQUIRED_DS_COLUMNS = ["Name", "Path", "Type", "Startup", "Vector"]
-OPTIONAL_DS_DEFAULTS = {
-    "CVE": "n/a",
-    "Description": "n/a",
-    "References": "n/a",
-}
-ALLOWED_TYPE_VALUES = {"artifact", "docker", "docker-compose", "misconfig", "incompetence"}
-ALLOWED_VECTOR_VALUES = {"local", "remote"}
-
-def _validate_and_normalize_data_source_csv(file_path: str, max_bytes: int = 2_000_000, *, skip_invalid: bool = False):
-    """Validate uploaded CSV for Data Sources and normalize optional columns.
-
-    Rules:
-    - Must be under max size, have header + at least one data row, and consistent row widths (after normalization step below).
-    - Must include all REQUIRED_DS_COLUMNS (exact names).
-    - Optional columns from OPTIONAL_DS_DEFAULTS will be appended to header if missing, and populated per-row with defaults if empty/missing.
-    - Type values must be one of ALLOWED_TYPE_VALUES (case-insensitive), Vector values one of ALLOWED_VECTOR_VALUES (case-insensitive).
-    - Name, Path, Startup must be non-empty strings.
-
-        Parameters:
-            file_path: path to CSV file
-            max_bytes: size cap
-            skip_invalid: if True, invalid data rows are skipped instead of failing the whole import.
-
-        Returns: (ok: bool, note_or_error: str, rows: list[list[str]]|None, skipped_rows: list[int])
-            ok: overall success
-            note_or_error: description / counts; if skip_invalid True may include skip summary
-            rows: normalized rows including header (only valid rows if skipping)
-            skipped_rows: list of 1-based data row indices (relative to first data line after header) that were skipped
-    """
-    try:
-        st = os.stat(file_path)
-        if st.st_size > max_bytes:
-            return False, f"File too large (> {max_bytes} bytes)", None
-        # Load CSV
-        rows: list[list[str]] = []
-        with open(file_path, 'r', encoding='utf-8', errors='replace', newline='') as f:
-            rdr = csv.reader(f)
-            for i, row in enumerate(rdr):
-                if i > 10000:
-                    break
-                rows.append([str(c) if c is not None else '' for c in row])
-        if len(rows) < 2:
-            return False, "CSV must have header + at least one data row", None, []
-        header = rows[0]
-        # Strip UTF-8 BOM if present in first cell
-        if header and header[0].startswith('\ufeff'):
-            header[0] = header[0].lstrip('\ufeff')
-        # Ensure required headers exist
-        # Case-insensitive match for required headers
-        header_lower_map = {h.lower(): h for h in header}
-        missing = [h for h in REQUIRED_DS_COLUMNS if h.lower() not in header_lower_map]
-        # Normalize header casing to canonical names (only for required columns)
-        if not missing:
-            for req in REQUIRED_DS_COLUMNS:
-                real = header_lower_map.get(req.lower())
-                if real != req:
-                    # rename in place
-                    idx = header.index(real)
-                    header[idx] = req
-        if missing:
-            return False, f"Missing required column(s): {', '.join(missing)}", None, []
-        # Append optional headers if missing
-        for opt_col, default in OPTIONAL_DS_DEFAULTS.items():
-            if opt_col not in header:
-                header.append(opt_col)
-        # Normalize all rows to header length
-        width = len(header)
-        norm_rows: list[list[str]] = [header]
-        # Build column index map
-        col_idx = {name: header.index(name) for name in header}
-        # Validate and fill rows
-        errs: list[str] = []
-        skipped_rows: list[int] = []
-        for data_idx, row in enumerate(rows[1:], start=1):  # data_idx: 1-based index of data row (excluding header)
-            r = list(row)
-            if len(r) < width:
-                r = r + [''] * (width - len(r))
-            elif len(r) > width:
-                r = r[:width]
-            # Pull fields
-            name = (r[col_idx['Name']]).strip()
-            path = (r[col_idx['Path']]).strip()
-            typ = (r[col_idx['Type']]).strip()
-            startup = (r[col_idx['Startup']]).strip()
-            vector = (r[col_idx['Vector']]).strip()
-            row_err = False
-            if not name:
-                errs.append(f"row {data_idx}: Name is required"); row_err = True
-            if not path:
-                errs.append(f"row {data_idx}: Path is required"); row_err = True
-            if not startup:
-                errs.append(f"row {data_idx}: Startup is required"); row_err = True
-            if typ:
-                if typ.lower() not in ALLOWED_TYPE_VALUES:
-                    errs.append(f"row {data_idx}: Type '{typ}' not in {sorted(ALLOWED_TYPE_VALUES)}"); row_err = True
-                else:
-                    # Normalize to lower
-                    r[col_idx['Type']] = typ.lower()
-            else:
-                errs.append(f"row {data_idx}: Type is required"); row_err = True
-            if vector:
-                if vector.lower() not in ALLOWED_VECTOR_VALUES:
-                    errs.append(f"row {data_idx}: Vector '{vector}' not in {sorted(ALLOWED_VECTOR_VALUES)}"); row_err = True
-                else:
-                    r[col_idx['Vector']] = vector.lower()
-            else:
-                errs.append(f"row {data_idx}: Vector is required"); row_err = True
-            # Fill optionals with defaults if empty
-            for opt_col, default in OPTIONAL_DS_DEFAULTS.items():
-                if not r[col_idx[opt_col]].strip():
-                    r[col_idx[opt_col]] = default
-            if row_err and skip_invalid:
-                skipped_rows.append(data_idx)
-                continue
-            norm_rows.append(r)
-        if skip_invalid:
-            if len(norm_rows) == 1:
-                return False, "All data rows invalid", None, skipped_rows
-            note_parts = [f"{len(norm_rows)-1} rows"]
-            if skipped_rows:
-                listed = ','.join(str(i) for i in skipped_rows[:20])
-                extra = '' if len(skipped_rows) <= 20 else '...'
-                note_parts.append(f"skipped {len(skipped_rows)} invalid row(s): {listed}{extra}")
-            return True, ' | '.join(note_parts), norm_rows, skipped_rows
-        else:
-            if errs:
-                return False, "; ".join(errs[:20]) + (" ..." if len(errs)>20 else ''), None, []
-            return True, f"{len(norm_rows)-1} rows", norm_rows, []
-    except Exception as e:
-        return False, str(e), None, []
 
 def _default_scenarios_payload():
     return _default_scenarios_payload_for_names(["Scenario 1"])
@@ -30630,137 +29749,8 @@ def cancel_run(run_id: str):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------- Data Sources -----------------
-@app.route('/data_sources')
-def data_sources_page():
-    state = _load_data_sources_state()
-    return render_template('data_sources.html', sources=state.get('sources', []))
 
-@app.route('/data_sources/upload', methods=['POST'])
-def data_sources_upload():
-    f = request.files.get('csv_file')
-    if not f or f.filename == '':
-        flash('No file selected.')
-        return redirect(url_for('data_sources_page'))
-    filename = secure_filename(f.filename)
-    if not filename.lower().endswith('.csv'):
-        flash('Only .csv allowed.')
-        return redirect(url_for('data_sources_page'))
-    unique = datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
-    dest_dir = os.path.join(DATA_SOURCES_DIR)
-    os.makedirs(dest_dir, exist_ok=True)
-    path = os.path.join(dest_dir, f"{unique}-{filename}")
-    f.save(path)
-    ok, note, norm_rows, skipped = _validate_and_normalize_data_source_csv(path, skip_invalid=True)
-    if not ok:
-        try: os.remove(path)
-        except Exception: pass
-        flash(f'Invalid CSV: {note}')
-        return redirect(url_for('data_sources_page'))
-    # Write back normalized CSV to ensure required/optional columns are present
-    try:
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8', newline='') as f:
-            w = csv.writer(f)
-            for r in norm_rows:
-                w.writerow(r)
-        os.replace(tmp, path)
-    except Exception:
-        pass
-    state = _load_data_sources_state()
-    entry = {
-        "id": uuid.uuid4().hex[:12],
-        "name": filename,
-        "path": path,
-        "enabled": True,
-        "rows": note,
-        "uploaded": datetime.datetime.utcnow().isoformat() + 'Z'
-    }
-    state['sources'].append(entry)
-    _save_data_sources_state(state)
-    if ok and skipped:
-        flash(f'CSV imported with {len(skipped)} invalid row(s) skipped.')
-    else:
-        flash('CSV imported.')
-    return redirect(url_for('data_sources_page'))
-
-@app.route('/data_sources/toggle/<sid>', methods=['POST'])
-def data_sources_toggle(sid):
-    state = _load_data_sources_state()
-    for s in state.get('sources', []):
-        if s.get('id') == sid:
-            s['enabled'] = not s.get('enabled', False)
-            break
-    _save_data_sources_state(state)
-    return redirect(url_for('data_sources_page'))
-
-@app.route('/data_sources/delete/<sid>', methods=['POST'])
-def data_sources_delete(sid):
-    state = _load_data_sources_state()
-    new_sources = []
-    for s in state.get('sources', []):
-        if s.get('id') == sid:
-            try:
-                if os.path.exists(s.get('path','')):
-                    os.remove(s['path'])
-            except Exception:
-                pass
-            continue
-        new_sources.append(s)
-    state['sources'] = new_sources
-    _save_data_sources_state(state)
-    flash('Deleted.')
-    return redirect(url_for('data_sources_page'))
-
-@app.route('/data_sources/refresh/<sid>', methods=['POST'])
-def data_sources_refresh(sid):
-    state = _load_data_sources_state()
-    for s in state.get('sources', []):
-        if s.get('id') == sid:
-            ok, note, norm_rows, skipped = _validate_and_normalize_data_source_csv(s.get('path',''), skip_invalid=True)
-            if ok and norm_rows:
-                # Write back normalized CSV
-                try:
-                    p = s.get('path','')
-                    tmp = p + '.tmp'
-                    with open(tmp, 'w', encoding='utf-8', newline='') as f:
-                        w = csv.writer(f)
-                        for r in norm_rows:
-                            w.writerow(r)
-                    os.replace(tmp, p)
-                except Exception:
-                    pass
-            if ok and skipped:
-                note = note + f" (skipped {len(skipped)} invalid)"
-            s['rows'] = note if ok else f"ERR: {note}"
-            break
-    _save_data_sources_state(state)
-    return redirect(url_for('data_sources_page'))
-
-@app.route('/data_sources/download/<sid>')
-def data_sources_download(sid):
-    state = _load_data_sources_state()
-    for s in state.get('sources', []):
-        if s.get('id') == sid and os.path.exists(s.get('path','')):
-            return send_file(s['path'], as_attachment=True, download_name=os.path.basename(s['name']))
-    flash('Not found')
-    return redirect(url_for('data_sources_page'))
-
-@app.route('/data_sources/export_all')
-def data_sources_export_all():
-    import io, zipfile
-    state = _load_data_sources_state()
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
-        for s in state.get('sources', []):
-            p = s.get('path')
-            if p and os.path.exists(p):
-                z.write(p, arcname=os.path.basename(p))
-    mem.seek(0)
-    return send_file(mem, as_attachment=True, download_name='data_sources.zip')
-
-
-# ---------------- Flag Catalog (mirror of Vulnerability Catalog) -----------------
+# ---------------- Flag Catalog / Generator Packs -----------------
 
 
 def _require_builder_or_admin() -> None:
@@ -30812,17 +29802,15 @@ def _split_artifact_list(value: Any) -> list[str]:
 
 def _normalize_requires_with_optional(payload: dict[str, Any]) -> tuple[list[str], list[str]]:
     """Return (required_requires, optional_requires)."""
-    # New UI shape: requires = [{artifact, optional}, ...]
+    # Generator Builder UI shape: requires = [{artifact, optional}, ...]
     req_items = payload.get('requires')
-    if isinstance(req_items, list) and any(isinstance(x, dict) for x in req_items):
+    if not (isinstance(req_items, list) and all(isinstance(x, dict) for x in req_items)):
+        raise ValueError('requires must be a list of {artifact, optional} objects')
+
+    if isinstance(req_items, list):
         required: list[str] = []
         optional: list[str] = []
         for item in req_items:
-            if not isinstance(item, dict):
-                s = str(item or '').strip()
-                if s:
-                    required.append(s)
-                continue
             art = str(item.get('artifact') or '').strip()
             if not art:
                 continue
@@ -30835,13 +29823,6 @@ def _normalize_requires_with_optional(payload: dict[str, Any]) -> tuple[list[str
         required_set = {x for x in required if x}
         optional_set = {x for x in optional if x and x not in required_set}
         return sorted(required_set), sorted(optional_set)
-
-    # Back-compat: requires is a list of strings or textarea; optional_requires may be provided separately.
-    required2 = _split_artifact_list(payload.get('requires'))
-    optional2 = _split_artifact_list(payload.get('optional_requires'))
-    required_set2 = {x for x in required2 if x}
-    optional_set2 = {x for x in optional2 if x and x not in required_set2}
-    return sorted(required_set2), sorted(optional_set2)
 
 
 def _normalize_plugin_type(raw: Any) -> str:
@@ -30887,7 +29868,7 @@ def _inputs_schema_from_flags(flags: dict[str, Any], *, plugin_type: str) -> dic
     return inputs
 
 
-def _build_generator_scaffold(payload: dict[str, Any]) -> tuple[dict[str, str], dict[str, Any], str]:
+def _build_generator_scaffold(payload: dict[str, Any]) -> tuple[dict[str, str], str, str]:
     plugin_type = _normalize_plugin_type(payload.get('plugin_type'))
     plugin_id = _sanitize_id(payload.get('plugin_id'))
     if not plugin_id:
@@ -30975,6 +29956,14 @@ def _build_generator_scaffold(payload: dict[str, Any]) -> tuple[dict[str, str], 
         s = str(a or '').strip()
         if s:
             manifest_yaml += f"    - {s}\n"
+
+    if optional_requires:
+        manifest_yaml += "  optional_requires:\n"
+        for a in (optional_requires or []):
+            s = str(a or '').strip()
+            if s:
+                manifest_yaml += f"    - {s}\n"
+
     manifest_yaml += "  produces:\n"
     for a in (produces or []):
         s = str(a or '').strip()
@@ -31143,52 +30132,18 @@ if __name__ == '__main__':
     main()
 """
 
-    plugins_entry: dict[str, Any] = {
-        'plugin_id': plugin_id,
-        'plugin_type': plugin_type,
-        'version': '1.0',
-        'description': description,
-        'requires': requires,
-        'produces': [{'artifact': a} for a in produces if a],
-    }
-    if optional_requires:
-        plugins_entry['optional_requires'] = optional_requires
-    if inputs_schema:
-        plugins_entry['inputs'] = inputs_schema
     readme_override = str(payload.get('readme_text') or '')
     if readme_override and not readme_override.endswith('\n'):
         readme_override = readme_override + '\n'
-
-    impl_entry: dict[str, Any] = {
-        'plugin_id': plugin_id,
-        'name': display_name,
-        'language': 'python',
-        'source': {'type': 'local-path', 'path': folder_path},
-        'compose': {'file': 'docker-compose.yml', 'service': 'generator'},
-    }
-    if hint_templates:
-        impl_entry['hint_templates'] = hint_templates
-        impl_entry['hint_template'] = hint_templates[0]
-
-    if inject_files:
-        impl_entry['inject_files'] = inject_files
-
-    catalog_source = {
-        'schema_version': 3,
-        'plugin_type': plugin_type,
-        'plugins': [plugins_entry],
-        'implementations': [impl_entry],
-    }
 
     scaffold_files: dict[str, str] = {
         f"{folder_path}/docker-compose.yml": compose_yaml,
         f"{folder_path}/generator.py": generator_py,
         f"{folder_path}/README.md": readme_override or f"# {display_name}\n\nTODO: describe this generator.\n\n- plugin_id: `{plugin_id}`\n- type: `{plugin_type}`\n",
         f"{folder_path}/manifest.yaml": manifest_yaml,
-        f"{folder_path}/catalog_source.json": json.dumps(catalog_source, indent=2) + "\n",
     }
 
-    return scaffold_files, catalog_source, folder_path
+    return scaffold_files, manifest_yaml, folder_path
 
 
 @app.route('/generator_builder')
@@ -31362,12 +30317,12 @@ def api_generators_scaffold_meta():
     _require_builder_or_admin()
     payload = request.get_json(silent=True) or {}
     try:
-        scaffold_files, catalog_source, _folder_path = _build_generator_scaffold(payload)
+        scaffold_files, manifest_yaml, _folder_path = _build_generator_scaffold(payload)
     except Exception as exc:
         return jsonify({'ok': False, 'error': str(exc)}), 400
     return jsonify({
         'ok': True,
-        'catalog_source': catalog_source,
+        'manifest_yaml': manifest_yaml,
         'scaffold_paths': sorted(scaffold_files.keys()),
     })
 
@@ -31377,7 +30332,7 @@ def api_generators_scaffold_zip():
     _require_builder_or_admin()
     payload = request.get_json(silent=True) or {}
     try:
-        scaffold_files, _catalog_source, _folder_path = _build_generator_scaffold(payload)
+        scaffold_files, _manifest_yaml, _folder_path = _build_generator_scaffold(payload)
         plugin_id = _sanitize_id(payload.get('plugin_id')) or 'generator'
     except Exception as exc:
         return jsonify({'ok': False, 'error': str(exc)}), 400
@@ -31440,243 +30395,9 @@ def flag_catalog_page():
     )
 
 
-@app.route('/flag_catalog_data')
-def flag_catalog_data():
-    """Return aggregated flag catalog from enabled flag sources."""
-    try:
-        items, meta = _flag_catalog_items_from_enabled_sources()
-        return jsonify({
-            'types': meta.get('types', []),
-            'security_profiles': meta.get('security_profiles', []),
-            'items': items,
-        })
-    except Exception as e:
-        return jsonify({'error': str(e), 'types': [], 'security_profiles': [], 'items': []}), 500
 
 
-@app.route('/flag_sources/upload', methods=['POST'])
-def flag_sources_upload():
-    f = request.files.get('json_file')
-    if not f or f.filename == '':
-        flash('No file selected.')
-        return redirect(url_for('flag_catalog_page'))
-    filename = secure_filename(f.filename)
-    if not filename.lower().endswith('.json'):
-        flash('Only .json allowed.')
-        return redirect(url_for('flag_catalog_page'))
-    unique = datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
-    os.makedirs(FLAG_SOURCES_DIR, exist_ok=True)
-    path = os.path.join(FLAG_SOURCES_DIR, f"{unique}-{filename}")
-    f.save(path)
-    ok, note, items, skipped = _validate_and_normalize_flag_source_json(path)
-    if not ok:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-        flash(f'Invalid JSON: {note}')
-        return redirect(url_for('flag_catalog_page'))
-    # Write back normalized JSON
-    try:
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as fh:
-            json.dump(items, fh, indent=2)
-        os.replace(tmp, path)
-    except Exception:
-        pass
-    state = _load_flag_sources_state()
-    entry = {
-        'id': uuid.uuid4().hex[:12],
-        'name': filename,
-        'path': path,
-        'enabled': True,
-        'rows': note,
-        'uploaded': datetime.datetime.utcnow().isoformat() + 'Z',
-    }
-    state['sources'].append(entry)
-    _save_flag_sources_state(state)
-    if ok and skipped:
-        flash(f'JSON imported with {len(skipped)} invalid row(s) skipped.')
-    else:
-        flash('JSON imported.')
-    return redirect(url_for('flag_catalog_page'))
-
-
-@app.route('/flag_sources/toggle/<sid>', methods=['POST'])
-def flag_sources_toggle(sid):
-    state = _load_flag_sources_state()
-    for s in state.get('sources', []):
-        if s.get('id') == sid:
-            s['enabled'] = not s.get('enabled', False)
-            break
-    _save_flag_sources_state(state)
-    return redirect(url_for('flag_catalog_page'))
-
-
-@app.route('/flag_sources/delete/<sid>', methods=['POST'])
-def flag_sources_delete(sid):
-    state = _load_flag_sources_state()
-    kept = []
-    for s in state.get('sources', []):
-        if s.get('id') == sid:
-            try:
-                if os.path.exists(s.get('path', '')):
-                    os.remove(s['path'])
-            except Exception:
-                pass
-            continue
-        kept.append(s)
-    state['sources'] = kept
-    _save_flag_sources_state(state)
-    flash('Deleted.')
-    return redirect(url_for('flag_catalog_page'))
-
-
-@app.route('/flag_sources/refresh/<sid>', methods=['POST'])
-def flag_sources_refresh(sid):
-    state = _load_flag_sources_state()
-    for s in state.get('sources', []):
-        if s.get('id') == sid:
-            ok, note, items, skipped = _validate_and_normalize_flag_source_json(s.get('path', ''))
-            if ok and items is not None:
-                try:
-                    p = s.get('path', '')
-                    tmp = p + '.tmp'
-                    with open(tmp, 'w', encoding='utf-8') as fh:
-                        json.dump(items, fh, indent=2)
-                    os.replace(tmp, p)
-                except Exception:
-                    pass
-            if ok and skipped:
-                note = note + f" (skipped {len(skipped)} invalid)"
-            s['rows'] = note if ok else f"ERR: {note}"
-            break
-    _save_flag_sources_state(state)
-    return redirect(url_for('flag_catalog_page'))
-
-
-@app.route('/flag_sources/download/<sid>')
-def flag_sources_download(sid):
-    state = _load_flag_sources_state()
-    for s in state.get('sources', []):
-        if s.get('id') == sid and os.path.exists(s.get('path', '')):
-            return send_file(s['path'], as_attachment=True, download_name=os.path.basename(s.get('name') or 'flag_catalog.json'))
-    flash('Not found')
-    return redirect(url_for('flag_catalog_page'))
-
-
-@app.route('/flag_sources/export_all')
-def flag_sources_export_all():
-    import io, zipfile
-    state = _load_flag_sources_state()
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
-        for s in state.get('sources', []):
-            p = s.get('path')
-            if p and os.path.exists(p):
-                z.write(p, arcname=os.path.basename(p))
-    mem.seek(0)
-    return send_file(mem, as_attachment=True, download_name='flag_sources.zip')
-
-
-@app.route('/flag_sources/edit/<sid>')
-def flag_sources_edit(sid):
-    state = _load_flag_sources_state()
-    target = None
-    for s in state.get('sources', []):
-        if s.get('id') == sid:
-            target = s
-            break
-    if not target:
-        flash('Source not found')
-        return redirect(url_for('flag_catalog_page'))
-    path = target.get('path')
-    if not path or not os.path.exists(path):
-        flash('File missing')
-        return redirect(url_for('flag_catalog_page'))
-    ok, note, items, _skipped = _validate_and_normalize_flag_source_json(path)
-    if not ok:
-        flash(f'Invalid source JSON: {note}')
-        items = []
-    name = target.get('name') or os.path.basename(path)
-    return render_template('flag_source_edit.html', sid=sid, name=name, path=path, items=items, columns=FLAG_ALL_FIELDS, active_page='flag_catalog')
-
-
-@app.route('/flag_sources/save/<sid>', methods=['POST'])
-def flag_sources_save(sid):
-    """Save edited flag source JSON content.
-
-    Expects JSON payload: { rows: string[][] }
-    First row is header; remaining rows are values.
-    """
-    try:
-        data = request.get_json(silent=True)
-        if not isinstance(data, dict) or 'rows' not in data:
-            return jsonify({'ok': False, 'error': 'Invalid payload'}), 400
-        rows = data.get('rows')
-        if not isinstance(rows, list) or any(not isinstance(r, list) for r in rows):
-            return jsonify({'ok': False, 'error': 'Rows must be a list of lists'}), 400
-        if not rows:
-            return jsonify({'ok': False, 'error': 'No rows provided'}), 400
-        header = [str(c).strip() for c in (rows[0] or [])]
-        if not header:
-            return jsonify({'ok': False, 'error': 'Missing header'}), 400
-        # Build list of objects
-        items: list[dict] = []
-        for r in rows[1:]:
-            rec = {}
-            for i, h in enumerate(header):
-                if not h:
-                    continue
-                rec[h] = r[i] if i < len(r) else ''
-            # Skip completely empty rows
-            if not any(str(v).strip() for v in rec.values()):
-                continue
-            items.append(rec)
-
-        state = _load_flag_sources_state()
-        target = None
-        for s in state.get('sources', []):
-            if s.get('id') == sid:
-                target = s
-                break
-        if not target:
-            return jsonify({'ok': False, 'error': 'Source not found'}), 404
-        path = target.get('path')
-        if not path:
-            return jsonify({'ok': False, 'error': 'Missing file path'}), 400
-
-        # Validate by writing a preview file and reusing canonical validator
-        tmp_preview = path + '.editpreview'
-        try:
-            with open(tmp_preview, 'w', encoding='utf-8') as fh:
-                json.dump(items, fh, indent=2)
-            ok2, note2, norm_items, skipped2 = _validate_and_normalize_flag_source_json(tmp_preview)
-        finally:
-            try:
-                os.remove(tmp_preview)
-            except Exception:
-                pass
-        if not ok2:
-            return jsonify({'ok': False, 'error': note2}), 200
-
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as fh:
-            json.dump(norm_items, fh, indent=2)
-        os.replace(tmp, path)
-
-        # Update state row count
-        note = note2
-        if ok2 and skipped2:
-            note = note + f" (skipped {len(skipped2)} invalid)"
-        target['rows'] = note
-        _save_flag_sources_state(state)
-        return jsonify({'ok': True, 'skipped': len(skipped2) if ok2 else 0})
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
-
-
-# ---------------- Flag Generators (v3 plugin catalog) -----------------
+# ---------------- Flag Generators (manifest) -----------------
 
 
 def _flag_generators_from_manifests(*, kind: str) -> tuple[list[dict], dict[str, dict[str, Any]], list[dict]]:
@@ -33095,6 +31816,8 @@ def flag_generators_test_run():
     cmd = [
         sys.executable or 'python',
         runner_path,
+        '--kind',
+        'flag-generator',
         '--generator-id',
         generator_id,
         '--out-dir',
@@ -33203,7 +31926,7 @@ def flag_node_generators_test_run():
 
     gen = _find_enabled_node_generator_by_id(generator_id)
     if not gen:
-        return jsonify({'ok': False, 'error': 'Generator not found (must be in an enabled source).'}), 404
+        return jsonify({'ok': False, 'error': 'Generator not found (must be installed and enabled).'}), 404
 
     try:
         if isinstance(gen, dict) and _is_installed_generator_view(gen) and _is_installed_generator_disabled(kind='flag-node-generator', generator_id=generator_id):
@@ -33274,8 +31997,8 @@ def flag_node_generators_test_run():
     cmd = [
         sys.executable or 'python',
         runner_path,
-        '--catalog',
-        'flag_node_generators',
+        '--kind',
+        'flag-node-generator',
         '--generator-id',
         generator_id,
         '--out-dir',
@@ -33896,54 +32619,19 @@ def flag_compose_remove():
 
 @app.route('/vuln_catalog')
 def vuln_catalog():
-    """Return vulnerability catalog built from enabled data source CSVs.
+    """Return vulnerability catalog.
 
-    Response JSON:
-      {
-        "types": [str],
-        "vectors": [str],
-        "items": [ {"Name","Path","Type","Startup","Vector","CVE","Description","References"} ]
-      }
-    Only includes rows from enabled data sources that validate.
+    Latest-only policy: the web UI reads the repo-shipped raw datasource CSVs
+    (same source as the CLI).
     """
     try:
-        state = _load_data_sources_state()
-        types = set()
-        vectors = set()
-        items = []
-        for s in state.get('sources', []):
-            if not s.get('enabled'): continue
-            p = s.get('path')
-            if not p or not os.path.exists(p): continue
-            ok, note, norm_rows, _skipped = _validate_and_normalize_data_source_csv(p, skip_invalid=True)
-            if not ok or not norm_rows or len(norm_rows) < 2: continue
-            header = norm_rows[0]
-            idx = {name: header.index(name) for name in header if name in header}
-            for r in norm_rows[1:]:
-                try:
-                    rec = {
-                        'Name': r[idx.get('Name')],
-                        'Path': r[idx.get('Path')],
-                        'Type': r[idx.get('Type')],
-                        'Startup': r[idx.get('Startup')],
-                        'Vector': r[idx.get('Vector')],
-                        'CVE': r[idx.get('CVE')] if 'CVE' in idx else 'n/a',
-                        'Description': r[idx.get('Description')] if 'Description' in idx else 'n/a',
-                        'References': r[idx.get('References')] if 'References' in idx else 'n/a',
-                    }
-                    # keep only non-empty mandatory values
-                    if not rec['Name'] or not rec['Path']:
-                        continue
-                    items.append(rec)
-                    if rec['Type']: types.add(rec['Type'])
-                    if rec['Vector']: vectors.add(rec['Vector'])
-                except Exception:
-                    continue
-        return jsonify({
-            'types': sorted(types),
-            'vectors': sorted(vectors),
-            'items': items,
-        })
+        from core_topo_gen.utils.vuln_process import load_vuln_catalog
+
+        repo_root = _get_repo_root()
+        items = load_vuln_catalog(repo_root)
+        types = sorted({str(it.get('Type') or '').strip() for it in items if str(it.get('Type') or '').strip()})
+        vectors = sorted({str(it.get('Vector') or '').strip() for it in items if str(it.get('Vector') or '').strip()})
+        return jsonify({'types': types, 'vectors': vectors, 'items': items})
     except Exception as e:
         return jsonify({'error': str(e), 'types': [], 'vectors': [], 'items': []}), 500
 
@@ -34571,95 +33259,6 @@ def vuln_compose_remove():
         return jsonify({'items': out, 'log': logs})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-@app.route('/data_sources/edit/<sid>')
-def data_sources_edit(sid):
-    """Render an editable view of the CSV source in a simple table.
-    """
-    state = _load_data_sources_state()
-    target = None
-    for s in state.get('sources', []):
-        if s.get('id') == sid:
-            target = s
-            break
-    if not target:
-        flash('Source not found')
-        return redirect(url_for('data_sources_page'))
-    path = target.get('path')
-    if not path or not os.path.exists(path):
-        flash('File missing')
-        return redirect(url_for('data_sources_page'))
-    # Read CSV safely
-    rows = []
-    with open(path, 'r', encoding='utf-8', errors='replace', newline='') as f:
-        rdr = csv.reader(f)
-        for r in rdr:
-            rows.append(r)
-    name = target.get('name') or os.path.basename(path)
-    return render_template('data_source_edit.html', sid=sid, name=name, path=path, rows=rows)
-
-@app.route('/data_sources/save/<sid>', methods=['POST'])
-def data_sources_save(sid):
-    """Save edited CSV content coming from the editor page.
-    Expects JSON payload: { rows: string[][] }
-    """
-    try:
-        data = request.get_json(silent=True)
-        if not isinstance(data, dict) or 'rows' not in data:
-            return jsonify({"ok": False, "error": "Invalid payload"}), 400
-        rows = data.get('rows')
-        if not isinstance(rows, list) or any(not isinstance(r, list) for r in rows):
-            return jsonify({"ok": False, "error": "Rows must be a list of lists"}), 400
-        # Basic row length normalization (pad shorter rows to header length)
-        maxw = max((len(r) for r in rows), default=0)
-        norm = []
-        for r in rows:
-            if len(r) < maxw:
-                r = r + [''] * (maxw - len(r))
-            norm.append([str(c) if c is not None else '' for c in r])
-        state = _load_data_sources_state()
-        target = None
-        for s in state.get('sources', []):
-            if s.get('id') == sid:
-                target = s
-                break
-        if not target:
-            return jsonify({"ok": False, "error": "Source not found"}), 404
-        path = target.get('path')
-        if not path:
-            return jsonify({"ok": False, "error": "Missing file path"}), 400
-        # Validate and normalize according to schema
-        # Write temp to validate with the same function used for uploads
-        tmp_preview = path + '.editpreview'
-        try:
-            with open(tmp_preview, 'w', encoding='utf-8', newline='') as f:
-                w = csv.writer(f)
-                for r in norm:
-                    w.writerow(r)
-            ok2, note2, norm_rows2, skipped2 = _validate_and_normalize_data_source_csv(tmp_preview, skip_invalid=True)
-        finally:
-            try: os.remove(tmp_preview)
-            except Exception: pass
-        if not ok2:
-            return jsonify({"ok": False, "error": note2}), 200
-        # Atomic write normalized rows
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8', newline='') as f:
-            w = csv.writer(f)
-            for r in (norm_rows2 or norm):
-                w.writerow(r)
-        os.replace(tmp, path)
-        # Update state row count
-        ok, note = _validate_csv(path)
-        if ok2 and skipped2:
-            note_extra = f" (skipped {len(skipped2)} invalid)"
-        else:
-            note_extra = ''
-        target['rows'] = (note if ok else f"ERR: {note}") + note_extra
-        _save_data_sources_state(state)
-        return jsonify({"ok": True, "skipped": len(skipped2) if ok2 else 0})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 def _purge_run_history_for_scenario(scenario_name: str, delete_artifacts: bool = True) -> int:
     """Remove any run history entries whose scenario_names contains scenario_name.

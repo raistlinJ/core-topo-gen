@@ -19,7 +19,4 @@ How to use:
 	- Keep the generator in `flag_generators/` or `flag_node_generators/` and run it directly with the runner.
 6. Test with `python scripts/run_flag_generator.py ...`.
 
-Legacy note:
-- Some older generators are still described via v3 JSON catalog sources under `data_sources/...` and enabled via `_state.json`, but the recommended workflow is `manifest.yaml` + Generator Packs.
-
 See [docs/GENERATOR_AUTHORING.md](docs/GENERATOR_AUTHORING.md) for a full tutorial.

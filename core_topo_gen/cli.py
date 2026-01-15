@@ -1131,55 +1131,78 @@ def main():
                 standard_nodes = {}
 
             def _load_enabled_flag_node_generators(repo_root_path: str) -> list[dict]:
-                """Load enabled flag-node-generators from data_sources/flag_node_generators."""
+                """Load enabled flag-node-generators from YAML manifests.
+
+                Best-effort behavior:
+                  - discovers manifests in repo + outputs/installed_generators
+                  - filters out disabled installed generators when _packs_state.json is present
+                """
                 try:
-                    state_path = os.path.join(repo_root_path, 'data_sources', 'flag_node_generators', '_state.json')
-                    if not os.path.exists(state_path):
-                        return []
-                    with open(state_path, 'r', encoding='utf-8') as fh:
-                        st = json.load(fh) or {}
-                    sources = st.get('sources') or []
-                    if not isinstance(sources, list):
-                        return []
-                    enabled = [s for s in sources if isinstance(s, dict) and s.get('enabled')]
-                    gens: list[dict] = []
-                    for s in enabled:
-                        p = str(s.get('path') or '').strip()
-                        if not p:
+                    from core_topo_gen.generator_manifests import discover_generator_manifests
+
+                    gens, _plugins_by_id, errs = discover_generator_manifests(repo_root=repo_root_path, kind='flag-node-generator')
+                    try:
+                        if errs:
+                            logging.debug("flag-node-generator manifest warnings: %d", len(errs))
+                    except Exception:
+                        pass
+
+                    # Load disable map from installed generator packs state.
+                    disabled: dict[tuple[str, str], bool] = {}
+                    try:
+                        installed_root = str(os.environ.get('CORETG_INSTALLED_GENERATORS_DIR') or '').strip()
+                        if installed_root:
+                            installed_root = os.path.abspath(os.path.expanduser(installed_root))
+                        else:
+                            installed_root = os.path.abspath(os.path.join(repo_root_path, 'outputs', 'installed_generators'))
+                        state_path = os.path.join(installed_root, '_packs_state.json')
+                        if os.path.exists(state_path):
+                            with open(state_path, 'r', encoding='utf-8') as fh:
+                                st = json.load(fh) or {}
+                            packs = st.get('packs') if isinstance(st, dict) else None
+                            if not isinstance(packs, list):
+                                packs = []
+                            for p in packs:
+                                if not isinstance(p, dict):
+                                    continue
+                                pack_disabled = bool(p.get('disabled') is True)
+                                for it in (p.get('installed') or []):
+                                    if not isinstance(it, dict):
+                                        continue
+                                    gid = str(it.get('id') or '').strip()
+                                    kind = str(it.get('kind') or '').strip()
+                                    if not gid or not kind:
+                                        continue
+                                    item_disabled = bool(it.get('disabled') is True)
+                                    disabled[(kind, gid)] = bool(pack_disabled or item_disabled)
+                    except Exception:
+                        disabled = {}
+
+                    # Filter out disabled installed generators; keep non-installed generators.
+                    out: list[dict] = []
+                    for g in (gens or []):
+                        if not isinstance(g, dict):
                             continue
-                        if not os.path.isabs(p):
-                            p = os.path.abspath(os.path.join(repo_root_path, p))
-                        if not os.path.exists(p):
+                        gid = str(g.get('id') or '').strip()
+                        if not gid:
                             continue
+                        # Best-effort installed check: manifest path under installed_root.
+                        is_installed = False
                         try:
-                            with open(p, 'r', encoding='utf-8') as fh:
-                                doc = json.load(fh) or {}
-                            try:
-                                schema_version = int(doc.get('schema_version') or 0)
-                            except Exception:
-                                schema_version = 0
-                            if schema_version != 3:
-                                continue
-                            arr = doc.get('implementations') or []
-                            if isinstance(arr, list):
-                                for impl in arr:
-                                    if not isinstance(impl, dict):
-                                        continue
-                                    pid = str(impl.get('plugin_id') or '').strip()
-                                    if not pid:
-                                        continue
-                                    # Expose plugin_id as id for legacy callers.
-                                    rec = dict(impl)
-                                    rec.setdefault('id', pid)
-                                    gens.append(rec)
+                            mp = str(g.get('_source_path') or '').strip()
+                            if mp and 'installed_root' in locals():
+                                is_installed = os.path.commonpath([os.path.abspath(installed_root), os.path.abspath(mp)]) == os.path.abspath(installed_root)
                         except Exception:
+                            is_installed = False
+                        if is_installed and disabled.get(('flag-node-generator', gid)):
                             continue
-                    return gens
+                        out.append(g)
+                    return out
                 except Exception:
                     return []
 
             def _run_flag_node_generator(generator_id: str, *, out_dir: str, config: dict) -> tuple[bool, str]:
-                """Best-effort run of scripts/run_flag_generator.py for flag_node_generators catalog."""
+                """Best-effort run of scripts/run_flag_generator.py for flag-node-generators (manifest-based)."""
                 try:
                     runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
                     if not os.path.exists(runner_path):
@@ -1193,6 +1216,8 @@ def main():
                     cmd = [
                         sys.executable or 'python',
                         runner_path,
+                        '--kind',
+                        'flag-node-generator',
                         '--generator-id',
                         generator_id,
                         '--out-dir',
@@ -1201,8 +1226,6 @@ def main():
                         json.dumps(config, ensure_ascii=False),
                         '--repo-root',
                         repo_root,
-                        '--catalog',
-                        'flag_node_generators',
                     ]
                     p = subprocess.run(
                         cmd,

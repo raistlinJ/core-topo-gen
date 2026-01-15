@@ -61,16 +61,7 @@ This repo includes JSON schemas to make generator behavior consistent across bot
 - **flag-node-generators** (generators that emit a per-node docker-compose environment).
 
 Files:
-- `validation/flag_generator_catalog.schema.json` — schema for generator-catalog JSON sources under `data_sources/flag_generators/` and `data_sources/flag_node_generators/`.
 - `validation/flag_generator_outputs.schema.json` — schema for the runtime `/outputs/outputs.json` manifest emitted by a generator.
-
-### v3 Contract Notes (`requires` vs `inputs`)
-
-In schema version 3 catalogs:
-
-- `plugins[].requires` is **artifacts-only**: keys that must be produced by earlier chain steps.
-- Flow-synthesized runtime fields **must not** appear in `requires` (they belong in `plugins[].inputs`).
-	- Currently enforced forbidden names: `seed`, `secret`, `env_name`, `challenge`, `flag_prefix`, `username_prefix`, `key_len`, `node_name`.
 
 ### Output Placeholder Substitution
 
@@ -84,18 +75,18 @@ Example hint template:
 
 `Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}`
 
-## Injected artifacts (`inject_files`)
+## Injected artifacts (`injects`)
 
-Some generators need to deliver a file/binary that will be mounted/copied into other containers (or uploaded for remote execution). Use the `implementations[].inject_files` allowlist.
+Some generators need to deliver a file/binary that will be mounted/copied into other containers (or uploaded for remote execution). Use the manifest `injects` allowlist.
 
 Key rules:
 
 - Write the generated file under `/outputs/artifacts/...` and reference it from `outputs.json`.
-- Prefer declaring `inject_files` using an output key, not a path.
+- Prefer declaring `injects` using an output key, not a path.
 
 Example:
 
 - `outputs.json.outputs.filesystem.file = "artifacts/challenge"`
-- `implementations[].inject_files = ["filesystem.file"]`
+- `manifest.yaml: injects: ["filesystem.file"]`
 
 The runner will stage only allowlisted items into `<out_dir>/injected/`.

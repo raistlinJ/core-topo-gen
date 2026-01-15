@@ -1,14 +1,5 @@
 {
-  "note": "This directory contains generator plugin contract docs (new schema) converted from existing generator-catalog JSON sources under data_sources/.",
-  "sources": {
-    "flag_generators": [
-      "data_sources/flag_generators/20260105-012906-ef4f4e-flag_generators.json",
-      "data_sources/flag_generators/20260106-flag_generators_creds_drive_xor.json"
-    ],
-    "flag_node_generators": [
-      "data_sources/flag_node_generators/20260106-flag_node_generators_default.json"
-    ]
-  },
+  "note": "This directory contains generator plugin contract docs. This mapping links generator ids to Flow plugin ids (historical/compat).",
   "plugin_id_by_generator_id": {
     "gen.cpp.basic_binary": "gen-cpp-basic_binary",
     "gen.c.basic_binary": "gen-c-basic_binary",

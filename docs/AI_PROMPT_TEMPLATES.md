@@ -12,7 +12,7 @@ For best results, paste:
 
 - Your target **generator type**: `flag-generator` or `flag-node-generator`
 - Your intended generator **source id** (the `id` in `manifest.yaml`)
-- Your intended `requires` and `produces` artifacts
+- Your intended artifact **inputs/outputs** (Generator Builder labels these as “Inputs (artifacts)” and “Outputs (artifacts)”; underlying schemas may call them `requires`/`produces`)
 - Your `manifest.yaml` (or at least the relevant fields: `id`, `kind`, `runtime`, `inputs`, `artifacts`, `hint_templates`, `injects`)
 - The current scaffolded `generator.py` (and optionally your `docker-compose.yml` / README)
 - A short description of the generator behavior you want
@@ -42,7 +42,7 @@ Tell the AI these are strict requirements:
 - Outputs should be **deterministic** for the same inputs.
 - `hint.txt` is optional. Prefer `hint_templates` in the catalog; only write `/outputs/hint.txt` if you explicitly need a standalone hint file.
 - Treat Flow-synthesized values as **inputs**, not artifacts:
-  - Never put `seed`, `secret`, `node_name`, `flag_prefix` into `requires`.
+  - Never put `seed`, `secret`, `node_name`, `flag_prefix` into artifact inputs (aka `requires`).
 
 If the generator needs to deliver a file/binary to participants:
 
@@ -87,8 +87,12 @@ If this generator outputs a file/binary:
 - Put a path to it in outputs.json.outputs (example key: filesystem.file => artifacts/<name>)
 
 Catalog intent:
-- requires artifacts: <list artifacts or '(none)'>
-- produces artifacts: <list artifacts; must include 'flag'>
+- inputs artifacts: <list artifacts or '(none)'>
+- outputs artifacts: <list artifacts; must include 'flag'>
+
+Artifact input strictness:
+- Default to optional inputs.
+- Mark any input as required only if the generator truly cannot run without it.
 
 Task:
 - Modify ONLY generator.py to implement this behavior: <describe behavior>.
@@ -134,8 +138,12 @@ Hard requirements (do not violate):
 - Inputs (NOT artifacts): seed (required), node_name (required), flag_prefix (optional).
 
 Catalog intent:
-- requires artifacts: <list artifacts or '(none)'>
-- produces artifacts: <list artifacts; typically includes 'compose_path' and 'flag'>
+- inputs artifacts: <list artifacts or '(none)'>
+- outputs artifacts: <list artifacts; typically includes 'compose_path' and 'flag'>
+
+Artifact input strictness:
+- Default to optional inputs.
+- Mark any input as required only if the generator truly cannot run without it.
 
 Task:
 - Modify ONLY generator.py to implement this behavior: <describe behavior>.
@@ -160,18 +168,18 @@ If you want the AI to update the README too:
 
 ```text
 Also update README.md to explain:
-- What artifacts it requires/produces
+- What artifact inputs/outputs it uses
 - How it is tested locally using scripts/run_flag_generator.py
 - Any environment variables or assumptions
 Output BOTH files: generator.py then README.md (clearly separated).
 ```
 
-### Make “produces” align to the catalog
+### Make “outputs” align to the catalog
 
-If you already created a `produces` list in the Generator Builder UI:
+If you already created an Outputs (artifacts) list in the Generator Builder UI:
 
 ```text
-Important: The keys in outputs.json.outputs MUST exactly match my catalog produces list.
+Important: The keys in outputs.json.outputs MUST exactly match my intended outputs list.
 If you add new outputs, tell me what catalog changes I should make.
 ```
 

@@ -14,80 +14,6 @@ def repo_root_from_here() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def load_enabled_sources(repo_root: Path) -> list[dict[str, Any]]:
-    # Support multiple generator catalogs that share the same schema.
-    # Default remains "flag_generators" to preserve existing behavior.
-    catalog = os.environ.get("FLAG_GENERATOR_CATALOG", "flag_generators").strip() or "flag_generators"
-    state_path = repo_root / "data_sources" / catalog / "_state.json"
-    if not state_path.exists():
-        return []
-    state = json.loads(state_path.read_text("utf-8"))
-    sources = state.get("sources")
-    if not isinstance(sources, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for s in sources:
-        if isinstance(s, dict) and s.get("enabled"):
-            out.append(s)
-    return out
-
-
-def load_generators_from_source(path: Path) -> list[dict[str, Any]]:
-    doc = json.loads(path.read_text("utf-8"))
-    if not isinstance(doc, dict):
-        return []
-    try:
-        schema_version = int(doc.get("schema_version") or 0)
-    except Exception:
-        schema_version = 0
-    if schema_version != 3:
-        return []
-
-    plugins = doc.get("plugins")
-    if not isinstance(plugins, list):
-        plugins = []
-    plugins_by_id: dict[str, dict[str, Any]] = {}
-    for p in plugins:
-        if not isinstance(p, dict):
-            continue
-        pid = str(p.get("plugin_id") or "").strip()
-        if pid and pid not in plugins_by_id:
-            plugins_by_id[pid] = p
-
-    impls = doc.get("implementations")
-    if not isinstance(impls, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for impl in impls:
-        if not isinstance(impl, dict):
-            continue
-        pid = str(impl.get("plugin_id") or "").strip()
-        if not pid:
-            continue
-        inject_files = impl.get("inject_files")
-        if not isinstance(inject_files, list):
-            inject_files = []
-        rec: dict[str, Any] = {
-            "id": pid,
-            "plugin_id": pid,
-            "name": impl.get("name") or pid,
-            "language": impl.get("language"),
-            "source": impl.get("source"),
-            "compose": impl.get("compose"),
-            "build": impl.get("build"),
-            "run": impl.get("run"),
-            "env": impl.get("env"),
-            "hint_template": impl.get("hint_template"),
-            "handoff": impl.get("handoff"),
-            "inject_files": [str(x) for x in inject_files if x is not None and str(x).strip()],
-        }
-        plugin = plugins_by_id.get(pid)
-        if isinstance(plugin, dict):
-            rec["plugin"] = plugin
-        out.append(rec)
-    return out
-
-
 def _norm_inject_path(raw: str) -> str:
     s = str(raw or "").strip()
     if not s:
@@ -256,24 +182,10 @@ def _rewrite_compose_relative_binds_to_injected(out_dir: Path, compose_path: Pat
         print(f"[inject_files] warning: failed to write rewritten compose: {exc}")
 
 
-def find_generator(repo_root: Path, generator_id: str) -> tuple[dict[str, Any], Path]:
-    # 1) Legacy: enabled v3 JSON catalogs
-    for src in load_enabled_sources(repo_root):
-        p = Path(src.get("path") or "")
-        if not p.is_absolute():
-            p = (repo_root / p).resolve()
-        if not p.exists():
-            continue
-        for g in load_generators_from_source(p):
-            if str(g.get("id")) == generator_id:
-                return g, p
-
-    # 2) Strict: per-generator YAML manifests in the repo
+def find_generator(repo_root: Path, kind: str, generator_id: str) -> tuple[dict[str, Any], Path]:
+    # Strict: per-generator YAML manifests (repo + installed generator packs)
     try:
         from core_topo_gen.generator_manifests import discover_generator_manifests
-
-        catalog = os.environ.get("FLAG_GENERATOR_CATALOG", "flag_generators").strip() or "flag_generators"
-        kind = 'flag-node-generator' if catalog == 'flag_node_generators' else 'flag-generator'
 
         gens, _plugins_by_id, errs = discover_generator_manifests(repo_root=repo_root, kind=kind)
         if errs:
@@ -471,23 +383,21 @@ def run_compose(
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Run a Flag-Generator definition from the enabled catalog sources.")
+    ap = argparse.ArgumentParser(description="Run a generator from manifest-based generator packs.")
     ap.add_argument("--generator-id", required=True)
+    ap.add_argument(
+        "--kind",
+        default="flag-generator",
+        help="Generator kind: flag-generator or flag-node-generator (default: flag-generator)",
+    )
     ap.add_argument("--out-dir", default="/tmp/flag_generator_out")
     ap.add_argument("--config", default="{}", help="JSON object of inputs")
     ap.add_argument("--repo-root", default="", help="Path to repo root (optional)")
-    ap.add_argument("--catalog", default="flag_generators", help="Catalog directory under data_sources/ (default: flag_generators)")
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve() if args.repo_root else repo_root_from_here()
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Catalog selection (used by load_enabled_sources/find_generator)
-    try:
-        os.environ["FLAG_GENERATOR_CATALOG"] = str(args.catalog or "flag_generators")
-    except Exception:
-        pass
 
     inputs_dir = out_dir / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
@@ -499,7 +409,7 @@ def main() -> int:
     if not isinstance(config, dict):
         raise SystemExit("--config must be a JSON object")
 
-    gen, _src_path = find_generator(repo_root, args.generator_id)
+    gen, _src_path = find_generator(repo_root, str(args.kind or "flag-generator"), args.generator_id)
     inject_files = gen.get('inject_files')
     if not isinstance(inject_files, list):
         inject_files = []

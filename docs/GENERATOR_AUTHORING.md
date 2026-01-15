@@ -33,19 +33,6 @@ For local development you can also place manifests directly under:
 
 The runner and discovery logic will pick these up (in addition to installed generators).
 
-### Legacy v3 JSON catalogs (still supported, but not the primary workflow)
-Older generators may still be described as schema v3 catalog sources under:
-
-- `data_sources/flag_generators/*.json`
-- `data_sources/flag_node_generators/*.json`
-
-and enabled via:
-
-- `data_sources/flag_generators/_state.json`
-- `data_sources/flag_node_generators/_state.json`
-
-This legacy mechanism remains for backwards compatibility and ad-hoc experiments, but the Web UI/Flow selection is driven by installed manifests.
-
 ---
 
 ## 2) The manifest format (`manifest_version: 1`)
@@ -189,16 +176,13 @@ The canonical runner is:
 
 - `scripts/run_flag_generator.py`
 
-It can run:
-
-- Legacy enabled v3 JSON catalogs (via `data_sources/<catalog>/_state.json`), and
-- Manifest-based generators (repo-local or installed).
+It runs manifest-based generators (repo-local or installed).
 
 ### Test a flag-generator
 
 ```bash
 python scripts/run_flag_generator.py \
-  --catalog flag_generators \
+  --kind flag-generator \
   --generator-id <generator_id> \
   --out-dir /tmp/fg_test \
   --config '{"seed":"123","secret":"demo"}'
@@ -210,7 +194,7 @@ cat /tmp/fg_test/outputs.json
 
 ```bash
 python scripts/run_flag_generator.py \
-  --catalog flag_node_generators \
+  --kind flag-node-generator \
   --generator-id <generator_id> \
   --out-dir /tmp/nodegen_test \
   --config '{"seed":"123","node_name":"node1","flag_prefix":"FLAG"}'

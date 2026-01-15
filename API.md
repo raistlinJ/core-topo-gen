@@ -200,7 +200,11 @@ These endpoints power the **Generator-Builder** page in the Web UI.
 : HTML page that helps scaffold new generators.
 
 `POST /api/generators/scaffold_meta`
-: JSON request describing the generator you want. Returns `{ ok, catalog_source, scaffold_paths }`.
+: JSON request describing the generator you want. Returns `{ ok, manifest_yaml, scaffold_paths }`.
+
+UI terminology:
+- The Generator Builder page labels artifact dependencies as **Inputs (artifacts)** and **Outputs (artifacts)**.
+- The API field names remain `requires` / `optional_requires` / `produces` to match generator manifest fields.
 
 Example request:
 
@@ -211,7 +215,10 @@ Example request:
 	"folder_name": "py_my_ssh_creds",
 	"name": "SSH Credentials",
 	"description": "Emits deterministic SSH credentials.",
-	"requires": [],
+	"requires": [
+		{"artifact": "ssh.username", "optional": true},
+		{"artifact": "ssh.password", "optional": false}
+	],
 	"optional_requires": [],
 	"produces": ["flag", "ssh_username", "ssh_password"],
 	"inputs": {"seed": true, "secret": true, "flag_prefix": true},
@@ -223,23 +230,16 @@ Example request:
 ```
 
 Notes:
-- `inputs` is a convenience flags object that adds standard entries (seed/secret/node_name/flag_prefix) to `plugins[].inputs` in the generated schema v3 catalog.
-- `inject_files` is optional; when present it is written into `implementations[].inject_files`.
+- `requires` must be a list of objects `{ artifact, optional }`.
+- `inputs` is a list of runtime input definitions (name/type/required/etc) written into `manifest.yaml`.
+- `inject_files` is optional; when present it is written into `manifest.yaml` as `injects`.
 
 `POST /api/generators/scaffold_zip`
 : Same JSON request body as `/api/generators/scaffold_meta`, but returns a ZIP you can unzip into the repo root.
 
 Registering the scaffolded generator:
 - The scaffold ZIP creates a folder under `flag_generators/<folder>/...` or `flag_node_generators/<folder>/...`.
-- **Legacy workflow (v3 JSON catalogs):** copy the generated `catalog_source.json` into a catalog source file under `data_sources/flag_generators/` or `data_sources/flag_node_generators/`, then enable that source in the corresponding `_state.json`.
-- **Recommended workflow (manifests + packs):** add a `manifest.yaml` to the generator folder, zip it as a Generator Pack, and install it via the Flag Catalog page.
-
-`POST /api/generators/register_catalog`
-: **Legacy convenience endpoint** that writes the generated schema v3 catalog source JSON to `data_sources/flag_generators/` or `data_sources/flag_node_generators/` and enables it in the corresponding `_state.json`. Returns `{ ok, catalog_path, state_path, source, note }`.
-
-Notes:
-- By default it refuses to register if a generator with the same `plugin_id` already exists in enabled sources (HTTP 409).
-- Set request JSON fields `force=true` to bypass the duplicate check, and `overwrite=true` to overwrite the generated catalog source filename if it already exists.
+- Package/install workflow: add a `manifest.yaml` to the generator folder, zip it as a Generator Pack, and install it via the Flag Catalog page.
 
 ### Generator Packs & Installed Generators
 
@@ -418,37 +418,8 @@ Important behavior:
 `POST /test_core`
 : Form or JSON body with `host` (string) and `port` (int). Returns `{ "ok": true }` when gRPC connectivity succeeds.
 
-### Data Sources & Vulnerability Catalog
-
-`GET /data_sources`
-: Renders the data sources administration page.
-
-`POST /data_sources/upload`
-: Multipart field `csv_file`. Adds a new data source.
-
-`POST /data_sources/toggle/<sid>`
-: Enables or disables a data source.
-
-`POST /data_sources/delete/<sid>`
-: Removes a data source.
-
-`POST /data_sources/refresh/<sid>`
-: Refreshes a source (implementation-specific).
-
-`GET /data_sources/download/<sid>`
-: Downloads a single source as CSV.
-
-`GET /data_sources/export_all`
-: Downloads all sources in a ZIP or bundled CSV.
-
-`GET /data_sources/edit/<sid>`
-: Renders the inline CSV editor.
-
-`POST /data_sources/save/<sid>`
-: JSON body `{ "rows": [["Header", "Value"], ...] }`. Normalizes and saves the CSV, then redirects back to the editor. Malformed payloads return HTTP 400.
-
 `GET /vuln_catalog`
-: Renders the vulnerability catalog view.
+: Returns the vulnerability catalog as JSON (types/vectors/items).
 
 `POST /vuln_compose/status`
 : JSON `{ "items": [{ "Name": "Node1", "Path": "...", "compose"?: "docker-compose.yml" }] }`. Returns `{ "items": [...], "log": [...] }` with compose availability and Docker pull state.

@@ -282,12 +282,19 @@ def discover_generator_manifests(
                 if s:
                     requires.append(s)
 
+            optional_requires = []
+            for x in _as_list(artifacts.get('optional_requires')):
+                s = str(x or '').strip()
+                if s:
+                    optional_requires.append(s)
+
             plugin_contract: dict[str, Any] = {
                 'plugin_id': gen_id,
                 'plugin_type': plugin_type,
                 'version': str(doc.get('version') or '1.0'),
                 'description': description,
                 'requires': requires,
+                'optional_requires': optional_requires,
                 'produces': produces_list,
                 # Optional convenience mirror.
                 'inputs': {i.get('name'): i for i in (gen.get('inputs') or []) if isinstance(i, dict) and i.get('name')},

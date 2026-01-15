@@ -74,24 +74,41 @@ def _docker_sudo_password() -> Optional[str]:
 
 def _read_csv(path: str) -> List[Dict[str, str]]:
 	rows: List[Dict[str, str]] = []
+	def _get(row: Dict[str, str], key: str) -> str:
+		try:
+			v = row.get(key)
+			if v is not None:
+				return v
+		except Exception:
+			pass
+		# Handle BOM-prefixed header names seen in some CSV exports.
+		try:
+			if not key.startswith('\ufeff'):
+				v2 = row.get('\ufeff' + key)
+				if v2 is not None:
+					return v2
+		except Exception:
+			pass
+		return ''
+
 	try:
 		with open(path, newline='', encoding='utf-8', errors='ignore') as f:
 			r = csv.DictReader(f)
 			for row in r:
 				# Normalize keys we care about; ignore rows without mandatory fields
-				name = (row.get('Name') or '').strip()
-				path_val = (row.get('Path') or '').strip()
+				name = (_get(row, 'Name') or '').strip()
+				path_val = (_get(row, 'Path') or '').strip()
 				if not name or not path_val:
 					continue
 				rows.append({
 					'Name': name,
 					'Path': path_val,
-					'Type': (row.get('Type') or '').strip(),
-					'Vector': (row.get('Vector') or '').strip(),
-					'Startup': (row.get('Startup') or '').strip(),
-					'CVE': (row.get('CVE') or '').strip(),
-					'Description': (row.get('Description') or '').strip(),
-					'References': (row.get('References') or '').strip(),
+					'Type': (_get(row, 'Type') or '').strip(),
+					'Vector': (_get(row, 'Vector') or '').strip(),
+					'Startup': (_get(row, 'Startup') or '').strip(),
+					'CVE': (_get(row, 'CVE') or '').strip(),
+					'Description': (_get(row, 'Description') or '').strip(),
+					'References': (_get(row, 'References') or '').strip(),
 				})
 	except Exception:
 		return []
