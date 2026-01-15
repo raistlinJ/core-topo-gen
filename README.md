@@ -17,6 +17,7 @@ Generate reproducible CORE network topologies from scenario XML files using a ri
 	- [Traffic, segmentation, and services](#traffic-segmentation-and-services)
 	- [Reports & artifacts](#reports--artifacts)
 	- [Generator packs & manifests](#generator-packs--manifests)
+	- [Vulnerability catalog packs](#vulnerability-catalog-packs)
 - [Architecture overview](#architecture-overview)
 - [Troubleshooting](#troubleshooting)
 - [Additional documentation](#additional-documentation)
@@ -110,6 +111,14 @@ Popular options:
 - Disable semantics:
 	- Packs and individual generators can be disabled.
 	- Disabled generators are hidden from Flow substitution and are rejected at preview/execute time.
+
+### Vulnerability catalog packs
+- The Web UI exposes a **Vuln-Catalog** page that mirrors the Flag Catalog pack UX.
+- You can upload/import a ZIP containing directories/subdirectories.
+	- Any directory that contains a `docker-compose.yml` is treated as a valid vulnerability template.
+	- All other files in those directories are preserved.
+	- The UI provides a per-pack file browser so users can download/view the extracted files.
+	- The server generates a `vuln_list_w_url.csv` internally so downstream vulnerability selection/processing remains unchanged.
 
 ## Architecture overview
 | Folder | Purpose |

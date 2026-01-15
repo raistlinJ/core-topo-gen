@@ -118,13 +118,66 @@ def _read_csv(path: str) -> List[Dict[str, str]]:
 def load_vuln_catalog(repo_root: str) -> List[Dict[str, str]]:
 	"""Load a vulnerability catalog for CLI selection.
 
-	Best-effort: prefer raw_datasources CSVs shipped with the repo.
+	Best-effort: prefer an "active" installed catalog (written by the Web UI) and
+	fall back to raw_datasources CSVs shipped with the repo.
 	Returns a list of dicts with at least Name, Path, and optional Type/Vector.
 	"""
-	candidates = [
+	def _installed_state_path(root: str) -> str:
+		return os.path.join(root, 'outputs', 'installed_vuln_catalogs', '_catalogs_state.json')
+
+	def _load_installed_state(root: str) -> Dict[str, object]:
+		try:
+			p = _installed_state_path(root)
+			if not os.path.exists(p):
+				return {}
+			with open(p, 'r', encoding='utf-8') as f:
+				obj = json.load(f)
+			return obj if isinstance(obj, dict) else {}
+		except Exception:
+			return {}
+
+	def _active_installed_csvs(root: str) -> List[str]:
+		state = _load_installed_state(root)
+		active_id = str(state.get('active_id') or '').strip() if isinstance(state, dict) else ''
+		catalogs = state.get('catalogs') if isinstance(state, dict) else None
+		if not active_id or not isinstance(catalogs, list):
+			return []
+		for c in catalogs:
+			if not isinstance(c, dict):
+				continue
+			cid = str(c.get('id') or '').strip()
+			if cid != active_id:
+				continue
+			paths = c.get('csv_paths')
+			out: List[str] = []
+			if isinstance(paths, list):
+				for p in paths:
+					ps = str(p or '').strip()
+					if not ps:
+						continue
+					# Allow relative paths in state for portability.
+					if not os.path.isabs(ps):
+						ps = os.path.join(root, ps)
+					out.append(ps)
+				return out
+			# Back-compat: a single csv_path string
+			ps2 = str(c.get('csv_path') or '').strip()
+			if ps2:
+				if not os.path.isabs(ps2):
+					ps2 = os.path.join(root, ps2)
+				return [ps2]
+			return []
+		return []
+
+	candidates = []
+	# 1) Active installed catalog (if present)
+	for p in _active_installed_csvs(repo_root):
+		candidates.append(p)
+	# 2) Repo-shipped defaults
+	candidates.extend([
 		os.path.join(repo_root, 'raw_datasources', 'vuln_list_w_url.csv'),
 		os.path.join(repo_root, 'raw_datasources', 'vuln_list.csv'),
-	]
+	])
 	items: List[Dict[str, str]] = []
 	for p in candidates:
 		if os.path.exists(p):

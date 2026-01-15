@@ -1,0 +1,86 @@
+{% extends "layout.html" %}
+
+{% block title %}Vuln-Catalog Files{% endblock %}
+{% block header_icon %}<i class="bi bi-folder2-open fs-4"></i>{% endblock %}
+{% block header_title %}Vuln-Catalog Files{% endblock %}
+{% block active_page %}{% set active_page = 'vuln_catalog' %}{% endblock %}
+
+{% block content %}
+<div class="container-fluid">
+  <div class="row">
+    <div class="col-12">
+      <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-2">
+        <div>
+          <h5 class="mb-0">Pack {{ catalog_id }}</h5>
+          <div class="small text-muted">Browsing extracted content{% if rel_dir %}: <code>{{ rel_dir }}</code>{% endif %}</div>
+        </div>
+        <div class="d-flex gap-2">
+          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('vuln_catalog_page') }}">Back to Vuln-Catalog</a>
+        </div>
+      </div>
+
+      <nav aria-label="breadcrumb" class="mb-3">
+        <ol class="breadcrumb mb-0">
+          {% for c in crumbs %}
+            <li class="breadcrumb-item"><a href="{{ c.href }}">{{ c.name }}</a></li>
+          {% endfor %}
+        </ol>
+      </nav>
+
+      <div class="card">
+        <div class="card-body">
+          <div class="table-responsive">
+            <table class="table table-sm align-middle">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th style="width: 140px;">Type</th>
+                  <th style="width: 220px;">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% if rel_dir %}
+                  <tr>
+                    <td colspan="3">
+                      <a href="{{ url_for('vuln_catalog_packs_browse', catalog_id=catalog_id, subpath=(rel_dir.rsplit('/', 1)[0] if '/' in rel_dir else '') ) }}">..</a>
+                      <span class="text-muted ms-2">Parent directory</span>
+                    </td>
+                  </tr>
+                {% endif %}
+
+                {% for e in entries %}
+                  {% set child = (rel_dir ~ '/' if rel_dir else '') ~ e.name %}
+                  <tr>
+                    <td>
+                      {% if e.kind == 'dir' %}
+                        <i class="bi bi-folder-fill me-2 text-warning"></i>
+                        <a href="{{ url_for('vuln_catalog_packs_browse', catalog_id=catalog_id, subpath=child) }}">{{ e.name }}</a>
+                      {% else %}
+                        <i class="bi bi-file-earmark-text me-2 text-secondary"></i>
+                        {{ e.name }}
+                      {% endif %}
+                    </td>
+                    <td class="small text-muted">{{ e.kind }}</td>
+                    <td>
+                      {% if e.kind == 'dir' %}
+                        <a class="btn btn-sm btn-outline-primary" href="{{ url_for('vuln_catalog_packs_browse', catalog_id=catalog_id, subpath=child) }}">Open</a>
+                      {% else %}
+                        <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('vuln_catalog_packs_file', catalog_id=catalog_id, subpath=child) }}">Download</a>
+                      {% endif %}
+                    </td>
+                  </tr>
+                {% endfor %}
+
+                {% if not entries %}
+                  <tr><td colspan="3" class="text-muted">Directory is empty.</td></tr>
+                {% endif %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+{% endblock %}

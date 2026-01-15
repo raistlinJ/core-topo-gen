@@ -1689,8 +1689,35 @@ paths:
     get:
       tags:
         - Vulnerabilities
+      summary: Return the vulnerability catalog (JSON)
+      responses:
+        '200':
+          description: Vulnerability catalog JSON.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  types:
+                    type: array
+                    items:
+                      type: string
+                  vectors:
+                    type: array
+                    items:
+                      type: string
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+
+  /vuln_catalog_page:
+    get:
+      tags:
+        - Vulnerabilities
         - UI Pages
-      summary: Render the vulnerability catalog dashboard
+      summary: Render the vulnerability catalog page
       responses:
         '200':
           description: Vulnerability catalog HTML page.
@@ -1698,6 +1725,172 @@ paths:
             text/html:
               schema:
                 type: string
+
+  /vuln_catalog_packs/upload:
+    post:
+      tags:
+        - Vulnerabilities
+        - UI Pages
+      summary: Upload and install a Vulnerability Catalog Pack ZIP
+      description: >-
+        Upload a `.zip` file containing directories/subdirectories. Each valid vulnerability directory
+        must include a `docker-compose.yml`. The server extracts all files under
+        `outputs/installed_vuln_catalogs/<id>/content/` and generates a `vuln_list_w_url.csv`
+        that points to the extracted compose files.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                zip_file:
+                  type: string
+                  format: binary
+      responses:
+        '302':
+          description: Redirect back to vulnerability catalog page.
+
+  /vuln_catalog_packs/import_url:
+    post:
+      tags:
+        - Vulnerabilities
+        - UI Pages
+      summary: Install a Vulnerability Catalog Pack from a URL
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                zip_url:
+                  type: string
+      responses:
+        '302':
+          description: Redirect back to vulnerability catalog page.
+
+  /vuln_catalog_packs/download/{catalog_id}:
+    get:
+      tags:
+        - Vulnerabilities
+      summary: Download a previously uploaded Vulnerability Catalog Pack ZIP
+      parameters:
+        - name: catalog_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: ZIP archive.
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+
+  /vuln_catalog_packs/browse/{catalog_id}:
+    get:
+      tags:
+        - Vulnerabilities
+        - UI Pages
+      summary: Browse extracted vulnerability pack files (root)
+      parameters:
+        - name: catalog_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: HTML directory listing.
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /vuln_catalog_packs/browse/{catalog_id}/{subpath}:
+    get:
+      tags:
+        - Vulnerabilities
+        - UI Pages
+      summary: Browse extracted vulnerability pack files (subpath)
+      parameters:
+        - name: catalog_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: subpath
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: HTML directory listing (or redirects to file download).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /vuln_catalog_packs/file/{catalog_id}/{subpath}:
+    get:
+      tags:
+        - Vulnerabilities
+      summary: Download a single extracted file from a vulnerability pack
+      parameters:
+        - name: catalog_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: subpath
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: File download.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+
+  /vuln_catalog_packs/set_active/{catalog_id}:
+    post:
+      tags:
+        - Vulnerabilities
+        - UI Pages
+      summary: Mark a Vulnerability Catalog Pack as active
+      parameters:
+        - name: catalog_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect back to vulnerability catalog page.
+
+  /vuln_catalog_packs/delete/{catalog_id}:
+    post:
+      tags:
+        - Vulnerabilities
+        - UI Pages
+      summary: Delete a Vulnerability Catalog Pack
+      parameters:
+        - name: catalog_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect back to vulnerability catalog page.
   /stream/{run_id}:
     get:
       tags:

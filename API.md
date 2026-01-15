@@ -421,11 +421,40 @@ Important behavior:
 `GET /vuln_catalog`
 : Returns the vulnerability catalog as JSON (types/vectors/items).
 
+`GET /vuln_catalog_page`
+: HTML page that mirrors the Flag Catalog pack UX, but for vulnerability catalog packs.
+
+`POST /vuln_catalog_packs/upload`
+: Form upload endpoint. Expects multipart field `zip_file` containing a ZIP with directories/subdirectories.
+	Each valid vulnerability directory must include `docker-compose.yml`. The server extracts the ZIP and
+	generates a `vuln_list_w_url.csv` for selection.
+
+`POST /vuln_catalog_packs/import_url`
+: Form endpoint. Field `zip_url` points to a ZIP containing compose directories.
+
+`GET /vuln_catalog_packs/download/<catalog_id>`
+: Downloads the previously uploaded ZIP.
+
+`GET /vuln_catalog_packs/browse/<catalog_id>`
+: HTML directory browser for the extracted pack content.
+
+`GET /vuln_catalog_packs/browse/<catalog_id>/<subpath>`
+: Browse a subdirectory under the extracted content.
+
+`GET /vuln_catalog_packs/file/<catalog_id>/<subpath>`
+: Download a specific extracted file.
+
+`POST /vuln_catalog_packs/set_active/<catalog_id>`
+: Marks the selected catalog pack as active.
+
+`POST /vuln_catalog_packs/delete/<catalog_id>`
+: Deletes the selected catalog pack.
+
 `POST /vuln_compose/status`
 : JSON `{ "items": [{ "Name": "Node1", "Path": "...", "compose"?: "docker-compose.yml" }] }`. Returns `{ "items": [...], "log": [...] }` with compose availability and Docker pull state.
 
 `POST /vuln_compose/download`
-: Same payload. Supports GitHub URLs (cloned via `git`) and direct download paths. Responds with `{ "items": [...], "log": [...] }` summarizing results.
+: Same payload. Supports GitHub URLs (cloned via `git`), direct download URLs, and local compose paths (as produced by installed vulnerability packs). Responds with `{ "items": [...], "log": [...] }` summarizing results.
 
 `POST /vuln_compose/pull`
 : Performs `docker compose pull` for each item. Requires Docker CLI access.

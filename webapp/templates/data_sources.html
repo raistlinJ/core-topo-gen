@@ -1,0 +1,21 @@
+{% extends "layout.html" %}
+
+{% block title %}Data Sources (Removed){% endblock %}
+{% block header_icon %}<i class="bi bi-folder-x fs-4"></i>{% endblock %}
+{% block header_title %}Data Sources{% endblock %}
+
+{% block content %}
+<div class="card shadow-sm">
+  <div class="card-body">
+    <h5 class="card-title mb-2">This page has been removed</h5>
+    <p class="text-muted mb-3">
+      CORE TopoGen no longer supports managing legacy <code>data_sources/</code> catalog sources from the Web UI.
+      Generators are now discovered from installed Generator Packs via <code>manifest.yaml</code>.
+    </p>
+    <div class="d-flex gap-2 flex-wrap">
+      <a class="btn btn-primary" href="{{ url_for('flag_catalog_page') }}">Go to Flag Catalog</a>
+      <a class="btn btn-outline-secondary" href="{{ url_for('index') }}">Back to Scenarios</a>
+    </div>
+  </div>
+</div>
+{% endblock %}

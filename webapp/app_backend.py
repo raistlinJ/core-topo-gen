@@ -30395,6 +30395,16 @@ def flag_catalog_page():
     )
 
 
+@app.route('/data_sources')
+def data_sources_page():
+    """Legacy page removed.
+
+    Keep a tombstone route so old bookmarks don't throw 500s.
+    """
+    # Not linked from the UI anymore; intentionally excluded from OpenAPI.
+    return render_template('data_sources.html', active_page='')
+
+
 
 
 # ---------------- Flag Generators (manifest) -----------------
@@ -30722,6 +30732,603 @@ def _download_zip_from_url(url: str, *, max_bytes: int = 50_000_000) -> bytes:
         if len(buf) > max_bytes:
             raise ValueError('Download too large')
         return buf
+
+
+# ---------------- Vulnerability Catalog Packs -----------------
+
+
+def _installed_vuln_catalogs_root() -> str:
+    return os.path.join(_outputs_dir(), 'installed_vuln_catalogs')
+
+
+def _vuln_catalogs_state_path() -> str:
+    return os.path.join(_installed_vuln_catalogs_root(), '_catalogs_state.json')
+
+
+def _load_vuln_catalogs_state() -> dict:
+    try:
+        p = _vuln_catalogs_state_path()
+        if not os.path.exists(p):
+            return {'catalogs': [], 'active_id': ''}
+        with open(p, 'r', encoding='utf-8') as f:
+            obj = json.load(f)
+        if not isinstance(obj, dict):
+            return {'catalogs': [], 'active_id': ''}
+        obj.setdefault('catalogs', [])
+        obj.setdefault('active_id', '')
+        return obj
+    except Exception:
+        return {'catalogs': [], 'active_id': ''}
+
+
+def _write_vuln_catalogs_state(state: dict) -> None:
+    os.makedirs(_installed_vuln_catalogs_root(), exist_ok=True)
+    p = _vuln_catalogs_state_path()
+    tmp = p + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, p)
+
+
+def _vuln_catalog_pack_dir(catalog_id: str) -> str:
+    return os.path.join(_installed_vuln_catalogs_root(), str(catalog_id))
+
+
+def _vuln_catalog_pack_zip_path(catalog_id: str) -> str:
+    return os.path.join(_vuln_catalog_pack_dir(catalog_id), 'catalog.zip')
+
+
+def _vuln_catalog_pack_content_dir(catalog_id: str) -> str:
+    return os.path.join(_vuln_catalog_pack_dir(catalog_id), 'content')
+
+
+def _safe_path_under(base_dir: str, subpath: str) -> str:
+    """Resolve a user-provided subpath under base_dir safely."""
+    base_abs = os.path.abspath(base_dir)
+    rel = str(subpath or '').replace('\\', '/').strip()
+    rel = rel.lstrip('/')
+    parts = [p for p in rel.split('/') if p not in ('', '.')]
+    if any(p == '..' for p in parts):
+        raise ValueError('Invalid path')
+    out = os.path.abspath(os.path.join(base_abs, *parts))
+    if out == base_abs:
+        return out
+    if not out.startswith(base_abs + os.sep):
+        raise ValueError('Path escaped base directory')
+    return out
+
+
+def _pick_vuln_csv_from_zip(zf: zipfile.ZipFile) -> str | None:
+    names = [n for n in (zf.namelist() or []) if isinstance(n, str)]
+    preferred = [n for n in names if n.lower().endswith('/vuln_list_w_url.csv') or n.lower() == 'vuln_list_w_url.csv']
+    if preferred:
+        preferred.sort(key=lambda s: (s.count('/'), len(s)))
+        return preferred[0]
+    alt = [n for n in names if n.lower().endswith('/vuln_list.csv') or n.lower() == 'vuln_list.csv']
+    if alt:
+        alt.sort(key=lambda s: (s.count('/'), len(s)))
+        return alt[0]
+    return None
+
+
+def _install_vuln_catalog_zip_bytes(*, zip_bytes: bytes, label: str, origin: str) -> dict:
+    os.makedirs(_installed_vuln_catalogs_root(), exist_ok=True)
+    catalog_id = time.strftime('%Y%m%d-%H%M%S') + '-' + secrets.token_hex(3)
+    pack_dir = _vuln_catalog_pack_dir(catalog_id)
+    os.makedirs(pack_dir, exist_ok=True)
+
+    zip_path = _vuln_catalog_pack_zip_path(catalog_id)
+    with open(zip_path, 'wb') as f:
+        f.write(zip_bytes or b'')
+
+    csv_rel_paths: list[str] = []
+    compose_items: list[dict[str, Any]] = []
+    try:
+        # Extract the entire ZIP directory tree so compose directories (and their
+        # support files) are preserved.
+        content_dir = _vuln_catalog_pack_content_dir(catalog_id)
+        _safe_extract_zip_to_dir(zip_path, content_dir)
+
+        # Discover all directories containing docker-compose.yml (required).
+        compose_paths: list[tuple[str, str]] = []
+        for dirpath, _dirnames, filenames in os.walk(content_dir):
+            if '__MACOSX' in dirpath:
+                continue
+            if not filenames:
+                continue
+            if 'docker-compose.yml' not in filenames:
+                continue
+            compose_path = os.path.join(dirpath, 'docker-compose.yml')
+            if not os.path.isfile(compose_path):
+                continue
+            rel_dir = os.path.relpath(dirpath, content_dir).replace('\\', '/')
+            name = rel_dir if rel_dir not in ('.', '') else 'root'
+            compose_paths.append((name, compose_path))
+
+        if not compose_paths:
+            raise ValueError('ZIP must contain at least one directory with docker-compose.yml')
+
+        # Build item metadata (stable numeric id; UI name uses the parent folder name).
+        norm_label = str(label or '').strip()
+        for idx, (rel_name, compose_path) in enumerate(sorted(compose_paths, key=lambda t: t[0]), start=1):
+            rel_dir = rel_name
+            display_name = os.path.basename(rel_dir.rstrip('/')) if rel_dir not in ('', '.', 'root') else 'root'
+            if not display_name:
+                display_name = rel_dir or 'root'
+            compose_rel = os.path.relpath(compose_path, content_dir).replace('\\', '/')
+            dir_rel = os.path.relpath(os.path.dirname(compose_path), content_dir).replace('\\', '/')
+            compose_items.append({
+                'id': idx,
+                'name': display_name,
+                'rel_dir': rel_dir,
+                'dir_rel': dir_rel,
+                'compose_rel': compose_rel,
+                # Keep repo-relative paths for convenience / compatibility.
+                'compose_path': os.path.relpath(compose_path, _get_repo_root()).replace('\\', '/'),
+                'dir': os.path.relpath(os.path.dirname(compose_path), _get_repo_root()).replace('\\', '/'),
+                'from_source': norm_label,
+                'disabled': False,
+            })
+
+        # Generate a catalog CSV from discovered compose directories.
+        out_path = os.path.join(pack_dir, 'vuln_list_w_url.csv')
+        with open(out_path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            w.writerow(['Name', 'Path', 'Type', 'Vector', 'Startup', 'CVE', 'Description', 'References'])
+            for it in compose_items:
+                abs_compose = os.path.abspath(os.path.join(content_dir, str(it.get('compose_rel') or 'docker-compose.yml')))
+                w.writerow([str(it.get('name') or ''), abs_compose, 'docker-compose', '', '', '', '', ''])
+
+        # Validate generated CSV is parseable and non-empty.
+        try:
+            from core_topo_gen.utils.vuln_process import _read_csv as _read_vuln_csv
+            if not _read_vuln_csv(out_path):
+                raise ValueError('Generated catalog CSV parsed as empty')
+        except Exception as exc:
+            raise ValueError(f'Invalid vulnerability catalog CSV: {exc}')
+
+        csv_rel_paths = [os.path.relpath(out_path, _get_repo_root())]
+    except Exception:
+        shutil.rmtree(pack_dir, ignore_errors=True)
+        raise
+
+    entry = {
+        'id': catalog_id,
+        'label': str(label or '').strip() or catalog_id,
+        'from_source': str(label or '').strip() or catalog_id,
+        'origin': str(origin or '').strip(),
+        'installed_at': datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'csv_paths': csv_rel_paths,
+        'content_dir': os.path.relpath(_vuln_catalog_pack_content_dir(catalog_id), _get_repo_root()).replace('\\', '/'),
+        'compose_items': compose_items,
+        'compose_count': len(compose_items),
+    }
+
+    state = _load_vuln_catalogs_state()
+    catalogs = state.get('catalogs')
+    if not isinstance(catalogs, list):
+        catalogs = []
+    catalogs.append(entry)
+    state['catalogs'] = catalogs
+    if not str(state.get('active_id') or '').strip():
+        state['active_id'] = catalog_id
+    _write_vuln_catalogs_state(state)
+    return entry
+
+
+@app.route('/vuln_catalog_page')
+def vuln_catalog_page():
+    _require_builder_or_admin()
+    state = _load_vuln_catalogs_state()
+    catalogs = [c for c in (state.get('catalogs') or []) if isinstance(c, dict)]
+    active_id = str(state.get('active_id') or '').strip()
+    active_label = None
+    for c in catalogs:
+        if str(c.get('id') or '').strip() == active_id:
+            active_label = str(c.get('label') or '').strip() or active_id
+            break
+    items_count = None
+    try:
+        from core_topo_gen.utils.vuln_process import load_vuln_catalog
+        items_count = len(load_vuln_catalog(_get_repo_root()))
+    except Exception:
+        items_count = None
+    return render_template(
+        'vuln_catalog.html',
+        catalogs=catalogs,
+        active_id=active_id,
+        active_label=active_label,
+        items_count=items_count,
+        active_page='vuln_catalog',
+    )
+
+
+@app.route('/vuln_catalog_packs/upload', methods=['POST'])
+def vuln_catalog_packs_upload():
+    _require_builder_or_admin()
+    f = request.files.get('zip_file')
+    if not f:
+        flash('Missing zip_file')
+        return redirect(url_for('vuln_catalog_page'))
+    try:
+        data = f.read() or b''
+        label = secure_filename(getattr(f, 'filename', '') or '') or 'vuln-catalog'
+        _install_vuln_catalog_zip_bytes(zip_bytes=data, label=label, origin='upload')
+        flash('Vulnerability catalog pack installed.')
+    except Exception as exc:
+        flash(f'Failed to install vulnerability catalog pack: {exc}')
+    return redirect(url_for('vuln_catalog_page'))
+
+
+@app.route('/vuln_catalog_packs/import_url', methods=['POST'])
+def vuln_catalog_packs_import_url():
+    _require_builder_or_admin()
+    url = str(request.form.get('zip_url') or '').strip()
+    ok, msg = _is_safe_remote_zip_url(url)
+    if not ok:
+        flash(f'Blocked URL: {msg}')
+        return redirect(url_for('vuln_catalog_page'))
+    try:
+        data = _download_zip_from_url(url)
+        label = os.path.basename(urlparse(url).path) or 'vuln-catalog'
+        _install_vuln_catalog_zip_bytes(zip_bytes=data, label=label, origin=url)
+        flash('Vulnerability catalog pack installed from URL.')
+    except Exception as exc:
+        flash(f'Failed to import vulnerability catalog pack: {exc}')
+    return redirect(url_for('vuln_catalog_page'))
+
+
+@app.route('/vuln_catalog_packs/download/<catalog_id>')
+def vuln_catalog_packs_download(catalog_id: str):
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    if not cid:
+        abort(404)
+    zip_path = _vuln_catalog_pack_zip_path(cid)
+    if not os.path.exists(zip_path):
+        abort(404)
+    return send_file(zip_path, as_attachment=True, download_name=f'vuln_catalog_{cid}.zip')
+
+
+@app.route('/vuln_catalog_packs/browse/<catalog_id>')
+@app.route('/vuln_catalog_packs/browse/<catalog_id>/<path:subpath>')
+def vuln_catalog_packs_browse(catalog_id: str, subpath: str = ''):
+    """Browse extracted files for an installed vulnerability catalog pack."""
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    if not cid:
+        abort(404)
+    base_dir = _vuln_catalog_pack_content_dir(cid)
+    if not os.path.isdir(base_dir):
+        abort(404)
+
+    try:
+        cur_abs = _safe_path_under(base_dir, subpath or '')
+    except Exception:
+        abort(400)
+
+    if os.path.isfile(cur_abs):
+        rel = os.path.relpath(cur_abs, base_dir).replace('\\', '/')
+        return redirect(url_for('vuln_catalog_packs_file', catalog_id=cid, subpath=rel))
+    if not os.path.isdir(cur_abs):
+        abort(404)
+
+    rel_dir = os.path.relpath(cur_abs, base_dir).replace('\\', '/')
+    if rel_dir in ('.', ''):
+        rel_dir = ''
+
+    entries: list[dict[str, Any]] = []
+    try:
+        for nm in sorted(os.listdir(cur_abs)):
+            if nm in ('.', '..'):
+                continue
+            p = os.path.join(cur_abs, nm)
+            kind = 'dir' if os.path.isdir(p) else 'file'
+            entries.append({'name': nm, 'kind': kind})
+    except Exception:
+        entries = []
+
+    crumbs: list[dict[str, str]] = [{'name': 'root', 'href': url_for('vuln_catalog_packs_browse', catalog_id=cid)}]
+    if rel_dir:
+        acc: list[str] = []
+        for part in [p for p in rel_dir.split('/') if p]:
+            acc.append(part)
+            crumbs.append({
+                'name': part,
+                'href': url_for('vuln_catalog_packs_browse', catalog_id=cid, subpath='/'.join(acc)),
+            })
+
+    return render_template(
+        'vuln_catalog_browse.html',
+        catalog_id=cid,
+        rel_dir=rel_dir,
+        entries=entries,
+        crumbs=crumbs,
+        active_page='vuln_catalog',
+    )
+
+
+@app.route('/vuln_catalog_packs/file/<catalog_id>/<path:subpath>')
+def vuln_catalog_packs_file(catalog_id: str, subpath: str):
+    """Download a single extracted file from an installed vulnerability catalog pack."""
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    if not cid:
+        abort(404)
+    base_dir = _vuln_catalog_pack_content_dir(cid)
+    if not os.path.isdir(base_dir):
+        abort(404)
+    try:
+        abs_p = _safe_path_under(base_dir, subpath or '')
+    except Exception:
+        abort(400)
+    if not os.path.isfile(abs_p):
+        abort(404)
+    return send_file(abs_p, as_attachment=True, download_name=os.path.basename(abs_p))
+
+
+@app.route('/vuln_catalog_packs/set_active/<catalog_id>', methods=['POST'])
+def vuln_catalog_packs_set_active(catalog_id: str):
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    state = _load_vuln_catalogs_state()
+    catalogs = [c for c in (state.get('catalogs') or []) if isinstance(c, dict)]
+    if not any(str(c.get('id') or '').strip() == cid for c in catalogs):
+        flash('Unknown catalog id')
+        return redirect(url_for('vuln_catalog_page'))
+    state['active_id'] = cid
+    _write_vuln_catalogs_state(state)
+    flash('Active vulnerability catalog updated.')
+    return redirect(url_for('vuln_catalog_page'))
+
+
+@app.route('/vuln_catalog_packs/delete/<catalog_id>', methods=['POST'])
+def vuln_catalog_packs_delete(catalog_id: str):
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    state = _load_vuln_catalogs_state()
+    catalogs = [c for c in (state.get('catalogs') or []) if isinstance(c, dict)]
+    kept = [c for c in catalogs if str(c.get('id') or '').strip() != cid]
+    state['catalogs'] = kept
+    if str(state.get('active_id') or '').strip() == cid:
+        state['active_id'] = str((kept[0].get('id') if kept else '') or '').strip()
+    _write_vuln_catalogs_state(state)
+    shutil.rmtree(_vuln_catalog_pack_dir(cid), ignore_errors=True)
+    flash('Vulnerability catalog pack deleted.')
+    return redirect(url_for('vuln_catalog_page'))
+
+
+def _get_active_vuln_catalog_entry(state: dict) -> dict | None:
+    active_id = str((state or {}).get('active_id') or '').strip()
+    catalogs = [c for c in ((state or {}).get('catalogs') or []) if isinstance(c, dict)]
+    for c in catalogs:
+        if str(c.get('id') or '').strip() == active_id:
+            return c
+    return None
+
+
+def _normalize_vuln_catalog_items(entry: dict) -> list[dict[str, Any]]:
+    items = entry.get('compose_items')
+    if not isinstance(items, list):
+        items = []
+    out: list[dict[str, Any]] = []
+    next_id = 1
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        it = dict(raw)
+        iid = it.get('id')
+        try:
+            iid_int = int(iid)
+        except Exception:
+            iid_int = next_id
+        if iid_int < 1:
+            iid_int = next_id
+        next_id = max(next_id, iid_int + 1)
+        it['id'] = iid_int
+        it['disabled'] = bool(it.get('disabled', False))
+        it['name'] = str(it.get('name') or '').strip() or 'root'
+        out.append(it)
+    out.sort(key=lambda d: int(d.get('id') or 0))
+    return out
+
+
+def _vuln_catalog_item_abs_compose_path(*, catalog_id: str, item: dict[str, Any]) -> str:
+    content_dir = _vuln_catalog_pack_content_dir(catalog_id)
+    rel = str(item.get('compose_rel') or '').strip()
+    if rel:
+        return _safe_path_under(content_dir, rel)
+    # Back-compat: older items may only have repo-relative compose_path
+    repo_rel = str(item.get('compose_path') or '').strip().replace('\\', '/')
+    if not repo_rel:
+        raise ValueError('Missing compose path')
+    abs_p = os.path.abspath(os.path.join(_get_repo_root(), repo_rel))
+    repo_root = os.path.abspath(_get_repo_root())
+    if os.path.commonpath([repo_root, abs_p]) != repo_root:
+        raise ValueError('Compose path escaped repo root')
+    return abs_p
+
+
+def _write_vuln_catalog_csv_from_items(*, catalog_id: str, items: list[dict[str, Any]]) -> list[str]:
+    """Rewrite vuln_list_w_url.csv for a pack based on enabled items."""
+    pack_dir = _vuln_catalog_pack_dir(catalog_id)
+    content_dir = _vuln_catalog_pack_content_dir(catalog_id)
+    os.makedirs(pack_dir, exist_ok=True)
+    os.makedirs(content_dir, exist_ok=True)
+
+    enabled = [it for it in (items or []) if not bool(it.get('disabled', False))]
+    out_path = os.path.join(pack_dir, 'vuln_list_w_url.csv')
+    with open(out_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['Name', 'Path', 'Type', 'Vector', 'Startup', 'CVE', 'Description', 'References'])
+        for it in enabled:
+            abs_compose = _vuln_catalog_item_abs_compose_path(catalog_id=catalog_id, item=it)
+            w.writerow([str(it.get('name') or ''), os.path.abspath(abs_compose), 'docker-compose', '', '', '', '', ''])
+
+    return [os.path.relpath(out_path, _get_repo_root()).replace('\\', '/')]
+
+
+@app.route('/vuln_catalog_items_data')
+def vuln_catalog_items_data():
+    _require_builder_or_admin()
+    state = _load_vuln_catalogs_state()
+    entry = _get_active_vuln_catalog_entry(state)
+    if not entry:
+        return jsonify({'ok': True, 'active': None, 'items': []})
+    cid = str(entry.get('id') or '').strip()
+    items = _normalize_vuln_catalog_items(entry)
+    from_source = str(entry.get('from_source') or entry.get('label') or '').strip()
+    out_items: list[dict[str, Any]] = []
+    for it in items:
+        out_items.append({
+            'id': int(it.get('id') or 0),
+            'name': str(it.get('name') or '').strip() or 'root',
+            'type': 'docker-compose',
+            'from_source': from_source,
+            'disabled': bool(it.get('disabled', False)),
+        })
+    return jsonify({
+        'ok': True,
+        'active': {
+            'id': cid,
+            'label': str(entry.get('label') or '').strip() or cid,
+            'from_source': from_source,
+        },
+        'items': out_items,
+    })
+
+
+@app.route('/vuln_catalog_items/set_disabled', methods=['POST'])
+def vuln_catalog_items_set_disabled():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    item_id_raw = payload.get('item_id')
+    disabled = bool(payload.get('disabled', False))
+    try:
+        item_id = int(item_id_raw)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Invalid item_id'}), 400
+
+    state = _load_vuln_catalogs_state()
+    entry = _get_active_vuln_catalog_entry(state)
+    if not entry:
+        return jsonify({'ok': False, 'error': 'No active catalog pack'}), 404
+    cid = str(entry.get('id') or '').strip()
+    catalogs = [c for c in (state.get('catalogs') or []) if isinstance(c, dict)]
+
+    updated = False
+    for c in catalogs:
+        if str(c.get('id') or '').strip() != cid:
+            continue
+        items = _normalize_vuln_catalog_items(c)
+        for it in items:
+            if int(it.get('id') or 0) == item_id:
+                it['disabled'] = disabled
+                updated = True
+                break
+        c['compose_items'] = items
+        c['csv_paths'] = _write_vuln_catalog_csv_from_items(catalog_id=cid, items=items)
+        break
+    if not updated:
+        return jsonify({'ok': False, 'error': 'Unknown item id'}), 404
+
+    state['catalogs'] = catalogs
+    _write_vuln_catalogs_state(state)
+    return jsonify({'ok': True})
+
+
+@app.route('/vuln_catalog_items/delete', methods=['POST'])
+def vuln_catalog_items_delete():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    item_id_raw = payload.get('item_id')
+    try:
+        item_id = int(item_id_raw)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Invalid item_id'}), 400
+
+    state = _load_vuln_catalogs_state()
+    entry = _get_active_vuln_catalog_entry(state)
+    if not entry:
+        return jsonify({'ok': False, 'error': 'No active catalog pack'}), 404
+    cid = str(entry.get('id') or '').strip()
+    catalogs = [c for c in (state.get('catalogs') or []) if isinstance(c, dict)]
+
+    removed = False
+    for c in catalogs:
+        if str(c.get('id') or '').strip() != cid:
+            continue
+        items = _normalize_vuln_catalog_items(c)
+        kept = [it for it in items if int(it.get('id') or 0) != item_id]
+        removed = len(kept) != len(items)
+        c['compose_items'] = kept
+        c['compose_count'] = len(kept)
+        c['csv_paths'] = _write_vuln_catalog_csv_from_items(catalog_id=cid, items=kept)
+        break
+    if not removed:
+        return jsonify({'ok': False, 'error': 'Unknown item id'}), 404
+
+    state['catalogs'] = catalogs
+    _write_vuln_catalogs_state(state)
+    return jsonify({'ok': True})
+
+
+@app.route('/vuln_catalog_items/test', methods=['POST'])
+def vuln_catalog_items_test():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    item_id_raw = payload.get('item_id')
+    try:
+        item_id = int(item_id_raw)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Invalid item_id'}), 400
+
+    state = _load_vuln_catalogs_state()
+    entry = _get_active_vuln_catalog_entry(state)
+    if not entry:
+        return jsonify({'ok': False, 'error': 'No active catalog pack'}), 404
+    cid = str(entry.get('id') or '').strip()
+    items = _normalize_vuln_catalog_items(entry)
+    target = None
+    for it in items:
+        if int(it.get('id') or 0) == item_id:
+            target = it
+            break
+    if not target:
+        return jsonify({'ok': False, 'error': 'Unknown item id'}), 404
+
+    try:
+        compose_path = _vuln_catalog_item_abs_compose_path(catalog_id=cid, item=target)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'Invalid compose path: {exc}'}), 400
+    if not os.path.isfile(compose_path):
+        return jsonify({'ok': False, 'error': 'docker-compose.yml not found'}), 404
+
+    log_lines: list[str] = []
+    log_lines.append(f"compose: {os.path.relpath(compose_path, _get_repo_root())}")
+
+    try:
+        proc = subprocess.run(
+            ['docker', 'compose', '-f', compose_path, 'config'],
+            cwd=os.path.dirname(compose_path),
+            capture_output=True,
+            text=True,
+            timeout=25,
+            check=False,
+        )
+        out = (proc.stdout or '') + (('\n' + proc.stderr) if proc.stderr else '')
+        out = out.strip()
+        if len(out) > 12000:
+            out = out[:12000] + "\n…(truncated)…"
+        if out:
+            log_lines.append(out)
+        return jsonify({'ok': proc.returncode == 0, 'log': '\n'.join(log_lines)})
+    except FileNotFoundError:
+        log_lines.append('docker not found on host')
+        return jsonify({'ok': False, 'log': '\n'.join(log_lines)})
+    except Exception as exc:
+        log_lines.append(str(exc))
+        return jsonify({'ok': False, 'log': '\n'.join(log_lines)})
 
 
 def _zip_entry_is_symlink(info) -> bool:
@@ -32689,6 +33296,29 @@ def _compose_candidates(base_dir: str):
         pass
     return out
 
+
+def _vuln_resolve_local_path(path_raw: str) -> str | None:
+    """Resolve a local vuln compose path (file or directory).
+
+    Safety: only allow paths under the repo root.
+    """
+    try:
+        p = str(path_raw or '').strip()
+        if not p:
+            return None
+        abs_p = os.path.abspath(os.path.expanduser(p))
+        if not os.path.exists(abs_p):
+            return None
+        repo_root = os.path.abspath(_get_repo_root())
+        try:
+            if os.path.commonpath([repo_root, abs_p]) != repo_root:
+                return None
+        except Exception:
+            return None
+        return abs_p
+    except Exception:
+        return None
+
 @app.route('/vuln_compose/status', methods=['POST'])
 def vuln_compose_status():
     """Return status for a list of catalog items: whether compose file is downloaded and images pulled.
@@ -32709,53 +33339,72 @@ def vuln_compose_status():
             compose_name = (it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
             safe = _safe_name(name or 'vuln')
             vdir = os.path.join(base_out, safe)
-            gh = _parse_github_url(path)
             base_dir = vdir
             compose_file = None
-            if gh.get('is_github'):
-                try:
-                    logs.append(f"[status] {name}: Path={path}")
-                    logs.append(f"[status] {name}: git_url={gh.get('git_url')} branch={gh.get('branch')} subpath={gh.get('subpath')} mode={gh.get('mode')}")
-                except Exception:
-                    pass
-                repo_dir = os.path.join(vdir, _vuln_repo_subdir())
-                sub = gh.get('subpath') or ''
-                # If subpath looks like a compose file, resolve directly
-                is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
-                if is_file_sub:
-                    compose_file = os.path.join(repo_dir, sub)
-                    base_dir = os.path.dirname(compose_file)
-                    exists = os.path.exists(compose_file)
+            exists = False
+
+            local = _vuln_resolve_local_path(path)
+            if local:
+                if os.path.isdir(local):
+                    base_dir = local
+                    pref = os.path.join(base_dir, compose_name)
+                    if os.path.exists(pref):
+                        compose_file = pref
+                    else:
+                        cand = _compose_candidates(base_dir)
+                        compose_file = cand[0] if cand else None
+                    exists = bool(compose_file and os.path.exists(compose_file))
                 else:
-                    base_dir = os.path.join(repo_dir, sub) if sub else repo_dir
-                    exists = os.path.isdir(base_dir)
-                try:
-                    logs.append(f"[status] {name}: base={base_dir} exists={exists} compose={compose_name}")
-                except Exception:
-                    pass
-                # prefer provided compose name
-                if exists and compose_name and not compose_file:
-                    p = os.path.join(base_dir, compose_name)
-                    if os.path.exists(p):
-                        compose_file = p
-                # log compose candidates
-                try:
-                    cands = _compose_candidates(base_dir) if exists else []
-                    logs.append(f"[status] {name}: compose candidates={cands[:4]}")
-                except Exception:
-                    pass
-                if not compose_file:
-                    # find compose candidates within base_dir
-                    cand = _compose_candidates(base_dir)
-                    compose_file = cand[0] if cand else None
+                    compose_file = local
+                    base_dir = os.path.dirname(local)
+                    exists = os.path.exists(compose_file)
             else:
-                # legacy direct download to vdir/docker-compose.yml
-                compose_file = os.path.join(vdir, compose_name or 'docker-compose.yml')
-                exists = os.path.exists(compose_file)
-                try:
-                    logs.append(f"[status] {name}: non-github Path={path} compose_path={compose_file} exists={exists}")
-                except Exception:
-                    pass
+                gh = _parse_github_url(path)
+                if gh.get('is_github'):
+                    try:
+                        logs.append(f"[status] {name}: Path={path}")
+                        logs.append(f"[status] {name}: git_url={gh.get('git_url')} branch={gh.get('branch')} subpath={gh.get('subpath')} mode={gh.get('mode')}")
+                    except Exception:
+                        pass
+                    repo_dir = os.path.join(vdir, _vuln_repo_subdir())
+                    sub = gh.get('subpath') or ''
+                    # If subpath looks like a compose file, resolve directly
+                    is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                    if is_file_sub:
+                        compose_file = os.path.join(repo_dir, sub)
+                        base_dir = os.path.dirname(compose_file)
+                        exists = os.path.exists(compose_file)
+                    else:
+                        base_dir = os.path.join(repo_dir, sub) if sub else repo_dir
+                        exists = os.path.isdir(base_dir)
+                        # prefer provided compose name
+                        if exists and compose_name:
+                            p = os.path.join(base_dir, compose_name)
+                            if os.path.exists(p):
+                                compose_file = p
+                        if not compose_file and exists:
+                            cand = _compose_candidates(base_dir)
+                            compose_file = cand[0] if cand else None
+                        exists = bool(compose_file and os.path.exists(compose_file)) if compose_file else bool(exists)
+                    try:
+                        logs.append(f"[status] {name}: base={base_dir} exists={exists} compose={compose_name}")
+                    except Exception:
+                        pass
+                    # log compose candidates
+                    try:
+                        cands = _compose_candidates(base_dir) if os.path.isdir(base_dir) else []
+                        logs.append(f"[status] {name}: compose candidates={cands[:4]}")
+                    except Exception:
+                        pass
+                else:
+                    # legacy / direct download case: vdir/docker-compose.yml
+                    compose_file = os.path.join(vdir, compose_name or 'docker-compose.yml')
+                    base_dir = vdir
+                    exists = os.path.exists(compose_file)
+                    try:
+                        logs.append(f"[status] {name}: non-github Path={path} compose_path={compose_file} exists={exists}")
+                    except Exception:
+                        pass
             pulled = False
             if exists and compose_file and shutil.which('docker'):
                 try:
@@ -32819,9 +33468,22 @@ def vuln_compose_status_images():
         def _resolve_compose_path(name: str, path: str, compose_name: str) -> tuple[bool, str | None]:
             safe = _safe_name(name or 'vuln')
             vdir = os.path.join(base_out, safe)
-            gh = _parse_github_url(path)
             compose_file: str | None = None
             exists = False
+
+            local = _vuln_resolve_local_path(path)
+            if local:
+                if os.path.isdir(local):
+                    pref = os.path.join(local, compose_name)
+                    if os.path.exists(pref):
+                        compose_file = pref
+                    else:
+                        cand = _compose_candidates(local)
+                        compose_file = cand[0] if cand else None
+                    return bool(compose_file and os.path.exists(compose_file)), compose_file
+                return bool(os.path.exists(local)), local
+
+            gh = _parse_github_url(path)
 
             if gh.get('is_github'):
                 repo_dir = os.path.join(vdir, _vuln_repo_subdir())
@@ -32980,6 +33642,19 @@ def vuln_compose_download():
             safe = _safe_name(name or 'vuln')
             vdir = os.path.join(base_out, safe)
             os.makedirs(vdir, exist_ok=True)
+
+            local = _vuln_resolve_local_path(path)
+            if local:
+                if os.path.isdir(local):
+                    pref = os.path.join(local, compose_name)
+                    if os.path.exists(pref):
+                        out.append({'Name': name, 'Path': path, 'ok': True, 'dir': local, 'message': 'local compose directory'})
+                    else:
+                        out.append({'Name': name, 'Path': path, 'ok': False, 'dir': local, 'message': 'compose file missing in local directory'})
+                else:
+                    out.append({'Name': name, 'Path': path, 'ok': True, 'dir': os.path.dirname(local), 'message': 'local compose file'})
+                continue
+
             gh = _parse_github_url(path)
             if gh.get('is_github'):
                 # Clone the repo; use branch if provided
@@ -33105,34 +33780,47 @@ def vuln_compose_pull():
             compose_name = (it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
             safe = _safe_name(name or 'vuln')
             vdir = os.path.join(base_out, safe)
-            gh = _parse_github_url(path)
-            if gh.get('is_github'):
-                repo_dir = os.path.join(vdir, _vuln_repo_subdir())
-                sub = gh.get('subpath') or ''
-                # blob file path -> direct compose path
-                is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
-                base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
-                try:
-                    logs.append(
-                        f"[pull] {name}: git_url={gh.get('git_url')} branch={gh.get('branch')} subpath={gh.get('subpath')} base_dir={base_dir}"
-                    )
-                except Exception:
-                    pass
-                # prefer provided compose name
-                yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
-                if not os.path.exists(yml_path):
-                    cand = _compose_candidates(base_dir)
-                    yml_path = cand[0] if cand else None
-                try:
-                    logs.append(f"[pull] {name}: yml_path={yml_path}")
-                except Exception:
-                    pass
+
+            local = _vuln_resolve_local_path(path)
+            if local:
+                if os.path.isdir(local):
+                    pref = os.path.join(local, compose_name)
+                    if os.path.exists(pref):
+                        yml_path = pref
+                    else:
+                        cand = _compose_candidates(local)
+                        yml_path = cand[0] if cand else None
+                else:
+                    yml_path = local
             else:
-                yml_path = os.path.join(vdir, compose_name)
-                try:
-                    logs.append(f"[pull] {name}: non-github base_dir={vdir}")
-                except Exception:
-                    pass
+                gh = _parse_github_url(path)
+                if gh.get('is_github'):
+                    repo_dir = os.path.join(vdir, _vuln_repo_subdir())
+                    sub = gh.get('subpath') or ''
+                    # blob file path -> direct compose path
+                    is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                    base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
+                    try:
+                        logs.append(
+                            f"[pull] {name}: git_url={gh.get('git_url')} branch={gh.get('branch')} subpath={gh.get('subpath')} base_dir={base_dir}"
+                        )
+                    except Exception:
+                        pass
+                    # prefer provided compose name
+                    yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
+                    if not os.path.exists(yml_path):
+                        cand = _compose_candidates(base_dir)
+                        yml_path = cand[0] if cand else None
+                    try:
+                        logs.append(f"[pull] {name}: yml_path={yml_path}")
+                    except Exception:
+                        pass
+                else:
+                    yml_path = os.path.join(vdir, compose_name)
+                    try:
+                        logs.append(f"[pull] {name}: non-github base_dir={vdir}")
+                    except Exception:
+                        pass
             if not yml_path or not os.path.exists(yml_path):
                 out.append({'Name': name, 'Path': path, 'ok': False, 'message': 'compose file missing', 'compose': compose_name})
                 continue
@@ -33182,24 +33870,41 @@ def vuln_compose_remove():
             compose_name = (it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
             safe = _safe_name(name or 'vuln')
             vdir = os.path.join(base_out, safe)
-            gh = _parse_github_url(path)
             yml_path = None
             base_dir = vdir
+            is_local = False
             try:
                 logs.append(f"[remove] {name}: Path={path}")
             except Exception:
                 pass
-            if gh.get('is_github'):
-                repo_dir = os.path.join(vdir, _vuln_repo_subdir())
-                sub = gh.get('subpath') or ''
-                is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
-                base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
-                yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
-                if not os.path.exists(yml_path):
-                    cand = _compose_candidates(base_dir)
-                    yml_path = cand[0] if cand else None
+
+            local = _vuln_resolve_local_path(path)
+            if local:
+                is_local = True
+                if os.path.isdir(local):
+                    base_dir = local
+                    pref = os.path.join(base_dir, compose_name)
+                    if os.path.exists(pref):
+                        yml_path = pref
+                    else:
+                        cand = _compose_candidates(base_dir)
+                        yml_path = cand[0] if cand else None
+                else:
+                    yml_path = local
+                    base_dir = os.path.dirname(local)
             else:
-                yml_path = os.path.join(vdir, compose_name)
+                gh = _parse_github_url(path)
+                if gh.get('is_github'):
+                    repo_dir = os.path.join(vdir, _vuln_repo_subdir())
+                    sub = gh.get('subpath') or ''
+                    is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                    base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
+                    yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
+                    if not os.path.exists(yml_path):
+                        cand = _compose_candidates(base_dir)
+                        yml_path = cand[0] if cand else None
+                else:
+                    yml_path = os.path.join(vdir, compose_name)
             # Bring down compose stack
             if yml_path and os.path.exists(yml_path) and shutil.which('docker'):
                 try:
@@ -33231,27 +33936,32 @@ def vuln_compose_remove():
                     pass
             # Remove downloaded files/dirs under outputs for this item
             try:
-                if gh.get('is_github'):
-                    repo_dir = os.path.join(vdir, _vuln_repo_subdir())
-                    if os.path.isdir(repo_dir):
-                        shutil.rmtree(repo_dir, ignore_errors=True)
-                        logs.append(f"[remove] {name}: deleted {repo_dir}")
-                else:
-                    # legacy direct compose path
-                    yml = os.path.join(vdir, compose_name)
-                    if os.path.exists(yml):
-                        try:
-                            os.remove(yml)
-                            logs.append(f"[remove] {name}: deleted {yml}")
-                        except Exception:
-                            pass
-                # Remove vdir if empty
-                try:
-                    if os.path.isdir(vdir) and not os.listdir(vdir):
-                        os.rmdir(vdir)
-                        logs.append(f"[remove] {name}: cleaned empty {vdir}")
-                except Exception:
+                if is_local:
+                    # Never delete repo-local installed templates.
                     pass
+                else:
+                    gh = _parse_github_url(path)
+                    if gh.get('is_github'):
+                        repo_dir = os.path.join(vdir, _vuln_repo_subdir())
+                        if os.path.isdir(repo_dir):
+                            shutil.rmtree(repo_dir, ignore_errors=True)
+                            logs.append(f"[remove] {name}: deleted {repo_dir}")
+                    else:
+                        # legacy direct compose path
+                        yml = os.path.join(vdir, compose_name)
+                        if os.path.exists(yml):
+                            try:
+                                os.remove(yml)
+                                logs.append(f"[remove] {name}: deleted {yml}")
+                            except Exception:
+                                pass
+                    # Remove vdir if empty
+                    try:
+                        if os.path.isdir(vdir) and not os.listdir(vdir):
+                            os.rmdir(vdir)
+                            logs.append(f"[remove] {name}: cleaned empty {vdir}")
+                    except Exception:
+                        pass
             except Exception as e:
                 try: logs.append(f"[remove] cleanup error: {e}")
                 except Exception: pass
