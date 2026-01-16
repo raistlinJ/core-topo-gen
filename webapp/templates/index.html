@@ -7025,7 +7025,7 @@ const dropdownsBySection = {
     'Services': ['SSH','HTTP','DHCPClient','Random'],
     'Traffic': ['Random','TCP','UDP','CUSTOM'],
     'Events': ['Script Path'],
-    'Vulnerabilities': ['Category','Specific','Random'],
+    'Vulnerabilities': ['Random','Specific'],
     'Segmentation': ['Random','Firewall','NAT','CUSTOM']
 };
 
@@ -12520,7 +12520,7 @@ function renderMain() {
                                                                     <tbody>
                                                                                 ${(() => {
                                                                                 const items = sec.items || [];
-                                                                                const rowsByMetric = items.map((it, iidx) => ({ it, iidx, metric: (it.v_metric || (name==='Vulnerabilities' && (it.selected||'Category')==='Specific' ? 'Count' : 'Weight')) }));
+                                                                                const rowsByMetric = items.map((it, iidx) => ({ it, iidx, metric: (it.v_metric || (name==='Vulnerabilities' && (it.selected||'Random')==='Specific' ? 'Count' : 'Weight')) }));
                                                                                 const weights = rowsByMetric.filter(x => x.metric === 'Weight');
                                                                                 const counts = rowsByMetric.filter(x => x.metric === 'Count');
                                                                                 // If there are no remaining weight rows but a stale total_nodes exists, clear it (frontend-only cleanup)
@@ -12659,15 +12659,13 @@ function renderMain() {
     root.appendChild(notesCard);
 
     wireHandlers();
-    // Populate dynamic vuln selects after DOM paint
-    populateVulnSelects();
     // Hook up Specific picker buttons
     document.querySelectorAll('[data-action="pick-specific"]').forEach(btn => {
         const handler = () => {
             const sidx = parseInt(btn.getAttribute('data-scen-idx'));
             const sec = btn.getAttribute('data-sec');
             const iidx = parseInt(btn.getAttribute('data-item-idx'));
-            openVulnPicker(sidx, sec, iidx);
+            openVulnPicker(sidx, sec, iidx, { revertToRandomOnCancel: false });
         };
         // Attach the click handler (fix: previously not wired)
         btn.addEventListener('click', handler);
@@ -12983,9 +12981,9 @@ function renderItemRow(sidx, secName, iidx, it) {
     const weight = ((parseFloat(it.factor) || 0).toFixed(3));
     let opts = '';
     if (secName === 'Vulnerabilities') {
-        const curRaw = it.selected || 'Category';
-        const cur = (curRaw === 'Type/Vector') ? 'Category' : curRaw;
-        const options = ['Category', 'Specific', 'Random'];
+        const curRaw = (it.selected || 'Random');
+        const cur = (curRaw === 'Category' || curRaw === 'Type/Vector') ? 'Random' : curRaw;
+        const options = ['Random', 'Specific'];
         opts = options.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
     } else {
         const cur = it.selected || 'Random';
@@ -13101,7 +13099,8 @@ function renderItemRow(sidx, secName, iidx, it) {
                 </div>`;
         }
         if (secName === 'Vulnerabilities') {
-            const mode = it.selected || 'Type/Vector';
+            const modeRaw = it.selected || 'Random';
+            const mode = (modeRaw === 'Category' || modeRaw === 'Type/Vector') ? 'Random' : modeRaw;
             if (mode === 'Specific') {
                 const nm = it.v_name || '';
                 // Try to obtain full description (prefer stored v_desc, else look up in catalog)
@@ -13131,22 +13130,9 @@ function renderItemRow(sidx, secName, iidx, it) {
         const disabledAttr = isProtectedRandom ? 'disabled title="Residual Random row is auto-managed"' : '';
         const selectedCtl = `<select class="form-select form-select-sm" ${disabledAttr} data-field="selected" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${opts}</select>`;
         if (secName !== 'Vulnerabilities') return selectedCtl;
-    const modeRaw = it.selected || 'Category';
-    const mode = (modeRaw === 'Type/Vector') ? 'Category' : modeRaw;
-    if (mode === 'Category') {
-            return `
-            <div class="d-flex flex-wrap gap-2 align-items-end">
-                <div style="min-width:160px">${selectedCtl}</div>
-                <div>
-                    <label class="form-label mb-0">Type</label>
-                    <select class="form-select form-select-sm vuln-type" data-field="v_type" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></select>
-                </div>
-                <div>
-                    <label class="form-label mb-0">Vector</label>
-                    <select class="form-select form-select-sm vuln-vector" data-field="v_vector" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></select>
-                </div>
-            </div>`;
-        } else if (mode === 'Specific') {
+        const modeRaw = it.selected || 'Random';
+        const mode = (modeRaw === 'Category' || modeRaw === 'Type/Vector') ? 'Random' : modeRaw;
+        if (mode === 'Specific') {
             const nm = it.v_name || '';
             // Try to obtain full description (prefer stored v_desc, else look up in catalog)
             let fullDesc = it.v_desc || '';
@@ -13173,7 +13159,8 @@ function renderItemRow(sidx, secName, iidx, it) {
     // Right-most: Weight or Count cell
     const weightCell = (() => {
         if (secName === 'Vulnerabilities') {
-            const mode = it.selected || 'Type/Vector';
+            const modeRaw = it.selected || 'Random';
+            const mode = (modeRaw === 'Category' || modeRaw === 'Type/Vector') ? 'Random' : modeRaw;
             const metric = it.v_metric || (mode === 'Specific' ? 'Count' : 'Weight');
             const metricSel = `<select class="form-select form-select-sm" style="min-width: 140px" data-field="v_metric" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"><option ${metric==='Weight'?'selected':''}>Weight</option><option ${metric==='Count'?'selected':''}>Count</option></select>`;
             if (metric === 'Count') {
@@ -13208,12 +13195,20 @@ function renderItemRow(sidx, secName, iidx, it) {
 }
 // Render Vulnerabilities rows grouped with two row-headers
 function renderVulnRows(sidx, secName, items) {
+    try {
+        (items || []).forEach(it => {
+            if (!it) return;
+            if (it.selected === 'Category' || it.selected === 'Type/Vector') {
+                it.selected = 'Random';
+            }
+        });
+    } catch (e) {}
     const withIdx = items.map((it, iidx) => ({ it, iidx }));
-    const typeOrRandom = withIdx.filter(x => (x.it.selected || 'Category') !== 'Specific');
-    const specifics = withIdx.filter(x => (x.it.selected || 'Category') === 'Specific');
+    const typeOrRandom = withIdx.filter(x => (x.it.selected || 'Random') !== 'Specific');
+    const specifics = withIdx.filter(x => (x.it.selected || 'Random') === 'Specific');
     const parts = [];
     if (typeOrRandom.length) {
-        parts.push(`<tr class="table-light"><td colspan="4"><strong>Category or Random</strong></td></tr>`);
+        parts.push(`<tr class="table-light"><td colspan="4"><strong>Random</strong></td></tr>`);
         parts.push(typeOrRandom.map(x => renderItemRow(sidx, secName, x.iidx, x.it)).join(''));
     }
     if (specifics.length) {
@@ -13330,7 +13325,7 @@ function wireHandlers() {
                         if (field === 'edges' || field === 'r2s_edges') {
                             setTimeout(validateRoutingEdges, 20);
                         }
-                    } else if (['pattern','content_type','selected','script_path','v_type','v_vector','v_name','v_path','v_count','v_metric','r2r_mode','r2s_mode'].includes(field)) {
+                    } else if (['pattern','content_type','selected','script_path','v_name','v_path','v_count','v_metric','r2r_mode','r2s_mode'].includes(field)) {
                         const prev = item[field];
                         if (field === 'v_count') {
                             let n = clampNodeCountValue(el.value);
@@ -13364,6 +13359,13 @@ function wireHandlers() {
                             // Re-render to reflect show/hide of traffic-config inputs when Random is selected
                             renderMain();
                         } else if (field === 'selected') {
+                            // Vulnerabilities legacy: UI used to expose Category/Type/Vector.
+                            if (sec === 'Vulnerabilities' && (item.selected === 'Category' || item.selected === 'Type/Vector')) {
+                                item.selected = 'Random';
+                            }
+
+                            const shouldAutoOpenSpecific = (sec === 'Vulnerabilities' && item.selected === 'Specific' && prev !== 'Specific');
+
                             if (item.selected === 'Specific') {
                                 if (!item.v_count) item.v_count = 5;
                                 if (!item.v_metric) item.v_metric = 'Count';
@@ -13375,6 +13377,26 @@ function wireHandlers() {
                             }
                             // Re-render to show/hide appropriate controls and recalc weight warnings
                             renderMain();
+
+                            if (shouldAutoOpenSpecific) {
+                                setTimeout(async () => {
+                                    try {
+                                        const res = await openVulnPicker(sidx, sec, rowIdx, { revertToRandomOnCancel: true });
+                                        // openVulnPicker handles revert-on-cancel when requested.
+                                        if (res && res.selected) return;
+                                    } catch (e) {
+                                        // Best-effort fallback
+                                        try {
+                                            const curItem = state.scenarios?.[sidx]?.sections?.[sec]?.items?.[rowIdx];
+                                            if (curItem && curItem.selected === 'Specific') {
+                                                curItem.selected = 'Random';
+                                                renderMain();
+                                                persistEditorState();
+                                            }
+                                        } catch (_) {}
+                                    }
+                                }, 0);
+                            }
                         } else if (field === 'v_metric') {
                             // On metric toggle, normalize weights for current section and re-render
                             if (item.v_metric === 'Count' && (item.v_count === undefined || item.v_count === null || isNaN(parseInt(item.v_count, 10)))) {
@@ -13539,7 +13561,7 @@ function wireHandlers() {
             const item = { selected: defaultSelected, factor: 1.0 };
             if (sec === 'Events') item.script_path = '';
             if (sec === 'Traffic') { item.pattern = 'continuous'; item.rate_kbps = 64.0; item.period_s = 1.0; item.jitter_pct = 10.0; item.content_type = 'Random'; }
-            if (sec === 'Vulnerabilities') { item.selected = 'Category'; item.v_type = 'Random'; item.v_vector = 'Random'; }
+            if (sec === 'Vulnerabilities') { item.selected = 'Random'; }
             // Default new rows: Node Information -> Count; others -> Weight.
             if (sec === 'Node Information') { item.v_metric = 'Count'; item.v_count = 5; }
             else { item.v_metric = 'Weight'; }
@@ -16673,39 +16695,14 @@ document.addEventListener('DOMContentLoaded', () => {
 async function setupVulnCatalog(){
     try {
         const res = await fetch('/vuln_catalog', { credentials: 'same-origin' });
-    if(res.ok){ window.VULN_CATALOG = await res.json(); }
+        if (res.ok) {
+            window.VULN_CATALOG = await res.json();
+        } else {
+            // Avoid keeping stale items when the request fails (e.g. auth/session).
+            window.VULN_CATALOG = { types: [], vectors: [], items: [] };
+        }
     } catch(e) { window.VULN_CATALOG = { types: [], vectors: [], items: [] }; }
-    // Refresh any already-rendered selects once the catalog loads.
-    try { if (typeof populateVulnSelects === 'function') populateVulnSelects(); } catch (e) {}
     return window.VULN_CATALOG;
-}
-
-function populateVulnSelects() {
-        document.querySelectorAll('.vuln-type').forEach(sel => {
-                const sidx = parseInt(sel.getAttribute('data-scen-idx'));
-                const sec = sel.getAttribute('data-sec');
-                const iidx = parseInt(sel.getAttribute('data-item-idx'));
-        const rawCur = (state.scenarios[sidx].sections[sec].items[iidx].v_type) || 'Random';
-        const opts = ['Random', ...(window.VULN_CATALOG?.types || [])];
-        const cur = opts.includes(rawCur) ? rawCur : 'Random';
-        // Coerce stale values to Random so downstream filters don't zero-out.
-        if (cur !== rawCur) {
-            try { state.scenarios[sidx].sections[sec].items[iidx].v_type = cur; } catch (e) {}
-        }
-        sel.innerHTML = opts.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
-        });
-        document.querySelectorAll('.vuln-vector').forEach(sel => {
-                const sidx = parseInt(sel.getAttribute('data-scen-idx'));
-                const sec = sel.getAttribute('data-sec');
-                const iidx = parseInt(sel.getAttribute('data-item-idx'));
-        const rawCur = (state.scenarios[sidx].sections[sec].items[iidx].v_vector) || 'Random';
-        const opts = ['Random', ...(window.VULN_CATALOG?.vectors || [])];
-        const cur = opts.includes(rawCur) ? rawCur : 'Random';
-        if (cur !== rawCur) {
-            try { state.scenarios[sidx].sections[sec].items[iidx].v_vector = cur; } catch (e) {}
-        }
-        sel.innerHTML = opts.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
-        });
 }
 
 // Modal for Specific selection
@@ -16854,13 +16851,13 @@ function hideVulnProgressModal(){
         } catch (e) {}
 }
 
-async function openVulnPicker(sidx, secName, iidx){
+async function openVulnPicker(sidx, secName, iidx, options = {}){
     try { await setupVulnCatalog(); } catch (e) {}
     ensureVulnModal();
     const modalEl = document.getElementById('vulnModal');
     if (!modalEl) {
         logError('Vulnerability modal element not found');
-        return;
+        return { selected: false, cancelled: true };
     }
     const modalObj = window.bootstrap ? (bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl, { backdrop: true, keyboard: true })) : null;
     const filterInput = modalEl.querySelector('#vulnFilter');
@@ -16872,25 +16869,9 @@ async function openVulnPicker(sidx, secName, iidx){
     const loadWrap = modalEl.querySelector('#vulnLoadingWrap');
     const loadBar = modalEl.querySelector('#vulnLoadProgressBar');
     const loadMeta = modalEl.querySelector('#vulnLoadMeta');
-    const row = state.scenarios[sidx].sections[secName].items[iidx] || {};
-    const vectorsLower = new Set((window.VULN_CATALOG?.vectors || []).map(v => String(v || '').toLowerCase()));
-    const rawSelVector = (row.v_vector || 'Random');
-    const selVector = (rawSelVector && rawSelVector !== 'Random' && vectorsLower.has(String(rawSelVector).toLowerCase()))
-        ? rawSelVector
-        : 'Random';
     // Base: docker-compose only
     const all = (window.VULN_CATALOG?.items || []);
-    let base = all.filter(it => (it.Type||'').toLowerCase() === 'docker-compose');
-    if (selVector && selVector !== 'Random') {
-        const vv = selVector.toLowerCase();
-        base = base.filter(it => (it.Vector||'').toLowerCase() === vv);
-    }
-    // If the catalog didn't have this vector (stale scenario state), don't hide everything.
-    if (rawSelVector && rawSelVector !== 'Random' && selVector === 'Random') {
-        try {
-            if (loadMeta) loadMeta.textContent = `Loading eligible items… (ignoring stale vector “${rawSelVector}”)`;
-        } catch (e) {}
-    }
+    const base = all.filter(it => (it.Type||'').toLowerCase() === 'docker-compose');
     // Status cache keyed by Path (stable) or Name fallback
     const statusByKey = new Map();
     const itemKey = (it) => String((it && (it.Path || it.Name)) || '');
@@ -16949,6 +16930,35 @@ async function openVulnPicker(sidx, secName, iidx){
     // Show modal and kick off status check
     let eligible = base;
     let current = eligible;
+
+    let picked = false;
+    let pickedRecord = null;
+    const revertToRandomOnCancel = !!(options && options.revertToRandomOnCancel);
+    const resultPromise = new Promise((resolve) => {
+        const onHidden = () => {
+            try { modalEl.removeEventListener('hidden.bs.modal', onHidden); } catch (e) {}
+            if (picked) {
+                resolve({ selected: true, item: pickedRecord });
+                return;
+            }
+            if (revertToRandomOnCancel) {
+                try {
+                    const target = state.scenarios?.[sidx]?.sections?.[secName]?.items?.[iidx];
+                    if (target && target.selected === 'Specific') {
+                        target.selected = 'Random';
+                        renderMain();
+                        persistEditorState();
+                        try {
+                            document.getElementById('scenarios_json').value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+                        } catch (e) {}
+                    }
+                } catch (e) {}
+            }
+            resolve({ selected: false, cancelled: true });
+        };
+        try { modalEl.addEventListener('hidden.bs.modal', onHidden); } catch (e) {}
+    });
+
     try {
         if (modalObj) modalObj.show();
     } catch(e){}
@@ -16971,8 +16981,24 @@ async function openVulnPicker(sidx, secName, iidx){
             if (st.docker_available === false) return '<span class="badge text-bg-secondary" title="Docker not available">No docker</span>';
             if (!st.exists) return '<span class="badge text-bg-warning" title="Compose not downloaded">Not downloaded</span>';
             if (!st.pulled) {
-                const missing = Array.isArray(st.missing_images) ? st.missing_images.length : 0;
-                return `<span class="badge text-bg-warning" title="Missing images">Missing ${missing}</span>`;
+                const missingList = Array.isArray(st.missing_images)
+                    ? st.missing_images.map(x => String(x || '').trim()).filter(Boolean)
+                    : [];
+                const missing = missingList.length;
+                const escAttr = (value) => (value ?? '').toString()
+                    .replace(/&/g,'&amp;')
+                    .replace(/</g,'&lt;')
+                    .replace(/>/g,'&gt;')
+                    .replace(/"/g,'&quot;')
+                    .replace(/'/g,'&#39;')
+                    .replace(/\n/g, '&#10;');
+                const maxShow = 8;
+                const shown = missingList.slice(0, maxShow);
+                const more = missingList.length > maxShow ? `\n…and ${missingList.length - maxShow} more` : '';
+                const title = missingList.length
+                    ? `Missing images:\n${shown.join('\n')}${more}`
+                    : 'Missing images';
+                return `<span class="badge text-bg-warning" title="${escAttr(title)}">Missing ${missing}</span>`;
             }
             return '<span class="badge text-bg-success">Ready</span>';
         } catch (e) {
@@ -17238,11 +17264,11 @@ async function openVulnPicker(sidx, secName, iidx){
                 const item = state.scenarios[sidx].sections[secName].items[iidx];
                 item.v_name = it.Name;
                 item.v_path = it.Path;
-                item.v_type = it.Type;
-                item.v_vector = it.Vector;
                 if (it.Description) item.v_desc = it.Description;
                 // also set selected to Specific defensively
                 item.selected = 'Specific';
+                picked = true;
+                pickedRecord = it;
                 try { persistEditorState(); } catch (e) {}
                 try {
                     if (typeof flushServerSnapshotPersistNow === 'function') {
@@ -17311,6 +17337,8 @@ async function openVulnPicker(sidx, secName, iidx){
         renderRows();
         applyFilter();
     } catch(e){}
+
+    return await resultPromise;
 }
 
 const RUN_CLI_URL = "{{ url_for('run_cli_async') }}";

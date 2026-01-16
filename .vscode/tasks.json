@@ -195,6 +195,57 @@
 			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\" && sleep 0.5 && curl -fsS http://127.0.0.1:9090/healthz && echo",
 			"isBackground": false,
 			"problemMatcher": []
+		},
+		{
+			"label": "Restart Web UI detached (9090) [autogen7]",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\" && sleep 0.5 && curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Restart Web UI detached (9090) [autogen8]",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\" && sleep 0.5 && curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Restart Web UI detached (9090) [autogen9]",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\" && sleep 0.5 && curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Web UI debug (9090)",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main",
+			"isBackground": true
+		},
+		{
+			"label": "Healthz debug 9090",
+			"type": "shell",
+			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"isBackground": false
+		},
+		{
+			"label": "Install markdown deps (.venv312)",
+			"type": "shell",
+			"command": "/Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -m pip install 'Markdown>=3.6' 'bleach>=6.1.0'",
+			"isBackground": false
+		},
+		{
+			"label": "Restart Web UI (9090) after README styling",
+			"type": "shell",
+			"command": "cd /Users/jcacosta/Documents/core-topo-gen && pid=$(lsof -t -iTCP:9090 -sTCP:LISTEN 2>/dev/null | head -n 1) && if [ -n \"$pid\" ]; then kill \"$pid\"; fi && mkdir -p outputs/logs && nohup env CORETG_PORT=9090 WEBAPP_LOG_LEVEL=INFO PYTHONUNBUFFERED=1 /Users/jcacosta/Documents/core-topo-gen/.venv312/bin/python -u -m main > outputs/logs/webui-9090.log 2>&1 & echo \"NEW_PID=$!\"",
+			"isBackground": false
+		},
+		{
+			"label": "Healthz 9090 after README styling",
+			"type": "shell",
+			"command": "curl -fsS http://127.0.0.1:9090/healthz && echo",
+			"isBackground": false
 		}
 	]
 }

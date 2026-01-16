@@ -8,3 +8,5 @@ proxmoxer>=2.0.1
 cryptography>=42.0.0
 paramiko>=3.4.0
 jsonschema>=4.21.1
+Markdown>=3.6
+bleach>=6.1.0

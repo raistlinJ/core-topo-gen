@@ -169,17 +169,27 @@ def load_vuln_catalog(repo_root: str) -> List[Dict[str, str]]:
 			return []
 		return []
 
-	candidates = []
-	# 1) Active installed catalog (if present)
-	for p in _active_installed_csvs(repo_root):
-		candidates.append(p)
-	# 2) Repo-shipped defaults
-	candidates.extend([
+	active_csvs = list(_active_installed_csvs(repo_root) or [])
+	items: List[Dict[str, str]] = []
+
+	# 1) Active installed catalog (if present). Important behavior: if the active
+	# installed catalog exists but contains zero rows, treat the catalog as empty
+	# (do NOT fall back to repo defaults). This matches the Web UI expectation
+	# that deleting all items results in no selectable vulnerabilities.
+	active_any_exists = False
+	for p in active_csvs:
+		if os.path.exists(p):
+			active_any_exists = True
+			items.extend(_read_csv(p))
+	if active_csvs and active_any_exists and not items:
+		return []
+
+	# 2) Repo-shipped defaults (only when no active installed catalog is present,
+	# or when active paths are missing entirely).
+	for p in [
 		os.path.join(repo_root, 'raw_datasources', 'vuln_list_w_url.csv'),
 		os.path.join(repo_root, 'raw_datasources', 'vuln_list.csv'),
-	])
-	items: List[Dict[str, str]] = []
-	for p in candidates:
+	]:
 		if os.path.exists(p):
 			items.extend(_read_csv(p))
 	# Deduplicate by (Name, Path)

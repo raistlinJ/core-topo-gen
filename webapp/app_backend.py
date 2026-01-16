@@ -31080,6 +31080,256 @@ def vuln_catalog_packs_file(catalog_id: str, subpath: str):
     return send_file(abs_p, as_attachment=True, download_name=os.path.basename(abs_p))
 
 
+@app.route('/vuln_catalog_packs/view/<catalog_id>/<path:subpath>')
+def vuln_catalog_packs_view(catalog_id: str, subpath: str):
+    """View a single extracted file inline (no forced download).
+
+    Used for README links in the Vulnerability Catalog UI.
+    """
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    if not cid:
+        abort(404)
+    base_dir = _vuln_catalog_pack_content_dir(cid)
+    if not os.path.isdir(base_dir):
+        abort(404)
+    try:
+        abs_p = _safe_path_under(base_dir, subpath or '')
+    except Exception:
+        abort(400)
+    if not os.path.isfile(abs_p):
+        abort(404)
+    # Let Flask infer mimetype; keep it inline.
+    return send_file(abs_p, as_attachment=False, download_name=os.path.basename(abs_p))
+
+
+@app.route('/vuln_catalog_packs/readme/<catalog_id>/<path:subpath>')
+def vuln_catalog_packs_readme(catalog_id: str, subpath: str):
+    """Render a README file nicely (Markdown -> sanitized HTML; txt -> preformatted).
+
+    This is used by the Vuln-Catalog "Description" column.
+    """
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    if not cid:
+        abort(404)
+    base_dir = _vuln_catalog_pack_content_dir(cid)
+    if not os.path.isdir(base_dir):
+        abort(404)
+    try:
+        abs_p = _safe_path_under(base_dir, subpath or '')
+    except Exception:
+        abort(400)
+    if not os.path.isfile(abs_p):
+        abort(404)
+
+    ext = os.path.splitext(abs_p)[1].lower().lstrip('.')
+    if ext not in ('md', 'markdown', 'txt'):
+        abort(404)
+
+    try:
+        with open(abs_p, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except Exception:
+        abort(404)
+
+    readme_title = os.path.basename(abs_p)
+    readme_rel = os.path.relpath(abs_p, base_dir).replace('\\', '/')
+
+    def _rewrite_pack_relative_urls(*, html_in: str, readme_rel_path: str) -> str:
+        """Rewrite relative URLs in rendered HTML to point at pack routes.
+
+        This makes relative image/link references inside README.md work, e.g. "1.png".
+        """
+        import html as _html
+        import posixpath as _posixpath
+        from html.parser import HTMLParser as _HTMLParser
+        from urllib.parse import urlparse as _urlparse
+
+        base_rel_dir = _posixpath.dirname(readme_rel_path or '')
+
+        def _is_relative_url(u: str) -> bool:
+            u = (u or '').strip()
+            if not u:
+                return False
+            if u.startswith('#'):
+                return False
+            # Absolute-path URLs ("/foo") are already rooted.
+            if u.startswith('/'):
+                return False
+            parsed = _urlparse(u)
+            return not bool(parsed.scheme)
+
+        def _resolve_rel(u: str) -> str | None:
+            # Prevent escaping out of pack content.
+            u = (u or '').strip().replace('\\', '/')
+            if not u or u.startswith('/'):
+                return None
+            resolved = _posixpath.normpath(_posixpath.join(base_rel_dir, u))
+            # normpath can return '.'
+            if resolved in ('', '.'):
+                return None
+            if resolved.startswith('..'):
+                return None
+            return resolved
+
+        def _rewrite_href(u: str) -> str:
+            if not _is_relative_url(u):
+                return u
+            resolved = _resolve_rel(u)
+            if not resolved:
+                return u
+            ext = os.path.splitext(resolved)[1].lower().lstrip('.')
+            if ext in ('md', 'markdown', 'txt'):
+                return url_for('vuln_catalog_packs_readme', catalog_id=cid, subpath=resolved)
+            return url_for('vuln_catalog_packs_view', catalog_id=cid, subpath=resolved)
+
+        def _rewrite_src(u: str) -> str:
+            if not _is_relative_url(u):
+                return u
+            resolved = _resolve_rel(u)
+            if not resolved:
+                return u
+            return url_for('vuln_catalog_packs_view', catalog_id=cid, subpath=resolved)
+
+        class _Rewriter(_HTMLParser):
+            def __init__(self) -> None:
+                super().__init__(convert_charrefs=False)
+                self._out: list[str] = []
+
+            def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                self._emit_tag(tag, attrs, closed=False)
+
+            def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                self._emit_tag(tag, attrs, closed=True)
+
+            def _emit_tag(self, tag: str, attrs: list[tuple[str, str | None]], *, closed: bool) -> None:
+                tag_l = (tag or '').lower()
+                new_attrs: list[tuple[str, str | None]] = []
+                for k, v in (attrs or []):
+                    if not k:
+                        continue
+                    k_l = k.lower()
+                    if v is not None and tag_l == 'a' and k_l == 'href':
+                        v = _rewrite_href(v)
+                    elif v is not None and tag_l == 'img' and k_l == 'src':
+                        v = _rewrite_src(v)
+                    new_attrs.append((k, v))
+
+                self._out.append('<')
+                self._out.append(tag)
+                for k, v in new_attrs:
+                    if v is None:
+                        self._out.append(f' {k}')
+                    else:
+                        self._out.append(f' {k}="{_html.escape(str(v), quote=True)}"')
+                self._out.append(' />' if closed else '>')
+
+            def handle_endtag(self, tag: str) -> None:
+                self._out.append(f'</{tag}>')
+
+            def handle_data(self, data: str) -> None:
+                self._out.append(data)
+
+            def handle_entityref(self, name: str) -> None:
+                self._out.append(f'&{name};')
+
+            def handle_charref(self, name: str) -> None:
+                self._out.append(f'&#{name};')
+
+            def handle_comment(self, data: str) -> None:
+                self._out.append(f'<!--{data}-->')
+
+            def handle_decl(self, decl: str) -> None:
+                self._out.append(f'<!{decl}>')
+
+        p = _Rewriter()
+        try:
+            p.feed(html_in or '')
+            p.close()
+        except Exception:
+            return html_in
+        return ''.join(p._out)
+
+    rendered_html = ''
+    plain_text = ''
+    render_warning = ''
+    if ext == 'txt':
+        plain_text = content
+    else:
+        # Render markdown and sanitize it.
+        try:
+            import markdown as _markdown  # type: ignore
+        except Exception:
+            _markdown = None
+        try:
+            import bleach as _bleach  # type: ignore
+        except Exception:
+            _bleach = None
+
+        if _markdown is None or _bleach is None:
+            plain_text = content
+            missing = []
+            if _markdown is None:
+                missing.append('Markdown')
+            if _bleach is None:
+                missing.append('bleach')
+            try:
+                import sys as _sys
+                py_exe = str(getattr(_sys, 'executable', '') or '').strip()
+            except Exception:
+                py_exe = ''
+            if missing:
+                render_warning = f"Markdown rendering unavailable (missing: {', '.join(missing)})."
+            else:
+                render_warning = 'Markdown rendering unavailable.'
+            if py_exe:
+                render_warning += f" Python: {py_exe}."
+            render_warning += ' Showing plain text.'
+        else:
+            html = _markdown.markdown(
+                content,
+                extensions=['fenced_code', 'tables', 'sane_lists'],
+                output_format='html5',
+            )
+            html = _rewrite_pack_relative_urls(html_in=html, readme_rel_path=readme_rel)
+            allowed_tags = [
+                'a', 'p', 'br', 'hr',
+                'strong', 'em', 'code', 'pre', 'blockquote',
+                'ul', 'ol', 'li',
+                'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+                'table', 'thead', 'tbody', 'tr', 'th', 'td',
+                'img',
+            ]
+            allowed_attrs = {
+                'a': ['href', 'title', 'target', 'rel'],
+                'code': ['class'],
+                'pre': ['class'],
+                'th': ['align'],
+                'td': ['align'],
+                'img': ['src', 'alt', 'title'],
+            }
+            cleaned = _bleach.clean(
+                html,
+                tags=allowed_tags,
+                attributes=allowed_attrs,
+                protocols=['http', 'https', 'mailto'],
+                strip=True,
+            )
+            rendered_html = cleaned
+
+    return render_template(
+        'vuln_catalog_readme.html',
+        active_page='vuln_catalog',
+        catalog_id=cid,
+        readme_title=readme_title,
+        readme_rel=readme_rel,
+        rendered_html=rendered_html,
+        plain_text=plain_text,
+        render_warning=render_warning,
+    )
+
+
 @app.route('/vuln_catalog_packs/item_files/<catalog_id>/<int:item_id>')
 def vuln_catalog_pack_item_files(catalog_id: str, item_id: int):
     """Return a list of files for a single vulnerability item directory.
@@ -31268,14 +31518,51 @@ def vuln_catalog_items_data():
             return f"{parts[-2]}/{parts[-1]}"
         return parts[-1] if parts else base
 
+    base_dir = _vuln_catalog_pack_content_dir(cid)
     out_items: list[dict[str, Any]] = []
     for it in items:
+        readme_url = ''
+        try:
+            rel_dir = str(it.get('dir_rel') or it.get('rel_dir') or '').strip().replace('\\', '/')
+            abs_dir = _safe_path_under(base_dir, rel_dir)
+            if os.path.isdir(abs_dir):
+                # Look for a README (case-insensitive) in the item directory.
+                # Prefer the canonical names first, then fall back to README.*.md/markdown/txt.
+                best_nm = None
+                best_rank = 10**9
+                for nm in os.listdir(abs_dir):
+                    if not isinstance(nm, str):
+                        continue
+                    low = nm.lower().strip()
+                    if not low.startswith('readme'):
+                        continue
+                    ext = os.path.splitext(low)[1].lstrip('.')
+                    if ext not in ('md', 'markdown', 'txt'):
+                        continue
+                    # Rank exact matches highest.
+                    if low in ('readme.md', 'readme.markdown', 'readme.txt'):
+                        rank = 0
+                    # Prefer English-ish before localized variants if present.
+                    elif low.startswith('readme.en'):
+                        rank = 1
+                    else:
+                        rank = 2
+                    if rank < best_rank:
+                        best_rank = rank
+                        best_nm = nm
+
+                if best_nm:
+                    rel = os.path.relpath(os.path.join(abs_dir, best_nm), base_dir).replace('\\', '/')
+                    readme_url = url_for('vuln_catalog_packs_readme', catalog_id=cid, subpath=rel)
+        except Exception:
+            readme_url = ''
         out_items.append({
             'id': int(it.get('id') or 0),
             'name': _display_name(it),
             'type': 'docker-compose',
             'from_source': from_source,
             'disabled': bool(it.get('disabled', False)),
+            'readme_url': readme_url,
         })
     return jsonify({
         'ok': True,
@@ -33320,11 +33607,13 @@ def vuln_catalog():
 
     The Topology tab uses this for the "Select Vulnerability" modal.
 
-    Source priority:
-    1) Active installed Vulnerability Pack (Web UI state in outputs/installed_vuln_catalogs)
-       - respects disabled/deleted items
-       - uses UI-style display names (e.g. <parent>/<leaf>)
-    2) Fallback to repo/CLI CSV loader (raw_datasources)
+     Source priority (strict for Web UI):
+     1) Active installed Vulnerability Pack (Web UI state in outputs/installed_vuln_catalogs)
+         - respects disabled/deleted items
+         - uses UI-style display names (e.g. <parent>/<leaf>)
+
+     Note: We intentionally do NOT fall back to repo defaults here. If the user
+     has an empty/absent catalog pack, the Topology picker should show no items.
     """
     try:
         # Prefer the new vulnerability-pack-backed catalog when present.
@@ -33378,20 +33667,7 @@ def vuln_catalog():
                     'files_api_url': files_api_url,
                 })
         else:
-            from core_topo_gen.utils.vuln_process import load_vuln_catalog
-
-            repo_root = _get_repo_root()
-            items = load_vuln_catalog(repo_root)
-
-            # Provide optional fields used by some UIs; safe no-ops for older clients.
-            try:
-                for it in items:
-                    if isinstance(it, dict):
-                        it.setdefault('id', '')
-                        it.setdefault('from_source', 'raw_datasources')
-                        it.setdefault('files_api_url', '')
-            except Exception:
-                pass
+            items = []
 
         types = sorted({str(it.get('Type') or '').strip() for it in items if str(it.get('Type') or '').strip()})
         vectors = sorted({str(it.get('Vector') or '').strip() for it in items if str(it.get('Vector') or '').strip()})

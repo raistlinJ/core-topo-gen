@@ -135,7 +135,7 @@
                     <tr>
                       <th style="width: 60px;">#</th>
                       <th>Name</th>
-                      <th>Type</th>
+                      <th>Description</th>
                       <th>From Source</th>
                       <th style="width: 160px;">Actions</th>
                     </tr>
@@ -461,7 +461,6 @@
     const sorted = stableSorted(rows, (it) => {
       if (!it || typeof it !== 'object') return '';
       if (sortKey === 'name') return it.name || '';
-      if (sortKey === 'type') return it.type || '';
       if (sortKey === 'from_source') return it.from_source || '';
       if (sortKey === 'id') return String(it.id || '');
       return it[sortKey] || '';
@@ -479,7 +478,9 @@
           </div>
           <div class="small text-muted">ID: ${escapeHtml(it.id ?? '')}</div>
         </td>
-        <td class="small">${escapeHtml(it.type || 'docker-compose')}</td>
+        <td class="small">
+          ${it.readme_url ? `<a href="${escapeHtml(it.readme_url)}" target="_blank" rel="noopener">README</a>` : '<span class="text-muted">—</span>'}
+        </td>
         <td class="small">${escapeHtml(it.from_source || '')}</td>
         <td>
           <div class="btn-group btn-group-sm" role="group">
@@ -722,7 +723,7 @@
     enableTableSorting('vulnCatalogTable', _vulnCatalogState, [
       { label: '#', key: null },
       { label: 'Name', key: 'name' },
-      { label: 'Type', key: 'type' },
+      { label: 'Description', key: null },
       { label: 'From Source', key: 'from_source' },
       { label: 'Actions', key: null },
     ], _renderVulnCatalogTable);
