@@ -7142,10 +7142,10 @@ const dropdownsBySection = {
     // Added 'Random' entry so user can explicitly request a random routing protocol.
     'Routing': ['RIP','RIPNG','BGP','OSPFv2','OSPFv3','Random'],
     'Services': ['SSH','HTTP','DHCPClient','Random'],
-    'Traffic': ['Random','TCP','UDP','CUSTOM'],
+    'Traffic': ['Random','TCP','UDP'],
     'Events': ['Script Path'],
     'Vulnerabilities': ['Random','Specific'],
-    'Segmentation': ['Random','Firewall','NAT','CUSTOM']
+    'Segmentation': ['Random','Firewall','NAT']
 };
 
 function deepCloneJsonSafe(value) {
@@ -13682,6 +13682,7 @@ function renderItemRow(sidx, secName, iidx, it) {
         const cur = it.selected || 'Random';
         // Per-section allowed options (excluding 'auto')
         let options = ['Random'];
+        let legacyOptionHtml = '';
         switch (secName) {
             case 'Node Information':
                 options = ['Server', 'Workstation', 'PC', 'Docker', 'Random'];
@@ -13693,18 +13694,20 @@ function renderItemRow(sidx, secName, iidx, it) {
                 options = ['SSH', 'HTTP', 'DHCPClient', 'Random'];
                 break;
             case 'Traffic':
-                options = ['Random', 'TCP', 'UDP', 'CUSTOM'];
+                options = ['Random', 'TCP', 'UDP'];
+                if (cur === 'CUSTOM') legacyOptionHtml = '<option selected value="CUSTOM" disabled>CUSTOM (legacy)</option>';
                 break;
             case 'Events':
                 options = ['Script Path'];
                 break;
             case 'Segmentation':
-                options = ['Random', 'Firewall', 'NAT', 'CUSTOM'];
+                options = ['Random', 'Firewall', 'NAT'];
+                if (cur === 'CUSTOM') legacyOptionHtml = '<option selected value="CUSTOM" disabled>CUSTOM (legacy)</option>';
                 break;
             default:
                 options = ['Random'];
         }
-        opts = options.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
+        opts = legacyOptionHtml + options.map(o => `<option ${o===cur?'selected':''}>${o}</option>`).join('');
     }
 
     const extras = (() => {

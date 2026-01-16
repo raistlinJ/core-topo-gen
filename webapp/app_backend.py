@@ -8798,9 +8798,14 @@ def _flow_compute_flag_assignments_for_preset(
     def _requirement_message(*, required_total: int, required_nonvuln_docker: int) -> str:
         st = _preset_stats()
         docker_total = int(st.get('docker_total') or 0)
+        docker_nonvuln_total = int(st.get('docker_nonvuln_total') or 0)
         vuln_total = int(st.get('vuln_total') or 0)
+        eligible_total = int(st.get('eligible_total') or 0)
         required_any = max(0, int(required_total) - int(required_nonvuln_docker))
-        return f"Requires {required_any} Docker/Vuln and {int(required_nonvuln_docker)} Non-Vuln. Current: Docker: {docker_total}, Vuln: {vuln_total}"
+        return (
+            f"Requires {required_any} Docker/Vuln and {int(required_nonvuln_docker)} Non-Vuln Docker. "
+            f"Current: Eligible: {eligible_total}, Docker: {docker_total} (Non-Vuln: {docker_nonvuln_total}), Vuln: {vuln_total}"
+        )
 
     required_total = len(steps)
     required_nonvuln_docker = sum(1 for s in steps if str((s or {}).get('kind') or '').strip() == 'flag-node-generator')
@@ -30676,13 +30681,31 @@ def _build_installed_disable_maps() -> tuple[dict[str, dict[str, Any]], dict[tup
             if not gid or not kind:
                 continue
             item_disabled = bool(it.get('disabled') is True)
-            gen_by_kind_id[(kind, gid)] = {
+            info_obj = {
                 'pack_id': pid,
                 'pack_label': pack_label,
                 'pack_disabled': pack_disabled,
                 'disabled': pack_disabled or item_disabled,
                 'item_disabled': item_disabled,
             }
+
+            # Back-compat: generator packs may use numeric ids in the packs state,
+            # but Flow/UI operate on stable `source_generator_id`. If we can
+            # resolve a source id from the installed pack marker, map both.
+            gen_by_kind_id[(kind, gid)] = info_obj
+            try:
+                pack_path = str(it.get('path') or '').strip()
+                if pack_path:
+                    marker_path = os.path.join(pack_path, '.coretg_pack.json')
+                    if os.path.exists(marker_path) and os.path.isfile(marker_path):
+                        with open(marker_path, 'r', encoding='utf-8') as fh:
+                            marker = json.load(fh)
+                        if isinstance(marker, dict):
+                            src_id = str(marker.get('source_generator_id') or '').strip()
+                            if src_id:
+                                gen_by_kind_id.setdefault((kind, src_id), info_obj)
+            except Exception:
+                pass
 
     return pack_by_id, gen_by_kind_id
 
@@ -31917,23 +31940,32 @@ def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[d
 
 
 def _compute_next_numeric_generator_id(*, repo_root: str) -> int:
-    """Return the next numeric generator id across both catalogs."""
-    try:
-        from core_topo_gen.generator_manifests import discover_generator_manifests
-    except Exception:
-        return 1
+    """Return the next numeric generator id across installed packs.
 
-    existing_flag, _, _ = discover_generator_manifests(repo_root=repo_root, kind='flag-generator')
-    existing_node, _, _ = discover_generator_manifests(repo_root=repo_root, kind='flag-node-generator')
-    existing_ids = {str(g.get('id') or '').strip() for g in (existing_flag + existing_node) if isinstance(g, dict)}
+    Generator packs use numeric ids for uniqueness, but manifest discovery may
+    remap ids to stable source ids for UI/Flow. To avoid collisions, derive the
+    numeric max from installed pack markers.
+    """
     max_numeric = 0
-    for eid in existing_ids:
-        s = str(eid or '').strip()
-        if s.isdigit():
+    try:
+        root = _installed_generators_root()
+        for dirpath, _dirnames, filenames in os.walk(root):
+            if '.coretg_pack.json' not in filenames:
+                continue
+            marker_path = os.path.join(dirpath, '.coretg_pack.json')
             try:
-                max_numeric = max(max_numeric, int(s))
+                with open(marker_path, 'r', encoding='utf-8') as fh:
+                    marker = json.load(fh)
+                if not isinstance(marker, dict):
+                    continue
+                gid = str(marker.get('generator_id') or '').strip()
+                if gid.isdigit():
+                    max_numeric = max(max_numeric, int(gid))
             except Exception:
                 continue
+    except Exception:
+        max_numeric = 0
+
     return max_numeric + 1
 
 

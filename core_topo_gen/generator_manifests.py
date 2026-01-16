@@ -141,6 +141,8 @@ def discover_generator_manifests(
 
     generators: list[dict[str, Any]] = []
     plugins_by_id: dict[str, dict[str, Any]] = {}
+    gen_index_by_id: dict[str, int] = {}
+    is_installed_by_id: dict[str, bool] = {}
     errors: list[ManifestLoadError] = []
 
     for base_dir in base_dirs:
@@ -156,6 +158,25 @@ def discover_generator_manifests(
         for child in sorted(base_dir.iterdir()):
             if not child.is_dir():
                 continue
+
+            # Installed generator packs rewrite manifest `id` to a numeric value.
+            # For UI/Flow sequencing we want stable IDs, so we remap to the
+            # original `source_generator_id` when a pack marker is present.
+            installed_source_id = ''
+            installed_assigned_id = ''
+            if is_installed_base:
+                try:
+                    import json
+
+                    marker_path = child / '.coretg_pack.json'
+                    if marker_path.exists() and marker_path.is_file():
+                        marker = json.loads(marker_path.read_text('utf-8', errors='ignore') or '{}')
+                        if isinstance(marker, dict):
+                            installed_source_id = str(marker.get('source_generator_id') or '').strip()
+                            installed_assigned_id = str(marker.get('generator_id') or '').strip()
+                except Exception:
+                    installed_source_id = ''
+                    installed_assigned_id = ''
 
             manifest_path = None
             for nm in ('manifest.yaml', 'manifest.yml'):
@@ -188,6 +209,10 @@ def discover_generator_manifests(
             if not gen_id:
                 errors.append(ManifestLoadError(path=str(manifest_path), error='missing id'))
                 continue
+
+            # Remap installed pack numeric IDs to stable source IDs when possible.
+            if is_installed_base and installed_source_id:
+                gen_id = installed_source_id
 
             name = str(doc.get('name') or gen_id).strip() or gen_id
             description = str(doc.get('description') or '').strip()
@@ -241,6 +266,12 @@ def discover_generator_manifests(
                 'hint_template': str(doc.get('hint_template') or ''),
                 'env': dict(doc.get('env') or {}) if isinstance(doc.get('env'), dict) else {},
             }
+
+            if is_installed_base:
+                if installed_assigned_id:
+                    gen['_installed_assigned_id'] = installed_assigned_id
+                if installed_source_id:
+                    gen['_installed_source_id'] = installed_source_id
 
             # Runtime
             if runtime_type in {'docker-compose', 'compose'}:
@@ -301,10 +332,27 @@ def discover_generator_manifests(
             }
 
             if gen_id in plugins_by_id:
+                # Prefer installed generators over repo copies when ids collide.
+                # This keeps "installed-only" policies working even when a repo
+                # includes template/sample generators with the same id.
+                prev_installed = bool(is_installed_by_id.get(gen_id))
+                if is_installed_base and (not prev_installed):
+                    plugins_by_id[gen_id] = plugin_contract
+                    idx = gen_index_by_id.get(gen_id)
+                    if isinstance(idx, int) and 0 <= idx < len(generators):
+                        generators[idx] = gen
+                    else:
+                        gen_index_by_id[gen_id] = len(generators)
+                        generators.append(gen)
+                    is_installed_by_id[gen_id] = True
+                    continue
+
                 errors.append(ManifestLoadError(path=str(manifest_path), error=f'duplicate generator id: {gen_id}'))
                 continue
 
             plugins_by_id[gen_id] = plugin_contract
+            gen_index_by_id[gen_id] = len(generators)
+            is_installed_by_id[gen_id] = bool(is_installed_base)
             generators.append(gen)
 
     generators.sort(key=lambda g: (str(g.get('name') or '').lower(), str(g.get('id') or '')))

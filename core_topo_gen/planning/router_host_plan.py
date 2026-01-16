@@ -194,6 +194,84 @@ def plan_r2s_grouping(
     # seeded RNG for deterministic but varied subnet selection per preview seed
     rnd = random.Random(seed if seed is not None else 0)
 
+    # Special-case: no routers planned.
+    # In this mode, preview should still show all hosts in a sensible topology.
+    # We synthesize a star: a single L2 switch with every host connected.
+    if routers_planned <= 0:
+        host_ids: List[int] = []
+        for h in host_nodes or []:
+            try:
+                hid = int(getattr(h, 'node_id'))
+            except Exception:
+                continue
+            if hid > 0:
+                host_ids.append(hid)
+        host_ids = sorted(set(host_ids))
+
+        switch_id = next_switch_id
+        lan_subnet = None
+        if subnet_alloc is not None and host_ids:
+            try:
+                try:
+                    lan_subnet = str(subnet_alloc.next_random_subnet(DEFAULT_IPV4_PREFIXLEN, rnd=rnd))
+                except TypeError:
+                    lan_subnet = str(subnet_alloc.next_random_subnet(DEFAULT_IPV4_PREFIXLEN))
+            except Exception:
+                lan_subnet = None
+        if not lan_subnet:
+            lan_subnet = '10.200.0.0/24'
+
+        rsw_subnet = lan_subnet
+        router_ip = None
+        try:
+            net = ipaddress.ip_network(lan_subnet, strict=False)
+            # Use the first host as the synthetic gateway/router interface IP.
+            host_iter = net.hosts()
+            first_host = next(host_iter, None)
+            if first_host is not None:
+                router_ip = f"{first_host}/{net.prefixlen}"
+        except Exception:
+            router_ip = None
+
+        switch_nodes = [{'node_id': switch_id, 'name': f'sw-{switch_id}'}] if host_ids else []
+        switches_detail = []
+        if host_ids:
+            switches_detail.append({
+                'switch_id': switch_id,
+                # IMPORTANT: keep router_id null so frontends don't materialize a fake router.
+                'router_id': None,
+                'hosts': host_ids,
+                # Under the single-subnet policy, rsw_subnet and lan_subnet must match.
+                'rsw_subnet': rsw_subnet,
+                'lan_subnet': lan_subnet,
+                # Validator expects a router_ip; in no-router mode we provide a synthetic gateway IP.
+                'router_ip': router_ip,
+                'host_if_ips': {},
+            })
+
+        grouping_preview = [{
+            'mode': 'star',
+            'router_id': None,
+            'switches': len(switch_nodes),
+            'hosts': len(host_ids),
+        }]
+        computed_r2s_policy = {
+            'mode': 'none',
+            'target_per_router': 0,
+            'note': 'No routers planned; preview uses a single-switch star topology.',
+        }
+
+        return {
+            'grouping_preview': grouping_preview,
+            'computed_r2s_policy': computed_r2s_policy,
+            'switch_nodes': switch_nodes,
+            'switches_detail': switches_detail,
+            'ptp_subnets': [],
+            'router_switch_subnets': [rsw_subnet] if host_ids else [],
+            'lan_subnets': [lan_subnet] if host_ids else [],
+            'r2r_subnets': [],
+        }
+
     def _next_group_subnets(router_id: int, group_idx: int, host_count: int = 0) -> tuple[str, str]:
         """Allocate subnets for router/group.
 
