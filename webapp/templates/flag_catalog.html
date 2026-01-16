@@ -772,10 +772,7 @@
     arr.forEach((x) => {
       const s = String(x || '').trim();
       if (!s) return;
-      // Best-effort: label common injected artifact keys.
-      if (s === 'filesystem.file') out.push('filesystem.file (file)');
-      else if (s === 'filesystem.dir') out.push('filesystem.dir (folder)');
-      else out.push(s);
+      out.push(s);
     });
     out.sort();
     return out.length ? out.join(', ') : '—';

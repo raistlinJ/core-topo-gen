@@ -11,7 +11,8 @@ The flag is embedded inside the binary as a static string so it can be recovered
 All inputs are optional and provided via `inputs/config.json`:
 
 - `seed` (text): used to deterministically derive a flag and default filename.
-- `filename` (text): optional output binary filename; if omitted, a deterministic random-looking name is derived from `seed`.
+- `filesystem.file` (text): optional output binary filename (or relative path like `artifacts/<name>`); if omitted, a deterministic random-looking name is derived from `seed`.
+	- Legacy alias: `filename`.
 - `flag` (text): optional explicit flag value to embed; if omitted, a deterministic flag is derived from `seed`.
 
 ## Outputs

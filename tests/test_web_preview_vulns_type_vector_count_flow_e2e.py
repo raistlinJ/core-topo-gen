@@ -127,9 +127,9 @@ def test_flow_attackflow_preview_sample_preset_forces_sample_chain(tmp_path):
     full_preview = {
         "seed": 123,
         "hosts": [
-            {"node_id": "h1", "name": "docker-1", "role": "Docker", "vulnerabilities": []},
-            {"node_id": "h2", "name": "docker-2", "role": "Docker", "vulnerabilities": []},
-            {"node_id": "h3", "name": "docker-3", "role": "Docker", "vulnerabilities": []},
+            {"node_id": "h1", "name": "docker-1", "role": "Docker", "vulnerabilities": [], "ipv4": ["10.0.0.1/24"]},
+            {"node_id": "h2", "name": "docker-2", "role": "Docker", "vulnerabilities": [], "ipv4": ["10.0.0.2/24"]},
+            {"node_id": "h3", "name": "docker-3", "role": "Docker", "vulnerabilities": [], "ipv4": ["10.0.0.3/24"]},
         ],
         "routers": [],
         "switches": [{"node_id": "s1", "name": "switch-1"}],
@@ -168,6 +168,16 @@ def test_flow_attackflow_preview_sample_preset_forces_sample_chain(tmp_path):
         kinds = [str(a.get("type") or "") for a in fas]
         assert ids == ["binary_embed_text", "nfs_sensitive_file", "textfile_username_password"]
         assert kinds == ["flag-generator", "flag-node-generator", "flag-generator"]
+
+        # Regression: preset path should include inject_files from manifest metadata.
+        assert isinstance(fas[0].get("inject_files"), list)
+        assert "filesystem.file" in fas[0].get("inject_files")
+
+        # Hint should include the next node's IP address when available.
+        # Step 1 points to docker-2 (10.0.0.2).
+        hint0 = str((fas[0] or {}).get("hint") or "")
+        assert "docker-2" in hint0
+        assert "10.0.0.2" in hint0
     finally:
         try:
             os.remove(plan_path)

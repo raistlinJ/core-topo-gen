@@ -3,6 +3,7 @@ id: textfile_username_password
 kind: flag-generator
 name: "Sample: Textfile Username/Password"
 description: "Emit a secrets text file and a deterministic flag."
+hint_template: "Next: {{NEXT_NODE_NAME}} @ {{NEXT_NODE_IP}}"
 runtime:
   type: docker-compose
   compose_file: docker-compose.yml

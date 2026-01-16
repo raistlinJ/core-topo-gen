@@ -3,6 +3,7 @@ id: nfs_sensitive_file
 kind: flag-node-generator
 name: "Sample: NFS Sensitive File"
 description: "Generates an NFS export containing creds.txt and flag.txt."
+hint_template: "Next: {{NEXT_NODE_NAME}} @ {{NEXT_NODE_IP}}"
 runtime:
   type: docker-compose
   compose_file: docker-compose.yml

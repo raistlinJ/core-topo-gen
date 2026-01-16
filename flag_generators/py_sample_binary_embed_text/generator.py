@@ -111,15 +111,22 @@ def main() -> int:
     cfg_flag = str(cfg.get("flag") or "").strip()
     flag_value = cfg_flag or _derive_flag(seed, generator_id, os.environ.get("FLAG_PREFIX", "FLAG"))
 
-    # Inputs:
-    # - filename (preferred)
+    # Inputs (all optional):
+    # - filesystem.file (preferred): may be a filename or a relative path (e.g., artifacts/<name>)
+    # - filename (legacy alias)
     # - bin_name/bin-name (legacy)
-    cfg_filename = str(
-        cfg.get("filename")
+    cfg_filename_raw = str(
+        cfg.get("filesystem.file")
+        or cfg.get("filename")
         or cfg.get("bin_name")
         or cfg.get("bin-name")
         or ""
     ).strip()
+    try:
+        # If a relative path is provided (e.g. artifacts/challengeA), treat it as a filename.
+        cfg_filename = cfg_filename_raw.split("/")[-1].strip() if cfg_filename_raw else ""
+    except Exception:
+        cfg_filename = cfg_filename_raw
 
     # Build an x86_64 ELF binary that contains the flag in .rodata.
     # NOTE: The compose service is pinned to linux/amd64 to ensure the compiler

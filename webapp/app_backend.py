@@ -8684,6 +8684,18 @@ def _flow_strip_ids_from_hint(text: str) -> str:
         s = re.sub(r"\s*\(\s*id\s*=\s*[^)]*\)", "", s, flags=re.IGNORECASE)
     except Exception:
         pass
+    # If templates include optional fields (e.g., "({{NEXT_NODE_IP}})"),
+    # the placeholder may resolve to an empty string. Strip empty parens.
+    try:
+        s = re.sub(r"\s*\(\s*\)", "", s)
+    except Exception:
+        pass
+    # If templates include optional IP (e.g., "@ {{NEXT_NODE_IP}}") and the IP is
+    # unavailable, the placeholder resolves to empty and leaves a dangling '@'.
+    try:
+        s = re.sub(r"\s*@\s*$", "", s)
+    except Exception:
+        pass
     # Remove any leftover unexpanded id placeholders.
     for token in ('{{NEXT_NODE_ID}}', '{{THIS_NODE_ID}}'):
         try:
@@ -8697,21 +8709,47 @@ def _flow_strip_ids_from_hint(text: str) -> str:
     return s.strip()
 
 
-def _flow_render_hint_template(tpl: str, *, scenario_label: str, id_to_name: dict[str, str], this_id: str, next_id: str) -> str:
+def _flow_render_hint_template(
+    tpl: str,
+    *,
+    scenario_label: str,
+    id_to_name: dict[str, str],
+    id_to_ip: dict[str, str] | None = None,
+    this_id: str,
+    next_id: str,
+) -> str:
     try:
-        text = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}}'
+        raw_tpl = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}}'
+        text = raw_tpl
         next_id_val = str(next_id or '').strip()
         next_name_val = (id_to_name.get(next_id_val) or '').strip() if next_id_val else ''
+        next_ip_val = ''
+        this_ip_val = ''
+        try:
+            if isinstance(id_to_ip, dict):
+                next_ip_val = str(id_to_ip.get(next_id_val) or '').strip()
+                this_ip_val = str(id_to_ip.get(str(this_id or '').strip()) or '').strip()
+        except Exception:
+            next_ip_val = ''
+            this_ip_val = ''
         if not next_id_val:
             return "You've completed this sequence of challenges!"
         if not next_name_val:
             next_name_val = next_id_val
+
+        # If the template references NEXT_NODE_NAME but not NEXT_NODE_IP,
+        # append the IP address to the displayed name when available.
+        if ('{{NEXT_NODE_NAME}}' in raw_tpl) and ('{{NEXT_NODE_IP}}' not in raw_tpl) and next_ip_val:
+            next_name_val = f"{next_name_val} ({next_ip_val})"
+
         repl = {
             '{{SCENARIO}}': str(scenario_label or ''),
             '{{THIS_NODE_ID}}': str(this_id or ''),
             '{{THIS_NODE_NAME}}': id_to_name.get(str(this_id or '')) or str(this_id or ''),
+            '{{THIS_NODE_IP}}': this_ip_val,
             '{{NEXT_NODE_ID}}': next_id_val,
             '{{NEXT_NODE_NAME}}': next_name_val,
+            '{{NEXT_NODE_IP}}': next_ip_val,
         }
         for k, v in repl.items():
             try:
@@ -8838,12 +8876,20 @@ def _flow_compute_flag_assignments_for_preset(
 
     chain_ids: list[str] = [str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()]
     id_to_name: dict[str, str] = {}
+    id_to_ip: dict[str, str] = {}
     for n in chain_nodes:
         try:
             nid = str(n.get('id') or '').strip()
             nm = str(n.get('name') or '').strip()
             if nid:
                 id_to_name[nid] = nm or nid
+                ip = ''
+                try:
+                    ip = _first_valid_ipv4(n.get('ip4') or n.get('ipv4') or n.get('ip') or '')
+                except Exception:
+                    ip = ''
+                if ip:
+                    id_to_ip[nid] = ip
         except Exception:
             pass
 
@@ -8928,7 +8974,14 @@ def _flow_compute_flag_assignments_for_preset(
         outputs_effective = sorted(set(produces_artifacts) | set(output_fields))
 
         rendered_hints = [
-            _flow_render_hint_template(t, scenario_label=scenario_label, id_to_name=id_to_name, this_id=str(cid), next_id=str(next_id))
+            _flow_render_hint_template(
+                t,
+                scenario_label=scenario_label,
+                id_to_name=id_to_name,
+                id_to_ip=id_to_ip,
+                this_id=str(cid),
+                next_id=str(next_id),
+            )
             for t in (hint_templates or [])
         ]
         out.append({
@@ -8941,6 +8994,7 @@ def _flow_compute_flag_assignments_for_preset(
             'generator_catalog': catalog,
             'language': str(gen.get('language') or ''),
             'description_hints': list(gen.get('description_hints') or []) if isinstance(gen.get('description_hints'), list) else [],
+            'inject_files': list(gen.get('inject_files') or []) if isinstance(gen.get('inject_files'), list) else [],
             # Effective union (used for chaining feasibility / ordering validation).
             'inputs': inputs_effective,
             'outputs': outputs_effective,
@@ -8954,7 +9008,14 @@ def _flow_compute_flag_assignments_for_preset(
             'output_fields': output_fields,
             'hint_template': hint_tpl,
             'hint_templates': hint_templates,
-            'hint': rendered_hints[0] if rendered_hints else _flow_render_hint_template(hint_tpl, scenario_label=scenario_label, id_to_name=id_to_name, this_id=str(cid), next_id=str(next_id)),
+            'hint': rendered_hints[0] if rendered_hints else _flow_render_hint_template(
+                hint_tpl,
+                scenario_label=scenario_label,
+                id_to_name=id_to_name,
+                id_to_ip=id_to_ip,
+                this_id=str(cid),
+                next_id=str(next_id),
+            ),
             'hints': rendered_hints,
             'next_node_id': str(next_id),
             'next_node_name': str(id_to_name.get(str(next_id)) or ''),
@@ -9575,7 +9636,16 @@ def _build_topology_graph_from_preview_plan(preview: Dict[str, Any]) -> Tuple[li
     links_out: list[dict[str, str]] = []
     by_id: dict[str, dict[str, Any]] = {}
 
-    def _add_node(nid: str, name: str, ntype: str, *, compose: str = '', compose_name: str = '', is_vuln: bool = False) -> None:
+    def _add_node(
+        nid: str,
+        name: str,
+        ntype: str,
+        *,
+        compose: str = '',
+        compose_name: str = '',
+        is_vuln: bool = False,
+        ip4: str = '',
+    ) -> None:
         if not nid or nid in by_id:
             return
         rec = {
@@ -9585,6 +9655,7 @@ def _build_topology_graph_from_preview_plan(preview: Dict[str, Any]) -> Tuple[li
             'compose': compose or '',
             'compose_name': compose_name or '',
             'is_vuln': bool(is_vuln),
+            'ip4': str(ip4 or '').strip(),
             'interfaces': [],
             'services': [],
         }
@@ -9651,7 +9722,32 @@ def _build_topology_graph_from_preview_plan(preview: Dict[str, Any]) -> Tuple[li
         if is_docker_role:
             compose_name = 'standard-ubuntu-docker-core'
             compose = 'scripts/standard-ubuntu-docker-core/docker-compose.yml'
-        _add_node(hid, str(h.get('name') or f'host-{hid}'), node_type, compose=compose, compose_name=compose_name, is_vuln=is_vuln)
+        # Best-effort: pull an IPv4 address from host payload if present.
+        host_ip4 = ''
+        try:
+            host_ip4 = _first_valid_ipv4(h.get('ip4') or h.get('ipv4') or h.get('ip'))
+        except Exception:
+            host_ip4 = ''
+        if not host_ip4:
+            try:
+                ifaces = h.get('interfaces') if isinstance(h.get('interfaces'), list) else []
+                for iface in ifaces:
+                    if not isinstance(iface, dict):
+                        continue
+                    host_ip4 = _first_valid_ipv4(iface.get('ip4') or iface.get('ipv4') or iface.get('ip') or iface.get('address'))
+                    if host_ip4:
+                        break
+            except Exception:
+                host_ip4 = ''
+        _add_node(
+            hid,
+            str(h.get('name') or f'host-{hid}'),
+            node_type,
+            compose=compose,
+            compose_name=compose_name,
+            is_vuln=is_vuln,
+            ip4=host_ip4,
+        )
 
     # Router-to-router links
     for l in (preview.get('r2r_links_preview') or []):
@@ -9958,12 +10054,20 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
 
     # Map ids -> names for THIS/NEXT substitution.
     id_to_name: dict[str, str] = {}
+    id_to_ip: dict[str, str] = {}
     for n in chain_nodes:
         try:
             nid = str(n.get('id') or '').strip()
             nm = str(n.get('name') or '').strip()
             if nid:
                 id_to_name[nid] = nm or nid
+                ip = ''
+                try:
+                    ip = _first_valid_ipv4(n.get('ip4') or n.get('ipv4') or n.get('ip') or '')
+                except Exception:
+                    ip = ''
+                if ip:
+                    id_to_ip[nid] = ip
         except Exception:
             pass
 
@@ -9983,19 +10087,24 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
 
     def _render_hint(tpl: str, *, this_id: str, next_id: str) -> str:
         try:
-            text = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}}'
+            raw_tpl = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}}'
+            text = raw_tpl
             next_id_val = str(next_id or '').strip()
             next_name_val = (id_to_name.get(next_id_val) or '').strip() if next_id_val else ''
+            next_ip_val = str(id_to_ip.get(next_id_val) or '').strip() if next_id_val else ''
             if not next_id_val:
                 return "You've completed this sequence of challenges!"
             if not next_name_val:
                 next_name_val = next_id_val
+            if ('{{NEXT_NODE_NAME}}' in raw_tpl) and ('{{NEXT_NODE_IP}}' not in raw_tpl) and next_ip_val:
+                next_name_val = f"{next_name_val} ({next_ip_val})"
             repl = {
                 '{{SCENARIO}}': str(scenario_label or ''),
                 '{{THIS_NODE_ID}}': this_id,
                 '{{THIS_NODE_NAME}}': id_to_name.get(this_id) or this_id,
                 '{{NEXT_NODE_ID}}': next_id_val,
                 '{{NEXT_NODE_NAME}}': next_name_val,
+                '{{NEXT_NODE_IP}}': next_ip_val,
             }
             for k, v in repl.items():
                 text = text.replace(k, str(v))
@@ -10406,6 +10515,31 @@ def _flow_enrich_saved_flag_assignments(
 
         gen_id = str(a2.get('id') or '').strip()
         gen_def = by_id.get(gen_id) if gen_id else None
+
+        # Backfill source label for older persisted assignments.
+        # Historically this was often the generic string "manifest"; now we prefer
+        # the containing pack/bundle label (or "repo") from the current catalog.
+        try:
+            existing_src = str(a2.get('flag_generator') or '').strip()
+        except Exception:
+            existing_src = ''
+        try:
+            catalog_src = str((gen_def or {}).get('_source_name') or '').strip() if isinstance(gen_def, dict) else ''
+        except Exception:
+            catalog_src = ''
+        if catalog_src and (not existing_src or existing_src.lower() == 'manifest'):
+            a2['flag_generator'] = catalog_src
+
+        # Backfill inject_files for older persisted assignments.
+        try:
+            existing_injects = a2.get('inject_files')
+            if not (isinstance(existing_injects, list) and any(str(x or '').strip() for x in existing_injects)):
+                if isinstance(gen_def, dict):
+                    inj = gen_def.get('inject_files')
+                    if isinstance(inj, list):
+                        a2['inject_files'] = [str(x or '').strip() for x in inj if str(x or '').strip()]
+        except Exception:
+            pass
 
         # Ensure generator description exists (if the catalog provides it).
         try:

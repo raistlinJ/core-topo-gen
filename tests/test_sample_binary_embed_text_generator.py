@@ -28,7 +28,7 @@ def test_sample_binary_embed_text_outputs_and_optional_filename_and_flag(tmp_pat
 
     cfg = {
         "seed": "seed-1",
-        "filename": "challengeA",
+        "filesystem.file": "challengeA",
         "flag": "FLAG{TEST_FLAG_VALUE}",
         "generator_id": "sample.binary_embed_text",
     }

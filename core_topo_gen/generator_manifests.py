@@ -164,6 +164,9 @@ def discover_generator_manifests(
             # original `source_generator_id` when a pack marker is present.
             installed_source_id = ''
             installed_assigned_id = ''
+            installed_pack_id = ''
+            installed_pack_label = ''
+            installed_pack_origin = ''
             if is_installed_base:
                 try:
                     import json
@@ -174,9 +177,15 @@ def discover_generator_manifests(
                         if isinstance(marker, dict):
                             installed_source_id = str(marker.get('source_generator_id') or '').strip()
                             installed_assigned_id = str(marker.get('generator_id') or '').strip()
+                            installed_pack_id = str(marker.get('pack_id') or '').strip()
+                            installed_pack_label = str(marker.get('pack_label') or '').strip()
+                            installed_pack_origin = str(marker.get('origin') or '').strip()
                 except Exception:
                     installed_source_id = ''
                     installed_assigned_id = ''
+                    installed_pack_id = ''
+                    installed_pack_label = ''
+                    installed_pack_origin = ''
 
             manifest_path = None
             for nm in ('manifest.yaml', 'manifest.yml'):
@@ -257,7 +266,13 @@ def discover_generator_manifests(
                     'subpath': '',
                     'entry': '',
                 },
-                '_source_name': 'manifest',
+                # Human-facing source label used throughout the web UI.
+                # Prefer the containing pack/bundle label for installed generators.
+                '_source_name': (
+                    installed_pack_label
+                    or (f"pack:{installed_pack_id}" if installed_pack_id else '')
+                    or ('repo' if (not is_installed_base) else 'installed')
+                ),
                 '_source_path': str(manifest_path),
                 '_flow_kind': plugin_type,
                 '_flow_catalog': flow_catalog,
@@ -272,6 +287,12 @@ def discover_generator_manifests(
                     gen['_installed_assigned_id'] = installed_assigned_id
                 if installed_source_id:
                     gen['_installed_source_id'] = installed_source_id
+                if installed_pack_id:
+                    gen['_installed_pack_id'] = installed_pack_id
+                if installed_pack_label:
+                    gen['_installed_pack_label'] = installed_pack_label
+                if installed_pack_origin:
+                    gen['_installed_pack_origin'] = installed_pack_origin
 
             # Runtime
             if runtime_type in {'docker-compose', 'compose'}:
