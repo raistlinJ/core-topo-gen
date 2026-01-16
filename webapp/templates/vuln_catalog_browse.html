@@ -35,13 +35,12 @@
                 <tr>
                   <th>Name</th>
                   <th style="width: 140px;">Type</th>
-                  <th style="width: 220px;">Action</th>
                 </tr>
               </thead>
               <tbody>
                 {% if rel_dir %}
                   <tr>
-                    <td colspan="3">
+                    <td colspan="2">
                       <a href="{{ url_for('vuln_catalog_packs_browse', catalog_id=catalog_id, subpath=(rel_dir.rsplit('/', 1)[0] if '/' in rel_dir else '') ) }}">..</a>
                       <span class="text-muted ms-2">Parent directory</span>
                     </td>
@@ -57,22 +56,15 @@
                         <a href="{{ url_for('vuln_catalog_packs_browse', catalog_id=catalog_id, subpath=child) }}">{{ e.name }}</a>
                       {% else %}
                         <i class="bi bi-file-earmark-text me-2 text-secondary"></i>
-                        {{ e.name }}
+                        <a href="{{ url_for('vuln_catalog_packs_file', catalog_id=catalog_id, subpath=child) }}" target="_blank" rel="noopener">{{ e.name }}</a>
                       {% endif %}
                     </td>
                     <td class="small text-muted">{{ e.kind }}</td>
-                    <td>
-                      {% if e.kind == 'dir' %}
-                        <a class="btn btn-sm btn-outline-primary" href="{{ url_for('vuln_catalog_packs_browse', catalog_id=catalog_id, subpath=child) }}">Open</a>
-                      {% else %}
-                        <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('vuln_catalog_packs_file', catalog_id=catalog_id, subpath=child) }}">Download</a>
-                      {% endif %}
-                    </td>
                   </tr>
                 {% endfor %}
 
                 {% if not entries %}
-                  <tr><td colspan="3" class="text-muted">Directory is empty.</td></tr>
+                  <tr><td colspan="2" class="text-muted">Directory is empty.</td></tr>
                 {% endif %}
               </tbody>
             </table>

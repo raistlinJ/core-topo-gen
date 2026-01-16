@@ -68,7 +68,7 @@
                       <th>Origin</th>
                       <th>Installed</th>
                       <th>Files</th>
-                      <th style="width: 220px;">Actions</th>
+                      <th style="width: 550px;">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -88,14 +88,6 @@
                       <td class="small" style="max-width: 720px; word-break: break-word;">
                         {% if c.compose_count %}
                           <div><span class="text-muted">Compose dirs:</span> <strong>{{ c.compose_count }}</strong></div>
-                        {% endif %}
-                        {% if c.content_dir %}
-                          <div><span class="text-muted">Content:</span> <code>{{ c.content_dir }}</code></div>
-                        {% endif %}
-                        {% if c.csv_paths %}
-                          {% for p in c.csv_paths %}
-                            <div><span class="text-muted">Catalog:</span> <code>{{ p }}</code></div>
-                          {% endfor %}
                         {% endif %}
                       </td>
                       <td>
@@ -196,9 +188,28 @@
           <div><strong id="vulnTestName"></strong></div>
           <div class="small text-muted" id="vulnTestId"></div>
         </div>
+
+        <div class="mt-3" id="vulnTestInputsBlock" style="display:none;">
+          <div class="small text-muted mb-1">Inputs</div>
+          <form id="vulnTestForm">
+            <input type="hidden" name="item_id" id="vulnTestItemId" />
+            <div id="vulnTestInputs"></div>
+          </form>
+          <div class="small text-muted">Fields marked with <strong>*</strong> are required.</div>
+        </div>
+
         <div class="mt-3">
           <div class="small text-muted mb-1">Progress / Log</div>
-          <pre class="small bg-light p-2" id="vulnTestLog" style="max-height: 300px; overflow: auto;"></pre>
+          <pre class="small bg-light p-2" id="vulnTestLog" style="max-height: 220px; overflow: auto;"></pre>
+        </div>
+
+        <div class="mt-3">
+          <div class="small text-muted mb-1">Result</div>
+          <div id="vulnTestStatus" class="small text-muted mb-2" style="display:none;">
+            <span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>
+            <span id="vulnTestStatusText">Working…</span>
+          </div>
+          <div id="vulnTestResult" class="small"></div>
         </div>
       </div>
       <div class="modal-footer">
@@ -322,11 +333,24 @@
     el.textContent = String(txt || '');
   }
 
+  function _isNearBottom(el, thresholdPx) {
+    const thr = (typeof thresholdPx === 'number' && isFinite(thresholdPx)) ? thresholdPx : 24;
+    try {
+      return (el.scrollTop + el.clientHeight) >= (el.scrollHeight - thr);
+    } catch (e) {
+      return true;
+    }
+  }
+
   function _appendLog(id, line) {
     const el = _qs(id);
     if (!el) return;
+    const shouldStick = _isNearBottom(el, 24);
     const cur = el.textContent || '';
     el.textContent = (cur ? (cur + '\n') : '') + String(line || '');
+    if (shouldStick) {
+      try { el.scrollTop = el.scrollHeight; } catch (e) {}
+    }
   }
 
   async function _fetchJson(url, opts) {
@@ -350,6 +374,71 @@
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: JSON.stringify(payload || {}),
     });
+  }
+
+  function _isRequiredInput(inp) {
+    if (!inp || typeof inp !== 'object') return false;
+    if (Object.prototype.hasOwnProperty.call(inp, 'required')) {
+      return inp.required !== false;
+    }
+    return true; // required by default
+  }
+
+  function _isFileInputType(t) {
+    const v = String(t || '').toLowerCase();
+    return v === 'file' || v === 'path' || v === 'artifact' || v === 'binary';
+  }
+
+  function _buildVulnTestInputRow(inp) {
+    const name = inp && inp.name ? String(inp.name) : '';
+    if (!name) return '';
+    const required = _isRequiredInput(inp);
+    const type = inp && inp.type ? String(inp.type) : 'string';
+    const desc = inp && inp.description ? String(inp.description) : '';
+    const hasDefault = !!(inp && Object.prototype.hasOwnProperty.call(inp, 'default'));
+    const defaultVal = hasDefault ? String(inp.default) : '';
+    const label = `${name}${required ? ' *' : ''}`;
+    const help = desc ? `<div class="form-text">${escapeHtml(desc)}</div>` : '';
+
+    if (_isFileInputType(type)) {
+      // Vulnerability tests currently don't accept uploads server-side, but we
+      // render this for consistency and potential future use.
+      return `
+        <div class="mb-3">
+          <label class="form-label">${escapeHtml(label)}</label>
+          <input class="form-control" type="file" name="${escapeHtml(name)}" ${required ? 'required' : ''} />
+          ${help}
+        </div>
+      `;
+    }
+
+    const inputType = String(type || '').toLowerCase() === 'number' ? 'number' : 'text';
+    const valueAttr = hasDefault && defaultVal !== '' ? ` value="${escapeHtml(defaultVal)}"` : '';
+    return `
+      <div class="mb-3">
+        <label class="form-label">${escapeHtml(label)}</label>
+        <input class="form-control" type="${escapeHtml(inputType)}" name="${escapeHtml(name)}"${valueAttr} ${required ? 'required' : ''} />
+        ${help}
+      </div>
+    `;
+  }
+
+  function _collectVulnTestInputs(item) {
+    const inputs = Array.isArray(item && item.inputs) ? item.inputs : [];
+    const out = {};
+    inputs.forEach((inp) => {
+      if (!inp || typeof inp !== 'object') return;
+      const name = String(inp.name || '').trim();
+      if (!name) return;
+      const el = document.querySelector(`#vulnTestForm [name="${CSS.escape(name)}"]`);
+      if (!el) return;
+      if (el.type === 'file') {
+        // Not currently supported by backend; skip.
+        return;
+      }
+      out[name] = el.value;
+    });
+    return out;
   }
 
   function _renderVulnCatalogTable() {
@@ -459,6 +548,33 @@
     _setText('vulnTestName', item && item.name ? item.name : '');
     _setText('vulnTestId', item && item.id ? `#${item.id}` : '');
     _setText('vulnTestLog', '');
+
+    try {
+      const itemIdEl = _qs('vulnTestItemId');
+      if (itemIdEl) itemIdEl.value = item && item.id ? String(item.id) : '';
+      const inputsBlock = _qs('vulnTestInputsBlock');
+      const inputsEl = _qs('vulnTestInputs');
+      const inputs = Array.isArray(item && item.inputs) ? item.inputs : [];
+      if (inputsBlock && inputsEl) {
+        if (inputs.length) {
+          inputsEl.innerHTML = inputs.map(_buildVulnTestInputRow).join('');
+          inputsBlock.style.display = '';
+        } else {
+          inputsEl.innerHTML = '';
+          inputsBlock.style.display = 'none';
+        }
+      }
+    } catch (e) {}
+
+    try {
+      const res = _qs('vulnTestResult');
+      if (res) res.innerHTML = '';
+      const st = _qs('vulnTestStatus');
+      if (st) st.style.display = 'none';
+      _setText('vulnTestStatusText', 'Working…');
+      const btn = _qs('vulnTestRunBtn');
+      if (btn) btn.disabled = false;
+    } catch (e) {}
     const modal = new bootstrap.Modal(_qs('vulnTestModal'));
     modal.show();
   }
@@ -466,15 +582,58 @@
   async function runVulnTest() {
     const it = _vulnCatalogState.selectedItem;
     if (!it) return;
+    const btn = _qs('vulnTestRunBtn');
+    if (btn) btn.disabled = true;
     _setText('vulnTestLog', '');
-    _appendLog('vulnTestLog', `Testing #${it.id} (${it.name})…`);
     try {
-      const data = await _postJson('/vuln_catalog_items/test', { item_id: it.id });
-      if (data && data.log) _appendLog('vulnTestLog', data.log);
-      if (data && data.ok) _appendLog('vulnTestLog', 'OK');
-      else _appendLog('vulnTestLog', 'FAILED');
+      const res = _qs('vulnTestResult');
+      if (res) res.innerHTML = '';
+      const st = _qs('vulnTestStatus');
+      if (st) st.style.display = '';
+      _setText('vulnTestStatusText', 'Running docker compose config…');
+    } catch (e) {}
+
+    _appendLog('vulnTestLog', `[ui] Testing #${it.id} (${it.name})…`);
+    try {
+      // Client-side validation for rendered inputs.
+      try {
+        const form = _qs('vulnTestForm');
+        if (form && typeof form.reportValidity === 'function') {
+          if (!form.reportValidity()) {
+            _appendLog('vulnTestLog', '[ui] Missing required inputs.');
+            return;
+          }
+        }
+      } catch (e) {}
+
+      const inputs = _collectVulnTestInputs(it);
+      const data = await _postJson('/vuln_catalog_items/test', { item_id: it.id, inputs });
+      if (data && data.log) {
+        String(data.log).split('\n').forEach(line => _appendLog('vulnTestLog', line));
+      }
+      const ok = !!(data && data.ok);
+      try {
+        const res = _qs('vulnTestResult');
+        if (res) {
+          res.innerHTML = ok
+            ? '<span class="badge text-bg-success">OK</span>'
+            : '<span class="badge text-bg-danger">FAILED</span>';
+        }
+      } catch (e) {}
+      _appendLog('vulnTestLog', ok ? '[ui] Result: OK' : '[ui] Result: FAILED');
     } catch (e) {
-      _appendLog('vulnTestLog', `Error: ${e}`);
+      _appendLog('vulnTestLog', `[ui] ERROR: ${e}`);
+      try {
+        const res = _qs('vulnTestResult');
+        if (res) res.innerHTML = `<span class="badge text-bg-danger">ERROR</span> <span class="text-danger">${escapeHtml(String(e))}</span>`;
+      } catch (e2) {}
+    } finally {
+      try {
+        const st = _qs('vulnTestStatus');
+        if (st) st.style.display = 'none';
+        _setText('vulnTestStatusText', 'Working…');
+      } catch (e) {}
+      if (btn) btn.disabled = false;
     }
   }
 

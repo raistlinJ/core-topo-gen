@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import sys
 import subprocess
 import time
 import shutil
@@ -183,6 +184,18 @@ def _rewrite_compose_relative_binds_to_injected(out_dir: Path, compose_path: Pat
 
 
 def find_generator(repo_root: Path, kind: str, generator_id: str) -> tuple[dict[str, Any], Path]:
+    # When executed as a script (python scripts/run_flag_generator.py), Python
+    # adds only the scripts/ directory to sys.path. Ensure the repo root is on
+    # sys.path so imports like `core_topo_gen.*` work without requiring an
+    # installed package.
+    try:
+        rr = Path(repo_root).resolve()
+        rr_s = str(rr)
+        if rr_s and rr_s not in sys.path:
+            sys.path.insert(0, rr_s)
+    except Exception:
+        pass
+
     # Strict: per-generator YAML manifests (repo + installed generator packs)
     try:
         from core_topo_gen.generator_manifests import discover_generator_manifests

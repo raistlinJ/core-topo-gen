@@ -1164,7 +1164,8 @@
   function buildInputRow(inp) {
     const name = inp && inp.name ? String(inp.name) : '';
     if (!name) return '';
-    const required = !!(inp && inp.required);
+    // Convention: inputs are required by default unless explicitly marked optional.
+    const required = !((inp && Object.prototype.hasOwnProperty.call(inp, 'required')) ? (inp.required === false) : false);
     const type = inp && inp.type ? String(inp.type) : 'string';
     const desc = inp && inp.description ? String(inp.description) : '';
     const hasDefault = !!(inp && Object.prototype.hasOwnProperty.call(inp, 'default'));
