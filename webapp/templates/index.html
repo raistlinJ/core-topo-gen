@@ -75,6 +75,9 @@
                         {% endif %}
                     </div>
                     <div class="btn-toolbar gap-1 align-items-center flex-nowrap">
+                        <button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" id="toggleScenarioSeedBtn" title="Show seeds" aria-label="Toggle seed visibility">
+                            <i class="bi bi-eye" aria-hidden="true"></i>
+                        </button>
                         {% if not is_builder_view %}
                         <button type="button" class="btn btn-sm btn-outline-secondary" id="importBtn" title="Import scenarios XML">Import</button>
                         <button type="button" class="btn btn-sm btn-outline-info" id="exportBtn" title="Export last saved XML">Export</button>
@@ -499,15 +502,41 @@
             if(options.force !== true){
                 return null;
             }
-            if(!window.bootstrap || !bootstrap.Toast){
-                // Best-effort fallback.
-                try { console.log(String(message || '')); } catch (e) {}
-                return null;
-            }
-            const container = document.getElementById('coretgToastContainer');
+            const container = document.getElementById('coretgToastContainer') || document.body;
             if(!container){
                 return null;
             }
+
+            // If Bootstrap's Toast JS isn't available, fall back to a lightweight DOM toast.
+            if(!window.bootstrap || !bootstrap.Toast){
+                const el = document.createElement('div');
+                el.style.position = 'fixed';
+                el.style.top = '12px';
+                el.style.right = '12px';
+                el.style.zIndex = '3000';
+                el.style.maxWidth = '520px';
+                el.style.padding = '10px 12px';
+                el.style.borderRadius = '10px';
+                el.style.background = 'rgba(33, 37, 41, 0.96)';
+                el.style.color = '#fff';
+                el.style.boxShadow = '0 10px 30px rgba(0,0,0,0.25)';
+                el.style.fontSize = '13px';
+                el.style.lineHeight = '1.35';
+                el.style.whiteSpace = 'pre-wrap';
+                el.style.pointerEvents = 'auto';
+                el.style.cursor = 'pointer';
+                const title = String(options.title || 'Notice');
+                const body = String(message || '');
+                el.innerHTML = `<div style="font-weight:600; margin-bottom:4px; opacity:0.95;">${title}</div><div>${body}</div>`;
+                el.addEventListener('click', ()=>{ try { el.remove(); } catch(e){} });
+                container.appendChild(el);
+                const delay = (options.autohide === true) ? (Number(options.delay) || 5000) : null;
+                if (delay) {
+                    setTimeout(()=>{ try { el.remove(); } catch(e){} }, delay);
+                }
+                return { hide: ()=>{ try { el.remove(); } catch(e){} } };
+            }
+
             const el = document.createElement('div');
             el.className = 'toast';
             el.setAttribute('role','alert');
@@ -1483,8 +1512,8 @@ function defaultScenario(name) {
         hitl: { enabled: false, interfaces: [] },
         density_count: 10,
         sections: {
-            // Default: one Count-based row; weight-based nodes/density start at 0
-            'Node Information': { total_nodes: 0, density: 0, items: [ { selected: 'Random', factor: 1.0, v_metric: 'Count', v_count: 5 } ] },
+            // Default: one Weight-based Random row (factor=1.000)
+            'Node Information': { total_nodes: 0, density: 0, items: [ { selected: 'Random', factor: 1.0, v_metric: 'Weight' } ] },
             'Routing': { density: 0.5, items: [] },
             'Services': { density: 0.5, items: [] },
             'Traffic': { density: 0.5, items: [] },
@@ -2846,8 +2875,6 @@ function computeHitlPreviewLinkIps(scenarioKey, ifaceName, ordinal, prefixLen = 
         const addressSpaceSize = 1 << 16; // /16 block span
         const hostBlock = sanitizedPrefix >= 32 ? 1 : (1 << Math.max(0, 32 - sanitizedPrefix));
         if (hostBlock < 8) {
-                const pwdInput = document.querySelector(`[data-hitl-core-field="ssh_password"][data-scen-idx="${sidx}"]`);
-                if (pwdInput) pwdInput.removeAttribute('placeholder');
             // Need at least 3 usable hosts (existing router, new router, RJ45)
             return null;
         }
@@ -4200,6 +4227,10 @@ if (USE_LOCAL_EDITOR_STATE) {
 
 // Base state is from server payload or default
 let state = initialPayload ?? { scenarios: [ defaultScenario('Scenario 1') ], result_path: null };
+// Expose live in-memory state to shared cross-tab helpers (Topology/Flow/Preview).
+// Note: `let state = ...` does not create `window.state`, so helpers in other templates
+// cannot see it unless we explicitly attach it.
+try { window.state = state; } catch (e) {}
 // Host interface cache: prefer a non-empty server payload; otherwise fall back to persisted cache.
 // This prevents a page refresh from wiping out interface-derived summary fields (e.g., CORE VM Bridge)
 // when the server renders an empty `host_interfaces: []`.
@@ -5005,6 +5036,16 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('scenariosExecuteBtn')?.addEventListener('click', (ev)=>{
         try {
             ev.preventDefault();
+            const btn = document.getElementById('scenariosExecuteBtn');
+            const action = (btn?.dataset?.coretgAction || '').toString().trim().toLowerCase();
+            if (action === 'continue') {
+                const scenario = (btn?.dataset?.coretgScenario || '').toString().trim();
+                // Clear the post-save continue state so returning to Topology doesn't stay "Continue" forever.
+                try { sessionStorage.removeItem('coretg_topology_continue_after_save_v1'); } catch (e) {}
+                const url = '/scenarios/flag-sequencing' + (scenario ? ('?scenario=' + encodeURIComponent(scenario)) : '');
+                window.location.href = url;
+                return;
+            }
             document.getElementById('scenariosPreviewTabLink')?.click();
         } catch(e){}
     });
@@ -5104,6 +5145,12 @@ async function computeFullPlanPreview(){
         }
         else {
             previewState.fullPreview = data.full_preview;
+            try {
+                const s = previewState.fullPreview && previewState.fullPreview.seed;
+                if (s !== undefined && s !== null && String(s).trim()) {
+                    localStorage.setItem(LAST_PREVIEW_SEED_STORAGE_KEY, String(s));
+                }
+            } catch (e) {}
             buildFullPreviewArtifacts(previewState.fullPreview);
             if (pre) pre.textContent = JSON.stringify(previewState.fullPreview, null, 2);
             renderFullPreviewStructured();
@@ -5138,6 +5185,8 @@ async function computeFullPlanPreview(){
                 });
                 saveFullPreviewHistory();
             } catch(e){}
+            try { syncSidebarSeedToggleButton(); } catch (e) {}
+            try { renderSidebar(); } catch (e) {}
         }
     } catch(e){
         if (pre) pre.textContent='Error: '+e;
@@ -6563,9 +6612,34 @@ async function autoSaveXml(){
     }
     return new Promise((resolve, reject) => {
         try {
+            const originalScenarios = state.scenarios;
+            let activeScenarioSeedForSave = null;
             const scenariosJsonInput = document.getElementById('scenarios_json');
             if(!scenariosJsonInput){ reject('Editor form missing'); return; }
-            try { scenariosJsonInput.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx }); } catch(e){ reject('Serialize failed'); return; }
+            // Concretize any 'Random' UI dropdown values at Save-time so saved XML reflects
+            // stable concrete values (seeded) for downstream consumers.
+            try {
+                state.scenarios = concretizeRandomSelectionsForSave(state.scenarios);
+                // Ensure the UI reflects the concretized values immediately (no lingering "Random").
+                try { renderMain(); } catch (_) { try { render(); } catch (__) {} }
+                try {
+                    const n = Number(window.__coretg_last_concretize_count || 0);
+                    if (n > 0) {
+                        try { showToast(`Resolved ${n} Random value${n === 1 ? '' : 's'} on save.`, { autohide: true, delay: 2200 }); } catch (_) {}
+                    }
+                } catch (_) {}
+                try {
+                    const activeScen = state.scenarios?.[activeIdx];
+                    activeScenarioSeedForSave = getDeterministicSeedForScenarioOnSave(activeScen, activeIdx);
+                } catch (e) {
+                    activeScenarioSeedForSave = null;
+                }
+                scenariosJsonInput.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
+            } catch(e){
+                state.scenarios = originalScenarios;
+                reject('Serialize failed');
+                return;
+            }
             const latestCoreConfig = getCoreConfig(true);
             const coreJsonInput = document.getElementById('core_json');
             if (coreJsonInput) {
@@ -6620,11 +6694,48 @@ async function autoSaveXml(){
                 // Persist again so the new result_path becomes the active project key
                 persistEditorState();
             };
-            const finalizeSuccess = () => {
+            const persistPreviewPlanAfterSave = async () => {
+                try {
+                    const rp = String(state?.result_path || '').trim();
+                    if (!rp || !rp.endsWith('.xml')) return;
+                    const activeScenario = state?.scenarios?.[activeIdx];
+                    const scenarioName = (activeScenario && activeScenario.name) ? String(activeScenario.name).trim() : '';
+                    if (!scenarioName) return;
+
+                    const payload = { xml_path: rp, scenario: scenarioName };
+                    if (Number.isInteger(activeScenarioSeedForSave) && activeScenarioSeedForSave > 0) {
+                        payload.seed = activeScenarioSeedForSave;
+                    }
+                    const res = await fetch('/api/plan/persist_preview_plan', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        credentials: 'same-origin',
+                        body: JSON.stringify(payload),
+                    });
+                    const data = await res.json().catch(() => null);
+                    if (!res.ok || !data || data.ok === false) {
+                        const msg = (data && (data.error || data.message)) || `HTTP ${res.status}`;
+                        throw new Error(msg);
+                    }
+                    try {
+                        if (data.seed) {
+                            localStorage.setItem(LAST_PREVIEW_SEED_STORAGE_KEY, String(data.seed));
+                        }
+                    } catch (e) {}
+                } catch (err) {
+                    const message = err instanceof Error ? err.message : String(err || 'persist preview plan failed');
+                    console.warn('persist_preview_plan after save failed', err);
+                    try { showToast(`Saved XML, but preview plan persistence failed (${message}).`, { autohide: true, delay: 6000 }); } catch (_) {}
+                }
+            };
+
+            const finalizeSuccess = async () => {
                 previewState.xmlSaved = true;
                 try { updatePlanButtons(); } catch(err) {}
                 // Keep the dock's XML Preview in sync for all save paths (auto-save + modal saves).
                 try { refreshXmlDockPreview({ force: true, preferSavedPath: true }); } catch (e) {}
+                // Persist a concrete preview plan artifact so Flag Sequencing has inputs without extra clicks.
+                try { await persistPreviewPlanAfterSave(); } catch (e) {}
                 resolve();
             };
             const legacySave = () => {
@@ -6685,7 +6796,7 @@ async function autoSaveXml(){
                     if (data.result_path) {
                         applyResultPath(data.result_path);
                     }
-                    finalizeSuccess();
+                    await finalizeSuccess();
                 });
             };
             apiSave().catch(err => {
@@ -6944,6 +7055,10 @@ if (USE_LOCAL_EDITOR_STATE && persistedState) {
     if (persistedState.core_tested_port !== undefined) state.core_tested_port = persistedState.core_tested_port;
 }
 let activeIdx = Math.min(Math.max(0, persistedActiveIdx), (state.scenarios.length||1)-1);
+try {
+    state.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
+    window.state = state;
+} catch (e) {}
 
 // Prevent stale local project snapshots from resurrecting scenarios that were
 // previously deleted (identified by stable _sid).
@@ -6952,6 +7067,10 @@ try { pruneDeletedScenariosInState(); } catch (e) {}
 
 function persistEditorState(){
     try {
+        try {
+            state.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
+            window.state = state;
+        } catch (e) {}
         const baseUploadMeta = normalizeBaseUpload(state.base_upload) || (state.scenarios?.[0]?.base?.filepath || state.scenarios?.[0]?.base?.display_name ? {
             path: state.scenarios?.[0]?.base?.filepath || '',
             display_name: state.scenarios?.[0]?.base?.display_name || (state.scenarios?.[0]?.base?.filepath ? state.scenarios[0].base.filepath.split(/[/\\]/).pop() || '' : '')
@@ -7028,6 +7147,435 @@ const dropdownsBySection = {
     'Vulnerabilities': ['Random','Specific'],
     'Segmentation': ['Random','Firewall','NAT','CUSTOM']
 };
+
+function deepCloneJsonSafe(value) {
+    try {
+        if (typeof structuredClone === 'function') {
+            return structuredClone(value);
+        }
+    } catch (e) {}
+    try {
+        return JSON.parse(JSON.stringify(value));
+    } catch (e) {
+        return value;
+    }
+}
+
+function getRandomResolutionOptionsForSection(sectionName) {
+    const options = (dropdownsBySection && dropdownsBySection[sectionName]) ? dropdownsBySection[sectionName] : [];
+    if (!Array.isArray(options)) return [];
+    return options.filter(v => v && v !== 'Random' && v !== 'Script Path');
+}
+
+function getDeterministicSeedForScenarioOnSave(scen, idx) {
+    // Prefer last Full Preview seed for active scenario.
+    try {
+        if (idx === activeIdx) {
+            const s = getLastKnownPreviewSeed();
+            if (Number.isInteger(s) && s > 0) return s;
+        }
+    } catch (e) {}
+    // Otherwise, use the same seed source as the sidebar seed display.
+    try {
+        const s = getSidebarSeedForScenario(scen, idx);
+        if (Number.isInteger(s) && s > 0) return s;
+    } catch (e) {}
+    return null;
+}
+
+function concretizeRandomSelectionsForSave(scenarios) {
+    const cloned = deepCloneJsonSafe(Array.isArray(scenarios) ? scenarios : []);
+    let resolvedCount = 0;
+    const resolvedBySection = {};
+    const exampleChanges = [];
+    const MAX_EXAMPLES = 8;
+    const warnings = [];
+    const pushExample = (obj) => {
+        try {
+            if (!obj || typeof obj !== 'object') return;
+            if (exampleChanges.length >= MAX_EXAMPLES) return;
+            exampleChanges.push(obj);
+        } catch (e) {}
+    };
+    const bumpSection = (sec) => {
+        try {
+            const k = String(sec || '').trim() || 'Unknown';
+            resolvedBySection[k] = (resolvedBySection[k] || 0) + 1;
+        } catch (e) {}
+    };
+    for (let sidx = 0; sidx < cloned.length; sidx++) {
+        const scen = cloned[sidx];
+        if (!scen || typeof scen !== 'object') continue;
+
+        const seedVal = getDeterministicSeedForScenarioOnSave(scen, sidx) || 1;
+        const scenName = (scen.name ? String(scen.name) : '').trim() || `Scenario ${sidx + 1}`;
+        const sections = (scen.sections && typeof scen.sections === 'object') ? scen.sections : {};
+
+        // These are the Topology-box cards where the UI allows Random selections.
+        const targetSections = ['Node Information', 'Routing', 'Services', 'Traffic', 'Vulnerabilities', 'Segmentation'];
+        for (const sectionName of targetSections) {
+            const sec = sections[sectionName];
+            if (!sec || typeof sec !== 'object') continue;
+            const items = Array.isArray(sec.items) ? sec.items : [];
+            if (!items.length) continue;
+
+            // Vulnerabilities: deterministically pick a specific vulnerability when possible.
+            // This replaces visible "Random" in the UI and avoids backend preview-plan failures.
+            if (sectionName === 'Vulnerabilities') {
+                const catalogItems = (window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) ? window.VULN_CATALOG.items : [];
+                // Only choose from vulnerabilities that are "Ready" (compose exists + images pulled).
+                const cache = (window.__coretg_vuln_status_by_key && typeof window.__coretg_vuln_status_by_key === 'object')
+                    ? window.__coretg_vuln_status_by_key
+                    : {};
+                const isReadyItem = (it) => {
+                    try {
+                        const key = String((it && (it.Path || it.Name)) || '');
+                        if (!key) return false;
+                        const st = cache[key] || null;
+                        if (!st) return false;
+                        if (st.docker_available === false) return false;
+                        return !!(st.exists && st.pulled);
+                    } catch (e) {
+                        return false;
+                    }
+                };
+                const eligibleReady = catalogItems.filter(isReadyItem);
+                for (let i = 0; i < items.length; i++) {
+                    const it = items[i];
+                    if (!it || typeof it !== 'object') continue;
+                    const rawSelected = (it.selected !== undefined && it.selected !== null) ? String(it.selected).trim() : '';
+                    const normalized = rawSelected.toLowerCase();
+                    const isRandomSelected = (!rawSelected || normalized === 'random' || normalized === 'category' || normalized === 'type/vector');
+                    if (!isRandomSelected) continue;
+                    if (!eligibleReady.length) {
+                        warnings.push('No Ready vulnerabilities available (download/pull at least one vuln pack item).');
+                        pushExample({ scenario: scenName, section: 'Vulnerabilities', row: i + 1, field: 'selected', from: rawSelected || 'Random', to: 'Left Random (no Ready items)' });
+                        continue;
+                    }
+
+                    const rng = makeDeterministicRng(`${seedVal}|${scenName}|${sectionName}|${i}|v_name|save-xml`);
+                    const pick = eligibleReady[Math.floor(rng() * eligibleReady.length) % eligibleReady.length];
+                    const pickedName = pick && (pick.Name || pick.name) ? String(pick.Name || pick.name) : '';
+                    if (!pickedName) continue;
+
+                    const from = rawSelected || 'Random';
+                    it.selected = 'Specific';
+                    it.v_name = pickedName;
+                    if (pick && (pick.Path || pick.path)) it.v_path = String(pick.Path || pick.path);
+                    if (pick && (pick.Description || pick.description)) it.v_desc = String(pick.Description || pick.description);
+                    if (!it.v_metric) it.v_metric = 'Count';
+                    if (it.v_metric === 'Weight') it.v_metric = 'Count';
+                    resolvedCount += 1;
+                    bumpSection('Vulnerabilities');
+                    pushExample({ scenario: scenName, section: 'Vulnerabilities', row: i + 1, field: 'selected', from, to: `Specific (${pickedName})` });
+                }
+                continue;
+            }
+
+            let options = getRandomResolutionOptionsForSection(sectionName);
+            // Avoid forcing "CUSTOM" modes during save-time concretization.
+            if (sectionName === 'Traffic') options = options.filter(v => v !== 'CUSTOM');
+            if (sectionName === 'Segmentation') options = options.filter(v => v !== 'CUSTOM');
+            if (!options.length) continue;
+
+            for (let i = 0; i < items.length; i++) {
+                const it = items[i];
+                if (!it || typeof it !== 'object') continue;
+
+                // Routing has additional edge-policy fields that can also be "Random".
+                // Resolve these on save so the UI/serialized XML no longer shows Random.
+                if (sectionName === 'Routing') {
+                    const edgeModeOptions = ['Min', 'Uniform', 'Exact', 'NonUniform'];
+                    const rawR2rMode = (it.r2r_mode !== undefined && it.r2r_mode !== null) ? String(it.r2r_mode).trim() : '';
+                    if (!rawR2rMode || rawR2rMode.toLowerCase() === 'random') {
+                        const rngMode = makeDeterministicRng(`${seedVal}|${scenName}|Routing|${i}|r2r_mode|save-xml`);
+                        const pickMode = edgeModeOptions[Math.floor(rngMode() * edgeModeOptions.length) % edgeModeOptions.length];
+                        it.r2r_mode = pickMode;
+                        // Only keep r2r_edges when Exact; otherwise clear it to reduce confusion.
+                        if (pickMode !== 'Exact') {
+                            try { delete it.r2r_edges; } catch (_) { it.r2r_edges = null; }
+                        }
+                        resolvedCount += 1;
+                        bumpSection('Routing');
+                        pushExample({ scenario: scenName, section: 'Routing', row: i + 1, field: 'r2r_mode', from: rawR2rMode || 'Random', to: pickMode });
+                    }
+                    // If r2r_mode is Exact but no degree provided, pick a small deterministic default.
+                    try {
+                        const modeNow = String(it.r2r_mode || '').trim();
+                        const isExact = modeNow === 'Exact';
+                        const rawEdges = (it.r2r_edges !== undefined && it.r2r_edges !== null) ? String(it.r2r_edges).trim() : '';
+                        const parsedEdges = parseInt(rawEdges, 10);
+                        if (isExact && (!rawEdges || !Number.isFinite(parsedEdges) || parsedEdges <= 0)) {
+                            const rngEdges = makeDeterministicRng(`${seedVal}|${scenName}|Routing|${i}|r2r_edges|save-xml`);
+                            const pickEdges = 2 + (Math.floor(rngEdges() * 3) % 3); // 2..4
+                            it.r2r_edges = pickEdges;
+                            resolvedCount += 1;
+                            bumpSection('Routing');
+                            pushExample({ scenario: scenName, section: 'Routing', row: i + 1, field: 'r2r_edges', from: rawEdges || '∅', to: String(pickEdges) });
+                        }
+                    } catch (e) {}
+
+                    const rawR2sMode = (it.r2s_mode !== undefined && it.r2s_mode !== null) ? String(it.r2s_mode).trim() : '';
+                    if (!rawR2sMode || rawR2sMode.toLowerCase() === 'random') {
+                        const rngMode = makeDeterministicRng(`${seedVal}|${scenName}|Routing|${i}|r2s_mode|save-xml`);
+                        const pickMode = edgeModeOptions[Math.floor(rngMode() * edgeModeOptions.length) % edgeModeOptions.length];
+                        it.r2s_mode = pickMode;
+                        if (pickMode !== 'Exact') {
+                            try { delete it.r2s_edges; } catch (_) { it.r2s_edges = null; }
+                        }
+                        resolvedCount += 1;
+                        bumpSection('Routing');
+                        pushExample({ scenario: scenName, section: 'Routing', row: i + 1, field: 'r2s_mode', from: rawR2sMode || 'Random', to: pickMode });
+                    }
+                    // If r2s_mode is Exact but missing target, pick a small deterministic default.
+                    try {
+                        const modeNow = String(it.r2s_mode || '').trim();
+                        const isExact = modeNow === 'Exact';
+                        const rawEdges = (it.r2s_edges !== undefined && it.r2s_edges !== null) ? String(it.r2s_edges).trim() : '';
+                        const parsedEdges = parseInt(rawEdges, 10);
+                        if (isExact && (!rawEdges || !Number.isFinite(parsedEdges) || parsedEdges <= 0)) {
+                            const rngEdges = makeDeterministicRng(`${seedVal}|${scenName}|Routing|${i}|r2s_edges|save-xml`);
+                            const pickEdges = 1 + (Math.floor(rngEdges() * 3) % 3); // 1..3
+                            it.r2s_edges = pickEdges;
+                            resolvedCount += 1;
+                            bumpSection('Routing');
+                            pushExample({ scenario: scenName, section: 'Routing', row: i + 1, field: 'r2s_edges', from: rawEdges || '∅', to: String(pickEdges) });
+                        }
+                    } catch (e) {}
+
+                    // Ensure NonUniform bounds exist and are sane.
+                    try {
+                        const modeNow = String(it.r2s_mode || '').trim();
+                        if (modeNow === 'NonUniform') {
+                            let mn = parseInt(String(it.r2s_hosts_min ?? ''), 10);
+                            let mx = parseInt(String(it.r2s_hosts_max ?? ''), 10);
+                            if (!Number.isFinite(mn) || mn <= 0) mn = 1;
+                            if (!Number.isFinite(mx) || mx <= 0) mx = 4;
+                            if (mn > mx) { const t = mn; mn = mx; mx = t; }
+                            it.r2s_hosts_min = mn;
+                            it.r2s_hosts_max = mx;
+                        }
+                    } catch (e) {}
+                }
+
+                // Primary "kind" selector lives in `selected` for these sections.
+                const rawSelected = (it.selected !== undefined && it.selected !== null) ? String(it.selected).trim() : '';
+                const isRandomSelected = !rawSelected || rawSelected.toLowerCase() === 'random';
+                if (isRandomSelected) {
+                    const rng = makeDeterministicRng(`${seedVal}|${scenName}|${sectionName}|${i}|selected|save-xml`);
+                    const pick = options[Math.floor(rng() * options.length) % options.length];
+                    const from = rawSelected || 'Random';
+                    it.selected = pick;
+                    resolvedCount += 1;
+                    bumpSection(sectionName);
+                    pushExample({ scenario: scenName, section: sectionName, row: i + 1, field: 'selected', from, to: pick });
+                }
+
+                // Traffic has an additional "Payload" dropdown stored in `content_type`.
+                if (sectionName === 'Traffic') {
+                    const rawCt = (it.content_type !== undefined && it.content_type !== null) ? String(it.content_type).trim() : '';
+                    const isRandomCt = !rawCt || rawCt.toLowerCase() === 'random';
+                    if (isRandomCt) {
+                        const ctOptions = ['text', 'photo', 'audio', 'video', 'gibberish'];
+                        const rngCt = makeDeterministicRng(`${seedVal}|${scenName}|${sectionName}|${i}|content_type|save-xml`);
+                        const pickCt = ctOptions[Math.floor(rngCt() * ctOptions.length) % ctOptions.length];
+                        const fromCt = rawCt || 'Random';
+                        it.content_type = pickCt;
+                        resolvedCount += 1;
+                        bumpSection('Traffic');
+                        pushExample({ scenario: scenName, section: 'Traffic', row: i + 1, field: 'content_type', from: fromCt, to: pickCt });
+                    }
+
+                    // Traffic Pattern supports a visible Random option; if selected, freeze it on save.
+                    try {
+                        const ctNow = (it.content_type !== undefined && it.content_type !== null) ? String(it.content_type).trim() : '';
+                        const rawPattern = (it.pattern !== undefined && it.pattern !== null) ? String(it.pattern).trim() : '';
+                        const isRandomPattern = !rawPattern || rawPattern.toLowerCase() === 'random';
+                        // Only resolve pattern when traffic is actually enabled (payload is not Random).
+                        if (ctNow && ctNow.toLowerCase() !== 'random' && isRandomPattern) {
+                            const patOptions = ['continuous', 'periodic', 'burst', 'poisson', 'ramp'];
+                            const rngPat = makeDeterministicRng(`${seedVal}|${scenName}|${sectionName}|${i}|pattern|save-xml`);
+                            const pickPat = patOptions[Math.floor(rngPat() * patOptions.length) % patOptions.length];
+                            it.pattern = pickPat;
+                            resolvedCount += 1;
+                            bumpSection('Traffic');
+                            pushExample({ scenario: scenName, section: 'Traffic', row: i + 1, field: 'pattern', from: rawPattern || 'Random', to: pickPat });
+                        }
+                    } catch (e) {}
+                }
+            }
+        }
+
+        // Node Information safeguard: ensure at least one node is created.
+        // If the scenario has no base hosts (density_count <= 0) and no Count rows, add 10 PCs.
+        try {
+            const ni = sections['Node Information'];
+            const niItems = Array.isArray(ni?.items) ? ni.items : [];
+            let densityCount = 0;
+            try {
+                const raw = scen.density_count;
+                const parsed = parseInt(String(raw ?? ''), 10);
+                if (Number.isFinite(parsed)) densityCount = parsed;
+            } catch (e) { densityCount = 0; }
+
+            const countRows = niItems.filter(it => it && typeof it === 'object' && String(it.v_metric || '').toLowerCase() === 'count');
+            const countSum = countRows.reduce((acc, it) => {
+                const n = parseInt(String(it.v_count ?? ''), 10);
+                return acc + (Number.isFinite(n) ? Math.max(0, n) : 0);
+            }, 0);
+
+            const weightRows = niItems.filter(it => it && typeof it === 'object' && String(it.v_metric || 'Weight').toLowerCase() !== 'count');
+            const hasUsableWeight = weightRows.some(it => {
+                const f = parseFloat(String(it.factor ?? ''));
+                return !Number.isNaN(f) ? f > 0 : true; // missing/NaN -> treat as present
+            });
+            const plannedFromWeight = (densityCount > 0 && hasUsableWeight) ? densityCount : 0;
+            const plannedTotal = countSum + plannedFromWeight;
+
+            if (plannedTotal <= 0) {
+                if (ni && typeof ni === 'object') {
+                    if (!Array.isArray(ni.items)) ni.items = [];
+                    ni.items.push({ selected: 'PC', v_metric: 'Count', v_count: 10, factor: 1.0 });
+                } else {
+                    sections['Node Information'] = { items: [ { selected: 'PC', v_metric: 'Count', v_count: 10, factor: 1.0 } ] };
+                }
+                resolvedCount += 1;
+                bumpSection('Node Information');
+                pushExample({ scenario: scenName, section: 'Node Information', row: (niItems.length || 0) + 1, field: 'fallback', from: '0 nodes', to: 'Added 10 PC (Count)' });
+            }
+        } catch (e) {}
+    }
+    try {
+        window.__coretg_last_concretize_count = resolvedCount;
+        window.__coretg_last_concretize_summary = {
+            total: resolvedCount,
+            by_section: resolvedBySection,
+            examples: exampleChanges,
+            warnings,
+        };
+    } catch (e) {}
+    return cloned;
+}
+
+async function ensureVulnReadyStatusCache(items) {
+    // Populates window.__coretg_vuln_status_by_key so save-time concretization can
+    // choose only from "Ready" vulnerabilities.
+    try {
+        const list = Array.isArray(items) ? items : [];
+        if (!list.length) return;
+
+        const progressHook = (typeof window.__coretg_progress_hook === 'function') ? window.__coretg_progress_hook : null;
+        try {
+            if (progressHook) {
+                progressHook({
+                    percent: 20,
+                    message: `Checking vulnerability readiness… (0/${list.length})`,
+                });
+            }
+        } catch (e) {}
+
+        if (!window.__coretg_vuln_status_by_key || typeof window.__coretg_vuln_status_by_key !== 'object') {
+            window.__coretg_vuln_status_by_key = {};
+        }
+        const cache = window.__coretg_vuln_status_by_key;
+        const chunkSize = 25;
+        for (let i = 0; i < list.length; i += chunkSize) {
+            const chunk = list.slice(i, i + chunkSize);
+            const payload = { items: chunk.map(it => ({
+                Name: it?.Name,
+                Path: it?.Path,
+                compose: it?.compose || 'docker-compose.yml',
+            })) };
+            let resp = null;
+            try {
+                const res = await fetch('/vuln_compose/status_images', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify(payload),
+                });
+                resp = res.ok ? await res.json().catch(() => null) : null;
+            } catch (e) {
+                resp = null;
+            }
+            const got = resp && Array.isArray(resp.items) ? resp.items : [];
+            got.forEach(st => {
+                try {
+                    const k = String((st && (st.Path || st.Name)) || '');
+                    if (k) cache[k] = st;
+                } catch (e) {}
+            });
+
+            try {
+                if (progressHook) {
+                    const done = Math.min(i + chunk.length, list.length);
+                    const pct = 20 + Math.round((done / Math.max(1, list.length)) * 60);
+                    progressHook({
+                        percent: pct,
+                        message: `Checking vulnerability readiness… (${done}/${list.length})`,
+                    });
+                }
+            } catch (e) {}
+        }
+
+        try {
+            if (progressHook) {
+                progressHook({
+                    percent: 80,
+                    message: 'Vulnerability readiness check complete.',
+                });
+            }
+        } catch (e) {}
+    } catch (e) {}
+}
+
+async function concretizeRandomSelectionsForSaveAsync(scenarios) {
+    try {
+        const list = Array.isArray(scenarios) ? scenarios : [];
+        // Only do the potentially-expensive ready-status check if we have Vulnerability Random rows.
+        let needsVuln = false;
+        try {
+            for (const sc of list) {
+                const items = sc?.sections?.['Vulnerabilities']?.items;
+                if (!Array.isArray(items)) continue;
+                if (items.some(it => {
+                    const sel = (it && it.selected !== undefined && it.selected !== null) ? String(it.selected).trim().toLowerCase() : '';
+                    return (!sel || sel === 'random' || sel === 'category' || sel === 'type/vector');
+                })) {
+                    needsVuln = true;
+                    break;
+                }
+            }
+        } catch (e) { needsVuln = false; }
+
+        if (needsVuln) {
+            const catalogItems = (window.VULN_CATALOG && Array.isArray(window.VULN_CATALOG.items)) ? window.VULN_CATALOG.items : [];
+            await ensureVulnReadyStatusCache(catalogItems);
+        }
+    } catch (e) {}
+    return concretizeRandomSelectionsForSave(scenarios);
+}
+
+function formatConcretizeSummaryToast(summary) {
+    try {
+        const s = (summary && typeof summary === 'object') ? summary : null;
+        const total = s ? Number(s.total || 0) : 0;
+        const warns = (s && Array.isArray(s.warnings)) ? s.warnings : [];
+        if ((!Number.isFinite(total) || total <= 0) && !warns.length) return '';
+        const by = (s.by_section && typeof s.by_section === 'object') ? s.by_section : {};
+        const parts = Object.keys(by).sort().map(k => `${k}:${by[k]}`);
+        const head = (Number.isFinite(total) && total > 0)
+            ? `Resolved ${total} Random value${total === 1 ? '' : 's'} on save`
+            : 'No Random values resolved on save';
+        const details = parts.length ? ` (${parts.join(', ')})` : '';
+        const ex = Array.isArray(s.examples) ? s.examples : [];
+        const exText = ex.length ? `\n${ex.slice(0, 6).map(x => `• ${x.section} row ${x.row}: ${x.field} → ${x.to}`).join('\n')}` : '';
+        const warnText = warns.length ? `\n${warns.slice(0, 3).map(w => `• ${w}`).join('\n')}` : '';
+        return `${head}${details}${warnText}${exText}`;
+    } catch (e) {
+        return '';
+    }
+}
 
 const proxInventoryFetchInFlight = new Set();
 // Feature flag: disable automatic CORE VM interface refresh; require explicit user action
@@ -10193,8 +10741,168 @@ function updateBulkButtonsState() {
     else { delBtn.setAttribute('disabled','disabled'); delBtn.title = 'No scenarios selected'; }
 }
 
+const SIDEBAR_SEED_VISIBILITY_STORAGE_KEY = 'coretg_sidebar_show_seed';
+const LAST_PREVIEW_SEED_STORAGE_KEY = 'coretg_last_preview_seed';
+
+let sidebarSeedHints = {};
+let sidebarSeedHintsXmlPath = '';
+let sidebarSeedHintsInFlight = false;
+let sidebarSeedHintsDebounce = null;
+
+function getSidebarShowSeed() {
+    try {
+        return (localStorage.getItem(SIDEBAR_SEED_VISIBILITY_STORAGE_KEY) || '') === '1';
+    } catch (e) {
+        return false;
+    }
+}
+
+function setSidebarShowSeed(value) {
+    try {
+        localStorage.setItem(SIDEBAR_SEED_VISIBILITY_STORAGE_KEY, value ? '1' : '0');
+    } catch (e) {}
+}
+
+function getLastKnownPreviewSeed() {
+    try {
+        if (previewState && previewState.fullPreview && previewState.fullPreview.seed) {
+            const s = parseInt(previewState.fullPreview.seed, 10);
+            if (!isNaN(s) && s > 0) return s;
+        }
+    } catch (e) {}
+    try {
+        const raw = localStorage.getItem(LAST_PREVIEW_SEED_STORAGE_KEY) || '';
+        const s = parseInt(raw, 10);
+        if (!isNaN(s) && s > 0) return s;
+    } catch (e) {}
+    try {
+        if (previewState && Array.isArray(previewState.fullPreviewHistory) && previewState.fullPreviewHistory.length) {
+            const last = previewState.fullPreviewHistory[previewState.fullPreviewHistory.length - 1];
+            const s = parseInt(last?.seed, 10);
+            if (!isNaN(s) && s > 0) return s;
+        }
+    } catch (e) {}
+    return null;
+}
+
+function getScenarioSeedHintKey(scen) {
+    try {
+        const name = (scen && typeof scen === 'object' && scen.name) ? String(scen.name).trim() : '';
+        if (name) return name.toLowerCase();
+    } catch (e) {}
+    return null;
+}
+
+function getSidebarSeedForScenario(scen, idx) {
+    // Prefer the active scenario's Full Preview seed if present.
+    try {
+        if (idx === activeIdx && previewState && previewState.fullPreview && previewState.fullPreview.seed) {
+            const s = parseInt(previewState.fullPreview.seed, 10);
+            if (!isNaN(s) && s > 0) return s;
+        }
+    } catch (e) {}
+
+    // Otherwise use server-derived per-scenario hint if we have it.
+    try {
+        const key = getScenarioSeedHintKey(scen);
+        if (key && sidebarSeedHints && Object.prototype.hasOwnProperty.call(sidebarSeedHints, key)) {
+            const s = parseInt(sidebarSeedHints[key], 10);
+            if (!isNaN(s) && s > 0) return s;
+        }
+    } catch (e) {}
+
+    // Fallback: stable local derivation based on scenario name.
+    try {
+        const name = (scen && typeof scen === 'object' && scen.name) ? String(scen.name).trim() : '';
+        if (name) {
+            const rng = makeDeterministicRng(name);
+            return Math.max(1, Math.floor(rng() * 2147483647));
+        }
+    } catch (e) {}
+    return null;
+}
+
+function scheduleSidebarSeedHintsFetch() {
+    try {
+        if (!getSidebarShowSeed()) return;
+        const rp = String(state?.result_path || '').trim();
+        if (!rp || !rp.endsWith('.xml')) return;
+        if (sidebarSeedHintsXmlPath !== rp) {
+            sidebarSeedHintsXmlPath = rp;
+            sidebarSeedHints = {};
+        }
+        if (sidebarSeedHintsInFlight) return;
+        if (sidebarSeedHintsDebounce) {
+            clearTimeout(sidebarSeedHintsDebounce);
+        }
+        sidebarSeedHintsDebounce = setTimeout(async () => {
+            sidebarSeedHintsDebounce = null;
+            try {
+                const names = (state.scenarios || [])
+                    .map(s => (s && typeof s === 'object' && s.name) ? String(s.name).trim() : '')
+                    .filter(Boolean);
+                if (!names.length) return;
+                sidebarSeedHintsInFlight = true;
+                const res = await fetch('/api/seed_hints', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({ xml_path: rp, scenarios: names }),
+                });
+                const data = await res.json().catch(() => null);
+                if (!res.ok || !data || !data.ok) {
+                    return;
+                }
+                if (data.xml_path && String(data.xml_path).trim() && String(data.xml_path).trim() !== sidebarSeedHintsXmlPath) {
+                    // Stale response.
+                    return;
+                }
+                if (data.seeds && typeof data.seeds === 'object') {
+                    sidebarSeedHints = { ...sidebarSeedHints, ...data.seeds };
+                }
+                renderSidebar();
+            } catch (e) {
+                // ignore
+            } finally {
+                sidebarSeedHintsInFlight = false;
+            }
+        }, 150);
+    } catch (e) {}
+}
+
+function syncSidebarSeedToggleButton() {
+    const btn = document.getElementById('toggleScenarioSeedBtn');
+    if (!btn) return;
+    const show = getSidebarShowSeed();
+    const icon = btn.querySelector('i');
+    if (icon) {
+        icon.classList.remove('bi-eye', 'bi-eye-slash');
+        icon.classList.add(show ? 'bi-eye-slash' : 'bi-eye');
+    }
+    btn.title = show ? 'Hide seeds' : 'Show seeds';
+}
+
+function bindSidebarSeedToggle() {
+    const btn = document.getElementById('toggleScenarioSeedBtn');
+    if (!btn || btn.dataset.boundSeedToggle === '1') return;
+    btn.addEventListener('click', (ev) => {
+        try { ev.preventDefault(); } catch (e) {}
+        const next = !getSidebarShowSeed();
+        setSidebarShowSeed(next);
+        syncSidebarSeedToggleButton();
+        if (next) {
+            try { scheduleSidebarSeedHintsFetch(); } catch (e) {}
+        }
+        renderSidebar();
+    });
+    btn.dataset.boundSeedToggle = '1';
+    syncSidebarSeedToggleButton();
+}
+
 function renderSidebar() {
     ensureScenarioIds();
+    bindSidebarSeedToggle();
+    try { scheduleSidebarSeedHintsFetch(); } catch (e) {}
     const list = document.getElementById('scenarioList');
     list.innerHTML = '';
     const escapeHtml = (value) => (value ?? '').toString()
@@ -10213,9 +10921,17 @@ function renderSidebar() {
         const name = scen.name || `Scenario ${idx+1}`;
         const safeName = escapeHtml(name);
         const checkboxHtml = IS_BUILDER_VIEW ? '' : `<input type="checkbox" class="form-check-input me-2 scenario-select" data-sid="${sid}" ${isChecked? 'checked':''} onclick="event.stopPropagation(); toggleScenarioSelection('${sid}', this.checked);" />`;
+        const showSeed = getSidebarShowSeed();
+        const seedVal = showSeed ? getSidebarSeedForScenario(scen, idx) : null;
+        const seedText = showSeed ? `seed=${(seedVal !== null ? seedVal : '…')}` : '';
+        const seedTitle = (showSeed && idx === activeIdx && previewState && previewState.fullPreview && previewState.fullPreview.seed)
+            ? 'Full Preview seed'
+            : 'Derived seed (stable)';
+        const seedSpan = showSeed ? `<span class="badge text-bg-light border ms-2" title="${escapeHtml(seedTitle)}">${escapeHtml(seedText)}</span>` : '';
         a.innerHTML = `<div class="d-flex align-items-center">
             ${checkboxHtml}
             <span class="flex-grow-1 text-truncate" title="${safeName}">${safeName}</span>
+            ${seedSpan}
         </div>`;
         a.onclick = (e) => {
             e.preventDefault();
@@ -12252,48 +12968,25 @@ function renderMain() {
         });
     })();
 
-    // --- Host density normalization for Node Information ---
+    // --- Node Information sanitization ---
+    // Previous UI behavior forced a non-removable Random "residual" row.
+    // New behavior: all rows are user-editable; we only clamp invalid factors.
     try {
         const ni = scen.sections && scen.sections['Node Information'];
         if (ni) {
             ni.items = ni.items || [];
-            // Ensure at least one weight row (Random) exists for fallback if all removed
-            let randomRow = ni.items.find(it => !(it.v_metric==='Count') && (it.selected||'').toLowerCase()==='random');
-            if (!randomRow) {
-                // Add with temporary factor 0 (will be set if needed)
-                ni.items.unshift({ selected:'Random', factor: 0.0 });
-                randomRow = ni.items[0];
-            }
-            // Mark the first Random weight row as protected residual; unmark any other Random weight rows
-            randomRow._protected_random = true;
             ni.items.forEach(it => {
-                if (it !== randomRow && (it.v_metric !== 'Count') && ((it.selected||'').toLowerCase()==='random')) {
-                    if (it._protected_random) delete it._protected_random;
+                if (!it || typeof it !== 'object') return;
+                if (it._protected_random) { try { delete it._protected_random; } catch (_) {} }
+                const metric = (it.v_metric || 'Weight');
+                if (metric !== 'Count') {
+                    let f = parseFloat(it.factor);
+                    if (isNaN(f) || f < 0) f = 0;
+                    it.factor = f;
                 }
             });
-            const weightRows = ni.items.filter(it => !(it.v_metric==='Count'));
-            weightRows.forEach(it => { let f = parseFloat(it.factor); if (isNaN(f) || f < 0) f = 0; it.factor = f; });
-            // Sum excluding Random for decision
-            const nonRandom = weightRows.filter(it => (it.selected||'').toLowerCase()!=='random');
-            let nonRandomSum = nonRandom.reduce((a,b)=> a + (parseFloat(b.factor)||0), 0);
-            if (nonRandom.length === 0) {
-                // Only Random exists; set to 1.0
-                randomRow.factor = 1.0; nonRandomSum = 0;
-            } else {
-                if (nonRandomSum >= 1.0) {
-                    randomRow.factor = 0.0; // others define full density
-                } else {
-                    randomRow.factor = 1.0 - nonRandomSum;
-                }
-            }
-            // Final normalization (should already sum to 1.0)
-            const finalSum = weightRows.reduce((a,b)=> a + (parseFloat(b.factor)||0), 0);
-            if (Math.abs(finalSum - 1.0) > 1e-6 && finalSum > 0) {
-                // scale all
-                weightRows.forEach(it => { it.factor = (parseFloat(it.factor)||0)/finalSum; });
-            }
         }
-    } catch(e) { console.warn('Normalization error', e); }
+    } catch(e) { console.warn('Node Information sanitize error', e); }
     // No auto-insertion of Count rows for Node Information; totals should only include user-added Count rows
     // Scenario header with Count for Density (base host pool) restored
     const niSec = scen.sections['Node Information'] || { items: [] };
@@ -13081,7 +13774,7 @@ function renderItemRow(sidx, secName, iidx, it) {
                     <div class="traffic-config" style="display:${((it.content_type||'Random')==='Random')?'none':'block'};">
                         <label class="form-label mb-0">Pattern</label>
                         <select class="form-select form-select-sm" data-field="pattern" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">
-                            ${['continuous','periodic','burst','poisson','ramp'].map(p => `<option ${((it.pattern||'')===p)?'selected':''}>${p}</option>`).join('')}
+                            ${['Random','continuous','periodic','burst','poisson','ramp'].map(p => `<option ${((it.pattern||'Random')===p)?'selected':''}>${p}</option>`).join('')}
                         </select>
                     </div>
                     <div class="traffic-config" style="display:${((it.content_type||'Random')==='Random')?'none':'block'};">
@@ -13126,9 +13819,7 @@ function renderItemRow(sidx, secName, iidx, it) {
     })();
     // Build first cell content, optionally augmenting Selected with Vulnerabilities controls
     const firstCell = (() => {
-        const isProtectedRandom = (secName === 'Node Information') && ((it.selected||'').toLowerCase()==='random') && it._protected_random;
-        const disabledAttr = isProtectedRandom ? 'disabled title="Residual Random row is auto-managed"' : '';
-        const selectedCtl = `<select class="form-select form-select-sm" ${disabledAttr} data-field="selected" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${opts}</select>`;
+        const selectedCtl = `<select class="form-select form-select-sm" data-field="selected" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">${opts}</select>`;
         if (secName !== 'Vulnerabilities') return selectedCtl;
         const modeRaw = it.selected || 'Random';
         const mode = (modeRaw === 'Category' || modeRaw === 'Type/Vector') ? 'Random' : modeRaw;
@@ -13176,15 +13867,9 @@ function renderItemRow(sidx, secName, iidx, it) {
             const count = (parseInt(it.v_count, 10) || NODE_COUNT_MIN);
             return `<div class="d-flex gap-2">${metricSel}<input type="number" min="${NODE_COUNT_MIN}" max="${NODE_COUNT_MAX}" step="1" class="form-control form-control-sm" style="min-width: 120px" value="${count}" data-field="v_count" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></div>`;
         }
-    const isProtectedRandom = (secName === 'Node Information') && ((it.selected||'').toLowerCase()==='random') && it._protected_random;
-    const metricDisabled = isProtectedRandom ? 'disabled title="Residual Random row metric locked"' : '';
-    const metricSelProtected = `<select class="form-select form-select-sm" ${metricDisabled} style="min-width: 140px" data-field="v_metric" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"><option ${metric==='Weight'?'selected':''}>Weight</option><option ${metric==='Count'?'selected':''}>Count</option></select>`;
-    const ro = isProtectedRandom ? 'readonly class="form-control form-control-sm weight-input bg-light" title="Auto-adjusted to keep sum=1.0"' : 'class="form-control form-control-sm weight-input"';
-    return `<div class="d-flex gap-2">${metricSelProtected}<input type="number" step="0.01" min="0" max="1" ${ro} style="min-width: 120px" value="${weight}" data-field="factor" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></div>`;
+    return `<div class="d-flex gap-2">${metricSel}<input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm weight-input" style="min-width: 120px" value="${weight}" data-field="factor" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}"></div>`;
     })();
-    const removeBtnHtml = ((secName === 'Node Information') && ((it.selected||'').toLowerCase()==='random') && it._protected_random)
-        ? '<span class="text-muted small" title="Residual Random row">&mdash;</span>'
-        : `<button type="button" class="btn btn-sm btn-outline-danger" data-action="remove-item" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">Remove</button>`;
+    const removeBtnHtml = `<button type="button" class="btn btn-sm btn-outline-danger" data-action="remove-item" data-scen-idx="${sidx}" data-sec="${secName}" data-item-idx="${iidx}">Remove</button>`;
     return `
         <tr>
             <td>${firstCell}</td>
@@ -13390,9 +14075,9 @@ function wireHandlers() {
                                             const curItem = state.scenarios?.[sidx]?.sections?.[sec]?.items?.[rowIdx];
                                             if (curItem && curItem.selected === 'Specific') {
                                                 curItem.selected = 'Random';
-                                                renderMain();
-                                                persistEditorState();
                                             }
+                                            renderMain();
+                                            persistEditorState();
                                         } catch (_) {}
                                     }
                                 }, 0);
@@ -13402,7 +14087,6 @@ function wireHandlers() {
                             if (item.v_metric === 'Count' && (item.v_count === undefined || item.v_count === null || isNaN(parseInt(item.v_count, 10)))) {
                                 item.v_count = 5;
                             }
-                            redistributeEven(sidx, sec);
                             if (sec === 'Node Information') {
                                 const secRef = state.scenarios[sidx].sections[sec];
                                 const hasWeight = (secRef.items || []).some(it => (it.v_metric || 'Weight') === 'Weight');
@@ -13560,16 +14244,17 @@ function wireHandlers() {
             }
             const item = { selected: defaultSelected, factor: 1.0 };
             if (sec === 'Events') item.script_path = '';
-            if (sec === 'Traffic') { item.pattern = 'continuous'; item.rate_kbps = 64.0; item.period_s = 1.0; item.jitter_pct = 10.0; item.content_type = 'Random'; }
+            if (sec === 'Traffic') { item.pattern = 'Random'; item.rate_kbps = 64.0; item.period_s = 1.0; item.jitter_pct = 10.0; item.content_type = 'Random'; }
             if (sec === 'Vulnerabilities') { item.selected = 'Random'; }
-            // Default new rows: Node Information -> Count; others -> Weight.
+            // Default new rows: Node Information -> Count; Vulnerabilities -> Count (1); others -> Weight.
             if (sec === 'Node Information') { item.v_metric = 'Count'; item.v_count = 5; }
+            else if (sec === 'Vulnerabilities') { item.v_metric = 'Count'; item.v_count = 1; }
             else { item.v_metric = 'Weight'; }
             state.scenarios[sidx].sections[sec].items.push(item);
                         logInfo(`Added item to ${sec}`);
               redistributeEven(sidx, sec);
-            if (sec === 'Node Information') {
-                const newIdx = state.scenarios[sidx].sections[sec].items.length - 1;
+            const newIdx = state.scenarios[sidx].sections[sec].items.length - 1;
+            if (item.v_metric === 'Count') {
                 enforceSectionCountBoundsForScenario(sidx, sec, newIdx);
             }
                             renderMain();
@@ -15460,13 +16145,21 @@ function isActiveScenarioCoreVmVerifiedForProject() {
 function refreshScenariosExecuteButtonState() {
     const btn = document.getElementById('scenariosExecuteBtn');
     if (!btn) return;
+
+    // The shared fixed-bottom button is "Preview" on the Topology/Connection Setup pages.
+    // Only require verification when the button is actually "Execute".
+    const label = (btn.textContent || '').toString().trim().toLowerCase();
+    const isExecute = label === 'execute';
+    if (!isExecute) {
+        btn.disabled = false;
+        btn.removeAttribute('title');
+        return;
+    }
+
     const verified = isActiveScenarioCoreVmVerifiedForProject();
     btn.disabled = !verified;
-    if (!verified) {
-        btn.setAttribute('title', 'Verify a CORE VM in VM / Access to enable Execute.');
-    } else {
-        btn.removeAttribute('title');
-    }
+    if (!verified) btn.setAttribute('title', 'Verify a CORE VM in VM / Access to enable Execute.');
+    else btn.removeAttribute('title');
 }
 
 async function handleExecuteCoreTestClick() {
@@ -18102,6 +18795,26 @@ async function runAsync() {
 // Save XML via JSON API without navigation
 async function saveXmlAjax(){
     try {
+        // Concretize any 'Random' dropdown selections at Save-time.
+        try {
+            state.scenarios = concretizeRandomSelectionsForSave(state.scenarios);
+            // Ensure the UI reflects the concretized values immediately (no lingering "Random").
+            try { renderMain(); } catch (_) { try { render(); } catch (__) {} }
+            try {
+                const n = Number(window.__coretg_last_concretize_count || 0);
+                if (n > 0) {
+                    try { showToast(`Resolved ${n} Random value${n === 1 ? '' : 's'} on save.`, { autohide: true, delay: 2200 }); } catch (_) {}
+                }
+            } catch (_) {}
+        } catch (e) {}
+        let activeScenarioSeedForSave = null;
+        try {
+            const activeScenario = state?.scenarios?.[activeIdx];
+            activeScenarioSeedForSave = getDeterministicSeedForScenarioOnSave(activeScenario, activeIdx);
+        } catch (e) {
+            activeScenarioSeedForSave = null;
+        }
+
         const payload = { scenarios: state.scenarios, core: getCoreConfig(true), active_index: activeIdx };
         if (state.base_upload) {
             payload.base_upload = state.base_upload;
@@ -18132,6 +18845,44 @@ async function saveXmlAjax(){
             try {
                 await refreshXmlDockPreview({ force: true, preferSavedPath: true });
             } catch(e){}
+
+            // Persist a concrete preview plan artifact so Flag Sequencing has inputs.
+            try {
+                const rp = String(state?.result_path || '').trim();
+                const activeScenario = state?.scenarios?.[activeIdx];
+                const scenarioName = (activeScenario && activeScenario.name) ? String(activeScenario.name).trim() : '';
+                if (rp && rp.endsWith('.xml') && scenarioName) {
+                    const planPayload = { xml_path: rp, scenario: scenarioName };
+                    if (Number.isInteger(activeScenarioSeedForSave) && activeScenarioSeedForSave > 0) {
+                        planPayload.seed = activeScenarioSeedForSave;
+                    }
+                    const pres = await fetch('/api/plan/persist_preview_plan', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        credentials: 'same-origin',
+                        body: JSON.stringify(planPayload),
+                    });
+                    const pdata = await pres.json().catch(() => null);
+                    if (!pres.ok || !pdata || pdata.ok === false) {
+                        const detail = (pdata && (pdata.error || pdata.message)) || `HTTP ${pres.status}`;
+                        try { showToast(`Saved XML, but preview plan persistence failed (${detail}).`, { autohide: true, delay: 6000 }); } catch (_) {}
+                    } else {
+                        try {
+                            if (pdata.seed) {
+                                localStorage.setItem(LAST_PREVIEW_SEED_STORAGE_KEY, String(pdata.seed));
+                            }
+                        } catch (e) {}
+                    }
+                }
+            } catch (e) {
+                // Non-fatal.
+            }
+
+            // Mark XML saved for planning-related UI.
+            try {
+                previewState.xmlSaved = true;
+                updatePlanButtons();
+            } catch (e) {}
             return true;
         }
         logWarn('Save did not return a valid path');

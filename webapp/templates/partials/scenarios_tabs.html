@@ -54,6 +54,23 @@
   </div>
 </div>
 
+<!-- Progress overlay for long-running Save XML work (e.g., checking vuln readiness) -->
+<div id="coretgProgressOverlay" style="display:none; position:fixed; inset:0; z-index: 4000; background: rgba(0,0,0,0.35); align-items:center; justify-content:center;">
+  <div style="width: min(560px, calc(100vw - 24px)); background:#fff; border-radius:14px; padding:16px 16px 14px 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.25);">
+    <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px;">
+      <div style="min-width: 0;">
+        <div id="coretgProgressTitle" style="font-weight:600; font-size:14px;">Working…</div>
+        <div id="coretgProgressMessage" style="margin-top:4px; font-size:13px; color: rgba(0,0,0,0.72); white-space: pre-wrap; overflow-wrap: anywhere;">Starting…</div>
+      </div>
+      <div id="coretgProgressPercent" style="white-space:nowrap; font-variant-numeric: tabular-nums; font-weight:600; color: rgba(0,0,0,0.72);">0%</div>
+    </div>
+    <div style="margin-top:12px; height:10px; background: rgba(0,0,0,0.10); border-radius: 999px; overflow:hidden;">
+      <div id="coretgProgressBar" style="height: 100%; width: 0%; background: #0d6efd; border-radius: 999px;"></div>
+    </div>
+    <div style="margin-top:10px; font-size:12px; color: rgba(0,0,0,0.55);">This may take a moment while checking Docker images.</div>
+  </div>
+</div>
+
 <script>
 (function(){
   const PROJECT_STATE_STORAGE_KEY = 'coretg_project_state_map_v1';
@@ -63,6 +80,117 @@
   const SEED_BY_SCENARIO_STORAGE_KEY = 'coretg_seed_by_scenario_v1';
   const PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY = 'coretg_preview_plan_by_scenario_v1';
   const FLOW_DIRTY_BY_SCENARIO_STORAGE_KEY = 'coretg_flow_dirty_by_scenario_v1';
+  const TOPOLOGY_CONTINUE_STORAGE_KEY = 'coretg_topology_continue_after_save_v1';
+
+  function getActiveTabName(){
+    try {
+      const v = (window.CORETG_SCENARIOS_ACTIVE_TAB ?? window.SCENARIOS_ACTIVE_TAB ?? '').toString();
+      if (v) return v;
+    } catch (e) {}
+    // Fall back to URL heuristics.
+    try {
+      const p = (window.location && window.location.pathname) ? String(window.location.pathname) : '';
+      if (p.includes('/scenarios/flag-sequencing')) return 'flag-sequencing';
+      if (p.includes('/scenarios/preview')) return 'preview';
+      return 'topology';
+    } catch (e) {}
+    return 'topology';
+  }
+
+  function setFixedPreviewButtonMode(mode, scenarioName){
+    try {
+      const btn = document.getElementById('scenariosExecuteBtn');
+      if (!btn) return;
+      const m = (mode || '').toString().trim().toLowerCase();
+      if (m === 'continue') {
+        btn.textContent = 'Continue';
+        btn.dataset.coretgAction = 'continue';
+        btn.dataset.coretgScenario = (scenarioName || '').toString();
+        btn.disabled = false;
+        btn.setAttribute('title', 'Continue to Flag Sequencing');
+        return;
+      }
+      // default: return to normal label
+      btn.dataset.coretgAction = '';
+      btn.dataset.coretgScenario = '';
+      btn.removeAttribute('data-coretg-action');
+      btn.removeAttribute('data-coretg-scenario');
+      btn.removeAttribute('title');
+      // Let other logic decide enablement; only fix the label here.
+      const activeTab = getActiveTabName();
+      btn.textContent = (activeTab === 'preview') ? 'Execute' : 'Preview';
+    } catch (e) {}
+  }
+
+  function rememberContinueAfterSave(scenarioName){
+    try {
+      const payload = {
+        scenario: (scenarioName || '').toString().trim(),
+        updated_at: Date.now(),
+      };
+      sessionStorage.setItem(TOPOLOGY_CONTINUE_STORAGE_KEY, JSON.stringify(payload));
+    } catch (e) {}
+  }
+
+  function clearContinueAfterSave(){
+    try { sessionStorage.removeItem(TOPOLOGY_CONTINUE_STORAGE_KEY); } catch (e) {}
+  }
+
+  function restoreContinueAfterSaveIfAny(){
+    try {
+      const activeTab = getActiveTabName();
+      if (activeTab !== 'topology') {
+        clearContinueAfterSave();
+        return;
+      }
+      const raw = sessionStorage.getItem(TOPOLOGY_CONTINUE_STORAGE_KEY);
+      if (!raw) return;
+      let obj = null;
+      try { obj = JSON.parse(raw); } catch (e) { obj = null; }
+      const scen = (obj && typeof obj === 'object') ? (obj.scenario || '') : '';
+      if (!String(scen || '').trim()) return;
+      setFixedPreviewButtonMode('continue', scen);
+    } catch (e) {}
+  }
+
+  // Progress overlay helpers (used by Save XML).
+  function setProgressUI(payload){
+    try {
+      const p = (payload && typeof payload === 'object') ? payload : {};
+      const overlay = document.getElementById('coretgProgressOverlay');
+      const titleEl = document.getElementById('coretgProgressTitle');
+      const msgEl = document.getElementById('coretgProgressMessage');
+      const pctEl = document.getElementById('coretgProgressPercent');
+      const barEl = document.getElementById('coretgProgressBar');
+      if (!overlay || !titleEl || !msgEl || !pctEl || !barEl) return;
+      const pct = Math.max(0, Math.min(100, Number.isFinite(+p.percent) ? (+p.percent) : 0));
+      if (typeof p.title === 'string' && p.title.trim()) titleEl.textContent = p.title;
+      if (typeof p.message === 'string') msgEl.textContent = p.message;
+      pctEl.textContent = `${Math.round(pct)}%`;
+      barEl.style.width = `${pct}%`;
+    } catch (e) {}
+  }
+
+  window.coretgShowProgress = function(payload){
+    try {
+      const overlay = document.getElementById('coretgProgressOverlay');
+      if (!overlay) return;
+      overlay.style.display = 'flex';
+      setProgressUI(payload || { title: 'Working…', message: 'Starting…', percent: 0 });
+    } catch (e) {}
+  };
+  window.coretgUpdateProgress = function(payload){
+    setProgressUI(payload);
+  };
+  window.coretgHideProgress = function(){
+    try {
+      const overlay = document.getElementById('coretgProgressOverlay');
+      if (overlay) overlay.style.display = 'none';
+    } catch (e) {}
+  };
+
+  // Restore any pending "Continue" mode after reloads.
+  try { document.addEventListener('DOMContentLoaded', restoreContinueAfterSaveIfAny); } catch (e) {}
 
   function readJsonFromLocalStorage(key, fallback){
     try {
@@ -447,6 +575,36 @@
     try {
       if (window.state && Array.isArray(window.state.scenarios) && window.state.scenarios.length) {
         const active_index = (typeof window.state.active_index === 'number') ? window.state.active_index : 0;
+
+        // Topology UX: when the user saves, freeze any visible "Random" dropdowns into
+        // deterministic concrete values and re-render so the UI reflects what was saved.
+        try {
+          if (typeof window.concretizeRandomSelectionsForSave === 'function') {
+            window.state.scenarios = window.concretizeRandomSelectionsForSave(window.state.scenarios);
+            try {
+              const hidden = document.getElementById('scenarios_json');
+              if (hidden) hidden.value = JSON.stringify({ scenarios: window.state.scenarios, active_index });
+            } catch (e) {}
+            try {
+              const n = Number(window.__coretg_last_concretize_count || 0);
+              if (n > 0 && typeof window.showToast === 'function') {
+                let msg = '';
+                try {
+                  if (typeof window.formatConcretizeSummaryToast === 'function') {
+                    msg = window.formatConcretizeSummaryToast(window.__coretg_last_concretize_summary || null);
+                  }
+                } catch (e) { msg = ''; }
+                if (!msg) msg = `Resolved ${n} Random value${n === 1 ? '' : 's'} on save.`;
+                try { window.showToast(msg, { force: true, autohide: true, delay: 4200 }); } catch (_) {}
+              }
+            } catch (e) {}
+            try {
+              if (typeof window.renderMain === 'function') window.renderMain();
+              else if (typeof window.render === 'function') window.render();
+            } catch (e) {}
+          }
+        } catch (e) {}
+
         const core = (typeof window.getCoreConfig === 'function') ? window.getCoreConfig(true) : (window.state.core || null);
         const project_key_hint = (window.currentProjectKey || '').toString().trim();
         const scenario_query = (typeof window.resolveScenarioQueryHint === 'function') ? window.resolveScenarioQueryHint() : '';
@@ -470,10 +628,111 @@
   }
 
   async function saveXmlViaApi(){
+    let progressShown = false;
+    let hideTimer = null;
+    const safeHideProgress = (immediate) => {
+      try {
+        if (!progressShown || typeof window.coretgHideProgress !== 'function') return;
+        if (hideTimer !== null) {
+          try { clearTimeout(hideTimer); } catch (e) {}
+          hideTimer = null;
+        }
+        if (immediate) window.coretgHideProgress();
+        else hideTimer = setTimeout(() => { try { window.coretgHideProgress(); } catch (e) {} }, 250);
+      } catch (e) {}
+    };
+
+    try {
+      if (typeof window.coretgShowProgress === 'function') {
+        window.coretgShowProgress({ title: 'Saving XML', message: 'Preparing…', percent: 2 });
+        progressShown = true;
+      }
+    } catch (e) {}
+
+    try {
+
+    // If we're on the Topology page, we can concretize directly against live in-memory state.
+    try {
+      if (window.state && Array.isArray(window.state.scenarios) && window.state.scenarios.length) {
+        const active_index = (typeof window.state.active_index === 'number') ? window.state.active_index
+          : ((typeof window.state.active_index === 'string') ? parseInt(window.state.active_index, 10) : null);
+        const idx = Number.isInteger(active_index) ? active_index : ((typeof window.state.activeIdx === 'number') ? window.state.activeIdx : 0);
+
+        try {
+          if (typeof window.coretgUpdateProgress === 'function') {
+            window.coretgUpdateProgress({ title: 'Saving XML', message: 'Freezing Random values…', percent: 10 });
+          }
+        } catch (e) {}
+
+        // Progress hook: allow index.html async concretization to report vuln readiness progress.
+        try {
+          window.__coretg_progress_hook = function(p){
+            try {
+              if (typeof window.coretgUpdateProgress !== 'function') return;
+              const percent = (p && Number.isFinite(+p.percent)) ? (+p.percent) : null;
+              const message = (p && typeof p.message === 'string' && p.message) ? p.message : 'Working…';
+              window.coretgUpdateProgress({ title: 'Saving XML', message, percent: (percent === null ? 20 : percent) });
+            } catch (e) {}
+          };
+        } catch (e) {}
+
+        try {
+          if (typeof window.concretizeRandomSelectionsForSaveAsync === 'function') {
+            window.state.scenarios = await window.concretizeRandomSelectionsForSaveAsync(window.state.scenarios);
+          } else if (typeof window.concretizeRandomSelectionsForSave === 'function') {
+            window.state.scenarios = window.concretizeRandomSelectionsForSave(window.state.scenarios);
+          }
+        } finally {
+          try { delete window.__coretg_progress_hook; } catch (e) { window.__coretg_progress_hook = null; }
+        }
+
+        try {
+          if (typeof window.coretgUpdateProgress === 'function') {
+            window.coretgUpdateProgress({ title: 'Saving XML', message: 'Updating UI…', percent: 82 });
+          }
+        } catch (e) {}
+
+        try {
+          const hidden = document.getElementById('scenarios_json');
+          if (hidden) hidden.value = JSON.stringify({ scenarios: window.state.scenarios, active_index: idx });
+        } catch (e) {}
+
+        try {
+          if (typeof window.renderMain === 'function') window.renderMain();
+          else if (typeof window.render === 'function') window.render();
+        } catch (e) {}
+
+        try {
+          const sum = window.__coretg_last_concretize_summary || null;
+          const n = Number(window.__coretg_last_concretize_count || 0);
+          const warns = (sum && Array.isArray(sum.warnings)) ? sum.warnings : [];
+          if ((n > 0 || warns.length) && typeof window.showToast === 'function') {
+            let msg = '';
+            try {
+              if (typeof window.formatConcretizeSummaryToast === 'function') {
+                msg = window.formatConcretizeSummaryToast(sum);
+              }
+            } catch (e) { msg = ''; }
+            if (!msg && n > 0) msg = `Resolved ${n} Random value${n === 1 ? '' : 's'} on save.`;
+            if (!msg && warns.length) msg = warns.slice(0, 2).join('\n');
+            if (msg) {
+              try { window.showToast(msg, { force: true, autohide: true, delay: 5200 }); } catch (_) {}
+            }
+          }
+        } catch (e) {}
+      }
+    } catch (e) {}
+
     const payload = buildSaveXmlApiPayload();
     if (!Array.isArray(payload.scenarios) || !payload.scenarios.length) {
       throw new Error('No scenarios available to save.');
     }
+
+    try {
+      if (typeof window.coretgUpdateProgress === 'function') {
+        window.coretgUpdateProgress({ title: 'Saving XML', message: 'Writing XML snapshot…', percent: 88 });
+      }
+    } catch (e) {}
     const data = await postJson('/save_xml_api', payload);
     const xmlPath = (data && data.result_path) ? String(data.result_path) : '';
     if (!xmlPath) throw new Error('Save succeeded but returned no result_path.');
@@ -483,6 +742,19 @@
     try {
       const scenarioName = resolveScenarioNameForSave();
       if (scenarioName) setLatestXmlPathForScenario(scenarioName, xmlPath);
+    } catch (e) {}
+
+    // Topology workflow: after saving from Topology, turn the fixed "Preview" button into "Continue"
+    // and have it navigate to Flag Sequencing.
+    try {
+      const activeTab = getActiveTabName();
+      if (activeTab === 'topology') {
+        const scenarioName = resolveScenarioNameForSave();
+        if (scenarioName) {
+          rememberContinueAfterSave(scenarioName);
+          setFixedPreviewButtonMode('continue', scenarioName);
+        }
+      }
     } catch (e) {}
 
     // Preserve a stable per-scenario seed across saves so Preview/Flow do not "re-roll"
@@ -495,6 +767,11 @@
     // Always persist a fresh preview plan after Save XML so the Preview tab cannot
     // display stale cached results from an older XML snapshot.
     try {
+      try {
+        if (typeof window.coretgUpdateProgress === 'function') {
+          window.coretgUpdateProgress({ title: 'Saving XML', message: 'Persisting preview plan…', percent: 95 });
+        }
+      } catch (e) {}
       const scenarioName = resolveScenarioNameForSave();
       if (scenarioName && typeof window.coretgPostJson === 'function') {
         let seed = null;
@@ -555,6 +832,15 @@
       }
     } catch (e) {}
 
+    // Topology page: ensure Full Preview / Plan buttons re-evaluate after saving.
+    try {
+      if (typeof window.updatePlanButtons === 'function') {
+        window.updatePlanButtons();
+      } else if (typeof updatePlanButtons === 'function') {
+        updatePlanButtons();
+      }
+    } catch (e) {}
+
     try {
       const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
       if (xmlPathInput) xmlPathInput.value = xmlPath;
@@ -566,7 +852,17 @@
         dl.removeAttribute('title');
       }
     } catch (e) {}
+    try {
+      if (typeof window.coretgUpdateProgress === 'function') {
+        window.coretgUpdateProgress({ title: 'Saving XML', message: 'Done.', percent: 100 });
+      }
+    } catch (e) {}
+    safeHideProgress(false);
     return xmlPath;
+    } catch (err) {
+      safeHideProgress(true);
+      throw err;
+    }
   }
 
   async function saveAllAndGoPreview(opts){

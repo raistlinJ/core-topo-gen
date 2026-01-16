@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import sys
 import re
 import shutil
@@ -4914,6 +4915,22 @@ def _derive_default_seed(xml_hash: str) -> int:
         return seed_val
     except Exception:
         return 1357911
+
+
+def _derive_seed_for_scenario(xml_hash: str, scenario: str | None) -> int:
+    """Derive a stable seed for a given scenario based on the XML hash.
+
+    This is used for UI hints (e.g., sidebar) when no explicit seed was provided.
+    It should be stable across refreshes and different clients.
+    """
+    scen = (scenario or '').strip()
+    if not scen:
+        return _derive_default_seed(xml_hash)
+    try:
+        digest = hashlib.sha256(f"{xml_hash}|{scen}".encode('utf-8', errors='ignore')).hexdigest()
+        return _derive_default_seed(digest)
+    except Exception:
+        return _derive_default_seed(xml_hash)
 
 # Additional helper dirs (stubs restored after accidental removal)
 def _traffic_dir() -> str:
@@ -22859,6 +22876,51 @@ def run_cli():
 
 
 # ----------------------- Planning (Preview / Run) -----------------------
+
+
+@app.route('/api/seed_hints', methods=['POST'])
+def api_seed_hints():
+    """Return deterministic seed hints for one or more scenarios.
+
+    Request JSON: { xml_path: "/abs/scenarios.xml", scenarios: ["Scenario 1", ...] }
+    Response JSON: { ok: true, xml_path, xml_hash, seeds: { "scenario 1": 123, ... } }
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        xml_path = (payload.get('xml_path') or '').strip()
+        scenarios = payload.get('scenarios') or []
+        if not xml_path:
+            return jsonify({'ok': False, 'error': 'xml_path missing'}), 400
+        xml_path = os.path.abspath(xml_path)
+        if not os.path.exists(xml_path):
+            return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
+
+        try:
+            from core_topo_gen.planning.plan_cache import hash_xml_file
+            xml_hash = hash_xml_file(xml_path)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': f'Failed to hash XML: {exc}'}), 500
+
+        seeds: dict[str, int] = {}
+        if isinstance(scenarios, list):
+            for raw in scenarios:
+                try:
+                    name = (str(raw) if raw is not None else '').strip()
+                    if not name:
+                        continue
+                    key = name.lower()
+                    if key in seeds:
+                        continue
+                    seeds[key] = _derive_seed_for_scenario(xml_hash, name)
+                except Exception:
+                    continue
+        return jsonify({'ok': True, 'xml_path': xml_path, 'xml_hash': xml_hash, 'seeds': seeds})
+    except Exception as e:
+        try:
+            app.logger.exception('[seed_hints] error: %s', e)
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 
 
