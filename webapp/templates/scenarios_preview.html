@@ -25,9 +25,14 @@
   <div class="row g-3 flex-grow-1 align-items-stretch" id="previewLayoutRow">
     <div class="col-12 col-lg-3 d-flex">
       <div class="card shadow-sm mb-3 flex-fill d-flex flex-column">
-        <div class="card-header d-flex justify-content-between align-items-center">
+        <div class="card-header d-flex justify-content-between align-items-center flex-nowrap gap-2">
           <span class="fw-bold">Scenarios</span>
-          <button class="btn btn-sm btn-outline-secondary {% if not active_scenario %}d-none{% endif %}" id="previewScenarioFilterClear" type="button" title="Clear">Clear</button>
+          <div class="btn-toolbar gap-1 align-items-center flex-nowrap">
+            <button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" id="toggleScenarioSeedBtn" title="Show seeds" aria-label="Toggle seed visibility">
+              <i class="bi bi-eye" aria-hidden="true"></i>
+            </button>
+            <button class="btn btn-sm btn-outline-secondary {% if not active_scenario %}d-none{% endif %}" id="previewScenarioFilterClear" type="button" title="Clear">Clear</button>
+          </div>
         </div>
         <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="previewScenarioList" style="min-height:0;">
           {% if scenarios %}
@@ -37,7 +42,12 @@
               class="list-group-item list-group-item-action py-1 {% if active_scenario and active_scenario==s %}active bg-primary text-white{% endif %}"
               data-scen-name="{{ s }}"
               data-xml-path="{{ (scenario_xml_by_name or {}).get(s, '') }}"
-            >{{ s }}</button>
+            >
+              <div class="d-flex align-items-center">
+                <span class="flex-grow-1 text-truncate">{{ s }}</span>
+                <span class="badge text-bg-light border ms-2 d-none" data-seed-badge="1"></span>
+              </div>
+            </button>
             {% endfor %}
           {% else %}
             <div class="p-3 text-muted small">No scenarios yet</div>
@@ -88,6 +98,65 @@
 {% include 'partials/dock.html' %}
 <script>
 (function(){
+  const SIDEBAR_SEED_VISIBILITY_STORAGE_KEY = 'coretg_sidebar_show_seed';
+
+  function getSidebarShowSeed() {
+    try {
+      return (localStorage.getItem(SIDEBAR_SEED_VISIBILITY_STORAGE_KEY) || '') === '1';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function setSidebarShowSeed(value) {
+    try {
+      localStorage.setItem(SIDEBAR_SEED_VISIBILITY_STORAGE_KEY, value ? '1' : '0');
+    } catch (e) {}
+  }
+
+  function syncSidebarSeedToggleButton() {
+    const btn = document.getElementById('toggleScenarioSeedBtn');
+    if (!btn) return;
+    const show = getSidebarShowSeed();
+    const icon = btn.querySelector('i');
+    if (icon) {
+      icon.classList.remove('bi-eye', 'bi-eye-slash');
+      icon.classList.add(show ? 'bi-eye-slash' : 'bi-eye');
+    }
+    btn.title = show ? 'Hide seeds' : 'Show seeds';
+  }
+
+  function updateScenarioSeedBadges() {
+    const list = document.getElementById('previewScenarioList');
+    if (!list) return;
+    const show = getSidebarShowSeed();
+    const badges = list.querySelectorAll('[data-seed-badge="1"]');
+    badges.forEach((badge) => {
+      const btn = badge && badge.closest ? badge.closest('button[data-scen-name]') : null;
+      const scen = (btn && btn.getAttribute) ? (btn.getAttribute('data-scen-name') || '').toString().trim() : '';
+      let seed = null;
+      try {
+        if (show && scen && typeof window.coretgEnsureSeedForScenario === 'function') {
+          seed = window.coretgEnsureSeedForScenario(scen);
+        }
+      } catch (e) {
+        seed = null;
+      }
+
+      if (show && seed) {
+        badge.textContent = 'seed=' + String(seed);
+        badge.classList.remove('d-none');
+      } else {
+        badge.classList.add('d-none');
+      }
+    });
+  }
+
+  // Allow the embedded Full Preview iframe to request a sidebar refresh after a re-roll.
+  try {
+    window.coretgPreviewRefreshScenarioSeedBadges = updateScenarioSeedBadges;
+  } catch (e) {}
+
   function showLoading(){
     try {
       const el = document.getElementById('scenariosPreviewLoadingModal');
@@ -190,6 +259,29 @@
   }
 
   document.addEventListener('DOMContentLoaded', ()=>{
+    try {
+      const params = new URLSearchParams(window.location.search || '');
+      const scenario = (params.get('scenario') || document.getElementById('scenariosPreviewLoadScenario')?.value || '').trim();
+      if (scenario && typeof window.coretgSetActiveScenarioForNav === 'function') {
+        window.coretgSetActiveScenarioForNav(scenario);
+      }
+    } catch (e) {}
+
+    try {
+      const btn = document.getElementById('toggleScenarioSeedBtn');
+      if (btn && btn.dataset.boundSeedToggle !== '1') {
+        btn.addEventListener('click', (ev) => {
+          try { ev.preventDefault(); } catch (e) {}
+          setSidebarShowSeed(!getSidebarShowSeed());
+          syncSidebarSeedToggleButton();
+          updateScenarioSeedBadges();
+        });
+        btn.dataset.boundSeedToggle = '1';
+      }
+      syncSidebarSeedToggleButton();
+      updateScenarioSeedBadges();
+    } catch (e) {}
+
     // Shared Scenarios Execute button: hand off to Topology execution flow.
     try {
       document.getElementById('scenariosExecuteBtn')?.addEventListener('click', (ev)=>{
@@ -198,6 +290,11 @@
           const params = new URLSearchParams(window.location.search || '');
           const xmlPath = (document.getElementById('scenariosPreviewLoadXmlPath')?.value || params.get('xml_path') || '').trim();
           const scenario = (params.get('scenario') || document.getElementById('scenariosPreviewLoadScenario')?.value || '').trim();
+          try {
+            if (scenario && typeof window.coretgSetActiveScenarioForNav === 'function') {
+              window.coretgSetActiveScenarioForNav(scenario);
+            }
+          } catch (e) {}
           if(!xmlPath){
             alert('Save XML first to execute.');
             return;
@@ -220,6 +317,11 @@
       const baseUrl = '/scenarios/preview';
       function goScenario(name){
         const scen = (name || '').toString().trim();
+        try {
+          if (scen && typeof window.coretgSetActiveScenarioForNav === 'function') {
+            window.coretgSetActiveScenarioForNav(scen);
+          }
+        } catch (e) {}
         let xml = (xmlByName && scen && xmlByName[scen]) ? String(xmlByName[scen]) : '';
         try {
           if (scen && typeof window.coretgGetLatestXmlPathForScenario === 'function') {

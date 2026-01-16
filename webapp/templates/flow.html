@@ -25,14 +25,24 @@
   <div class="row g-3 flex-grow-1 align-items-stretch" id="flowLayoutRow">
     <div class="col-12 col-lg-3 d-flex">
       <div class="card shadow-sm mb-3 flex-fill d-flex flex-column">
-        <div class="card-header d-flex justify-content-between align-items-center">
+        <div class="card-header d-flex justify-content-between align-items-center flex-nowrap gap-2">
           <span class="fw-bold">Scenarios</span>
-          <button class="btn btn-sm btn-outline-secondary {% if not active_scenario %}d-none{% endif %}" id="flowScenarioFilterClear" type="button" title="Clear">Clear</button>
+          <div class="btn-toolbar gap-1 align-items-center flex-nowrap">
+            <button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" id="toggleScenarioSeedBtn" title="Show seeds" aria-label="Toggle seed visibility">
+              <i class="bi bi-eye" aria-hidden="true"></i>
+            </button>
+            <button class="btn btn-sm btn-outline-secondary {% if not active_scenario %}d-none{% endif %}" id="flowScenarioFilterClear" type="button" title="Clear">Clear</button>
+          </div>
         </div>
         <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="flowScenarioList" style="min-height:0;">
           {% if scenarios %}
             {% for s in scenarios %}
-            <button type="button" class="list-group-item list-group-item-action py-1 {% if active_scenario and active_scenario==s %}active bg-primary text-white{% endif %}" data-scen-name="{{ s }}">{{ s }}</button>
+            <button type="button" class="list-group-item list-group-item-action py-1 {% if active_scenario and active_scenario==s %}active bg-primary text-white{% endif %}" data-scen-name="{{ s }}">
+              <div class="d-flex align-items-center">
+                <span class="flex-grow-1 text-truncate">{{ s }}</span>
+                <span class="badge text-bg-light border ms-2 d-none" data-seed-badge="1"></span>
+              </div>
+            </button>
             {% endfor %}
           {% else %}
             <div class="p-3 text-muted small">No scenarios yet</div>
@@ -213,6 +223,8 @@
 
 <script>
 (function(){
+  const SIDEBAR_SEED_VISIBILITY_STORAGE_KEY = 'coretg_sidebar_show_seed';
+
   const statusEl = document.getElementById('flowStatus');
   const loginLinkEl = document.getElementById('flowLoginLink');
   const scenarioEl = document.getElementById('flowScenario');
@@ -240,6 +252,7 @@
   const afbDownloadLink = document.getElementById('flowAfbDownloadLink');
   const scenarioListEl = document.getElementById('flowScenarioList');
   const clearScenarioBtn = document.getElementById('flowScenarioFilterClear');
+  const seedToggleBtn = document.getElementById('toggleScenarioSeedBtn');
   const validityAlertEl = document.getElementById('flowValidityAlert');
   const loadingOverlayEl = document.getElementById('flowLoadingOverlay');
   const loadingTextEl = document.getElementById('flowLoadingText');
@@ -250,6 +263,59 @@
   const scenarioNamesCache = {{ (scenarios or [])|tojson }};
   const initialScenario = {{ (active_scenario or '')|tojson }};
   let activeScenario = (initialScenario || (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length ? String(scenarioNamesCache[0]) : '')).trim();
+
+  function getSidebarShowSeed(){
+    try { return (localStorage.getItem(SIDEBAR_SEED_VISIBILITY_STORAGE_KEY) || '') === '1'; } catch(e) { return false; }
+  }
+
+  function setSidebarShowSeed(value){
+    try { localStorage.setItem(SIDEBAR_SEED_VISIBILITY_STORAGE_KEY, value ? '1' : '0'); } catch(e) {}
+  }
+
+  function syncSidebarSeedToggleButton(){
+    if(!seedToggleBtn) return;
+    const show = getSidebarShowSeed();
+    const icon = seedToggleBtn.querySelector('i');
+    if(icon){
+      icon.classList.remove('bi-eye', 'bi-eye-slash');
+      icon.classList.add(show ? 'bi-eye-slash' : 'bi-eye');
+    }
+    seedToggleBtn.title = show ? 'Hide seeds' : 'Show seeds';
+  }
+
+  function updateScenarioSeedBadges(){
+    if(!scenarioListEl) return;
+    const show = getSidebarShowSeed();
+    scenarioListEl.querySelectorAll('button[data-scen-name]').forEach((btn)=>{
+      const scen = (btn.getAttribute('data-scen-name') || '').trim();
+      const badge = btn.querySelector('[data-seed-badge]');
+      if(!badge) return;
+      if(!show){
+        badge.classList.add('d-none');
+        badge.textContent = '';
+        return;
+      }
+      let seed = null;
+      try {
+        if (scen && typeof window.coretgEnsureSeedForScenario === 'function') {
+          seed = window.coretgEnsureSeedForScenario(scen);
+        }
+      } catch(e) { seed = null; }
+      badge.textContent = 'seed=' + (seed !== null && seed !== undefined ? String(seed) : '…');
+      badge.classList.remove('d-none');
+    });
+    syncSidebarSeedToggleButton();
+  }
+
+  function rememberActiveScenario(){
+    try {
+      if (activeScenario && typeof window.coretgSetActiveScenarioForNav === 'function') {
+        window.coretgSetActiveScenarioForNav(activeScenario);
+      } else if (activeScenario && typeof window.coretgSetLastSelectedScenario === 'function') {
+        window.coretgSetLastSelectedScenario(activeScenario);
+      }
+    } catch(e) {}
+  }
 
   let currentChain = [];
   let lastStats = null;
@@ -456,6 +522,8 @@
     updateScenarioQueryParam();
     updateScenarioFilterControls();
     refreshParticipantNavForScenario(activeScenario);
+    rememberActiveScenario();
+    updateScenarioSeedBadges();
     // When switching scenarios (or loading after refresh), prefer any saved Flow state.
     await generate(false);
   }
@@ -2898,6 +2966,17 @@
   updateScenarioQueryParam();
   updateScenarioFilterControls();
   refreshParticipantNavForScenario(activeScenario);
+  rememberActiveScenario();
+  if(seedToggleBtn && !seedToggleBtn.dataset.boundSeedToggle){
+    seedToggleBtn.addEventListener('click', (ev)=>{
+      try { ev.preventDefault(); } catch(e) {}
+      const next = !getSidebarShowSeed();
+      setSidebarShowSeed(next);
+      updateScenarioSeedBadges();
+    });
+    seedToggleBtn.dataset.boundSeedToggle = '1';
+  }
+  updateScenarioSeedBadges();
   // Auto-generate on load (prefer any saved Flow state).
   try { refreshXmlDockPreview({ force: false }); } catch(e) {}
   generate(false);

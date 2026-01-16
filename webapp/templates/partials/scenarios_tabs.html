@@ -81,6 +81,7 @@
   const PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY = 'coretg_preview_plan_by_scenario_v1';
   const FLOW_DIRTY_BY_SCENARIO_STORAGE_KEY = 'coretg_flow_dirty_by_scenario_v1';
   const TOPOLOGY_CONTINUE_STORAGE_KEY = 'coretg_topology_continue_after_save_v1';
+  const LAST_SELECTED_SCENARIO_STORAGE_KEY = 'coretg_last_selected_scenario_v1';
 
   function getActiveTabName(){
     try {
@@ -346,6 +347,19 @@
       if (!key) return;
       const n = parseInt(String(seed ?? ''), 10);
       if (!Number.isFinite(n)) return;
+
+      // If the seed changes, any previously persisted preview plan becomes stale
+      // (it was generated with a different seed). Clear it so Preview recomputes.
+      try {
+        const prev = getSeedForScenario(scenarioName);
+        if (prev !== null && prev !== undefined) {
+          const prevN = parseInt(String(prev), 10);
+          if (Number.isFinite(prevN) && prevN > 0 && prevN !== n) {
+            setPreviewPlanPathForScenario(scenarioName, '');
+          }
+        }
+      } catch (e) {}
+
       const map = readSeedMap();
       const next = (map && typeof map === 'object') ? map : {};
       next[key] = {
@@ -491,6 +505,73 @@
     } catch (e) {
       return '';
     }
+  }
+
+  function setLastSelectedScenario(scenarioName){
+    try {
+      const s = (scenarioName || '').toString().trim();
+      if (!s) return;
+      localStorage.setItem(LAST_SELECTED_SCENARIO_STORAGE_KEY, s);
+    } catch (e) {}
+  }
+
+  function getLastSelectedScenario(){
+    try {
+      const s = (localStorage.getItem(LAST_SELECTED_SCENARIO_STORAGE_KEY) || '').toString().trim();
+      return s;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function resolveScenarioNameFromUrlOrHidden(){
+    try {
+      const params = new URLSearchParams(window.location.search || '');
+      const qp = (params.get('scenario') || '').trim();
+      if (qp) return qp;
+    } catch (e) {}
+    try {
+      const hidden = document.getElementById('scenariosPreviewScenario');
+      const val = (hidden && typeof hidden.value === 'string') ? hidden.value.trim() : '';
+      if (val) return val;
+    } catch (e) {}
+    return '';
+  }
+
+  function syncScenarioTabLinks(scenarioName){
+    try {
+      const scen = (scenarioName || '').toString().trim();
+
+      // Keep shared hidden field in sync for Preview handoff logic.
+      try {
+        const hidden = document.getElementById('scenariosPreviewScenario');
+        if (hidden) hidden.value = scen;
+      } catch (e) {}
+
+      // Update all scenario sub-tab links to carry the active scenario.
+      const links = document.querySelectorAll('ul.nav.nav-tabs a.nav-link');
+      links.forEach(a => {
+        try {
+          const href = a.getAttribute('href') || '';
+          if (!href || href === '#') return;
+          const url = new URL(href, window.location.origin);
+          if (scen) url.searchParams.set('scenario', scen);
+          else url.searchParams.delete('scenario');
+          const next = url.pathname + (url.search ? url.search : '') + (url.hash || '');
+          a.setAttribute('href', next);
+        } catch (e) {
+          // ignore
+        }
+      });
+    } catch (e) {}
+  }
+
+  function ensureScenarioPersistedAndTabsSynced(){
+    try {
+      const scen = resolveScenarioNameFromUrlOrHidden() || getLastSelectedScenario();
+      if (scen) setLastSelectedScenario(scen);
+      syncScenarioTabLinks(scen);
+    } catch (e) {}
   }
 
   function readFlowStateMap(){
@@ -902,8 +983,21 @@
   window.coretgIsFlowDirtyForScenario = isFlowDirtyForScenario;
   window.coretgSetFlowDirtyForScenario = setFlowDirtyForScenario;
 
+  // Cross-page scenario persistence helpers.
+  window.coretgSetLastSelectedScenario = setLastSelectedScenario;
+  window.coretgGetLastSelectedScenario = getLastSelectedScenario;
+  window.coretgSyncScenarioTabLinks = syncScenarioTabLinks;
+  window.coretgSetActiveScenarioForNav = function(scenarioName){
+    try {
+      const scen = (scenarioName || '').toString().trim();
+      if (scen) setLastSelectedScenario(scen);
+      syncScenarioTabLinks(scen);
+    } catch (e) {}
+  };
+
   window.coretgRefreshScenariosExecuteButtonState = refreshScenariosExecuteButtonState;
   document.addEventListener('DOMContentLoaded', refreshScenariosExecuteButtonState);
+  document.addEventListener('DOMContentLoaded', ensureScenarioPersistedAndTabsSynced);
   window.addEventListener('storage', (ev) => {
     try {
       if (!ev || !ev.key) return;

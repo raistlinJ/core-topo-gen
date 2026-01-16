@@ -5133,6 +5133,29 @@ async function computeFullPlanPreview(){
         ? { scenarios: state.scenarios, r2s_hosts_min_list: r2sHostsMinList, r2s_hosts_max_list: r2sHostsMaxList, core: getCoreConfig(true) }
         : { xml_path: newXmlPath, r2s_hosts_min_list: r2sHostsMinList, r2s_hosts_max_list: r2sHostsMaxList, core: getCoreConfig(true) };
     const body = enrichPayloadWithScenarioContext(baseBody);
+
+    // Align with Preview/Flow: include the shared per-scenario seed when available.
+    try {
+        const scenName = (body.scenario || body.scenario_name || '').toString().trim();
+        if (scenName) {
+            let seed = null;
+            try {
+                if (typeof window.coretgGetSeedForScenario === 'function') {
+                    seed = window.coretgGetSeedForScenario(scenName);
+                }
+            } catch (e) { seed = null; }
+            try {
+                if ((seed === null || seed === undefined || seed === '') && typeof window.coretgEnsureSeedForScenario === 'function') {
+                    seed = window.coretgEnsureSeedForScenario(scenName);
+                }
+            } catch (e) { /* ignore */ }
+            const n = parseInt(String(seed ?? ''), 10);
+            if (!isNaN(n) && n > 0) {
+                body.seed = n;
+            }
+        }
+    } catch (e) {}
+
         const res = await fetch('/api/plan/preview_full', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
         const data = await res.json();
         try {
@@ -10794,6 +10817,23 @@ function getScenarioSeedHintKey(scen) {
 }
 
 function getSidebarSeedForScenario(scen, idx) {
+    // Prefer the shared per-scenario seed (used by Preview/Flow) when available.
+    try {
+        const name = (scen && typeof scen === 'object' && scen.name) ? String(scen.name).trim() : '';
+        if (name) {
+            if (typeof window.coretgGetSeedForScenario === 'function') {
+                const s = window.coretgGetSeedForScenario(name);
+                const n = parseInt(String(s ?? ''), 10);
+                if (!isNaN(n) && n > 0) return n;
+            }
+            if (typeof window.coretgEnsureSeedForScenario === 'function') {
+                const s = window.coretgEnsureSeedForScenario(name);
+                const n = parseInt(String(s ?? ''), 10);
+                if (!isNaN(n) && n > 0) return n;
+            }
+        }
+    } catch (e) {}
+
     // Prefer the active scenario's Full Preview seed if present.
     try {
         if (idx === activeIdx && previewState && previewState.fullPreview && previewState.fullPreview.seed) {
@@ -10936,6 +10976,13 @@ function renderSidebar() {
         a.onclick = (e) => {
             e.preventDefault();
             activeIdx = idx;
+            try {
+                if (name && typeof window.coretgSetActiveScenarioForNav === 'function') {
+                    window.coretgSetActiveScenarioForNav(name);
+                } else if (name && typeof window.coretgSetLastSelectedScenario === 'function') {
+                    window.coretgSetLastSelectedScenario(name);
+                }
+            } catch (err) {}
             persistEditorState();
             render();
             try { refreshXmlDockPreview({ force: true }); } catch (err) {}

@@ -3911,6 +3911,33 @@ function buildScenarioUrl(basePath){
     const currentSeed = String({{ seed|tojson }} || '').trim();
     const scenarioName = String({{ (scenario or '')|tojson }} || '').trim();
 
+    function notifyParentSeed(seedStr){
+      try {
+        const p = (window.parent && window.parent !== window) ? window.parent : null;
+        if (!p) return;
+        const n = parseInt(String(seedStr || '').trim(), 10);
+        if (!Number.isFinite(n) || n <= 0) return;
+        try {
+          if (scenarioName && typeof p.coretgSetSeedForScenario === 'function') {
+            p.coretgSetSeedForScenario(scenarioName, n);
+          }
+        } catch (e) {}
+        try {
+          if (typeof p.coretgPreviewRefreshScenarioSeedBadges === 'function') {
+            p.coretgPreviewRefreshScenarioSeedBadges();
+          }
+        } catch (e) {}
+      } catch (e) {}
+    }
+
+    // In embedded mode, sync the displayed server seed back to the parent.
+    // This covers "random" rerolls where the user doesn't type a seed.
+    try {
+      if (scenarioName && currentSeed) {
+        notifyParentSeed(currentSeed);
+      }
+    } catch (e) {}
+
     form.addEventListener('submit', (ev)=>{
       // If multiple submit listeners exist for any reason, ensure the confirm
       // prompt is only shown once per submission.
@@ -3925,16 +3952,8 @@ function buildScenarioUrl(basePath){
             return;
           }
         }
-        if(scenarioName && nextSeed){
-          const n = parseInt(nextSeed, 10);
-          if(Number.isFinite(n)){
-            try {
-              const p = (window.parent && window.parent !== window) ? window.parent : null;
-              if(p && typeof p.coretgSetSeedForScenario === 'function'){
-                p.coretgSetSeedForScenario(scenarioName, n);
-              }
-            } catch(e) {}
-          }
+        if (scenarioName && nextSeed) {
+          notifyParentSeed(nextSeed);
         }
       } catch(e) {}
       finally {
