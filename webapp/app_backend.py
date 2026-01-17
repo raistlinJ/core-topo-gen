@@ -10440,6 +10440,8 @@ def _flow_strip_runtime_sensitive_fields(flag_assignments: list[dict[str, Any]])
         a2 = dict(a)
         a2.pop('runtime_flags', None)
         a2.pop('runtime_outputs', None)
+        a2.pop('resolved_inputs', None)
+        a2.pop('resolved_outputs', None)
         # Effective generator config may include secrets and should not be persisted.
         a2.pop('config', None)
         out.append(a2)
@@ -10559,6 +10561,20 @@ def _flow_enrich_saved_flag_assignments(
                 dh = (gen_def or {}).get('description_hints') if isinstance(gen_def, dict) else None
                 if isinstance(dh, list):
                     a2['description_hints'] = [str(x or '').strip() for x in dh if str(x or '').strip()]
+        except Exception:
+            pass
+
+        # If hint overrides exist, treat them as authoritative.
+        try:
+            if 'hint_overrides' in a2:
+                if a2.get('hint_overrides') is None:
+                    a2.pop('hint_overrides', None)
+                elif isinstance(a2.get('hint_overrides'), list):
+                    ovr = [str(x or '').strip() for x in (a2.get('hint_overrides') or [])]
+                    ovr = [x for x in ovr if x]
+                    a2['hint_overrides'] = ovr
+                    a2['hints'] = ovr
+                    a2['hint'] = ovr[0] if ovr else ''
         except Exception:
             pass
 
@@ -12079,18 +12095,14 @@ def api_flow_prepare_preview_for_execute():
             pass
 
     # Load enabled generator catalogs once so we can prune config to declared inputs.
-    # Only needed when flags are enabled.
-    if flags_enabled:
-        try:
-            _gens_for_cfg, _ = _flag_generators_from_enabled_sources()
-        except Exception:
-            _gens_for_cfg = []
-        try:
-            _node_gens_for_cfg, _ = _flag_node_generators_from_enabled_sources()
-        except Exception:
-            _node_gens_for_cfg = []
-    else:
+    # We do this even when flags are disabled so the UI can still show resolved inputs.
+    try:
+        _gens_for_cfg, _ = _flag_generators_from_enabled_sources()
+    except Exception:
         _gens_for_cfg = []
+    try:
+        _node_gens_for_cfg, _ = _flag_node_generators_from_enabled_sources()
+    except Exception:
         _node_gens_for_cfg = []
 
     _gen_by_id: dict[str, dict[str, Any]] = {}
@@ -12281,15 +12293,78 @@ def api_flow_prepare_preview_for_execute():
             return False, 'generator timed out', None
         except Exception as exc:
             return False, f'generator exception: {exc}', None
+
+    def _redact_kv_for_ui(kv: Any) -> dict[str, Any]:
+        """Best-effort redaction for UI display.
+
+        The Flow UI is an organizer/admin surface, but we still avoid blasting obvious
+        secrets (and flag material) into the main chain tables by default.
+        """
+        if not isinstance(kv, dict) or not kv:
+            return {}
+
+        def _is_sensitive_key(k: str) -> bool:
+            kk = (k or '').strip().lower()
+            if not kk:
+                return False
+            # Explicit keys.
+            if kk in {'secret', 'password', 'passwd', 'token', 'api_key', 'apikey', 'private_key', 'ssh_private_key'}:
+                return True
+            # Common substrings.
+            for needle in ('secret', 'password', 'passwd', 'token', 'api_key', 'apikey', 'private', 'ssh'):
+                if needle in kk:
+                    return True
+            return False
+
+        def _redact_val(v: Any) -> Any:
+            if isinstance(v, str):
+                return '[redacted]'
+            return '[redacted]'
+
+        out0: dict[str, Any] = {}
+        for k, v in kv.items():
+            try:
+                ks = str(k)
+            except Exception:
+                continue
+            if not ks:
+                continue
+            if _is_sensitive_key(ks):
+                out0[ks] = _redact_val(v)
+            else:
+                out0[ks] = v
+        return out0
+    def _preview_host_ip4(host: dict) -> str:
+        """Best-effort: return the primary IPv4 address for a preview host."""
+        try:
+            ip4 = host.get('ip4')
+            if isinstance(ip4, str) and _first_valid_ipv4(ip4):
+                return _first_valid_ipv4(ip4)
+        except Exception:
+            pass
+        for key in ('ipv4', 'ip', 'ip_addr', 'address'):
+            try:
+                v = host.get(key)
+            except Exception:
+                v = None
+            ip_str = _first_valid_ipv4(v)
+            if ip_str:
+                return ip_str
+        return ''
+
+    host_by_id: dict[str, dict[str, Any]] = {}
+    try:
+        hosts = preview.get('hosts') or []
+        if isinstance(hosts, list):
+            for h in hosts:
+                if not isinstance(h, dict):
+                    continue
+                host_by_id[str(h.get('node_id') or '').strip()] = h
+    except Exception:
+        host_by_id = {}
+
     if flags_enabled:
         try:
-            host_by_id: dict[str, dict[str, Any]] = {}
-            hosts = preview.get('hosts') or []
-            if isinstance(hosts, list):
-                for h in hosts:
-                    if not isinstance(h, dict):
-                        continue
-                    host_by_id[str(h.get('node_id') or '').strip()] = h
 
             # Flow has a "god-eye" view of generator outputs across the chain. As we run each
             # generator, we capture outputs.json and feed those values into subsequent generator
@@ -12388,25 +12463,6 @@ def api_flow_prepare_preview_for_execute():
                 h = host_by_id.get(cid)
                 if not h or not isinstance(h, dict):
                     continue
-
-                def _preview_host_ip4(host: dict) -> str:
-                    """Best-effort: return the primary IPv4 address for a preview host."""
-                    try:
-                        ip4 = host.get('ip4')
-                        if isinstance(ip4, str) and _first_valid_ipv4(ip4):
-                            return _first_valid_ipv4(ip4)
-                    except Exception:
-                        pass
-                    for key in ('ipv4', 'ip', 'ip_addr', 'address'):
-                        try:
-                            v = host.get(key)
-                        except Exception:
-                            v = None
-                        ip_str = _first_valid_ipv4(v)
-                        if ip_str:
-                            return ip_str
-                    return ''
-
                 preview_ip4 = _preview_host_ip4(h)
 
                 meta_h = h.get('metadata')
@@ -12566,6 +12622,13 @@ def api_flow_prepare_preview_for_execute():
                     declared_output_keys = []
                 mismatch: dict[str, Any] = {}
 
+                # UI convenience: expose resolved inputs (redacted) even if generator execution
+                # is skipped or fails.
+                try:
+                    fa['resolved_inputs'] = _redact_kv_for_ui(cfg)
+                except Exception:
+                    pass
+
                 try:
                     if generator_id:
                         if deadline is not None and time.monotonic() >= deadline:
@@ -12672,6 +12735,12 @@ def api_flow_prepare_preview_for_execute():
                                             if not kk:
                                                 continue
                                             flow_context[kk] = v
+                                    except Exception:
+                                        pass
+
+                                    # UI convenience: expose resolved outputs (redacted).
+                                    try:
+                                        fa['resolved_outputs'] = _redact_kv_for_ui(outs)
                                     except Exception:
                                         pass
 
@@ -12899,9 +12968,65 @@ def api_flow_prepare_preview_for_execute():
     else:
         # Ensure the UI gets a consistent signal when flags are disabled.
         try:
+            occurrence_ctr: dict[tuple[str, str], int] = {}
             for fa in (flag_assignments or []):
                 if not isinstance(fa, dict):
                     continue
+                cid = str(fa.get('node_id') or '').strip()
+                h = host_by_id.get(cid)
+                preview_ip4 = _preview_host_ip4(h) if isinstance(h, dict) else ''
+
+                generator_id = str(fa.get('id') or '').strip()
+                seed_val = preview.get('seed') if isinstance(preview, dict) else None
+
+                occ_key = (cid, generator_id)
+                occ = int(occurrence_ctr.get(occ_key, 0) or 0)
+                occurrence_ctr[occ_key] = occ + 1
+
+                # Compute a best-effort effective config so the UI can show resolved inputs
+                # even when dependency order is invalid.
+                try:
+                    cfg_full = _flow_default_generator_config(fa, seed_val=seed_val, occurrence_idx=occ)
+                    if preview_ip4:
+                        cfg_full.setdefault('network.ip', preview_ip4)
+                        cfg_full.setdefault('target_ip', preview_ip4)
+                        cfg_full.setdefault('host_ip', preview_ip4)
+                        cfg_full.setdefault('ip4', preview_ip4)
+                        cfg_full.setdefault('ipv4', preview_ip4)
+                    try:
+                        node_name_val = str((h or {}).get('name') or '').strip() if isinstance(h, dict) else ''
+                        if node_name_val:
+                            cfg_full['node_name'] = node_name_val
+                    except Exception:
+                        pass
+
+                    raw_overrides = fa.get('config_overrides') or fa.get('inputs_overrides') or fa.get('input_overrides')
+                    if isinstance(raw_overrides, dict) and raw_overrides:
+                        for k, v in raw_overrides.items():
+                            kk = str(k or '').strip()
+                            if not kk:
+                                continue
+                            cfg_full[kk] = v
+                        fa['config_overrides'] = dict(raw_overrides)
+
+                    cfg = cfg_full
+                    gen_def = _gen_by_id.get(generator_id)
+                    if isinstance(gen_def, dict):
+                        allowed = _all_input_names_of(gen_def)
+                        declared_required = _required_input_names_of(gen_def)
+                        if allowed:
+                            keep = set(allowed)
+                            try:
+                                keep |= set(declared_required or set())
+                            except Exception:
+                                pass
+                            cfg = {k: v for k, v in (cfg_full or {}).items() if k in keep}
+
+                    fa['config'] = cfg
+                    fa['resolved_inputs'] = _redact_kv_for_ui(cfg)
+                except Exception:
+                    pass
+
                 fa['generated'] = False
                 fa['generation_note'] = 'flags disabled (invalid dependency order)'
         except Exception:
@@ -13240,6 +13365,36 @@ def api_flow_save_flow_substitutions():
             for t in (hint_templates or [])
         ]
 
+        # Optional user overrides for hint text. Contract:
+        # - If key is absent: use generated hints.
+        # - If key is present and value is null: clear any override and use generated hints.
+        # - If key is present and value is a list (possibly empty): use it verbatim (after trimming).
+        hint_overrides_present = False
+        raw_hint_overrides: Any = None
+        try:
+            hint_overrides_present = 'hint_overrides' in req
+            raw_hint_overrides = req.get('hint_overrides')
+        except Exception:
+            hint_overrides_present = False
+            raw_hint_overrides = None
+
+        hint_overrides: list[str] | None = None
+        clear_hint_overrides = False
+        if hint_overrides_present:
+            if raw_hint_overrides is None:
+                clear_hint_overrides = True
+                hint_overrides = None
+            elif isinstance(raw_hint_overrides, list):
+                cleaned = [str(x or '').strip() for x in (raw_hint_overrides or [])]
+                cleaned = [x for x in cleaned if x]
+                hint_overrides = cleaned
+            elif isinstance(raw_hint_overrides, str):
+                s = str(raw_hint_overrides or '').strip()
+                hint_overrides = [s] if s else []
+            else:
+                # Unsupported type: ignore.
+                hint_overrides = None
+
         requires_artifacts = sorted(list(_artifact_requires_of(gen)))
         produces_artifacts = sorted(list(_artifact_produces_of(gen)))
         input_fields_required = sorted(list(_required_input_fields_of(gen)))
@@ -13278,7 +13433,7 @@ def api_flow_save_flow_substitutions():
         inputs_effective = sorted(list(set(requires_effective) | set(input_fields_required)))
         outputs_effective = sorted(list(_provides_of(gen)))
 
-        out_assignments.append({
+        out_a: dict[str, Any] = {
             'node_id': str(node_id),
             'id': str(gen.get('id') or ''),
             'name': str(gen.get('name') or ''),
@@ -13302,7 +13457,18 @@ def api_flow_save_flow_substitutions():
             'hints': rendered_hints,
             'next_node_id': str(next_id),
             'next_node_name': str(id_to_name.get(str(next_id)) or ''),
-        })
+        }
+
+        if hint_overrides_present:
+            if clear_hint_overrides:
+                # Explicit clear: do not persist overrides.
+                out_a.pop('hint_overrides', None)
+            elif hint_overrides is not None:
+                out_a['hint_overrides'] = list(hint_overrides)
+                out_a['hints'] = list(hint_overrides)
+                out_a['hint'] = hint_overrides[0] if hint_overrides else ''
+
+        out_assignments.append(out_a)
 
     # Validate (non-blocking)
     try:
@@ -23683,7 +23849,24 @@ def _plan_summary_from_full_preview(full_prev: dict) -> dict:
     routers_planned = len(full_prev.get('routers') or [])
     switches = full_prev.get('switches_detail') or []
     services_plan = full_prev.get('services_plan') or full_prev.get('services_preview') or {}
-    vuln_plan = full_prev.get('vulnerabilities_plan') or full_prev.get('vulnerabilities_preview') or {}
+    vuln_plan = full_prev.get('vulnerabilities_plan') or {}
+    if not vuln_plan:
+        # Backwards/compat: some payloads only have assignments-by-host.
+        # Derive planned counts by counting occurrences.
+        try:
+            vp = full_prev.get('vulnerabilities_preview') or {}
+            if isinstance(vp, dict):
+                counts: dict[str, int] = {}
+                for _hid, vv in vp.items():
+                    if isinstance(vv, list):
+                        for name in vv:
+                            s = str(name or '').strip()
+                            if s:
+                                counts[s] = counts.get(s, 0) + 1
+                if counts:
+                    vuln_plan = counts
+        except Exception:
+            pass
     r2r_policy = full_prev.get('r2r_policy_preview') or {}
     r2s_policy = full_prev.get('r2s_policy_preview') or {}
     summary = {

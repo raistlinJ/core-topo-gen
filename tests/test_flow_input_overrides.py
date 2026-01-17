@@ -193,8 +193,125 @@ def test_prepare_preview_applies_config_overrides_into_effective_config(monkeypa
         cfg = fas[0].get("config") or {}
         assert cfg.get("key_len") == 7
         assert (fas[0].get("config_overrides") or {}).get("key_len") == 7
+
+        # Also expose redacted resolved inputs for UI tabular display.
+        resolved_inputs = fas[0].get("resolved_inputs") or {}
+        assert isinstance(resolved_inputs, dict)
+        assert resolved_inputs.get("key_len") == 7
     finally:
         try:
             os.remove(plan_path)
         except Exception:
             pass
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_save_flow_substitutions_persists_hint_overrides_and_can_clear(monkeypatch):
+    app.config["TESTING"] = True
+    client = app.test_client()
+
+    login_resp = client.post("/login", data={"username": "coreadmin", "password": "coreadmin"})
+    assert login_resp.status_code in (302, 303)
+
+    scenario = f"zz-test-flow-hint-overrides-{uuid.uuid4().hex[:10]}"
+
+    full_preview = {
+        "seed": 123,
+        "routers": [],
+        "switches": [],
+        "switches_detail": [],
+        "hosts": [
+            {"node_id": "h1", "name": "h1", "role": "Docker", "ip4": "172.27.83.6", "vulnerabilities": []},
+        ],
+        "host_router_map": {},
+        "r2r_links_preview": [],
+    }
+
+    plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
+    os.makedirs(plans_dir, exist_ok=True)
+    plan_path = os.path.join(plans_dir, f"plan_from_preview_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
+    with open(plan_path, "w", encoding="utf-8") as f:
+        json.dump({"full_preview": full_preview, "metadata": {"xml_path": "/tmp/does-not-matter.xml", "scenario": scenario, "seed": 123}}, f)
+
+    fake_gen = {
+        "id": "zz_hint_override",
+        "name": "ZZ Hint Override",
+        "language": "python",
+        "description": "test",
+        "inputs": [],
+        "outputs": [],
+        "hint_templates": ["from_tpl"],
+        "_source_name": "test",
+    }
+
+    monkeypatch.setattr(app_backend, "_flag_generators_from_enabled_sources", lambda: ([fake_gen], []))
+    monkeypatch.setattr(app_backend, "_flag_node_generators_from_enabled_sources", lambda: ([], []))
+    monkeypatch.setattr(app_backend, "_flow_enabled_plugin_contracts_by_id", lambda: {})
+    monkeypatch.setattr(app_backend, "_flow_validate_chain_order_by_requires_produces", lambda *args, **kwargs: (True, []))
+
+    flow_plan_path = None
+    try:
+        # Set overrides
+        resp = client.post(
+            "/api/flag-sequencing/save_flow_substitutions",
+            json={
+                "scenario": scenario,
+                "chain_ids": ["h1"],
+                "preview_plan": plan_path,
+                "flag_assignments": [
+                    {"node_id": "h1", "id": "zz_hint_override", "hint_overrides": ["custom one", "custom two"]},
+                ],
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data and data.get("ok") is True
+
+        fas = data.get("flag_assignments") or []
+        assert len(fas) == 1
+        assert fas[0].get("id") == "zz_hint_override"
+        assert fas[0].get("hint_overrides") == ["custom one", "custom two"]
+        assert fas[0].get("hints") == ["custom one", "custom two"]
+        assert fas[0].get("hint") == "custom one"
+
+        flow_plan_path = data.get("flow_plan_path")
+        assert flow_plan_path
+        with open(flow_plan_path, "r", encoding="utf-8") as f:
+            payload = json.load(f) or {}
+        flow_meta = (((payload.get("metadata") or {}).get("flow")) if isinstance(payload, dict) else None) or {}
+        saved_fas = flow_meta.get("flag_assignments") or []
+        assert isinstance(saved_fas, list) and len(saved_fas) == 1
+        assert saved_fas[0].get("hint_overrides") == ["custom one", "custom two"]
+
+        # Clear overrides (null means "use generated")
+        resp2 = client.post(
+            "/api/flag-sequencing/save_flow_substitutions",
+            json={
+                "scenario": scenario,
+                "chain_ids": ["h1"],
+                "preview_plan": plan_path,
+                "flag_assignments": [
+                    {"node_id": "h1", "id": "zz_hint_override", "hint_overrides": None},
+                ],
+            },
+        )
+        assert resp2.status_code == 200
+        data2 = resp2.get_json()
+        assert data2 and data2.get("ok") is True
+        fas2 = data2.get("flag_assignments") or []
+        assert len(fas2) == 1
+        # Should revert to generated hint text (exact wording can vary).
+        hints2 = fas2[0].get("hints")
+        assert isinstance(hints2, list)
+        assert fas2[0].get("hint") != "custom one"
+        assert "hint_overrides" not in fas2[0] or fas2[0].get("hint_overrides") in (None, [])
+    finally:
+        try:
+            os.remove(plan_path)
+        except Exception:
+            pass
+        if flow_plan_path:
+            try:
+                os.remove(flow_plan_path)
+            except Exception:
+                pass

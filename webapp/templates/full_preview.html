@@ -14,6 +14,15 @@
   .form-switch.form-switch-sm .form-check-label {
     padding-left: .35rem;
   }
+
+  /* Preview tables inside scroll containers */
+  .fp-scroll-table { overflow: auto; }
+  .fp-scroll-table .fp-sticky-head thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  .fp-vuln-cell { white-space: normal; word-break: break-word; }
 </style>
 {% endblock %}
 {% block content %}
@@ -189,14 +198,51 @@
         </div>
   <div class="tab-pane fade" id="fp-vulnerabilities">
           <div id="fp-vuln-body">
-          {% set vuln_plan = full_preview.vulnerabilities_preview or {} %}
+      {# vulnerabilities_plan: vulnerability name -> planned count #}
+      {% set vuln_plan = full_preview.vulnerabilities_plan or {} %}
           {% set vuln_assign = full_preview.vulnerabilities_by_node or {} %}
+
+          {# Summary totals #}
+          {% set planned_total = 0 %}
+          {% set planned_unique = 0 %}
+          {% if vuln_plan %}
+            {% set planned_unique = (vuln_plan|length) %}
+            {% for _k, _v in vuln_plan.items() %}
+              {% set planned_total = planned_total + (_v|int) %}
+            {% endfor %}
+          {% endif %}
+
+          {% set assigned_total = 0 %}
+          {% set assigned_unique = 0 %}
+          {% if vuln_assign %}
+            {% set uniq = namespace(v={}) %}
+            {% for _hid, _vv in vuln_assign.items() %}
+              {% if _vv is sequence and (_vv is not string) %}
+                {% set assigned_total = assigned_total + (_vv|length) %}
+                {% for _name in _vv %}
+                  {% set _s = _name|string %}
+                  {% if _s %}
+                    {% set _ = uniq.v.update({_s: True}) %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+            {% endfor %}
+            {% set assigned_unique = (uniq.v|length) %}
+          {% endif %}
+
+          <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+            <span class="badge text-bg-secondary">Planned total: {{ planned_total }}</span>
+            <span class="badge text-bg-secondary">Assigned total: {{ assigned_total }}</span>
+            <span class="badge text-bg-light border">Unique planned: {{ planned_unique }}</span>
+            <span class="badge text-bg-light border">Unique assigned: {{ assigned_unique }}</span>
+          </div>
+
           <div class="row g-3">
             <div class="col-md-4">
               <h6 class="mb-2">Planned Counts</h6>
               {% set plan_ns = namespace(has_rows=False) %}
-              <div class="table-responsive" style="max-height:220px;overflow:auto;">
-                <table class="table table-sm table-striped small align-middle">
+              <div class="table-responsive fp-scroll-table" style="max-height:220px;">
+                <table class="table table-sm table-striped table-bordered small align-middle mb-0 fp-sticky-head">
                   <thead class="table-light"><tr><th>Vulnerability</th><th class="text-end">Count</th></tr></thead>
                   <tbody>
                   {% for v_name, v_count in vuln_plan.items() %}
@@ -214,23 +260,43 @@
             </div>
             <div class="col-md-8">
               <h6 class="mb-2">Assignments by Host</h6>
-              {% set sorted_assign = vuln_assign|dictsort %}
-              {% if sorted_assign %}
-              <div class="table-responsive" style="max-height:220px;overflow:auto;">
-                <table class="table table-sm table-striped small align-middle">
+              {% set assign_rows_ns = namespace(rows=[]) %}
+              {% for node_id_str, vulns in (vuln_assign|dictsort) %}
+                {% if vulns %}
+                  {% set assign_rows_ns.rows = assign_rows_ns.rows + [{'node_id': (node_id_str|int), 'node_id_str': node_id_str, 'vulns': vulns}] %}
+                {% endif %}
+              {% endfor %}
+              {% set assign_rows = assign_rows_ns.rows|sort(attribute='node_id') %}
+              {% if assign_rows %}
+              <div class="table-responsive fp-scroll-table" style="max-height:220px;">
+                <table class="table table-sm table-striped table-bordered small align-middle mb-0 fp-sticky-head" style="table-layout: fixed;">
                   <thead class="table-light"><tr><th>Host ID</th><th>Name</th><th>Role</th><th>Vulnerabilities</th></tr></thead>
                   <tbody>
                   {% set assign_ns = namespace(has_rows=False) %}
-                  {% for node_id_str, vulns in sorted_assign %}
+                  {% for row in assign_rows %}
+                    {% set node_id_str = row.node_id_str %}
+                    {% set vulns = row.vulns %}
                     {% if vulns %}
                       {% set assign_ns.has_rows = True %}
-                      {% set node_id = node_id_str|int %}
+                      {% set node_id = row.node_id %}
                       {% set host = (full_preview.hosts | selectattr('node_id','equalto', node_id) | first) %}
                       <tr>
                         <td>{{ node_id }}</td>
                         <td>{{ host.name if host else 'Host ' ~ node_id }}</td>
                         <td>{{ host.role if host and host.role else 'host' }}</td>
-                        <td>{{ vulns|join(', ') }}</td>
+                        <td class="fp-vuln-cell">
+                          {% if vulns is string %}
+                            {{ vulns }}
+                          {% elif vulns is sequence %}
+                            <div class="d-flex flex-wrap gap-1">
+                              {% for v in (vulns|sort) %}
+                                <span class="badge text-bg-danger">{{ v }}</span>
+                              {% endfor %}
+                            </div>
+                          {% else %}
+                            {{ vulns }}
+                          {% endif %}
+                        </td>
                       </tr>
                     {% endif %}
                   {% endfor %}
@@ -631,6 +697,22 @@
     try {
       if(!flowNodeFlagModalEl || !flowNodeFlagModalBodyEl) return;
 
+      function collectHintTexts(fa){
+        const out = [];
+        try {
+          if(!fa || typeof fa !== 'object') return out;
+          const hs = Array.isArray(fa.hints) ? fa.hints : [];
+          hs.forEach((x)=>{ const s = String(x || '').trim(); if(s) out.push(s); });
+          if(typeof fa.hint === 'string'){
+            const s = fa.hint.trim();
+            if(s) out.push(s);
+          }
+          const dh = Array.isArray(fa.description_hints) ? fa.description_hints : [];
+          dh.forEach((x)=>{ const s = String(x || '').trim(); if(s) out.push(s); });
+        } catch(e) {}
+        return out;
+      }
+
       // Ensure modal isn't clipped by embedded containers.
       try {
         if(!flowNodeFlagModalEl.__appendedToBody){
@@ -701,34 +783,30 @@
         addRow('flag', '-');
       }
 
-      // Description hints (flatten if multiple flags).
-      const desc = [];
+      // Hints (prefer rendered runtime hints; fall back to static description hints).
+      const hints = [];
       try {
         matches.forEach((fa) => {
-          const dh = (fa && Array.isArray(fa.description_hints)) ? fa.description_hints : [];
-          dh.forEach((x) => {
-            const s = String(x || '').trim();
-            if(s) desc.push(s);
-          });
+          collectHintTexts(fa).forEach((s) => { if(s) hints.push(s); });
         });
       } catch(e) {}
 
-      const descUniq = Array.from(new Set(desc));
-      if(descUniq.length > 1){
+      const hintsUniq = Array.from(new Set(hints));
+      if(hintsUniq.length > 1){
         const wrap = document.createElement('div');
         const ol = document.createElement('ol');
         ol.className = 'mb-0 ps-3';
-        descUniq.forEach((t) => {
+        hintsUniq.forEach((t) => {
           const li = document.createElement('li');
           li.textContent = t;
           ol.appendChild(li);
         });
         wrap.appendChild(ol);
-        addRow('description hints', wrap);
-      } else if(descUniq.length === 1){
-        addRow('description hints', descUniq[0]);
+        addRow('hints', wrap);
+      } else if(hintsUniq.length === 1){
+        addRow('hints', hintsUniq[0]);
       } else {
-        addRow('description hints', '-');
+        addRow('hints', '-');
       }
 
       // Runtime flag value (only if present in the loaded data).
@@ -795,6 +873,22 @@
     const body = document.getElementById('fp-flag-sequence-body');
     if(!body) return;
 
+    function collectHintTexts(fa){
+      const out = [];
+      try {
+        if(!fa || typeof fa !== 'object') return out;
+        const hs = Array.isArray(fa.hints) ? fa.hints : [];
+        hs.forEach((x)=>{ const s = String(x || '').trim(); if(s) out.push(s); });
+        if(typeof fa.hint === 'string'){
+          const s = fa.hint.trim();
+          if(s) out.push(s);
+        }
+        const dh = Array.isArray(fa.description_hints) ? fa.description_hints : [];
+        dh.forEach((x)=>{ const s = String(x || '').trim(); if(s) out.push(s); });
+      } catch(e) {}
+      return out;
+    }
+
     const mdFlow = previewData && previewData.metadata && previewData.metadata.flow ? previewData.metadata.flow : null;
     const flow = mdFlow || (previewData && previewData.flow ? previewData.flow : null) || null;
     const chain = (flow && Array.isArray(flow.chain)) ? flow.chain : [];
@@ -821,7 +915,7 @@
     tbl.className = 'table table-sm table-bordered small align-middle mb-0';
     const thead = document.createElement('thead');
     thead.className = 'table-light';
-    thead.innerHTML = '<tr><th style="width:96px;">Sequence</th><th>Node</th><th style="width:260px;">Flag</th><th>Description hints</th><th style="width:220px;">Flag value</th></tr>';
+    thead.innerHTML = '<tr><th style="width:96px;">Sequence</th><th>Node</th><th style="width:260px;">Flag</th><th>Hints</th><th style="width:220px;">Flag value</th></tr>';
     const tbody = document.createElement('tbody');
 
     const faByNodeId = new Map();
@@ -878,28 +972,24 @@
       }
 
       const descTd = document.createElement('td');
-      const desc = [];
+      const hints = [];
       try {
         matches.forEach((fa) => {
-          const dh = (fa && Array.isArray(fa.description_hints)) ? fa.description_hints : [];
-          dh.forEach((x) => {
-            const s = String(x || '').trim();
-            if(s) desc.push(s);
-          });
+          collectHintTexts(fa).forEach((s) => { if(s) hints.push(s); });
         });
       } catch(e){}
-      const descUniq = Array.from(new Set(desc));
-      if(descUniq.length > 1){
+      const hintsUniq = Array.from(new Set(hints));
+      if(hintsUniq.length > 1){
         const ol = document.createElement('ol');
         ol.className = 'mb-0 ps-3';
-        descUniq.forEach((t) => {
+        hintsUniq.forEach((t) => {
           const li = document.createElement('li');
           li.textContent = t;
           ol.appendChild(li);
         });
         descTd.appendChild(ol);
-      } else if(descUniq.length === 1){
-        descTd.textContent = descUniq[0];
+      } else if(hintsUniq.length === 1){
+        descTd.textContent = hintsUniq[0];
       } else {
         descTd.textContent = '-';
       }

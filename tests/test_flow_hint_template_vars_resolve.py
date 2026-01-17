@@ -98,6 +98,12 @@ def test_prepare_preview_resolves_chain_and_output_template_vars(monkeypatch):
         fas = data.get("flag_assignments") or []
         assert len(fas) == 2
 
+        # Resolved outputs should be surfaced for UI display (network.ip clamped to preview ip4).
+        resolved_outputs = (fas[0].get("resolved_outputs") or {})
+        assert isinstance(resolved_outputs, dict)
+        assert resolved_outputs.get("network.ip") == "172.27.83.6"
+        assert resolved_outputs.get("https_port") == 8443
+
         hints = fas[0].get("hints") or []
         assert len(hints) >= 2
 

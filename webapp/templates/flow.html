@@ -838,6 +838,38 @@
         badge.textContent = 'Duplicate generator' + sameAs;
         titleRow.appendChild(badge);
       }
+
+      // Per-step actions (top-right).
+      try {
+        const btnGroup = document.createElement('div');
+        btnGroup.className = 'btn-group btn-group-sm ms-auto';
+
+        const inputsBtn = document.createElement('button');
+        inputsBtn.type = 'button';
+        inputsBtn.className = 'btn btn-outline-secondary';
+        inputsBtn.textContent = 'Value Override';
+        inputsBtn.addEventListener('click', (ev)=>{
+          try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
+          try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
+          try { selectChainIndex(idx); } catch(e) {}
+          try { openInputsDialog(idx); } catch(e) {}
+        });
+
+        const subBtn = document.createElement('button');
+        subBtn.type = 'button';
+        subBtn.className = 'btn btn-outline-primary';
+        subBtn.textContent = 'Edit';
+        subBtn.addEventListener('click', (ev)=>{
+          try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
+          try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
+          try { selectChainIndex(idx); } catch(e) {}
+          try { openSubstituteDialog(idx); } catch(e) {}
+        });
+
+        btnGroup.appendChild(inputsBtn);
+        btnGroup.appendChild(subBtn);
+        titleRow.appendChild(btnGroup);
+      } catch(e) {}
       left.appendChild(titleRow);
 
       // Sub-details: compact table for readability.
@@ -974,6 +1006,110 @@
 
           const showMissingCol = (missingArtifacts.length + missingFields.length) > 0;
 
+          function _stringifyAny(v){
+            if(v === undefined) return '';
+            if(v === null) return 'null';
+            if(typeof v === 'string') return v;
+            try { return JSON.stringify(v); } catch(e) { return String(v); }
+          }
+
+          function renderResolvedCell(kv, keysOrder, opts){
+            const options = (opts && typeof opts === 'object') ? opts : {};
+            const maxItems = Number.isFinite(+options.maxItems) ? (+options.maxItems) : 3;
+            const maxLen = Number.isFinite(+options.maxLen) ? (+options.maxLen) : 60;
+            const maxDetailItems = Number.isFinite(+options.maxDetailItems) ? (+options.maxDetailItems) : 25;
+
+            const obj = (kv && typeof kv === 'object' && !Array.isArray(kv)) ? kv : null;
+            if(!obj || !Object.keys(obj).length) return document.createTextNode('-');
+
+            let keys = Array.isArray(keysOrder) && keysOrder.length
+              ? keysOrder.map(x => String(x || '').trim()).filter(Boolean)
+              : Object.keys(obj);
+
+            // Prefer showing flag first when present.
+            try {
+              if(Object.prototype.hasOwnProperty.call(obj, 'flag')){
+                keys = ['flag'].concat(keys.filter(k => k !== 'flag'));
+              }
+            } catch(e) {}
+
+            const seen = new Set();
+            const pairs = [];
+            for(const k of keys){
+              const kk = String(k || '').trim();
+              if(!kk || seen.has(kk)) continue;
+              seen.add(kk);
+              if(!(kk in obj)) continue;
+              const v = obj[kk];
+              if(v === undefined) continue;
+              const full = _stringifyAny(v);
+              let short = full;
+              if(typeof short === 'string' && short.length > maxLen){
+                short = short.slice(0, Math.max(0, maxLen - 1)) + '…';
+              }
+              pairs.push({ k: kk, full, short });
+            }
+
+            if(!pairs.length) return document.createTextNode('-');
+
+            const details = document.createElement('details');
+            details.className = 'small';
+            const summary = document.createElement('summary');
+            summary.style.cursor = 'pointer';
+            summary.className = 'text-decoration-none';
+
+            const summaryWrap = document.createElement('span');
+            summaryWrap.className = 'd-inline-flex flex-wrap gap-1 align-items-center';
+
+            const head = pairs.slice(0, Math.max(1, maxItems));
+            head.forEach(p => {
+              const code = document.createElement('code');
+              code.className = 'font-monospace';
+              code.title = p.k + '=' + p.full;
+              code.textContent = p.k + '=' + p.short;
+              summaryWrap.appendChild(code);
+            });
+            if(pairs.length > head.length){
+              const more = document.createElement('span');
+              more.className = 'text-muted';
+              more.textContent = `(+${pairs.length - head.length})`;
+              summaryWrap.appendChild(more);
+            }
+            summary.appendChild(summaryWrap);
+            details.appendChild(summary);
+
+            const body = document.createElement('div');
+            body.className = 'mt-1';
+            const list = document.createElement('div');
+            list.className = 'd-flex flex-column gap-1';
+            pairs.slice(0, maxDetailItems).forEach(p => {
+              const row = document.createElement('div');
+              const kcode = document.createElement('code');
+              kcode.className = 'me-1 text-muted';
+              kcode.textContent = p.k;
+              const vcode = document.createElement('code');
+              vcode.className = 'font-monospace';
+              vcode.style.whiteSpace = 'pre-wrap';
+              vcode.textContent = p.full;
+              row.appendChild(kcode);
+              row.appendChild(document.createTextNode(': '));
+              row.appendChild(vcode);
+              list.appendChild(row);
+            });
+            if(pairs.length > maxDetailItems){
+              const moreLine = document.createElement('div');
+              moreLine.className = 'text-muted';
+              moreLine.textContent = `(+${pairs.length - maxDetailItems} more not shown)`;
+              list.appendChild(moreLine);
+            }
+            body.appendChild(list);
+            details.appendChild(body);
+            return details;
+          }
+
+          const resolvedInputs = (fa && typeof fa.resolved_inputs === 'object' && fa.resolved_inputs && !Array.isArray(fa.resolved_inputs)) ? fa.resolved_inputs : null;
+          const resolvedOutputs = (fa && typeof fa.resolved_outputs === 'object' && fa.resolved_outputs && !Array.isArray(fa.resolved_outputs)) ? fa.resolved_outputs : null;
+
           const outFields = (fa && Array.isArray(fa.output_fields)) ? fa.output_fields.map(String).filter(Boolean) : [];
           const outArtifacts = (fa && Array.isArray(fa.produces)) ? fa.produces.map(String).filter(Boolean) : [];
 
@@ -1001,8 +1137,8 @@
           inputsTbl.className = 'table table-sm mb-0';
           const itHead = document.createElement('thead');
           itHead.innerHTML = showMissingCol
-            ? '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Inputs</th><th>Required</th><th>Defined</th><th>Provided by Chain</th><th>Provided by Sequencer</th><th>Missing</th></tr>'
-            : '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Inputs</th><th>Required</th><th>Defined</th><th>Provided by Chain</th><th>Provided by Sequencer</th></tr>';
+            ? '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Inputs</th><th>Required</th><th>Defined</th><th>Resolved</th><th>Provided by Chain</th><th>Provided by Sequencer</th><th>Missing</th></tr>'
+            : '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Inputs</th><th>Required</th><th>Defined</th><th>Resolved</th><th>Provided by Chain</th><th>Provided by Sequencer</th></tr>';
           inputsTbl.appendChild(itHead);
           const itBody = document.createElement('tbody');
           function addIoRow(label, requiredList, definedList, byChainList, bySeqList, missingList){
@@ -1015,6 +1151,14 @@
             td1.textContent = (requiredList && requiredList.length) ? requiredList.join(', ') : '-';
             const td2 = document.createElement('td');
             td2.textContent = (definedList && definedList.length) ? definedList.join(', ') : '-';
+            const tdR = document.createElement('td');
+            tdR.className = 'small';
+            if(label === 'Fields'){
+              const keys = (fa && Array.isArray(fa.input_fields) && fa.input_fields.length) ? fa.input_fields : (definedList || []);
+              tdR.appendChild(renderResolvedCell(resolvedInputs, keys, { maxItems: 2, maxLen: 48, maxDetailItems: 25 }));
+            } else {
+              tdR.textContent = '-';
+            }
             const td3 = document.createElement('td');
             td3.textContent = (byChainList && byChainList.length) ? byChainList.join(', ') : '-';
             const td4 = document.createElement('td');
@@ -1022,6 +1166,7 @@
             tr.appendChild(td0);
             tr.appendChild(td1);
             tr.appendChild(td2);
+            tr.appendChild(tdR);
             tr.appendChild(td3);
             tr.appendChild(td4);
             if(showMissingCol){
@@ -1050,7 +1195,7 @@
           const outputsTbl = document.createElement('table');
           outputsTbl.className = 'table table-sm mb-0';
           const otHead = document.createElement('thead');
-          otHead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Outputs</th><th>Required</th><th>Defined</th><th>Injects</th><th>Provided to Chain</th></tr>';
+          otHead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Outputs</th><th>Required</th><th>Defined</th><th>Injects</th><th>Provided to Chain</th><th>Resolved</th></tr>';
           outputsTbl.appendChild(otHead);
           const otBody = document.createElement('tbody');
           function addOutRow(label, requiredList, definedList, injectedList, toChainList){
@@ -1067,11 +1212,22 @@
             td3.textContent = (injectedList && injectedList.length) ? injectedList.join(', ') : '-';
             const td4 = document.createElement('td');
             td4.textContent = (toChainList && toChainList.length) ? toChainList.join(', ') : '-';
+            const tdR = document.createElement('td');
+            tdR.className = 'small';
+            if(label === 'Fields'){
+              const keys = (fa && Array.isArray(fa.actual_outputs) && fa.actual_outputs.length)
+                ? fa.actual_outputs
+                : ((fa && Array.isArray(fa.output_fields) && fa.output_fields.length) ? fa.output_fields : (definedList || []));
+              tdR.appendChild(renderResolvedCell(resolvedOutputs, keys, { maxItems: 2, maxLen: 48, maxDetailItems: 25 }));
+            } else {
+              tdR.textContent = '-';
+            }
             tr.appendChild(td0);
             tr.appendChild(td1);
             tr.appendChild(td2);
             tr.appendChild(td3);
             tr.appendChild(td4);
+            tr.appendChild(tdR);
             otBody.appendChild(tr);
           }
           // Generator outputs are provided to the chain; sequencer does not provide outputs here.
@@ -1155,40 +1311,7 @@
       details.appendChild(tbl);
       left.appendChild(details);
 
-      // Row-level Substitute shortcut (bottom-right of Details column).
-      try {
-        const shortcutRow = document.createElement('div');
-        shortcutRow.className = 'd-flex justify-content-end mt-2';
-        const btnGroup = document.createElement('div');
-        btnGroup.className = 'btn-group btn-group-sm';
-
-        const inputsBtn = document.createElement('button');
-        inputsBtn.type = 'button';
-        inputsBtn.className = 'btn btn-outline-secondary';
-        inputsBtn.textContent = 'Inputs';
-        inputsBtn.addEventListener('click', (ev)=>{
-          try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
-          try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
-          try { selectChainIndex(idx); } catch(e) {}
-          try { openInputsDialog(idx); } catch(e) {}
-        });
-
-        const subBtn = document.createElement('button');
-        subBtn.type = 'button';
-        subBtn.className = 'btn btn-outline-primary';
-        subBtn.textContent = 'Substitute';
-        subBtn.addEventListener('click', (ev)=>{
-          try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
-          try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
-          try { selectChainIndex(idx); } catch(e) {}
-          try { openSubstituteDialog(idx); } catch(e) {}
-        });
-
-        btnGroup.appendChild(inputsBtn);
-        btnGroup.appendChild(subBtn);
-        shortcutRow.appendChild(btnGroup);
-        left.appendChild(shortcutRow);
-      } catch(e) {}
+      // (Per-step action buttons moved to title row.)
 
       const right = document.createElement('div');
       right.className = 'btn-group btn-group-sm';
@@ -1333,7 +1456,7 @@
 
     const seq = toRoman(i + 1);
     const nodeName = (node && node.name) ? String(node.name) : ('Node ' + (i + 1));
-    if(inputsTitleEl) inputsTitleEl.textContent = 'Inputs — ' + (seq ? (seq + '. ') : '') + nodeName;
+    if(inputsTitleEl) inputsTitleEl.textContent = 'Value Override — ' + (seq ? (seq + '. ') : '') + nodeName;
 
     inputsBodyEl.innerHTML = '';
 
@@ -1589,9 +1712,14 @@
     const node = currentChain[i] || {};
     const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[i]) ? currentFlagAssignments[i] : null;
 
+    // Hint overrides editor state (scoped to this dialog open).
+    let hintOverridesEnabled = false;
+    let hintOverrideToggleEl = null;
+    let hintOverrideInputs = [];
+
     const seq = toRoman(i + 1);
     const nodeName = (node && node.name) ? String(node.name) : ('Node ' + (i + 1));
-    if(substituteTitleEl) substituteTitleEl.textContent = 'Substitute — ' + (seq ? (seq + '. ') : '') + nodeName;
+    if(substituteTitleEl) substituteTitleEl.textContent = 'Edit Flag + Hints — ' + (seq ? (seq + '. ') : '') + nodeName;
 
     substituteBodyEl.innerHTML = '';
 
@@ -1811,6 +1939,147 @@
       row2.appendChild(entryErr);
       row2.appendChild(candWrap);
       form.appendChild(row2);
+
+      // Hints editor (override / generated).
+      try {
+        const hintsDivider = document.createElement('hr');
+        hintsDivider.className = 'my-3';
+        form.appendChild(hintsDivider);
+
+        const hintsHdr = document.createElement('div');
+        hintsHdr.className = 'fw-semibold';
+        hintsHdr.textContent = 'Hints';
+        form.appendChild(hintsHdr);
+
+        const hintsHelp = document.createElement('div');
+        hintsHelp.className = 'small text-muted';
+        hintsHelp.textContent = 'Override the displayed hints for this step. If disabled, hints are generated from the selected generator templates.';
+        form.appendChild(hintsHelp);
+
+        const toggleRow = document.createElement('div');
+        toggleRow.className = 'd-flex align-items-center justify-content-between gap-2 mt-2';
+
+        const toggleWrap = document.createElement('div');
+        toggleWrap.className = 'form-check';
+        hintOverrideToggleEl = document.createElement('input');
+        hintOverrideToggleEl.type = 'checkbox';
+        hintOverrideToggleEl.className = 'form-check-input';
+        hintOverrideToggleEl.id = 'flowHintOverrideToggle_' + i;
+        const toggleLabel = document.createElement('label');
+        toggleLabel.className = 'form-check-label';
+        toggleLabel.setAttribute('for', hintOverrideToggleEl.id);
+        toggleLabel.textContent = 'Override hints';
+        toggleWrap.appendChild(hintOverrideToggleEl);
+        toggleWrap.appendChild(toggleLabel);
+
+        const resetBtn = document.createElement('button');
+        resetBtn.type = 'button';
+        resetBtn.className = 'btn btn-sm btn-outline-secondary';
+        resetBtn.textContent = 'Reset to generated';
+
+        toggleRow.appendChild(toggleWrap);
+        toggleRow.appendChild(resetBtn);
+        form.appendChild(toggleRow);
+
+        const listWrap = document.createElement('div');
+        listWrap.className = 'border rounded p-2 mt-2';
+        form.appendChild(listWrap);
+
+        function normalizeHints(list){
+          const out = [];
+          try {
+            (Array.isArray(list) ? list : []).forEach((x)=>{
+              const s = String(x ?? '').trim();
+              if(!s) return;
+              out.push(s);
+            });
+          } catch(e) {}
+          return out;
+        }
+
+        function getGeneratedHintsFromAssignment(){
+          const cur = (fa && Array.isArray(fa.hints) && fa.hints.length) ? normalizeHints(fa.hints) : [];
+          if(cur.length) return cur;
+          const h = (fa && fa.hint) ? String(fa.hint || '').trim() : '';
+          return h ? [h] : [];
+        }
+
+        function getOverrideHintsFromAssignment(){
+          if(fa && Array.isArray(fa.hint_overrides)) return normalizeHints(fa.hint_overrides);
+          return null;
+        }
+
+        function renderHintList(hints){
+          hintOverrideInputs = [];
+          listWrap.innerHTML = '';
+
+          const stack = document.createElement('div');
+          stack.className = 'd-flex flex-column gap-2';
+
+          function addRow(value){
+            const row = document.createElement('div');
+            row.className = 'd-flex gap-2 align-items-center';
+
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.className = 'form-control form-control-sm';
+            inp.placeholder = 'Hint text…';
+            inp.value = String(value ?? '');
+
+            const del = document.createElement('button');
+            del.type = 'button';
+            del.className = 'btn btn-sm btn-outline-danger';
+            del.textContent = 'Remove';
+            del.addEventListener('click', ()=>{
+              try { row.remove(); } catch(e) {}
+              hintOverrideInputs = hintOverrideInputs.filter(x => x !== inp);
+            });
+
+            hintOverrideInputs.push(inp);
+            row.appendChild(inp);
+            row.appendChild(del);
+            stack.appendChild(row);
+          }
+
+          (Array.isArray(hints) && hints.length ? hints : ['']).forEach(addRow);
+
+          const addBtn = document.createElement('button');
+          addBtn.type = 'button';
+          addBtn.className = 'btn btn-sm btn-outline-primary';
+          addBtn.textContent = 'Add hint';
+          addBtn.addEventListener('click', ()=> addRow(''));
+
+          listWrap.appendChild(stack);
+          listWrap.appendChild(addBtn);
+        }
+
+        function setHintOverrideEnabled(enabled){
+          hintOverridesEnabled = !!enabled;
+          try { if(hintOverrideToggleEl) hintOverrideToggleEl.checked = hintOverridesEnabled; } catch(e) {}
+          try { listWrap.style.display = hintOverridesEnabled ? '' : 'none'; } catch(e) {}
+          try { resetBtn.disabled = !hintOverridesEnabled; } catch(e) {}
+        }
+
+        const existingOverride = getOverrideHintsFromAssignment();
+        if(existingOverride !== null){
+          renderHintList(existingOverride);
+          setHintOverrideEnabled(true);
+        } else {
+          renderHintList(getGeneratedHintsFromAssignment());
+          setHintOverrideEnabled(false);
+        }
+
+        hintOverrideToggleEl.addEventListener('change', ()=>{
+          setHintOverrideEnabled(!!hintOverrideToggleEl.checked);
+        });
+
+        resetBtn.addEventListener('click', ()=>{
+          setHintOverrideEnabled(false);
+          renderHintList(getGeneratedHintsFromAssignment());
+        });
+      } catch(e) {
+        // Non-fatal
+      }
 
       const row3 = document.createElement('div');
       row3.className = 'd-flex align-items-center justify-content-between gap-2 mt-2';
@@ -2095,7 +2364,38 @@
                 ovr = undefined;
               }
             }
-            return { node_id: nid, id: idOut, config_overrides: ovr };
+
+            // Preserve hint overrides for other steps. For this step:
+            // - if override enabled: send list
+            // - else: send null to clear any previous override (use generated templates)
+            let hintOvr = undefined;
+            try {
+              if(curA && Array.isArray(curA.hint_overrides)) hintOvr = curA.hint_overrides;
+            } catch(e) {}
+
+            if(j === i){
+              if(hintOverridesEnabled){
+                const texts = [];
+                try {
+                  (hintOverrideInputs || []).forEach((el)=>{
+                    const s = String((el && el.value) ?? '').trim();
+                    if(!s) return;
+                    texts.push(s);
+                  });
+                } catch(e) {}
+                hintOvr = texts;
+              } else {
+                hintOvr = null;
+              }
+
+              if((String(nid) !== String(currentNodeId) || String(idOut) !== String(curId)) && !hintOverridesEnabled){
+                hintOvr = null;
+              }
+            }
+
+            const out = { node_id: nid, id: idOut, config_overrides: ovr };
+            if(hintOvr !== undefined) out.hint_overrides = hintOvr;
+            return out;
           });
           const missing = reqAssignments.find(x => !x.id);
           if(missing){
@@ -2116,7 +2416,7 @@
           if(res && res.flow_plan_path) lastFlowPlanPath = String(res.flow_plan_path);
           updateMeta();
           renderChainEditor();
-          setStatus('Substitution saved. Saving XML…', false);
+          setStatus('Edits saved. Saving XML…', false);
 
           try {
             if(typeof substituteDialogEl.close === 'function') substituteDialogEl.close();
@@ -2125,10 +2425,10 @@
           try {
             await saveXmlOnly({});
           } catch(e) {
-            setStatus('Saved substitution, but Save XML failed: ' + String(e && e.message || e), true);
+            setStatus('Saved edits, but Save XML failed: ' + String(e && e.message || e), true);
           }
         } catch(e){
-          setStatus('Failed to save substitution: ' + String(e && e.message || e), true);
+          setStatus('Failed to save edits: ' + String(e && e.message || e), true);
         } finally {
           try { applyBtn.disabled = false; } catch(e) {}
           try { cancelBtn.disabled = false; } catch(e) {}
