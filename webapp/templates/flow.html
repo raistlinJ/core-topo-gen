@@ -908,6 +908,9 @@
       const genLabel = fa && fa.flag_generator ? String(fa.flag_generator) : '-';
       addRow('Source', genLabel);
 
+      const genType = fa && fa.type ? String(fa.type) : '-';
+      addRow('Type', genType);
+
       try{
         const nid = (node && node.id) ? String(node.id).trim() : '';
         if(nid && idCounts[nid] > 1){
@@ -1397,36 +1400,162 @@
           btnOutputs.className = 'btn btn-sm btn-outline-primary';
           btnOutputs.textContent = 'Outputs';
 
+          const btnInjects = document.createElement('button');
+          btnInjects.type = 'button';
+          btnInjects.className = 'btn btn-sm btn-outline-primary';
+          btnInjects.textContent = 'Injects';
+
           tabBar.appendChild(btnInputs);
           tabBar.appendChild(btnOutputs);
+          tabBar.appendChild(btnInjects);
           ioWrap.appendChild(tabBar);
 
           const inputsPane = document.createElement('div');
           const outputsPane = document.createElement('div');
+          const injectsPane = document.createElement('div');
           inputsPane.appendChild(buildIoTable('inputs'));
           outputsPane.appendChild(buildIoTable('outputs'));
+          function parseInjectSpec(text){
+            const raw = String(text ?? '').trim();
+            if(!raw) return { src: '', dest: '' };
+            for(const sep of ['->', '=>']){
+              const idx = raw.indexOf(sep);
+              if(idx >= 0){
+                const left = raw.slice(0, idx).trim();
+                const right = raw.slice(idx + sep.length).trim();
+                return { src: left, dest: right };
+              }
+            }
+            return { src: raw, dest: '' };
+          }
+
+          function _basenameFromPath(p){
+            const s = String(p || '').replace('\\', '/');
+            const parts = s.split('/').filter(Boolean);
+            return parts.length ? parts[parts.length - 1] : s;
+          }
+
+          function filenameFromPath(p){
+            const s = String(p || '').replace('\\', '/');
+            const parts = s.split('/').filter(Boolean);
+            return parts.length ? parts[parts.length - 1] : s;
+          }
+
+          function buildInjectsTable(files, resolved){
+            const tbl = document.createElement('table');
+            tbl.className = 'table table-sm mb-0';
+            const thead = document.createElement('thead');
+            thead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved</th><th>Path</th></tr>';
+            tbl.appendChild(thead);
+            const tbody2 = document.createElement('tbody');
+            const rows = Array.isArray(files) ? files : [];
+            if(!rows.length){
+              const tr = document.createElement('tr');
+              const td = document.createElement('td');
+              td.colSpan = 3;
+              td.className = 'text-muted small';
+              td.textContent = 'No inject files.';
+              tr.appendChild(td);
+              tbody2.appendChild(tr);
+            } else {
+              const resolvedMap = (resolved && typeof resolved === 'object' && !Array.isArray(resolved)) ? resolved : null;
+
+              function normalizeDestDir(d){
+                const s = String(d || '').trim();
+                if(!s || !s.startsWith('/')) return '/tmp';
+                return s.replace(/\/+$/g, '') || '/tmp';
+              }
+
+              function resolvedTargetsFor(src){
+                if(!resolvedMap) return [];
+                const key = String(src || '').trim();
+                if(!key || !(key in resolvedMap)) return [];
+                const v = resolvedMap[key];
+                if(Array.isArray(v)){
+                  return v.map(x => String(x ?? '')).filter(x => x.trim());
+                }
+                if(typeof v === 'string') return [v.trim()].filter(Boolean);
+                return [];
+              }
+
+              function basenameFrom(p){
+                const s = String(p || '').replace('\\', '/');
+                const parts = s.split('/').filter(Boolean);
+                return parts.length ? parts[parts.length - 1] : s;
+              }
+
+              rows.forEach((entry)=>{
+                const parsed = parseInjectSpec(entry);
+                const srcRaw = String(parsed.src || '');
+                const dest = parsed.dest || '';
+
+                let displaySrc = srcRaw;
+                let resolvedTargets = [];
+                if(srcRaw.startsWith('upload:')){
+                  const base = filenameFromPath(srcRaw.slice('upload:'.length));
+                  displaySrc = base ? `artifacts/${base}` : srcRaw;
+                  resolvedTargets = displaySrc ? [displaySrc] : [];
+                } else {
+                  displaySrc = srcRaw;
+                  resolvedTargets = resolvedTargetsFor(srcRaw);
+                }
+
+                const name = filenameFromPath(displaySrc);
+                const destDir = normalizeDestDir(dest);
+
+                const entries = resolvedTargets.length ? resolvedTargets : [''];
+                entries.forEach((resolvedVal, idx)=>{
+                  const tr = document.createElement('tr');
+                  const tdName = document.createElement('td');
+                  const nameCode = document.createElement('code');
+                  nameCode.className = 'font-monospace';
+                  nameCode.textContent = (idx === 0 ? (name || '-') : '');
+                  tdName.appendChild(nameCode);
+
+                  const tdResolved = document.createElement('td');
+                  tdResolved.className = 'small text-muted';
+                  tdResolved.textContent = resolvedVal ? resolvedVal : (resolvedTargets.length ? '-' : '');
+
+                  const tdPath = document.createElement('td');
+                  tdPath.className = 'small text-muted';
+                  const resolvedBase = resolvedVal ? basenameFrom(resolvedVal) : basenameFrom(displaySrc);
+                  const destPath = resolvedBase ? `${destDir}/${resolvedBase}` : destDir;
+                  tdPath.textContent = destPath || '-';
+
+                  tr.appendChild(tdName);
+                  tr.appendChild(tdResolved);
+                  tr.appendChild(tdPath);
+                  tbody2.appendChild(tr);
+                });
+              });
+            }
+            tbl.appendChild(tbody2);
+            return tbl;
+          }
+
+          injectsPane.appendChild(buildInjectsTable(injectedFiles, resolvedOutputs));
           outputsPane.style.display = 'none';
+          injectsPane.style.display = 'none';
 
           function setTab(which){
             const showInputs = which === 'inputs';
+            const showOutputs = which === 'outputs';
+            const showInjects = which === 'injects';
             inputsPane.style.display = showInputs ? '' : 'none';
-            outputsPane.style.display = showInputs ? 'none' : '';
+            outputsPane.style.display = showOutputs ? '' : 'none';
+            injectsPane.style.display = showInjects ? '' : 'none';
             btnInputs.className = showInputs ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-primary';
-            btnOutputs.className = showInputs ? 'btn btn-sm btn-outline-primary' : 'btn btn-sm btn-primary';
+            btnOutputs.className = showOutputs ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-primary';
+            btnInjects.className = showInjects ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-primary';
           }
           btnInputs.addEventListener('click', () => setTab('inputs'));
           btnOutputs.addEventListener('click', () => setTab('outputs'));
+          btnInjects.addEventListener('click', () => setTab('injects'));
           setTab('inputs');
 
           ioWrap.appendChild(inputsPane);
           ioWrap.appendChild(outputsPane);
-
-          if(injectedFiles.length){
-            const inj = document.createElement('div');
-            inj.className = 'small text-muted mt-2';
-            inj.textContent = 'Inject files: ' + injectedFiles.join(', ');
-            ioWrap.appendChild(inj);
-          }
+          ioWrap.appendChild(injectsPane);
 
           // Full-width row so the IO block is flush-left.
           {
@@ -1746,7 +1875,7 @@
     let outputOverridesTouched = false;
 
     // Inject files editor state.
-    let injectOverridesEnabled = false;
+    let injectOverridesEnabled = true;
     let injectOverrideToggleEl = null;
     let injectOverrideInputs = [];
     let injectsTouched = false;
@@ -2418,14 +2547,22 @@
       btnOutputs.className = 'btn btn-sm btn-outline-primary';
       btnOutputs.textContent = 'Outputs';
 
+      const btnInjects = document.createElement('button');
+      btnInjects.type = 'button';
+      btnInjects.className = 'btn btn-sm btn-outline-primary';
+      btnInjects.textContent = 'Injects';
+
       tabBar.appendChild(btnInputs);
       tabBar.appendChild(btnOutputs);
+      tabBar.appendChild(btnInjects);
       ioOuter.appendChild(tabBar);
 
       const inputsPane = document.createElement('div');
       const outputsPane = document.createElement('div');
+      const injectsPane = document.createElement('div');
       inputsPane.className = 'mt-2';
       outputsPane.className = 'mt-2';
+      injectsPane.className = 'mt-2';
       inputsPane.appendChild(buildIoTable('inputs'));
       outputsPane.appendChild(buildIoTable('outputs'));
 
@@ -2441,30 +2578,21 @@
 
         const injHelp = document.createElement('div');
         injHelp.className = 'small text-muted';
-        injHelp.textContent = 'Override the list of files the generator may inject (e.g., hint.txt). Use zero entries to allow none.';
+        injHelp.textContent = 'Override the list of files the generator may inject. Variable can be a path or an output key (e.g., filesystem.file). Optionally set a destination directory; default is /tmp.';
         injWrap.appendChild(injHelp);
+
+        const injHelp2 = document.createElement('div');
+        injHelp2.className = 'small text-muted';
+        injHelp2.textContent = 'Example: variable=filesystem.file, dest=/opt/bin (saved as filesystem.file -> /opt/bin).';
+        injWrap.appendChild(injHelp2);
 
         const toggleRow = document.createElement('div');
         toggleRow.className = 'd-flex align-items-center justify-content-between gap-2 mt-2';
-        const toggleWrap = document.createElement('div');
-        toggleWrap.className = 'form-check';
-        injectOverrideToggleEl = document.createElement('input');
-        injectOverrideToggleEl.type = 'checkbox';
-        injectOverrideToggleEl.className = 'form-check-input';
-        injectOverrideToggleEl.id = 'flowInjectOverrideToggle_inputs_' + i;
-        const toggleLabel = document.createElement('label');
-        toggleLabel.className = 'form-check-label';
-        toggleLabel.setAttribute('for', injectOverrideToggleEl.id);
-        toggleLabel.textContent = 'Override inject files';
-        toggleWrap.appendChild(injectOverrideToggleEl);
-        toggleWrap.appendChild(toggleLabel);
-
         const resetBtn = document.createElement('button');
         resetBtn.type = 'button';
         resetBtn.className = 'btn btn-sm btn-outline-secondary';
         resetBtn.textContent = 'Reset to generator';
 
-        toggleRow.appendChild(toggleWrap);
         toggleRow.appendChild(resetBtn);
         injWrap.appendChild(toggleRow);
 
@@ -2484,6 +2612,21 @@
           return out;
         }
 
+        function splitInjectSpec(text){
+          const raw = String(text ?? '').trim();
+          if(!raw) return { src: '', dest: '' };
+          const seps = ['->', '=>'];
+          for(const sep of seps){
+            const idx = raw.indexOf(sep);
+            if(idx >= 0){
+              const left = raw.slice(0, idx).trim();
+              const right = raw.slice(idx + sep.length).trim();
+              return { src: left, dest: right };
+            }
+          }
+          return { src: raw, dest: '' };
+        }
+
         function getGeneratedInjectsFromAssignment(){
           const cur = (fa && Array.isArray(fa.inject_files) && fa.inject_files.length) ? normalizeInjects(fa.inject_files) : [];
           return cur;
@@ -2501,16 +2644,143 @@
           const stack = document.createElement('div');
           stack.className = 'd-flex flex-column gap-2';
 
+          const header = document.createElement('div');
+          header.className = 'd-flex gap-2 align-items-center small text-muted';
+          const h1 = document.createElement('div');
+          h1.style.minWidth = '200px';
+          h1.textContent = 'Variable';
+          const h2 = document.createElement('div');
+          h2.style.minWidth = '140px';
+          h2.textContent = 'Destination dir';
+          const h3 = document.createElement('div');
+          h3.style.minWidth = '180px';
+          h3.textContent = '';
+          header.appendChild(h1);
+          header.appendChild(h2);
+          header.appendChild(h3);
+          stack.appendChild(header);
+
+          const availableInputs = Array.isArray(inAll) ? inAll.map(String).filter(Boolean) : [];
+          const availableOutputs = Array.isArray(outFields) ? outFields.map(String).filter(Boolean) : [];
+          let availableResolvedOutputs = [];
+          try{
+            if(resolvedOutputs && typeof resolvedOutputs === 'object' && !Array.isArray(resolvedOutputs)){
+              availableResolvedOutputs = Object.keys(resolvedOutputs || {}).map(String).filter(Boolean);
+            }
+          } catch(e) { availableResolvedOutputs = []; }
+
+          function buildVarPicker(){
+            const sel = document.createElement('select');
+            sel.className = 'form-select form-select-sm font-monospace';
+            const empty = document.createElement('option');
+            empty.value = '';
+            empty.textContent = 'Pick input/output…';
+            sel.appendChild(empty);
+
+            function addGroup(label, items){
+              if(!items || !items.length) return;
+              const grp = document.createElement('optgroup');
+              grp.label = label;
+              items.forEach((k)=>{
+                const opt = document.createElement('option');
+                opt.value = k;
+                opt.textContent = k;
+                grp.appendChild(opt);
+              });
+              sel.appendChild(grp);
+            }
+
+            addGroup('Inputs', Array.from(new Set(availableInputs)));
+            addGroup('Outputs', Array.from(new Set(availableOutputs)));
+            addGroup('Resolved outputs', Array.from(new Set(availableResolvedOutputs)));
+            return sel;
+          }
+
           function addRow(value){
+            const parsed = splitInjectSpec(value);
             const row = document.createElement('div');
             row.className = 'd-flex gap-2 align-items-center';
 
-            const inp = document.createElement('input');
-            inp.type = 'text';
-            inp.className = 'form-control form-control-sm font-monospace';
-            inp.placeholder = 'e.g., hint.txt';
-            inp.value = String(value ?? '');
-            inp.addEventListener('input', ()=>{ injectsTouched = true; });
+            const srcInp = document.createElement('input');
+            srcInp.type = 'text';
+            srcInp.className = 'form-control form-control-sm font-monospace';
+            srcInp.placeholder = 'e.g., hint.txt or filesystem.file';
+            {
+              const rawSrc = String(parsed.src ?? '');
+              if(rawSrc.startsWith('upload:')){
+                const base = _basenameFromPath(rawSrc.slice('upload:'.length));
+                srcInp.dataset.uploadToken = rawSrc;
+                srcInp.value = base ? `artifacts/${base}` : '';
+              } else {
+                srcInp.value = rawSrc;
+              }
+            }
+            srcInp.addEventListener('input', ()=>{
+              injectsTouched = true;
+              try { delete srcInp.dataset.uploadToken; } catch(e) {}
+            });
+
+            const destInp = document.createElement('input');
+            destInp.type = 'text';
+            destInp.className = 'form-control form-control-sm font-monospace';
+            destInp.placeholder = '/tmp (default)';
+            destInp.value = String(parsed.dest ?? '');
+            destInp.addEventListener('input', ()=>{ injectsTouched = true; });
+
+            const picker = buildVarPicker();
+            picker.addEventListener('change', ()=>{
+              const v = String(picker.value || '').trim();
+              if(!v) return;
+              srcInp.value = v;
+              injectsTouched = true;
+              try { delete srcInp.dataset.uploadToken; } catch(e) {}
+              try { picker.value = ''; } catch(e) {}
+            });
+
+            const uploadBtn = document.createElement('button');
+            uploadBtn.type = 'button';
+            uploadBtn.className = 'btn btn-sm btn-outline-primary';
+            uploadBtn.textContent = 'Upload';
+
+            const uploadInput = document.createElement('input');
+            uploadInput.type = 'file';
+            uploadInput.className = 'd-none';
+
+            uploadBtn.addEventListener('click', ()=>{ try { uploadInput.click(); } catch(e) {} });
+            uploadInput.addEventListener('change', async ()=>{
+              const fileObj = (uploadInput.files && uploadInput.files.length) ? uploadInput.files[0] : null;
+              if(!fileObj) return;
+              uploadBtn.disabled = true;
+              const prev = uploadBtn.textContent;
+              uploadBtn.textContent = 'Uploading…';
+              try{
+                const scen = (scenarioEl && scenarioEl.value) ? String(scenarioEl.value).trim() : '';
+                const fd = new FormData();
+                fd.append('scenario', scen);
+                fd.append('step_index', String(i));
+                fd.append('generator_id', String(generatorIdForDialog || ''));
+                fd.append('file', fileObj, (fileObj && fileObj.name) ? fileObj.name : 'upload');
+                const resp = await fetch('/api/flag-sequencing/upload_flow_inject_file', { method: 'POST', body: fd });
+                let data = null;
+                try { data = await resp.json(); } catch(e) { data = null; }
+                if(!resp.ok || !data || !data.ok){
+                  const msg = (data && data.error) ? String(data.error) : `Upload failed (HTTP ${resp.status})`;
+                  throw new Error(msg);
+                }
+                try { srcInp.dataset.uploadToken = String(data.inject_value || data.stored_path || ''); } catch(e) {}
+                const base = _basenameFromPath(String(data.stored_filename || ''));
+                srcInp.value = base ? `artifacts/${base}` : String(data.stored_filename || data.original_filename || '') || 'artifacts/upload';
+                injectsTouched = true;
+              } catch(err){
+                alert(String((err && err.message) || err || 'Upload failed'));
+              } finally {
+                uploadBtn.disabled = false;
+                uploadBtn.textContent = prev;
+                try { uploadInput.value = ''; } catch(e) {}
+              }
+            });
+
+            const rowObj = { srcEl: srcInp, destEl: destInp };
 
             const del = document.createElement('button');
             del.type = 'button';
@@ -2518,12 +2788,20 @@
             del.textContent = 'Remove';
             del.addEventListener('click', ()=>{
               try { row.remove(); } catch(e) {}
-              injectOverrideInputs = injectOverrideInputs.filter(x => x !== inp);
+              injectOverrideInputs = injectOverrideInputs.filter(x => x !== rowObj);
               injectsTouched = true;
             });
 
-            injectOverrideInputs.push(inp);
-            row.appendChild(inp);
+            injectOverrideInputs.push(rowObj);
+            const pickWrap = document.createElement('div');
+            pickWrap.className = 'd-flex align-items-center gap-2';
+            pickWrap.appendChild(picker);
+            pickWrap.appendChild(uploadBtn);
+            pickWrap.appendChild(uploadInput);
+
+            row.appendChild(srcInp);
+            row.appendChild(destInp);
+            row.appendChild(pickWrap);
             row.appendChild(del);
             stack.appendChild(row);
           }
@@ -2540,50 +2818,42 @@
           listWrap.appendChild(addBtn);
         }
 
-        function setInjectOverrideEnabled(enabled){
-          injectOverridesEnabled = !!enabled;
-          try { if(injectOverrideToggleEl) injectOverrideToggleEl.checked = injectOverridesEnabled; } catch(e) {}
-          try { listWrap.style.display = injectOverridesEnabled ? '' : 'none'; } catch(e) {}
-          try { resetBtn.disabled = !injectOverridesEnabled; } catch(e) {}
-        }
-
         const existingOverride = getOverrideInjectsFromAssignment();
         if(existingOverride !== null){
           renderInjectList(existingOverride);
-          setInjectOverrideEnabled(true);
         } else {
           renderInjectList(getGeneratedInjectsFromAssignment());
-          setInjectOverrideEnabled(false);
         }
-
-        injectOverrideToggleEl.addEventListener('change', ()=>{
-          injectsTouched = true;
-          setInjectOverrideEnabled(!!injectOverrideToggleEl.checked);
-        });
 
         resetBtn.addEventListener('click', ()=>{
           injectsTouched = true;
-          setInjectOverrideEnabled(false);
           renderInjectList(getGeneratedInjectsFromAssignment());
         });
 
-        outputsPane.appendChild(injWrap);
+        injectsPane.appendChild(injWrap);
       } catch(e) {}
 
       outputsPane.style.display = 'none';
+      injectsPane.style.display = 'none';
 
       function setTab(which){
         const showInputs = which === 'inputs';
+        const showOutputs = which === 'outputs';
+        const showInjects = which === 'injects';
         inputsPane.style.display = showInputs ? '' : 'none';
-        outputsPane.style.display = showInputs ? 'none' : '';
+        outputsPane.style.display = showOutputs ? '' : 'none';
+        injectsPane.style.display = showInjects ? '' : 'none';
         btnInputs.className = showInputs ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-primary';
-        btnOutputs.className = showInputs ? 'btn btn-sm btn-outline-primary' : 'btn btn-sm btn-primary';
+        btnOutputs.className = showOutputs ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-primary';
+        btnInjects.className = showInjects ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-primary';
       }
       btnInputs.addEventListener('click', () => setTab('inputs'));
       btnOutputs.addEventListener('click', () => setTab('outputs'));
+      btnInjects.addEventListener('click', () => setTab('injects'));
 
       ioOuter.appendChild(inputsPane);
       ioOuter.appendChild(outputsPane);
+      ioOuter.appendChild(injectsPane);
 
       inputsBodyEl.appendChild(ioOuter);
     } catch(e) {
@@ -2881,24 +3151,28 @@
             outOvr = newOutOverrides;
 
             // Inject override list.
-            if(injectOverrideToggleEl){
-              if(injectOverridesEnabled){
-                const files = [];
-                try {
-                  (injectOverrideInputs || []).forEach((el)=>{
-                    const s = String((el && el.value) ?? '').trim();
-                    if(!s) return;
-                    files.push(s);
-                  });
-                } catch(e) {}
-                injOvr = files;
-              } else {
-                if(hadInjectOverrideInitially || injectsTouched){
-                  injOvr = null;
-                } else {
-                  injOvr = undefined;
-                }
-              }
+            {
+              const files = [];
+              try {
+                (injectOverrideInputs || []).forEach((el)=>{
+                  const srcEl = el && el.srcEl ? el.srcEl : el;
+                  const destEl = el && el.destEl ? el.destEl : null;
+                  let src = String((srcEl && srcEl.value) ?? '').trim();
+                  try{
+                    if(srcEl && srcEl.dataset && srcEl.dataset.uploadToken){
+                      src = String(srcEl.dataset.uploadToken || '').trim();
+                    }
+                  } catch(e) {}
+                  if(!src) return;
+                  const dest = String((destEl && destEl.value) ?? '').trim();
+                  if(dest){
+                    files.push(`${src} -> ${dest}`);
+                  } else {
+                    files.push(src);
+                  }
+                });
+              } catch(e) {}
+              injOvr = files;
             }
 
             // Hint overrides from this dialog.

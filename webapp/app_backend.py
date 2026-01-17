@@ -12477,6 +12477,7 @@ def api_flow_prepare_preview_for_execute():
         config: dict[str, Any],
         kind: str = 'flag-generator',
         timeout_s: int = 120,
+        inject_files_override: list[str] | None = None,
     ) -> tuple[bool, str, str | None]:
         """Best-effort run of scripts/run_flag_generator.py.
 
@@ -12502,6 +12503,14 @@ def api_flow_prepare_preview_for_execute():
                 '--repo-root',
                 repo_root,
             ]
+            env = None
+            try:
+                if isinstance(inject_files_override, list):
+                    env = dict(os.environ)
+                    env['CORETG_INJECT_FILES_JSON'] = json.dumps(list(inject_files_override))
+            except Exception:
+                env = None
+
             p = subprocess.run(
                 cmd,
                 cwd=repo_root,
@@ -12509,6 +12518,7 @@ def api_flow_prepare_preview_for_execute():
                 capture_output=True,
                 text=True,
                 timeout=max(1, int(timeout_s or 120)),
+                env=env,
             )
             manifest_path = os.path.join(out_dir, 'outputs.json')
             if p.returncode != 0:
@@ -12943,12 +12953,79 @@ def api_flow_prepare_preview_for_execute():
                         if remaining is not None:
                             gen_timeout_s = min(gen_timeout_s, remaining)
 
+                        def _split_inject_spec(raw: str) -> tuple[str, str]:
+                            text = str(raw or '').strip()
+                            if not text:
+                                return '', ''
+                            for sep in ('->', '=>'):
+                                if sep in text:
+                                    left, right = text.split(sep, 1)
+                                    return left.strip(), right.strip()
+                            return text, ''
+
+                        def _stage_inject_uploads(injects: list[str], run_dir: str) -> list[str]:
+                            if not injects:
+                                return []
+                            try:
+                                repo_root = _get_repo_root()
+                            except Exception:
+                                repo_root = os.getcwd()
+                            allowed_root = os.path.abspath(_flow_inject_uploads_dir())
+                            art_dir = os.path.join(run_dir, 'artifacts')
+                            os.makedirs(art_dir, exist_ok=True)
+
+                            out_list: list[str] = []
+                            for raw in injects:
+                                src_raw, dest_raw = _split_inject_spec(str(raw))
+                                src = str(src_raw or '').strip()
+                                if src.startswith('upload:'):
+                                    src = src[len('upload:'):].strip()
+                                if src:
+                                    try:
+                                        abs_src = os.path.abspath(src)
+                                    except Exception:
+                                        abs_src = ''
+                                else:
+                                    abs_src = ''
+
+                                if abs_src and os.path.exists(abs_src):
+                                    try:
+                                        if os.path.commonpath([allowed_root, abs_src]) == allowed_root:
+                                            base = os.path.basename(abs_src.rstrip('/')) or 'upload'
+                                            dest_path = os.path.join(art_dir, base)
+                                            if os.path.isdir(abs_src):
+                                                shutil.copytree(abs_src, dest_path, dirs_exist_ok=True)
+                                            else:
+                                                shutil.copy2(abs_src, dest_path)
+                                            new_src = f"artifacts/{base}"
+                                            if dest_raw:
+                                                out_list.append(f"{new_src} -> {dest_raw}")
+                                            else:
+                                                out_list.append(new_src)
+                                            continue
+                                    except Exception:
+                                        pass
+
+                                # Fallback: keep original entry.
+                                out_list.append(str(raw))
+                            return out_list
+
+                        effective_injects = None
+                        try:
+                            eff = fa.get('inject_files') if isinstance(fa, dict) else None
+                            if isinstance(eff, list) and eff:
+                                effective_injects = _stage_inject_uploads(list(eff), str(flow_out_dir))
+                                fa['inject_files'] = list(effective_injects)
+                        except Exception:
+                            effective_injects = None
+
                         ok_run, note, manifest_path = _flow_try_run_generator(
                             generator_id,
                             out_dir=flow_out_dir,
                             config=cfg,
                             kind=assignment_type,
                             timeout_s=gen_timeout_s,
+                            inject_files_override=effective_injects,
                         )
 
                         if not ok_run:
@@ -13105,6 +13182,10 @@ def api_flow_prepare_preview_for_execute():
                                     allow_hint = False
                                     for raw in inj_list:
                                         s = str(raw or '').strip().replace('\\', '/')
+                                        for sep in ('->', '=>'):
+                                            if sep in s:
+                                                s = s.split(sep, 1)[0].strip()
+                                                break
                                         if not s:
                                             continue
                                         if s == 'hint.txt' or s.endswith('/hint.txt'):
@@ -13852,6 +13933,12 @@ def _flow_uploads_dir() -> str:
     return d
 
 
+def _flow_inject_uploads_dir() -> str:
+    d = os.path.join(_outputs_dir(), 'flow_inject_uploads')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 @app.route('/api/flag-sequencing/upload_flow_input_file', methods=['POST'])
 def api_flow_upload_flow_input_file():
     """Upload a file to be used as a Flow generator input override.
@@ -13919,6 +14006,72 @@ def api_flow_upload_flow_input_file():
         'original_filename': original_filename,
         'stored_filename': stored_name,
         'stored_path': os.path.abspath(stored_path),
+    })
+
+
+@app.route('/api/flag-sequencing/upload_flow_inject_file', methods=['POST'])
+def api_flow_upload_flow_inject_file():
+    """Upload a file to be used as a Flow inject override.
+
+    Stores the file under outputs/flow_inject_uploads and returns an inject
+    reference token (upload:<abs_path>). At runtime, Flow stages these into
+    the run's artifacts/ directory and rewrites inject entries accordingly.
+    """
+    scenario_label = str(request.form.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    step_index_raw = str(request.form.get('step_index') or '').strip()
+    generator_id = str(request.form.get('generator_id') or '').strip()
+
+    f = request.files.get('file')
+    if not f or not getattr(f, 'filename', ''):
+        return jsonify({'ok': False, 'error': 'No file provided.'}), 400
+
+    max_bytes = 10 * 1024 * 1024
+    try:
+        clen = request.content_length
+        if isinstance(clen, int) and clen > max_bytes:
+            return jsonify({'ok': False, 'error': 'File too large (max 10MB).'}), 413
+    except Exception:
+        pass
+
+    def _unique_dest_filename(dir_path: str, filename: str) -> str:
+        base = secure_filename(filename) or 'upload'
+        cand = base
+        root, ext = os.path.splitext(base)
+        i = 1
+        while os.path.exists(os.path.join(dir_path, cand)):
+            cand = f"{root}_{i}{ext}"
+            i += 1
+            if i > 5000:
+                break
+        return cand
+
+    original_filename = str(getattr(f, 'filename', '') or '')
+    safe_filename = secure_filename(original_filename) or 'upload'
+    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]
+    base_dir = os.path.join(_flow_inject_uploads_dir(), scenario_norm, unique)
+    os.makedirs(base_dir, exist_ok=True)
+
+    stored_name = _unique_dest_filename(base_dir, safe_filename)
+    stored_path = os.path.join(base_dir, stored_name)
+    try:
+        f.save(stored_path)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed saving upload: {e}'}), 400
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'scenario_norm': scenario_norm,
+        'step_index': step_index_raw,
+        'generator_id': generator_id,
+        'original_filename': original_filename,
+        'stored_filename': stored_name,
+        'stored_path': os.path.abspath(stored_path),
+        'inject_value': f"upload:{os.path.abspath(stored_path)}",
     })
 
     out_assignments: list[dict[str, Any]] = []

@@ -82,10 +82,10 @@ Some generators need to deliver a file/binary that will be mounted/copied into o
 
 Key rules:
 
-- Write the generated file under `/outputs/artifacts/...` and reference it from `outputs.json`.
-- Prefer declaring `injects` using an output key, not a path.
+Destination directory (optional):
 
-Example:
+- `injects: ["filesystem.file -> /opt/bin"]`
+- If unspecified or invalid, files default to `/tmp`.
 
 - `outputs.json.outputs.filesystem.file = "artifacts/challenge"`
 - `manifest.yaml: injects: ["filesystem.file"]`

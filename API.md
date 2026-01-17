@@ -233,6 +233,7 @@ Notes:
 - `requires` must be a list of objects `{ artifact, optional }`.
 - `inputs` is a list of runtime input definitions (name/type/required/etc) written into `manifest.yaml`.
 - `inject_files` is optional; when present it is written into `manifest.yaml` as `injects`.
+- Optional destination directory syntax: `inject_files: ["filesystem.file -> /opt/bin"]`. If omitted or invalid, files default to `/tmp`.
 
 `POST /api/generators/scaffold_zip`
 : Same JSON request body as `/api/generators/scaffold_meta`, but returns a ZIP you can unzip into the repo root.

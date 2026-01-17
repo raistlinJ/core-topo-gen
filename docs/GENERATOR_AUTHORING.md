@@ -154,12 +154,19 @@ How it works:
 
 - Generators should write files under `/outputs/artifacts/...`.
 - After the generator finishes, `scripts/run_flag_generator.py` stages **only** allowlisted items into `<out_dir>/injected/`.
-- If the generator produces a `docker-compose.yml`, the runner rewrites relative bind mounts to go through `./injected/...`.
+- If the generator produces a `docker-compose.yml`, the runner rewrites **relative bind mounts** to use a named volume and adds an **init-copy** service that copies allowlisted files into the volume before the main service runs.
 
 `injects` entries can be:
 
 - A relative path like `artifacts/my_binary` (prefix `artifacts/` is optional), or
 - An **output artifact key** like `filesystem.file` which is resolved via `outputs.json.outputs`.
+
+Optional destination directory syntax:
+
+- `artifacts/my_binary -> /opt/bin`
+- `filesystem.file => /var/tmp`
+
+If no destination is provided (or it fails validation), files default to `/tmp`.
 
 ---
 
