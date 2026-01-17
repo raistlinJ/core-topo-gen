@@ -61,6 +61,7 @@ This repo includes JSON schemas to make generator behavior consistent across bot
 - **flag-node-generators** (generators that emit a per-node docker-compose environment).
 
 Files:
+- `validation/generator_manifest_v1.schema.json` — schema for `manifest.yaml` (manifest_version: 1), including canonical input types.
 - `validation/flag_generator_outputs.schema.json` — schema for the runtime `/outputs/outputs.json` manifest emitted by a generator.
 
 ### Output Placeholder Substitution

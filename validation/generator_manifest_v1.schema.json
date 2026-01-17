@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/core-topo-gen/generator_manifest_v1.schema.json",
+  "title": "CORE Topo Gen - Generator Manifest v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["manifest_version", "id", "kind", "runtime"],
+  "properties": {
+    "manifest_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["flag-generator", "flag-node-generator"]
+    },
+    "name": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["docker-compose", "compose", "run", "command"]
+        },
+        "compose_file": { "type": "string" },
+        "service": { "type": "string" },
+        "cmd": {
+          "oneOf": [
+            {"type": "string"},
+            {"type": "array", "items": {"type": "string"}}
+          ]
+        }
+      },
+      "required": ["type"]
+    },
+    "inputs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["name"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "type": {
+            "type": "string",
+            "description": "Canonical input types. Unknown/missing types fall back to string at runtime.",
+            "enum": [
+              "string",
+              "int",
+              "float",
+              "number",
+              "boolean",
+              "json",
+              "file",
+              "string_list",
+              "file_list"
+            ]
+          },
+          "required": {"type": "boolean"},
+          "default": {},
+          "sensitive": {"type": "boolean"},
+          "description": {"type": "string"}
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "requires": {"type": "array", "items": {"type": "string"}},
+        "optional_requires": {"type": "array", "items": {"type": "string"}},
+        "produces": {"type": "array"}
+      }
+    },
+    "hint_template": {"type": "string"},
+    "hint_templates": {"type": "array", "items": {"type": "string"}},
+    "injects": {"type": "array", "items": {"type": "string"}},
+    "env": {"type": "object", "additionalProperties": {"type": "string"}}
+  }
+}

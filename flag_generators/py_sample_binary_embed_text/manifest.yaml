@@ -10,17 +10,17 @@ runtime:
   service: generator
 inputs:
   - name: seed
-    type: text
+    type: string
     required: false
   - name: filesystem.file
-    type: text
+    type: string
     required: false
   - name: flag
     type: text
-    required: false
+    type: string
     sensitive: true
   - name: flag_prefix
-    type: text
+    type: string
     required: false
 artifacts:
   requires: []

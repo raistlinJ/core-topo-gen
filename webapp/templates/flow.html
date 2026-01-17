@@ -1052,14 +1052,47 @@
 
             if(!pairs.length) return document.createTextNode('-');
 
-            // If there's only one value, render it inline (no dropdown).
+            // If there's only one value, render it inline unless it's "complex" (object/array/truncated).
             if(pairs.length === 1){
               const p = pairs[0];
+              let isComplex = false;
+              try{
+                const raw = obj[p.k];
+                if(raw && typeof raw === 'object') isComplex = true;
+              } catch(e) {}
+              try{
+                if(typeof p.full === 'string' && typeof p.short === 'string' && p.full !== p.short) isComplex = true;
+              } catch(e) {}
+              try{
+                if(typeof p.full === 'string' && p.full.includes('\n')) isComplex = true;
+              } catch(e) {}
+              if(!isComplex){
+                const code = document.createElement('code');
+                code.className = 'font-monospace';
+                code.title = p.full;
+                code.textContent = p.short;
+                return code;
+              }
+              const details = document.createElement('details');
+              details.className = 'small';
+              const summary = document.createElement('summary');
+              summary.style.cursor = 'pointer';
+              summary.className = 'text-decoration-none';
               const code = document.createElement('code');
               code.className = 'font-monospace';
-              code.title = p.k + '=' + p.full;
-              code.textContent = p.k + '=' + p.short;
-              return code;
+              code.title = p.full;
+              code.textContent = p.short;
+              summary.appendChild(code);
+              details.appendChild(summary);
+              const body = document.createElement('div');
+              body.className = 'mt-1';
+              const vcode = document.createElement('code');
+              vcode.className = 'font-monospace';
+              vcode.style.whiteSpace = 'pre-wrap';
+              vcode.textContent = p.full;
+              body.appendChild(vcode);
+              details.appendChild(body);
+              return details;
             }
 
             const details = document.createElement('details');
@@ -1075,8 +1108,8 @@
             head.forEach(p => {
               const code = document.createElement('code');
               code.className = 'font-monospace';
-              code.title = p.k + '=' + p.full;
-              code.textContent = p.k + '=' + p.short;
+              code.title = p.full;
+              code.textContent = p.k + ': ' + p.short;
               summaryWrap.appendChild(code);
             });
             if(pairs.length > head.length){
@@ -1607,12 +1640,91 @@
     } catch(e) {}
   }
 
-  function openInputsDialog(idx){
+  async function openInputsDialog(idx){
     if(!inputsDialogEl || !inputsBodyEl) return;
     const i = Number.isFinite(+idx) ? (+idx) : -1;
     if(!Array.isArray(currentChain) || i < 0 || i >= currentChain.length) return;
     const node = currentChain[i] || {};
     const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[i]) ? currentFlagAssignments[i] : null;
+
+    // Best-effort: load generator catalogs so we can show input types and file pickers.
+    let inputDefsByName = new Map();
+    let generatorIdForDialog = '';
+    try{
+      generatorIdForDialog = (fa && fa.id) ? String(fa.id) : '';
+    } catch(e) { generatorIdForDialog = ''; }
+    try{
+      await ensureGeneratorCatalogsLoaded();
+      let catalog = '';
+      try{ catalog = (fa && fa.generator_catalog) ? String(fa.generator_catalog) : ''; } catch(e) { catalog = ''; }
+      const list = (catalog === 'flag_node_generators') ? _flagNodeGeneratorsCatalog : _flagGeneratorsCatalog;
+      const gen = (Array.isArray(list) && generatorIdForDialog)
+        ? list.find(g => String((g && g.id) || '').trim() === String(generatorIdForDialog).trim())
+        : null;
+      const inputs = (gen && Array.isArray(gen.inputs)) ? gen.inputs : [];
+      inputs.forEach((inp)=>{
+        try{
+          if(!inp || typeof inp !== 'object') return;
+          const nm = String(inp.name || '').trim();
+          if(!nm) return;
+          inputDefsByName.set(nm, inp);
+        } catch(e) {}
+      });
+    } catch(e) {
+      inputDefsByName = new Map();
+    }
+
+    function normalizeInputType(typeVal){
+      const t0 = String(typeVal || '').trim().toLowerCase();
+      if(!t0) return 'string';
+      const t = t0;
+      const isList = t.includes('list') || t.endsWith('[]');
+      if(t === 'file_list' || t === 'files') return 'file_list';
+      if(t === 'string_list' || t === 'strings') return 'string_list';
+      if(isList && (t.includes('file') || t.includes('path'))) return 'file_list';
+      if(isList && (t.includes('string') || t.includes('text') || t.includes('str'))) return 'string_list';
+      if(t.endsWith('[]')) return 'string_list';
+      if(t === 'file' || t === 'filepath' || t === 'file_path' || t === 'path' || t === 'pathname') return 'file';
+      if(t.includes('file') || t.includes('path')) return 'file';
+      if(t === 'string' || t === 'text' || t === 'str') return 'string';
+      if(t === 'int' || t === 'integer') return 'int';
+      if(t === 'float' || t === 'double') return 'float';
+      if(t === 'number' || t === 'numeric') return 'number';
+      if(t === 'bool' || t === 'boolean') return 'boolean';
+      if(t === 'json' || t === 'object' || t === 'dict' || t === 'map') return 'json';
+      return 'string';
+    }
+
+    function isFileType(typeVal){
+      const t = normalizeInputType(typeVal);
+      return (t === 'file' || t === 'file_list');
+    }
+
+    function isFileListType(typeVal){
+      return normalizeInputType(typeVal) === 'file_list';
+    }
+
+    function isStringListType(typeVal){
+      return normalizeInputType(typeVal) === 'string_list';
+    }
+
+    async function uploadFlowInputFile(fileObj, inputName){
+      const scen = (scenarioEl && scenarioEl.value) ? String(scenarioEl.value).trim() : '';
+      const fd = new FormData();
+      fd.append('scenario', scen);
+      fd.append('step_index', String(i));
+      fd.append('generator_id', String(generatorIdForDialog || ''));
+      fd.append('input_name', String(inputName || ''));
+      fd.append('file', fileObj, (fileObj && fileObj.name) ? fileObj.name : 'upload');
+      const resp = await fetch('/api/flag-sequencing/upload_flow_input_file', { method: 'POST', body: fd });
+      let data = null;
+      try { data = await resp.json(); } catch(e) { data = null; }
+      if(!resp.ok || !data || !data.ok){
+        const msg = (data && data.error) ? String(data.error) : `Upload failed (HTTP ${resp.status})`;
+        throw new Error(msg);
+      }
+      return data;
+    }
 
     // Editor state (scoped to this dialog open).
     let hintOverridesEnabled = false;
@@ -1779,14 +1891,47 @@
 
         if(!pairs.length) return document.createTextNode('-');
 
-        // If there's only one value, render it inline (no dropdown).
+        // If there's only one value, render it inline unless it's "complex" (object/array/truncated).
         if(pairs.length === 1){
           const p = pairs[0];
+          let isComplex = false;
+          try{
+            const raw = obj[p.k];
+            if(raw && typeof raw === 'object') isComplex = true;
+          } catch(e) {}
+          try{
+            if(typeof p.full === 'string' && typeof p.short === 'string' && p.full !== p.short) isComplex = true;
+          } catch(e) {}
+          try{
+            if(typeof p.full === 'string' && p.full.includes('\n')) isComplex = true;
+          } catch(e) {}
+          if(!isComplex){
+            const code = document.createElement('code');
+            code.className = 'font-monospace';
+            code.title = p.full;
+            code.textContent = p.short;
+            return code;
+          }
+          const details = document.createElement('details');
+          details.className = 'small';
+          const summary = document.createElement('summary');
+          summary.style.cursor = 'pointer';
+          summary.className = 'text-decoration-none';
           const code = document.createElement('code');
           code.className = 'font-monospace';
-          code.title = p.k + '=' + p.full;
-          code.textContent = p.k + '=' + p.short;
-          return code;
+          code.title = p.full;
+          code.textContent = p.short;
+          summary.appendChild(code);
+          details.appendChild(summary);
+          const body = document.createElement('div');
+          body.className = 'mt-1';
+          const vcode = document.createElement('code');
+          vcode.className = 'font-monospace';
+          vcode.style.whiteSpace = 'pre-wrap';
+          vcode.textContent = p.full;
+          body.appendChild(vcode);
+          details.appendChild(body);
+          return details;
         }
 
         const details = document.createElement('details');
@@ -1802,8 +1947,8 @@
         head.forEach(p => {
           const code = document.createElement('code');
           code.className = 'font-monospace';
-          code.title = p.k + '=' + p.full;
-          code.textContent = p.k + '=' + p.short;
+          code.title = p.full;
+          code.textContent = p.k + ': ' + p.short;
           summaryWrap.appendChild(code);
         });
         if(pairs.length > head.length){
@@ -1929,7 +2074,14 @@
           const tdType = document.createElement('td');
           tdType.className = 'text-muted';
           tdType.style.whiteSpace = 'nowrap';
-          tdType.textContent = v.kind;
+          let typeLabel = v.kind;
+          try{
+            if(isInputs && v.kind === 'Field'){
+              const def = inputDefsByName.get(v.name);
+              if(def && def.type) typeLabel = normalizeInputType(def.type);
+            }
+          } catch(e) {}
+          tdType.textContent = typeLabel;
 
           const tdRes = document.createElement('td');
           tdRes.className = 'small';
@@ -1945,6 +2097,16 @@
             inp.type = 'text';
             inp.className = 'form-control form-control-sm font-monospace';
             inp.placeholder = 'JSON or string';
+
+            // Inputs can be typed; outputs remain free-form.
+            let inputType = 'string';
+            if(isInputs){
+              try{
+                const def = inputDefsByName.get(v.name);
+                inputType = def ? normalizeInputType(def.type) : 'string';
+              } catch(e) { inputType = 'string'; }
+            }
+
             if(isInputs){
               inp.value = (overridesIn0 && (v.name in overridesIn0)) ? renderVal(overridesIn0[v.name]) : '';
               inp.addEventListener('input', ()=>{ inputOverridesTouched = true; });
@@ -1954,7 +2116,178 @@
               inp.addEventListener('input', ()=>{ outputOverridesTouched = true; });
               outputOverrideElsByKey[v.name] = inp;
             }
-            tdOvr.appendChild(inp);
+
+            let wantsFileUi = false;
+            let wantsFileListUi = false;
+            let wantsStringListUi = false;
+            try{
+              if(isInputs){
+                wantsFileUi = (inputType === 'file');
+                wantsFileListUi = (inputType === 'file_list');
+                wantsStringListUi = (inputType === 'string_list');
+              }
+            } catch(e) {
+              wantsFileUi = false;
+              wantsFileListUi = false;
+              wantsStringListUi = false;
+            }
+
+            if(wantsFileListUi || wantsStringListUi){
+              // Render list editor + store canonical JSON array in a hidden input.
+              const hidden = document.createElement('input');
+              hidden.type = 'hidden';
+              hidden.value = '';
+              inputOverrideElsByKey[v.name] = hidden;
+
+              const wrap = document.createElement('div');
+              wrap.className = 'd-flex flex-column gap-2';
+
+              const stack = document.createElement('div');
+              stack.className = 'd-flex flex-column gap-2';
+
+              const addBtn = document.createElement('button');
+              addBtn.type = 'button';
+              addBtn.className = 'btn btn-sm btn-outline-primary align-self-start';
+              addBtn.textContent = wantsFileListUi ? 'Add file' : 'Add value';
+
+              function syncHidden(){
+                const vals = [];
+                try{
+                  const rows = stack.querySelectorAll('input[type="text"]');
+                  rows.forEach((el)=>{
+                    const s = String((el && el.value) ?? '').trim();
+                    if(!s) return;
+                    vals.push(s);
+                  });
+                } catch(e) {}
+                hidden.value = vals.length ? JSON.stringify(vals) : '';
+              }
+
+              function addRow(initial){
+                const row = document.createElement('div');
+                row.className = 'd-flex align-items-center gap-2';
+
+                const txt = document.createElement('input');
+                txt.type = 'text';
+                txt.className = 'form-control form-control-sm font-monospace';
+                txt.placeholder = wantsFileListUi ? 'Choose a file…' : 'Value';
+                txt.value = String(initial || '');
+                txt.addEventListener('input', ()=>{ inputOverridesTouched = true; syncHidden(); });
+
+                const del = document.createElement('button');
+                del.type = 'button';
+                del.className = 'btn btn-sm btn-outline-danger';
+                del.textContent = 'Remove';
+                del.addEventListener('click', ()=>{
+                  inputOverridesTouched = true;
+                  try { row.remove(); } catch(e) {}
+                  syncHidden();
+                });
+
+                row.appendChild(txt);
+
+                if(wantsFileListUi){
+                  const btn = document.createElement('button');
+                  btn.type = 'button';
+                  btn.className = 'btn btn-sm btn-outline-primary';
+                  btn.textContent = 'Choose File';
+
+                  const fileEl = document.createElement('input');
+                  fileEl.type = 'file';
+                  fileEl.className = 'd-none';
+
+                  btn.addEventListener('click', ()=>{ try { fileEl.click(); } catch(e) {} });
+                  fileEl.addEventListener('change', async ()=>{
+                    const fileObj = (fileEl.files && fileEl.files.length) ? fileEl.files[0] : null;
+                    if(!fileObj) return;
+                    btn.disabled = true;
+                    const prevText = btn.textContent;
+                    btn.textContent = 'Uploading…';
+                    try{
+                      const up = await uploadFlowInputFile(fileObj, v.name);
+                      txt.value = String(up.stored_path || '');
+                      inputOverridesTouched = true;
+                      syncHidden();
+                    } catch(err){
+                      alert(String((err && err.message) || err || 'Upload failed'));
+                    } finally {
+                      btn.disabled = false;
+                      btn.textContent = prevText;
+                      try { fileEl.value = ''; } catch(e) {}
+                    }
+                  });
+
+                  row.appendChild(btn);
+                  row.appendChild(fileEl);
+                }
+
+                row.appendChild(del);
+                stack.appendChild(row);
+              }
+
+              addBtn.addEventListener('click', ()=>{ inputOverridesTouched = true; addRow(''); syncHidden(); });
+
+              // Initialize from existing override value.
+              let initialVals = [];
+              try{
+                const existing = (overridesIn0 && (v.name in overridesIn0)) ? overridesIn0[v.name] : null;
+                if(Array.isArray(existing)){
+                  initialVals = existing.map(x => String(x ?? '')).filter(x => x.trim());
+                } else if(typeof existing === 'string'){
+                  const parsed = tryParseLooseJson(existing);
+                  if(Array.isArray(parsed)) initialVals = parsed.map(x => String(x ?? '')).filter(x => x.trim());
+                }
+              } catch(e) { initialVals = []; }
+
+              (initialVals.length ? initialVals : ['']).forEach(addRow);
+              syncHidden();
+
+              wrap.appendChild(stack);
+              wrap.appendChild(addBtn);
+              wrap.appendChild(hidden);
+              tdOvr.appendChild(wrap);
+            }
+            else if(wantsFileUi){
+              const wrap = document.createElement('div');
+              wrap.className = 'd-flex align-items-center gap-2';
+
+              const btn = document.createElement('button');
+              btn.type = 'button';
+              btn.className = 'btn btn-sm btn-outline-primary';
+              btn.textContent = 'Choose File';
+
+              const fileEl = document.createElement('input');
+              fileEl.type = 'file';
+              fileEl.className = 'd-none';
+
+              btn.addEventListener('click', ()=>{ try { fileEl.click(); } catch(e) {} });
+
+              fileEl.addEventListener('change', async ()=>{
+                const fileObj = (fileEl.files && fileEl.files.length) ? fileEl.files[0] : null;
+                if(!fileObj) return;
+                btn.disabled = true;
+                const prevText = btn.textContent;
+                btn.textContent = 'Uploading…';
+                try{
+                  const up = await uploadFlowInputFile(fileObj, v.name);
+                  inp.value = String(up.stored_path || '');
+                  inputOverridesTouched = true;
+                } catch(err){
+                  alert(String((err && err.message) || err || 'Upload failed'));
+                } finally {
+                  btn.disabled = false;
+                  btn.textContent = prevText;
+                  try { fileEl.value = ''; } catch(e) {}
+                }
+              });
+
+              wrap.appendChild(inp);
+              wrap.appendChild(btn);
+              wrap.appendChild(fileEl);
+              tdOvr.appendChild(wrap);
+            } else {
+              tdOvr.appendChild(inp);
+            }
           } else {
             tdOvr.className = 'text-muted small';
             tdOvr.textContent = '-';

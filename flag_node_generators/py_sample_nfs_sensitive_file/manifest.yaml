@@ -10,13 +10,13 @@ runtime:
   service: generator
 inputs:
   - name: seed
-    type: text
+    type: string
     required: true
   - name: node_name
-    type: text
+    type: string
     required: true
   - name: flag_prefix
-    type: text
+    type: string
     required: false
   - name: nfs_port
     type: number

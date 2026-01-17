@@ -10,10 +10,10 @@ runtime:
   service: generator
 inputs:
   - name: seed
-    type: text
+    type: string
     required: false
   - name: flag_prefix
-    type: text
+    type: string
     required: false
 artifacts:
   requires: []

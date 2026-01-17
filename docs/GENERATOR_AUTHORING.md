@@ -57,10 +57,10 @@ runtime:
 
 inputs:
   - name: seed
-    type: text
+    type: string
     required: true
   - name: secret
-    type: text
+    type: string
     required: true
     sensitive: true
 
@@ -87,6 +87,21 @@ Notes:
 - `kind` must be `flag-generator` or `flag-node-generator`.
 - `inputs` is a list of input descriptors (used by UI forms and Flow).
 - `artifacts.requires` / `artifacts.produces` drive Flow dependency chaining.
+
+### Input types (mandatory convention)
+Generator input `type` values are normalized to a small canonical set. If your manifest omits `type` or uses an unknown value, it **falls back to** `string`.
+
+Canonical values:
+- `string`
+- `int`, `float`, `number`
+- `boolean`
+- `json`
+- `file` (or `path`/`filepath` aliases)
+- `string_list`
+- `file_list`
+
+Schema reference:
+- `validation/generator_manifest_v1.schema.json`
 
 ### Important: IDs are rewritten on install
 When you install a Generator Pack via the Web UI, each generator is assigned a **new numeric** `id` (as a string) and the installed manifest is rewritten to use that numeric ID.

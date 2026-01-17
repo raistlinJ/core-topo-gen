@@ -9266,22 +9266,19 @@ def _latest_preview_plan_for_scenario_norm(scenario_norm: str, *, prefer_flow: b
                         payload = json.load(f) or {}
                     meta = payload.get('metadata') if isinstance(payload, dict) else None
                     scen = str((meta or {}).get('scenario') or '').strip()
-                    if _normalize_scenario_label(scen) == scenario_norm:
-                        return p, _created_at_ts(meta, fallback_path=p)
+                    if _normalize_scenario_label(scen) != scenario_norm:
+                        continue
+                    return p, _created_at_ts(meta, fallback_path=p)
                 except Exception:
                     continue
             return None, 0.0
 
-        latest_flow, latest_flow_ts = _latest_matching('plan_from_flow*.json')
-        latest_preview, latest_preview_ts = _latest_matching('plan_from_preview_*.json')
+        latest_preview, preview_ts = _latest_matching('plan_from_preview_*.json')
+        latest_flow, flow_ts = _latest_matching('plan_from_flow*.json')
 
-        if prefer_flow:
-            # Prefer flow plan only when no preview exists.
-            if latest_preview is not None:
-                return str(latest_preview)
-            if latest_flow is not None:
-                return str(latest_flow)
-            return None
+        # Prefer flow plan only when no preview exists.
+        if prefer_flow and latest_preview is None and latest_flow is not None:
+            return str(latest_flow)
 
         # prefer_flow=False (default): always prefer preview when available.
         if latest_preview is not None:
@@ -10561,6 +10558,22 @@ def _flow_enrich_saved_flag_assignments(
                 dh = (gen_def or {}).get('description_hints') if isinstance(gen_def, dict) else None
                 if isinstance(dh, list):
                     a2['description_hints'] = [str(x or '').strip() for x in dh if str(x or '').strip()]
+        except Exception:
+            pass
+
+        # Ensure input/output descriptors exist (if the catalog provides them).
+        try:
+            existing_in_defs = a2.get('input_defs')
+            if not (isinstance(existing_in_defs, list) and existing_in_defs):
+                if isinstance(gen_def, dict) and isinstance(gen_def.get('inputs'), list):
+                    a2['input_defs'] = list(gen_def.get('inputs') or [])
+        except Exception:
+            pass
+        try:
+            existing_out_defs = a2.get('output_defs')
+            if not (isinstance(existing_out_defs, list) and existing_out_defs):
+                if isinstance(gen_def, dict) and isinstance(gen_def.get('outputs'), list):
+                    a2['output_defs'] = list(gen_def.get('outputs') or [])
         except Exception:
             pass
 
@@ -12175,6 +12188,170 @@ def api_flow_prepare_preview_for_execute():
     except Exception:
         _gen_by_id = {}
 
+    def _flow_is_file_input_type(type_value: Any) -> bool:
+        try:
+            t = str(type_value or '').strip().lower()
+        except Exception:
+            return False
+        if not t:
+            return False
+        if t in {'file', 'file_list'}:
+            return True
+        if t in {'file', 'filepath', 'file_path', 'path', 'pathname'}:
+            return True
+        if 'file' in t:
+            return True
+        if 'path' in t:
+            return True
+        return False
+
+    def _flow_is_file_list_input_type(type_value: Any) -> bool:
+        try:
+            t = str(type_value or '').strip().lower()
+        except Exception:
+            return False
+        if not t:
+            return False
+        if t == 'file_list':
+            return True
+        # Back-compat heuristic.
+        if 'list' in t and ('file' in t or 'path' in t):
+            return True
+        return False
+
+    def _flow_is_allowed_upload_path(path_value: Any) -> bool:
+        """Only allow staging from known safe roots (outputs/flow_uploads and uploads/)."""
+        if not path_value:
+            return False
+        try:
+            ap = os.path.abspath(str(path_value))
+        except Exception:
+            return False
+        try:
+            if not os.path.isfile(ap):
+                return False
+        except Exception:
+            return False
+        try:
+            allowed_roots = [
+                os.path.abspath(os.path.join(_outputs_dir(), 'flow_uploads')),
+                os.path.abspath(_uploads_dir()),
+            ]
+            for root in allowed_roots:
+                try:
+                    if os.path.commonpath([ap, root]) == root:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
+    def _flow_unique_dest_filename(dir_path: str, filename: str) -> str:
+        base = secure_filename(filename) or 'upload'
+        cand = base
+        root, ext = os.path.splitext(base)
+        i = 1
+        while os.path.exists(os.path.join(dir_path, cand)):
+            cand = f"{root}_{i}{ext}"
+            i += 1
+            if i > 5000:
+                break
+        return cand
+
+    def _flow_stage_file_inputs_for_generator(cfg_to_pass: dict[str, Any], gen_def: dict[str, Any], *, run_dir: str) -> None:
+        if not isinstance(cfg_to_pass, dict) or not isinstance(gen_def, dict):
+            return
+        if not run_dir:
+            return
+        inputs = gen_def.get('inputs') if isinstance(gen_def, dict) else None
+        inputs_list = inputs if isinstance(inputs, list) else []
+
+        file_input_names: set[str] = set()
+        file_list_input_names: set[str] = set()
+        for inp in inputs_list:
+            if not isinstance(inp, dict):
+                continue
+            nm = str(inp.get('name') or '').strip()
+            if not nm:
+                continue
+            if _flow_is_file_list_input_type(inp.get('type')):
+                file_list_input_names.add(nm)
+                continue
+            if _flow_is_file_input_type(inp.get('type')):
+                file_input_names.add(nm)
+
+        if not file_input_names and not file_list_input_names:
+            return
+
+        inputs_dir = os.path.join(str(run_dir), 'inputs')
+        os.makedirs(inputs_dir, exist_ok=True)
+
+        for key in list(cfg_to_pass.keys()):
+            # file
+            if key in file_input_names:
+                val = cfg_to_pass.get(key)
+                if not isinstance(val, str):
+                    continue
+                raw = val.strip()
+                if not raw:
+                    continue
+                # Already a container path.
+                if raw.startswith('/inputs/'):
+                    continue
+                if not _flow_is_allowed_upload_path(raw):
+                    continue
+                try:
+                    src = os.path.abspath(raw)
+                except Exception:
+                    continue
+                try:
+                    base = os.path.basename(src) or f"{key}.upload"
+                except Exception:
+                    base = f"{key}.upload"
+                dest_name = _flow_unique_dest_filename(inputs_dir, base)
+                dest = os.path.join(inputs_dir, dest_name)
+                try:
+                    shutil.copyfile(src, dest)
+                    cfg_to_pass[key] = f"/inputs/{dest_name}"
+                except Exception:
+                    continue
+
+            # file_list
+            if key in file_list_input_names:
+                val = cfg_to_pass.get(key)
+                if not isinstance(val, list):
+                    continue
+                staged: list[str] = []
+                for item in (val or []):
+                    if not isinstance(item, str):
+                        continue
+                    raw = item.strip()
+                    if not raw:
+                        continue
+                    if raw.startswith('/inputs/'):
+                        staged.append(raw)
+                        continue
+                    if not _flow_is_allowed_upload_path(raw):
+                        continue
+                    try:
+                        src = os.path.abspath(raw)
+                    except Exception:
+                        continue
+                    try:
+                        base = os.path.basename(src) or f"{key}.upload"
+                    except Exception:
+                        base = f"{key}.upload"
+                    dest_name = _flow_unique_dest_filename(inputs_dir, base)
+                    dest = os.path.join(inputs_dir, dest_name)
+                    try:
+                        shutil.copyfile(src, dest)
+                        staged.append(f"/inputs/{dest_name}")
+                    except Exception:
+                        continue
+                if staged:
+                    cfg_to_pass[key] = staged
+
     # Hard validation: if flags are enabled, every referenced generator must exist and be enabled.
     # If not, fail with a clear error so the user can fix assignments.
     if flags_enabled:
@@ -12743,6 +12920,16 @@ def api_flow_prepare_preview_for_execute():
                         os.makedirs(flow_out_dir, exist_ok=True)
                         try:
                             created_run_dirs.append(str(flow_out_dir))
+                        except Exception:
+                            pass
+
+                        # If any config inputs are declared as file/path types, and the user provided
+                        # an override pointing to a previously-uploaded server file, stage it into
+                        # the run's inputs/ directory and rewrite the config to /inputs/<filename>.
+                        try:
+                            gen_def = _gen_by_id.get(generator_id)
+                            if isinstance(gen_def, dict) and isinstance(cfg, dict):
+                                _flow_stage_file_inputs_for_generator(cfg, gen_def, run_dir=str(flow_out_dir))
                         except Exception:
                             pass
 
@@ -13472,6 +13659,269 @@ def api_flow_save_flow_substitutions():
         return provides
 
     out_assignments: list[dict[str, Any]] = []
+    for i, (cid, raw_a) in enumerate(zip(chain_ids, (fas_in or []))):
+        if not isinstance(raw_a, dict):
+            raw_a = {}
+
+        generator_id = str(raw_a.get('id') or raw_a.get('generator_id') or '').strip()
+        if not generator_id:
+            return jsonify({'ok': False, 'error': f'Missing generator id for position {i}.'}), 400
+
+        gen = gen_by_id.get(generator_id)
+        if not isinstance(gen, dict):
+            return jsonify({'ok': False, 'error': f'Generator not found/enabled: {generator_id}'}), 422
+
+        # Keep assignment aligned to the provided chain_ids order.
+        a2 = dict(raw_a)
+        a2['node_id'] = str(cid)
+        a2['id'] = str(generator_id)
+        a2['name'] = str(gen.get('name') or '')
+        a2['description'] = str(gen.get('description') or '')
+        a2['type'] = str(gen.get('_flow_kind') or a2.get('type') or 'flag-generator')
+        a2['flag_generator'] = str(gen.get('_source_name') or '').strip() or 'unknown'
+        a2['generator_catalog'] = str(gen.get('_flow_catalog') or a2.get('generator_catalog') or 'flag_generators')
+        a2['language'] = str(gen.get('language') or '')
+
+        hint_templates = _flow_hint_templates_from_generator(gen)
+        a2['hint_templates'] = hint_templates
+        a2['hint_template'] = str((hint_templates[0] if hint_templates else '') or '')
+
+        try:
+            next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
+        except Exception:
+            next_id = ''
+        a2['next_node_id'] = str(next_id)
+        a2['next_node_name'] = str(id_to_name.get(str(next_id)) or '')
+
+        # Chain semantics.
+        requires_artifacts = sorted(list(_artifact_requires_of(gen)))
+        produces_artifacts = sorted(list(_artifact_produces_of(gen)))
+        input_fields_required = sorted(list(_required_input_fields_of(gen)))
+        input_fields_all = sorted(list(_all_input_fields_of(gen)))
+        input_fields_optional = sorted([x for x in input_fields_all if x and x not in set(input_fields_required)])
+        output_fields = sorted(list(_output_fields_of(gen)))
+
+        # Filter config_overrides to declared inputs + synthesized inputs.
+        allowed_override_keys: set[str] = set(input_fields_all)
+        try:
+            allowed_override_keys |= set(_flow_synthesized_inputs())
+        except Exception:
+            pass
+
+        raw_overrides: Any = None
+        overrides_present = False
+        try:
+            if 'config_overrides' in a2:
+                overrides_present = True
+                raw_overrides = a2.get('config_overrides')
+            elif 'inputs_overrides' in a2:
+                overrides_present = True
+                raw_overrides = a2.get('inputs_overrides')
+            elif 'input_overrides' in a2:
+                overrides_present = True
+                raw_overrides = a2.get('input_overrides')
+        except Exception:
+            overrides_present = False
+            raw_overrides = None
+
+        if overrides_present:
+            if raw_overrides is None:
+                a2.pop('config_overrides', None)
+            elif isinstance(raw_overrides, dict):
+                config_overrides: dict[str, Any] = {}
+                for k, v in (raw_overrides or {}).items():
+                    kk = str(k or '').strip()
+                    if not kk:
+                        continue
+                    if kk not in allowed_override_keys:
+                        continue
+                    config_overrides[kk] = v
+                if config_overrides:
+                    a2['config_overrides'] = dict(config_overrides)
+                else:
+                    a2.pop('config_overrides', None)
+            else:
+                a2.pop('config_overrides', None)
+
+        # Drop legacy keys if present (we normalize into config_overrides).
+        a2.pop('inputs_overrides', None)
+        a2.pop('input_overrides', None)
+
+        a2['requires'] = requires_artifacts
+        a2['produces'] = produces_artifacts
+        a2['input_fields'] = input_fields_all
+        a2['input_fields_required'] = input_fields_required
+        a2['input_fields_optional'] = input_fields_optional
+        a2['output_fields'] = output_fields
+
+        a2['inputs'] = sorted(list((_artifact_requires_of(gen) | set(_required_input_fields_of(gen)))))
+        a2['outputs'] = sorted(list(_provides_of(gen)))
+
+        # Normalize persisted overrides / new fields.
+        out_assignments.append(a2)
+
+    try:
+        out_assignments = _flow_enrich_saved_flag_assignments(
+            out_assignments,
+            chain_nodes,
+            scenario_label=(scenario_label or scenario_norm),
+        )
+    except Exception:
+        pass
+
+    try:
+        flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
+            chain_nodes,
+            out_assignments,
+            scenario_label=(scenario_label or scenario_norm),
+        )
+    except Exception:
+        flow_valid, flow_errors = True, []
+    flags_enabled = bool(flow_valid)
+
+    # Persist as plan_from_flow_*.json
+    try:
+        persisted_flag_assignments = _flow_strip_runtime_sensitive_fields(out_assignments)
+        flow_meta = {
+            'source_preview_plan_path': base_plan_path,
+            'scenario': scenario_label or scenario_norm,
+            'length': len(chain_nodes),
+            'requested_length': len(chain_nodes),
+            'allow_node_duplicates': bool(allow_node_duplicates),
+            'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+            'flag_assignments': persisted_flag_assignments,
+            'flags_enabled': bool(flags_enabled),
+            'flow_valid': bool(flow_valid),
+            'flow_errors': list(flow_errors or []),
+            'modified_at': _iso_now(),
+        }
+        if isinstance(meta, dict):
+            meta2 = dict(meta)
+            meta2['flow'] = flow_meta
+        else:
+            meta2 = {'flow': flow_meta}
+    except Exception:
+        meta2 = meta
+
+    try:
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        seed = 0
+        try:
+            seed = int((preview.get('seed') if isinstance(preview, dict) else None) or (meta2.get('seed') if isinstance(meta2, dict) else None) or 0)
+        except Exception:
+            seed = 0
+        suffix = secrets.token_hex(3)
+        out_name = f"plan_from_flow_{seed}_{int(time.time())}_{suffix}.json"
+        out_path = str(plans_dir / out_name)
+        out_payload = {
+            'full_preview': preview,
+            'metadata': meta2,
+        }
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(out_payload, f, indent=2)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to persist flow-modified preview plan: {e}'}), 500
+
+    # Stats for UI.
+    try:
+        stats = _flow_compose_docker_stats(nodes)
+    except Exception:
+        stats = {}
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'length': len(chain_nodes),
+        'stats': stats,
+        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or ''), 'is_vuln': bool(n.get('is_vuln'))} for n in chain_nodes],
+        'flag_assignments': out_assignments,
+        'flags_enabled': bool(flags_enabled),
+        'flow_valid': bool(flow_valid),
+        'flow_errors': list(flow_errors or []),
+        'preview_plan_path': base_plan_path,
+        'flow_plan_path': out_path,
+        'base_preview_plan_path': base_plan_path,
+        'allow_node_duplicates': bool(allow_node_duplicates),
+    })
+
+
+def _flow_uploads_dir() -> str:
+    d = os.path.join(_outputs_dir(), 'flow_uploads')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+@app.route('/api/flag-sequencing/upload_flow_input_file', methods=['POST'])
+def api_flow_upload_flow_input_file():
+    """Upload a file to be used as a Flow generator input override.
+
+    The Flow Value Override dialog can upload a file, store it under outputs/flow_uploads,
+    and persist the returned absolute path in config_overrides. During
+    /api/flag-sequencing/prepare_preview_for_execute, the server will stage the file into
+    the generator run's inputs/ directory and rewrite the config value to /inputs/<file>.
+    """
+    scenario_label = str(request.form.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    step_index_raw = str(request.form.get('step_index') or '').strip()
+    input_name = str(request.form.get('input_name') or '').strip()
+    generator_id = str(request.form.get('generator_id') or '').strip()
+
+    f = request.files.get('file')
+    if not f or not getattr(f, 'filename', ''):
+        return jsonify({'ok': False, 'error': 'No file provided.'}), 400
+
+    # Basic size guard (best-effort). Flask may not expose content_length reliably.
+    max_bytes = 10 * 1024 * 1024
+    try:
+        clen = request.content_length
+        if isinstance(clen, int) and clen > max_bytes:
+            return jsonify({'ok': False, 'error': 'File too large (max 10MB).'}), 413
+    except Exception:
+        pass
+
+    def _unique_dest_filename(dir_path: str, filename: str) -> str:
+        base = secure_filename(filename) or 'upload'
+        cand = base
+        root, ext = os.path.splitext(base)
+        i = 1
+        while os.path.exists(os.path.join(dir_path, cand)):
+            cand = f"{root}_{i}{ext}"
+            i += 1
+            if i > 5000:
+                break
+        return cand
+
+    original_filename = str(getattr(f, 'filename', '') or '')
+    safe_filename = secure_filename(original_filename) or 'upload'
+    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]
+    base_dir = os.path.join(_flow_uploads_dir(), scenario_norm, unique)
+    os.makedirs(base_dir, exist_ok=True)
+
+    prefix = (secure_filename(input_name) or 'input')
+    stored_name = _unique_dest_filename(base_dir, f"{prefix}__{safe_filename}")
+    stored_path = os.path.join(base_dir, stored_name)
+    try:
+        f.save(stored_path)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed saving upload: {e}'}), 400
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'scenario_norm': scenario_norm,
+        'step_index': step_index_raw,
+        'generator_id': generator_id,
+        'input_name': input_name,
+        'original_filename': original_filename,
+        'stored_filename': stored_name,
+        'stored_path': os.path.abspath(stored_path),
+    })
+
+    out_assignments: list[dict[str, Any]] = []
     for i, cid in enumerate(chain_ids):
         req = fas_in[i] if i < len(fas_in) else {}
         if not isinstance(req, dict):
@@ -13676,6 +14126,8 @@ def api_flow_save_flow_substitutions():
             'input_fields_required': input_fields_required,
             'input_fields_optional': input_fields_optional,
             'output_fields': output_fields,
+            'input_defs': list(gen.get('inputs') or []) if isinstance(gen.get('inputs'), list) else [],
+            'output_defs': list(gen.get('outputs') or []) if isinstance(gen.get('outputs'), list) else [],
             'hint_template': hint_tpl,
             'hint_templates': hint_templates,
             'hint': rendered_hints[0] if rendered_hints else _flow_render_hint_template(hint_tpl, scenario_label=(scenario_label or scenario_norm), id_to_name=id_to_name, this_id=str(node_id), next_id=str(next_id)),
@@ -30485,7 +30937,7 @@ def _inputs_schema_from_flags(flags: dict[str, Any], *, plugin_type: str) -> dic
     inputs: dict[str, Any] = {}
 
     def _add(name: str, *, sensitive: bool = False, required: bool = True) -> None:
-        inputs[name] = {'type': 'text', 'required': bool(required)}
+        inputs[name] = {'type': 'string', 'required': bool(required)}
         if sensitive:
             inputs[name]['sensitive'] = True
 
@@ -30541,7 +30993,7 @@ def _build_generator_scaffold(payload: dict[str, Any]) -> tuple[dict[str, str], 
             nm = str(name or '').strip()
             if not nm:
                 continue
-            rec: dict[str, Any] = {'name': nm, 'type': str((meta or {}).get('type') or 'text')}
+            rec: dict[str, Any] = {'name': nm, 'type': str((meta or {}).get('type') or 'string')}
             if isinstance(meta, dict):
                 if 'required' in meta:
                     rec['required'] = bool(meta.get('required'))
@@ -30572,7 +31024,7 @@ def _build_generator_scaffold(payload: dict[str, Any]) -> tuple[dict[str, str], 
                 if not nm:
                     continue
                 manifest_yaml += f"  - name: {nm}\n"
-                tp = str(inp.get('type') or 'text').strip() or 'text'
+                tp = str(inp.get('type') or 'string').strip() or 'string'
                 manifest_yaml += f"    type: {tp}\n"
                 if 'required' in inp:
                     manifest_yaml += f"    required: {'true' if bool(inp.get('required')) else 'false'}\n"
@@ -31035,6 +31487,146 @@ def data_sources_page():
     """
     # Not linked from the UI anymore; intentionally excluded from OpenAPI.
     return render_template('data_sources.html', active_page='')
+
+
+def _validate_and_normalize_data_source_csv(csv_path: str, *, skip_invalid: bool = False) -> tuple[bool, str, list[list[str]], list[int]]:
+    """Validate and normalize a legacy data-sources CSV.
+
+    This is a small helper primarily used by tests. The legacy Data Sources UI
+    has been removed, but we keep the parser behavior stable.
+
+    Returns:
+      (ok, note, normalized_rows, skipped_row_numbers)
+
+    Normalization:
+      - Strips UTF-8 BOM from the first header cell.
+      - Canonicalizes standard headers to: Name, Path, Type, Startup, Vector.
+      - Lowercases/strips known enum-ish fields.
+
+    Validation (best-effort):
+      - Requires non-empty Name and Path.
+      - Requires Type in a small allowed set (currently includes 'artifact').
+      - Startup accepts yes/no/true/false/1/0 and normalizes to yes|no.
+      - Vector accepts local|remote (and a few aliases).
+    """
+    import csv
+
+    path = str(csv_path or '').strip()
+    if not path:
+        return False, 'Missing csv path', [], []
+    if not os.path.exists(path) or not os.path.isfile(path):
+        return False, f'CSV not found: {path}', [], []
+
+    allowed_types = {
+        # Minimal set (legacy + tests).
+        'artifact',
+        # A few pragmatic extras for backward compatibility.
+        'file', 'path', 'url', 'text', 'json',
+    }
+    startup_true = {'1', 'true', 'yes', 'y', 'on'}
+    startup_false = {'0', 'false', 'no', 'n', 'off'}
+    vector_alias = {
+        'local': 'local',
+        'localhost': 'local',
+        'host': 'local',
+        'remote': 'remote',
+        'network': 'remote',
+    }
+
+    normalized_rows: list[list[str]] = []
+    skipped: list[int] = []
+    try:
+        with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+    except Exception as exc:
+        return False, f'Failed reading CSV: {exc}', [], []
+
+    if not rows:
+        return False, 'Empty CSV', [], []
+
+    raw_header = [str(x or '').strip() for x in (rows[0] or [])]
+    if raw_header:
+        # utf-8-sig should remove BOM, but be defensive.
+        raw_header[0] = raw_header[0].lstrip('\ufeff').strip()
+
+    # Canonicalize standard headers.
+    canon_map = {
+        'name': 'Name',
+        'path': 'Path',
+        'type': 'Type',
+        'startup': 'Startup',
+        'vector': 'Vector',
+    }
+    header = []
+    for h in raw_header:
+        k = str(h or '').strip()
+        header.append(canon_map.get(k.lower(), k))
+
+    # Determine column indices (case-insensitive).
+    idx: dict[str, int] = {}
+    for i, h in enumerate(header):
+        hl = str(h or '').strip().lower()
+        if hl and hl not in idx:
+            idx[hl] = i
+
+    required_cols = ['name', 'path', 'type', 'startup', 'vector']
+    missing = [c for c in required_cols if c not in idx]
+    if missing:
+        msg = f"Missing required columns: {', '.join(missing)}"
+        return (False, msg, [header], []) if not skip_invalid else (True, msg + ' (skipped all rows)', [header], list(range(2, 2 + max(0, len(rows) - 1))))
+
+    normalized_rows.append(header)
+
+    invalid_count = 0
+    for row_i, row in enumerate(rows[1:], start=2):
+        # row_i is 1-based line number in the CSV file.
+        values = [str(x or '').strip() for x in (row or [])]
+        # Pad to header length to avoid IndexError.
+        while len(values) < len(header):
+            values.append('')
+
+        name = values[idx['name']].strip()
+        path_value = values[idx['path']].strip()
+        type_value = values[idx['type']].strip().lower()
+        startup_value = values[idx['startup']].strip().lower()
+        vector_value = values[idx['vector']].strip().lower()
+
+        ok_row = True
+        if not name or not path_value:
+            ok_row = False
+        if type_value not in allowed_types:
+            ok_row = False
+
+        if startup_value in startup_true:
+            startup_norm = 'yes'
+        elif startup_value in startup_false:
+            startup_norm = 'no'
+        else:
+            ok_row = False
+            startup_norm = startup_value or ''
+
+        vector_norm = vector_alias.get(vector_value, '')
+        if not vector_norm:
+            ok_row = False
+
+        if not ok_row:
+            invalid_count += 1
+            if skip_invalid:
+                skipped.append(row_i)
+                continue
+            return False, f'Invalid row at line {row_i}', normalized_rows, [row_i]
+
+        # Apply normalized enums back into the row.
+        values[idx['type']] = type_value
+        values[idx['startup']] = startup_norm
+        values[idx['vector']] = vector_norm
+        normalized_rows.append(values)
+
+    note = f'OK ({len(normalized_rows) - 1} row(s))'
+    if invalid_count:
+        note += f'; skipped {invalid_count} invalid row(s)'
+    return True, note, normalized_rows, skipped
 
 
 
@@ -32396,7 +32988,7 @@ def _safe_extract_zip_to_dir(zip_path: str, dest_dir: str) -> None:
                 dst.write(src.read())
 
 
-def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[dict[str, Any]]]:
+def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[dict[str, Any]], list[dict[str, Any]]]:
     """Validate generator pack contents.
 
     Returns (ok, note, items) where items are generator dirs to install.
@@ -32414,7 +33006,7 @@ def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[d
 
     root = Path(extracted_dir)
     if not root.exists() or not root.is_dir():
-        return False, 'Empty pack', []
+        return False, 'Empty pack', [], []
 
     # Find all manifest files.
     manifests: list[Path] = []
@@ -32429,10 +33021,64 @@ def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[d
     # De-dupe
     manifests = sorted({m.resolve() for m in manifests})
     if not manifests:
-        return False, 'No manifest.yaml found in zip', []
+        return False, 'No manifest.yaml found in zip', [], []
 
     items: list[dict[str, Any]] = []
     errors: list[str] = []
+    warnings: list[dict[str, Any]] = []
+
+    canonical_types = {
+        'string', 'int', 'float', 'number', 'boolean', 'json', 'file', 'string_list', 'file_list'
+    }
+
+    def _normalize_input_type_for_warning(type_value: Any) -> tuple[str, bool]:
+        """Return (canonical_type, used_fallback).
+
+        used_fallback=True means we could not map the provided type (or it was missing)
+        and defaulted to "string".
+        """
+        try:
+            t0 = str(type_value or '').strip().lower()
+        except Exception:
+            t0 = ''
+        if not t0:
+            return 'string', True
+
+        t = t0
+        is_list = False
+        try:
+            is_list = ('list' in t) or t.endswith('[]')
+        except Exception:
+            is_list = False
+
+        if t in canonical_types:
+            return t, False
+
+        # Common aliases.
+        if t in {'text', 'str'}:
+            return 'string', False
+        if t in {'integer'}:
+            return 'int', False
+        if t in {'double'}:
+            return 'float', False
+        if t in {'bool'}:
+            return 'boolean', False
+        if t in {'object', 'dict', 'map'}:
+            return 'json', False
+        if t in {'filepath', 'file_path', 'path', 'pathname'}:
+            return 'file', False
+        if t in {'strings'}:
+            return 'string_list', False
+        if t in {'files'}:
+            return 'file_list', False
+        if is_list and ('file' in t or 'path' in t):
+            return 'file_list', False
+        if is_list and ('string' in t or 'text' in t or 'str' in t):
+            return 'string_list', False
+        if t.endswith('[]'):
+            return 'string_list', False
+
+        return 'string', True
     for mp in manifests:
         try:
             doc = yaml.safe_load(mp.read_text('utf-8', errors='ignore'))
@@ -32446,7 +33092,23 @@ def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[d
         if mv != 1:
             errors.append(f'{mp}: manifest_version must be 1')
             continue
-        source_id = str(doc.get('id') or '').strip()
+        manifest_id = str(doc.get('id') or '').strip()
+        source_id = manifest_id
+
+        # If this generator was exported from an installed pack, it may carry a
+        # marker with the original stable source id. Prefer that over the
+        # (numeric) installed manifest id so export/import roundtrips preserve ids.
+        try:
+            marker_path = mp.parent / '.coretg_pack.json'
+            if marker_path.exists() and marker_path.is_file():
+                marker = json.loads(marker_path.read_text('utf-8', errors='ignore') or '{}')
+                if isinstance(marker, dict):
+                    marker_source_id = str(marker.get('source_generator_id') or '').strip()
+                    if marker_source_id and len(marker_source_id) <= 256:
+                        source_id = marker_source_id
+        except Exception:
+            pass
+
         # Allow packs to omit ids; we will assign numeric ids on install.
         gen_id = source_id
         if not gen_id:
@@ -32460,6 +33122,37 @@ def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[d
         if kind not in ('flag-generator', 'flag-node-generator'):
             errors.append(f'{mp}: kind must be flag-generator or flag-node-generator')
             continue
+
+        # Warn on missing/unknown input types (they will fall back to string at runtime).
+        try:
+            raw_inputs = doc.get('inputs')
+            if isinstance(raw_inputs, list):
+                for idx, inp in enumerate(raw_inputs):
+                    if not isinstance(inp, dict):
+                        continue
+                    nm = str(inp.get('name') or '').strip()
+                    if not nm:
+                        continue
+                    raw_t = inp.get('type')
+                    normalized, used_fallback = _normalize_input_type_for_warning(raw_t)
+                    if raw_t is None:
+                        warnings.append({
+                            'manifest_path': str(mp),
+                            'input_name': nm,
+                            'raw_type': None,
+                            'normalized_type': normalized,
+                            'warning': 'inputs[].type is missing; defaulting to string',
+                        })
+                    elif used_fallback:
+                        warnings.append({
+                            'manifest_path': str(mp),
+                            'input_name': nm,
+                            'raw_type': str(raw_t),
+                            'normalized_type': normalized,
+                            'warning': f'Unknown input type "{raw_t}"; defaulting to string',
+                        })
+        except Exception:
+            pass
 
         gen_dir = mp.parent
         runtime = doc.get('runtime') if isinstance(doc.get('runtime'), dict) else {}
@@ -32496,12 +33189,19 @@ def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[d
             errors.append(f'{mp}: python syntax error: {exc}')
             continue
 
-        items.append({'id': gen_id, 'kind': kind, 'path': str(gen_dir), 'source_id': source_id, 'manifest_path': str(mp)})
+        items.append({
+            'id': gen_id,
+            'kind': kind,
+            'path': str(gen_dir),
+            'source_id': source_id,
+            'manifest_id': manifest_id,
+            'manifest_path': str(mp),
+        })
 
     if errors:
         # Show first few errors.
-        return False, '; '.join(errors[:4]) + (f' (+{len(errors)-4} more)' if len(errors) > 4 else ''), []
-    return True, f'Validated {len(items)} generator(s)', items
+        return False, '; '.join(errors[:4]) + (f' (+{len(errors)-4} more)' if len(errors) > 4 else ''), [], warnings
+    return True, f'Validated {len(items)} generator(s)', items, warnings
 
 
 def _compute_next_numeric_generator_id(*, repo_root: str) -> int:
@@ -32541,7 +33241,7 @@ def _install_generator_pack_payload(
     safe_label: str,
     pack_origin: str,
     next_numeric: int,
-) -> tuple[bool, str, list[dict[str, Any]], int]:
+) -> tuple[bool, str, list[dict[str, Any]], int, list[dict[str, Any]]]:
     """Install a pack zip payload and return installed items.
 
     This does not write to the packs state file; callers decide how to record grouping.
@@ -32553,15 +33253,15 @@ def _install_generator_pack_payload(
     try:
         import yaml  # type: ignore
     except Exception as exc:
-        return False, f'Pack install requires PyYAML: {exc}', [], next_numeric
+        return False, f'Pack install requires PyYAML: {exc}', [], next_numeric, []
 
     root = _installed_generators_root()
     tmp_dir = tempfile.mkdtemp(prefix='coretg_pack_')
     try:
         _safe_extract_zip_to_dir(zip_path, tmp_dir)
-        ok, note, items = _validate_generator_pack_tree(tmp_dir)
+        ok, note, items, warnings = _validate_generator_pack_tree(tmp_dir)
         if not ok:
-            return False, note, [], next_numeric
+            return False, note, [], next_numeric, warnings
 
         installed: list[dict[str, Any]] = []
         for it in items:
@@ -32636,7 +33336,7 @@ def _install_generator_pack_payload(
 
             installed.append({'id': assigned_gid, 'kind': kind, 'path': dest_dir})
 
-        return True, note, installed, next_numeric
+        return True, note, installed, next_numeric, warnings
     finally:
         try:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -32655,7 +33355,7 @@ def _install_generator_pack(*, zip_path: str, pack_label: str, pack_origin: str)
         pack_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
         next_numeric = _compute_next_numeric_generator_id(repo_root=repo_root)
 
-        ok, note, installed, _next = _install_generator_pack_payload(
+        ok, note, installed, _next, warnings = _install_generator_pack_payload(
             zip_path=zip_path,
             pack_id=pack_id,
             safe_label=safe_label,
@@ -32672,11 +33372,18 @@ def _install_generator_pack(*, zip_path: str, pack_label: str, pack_origin: str)
             'label': safe_label,
             'origin': pack_origin,
             'note': note,
+            'warnings': warnings,
             'installed_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
             'installed': installed,
         })
         _save_installed_generator_packs_state(state)
-        return True, f"Installed {len(installed)} generator(s) from {safe_label}"
+        warn_note = ''
+        try:
+            if isinstance(warnings, list) and warnings:
+                warn_note = f" (warnings: {len(warnings)})"
+        except Exception:
+            warn_note = ''
+        return True, f"Installed {len(installed)} generator(s) from {safe_label}" + warn_note
     except ValueError as ve:
         return False, str(ve)
     except Exception as exc:
@@ -32720,6 +33427,7 @@ def _install_generator_pack_or_bundle(*, zip_path: str, pack_label: str, pack_or
                 successes = 0
                 failures: list[str] = []
                 installed_all: list[dict[str, Any]] = []
+                warnings_all: list[dict[str, Any]] = []
 
                 for inner_name in sorted(set(nested)):
                     try:
@@ -32734,7 +33442,7 @@ def _install_generator_pack_or_bundle(*, zip_path: str, pack_label: str, pack_or
                         with open(inner_tmp, 'wb') as fh:
                             fh.write(inner_bytes)
 
-                        ok_inner, note_inner, installed_inner, next_numeric = _install_generator_pack_payload(
+                        ok_inner, note_inner, installed_inner, next_numeric, warnings_inner = _install_generator_pack_payload(
                             zip_path=inner_tmp,
                             pack_id=pack_id,
                             safe_label=safe_label,
@@ -32743,6 +33451,8 @@ def _install_generator_pack_or_bundle(*, zip_path: str, pack_label: str, pack_or
                         )
                         if ok_inner:
                             installed_all.extend(installed_inner)
+                            if isinstance(warnings_inner, list) and warnings_inner:
+                                warnings_all.extend(warnings_inner)
                             successes += 1
                         else:
                             failures.append(f'{inner_name}: {note_inner}')
@@ -32761,6 +33471,7 @@ def _install_generator_pack_or_bundle(*, zip_path: str, pack_label: str, pack_or
                         'label': safe_label,
                         'origin': pack_origin,
                         'note': f'Imported {successes} pack(s) from bundle' + (f'; {failures[0]}' if failures else ''),
+                        'warnings': warnings_all,
                         'installed_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
                         'installed': installed_all,
                     })
@@ -32768,9 +33479,15 @@ def _install_generator_pack_or_bundle(*, zip_path: str, pack_label: str, pack_or
                 except Exception:
                     pass
 
+                warn_note = ''
+                try:
+                    if warnings_all:
+                        warn_note = f" (warnings: {len(warnings_all)})"
+                except Exception:
+                    warn_note = ''
                 if failures:
-                    return successes > 0, f'Imported {successes} pack(s) from bundle as {safe_label}; {failures[0]}'
-                return True, f'Imported {successes} pack(s) from bundle as {safe_label}'
+                    return successes > 0, f'Imported {successes} pack(s) from bundle as {safe_label}{warn_note}; {failures[0]}'
+                return True, f'Imported {successes} pack(s) from bundle as {safe_label}{warn_note}'
 
     except Exception as exc:
         return False, f'Invalid zip: {exc}'
@@ -32806,7 +33523,19 @@ def generator_packs_upload():
         ok, note = _install_generator_pack_or_bundle(zip_path=tmp_path, pack_label=label, pack_origin='upload')
         if is_xhr:
             if ok:
-                return jsonify({'ok': True, 'message': note}), 200
+                # Include warnings (best-effort) by reading the latest pack state entry.
+                warnings: list[dict[str, Any]] = []
+                try:
+                    state = _load_installed_generator_packs_state()
+                    packs = state.get('packs') if isinstance(state, dict) else None
+                    if isinstance(packs, list) and packs:
+                        last = packs[-1] if isinstance(packs[-1], dict) else {}
+                        ww = last.get('warnings') if isinstance(last, dict) else None
+                        if isinstance(ww, list):
+                            warnings = ww
+                except Exception:
+                    warnings = []
+                return jsonify({'ok': True, 'message': note, 'warnings': warnings}), 200
             return jsonify({'ok': False, 'error': f'Pack install failed: {note}'}), 400
 
         flash(note if ok else f'Pack install failed: {note}')

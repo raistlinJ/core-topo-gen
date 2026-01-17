@@ -18,6 +18,81 @@ class ManifestLoadError:
     error: str
 
 
+CANONICAL_INPUT_TYPES: set[str] = {
+    'string',
+    'int',
+    'float',
+    'number',
+    'boolean',
+    'json',
+    'file',
+    'string_list',
+    'file_list',
+}
+
+
+def normalize_manifest_input_type(type_value: Any) -> str:
+    """Normalize manifest input types to a small, mandatory canonical set.
+
+    Unknown/missing values fall back to "string".
+    """
+    try:
+        t0 = str(type_value or '').strip().lower()
+    except Exception:
+        t0 = ''
+    if not t0:
+        return 'string'
+
+    t = t0
+    is_list = False
+    try:
+        if 'list' in t or t.endswith('[]'):
+            is_list = True
+    except Exception:
+        is_list = False
+
+    if t in CANONICAL_INPUT_TYPES:
+        return t
+
+    # File/path.
+    if t in {'filepath', 'file_path', 'path', 'pathname'}:
+        return 'file'
+    if is_list and ('file' in t or 'path' in t):
+        return 'file_list'
+    if (not is_list) and ('file' in t or 'path' in t):
+        return 'file'
+
+    # Strings.
+    if t in {'str', 'text'}:
+        return 'string'
+    if is_list and ('string' in t or 'str' in t or 'text' in t):
+        return 'string_list'
+    if t in {'strings'}:
+        return 'string_list'
+    if t in {'files'}:
+        return 'file_list'
+    if t.endswith('[]'):
+        return 'string_list'
+
+    # Numbers.
+    if t in {'integer'}:
+        return 'int'
+    if t in {'double'}:
+        return 'float'
+    if t in {'numeric'}:
+        return 'number'
+
+    # Booleans.
+    if t == 'bool':
+        return 'boolean'
+
+    # JSON-ish.
+    if t in {'object', 'dict', 'map'}:
+        return 'json'
+
+    return 'string'
+
+
 def _as_list(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -45,7 +120,7 @@ def _norm_inputs(inputs: Any) -> list[dict[str, Any]]:
             continue
         rec: dict[str, Any] = {
             'name': name,
-            'type': str(item.get('type') or 'text').strip() or 'text',
+            'type': normalize_manifest_input_type(item.get('type')),
         }
         if 'required' in item:
             rec['required'] = bool(item.get('required'))
