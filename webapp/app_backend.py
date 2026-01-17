@@ -10578,6 +10578,59 @@ def _flow_enrich_saved_flag_assignments(
         except Exception:
             pass
 
+        # Normalize optional persisted flag override.
+        try:
+            if 'flag_override' in a2:
+                if a2.get('flag_override') is None:
+                    a2.pop('flag_override', None)
+                elif isinstance(a2.get('flag_override'), str):
+                    s = str(a2.get('flag_override') or '').strip()
+                    if s:
+                        a2['flag_override'] = s
+                    else:
+                        a2.pop('flag_override', None)
+                else:
+                    a2.pop('flag_override', None)
+        except Exception:
+            pass
+
+        # Normalize optional persisted output overrides (dict of output_key -> value).
+        try:
+            if 'output_overrides' in a2:
+                if a2.get('output_overrides') is None:
+                    a2.pop('output_overrides', None)
+                elif isinstance(a2.get('output_overrides'), dict):
+                    cleaned: dict[str, Any] = {}
+                    for k, v in (a2.get('output_overrides') or {}).items():
+                        kk = str(k or '').strip()
+                        if not kk:
+                            continue
+                        cleaned[kk] = v
+                    if cleaned:
+                        a2['output_overrides'] = cleaned
+                    else:
+                        a2.pop('output_overrides', None)
+                else:
+                    a2.pop('output_overrides', None)
+        except Exception:
+            pass
+
+        # Normalize optional persisted inject-files override (list of paths).
+        try:
+            if 'inject_files_override' in a2:
+                if a2.get('inject_files_override') is None:
+                    a2.pop('inject_files_override', None)
+                elif isinstance(a2.get('inject_files_override'), list):
+                    cleaned = [str(x or '').strip() for x in (a2.get('inject_files_override') or [])]
+                    cleaned = [x for x in cleaned if x]
+                    a2['inject_files_override'] = cleaned
+                    # Mirror into inject_files so the UI/runner sees the effective list.
+                    a2['inject_files'] = cleaned
+                else:
+                    a2.pop('inject_files_override', None)
+        except Exception:
+            pass
+
         # Preserve persisted hint text when present (Flow persistence contract), but
         # strip ids if they exist. Only regenerate hints from catalogs when missing.
         has_hints = False
@@ -12629,6 +12682,48 @@ def api_flow_prepare_preview_for_execute():
                 except Exception:
                     pass
 
+                # Apply inject-files override early so downstream hint.txt allowlist uses it.
+                try:
+                    inj_ovr = (fa or {}).get('inject_files_override')
+                    if isinstance(inj_ovr, list):
+                        cleaned = [str(x or '').strip() for x in (inj_ovr or [])]
+                        cleaned = [x for x in cleaned if x]
+                        fa['inject_files'] = cleaned
+                except Exception:
+                    pass
+
+                # If the user provided an explicit FLAG override, expose it even before
+                # generator execution (so UI can show Resolved outputs / Flag).
+                try:
+                    flag_override = str((fa or {}).get('flag_override') or '').strip()
+                    if flag_override:
+                        fa['flag_value'] = flag_override
+                        fa['resolved_outputs'] = _redact_kv_for_ui({'flag': flag_override})
+                except Exception:
+                    pass
+
+                # If the user provided output overrides, expose them even before generator
+                # execution (useful when running best-effort or when generator outputs are unknown).
+                try:
+                    out_ovr = (fa or {}).get('output_overrides')
+                    if isinstance(out_ovr, dict) and out_ovr:
+                        cleaned: dict[str, Any] = {}
+                        for k, v in (out_ovr or {}).items():
+                            kk = str(k or '').strip()
+                            if not kk:
+                                continue
+                            cleaned[kk] = v
+                        if cleaned:
+                            fa['resolved_outputs'] = _redact_kv_for_ui(cleaned)
+                            # Prefer showing overridden flag value in the UI's Flag row.
+                            try:
+                                if isinstance(cleaned.get('flag'), str) and str(cleaned.get('flag') or '').strip():
+                                    fa['flag_value'] = str(cleaned.get('flag') or '').strip()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
                 try:
                     if generator_id:
                         if deadline is not None and time.monotonic() >= deadline:
@@ -12690,6 +12785,25 @@ def api_flow_prepare_preview_for_execute():
                                     m = json.load(f) or {}
                                 outs = m.get('outputs') if isinstance(m, dict) else None
                                 if isinstance(outs, dict):
+                                    # Apply user override for FLAG value (if provided).
+                                    try:
+                                        flag_override = str((fa or {}).get('flag_override') or '').strip()
+                                        if flag_override:
+                                            outs['flag'] = flag_override
+                                    except Exception:
+                                        pass
+
+                                    # Apply user output overrides (if provided).
+                                    try:
+                                        out_ovr = (fa or {}).get('output_overrides')
+                                        if isinstance(out_ovr, dict) and out_ovr:
+                                            for k, v in (out_ovr or {}).items():
+                                                kk = str(k or '').strip()
+                                                if not kk:
+                                                    continue
+                                                outs[kk] = v
+                                    except Exception:
+                                        pass
                                     # Ensure any IP-like outputs align with the preview host IP.
                                     # This prevents resolved hints from drifting away from Preview
                                     # even if a generator invents its own network.ip.
@@ -13024,6 +13138,45 @@ def api_flow_prepare_preview_for_execute():
 
                     fa['config'] = cfg
                     fa['resolved_inputs'] = _redact_kv_for_ui(cfg)
+                except Exception:
+                    pass
+
+                # Apply inject-files override even when flags are disabled.
+                try:
+                    inj_ovr = (fa or {}).get('inject_files_override')
+                    if isinstance(inj_ovr, list):
+                        cleaned = [str(x or '').strip() for x in (inj_ovr or [])]
+                        cleaned = [x for x in cleaned if x]
+                        fa['inject_files'] = cleaned
+                except Exception:
+                    pass
+
+                # Preserve FLAG override visibility even when flags are disabled.
+                try:
+                    flag_override = str((fa or {}).get('flag_override') or '').strip()
+                    if flag_override:
+                        fa['flag_value'] = flag_override
+                        fa['resolved_outputs'] = _redact_kv_for_ui({'flag': flag_override})
+                except Exception:
+                    pass
+
+                # Preserve output override visibility even when flags are disabled.
+                try:
+                    out_ovr = (fa or {}).get('output_overrides')
+                    if isinstance(out_ovr, dict) and out_ovr:
+                        cleaned: dict[str, Any] = {}
+                        for k, v in (out_ovr or {}).items():
+                            kk = str(k or '').strip()
+                            if not kk:
+                                continue
+                            cleaned[kk] = v
+                        if cleaned:
+                            fa['resolved_outputs'] = _redact_kv_for_ui(cleaned)
+                            try:
+                                if isinstance(cleaned.get('flag'), str) and str(cleaned.get('flag') or '').strip():
+                                    fa['flag_value'] = str(cleaned.get('flag') or '').strip()
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
@@ -13395,6 +13548,78 @@ def api_flow_save_flow_substitutions():
                 # Unsupported type: ignore.
                 hint_overrides = None
 
+        # Optional user override for the realized FLAG value.
+        flag_override_present = False
+        raw_flag_override: Any = None
+        try:
+            flag_override_present = 'flag_override' in req
+            raw_flag_override = req.get('flag_override')
+        except Exception:
+            flag_override_present = False
+            raw_flag_override = None
+
+        flag_override: str | None = None
+        clear_flag_override = False
+        if flag_override_present:
+            if raw_flag_override is None:
+                clear_flag_override = True
+                flag_override = None
+            elif isinstance(raw_flag_override, str):
+                s = str(raw_flag_override or '').strip()
+                flag_override = s if s else None
+            else:
+                flag_override = None
+
+        # Optional user overrides for outputs (dict of output_key -> value).
+        output_overrides_present = False
+        raw_output_overrides: Any = None
+        try:
+            output_overrides_present = 'output_overrides' in req
+            raw_output_overrides = req.get('output_overrides')
+        except Exception:
+            output_overrides_present = False
+            raw_output_overrides = None
+
+        output_overrides: dict[str, Any] | None = None
+        clear_output_overrides = False
+        if output_overrides_present:
+            if raw_output_overrides is None:
+                clear_output_overrides = True
+                output_overrides = None
+            elif isinstance(raw_output_overrides, dict):
+                cleaned: dict[str, Any] = {}
+                for k, v in (raw_output_overrides or {}).items():
+                    kk = str(k or '').strip()
+                    if not kk:
+                        continue
+                    cleaned[kk] = v
+                output_overrides = cleaned
+            else:
+                output_overrides = None
+
+        # Optional override for inject_files allowlist.
+        inject_files_override_present = False
+        raw_inject_files_override: Any = None
+        try:
+            inject_files_override_present = 'inject_files_override' in req
+            raw_inject_files_override = req.get('inject_files_override')
+        except Exception:
+            inject_files_override_present = False
+            raw_inject_files_override = None
+
+        inject_files_override: list[str] | None = None
+        clear_inject_files_override = False
+        if inject_files_override_present:
+            if raw_inject_files_override is None:
+                clear_inject_files_override = True
+                inject_files_override = None
+            elif isinstance(raw_inject_files_override, list):
+                cleaned = [str(x or '').strip() for x in (raw_inject_files_override or [])]
+                cleaned = [x for x in cleaned if x]
+                inject_files_override = cleaned
+            else:
+                inject_files_override = None
+
         requires_artifacts = sorted(list(_artifact_requires_of(gen)))
         produces_artifacts = sorted(list(_artifact_produces_of(gen)))
         input_fields_required = sorted(list(_required_input_fields_of(gen)))
@@ -13467,6 +13692,29 @@ def api_flow_save_flow_substitutions():
                 out_a['hint_overrides'] = list(hint_overrides)
                 out_a['hints'] = list(hint_overrides)
                 out_a['hint'] = hint_overrides[0] if hint_overrides else ''
+
+        if flag_override_present:
+            if clear_flag_override:
+                out_a.pop('flag_override', None)
+            elif flag_override is not None:
+                out_a['flag_override'] = str(flag_override)
+
+        if output_overrides_present:
+            if clear_output_overrides:
+                out_a.pop('output_overrides', None)
+            elif output_overrides is not None:
+                if output_overrides:
+                    out_a['output_overrides'] = dict(output_overrides)
+                else:
+                    out_a.pop('output_overrides', None)
+
+        if inject_files_override_present:
+            if clear_inject_files_override:
+                out_a.pop('inject_files_override', None)
+            elif inject_files_override is not None:
+                out_a['inject_files_override'] = list(inject_files_override)
+                # Mirror to inject_files for effective view.
+                out_a['inject_files'] = list(inject_files_override)
 
         out_assignments.append(out_a)
 

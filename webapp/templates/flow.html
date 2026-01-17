@@ -983,7 +983,7 @@
         const inOpt = (fa && Array.isArray(fa.input_fields_optional)) ? fa.input_fields_optional.map(String).filter(Boolean) : [];
         const inAll = (fa && Array.isArray(fa.input_fields)) ? fa.input_fields.map(String).filter(Boolean) : [];
         const inputsDisplay = (inReq.length || inOpt.length)
-          ? (inReq.concat(inOpt.map(x => x + ' (optional)')).join(', '))
+          ? (inReq.concat(inOpt).join(', '))
           : (inAll.length ? inAll.join(', ') : '-');
         const isNodeGen = String((fa && fa.type) || '').trim() === 'flag-node-generator';
         const injectedFiles = (fa && Array.isArray(fa.inject_files))
@@ -998,7 +998,7 @@
 
           const reqFields = inReq;
           const defFields = (inReq.length || inOpt.length)
-            ? inReq.concat(inOpt.map(x => x + ' (optional)'))
+            ? inReq.concat(inOpt)
             : inAll;
           const providedFieldsChain = (step && Array.isArray(step.providing_fields_chain)) ? step.providing_fields_chain.map(String).filter(Boolean) : [];
           const providedFieldsSeq = (step && Array.isArray(step.providing_fields_sequencer)) ? step.providing_fields_sequencer.map(String).filter(Boolean) : [];
@@ -1051,6 +1051,16 @@
             }
 
             if(!pairs.length) return document.createTextNode('-');
+
+            // If there's only one value, render it inline (no dropdown).
+            if(pairs.length === 1){
+              const p = pairs[0];
+              const code = document.createElement('code');
+              code.className = 'font-monospace';
+              code.title = p.k + '=' + p.full;
+              code.textContent = p.k + '=' + p.short;
+              return code;
+            }
 
             const details = document.createElement('details');
             details.className = 'small';
@@ -1133,115 +1143,265 @@
           const outArtifactsReq = outArtifacts.filter(k => downstreamReqArtifacts.has(k));
           const outFieldsReq = outFields.filter(k => downstreamReqFields.has(k));
 
-          const inputsTbl = document.createElement('table');
-          inputsTbl.className = 'table table-sm mb-0';
-          const itHead = document.createElement('thead');
-          itHead.innerHTML = showMissingCol
-            ? '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Inputs</th><th>Required</th><th>Defined</th><th>Resolved</th><th>Provided by Chain</th><th>Provided by Sequencer</th><th>Missing</th></tr>'
-            : '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Inputs</th><th>Required</th><th>Defined</th><th>Resolved</th><th>Provided by Chain</th><th>Provided by Sequencer</th></tr>';
-          inputsTbl.appendChild(itHead);
-          const itBody = document.createElement('tbody');
-          function addIoRow(label, requiredList, definedList, byChainList, bySeqList, missingList){
-            const tr = document.createElement('tr');
-            const td0 = document.createElement('td');
-            td0.className = 'text-muted';
-            td0.style.whiteSpace = 'nowrap';
-            td0.textContent = label;
-            const td1 = document.createElement('td');
-            td1.textContent = (requiredList && requiredList.length) ? requiredList.join(', ') : '-';
-            const td2 = document.createElement('td');
-            td2.textContent = (definedList && definedList.length) ? definedList.join(', ') : '-';
-            const tdR = document.createElement('td');
-            tdR.className = 'small';
-            if(label === 'Fields'){
-              const keys = (fa && Array.isArray(fa.input_fields) && fa.input_fields.length) ? fa.input_fields : (definedList || []);
-              tdR.appendChild(renderResolvedCell(resolvedInputs, keys, { maxItems: 2, maxLen: 48, maxDetailItems: 25 }));
-            } else {
-              tdR.textContent = '-';
-            }
-            const td3 = document.createElement('td');
-            td3.textContent = (byChainList && byChainList.length) ? byChainList.join(', ') : '-';
-            const td4 = document.createElement('td');
-            td4.textContent = (bySeqList && bySeqList.length) ? bySeqList.join(', ') : '-';
-            tr.appendChild(td0);
-            tr.appendChild(td1);
-            tr.appendChild(td2);
-            tr.appendChild(tdR);
-            tr.appendChild(td3);
-            tr.appendChild(td4);
-            if(showMissingCol){
-              const td5 = document.createElement('td');
-              if(missingList && missingList.length) td5.classList.add('text-danger');
-              td5.textContent = (missingList && missingList.length) ? missingList.join(', ') : '-';
-              tr.appendChild(td5);
-            }
-            itBody.appendChild(tr);
+          function renderBoolCheckbox(checked, title){
+            const wrap = document.createElement('div');
+            wrap.className = 'form-check mb-0';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.className = 'form-check-input';
+            cb.disabled = true;
+            cb.checked = !!checked;
+            if(title) cb.title = String(title);
+            wrap.appendChild(cb);
+            return wrap;
           }
-          addIoRow('Artifacts', reqArtifacts, reqArtifacts, providedArtifactsChain, providedArtifactsSeq, missingArtifacts);
-          addIoRow('Fields', reqFields, defFields, providedFieldsChain, providedFieldsSeq, missingFields);
-          inputsTbl.appendChild(itBody);
 
-          // Full-width row so the Inputs table is flush-left (no empty label column indentation).
+          function renderVarName(name, required){
+            const span = document.createElement('span');
+            span.style.whiteSpace = 'nowrap';
+            const code = document.createElement('code');
+            code.className = 'font-monospace';
+            code.textContent = String(name || '').trim() || '-';
+            span.appendChild(code);
+            if(required){
+              const star = document.createElement('span');
+              star.className = 'text-danger ms-1';
+              star.textContent = '*';
+              span.appendChild(star);
+            }
+            return span;
+          }
+
+          function renderResolvedValueForKey(resolvedKv, key){
+            const k = String(key || '').trim();
+            if(!k || !resolvedKv || typeof resolvedKv !== 'object' || Array.isArray(resolvedKv)) return document.createTextNode('-');
+            if(!(k in resolvedKv)) return document.createTextNode('-');
+            const obj = {};
+            obj[k] = resolvedKv[k];
+            return renderResolvedCell(obj, [k], { maxItems: 1, maxLen: 72, maxDetailItems: 25 });
+          }
+
+          function buildIoTable(mode){
+            const isInputs = mode === 'inputs';
+
+            const tbl = document.createElement('table');
+            tbl.className = 'table table-sm mb-0';
+
+            const thead = document.createElement('thead');
+            if(isInputs){
+              thead.innerHTML = showMissingCol
+                ? '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th style="width: 1%; white-space: nowrap;">Type</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th><th style="width: 1%; white-space: nowrap;">Missing</th></tr>'
+                : '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th style="width: 1%; white-space: nowrap;">Type</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th></tr>';
+            } else {
+              thead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th style="width: 1%; white-space: nowrap;">Type</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">To Chain</th></tr>';
+            }
+            tbl.appendChild(thead);
+
+            const tbody2 = document.createElement('tbody');
+
+            function addRowVar(v){
+              const tr = document.createElement('tr');
+
+              const tdVar = document.createElement('td');
+              tdVar.appendChild(renderVarName(v.name, v.required));
+
+              const tdType = document.createElement('td');
+              tdType.className = 'text-muted';
+              tdType.style.whiteSpace = 'nowrap';
+              tdType.textContent = v.kind;
+
+              const tdRes = document.createElement('td');
+              tdRes.className = 'small';
+              if(v.kind === 'Field'){
+                tdRes.appendChild(renderResolvedValueForKey(isInputs ? resolvedInputs : resolvedOutputs, v.name));
+              } else {
+                tdRes.textContent = '-';
+              }
+
+              tr.appendChild(tdVar);
+              tr.appendChild(tdType);
+              tr.appendChild(tdRes);
+
+              if(isInputs){
+                const tdFromChain = document.createElement('td');
+                tdFromChain.appendChild(renderBoolCheckbox(v.fromChain, 'Provided by chain'));
+                const tdFromSeq = document.createElement('td');
+                tdFromSeq.appendChild(renderBoolCheckbox(v.fromSeq, 'Provided by sequencer (synthesized)'));
+                tr.appendChild(tdFromChain);
+                tr.appendChild(tdFromSeq);
+                if(showMissingCol){
+                  const tdMiss = document.createElement('td');
+                  if(v.missing) tdMiss.classList.add('text-danger');
+                  tdMiss.appendChild(renderBoolCheckbox(v.missing, v.missing ? 'Missing' : 'Not missing'));
+                  tr.appendChild(tdMiss);
+                }
+              } else {
+                const tdToChain = document.createElement('td');
+                tdToChain.appendChild(renderBoolCheckbox(v.toChain, 'Provided to chain'));
+                tr.appendChild(tdToChain);
+              }
+
+              tbody2.appendChild(tr);
+            }
+
+            const reqArtifactSet = new Set(reqArtifacts);
+            const reqFieldSet = new Set(reqFields);
+            const defArtifactSet = new Set(reqArtifacts);
+            const defFieldSet = new Set(defFields);
+
+            const provArtChainSet = new Set(providedArtifactsChain);
+            const provArtSeqSet = new Set(providedArtifactsSeq);
+            const missArtSet = new Set(missingArtifacts);
+
+            const provFldChainSet = new Set(providedFieldsChain);
+            const provFldSeqSet = new Set(providedFieldsSeq);
+            const missFldSet = new Set(missingFields);
+
+            if(isInputs){
+              const rows = [];
+              Array.from(defArtifactSet).sort().forEach((name) => {
+                const n = String(name || '').trim();
+                if(!n) return;
+                rows.push({
+                  name: n,
+                  kind: 'Artifact',
+                  required: reqArtifactSet.has(n),
+                  fromChain: provArtChainSet.has(n),
+                  fromSeq: provArtSeqSet.has(n),
+                  missing: missArtSet.has(n),
+                });
+              });
+
+              // If the generator declares no explicit input fields, still show any
+              // resolved config keys (including synthesized defaults) so the Resolved
+              // column isn't empty.
+              const fieldNameSet = new Set(Array.from(defFieldSet));
+              try{
+                if((!fieldNameSet.size) && resolvedInputs && typeof resolvedInputs === 'object' && !Array.isArray(resolvedInputs)){
+                  Object.keys(resolvedInputs).forEach(k => { if(String(k || '').trim()) fieldNameSet.add(String(k).trim()); });
+                }
+              } catch(e) {}
+              try{
+                // Prefer including synthesized fields when present.
+                if(Array.isArray(synthesizedFields) && synthesizedFields.length && resolvedInputs){
+                  synthesizedFields.forEach(k => {
+                    const kk = String(k || '').trim();
+                    if(!kk) return;
+                    try{
+                      if(resolvedInputs && typeof resolvedInputs === 'object' && !Array.isArray(resolvedInputs) && (kk in resolvedInputs)){
+                        fieldNameSet.add(kk);
+                      }
+                    } catch(e) {}
+                  });
+                }
+              } catch(e) {}
+
+              Array.from(fieldNameSet).sort().forEach((name) => {
+                const n = String(name || '').trim();
+                if(!n) return;
+                rows.push({
+                  name: n,
+                  kind: 'Field',
+                  required: reqFieldSet.has(n),
+                  fromChain: provFldChainSet.has(n),
+                  fromSeq: provFldSeqSet.has(n),
+                  missing: missFldSet.has(n),
+                });
+              });
+              rows.forEach(addRowVar);
+            } else {
+              const reqOutArtifactSet = new Set(outArtifactsReq);
+              const reqOutFieldSet = new Set(outFieldsReq);
+              const rows = [];
+              outArtifacts.map(String).filter(Boolean).sort().forEach((name) => {
+                const n = String(name || '').trim();
+                if(!n) return;
+                rows.push({
+                  name: n,
+                  kind: 'Artifact',
+                  required: reqOutArtifactSet.has(n),
+                  toChain: true,
+                });
+              });
+
+              const outFieldNameSet = new Set(outFields.map(String).filter(Boolean).map(s => String(s).trim()).filter(Boolean));
+              try{
+                if((!outFieldNameSet.size) && resolvedOutputs && typeof resolvedOutputs === 'object' && !Array.isArray(resolvedOutputs)){
+                  Object.keys(resolvedOutputs).forEach(k => { if(String(k || '').trim()) outFieldNameSet.add(String(k).trim()); });
+                }
+              } catch(e) {}
+
+              Array.from(outFieldNameSet).sort().forEach((name) => {
+                const n = String(name || '').trim();
+                if(!n) return;
+                rows.push({
+                  name: n,
+                  kind: 'Field',
+                  required: reqOutFieldSet.has(n),
+                  toChain: true,
+                });
+              });
+              rows.forEach(addRowVar);
+            }
+
+            tbl.appendChild(tbody2);
+            return tbl;
+          }
+
+          // Single tabbed table (Inputs/Outputs) in chain order.
+          const ioWrap = document.createElement('div');
+
+          const tabBar = document.createElement('div');
+          tabBar.className = 'd-flex align-items-center gap-2 mb-2';
+
+          const btnInputs = document.createElement('button');
+          btnInputs.type = 'button';
+          btnInputs.className = 'btn btn-sm btn-outline-primary';
+          btnInputs.textContent = 'Inputs';
+
+          const btnOutputs = document.createElement('button');
+          btnOutputs.type = 'button';
+          btnOutputs.className = 'btn btn-sm btn-outline-primary';
+          btnOutputs.textContent = 'Outputs';
+
+          tabBar.appendChild(btnInputs);
+          tabBar.appendChild(btnOutputs);
+          ioWrap.appendChild(tabBar);
+
+          const inputsPane = document.createElement('div');
+          const outputsPane = document.createElement('div');
+          inputsPane.appendChild(buildIoTable('inputs'));
+          outputsPane.appendChild(buildIoTable('outputs'));
+          outputsPane.style.display = 'none';
+
+          function setTab(which){
+            const showInputs = which === 'inputs';
+            inputsPane.style.display = showInputs ? '' : 'none';
+            outputsPane.style.display = showInputs ? 'none' : '';
+            btnInputs.className = showInputs ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-primary';
+            btnOutputs.className = showInputs ? 'btn btn-sm btn-outline-primary' : 'btn btn-sm btn-primary';
+          }
+          btnInputs.addEventListener('click', () => setTab('inputs'));
+          btnOutputs.addEventListener('click', () => setTab('outputs'));
+          setTab('inputs');
+
+          ioWrap.appendChild(inputsPane);
+          ioWrap.appendChild(outputsPane);
+
+          if(injectedFiles.length){
+            const inj = document.createElement('div');
+            inj.className = 'small text-muted mt-2';
+            inj.textContent = 'Inject files: ' + injectedFiles.join(', ');
+            ioWrap.appendChild(inj);
+          }
+
+          // Full-width row so the IO block is flush-left.
           {
             const tr = document.createElement('tr');
             const td = document.createElement('td');
             td.colSpan = 2;
             td.style.paddingLeft = '0';
-            td.appendChild(inputsTbl);
-            tr.appendChild(td);
-            tbody.appendChild(tr);
-          }
-
-          const outputsTbl = document.createElement('table');
-          outputsTbl.className = 'table table-sm mb-0';
-          const otHead = document.createElement('thead');
-          otHead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Outputs</th><th>Required</th><th>Defined</th><th>Injects</th><th>Provided to Chain</th><th>Resolved</th></tr>';
-          outputsTbl.appendChild(otHead);
-          const otBody = document.createElement('tbody');
-          function addOutRow(label, requiredList, definedList, injectedList, toChainList){
-            const tr = document.createElement('tr');
-            const td0 = document.createElement('td');
-            td0.className = 'text-muted';
-            td0.style.whiteSpace = 'nowrap';
-            td0.textContent = label;
-            const td1 = document.createElement('td');
-            td1.textContent = (requiredList && requiredList.length) ? requiredList.join(', ') : '-';
-            const td2 = document.createElement('td');
-            td2.textContent = (definedList && definedList.length) ? definedList.join(', ') : '-';
-            const td3 = document.createElement('td');
-            td3.textContent = (injectedList && injectedList.length) ? injectedList.join(', ') : '-';
-            const td4 = document.createElement('td');
-            td4.textContent = (toChainList && toChainList.length) ? toChainList.join(', ') : '-';
-            const tdR = document.createElement('td');
-            tdR.className = 'small';
-            if(label === 'Fields'){
-              const keys = (fa && Array.isArray(fa.actual_outputs) && fa.actual_outputs.length)
-                ? fa.actual_outputs
-                : ((fa && Array.isArray(fa.output_fields) && fa.output_fields.length) ? fa.output_fields : (definedList || []));
-              tdR.appendChild(renderResolvedCell(resolvedOutputs, keys, { maxItems: 2, maxLen: 48, maxDetailItems: 25 }));
-            } else {
-              tdR.textContent = '-';
-            }
-            tr.appendChild(td0);
-            tr.appendChild(td1);
-            tr.appendChild(td2);
-            tr.appendChild(td3);
-            tr.appendChild(td4);
-            tr.appendChild(tdR);
-            otBody.appendChild(tr);
-          }
-          // Generator outputs are provided to the chain; sequencer does not provide outputs here.
-          addOutRow('Artifacts', outArtifactsReq, outArtifacts, injectedFiles, outArtifacts);
-          addOutRow('Fields', outFieldsReq, outFields, [], outFields);
-          outputsTbl.appendChild(otBody);
-
-          // Full-width row so the Outputs table is flush-left (no empty label column indentation).
-          {
-            const tr = document.createElement('tr');
-            const td = document.createElement('td');
-            td.colSpan = 2;
-            td.style.paddingLeft = '0';
-            td.appendChild(outputsTbl);
+            td.appendChild(ioWrap);
             tr.appendChild(td);
             tbody.appendChild(tr);
           }
@@ -1454,6 +1614,48 @@
     const node = currentChain[i] || {};
     const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[i]) ? currentFlagAssignments[i] : null;
 
+    // Editor state (scoped to this dialog open).
+    let hintOverridesEnabled = false;
+    let hintOverrideToggleEl = null;
+    let hintOverrideInputs = [];
+    let hintsTouched = false;
+    let hadHintOverrideInitially = false;
+    try { hadHintOverrideInitially = !!(fa && Array.isArray(fa.hint_overrides)); } catch(e) { hadHintOverrideInitially = false; }
+
+    let flagOverrideEl = null;
+    let flagTouched = false;
+    let hadFlagOverrideInitially = false;
+    try { hadFlagOverrideInitially = !!(fa && typeof fa.flag_override === 'string' && fa.flag_override.trim()); } catch(e) { hadFlagOverrideInitially = false; }
+
+    // Value override editor state.
+    let inputOverrideElsByKey = {};
+    let outputOverrideElsByKey = {};
+    let inputOverridesTouched = false;
+    let outputOverridesTouched = false;
+
+    // Inject files editor state.
+    let injectOverridesEnabled = false;
+    let injectOverrideToggleEl = null;
+    let injectOverrideInputs = [];
+    let injectsTouched = false;
+    let hadInjectOverrideInitially = false;
+    try { hadInjectOverrideInitially = !!(fa && Array.isArray(fa.inject_files_override)); } catch(e) { hadInjectOverrideInitially = false; }
+
+    function renderVal(v){
+      if(v === undefined) return '';
+      if(v === null) return 'null';
+      if(typeof v === 'string') return v;
+      try { return JSON.stringify(v); } catch(e) { return String(v); }
+    }
+
+    function tryParseLooseJson(raw){
+      const s = String(raw ?? '').trim();
+      if(!s) return '';
+      const looksJson = s.startsWith('{') || s.startsWith('[') || s.startsWith('"') || s === 'true' || s === 'false' || s === 'null' || /^-?\d+(?:\.\d+)?$/.test(s);
+      if(!looksJson) return s;
+      try { return JSON.parse(s); } catch(e) { return s; }
+    }
+
     const seq = toRoman(i + 1);
     const nodeName = (node && node.name) ? String(node.name) : ('Node ' + (i + 1));
     if(inputsTitleEl) inputsTitleEl.textContent = 'Value Override — ' + (seq ? (seq + '. ') : '') + nodeName;
@@ -1498,111 +1700,771 @@
       inputsBodyEl.appendChild(hdr);
     } catch(e) {}
 
-    // Inputs override UI (always expanded).
+    // Inputs/Outputs tabular (same model as Chain Order), using current chain feasibility.
     try{
-      const box = document.createElement('div');
-      box.className = 'd-flex flex-column gap-2';
+      const feas = chainFeasibility(currentFlagAssignments);
+      const step = (feas && feas[i]) ? feas[i] : null;
 
-      const help = document.createElement('div');
-      help.className = 'small text-muted';
-      help.textContent = 'Override generator input values for this chain step.';
-      box.appendChild(help);
+      const resolvedInputs = (fa && typeof fa.resolved_inputs === 'object' && fa.resolved_inputs && !Array.isArray(fa.resolved_inputs)) ? fa.resolved_inputs : null;
+      const resolvedOutputs = (fa && typeof fa.resolved_outputs === 'object' && fa.resolved_outputs && !Array.isArray(fa.resolved_outputs)) ? fa.resolved_outputs : null;
 
-      const form = document.createElement('div');
-      form.className = 'border rounded p-2';
+      const reqArtifacts = (fa && Array.isArray(fa.requires)) ? fa.requires.map(String).filter(Boolean) : [];
+      const providedArtifactsChain = (step && Array.isArray(step.providing_artifacts_chain)) ? step.providing_artifacts_chain.map(String).filter(Boolean) : [];
+      const providedArtifactsSeq = (step && Array.isArray(step.providing_artifacts_sequencer)) ? step.providing_artifacts_sequencer.map(String).filter(Boolean) : [];
+      const missingArtifacts = (step && Array.isArray(step.missing_artifacts)) ? step.missing_artifacts.map(String).filter(Boolean) : [];
 
-      const cfg = (fa && typeof fa.config === 'object' && fa.config && !Array.isArray(fa.config)) ? fa.config : null;
-      const overrides0 = (fa && typeof fa.config_overrides === 'object' && fa.config_overrides && !Array.isArray(fa.config_overrides)) ? fa.config_overrides : null;
-      const inputNames = [];
-      try{
-        const req = (fa && Array.isArray(fa.input_fields_required)) ? fa.input_fields_required.map(String) : [];
-        const opt = (fa && Array.isArray(fa.input_fields_optional)) ? fa.input_fields_optional.map(String) : [];
-        const all = (req.length || opt.length) ? req.concat(opt) : ((fa && Array.isArray(fa.input_fields)) ? fa.input_fields.map(String) : []);
-        const seen = new Set();
-        for(const k of all){
-          const kk = String(k || '').trim();
-          if(!kk || seen.has(kk)) continue;
-          seen.add(kk);
-          inputNames.push(kk);
-        }
-      } catch(e) {}
+      const inReq = (fa && Array.isArray(fa.input_fields_required)) ? fa.input_fields_required.map(String).filter(Boolean) : [];
+      const inOpt = (fa && Array.isArray(fa.input_fields_optional)) ? fa.input_fields_optional.map(String).filter(Boolean) : [];
+      const inAll = (fa && Array.isArray(fa.input_fields)) ? fa.input_fields.map(String).filter(Boolean) : [];
 
-      const note = document.createElement('div');
-      note.className = 'small text-muted';
-      note.textContent = cfg
-        ? 'Effective config is shown below. Overrides persist into Execute and Save.'
-        : 'No effective config yet. Click Generate (with hint resolution) or Execute to compute defaults, then override.';
-      form.appendChild(note);
+      const reqFields = inReq;
+      const defFields = (inReq.length || inOpt.length) ? inReq.concat(inOpt) : inAll;
 
-      const tableWrap = document.createElement('div');
-      tableWrap.className = 'mt-2';
-      const t = document.createElement('table');
-      t.className = 'table table-sm mb-0 align-middle';
-      const thead = document.createElement('thead');
-      thead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Input</th><th>Effective</th><th>Override</th></tr>';
-      t.appendChild(thead);
-      const tb = document.createElement('tbody');
+      const providedFieldsChain = (step && Array.isArray(step.providing_fields_chain)) ? step.providing_fields_chain.map(String).filter(Boolean) : [];
+      const providedFieldsSeq = (step && Array.isArray(step.providing_fields_sequencer)) ? step.providing_fields_sequencer.map(String).filter(Boolean) : [];
+      const missingFields = (step && Array.isArray(step.missing_fields)) ? step.missing_fields.map(String).filter(Boolean) : [];
 
-      const inputElsByKey = {};
-      function renderVal(v){
+      const outFields = (fa && Array.isArray(fa.output_fields)) ? fa.output_fields.map(String).filter(Boolean) : [];
+      const outArtifacts = (fa && Array.isArray(fa.produces)) ? fa.produces.map(String).filter(Boolean) : [];
+
+      const overridesIn0 = (fa && typeof fa.config_overrides === 'object' && fa.config_overrides && !Array.isArray(fa.config_overrides)) ? fa.config_overrides : null;
+      const overridesOut0 = (fa && typeof fa.output_overrides === 'object' && fa.output_overrides && !Array.isArray(fa.output_overrides)) ? fa.output_overrides : null;
+
+      // In the Value Override dialog we hide Artifact rows (they're not editable values),
+      // so only show the Missing column when we have missing *fields* to display.
+      const showMissingCol = (missingFields.length) > 0;
+
+      function _stringifyAny(v){
         if(v === undefined) return '';
         if(v === null) return 'null';
         if(typeof v === 'string') return v;
         try { return JSON.stringify(v); } catch(e) { return String(v); }
       }
 
-      function tryParseInputValue(raw){
-        const s = String(raw ?? '').trim();
-        if(!s) return '';
-        const looksJson = s.startsWith('{') || s.startsWith('[') || s.startsWith('"') || s === 'true' || s === 'false' || s === 'null' || /^-?\d+(?:\.\d+)?$/.test(s);
-        if(!looksJson) return s;
-        try { return JSON.parse(s); } catch(e) { return s; }
+      function renderResolvedCell(kv, keysOrder, opts){
+        const options = (opts && typeof opts === 'object') ? opts : {};
+        const maxItems = Number.isFinite(+options.maxItems) ? (+options.maxItems) : 3;
+        const maxLen = Number.isFinite(+options.maxLen) ? (+options.maxLen) : 60;
+        const maxDetailItems = Number.isFinite(+options.maxDetailItems) ? (+options.maxDetailItems) : 25;
+
+        const obj = (kv && typeof kv === 'object' && !Array.isArray(kv)) ? kv : null;
+        if(!obj || !Object.keys(obj).length) return document.createTextNode('-');
+
+        let keys = Array.isArray(keysOrder) && keysOrder.length
+          ? keysOrder.map(x => String(x || '').trim()).filter(Boolean)
+          : Object.keys(obj);
+
+        try {
+          if(Object.prototype.hasOwnProperty.call(obj, 'flag')){
+            keys = ['flag'].concat(keys.filter(k => k !== 'flag'));
+          }
+        } catch(e) {}
+
+        const seen = new Set();
+        const pairs = [];
+        for(const k of keys){
+          const kk = String(k || '').trim();
+          if(!kk || seen.has(kk)) continue;
+          seen.add(kk);
+          if(!(kk in obj)) continue;
+          const v = obj[kk];
+          if(v === undefined) continue;
+          const full = _stringifyAny(v);
+          let short = full;
+          if(typeof short === 'string' && short.length > maxLen){
+            short = short.slice(0, Math.max(0, maxLen - 1)) + '…';
+          }
+          pairs.push({ k: kk, full, short });
+        }
+
+        if(!pairs.length) return document.createTextNode('-');
+
+        // If there's only one value, render it inline (no dropdown).
+        if(pairs.length === 1){
+          const p = pairs[0];
+          const code = document.createElement('code');
+          code.className = 'font-monospace';
+          code.title = p.k + '=' + p.full;
+          code.textContent = p.k + '=' + p.short;
+          return code;
+        }
+
+        const details = document.createElement('details');
+        details.className = 'small';
+        const summary = document.createElement('summary');
+        summary.style.cursor = 'pointer';
+        summary.className = 'text-decoration-none';
+
+        const summaryWrap = document.createElement('span');
+        summaryWrap.className = 'd-inline-flex flex-wrap gap-1 align-items-center';
+
+        const head = pairs.slice(0, Math.max(1, maxItems));
+        head.forEach(p => {
+          const code = document.createElement('code');
+          code.className = 'font-monospace';
+          code.title = p.k + '=' + p.full;
+          code.textContent = p.k + '=' + p.short;
+          summaryWrap.appendChild(code);
+        });
+        if(pairs.length > head.length){
+          const more = document.createElement('span');
+          more.className = 'text-muted';
+          more.textContent = `(+${pairs.length - head.length})`;
+          summaryWrap.appendChild(more);
+        }
+        summary.appendChild(summaryWrap);
+        details.appendChild(summary);
+
+        const body = document.createElement('div');
+        body.className = 'mt-1';
+        const list = document.createElement('div');
+        list.className = 'd-flex flex-column gap-1';
+        pairs.slice(0, maxDetailItems).forEach(p => {
+          const row = document.createElement('div');
+          const kcode = document.createElement('code');
+          kcode.className = 'me-1 text-muted';
+          kcode.textContent = p.k;
+          const vcode = document.createElement('code');
+          vcode.className = 'font-monospace';
+          vcode.style.whiteSpace = 'pre-wrap';
+          vcode.textContent = p.full;
+          row.appendChild(kcode);
+          row.appendChild(document.createTextNode(': '));
+          row.appendChild(vcode);
+          list.appendChild(row);
+        });
+        if(pairs.length > maxDetailItems){
+          const moreLine = document.createElement('div');
+          moreLine.className = 'text-muted';
+          moreLine.textContent = `(+${pairs.length - maxDetailItems} more not shown)`;
+          list.appendChild(moreLine);
+        }
+        body.appendChild(list);
+        details.appendChild(body);
+        return details;
       }
 
-      function setInputRow(k){
-        const tr = document.createElement('tr');
-        const tdK = document.createElement('td');
-        tdK.className = 'text-muted';
-        tdK.style.whiteSpace = 'nowrap';
+      function renderBoolCheckbox(checked, title){
+        const wrap = document.createElement('div');
+        wrap.className = 'form-check mb-0';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.className = 'form-check-input';
+        cb.disabled = true;
+        cb.checked = !!checked;
+        if(title) cb.title = String(title);
+        wrap.appendChild(cb);
+        return wrap;
+      }
+
+      function renderVarName(name, required){
+        const span = document.createElement('span');
+        span.style.whiteSpace = 'nowrap';
         const code = document.createElement('code');
-        code.textContent = k;
-        tdK.appendChild(code);
+        code.className = 'font-monospace';
+        code.textContent = String(name || '').trim() || '-';
+        span.appendChild(code);
+        if(required){
+          const star = document.createElement('span');
+          star.className = 'text-danger ms-1';
+          star.textContent = '*';
+          span.appendChild(star);
+        }
+        return span;
+      }
 
-        const tdEff = document.createElement('td');
-        tdEff.className = 'small';
-        const eff = cfg ? cfg[k] : undefined;
-        tdEff.textContent = (eff === undefined) ? '-' : renderVal(eff);
+      function renderResolvedValueForKey(resolvedKv, key){
+        const k = String(key || '').trim();
+        if(!k || !resolvedKv || typeof resolvedKv !== 'object' || Array.isArray(resolvedKv)) return document.createTextNode('-');
+        if(!(k in resolvedKv)) return document.createTextNode('-');
+        const obj = {};
+        obj[k] = resolvedKv[k];
+        return renderResolvedCell(obj, [k], { maxItems: 1, maxLen: 72, maxDetailItems: 25 });
+      }
 
-        const tdOvr = document.createElement('td');
+      // For outputs, show what is *required by downstream steps* (subset of this step's defined outputs).
+      const synthesizedFields = ['seed','secret','env_name','challenge','flag_prefix','username_prefix','key_len','node_name'];
+      const synthesizedSet = new Set(synthesizedFields);
+      const downstreamReqArtifacts = new Set();
+      const downstreamReqFields = new Set();
+      try{
+        for(let j = i + 1; j < (Array.isArray(currentFlagAssignments) ? currentFlagAssignments.length : 0); j++){
+          const a2 = currentFlagAssignments[j] || {};
+          const reqArtRaw = Array.isArray(a2.requires) ? a2.requires.map(String).filter(Boolean) : [];
+          reqArtRaw.filter(k => k && !synthesizedSet.has(k)).forEach(k => downstreamReqArtifacts.add(k));
+
+          const reqFld = Array.isArray(a2.input_fields_required)
+            ? a2.input_fields_required.map(String).filter(Boolean)
+            : (Array.isArray(a2.input_fields) ? a2.input_fields.map(String).filter(Boolean) : []);
+          reqFld.forEach(k => downstreamReqFields.add(k));
+        }
+      } catch(e) {}
+      const outArtifactsReq = outArtifacts.filter(k => downstreamReqArtifacts.has(k));
+      const outFieldsReq = outFields.filter(k => downstreamReqFields.has(k));
+
+      function buildIoTable(mode){
+        const isInputs = mode === 'inputs';
+
+        const tbl = document.createElement('table');
+        tbl.className = 'table table-sm mb-0';
+
+        const thead = document.createElement('thead');
+        if(isInputs){
+          thead.innerHTML = showMissingCol
+            ? '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th style="width: 1%; white-space: nowrap;">Type</th><th>Resolved</th><th>Override</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th><th style="width: 1%; white-space: nowrap;">Missing</th></tr>'
+            : '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th style="width: 1%; white-space: nowrap;">Type</th><th>Resolved</th><th>Override</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th></tr>';
+        } else {
+          thead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th style="width: 1%; white-space: nowrap;">Type</th><th>Resolved</th><th>Override</th><th style="width: 1%; white-space: nowrap;">To Chain</th></tr>';
+        }
+        tbl.appendChild(thead);
+
+        const tbody2 = document.createElement('tbody');
+
+        function addRowVar(v){
+          const tr = document.createElement('tr');
+
+          const tdVar = document.createElement('td');
+          tdVar.appendChild(renderVarName(v.name, v.required));
+
+          const tdType = document.createElement('td');
+          tdType.className = 'text-muted';
+          tdType.style.whiteSpace = 'nowrap';
+          tdType.textContent = v.kind;
+
+          const tdRes = document.createElement('td');
+          tdRes.className = 'small';
+          if(v.kind === 'Field'){
+            tdRes.appendChild(renderResolvedValueForKey(isInputs ? resolvedInputs : resolvedOutputs, v.name));
+          } else {
+            tdRes.textContent = '-';
+          }
+
+          const tdOvr = document.createElement('td');
+          if(v.kind === 'Field'){
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.className = 'form-control form-control-sm font-monospace';
+            inp.placeholder = 'JSON or string';
+            if(isInputs){
+              inp.value = (overridesIn0 && (v.name in overridesIn0)) ? renderVal(overridesIn0[v.name]) : '';
+              inp.addEventListener('input', ()=>{ inputOverridesTouched = true; });
+              inputOverrideElsByKey[v.name] = inp;
+            } else {
+              inp.value = (overridesOut0 && (v.name in overridesOut0)) ? renderVal(overridesOut0[v.name]) : '';
+              inp.addEventListener('input', ()=>{ outputOverridesTouched = true; });
+              outputOverrideElsByKey[v.name] = inp;
+            }
+            tdOvr.appendChild(inp);
+          } else {
+            tdOvr.className = 'text-muted small';
+            tdOvr.textContent = '-';
+          }
+
+          tr.appendChild(tdVar);
+          tr.appendChild(tdType);
+          tr.appendChild(tdRes);
+          tr.appendChild(tdOvr);
+
+          if(isInputs){
+            const tdFromChain = document.createElement('td');
+            tdFromChain.appendChild(renderBoolCheckbox(v.fromChain, 'Provided by chain'));
+            const tdFromSeq = document.createElement('td');
+            tdFromSeq.appendChild(renderBoolCheckbox(v.fromSeq, 'Provided by sequencer (synthesized)'));
+            tr.appendChild(tdFromChain);
+            tr.appendChild(tdFromSeq);
+            if(showMissingCol){
+              const tdMiss = document.createElement('td');
+              if(v.missing) tdMiss.classList.add('text-danger');
+              tdMiss.appendChild(renderBoolCheckbox(v.missing, v.missing ? 'Missing' : 'Not missing'));
+              tr.appendChild(tdMiss);
+            }
+          } else {
+            const tdToChain = document.createElement('td');
+            tdToChain.appendChild(renderBoolCheckbox(v.toChain, 'Provided to chain'));
+            tr.appendChild(tdToChain);
+          }
+
+          tbody2.appendChild(tr);
+        }
+
+        const reqArtifactSet = new Set(reqArtifacts);
+        const reqFieldSet = new Set(reqFields);
+        const defArtifactSet = new Set(reqArtifacts);
+        const defFieldSet = new Set(defFields);
+
+        const provArtChainSet = new Set(providedArtifactsChain);
+        const provArtSeqSet = new Set(providedArtifactsSeq);
+        const missArtSet = new Set(missingArtifacts);
+
+        const provFldChainSet = new Set(providedFieldsChain);
+        const provFldSeqSet = new Set(providedFieldsSeq);
+        const missFldSet = new Set(missingFields);
+
+        if(isInputs){
+          const rows = [];
+
+          const fieldNameSet = new Set(Array.from(defFieldSet));
+          try{
+            if((!fieldNameSet.size) && resolvedInputs && typeof resolvedInputs === 'object' && !Array.isArray(resolvedInputs)){
+              Object.keys(resolvedInputs).forEach(k => { if(String(k || '').trim()) fieldNameSet.add(String(k).trim()); });
+            }
+          } catch(e) {}
+          try{
+            if(Array.isArray(synthesizedFields) && synthesizedFields.length && resolvedInputs){
+              synthesizedFields.forEach(k => {
+                const kk = String(k || '').trim();
+                if(!kk) return;
+                try{
+                  if(resolvedInputs && typeof resolvedInputs === 'object' && !Array.isArray(resolvedInputs) && (kk in resolvedInputs)){
+                    fieldNameSet.add(kk);
+                  }
+                } catch(e) {}
+              });
+            }
+          } catch(e) {}
+
+          Array.from(fieldNameSet).sort().forEach((name) => {
+            const n = String(name || '').trim();
+            if(!n) return;
+            rows.push({
+              name: n,
+              kind: 'Field',
+              required: reqFieldSet.has(n),
+              fromChain: provFldChainSet.has(n),
+              fromSeq: provFldSeqSet.has(n),
+              missing: missFldSet.has(n),
+            });
+          });
+          rows.forEach(addRowVar);
+        } else {
+          const reqOutFieldSet = new Set(outFieldsReq);
+          const rows = [];
+
+          const outFieldNameSet = new Set(outFields.map(String).filter(Boolean).map(s => String(s).trim()).filter(Boolean));
+          try{
+            if((!outFieldNameSet.size) && resolvedOutputs && typeof resolvedOutputs === 'object' && !Array.isArray(resolvedOutputs)){
+              Object.keys(resolvedOutputs).forEach(k => { if(String(k || '').trim()) outFieldNameSet.add(String(k).trim()); });
+            }
+          } catch(e) {}
+
+          Array.from(outFieldNameSet).sort().forEach((name) => {
+            const n = String(name || '').trim();
+            if(!n) return;
+            rows.push({
+              name: n,
+              kind: 'Field',
+              required: reqOutFieldSet.has(n),
+              toChain: true,
+            });
+          });
+          rows.forEach(addRowVar);
+        }
+
+        tbl.appendChild(tbody2);
+        return tbl;
+      }
+
+      const ioOuter = document.createElement('div');
+      ioOuter.className = 'mt-2';
+
+      const ioHelp = document.createElement('div');
+      ioHelp.className = 'small text-muted';
+      ioHelp.textContent = 'Inputs/Outputs view for this step. Resolved values appear after Generate (with hint resolution) or Execute.';
+      ioOuter.appendChild(ioHelp);
+
+      const tabBar = document.createElement('div');
+      tabBar.className = 'd-flex align-items-center gap-2 mt-2';
+
+      const btnInputs = document.createElement('button');
+      btnInputs.type = 'button';
+      btnInputs.className = 'btn btn-sm btn-primary';
+      btnInputs.textContent = 'Inputs';
+
+      const btnOutputs = document.createElement('button');
+      btnOutputs.type = 'button';
+      btnOutputs.className = 'btn btn-sm btn-outline-primary';
+      btnOutputs.textContent = 'Outputs';
+
+      tabBar.appendChild(btnInputs);
+      tabBar.appendChild(btnOutputs);
+      ioOuter.appendChild(tabBar);
+
+      const inputsPane = document.createElement('div');
+      const outputsPane = document.createElement('div');
+      inputsPane.className = 'mt-2';
+      outputsPane.className = 'mt-2';
+      inputsPane.appendChild(buildIoTable('inputs'));
+      outputsPane.appendChild(buildIoTable('outputs'));
+
+      // Inject files editor (override list; may be empty).
+      try{
+        const injWrap = document.createElement('div');
+        injWrap.className = 'border rounded p-2 mt-2';
+
+        const injHdr = document.createElement('div');
+        injHdr.className = 'fw-semibold';
+        injHdr.textContent = 'Inject files';
+        injWrap.appendChild(injHdr);
+
+        const injHelp = document.createElement('div');
+        injHelp.className = 'small text-muted';
+        injHelp.textContent = 'Override the list of files the generator may inject (e.g., hint.txt). Use zero entries to allow none.';
+        injWrap.appendChild(injHelp);
+
+        const toggleRow = document.createElement('div');
+        toggleRow.className = 'd-flex align-items-center justify-content-between gap-2 mt-2';
+        const toggleWrap = document.createElement('div');
+        toggleWrap.className = 'form-check';
+        injectOverrideToggleEl = document.createElement('input');
+        injectOverrideToggleEl.type = 'checkbox';
+        injectOverrideToggleEl.className = 'form-check-input';
+        injectOverrideToggleEl.id = 'flowInjectOverrideToggle_inputs_' + i;
+        const toggleLabel = document.createElement('label');
+        toggleLabel.className = 'form-check-label';
+        toggleLabel.setAttribute('for', injectOverrideToggleEl.id);
+        toggleLabel.textContent = 'Override inject files';
+        toggleWrap.appendChild(injectOverrideToggleEl);
+        toggleWrap.appendChild(toggleLabel);
+
+        const resetBtn = document.createElement('button');
+        resetBtn.type = 'button';
+        resetBtn.className = 'btn btn-sm btn-outline-secondary';
+        resetBtn.textContent = 'Reset to generator';
+
+        toggleRow.appendChild(toggleWrap);
+        toggleRow.appendChild(resetBtn);
+        injWrap.appendChild(toggleRow);
+
+        const listWrap = document.createElement('div');
+        listWrap.className = 'border rounded p-2 mt-2';
+        injWrap.appendChild(listWrap);
+
+        function normalizeInjects(list){
+          const out = [];
+          try{
+            (Array.isArray(list) ? list : []).forEach((x)=>{
+              const s = String(x ?? '').trim();
+              if(!s) return;
+              out.push(s);
+            });
+          } catch(e) {}
+          return out;
+        }
+
+        function getGeneratedInjectsFromAssignment(){
+          const cur = (fa && Array.isArray(fa.inject_files) && fa.inject_files.length) ? normalizeInjects(fa.inject_files) : [];
+          return cur;
+        }
+
+        function getOverrideInjectsFromAssignment(){
+          if(fa && Array.isArray(fa.inject_files_override)) return normalizeInjects(fa.inject_files_override);
+          return null;
+        }
+
+        function renderInjectList(files){
+          injectOverrideInputs = [];
+          listWrap.innerHTML = '';
+
+          const stack = document.createElement('div');
+          stack.className = 'd-flex flex-column gap-2';
+
+          function addRow(value){
+            const row = document.createElement('div');
+            row.className = 'd-flex gap-2 align-items-center';
+
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.className = 'form-control form-control-sm font-monospace';
+            inp.placeholder = 'e.g., hint.txt';
+            inp.value = String(value ?? '');
+            inp.addEventListener('input', ()=>{ injectsTouched = true; });
+
+            const del = document.createElement('button');
+            del.type = 'button';
+            del.className = 'btn btn-sm btn-outline-danger';
+            del.textContent = 'Remove';
+            del.addEventListener('click', ()=>{
+              try { row.remove(); } catch(e) {}
+              injectOverrideInputs = injectOverrideInputs.filter(x => x !== inp);
+              injectsTouched = true;
+            });
+
+            injectOverrideInputs.push(inp);
+            row.appendChild(inp);
+            row.appendChild(del);
+            stack.appendChild(row);
+          }
+
+          (Array.isArray(files) ? files : []).forEach(addRow);
+
+          const addBtn = document.createElement('button');
+          addBtn.type = 'button';
+          addBtn.className = 'btn btn-sm btn-outline-primary';
+          addBtn.textContent = 'Add inject file';
+          addBtn.addEventListener('click', ()=>{ injectsTouched = true; addRow(''); });
+
+          listWrap.appendChild(stack);
+          listWrap.appendChild(addBtn);
+        }
+
+        function setInjectOverrideEnabled(enabled){
+          injectOverridesEnabled = !!enabled;
+          try { if(injectOverrideToggleEl) injectOverrideToggleEl.checked = injectOverridesEnabled; } catch(e) {}
+          try { listWrap.style.display = injectOverridesEnabled ? '' : 'none'; } catch(e) {}
+          try { resetBtn.disabled = !injectOverridesEnabled; } catch(e) {}
+        }
+
+        const existingOverride = getOverrideInjectsFromAssignment();
+        if(existingOverride !== null){
+          renderInjectList(existingOverride);
+          setInjectOverrideEnabled(true);
+        } else {
+          renderInjectList(getGeneratedInjectsFromAssignment());
+          setInjectOverrideEnabled(false);
+        }
+
+        injectOverrideToggleEl.addEventListener('change', ()=>{
+          injectsTouched = true;
+          setInjectOverrideEnabled(!!injectOverrideToggleEl.checked);
+        });
+
+        resetBtn.addEventListener('click', ()=>{
+          injectsTouched = true;
+          setInjectOverrideEnabled(false);
+          renderInjectList(getGeneratedInjectsFromAssignment());
+        });
+
+        outputsPane.appendChild(injWrap);
+      } catch(e) {}
+
+      outputsPane.style.display = 'none';
+
+      function setTab(which){
+        const showInputs = which === 'inputs';
+        inputsPane.style.display = showInputs ? '' : 'none';
+        outputsPane.style.display = showInputs ? 'none' : '';
+        btnInputs.className = showInputs ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-primary';
+        btnOutputs.className = showInputs ? 'btn btn-sm btn-outline-primary' : 'btn btn-sm btn-primary';
+      }
+      btnInputs.addEventListener('click', () => setTab('inputs'));
+      btnOutputs.addEventListener('click', () => setTab('outputs'));
+
+      ioOuter.appendChild(inputsPane);
+      ioOuter.appendChild(outputsPane);
+
+      inputsBodyEl.appendChild(ioOuter);
+    } catch(e) {
+      // Non-fatal
+    }
+
+    // FLAG + Hints editing (persisted overrides).
+    try{
+      const section = document.createElement('div');
+      section.className = 'border rounded p-2 mt-3';
+
+      const hdr = document.createElement('div');
+      hdr.className = 'fw-semibold';
+      hdr.textContent = 'FLAG + Hints';
+      section.appendChild(hdr);
+
+      const help = document.createElement('div');
+      help.className = 'small text-muted';
+      help.textContent = 'Override the flag value and/or hints for this step. Leave FLAG blank to use generated output.';
+      section.appendChild(help);
+
+      // FLAG override input.
+      {
+        const row = document.createElement('div');
+        row.className = 'mt-2';
+
+        const label = document.createElement('div');
+        label.className = 'small text-muted';
+        label.textContent = 'FLAG';
+        row.appendChild(label);
+
         const inp = document.createElement('input');
         inp.type = 'text';
         inp.className = 'form-control form-control-sm font-monospace';
-        inp.placeholder = 'leave blank to use default';
-        inp.value = (overrides0 && (k in overrides0)) ? renderVal(overrides0[k]) : '';
-        inputElsByKey[k] = inp;
-        tdOvr.appendChild(inp);
+        inp.placeholder = 'leave blank to use generated';
+        inp.value = (fa && typeof fa.flag_override === 'string') ? String(fa.flag_override || '') : '';
+        inp.addEventListener('input', ()=>{ flagTouched = true; });
+        flagOverrideEl = inp;
+        row.appendChild(inp);
 
-        tr.appendChild(tdK);
-        tr.appendChild(tdEff);
-        tr.appendChild(tdOvr);
-        tb.appendChild(tr);
+        section.appendChild(row);
       }
 
-      if(inputNames.length){
-        inputNames.forEach(setInputRow);
-      } else {
-        const tr = document.createElement('tr');
-        const td = document.createElement('td');
-        td.colSpan = 3;
-        td.className = 'text-muted small';
-        td.textContent = 'This generator declares no inputs.';
-        tr.appendChild(td);
-        tb.appendChild(tr);
+      // Hints editor (override / generated).
+      {
+        const div = document.createElement('div');
+        div.className = 'mt-3';
+
+        const hintsHdr = document.createElement('div');
+        hintsHdr.className = 'fw-semibold';
+        hintsHdr.textContent = 'Hints';
+        div.appendChild(hintsHdr);
+
+        const hintsHelp = document.createElement('div');
+        hintsHelp.className = 'small text-muted';
+        hintsHelp.textContent = 'Override the displayed hints for this step. Must have at least one hint when overriding.';
+        div.appendChild(hintsHelp);
+
+        const toggleRow = document.createElement('div');
+        toggleRow.className = 'd-flex align-items-center justify-content-between gap-2 mt-2';
+
+        const toggleWrap = document.createElement('div');
+        toggleWrap.className = 'form-check';
+        hintOverrideToggleEl = document.createElement('input');
+        hintOverrideToggleEl.type = 'checkbox';
+        hintOverrideToggleEl.className = 'form-check-input';
+        hintOverrideToggleEl.id = 'flowHintOverrideToggle_inputs_' + i;
+        const toggleLabel = document.createElement('label');
+        toggleLabel.className = 'form-check-label';
+        toggleLabel.setAttribute('for', hintOverrideToggleEl.id);
+        toggleLabel.textContent = 'Override hints';
+        toggleWrap.appendChild(hintOverrideToggleEl);
+        toggleWrap.appendChild(toggleLabel);
+
+        const resetBtn = document.createElement('button');
+        resetBtn.type = 'button';
+        resetBtn.className = 'btn btn-sm btn-outline-secondary';
+        resetBtn.textContent = 'Reset to generated';
+
+        toggleRow.appendChild(toggleWrap);
+        toggleRow.appendChild(resetBtn);
+        div.appendChild(toggleRow);
+
+        const listWrap = document.createElement('div');
+        listWrap.className = 'border rounded p-2 mt-2';
+        div.appendChild(listWrap);
+
+        function normalizeHints(list){
+          const out = [];
+          try {
+            (Array.isArray(list) ? list : []).forEach((x)=>{
+              const s = String(x ?? '').trim();
+              if(!s) return;
+              out.push(s);
+            });
+          } catch(e) {}
+          return out;
+        }
+
+        function getGeneratedHintsFromAssignment(){
+          const cur = (fa && Array.isArray(fa.hints) && fa.hints.length) ? normalizeHints(fa.hints) : [];
+          if(cur.length) return cur;
+          const h = (fa && fa.hint) ? String(fa.hint || '').trim() : '';
+          return h ? [h] : [];
+        }
+
+        function getOverrideHintsFromAssignment(){
+          if(fa && Array.isArray(fa.hint_overrides)) return normalizeHints(fa.hint_overrides);
+          return null;
+        }
+
+        function renderHintList(hints){
+          hintOverrideInputs = [];
+          listWrap.innerHTML = '';
+
+          const stack = document.createElement('div');
+          stack.className = 'd-flex flex-column gap-2';
+
+          function syncRemoveDisabled(){
+            const onlyOne = (hintOverrideInputs.length <= 1);
+            try {
+              Array.from(stack.querySelectorAll('button[data-role="remove-hint"]')).forEach((btn)=>{
+                btn.disabled = onlyOne;
+              });
+            } catch(e) {}
+          }
+
+          function addRow(value){
+            const row = document.createElement('div');
+            row.className = 'd-flex gap-2 align-items-center';
+
+            const inp = document.createElement('input');
+            inp.type = 'text';
+            inp.className = 'form-control form-control-sm';
+            inp.placeholder = 'Hint text…';
+            inp.value = String(value ?? '');
+            inp.addEventListener('input', ()=>{ hintsTouched = true; });
+
+            const del = document.createElement('button');
+            del.type = 'button';
+            del.className = 'btn btn-sm btn-outline-danger';
+            del.textContent = 'Remove';
+            del.setAttribute('data-role', 'remove-hint');
+            del.addEventListener('click', ()=>{
+              if(hintOverrideInputs.length <= 1) return;
+              try { row.remove(); } catch(e) {}
+              hintOverrideInputs = hintOverrideInputs.filter(x => x !== inp);
+              hintsTouched = true;
+              syncRemoveDisabled();
+            });
+
+            hintOverrideInputs.push(inp);
+            row.appendChild(inp);
+            row.appendChild(del);
+            stack.appendChild(row);
+            syncRemoveDisabled();
+          }
+
+          (Array.isArray(hints) && hints.length ? hints : ['']).forEach(addRow);
+
+          const addBtn = document.createElement('button');
+          addBtn.type = 'button';
+          addBtn.className = 'btn btn-sm btn-outline-primary';
+          addBtn.textContent = 'Add hint';
+          addBtn.addEventListener('click', ()=>{ hintsTouched = true; addRow(''); });
+
+          listWrap.appendChild(stack);
+          listWrap.appendChild(addBtn);
+        }
+
+        function setHintOverrideEnabled(enabled){
+          hintOverridesEnabled = !!enabled;
+          try { if(hintOverrideToggleEl) hintOverrideToggleEl.checked = hintOverridesEnabled; } catch(e) {}
+          try { listWrap.style.display = hintOverridesEnabled ? '' : 'none'; } catch(e) {}
+          try { resetBtn.disabled = !hintOverridesEnabled; } catch(e) {}
+        }
+
+        const existingOverride = getOverrideHintsFromAssignment();
+        if(existingOverride !== null){
+          renderHintList(existingOverride);
+          setHintOverrideEnabled(true);
+        } else {
+          renderHintList(getGeneratedHintsFromAssignment());
+          setHintOverrideEnabled(false);
+        }
+
+        hintOverrideToggleEl.addEventListener('change', ()=>{
+          hintsTouched = true;
+          setHintOverrideEnabled(!!hintOverrideToggleEl.checked);
+        });
+
+        resetBtn.addEventListener('click', ()=>{
+          hintsTouched = true;
+          setHintOverrideEnabled(false);
+          renderHintList(getGeneratedHintsFromAssignment());
+        });
+
+        section.appendChild(div);
       }
 
-      t.appendChild(tb);
-      tableWrap.appendChild(t);
-      form.appendChild(tableWrap);
+      inputsBodyEl.appendChild(section);
+    } catch(e) {
+      // Non-fatal
+    }
+
+    // Save / Clear overrides (single place).
+    try{
+      const box = document.createElement('div');
+      box.className = 'border rounded p-2 mt-3';
+
+      const help = document.createElement('div');
+      help.className = 'small text-muted';
+      help.textContent = 'Edits persist into Execute and Save.';
+      box.appendChild(help);
 
       const actions = document.createElement('div');
       actions.className = 'd-flex justify-content-end gap-2 mt-2';
@@ -1616,7 +2478,18 @@
       saveBtn.textContent = 'Save overrides';
       actions.appendChild(clearBtn);
       actions.appendChild(saveBtn);
-      form.appendChild(actions);
+      box.appendChild(actions);
+
+      const localStatus = document.createElement('div');
+      localStatus.className = 'small text-muted mt-2';
+      localStatus.textContent = '';
+      box.appendChild(localStatus);
+
+      function setLocalStatus(msg, isError){
+        localStatus.textContent = String(msg || '');
+        localStatus.classList.toggle('text-danger', !!isError);
+        localStatus.classList.toggle('text-muted', !isError);
+      }
 
       async function persistOverridesForIndex(){
         if(!Array.isArray(currentChain) || !currentChain.length) throw new Error('Generate a chain first.');
@@ -1628,15 +2501,121 @@
         const reqAssignments = chainIds.map((nid, j)=>{
           const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
           const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
-          const ovr = (curA && typeof curA.config_overrides === 'object' && curA.config_overrides && !Array.isArray(curA.config_overrides))
+
+          let ovr = (curA && typeof curA.config_overrides === 'object' && curA.config_overrides && !Array.isArray(curA.config_overrides))
             ? curA.config_overrides
             : undefined;
-          return { node_id: nid, id: curId, config_overrides: ovr };
+
+          let outOvr = (curA && typeof curA.output_overrides === 'object' && curA.output_overrides && !Array.isArray(curA.output_overrides))
+            ? curA.output_overrides
+            : undefined;
+
+          let injOvr = (curA && Array.isArray(curA.inject_files_override))
+            ? curA.inject_files_override
+            : undefined;
+
+          let hintOvr = undefined;
+          try {
+            if(curA && Array.isArray(curA.hint_overrides)) hintOvr = curA.hint_overrides;
+          } catch(e) {}
+
+          let flagOvr = undefined;
+          try {
+            if(curA && typeof curA.flag_override === 'string' && curA.flag_override.trim()) flagOvr = String(curA.flag_override).trim();
+          } catch(e) {}
+
+          if(j === i){
+            // Inputs overrides from IO table.
+            const newOverrides = {};
+            for(const k of Object.keys(inputOverrideElsByKey || {})){
+              const el = inputOverrideElsByKey[k];
+              const raw = (el && el.value !== undefined) ? String(el.value) : '';
+              const trimmed = raw.trim();
+              if(!trimmed) continue;
+              newOverrides[k] = tryParseLooseJson(trimmed);
+            }
+            ovr = newOverrides;
+
+            // Outputs overrides from IO table.
+            const newOutOverrides = {};
+            for(const k of Object.keys(outputOverrideElsByKey || {})){
+              const el = outputOverrideElsByKey[k];
+              const raw = (el && el.value !== undefined) ? String(el.value) : '';
+              const trimmed = raw.trim();
+              if(!trimmed) continue;
+              newOutOverrides[k] = tryParseLooseJson(trimmed);
+            }
+            outOvr = newOutOverrides;
+
+            // Inject override list.
+            if(injectOverrideToggleEl){
+              if(injectOverridesEnabled){
+                const files = [];
+                try {
+                  (injectOverrideInputs || []).forEach((el)=>{
+                    const s = String((el && el.value) ?? '').trim();
+                    if(!s) return;
+                    files.push(s);
+                  });
+                } catch(e) {}
+                injOvr = files;
+              } else {
+                if(hadInjectOverrideInitially || injectsTouched){
+                  injOvr = null;
+                } else {
+                  injOvr = undefined;
+                }
+              }
+            }
+
+            // Hint overrides from this dialog.
+            if(hintOverrideToggleEl){
+              if(hintOverridesEnabled){
+                const texts = [];
+                try {
+                  (hintOverrideInputs || []).forEach((el)=>{
+                    const s = String((el && el.value) ?? '').trim();
+                    if(!s) return;
+                    texts.push(s);
+                  });
+                } catch(e) {}
+                if(!texts.length){
+                  throw new Error('Hints override is enabled, but there are no non-empty hints. Add at least one hint.');
+                }
+                hintOvr = texts;
+              } else {
+                if(hadHintOverrideInitially || hintsTouched){
+                  hintOvr = null;
+                } else {
+                  hintOvr = undefined;
+                }
+              }
+            }
+
+            // FLAG override from this dialog.
+            if(flagOverrideEl){
+              const s = String((flagOverrideEl.value ?? '')).trim();
+              if(s){
+                flagOvr = s;
+              } else {
+                if(hadFlagOverrideInitially || flagTouched){
+                  flagOvr = null;
+                } else {
+                  flagOvr = undefined;
+                }
+              }
+            }
+          }
+
+          const out = { node_id: nid, id: curId, config_overrides: ovr, output_overrides: outOvr, inject_files_override: injOvr };
+          if(hintOvr !== undefined) out.hint_overrides = hintOvr;
+          if(flagOvr !== undefined) out.flag_override = flagOvr;
+          return out;
         });
         const missing = reqAssignments.find(x => !x.id);
         if(missing) throw new Error('Some chain positions have no generator assignment yet. Try Generate again.');
 
-        showLoading('Saving input overrides…');
+        showLoading('Saving overrides…');
         const res = await postJson('/api/flag-sequencing/save_flow_substitutions', {
           scenario: activeScenario,
           chain_ids: chainIds,
@@ -1658,13 +2637,26 @@
         try {
           if(!Array.isArray(currentFlagAssignments) || !currentFlagAssignments[i]) throw new Error('No assignment for this step.');
           currentFlagAssignments[i].config_overrides = {};
-          await persistOverridesForIndex();
-          for(const k of Object.keys(inputElsByKey)){
-            try { inputElsByKey[k].value = ''; } catch(e) {}
+          currentFlagAssignments[i].output_overrides = {};
+          try { currentFlagAssignments[i].inject_files_override = null; } catch(e) {}
+          try { currentFlagAssignments[i].hint_overrides = null; } catch(e) {}
+          try { currentFlagAssignments[i].flag_override = null; } catch(e) {}
+
+          // Clear UI fields.
+          for(const k of Object.keys(inputOverrideElsByKey || {})){
+            try { inputOverrideElsByKey[k].value = ''; } catch(e) {}
           }
-          setStatus('Input overrides cleared.', false);
+          for(const k of Object.keys(outputOverrideElsByKey || {})){
+            try { outputOverrideElsByKey[k].value = ''; } catch(e) {}
+          }
+          try { if(flagOverrideEl) flagOverrideEl.value = ''; } catch(e) {}
+          try { if(injectOverrideToggleEl) injectOverrideToggleEl.checked = false; } catch(e) {}
+          injectOverridesEnabled = false;
+
+          await persistOverridesForIndex();
+          setLocalStatus('Overrides cleared.', false);
         } catch(e) {
-          setStatus('Failed to clear overrides: ' + String(e && e.message || e), true);
+          setLocalStatus('Failed to clear overrides: ' + String(e && e.message || e), true);
         } finally {
           hideLoading();
           try { clearBtn.disabled = false; saveBtn.disabled = false; } catch(e) {}
@@ -1675,26 +2667,16 @@
         try { clearBtn.disabled = true; saveBtn.disabled = true; } catch(e) {}
         try {
           if(!Array.isArray(currentFlagAssignments) || !currentFlagAssignments[i]) throw new Error('No assignment for this step.');
-          const newOverrides = {};
-          for(const k of Object.keys(inputElsByKey)){
-            const el = inputElsByKey[k];
-            const raw = (el && el.value !== undefined) ? String(el.value) : '';
-            const trimmed = raw.trim();
-            if(!trimmed) continue;
-            newOverrides[k] = tryParseInputValue(trimmed);
-          }
-          currentFlagAssignments[i].config_overrides = newOverrides;
           await persistOverridesForIndex();
-          setStatus('Input overrides saved.', false);
+          setLocalStatus('Edits saved.', false);
         } catch(e) {
-          setStatus('Failed to save overrides: ' + String(e && e.message || e), true);
+          setLocalStatus('Failed to save overrides: ' + String(e && e.message || e), true);
         } finally {
           hideLoading();
           try { clearBtn.disabled = false; saveBtn.disabled = false; } catch(e) {}
         }
       });
 
-      box.appendChild(form);
       inputsBodyEl.appendChild(box);
     } catch(e) {
       // Non-fatal
