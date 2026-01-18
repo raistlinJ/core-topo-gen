@@ -590,7 +590,20 @@
       const length = Number.isFinite(+entry.length) ? (+entry.length) : null;
       const chain_ids = Array.isArray(entry.chain_ids) ? entry.chain_ids.map(x => String(x || '').trim()).filter(Boolean) : [];
       if (!chain_ids.length) return null;
-      return { scenario, preset, length: length || chain_ids.length, chain_ids };
+      const flag_assignments = Array.isArray(entry.flag_assignments) ? entry.flag_assignments : null;
+      const allow_node_duplicates = !!entry.allow_node_duplicates;
+      const initial_facts = entry.initial_facts || null;
+      const goal_facts = entry.goal_facts || null;
+      return {
+        scenario,
+        preset,
+        length: length || chain_ids.length,
+        chain_ids,
+        flag_assignments,
+        allow_node_duplicates,
+        initial_facts,
+        goal_facts,
+      };
     } catch (e) {
       return null;
     }
@@ -608,6 +621,10 @@
         preset: (s.preset || '').toString(),
         length: Number.isFinite(+s.length) ? (+s.length) : null,
         chain_ids: Array.isArray(s.chain_ids) ? s.chain_ids.map(x => String(x || '').trim()).filter(Boolean) : [],
+        flag_assignments: Array.isArray(s.flag_assignments) ? s.flag_assignments : null,
+        allow_node_duplicates: !!s.allow_node_duplicates,
+        initial_facts: s.initial_facts || null,
+        goal_facts: s.goal_facts || null,
         updated_at: Date.now(),
       };
       localStorage.setItem(FLOW_STATE_STORAGE_KEY, JSON.stringify(next));
@@ -889,6 +906,38 @@
         }
       } catch (_) {}
     }
+
+    // If a saved Flag Sequencing chain exists, persist it against the latest preview plan.
+    try {
+      const scenarioName = resolveScenarioNameForSave();
+      const flowState = (scenarioName && typeof window.coretgGetSavedFlowStateForScenario === 'function')
+        ? window.coretgGetSavedFlowStateForScenario(scenarioName)
+        : null;
+      if (scenarioName && flowState && Array.isArray(flowState.chain_ids) && flowState.chain_ids.length) {
+        const chain_ids = flowState.chain_ids;
+        const flag_assignments = Array.isArray(flowState.flag_assignments) ? flowState.flag_assignments : null;
+        const fallback_assignments = !flag_assignments ? chain_ids.map((nid) => ({ node_id: String(nid || ''), id: '' })) : null;
+        const previewPlan = (typeof window.coretgGetPreviewPlanPathForScenario === 'function')
+          ? window.coretgGetPreviewPlanPathForScenario(scenarioName)
+          : '';
+        if ((flag_assignments || fallback_assignments) && previewPlan && typeof window.coretgPostJson === 'function') {
+          await window.coretgPostJson('/api/flag-sequencing/save_flow_substitutions', {
+            scenario: scenarioName,
+            chain_ids,
+            preview_plan: previewPlan,
+            flag_assignments: flag_assignments || fallback_assignments,
+            allow_node_duplicates: !!flowState.allow_node_duplicates,
+            initial_facts: flowState.initial_facts || null,
+            goal_facts: flowState.goal_facts || null,
+          });
+          try {
+            if (typeof window.coretgSetFlowDirtyForScenario === 'function') {
+              window.coretgSetFlowDirtyForScenario(scenarioName, false);
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (e) {}
 
     // If a saved Flag Sequencing chain exists for this scenario, changing and saving
     // topology/VM settings can make the chain stale. Mark it dirty so Preview can

@@ -423,6 +423,10 @@
         preset,
         length: chainIds.length,
         chain_ids: chainIds,
+        flag_assignments: buildPersistAssignments(chainIds),
+        allow_node_duplicates: !!allowNodeDuplicates,
+        initial_facts: flowInitialFactsOverride,
+        goal_facts: flowGoalFactsOverride,
       });
     } catch(e) {}
   }
@@ -1102,6 +1106,9 @@
 
       if(hints.length > 1){
         const wrap = document.createElement('div');
+        const labelEl = document.createElement('div');
+        labelEl.className = 'text-muted';
+        labelEl.textContent = 'Hints:';
         const ul = document.createElement('ol');
         ul.className = 'mb-0 ps-3';
         hints.forEach((ht) => {
@@ -1109,10 +1116,20 @@
           li.textContent = ht;
           ul.appendChild(li);
         });
+        wrap.appendChild(labelEl);
         wrap.appendChild(ul);
-        addRow('Hints', wrap);
+        addRow('', wrap);
       } else if(hints.length === 1){
-        addRow('Hint', hints[0]);
+        const wrap = document.createElement('div');
+        wrap.className = 'd-flex align-items-baseline gap-2';
+        const labelEl = document.createElement('span');
+        labelEl.className = 'text-muted';
+        labelEl.textContent = 'Hint:';
+        const textEl = document.createElement('span');
+        textEl.textContent = hints[0];
+        wrap.appendChild(labelEl);
+        wrap.appendChild(textEl);
+        addRow('', wrap);
       }
 
       if(inputsRaw){
@@ -1305,6 +1322,25 @@
             resolved: ri[k],
             toChain: true,
           })).filter(x => x && x.name);
+        }
+        if(!initOutputs.length){
+          const names = new Set();
+          try{
+            const reqArt = (faFirst && Array.isArray(faFirst.requires)) ? faFirst.requires.map(String).filter(Boolean) : [];
+            reqArt.forEach(n => { const s = String(n || '').trim(); if(s) names.add(s); });
+          } catch(e) {}
+          try{
+            const inReq = (faFirst && Array.isArray(faFirst.input_fields_required)) ? faFirst.input_fields_required.map(String).filter(Boolean) : [];
+            const inOpt = (faFirst && Array.isArray(faFirst.input_fields_optional)) ? faFirst.input_fields_optional.map(String).filter(Boolean) : [];
+            const inAll = (faFirst && Array.isArray(faFirst.input_fields)) ? faFirst.input_fields.map(String).filter(Boolean) : [];
+            const fields = (inReq.length || inOpt.length) ? inReq.concat(inOpt) : inAll;
+            fields.forEach(n => { const s = String(n || '').trim(); if(s) names.add(s); });
+          } catch(e) {}
+          initOutputs = Array.from(names).sort().map((k)=>({
+            name: k,
+            resolved: ri ? ri[k] : undefined,
+            toChain: true,
+          }));
         }
       } catch(e) { initHints = []; }
       renderFactSummaryRow({
@@ -3906,6 +3942,7 @@
         const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
         if(!chainIds.length) throw new Error('Missing chain ids.');
 
+        let stepFlagOverride = undefined;
         const reqAssignments = chainIds.map((nid, j)=>{
           const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
           const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
@@ -4017,6 +4054,7 @@
                 }
               }
             }
+            stepFlagOverride = flagOvr;
           }
 
           const out = { node_id: nid, id: curId, config_overrides: ovr, output_overrides: outOvr, inject_files_override: injOvr };
@@ -4075,7 +4113,16 @@
               if(cur.output_overrides && typeof cur.output_overrides === 'object'){
                 cur.resolved_outputs = Object.assign({}, (cur.resolved_outputs || {}), cur.output_overrides);
               }
-              if(cur.flag_override && typeof cur.flag_override === 'string' && cur.flag_override.trim()){
+              if(stepFlagOverride !== undefined){
+                if(stepFlagOverride === null){
+                  cur.flag_override = null;
+                  cur.flag_value = undefined;
+                } else if(typeof stepFlagOverride === 'string' && stepFlagOverride.trim()){
+                  cur.flag_override = stepFlagOverride.trim();
+                  cur.flag_value = stepFlagOverride.trim();
+                  cur.resolved_outputs = Object.assign({}, (cur.resolved_outputs || {}), { 'Flag(flag_id)': stepFlagOverride.trim() });
+                }
+              } else if(cur.flag_override && typeof cur.flag_override === 'string' && cur.flag_override.trim()){
                 cur.flag_value = cur.flag_override.trim();
                 cur.resolved_outputs = Object.assign({}, (cur.resolved_outputs || {}), { 'Flag(flag_id)': cur.flag_override.trim() });
               }
@@ -4154,45 +4201,327 @@
   }
 
   async function openFactsDialog(kind){
-    if(!factsDialogEl || !factsBodyEl) return;
+    if(!inputsDialogEl || !inputsBodyEl) return;
     const k = (String(kind || '').toLowerCase() === 'goal') ? 'goal' : 'initial';
-    const title = (k === 'goal') ? 'Goal Facts — Override' : 'Initial Facts — Override';
-    if(factsTitleEl) factsTitleEl.textContent = title;
-    factsBodyEl.innerHTML = '';
+    const title = (k === 'goal') ? 'Value Override — Goal Facts' : 'Value Override — Initial Facts';
+    if(inputsTitleEl) inputsTitleEl.textContent = title;
+    inputsBodyEl.innerHTML = '';
 
     const cur = (k === 'goal') ? flowGoalFactsOverride : flowInitialFactsOverride;
     const curArts = cur && Array.isArray(cur.artifacts) ? cur.artifacts : [];
     const curFields = cur && Array.isArray(cur.fields) ? cur.fields : [];
+    const overrideArtifacts = new Set(curArts.map(x => String(x || '').trim()).filter(Boolean));
+    const overrideFields = new Set(curFields.map(x => String(x || '').trim()).filter(Boolean));
+    const overrideArtifactMap = {};
+    const overrideFieldMap = {};
+    let extraArtifactOverrides = [];
+    let extraFieldOverrides = [];
+
+    function mergeOverrideList(primary, extras){
+      const out = [];
+      const seen = new Set();
+      (primary || []).forEach((v)=>{
+        const s = String(v || '').trim();
+        if(!s || seen.has(s)) return;
+        seen.add(s);
+        out.push(s);
+      });
+      (extras || []).forEach((v)=>{
+        const s = String(v || '').trim();
+        if(!s || seen.has(s)) return;
+        seen.add(s);
+        out.push(s);
+      });
+      return out;
+    }
+
+    function currentOverrideLists(){
+      const artVals = Object.values(overrideArtifactMap).map(v => String(v || '').trim()).filter(Boolean);
+      const fieldVals = Object.values(overrideFieldMap).map(v => String(v || '').trim()).filter(Boolean);
+      return {
+        artifacts: mergeOverrideList(artVals, extraArtifactOverrides),
+        fields: mergeOverrideList(fieldVals, extraFieldOverrides),
+      };
+    }
 
     const wrap = document.createElement('div');
     wrap.className = 'd-flex flex-column gap-3';
 
-    const help = document.createElement('div');
-    help.className = 'small text-muted';
-    help.textContent = 'Provide one fact per line. Artifacts are fact-style (e.g., Knowledge(ip)). Fields are plain input/output keys.';
-    wrap.appendChild(help);
+    function renderResolvedInline(val){
+      let resolvedText = '';
+      try{
+        if(Array.isArray(val)){
+          resolvedText = val.map(x => (x === null || x === undefined) ? '' : String(x)).filter(Boolean).join(', ');
+        } else if(val && typeof val === 'object'){
+          resolvedText = JSON.stringify(val);
+        } else if(val !== undefined && val !== null) {
+          resolvedText = String(val);
+        }
+      } catch(e) { resolvedText = ''; }
+      if(!resolvedText) return document.createTextNode('-');
+      const vcode = document.createElement('code');
+      vcode.className = 'font-monospace';
+      vcode.textContent = resolvedText;
+      return vcode;
+    }
 
-    const artsLabel = document.createElement('div');
-    artsLabel.className = 'small text-muted';
-    artsLabel.textContent = 'Artifacts';
-    wrap.appendChild(artsLabel);
+    function renderBoolCheckbox(checked){
+      const wrap = document.createElement('div');
+      wrap.className = 'form-check mb-0';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.className = 'form-check-input';
+      cb.disabled = true;
+      cb.checked = !!checked;
+      wrap.appendChild(cb);
+      return wrap;
+    }
 
-    const artsInput = document.createElement('textarea');
-    artsInput.className = 'form-control form-control-sm font-monospace';
-    artsInput.rows = 4;
-    artsInput.value = factsToText(curArts);
-    wrap.appendChild(artsInput);
+    function buildInputsTable(rows, showMissing){
+      const tbl = document.createElement('table');
+      tbl.className = 'table table-sm mb-0';
+      const thead = document.createElement('thead');
+      thead.innerHTML = showMissing
+        ? '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th style="width: 1%; white-space: nowrap;">Type</th><th>Resolved</th><th>Override</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th><th style="width: 1%; white-space: nowrap;">Missing</th></tr>'
+        : '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th style="width: 1%; white-space: nowrap;">Type</th><th>Resolved</th><th>Override</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th></tr>';
+      tbl.appendChild(thead);
+      const tbody = document.createElement('tbody');
+      (rows || []).forEach((row)=>{
+        if(!row || !row.name) return;
+        const tr = document.createElement('tr');
+        const tdVar = document.createElement('td');
+        const code = document.createElement('code');
+        code.className = 'font-monospace';
+        code.textContent = String(row.name || '-');
+        tdVar.appendChild(code);
+        const tdType = document.createElement('td');
+        tdType.className = 'text-muted';
+        tdType.style.whiteSpace = 'nowrap';
+        tdType.textContent = String(row.kind || 'Field');
+        const tdRes = document.createElement('td');
+        tdRes.className = 'small';
+        tdRes.appendChild(renderResolvedInline(row.resolved));
+        const tdOvr = document.createElement('td');
+        const ovrInput = document.createElement('input');
+        ovrInput.type = 'text';
+        ovrInput.className = 'form-control form-control-sm font-monospace';
+        ovrInput.value = row.overrideValue || '';
+        if(k === 'goal') ovrInput.disabled = true;
+        ovrInput.addEventListener('input', ()=>{
+          const val = String(ovrInput.value || '').trim();
+          if(String(row.kind || '') === 'Artifact'){
+            if(val) overrideArtifactMap[row.name] = val;
+            else delete overrideArtifactMap[row.name];
+          } else {
+            if(val) overrideFieldMap[row.name] = val;
+            else delete overrideFieldMap[row.name];
+          }
+          // no-op
+        });
+        tdOvr.appendChild(ovrInput);
+        const tdFromChain = document.createElement('td');
+        tdFromChain.appendChild(renderBoolCheckbox(row.fromChain));
+        const tdFromSeq = document.createElement('td');
+        tdFromSeq.appendChild(renderBoolCheckbox(row.fromSeq));
+        tr.appendChild(tdVar);
+        tr.appendChild(tdType);
+        tr.appendChild(tdRes);
+        tr.appendChild(tdOvr);
+        tr.appendChild(tdFromChain);
+        tr.appendChild(tdFromSeq);
+        if(showMissing){
+          const tdMiss = document.createElement('td');
+          if(row.missing) tdMiss.classList.add('text-danger');
+          tdMiss.appendChild(renderBoolCheckbox(row.missing));
+          tr.appendChild(tdMiss);
+        }
+        tbody.appendChild(tr);
+      });
+      tbl.appendChild(tbody);
+      return tbl;
+    }
 
-    const fieldsLabel = document.createElement('div');
-    fieldsLabel.className = 'small text-muted';
-    fieldsLabel.textContent = 'Fields';
-    wrap.appendChild(fieldsLabel);
+    function buildOutputsTable(rows){
+      const tbl = document.createElement('table');
+      tbl.className = 'table table-sm mb-0';
+      const thead = document.createElement('thead');
+      thead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th style="width: 1%; white-space: nowrap;">Type</th><th>Resolved</th><th>Override</th><th style="width: 1%; white-space: nowrap;">To Chain</th></tr>';
+      tbl.appendChild(thead);
+      const tbody = document.createElement('tbody');
+      (rows || []).forEach((row)=>{
+        if(!row || !row.name) return;
+        const tr = document.createElement('tr');
+        const tdVar = document.createElement('td');
+        const code = document.createElement('code');
+        code.className = 'font-monospace';
+        code.textContent = String(row.name || '-');
+        tdVar.appendChild(code);
+        const tdType = document.createElement('td');
+        tdType.className = 'text-muted';
+        tdType.style.whiteSpace = 'nowrap';
+        tdType.textContent = String(row.kind || 'Field');
+        const tdRes = document.createElement('td');
+        tdRes.className = 'small';
+        tdRes.appendChild(renderResolvedInline(row.resolved));
+        const tdOvr = document.createElement('td');
+        const ovrInput = document.createElement('input');
+        ovrInput.type = 'text';
+        ovrInput.className = 'form-control form-control-sm font-monospace';
+        ovrInput.value = row.overrideValue || '';
+        if(k === 'goal') ovrInput.disabled = true;
+        ovrInput.addEventListener('input', ()=>{
+          const val = String(ovrInput.value || '').trim();
+          if(val) overrideFieldMap[row.name] = val;
+          else delete overrideFieldMap[row.name];
+          // no-op
+        });
+        tdOvr.appendChild(ovrInput);
+        const tdToChain = document.createElement('td');
+        tdToChain.appendChild(renderBoolCheckbox(row.toChain));
+        tr.appendChild(tdVar);
+        tr.appendChild(tdType);
+        tr.appendChild(tdRes);
+        tr.appendChild(tdOvr);
+        tr.appendChild(tdToChain);
+        tbody.appendChild(tr);
+      });
+      tbl.appendChild(tbody);
+      return tbl;
+    }
 
-    const fieldsInput = document.createElement('textarea');
-    fieldsInput.className = 'form-control form-control-sm font-monospace';
-    fieldsInput.rows = 4;
-    fieldsInput.value = factsToText(curFields);
-    wrap.appendChild(fieldsInput);
+    try{
+      const ioOuter = document.createElement('div');
+      ioOuter.className = 'mt-2';
+      const tabBar = document.createElement('div');
+      tabBar.className = 'd-flex align-items-center gap-2 mt-2';
+
+      const btnInputs = document.createElement('button');
+      btnInputs.type = 'button';
+      btnInputs.className = (k === 'goal') ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-outline-primary';
+      btnInputs.textContent = 'Inputs';
+      btnInputs.disabled = (k !== 'goal');
+
+      const btnOutputs = document.createElement('button');
+      btnOutputs.type = 'button';
+      btnOutputs.className = (k === 'goal') ? 'btn btn-sm btn-outline-primary' : 'btn btn-sm btn-primary';
+      btnOutputs.textContent = 'Outputs';
+      btnOutputs.disabled = (k === 'goal');
+
+      tabBar.appendChild(btnInputs);
+      tabBar.appendChild(btnOutputs);
+      ioOuter.appendChild(tabBar);
+
+      const pane = document.createElement('div');
+      pane.className = 'mt-2';
+
+      if(k === 'goal'){
+        const lastIdx = Math.max(0, (Array.isArray(currentFlagAssignments) ? currentFlagAssignments.length : 0) - 1);
+        const faLast = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[lastIdx]) ? currentFlagAssignments[lastIdx] : null;
+        const feas = chainFeasibility(currentFlagAssignments);
+        const stepGoal = (feas && feas[lastIdx]) ? feas[lastIdx] : null;
+        const ri = (faLast && typeof faLast.resolved_inputs === 'object' && faLast.resolved_inputs && !Array.isArray(faLast.resolved_inputs))
+          ? faLast.resolved_inputs
+          : null;
+        const reqArtifacts = (faLast && Array.isArray(faLast.requires)) ? faLast.requires.map(String).filter(Boolean) : [];
+        const inReq = (faLast && Array.isArray(faLast.input_fields_required)) ? faLast.input_fields_required.map(String).filter(Boolean) : [];
+        const inOpt = (faLast && Array.isArray(faLast.input_fields_optional)) ? faLast.input_fields_optional.map(String).filter(Boolean) : [];
+        const inAll = (faLast && Array.isArray(faLast.input_fields)) ? faLast.input_fields.map(String).filter(Boolean) : [];
+        const defFields = (inReq.length || inOpt.length) ? inReq.concat(inOpt) : inAll;
+        const providedArtifactsChain = (stepGoal && Array.isArray(stepGoal.providing_artifacts_chain)) ? stepGoal.providing_artifacts_chain.map(String).filter(Boolean) : [];
+        const providedArtifactsSeq = (stepGoal && Array.isArray(stepGoal.providing_artifacts_sequencer)) ? stepGoal.providing_artifacts_sequencer.map(String).filter(Boolean) : [];
+        const missingArtifacts = (stepGoal && Array.isArray(stepGoal.missing_artifacts)) ? stepGoal.missing_artifacts.map(String).filter(Boolean) : [];
+        const providedFieldsChain = (stepGoal && Array.isArray(stepGoal.providing_fields_chain)) ? stepGoal.providing_fields_chain.map(String).filter(Boolean) : [];
+        const providedFieldsSeq = (stepGoal && Array.isArray(stepGoal.providing_fields_sequencer)) ? stepGoal.providing_fields_sequencer.map(String).filter(Boolean) : [];
+        const missingFields = (stepGoal && Array.isArray(stepGoal.missing_fields)) ? stepGoal.missing_fields.map(String).filter(Boolean) : [];
+
+        const rows = [];
+        const reqArtifactSet = new Set(reqArtifacts);
+        const provArtChainSet = new Set(providedArtifactsChain);
+        const provArtSeqSet = new Set(providedArtifactsSeq);
+        const missArtSet = new Set(missingArtifacts);
+        const artifactNameSet = new Set();
+        reqArtifacts.map(String).filter(Boolean).sort().forEach((name)=>{
+          const n = String(name || '').trim();
+          if(!n) return;
+          artifactNameSet.add(n);
+          rows.push({
+            name: n,
+            resolved: ri ? ri[n] : undefined,
+            fromChain: provArtChainSet.has(n),
+            fromSeq: provArtSeqSet.has(n),
+            missing: missArtSet.has(n),
+            required: reqArtifactSet.has(n),
+            kind: 'Artifact',
+            overrideValue: overrideArtifacts.has(n) ? n : '',
+          });
+        });
+
+        const fieldNameSet = new Set(defFields.map(String).filter(Boolean));
+        try{
+          if((!fieldNameSet.size) && ri && typeof ri === 'object' && !Array.isArray(ri)){
+            Object.keys(ri).forEach(k0 => { if(String(k0 || '').trim()) fieldNameSet.add(String(k0).trim()); });
+          }
+        } catch(e) {}
+        const reqFieldSet = new Set(inReq.map(String).filter(Boolean));
+        const provFldChainSet = new Set(providedFieldsChain);
+        const provFldSeqSet = new Set(providedFieldsSeq);
+        const missFldSet = new Set(missingFields);
+        Array.from(fieldNameSet).sort().forEach((name)=>{
+          const n = String(name || '').trim();
+          if(!n) return;
+          rows.push({
+            name: n,
+            resolved: ri ? ri[n] : undefined,
+            fromChain: provFldChainSet.has(n),
+            fromSeq: provFldSeqSet.has(n),
+            missing: missFldSet.has(n),
+            required: reqFieldSet.has(n),
+            kind: 'Field',
+            overrideValue: overrideFields.has(n) ? n : '',
+          });
+        });
+        try{
+          const artSet = new Set(Array.from(artifactNameSet));
+          extraArtifactOverrides = curArts.map(String).map(s => String(s || '').trim()).filter(Boolean).filter(v => !artSet.has(v));
+          curArts.map(String).map(s => String(s || '').trim()).filter(Boolean).forEach(v => { if(artSet.has(v)) overrideArtifactMap[v] = v; });
+        } catch(e) { extraArtifactOverrides = []; }
+        try{
+          const fldSet = new Set(Array.from(fieldNameSet));
+          extraFieldOverrides = curFields.map(String).map(s => String(s || '').trim()).filter(Boolean).filter(v => !fldSet.has(v));
+          curFields.map(String).map(s => String(s || '').trim()).filter(Boolean).forEach(v => { if(fldSet.has(v)) overrideFieldMap[v] = v; });
+        } catch(e) { extraFieldOverrides = []; }
+        const showMissing = rows.some(r => r && r.missing);
+        pane.appendChild(buildInputsTable(rows, showMissing));
+      } else {
+        const faFirst = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[0]) ? currentFlagAssignments[0] : null;
+        const ri = (faFirst && typeof faFirst.resolved_inputs === 'object' && faFirst.resolved_inputs && !Array.isArray(faFirst.resolved_inputs))
+          ? faFirst.resolved_inputs
+          : null;
+        const rows = [];
+        const fieldNameSet = new Set();
+        if(ri && typeof ri === 'object'){
+          Object.keys(ri).sort((a, b) => String(a).localeCompare(String(b))).forEach((k0)=>{
+            const k1 = String(k0 || '').trim();
+            if(!k1) return;
+            fieldNameSet.add(k1);
+            rows.push({ name: k1, resolved: ri[k1], toChain: true, kind: 'Field', overrideValue: overrideFields.has(k1) ? k1 : '' });
+          });
+        }
+        try{
+          extraArtifactOverrides = curArts.map(String).map(s => String(s || '').trim()).filter(Boolean);
+        } catch(e) { extraArtifactOverrides = []; }
+        try{
+          const fldSet = new Set(Array.from(fieldNameSet));
+          extraFieldOverrides = curFields.map(String).map(s => String(s || '').trim()).filter(Boolean).filter(v => !fldSet.has(v));
+          curFields.map(String).map(s => String(s || '').trim()).filter(Boolean).forEach(v => { if(fldSet.has(v)) overrideFieldMap[v] = v; });
+        } catch(e) { extraFieldOverrides = []; }
+        pane.appendChild(buildOutputsTable(rows));
+      }
+      ioOuter.appendChild(pane);
+      wrap.appendChild(ioOuter);
+    } catch(e) {}
+
+    // No hidden textareas needed; overrides are derived from the table inputs.
 
     const actions = document.createElement('div');
     actions.className = 'd-flex justify-content-end gap-2';
@@ -4203,12 +4532,12 @@
     const saveBtn = document.createElement('button');
     saveBtn.type = 'button';
     saveBtn.className = 'btn btn-sm btn-primary';
-    saveBtn.textContent = 'Save';
+    saveBtn.textContent = 'Save Overrides';
     actions.appendChild(clearBtn);
     actions.appendChild(saveBtn);
 
     wrap.appendChild(actions);
-    factsBodyEl.appendChild(wrap);
+    inputsBodyEl.appendChild(wrap);
 
     async function persistFactsOverride(nextOverride){
       if(k === 'goal') flowGoalFactsOverride = nextOverride;
@@ -4232,6 +4561,14 @@
         return out;
       });
 
+      const prevResolved = Array.isArray(currentFlagAssignments)
+        ? currentFlagAssignments.map(a => ({
+            resolved_inputs: a && a.resolved_inputs,
+            resolved_outputs: a && a.resolved_outputs,
+            flag_value: a && a.flag_value,
+          }))
+        : [];
+
       showLoading('Saving facts override…');
       try{
         const res = await postJson('/api/flag-sequencing/save_flow_substitutions', {
@@ -4244,10 +4581,29 @@
         }, { timeoutMs: 60000 });
         setFlowValidityFromPayload(res);
         if(res && Array.isArray(res.chain)) currentChain = res.chain.slice();
-        if(res && Array.isArray(res.flag_assignments)) currentFlagAssignments = res.flag_assignments.slice();
+        if(res && Array.isArray(res.flag_assignments)){
+          const next = res.flag_assignments.slice();
+          try{
+            next.forEach((a, idx) => {
+              if(!a || typeof a !== 'object') return;
+              const prev = prevResolved[idx];
+              if(!prev || typeof prev !== 'object') return;
+              if(a.resolved_inputs === undefined && prev.resolved_inputs !== undefined){
+                a.resolved_inputs = prev.resolved_inputs;
+              }
+              if(a.resolved_outputs === undefined && prev.resolved_outputs !== undefined){
+                a.resolved_outputs = prev.resolved_outputs;
+              }
+              if(a.flag_value === undefined && prev.flag_value !== undefined){
+                a.flag_value = prev.flag_value;
+              }
+            });
+          } catch(e) {}
+          currentFlagAssignments = next;
+        }
         if(res && res.flow_plan_path) lastFlowPlanPath = String(res.flow_plan_path);
         renderChainEditor();
-        try { if(typeof factsDialogEl.close === 'function') factsDialogEl.close(); } catch(e) {}
+        try { if(typeof inputsDialogEl.close === 'function') inputsDialogEl.close(); } catch(e) {}
       } finally {
         hideLoading();
       }
@@ -4256,21 +4612,24 @@
     clearBtn.addEventListener('click', ()=>{
       if(k === 'goal') flowGoalFactsOverride = null;
       else flowInitialFactsOverride = null;
-      artsInput.value = '';
-      fieldsInput.value = '';
+      try { Object.keys(overrideArtifactMap).forEach(k0 => { delete overrideArtifactMap[k0]; }); } catch(e) {}
+      try { Object.keys(overrideFieldMap).forEach(k0 => { delete overrideFieldMap[k0]; }); } catch(e) {}
+      extraArtifactOverrides = [];
+      extraFieldOverrides = [];
       persistFactsOverride(null);
     });
 
     saveBtn.addEventListener('click', ()=>{
+      const lists = currentOverrideLists();
       const next = normalizeFactsOverride({
-        artifacts: parseFactsText(artsInput.value),
-        fields: parseFactsText(fieldsInput.value),
+        artifacts: lists.artifacts,
+        fields: lists.fields,
       });
       persistFactsOverride(next);
     });
 
     try{
-      if(typeof factsDialogEl.showModal === 'function') factsDialogEl.showModal();
+      if(typeof inputsDialogEl.showModal === 'function') inputsDialogEl.showModal();
     } catch(e) {}
   }
 
