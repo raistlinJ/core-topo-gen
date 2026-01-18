@@ -17,7 +17,7 @@ def test_generator_plugin_schema_accepts_minimal_valid_plugin():
         "plugin_type": "flag-generator",
         "version": "1.0",
         "requires": [],
-        "produces": [{"artifact": "network.ip"}],
+        "produces": [{"artifact": "Knowledge(ip)"}],
         "inputs": {
             "difficulty": {"type": "string", "required": False, "values": ["easy", "medium", "hard"]}
         },
@@ -50,23 +50,23 @@ def test_dag_builds_and_toposorts_sample_like_chain():
             "plugin_type": "flag-generator",
             "version": "1.0",
             "requires": [],
-            "produces": [{"artifact": "network.ip"}],
+            "produces": [{"artifact": "Knowledge(ip)"}],
             "inputs": {},
         },
         "nfs_sensitive_file": {
             "plugin_id": "nfs_sensitive_file",
             "plugin_type": "flag-node-generator",
             "version": "1.0",
-            "requires": ["network.ip"],
-            "produces": [{"artifact": "credential.pair"}],
+            "requires": ["Knowledge(ip)"],
+            "produces": [{"artifact": "Credential(user, password)"}],
             "inputs": {},
         },
         "textfile_username_password": {
             "plugin_id": "textfile_username_password",
             "plugin_type": "flag-generator",
             "version": "1.0",
-            "requires": ["credential.pair"],
-            "produces": [{"artifact": "filesystem.file"}],
+            "requires": ["Credential(user, password)"],
+            "produces": [{"artifact": "File(path)"}],
             "inputs": {},
         },
     }
@@ -94,7 +94,7 @@ def test_dag_respects_explicit_source_binding():
             "plugin_type": "flag-generator",
             "version": "1.0",
             "requires": [],
-            "produces": [{"artifact": "network.ip"}],
+            "produces": [{"artifact": "Knowledge(ip)"}],
             "inputs": {},
         },
         "p2": {
@@ -102,15 +102,15 @@ def test_dag_respects_explicit_source_binding():
             "plugin_type": "flag-generator",
             "version": "1.0",
             "requires": [],
-            "produces": [{"artifact": "network.ip"}],
+            "produces": [{"artifact": "Knowledge(ip)"}],
             "inputs": {},
         },
         "consumer": {
             "plugin_id": "consumer",
             "plugin_type": "flag-generator",
             "version": "1.0",
-            "requires": ["network.ip"],
-            "produces": [{"artifact": "filesystem.file"}],
+            "requires": ["Knowledge(ip)"],
+            "produces": [{"artifact": "File(path)"}],
             "inputs": {},
         },
     }
@@ -121,15 +121,15 @@ def test_dag_respects_explicit_source_binding():
         {
             "challenge_id": "c",
             "plugin": "consumer",
-            "requires": [{"artifact": "network.ip", "source": "b"}],
+            "requires": [{"artifact": "Knowledge(ip)", "source": "b"}],
         },
     ]
 
     res, errors = build_dag(challenges, plugins_by_id=plugins)
     assert res is not None, errors
 
-    # Ensure there's an edge b -> c for network.ip.
-    assert any(e.src == "b" and e.dst == "c" and e.artifact == "network.ip" for e in res.edges)
+    # Ensure there's an edge b -> c for Knowledge(ip).
+    assert any(e.src == "b" and e.dst == "c" and e.artifact == "Knowledge(ip)" for e in res.edges)
 
 
 def test_dag_rejects_instance_requires_not_declared_by_plugin():
@@ -139,7 +139,7 @@ def test_dag_rejects_instance_requires_not_declared_by_plugin():
             "plugin_type": "flag-generator",
             "version": "1.0",
             "requires": [],
-            "produces": [{"artifact": "filesystem.file"}],
+            "produces": [{"artifact": "File(path)"}],
             "inputs": {},
         }
     }
@@ -148,7 +148,7 @@ def test_dag_rejects_instance_requires_not_declared_by_plugin():
         {
             "challenge_id": "c",
             "plugin": "consumer",
-            "requires": [{"artifact": "network.ip"}],
+            "requires": [{"artifact": "Knowledge(ip)"}],
         }
     ]
 
@@ -163,16 +163,16 @@ def test_dag_detects_cycle():
             "plugin_id": "a",
             "plugin_type": "flag-generator",
             "version": "1.0",
-            "requires": ["b.out"],
-            "produces": [{"artifact": "a.out"}],
+            "requires": ["Knowledge(b.out)"],
+            "produces": [{"artifact": "Knowledge(a.out)"}],
             "inputs": {},
         },
         "b": {
             "plugin_id": "b",
             "plugin_type": "flag-generator",
             "version": "1.0",
-            "requires": ["a.out"],
-            "produces": [{"artifact": "b.out"}],
+            "requires": ["Knowledge(a.out)"],
+            "produces": [{"artifact": "Knowledge(b.out)"}],
             "inputs": {},
         },
     }
@@ -193,8 +193,8 @@ def test_dag_rejects_required_artifact_with_no_producer():
             "plugin_id": "consumer",
             "plugin_type": "flag-generator",
             "version": "1.0",
-            "requires": ["network.ip"],
-            "produces": [{"artifact": "filesystem.file"}],
+            "requires": ["Knowledge(ip)"],
+            "produces": [{"artifact": "File(path)"}],
             "inputs": {},
         }
     }

@@ -1,0 +1,43 @@
+# Example Node: Web Backup Leak
+# Purpose: Demonstrates a simple infoleak-based node using the schema.
+
+node_id: "web_backup_leak_01"
+template: "web_infoleak"
+version: "1.0.0"
+
+metadata:
+  name: "Exposed Backup Directory"
+  description: "An unprotected backup directory leaks credentials."
+  category: [web, recon]
+  difficulty: 3
+  tags: ["backup", "infoleak"]
+
+logic:
+  requires:
+    - name: "NetworkAccess"
+      args: ["attacker", "web", 80]
+  optional_requires:
+    - name: "Browser"
+      args: ["any"]
+  provides:
+    - name: "File"
+      args: ["/backups/db.sql"]
+    - name: "Credential"
+      args: ["admin", "password"]
+
+deployment:
+  container:
+    image: "vuln-web:latest"
+    exposed_ports:
+      - "80/tcp"
+  injected:
+    - "/var/www/html/backups/db.sql"
+
+runtime:
+  generates:
+    - "BackupIndex"
+  side_effects:
+    - "ExposedDirectory"
+
+flags:
+  - "flag_web_backup"

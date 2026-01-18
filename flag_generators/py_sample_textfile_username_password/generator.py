@@ -33,7 +33,7 @@ def _derive_flag(seed: str, generator_id: str, flag_prefix: str) -> str:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Sample generator: emit a filesystem.file containing creds")
+    ap = argparse.ArgumentParser(description="Sample generator: emit a File(path) containing creds")
     ap.add_argument("--config", default=os.environ.get("CONFIG_PATH", ""))
     ap.add_argument("--seed", default=os.environ.get("SEED", ""))
     ap.add_argument("--flag-prefix", default=os.environ.get("FLAG_PREFIX", "FLAG"))
@@ -59,8 +59,8 @@ def main() -> int:
     outputs = {
         "generator_id": generator_id,
         "outputs": {
-            "flag": flag_value,
-            "filesystem.file": "artifacts/secrets.txt",
+            "Flag(flag_id)": flag_value,
+            "File(path)": "artifacts/secrets.txt",
         },
     }
 

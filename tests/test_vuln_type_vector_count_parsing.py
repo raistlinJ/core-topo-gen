@@ -28,7 +28,7 @@ def test_parse_vulnerabilities_type_vector_count_includes_v_count(tmp_path):
     xml_path = tmp_path / 's.xml'
     ET.ElementTree(root).write(xml_path, encoding='utf-8', xml_declaration=True)
 
-    density, items = parse_vulnerabilities_info(str(xml_path), 'S1')
+    density, items, _flag_type = parse_vulnerabilities_info(str(xml_path), 'S1')
     assert density == 0.0
     assert len(items) == 1
     assert items[0].get('selected') == 'Type/Vector'

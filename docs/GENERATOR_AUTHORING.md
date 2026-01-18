@@ -68,15 +68,15 @@ artifacts:
   requires: []
   produces:
     - flag
-    - ssh.username
-    - ssh.password
+    - Credential(user)
+    - Credential(user, password)
 
 hint_templates:
-  - "Next: use {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}"
+  - "Next: use {{OUTPUT.Credential(user)}} / {{OUTPUT.Credential(user,password)}}"
 
 # If you produce files/binaries that should be safe to mount into other containers.
 injects:
-  - filesystem.file
+  - File(path)
 
 # Optional fixed env vars passed to the runtime.
 env:
@@ -159,12 +159,12 @@ How it works:
 `injects` entries can be:
 
 - A relative path like `artifacts/my_binary` (prefix `artifacts/` is optional), or
-- An **output artifact key** like `filesystem.file` which is resolved via `outputs.json.outputs`.
+- An **output artifact key** like `File(path)` which is resolved via `outputs.json.outputs`.
 
 Optional destination directory syntax:
 
 - `artifacts/my_binary -> /opt/bin`
-- `filesystem.file => /var/tmp`
+- `File(path) => /var/tmp`
 
 If no destination is provided (or it fails validation), files default to `/tmp`.
 
@@ -187,7 +187,7 @@ Flow substitutions include:
 Example:
 
 ```
-Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}
+Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.Credential(user)}} / {{OUTPUT.Credential(user,password)}}
 ```
 
 ---

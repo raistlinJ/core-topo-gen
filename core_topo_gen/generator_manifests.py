@@ -31,6 +31,26 @@ CANONICAL_INPUT_TYPES: set[str] = {
 }
 
 
+LEGACY_ARTIFACT_MAP: dict[str, str] = {
+    'flag': 'Flag(flag_id)',
+    'filesystem.file': 'File(path)',
+    'file': 'File(path)',
+    'file.path': 'File(path)',
+    'filepath': 'File(path)',
+    'filesystem.path': 'File(path)',
+}
+
+
+def normalize_artifact_name(name: Any) -> str:
+    raw = str(name or '').strip()
+    if not raw:
+        return ''
+    if '(' in raw and raw.endswith(')'):
+        return raw
+    key = raw.strip().lower()
+    return LEGACY_ARTIFACT_MAP.get(key, raw)
+
+
 def normalize_manifest_input_type(type_value: Any) -> str:
     """Normalize manifest input types to a small, mandatory canonical set.
 
@@ -115,7 +135,7 @@ def _norm_inputs(inputs: Any) -> list[dict[str, Any]]:
     for item in _as_list(inputs):
         if not isinstance(item, dict):
             continue
-        name = str(item.get('name') or '').strip()
+        name = normalize_artifact_name(item.get('name'))
         if not name:
             continue
         rec: dict[str, Any] = {
@@ -139,12 +159,12 @@ def _norm_artifact_list(value: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for item in _as_list(value):
         if isinstance(item, str):
-            a = item.strip()
+            a = normalize_artifact_name(item)
             if a:
                 out.append({'artifact': a})
             continue
         if isinstance(item, dict):
-            a = str(item.get('artifact') or item.get('name') or '').strip()
+            a = normalize_artifact_name(item.get('artifact') or item.get('name') or '')
             if not a:
                 continue
             rec: dict[str, Any] = {'artifact': a}
@@ -157,16 +177,24 @@ def _norm_artifact_list(value: Any) -> list[dict[str, Any]]:
 def _artifact_kind(artifact: str) -> str:
     """Best-effort classification for UI (file vs folder vs other).
 
-    Manifests declare artifacts by key (e.g., "filesystem.file"). We only need
-    a lightweight hint so the UI can distinguish file vs folder.
+    Artifacts are now fact-style (e.g., "File(path)"). We only need a lightweight
+    hint so the UI can distinguish file vs folder.
     """
-    a = str(artifact or '').strip().lower()
+    a = str(artifact or '').strip()
     if not a:
         return ''
-    if a == 'filesystem.file' or a.endswith('.file'):
-        return 'file'
-    if a == 'filesystem.dir' or a.endswith('.dir'):
-        return 'dir'
+    try:
+        from core_topo_gen.sequencer.facts import parse_fact_ref
+        parsed = parse_fact_ref(a)
+    except Exception:
+        parsed = None
+    if parsed:
+        name = parsed[0].strip().lower()
+        if name in {'file', 'binary', 'pcap', 'backuparchive', 'sourcecode', 'encryptedblob', 'decryptionkey'}:
+            return 'file'
+        if name in {'directory'}:
+            return 'dir'
+        return ''
     return ''
 
 
@@ -397,7 +425,7 @@ def discover_generator_manifests(
             injects = doc.get('injects')
             inject_files: list[str] = []
             for x in _as_list(injects):
-                s = str(x or '').strip()
+                s = normalize_artifact_name(x)
                 if s:
                     inject_files.append(s)
             gen['inject_files'] = inject_files

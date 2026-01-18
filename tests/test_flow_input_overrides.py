@@ -457,7 +457,7 @@ def test_save_flow_substitutions_persists_output_overrides_and_inject_override_a
         "language": "python",
         "description": "test",
         "inputs": [],
-        "outputs": [{"name": "flag", "type": "string"}, {"name": "username", "type": "string"}],
+        "outputs": [{"name": "Flag(flag_id)", "type": "string"}, {"name": "username", "type": "string"}],
         "hint_templates": ["from_tpl"],
         "_source_name": "test",
     }
@@ -480,7 +480,7 @@ def test_save_flow_substitutions_persists_output_overrides_and_inject_override_a
                     {
                         "node_id": "h1",
                         "id": "zz_output_inject_override",
-                        "output_overrides": {"flag": "FLAG{OVR}", "username": "alice"},
+                        "output_overrides": {"Flag(flag_id)": "FLAG{OVR}", "username": "alice"},
                         "inject_files_override": ["hint.txt", "notes.txt"],
                     },
                 ],
@@ -493,7 +493,7 @@ def test_save_flow_substitutions_persists_output_overrides_and_inject_override_a
         fas = data.get("flag_assignments") or []
         assert len(fas) == 1
         assert fas[0].get("id") == "zz_output_inject_override"
-        assert (fas[0].get("output_overrides") or {}).get("flag") == "FLAG{OVR}"
+        assert (fas[0].get("output_overrides") or {}).get("Flag(flag_id)") == "FLAG{OVR}"
         assert (fas[0].get("output_overrides") or {}).get("username") == "alice"
         assert fas[0].get("inject_files_override") == ["hint.txt", "notes.txt"]
         assert fas[0].get("inject_files") == ["hint.txt", "notes.txt"]
@@ -505,7 +505,7 @@ def test_save_flow_substitutions_persists_output_overrides_and_inject_override_a
         flow_meta = (((payload.get("metadata") or {}).get("flow")) if isinstance(payload, dict) else None) or {}
         saved_fas = flow_meta.get("flag_assignments") or []
         assert isinstance(saved_fas, list) and len(saved_fas) == 1
-        assert (saved_fas[0].get("output_overrides") or {}).get("flag") == "FLAG{OVR}"
+        assert (saved_fas[0].get("output_overrides") or {}).get("Flag(flag_id)") == "FLAG{OVR}"
         assert saved_fas[0].get("inject_files_override") == ["hint.txt", "notes.txt"]
 
         # Clear overrides

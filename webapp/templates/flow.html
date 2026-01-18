@@ -62,7 +62,7 @@
             <input id="flowScenario" class="form-control d-none" value="{{ active_scenario or request.args.get('scenario','') }}">
             <div class="row g-2 align-items-end">
               <div class="col-sm-6 col-md-2">
-                <label class="form-label">Chain Length</label>
+                <label class="form-label">Max Chain length</label>
                 <input id="flowLength" class="form-control" type="number" min="1" max="50" value="5">
               </div>
               <div class="col-sm-6 col-md-4">
@@ -85,7 +85,15 @@
                 </div>
               </div>
             </div>
-            <div class="small text-muted mt-2">Current rule: flags are placed on Docker-role nodes and vulnerability nodes. Vulnerability nodes are only assigned <span class="font-monospace">flag-generator</span> flags (not <span class="font-monospace">flag-node-generator</span>). Default chain order is randomized; you can tweak it below.</div>
+            <div class="small text-muted mt-2">Current rule: <span class="font-monospace">flag-generator</span> steps are placed on vulnerability nodes only. Non-vulnerability Docker nodes use <span class="font-monospace">flag-node-generator</span>. Default chain order is randomized; you can tweak it below.</div>
+            <details class="small text-muted mt-2">
+              <summary>Examples</summary>
+              <div class="mt-2">
+                <div>Overrides: <span class="font-monospace">Flag(flag_id)=FLAG{OVERRIDE}</span></div>
+                <div>Injects: <span class="font-monospace">File(path) -> /opt/bin</span></div>
+                <div>Hints: <span class="font-monospace">Next: {{ '{{OUTPUT.Knowledge(ip)}}' }}</span></div>
+              </div>
+            </details>
           </div>
         </div>
 
@@ -136,10 +144,26 @@
               <form method="dialog" class="m-0" style="display:flex;flex-direction:column;max-height:85vh;">
                 <div class="p-3 border-bottom d-flex align-items-center justify-content-between" style="flex:0 0 auto;">
                   <div class="fw-semibold" id="flowInputsTitle">Inputs</div>
-                  <button class="btn btn-sm btn-outline-secondary" value="close" type="submit">Close</button>
                 </div>
                 <div class="p-3" style="flex:1 1 auto; overflow: auto;">
                   <div id="flowInputsBody" class="small"></div>
+                </div>
+                <div class="p-3 border-top d-flex justify-content-end" style="flex:0 0 auto;">
+                  <button class="btn btn-sm btn-outline-secondary" value="close" type="submit">Close</button>
+                </div>
+              </form>
+            </dialog>
+
+            <dialog id="flowFactsDialog" class="p-0 border rounded" style="max-width: 800px; width: calc(100% - 2rem); max-height: 85vh; overflow: hidden;">
+              <form method="dialog" class="m-0" style="display:flex;flex-direction:column;max-height:85vh;">
+                <div class="p-3 border-bottom d-flex align-items-center justify-content-between" style="flex:0 0 auto;">
+                  <div class="fw-semibold" id="flowFactsTitle">Facts</div>
+                </div>
+                <div class="p-3" style="flex:1 1 auto; overflow: auto;">
+                  <div id="flowFactsBody" class="small"></div>
+                </div>
+                <div class="p-3 border-top d-flex justify-content-end" style="flex:0 0 auto;">
+                  <button class="btn btn-sm btn-outline-secondary" value="close" type="submit">Close</button>
                 </div>
               </form>
             </dialog>
@@ -246,6 +270,9 @@
   const inputsDialogEl = document.getElementById('flowInputsDialog');
   const inputsTitleEl = document.getElementById('flowInputsTitle');
   const inputsBodyEl = document.getElementById('flowInputsBody');
+  const factsDialogEl = document.getElementById('flowFactsDialog');
+  const factsTitleEl = document.getElementById('flowFactsTitle');
+  const factsBodyEl = document.getElementById('flowFactsBody');
   const substituteDialogEl = document.getElementById('flowSubstituteDialog');
   const substituteTitleEl = document.getElementById('flowSubstituteTitle');
   const substituteBodyEl = document.getElementById('flowSubstituteBody');
@@ -286,6 +313,15 @@
   function updateScenarioSeedBadges(){
     if(!scenarioListEl) return;
     const show = getSidebarShowSeed();
+    try{
+      const maxLen = Array.isArray(currentChain) ? currentChain.length : 0;
+      Array.from(heldChainIndices || []).forEach((idx)=>{
+        const n = Number(idx);
+        if(!Number.isFinite(n) || n < 0 || n >= maxLen){
+          try { heldChainIndices.delete(idx); } catch(e) {}
+        }
+      });
+    } catch(e) {}
     scenarioListEl.querySelectorAll('button[data-scen-name]').forEach((btn)=>{
       const scen = (btn.getAttribute('data-scen-name') || '').trim();
       const badge = btn.querySelector('[data-seed-badge]');
@@ -327,6 +363,10 @@
   let lastFlowErrors = [];
   let lastFlagsEnabled = true;
   let allowNodeDuplicates = false;
+  let heldChainIndices = new Set();
+  let heldFactRows = new Set();
+  let flowInitialFactsOverride = null;
+  let flowGoalFactsOverride = null;
 
   let _flagGeneratorsCatalog = null;
   let _flagNodeGeneratorsCatalog = null;
@@ -387,6 +427,45 @@
     } catch(e) {}
   }
 
+  function buildPersistAssignments(chainIds){
+    const ids = Array.isArray(chainIds) ? chainIds : [];
+    return ids.map((nid, j)=>{
+      const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
+      const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
+      const out = { node_id: String(nid || ''), id: curId };
+
+      const ovr = (curA && typeof curA.config_overrides === 'object' && curA.config_overrides && !Array.isArray(curA.config_overrides))
+        ? curA.config_overrides
+        : undefined;
+      const outOvr = (curA && typeof curA.output_overrides === 'object' && curA.output_overrides && !Array.isArray(curA.output_overrides))
+        ? curA.output_overrides
+        : undefined;
+      const injOvr = (curA && Array.isArray(curA.inject_files_override))
+        ? curA.inject_files_override
+        : undefined;
+      const hintOvr = (curA && Array.isArray(curA.hint_overrides)) ? curA.hint_overrides : undefined;
+      const flagOvr = (curA && typeof curA.flag_override === 'string' && curA.flag_override.trim()) ? String(curA.flag_override).trim() : undefined;
+
+      if(ovr !== undefined) out.config_overrides = ovr;
+      if(outOvr !== undefined) out.output_overrides = outOvr;
+      if(injOvr !== undefined) out.inject_files_override = injOvr;
+      if(hintOvr !== undefined) out.hint_overrides = hintOvr;
+      if(flagOvr !== undefined) out.flag_override = flagOvr;
+      try{
+        if(curA && typeof curA.resolved_inputs === 'object' && !Array.isArray(curA.resolved_inputs)){
+          out.resolved_inputs = curA.resolved_inputs;
+        }
+        if(curA && typeof curA.resolved_outputs === 'object' && !Array.isArray(curA.resolved_outputs)){
+          out.resolved_outputs = curA.resolved_outputs;
+        }
+        if(curA && typeof curA.flag_value === 'string' && curA.flag_value.trim()){
+          out.flag_value = curA.flag_value.trim();
+        }
+      } catch(e) {}
+      return out;
+    });
+  }
+
   function toRoman(n){
     const num = parseInt(n, 10);
     if(!Number.isFinite(num) || num <= 0) return '';
@@ -429,6 +508,14 @@
     lastFlowValid = flowValid;
     lastFlagsEnabled = flagsEnabled;
     lastFlowErrors = flowErrors;
+    try {
+      if(p && p.initial_facts){
+        flowInitialFactsOverride = normalizeFactsOverride(p.initial_facts);
+      }
+      if(p && p.goal_facts){
+        flowGoalFactsOverride = normalizeFactsOverride(p.goal_facts);
+      }
+    } catch(e) {}
     if(!validityAlertEl) return;
     if(flowValid && flagsEnabled){
       validityAlertEl.classList.add('d-none');
@@ -439,6 +526,32 @@
     const details = flowErrors.length ? (' ' + flowErrors.join(' | ')) : '';
     validityAlertEl.textContent = base + details;
     validityAlertEl.classList.remove('d-none');
+  }
+
+  function normalizeFactsOverride(raw){
+    if(!raw || typeof raw !== 'object') return null;
+    const arts = Array.isArray(raw.artifacts) ? raw.artifacts : [];
+    const fields = Array.isArray(raw.fields) ? raw.fields : [];
+    const outArts = arts.map(x => String(x ?? '').trim()).filter(Boolean);
+    const outFields = fields.map(x => String(x ?? '').trim()).filter(Boolean);
+    if(!outArts.length && !outFields.length) return null;
+    return { artifacts: outArts, fields: outFields };
+  }
+
+  function factsToText(list){
+    return (Array.isArray(list) ? list : []).map(x => String(x ?? '').trim()).filter(Boolean).join('\n');
+  }
+
+  function parseFactsText(text){
+    const out = [];
+    try {
+      String(text || '').split(/\r?\n/).forEach((line)=>{
+        const s = String(line || '').trim();
+        if(!s) return;
+        out.push(s);
+      });
+    } catch(e) {}
+    return out;
   }
 
   async function refreshXmlDockPreview({ force = false } = {}){
@@ -657,13 +770,14 @@
     // Keep in sync with server-side synthesized Flow inputs (see _flow_default_generator_config).
     const synthesizedFields = ['seed','secret','env_name','challenge','flag_prefix','username_prefix','key_len','node_name'];
     const synthesizedSet = new Set(synthesizedFields);
+    const sequencerArtifacts = ['Knowledge(ip)'];
     const haveEffective = new Set(synthesizedFields);
     // Track origin so UI can show "Provided by Chain" vs "Provided by Sequencer".
     const haveArtifactsChain = new Set();
-    const haveArtifactsSequencer = new Set();
+    const haveArtifactsSequencer = new Set(sequencerArtifacts);
     const haveFieldsChain = new Set();
     const haveFieldsSequencer = new Set(synthesizedFields);
-    const haveArtifacts = new Set();
+    const haveArtifacts = new Set(sequencerArtifacts);
     const haveFields = new Set(synthesizedFields);
     if(!Array.isArray(assignments)) return out;
     for(let i=0;i<assignments.length;i++){
@@ -742,6 +856,15 @@
     const wrap = document.getElementById('flowChainList');
     if(!wrap) return;
     wrap.innerHTML = '';
+    try{
+      const maxLen = Array.isArray(currentChain) ? currentChain.length : 0;
+      Array.from(heldChainIndices || []).forEach((idx)=>{
+        const n = Number(idx);
+        if(!Number.isFinite(n) || n < 0 || n >= maxLen){
+          try { heldChainIndices.delete(idx); } catch(e) {}
+        }
+      });
+    } catch(e) {}
     if(!Array.isArray(currentChain) || currentChain.length === 0){
       const empty = document.createElement('div');
       empty.className = 'text-muted small';
@@ -754,6 +877,8 @@
     const idFirstIdx = {};
     const genCounts = {};
     const genFirstIdx = {};
+    let chainFeas = [];
+    try { chainFeas = chainFeasibility(currentFlagAssignments) || []; } catch(e) { chainFeas = []; }
     try{
       currentChain.forEach((n, idx) => {
         const id = (n && n.id) ? String(n.id).trim() : '';
@@ -769,6 +894,429 @@
         if(!gid) return;
         genCounts[gid] = (genCounts[gid] || 0) + 1;
         if(genFirstIdx[gid] === undefined) genFirstIdx[gid] = idx;
+      });
+    } catch(e) {}
+
+    function normalizeFactList(list){
+      const out = [];
+      try {
+        (Array.isArray(list) ? list : []).forEach((x)=>{
+          const s = String(x ?? '').trim();
+          if(!s) return;
+          if(out.includes(s)) return;
+          out.push(s);
+        });
+      } catch(e) {}
+      return out;
+    }
+
+    function _resolveNodeIpsForChain(){
+      const nameToIp = new Map();
+      try{
+        (Array.isArray(currentChain) ? currentChain : []).forEach((node, idx) => {
+          const name = (node && node.name) ? String(node.name) : '';
+          if(!name || nameToIp.has(name)) return;
+          const ips = [];
+          const pushIps = (val) => {
+            if(!val) return;
+            if(Array.isArray(val)){
+              val.forEach(v => pushIps(v));
+              return;
+            }
+            const s = String(val || '').trim();
+            if(!s) return;
+            s.split(',').forEach(part => {
+              const p = String(part || '').trim();
+              if(p) ips.push(p);
+            });
+          };
+          try{
+            pushIps(node && (node.ip4 || node.ipv4 || node.ip || node.address));
+            pushIps(node && node.ips);
+            pushIps(node && node.addresses);
+            pushIps(node && node.ipv4s);
+            const ifaces = node && Array.isArray(node.interfaces) ? node.interfaces : [];
+            ifaces.forEach(iface => {
+              if(!iface || typeof iface !== 'object') return;
+              pushIps(iface.ip4 || iface.ipv4 || iface.ip || iface.address);
+            });
+          } catch(e) {}
+          try{
+            const fa0 = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
+            const ri = fa0 && fa0.resolved_inputs ? fa0.resolved_inputs : null;
+            if(ri && typeof ri === 'object'){
+              pushIps(ri['Knowledge(ip)'] || ri['host_ip'] || ri['target_ip'] || ri['ip4'] || ri['ipv4']);
+            }
+          } catch(e) {}
+          const uniq = Array.from(new Set(ips)).filter(Boolean);
+          const ipText = uniq.length ? uniq.join(', ') : '';
+          if(ipText) nameToIp.set(name, ipText);
+        });
+      } catch(e) {}
+      return nameToIp;
+    }
+
+    function _applyHintNodeIps(text, nameToIp){
+      const t = String(text || '');
+      if(!t) return t;
+      if(!(nameToIp && nameToIp.size)) return t;
+      let out = t;
+      const entries = Array.from(nameToIp.entries())
+        .filter(([name, ip]) => name && ip)
+        .sort((a, b) => b[0].length - a[0].length);
+      entries.forEach(([name, ip]) => {
+        if(!name || !ip) return;
+        const needle = String(name);
+        if(!out.includes(needle)) return;
+        if(out.includes(needle + ' @')) return;
+        out = out.split(needle).join(needle + ' @ ' + ip);
+      });
+      return out;
+    }
+
+    function renderFactSummaryRow(opts){
+      const o = (opts && typeof opts === 'object') ? opts : {};
+      const label = String(o.label || '').trim() || 'Facts';
+      const artifacts = normalizeFactList(o.artifacts);
+      const fields = normalizeFactList(o.fields);
+      const hints = normalizeFactList(o.hints);
+      const holdKey = String(o.holdKey || '').trim();
+      const canOverride = typeof o.onValueOverride === 'function';
+
+      const item = document.createElement('div');
+      item.className = 'list-group-item';
+      item.style.cursor = 'default';
+      item.style.display = 'grid';
+      item.style.gridTemplateColumns = '84px 1fr 76px';
+      item.style.columnGap = '.5rem';
+      item.style.alignItems = 'start';
+
+      const seq = document.createElement('div');
+      seq.className = 'text-muted small fw-semibold';
+      seq.style.width = '84px';
+      seq.style.whiteSpace = 'nowrap';
+      seq.style.borderRight = '1px solid var(--bs-border-color, #dee2e6)';
+      seq.style.paddingRight = '.5rem';
+      seq.textContent = String(o.seq || '').trim() || '—';
+
+      const left = document.createElement('div');
+      left.className = 'd-flex flex-column';
+      left.style.minWidth = '0';
+      left.style.justifySelf = 'stretch';
+
+      const titleRow = document.createElement('div');
+      titleRow.className = 'd-flex align-items-center gap-2';
+      const title = document.createElement('div');
+      title.className = 'fw-semibold';
+      title.textContent = label;
+      titleRow.appendChild(title);
+      if(canOverride || holdKey){
+        const btnGroup = document.createElement('div');
+        btnGroup.className = 'btn-group btn-group-sm ms-auto';
+        if(canOverride){
+          const ovBtn = document.createElement('button');
+          ovBtn.type = 'button';
+          ovBtn.className = 'btn btn-outline-secondary';
+          ovBtn.textContent = 'Value Override';
+          ovBtn.addEventListener('click', (ev)=>{
+            try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
+            try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
+            try { o.onValueOverride(); } catch(e) {}
+          });
+          btnGroup.appendChild(ovBtn);
+        }
+        if(holdKey){
+          const holdBtn = document.createElement('button');
+          holdBtn.type = 'button';
+          const held = heldFactRows && heldFactRows.has(holdKey);
+          holdBtn.className = held ? 'btn btn-warning' : 'btn btn-outline-warning';
+          holdBtn.textContent = 'Hold';
+          holdBtn.title = held ? 'Facts held' : 'Hold facts';
+          holdBtn.addEventListener('click', (ev)=>{
+            try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
+            try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
+            try {
+              if(heldFactRows && heldFactRows.has(holdKey)) heldFactRows.delete(holdKey);
+              else heldFactRows.add(holdKey);
+            } catch(e) {}
+            renderChainEditor();
+          });
+          btnGroup.appendChild(holdBtn);
+        }
+        titleRow.appendChild(btnGroup);
+      }
+      left.appendChild(titleRow);
+
+      const details = document.createElement('div');
+      details.className = 'mt-1';
+      const tbl = document.createElement('table');
+      tbl.className = 'table table-sm table-borderless mb-0 small';
+      const tbody = document.createElement('tbody');
+
+      function addRow(labelText, valueElOrText){
+        const tr = document.createElement('tr');
+        const labelClean = String(labelText || '').trim();
+        if(labelClean){
+          const tdL = document.createElement('td');
+          tdL.className = 'text-muted';
+          tdL.style.whiteSpace = 'nowrap';
+          tdL.style.width = '1%';
+          tdL.textContent = labelClean + ':';
+          tr.appendChild(tdL);
+        }
+        const tdV = document.createElement('td');
+        if(!labelClean){
+          tdV.style.padding = '0';
+          tdV.style.margin = '0';
+        }
+        if(valueElOrText && typeof valueElOrText === 'object' && valueElOrText.nodeType){
+          tdV.appendChild(valueElOrText);
+        } else {
+          tdV.textContent = String(valueElOrText || '-') || '-';
+        }
+        tr.appendChild(tdV);
+        tbody.appendChild(tr);
+      }
+
+      const outputsRaw = Array.isArray(o.outputs) ? o.outputs : null;
+      const inputsRaw = Array.isArray(o.inputs) ? o.inputs : null;
+      const inputsShowMissing = !!o.inputsShowMissing;
+      const hideArtifactsFields = !!o.hideArtifactsFields;
+      function renderResolvedInline(val){
+        let resolvedText = '';
+        try{
+          if(Array.isArray(val)){
+            resolvedText = val.map(x => (x === null || x === undefined) ? '' : String(x)).filter(Boolean).join(', ');
+          } else if(val && typeof val === 'object'){
+            resolvedText = JSON.stringify(val);
+          } else if(val !== undefined && val !== null) {
+            resolvedText = String(val);
+          }
+        } catch(e) { resolvedText = ''; }
+        if(!resolvedText) return document.createTextNode('-');
+        const vcode = document.createElement('code');
+        vcode.className = 'font-monospace';
+        vcode.textContent = resolvedText;
+        return vcode;
+      }
+
+      if(hints.length > 1){
+        const wrap = document.createElement('div');
+        const ul = document.createElement('ol');
+        ul.className = 'mb-0 ps-3';
+        hints.forEach((ht) => {
+          const li = document.createElement('li');
+          li.textContent = ht;
+          ul.appendChild(li);
+        });
+        wrap.appendChild(ul);
+        addRow('Hints', wrap);
+      } else if(hints.length === 1){
+        addRow('Hint', hints[0]);
+      }
+
+      if(inputsRaw){
+        const inTbl = document.createElement('table');
+        inTbl.className = 'table table-sm mb-0';
+        inTbl.style.marginLeft = '0';
+        inTbl.style.marginRight = '0';
+        inTbl.style.width = '100%';
+        inTbl.style.paddingLeft = '0';
+        const thead = document.createElement('thead');
+        thead.innerHTML = inputsShowMissing
+          ? '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th><th style="width: 1%; white-space: nowrap;">Missing</th></tr>'
+          : '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th></tr>';
+        inTbl.appendChild(thead);
+        try{
+          const firstTh = thead.querySelector('th');
+          if(firstTh) firstTh.style.paddingLeft = '0';
+        } catch(e) {}
+        const tbodyIn = document.createElement('tbody');
+        inputsRaw.forEach((row)=>{
+          if(!row || !row.name) return;
+          const tr = document.createElement('tr');
+          const tdVar = document.createElement('td');
+          tdVar.style.paddingLeft = '0';
+          const code = document.createElement('code');
+          code.className = 'font-monospace';
+          code.textContent = String(row.name || '-');
+          tdVar.appendChild(code);
+
+          const tdRes = document.createElement('td');
+          tdRes.className = 'small';
+          tdRes.appendChild(renderResolvedInline(row.resolved));
+
+          const tdFromChain = document.createElement('td');
+          const cbWrap1 = document.createElement('div');
+          cbWrap1.className = 'form-check mb-0';
+          const cb1 = document.createElement('input');
+          cb1.type = 'checkbox';
+          cb1.className = 'form-check-input';
+          cb1.disabled = true;
+          cb1.checked = !!row.fromChain;
+          cbWrap1.appendChild(cb1);
+          tdFromChain.appendChild(cbWrap1);
+
+          const tdFromSeq = document.createElement('td');
+          const cbWrap2 = document.createElement('div');
+          cbWrap2.className = 'form-check mb-0';
+          const cb2 = document.createElement('input');
+          cb2.type = 'checkbox';
+          cb2.className = 'form-check-input';
+          cb2.disabled = true;
+          cb2.checked = !!row.fromSeq;
+          cbWrap2.appendChild(cb2);
+          tdFromSeq.appendChild(cbWrap2);
+
+          tr.appendChild(tdVar);
+          tr.appendChild(tdRes);
+          tr.appendChild(tdFromChain);
+          tr.appendChild(tdFromSeq);
+
+          if(inputsShowMissing){
+            const tdMiss = document.createElement('td');
+            if(row.missing) tdMiss.classList.add('text-danger');
+            const cbWrap3 = document.createElement('div');
+            cbWrap3.className = 'form-check mb-0';
+            const cb3 = document.createElement('input');
+            cb3.type = 'checkbox';
+            cb3.className = 'form-check-input';
+            cb3.disabled = true;
+            cb3.checked = !!row.missing;
+            cbWrap3.appendChild(cb3);
+            tdMiss.appendChild(cbWrap3);
+            tr.appendChild(tdMiss);
+          }
+
+          tbodyIn.appendChild(tr);
+        });
+        inTbl.appendChild(tbodyIn);
+        addRow('', inTbl);
+      }
+
+      if(outputsRaw){
+        const outputs = [];
+        const seen = new Set();
+        outputsRaw.forEach((entry)=>{
+          if(entry && typeof entry === 'object' && !Array.isArray(entry)){
+            const name = String(entry.name || '').trim();
+            if(!name || seen.has(name)) return;
+            seen.add(name);
+            outputs.push({
+              name,
+              resolved: entry.resolved,
+              toChain: (entry.toChain !== undefined) ? !!entry.toChain : true,
+            });
+            return;
+          }
+          const name = String(entry || '').trim();
+          if(!name || seen.has(name)) return;
+          seen.add(name);
+          outputs.push({ name, resolved: undefined, toChain: true });
+        });
+
+        const outTbl = document.createElement('table');
+        outTbl.className = 'table table-sm mb-0';
+        outTbl.style.marginLeft = '0';
+        outTbl.style.marginRight = '0';
+        outTbl.style.width = '100%';
+        outTbl.style.paddingLeft = '0';
+        const thead = document.createElement('thead');
+        thead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">To Chain</th></tr>';
+        outTbl.appendChild(thead);
+        try{
+          const firstTh = thead.querySelector('th');
+          if(firstTh) firstTh.style.paddingLeft = '0';
+        } catch(e) {}
+        const tbodyOut = document.createElement('tbody');
+        outputs.forEach((row)=>{
+          const tr = document.createElement('tr');
+          const tdVar = document.createElement('td');
+          tdVar.style.paddingLeft = '0';
+          const code = document.createElement('code');
+          code.className = 'font-monospace';
+          code.textContent = String(row.name || '-');
+          tdVar.appendChild(code);
+
+          const tdRes = document.createElement('td');
+          tdRes.className = 'small';
+          tdRes.appendChild(renderResolvedInline(row.resolved));
+
+          const tdToChain = document.createElement('td');
+          const cbWrap = document.createElement('div');
+          cbWrap.className = 'form-check mb-0';
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.className = 'form-check-input';
+          cb.disabled = true;
+          cb.checked = !!row.toChain;
+          cbWrap.appendChild(cb);
+          tdToChain.appendChild(cbWrap);
+
+          tr.appendChild(tdVar);
+          tr.appendChild(tdRes);
+          tr.appendChild(tdToChain);
+          tbodyOut.appendChild(tr);
+        });
+        outTbl.appendChild(tbodyOut);
+        addRow('', outTbl);
+      }
+      if(!hideArtifactsFields){
+        addRow('Artifacts', artifacts.length ? artifacts.join(', ') : '-');
+        addRow('Fields', fields.length ? fields.join(', ') : '-');
+      }
+
+      tbl.appendChild(tbody);
+      details.appendChild(tbl);
+      left.appendChild(details);
+
+      const right = document.createElement('div');
+      right.className = 'btn-group btn-group-sm';
+      right.style.justifySelf = 'end';
+
+      item.appendChild(seq);
+      item.appendChild(left);
+      item.appendChild(right);
+      wrap.appendChild(item);
+    }
+
+    const _hintNodeIpMap = _resolveNodeIpsForChain();
+
+    try {
+      const firstStep = (chainFeas && chainFeas.length) ? chainFeas[0] : null;
+      const initArtifacts = firstStep && Array.isArray(firstStep.missing_artifacts) ? firstStep.missing_artifacts : [];
+      const initFields = firstStep && Array.isArray(firstStep.missing_fields) ? firstStep.missing_fields : [];
+      const initOverride = normalizeFactsOverride(flowInitialFactsOverride);
+      let initHints = [];
+      let initOutputs = [];
+      try{
+        const faFirst = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[0]) ? currentFlagAssignments[0] : null;
+        const hlist = (faFirst && Array.isArray(faFirst.hints) && faFirst.hints.length) ? faFirst.hints : [];
+        const h1 = (faFirst && typeof faFirst.hint === 'string') ? String(faFirst.hint).trim() : '';
+        initHints = hlist.length ? hlist : (h1 ? [h1] : []);
+        initHints = initHints.map(h => _applyHintNodeIps(h, _hintNodeIpMap));
+        const ri = (faFirst && typeof faFirst.resolved_inputs === 'object' && faFirst.resolved_inputs && !Array.isArray(faFirst.resolved_inputs))
+          ? faFirst.resolved_inputs
+          : null;
+        if(ri){
+          const keys = Object.keys(ri).sort((a, b) => String(a).localeCompare(String(b)));
+          initOutputs = keys.map((k)=>({
+            name: String(k || '').trim(),
+            resolved: ri[k],
+            toChain: true,
+          })).filter(x => x && x.name);
+        }
+      } catch(e) { initHints = []; }
+      renderFactSummaryRow({
+        seq: 'Init',
+        label: 'Initial Facts',
+        outputs: initOutputs,
+        artifacts: initOverride ? initOverride.artifacts : initArtifacts,
+        fields: initOverride ? initOverride.fields : initFields,
+        hideArtifactsFields: true,
+        hints: initHints,
+        onValueOverride: () => openFactsDialog('initial'),
+        holdKey: 'initial',
       });
     } catch(e) {}
 
@@ -820,7 +1368,83 @@
       titleRow.className = 'd-flex align-items-center gap-2';
       const title = document.createElement('div');
       title.className = 'fw-semibold';
-      title.textContent = (node && node.name) ? String(node.name) : ('Node ' + (idx+1));
+      const baseName = (node && node.name) ? String(node.name) : ('Node ' + (idx+1));
+      let ipText = '';
+      try{
+        const ips = [];
+        const pushIps = (val) => {
+          if(!val) return;
+          if(Array.isArray(val)){
+            val.forEach(v => pushIps(v));
+            return;
+          }
+          const s = String(val || '').trim();
+          if(!s) return;
+          s.split(',').forEach(part => {
+            const p = String(part || '').trim();
+            if(p) ips.push(p);
+          });
+        };
+        pushIps(node && (node.ip4 || node.ipv4 || node.ip || node.address));
+        pushIps(node && node.ips);
+        pushIps(node && node.addresses);
+        pushIps(node && node.ipv4s);
+        try{
+          const ifaces = node && Array.isArray(node.interfaces) ? node.interfaces : [];
+          ifaces.forEach(iface => {
+            if(!iface || typeof iface !== 'object') return;
+            pushIps(iface.ip4 || iface.ipv4 || iface.ip || iface.address);
+          });
+        } catch(e) {}
+        try{
+          const fa0 = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
+          const ri = fa0 && fa0.resolved_inputs ? fa0.resolved_inputs : null;
+          if(ri && typeof ri === 'object'){
+            pushIps(ri['Knowledge(ip)'] || ri['host_ip'] || ri['target_ip'] || ri['ip4'] || ri['ipv4']);
+          }
+        } catch(e) {}
+        const uniq = Array.from(new Set(ips));
+        if(uniq.length){
+          ipText = uniq.join(', ');
+        } else {
+          ipText = 'unknown';
+        }
+      } catch(e) {}
+      let titleSuffix = '';
+      try{
+        const fa1 = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
+        let vulns = fa1 && Array.isArray(fa1.vulnerabilities) ? fa1.vulnerabilities.map(String).filter(Boolean) : [];
+        if(!vulns.length){
+          try{
+            const nodeV = node && Array.isArray(node.vulnerabilities) ? node.vulnerabilities : [];
+            vulns = nodeV.map(String).filter(Boolean);
+          } catch(e) {}
+        }
+        const isVulnNode = vulns.length > 0;
+        if(isVulnNode){
+          titleSuffix = ' - ' + vulns.join(', ');
+        } else {
+          let osLabel = '';
+          try{
+            const composeName = node && node.compose_name ? String(node.compose_name) : '';
+            const composePath = node && node.compose ? String(node.compose) : '';
+            const hay = (composeName + ' ' + composePath).toLowerCase();
+            if(hay.includes('ubuntu-22') || hay.includes('ubuntu22') || hay.includes('ubuntu-2204') || hay.includes('ubuntu_22')){
+              osLabel = 'Ubuntu 22';
+            } else if(hay.includes('ubuntu-20') || hay.includes('ubuntu20') || hay.includes('ubuntu-2004') || hay.includes('ubuntu_20')){
+              osLabel = 'Ubuntu 20';
+            } else if(hay.includes('ubuntu')){
+              osLabel = 'Ubuntu';
+            } else if(hay.includes('debian')){
+              osLabel = 'Debian';
+            } else if(hay.includes('alpine')){
+              osLabel = 'Alpine';
+            }
+          } catch(e) {}
+          titleSuffix = osLabel ? (' - Docker Node (' + osLabel + ')') : ' - Docker Node';
+        }
+      } catch(e) {}
+      title.textContent = ipText ? (baseName + ' @ ' + ipText + titleSuffix) : (baseName + titleSuffix);
       titleRow.appendChild(title);
       if(isDupNode){
         const badge = document.createElement('span');
@@ -858,7 +1482,7 @@
         const subBtn = document.createElement('button');
         subBtn.type = 'button';
         subBtn.className = 'btn btn-outline-primary';
-        subBtn.textContent = 'Edit';
+        subBtn.textContent = 'Change Node';
         subBtn.addEventListener('click', (ev)=>{
           try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
           try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
@@ -866,8 +1490,29 @@
           try { openSubstituteDialog(idx); } catch(e) {}
         });
 
-        btnGroup.appendChild(inputsBtn);
+        const holdBtn = document.createElement('button');
+        holdBtn.type = 'button';
+        holdBtn.className = (heldChainIndices && heldChainIndices.has(idx)) ? 'btn btn-warning' : 'btn btn-outline-warning';
+        holdBtn.textContent = 'Hold';
+        holdBtn.title = (heldChainIndices && heldChainIndices.has(idx))
+          ? 'Node held (generator changes will not change this chain position)'
+          : 'Hold node (generator changes will not change this chain position)';
+        holdBtn.addEventListener('click', (ev)=>{
+          try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
+          try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
+          try {
+            if(heldChainIndices && heldChainIndices.has(idx)){
+              heldChainIndices.delete(idx);
+            } else {
+              heldChainIndices.add(idx);
+            }
+          } catch(e) {}
+          renderChainEditor();
+        });
+
         btnGroup.appendChild(subBtn);
+        btnGroup.appendChild(inputsBtn);
+        btnGroup.appendChild(holdBtn);
         titleRow.appendChild(btnGroup);
       } catch(e) {}
       left.appendChild(titleRow);
@@ -964,11 +1609,12 @@
       const hintList = (fa && Array.isArray(fa.hints) && fa.hints.length)
         ? fa.hints.map(x => String(x || '').trim()).filter(Boolean)
         : [];
+      const hintListWithIp = hintList.map(h => _applyHintNodeIps(h, _hintNodeIpMap));
       if(hintList.length > 1){
         const wrap = document.createElement('div');
         const ul = document.createElement('ol');
         ul.className = 'mb-0 ps-3';
-        hintList.forEach((ht) => {
+        hintListWithIp.forEach((ht) => {
           const li = document.createElement('li');
           li.textContent = ht;
           ul.appendChild(li);
@@ -976,7 +1622,8 @@
         wrap.appendChild(ul);
         addRow('Hints', wrap);
       } else {
-        const hintText = hintList.length ? hintList[0] : (fa && fa.hint ? String(fa.hint) : '');
+        const hintTextRaw = hintList.length ? hintList[0] : (fa && fa.hint ? String(fa.hint) : '');
+        const hintText = _applyHintNodeIps(hintTextRaw, _hintNodeIpMap);
         addRow('Hint', hintText || '-');
       }
 
@@ -1226,10 +1873,10 @@
             const thead = document.createElement('thead');
             if(isInputs){
               thead.innerHTML = showMissingCol
-                ? '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th style="width: 1%; white-space: nowrap;">Type</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th><th style="width: 1%; white-space: nowrap;">Missing</th></tr>'
-                : '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th style="width: 1%; white-space: nowrap;">Type</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th></tr>';
+                ? '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th><th style="width: 1%; white-space: nowrap;">Missing</th></tr>'
+                : '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">From Chain</th><th style="width: 1%; white-space: nowrap;">From Sequencer</th></tr>';
             } else {
-              thead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th style="width: 1%; white-space: nowrap;">Type</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">To Chain</th></tr>';
+              thead.innerHTML = '<tr class="text-secondary"><th style="width: 1%; white-space: nowrap;">Variable</th><th>Resolved</th><th style="width: 1%; white-space: nowrap;">To Chain</th></tr>';
             }
             tbl.appendChild(thead);
 
@@ -1241,21 +1888,11 @@
               const tdVar = document.createElement('td');
               tdVar.appendChild(renderVarName(v.name, v.required));
 
-              const tdType = document.createElement('td');
-              tdType.className = 'text-muted';
-              tdType.style.whiteSpace = 'nowrap';
-              tdType.textContent = v.kind;
-
               const tdRes = document.createElement('td');
               tdRes.className = 'small';
-              if(v.kind === 'Field'){
-                tdRes.appendChild(renderResolvedValueForKey(isInputs ? resolvedInputs : resolvedOutputs, v.name));
-              } else {
-                tdRes.textContent = '-';
-              }
+              tdRes.appendChild(renderResolvedValueForKey(isInputs ? resolvedInputs : resolvedOutputs, v.name));
 
               tr.appendChild(tdVar);
-              tr.appendChild(tdType);
               tr.appendChild(tdRes);
 
               if(isInputs){
@@ -1349,6 +1986,7 @@
               const reqOutArtifactSet = new Set(outArtifactsReq);
               const reqOutFieldSet = new Set(outFieldsReq);
               const rows = [];
+              const outArtifactSet = new Set(outArtifacts.map(String).filter(Boolean).map(s => String(s).trim()).filter(Boolean));
               outArtifacts.map(String).filter(Boolean).sort().forEach((name) => {
                 const n = String(name || '').trim();
                 if(!n) return;
@@ -1370,6 +2008,7 @@
               Array.from(outFieldNameSet).sort().forEach((name) => {
                 const n = String(name || '').trim();
                 if(!n) return;
+                if(outArtifactSet.has(n)) return;
                 rows.push({
                   name: n,
                   kind: 'Field',
@@ -1674,6 +2313,91 @@
       item.appendChild(right);
       wrap.appendChild(item);
     });
+
+    try {
+      const lastIdx = Math.max(0, (Array.isArray(currentFlagAssignments) ? currentFlagAssignments.length : 0) - 1);
+      const faLast = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[lastIdx]) ? currentFlagAssignments[lastIdx] : null;
+      const goalArtifacts = faLast && Array.isArray(faLast.produces) ? faLast.produces : [];
+      const goalFields = faLast && Array.isArray(faLast.output_fields) ? faLast.output_fields : [];
+      const goalOverride = normalizeFactsOverride(flowGoalFactsOverride);
+      let goalHints = [];
+      let goalInputs = [];
+      try{
+        const hlist = (faLast && Array.isArray(faLast.hints) && faLast.hints.length) ? faLast.hints : [];
+        const h1 = (faLast && typeof faLast.hint === 'string') ? String(faLast.hint).trim() : '';
+        goalHints = hlist.length ? hlist : (h1 ? [h1] : []);
+        goalHints = goalHints.map(h => _applyHintNodeIps(h, _hintNodeIpMap));
+        const ri = (faLast && typeof faLast.resolved_inputs === 'object' && faLast.resolved_inputs && !Array.isArray(faLast.resolved_inputs))
+          ? faLast.resolved_inputs
+          : null;
+        const stepGoal = (chainFeas && chainFeas[lastIdx]) ? chainFeas[lastIdx] : null;
+        const reqArtifacts = (faLast && Array.isArray(faLast.requires)) ? faLast.requires.map(String).filter(Boolean) : [];
+        const inReq = (faLast && Array.isArray(faLast.input_fields_required)) ? faLast.input_fields_required.map(String).filter(Boolean) : [];
+        const inOpt = (faLast && Array.isArray(faLast.input_fields_optional)) ? faLast.input_fields_optional.map(String).filter(Boolean) : [];
+        const inAll = (faLast && Array.isArray(faLast.input_fields)) ? faLast.input_fields.map(String).filter(Boolean) : [];
+        const defFields = (inReq.length || inOpt.length) ? inReq.concat(inOpt) : inAll;
+        const providedArtifactsChain = (stepGoal && Array.isArray(stepGoal.providing_artifacts_chain)) ? stepGoal.providing_artifacts_chain.map(String).filter(Boolean) : [];
+        const providedArtifactsSeq = (stepGoal && Array.isArray(stepGoal.providing_artifacts_sequencer)) ? stepGoal.providing_artifacts_sequencer.map(String).filter(Boolean) : [];
+        const missingArtifacts = (stepGoal && Array.isArray(stepGoal.missing_artifacts)) ? stepGoal.missing_artifacts.map(String).filter(Boolean) : [];
+        const providedFieldsChain = (stepGoal && Array.isArray(stepGoal.providing_fields_chain)) ? stepGoal.providing_fields_chain.map(String).filter(Boolean) : [];
+        const providedFieldsSeq = (stepGoal && Array.isArray(stepGoal.providing_fields_sequencer)) ? stepGoal.providing_fields_sequencer.map(String).filter(Boolean) : [];
+        const missingFields = (stepGoal && Array.isArray(stepGoal.missing_fields)) ? stepGoal.missing_fields.map(String).filter(Boolean) : [];
+
+        const rows = [];
+        const reqArtifactSet = new Set(reqArtifacts);
+        const provArtChainSet = new Set(providedArtifactsChain);
+        const provArtSeqSet = new Set(providedArtifactsSeq);
+        const missArtSet = new Set(missingArtifacts);
+        reqArtifacts.map(String).filter(Boolean).sort().forEach((name)=>{
+          const n = String(name || '').trim();
+          if(!n) return;
+          rows.push({
+            name: n,
+            resolved: ri ? ri[n] : undefined,
+            fromChain: provArtChainSet.has(n),
+            fromSeq: provArtSeqSet.has(n),
+            missing: missArtSet.has(n),
+            required: reqArtifactSet.has(n),
+          });
+        });
+
+        const fieldNameSet = new Set(defFields.map(String).filter(Boolean));
+        try{
+          if((!fieldNameSet.size) && ri && typeof ri === 'object' && !Array.isArray(ri)){
+            Object.keys(ri).forEach(k => { if(String(k || '').trim()) fieldNameSet.add(String(k).trim()); });
+          }
+        } catch(e) {}
+        const reqFieldSet = new Set(inReq.map(String).filter(Boolean));
+        const provFldChainSet = new Set(providedFieldsChain);
+        const provFldSeqSet = new Set(providedFieldsSeq);
+        const missFldSet = new Set(missingFields);
+        Array.from(fieldNameSet).sort().forEach((name)=>{
+          const n = String(name || '').trim();
+          if(!n) return;
+          rows.push({
+            name: n,
+            resolved: ri ? ri[n] : undefined,
+            fromChain: provFldChainSet.has(n),
+            fromSeq: provFldSeqSet.has(n),
+            missing: missFldSet.has(n),
+            required: reqFieldSet.has(n),
+          });
+        });
+        goalInputs = rows;
+      } catch(e) { goalHints = []; }
+      renderFactSummaryRow({
+        seq: 'Goal',
+        label: 'Goal Facts',
+        inputs: goalInputs,
+        inputsShowMissing: goalInputs.some(r => r && r.missing),
+        artifacts: goalOverride ? goalOverride.artifacts : goalArtifacts,
+        fields: goalOverride ? goalOverride.fields : goalFields,
+        hideArtifactsFields: true,
+        hints: goalHints,
+        onValueOverride: () => openFactsDialog('goal'),
+        holdKey: 'goal',
+      });
+    } catch(e) {}
   }
 
   function openNodeDetailsDialog(idx, opts){
@@ -2156,6 +2880,29 @@
         return renderResolvedCell(obj, [k], { maxItems: 1, maxLen: 72, maxDetailItems: 25 });
       }
 
+      function placeholderFromResolved(resolvedKv, key, opts){
+        const options = (opts && typeof opts === 'object') ? opts : {};
+        const maxLen = Number.isFinite(+options.maxLen) ? (+options.maxLen) : 80;
+        const k = String(key || '').trim();
+        if(!k || !resolvedKv || typeof resolvedKv !== 'object' || Array.isArray(resolvedKv)) return '';
+        if(!(k in resolvedKv)) return '';
+        let v = resolvedKv[k];
+        if(v === undefined || v === null) return '';
+        if(Array.isArray(v)){
+          if(!v.length) return '';
+          v = v[0];
+        }
+        let s = '';
+        if(typeof v === 'string') s = v;
+        else {
+          try { s = JSON.stringify(v); } catch(e) { s = String(v); }
+        }
+        s = String(s || '').trim();
+        if(!s) return '';
+        if(s.length > maxLen) s = s.slice(0, Math.max(0, maxLen - 1)) + '…';
+        return s;
+      }
+
       // For outputs, show what is *required by downstream steps* (subset of this step's defined outputs).
       const synthesizedFields = ['seed','secret','env_name','challenge','flag_prefix','username_prefix','key_len','node_name'];
       const synthesizedSet = new Set(synthesizedFields);
@@ -2225,7 +2972,8 @@
             const inp = document.createElement('input');
             inp.type = 'text';
             inp.className = 'form-control form-control-sm font-monospace';
-            inp.placeholder = 'JSON or string';
+            const ph = placeholderFromResolved(isInputs ? resolvedInputs : resolvedOutputs, v.name);
+            if(ph) inp.placeholder = ph;
 
             // Inputs can be typed; outputs remain free-form.
             let inputType = 'string';
@@ -2299,7 +3047,8 @@
                 const txt = document.createElement('input');
                 txt.type = 'text';
                 txt.className = 'form-control form-control-sm font-monospace';
-                txt.placeholder = wantsFileListUi ? 'Choose a file…' : 'Value';
+                const rowPh = placeholderFromResolved(resolvedInputs, v.name);
+                if(rowPh) txt.placeholder = rowPh;
                 txt.value = String(initial || '');
                 txt.addEventListener('input', ()=>{ inputOverridesTouched = true; syncHidden(); });
 
@@ -2578,12 +3327,12 @@
 
         const injHelp = document.createElement('div');
         injHelp.className = 'small text-muted';
-        injHelp.textContent = 'Override the list of files the generator may inject. Variable can be a path or an output key (e.g., filesystem.file). Optionally set a destination directory; default is /tmp.';
+        injHelp.textContent = 'Override the list of files the generator may inject. Variable can be a path or an output key (e.g., File(path)). Optionally set a destination directory; default is /tmp.';
         injWrap.appendChild(injHelp);
 
         const injHelp2 = document.createElement('div');
         injHelp2.className = 'small text-muted';
-        injHelp2.textContent = 'Example: variable=filesystem.file, dest=/opt/bin (saved as filesystem.file -> /opt/bin).';
+        injHelp2.textContent = 'Example: variable=File(path), dest=/opt/bin (saved as File(path) -> /opt/bin).';
         injWrap.appendChild(injHelp2);
 
         const toggleRow = document.createElement('div');
@@ -2639,7 +3388,10 @@
         }
 
         function getOverrideInjectsFromAssignment(){
-          if(fa && Array.isArray(fa.inject_files_override)) return normalizeInjects(fa.inject_files_override);
+          if(fa && Array.isArray(fa.inject_files_override)){
+            const vals = normalizeInjects(fa.inject_files_override);
+            return vals.length ? vals : null;
+          }
           return null;
         }
 
@@ -2651,19 +3403,23 @@
           stack.className = 'd-flex flex-column gap-2';
 
           const header = document.createElement('div');
-          header.className = 'd-flex gap-2 align-items-center small text-muted';
+          header.className = 'd-grid gap-2 align-items-center small text-muted';
+          header.style.gridTemplateColumns = '1fr 1fr 160px 260px 90px';
           const h1 = document.createElement('div');
-          h1.style.minWidth = '200px';
           h1.textContent = 'Variable';
           const h2 = document.createElement('div');
-          h2.style.minWidth = '140px';
-          h2.textContent = 'Destination dir';
+          h2.textContent = 'Resolved';
           const h3 = document.createElement('div');
-          h3.style.minWidth = '180px';
-          h3.textContent = '';
+          h3.textContent = 'Destination dir';
+          const h4 = document.createElement('div');
+          h4.textContent = '';
+          const h5 = document.createElement('div');
+          h5.textContent = '';
           header.appendChild(h1);
           header.appendChild(h2);
           header.appendChild(h3);
+          header.appendChild(h4);
+          header.appendChild(h5);
           stack.appendChild(header);
 
           const availableInputs = Array.isArray(inAll) ? inAll.map(String).filter(Boolean) : [];
@@ -2674,6 +3430,18 @@
               availableResolvedOutputs = Object.keys(resolvedOutputs || {}).map(String).filter(Boolean);
             }
           } catch(e) { availableResolvedOutputs = []; }
+
+          function resolvedTargetsFor(srcKey){
+            if(!resolvedOutputs || typeof resolvedOutputs !== 'object' || Array.isArray(resolvedOutputs)) return [];
+            const k = String(srcKey || '').trim();
+            if(!k || !(k in resolvedOutputs)) return [];
+            const v = resolvedOutputs[k];
+            if(Array.isArray(v)){
+              return v.map(x => String(x ?? '')).filter(x => x.trim());
+            }
+            if(typeof v === 'string') return [v.trim()].filter(Boolean);
+            return [];
+          }
 
           function buildVarPicker(){
             const sel = document.createElement('select');
@@ -2705,12 +3473,13 @@
           function addRow(value){
             const parsed = splitInjectSpec(value);
             const row = document.createElement('div');
-            row.className = 'd-flex gap-2 align-items-center';
+            row.className = 'd-grid gap-2 align-items-center';
+            row.style.gridTemplateColumns = '1fr 1fr 160px 260px 90px';
 
             const srcInp = document.createElement('input');
             srcInp.type = 'text';
             srcInp.className = 'form-control form-control-sm font-monospace';
-            srcInp.placeholder = 'e.g., hint.txt or filesystem.file';
+            srcInp.placeholder = 'e.g., hint.txt or File(path)';
             {
               const rawSrc = String(parsed.src ?? '');
               if(rawSrc.startsWith('upload:')){
@@ -2724,6 +3493,7 @@
             srcInp.addEventListener('input', ()=>{
               injectsTouched = true;
               try { delete srcInp.dataset.uploadToken; } catch(e) {}
+              try { refreshResolvedHint(); } catch(e) {}
             });
 
             const destInp = document.createElement('input');
@@ -2741,6 +3511,7 @@
               injectsTouched = true;
               try { delete srcInp.dataset.uploadToken; } catch(e) {}
               try { picker.value = ''; } catch(e) {}
+              try { refreshResolvedHint(); } catch(e) {}
             });
 
             const uploadBtn = document.createElement('button');
@@ -2777,6 +3548,7 @@
                 const base = basenameFromPath(String(data.stored_filename || ''));
                 srcInp.value = base ? `artifacts/${base}` : String(data.stored_filename || data.original_filename || '') || 'artifacts/upload';
                 injectsTouched = true;
+                try { refreshResolvedHint(); } catch(e) {}
               } catch(err){
                 alert(String((err && err.message) || err || 'Upload failed'));
               } finally {
@@ -2805,7 +3577,33 @@
             pickWrap.appendChild(uploadBtn);
             pickWrap.appendChild(uploadInput);
 
+            const resolvedHint = document.createElement('div');
+            resolvedHint.className = 'small text-muted';
+            resolvedHint.textContent = '-';
+
+            function refreshResolvedHint(){
+              let key = String((srcInp && srcInp.value) ?? '').trim();
+              try{
+                if(srcInp && srcInp.dataset && srcInp.dataset.uploadToken){
+                  key = String(srcInp.dataset.uploadToken || '').trim() || key;
+                }
+              } catch(e) {}
+              const targets = resolvedTargetsFor(key);
+              if(!targets.length){
+                resolvedHint.textContent = '-';
+                resolvedHint.classList.add('text-muted');
+                return;
+              }
+              const head = targets.slice(0, 3);
+              const more = targets.length > head.length ? ` (+${targets.length - head.length})` : '';
+              resolvedHint.textContent = `${head.join(', ')}${more}`;
+              resolvedHint.classList.remove('text-muted');
+            }
+
+            try { refreshResolvedHint(); } catch(e) {}
+
             row.appendChild(srcInp);
+            row.appendChild(resolvedHint);
             row.appendChild(destInp);
             row.appendChild(pickWrap);
             row.appendChild(del);
@@ -3229,6 +4027,14 @@
         const missing = reqAssignments.find(x => !x.id);
         if(missing) throw new Error('Some chain positions have no generator assignment yet. Try Generate again.');
 
+        const prevResolved = Array.isArray(currentFlagAssignments)
+          ? currentFlagAssignments.map(a => ({
+              resolved_inputs: a && a.resolved_inputs,
+              resolved_outputs: a && a.resolved_outputs,
+              flag_value: a && a.flag_value,
+            }))
+          : [];
+
         showLoading('Saving overrides…');
         const res = await postJson('/api/flag-sequencing/save_flow_substitutions', {
           scenario: activeScenario,
@@ -3236,10 +4042,47 @@
           preview_plan: (lastPreviewPlanPath || lastFlowPlanPath || ''),
           flag_assignments: reqAssignments,
           allow_node_duplicates: !!allowNodeDuplicates,
+          initial_facts: flowInitialFactsOverride,
+          goal_facts: flowGoalFactsOverride,
         }, { timeoutMs: 60000 });
         setFlowValidityFromPayload(res);
         if(res && Array.isArray(res.chain)) currentChain = res.chain.slice();
-        if(res && Array.isArray(res.flag_assignments)) currentFlagAssignments = res.flag_assignments.slice();
+        if(res && Array.isArray(res.flag_assignments)){
+          const next = res.flag_assignments.slice();
+          try{
+            next.forEach((a, idx) => {
+              if(!a || typeof a !== 'object') return;
+              const prev = prevResolved[idx];
+              if(!prev || typeof prev !== 'object') return;
+              if(a.resolved_inputs === undefined && prev.resolved_inputs !== undefined){
+                a.resolved_inputs = prev.resolved_inputs;
+              }
+              if(a.resolved_outputs === undefined && prev.resolved_outputs !== undefined){
+                a.resolved_outputs = prev.resolved_outputs;
+              }
+              if(a.flag_value === undefined && prev.flag_value !== undefined){
+                a.flag_value = prev.flag_value;
+              }
+            });
+          } catch(e) {}
+          try{
+            const idx = i;
+            const cur = next[idx];
+            if(cur && typeof cur === 'object'){
+              if(cur.config_overrides && typeof cur.config_overrides === 'object'){
+                cur.resolved_inputs = Object.assign({}, (cur.resolved_inputs || {}), cur.config_overrides);
+              }
+              if(cur.output_overrides && typeof cur.output_overrides === 'object'){
+                cur.resolved_outputs = Object.assign({}, (cur.resolved_outputs || {}), cur.output_overrides);
+              }
+              if(cur.flag_override && typeof cur.flag_override === 'string' && cur.flag_override.trim()){
+                cur.flag_value = cur.flag_override.trim();
+                cur.resolved_outputs = Object.assign({}, (cur.resolved_outputs || {}), { 'Flag(flag_id)': cur.flag_override.trim() });
+              }
+            }
+          } catch(e) {}
+          currentFlagAssignments = next;
+        }
         if(res && res.flow_plan_path) lastFlowPlanPath = String(res.flow_plan_path);
         updateMeta();
         renderChainEditor();
@@ -3284,6 +4127,9 @@
           await persistOverridesForIndex();
           setLocalStatus('Edits saved.', false);
           try {
+            if(inputsDialogEl && typeof inputsDialogEl.close === 'function') inputsDialogEl.close();
+          } catch(e) {}
+          try {
             const prev = saveBtn.textContent;
             saveBtn.textContent = 'Saved';
             setTimeout(()=>{ try { saveBtn.textContent = prev; } catch(e) {} }, 1200);
@@ -3304,6 +4150,127 @@
 
     try{
       if(typeof inputsDialogEl.showModal === 'function') inputsDialogEl.showModal();
+    } catch(e) {}
+  }
+
+  async function openFactsDialog(kind){
+    if(!factsDialogEl || !factsBodyEl) return;
+    const k = (String(kind || '').toLowerCase() === 'goal') ? 'goal' : 'initial';
+    const title = (k === 'goal') ? 'Goal Facts — Override' : 'Initial Facts — Override';
+    if(factsTitleEl) factsTitleEl.textContent = title;
+    factsBodyEl.innerHTML = '';
+
+    const cur = (k === 'goal') ? flowGoalFactsOverride : flowInitialFactsOverride;
+    const curArts = cur && Array.isArray(cur.artifacts) ? cur.artifacts : [];
+    const curFields = cur && Array.isArray(cur.fields) ? cur.fields : [];
+
+    const wrap = document.createElement('div');
+    wrap.className = 'd-flex flex-column gap-3';
+
+    const help = document.createElement('div');
+    help.className = 'small text-muted';
+    help.textContent = 'Provide one fact per line. Artifacts are fact-style (e.g., Knowledge(ip)). Fields are plain input/output keys.';
+    wrap.appendChild(help);
+
+    const artsLabel = document.createElement('div');
+    artsLabel.className = 'small text-muted';
+    artsLabel.textContent = 'Artifacts';
+    wrap.appendChild(artsLabel);
+
+    const artsInput = document.createElement('textarea');
+    artsInput.className = 'form-control form-control-sm font-monospace';
+    artsInput.rows = 4;
+    artsInput.value = factsToText(curArts);
+    wrap.appendChild(artsInput);
+
+    const fieldsLabel = document.createElement('div');
+    fieldsLabel.className = 'small text-muted';
+    fieldsLabel.textContent = 'Fields';
+    wrap.appendChild(fieldsLabel);
+
+    const fieldsInput = document.createElement('textarea');
+    fieldsInput.className = 'form-control form-control-sm font-monospace';
+    fieldsInput.rows = 4;
+    fieldsInput.value = factsToText(curFields);
+    wrap.appendChild(fieldsInput);
+
+    const actions = document.createElement('div');
+    actions.className = 'd-flex justify-content-end gap-2';
+    const clearBtn = document.createElement('button');
+    clearBtn.type = 'button';
+    clearBtn.className = 'btn btn-sm btn-outline-secondary';
+    clearBtn.textContent = 'Clear override';
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.className = 'btn btn-sm btn-primary';
+    saveBtn.textContent = 'Save';
+    actions.appendChild(clearBtn);
+    actions.appendChild(saveBtn);
+
+    wrap.appendChild(actions);
+    factsBodyEl.appendChild(wrap);
+
+    async function persistFactsOverride(nextOverride){
+      if(k === 'goal') flowGoalFactsOverride = nextOverride;
+      else flowInitialFactsOverride = nextOverride;
+
+      if(!Array.isArray(currentChain) || !currentChain.length) return;
+      const scenario = (scenarioEl && scenarioEl.value || '').trim();
+      if(!scenario) return;
+      const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+      if(!chainIds.length) return;
+
+      const reqAssignments = chainIds.map((nid, j)=>{
+        const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
+        const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
+        const out = { node_id: nid, id: curId };
+        if(curA && typeof curA.config_overrides === 'object' && curA.config_overrides && !Array.isArray(curA.config_overrides)) out.config_overrides = curA.config_overrides;
+        if(curA && typeof curA.output_overrides === 'object' && curA.output_overrides && !Array.isArray(curA.output_overrides)) out.output_overrides = curA.output_overrides;
+        if(curA && Array.isArray(curA.inject_files_override)) out.inject_files_override = curA.inject_files_override;
+        if(curA && Array.isArray(curA.hint_overrides)) out.hint_overrides = curA.hint_overrides;
+        if(curA && typeof curA.flag_override === 'string' && curA.flag_override.trim()) out.flag_override = String(curA.flag_override).trim();
+        return out;
+      });
+
+      showLoading('Saving facts override…');
+      try{
+        const res = await postJson('/api/flag-sequencing/save_flow_substitutions', {
+          scenario: activeScenario,
+          chain_ids: chainIds,
+          preview_plan: (lastPreviewPlanPath || lastFlowPlanPath || ''),
+          flag_assignments: reqAssignments,
+          initial_facts: flowInitialFactsOverride,
+          goal_facts: flowGoalFactsOverride,
+        }, { timeoutMs: 60000 });
+        setFlowValidityFromPayload(res);
+        if(res && Array.isArray(res.chain)) currentChain = res.chain.slice();
+        if(res && Array.isArray(res.flag_assignments)) currentFlagAssignments = res.flag_assignments.slice();
+        if(res && res.flow_plan_path) lastFlowPlanPath = String(res.flow_plan_path);
+        renderChainEditor();
+        try { if(typeof factsDialogEl.close === 'function') factsDialogEl.close(); } catch(e) {}
+      } finally {
+        hideLoading();
+      }
+    }
+
+    clearBtn.addEventListener('click', ()=>{
+      if(k === 'goal') flowGoalFactsOverride = null;
+      else flowInitialFactsOverride = null;
+      artsInput.value = '';
+      fieldsInput.value = '';
+      persistFactsOverride(null);
+    });
+
+    saveBtn.addEventListener('click', ()=>{
+      const next = normalizeFactsOverride({
+        artifacts: parseFactsText(artsInput.value),
+        fields: parseFactsText(fieldsInput.value),
+      });
+      persistFactsOverride(next);
+    });
+
+    try{
+      if(typeof factsDialogEl.showModal === 'function') factsDialogEl.showModal();
     } catch(e) {}
   }
 
@@ -3366,14 +4333,14 @@
     // Substitute generator UI (always expanded).
     try{
       const isVuln = !!(node && (node.is_vuln || node.is_vulnerability || node.isVuln));
-      const currentType = (fa && fa.type) ? String(fa.type) : (isVuln ? 'flag-generator' : 'flag-generator');
+      const currentType = (fa && fa.type) ? String(fa.type) : (isVuln ? 'flag-generator' : 'flag-node-generator');
       const currentSource = (fa && fa.flag_generator) ? String(fa.flag_generator) : '';
 
       const help = document.createElement('div');
       help.className = 'small text-muted';
       help.textContent = isVuln
-        ? 'Flag generator type (fixed for vulnerabilities)'
-        : 'Choose a compatible flag-generator or flag-node-generator.';
+        ? 'Flag-generator type (fixed for vulnerabilities)'
+        : 'Non-vulnerability nodes use flag-node-generators.';
       substituteBodyEl.appendChild(help);
 
       const form = document.createElement('div');
@@ -3403,17 +4370,17 @@
       const optFg = document.createElement('option');
       optFg.value = 'flag-generator';
       optFg.textContent = 'flag-generator';
-      kindSel.appendChild(optFg);
       const optFng = document.createElement('option');
       optFng.value = 'flag-node-generator';
       optFng.textContent = 'flag-node-generator';
-      if(!isVuln){
-        kindSel.appendChild(optFng);
-      }
-      kindSel.value = (currentType === 'flag-node-generator' && !isVuln) ? 'flag-node-generator' : 'flag-generator';
       if(isVuln){
-        kindSel.disabled = true;
+        kindSel.appendChild(optFg);
+        kindSel.value = 'flag-generator';
+      } else {
+        kindSel.appendChild(optFng);
+        kindSel.value = 'flag-node-generator';
       }
+      kindSel.disabled = true;
       row1.appendChild(kindSel);
 
       const sourceLabel = document.createElement('div');
@@ -3465,11 +4432,16 @@
       let selectedNodeId = '';
       let nodeCandidatesCache = [];
 
+      function isHoldActive(){
+        try { return !!(heldChainIndices && heldChainIndices.has(i)); } catch(e) { return false; }
+      }
+
       function chainIdsWithSelectedNode(){
         const base = Array.isArray(currentChain)
           ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean)
           : [];
         if(!base.length) return [];
+        if(isHoldActive()) return base;
         const chosen = String(selectedNodeId || '').trim();
         if(!chosen) return base;
         return base.map((cid, j) => (j === i ? chosen : cid));
@@ -3515,7 +4487,14 @@
           const pick = curOk || firstOk;
           selectedNodeId = pick ? pick.value : (curId || '');
         }
-        nodeSel.value = selectedNodeId;
+        if(isHoldActive()){
+          selectedNodeId = curId;
+          try { nodeSel.value = curId; } catch(e) {}
+          try { nodeSel.disabled = true; } catch(e) {}
+        } else {
+          nodeSel.value = selectedNodeId;
+          try { nodeSel.disabled = false; } catch(e) {}
+        }
       }
 
       function syncKindAvailabilityForSelectedNode(){
@@ -4010,6 +4989,8 @@
             chain_ids: chainIds,
             preview_plan: (lastPreviewPlanPath || lastFlowPlanPath || ''),
             flag_assignments: reqAssignments,
+            initial_facts: flowInitialFactsOverride,
+            goal_facts: flowGoalFactsOverride,
           }, { timeoutMs: 60000 });
 
           setFlowValidityFromPayload(res);
@@ -4190,6 +5171,9 @@
     if(usePreview){
       params.set('prefer_preview', '1');
       params.set('force_preview', '1');
+    } else {
+      // Auto-load should prefer the saved Flow plan when available.
+      params.set('prefer_flow', '1');
     }
 
     const allowDupes = !!options.allow_node_duplicates;
@@ -4303,6 +5287,24 @@
       selectedChainIndex = -1;
       renderChainEditor();
       persistFlowState();
+
+      // Persist the generated chain so hard refresh restores it (best-effort).
+      try{
+        const scenario = (scenarioEl && scenarioEl.value || '').trim();
+        const chainIds = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+        const planPath = (lastPreviewPlanPath || lastFlowPlanPath || '');
+        if(scenario && chainIds.length && planPath){
+          await postJson('/api/flag-sequencing/save_flow_substitutions', {
+            scenario,
+            chain_ids: chainIds,
+            preview_plan: planPath,
+            flag_assignments: buildPersistAssignments(chainIds),
+            allow_node_duplicates: !!allowNodeDuplicates,
+            initial_facts: flowInitialFactsOverride,
+            goal_facts: flowGoalFactsOverride,
+          }, { timeoutMs: 60000 });
+        }
+      } catch(e) {}
 
       if(jsonEl){
         jsonEl.textContent = JSON.stringify({
@@ -4529,12 +5531,26 @@
       if(chainIds.length){
         setStatus('Saving Flag Sequencing…', false);
         showLoading('Saving Flag Sequencing…');
+        const saveRes = await window.coretgPostJson('/api/flag-sequencing/save_flow_substitutions', {
+          scenario,
+          chain_ids: chainIds,
+          preview_plan: previewPlan,
+          flag_assignments: buildPersistAssignments(chainIds),
+          allow_node_duplicates: !!allowNodeDuplicates,
+          initial_facts: flowInitialFactsOverride,
+          goal_facts: flowGoalFactsOverride,
+        });
+        try {
+          if(saveRes && saveRes.flow_plan_path) lastFlowPlanPath = String(saveRes.flow_plan_path);
+          if(saveRes && Array.isArray(saveRes.flag_assignments)) currentFlagAssignments = saveRes.flag_assignments.slice();
+        } catch(e) {}
+
         await window.coretgPostJson('/api/flag-sequencing/prepare_preview_for_execute', {
           scenario,
           preset,
           length: chainIds.length,
           chain_ids: chainIds,
-          preview_plan: previewPlan,
+          preview_plan: (lastFlowPlanPath || previewPlan),
           allow_node_duplicates: !!allowNodeDuplicates,
         });
       }
@@ -4587,13 +5603,20 @@
           }
         } catch(e) {}
 
-        // Pull the fresh preview plan path produced during Save XML so subsequent
-        // hint resolution uses the latest snapshot.
+        // Persist a fresh preview plan for the saved XML.
         try {
-          if(scenario && typeof window.coretgGetPreviewPlanPathForScenario === 'function'){
-            const p = (window.coretgGetPreviewPlanPathForScenario(scenario) || '').toString().trim();
-            if(p) lastPreviewPlanPath = p;
+          let seed = null;
+          try {
+            if (scenario && typeof window.coretgEnsureSeedForScenario === 'function') {
+              seed = window.coretgEnsureSeedForScenario(scenario);
+            }
+          } catch(e) { seed = null; }
+          const persisted = await window.coretgPostJson('/api/plan/persist_preview_plan', { xml_path: xmlPath, scenario, seed });
+          if (scenario && persisted && persisted.seed !== undefined && typeof window.coretgSetSeedForScenario === 'function') {
+            window.coretgSetSeedForScenario(scenario, persisted.seed);
           }
+          const previewPlan = (persisted && persisted.preview_plan_path) ? String(persisted.preview_plan_path) : '';
+          if(previewPlan) lastPreviewPlanPath = previewPlan;
         } catch(e) {}
 
         // Best-effort: if a chain is already generated, resolve templates/hints now.
@@ -4603,13 +5626,26 @@
             const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
             const planPath = (lastPreviewPlanPath || '');
             if(chainIds.length && planPath){
+              showLoading('Saving Flag Sequencing…');
+              const saveRes = await postJson('/api/flag-sequencing/save_flow_substitutions', {
+                scenario,
+                chain_ids: chainIds,
+                preview_plan: planPath,
+                flag_assignments: buildPersistAssignments(chainIds),
+                allow_node_duplicates: !!allowNodeDuplicates,
+                initial_facts: flowInitialFactsOverride,
+                goal_facts: flowGoalFactsOverride,
+              });
+              if(saveRes && saveRes.flow_plan_path) lastFlowPlanPath = String(saveRes.flow_plan_path);
+              if(saveRes && Array.isArray(saveRes.flag_assignments)) currentFlagAssignments = saveRes.flag_assignments.slice();
+
               showLoading('Resolving hint values…');
               const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', {
                 scenario,
                 length,
                 preset,
                 chain_ids: chainIds,
-                preview_plan: planPath,
+                preview_plan: (lastFlowPlanPath || planPath),
                 allow_node_duplicates: !!allowNodeDuplicates,
               });
               setFlowValidityFromPayload(prepData);

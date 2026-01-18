@@ -16,7 +16,7 @@ def test_flow_optional_inputs_excluded_from_effective_inputs(monkeypatch: pytest
         "language": "python",
         "_source_name": "test",
         "inputs": [
-            {"name": "credential.pair", "required": False},
+            {"name": "Credential(user, password)", "required": False},
         ],
         "outputs": [],
     }
@@ -33,7 +33,7 @@ def test_flow_optional_inputs_excluded_from_effective_inputs(monkeypatch: pytest
                 "plugin_id": "opt_consumer",
                 "plugin_type": "flag-generator",
                 "version": "1.0",
-                "requires": ["credential.pair"],
+                "requires": ["Credential(user, password)"],
                 "produces": [],
                 "inputs": {},
             }
@@ -59,8 +59,8 @@ def test_flow_optional_inputs_excluded_from_effective_inputs(monkeypatch: pytest
     a0 = fas[0]
 
     # Optional field is recorded as optional, but is not treated as an effective required input.
-    assert "credential.pair" in (a0.get("input_fields_optional") or [])
-    assert "credential.pair" not in (a0.get("inputs") or [])
+    assert "Credential(user, password)" in (a0.get("input_fields_optional") or [])
+    assert "Credential(user, password)" not in (a0.get("inputs") or [])
 
     # Strict ordering validation must not fail due to that optional token.
     ok, errors = app_backend._flow_validate_chain_order_by_requires_produces(chain_nodes, fas, scenario_label="zz-test")

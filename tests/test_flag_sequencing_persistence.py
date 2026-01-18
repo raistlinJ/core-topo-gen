@@ -41,7 +41,7 @@ def test_flag_sequencing_attackflow_preview_reuses_saved_flow_assignments(tmp_pa
             'name': 'Saved Gen 2',
             'type': 'flag-generator',
             'hint': 'saved hint 2',
-            'outputs': ['network.ip'],
+            'outputs': ['Knowledge(ip)'],
         },
         {
             'node_id': 'h1',
@@ -49,8 +49,8 @@ def test_flag_sequencing_attackflow_preview_reuses_saved_flow_assignments(tmp_pa
             'name': 'Saved Gen 1',
             'type': 'flag-node-generator',
             'hint': 'saved hint 1',
-            'inputs': ['network.ip'],
-            'outputs': ['credential.pair'],
+            'inputs': ['Knowledge(ip)'],
+            'outputs': ['Credential(user, password)'],
         },
     ]
 
@@ -140,7 +140,7 @@ def test_flag_sequencing_reload_with_default_length_does_not_break_saved_chain(t
             'name': 'Saved Gen 2',
             'type': 'flag-generator',
             'hint': 'saved hint 2',
-            'outputs': ['network.ip'],
+            'outputs': ['Knowledge(ip)'],
         },
         {
             'node_id': 'h1',
@@ -148,8 +148,8 @@ def test_flag_sequencing_reload_with_default_length_does_not_break_saved_chain(t
             'name': 'Saved Gen 1',
             'type': 'flag-node-generator',
             'hint': 'saved hint 1',
-            'inputs': ['network.ip'],
-            'outputs': ['credential.pair'],
+            'inputs': ['Knowledge(ip)'],
+            'outputs': ['Credential(user, password)'],
         },
     ]
 

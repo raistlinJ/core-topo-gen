@@ -13,29 +13,27 @@ The Flow system treats each generator as a small contract:
 Use these keys consistently so chains can be validated and composed.
 
 ### SSH
-- `ssh.username`
-- `ssh.password`
-- `ssh.private_key`
+- `Credential(user)`
+- `Credential(user, password)`
+- `Credential(user, hash)`
 
 ### HTTP / Web
-- `http.basic.username`
-- `http.basic.password`
-- `api.token`
+- `Credential(user, password)`
+- `Token(service)`
+- `APIKey(service)`
 
 ### Progress / Targets
-- `next.node_name`
-- `next.node_id`
-- `flag`
+- `Flag(flag_id)`
+- `PartialFlag(flag_id, part)`
 
 ### Filesystem / Files
-- `filesystem.file` (path to a generated file, typically under `artifacts/...`)
-- `filesystem.dir`
-- `filesystem.path`
+- `File(path)` (path to a generated file, typically under `artifacts/...`)
+- `Directory(host, path)`
 
 ### Networking
-- `network.ip`
-- `network.port`
-- `network.subnet`
+- `Knowledge(value)` (e.g., an IP address)
+- `PortForward(host, port)`
+- `InternalNetwork(subnet)`
 
 ## Hint Templates
 
@@ -48,7 +46,7 @@ Flow will substitute these placeholders (if present):
 
 Example:
 
-`Next: SSH to {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}) using ssh.username/ssh.password.`
+`Next: SSH to {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}) using {{OUTPUT.Credential(user,password)}}.`
 
 Notes:
 - At the moment, Flow provides **node name/id** as the “address-like” hint. If you later want real IPs, we can extend the preview pipeline to compute and expose them.
@@ -74,7 +72,7 @@ Where `<key>` is a key inside `outputs.json` under the `outputs` object.
 
 Example hint template:
 
-`Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}`
+`Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.Credential(user)}} / {{OUTPUT.Credential(user,password)}}`
 
 ## Injected artifacts (`injects`)
 
@@ -84,10 +82,10 @@ Key rules:
 
 Destination directory (optional):
 
-- `injects: ["filesystem.file -> /opt/bin"]`
+- `injects: ["File(path) -> /opt/bin"]`
 - If unspecified or invalid, files default to `/tmp`.
 
-- `outputs.json.outputs.filesystem.file = "artifacts/challenge"`
-- `manifest.yaml: injects: ["filesystem.file"]`
+- `outputs.json.outputs.File(path) = "artifacts/challenge"`
+- `manifest.yaml: injects: ["File(path)"]`
 
 The runner will stage only allowlisted items into `<out_dir>/injected/`.

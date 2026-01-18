@@ -1746,122 +1746,23 @@ def _normalize_run_history_entry(entry: Any) -> Dict[str, Any]:
     else:
         # Normalize legacy non-list forms and then truncate to one.
         sn = normalized.get('scenario_names')
-        if not isinstance(sn, list):
-            if sn is None:
-                sn_list: list[str] = []
-            elif isinstance(sn, str):
-                if '||' in sn:
-                    sn_list = [s for s in sn.split('||') if s]
-                else:
-                    sn_list = [s.strip() for s in sn.split(',') if s.strip()]
-            else:
-                sn_list = []
-            normalized['scenario_names'] = sn_list
-        if isinstance(normalized.get('scenario_names'), list) and len(normalized['scenario_names']) > 1:
-            normalized['scenario_names'] = [normalized['scenario_names'][0]]
-    try:
-        normalized['core'] = _normalize_history_core_value(normalized.get('core'))
-    except Exception:
-        normalized['core'] = _normalize_core_config({}, include_password=False)
-    if 'core_cfg_public' in normalized:
-        try:
-            normalized['core_cfg_public'] = _normalize_history_core_value(normalized.get('core_cfg_public'))
-        except Exception:
-            normalized['core_cfg_public'] = _normalize_core_config({}, include_password=False)
-    if 'scenario_core' in normalized and normalized.get('scenario_core') is not None:
-        try:
-            normalized['scenario_core'] = _normalize_history_core_value(normalized.get('scenario_core'))
-        except Exception:
-            normalized['scenario_core'] = _normalize_core_config({}, include_password=False)
-    return normalized
-
-
-def _require_core_ssh_credentials(core_cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize and validate CORE SSH configuration, enforcing credential presence."""
-
-    source = core_cfg if isinstance(core_cfg, dict) else {}
-    extras: Dict[str, Any] = {}
-    if isinstance(source, dict):
-        for key, value in source.items():
-            if key in _CORE_FIELD_KEYS or key in {'ssh', 'ssh_password'}:
+        candidates: list[Any] = []
+        if isinstance(sn, list):
+            candidates = sn
+        elif isinstance(sn, str):
+            candidates = [sn]
+        elif sn is not None:
+            candidates = [sn]
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for entry in candidates:
+            normalized_name = str(entry or '').strip()
+            if not normalized_name or normalized_name in seen:
                 continue
-            extras[key] = value
-
-    cfg = _normalize_core_config(source, include_password=True)
-    # All backend interactions with the CORE daemon **must** traverse an SSH tunnel.
-    # This helper normalizes and validates the credentials up-front so callers do
-    # not accidentally bypass the tunnel when invoking gRPC helpers or CLI flows.
-    username = str(cfg.get('ssh_username') or '').strip()
-    if not username:
-        raise _SSHTunnelError('SSH username is required (SSH tunnel enforced for CORE gRPC)')
-    password_raw = cfg.get('ssh_password')
-    if password_raw is None:
-        password = ''
-    elif isinstance(password_raw, str):
-        password = password_raw.strip()
-    else:
-        password = str(password_raw).strip()
-    if not password:
-        raise _SSHTunnelError('SSH password is required (SSH tunnel enforced for CORE gRPC)')
-    cfg['ssh_username'] = username
-    cfg['ssh_password'] = password
-    if extras:
-        cfg.update(extras)
-    return cfg
-
-
-@contextlib.contextmanager
-def _core_connection(core_cfg: Dict[str, Any]) -> Iterator[Tuple[str, int]]:
-    cfg = _require_core_ssh_credentials(core_cfg)
-    logger = getattr(app, 'logger', logging.getLogger(__name__))
-    logger.info('Opening CORE SSH tunnel: %s@%s:%s → %s:%s', cfg['ssh_username'], cfg['ssh_host'], cfg['ssh_port'], cfg['host'], cfg['port'])
-    with _core_connection_via_ssh(cfg) as forwarded:
-        yield forwarded
-
-
-def _build_python_probe_command(host: str, port: int, timeout: float, *, interpreter: str = 'python3') -> str:
-    host_literal = json.dumps(host)
-    interpreter_safe = shlex.quote(interpreter)
-    script = textwrap.dedent(
-        f"""{interpreter_safe} - <<'PY'
-import socket
-import sys
-host = {host_literal}
-port = {int(port)}
-timeout = {timeout:.2f}
-try:
-    sock = socket.create_connection((host, port), timeout=timeout)
-except Exception as exc:
-    print("ERROR:", exc)
-    sys.exit(1)
-else:
-    sock.close()
-    print("OK")
-PY
-"""
-    )
-    return script
-
-
-def _candidate_remote_python_interpreters(core_cfg: Dict[str, Any]) -> List[str]:
-    venv_bin = str(core_cfg.get('venv_bin') or '').strip()
-    candidates: List[str] = []
-    if venv_bin:
-        sanitized = venv_bin.rstrip('/\\')
-        if sanitized:
-            candidates.append(os.path.join(sanitized, 'python3'))
-            candidates.append(os.path.join(sanitized, 'python'))
-    candidates.append('core-python')
-    candidates.extend(['python3', 'python'])
-    ordered: List[str] = []
-    seen: set[str] = set()
-    for entry in candidates:
-        normalized = str(entry or '').strip()
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        ordered.append(normalized)
-    return ordered
+            seen.add(normalized_name)
+            ordered.append(normalized_name)
+        normalized['scenario_names'] = ordered
+    return normalized
 
 
 def _compose_remote_python_command(interpreter: str, script: str, activate_path: Optional[str] = None) -> str:
@@ -4880,6 +4781,33 @@ def _reports_dir() -> str:
     os.makedirs(d, exist_ok=True)
     return d
 
+def _node_schema_authoring_path() -> str:
+    return os.path.join(_get_repo_root(), 'new-schema', 'node_schema_authoring.yaml')
+
+
+_NODE_SCHEMA_VALIDATION_CACHE: dict[str, Any] | None = None
+
+
+def _node_schema_validation_path() -> str:
+    return os.path.join(_get_repo_root(), 'new-schema', 'node_schema_validation.json')
+
+
+def _load_node_schema_validation() -> dict[str, Any] | None:
+    global _NODE_SCHEMA_VALIDATION_CACHE
+    if isinstance(_NODE_SCHEMA_VALIDATION_CACHE, dict):
+        return _NODE_SCHEMA_VALIDATION_CACHE
+    path = _node_schema_validation_path()
+    if not os.path.isfile(path):
+        _NODE_SCHEMA_VALIDATION_CACHE = None
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            _NODE_SCHEMA_VALIDATION_CACHE = json.load(f)
+        return _NODE_SCHEMA_VALIDATION_CACHE
+    except Exception:
+        _NODE_SCHEMA_VALIDATION_CACHE = None
+        return None
+
 
 def _try_resolve_latest_outputs_xml(xml_path: str) -> Optional[str]:
     """Best-effort recovery for stale saved XML paths.
@@ -7813,11 +7741,11 @@ def _pick_flag_chain_nodes(nodes: list[dict[str, Any]], adj: dict[str, set[str]]
         id_to_node[nid] = n
         t = (str(n.get('type') or '').strip().lower())
         # Flow placement eligibility:
-        # - flag-generators may be placed on vulnerability nodes and docker-role nodes
-        # - flag-node-generators require docker-role slots (enforced elsewhere)
+        # - flag-generators may be placed on vulnerability nodes only
+        # - flag-node-generators require non-vulnerability docker-role nodes (enforced elsewhere)
         is_docker = ('docker' in t) or (str(n.get('type') or '').strip().upper() == 'DOCKER')
-        is_vuln = bool(n.get('is_vuln'))
-        if is_docker or is_vuln:
+        is_vuln = bool(n.get('is_vuln')) or bool(n.get('vulnerabilities'))
+        if is_vuln:
             eligible_ids.append(nid)
 
     if not eligible_ids:
@@ -7903,8 +7831,8 @@ def _pick_flag_chain_nodes_allow_duplicates(
         id_to_node[nid] = n
         t = (str(n.get('type') or '').strip().lower())
         is_docker = ('docker' in t) or (str(n.get('type') or '').strip().upper() == 'DOCKER')
-        is_vuln = bool(n.get('is_vuln'))
-        if is_docker or is_vuln:
+        is_vuln = bool(n.get('is_vuln')) or bool(n.get('vulnerabilities'))
+        if is_vuln:
             eligible_ids.append(nid)
 
     if not eligible_ids:
@@ -7960,7 +7888,7 @@ def _pick_flag_chain_nodes_for_preset(
     """Pick a chain that satisfies preset step constraints.
 
     Currently enforced:
-    - flag-generator steps: may be placed on vulnerability nodes OR docker-role nodes
+    - flag-generator steps: must be placed on vulnerability nodes
     - flag-node-generator steps: must be placed on a non-vulnerability docker-role node
     """
     try:
@@ -7972,6 +7900,7 @@ def _pick_flag_chain_nodes_for_preset(
     id_to_node: dict[str, dict[str, Any]] = {}
     eligible_ids: list[str] = []
     docker_ids: set[str] = set()
+    vuln_ids: set[str] = set()
     for n in nodes or []:
         if not isinstance(n, dict):
             continue
@@ -7982,11 +7911,13 @@ def _pick_flag_chain_nodes_for_preset(
         t_raw = str(n.get('type') or '')
         t = t_raw.strip().lower()
         is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
-        is_vuln = bool(n.get('is_vuln'))
-        if is_docker or is_vuln:
+        is_vuln = bool(n.get('is_vuln')) or bool(n.get('vulnerabilities'))
+        if is_vuln:
+            vuln_ids.add(nid)
             eligible_ids.append(nid)
         if is_docker and not is_vuln:
             docker_ids.add(nid)
+            eligible_ids.append(nid)
 
     if not eligible_ids:
         return []
@@ -8026,10 +7957,10 @@ def _pick_flag_chain_nodes_for_preset(
     for step in (steps or [])[:length]:
         kind = str((step or {}).get('kind') or '').strip()
         need_docker = (kind == 'flag-node-generator')
-        pool = [
-            nid for nid in comp_eligible
-            if nid not in used and (not need_docker or nid in docker_ids)
-        ]
+        if need_docker:
+            pool = [nid for nid in comp_eligible if nid not in used and nid in docker_ids]
+        else:
+            pool = [nid for nid in comp_eligible if nid not in used and nid in vuln_ids]
         if not pool:
             return []
         pick = pool[0]
@@ -8047,11 +7978,11 @@ def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
     - docker_total: nodes that look like docker nodes
     - compose_backed_total: docker nodes that carry compose metadata
     - vuln_total: nodes that are vulnerability candidates
-    - eligible_total: nodes eligible for chain placement (docker role + vuln nodes)
+    - eligible_total: nodes eligible for chain placement (non-vuln docker + vuln nodes)
 
     Additional explicit metrics (new; kept alongside legacy keys):
     - docker_nonvuln_total: docker nodes that are NOT vulnerability candidates
-    - flag_generator_eligible_total: nodes eligible for flag-generator steps (docker role + vuln nodes)
+    - flag_generator_eligible_total: nodes eligible for flag-generator steps (vuln nodes only)
     - flag_node_generator_eligible_total: nodes eligible for flag-node-generator steps (non-vuln docker role only)
     """
     docker_total = 0
@@ -8065,7 +7996,7 @@ def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
         t_raw = str(n.get('type') or '')
         t = t_raw.strip().lower()
         is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
-        is_vuln = bool(n.get('is_vuln'))
+        is_vuln = bool(n.get('is_vuln')) or bool(n.get('vulnerabilities'))
         if is_docker:
             docker_total += 1
             comp = str(n.get('compose') or '').strip()
@@ -8076,7 +8007,7 @@ def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
             vuln_total += 1
         if is_docker and (not is_vuln):
             docker_nonvuln_total += 1
-        if is_docker or is_vuln:
+        if is_vuln or (is_docker and (not is_vuln)):
             eligible_total += 1
     return {
         'docker_total': docker_total,
@@ -8084,7 +8015,7 @@ def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
         'vuln_total': vuln_total,
         'compose_backed_total': compose_backed_total,
         'eligible_total': eligible_total,
-        'flag_generator_eligible_total': eligible_total,
+        'flag_generator_eligible_total': vuln_total,
         'flag_node_generator_eligible_total': docker_nonvuln_total,
     }
 
@@ -8157,13 +8088,13 @@ def _attack_flow_builder_afb_for_chain(
         output_files: list[str] = ['outputs.json', 'hint.txt']
         try:
             outs = (fa or {}).get('outputs')
-            if isinstance(outs, list) and any(str(x).strip() == 'flag' for x in outs):
+            if isinstance(outs, list) and any(str(x).strip() in {'flag', 'Flag(flag_id)'} for x in outs):
                 output_files.append('flag.txt')
         except Exception:
             pass
         try:
             actual = (fa or {}).get('actual_outputs')
-            if isinstance(actual, list) and any(str(x).strip() == 'flag' for x in actual):
+            if isinstance(actual, list) and any(str(x).strip() in {'flag', 'Flag(flag_id)'} for x in actual):
                 if 'flag.txt' not in output_files:
                     output_files.append('flag.txt')
         except Exception:
@@ -8523,8 +8454,8 @@ def _attack_flow_builder_afb_for_chain(
                     if isinstance(outputs_map, dict):
                         if out_key in outputs_map:
                             resolved = outputs_map.get(out_key)
-                        elif out_key == 'artifact.flag' and 'flag' in outputs_map:
-                            resolved = outputs_map.get('flag')
+                        elif out_key == 'artifact.flag' and ('Flag(flag_id)' in outputs_map or 'flag' in outputs_map):
+                            resolved = outputs_map.get('Flag(flag_id)') or outputs_map.get('flag')
 
                     if resolved is not None:
                         if isinstance(resolved, str):
@@ -8871,9 +8802,9 @@ def _flow_compute_flag_assignments_for_preset(
         docker_nonvuln_total = int(st.get('docker_nonvuln_total') or 0)
         vuln_total = int(st.get('vuln_total') or 0)
         eligible_total = int(st.get('eligible_total') or 0)
-        required_any = max(0, int(required_total) - int(required_nonvuln_docker))
+        required_vuln = max(0, int(required_total) - int(required_nonvuln_docker))
         return (
-            f"Requires {required_any} Docker/Vuln and {int(required_nonvuln_docker)} Non-Vuln Docker. "
+            f"Requires {required_vuln} Vuln and {int(required_nonvuln_docker)} Non-Vuln Docker. "
             f"Current: Eligible: {eligible_total}, Docker: {docker_total} (Non-Vuln: {docker_nonvuln_total}), Vuln: {vuln_total}"
         )
 
@@ -8909,6 +8840,78 @@ def _flow_compute_flag_assignments_for_preset(
     chain_ids: list[str] = [str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()]
     id_to_name: dict[str, str] = {}
     id_to_ip: dict[str, str] = {}
+    vuln_names_by_id: dict[str, list[str]] = {}
+    try:
+        hosts = preview.get('hosts') if isinstance(preview, dict) else None
+        if isinstance(hosts, list):
+            for h in hosts:
+                if not isinstance(h, dict):
+                    continue
+                hid = str(h.get('node_id') or '').strip()
+                if not hid:
+                    continue
+                vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
+                names: list[str] = []
+                for v in (vulns or []):
+                    if isinstance(v, str):
+                        s = v.strip()
+                        if s:
+                            names.append(s)
+                        continue
+                    if isinstance(v, dict):
+                        for key in ('name', 'title', 'id', 'vuln', 'cve', 'cve_id', 'slug'):
+                            val = v.get(key)
+                            if isinstance(val, str) and val.strip():
+                                names.append(val.strip())
+                                break
+                if names:
+                    uniq = []
+                    seen = set()
+                    for n in names:
+                        if n and n not in seen:
+                            seen.add(n)
+                            uniq.append(n)
+                    vuln_names_by_id[hid] = uniq
+    except Exception:
+        vuln_names_by_id = {}
+    def _extract_vuln_names(obj: dict[str, Any]) -> list[str]:
+        names: list[str] = []
+        try:
+            raw = obj.get('vulnerabilities')
+            if isinstance(raw, list):
+                for v in raw:
+                    if isinstance(v, str):
+                        s = v.strip()
+                        if s:
+                            names.append(s)
+                        continue
+                    if isinstance(v, dict):
+                        for key in ('name', 'title', 'id', 'vuln', 'cve', 'cve_id', 'slug'):
+                            val = v.get(key)
+                            if isinstance(val, str) and val.strip():
+                                names.append(val.strip())
+                                break
+        except Exception:
+            pass
+        return names
+    try:
+        for n in (chain_nodes or []):
+            if not isinstance(n, dict):
+                continue
+            nid = str(n.get('id') or '').strip()
+            if not nid or nid in vuln_names_by_id:
+                continue
+            names = _extract_vuln_names(n)
+            if names:
+                uniq = []
+                seen = set()
+                for nm in names:
+                    if nm and nm not in seen:
+                        seen.add(nm)
+                        uniq.append(nm)
+                vuln_names_by_id[nid] = uniq
+    except Exception:
+        pass
     for n in chain_nodes:
         try:
             nid = str(n.get('id') or '').strip()
@@ -9004,6 +9007,7 @@ def _flow_compute_flag_assignments_for_preset(
         # Effective chaining semantics used by ordering validation.
         inputs_effective = sorted(set(requires_effective) | set(input_fields_required))
         outputs_effective = sorted(set(produces_artifacts) | set(output_fields))
+        output_fields = sorted(set(output_fields) | set(produces_artifacts))
 
         rendered_hints = [
             _flow_render_hint_template(
@@ -9025,6 +9029,7 @@ def _flow_compute_flag_assignments_for_preset(
             'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
             'generator_catalog': catalog,
             'language': str(gen.get('language') or ''),
+            'vulnerabilities': list(vuln_names_by_id.get(str(cid), []) or []),
             'description_hints': list(gen.get('description_hints') or []) if isinstance(gen.get('description_hints'), list) else [],
             'inject_files': list(gen.get('inject_files') or []) if isinstance(gen.get('inject_files'), list) else [],
             # Effective union (used for chaining feasibility / ordering validation).
@@ -9521,7 +9526,7 @@ def _flow_node_is_vuln(node: dict[str, Any] | None) -> bool:
     try:
         if not isinstance(node, dict):
             return False
-        return bool(node.get('is_vuln'))
+        return bool(node.get('is_vuln')) or bool(node.get('vulnerabilities'))
     except Exception:
         return False
 
@@ -9533,7 +9538,7 @@ def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dic
     length, we return None and the caller should skip attaching Flow.
 
     Placement rules enforced:
-    - flag-generator: allowed on vuln nodes OR docker-role nodes
+    - flag-generator: allowed on vuln nodes only
     - flag-node-generator: allowed only on non-vuln docker-role nodes
     """
     if not isinstance(full_prev, dict) or not isinstance(flow_meta, dict):
@@ -9564,7 +9569,7 @@ def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dic
             continue
         is_docker = _flow_node_is_docker_role(n)
         is_vuln = _flow_node_is_vuln(n)
-        if is_docker or is_vuln:
+        if is_vuln:
             eligible_any.append(n)
         if is_docker and (not is_vuln):
             eligible_nonvuln_docker.append(n)
@@ -9610,7 +9615,7 @@ def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dic
                 if need_nonvuln_docker:
                     ok = bool(is_docker and (not is_vuln))
                 else:
-                    ok = bool(is_docker or is_vuln)
+                    ok = bool(is_vuln)
             if not ok:
                 cand = None
 
@@ -9878,7 +9883,7 @@ def _flow_read_flag_value_from_artifacts_dir(artifacts_dir: str) -> str:
                     m = json.load(f) or {}
                 outs = m.get('outputs') if isinstance(m, dict) else None
                 if isinstance(outs, dict):
-                    v = outs.get('flag')
+                    v = outs.get('Flag(flag_id)') or outs.get('flag')
                     if isinstance(v, str) and v.strip():
                         vv = v.strip()
                         return vv[:4096]
@@ -10002,7 +10007,14 @@ def api_flow_flag_values_for_node():
     })
 
 
-def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, Any]], scenario_label: str) -> list[dict[str, Any]]:
+def _flow_compute_flag_assignments(
+    preview: dict,
+    chain_nodes: list[dict[str, Any]],
+    scenario_label: str,
+    *,
+    initial_facts_override: dict[str, list[str]] | None = None,
+    goal_facts_override: dict[str, list[str]] | None = None,
+) -> list[dict[str, Any]]:
     """Return a per-position list of flag assignments aligned to chain_ids.
 
     Each item includes node_id plus the fields used for metadata.flow_flag.
@@ -10016,6 +10028,7 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
         return []
 
     vuln_ids: set[str] = set()
+    vuln_names_by_id: dict[str, list[str]] = {}
     try:
         hosts = preview.get('hosts') if isinstance(preview, dict) else None
         if isinstance(hosts, list):
@@ -10028,8 +10041,72 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
                 vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
                 if vulns:
                     vuln_ids.add(hid)
+                try:
+                    names: list[str] = []
+                    for v in (vulns or []):
+                        if isinstance(v, str):
+                            s = v.strip()
+                            if s:
+                                names.append(s)
+                            continue
+                        if isinstance(v, dict):
+                            for key in ('name', 'title', 'id', 'vuln', 'cve', 'cve_id', 'slug'):
+                                val = v.get(key)
+                                if isinstance(val, str) and val.strip():
+                                    names.append(val.strip())
+                                    break
+                    if names:
+                        uniq = []
+                        seen = set()
+                        for n in names:
+                            if n and n not in seen:
+                                seen.add(n)
+                                uniq.append(n)
+                        vuln_names_by_id[hid] = uniq
+                except Exception:
+                    pass
     except Exception:
         vuln_ids = set()
+    def _extract_vuln_names(obj: dict[str, Any]) -> list[str]:
+        names: list[str] = []
+        try:
+            raw = obj.get('vulnerabilities')
+            if isinstance(raw, list):
+                for v in raw:
+                    if isinstance(v, str):
+                        s = v.strip()
+                        if s:
+                            names.append(s)
+                        continue
+                    if isinstance(v, dict):
+                        for key in ('name', 'title', 'id', 'vuln', 'cve', 'cve_id', 'slug'):
+                            val = v.get(key)
+                            if isinstance(val, str) and val.strip():
+                                names.append(val.strip())
+                                break
+        except Exception:
+            pass
+        return names
+    try:
+        for n in (chain_nodes or []):
+            if not isinstance(n, dict):
+                continue
+            nid = str(n.get('id') or '').strip()
+            if not nid:
+                continue
+            names = _extract_vuln_names(n)
+            if names:
+                vuln_ids.add(nid)
+                if nid not in vuln_names_by_id:
+                    uniq = []
+                    seen = set()
+                    for nm in names:
+                        if nm and nm not in seen:
+                            seen.add(nm)
+                            uniq.append(nm)
+                    vuln_names_by_id[nid] = uniq
+    except Exception:
+        pass
 
     # Use generator-catalog entries:
     # - flag-generators: artifact/flag generation
@@ -10243,6 +10320,10 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
                         out_fields.add(nm)
         except Exception:
             pass
+        try:
+            out_fields |= _artifact_produces_of(gen)
+        except Exception:
+            pass
         return out_fields
 
     def _provides_of(gen: dict[str, Any]) -> set[str]:
@@ -10271,62 +10352,90 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
 
     # Inputs we can always synthesize deterministically at preview time.
     # Keep this in sync with _flow_default_generator_config() and common generator conventions.
-    available: set[str] = {
-        'seed',
-        'secret',
-        'env_name',
-        'challenge',
-        'flag_prefix',
-        'username_prefix',
-        'key_len',
-        'node_name',
-    }
-    prev_outputs: set[str] = set()
+    initial_facts: set[str] = set(_flow_synthesized_inputs())
+    try:
+        init_override = _flow_normalize_fact_override(initial_facts_override)
+        if init_override:
+            initial_facts |= set(init_override.get('artifacts') or [])
+            initial_facts |= set(init_override.get('fields') or [])
+    except Exception:
+        pass
+
+    goal_facts: set[str] = set()
+    try:
+        goal_override = _flow_normalize_fact_override(goal_facts_override)
+        if goal_override:
+            goal_facts |= set(goal_override.get('artifacts') or [])
+            goal_facts |= set(goal_override.get('fields') or [])
+    except Exception:
+        pass
+
+    state_known: set[str] = set(initial_facts)
+    deployed: set[str] = set()
 
     for i, cid in enumerate(chain_ids):
         node = id_to_node.get(str(cid)) or {}
-        is_vuln_node = bool(node.get('is_vuln')) or (str(cid) in vuln_ids)
+        is_vuln_node = bool(node.get('is_vuln')) or bool(node.get('vulnerabilities')) or (str(cid) in vuln_ids)
         is_docker_node = _flow_node_is_docker_role(node)
         # Enforce placement policy per node:
-        # - flag-generator: allowed on docker-role OR vuln nodes
+        # - flag-generator: allowed on vuln nodes only
         # - flag-node-generator: allowed only on non-vuln docker-role nodes
         def _eligible_for_node(g: dict[str, Any]) -> bool:
             k = str(g.get('_flow_kind') or '').strip() or 'flag-generator'
             if k == 'flag-node-generator':
                 return bool(is_docker_node and (not is_vuln_node))
-            return bool(is_docker_node or is_vuln_node)
+            return bool(is_vuln_node)
 
         pool = [g for g in eligible_gens if _eligible_for_node(g)]
         if not pool:
-            pool = eligible_gens
-        # Enforce chainability:
-        # - prefer generators whose required inputs are satisfied by the previous step's outputs
-        #   (plus globally-available synthesized inputs)
-        if i == 0:
-            feasible = [g for g in pool if _required_inputs_of(g).issubset(available)]
-        else:
-            satisfied_now = prev_outputs | available
-            feasible = [g for g in pool if _required_inputs_of(g) and _required_inputs_of(g).issubset(satisfied_now)]
-            if not feasible:
-                feasible = [g for g in pool if _required_inputs_of(g).issubset(satisfied_now)]
+            return []
 
-        if feasible:
+        candidates = [
+            g for g in pool
+            if _required_inputs_of(g).issubset(state_known) and str(g.get('id') or '').strip() not in deployed
+        ]
+        if not candidates:
+            candidates = [g for g in pool if _required_inputs_of(g).issubset(state_known)]
+        if not candidates:
+            return []
+
+        scored: list[tuple[dict[str, Any], int]] = []
+        for g in candidates:
+            try:
+                provides = _provides_of(g)
+            except Exception:
+                provides = set()
+            new_facts = set(provides) - set(state_known)
+            goal_new = (set(goal_facts) - set(state_known)) & set(provides)
+            score = max(1, len(new_facts) + (3 * len(goal_new)))
+            scored.append((g, score))
+
+        try:
             if rnd is not None:
-                try:
-                    gen = rnd.choice(feasible)
-                except Exception:
-                    gen = feasible[0]
+                total = sum(max(1, int(s)) for _, s in scored)
+                pick = rnd.random() * float(total)
+                acc = 0.0
+                gen = scored[0][0]
+                for g, s in scored:
+                    acc += max(1, int(s))
+                    if pick <= acc:
+                        gen = g
+                        break
             else:
-                gen = feasible[0]
-        else:
-            # If the catalog doesn't contain a seed (or no compatible step exists),
-            # fall back to a stable rotation.
-            gen = pool[i % len(pool)]
+                gen = scored[0][0]
+        except Exception:
+            gen = scored[0][0]
 
         # Update outputs for the next hop.
         try:
-            prev_outputs = _provides_of(gen)
-            available |= prev_outputs
+            produced = _provides_of(gen)
+            state_known |= set(produced)
+        except Exception:
+            pass
+        try:
+            gid = str(gen.get('id') or '').strip()
+            if gid:
+                deployed.add(gid)
         except Exception:
             pass
 
@@ -10387,6 +10496,7 @@ def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, An
             'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
             'generator_catalog': str(gen.get('_flow_catalog') or 'flag_generators'),
             'language': str(gen.get('language') or ''),
+            'vulnerabilities': list(vuln_names_by_id.get(str(cid), []) or []),
             'description_hints': list(gen.get('description_hints') or []) if isinstance(gen.get('description_hints'), list) else [],
             'inject_files': list(gen.get('inject_files') or []) if isinstance(gen.get('inject_files'), list) else [],
             # Effective union (used for chaining feasibility / ordering validation).
@@ -10424,17 +10534,28 @@ def _flow_synthesized_inputs() -> set[str]:
         'username_prefix',
         'key_len',
         'node_name',
-
         # Optional per-node context injected by Flow (may not be declared by a generator).
         # These are safe to ignore in "dropped" input reporting.
-        'network.ip',
-        'host.ip',
+        'Knowledge(ip)',
+        'Hostname(host)',
         'host_ip',
         'target_ip',
-        'ip',
         'ip4',
         'ipv4',
-        'address',
+    }
+
+def _flow_normalize_fact_override(raw: Any) -> dict[str, list[str]] | None:
+    if not isinstance(raw, dict):
+        return None
+    arts = raw.get('artifacts') if isinstance(raw.get('artifacts'), list) else []
+    fields = raw.get('fields') if isinstance(raw.get('fields'), list) else []
+    out_artifacts = [str(x or '').strip() for x in (arts or []) if str(x or '').strip()]
+    out_fields = [str(x or '').strip() for x in (fields or []) if str(x or '').strip()]
+    if not out_artifacts and not out_fields:
+        return None
+    return {
+        'artifacts': out_artifacts,
+        'fields': out_fields,
     }
 
 
@@ -10469,8 +10590,7 @@ def _flow_strip_runtime_sensitive_fields(flag_assignments: list[dict[str, Any]])
         a2 = dict(a)
         a2.pop('runtime_flags', None)
         a2.pop('runtime_outputs', None)
-        a2.pop('resolved_inputs', None)
-        a2.pop('resolved_outputs', None)
+        # Keep resolved inputs/outputs so the Flow UI can restore values after refresh.
         # Effective generator config may include secrets and should not be persisted.
         a2.pop('config', None)
         out.append(a2)
@@ -10500,6 +10620,7 @@ def _flow_enrich_saved_flag_assignments(
     # Map ids -> names for THIS/NEXT substitution.
     id_to_name: dict[str, str] = {}
     chain_ids: list[str] = []
+    vuln_names_by_id: dict[str, list[str]] = {}
     for n in (chain_nodes or []):
         if not isinstance(n, dict):
             continue
@@ -10509,6 +10630,32 @@ def _flow_enrich_saved_flag_assignments(
         chain_ids.append(nid)
         nm = str(n.get('name') or '').strip()
         id_to_name[nid] = nm or nid
+        try:
+            raw = n.get('vulnerabilities')
+            names: list[str] = []
+            if isinstance(raw, list):
+                for v in raw:
+                    if isinstance(v, str):
+                        s = v.strip()
+                        if s:
+                            names.append(s)
+                        continue
+                    if isinstance(v, dict):
+                        for key in ('name', 'title', 'id', 'vuln', 'cve', 'cve_id', 'slug'):
+                            val = v.get(key)
+                            if isinstance(val, str) and val.strip():
+                                names.append(val.strip())
+                                break
+            if names:
+                uniq = []
+                seen = set()
+                for nm in names:
+                    if nm and nm not in seen:
+                        seen.add(nm)
+                        uniq.append(nm)
+                vuln_names_by_id[nid] = uniq
+        except Exception:
+            pass
 
     # Build a by-id view of currently enabled generators.
     by_id: dict[str, dict[str, Any]] = {}
@@ -10543,6 +10690,16 @@ def _flow_enrich_saved_flag_assignments(
         a2['node_id'] = this_id
         a2['next_node_id'] = str(next_id)
         a2['next_node_name'] = str(id_to_name.get(str(next_id)) or '')
+        try:
+            existing_vulns = a2.get('vulnerabilities')
+            has_existing = isinstance(existing_vulns, list) and any(str(x or '').strip() for x in existing_vulns)
+        except Exception:
+            has_existing = False
+        if not has_existing:
+            try:
+                a2['vulnerabilities'] = list(vuln_names_by_id.get(str(this_id), []) or [])
+            except Exception:
+                pass
 
         gen_id = str(a2.get('id') or '').strip()
         gen_def = by_id.get(gen_id) if gen_id else None
@@ -10741,6 +10898,62 @@ def _flow_parse_bool(value: Any, *, default: bool = False) -> bool:
     return default
 
 
+def _flow_extract_node_authoring_doc(node: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(node, dict):
+        return None
+    meta = node.get('metadata') if isinstance(node.get('metadata'), dict) else {}
+    candidates: list[Any] = []
+    for key in ('node_authoring', 'node_schema', 'node_spec', 'node_definition', 'authoring'):
+        if key in node:
+            candidates.append(node.get(key))
+        if isinstance(meta, dict) and key in meta:
+            candidates.append(meta.get(key))
+    for raw in candidates:
+        if raw is None:
+            continue
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            try:
+                import yaml  # type: ignore
+                doc = yaml.safe_load(raw)
+            except Exception:
+                doc = None
+            if isinstance(doc, dict):
+                return doc
+    return None
+
+
+def _flow_validate_chain_nodes_against_node_schema(
+    chain_nodes: list[dict[str, Any]],
+    *,
+    scenario_label: str,
+) -> list[str]:
+    schema = _load_node_schema_validation()
+    if not isinstance(schema, dict):
+        return []
+    try:
+        from core_topo_gen.sequencer.schemas import validate_against_schema
+    except Exception:
+        return []
+    errors: list[str] = []
+    for node in (chain_nodes or []):
+        if not isinstance(node, dict):
+            continue
+        doc = _flow_extract_node_authoring_doc(node)
+        if not isinstance(doc, dict):
+            continue
+        ok, errs = validate_against_schema(doc, schema)
+        if not ok:
+            node_id = str(node.get('id') or node.get('node_id') or node.get('name') or '').strip()
+            prefix = f"{node_id}: " if node_id else ''
+            for err in errs:
+                errors.append(f"{prefix}node authoring invalid: {err}")
+    if errors:
+        errors.insert(0, f"node authoring schema validation failed for scenario '{scenario_label}'")
+    return errors
+
+
 def _flow_validate_chain_order_by_requires_produces(
     chain_nodes: list[dict[str, Any]],
     flag_assignments: list[dict[str, Any]],
@@ -10770,6 +10983,13 @@ def _flow_validate_chain_order_by_requires_produces(
     ]
     if not chain_ids:
         return False, ['empty chain']
+
+    node_schema_errors = _flow_validate_chain_nodes_against_node_schema(
+        chain_nodes,
+        scenario_label=scenario_label,
+    )
+    if node_schema_errors:
+        errors.extend(node_schema_errors)
 
     assign_by_node: dict[str, dict[str, Any]] = {}
     for a in flag_assignments:
@@ -11216,6 +11436,7 @@ def api_flow_attackflow_preview():
 
     prefer_preview = str(request.args.get('prefer_preview') or '').strip().lower() in ('1', 'true', 'yes', 'y')
     force_preview = str(request.args.get('force_preview') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+    prefer_flow = str(request.args.get('prefer_flow') or '').strip().lower() in ('1', 'true', 'yes', 'y')
     best_effort_query = str(request.args.get('best_effort') or '').strip().lower() in ('1', 'true', 'yes', 'y')
     allow_node_duplicates = str(request.args.get('allow_node_duplicates') or request.args.get('allow_duplicates') or '').strip().lower() in ('1', 'true', 'yes', 'y')
     debug_mode = str(request.args.get('debug') or '').strip().lower() in ('1', 'true', 'yes', 'y')
@@ -11239,17 +11460,21 @@ def api_flow_attackflow_preview():
         except Exception:
             preview_plan_path = None
     if not preview_plan_path:
-        if force_preview:
-            # Generate button: use the same topology source as refresh (preview plan)
-            # so stats/topology do not flip, but ignore any saved chain/assignments.
-            selected_by = 'force_preview_best_plan'
-            preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
-        elif prefer_preview:
-            selected_by = 'prefer_preview_preview_plan'
-            preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
-        else:
-            selected_by = 'default_best_plan'
-            preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+        if prefer_flow:
+            selected_by = 'prefer_flow_plan'
+            preview_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
+        if not preview_plan_path:
+            if force_preview:
+                # Generate button: use the same topology source as refresh (preview plan)
+                # so stats/topology do not flip, but ignore any saved chain/assignments.
+                selected_by = 'force_preview_best_plan'
+                preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+            elif prefer_preview:
+                selected_by = 'prefer_preview_preview_plan'
+                preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+            else:
+                selected_by = 'default_best_plan'
+                preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
 
     if not preview_plan_path:
         return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
@@ -11610,6 +11835,29 @@ def api_flow_attackflow_preview():
     except Exception:
         flag_assignments = []
 
+    initial_facts_override: dict[str, list[str]] | None = None
+    goal_facts_override: dict[str, list[str]] | None = None
+    try:
+        flow_for_facts = meta.get('flow') if isinstance(meta, dict) else None
+        if isinstance(flow_for_facts, dict):
+            initial_facts_override = _flow_normalize_fact_override(flow_for_facts.get('initial_facts'))
+            goal_facts_override = _flow_normalize_fact_override(flow_for_facts.get('goal_facts'))
+    except Exception:
+        initial_facts_override = None
+        goal_facts_override = None
+
+    initial_facts_override: dict[str, list[str]] | None = None
+    goal_facts_override: dict[str, list[str]] | None = None
+    try:
+        meta_for_facts = payload.get('metadata') if isinstance(payload, dict) else None
+        flow_for_facts = meta_for_facts.get('flow') if isinstance(meta_for_facts, dict) else None
+        if isinstance(flow_for_facts, dict):
+            initial_facts_override = _flow_normalize_fact_override(flow_for_facts.get('initial_facts'))
+            goal_facts_override = _flow_normalize_fact_override(flow_for_facts.get('goal_facts'))
+    except Exception:
+        initial_facts_override = None
+        goal_facts_override = None
+
     if not flag_assignments:
         if preset_steps and not used_saved_chain:
             preset_assignments, preset_err = _flow_compute_flag_assignments_for_preset(preview, chain_nodes, scenario_label or scenario_norm, preset)
@@ -11617,7 +11865,13 @@ def api_flow_attackflow_preview():
                 return jsonify({'ok': False, 'error': f'Error: {preset_err}', 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
             flag_assignments = preset_assignments
         else:
-            flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+            flag_assignments = _flow_compute_flag_assignments(
+                preview,
+                chain_nodes,
+                scenario_label or scenario_norm,
+                initial_facts_override=initial_facts_override,
+                goal_facts_override=goal_facts_override,
+            )
 
     # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
     # Presets force an intended generator order and should not be reordered.
@@ -11690,7 +11944,7 @@ def api_flow_attackflow_preview():
     flags_enabled = bool(flow_valid)
 
     if len(chain_nodes) < 1:
-        return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan (Docker role or vulnerability nodes).', 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
+        return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan (vulnerability nodes only for flag-generators).', 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
     if (not used_saved_chain) and (not allow_node_duplicates) and len(chain_nodes) < length:
         return jsonify({
             'ok': False,
@@ -11714,6 +11968,10 @@ def api_flow_attackflow_preview():
         'flags_enabled': bool(flags_enabled),
         'allow_node_duplicates': bool(allow_node_duplicates),
     }
+    if initial_facts_override:
+        out['initial_facts'] = initial_facts_override
+    if goal_facts_override:
+        out['goal_facts'] = goal_facts_override
     try:
         meta_out = payload.get('metadata') if isinstance(payload, dict) else None
         if isinstance(meta_out, dict):
@@ -11884,10 +12142,10 @@ def api_flow_prepare_preview_for_execute():
                             if (not allow_node_duplicates) and cid0 in used:
                                 return False
                             is_docker = _flow_node_is_docker_role(cand)
-                            is_vuln = bool(cand.get('is_vuln'))
+                            is_vuln = bool(cand.get('is_vuln')) or bool(cand.get('vulnerabilities'))
                             if _needs_nonvuln_docker(pos):
                                 return bool(is_docker) and (not is_vuln)
-                            return bool(is_docker) or bool(is_vuln)
+                            return bool(is_vuln)
                         except Exception:
                             return False
 
@@ -11971,7 +12229,7 @@ def api_flow_prepare_preview_for_execute():
                     pass
 
             # Enforce Flow placement rules:
-            # - flag-generators may be placed on vulnerability nodes OR docker-role nodes
+            # - flag-generators may be placed on vulnerability nodes only
             # - flag-node-generators must be placed on non-vulnerability docker-role nodes
             # If the caller provided a chain that violates this, best-effort replace nodes
             # with unused eligible nodes; otherwise fail with a clear error.
@@ -11994,7 +12252,7 @@ def api_flow_prepare_preview_for_execute():
                             if is_docker and (not is_vuln):
                                 continue
                         else:
-                            if is_docker or is_vuln:
+                            if is_vuln:
                                 continue
 
                         replacement = None
@@ -12009,14 +12267,14 @@ def api_flow_prepare_preview_for_execute():
                             ct_raw = str(cand.get('type') or '')
                             ct = ct_raw.strip().lower()
                             cand_is_docker = ('docker' in ct) or (ct_raw.strip().upper() == 'DOCKER')
-                            cand_is_vuln = bool(cand.get('is_vuln'))
+                            cand_is_vuln = bool(cand.get('is_vuln')) or bool(cand.get('vulnerabilities'))
                             if need_nonvuln_docker:
                                 if not cand_is_docker:
                                     continue
                                 if cand_is_vuln:
                                     continue
                             else:
-                                if not (cand_is_docker or cand_is_vuln):
+                                if not cand_is_vuln:
                                     continue
                             replacement = cand
                             break
@@ -12024,7 +12282,7 @@ def api_flow_prepare_preview_for_execute():
                         if replacement is None:
                             return jsonify({
                                 'ok': False,
-                                'error': 'Not enough eligible nodes for the provided chain. Flag-generators require docker-role or vulnerability nodes; flag-node-generators require non-vulnerability docker-role nodes.',
+                                'error': 'Not enough eligible nodes for the provided chain. Flag-generators require vulnerability nodes; flag-node-generators require non-vulnerability docker-role nodes.',
                                 'stats': stats,
                             }), 422
 
@@ -12050,7 +12308,7 @@ def api_flow_prepare_preview_for_execute():
                 else:
                     chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
             if len(chain_nodes) < 1:
-                return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan (Docker role or vulnerability nodes).', 'available': len(chain_nodes), 'stats': stats}), 422
+                return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan (vulnerability nodes only for flag-generators).', 'available': len(chain_nodes), 'stats': stats}), 422
             if (not allow_node_duplicates) and len(chain_nodes) < length:
                 return jsonify({'ok': False, 'error': 'Not enough eligible nodes in preview plan to build the requested chain.', 'available': len(chain_nodes), 'stats': stats}), 422
             chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if str(n.get('id') or '').strip()]
@@ -12142,7 +12400,13 @@ def api_flow_prepare_preview_for_execute():
                 return jsonify({'ok': False, 'error': f'Error: {preset_err}', 'stats': stats}), 422
             flag_assignments = preset_assignments
         else:
-            flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+            flag_assignments = _flow_compute_flag_assignments(
+                preview,
+                chain_nodes,
+                scenario_label or scenario_norm,
+                initial_facts_override=initial_facts_override,
+                goal_facts_override=goal_facts_override,
+            )
 
     # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
     # Note: chain_ids is populated for both explicit and auto-picked chains; use explicit_chain.
@@ -12575,37 +12839,10 @@ def api_flow_prepare_preview_for_execute():
         if not isinstance(kv, dict) or not kv:
             return {}
 
-        def _is_sensitive_key(k: str) -> bool:
-            kk = (k or '').strip().lower()
-            if not kk:
-                return False
-            # Explicit keys.
-            if kk in {'secret', 'password', 'passwd', 'token', 'api_key', 'apikey', 'private_key', 'ssh_private_key'}:
-                return True
-            # Common substrings.
-            for needle in ('secret', 'password', 'passwd', 'token', 'api_key', 'apikey', 'private', 'ssh'):
-                if needle in kk:
-                    return True
-            return False
+        # Redaction disabled for Flow UI (show full values).
+        return dict(kv)
 
-        def _redact_val(v: Any) -> Any:
-            if isinstance(v, str):
-                return '[redacted]'
-            return '[redacted]'
-
-        out0: dict[str, Any] = {}
-        for k, v in kv.items():
-            try:
-                ks = str(k)
-            except Exception:
-                continue
-            if not ks:
-                continue
-            if _is_sensitive_key(ks):
-                out0[ks] = _redact_val(v)
-            else:
-                out0[ks] = v
-        return out0
+        # (Unreachable) retained for reference.
     def _preview_host_ip4(host: dict) -> str:
         """Best-effort: return the primary IPv4 address for a preview host."""
         try:
@@ -12640,7 +12877,7 @@ def api_flow_prepare_preview_for_execute():
 
             # Flow has a "god-eye" view of generator outputs across the chain. As we run each
             # generator, we capture outputs.json and feed those values into subsequent generator
-            # configs when they declare matching input names (e.g. network.ip, credential.pair).
+            # configs when they declare matching input names (e.g. Knowledge(ip), Credential(user, password)).
             flow_context: dict[str, Any] = {}
 
             def _apply_outputs_to_hint_text(text_in: str, outs: dict[str, Any]) -> str:
@@ -12753,11 +12990,11 @@ def api_flow_prepare_preview_for_execute():
 
                 cfg_full = _flow_default_generator_config(fa, seed_val=seed_val, occurrence_idx=occ)
 
-                # Provide per-node network context. Some generators output network.ip and then
-                # hint templates reference it via {{OUTPUT.network.ip}}; make it match Preview.
+                # Provide per-node network context. Some generators output Knowledge(ip) and then
+                # hint templates reference it via {{OUTPUT.Knowledge(ip)}}; make it match Preview.
                 try:
                     if preview_ip4:
-                        cfg_full.setdefault('network.ip', preview_ip4)
+                        cfg_full.setdefault('Knowledge(ip)', preview_ip4)
                         cfg_full.setdefault('target_ip', preview_ip4)
                         cfg_full.setdefault('host_ip', preview_ip4)
                         cfg_full.setdefault('ip4', preview_ip4)
@@ -12794,6 +13031,26 @@ def api_flow_prepare_preview_for_execute():
                     gen_def = _gen_by_id.get(generator_id)
                     if isinstance(gen_def, dict):
                         allowed = _all_input_names_of(gen_def)
+
+                        # Apply manifest defaults for any inputs not already provided.
+                        try:
+                            inputs_def = gen_def.get('inputs')
+                            if isinstance(inputs_def, list):
+                                for inp in inputs_def:
+                                    if not isinstance(inp, dict):
+                                        continue
+                                    name = str(inp.get('name') or '').strip()
+                                    if not name:
+                                        continue
+                                    if 'default' not in inp:
+                                        continue
+                                    if name in cfg_full:
+                                        v = cfg_full.get(name)
+                                        if v is not None and (not isinstance(v, str) or v.strip()):
+                                            continue
+                                    cfg_full[name] = inp.get('default')
+                        except Exception:
+                            pass
 
                         declared_required = None
                         try:
@@ -12890,6 +13147,11 @@ def api_flow_prepare_preview_for_execute():
                     if declared_src is None:
                         declared_src = (fa.get('outputs') if isinstance(fa.get('outputs'), list) else [])
                     declared_output_keys = sorted([str(x) for x in (declared_src or []) if str(x).strip()])
+                    # Ensure artifact produces are treated as declared outputs.
+                    prod_src = (fa.get('produces') if isinstance(fa.get('produces'), list) else [])
+                    prod_keys = [str(x).strip() for x in (prod_src or []) if str(x).strip()]
+                    if prod_keys:
+                        declared_output_keys = sorted(set(declared_output_keys) | set(prod_keys))
                 except Exception:
                     declared_output_keys = []
                 mismatch: dict[str, Any] = {}
@@ -12898,6 +13160,12 @@ def api_flow_prepare_preview_for_execute():
                 # is skipped or fails.
                 try:
                     fa['resolved_inputs'] = _redact_kv_for_ui(cfg)
+                    try:
+                        if isinstance(fa.get('resolved_inputs'), dict) and isinstance(cfg_full, dict):
+                            if 'Knowledge(ip)' in cfg_full and 'Knowledge(ip)' not in fa['resolved_inputs']:
+                                fa['resolved_inputs']['Knowledge(ip)'] = cfg_full.get('Knowledge(ip)')
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -12917,7 +13185,7 @@ def api_flow_prepare_preview_for_execute():
                     flag_override = str((fa or {}).get('flag_override') or '').strip()
                     if flag_override:
                         fa['flag_value'] = flag_override
-                        fa['resolved_outputs'] = _redact_kv_for_ui({'flag': flag_override})
+                        fa['resolved_outputs'] = _redact_kv_for_ui({'Flag(flag_id)': flag_override})
                 except Exception:
                     pass
 
@@ -12936,7 +13204,9 @@ def api_flow_prepare_preview_for_execute():
                             fa['resolved_outputs'] = _redact_kv_for_ui(cleaned)
                             # Prefer showing overridden flag value in the UI's Flag row.
                             try:
-                                if isinstance(cleaned.get('flag'), str) and str(cleaned.get('flag') or '').strip():
+                                if isinstance(cleaned.get('Flag(flag_id)'), str) and str(cleaned.get('Flag(flag_id)') or '').strip():
+                                    fa['flag_value'] = str(cleaned.get('Flag(flag_id)') or '').strip()
+                                elif isinstance(cleaned.get('flag'), str) and str(cleaned.get('flag') or '').strip():
                                     fa['flag_value'] = str(cleaned.get('flag') or '').strip()
                             except Exception:
                                 pass
@@ -13085,6 +13355,7 @@ def api_flow_prepare_preview_for_execute():
                                     try:
                                         flag_override = str((fa or {}).get('flag_override') or '').strip()
                                         if flag_override:
+                                            outs['Flag(flag_id)'] = flag_override
                                             outs['flag'] = flag_override
                                     except Exception:
                                         pass
@@ -13100,13 +13371,19 @@ def api_flow_prepare_preview_for_execute():
                                                 outs[kk] = v
                                     except Exception:
                                         pass
+                                    # Normalize legacy 'flag' output to the fact-style key.
+                                    try:
+                                        if isinstance(outs, dict) and 'flag' in outs and 'Flag(flag_id)' not in outs:
+                                            outs['Flag(flag_id)'] = outs.get('flag')
+                                    except Exception:
+                                        pass
                                     # Ensure any IP-like outputs align with the preview host IP.
                                     # This prevents resolved hints from drifting away from Preview
-                                    # even if a generator invents its own network.ip.
+                                    # even if a generator invents its own Knowledge(ip).
                                     try:
                                         if preview_ip4:
                                             ip_keys = {
-                                                'network.ip',
+                                                'Knowledge(ip)',
                                                 'host.ip',
                                                 'host_ip',
                                                 'target_ip',
@@ -13169,10 +13446,10 @@ def api_flow_prepare_preview_for_execute():
                                     except Exception:
                                         pass
 
-                                    # Best-effort: if the generator emitted a top-level 'flag' value,
+                                    # Best-effort: if the generator emitted a flag value,
                                     # also write a plain flag.txt for easier participant discovery.
                                     try:
-                                        flag_val = outs.get('flag')
+                                        flag_val = outs.get('Flag(flag_id)') or outs.get('flag')
                                         if ok_run and flow_out_dir and isinstance(flag_val, str) and flag_val.strip():
                                             with open(os.path.join(flow_out_dir, 'flag.txt'), 'w', encoding='utf-8') as ff:
                                                 ff.write(flag_val.strip() + "\n")
@@ -13402,7 +13679,7 @@ def api_flow_prepare_preview_for_execute():
                 try:
                     cfg_full = _flow_default_generator_config(fa, seed_val=seed_val, occurrence_idx=occ)
                     if preview_ip4:
-                        cfg_full.setdefault('network.ip', preview_ip4)
+                        cfg_full.setdefault('Knowledge(ip)', preview_ip4)
                         cfg_full.setdefault('target_ip', preview_ip4)
                         cfg_full.setdefault('host_ip', preview_ip4)
                         cfg_full.setdefault('ip4', preview_ip4)
@@ -13426,6 +13703,24 @@ def api_flow_prepare_preview_for_execute():
                     cfg = cfg_full
                     gen_def = _gen_by_id.get(generator_id)
                     if isinstance(gen_def, dict):
+                        try:
+                            inputs_def = gen_def.get('inputs')
+                            if isinstance(inputs_def, list):
+                                for inp in inputs_def:
+                                    if not isinstance(inp, dict):
+                                        continue
+                                    name = str(inp.get('name') or '').strip()
+                                    if not name:
+                                        continue
+                                    if 'default' not in inp:
+                                        continue
+                                    if name in cfg_full:
+                                        v = cfg_full.get(name)
+                                        if v is not None and (not isinstance(v, str) or v.strip()):
+                                            continue
+                                    cfg_full[name] = inp.get('default')
+                        except Exception:
+                            pass
                         allowed = _all_input_names_of(gen_def)
                         declared_required = _required_input_names_of(gen_def)
                         if allowed:
@@ -13438,6 +13733,12 @@ def api_flow_prepare_preview_for_execute():
 
                     fa['config'] = cfg
                     fa['resolved_inputs'] = _redact_kv_for_ui(cfg)
+                    try:
+                        if isinstance(fa.get('resolved_inputs'), dict) and isinstance(cfg_full, dict):
+                            if 'Knowledge(ip)' in cfg_full and 'Knowledge(ip)' not in fa['resolved_inputs']:
+                                fa['resolved_inputs']['Knowledge(ip)'] = cfg_full.get('Knowledge(ip)')
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -13456,7 +13757,7 @@ def api_flow_prepare_preview_for_execute():
                     flag_override = str((fa or {}).get('flag_override') or '').strip()
                     if flag_override:
                         fa['flag_value'] = flag_override
-                        fa['resolved_outputs'] = _redact_kv_for_ui({'flag': flag_override})
+                        fa['resolved_outputs'] = _redact_kv_for_ui({'Flag(flag_id)': flag_override})
                 except Exception:
                     pass
 
@@ -13473,7 +13774,9 @@ def api_flow_prepare_preview_for_execute():
                         if cleaned:
                             fa['resolved_outputs'] = _redact_kv_for_ui(cleaned)
                             try:
-                                if isinstance(cleaned.get('flag'), str) and str(cleaned.get('flag') or '').strip():
+                                if isinstance(cleaned.get('Flag(flag_id)'), str) and str(cleaned.get('Flag(flag_id)') or '').strip():
+                                    fa['flag_value'] = str(cleaned.get('Flag(flag_id)') or '').strip()
+                                elif isinstance(cleaned.get('flag'), str) and str(cleaned.get('flag') or '').strip():
                                     fa['flag_value'] = str(cleaned.get('flag') or '').strip()
                             except Exception:
                                 pass
@@ -13501,6 +13804,17 @@ def api_flow_prepare_preview_for_execute():
             'flow_errors': list(flow_errors or []),
             'modified_at': _iso_now(),
         }
+        try:
+            flow_existing = meta.get('flow') if isinstance(meta, dict) else None
+            if isinstance(flow_existing, dict):
+                init_facts = _flow_normalize_fact_override(flow_existing.get('initial_facts'))
+                goal_facts = _flow_normalize_fact_override(flow_existing.get('goal_facts'))
+                if init_facts:
+                    flow_meta['initial_facts'] = init_facts
+                if goal_facts:
+                    flow_meta['goal_facts'] = goal_facts
+        except Exception:
+            pass
         if isinstance(meta, dict):
             meta = dict(meta)
             meta['flow'] = flow_meta
@@ -13604,6 +13918,17 @@ def api_flow_save_flow_substitutions():
             return jsonify({'ok': False, 'error': 'Preview plan is missing full_preview.'}), 422
     except Exception as e:
         return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
+
+    initial_facts_override = _flow_normalize_fact_override(j.get('initial_facts'))
+    goal_facts_override = _flow_normalize_fact_override(j.get('goal_facts'))
+    try:
+        flow_existing = meta.get('flow') if isinstance(meta, dict) else None
+        if initial_facts_override is None and isinstance(flow_existing, dict):
+            initial_facts_override = _flow_normalize_fact_override(flow_existing.get('initial_facts'))
+        if goal_facts_override is None and isinstance(flow_existing, dict):
+            goal_facts_override = _flow_normalize_fact_override(flow_existing.get('goal_facts'))
+    except Exception:
+        pass
 
     # Build chain node dicts with vulnerability flags.
     try:
@@ -13748,6 +14073,10 @@ def api_flow_save_flow_substitutions():
                         out_fields.add(nm)
         except Exception:
             pass
+        try:
+            out_fields |= _artifact_produces_of(gen)
+        except Exception:
+            pass
         return out_fields
 
     def _provides_of(gen: dict[str, Any]) -> set[str]:
@@ -13870,6 +14199,17 @@ def api_flow_save_flow_substitutions():
         a2['inputs'] = sorted(list((_artifact_requires_of(gen) | set(_required_input_fields_of(gen)))))
         a2['outputs'] = sorted(list(_provides_of(gen)))
 
+        # Preserve resolved values if provided by the client (for refresh persistence).
+        try:
+            if 'resolved_inputs' in raw_a and isinstance(raw_a.get('resolved_inputs'), dict):
+                a2['resolved_inputs'] = dict(raw_a.get('resolved_inputs') or {})
+            if 'resolved_outputs' in raw_a and isinstance(raw_a.get('resolved_outputs'), dict):
+                a2['resolved_outputs'] = dict(raw_a.get('resolved_outputs') or {})
+            if isinstance(raw_a.get('flag_value'), str) and str(raw_a.get('flag_value') or '').strip():
+                a2['flag_value'] = str(raw_a.get('flag_value') or '').strip()
+        except Exception:
+            pass
+
         # Normalize persisted overrides / new fields.
         out_assignments.append(a2)
 
@@ -13908,6 +14248,10 @@ def api_flow_save_flow_substitutions():
             'flow_errors': list(flow_errors or []),
             'modified_at': _iso_now(),
         }
+        if initial_facts_override:
+            flow_meta['initial_facts'] = initial_facts_override
+        if goal_facts_override:
+            flow_meta['goal_facts'] = goal_facts_override
         if isinstance(meta, dict):
             meta2 = dict(meta)
             meta2['flow'] = flow_meta
@@ -13956,6 +14300,8 @@ def api_flow_save_flow_substitutions():
         'flow_plan_path': out_path,
         'base_preview_plan_path': base_plan_path,
         'allow_node_duplicates': bool(allow_node_duplicates),
+        **({'initial_facts': initial_facts_override} if initial_facts_override else {}),
+        **({'goal_facts': goal_facts_override} if goal_facts_override else {}),
     })
 
 
@@ -14142,8 +14488,8 @@ def api_flow_upload_flow_inject_file():
                 return jsonify({'ok': False, 'error': f'Generator {gen_id} is not compatible with node {node_id} (flag-node-generator requires docker-role, non-vulnerability node).'}), 422
         else:
             # flag-generator
-            if not (is_docker_node or is_vuln_node):
-                return jsonify({'ok': False, 'error': f'Generator {gen_id} is not compatible with node {node_id} (flag-generator requires docker-role or vulnerability node).'}), 422
+            if not is_vuln_node:
+                return jsonify({'ok': False, 'error': f'Generator {gen_id} is not compatible with node {node_id} (flag-generator requires vulnerability node).'}), 422
 
         next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
         hint_templates = _flow_hint_templates_from_generator(gen)
@@ -14543,8 +14889,8 @@ def api_flow_substitution_candidates():
                     reasons.append('requires non-vulnerability node')
                 return (bool(is_docker) and (not is_vuln)), reasons
             # flag-generator
-            if not (is_docker or is_vuln):
-                reasons.append('requires docker-role or vulnerability node')
+            if not is_vuln:
+                reasons.append('requires vulnerability node')
                 return False, reasons
             return True, []
         except Exception:
@@ -14754,6 +15100,10 @@ def api_flow_substitution_candidates():
                         out_fields.add(nm)
         except Exception:
             pass
+        try:
+            out_fields |= _artifact_produces_of(gen)
+        except Exception:
+            pass
         return out_fields
 
     # Compute prefix availability (artifacts + fields) from current assignments.
@@ -14800,7 +15150,7 @@ def api_flow_substitution_candidates():
 
         # If an artifact requirement is also present as an *optional* input field,
         # treat it as optional (do not block compatibility on it). This helps
-        # avoid flagging things like credential.pair as a hard missing dependency
+        # avoid flagging things like Credential(user, password) as a hard missing dependency
         # when the generator can operate without it.
         try:
             all_in = _all_input_fields_of(gen)
@@ -14954,7 +15304,21 @@ def api_flow_afb_from_chain():
                 except Exception:
                     pass
                 if not flag_assignments:
-                    flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+                    try:
+                        meta = payload.get('metadata') if isinstance(payload, dict) else None
+                        flow_meta = meta.get('flow') if isinstance(meta, dict) else None
+                        init_facts = _flow_normalize_fact_override(flow_meta.get('initial_facts')) if isinstance(flow_meta, dict) else None
+                        goal_facts = _flow_normalize_fact_override(flow_meta.get('goal_facts')) if isinstance(flow_meta, dict) else None
+                    except Exception:
+                        init_facts = None
+                        goal_facts = None
+                    flag_assignments = _flow_compute_flag_assignments(
+                        preview,
+                        chain_nodes,
+                        scenario_label or scenario_norm,
+                        initial_facts_override=init_facts,
+                        goal_facts_override=goal_facts,
+                    )
     except Exception:
         flag_assignments = []
 
@@ -19146,388 +19510,97 @@ def _build_full_scenario_archive(out_dir: str, scenario_xml_path: str | None, re
     except Exception:
         return None
 
-# Reserved artifact keys (starter set). These are always offered in the Generator
-# Builder artifact picker to encourage consistent naming, while still allowing
-# custom artifact keys.
-_RESERVED_ARTIFACTS: dict[str, dict[str, Any]] = {
-    # Core contract
-    'flag': {'type': 'flag', 'description': 'Captured flag value.', 'sensitive': True},
+# Reserved artifact keys for the Generator Builder. Populated from the fact ontology.
+_RESERVED_ARTIFACTS: dict[str, dict[str, Any]] = {}
 
-    # Filesystem
-    'filesystem.file': {'type': 'file', 'description': 'Relative path to a file a participant should inspect.'},
-    'filesystem.dir': {'type': 'dir', 'description': 'Relative path to a directory a participant should inspect.'},
-    'filesystem.path': {'type': 'path', 'description': 'Generic filesystem path (file or directory).'},
-    'filesystem.filename': {'type': 'text', 'description': 'Filename only (no directory).'},
-    'filesystem.sha256': {'type': 'text', 'description': 'SHA-256 of a file (hex).'},
-    'filesystem.md5': {'type': 'text', 'description': 'MD5 of a file (hex).'},
 
-    # Network
-    'network.ip': {'type': 'ip', 'description': 'IP address (usually IPv4) relevant to the next step.'},
-    'network.ipv4': {'type': 'ip', 'description': 'IPv4 address relevant to the next step.'},
-    'network.ipv6': {'type': 'ip', 'description': 'IPv6 address relevant to the next step.'},
-    'network.host': {'type': 'host', 'description': 'Hostname or node identifier.'},
-    'network.hostname': {'type': 'host', 'description': 'Hostname (DNS label).'},
-    'network.port': {'type': 'port', 'description': 'TCP/UDP port number.'},
-    'network.proto': {'type': 'text', 'description': 'Transport/application protocol name (e.g., tcp, udp, http, ssh).'},
-    'network.subnet': {'type': 'subnet', 'description': 'Subnet/CIDR (e.g., 10.0.0.0/24).'},
-    'network.cidr': {'type': 'subnet', 'description': 'CIDR (alias for network.subnet).'},
-    'network.url': {'type': 'url', 'description': 'Network URL/URI (generic).'},
+def _load_fact_reserved_artifacts() -> dict[str, dict[str, Any]]:
+    """Build reserved artifacts from the fact ontology reference (best-effort)."""
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        from core_topo_gen.sequencer.facts import parse_fact_ref
+    except Exception:
+        parse_fact_ref = None  # type: ignore
 
-    # Web
-    'web.url': {'type': 'url', 'description': 'HTTP(S) URL (e.g., a login page).'},
-    'web.base_url': {'type': 'url', 'description': 'Base URL (scheme://host[:port]).'},
-    'web.path': {'type': 'text', 'description': 'HTTP path (e.g., /login).'},
-    'web.username': {'type': 'text', 'description': 'Web username.'},
-    'web.password': {'type': 'text', 'description': 'Web password.', 'sensitive': True},
-    'web.token': {'type': 'text', 'description': 'Web/API bearer token.', 'sensitive': True},
-    'web.cookie': {'type': 'text', 'description': 'Cookie header value.', 'sensitive': True},
+    def _fact_meta(sig: str) -> dict[str, Any]:
+        name = sig
+        try:
+            parsed = parse_fact_ref(sig) if parse_fact_ref else None
+        except Exception:
+            parsed = None
+        if parsed:
+            name = parsed[0]
+        base = str(name or '').strip().lower()
+        tp = 'text'
+        sensitive = False
+        if base in {'file', 'binary', 'pcap', 'backuparchive', 'sourcecode', 'encryptedblob', 'decryptionkey'}:
+            tp = 'file'
+        elif base in {'directory'}:
+            tp = 'dir'
+        elif base in {'flag', 'partialflag'}:
+            tp = 'flag'
+            sensitive = True
+        elif base in {'credential'}:
+            tp = 'credential'
+            sensitive = True
+        elif base in {'token', 'apikey', 'exposedsecret'}:
+            tp = 'text'
+            sensitive = True
+        return {'type': tp, 'description': f"Fact: {sig}", **({'sensitive': True} if sensitive else {})}
 
-    # Credentials (generic)
-    'credential.pair': {'type': 'credential', 'description': 'Combined credential pair (format defined by the generator).', 'sensitive': True},
-    'credential.username': {'type': 'text', 'description': 'Username value.'},
-    'credential.password': {'type': 'text', 'description': 'Password value.', 'sensitive': True},
-    'credential.token': {'type': 'text', 'description': 'Token value.', 'sensitive': True},
-    'credential.secret': {'type': 'text', 'description': 'Secret value.', 'sensitive': True},
+    try:
+        repo_root = _get_repo_root()
+        path = os.path.join(repo_root, 'new-schema', 'fact_ontology_reference.yaml')
+        if not os.path.isfile(path):
+            return out
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                raw = line.split('#', 1)[0].strip()
+                if not raw:
+                    continue
+                out[raw] = _fact_meta(raw)
+    except Exception:
+        return {}
+    return out
 
-    # SSH
-    'ssh.host': {'type': 'host', 'description': 'SSH host (hostname/IP).'},
-    'ssh.port': {'type': 'port', 'description': 'SSH port.'},
-    'ssh.username': {'type': 'text', 'description': 'SSH username.'},
-    'ssh.password': {'type': 'text', 'description': 'SSH password.', 'sensitive': True},
-    'ssh.private_key': {'type': 'text', 'description': 'SSH private key (PEM/OpenSSH).', 'sensitive': True},
-    'ssh.public_key': {'type': 'text', 'description': 'SSH public key (OpenSSH format).'},
-    'ssh.known_hosts': {'type': 'file', 'description': 'Known hosts file path.'},
 
-    # TLS
-    'tls.ca': {'type': 'file', 'description': 'CA certificate bundle path.'},
-    'tls.cert': {'type': 'file', 'description': 'Certificate path.'},
-    'tls.key': {'type': 'file', 'description': 'Private key path.', 'sensitive': True},
-    'tls.fingerprint': {'type': 'text', 'description': 'Certificate fingerprint (e.g., SHA-256).'},
-
-    # Database
-    'db.host': {'type': 'host', 'description': 'Database host (hostname/IP).'},
-    'db.port': {'type': 'port', 'description': 'Database port.'},
-    'db.name': {'type': 'text', 'description': 'Database name.'},
-    'db.username': {'type': 'text', 'description': 'Database username.'},
-    'db.password': {'type': 'text', 'description': 'Database password.', 'sensitive': True},
-    'db.uri': {'type': 'url', 'description': 'Database connection URI.', 'sensitive': True},
-
-    # Service discovery / endpoints
-    'service.name': {'type': 'text', 'description': 'Service name identifier.'},
-    'service.protocol': {'type': 'text', 'description': 'Protocol name (e.g., http, ssh, nfs).'},
-    'service.endpoint': {'type': 'text', 'description': 'Service endpoint identifier or URI.'},
-    'service.url': {'type': 'url', 'description': 'Service URL.'},
-
-    # API
-    'api.base_url': {'type': 'url', 'description': 'Base URL for an API.'},
-    'api.key': {'type': 'text', 'description': 'API key.', 'sensitive': True},
-    'api.token': {'type': 'text', 'description': 'API token.', 'sensitive': True},
-
-    # Host / OS context
-    'host.name': {'type': 'host', 'description': 'Host/node name identifier.'},
-    'host.ip': {'type': 'ip', 'description': 'Host IPv4/IPv6 address.'},
-    'host.ipv4': {'type': 'ip', 'description': 'Host IPv4 address.'},
-    'host.ipv6': {'type': 'ip', 'description': 'Host IPv6 address.'},
-    'host.port': {'type': 'port', 'description': 'Host port number.'},
-    'host.os': {'type': 'text', 'description': 'Operating system identifier (e.g., linux, windows).'},
-    'host.distro': {'type': 'text', 'description': 'Linux distribution (e.g., ubuntu).'},
-    'host.version': {'type': 'text', 'description': 'OS/version string.'},
-    'host.arch': {'type': 'text', 'description': 'CPU architecture (e.g., amd64, arm64).'},
-    'host.user': {'type': 'text', 'description': 'Username on the host.'},
-    'host.group': {'type': 'text', 'description': 'Group on the host.'},
-    'host.home': {'type': 'dir', 'description': 'Home directory path.'},
-    'host.shell': {'type': 'text', 'description': 'Shell path (e.g., /bin/bash).'},
-    'host.process': {'type': 'text', 'description': 'Process name/identifier.'},
-    'host.pid': {'type': 'text', 'description': 'Process id.'},
-    'host.service': {'type': 'text', 'description': 'Service name.'},
-
-    # Linux
-    'linux.passwd': {'type': 'file', 'description': 'Path to /etc/passwd (or equivalent).'},
-    'linux.shadow': {'type': 'file', 'description': 'Path to /etc/shadow (or equivalent).', 'sensitive': True},
-    'linux.sudoers': {'type': 'file', 'description': 'Path to sudoers configuration.'},
-    'linux.authorized_keys': {'type': 'file', 'description': 'SSH authorized_keys file path.'},
-    'linux.ssh_config': {'type': 'file', 'description': 'SSH client config file path.'},
-    'linux.sshd_config': {'type': 'file', 'description': 'SSH server config file path.'},
-    'linux.env_file': {'type': 'file', 'description': 'Environment file path (e.g., .env).', 'sensitive': True},
-    'linux.log_file': {'type': 'file', 'description': 'Log file path.'},
-    'linux.core_dump': {'type': 'file', 'description': 'Core dump file path.'},
-
-    # Windows
-    'windows.domain': {'type': 'text', 'description': 'Windows domain name.'},
-    'windows.username': {'type': 'text', 'description': 'Windows username.'},
-    'windows.password': {'type': 'text', 'description': 'Windows password.', 'sensitive': True},
-    'windows.ntlm': {'type': 'text', 'description': 'NTLM hash.', 'sensitive': True},
-    'windows.lm': {'type': 'text', 'description': 'LM hash.', 'sensitive': True},
-    'windows.share': {'type': 'text', 'description': 'SMB share name.'},
-    'windows.path': {'type': 'path', 'description': 'Windows filesystem path.'},
-
-    # HTTP(S)
-    'http.url': {'type': 'url', 'description': 'HTTP URL.'},
-    'http.base_url': {'type': 'url', 'description': 'HTTP base URL.'},
-    'http.host': {'type': 'host', 'description': 'HTTP host.'},
-    'http.port': {'type': 'port', 'description': 'HTTP port.'},
-    'http.path': {'type': 'text', 'description': 'HTTP path.'},
-    'http.method': {'type': 'text', 'description': 'HTTP method.'},
-    'http.header': {'type': 'text', 'description': 'HTTP header (name/value).', 'sensitive': True},
-    'http.authorization': {'type': 'text', 'description': 'HTTP Authorization header value.', 'sensitive': True},
-    'http.cookie': {'type': 'text', 'description': 'HTTP Cookie header value.', 'sensitive': True},
-    'http.csrf': {'type': 'text', 'description': 'CSRF token value.', 'sensitive': True},
-    'http.session': {'type': 'text', 'description': 'Session identifier or token.', 'sensitive': True},
-    'http.user_agent': {'type': 'text', 'description': 'HTTP User-Agent string.'},
-
-    'https.url': {'type': 'url', 'description': 'HTTPS URL.'},
-    'https.base_url': {'type': 'url', 'description': 'HTTPS base URL.'},
-    'https.host': {'type': 'host', 'description': 'HTTPS host.'},
-    'https.port': {'type': 'port', 'description': 'HTTPS port.'},
-
-    # DNS
-    'dns.server': {'type': 'ip', 'description': 'DNS server address.'},
-    'dns.domain': {'type': 'text', 'description': 'DNS domain name.'},
-    'dns.record': {'type': 'text', 'description': 'DNS record name/type/value.'},
-    'dns.zone': {'type': 'text', 'description': 'DNS zone name.'},
-
-    # Email
-    'email.address': {'type': 'text', 'description': 'Email address.'},
-    'email.username': {'type': 'text', 'description': 'Email username.'},
-    'email.password': {'type': 'text', 'description': 'Email password.', 'sensitive': True},
-    'smtp.host': {'type': 'host', 'description': 'SMTP host.'},
-    'smtp.port': {'type': 'port', 'description': 'SMTP port.'},
-    'imap.host': {'type': 'host', 'description': 'IMAP host.'},
-    'imap.port': {'type': 'port', 'description': 'IMAP port.'},
-    'pop3.host': {'type': 'host', 'description': 'POP3 host.'},
-    'pop3.port': {'type': 'port', 'description': 'POP3 port.'},
-
-    # FTP
-    'ftp.host': {'type': 'host', 'description': 'FTP host.'},
-    'ftp.port': {'type': 'port', 'description': 'FTP port.'},
-    'ftp.username': {'type': 'text', 'description': 'FTP username.'},
-    'ftp.password': {'type': 'text', 'description': 'FTP password.', 'sensitive': True},
-    'ftps.host': {'type': 'host', 'description': 'FTPS host.'},
-    'ftps.port': {'type': 'port', 'description': 'FTPS port.'},
-
-    # SMB / NFS
-    'smb.host': {'type': 'host', 'description': 'SMB host.'},
-    'smb.port': {'type': 'port', 'description': 'SMB port.'},
-    'smb.share': {'type': 'text', 'description': 'SMB share name.'},
-    'smb.username': {'type': 'text', 'description': 'SMB username.'},
-    'smb.password': {'type': 'text', 'description': 'SMB password.', 'sensitive': True},
-    'nfs.host': {'type': 'host', 'description': 'NFS host.'},
-    'nfs.port': {'type': 'port', 'description': 'NFS port.'},
-    'nfs.export': {'type': 'text', 'description': 'NFS export path.'},
-    'nfs.mount': {'type': 'dir', 'description': 'Mounted NFS directory path.'},
-
-    # Remote access
-    'rdp.host': {'type': 'host', 'description': 'RDP host.'},
-    'rdp.port': {'type': 'port', 'description': 'RDP port.'},
-    'vnc.host': {'type': 'host', 'description': 'VNC host.'},
-    'vnc.port': {'type': 'port', 'description': 'VNC port.'},
-    'vnc.password': {'type': 'text', 'description': 'VNC password.', 'sensitive': True},
-    'telnet.host': {'type': 'host', 'description': 'Telnet host.'},
-    'telnet.port': {'type': 'port', 'description': 'Telnet port.'},
-    'winrm.host': {'type': 'host', 'description': 'WinRM host.'},
-    'winrm.port': {'type': 'port', 'description': 'WinRM port.'},
-
-    # Databases / caches / queues
-    'mysql.host': {'type': 'host', 'description': 'MySQL host.'},
-    'mysql.port': {'type': 'port', 'description': 'MySQL port.'},
-    'mysql.db': {'type': 'text', 'description': 'MySQL database name.'},
-    'mysql.username': {'type': 'text', 'description': 'MySQL username.'},
-    'mysql.password': {'type': 'text', 'description': 'MySQL password.', 'sensitive': True},
-    'mysql.uri': {'type': 'url', 'description': 'MySQL connection URI.', 'sensitive': True},
-
-    'postgres.host': {'type': 'host', 'description': 'PostgreSQL host.'},
-    'postgres.port': {'type': 'port', 'description': 'PostgreSQL port.'},
-    'postgres.db': {'type': 'text', 'description': 'PostgreSQL database name.'},
-    'postgres.username': {'type': 'text', 'description': 'PostgreSQL username.'},
-    'postgres.password': {'type': 'text', 'description': 'PostgreSQL password.', 'sensitive': True},
-    'postgres.uri': {'type': 'url', 'description': 'PostgreSQL connection URI.', 'sensitive': True},
-
-    'redis.host': {'type': 'host', 'description': 'Redis host.'},
-    'redis.port': {'type': 'port', 'description': 'Redis port.'},
-    'redis.password': {'type': 'text', 'description': 'Redis password.', 'sensitive': True},
-    'redis.uri': {'type': 'url', 'description': 'Redis URI.', 'sensitive': True},
-
-    'mongodb.host': {'type': 'host', 'description': 'MongoDB host.'},
-    'mongodb.port': {'type': 'port', 'description': 'MongoDB port.'},
-    'mongodb.db': {'type': 'text', 'description': 'MongoDB database name.'},
-    'mongodb.username': {'type': 'text', 'description': 'MongoDB username.'},
-    'mongodb.password': {'type': 'text', 'description': 'MongoDB password.', 'sensitive': True},
-    'mongodb.uri': {'type': 'url', 'description': 'MongoDB URI.', 'sensitive': True},
-
-    'rabbitmq.host': {'type': 'host', 'description': 'RabbitMQ host.'},
-    'rabbitmq.port': {'type': 'port', 'description': 'RabbitMQ port.'},
-    'rabbitmq.username': {'type': 'text', 'description': 'RabbitMQ username.'},
-    'rabbitmq.password': {'type': 'text', 'description': 'RabbitMQ password.', 'sensitive': True},
-    'rabbitmq.vhost': {'type': 'text', 'description': 'RabbitMQ virtual host name.'},
-    'rabbitmq.uri': {'type': 'url', 'description': 'RabbitMQ URI.', 'sensitive': True},
-
-    # LDAP / Kerberos
-    'ldap.host': {'type': 'host', 'description': 'LDAP host.'},
-    'ldap.port': {'type': 'port', 'description': 'LDAP port.'},
-    'ldap.base_dn': {'type': 'text', 'description': 'LDAP base DN.'},
-    'ldap.bind_dn': {'type': 'text', 'description': 'LDAP bind DN.'},
-    'ldap.bind_password': {'type': 'text', 'description': 'LDAP bind password.', 'sensitive': True},
-    'kerberos.realm': {'type': 'text', 'description': 'Kerberos realm.'},
-    'kerberos.kdc': {'type': 'host', 'description': 'Kerberos KDC host.'},
-    'kerberos.ticket': {'type': 'file', 'description': 'Kerberos ticket cache file path.', 'sensitive': True},
-
-    # Containers / orchestration
-    'docker.image': {'type': 'text', 'description': 'Docker image name.'},
-    'docker.container': {'type': 'text', 'description': 'Docker container name/id.'},
-    'docker.network': {'type': 'text', 'description': 'Docker network name.'},
-    'docker.volume': {'type': 'text', 'description': 'Docker volume name.'},
-    'k8s.namespace': {'type': 'text', 'description': 'Kubernetes namespace.'},
-    'k8s.pod': {'type': 'text', 'description': 'Kubernetes pod name.'},
-    'k8s.service': {'type': 'text', 'description': 'Kubernetes service name.'},
-    'k8s.configmap': {'type': 'text', 'description': 'Kubernetes ConfigMap name.'},
-    'k8s.secret': {'type': 'text', 'description': 'Kubernetes Secret name.', 'sensitive': True},
-
-    # Crypto / secrets
-    'crypto.private_key': {'type': 'text', 'description': 'Private key material (format-specific).', 'sensitive': True},
-    'crypto.public_key': {'type': 'text', 'description': 'Public key material (format-specific).'},
-    'crypto.key': {'type': 'text', 'description': 'Symmetric key material.', 'sensitive': True},
-    'crypto.salt': {'type': 'text', 'description': 'Salt value.'},
-    'crypto.hash': {'type': 'text', 'description': 'Hash value (format-specific).', 'sensitive': True},
-    'crypto.jwt': {'type': 'text', 'description': 'JWT string.', 'sensitive': True},
-    'crypto.jwk': {'type': 'text', 'description': 'JWK JSON.', 'sensitive': True},
-
-    # Vulnerability / exploit metadata
-    'vuln.cve': {'type': 'text', 'description': 'CVE identifier (e.g., CVE-2024-12345).'},
-    'vuln.type': {'type': 'text', 'description': 'Vulnerability category/type.'},
-    'vuln.vector': {'type': 'text', 'description': 'Vulnerability vector/classification.'},
-    'vuln.severity': {'type': 'text', 'description': 'Vulnerability severity (e.g., low/med/high/critical).'},
-    'exploit.command': {'type': 'text', 'description': 'Exploit command line (if applicable).', 'sensitive': True},
-    'exploit.url': {'type': 'url', 'description': 'Exploit/reference URL.'},
-
-    # Generic service targets (preferred, tight namespace)
-    'service.host': {'type': 'host', 'description': 'Service host.'},
-    'service.ip': {'type': 'ip', 'description': 'Service IP address.'},
-    'service.port': {'type': 'port', 'description': 'Service port.'},
-    'service.base_url': {'type': 'url', 'description': 'Service base URL.'},
-    'service.health_url': {'type': 'url', 'description': 'Health check URL.'},
-    'service.version': {'type': 'text', 'description': 'Service version string.'},
-    'service.banner': {'type': 'text', 'description': 'Service banner string.'},
-    'service.config': {'type': 'file', 'description': 'Service configuration file path.'},
-
-    # Generic credentials (preferred, tight namespace)
-    'credential.userpass': {'type': 'text', 'description': 'Combined username:password credential.', 'sensitive': True},
-    'credential.api_key': {'type': 'text', 'description': 'Generic API key.', 'sensitive': True},
-    'credential.client_id': {'type': 'text', 'description': 'OAuth client_id or similar identifier.'},
-    'credential.client_secret': {'type': 'text', 'description': 'OAuth client_secret or similar secret.', 'sensitive': True},
-    'credential.refresh_token': {'type': 'text', 'description': 'OAuth refresh token.', 'sensitive': True},
-    'credential.access_token': {'type': 'text', 'description': 'OAuth access token.', 'sensitive': True},
-    'credential.bearer': {'type': 'text', 'description': 'Bearer token value.', 'sensitive': True},
-    'credential.cookie': {'type': 'text', 'description': 'Cookie value used for auth/session.', 'sensitive': True},
-    'credential.session': {'type': 'text', 'description': 'Session identifier.', 'sensitive': True},
-    'credential.csrf': {'type': 'text', 'description': 'CSRF token.', 'sensitive': True},
-    'credential.mfa_code': {'type': 'text', 'description': 'MFA/OTP code.', 'sensitive': True},
-    'credential.pin': {'type': 'text', 'description': 'PIN code.', 'sensitive': True},
-
-    'credential.private_key': {'type': 'text', 'description': 'Private key material.', 'sensitive': True},
-    'credential.public_key': {'type': 'text', 'description': 'Public key material.'},
-    'credential.ssh_private_key': {'type': 'file', 'description': 'Path to SSH private key file.', 'sensitive': True},
-    'credential.ssh_public_key': {'type': 'file', 'description': 'Path to SSH public key file.'},
-    'credential.ssh_known_hosts': {'type': 'file', 'description': 'Path to known_hosts file.'},
-    'credential.ssh_authorized_keys': {'type': 'file', 'description': 'Path to authorized_keys file.'},
-    'credential.keytab': {'type': 'file', 'description': 'Kerberos keytab file.', 'sensitive': True},
-    'credential.cert': {'type': 'file', 'description': 'Certificate file (PEM/DER).' },
-    'credential.ca_cert': {'type': 'file', 'description': 'CA certificate bundle file.'},
-    'credential.cert_key': {'type': 'file', 'description': 'Certificate private key file.', 'sensitive': True},
-    'credential.pfx': {'type': 'file', 'description': 'PKCS#12 / PFX bundle file.', 'sensitive': True},
-
-    # Web app context (preferred, tight namespace)
-    'web.host': {'type': 'host', 'description': 'Web host.'},
-    'web.port': {'type': 'port', 'description': 'Web port.'},
-    'web.login_url': {'type': 'url', 'description': 'Web login URL.'},
-    'web.logout_url': {'type': 'url', 'description': 'Web logout URL.'},
-    'web.register_url': {'type': 'url', 'description': 'Web registration URL.'},
-    'web.admin_url': {'type': 'url', 'description': 'Web admin URL.'},
-    'web.session': {'type': 'text', 'description': 'Web session id.', 'sensitive': True},
-    'web.csrf': {'type': 'text', 'description': 'Web CSRF token.', 'sensitive': True},
-    'web.header': {'type': 'text', 'description': 'Web request header (name/value).', 'sensitive': True},
-    'web.user_agent': {'type': 'text', 'description': 'Web User-Agent string.'},
-    'web.form_field': {'type': 'text', 'description': 'Web form field name.'},
-    'web.form_value': {'type': 'text', 'description': 'Web form field value.', 'sensitive': True},
-    'web.jwt': {'type': 'text', 'description': 'JWT used for web auth.', 'sensitive': True},
-
-    # Auth flows (preferred, tight namespace)
-    'auth.type': {'type': 'text', 'description': 'Authentication type (e.g., basic, bearer, cookie).'},
-    'auth.realm': {'type': 'text', 'description': 'Authentication realm (if applicable).'},
-    'auth.basic': {'type': 'text', 'description': 'Basic auth header or user:pass.', 'sensitive': True},
-    'auth.bearer': {'type': 'text', 'description': 'Bearer token string.', 'sensitive': True},
-    'auth.header': {'type': 'text', 'description': 'Auth header value.', 'sensitive': True},
-    'auth.cookie': {'type': 'text', 'description': 'Auth cookie value.', 'sensitive': True},
-    'auth.csrf': {'type': 'text', 'description': 'CSRF token.', 'sensitive': True},
-    'auth.redirect_uri': {'type': 'url', 'description': 'OAuth redirect URI.'},
-    'auth.scope': {'type': 'text', 'description': 'OAuth scope string.'},
-    'auth.state': {'type': 'text', 'description': 'OAuth state value.', 'sensitive': True},
-    'auth.code': {'type': 'text', 'description': 'OAuth authorization code.', 'sensitive': True},
-    'auth.issuer': {'type': 'url', 'description': 'OIDC issuer URL.'},
-    'auth.jwks_url': {'type': 'url', 'description': 'OIDC JWKS URL.'},
-    'auth.id_token': {'type': 'text', 'description': 'OIDC id_token JWT.', 'sensitive': True},
-
-    # Cloud/provider credentials (preferred, tight namespace)
-    'cloud.provider': {'type': 'text', 'description': 'Cloud provider identifier (aws/gcp/azure).'},
-    'cloud.region': {'type': 'text', 'description': 'Cloud region (e.g., us-east-1).'},
-    'cloud.account_id': {'type': 'text', 'description': 'Cloud account/subscription id.'},
-    'cloud.project_id': {'type': 'text', 'description': 'Cloud project id.'},
-
-    'cloud.aws.access_key_id': {'type': 'text', 'description': 'AWS access key id.', 'sensitive': True},
-    'cloud.aws.secret_access_key': {'type': 'text', 'description': 'AWS secret access key.', 'sensitive': True},
-    'cloud.aws.session_token': {'type': 'text', 'description': 'AWS session token.', 'sensitive': True},
-    'cloud.aws.profile': {'type': 'text', 'description': 'AWS credential profile name.'},
-
-    'cloud.gcp.service_account_json': {'type': 'file', 'description': 'GCP service account JSON file.', 'sensitive': True},
-    'cloud.gcp.access_token': {'type': 'text', 'description': 'GCP access token.', 'sensitive': True},
-
-    'cloud.azure.tenant_id': {'type': 'text', 'description': 'Azure tenant id.'},
-    'cloud.azure.client_id': {'type': 'text', 'description': 'Azure client id.'},
-    'cloud.azure.client_secret': {'type': 'text', 'description': 'Azure client secret.', 'sensitive': True},
-    'cloud.azure.subscription_id': {'type': 'text', 'description': 'Azure subscription id.'},
-
-    # VPN / tunnels (preferred, tight namespace)
-    'vpn.type': {'type': 'text', 'description': 'VPN type (wireguard, openvpn, ipsec).'},
-    'vpn.server': {'type': 'host', 'description': 'VPN server host.'},
-    'vpn.port': {'type': 'port', 'description': 'VPN server port.'},
-    'vpn.config': {'type': 'file', 'description': 'VPN config file path.', 'sensitive': True},
-    'vpn.psk': {'type': 'text', 'description': 'VPN pre-shared key.', 'sensitive': True},
-    'vpn.client_key': {'type': 'file', 'description': 'VPN client private key file.', 'sensitive': True},
-    'vpn.client_cert': {'type': 'file', 'description': 'VPN client cert file.'},
-
-    # Monitoring / observability (preferred, tight namespace)
-    'monitoring.url': {'type': 'url', 'description': 'Monitoring system URL.'},
-    'monitoring.api_key': {'type': 'text', 'description': 'Monitoring API key.', 'sensitive': True},
-    'monitoring.token': {'type': 'text', 'description': 'Monitoring token.', 'sensitive': True},
-    'monitoring.datasource': {'type': 'text', 'description': 'Monitoring datasource name.'},
-    'monitoring.dashboard': {'type': 'text', 'description': 'Monitoring dashboard identifier.'},
-    'monitoring.alert': {'type': 'text', 'description': 'Monitoring alert name/id.'},
-
-    'monitoring.prometheus.url': {'type': 'url', 'description': 'Prometheus base URL.'},
-    'monitoring.grafana.url': {'type': 'url', 'description': 'Grafana base URL.'},
-    'monitoring.grafana.api_key': {'type': 'text', 'description': 'Grafana API key.', 'sensitive': True},
-
-    # Logging (preferred, tight namespace)
-    'logging.url': {'type': 'url', 'description': 'Logging system URL.'},
-    'logging.token': {'type': 'text', 'description': 'Logging token.', 'sensitive': True},
-    'logging.index': {'type': 'text', 'description': 'Logging index name.'},
-    'logging.query': {'type': 'text', 'description': 'Logging query string.'},
-    'logging.log_file': {'type': 'file', 'description': 'Log file path.'},
-    'logging.trace_id': {'type': 'text', 'description': 'Trace id/correlation id.'},
-}
+try:
+    _FACT_RESERVED_ARTIFACTS = _load_fact_reserved_artifacts()
+    if _FACT_RESERVED_ARTIFACTS:
+        _RESERVED_ARTIFACTS = _FACT_RESERVED_ARTIFACTS
+except Exception:
+    pass
 
 
 def _coerce_flaggen_io_type(name: str) -> str:
-    n = (name or '').strip().lower()
-    if not n:
+    raw = (name or '').strip()
+    n = raw.lower()
+    if not raw:
         return 'text'
     try:
-        meta = _RESERVED_ARTIFACTS.get(n)
+        meta = _RESERVED_ARTIFACTS.get(raw) or _RESERVED_ARTIFACTS.get(n)
         if isinstance(meta, dict):
             tp0 = str(meta.get('type') or '').strip()
             if tp0:
                 return tp0
     except Exception:
         pass
+    try:
+        from core_topo_gen.sequencer.facts import parse_fact_ref
+        parsed = parse_fact_ref(raw)
+    except Exception:
+        parsed = None
+    if parsed:
+        base = parsed[0].strip().lower()
+        if base in {'file', 'binary', 'pcap', 'backuparchive', 'sourcecode', 'encryptedblob', 'decryptionkey'}:
+            return 'file'
+        if base in {'directory'}:
+            return 'dir'
+        if base in {'flag', 'partialflag'}:
+            return 'flag'
+        if base in {'credential'}:
+            return 'credential'
+        return 'text'
     if n.startswith('filesystem.'):
         if n.endswith('.dir'):
             return 'dir'
@@ -19561,14 +19634,24 @@ def _coerce_flaggen_io_type(name: str) -> str:
 
 
 def _coerce_flaggen_io_sensitive(name: str, tp: str) -> bool:
-    n = (name or '').strip().lower()
+    raw = (name or '').strip()
+    n = raw.lower()
     t = (tp or '').strip().lower()
     try:
-        meta = _RESERVED_ARTIFACTS.get(n)
+        meta = _RESERVED_ARTIFACTS.get(raw) or _RESERVED_ARTIFACTS.get(n)
         if isinstance(meta, dict) and meta.get('sensitive') is True:
             return True
     except Exception:
         pass
+    try:
+        from core_topo_gen.sequencer.facts import parse_fact_ref
+        parsed = parse_fact_ref(raw)
+    except Exception:
+        parsed = None
+    if parsed:
+        base = parsed[0].strip().lower()
+        if base in {'flag', 'partialflag', 'credential', 'token', 'apikey', 'exposedsecret', 'decryptionkey'}:
+            return True
     if t == 'flag':
         return True
     if any(k in n for k in ('password', 'secret', 'token', 'private_key', 'ssh.private_key')):
@@ -25290,6 +25373,19 @@ def download_report():
         pass
     app.logger.warning("[download] file not found: %s (candidates=%s)", result_path, candidates)
     return "File not found", 404
+
+
+@app.route('/schemas/node_authoring.yaml')
+def node_schema_authoring_yaml():
+    path = _node_schema_authoring_path()
+    if not path or not os.path.isfile(path):
+        return jsonify({'ok': False, 'error': 'schema not found'}), 404
+    return send_file(
+        path,
+        mimetype='text/yaml; charset=utf-8',
+        as_attachment=False,
+        download_name='node_schema_authoring.yaml',
+    )
 
 @app.route('/reports')
 def reports_page():
@@ -31228,8 +31324,8 @@ def _build_generator_scaffold(payload: dict[str, Any]) -> tuple[dict[str, str], 
             if s:
                 inject_files.append(s)
 
-    if 'flag' not in produces:
-        produces = ['flag'] + produces
+    if 'Flag(flag_id)' not in produces and 'flag' not in produces:
+        produces = ['Flag(flag_id)'] + produces
 
     inputs_flags = payload.get('inputs') if isinstance(payload.get('inputs'), dict) else {}
     inputs_schema = _inputs_schema_from_flags(inputs_flags, plugin_type=plugin_type)
@@ -31393,7 +31489,7 @@ def main() -> None:
     outputs = {{
         'generator_id': {json.dumps(plugin_id)},
         'outputs': {{
-            'flag': flag_value,
+            'Flag(flag_id)': flag_value,
         }},
     }}
 
@@ -31453,8 +31549,8 @@ def main() -> None:
     outputs = {{
         'generator_id': {json.dumps(plugin_id)},
         'outputs': {{
-            'compose_path': 'docker-compose.yml',
-            'flag': flag_value,
+            'File(path)': 'docker-compose.yml',
+            'Flag(flag_id)': flag_value,
         }},
     }}
     (out_dir / 'outputs.json').write_text(json.dumps(outputs, indent=2) + '\n', encoding='utf-8')
@@ -33252,6 +33348,11 @@ def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[d
     except Exception as exc:
         return False, f'Missing validator dependency: {exc}', []
 
+    try:
+        from core_topo_gen.sequencer.facts import parse_fact_ref
+    except Exception:
+        parse_fact_ref = None  # type: ignore
+
     root = Path(extracted_dir)
     if not root.exists() or not root.is_dir():
         return False, 'Empty pack', [], []
@@ -33278,6 +33379,33 @@ def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[d
     canonical_types = {
         'string', 'int', 'float', 'number', 'boolean', 'json', 'file', 'string_list', 'file_list'
     }
+
+    fact_pattern = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*\s*\([^\n]*\)$')
+
+    def _normalize_artifact_entry(item: Any) -> str:
+        if isinstance(item, dict):
+            return str(item.get('artifact') or item.get('name') or '').strip()
+        return str(item or '').strip()
+
+    def _validate_artifact_list(section: str, items: Any, *, manifest_path: Path) -> None:
+        if items is None:
+            return
+        if not isinstance(items, list):
+            errors.append(f'{manifest_path}: artifacts.{section} must be a list')
+            return
+        for idx, item in enumerate(items):
+            art = _normalize_artifact_entry(item)
+            if not art:
+                errors.append(f'{manifest_path}: artifacts.{section}[{idx}] is empty')
+                continue
+            if parse_fact_ref is not None:
+                try:
+                    parse_fact_ref(art)
+                except Exception:
+                    errors.append(f'{manifest_path}: artifacts.{section}[{idx}] must be fact-style (e.g., File(path))')
+            else:
+                if not fact_pattern.match(art):
+                    errors.append(f'{manifest_path}: artifacts.{section}[{idx}] must be fact-style (e.g., File(path))')
 
     def _normalize_input_type_for_warning(type_value: Any) -> tuple[str, bool]:
         """Return (canonical_type, used_fallback).
@@ -33370,6 +33498,16 @@ def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[d
         if kind not in ('flag-generator', 'flag-node-generator'):
             errors.append(f'{mp}: kind must be flag-generator or flag-node-generator')
             continue
+
+        # Enforce fact-style artifact keys in manifests.
+        try:
+            artifacts = doc.get('artifacts') if isinstance(doc.get('artifacts'), dict) else None
+            if artifacts:
+                _validate_artifact_list('requires', artifacts.get('requires'), manifest_path=mp)
+                _validate_artifact_list('optional_requires', artifacts.get('optional_requires'), manifest_path=mp)
+                _validate_artifact_list('produces', artifacts.get('produces'), manifest_path=mp)
+        except Exception:
+            pass
 
         # Warn on missing/unknown input types (they will fall back to string at runtime).
         try:
@@ -34374,7 +34512,7 @@ def flag_generators_test_run():
         desired = None
         try:
             if name == 'input_file':
-                desired = cfg.get('filesystem.filename')
+                desired = cfg.get('File(path)')
         except Exception:
             desired = None
         requested_filename = None

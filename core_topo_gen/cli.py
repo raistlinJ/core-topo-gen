@@ -141,10 +141,14 @@ def _run_offline_report(
     }
 
     try:
-        vuln_density, vuln_items = parse_vulnerabilities_info(args.xml, args.scenario)
+        vuln_density, vuln_items, vuln_flag_type = parse_vulnerabilities_info(args.xml, args.scenario)
     except Exception:
-        vuln_density, vuln_items = None, []
-    vulnerabilities_cfg = {"density": vuln_density, "items": vuln_items or []}
+        vuln_density, vuln_items, vuln_flag_type = None, [], None
+    vulnerabilities_cfg = {
+        "density": vuln_density,
+        "items": vuln_items or [],
+        "flag_type": vuln_flag_type,
+    }
 
     from datetime import datetime as _dt
     report_dir = os.path.join(repo_root, "reports")

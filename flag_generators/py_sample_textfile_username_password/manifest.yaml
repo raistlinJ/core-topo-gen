@@ -15,10 +15,13 @@ inputs:
   - name: flag_prefix
     type: string
     required: false
+  - name: Credential(user, password)
+    type: string
+    required: false
 artifacts:
   requires: []
   produces:
-    - flag
-    - filesystem.file
+    - Flag(flag_id)
+    - File(path)
 injects:
-  - filesystem.file
+  - File(path)

@@ -216,14 +216,14 @@ Example request:
 	"name": "SSH Credentials",
 	"description": "Emits deterministic SSH credentials.",
 	"requires": [
-		{"artifact": "ssh.username", "optional": true},
-		{"artifact": "ssh.password", "optional": false}
+		{"artifact": "Credential(user)", "optional": true},
+		{"artifact": "Credential(user, password)", "optional": false}
 	],
 	"optional_requires": [],
-	"produces": ["flag", "ssh_username", "ssh_password"],
+	"produces": ["Flag(flag_id)", "Credential(user)", "Credential(user, password)"],
 	"inputs": {"seed": true, "secret": true, "flag_prefix": true},
-	"hint_templates": ["Next: SSH using {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}"],
-	"inject_files": ["filesystem.file"],
+	"hint_templates": ["Next: SSH using {{OUTPUT.Credential(user)}} / {{OUTPUT.Credential(user,password)}}"],
+	"inject_files": ["File(path)"],
 	"compose_text": "(optional full docker-compose.yml override)",
 	"readme_text": "(optional full README.md override)"
 }
@@ -233,7 +233,7 @@ Notes:
 - `requires` must be a list of objects `{ artifact, optional }`.
 - `inputs` is a list of runtime input definitions (name/type/required/etc) written into `manifest.yaml`.
 - `inject_files` is optional; when present it is written into `manifest.yaml` as `injects`.
-- Optional destination directory syntax: `inject_files: ["filesystem.file -> /opt/bin"]`. If omitted or invalid, files default to `/tmp`.
+- Optional destination directory syntax: `inject_files: ["File(path) -> /opt/bin"]`. If omitted or invalid, files default to `/tmp`.
 
 `POST /api/generators/scaffold_zip`
 : Same JSON request body as `/api/generators/scaffold_meta`, but returns a ZIP you can unzip into the repo root.

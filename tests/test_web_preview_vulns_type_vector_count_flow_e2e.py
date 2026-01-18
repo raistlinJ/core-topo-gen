@@ -171,7 +171,8 @@ def test_flow_attackflow_preview_sample_preset_forces_sample_chain(tmp_path):
 
         # Regression: preset path should include inject_files from manifest metadata.
         assert isinstance(fas[0].get("inject_files"), list)
-        assert "filesystem.file" in fas[0].get("inject_files")
+        injects = fas[0].get("inject_files") or []
+        assert any(x in {"File(path)", "filesystem.file"} for x in injects)
 
         # Hint should include the next node's IP address when available.
         # Step 1 points to docker-2 (10.0.0.2).

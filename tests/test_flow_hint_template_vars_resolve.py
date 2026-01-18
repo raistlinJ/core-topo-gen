@@ -45,8 +45,8 @@ def test_prepare_preview_resolves_chain_and_output_template_vars(monkeypatch):
         "language": "python",
         "description": "test",
         "hint_templates": [
-            "Scenario={{SCENARIO}} next={{NEXT_NODE_NAME}} ip={{OUTPUT.network.ip}}",
-            "subnet={{OUTPUT.network.ip:subnet24}} last={{OUTPUT.network.ip:last_octet}} port={{OUTPUT.https_port}}",
+            "Scenario={{SCENARIO}} next={{NEXT_NODE_NAME}} ip={{OUTPUT.Knowledge(ip)}}",
+            "subnet={{OUTPUT.Knowledge(ip):subnet24}} last={{OUTPUT.Knowledge(ip):last_octet}} port={{OUTPUT.https_port}}",
         ],
         "inputs": [],
         "outputs": [],
@@ -66,8 +66,8 @@ def test_prepare_preview_resolves_chain_and_output_template_vars(monkeypatch):
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
             with open(os.path.join(out_dir, "outputs.json"), "w", encoding="utf-8") as mf:
-                # Deliberately emit a mismatching network.ip to ensure the clamp uses preview ip4.
-                json.dump({"outputs": {"network.ip": "10.0.0.99", "https_port": 8443}}, mf)
+                # Deliberately emit a mismatching Knowledge(ip) to ensure the clamp uses preview ip4.
+                json.dump({"outputs": {"Knowledge(ip)": "10.0.0.99", "https_port": 8443}}, mf)
 
         class Result:
             def __init__(self):
@@ -98,10 +98,10 @@ def test_prepare_preview_resolves_chain_and_output_template_vars(monkeypatch):
         fas = data.get("flag_assignments") or []
         assert len(fas) == 2
 
-        # Resolved outputs should be surfaced for UI display (network.ip clamped to preview ip4).
+        # Resolved outputs should be surfaced for UI display (Knowledge(ip) clamped to preview ip4).
         resolved_outputs = (fas[0].get("resolved_outputs") or {})
         assert isinstance(resolved_outputs, dict)
-        assert resolved_outputs.get("network.ip") == "172.27.83.6"
+        assert resolved_outputs.get("Knowledge(ip)") == "172.27.83.6"
         assert resolved_outputs.get("https_port") == 8443
 
         hints = fas[0].get("hints") or []
@@ -114,7 +114,7 @@ def test_prepare_preview_resolves_chain_and_output_template_vars(monkeypatch):
         assert f"Scenario={scenario}" in h0
         assert "next=h2" in h0
 
-        # OUTPUT vars (network.ip should be clamped to preview host ip4)
+        # OUTPUT vars (Knowledge(ip) should be clamped to preview host ip4)
         assert "ip=172.27.83.6" in h0
         assert "subnet=172.27.83.0/24" in h1
         assert "last=6" in h1

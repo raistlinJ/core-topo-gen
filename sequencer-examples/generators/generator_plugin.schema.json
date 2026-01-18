@@ -9,14 +9,17 @@
     "version": { "type": "string" },
     "description": { "type": "string" },
     "category": { "type": "array", "items": { "type": "string" } },
-    "requires": { "type": "array", "items": { "type": "string" } },
+    "requires": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*\\s*\\([^\\n]*\\)$" }
+    },
     "produces": {
       "type": "array",
       "items": {
         "type": "object",
         "required": ["artifact"],
         "properties": {
-          "artifact": { "type": "string" },
+          "artifact": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*\\s*\\([^\\n]*\\)$" },
           "optional": { "type": "boolean", "default": false }
         },
         "additionalProperties": false

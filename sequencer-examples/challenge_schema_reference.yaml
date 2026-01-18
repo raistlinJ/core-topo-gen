@@ -2,12 +2,12 @@ challenge_id: string
 kind: flag-generator | flag-node-generator
 
 requires:
-  - artifact: artifact.type
+  - artifact: FactName(arg1, arg2)
     source: optional.challenge_id
 
 produces:
   - name: output_name
-    artifact: artifact.type
+    artifact: FactName(arg1, arg2)
 
 container:
   image: docker_image

@@ -26,8 +26,8 @@ def test_afb_export_emits_inject_files_as_artifact_nodes():
             "name": "Test Generator",
             "type": "flag-generator",
             "inject_files": ["injected/flag.txt", "hint.txt"],
-            "produces": ["flag"],
-            "output_fields": ["flag"],
+            "produces": ["Flag(flag_id)"],
+            "output_fields": ["Flag(flag_id)"],
         }
     ]
 

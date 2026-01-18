@@ -418,8 +418,8 @@ def expand_inject_files_from_outputs(out_dir: Path, inject_files: list[str]) -> 
     expand it to the corresponding output value(s) when they look like paths.
 
     Example:
-        inject_files: ['filesystem.file']
-        outputs.json: {"outputs": {"filesystem.file": "artifacts/challenge"}}
+        inject_files: ['File(path)']
+        outputs.json: {"outputs": {"File(path)": "artifacts/challenge"}}
         -> expanded inject_files includes 'artifacts/challenge'
     """
     manifest = (out_dir / 'outputs.json').resolve()

@@ -28,8 +28,8 @@ def test_sample_binary_embed_text_outputs_and_optional_filename_and_flag(tmp_pat
 
     cfg = {
         "seed": "seed-1",
-        "filesystem.file": "challengeA",
-        "flag": "FLAG{TEST_FLAG_VALUE}",
+        "File(path)": "challengeA",
+        "Flag(flag_id)": "FLAG{TEST_FLAG_VALUE}",
         "generator_id": "sample.binary_embed_text",
     }
     config_path = inputs_dir / "config.json"
@@ -63,8 +63,8 @@ def test_sample_binary_embed_text_outputs_and_optional_filename_and_flag(tmp_pat
     assert isinstance(outputs, dict)
 
     # Per catalog spec: must emit these outputs.
-    assert outputs.get("flag") == "FLAG{TEST_FLAG_VALUE}"
-    assert outputs.get("filesystem.file") == "artifacts/challengeA"
+    assert outputs.get("Flag(flag_id)") == "FLAG{TEST_FLAG_VALUE}"
+    assert outputs.get("File(path)") == "artifacts/challengeA"
 
     # And the injected artifact must exist at the referenced path.
     bin_path = out_dir / "artifacts" / "challengeA"
@@ -105,7 +105,7 @@ def test_sample_binary_embed_text_binary_changes_with_seed(tmp_path: Path, monke
         doc = json.loads((out_dir / "outputs.json").read_text("utf-8"))
         outp = doc.get("outputs")
         assert isinstance(outp, dict)
-        rel = outp.get("filesystem.file")
+        rel = outp.get("File(path)")
         assert isinstance(rel, str) and rel.startswith("artifacts/")
         name = rel.split("/", 1)[1]
         return name, (out_dir / "artifacts" / name).read_bytes()

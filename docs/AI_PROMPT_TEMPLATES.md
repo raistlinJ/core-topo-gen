@@ -50,8 +50,8 @@ If the generator needs to deliver a file/binary to participants:
 - Allowlist injected files:
   - Manifest workflow: declare `injects` in `manifest.yaml`.
   - Legacy v3 JSON workflow: declare `inject_files` in the implementation.
-  - Prefer referencing an **output artifact key** so the allowlist stays stable, e.g. `inject_files: ["filesystem.file"]`.
-  - `inject_files` supports resolving output keys via `outputs.json` (e.g. `filesystem.file` -> `artifacts/my_binary`).
+  - Prefer referencing an **output artifact key** so the allowlist stays stable, e.g. `inject_files: ["File(path)"]`.
+  - `inject_files` supports resolving output keys via `outputs.json` (e.g. `File(path)` -> `artifacts/my_binary`).
 
 ---
 
@@ -71,7 +71,7 @@ Hard requirements (do not violate):
   {
     "generator_id": "<SOME STABLE STRING>",
     "outputs": {
-      "flag": "FLAG{...}",
+      "Flag(flag_id)": "FLAG{...}",
       "...": "..."
     }
   }
@@ -84,11 +84,11 @@ Hard requirements (do not violate):
 
 If this generator outputs a file/binary:
 - Write it under /outputs/artifacts/<name>
-- Put a path to it in outputs.json.outputs (example key: filesystem.file => artifacts/<name>)
+- Put a path to it in outputs.json.outputs (example key: File(path) => artifacts/<name>)
 
 Catalog intent:
 - inputs artifacts: <list artifacts or '(none)'>
-- outputs artifacts: <list artifacts; must include 'flag'>
+- outputs artifacts: <list artifacts; must include 'Flag(flag_id)'>
 
 Artifact input strictness:
 - Default to optional inputs.
@@ -126,8 +126,8 @@ Hard requirements (do not violate):
   {
     "generator_id": "<SOME STABLE STRING>",
     "outputs": {
-      "compose_path": "docker-compose.yml",
-      "flag": "FLAG{...}",
+      "File(path)": "docker-compose.yml",
+      "Flag(flag_id)": "FLAG{...}",
       "...": "..."
     }
   }
@@ -139,7 +139,7 @@ Hard requirements (do not violate):
 
 Catalog intent:
 - inputs artifacts: <list artifacts or '(none)'>
-- outputs artifacts: <list artifacts; typically includes 'compose_path' and 'flag'>
+- outputs artifacts: <list artifacts; typically includes 'File(path)' and 'Flag(flag_id)'>
 
 Artifact input strictness:
 - Default to optional inputs.
@@ -189,6 +189,6 @@ If you add new outputs, tell me what catalog changes I should make.
 
 - Don’t let the AI introduce third-party deps unless you explicitly want that.
 - Ensure `outputs.json` is always written even on “success with minimal outputs”.
-- Always include `flag` in produced outputs.
+- Always include `Flag(flag_id)` in produced outputs.
 - Keep file paths exactly `/inputs/config.json` and `/outputs/...`.
-- Prefer namespaced artifact keys (e.g., `ssh.username`, `network.ip`, `filesystem.file`) over ad-hoc keys (e.g., `user`, `ip`).
+- Prefer fact-ontology keys (e.g., `Credential(user,password)`, `Knowledge(ip)`, `File(path)`) over ad-hoc keys (e.g., `user`, `ip`).

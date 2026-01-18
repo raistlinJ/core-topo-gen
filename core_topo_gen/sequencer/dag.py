@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
+from .facts import load_fact_ontology, validate_fact_ref
+
 
 @dataclass(frozen=True)
 class DagEdge:
@@ -107,6 +109,7 @@ def build_dag(
     - We fail if a required artifact cannot be produced by any prior node (given topo order).
     """
     errors: List[str] = []
+    fact_ontology = load_fact_ontology()
 
     # Index plugins and compute per-challenge requires/produces.
     ch_by_id: Dict[str, Dict[str, Any]] = {}
@@ -140,6 +143,24 @@ def build_dag(
         reqs[cid] = r
         req_sources[cid] = _requires_sources(ch)
         prods[cid] = _plugin_produces(plugin)
+
+        # Validate fact-style artifacts against the ontology when applicable.
+        for art in sorted(_required_artifacts_from_instance(ch)):
+            fact_err = validate_fact_ref(art, ontology=fact_ontology)
+            if fact_err:
+                errors.append(f"{cid}: requires artifact {fact_err}")
+        for art in sorted(_plugin_requires(plugin)):
+            fact_err = validate_fact_ref(art, ontology=fact_ontology)
+            if fact_err:
+                errors.append(f"{cid}: plugin requires artifact {fact_err}")
+        for art in sorted(_plugin_optional_requires(plugin)):
+            fact_err = validate_fact_ref(art, ontology=fact_ontology)
+            if fact_err:
+                errors.append(f"{cid}: plugin optional_requires artifact {fact_err}")
+        for art in sorted(_plugin_produces(plugin)):
+            fact_err = validate_fact_ref(art, ontology=fact_ontology)
+            if fact_err:
+                errors.append(f"{cid}: plugin produces artifact {fact_err}")
 
         # Validate instance requires are a subset of plugin requires OR are explicitly supplied.
         # (We allow instances to declare fewer requires than the plugin; plugin.requires still applies.)

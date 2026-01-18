@@ -2,7 +2,7 @@
 
 This sample **flag-generator** writes an **x64 (amd64) Linux ELF** binary under `outputs/artifacts/` and returns its relative path as:
 
-- `outputs.json.outputs.filesystem.file = "artifacts/<filename>"`
+- `outputs.json.outputs.File(path) = "artifacts/<filename>"`
 
 The flag is embedded inside the binary as a static string so it can be recovered with tools like `strings` or a reverse engineering tool (e.g., Ghidra).
 
@@ -11,14 +11,14 @@ The flag is embedded inside the binary as a static string so it can be recovered
 All inputs are optional and provided via `inputs/config.json`:
 
 - `seed` (text): used to deterministically derive a flag and default filename.
-- `filesystem.file` (text): optional output binary filename (or relative path like `artifacts/<name>`); if omitted, a deterministic random-looking name is derived from `seed`.
+- `File(path)` (text): optional output binary filename (or relative path like `artifacts/<name>`); if omitted, a deterministic random-looking name is derived from `seed`.
 	- Legacy alias: `filename`.
-- `flag` (text): optional explicit flag value to embed; if omitted, a deterministic flag is derived from `seed`.
+- `Flag(flag_id)` (text): optional explicit flag value to embed; if omitted, a deterministic flag is derived from `seed`.
 
 ## Outputs
 
-- `flag` (text): the expected flag value (sensitive).
-- `filesystem.file` (file): relative path to the generated binary under `outputs/`.
+- `Flag(flag_id)` (text): the expected flag value (sensitive).
+- `File(path)` (file): relative path to the generated binary under `outputs/`.
 
 ## Notes
 

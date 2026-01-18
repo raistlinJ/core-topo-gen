@@ -70,11 +70,11 @@ def main() -> None:
     manifest = {
         "generator_id": str(cfg.get("generator_id") or "sample.nfs_sensitive_file"),
         "outputs": {
-            "flag": flag_value,
-            "credential.pair": credential_pair,
-            "compose_path": str(compose_path.name),
-            "nfs_port": nfs_port,
-            "nfs_export": "/exports",
+            "Flag(flag_id)": flag_value,
+            "Credential(user, password)": credential_pair,
+            "File(path)": str(compose_path.name),
+            "PortForward(host, port)": nfs_port,
+            "Directory(host, path)": "/exports",
         },
     }
     _write_text(outputs_dir / "outputs.json", json.dumps(manifest, indent=2) + "\n")
