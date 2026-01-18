@@ -2627,6 +2627,12 @@
           return { src: raw, dest: '' };
         }
 
+        function basenameFromPath(p){
+          const s = String(p || '').replace('\\', '/');
+          const parts = s.split('/').filter(Boolean);
+          return parts.length ? parts[parts.length - 1] : s;
+        }
+
         function getGeneratedInjectsFromAssignment(){
           const cur = (fa && Array.isArray(fa.inject_files) && fa.inject_files.length) ? normalizeInjects(fa.inject_files) : [];
           return cur;
@@ -2708,7 +2714,7 @@
             {
               const rawSrc = String(parsed.src ?? '');
               if(rawSrc.startsWith('upload:')){
-                const base = _basenameFromPath(rawSrc.slice('upload:'.length));
+                const base = basenameFromPath(rawSrc.slice('upload:'.length));
                 srcInp.dataset.uploadToken = rawSrc;
                 srcInp.value = base ? `artifacts/${base}` : '';
               } else {
@@ -2768,7 +2774,7 @@
                   throw new Error(msg);
                 }
                 try { srcInp.dataset.uploadToken = String(data.inject_value || data.stored_path || ''); } catch(e) {}
-                const base = _basenameFromPath(String(data.stored_filename || ''));
+                const base = basenameFromPath(String(data.stored_filename || ''));
                 srcInp.value = base ? `artifacts/${base}` : String(data.stored_filename || data.original_filename || '') || 'artifacts/upload';
                 injectsTouched = true;
               } catch(err){
@@ -3092,6 +3098,7 @@
         localStatus.textContent = String(msg || '');
         localStatus.classList.toggle('text-danger', !!isError);
         localStatus.classList.toggle('text-muted', !isError);
+        try { localStatus.style.display = msg ? '' : 'none'; } catch(e) {}
       }
 
       async function persistOverridesForIndex(){
@@ -3276,8 +3283,14 @@
           if(!Array.isArray(currentFlagAssignments) || !currentFlagAssignments[i]) throw new Error('No assignment for this step.');
           await persistOverridesForIndex();
           setLocalStatus('Edits saved.', false);
+          try {
+            const prev = saveBtn.textContent;
+            saveBtn.textContent = 'Saved';
+            setTimeout(()=>{ try { saveBtn.textContent = prev; } catch(e) {} }, 1200);
+          } catch(e) {}
         } catch(e) {
           setLocalStatus('Failed to save overrides: ' + String(e && e.message || e), true);
+          try { console.error(e); } catch(err) {}
         } finally {
           hideLoading();
           try { clearBtn.disabled = false; saveBtn.disabled = false; } catch(e) {}
