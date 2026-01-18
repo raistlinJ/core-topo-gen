@@ -558,6 +558,13 @@
     return out;
   }
 
+  function isFlagFactName(name){
+    const s = String(name || '').trim();
+    if(!s) return false;
+    if(s === 'Flag' || s.toLowerCase() === 'flag(flag_id)') return true;
+    return s.startsWith('Flag(') || s.startsWith('flag(');
+  }
+
   async function refreshXmlDockPreview({ force = false } = {}){
     const xmlPre = document.getElementById('xmlPre');
     if(!xmlPre) return;
@@ -1321,7 +1328,7 @@
             name: String(k || '').trim(),
             resolved: ri[k],
             toChain: true,
-          })).filter(x => x && x.name);
+          })).filter(x => x && x.name && !isFlagFactName(x.name));
         }
         if(!initOutputs.length){
           const names = new Set();
@@ -1336,7 +1343,7 @@
             const fields = (inReq.length || inOpt.length) ? inReq.concat(inOpt) : inAll;
             fields.forEach(n => { const s = String(n || '').trim(); if(s) names.add(s); });
           } catch(e) {}
-          initOutputs = Array.from(names).sort().map((k)=>({
+          initOutputs = Array.from(names).sort().filter(k => !isFlagFactName(k)).map((k)=>({
             name: k,
             resolved: ri ? ri[k] : undefined,
             toChain: true,
@@ -2386,7 +2393,7 @@
         const missArtSet = new Set(missingArtifacts);
         reqArtifacts.map(String).filter(Boolean).sort().forEach((name)=>{
           const n = String(name || '').trim();
-          if(!n) return;
+          if(!n || isFlagFactName(n)) return;
           rows.push({
             name: n,
             resolved: ri ? ri[n] : undefined,
@@ -2409,7 +2416,7 @@
         const missFldSet = new Set(missingFields);
         Array.from(fieldNameSet).sort().forEach((name)=>{
           const n = String(name || '').trim();
-          if(!n) return;
+          if(!n || isFlagFactName(n)) return;
           rows.push({
             name: n,
             resolved: ri ? ri[n] : undefined,
@@ -4239,8 +4246,8 @@
       const artVals = Object.values(overrideArtifactMap).map(v => String(v || '').trim()).filter(Boolean);
       const fieldVals = Object.values(overrideFieldMap).map(v => String(v || '').trim()).filter(Boolean);
       return {
-        artifacts: mergeOverrideList(artVals, extraArtifactOverrides),
-        fields: mergeOverrideList(fieldVals, extraFieldOverrides),
+        artifacts: mergeOverrideList(artVals, extraArtifactOverrides).filter(x => !isFlagFactName(x)),
+        fields: mergeOverrideList(fieldVals, extraFieldOverrides).filter(x => !isFlagFactName(x)),
       };
     }
 
@@ -4442,7 +4449,7 @@
         const artifactNameSet = new Set();
         reqArtifacts.map(String).filter(Boolean).sort().forEach((name)=>{
           const n = String(name || '').trim();
-          if(!n) return;
+          if(!n || isFlagFactName(n)) return;
           artifactNameSet.add(n);
           rows.push({
             name: n,
@@ -4468,7 +4475,7 @@
         const missFldSet = new Set(missingFields);
         Array.from(fieldNameSet).sort().forEach((name)=>{
           const n = String(name || '').trim();
-          if(!n) return;
+          if(!n || isFlagFactName(n)) return;
           rows.push({
             name: n,
             resolved: ri ? ri[n] : undefined,
@@ -4502,7 +4509,7 @@
         if(ri && typeof ri === 'object'){
           Object.keys(ri).sort((a, b) => String(a).localeCompare(String(b))).forEach((k0)=>{
             const k1 = String(k0 || '').trim();
-            if(!k1) return;
+            if(!k1 || isFlagFactName(k1)) return;
             fieldNameSet.add(k1);
             rows.push({ name: k1, resolved: ri[k1], toChain: true, kind: 'Field', overrideValue: overrideFields.has(k1) ? k1 : '' });
           });
@@ -5725,6 +5732,27 @@
             if(prepData && prepData.flow_plan_path){
               lastFlowPlanPath = String(prepData.flow_plan_path);
             }
+
+            // Persist resolved values from the prepare step so Generate both saves and resolves.
+            try{
+              if(prepData && Array.isArray(prepData.flag_assignments)){
+                const persistPlan = (prepData.preview_plan_path || lastPreviewPlanPath || '');
+                if(persistPlan){
+                  const saveRes2 = await postJson('/api/flag-sequencing/save_flow_substitutions', {
+                    scenario,
+                    chain_ids: chainIds,
+                    preview_plan: persistPlan,
+                    flag_assignments: prepData.flag_assignments,
+                    allow_node_duplicates: !!allowDupes,
+                    initial_facts: flowInitialFactsOverride,
+                    goal_facts: flowGoalFactsOverride,
+                  }, { timeoutMs: 60000 });
+                  if(saveRes2 && saveRes2.flow_plan_path){
+                    lastFlowPlanPath = String(saveRes2.flow_plan_path);
+                  }
+                }
+              }
+            } catch(e) {}
 
             // If chain changed, regenerate computed assignments to match (keep resolved hints in UI).
             if(newChain && newIds && oldIds !== newIds){

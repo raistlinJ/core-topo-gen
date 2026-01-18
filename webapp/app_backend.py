@@ -10373,62 +10373,213 @@ def _flow_compute_flag_assignments(
     state_known: set[str] = set(initial_facts)
     deployed: set[str] = set()
 
-    for i, cid in enumerate(chain_ids):
+    provides_cache: dict[str, set[str]] = {}
+    requires_cache: dict[str, set[str]] = {}
+
+    def _provides_cached(gen: dict[str, Any]) -> set[str]:
+        try:
+            gid = str(gen.get('id') or '').strip()
+        except Exception:
+            gid = ''
+        if gid and gid in provides_cache:
+            return provides_cache[gid]
+        try:
+            p = set(_provides_of(gen))
+        except Exception:
+            p = set()
+        if gid:
+            provides_cache[gid] = p
+        return p
+
+    def _requires_cached(gen: dict[str, Any]) -> set[str]:
+        try:
+            gid = str(gen.get('id') or '').strip()
+        except Exception:
+            gid = ''
+        if gid and gid in requires_cache:
+            return requires_cache[gid]
+        try:
+            r = set(_required_inputs_of(gen))
+        except Exception:
+            r = set()
+        if gid:
+            requires_cache[gid] = r
+        return r
+
+    pool_by_pos: list[list[dict[str, Any]]] = []
+    for cid in chain_ids:
         node = id_to_node.get(str(cid)) or {}
         is_vuln_node = bool(node.get('is_vuln')) or bool(node.get('vulnerabilities')) or (str(cid) in vuln_ids)
         is_docker_node = _flow_node_is_docker_role(node)
-        # Enforce placement policy per node:
-        # - flag-generator: allowed on vuln nodes only
-        # - flag-node-generator: allowed only on non-vuln docker-role nodes
         def _eligible_for_node(g: dict[str, Any]) -> bool:
             k = str(g.get('_flow_kind') or '').strip() or 'flag-generator'
             if k == 'flag-node-generator':
                 return bool(is_docker_node and (not is_vuln_node))
             return bool(is_vuln_node)
+        pool_by_pos.append([g for g in eligible_gens if _eligible_for_node(g)])
 
-        pool = [g for g in eligible_gens if _eligible_for_node(g)]
+    remaining_union_by_idx: list[set[str]] = []
+    try:
+        running: set[str] = set()
+        for i in range(len(pool_by_pos) - 1, -1, -1):
+            pool = pool_by_pos[i] if i < len(pool_by_pos) else []
+            for g in pool:
+                running |= _provides_cached(g)
+            remaining_union_by_idx.append(set(running))
+        remaining_union_by_idx = list(reversed(remaining_union_by_idx))
+    except Exception:
+        remaining_union_by_idx = [set() for _ in range(len(pool_by_pos))]
+
+    def _candidate_list(idx: int, state: set[str], deployed_ids: set[str]) -> list[dict[str, Any]]:
+        pool = pool_by_pos[idx] if idx < len(pool_by_pos) else []
+        if not pool:
+            return []
+        candidates = [
+            g for g in pool
+            if _requires_cached(g).issubset(state) and str(g.get('id') or '').strip() not in deployed_ids
+        ]
+        if not candidates:
+            candidates = [g for g in pool if _requires_cached(g).issubset(state)]
+        return candidates
+
+    def _score_order(cands: list[dict[str, Any]], state: set[str]) -> list[dict[str, Any]]:
+        scored: list[tuple[dict[str, Any], int]] = []
+        for g in cands:
+            provides = _provides_cached(g)
+            new_facts = set(provides) - set(state)
+            goal_new = (set(goal_facts) - set(state)) & set(provides)
+            score = max(1, len(new_facts) + (3 * len(goal_new)))
+            scored.append((g, score))
+        if rnd is not None:
+            try:
+                rnd.shuffle(scored)
+            except Exception:
+                pass
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [g for g, _ in scored]
+
+    chosen_gens: list[dict[str, Any]] | None = None
+    if goal_facts:
+        memo: set[tuple[int, frozenset[str], frozenset[str]]] = set()
+        try:
+            import time as _time
+            _deadline = _time.monotonic() + 30.0
+        except Exception:
+            _deadline = None
+
+        def _dfs(idx: int, state: set[str], deployed_ids: set[str]) -> list[dict[str, Any]] | None:
+            if _deadline is not None:
+                try:
+                    if _time.monotonic() >= _deadline:
+                        return None
+                except Exception:
+                    pass
+            key = (idx, frozenset(state), frozenset(deployed_ids))
+            if key in memo:
+                return None
+            if idx >= len(chain_ids):
+                return [] if set(goal_facts).issubset(state) else None
+            remaining_goal = set(goal_facts) - set(state)
+            if remaining_goal:
+                possible = set(state)
+                try:
+                    possible |= remaining_union_by_idx[idx]
+                except Exception:
+                    pass
+                if not remaining_goal.issubset(possible):
+                    memo.add(key)
+                    return None
+            candidates = _candidate_list(idx, state, deployed_ids)
+            if not candidates:
+                memo.add(key)
+                return None
+            ordered = _score_order(candidates, state)
+            for g in ordered:
+                provides = _provides_cached(g)
+                gid = str(g.get('id') or '').strip()
+                next_state = set(state) | set(provides)
+                next_deployed = set(deployed_ids)
+                if gid:
+                    next_deployed.add(gid)
+                tail = _dfs(idx + 1, next_state, next_deployed)
+                if tail is not None:
+                    return [g] + tail
+            memo.add(key)
+            return None
+
+        try:
+            chosen = _dfs(0, set(state_known), set(deployed))
+            if chosen and len(chosen) == len(chain_ids):
+                chosen_gens = chosen
+        except Exception:
+            chosen_gens = None
+
+    for i, cid in enumerate(chain_ids):
+        pool = pool_by_pos[i] if i < len(pool_by_pos) else []
         if not pool:
             return []
 
-        candidates = [
-            g for g in pool
-            if _required_inputs_of(g).issubset(state_known) and str(g.get('id') or '').strip() not in deployed
-        ]
-        if not candidates:
-            candidates = [g for g in pool if _required_inputs_of(g).issubset(state_known)]
-        if not candidates:
-            return []
+        if chosen_gens is not None:
+            gen = chosen_gens[i]
+        else:
+            candidates = [
+                g for g in pool
+                if _requires_cached(g).issubset(state_known) and str(g.get('id') or '').strip() not in deployed
+            ]
+            if not candidates:
+                candidates = [g for g in pool if _requires_cached(g).issubset(state_known)]
+            if not candidates:
+                return []
 
-        scored: list[tuple[dict[str, Any], int]] = []
-        for g in candidates:
+            remaining_goal = set(goal_facts) - set(state_known)
+            if remaining_goal:
+                if i == (len(chain_ids) - 1):
+                    goal_candidates = [g for g in candidates if remaining_goal & _provides_cached(g)]
+                    if goal_candidates:
+                        candidates = goal_candidates
+                else:
+                    try:
+                        remaining_union: set[str] = set()
+                        for j in range(i + 1, len(chain_ids)):
+                            for g in (pool_by_pos[j] if j < len(pool_by_pos) else []):
+                                remaining_union |= _provides_cached(g)
+                        filtered: list[dict[str, Any]] = []
+                        for g in candidates:
+                            future_possible = set(state_known) | _provides_cached(g) | remaining_union
+                            if remaining_goal.issubset(future_possible):
+                                filtered.append(g)
+                        if filtered:
+                            candidates = filtered
+                    except Exception:
+                        pass
+
+            scored: list[tuple[dict[str, Any], int]] = []
+            for g in candidates:
+                provides = _provides_cached(g)
+                new_facts = set(provides) - set(state_known)
+                goal_new = (set(goal_facts) - set(state_known)) & set(provides)
+                score = max(1, len(new_facts) + (3 * len(goal_new)))
+                scored.append((g, score))
+
             try:
-                provides = _provides_of(g)
+                if rnd is not None:
+                    total = sum(max(1, int(s)) for _, s in scored)
+                    pick = rnd.random() * float(total)
+                    acc = 0.0
+                    gen = scored[0][0]
+                    for g, s in scored:
+                        acc += max(1, int(s))
+                        if pick <= acc:
+                            gen = g
+                            break
+                else:
+                    gen = scored[0][0]
             except Exception:
-                provides = set()
-            new_facts = set(provides) - set(state_known)
-            goal_new = (set(goal_facts) - set(state_known)) & set(provides)
-            score = max(1, len(new_facts) + (3 * len(goal_new)))
-            scored.append((g, score))
-
-        try:
-            if rnd is not None:
-                total = sum(max(1, int(s)) for _, s in scored)
-                pick = rnd.random() * float(total)
-                acc = 0.0
                 gen = scored[0][0]
-                for g, s in scored:
-                    acc += max(1, int(s))
-                    if pick <= acc:
-                        gen = g
-                        break
-            else:
-                gen = scored[0][0]
-        except Exception:
-            gen = scored[0][0]
 
         # Update outputs for the next hop.
         try:
-            produced = _provides_of(gen)
+            produced = _provides_cached(gen)
             state_known |= set(produced)
         except Exception:
             pass
@@ -10549,8 +10700,24 @@ def _flow_normalize_fact_override(raw: Any) -> dict[str, list[str]] | None:
         return None
     arts = raw.get('artifacts') if isinstance(raw.get('artifacts'), list) else []
     fields = raw.get('fields') if isinstance(raw.get('fields'), list) else []
-    out_artifacts = [str(x or '').strip() for x in (arts or []) if str(x or '').strip()]
-    out_fields = [str(x or '').strip() for x in (fields or []) if str(x or '').strip()]
+    def _is_flag_fact(name: str) -> bool:
+        s = str(name or '').strip()
+        if not s:
+            return False
+        if s.lower() == 'flag(flag_id)' or s == 'Flag':
+            return True
+        return s.startswith('Flag(') or s.startswith('flag(')
+
+    out_artifacts = [
+        str(x or '').strip()
+        for x in (arts or [])
+        if str(x or '').strip() and not _is_flag_fact(str(x or '').strip())
+    ]
+    out_fields = [
+        str(x or '').strip()
+        for x in (fields or [])
+        if str(x or '').strip() and not _is_flag_fact(str(x or '').strip())
+    ]
     if not out_artifacts and not out_fields:
         return None
     return {
@@ -11830,6 +11997,90 @@ def api_flow_attackflow_preview():
                             chain_nodes,
                             scenario_label=(scenario_label or scenario_norm),
                         )
+                    except Exception:
+                        pass
+                    # Validate saved assignments against node eligibility (vuln vs docker).
+                    # If incompatible, discard and recompute assignments.
+                    try:
+                        try:
+                            gens_enabled, _ = _flag_generators_from_enabled_sources()
+                        except Exception:
+                            gens_enabled = []
+                        try:
+                            node_gens_enabled, _ = _flag_node_generators_from_enabled_sources()
+                        except Exception:
+                            node_gens_enabled = []
+                        flag_gen_ids: set[str] = set()
+                        node_gen_ids: set[str] = set()
+                        for g in (gens_enabled or []):
+                            if isinstance(g, dict):
+                                gid = str(g.get('id') or '').strip()
+                                if gid:
+                                    flag_gen_ids.add(gid)
+                        for g in (node_gens_enabled or []):
+                            if isinstance(g, dict):
+                                gid = str(g.get('id') or '').strip()
+                                if gid:
+                                    node_gen_ids.add(gid)
+
+                        vuln_ids: set[str] = set()
+                        try:
+                            hosts = preview.get('hosts') if isinstance(preview, dict) else None
+                            if isinstance(hosts, list):
+                                for h in hosts:
+                                    if not isinstance(h, dict):
+                                        continue
+                                    hid = str(h.get('node_id') or '').strip()
+                                    if not hid:
+                                        continue
+                                    vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
+                                    if vulns:
+                                        vuln_ids.add(hid)
+                        except Exception:
+                            vuln_ids = set()
+
+                        def _infer_kind(a: dict[str, Any]) -> str:
+                            try:
+                                k = str(a.get('type') or '').strip()
+                                if k:
+                                    return k
+                            except Exception:
+                                pass
+                            try:
+                                cat = str(a.get('generator_catalog') or '').strip().lower()
+                                if cat == 'flag_node_generators':
+                                    return 'flag-node-generator'
+                                if cat == 'flag_generators':
+                                    return 'flag-generator'
+                            except Exception:
+                                pass
+                            gid = str(a.get('id') or a.get('generator_id') or '').strip()
+                            if gid:
+                                if gid in node_gen_ids:
+                                    return 'flag-node-generator'
+                                if gid in flag_gen_ids:
+                                    return 'flag-generator'
+                            return ''
+
+                        invalid = False
+                        for i, a in enumerate(flag_assignments or []):
+                            if i >= len(chain_nodes):
+                                break
+                            node = chain_nodes[i] if i < len(chain_nodes) else {}
+                            if not isinstance(node, dict):
+                                continue
+                            nid = str(node.get('id') or '').strip()
+                            is_vuln_node = bool(node.get('is_vuln')) or bool(node.get('vulnerabilities')) or (nid in vuln_ids)
+                            is_docker_node = _flow_node_is_docker_role(node)
+                            kind = _infer_kind(a)
+                            if kind == 'flag-generator' and not is_vuln_node:
+                                invalid = True
+                                break
+                            if kind == 'flag-node-generator' and not (is_docker_node and (not is_vuln_node)):
+                                invalid = True
+                                break
+                        if invalid:
+                            flag_assignments = []
                     except Exception:
                         pass
     except Exception:
