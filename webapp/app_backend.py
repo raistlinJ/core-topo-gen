@@ -14450,14 +14450,39 @@ def api_flow_save_flow_substitutions():
         a2['inputs'] = sorted(list((_artifact_requires_of(gen) | set(_required_input_fields_of(gen)))))
         a2['outputs'] = sorted(list(_provides_of(gen)))
 
-        # Preserve resolved values if provided by the client (for refresh persistence).
+        # Preserve/derive resolved values for refresh persistence.
         try:
+            resolved_inputs: dict[str, Any] | None = None
+            resolved_outputs: dict[str, Any] | None = None
             if 'resolved_inputs' in raw_a and isinstance(raw_a.get('resolved_inputs'), dict):
-                a2['resolved_inputs'] = dict(raw_a.get('resolved_inputs') or {})
+                resolved_inputs = dict(raw_a.get('resolved_inputs') or {})
             if 'resolved_outputs' in raw_a and isinstance(raw_a.get('resolved_outputs'), dict):
-                a2['resolved_outputs'] = dict(raw_a.get('resolved_outputs') or {})
+                resolved_outputs = dict(raw_a.get('resolved_outputs') or {})
+
+            cfg_ovr = a2.get('config_overrides') if isinstance(a2, dict) else None
+            if isinstance(cfg_ovr, dict) and cfg_ovr:
+                resolved_inputs = dict(resolved_inputs or {})
+                resolved_inputs.update(cfg_ovr)
+
+            out_ovr = a2.get('output_overrides') if isinstance(a2, dict) else None
+            if isinstance(out_ovr, dict) and out_ovr:
+                resolved_outputs = dict(resolved_outputs or {})
+                resolved_outputs.update(out_ovr)
+
+            flag_val = None
             if isinstance(raw_a.get('flag_value'), str) and str(raw_a.get('flag_value') or '').strip():
-                a2['flag_value'] = str(raw_a.get('flag_value') or '').strip()
+                flag_val = str(raw_a.get('flag_value') or '').strip()
+            if isinstance(a2.get('flag_override'), str) and str(a2.get('flag_override') or '').strip():
+                flag_val = str(a2.get('flag_override') or '').strip()
+            if flag_val:
+                resolved_outputs = dict(resolved_outputs or {})
+                resolved_outputs['Flag(flag_id)'] = flag_val
+                a2['flag_value'] = flag_val
+
+            if isinstance(resolved_inputs, dict) and resolved_inputs:
+                a2['resolved_inputs'] = resolved_inputs
+            if isinstance(resolved_outputs, dict) and resolved_outputs:
+                a2['resolved_outputs'] = resolved_outputs
         except Exception:
             pass
 

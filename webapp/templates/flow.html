@@ -3954,6 +3954,16 @@
           const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
           const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
 
+          let resolvedInputs = (curA && typeof curA.resolved_inputs === 'object' && curA.resolved_inputs && !Array.isArray(curA.resolved_inputs))
+            ? curA.resolved_inputs
+            : undefined;
+          let resolvedOutputs = (curA && typeof curA.resolved_outputs === 'object' && curA.resolved_outputs && !Array.isArray(curA.resolved_outputs))
+            ? curA.resolved_outputs
+            : undefined;
+          let resolvedFlag = (curA && typeof curA.flag_value === 'string' && curA.flag_value.trim())
+            ? String(curA.flag_value).trim()
+            : undefined;
+
           let ovr = (curA && typeof curA.config_overrides === 'object' && curA.config_overrides && !Array.isArray(curA.config_overrides))
             ? curA.config_overrides
             : undefined;
@@ -3988,6 +3998,10 @@
             }
             ovr = newOverrides;
 
+            if(Object.keys(newOverrides).length){
+              resolvedInputs = Object.assign({}, (resolvedInputs || {}), newOverrides);
+            }
+
             // Outputs overrides from IO table.
             const newOutOverrides = {};
             for(const k of Object.keys(outputOverrideElsByKey || {})){
@@ -3998,6 +4012,10 @@
               newOutOverrides[k] = tryParseLooseJson(trimmed);
             }
             outOvr = newOutOverrides;
+
+            if(Object.keys(newOutOverrides).length){
+              resolvedOutputs = Object.assign({}, (resolvedOutputs || {}), newOutOverrides);
+            }
 
             // Inject override list.
             {
@@ -4062,11 +4080,22 @@
               }
             }
             stepFlagOverride = flagOvr;
+            if(stepFlagOverride !== undefined){
+              if(stepFlagOverride === null){
+                resolvedFlag = undefined;
+              } else if(typeof stepFlagOverride === 'string' && stepFlagOverride.trim()){
+                resolvedFlag = stepFlagOverride.trim();
+                resolvedOutputs = Object.assign({}, (resolvedOutputs || {}), { 'Flag(flag_id)': resolvedFlag });
+              }
+            }
           }
 
           const out = { node_id: nid, id: curId, config_overrides: ovr, output_overrides: outOvr, inject_files_override: injOvr };
           if(hintOvr !== undefined) out.hint_overrides = hintOvr;
           if(flagOvr !== undefined) out.flag_override = flagOvr;
+          if(resolvedInputs !== undefined) out.resolved_inputs = resolvedInputs;
+          if(resolvedOutputs !== undefined) out.resolved_outputs = resolvedOutputs;
+          if(resolvedFlag !== undefined) out.flag_value = resolvedFlag;
           return out;
         });
         const missing = reqAssignments.find(x => !x.id);
@@ -4556,6 +4585,21 @@
       const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
       if(!chainIds.length) return;
 
+      const targetIdx = (k === 'goal')
+        ? Math.max(0, (Array.isArray(currentFlagAssignments) ? currentFlagAssignments.length : 0) - 1)
+        : 0;
+
+      function parseOverrideValue(raw){
+        const s = String(raw ?? '').trim();
+        if(!s) return undefined;
+        const looksJson = s.startsWith('{') || s.startsWith('[') || s.startsWith('"') || s === 'true' || s === 'false' || s === 'null' || /^-?\d+(?:\.\d+)?$/.test(s);
+        if(!looksJson) return s;
+        try { return JSON.parse(s); } catch(e) { return s; }
+      }
+
+      const overridePairs = Object.assign({}, overrideArtifactMap || {}, overrideFieldMap || {});
+      const overrideKeys = Object.keys(overridePairs || {});
+
       const reqAssignments = chainIds.map((nid, j)=>{
         const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
         const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
@@ -4565,6 +4609,31 @@
         if(curA && Array.isArray(curA.inject_files_override)) out.inject_files_override = curA.inject_files_override;
         if(curA && Array.isArray(curA.hint_overrides)) out.hint_overrides = curA.hint_overrides;
         if(curA && typeof curA.flag_override === 'string' && curA.flag_override.trim()) out.flag_override = String(curA.flag_override).trim();
+
+        if(curA && typeof curA.resolved_inputs === 'object' && curA.resolved_inputs && !Array.isArray(curA.resolved_inputs)){
+          out.resolved_inputs = curA.resolved_inputs;
+        }
+        if(curA && typeof curA.resolved_outputs === 'object' && curA.resolved_outputs && !Array.isArray(curA.resolved_outputs)){
+          out.resolved_outputs = curA.resolved_outputs;
+        }
+        if(curA && typeof curA.flag_value === 'string' && curA.flag_value.trim()){
+          out.flag_value = String(curA.flag_value).trim();
+        }
+
+        if(j === targetIdx && overrideKeys.length){
+          const nextResolvedInputs = Object.assign({}, (out.resolved_inputs || {}));
+          overrideKeys.forEach((key)=>{
+            const k0 = String(key || '').trim();
+            if(!k0) return;
+            const v0 = parseOverrideValue(overridePairs[key]);
+            if(v0 === undefined){
+              delete nextResolvedInputs[k0];
+            } else {
+              nextResolvedInputs[k0] = v0;
+            }
+          });
+          out.resolved_inputs = nextResolvedInputs;
+        }
         return out;
       });
 
@@ -4605,6 +4674,23 @@
                 a.flag_value = prev.flag_value;
               }
             });
+          } catch(e) {}
+          try{
+            if(overrideKeys.length && next[targetIdx] && typeof next[targetIdx] === 'object'){
+              const cur = next[targetIdx];
+              const nextResolvedInputs = Object.assign({}, (cur.resolved_inputs || {}));
+              overrideKeys.forEach((key)=>{
+                const k0 = String(key || '').trim();
+                if(!k0) return;
+                const v0 = parseOverrideValue(overridePairs[key]);
+                if(v0 === undefined){
+                  delete nextResolvedInputs[k0];
+                } else {
+                  nextResolvedInputs[k0] = v0;
+                }
+              });
+              cur.resolved_inputs = nextResolvedInputs;
+            }
           } catch(e) {}
           currentFlagAssignments = next;
         }
