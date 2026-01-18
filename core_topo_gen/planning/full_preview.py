@@ -1065,7 +1065,10 @@ def build_full_preview(
     service_assignments = _preview_services(services_plan, [h.node_id for h in host_nodes], rnd_seed)
     vuln_assignments: Dict[int, List[str]] = {}
     if vulnerabilities_plan:
-        ordered = _stable_shuffle([h.node_id for h in host_nodes], rnd_seed + 101)
+        docker_hosts = [h for h in host_nodes if (getattr(h, 'role', None) or '').strip().lower() == 'docker']
+        # Prefer Docker hosts when present; else any host.
+        target_hosts = docker_hosts if docker_hosts else host_nodes
+        ordered = _stable_shuffle([h.node_id for h in target_hosts], rnd_seed + 101)
         flat: List[str] = []
         for name, count in vulnerabilities_plan.items():
             for _ in range(int(count)):

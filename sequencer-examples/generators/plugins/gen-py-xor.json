@@ -1,0 +1,18 @@
+{
+  "plugin_id": "gen-py-xor",
+  "plugin_type": "flag-generator",
+  "version": "1.0",
+  "description": "Converted from generator id 'gen.py.xor'.",
+  "requires": ["seed", "secret"],
+  "produces": [
+    {"artifact": "xor_key_hex"},
+    {"artifact": "xor_key_b64"},
+    {"artifact": "xor_key_len"},
+    {"artifact": "artifact_path"}
+  ],
+  "inputs": {
+    "seed": {"type": "string", "required": true},
+    "secret": {"type": "string", "required": true},
+    "key_len": {"type": "number", "required": false}
+  }
+}

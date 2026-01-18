@@ -1,0 +1,21 @@
+{
+  "plugin_id": "gen-py-shared_drive_config",
+  "plugin_type": "flag-generator",
+  "version": "1.0",
+  "description": "Converted from generator id 'gen.py.shared_drive_config'.",
+  "requires": ["seed", "secret", "env_name"],
+  "produces": [
+    {"artifact": "drive_share_host"},
+    {"artifact": "drive_share_name"},
+    {"artifact": "drive_share_path"},
+    {"artifact": "drive_mount_point"},
+    {"artifact": "drive_username"},
+    {"artifact": "drive_password"},
+    {"artifact": "artifact_path"}
+  ],
+  "inputs": {
+    "seed": {"type": "string", "required": true},
+    "secret": {"type": "string", "required": true},
+    "env_name": {"type": "string", "required": true}
+  }
+}

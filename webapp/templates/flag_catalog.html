@@ -1,0 +1,1791 @@
+{% extends "layout.html" %}
+
+{% block content %}
+<div class="container-fluid">
+  <div class="row">
+    <div class="col-12">
+      <ul class="nav nav-tabs" id="flagTabs" role="tablist">
+        <li class="nav-item" role="presentation">
+          <button class="nav-link active" id="flagGenSourcesTab" data-bs-toggle="tab" data-bs-target="#flagGenSources" type="button" role="tab">Generator Packs</button>
+        </li>
+        <li class="nav-item" role="presentation">
+          <button class="nav-link" id="flagGeneratorsTab" data-bs-toggle="tab" data-bs-target="#flagGenerators" type="button" role="tab">Flag-Generators</button>
+        </li>
+        <li class="nav-item" role="presentation">
+          <button class="nav-link" id="flagNodeGeneratorsTab" data-bs-toggle="tab" data-bs-target="#flagNodeGenerators" type="button" role="tab">Flag-Node-Generators</button>
+        </li>
+        <li class="nav-item" role="presentation">
+          <a class="nav-link" id="flagGeneratorBuilderTab" href="{{ url_for('generator_builder_page') }}"><i class="bi bi-wrench-adjustable me-1"></i>Generator Builder</a>
+        </li>
+      </ul>
+
+      <div class="tab-content mt-3">
+        <div class="tab-pane fade show active" id="flagGenSources" role="tabpanel">
+          <h5 class="mb-2">Generator Packs (ZIP)</h5>
+          <div class="card mb-3">
+            <div class="card-body">
+              <div class="small text-muted mb-2">
+                Upload a ZIP (or import from a URL) containing generator directories with <code>manifest.yaml</code>.
+                Packs are validated (YAML syntax, compose service, Python syntax) and installed under <code>outputs/installed_generators/</code>.
+              </div>
+
+              <form id="packUploadForm" class="row g-2 align-items-center" action="{{ url_for('generator_packs_upload') }}" method="post" enctype="multipart/form-data">
+                <div class="col-auto">
+                  <input id="packZipInput" class="form-control" type="file" name="zip_file" accept="application/zip,.zip" required>
+                </div>
+                <div class="col-auto">
+                  <button class="btn btn-primary" type="submit">Upload ZIP</button>
+                </div>
+                <div class="col-auto">
+                  <a class="btn btn-outline-secondary" href="{{ url_for('generator_packs_export_all') }}">Export All Packs</a>
+                </div>
+              </form>
+
+              <form class="row g-2 mt-2 align-items-center" action="{{ url_for('generator_packs_import_url') }}" method="post">
+                <div class="col-md-6">
+                  <input class="form-control" type="url" name="zip_url" placeholder="https://example.com/generator-pack.zip" required>
+                </div>
+                <div class="col-auto">
+                  <button class="btn btn-outline-primary" type="submit">Import from URL</button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-body">
+              <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                  <thead>
+                    <tr>
+                      <th>Label</th>
+                      <th>Origin</th>
+                      <th>Installed</th>
+                      <th>Generators</th>
+                      <th style="width: 160px;">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for p in packs %}
+                    <tr class="{{ 'table-secondary' if p.disabled else '' }}">
+                      <td>
+                        <div>
+                          <strong>{{ p.label or p.id }}</strong>
+                          {% if p.disabled %}
+                            <span class="badge bg-warning text-dark ms-2">Disabled</span>
+                          {% endif %}
+                        </div>
+                        <div class="small text-muted">{{ p.id }}</div>
+                      </td>
+                      <td class="small">{{ p.origin or '' }}</td>
+                      <td class="small">{{ p.installed_at or '' }}</td>
+                      <td class="small" style="max-width: 720px; word-break: break-word;">
+                        {% if p.installed_grouped %}
+                          {% for grp in p.installed_grouped %}
+                            <div>
+                              {{ grp.kind }}{% if grp.count %} ({{ grp.count }}){% endif %}:
+                              <code>{{ (grp.ids or []) | join(', ') }}</code>
+                            </div>
+                          {% endfor %}
+                        {% elif p.installed %}
+                          {% for g in p.installed %}
+                            <div>{{ g.kind }}: <code>{{ g.id }}</code></div>
+                          {% endfor %}
+                        {% else %}
+                          <span class="text-muted">—</span>
+                        {% endif %}
+                      </td>
+                      <td>
+                        <div class="d-flex gap-2 flex-wrap">
+                          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('generator_packs_download', pack_id=p.id) }}">Download ZIP</a>
+                          <form action="{{ url_for('generator_packs_set_disabled', pack_id=p.id) }}" method="post">
+                            <input type="hidden" name="disabled" value="{{ 0 if p.disabled else 1 }}" />
+                            <button class="btn btn-sm btn-outline-warning" type="submit">{{ 'Enable' if p.disabled else 'Disable' }}</button>
+                          </form>
+                          <form action="{{ url_for('generator_packs_delete', pack_id=p.id) }}" method="post" onsubmit="return confirm('Uninstall this pack?');">
+                            <button class="btn btn-sm btn-outline-danger" type="submit">Uninstall</button>
+                          </form>
+                        </div>
+                      </td>
+                    </tr>
+                    {% endfor %}
+                    {% if not packs %}
+                    <tr><td colspan="5" class="text-muted">No packs installed yet.</td></tr>
+                    {% endif %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="tab-pane fade" id="flagGenerators" role="tabpanel">
+          <div class="card mb-3">
+            <div class="card-body">
+              <div class="row g-2 align-items-center">
+                <div class="col-md-6">
+                  <input id="genFilter" class="form-control" placeholder="Filter generators…" />
+                </div>
+              </div>
+              <div class="small text-muted mt-2" id="genMeta"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-body">
+              <div class="table-responsive">
+                <table class="table table-sm align-middle" id="genTable">
+                  <thead>
+                    <tr>
+                      <th style="width: 60px;">#</th>
+                      <th>Name</th>
+                      <th>Type</th>
+                      <th>Inputs</th>
+                      <th>Outputs</th>
+                      <th>Injects</th>
+                      <th>From Source</th>
+                      <th style="width: 160px;">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="genBody"></tbody>
+                </table>
+              </div>
+              <pre class="mt-3 small" id="genLog" style="max-height: 240px; overflow: auto;"></pre>
+            </div>
+          </div>
+
+        </div>
+
+        <div class="tab-pane fade" id="flagNodeGenerators" role="tabpanel">
+          <div class="card mb-3">
+            <div class="card-body">
+              <div class="row g-2 align-items-center">
+                <div class="col-md-6">
+                  <input id="nodeGenFilter" class="form-control" placeholder="Filter node-generators…" />
+                </div>
+              </div>
+              <div class="small text-muted mt-2" id="nodeGenMeta"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-body">
+              <div class="table-responsive">
+                <table class="table table-sm align-middle" id="nodeGenTable">
+                  <thead>
+                    <tr>
+                      <th style="width: 60px;">#</th>
+                      <th>Name</th>
+                      <th>Type</th>
+                      <th>Inputs</th>
+                      <th>Outputs</th>
+                      <th>Injects</th>
+                      <th>From Source</th>
+                      <th style="width: 160px;">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="nodeGenBody"></tbody>
+                </table>
+              </div>
+              <pre class="mt-3 small" id="nodeGenLog" style="max-height: 240px; overflow: auto;"></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- Generator Test Modal -->
+<div class="modal fade" id="genTestModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Test Generator</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-2">
+          <div><strong id="genTestName"></strong></div>
+          <div class="small text-muted" id="genTestId"></div>
+        </div>
+
+        <form id="genTestForm">
+          <input type="hidden" name="generator_id" id="genTestGeneratorId" />
+          <div id="genTestInputs"></div>
+        </form>
+
+        <div class="mt-3">
+          <div class="small text-muted mb-1">Progress / Log</div>
+          <pre class="small bg-light p-2" id="genTestLog" style="max-height: 220px; overflow: auto;"></pre>
+        </div>
+
+        <div class="mt-3">
+          <div class="row g-3">
+            <div class="col-12">
+              <div class="small text-muted mb-1">Generated Files</div>
+              <div id="genTestOutputsStatus" class="small text-muted mb-2" style="display:none;">
+                <span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>
+                <span id="genTestOutputsStatusText">Working…</span>
+              </div>
+              <div id="genTestOutputs" class="small"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+        <button type="button" class="btn btn-primary" id="genTestRunBtn">Run</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Generator Pack Upload Progress Modal -->
+<div class="modal fade" id="packUploadProgressModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Uploading Generator Pack…</h5>
+      </div>
+      <div class="modal-body">
+        <div class="small text-muted mb-2" id="packUploadProgressText">Preparing upload…</div>
+        <div class="progress" role="progressbar" aria-label="Upload progress" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-bar progress-bar-striped progress-bar-animated" id="packUploadProgressBar" style="width: 0%">0%</div>
+        </div>
+        <div class="small text-muted mt-2" id="packUploadProgressBytes"></div>
+        <pre class="small bg-light p-2 mt-3" id="packUploadResult" style="max-height: 180px; overflow: auto; display:none;"></pre>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" id="packUploadCancelBtn">Cancel</button>
+        <button type="button" class="btn btn-primary" id="packUploadCloseBtn" data-bs-dismiss="modal" style="display:none;">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Cleanup Modal (shown while removing test artifacts) -->
+<div class="modal fade" id="genTestCleanupModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable" style="max-width: 600px;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Cleaning up</h5>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex align-items-center gap-2">
+          <span id="genTestCleanupSpinner" class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>
+          <span id="genTestCleanupText">Cleaning up, please wait…</span>
+        </div>
+        <pre class="small bg-light p-2 mt-2 mb-0" id="genTestCleanupLog" style="max-height: 320px; overflow: auto;"></pre>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary" id="genTestCleanupCloseBtn" data-bs-dismiss="modal" disabled>Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const genState = {
+    generators: [],
+    errors: [],
+    filter: '',
+    sortKey: 'name',
+    sortDir: 'asc',
+  };
+
+  const nodeGenState = {
+    generators: [],
+    errors: [],
+    filter: '',
+    sortKey: 'name',
+    sortDir: 'asc',
+  };
+
+  const genTestState = {
+    current: null,
+    testBase: '/flag_generators_test',
+    eventSource: null,
+    runId: null,
+    savedUploads: {},
+    outputsPollTimer: null,
+    outputsLastSig: null,
+    outputsStablePolls: 0,
+  };
+
+  let pendingCleanupRunId = null;
+  let pendingCleanupTestBase = null;
+
+  function normalizeForSort(v) {
+    try {
+      const s = String(v ?? '');
+      return s.toLowerCase();
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function compareForSort(a, b) {
+    const ax = normalizeForSort(a);
+    const bx = normalizeForSort(b);
+    if (ax < bx) return -1;
+    if (ax > bx) return 1;
+    return 0;
+  }
+
+  function stableSorted(items, keyFn, dir) {
+    const direction = (dir === 'desc') ? -1 : 1;
+    const decorated = (Array.isArray(items) ? items : []).map((item, idx) => ({ item, idx }));
+    decorated.sort((x, y) => {
+      const c = compareForSort(keyFn(x.item), keyFn(y.item));
+      if (c !== 0) return c * direction;
+      return x.idx - y.idx;
+    });
+    return decorated.map(d => d.item);
+  }
+
+  function updateSortIndicators(tableId, state, columns) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+    const ths = table.querySelectorAll('thead th');
+    ths.forEach((th, idx) => {
+      const col = columns[idx];
+      if (!col) return;
+      const base = col.label || th.getAttribute('data-base-label') || th.textContent || '';
+      if (!th.getAttribute('data-base-label')) {
+        th.setAttribute('data-base-label', base);
+      }
+      if (col.key && state.sortKey === col.key) {
+        const arrow = (state.sortDir === 'desc') ? '▼' : '▲';
+        th.textContent = `${base} ${arrow}`;
+      } else {
+        th.textContent = base;
+      }
+    });
+  }
+
+  function enableTableSorting(tableId, state, columns, renderFn) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+    const ths = table.querySelectorAll('thead th');
+    ths.forEach((th, idx) => {
+      const col = columns[idx];
+      if (!col || !col.key) return;
+      if (th.getAttribute('data-sort-init') === '1') return;
+      th.setAttribute('data-sort-init', '1');
+      th.style.cursor = 'pointer';
+      th.title = 'Click to sort';
+      th.classList.add('user-select-none');
+      th.addEventListener('click', () => {
+        if (state.sortKey === col.key) {
+          state.sortDir = (state.sortDir === 'asc') ? 'desc' : 'asc';
+        } else {
+          state.sortKey = col.key;
+          state.sortDir = 'asc';
+        }
+        try {
+          renderFn();
+        } catch (e) {}
+        updateSortIndicators(tableId, state, columns);
+      });
+    });
+    updateSortIndicators(tableId, state, columns);
+  }
+
+  function setOutputsStatus(visible, text) {
+    const box = document.getElementById('genTestOutputsStatus');
+    const t = document.getElementById('genTestOutputsStatusText');
+    if (!box || !t) return;
+    if (!visible) {
+      box.style.display = 'none';
+      t.textContent = '';
+      return;
+    }
+    box.style.display = 'block';
+    t.textContent = text || 'Working…';
+  }
+
+  function stopOutputsPolling() {
+    if (genTestState.outputsPollTimer) {
+      try { clearInterval(genTestState.outputsPollTimer); } catch (e) {}
+      genTestState.outputsPollTimer = null;
+    }
+    genTestState.outputsLastSig = null;
+    genTestState.outputsStablePolls = 0;
+  }
+
+  function resetGenTestUiState() {
+    stopOutputsPolling();
+    if (genTestState.eventSource) {
+      try { genTestState.eventSource.close(); } catch (e) {}
+      genTestState.eventSource = null;
+    }
+    genTestState.runId = null;
+    genTestState.current = null;
+    genTestState.testBase = '/flag_generators_test';
+    genTestState.savedUploads = {};
+    clearTestLog();
+    setOutputsHtml('');
+    setOutputsStatus(false);
+    const btn = document.getElementById('genTestRunBtn');
+    if (btn) btn.disabled = false;
+  }
+
+  function clearCleanupLog() {
+    const el = document.getElementById('genTestCleanupLog');
+    if (el) el.textContent = '';
+  }
+
+  function setCleanupLogLine(line) {
+    const el = document.getElementById('genTestCleanupLog');
+    if (!el) return;
+    el.textContent = (el.textContent || '') + (line || '') + '\n';
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function setCleanupSpinner(active) {
+    const sp = document.getElementById('genTestCleanupSpinner');
+    if (!sp) return;
+    sp.style.display = active ? 'inline-block' : 'none';
+  }
+
+  function _cleanupModalState(el) {
+    try {
+      const shown = !!(el && el.classList && el.classList.contains('show'));
+      const display = el ? (getComputedStyle(el).display || '') : '';
+      const backdrops = document.querySelectorAll('.modal-backdrop').length;
+      const openModals = document.querySelectorAll('.modal.show').length;
+      const bodyOpen = document.body && document.body.classList ? document.body.classList.contains('modal-open') : false;
+      return { shown, display, backdrops, openModals, bodyOpen };
+    } catch (e) {
+      return { error: String(e) };
+    }
+  }
+
+  function forceHideCleanupModal(cleanupModalEl) {
+    const el = cleanupModalEl;
+    if (!el) return;
+    const st0 = _cleanupModalState(el);
+    setCleanupLogLine(`[ui][cleanup] forceHide start state=${JSON.stringify(st0)}`);
+    try {
+      // Remove Bootstrap's show state.
+      el.classList.remove('show');
+      el.setAttribute('aria-hidden', 'true');
+      el.style.display = 'none';
+    } catch (e) {
+      setCleanupLogLine(`[ui][cleanup] forceHide modal element error: ${String(e)}`);
+    }
+    try {
+      // Remove any leftover backdrops.
+      const bds = Array.from(document.querySelectorAll('.modal-backdrop'));
+      bds.forEach(b => {
+        try { b.remove(); } catch (e) {}
+      });
+    } catch (e) {
+      setCleanupLogLine(`[ui][cleanup] forceHide backdrop error: ${String(e)}`);
+    }
+    try {
+      // Restore body scroll.
+      document.body.classList.remove('modal-open');
+      document.body.style.removeProperty('padding-right');
+      document.body.style.removeProperty('overflow');
+    } catch (e) {
+      setCleanupLogLine(`[ui][cleanup] forceHide body restore error: ${String(e)}`);
+    }
+    const st1 = _cleanupModalState(el);
+    setCleanupLogLine(`[ui][cleanup] forceHide end state=${JSON.stringify(st1)}`);
+  }
+
+  async function cleanupRunArtifacts(runId, testBase) {
+    if (!runId) return { ok: true };
+    const cleanupText = document.getElementById('genTestCleanupText');
+    const closeBtn = document.getElementById('genTestCleanupCloseBtn');
+    clearCleanupLog();
+    setCleanupLogLine(`[ui][cleanup] begin run_id=${runId}`);
+    if (cleanupText) cleanupText.textContent = 'Cleaning up, please wait…';
+    if (closeBtn) closeBtn.disabled = true;
+    setCleanupSpinner(true);
+    const cleanupModalEl = document.getElementById('genTestCleanupModal');
+    const cleanupModal = cleanupModalEl ? bootstrap.Modal.getOrCreateInstance(cleanupModalEl) : null;
+    if (cleanupModal) {
+      setCleanupLogLine('[ui][cleanup] showing modal…');
+      try { cleanupModal.show(); } catch (e) { setCleanupLogLine(`[ui][cleanup] modal.show error: ${String(e)}`); }
+    }
+    try {
+      const timeoutMs = 30000;
+      const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      const base = testBase || (genTestState && genTestState.testBase ? String(genTestState.testBase) : '/flag_generators_test');
+      const url = `${base}/cleanup/${encodeURIComponent(runId)}`;
+      const doReq = async () => {
+        setCleanupLogLine(`[ui][cleanup] POST ${url}`);
+        return await fetchJson(url, { method: 'POST', signal: controller ? controller.signal : undefined });
+      };
+      const resp = await Promise.race([
+        doReq(),
+        new Promise((resolve) => setTimeout(() => {
+          try { if (controller) controller.abort(); } catch (e) {}
+          resolve({ ok: false, error: `Cleanup timed out after ${timeoutMs}ms.` });
+        }, timeoutMs)),
+      ]);
+
+      setCleanupLogLine(`[ui][cleanup] response ok=${resp && resp.ok !== false}`);
+      if (resp && resp.ok === false) {
+        setCleanupLogLine(`[ui][cleanup] error: ${resp.error || 'unknown error'}`);
+        if (cleanupText) cleanupText.textContent = resp.error || 'Cleanup failed.';
+        await new Promise(r => setTimeout(r, 800));
+      } else {
+        if (cleanupText) cleanupText.textContent = 'Cleanup completed.';
+      }
+      return resp || { ok: true };
+    } finally {
+      // Do NOT auto-close the modal. Enable Close when cleanup is complete.
+      if (closeBtn) closeBtn.disabled = false;
+      setCleanupSpinner(false);
+      setCleanupLogLine('[ui][cleanup] end');
+    }
+  }
+
+  function fileListSignature(data) {
+    const paths = [];
+    try {
+      const add = (arr) => {
+        (Array.isArray(arr) ? arr : []).forEach(f => {
+          if (f && f.path) paths.push(String(f.path));
+        });
+      };
+      add(data && data.inputs);
+      add(data && data.outputs);
+      add(data && data.files);
+      add(data && data.misc);
+    } catch (e) {}
+    paths.sort();
+    return JSON.stringify(paths);
+  }
+
+  async function pollOutputsOnce(runId) {
+    const base = genTestState && genTestState.testBase ? String(genTestState.testBase) : '/flag_generators_test';
+    const data = await fetchJson(`${base}/outputs/${encodeURIComponent(runId)}`);
+    if (!data) return;
+    if (data._nonJson) {
+      setOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Login required')}</div>`);
+      setOutputsStatus(false);
+      stopOutputsPolling();
+      return;
+    }
+    if (data.ok === false) {
+      // If the run isn't found (e.g., server restart), surface it.
+      setOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Failed loading outputs')}</div>`);
+      setOutputsStatus(false);
+      stopOutputsPolling();
+      return;
+    }
+
+    // Track stability of the file list so the spinner doesn't disappear
+    // before the last files (including bundle) are visible.
+    const sig = fileListSignature(data);
+    if (genTestState.outputsLastSig === sig) {
+      genTestState.outputsStablePolls = (genTestState.outputsStablePolls || 0) + 1;
+    } else {
+      genTestState.outputsLastSig = sig;
+      genTestState.outputsStablePolls = 0;
+    }
+
+    const inputs = Array.isArray(data.inputs) ? data.inputs : [];
+    const outputs = Array.isArray(data.outputs) ? data.outputs : (Array.isArray(data.files) ? data.files : []);
+    const misc = Array.isArray(data.misc) ? data.misc : [];
+    const hasAny = !!(inputs.length || outputs.length || misc.length);
+
+    if (!data.done) {
+      setOutputsStatus(true, 'Generating outputs…');
+    } else if (data.done && genTestState.outputsStablePolls < 1) {
+      setOutputsStatus(true, 'Finalizing file list…');
+    } else {
+      setOutputsStatus(false);
+    }
+
+    // Update the UI as soon as anything exists, or when run completes.
+    if (hasAny || data.done) {
+      await loadTestOutputs(runId);
+    }
+    // Stop polling once the run is done and the file list is stable.
+    if (data.done && genTestState.outputsStablePolls >= 1) {
+      stopOutputsPolling();
+    }
+  }
+
+  function startOutputsPolling(runId) {
+    stopOutputsPolling();
+    // Poll once immediately, then every second until done.
+    setOutputsStatus(true, 'Generating outputs…');
+    pollOutputsOnce(runId);
+    genTestState.outputsPollTimer = setInterval(() => {
+      pollOutputsOnce(runId);
+    }, 1000);
+  }
+
+  async function fetchJson(url, options) {
+    let resp;
+    try {
+      resp = await fetch(url, options);
+    } catch (e) {
+      return { ok: false, error: `Network error calling ${url}: ${String(e)}` };
+    }
+    const ct = (resp.headers.get('content-type') || '').toLowerCase();
+    const redirectedToLogin = !!(resp.redirected && (resp.url || '').includes('/login'));
+    if (redirectedToLogin || (!ct.includes('application/json') && !ct.includes('+json'))) {
+      let snippet = '';
+      try {
+        const txt = await resp.text();
+        snippet = (txt || '').slice(0, 200);
+      } catch (e) {}
+      return {
+        ok: false,
+        error: 'Login required (your session may have expired). Please reload and sign in at /login.' + (snippet ? ` Response: ${snippet}` : ''),
+        _nonJson: true,
+        _status: resp.status,
+        _url: resp.url,
+      };
+    }
+    try {
+      return await resp.json();
+    } catch (e) {
+      let snippet = '';
+      try {
+        const txt = await resp.text();
+        snippet = (txt || '').slice(0, 200);
+      } catch (e2) {}
+      return { ok: false, error: 'Failed to parse server response.' + (snippet ? ` Response: ${snippet}` : ''), _parseError: true };
+    }
+  }
+
+  function setGenLog(lines) {
+    document.getElementById('genLog').textContent = (lines || []).join('\n');
+  }
+
+  function setNodeGenLog(lines) {
+    document.getElementById('nodeGenLog').textContent = (lines || []).join('\n');
+  }
+
+  function joinPath(a, b) {
+    const aa = String(a || '').trim();
+    const bb = String(b || '').trim();
+    if (!aa) return bb;
+    if (!bb) return aa;
+    return aa.replace(/\/+$/, '') + '/' + bb.replace(/^\/+/, '');
+  }
+
+  function normalizeIOType(t) {
+    const v = String(t || '').trim().toLowerCase();
+    if (!v) return '';
+    const map = {
+      'string': 'text',
+      'text': 'text',
+      'json': 'json',
+      'yaml': 'yaml',
+      'yml': 'yaml',
+      'md': 'markdown',
+      'markdown': 'markdown',
+      'html': 'html',
+      'file': 'file',
+      'path': 'file',
+      'artifact': 'file',
+      'dir': 'folder',
+      'directory': 'folder',
+      'folder': 'folder',
+      'binary': 'binary file',
+      'exe': 'binary file',
+      'image': 'photo',
+      'photo': 'photo',
+      'picture': 'photo',
+    };
+    return map[v] || v;
+  }
+
+  function formatNameWithKind(item) {
+    if (!item || typeof item !== 'object') return '';
+    const nm = String(item.name || '').trim();
+    if (!nm) return '';
+    const kind = normalizeIOType(item.type);
+    if (kind === 'file' || kind === 'folder' || kind === 'binary file') {
+      return `${nm} (${kind})`;
+    }
+    return nm;
+  }
+
+  function typeSummary(items) {
+    const arr = Array.isArray(items) ? items : [];
+    const seen = new Set();
+    arr.forEach((it) => {
+      if (!it || typeof it !== 'object') return;
+      const label = normalizeIOType(it.type);
+      if (label) seen.add(label);
+    });
+    const out = Array.from(seen);
+    out.sort();
+    return out.length ? out.join(', ') : '—';
+  }
+
+  function nameSummary(items) {
+    const arr = Array.isArray(items) ? items : [];
+    const out = [];
+    arr.forEach((it) => {
+      if (!it || typeof it !== 'object') return;
+      const nm = String(it.name || '').trim();
+      if (!nm) return;
+      out.push(nm);
+    });
+    out.sort();
+    return out.length ? out.join(', ') : '—';
+  }
+
+  function groupedNameHtml(items) {
+    const arr = Array.isArray(items) ? items : [];
+    const req = [];
+    const opt = [];
+    arr.forEach((it) => {
+      if (!it || typeof it !== 'object') return;
+      const nm = formatNameWithKind(it);
+      if (!nm) return;
+      const isOptional = it.required === false;
+      (isOptional ? opt : req).push(nm);
+    });
+    req.sort();
+    opt.sort();
+    const hasReq = req.length > 0;
+    const hasOpt = opt.length > 0;
+    if (!hasReq && !hasOpt) return '—';
+
+    const parts = [];
+    if (hasReq) {
+      parts.push(`<div><strong>Required:</strong> ${escapeHtml(req.join(', '))}</div>`);
+    }
+    if (hasOpt) {
+      parts.push(`<div><strong>Optional:</strong> ${escapeHtml(opt.join(', '))}</div>`);
+    }
+    return parts.join('');
+  }
+
+  function injectedSummary(items) {
+    const arr = Array.isArray(items) ? items : [];
+    const out = [];
+    arr.forEach((x) => {
+      const s = String(x || '').trim();
+      if (!s) return;
+      out.push(s);
+    });
+    out.sort();
+    return out.length ? out.join(', ') : '—';
+  }
+
+  function renderGenerators() {
+    const body = document.getElementById('genBody');
+    const q = (genState.filter || '').toLowerCase();
+    body.innerHTML = '';
+
+    let filtered = (genState.generators || []).filter((g) => {
+      if (!q) return true;
+      const src = (g.source && g.source.path) ? g.source.path : '';
+      const entry = (g.source && g.source.entry) ? g.source.entry : '';
+      const composeFile = (g.compose && typeof g.compose === 'object' && typeof g.compose.file === 'string') ? g.compose.file : '';
+      const composeService = (g.compose && typeof g.compose === 'object' && typeof g.compose.service === 'string') ? g.compose.service : '';
+      const hay = [
+        g.id,
+        g.name,
+        g.language,
+        src,
+        entry,
+        composeFile,
+        composeService,
+        nameSummary(g.inputs),
+        nameSummary(g.outputs),
+        typeSummary(g.inputs),
+        typeSummary(g.outputs),
+        g.description || '',
+        g._source_name || '',
+      ].join(' ').toLowerCase();
+      return hay.includes(q);
+    });
+
+    const sortKey = genState.sortKey || 'name';
+    const sortDir = genState.sortDir || 'asc';
+    filtered = stableSorted(filtered, (g) => {
+      if (!g || typeof g !== 'object') return '';
+      if (sortKey === 'name') return g.name || '';
+      if (sortKey === 'type') return g.language || '';
+      if (sortKey === 'inputs') return nameSummary(g.inputs);
+      if (sortKey === 'outputs') return nameSummary(g.outputs);
+      if (sortKey === 'injects') return injectedSummary(g.inject_files);
+      if (sortKey === 'source') return g._source_name || '';
+      return g[sortKey] || '';
+    }, sortDir);
+
+    filtered.forEach((g, idx) => {
+      const tr = document.createElement('tr');
+      const src = (g.source && g.source.path) ? g.source.path : '';
+      const entry = (g.source && g.source.entry) ? g.source.entry : '';
+      const inHtml = groupedNameHtml(g.inputs);
+      const outHtml = groupedNameHtml(g.outputs);
+      const injected = injectedSummary(g.inject_files);
+      const inTypes = typeSummary(g.inputs);
+      const outTypes = typeSummary(g.outputs);
+      const hasCompose = !!(g.compose && typeof g.compose === 'object');
+      const composeService = hasCompose && typeof g.compose.service === 'string' ? g.compose.service : '';
+      const composeFile = hasCompose && typeof g.compose.file === 'string' ? g.compose.file : '';
+      const composeLabel = composeService ? `compose: ${composeService}` : 'compose';
+      const isInstalled = isInstalledGeneratorSourcePath(src);
+      const isDisabled = !!(g && typeof g === 'object' && g._disabled);
+
+      if (isDisabled) {
+        tr.classList.add('table-secondary');
+      }
+
+      const typeLabel = String(g.language || '');
+      tr.innerHTML = `
+        <td class="text-muted">${idx + 1}</td>
+        <td>
+          <div>
+            <strong>${escapeHtml(g.name || '')}</strong>
+            ${isDisabled ? `<span class="badge bg-warning text-dark ms-2">Disabled</span>` : ''}
+            ${hasCompose ? `<span class="badge bg-secondary ms-2">${escapeHtml(composeLabel)}</span>` : ''}
+          </div>
+          ${g.description ? `<div class="small text-muted">${escapeHtml(g.description)}</div>` : ''}
+        </td>
+        <td class="small">${escapeHtml(typeLabel)}</td>
+        <td class="small" title="${escapeHtml(inTypes)}">${inHtml}</td>
+        <td class="small" title="${escapeHtml(outTypes)}">${outHtml}</td>
+        <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(injected)}</td>
+        <td class="small">${escapeHtml(g._source_name || '')}</td>
+        <td>
+          <div class="btn-group btn-group-sm" role="group">
+            <button class="btn btn-sm btn-outline-primary genTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isDisabled ? 'disabled' : ''} title="${isDisabled ? 'Disabled' : 'Test generator'}">Test</button>
+            <button class="btn btn-sm btn-outline-warning genDisableBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? (isDisabled ? 'Enable generator' : 'Disable generator') : 'Only installed generators can be disabled'}">${isDisabled ? 'Enable' : 'Disable'}</button>
+            <button class="btn btn-sm btn-outline-danger genDeleteBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? 'Delete installed generator' : 'Only installed generators can be deleted'}">Delete</button>
+          </div>
+        </td>
+      `;
+      body.appendChild(tr);
+
+      const btn = tr.querySelector('.genTestBtn');
+      if (btn) {
+        btn.addEventListener('click', () => {
+          openGenTestModal(g);
+        });
+      }
+
+      const delBtn = tr.querySelector('.genDeleteBtn');
+      if (delBtn && isInstalled) {
+        delBtn.addEventListener('click', async () => {
+          delBtn.disabled = true;
+          try {
+            await deleteInstalledGenerator('/api/flag_generators/delete', g, {
+              logPreId: 'genLog',
+              reloadFn: loadGenerators,
+              itemLabel: 'generator'
+            });
+          } finally {
+            delBtn.disabled = false;
+          }
+        });
+      }
+
+      const disBtn = tr.querySelector('.genDisableBtn');
+      if (disBtn && isInstalled) {
+        disBtn.addEventListener('click', async () => {
+          disBtn.disabled = true;
+          try {
+            await setInstalledGeneratorDisabled('/api/flag_generators/set_disabled', g, !isDisabled, {
+              logPreId: 'genLog',
+              reloadFn: loadGenerators,
+              itemLabel: 'generator'
+            });
+          } finally {
+            disBtn.disabled = false;
+          }
+        });
+      }
+    });
+  }
+
+  function renderNodeGenerators() {
+    const body = document.getElementById('nodeGenBody');
+    const q = (nodeGenState.filter || '').toLowerCase();
+    body.innerHTML = '';
+
+    let filtered = (nodeGenState.generators || []).filter((g) => {
+      if (!q) return true;
+      const src = (g.source && g.source.path) ? g.source.path : '';
+      const entry = (g.source && g.source.entry) ? g.source.entry : '';
+      const composeFile = (g.compose && typeof g.compose === 'object' && typeof g.compose.file === 'string') ? g.compose.file : '';
+      const composeService = (g.compose && typeof g.compose === 'object' && typeof g.compose.service === 'string') ? g.compose.service : '';
+      const hay = [
+        g.id,
+        g.name,
+        g.language,
+        src,
+        entry,
+        composeFile,
+        composeService,
+        nameSummary(g.inputs),
+        nameSummary(g.outputs),
+        typeSummary(g.inputs),
+        typeSummary(g.outputs),
+        g.description || '',
+        g._source_name || '',
+      ].join(' ').toLowerCase();
+      return hay.includes(q);
+    });
+
+    const sortKey = nodeGenState.sortKey || 'name';
+    const sortDir = nodeGenState.sortDir || 'asc';
+    filtered = stableSorted(filtered, (g) => {
+      if (!g || typeof g !== 'object') return '';
+      if (sortKey === 'name') return g.name || '';
+      if (sortKey === 'type') return g.language || '';
+      if (sortKey === 'inputs') return nameSummary(g.inputs);
+      if (sortKey === 'outputs') return nameSummary(g.outputs);
+      if (sortKey === 'injects') return injectedSummary(g.inject_files);
+      if (sortKey === 'source') return g._source_name || '';
+      return g[sortKey] || '';
+    }, sortDir);
+
+    filtered.forEach((g, idx) => {
+      const tr = document.createElement('tr');
+      const src = (g.source && g.source.path) ? g.source.path : '';
+      const entry = (g.source && g.source.entry) ? g.source.entry : '';
+      const inHtml = groupedNameHtml(g.inputs);
+      const outHtml = groupedNameHtml(g.outputs);
+      const injected = injectedSummary(g.inject_files);
+      const inTypes = typeSummary(g.inputs);
+      const outTypes = typeSummary(g.outputs);
+      const hasCompose = !!(g.compose && typeof g.compose === 'object');
+      const composeService = hasCompose && typeof g.compose.service === 'string' ? g.compose.service : '';
+      const composeFile = hasCompose && typeof g.compose.file === 'string' ? g.compose.file : '';
+      const composeLabel = composeService ? `compose: ${composeService}` : 'compose';
+      const isInstalled = isInstalledGeneratorSourcePath(src);
+      const isDisabled = !!(g && typeof g === 'object' && g._disabled);
+
+      if (isDisabled) {
+        tr.classList.add('table-secondary');
+      }
+
+      const typeLabel = String(g.language || '');
+      tr.innerHTML = `
+        <td class="text-muted">${idx + 1}</td>
+        <td>
+          <div>
+            <strong>${escapeHtml(g.name || '')}</strong>
+            ${isDisabled ? `<span class="badge bg-warning text-dark ms-2">Disabled</span>` : ''}
+            ${hasCompose ? `<span class="badge bg-secondary ms-2">${escapeHtml(composeLabel)}</span>` : ''}
+          </div>
+          ${g.description ? `<div class="small text-muted">${escapeHtml(g.description)}</div>` : ''}
+        </td>
+        <td class="small">${escapeHtml(typeLabel)}</td>
+        <td class="small" title="${escapeHtml(inTypes)}">${inHtml}</td>
+        <td class="small" title="${escapeHtml(outTypes)}">${outHtml}</td>
+        <td class="small" style="max-width: 520px; word-break: break-all;">${escapeHtml(injected)}</td>
+        <td class="small">${escapeHtml(g._source_name || '')}</td>
+        <td>
+          <div class="btn-group btn-group-sm" role="group">
+            <button class="btn btn-sm btn-outline-primary nodeGenTestBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isDisabled ? 'disabled' : ''} title="${isDisabled ? 'Disabled' : 'Test node-generator'}">Test</button>
+            <button class="btn btn-sm btn-outline-warning nodeGenDisableBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? (isDisabled ? 'Enable node-generator' : 'Disable node-generator') : 'Only installed node-generators can be disabled'}">${isDisabled ? 'Enable' : 'Disable'}</button>
+            <button class="btn btn-sm btn-outline-danger nodeGenDeleteBtn" type="button" data-genid="${escapeHtml(g.id || '')}" ${isInstalled ? '' : 'disabled'} title="${isInstalled ? 'Delete installed node-generator' : 'Only installed node-generators can be deleted'}">Delete</button>
+          </div>
+        </td>
+      `;
+      body.appendChild(tr);
+
+      const btn = tr.querySelector('.nodeGenTestBtn');
+      if (btn) {
+        btn.addEventListener('click', () => {
+          openGenTestModal(g, '/flag_node_generators_test');
+        });
+      }
+
+      const delBtn = tr.querySelector('.nodeGenDeleteBtn');
+      if (delBtn && isInstalled) {
+        delBtn.addEventListener('click', async () => {
+          delBtn.disabled = true;
+          try {
+            await deleteInstalledGenerator('/api/flag_node_generators/delete', g, {
+              logPreId: 'nodeGenLog',
+              reloadFn: loadNodeGenerators,
+              itemLabel: 'node-generator'
+            });
+          } finally {
+            delBtn.disabled = false;
+          }
+        });
+      }
+
+      const disBtn = tr.querySelector('.nodeGenDisableBtn');
+      if (disBtn && isInstalled) {
+        disBtn.addEventListener('click', async () => {
+          disBtn.disabled = true;
+          try {
+            await setInstalledGeneratorDisabled('/api/flag_node_generators/set_disabled', g, !isDisabled, {
+              logPreId: 'nodeGenLog',
+              reloadFn: loadNodeGenerators,
+              itemLabel: 'node-generator'
+            });
+          } finally {
+            disBtn.disabled = false;
+          }
+        });
+      }
+    });
+  }
+
+  function setTestLogLine(line) {
+    const el = document.getElementById('genTestLog');
+    el.textContent = (el.textContent || '') + (line || '') + '\n';
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function clearTestLog() {
+    document.getElementById('genTestLog').textContent = '';
+  }
+
+  function setOutputsHtml(html) {
+    document.getElementById('genTestOutputs').innerHTML = html || '';
+  }
+
+  function humanFileSize(bytes) {
+    const n = Number(bytes);
+    if (!isFinite(n) || n < 0) return '';
+    if (n < 1024) return `${n} B`;
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let v = n / 1024;
+    let u = 0;
+    while (v >= 1024 && u < units.length - 1) {
+      v /= 1024;
+      u++;
+    }
+    return `${v.toFixed(v < 10 ? 1 : 0)} ${units[u]}`;
+  }
+
+  function describeFile(path, category) {
+    const p = String(path || '');
+    const c = String(category || '').toLowerCase();
+    if (p === 'run.log') return 'Run log';
+    if (p === 'outputs.json') return 'Outputs manifest';
+    if (c === 'inputs') {
+      if (p.endsWith('/config.json') || p === 'inputs/config.json') return 'Generator config';
+      try {
+        const saved = (genTestState && genTestState.savedUploads) ? genTestState.savedUploads : {};
+        const rel = p.startsWith('inputs/') ? p : `inputs/${p}`;
+
+        for (const key of Object.keys(saved || {})) {
+          const meta = saved[key] || {};
+          const storedPath = String(meta.stored_path || '');
+          const storedFilename = String(meta.stored_filename || '');
+          if (!storedPath && !storedFilename) continue;
+          const hit = (storedPath && storedPath === rel) || (storedFilename && rel.endsWith('/' + storedFilename));
+          if (!hit) continue;
+
+          const containerPath = String(meta.container_path || '');
+          const orig = String(meta.original_filename || '');
+          const req = String(meta.requested_filename || '');
+          if (req) return `Upload for ${key} → ${containerPath} (requested: ${req}; orig: ${orig || '—'})`;
+          return `Upload for ${key} → ${containerPath}${orig ? ` (orig: ${orig})` : ''}`;
+        }
+      } catch (e) {}
+      return 'Input file';
+    }
+    if (c === 'logs') return 'Log file';
+    if (c === 'outputs') {
+      // Try to map to declared outputs (even though we no longer display them).
+      const g = genTestState.current || {};
+      const declared = Array.isArray(g.outputs) ? g.outputs : [];
+      const base = p.split('/').pop() || p;
+      const hit = declared.find(o => {
+        if (!o) return false;
+        const name = String(o.name || '').trim();
+        if (!name) return false;
+        return name === base || p.includes(name);
+      });
+      if (hit) return String(hit.description || 'Declared output');
+      return 'Generated output';
+    }
+    return 'File';
+  }
+
+  function renderFilesTable(rows) {
+    const items = Array.isArray(rows) ? rows : [];
+    if (!items.length) {
+      return '<div class="text-muted">No files available.</div>';
+    }
+    const body = items.map((r, idx) => {
+      const cat = escapeHtml(r.category || '');
+      const p = escapeHtml(r.path || '');
+      const size = escapeHtml(r.size || '');
+      const desc = escapeHtml(r.desc || '');
+      const href = r.href || '#';
+      return `
+        <tr>
+          <td class="text-muted">${idx + 1}</td>
+          <td class="text-muted">${cat}</td>
+          <td style="word-break: break-all;">${p}</td>
+          <td class="text-muted">${size}</td>
+          <td class="text-muted">${desc}</td>
+          <td><a href="${href}">Download</a></td>
+        </tr>
+      `;
+    }).join('');
+    return `
+      <div class="table-responsive">
+        <table class="table table-sm align-middle mb-0">
+          <thead>
+            <tr>
+              <th style="width: 50px;">#</th>
+              <th style="width: 90px;">Type</th>
+              <th>Path</th>
+              <th style="width: 90px;">Size</th>
+              <th>Description</th>
+              <th style="width: 90px;">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${body}
+          </tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  function isFileInputType(t) {
+    const v = (t || '').toLowerCase();
+    return v === 'file' || v === 'path' || v === 'artifact' || v === 'binary';
+  }
+
+  function buildInputRow(inp) {
+    const name = inp && inp.name ? String(inp.name) : '';
+    if (!name) return '';
+    // Convention: inputs are required by default unless explicitly marked optional.
+    const required = !((inp && Object.prototype.hasOwnProperty.call(inp, 'required')) ? (inp.required === false) : false);
+    const type = inp && inp.type ? String(inp.type) : 'string';
+    const desc = inp && inp.description ? String(inp.description) : '';
+    const hasDefault = !!(inp && Object.prototype.hasOwnProperty.call(inp, 'default'));
+    const defaultVal = hasDefault ? String(inp.default) : '';
+    const label = `${name}${required ? ' *' : ''}`;
+    const help = desc ? `<div class="form-text">${escapeHtml(desc)}</div>` : '';
+    if (isFileInputType(type)) {
+      return `
+        <div class="mb-3">
+          <label class="form-label">${escapeHtml(label)}</label>
+          <input class="form-control" type="file" name="${escapeHtml(name)}" ${required ? 'required' : ''} />
+          ${help}
+        </div>
+      `;
+    }
+
+    const inputType = (type || '').toLowerCase() === 'number' ? 'number' : 'text';
+    const valueAttr = hasDefault && defaultVal !== '' ? ` value="${escapeHtml(defaultVal)}"` : '';
+    return `
+      <div class="mb-3">
+        <label class="form-label">${escapeHtml(label)}</label>
+        <input class="form-control" type="${escapeHtml(inputType)}" name="${escapeHtml(name)}"${valueAttr} ${required ? 'required' : ''} />
+        ${help}
+      </div>
+    `;
+  }
+
+  function openGenTestModal(generator, testBase) {
+    genTestState.current = generator;
+    genTestState.testBase = testBase || '/flag_generators_test';
+    genTestState.runId = null;
+    genTestState.savedUploads = {};
+    stopOutputsPolling();
+    if (genTestState.eventSource) {
+      try { genTestState.eventSource.close(); } catch (e) {}
+      genTestState.eventSource = null;
+    }
+
+    document.getElementById('genTestName').textContent = generator.name || '';
+    document.getElementById('genTestId').textContent = generator.id || '';
+    document.getElementById('genTestGeneratorId').value = generator.id || '';
+
+    const inputs = Array.isArray(generator.inputs) ? generator.inputs : [];
+    const inputsHtml = inputs.map(buildInputRow).join('') || '<div class="text-muted small">No inputs</div>';
+    document.getElementById('genTestInputs').innerHTML = inputsHtml;
+
+    clearTestLog();
+    setOutputsHtml('');
+    setOutputsStatus(false);
+
+    const btn = document.getElementById('genTestRunBtn');
+    btn.disabled = false;
+    const modal = new bootstrap.Modal(document.getElementById('genTestModal'));
+    modal.show();
+  }
+
+  async function loadTestOutputs(runId) {
+    const base = genTestState.testBase || '/flag_generators_test';
+    const data = await fetchJson(`${base}/outputs/${encodeURIComponent(runId)}`);
+    if (!data.ok) {
+      setOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Failed loading outputs')}</div>`);
+      setOutputsStatus(false);
+      return;
+    }
+    // Back-compat: older backend returned {files:[...]}
+    const inputs = Array.isArray(data.inputs) ? data.inputs : [];
+    const outputs = Array.isArray(data.outputs) ? data.outputs : (Array.isArray(data.files) ? data.files : []);
+    const misc = Array.isArray(data.misc) ? data.misc : [];
+
+    if (!data.done) {
+      setOutputsStatus(true, 'Generating outputs…');
+    } else {
+      setOutputsStatus(false);
+    }
+
+    const all = [].concat(inputs, outputs, misc);
+    if (!all.length) {
+      const rc = (data && (data.returncode === 0 || data.returncode)) ? String(data.returncode) : '';
+      setOutputsHtml(`<div class=\"text-muted\">No outputs found${rc ? ` (returncode=${escapeHtml(rc)})` : ''}.</div>`);
+      return;
+    }
+
+    const rows = [];
+    const pushFiles = (categoryLabel, files, categoryKey) => {
+      (files || []).forEach(f => {
+        const p = f.path || '';
+        const href = `${base}/download/${encodeURIComponent(runId)}?p=${encodeURIComponent(p)}`;
+        rows.push({
+          category: categoryLabel,
+          path: p,
+          size: humanFileSize(f.size),
+          desc: describeFile(p, categoryKey),
+          href,
+        });
+      });
+    };
+
+    pushFiles('Input', inputs, 'inputs');
+    pushFiles('Output', outputs, 'outputs');
+    pushFiles('Log', misc, 'logs');
+
+    setOutputsHtml(renderFilesTable(rows));
+
+  }
+
+  async function loadTestOutputsWithRetry(runId, attempts = 10) {
+    for (let i = 0; i < attempts; i++) {
+      const base = genTestState.testBase || '/flag_generators_test';
+      const data = await fetchJson(`${base}/outputs/${encodeURIComponent(runId)}`);
+      if (data && data._nonJson) {
+        setOutputsHtml(`<div class="text-danger">${escapeHtml(data.error || 'Login required')}</div>`);
+        setOutputsStatus(false);
+        return;
+      }
+      const inputs = data && Array.isArray(data.inputs) ? data.inputs : [];
+      const outputs = data && Array.isArray(data.outputs) ? data.outputs : (data && Array.isArray(data.files) ? data.files : []);
+      const misc = data && Array.isArray(data.misc) ? data.misc : [];
+      if (data && data.ok && (inputs.length || outputs.length || misc.length)) {
+        await loadTestOutputs(runId);
+        return;
+      }
+      // If not done yet, wait a bit and retry. If done but no files yet, still retry briefly.
+      await new Promise(r => setTimeout(r, 500));
+    }
+    await loadTestOutputs(runId);
+  }
+
+  async function runCurrentGenTest() {
+    const btn = document.getElementById('genTestRunBtn');
+    btn.disabled = true;
+    clearTestLog();
+    setOutputsHtml('<div class="text-muted">Waiting for outputs…</div>');
+    stopOutputsPolling();
+    setOutputsStatus(true, 'Starting generator…');
+
+    setTestLogLine('[ui] preparing request…');
+
+    const form = document.getElementById('genTestForm');
+    const fd = new FormData(form);
+    const base = genTestState.testBase || '/flag_generators_test';
+    setTestLogLine(`[ui] POST ${base}/run …`);
+    const data = await fetchJson(`${base}/run`, { method: 'POST', body: fd });
+    setTestLogLine(`[ui] response received (status unknown; ok=${data && data.ok !== false})`);
+
+    if (!data || data.ok === false) {
+      setTestLogLine(`ERROR: ${data && data.error ? data.error : 'Failed to start run'}`);
+      setOutputsStatus(false);
+      btn.disabled = false;
+      return;
+    }
+
+    const runId = data.run_id;
+    genTestState.runId = runId;
+    genTestState.savedUploads = (data && data.saved_uploads) ? data.saved_uploads : {};
+    setTestLogLine(`[ui] run_id=${runId}`);
+    setTestLogLine(`Started run ${runId}`);
+
+    try {
+      const saved = genTestState.savedUploads || {};
+      const keys = Object.keys(saved);
+      if (keys.length) {
+        keys.forEach((k) => {
+          const m = saved[k] || {};
+          const orig = String(m.original_filename || '');
+          const dst = String(m.container_path || '');
+          const req = String(m.requested_filename || '');
+          setTestLogLine(`[ui] saved upload ${k}: ${orig || 'upload'} → ${dst || '(unknown)'}${req ? ` (requested: ${req})` : ''}`);
+        });
+      }
+    } catch (e) {}
+
+    // Start polling outputs immediately (works even if SSE disconnects).
+    startOutputsPolling(runId);
+
+    const es = new EventSource(`/stream/${encodeURIComponent(runId)}`);
+    genTestState.eventSource = es;
+    setTestLogLine('[ui] opening log stream…');
+    es.onmessage = (ev) => {
+      setTestLogLine(ev.data);
+    };
+    es.addEventListener('phase', (ev) => {
+      try {
+        const payload = JSON.parse(ev.data || '{}');
+        if (payload && payload.phase) {
+          setTestLogLine(`[phase] ${payload.phase}`);
+        }
+      } catch (e) {}
+    });
+    es.addEventListener('end', async () => {
+      try { es.close(); } catch (e) {}
+      genTestState.eventSource = null;
+      setTestLogLine('Completed.');
+      await loadTestOutputsWithRetry(runId);
+      // Keep polling until the file list stabilizes.
+      btn.disabled = false;
+    });
+    es.onerror = () => {
+      // Keep UI responsive; user can retry.
+      setTestLogLine('Log stream disconnected.');
+      try { es.close(); } catch (e) {}
+      genTestState.eventSource = null;
+      // Keep polling outputs so links still appear.
+      startOutputsPolling(runId);
+      btn.disabled = false;
+    };
+  }
+
+  function escapeHtml(str) {
+    return (str || '').replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  function isInstalledGeneratorSourcePath(srcPath) {
+    const raw = String(srcPath || '').trim();
+    if (!raw) return false;
+    const norm = raw.replace(/\\/g, '/').toLowerCase();
+    // Manifests commonly report relative paths like "outputs/installed_generators/...".
+    // Accept both absolute and relative forms.
+    return norm.includes('outputs/installed_generators') || norm.includes('/installed_generators/');
+  }
+
+  function appendPreLine(preId, line) {
+    const el = document.getElementById(preId);
+    if (!el) return;
+    const cur = el.textContent || '';
+    const next = cur ? (cur + '\n' + String(line || '')) : String(line || '');
+    el.textContent = next;
+  }
+
+  async function deleteInstalledGenerator(apiPath, generator, opts) {
+    const genId = String(generator && generator.id ? generator.id : '').trim();
+    const genName = String(generator && generator.name ? generator.name : genId).trim();
+    const logPreId = opts && opts.logPreId ? opts.logPreId : null;
+    const reloadFn = opts && typeof opts.reloadFn === 'function' ? opts.reloadFn : null;
+    const itemLabel = opts && opts.itemLabel ? opts.itemLabel : 'generator';
+
+    if (!genId) {
+      if (logPreId) appendPreLine(logPreId, '[ui] Missing generator id; cannot delete.');
+      return;
+    }
+
+    const ok = confirm(`Delete ${itemLabel} “${genName}” (id ${genId})?\n\nThis removes it from outputs/installed_generators.`);
+    if (!ok) return;
+
+    if (logPreId) appendPreLine(logPreId, `[ui] Deleting ${itemLabel} id=${genId}…`);
+
+    const resp = await fetchJson(apiPath, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: JSON.stringify({ generator_id: genId }),
+    });
+
+    if (resp && resp.ok === false) {
+      if (logPreId) appendPreLine(logPreId, `[error] ${resp.error || 'Delete failed.'}`);
+      return;
+    }
+
+    if (reloadFn) {
+      await reloadFn();
+    }
+    if (logPreId) appendPreLine(logPreId, `[ok] ${resp && resp.message ? resp.message : 'Deleted.'}`);
+  }
+
+  async function setInstalledGeneratorDisabled(apiPath, generator, disabled, opts) {
+    const genId = String(generator && generator.id ? generator.id : '').trim();
+    const genName = String(generator && generator.name ? generator.name : genId).trim();
+    const logPreId = opts && opts.logPreId ? opts.logPreId : null;
+    const reloadFn = opts && typeof opts.reloadFn === 'function' ? opts.reloadFn : null;
+    const itemLabel = opts && opts.itemLabel ? opts.itemLabel : 'generator';
+
+    if (!genId) {
+      if (logPreId) appendPreLine(logPreId, '[ui] Missing generator id; cannot update disabled state.');
+      return;
+    }
+
+    const verb = disabled ? 'Disable' : 'Enable';
+    if (logPreId) appendPreLine(logPreId, `[ui] ${verb.toLowerCase()} ${itemLabel} id=${genId}…`);
+
+    const resp = await fetchJson(apiPath, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: JSON.stringify({ generator_id: genId, disabled: !!disabled }),
+    });
+
+    if (resp && resp.ok === false) {
+      if (logPreId) appendPreLine(logPreId, `[error] ${resp.error || 'Update failed.'}`);
+      return;
+    }
+
+    if (reloadFn) {
+      await reloadFn();
+    }
+    if (logPreId) appendPreLine(logPreId, `[ok] ${resp && resp.message ? resp.message : 'Updated.'}`);
+  }
+
+  async function loadGenerators() {
+    const metaEl = document.getElementById('genMeta');
+    metaEl.textContent = 'Loading…';
+    setGenLog([]);
+    const data = await fetchJson('/flag_generators_data');
+    if (data && data.ok === false) {
+      metaEl.textContent = data.error || 'Failed loading generators.';
+      return;
+    }
+    genState.generators = data.generators || [];
+    genState.errors = data.errors || [];
+    metaEl.textContent = `Loaded ${genState.generators.length} installed generators.`;
+    const lines = [];
+    (genState.errors || []).forEach(e => lines.push(JSON.stringify(e)));
+    setGenLog(lines);
+    renderGenerators();
+  }
+
+  document.getElementById('genFilter').addEventListener('input', (e) => {
+    genState.filter = e.target.value || '';
+    renderGenerators();
+  });
+
+  // Load generator list when the tab is shown
+  document.getElementById('flagGeneratorsTab').addEventListener('shown.bs.tab', async () => {
+    await loadGenerators();
+  });
+
+  document.getElementById('genTestRunBtn').addEventListener('click', async () => {
+    await runCurrentGenTest();
+  });
+
+  // Cleanup when the Test Generator modal is closed.
+  // Important: don't block the close transition (Bootstrap can get stuck).
+  // Instead: capture run id on hide, then perform cleanup after it's hidden.
+  (function attachGenTestCleanupHandler() {
+    const el = document.getElementById('genTestModal');
+    if (!el) return;
+
+    el.addEventListener('hide.bs.modal', () => {
+      pendingCleanupRunId = genTestState.runId || null;
+      pendingCleanupTestBase = genTestState.testBase || '/flag_generators_test';
+      try { setTestLogLine(`[ui][cleanup] genTestModal hide: pendingCleanupRunId=${pendingCleanupRunId || ''}`); } catch (e) {}
+      // Stop background activity immediately to reduce flakiness.
+      stopOutputsPolling();
+      if (genTestState.eventSource) {
+        try { genTestState.eventSource.close(); } catch (e) {}
+        genTestState.eventSource = null;
+      }
+    });
+
+    el.addEventListener('hidden.bs.modal', async () => {
+      const runId = pendingCleanupRunId;
+      const testBase = pendingCleanupTestBase;
+      pendingCleanupRunId = null;
+      pendingCleanupTestBase = null;
+      try { setTestLogLine(`[ui][cleanup] genTestModal hidden: runId=${runId || ''}`); } catch (e) {}
+      resetGenTestUiState();
+      if (!runId) return;
+      try {
+        try { setCleanupLogLine(`[ui][cleanup] invoked from genTestModal hidden (runId=${runId})`); } catch (e) {}
+        await cleanupRunArtifacts(runId, testBase);
+      } catch (e) {
+        // Ignore cleanup errors; UI already closed.
+      }
+    });
+  })();
+
+  async function loadNodeGenerators() {
+    const metaEl = document.getElementById('nodeGenMeta');
+    metaEl.textContent = 'Loading…';
+    setNodeGenLog([]);
+    const data = await fetchJson('/flag_node_generators_data');
+    if (data && data.ok === false) {
+      metaEl.textContent = data.error || 'Failed loading node-generators.';
+      return;
+    }
+    nodeGenState.generators = data.generators || [];
+    nodeGenState.errors = data.errors || [];
+    metaEl.textContent = `Loaded ${nodeGenState.generators.length} installed node-generators.`;
+    const lines = [];
+    (nodeGenState.errors || []).forEach(e => lines.push(JSON.stringify(e)));
+    setNodeGenLog(lines);
+    renderNodeGenerators();
+  }
+
+  document.getElementById('nodeGenFilter').addEventListener('input', (e) => {
+    nodeGenState.filter = e.target.value || '';
+    renderNodeGenerators();
+  });
+
+  // Load node-generator list when the tab is shown
+  document.getElementById('flagNodeGeneratorsTab').addEventListener('shown.bs.tab', async () => {
+    await loadNodeGenerators();
+  });
+
+  // Enable sorting (click any header) for both generator tables.
+  enableTableSorting('genTable', genState, [
+    { key: null, label: '#' },
+    { key: 'name', label: 'Name' },
+    { key: 'type', label: 'Type' },
+    { key: 'inputs', label: 'Inputs' },
+    { key: 'outputs', label: 'Outputs' },
+    { key: 'injects', label: 'Injects' },
+    { key: 'source', label: 'From Source' },
+    { key: null, label: 'Actions' },
+  ], renderGenerators);
+
+  enableTableSorting('nodeGenTable', nodeGenState, [
+    { key: null, label: '#' },
+    { key: 'name', label: 'Name' },
+    { key: 'type', label: 'Type' },
+    { key: 'inputs', label: 'Inputs' },
+    { key: 'outputs', label: 'Outputs' },
+    { key: 'injects', label: 'Injects' },
+    { key: 'source', label: 'From Source' },
+    { key: null, label: 'Actions' },
+  ], renderNodeGenerators);
+
+  (function attachCleanupModalHandlers() {
+    const el = document.getElementById('genTestCleanupModal');
+    if (!el) return;
+    const closeBtn = document.getElementById('genTestCleanupCloseBtn');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', () => {
+        try { setCleanupLogLine('[ui][cleanup] user clicked Close'); } catch (e) {}
+      });
+    }
+    el.addEventListener('hidden.bs.modal', () => {
+      try { clearCleanupLog(); } catch (e) {}
+    });
+  })();
+
+  (function attachGeneratorPackUploadProgress() {
+    const form = document.getElementById('packUploadForm');
+    const fileInput = document.getElementById('packZipInput');
+    const modalEl = document.getElementById('packUploadProgressModal');
+    const barEl = document.getElementById('packUploadProgressBar');
+    const textEl = document.getElementById('packUploadProgressText');
+    const bytesEl = document.getElementById('packUploadProgressBytes');
+    const cancelBtn = document.getElementById('packUploadCancelBtn');
+    const resultEl = document.getElementById('packUploadResult');
+    const closeBtn = document.getElementById('packUploadCloseBtn');
+
+    if (!form || !fileInput || !modalEl || !barEl || !textEl || !bytesEl || !cancelBtn || !resultEl || !closeBtn) return;
+
+    function fmtBytes(n) {
+      const num = Number(n) || 0;
+      const units = ['B', 'KB', 'MB', 'GB'];
+      let i = 0;
+      let v = num;
+      while (v >= 1024 && i < units.length - 1) {
+        v = v / 1024;
+        i += 1;
+      }
+      const digits = i === 0 ? 0 : (i === 1 ? 1 : 2);
+      return `${v.toFixed(digits)} ${units[i]}`;
+    }
+
+    function setProgress(pct, loaded, total) {
+      const p = Math.max(0, Math.min(100, Math.round(pct || 0)));
+      barEl.style.width = `${p}%`;
+      barEl.textContent = `${p}%`;
+      barEl.setAttribute('aria-valuenow', String(p));
+      if (total && total > 0) {
+        bytesEl.textContent = `${fmtBytes(loaded)} / ${fmtBytes(total)}`;
+      } else if (loaded) {
+        bytesEl.textContent = `${fmtBytes(loaded)}`;
+      } else {
+        bytesEl.textContent = '';
+      }
+    }
+
+    function setBarStyle(kind) {
+      barEl.classList.remove('bg-danger', 'bg-success', 'bg-secondary');
+      barEl.classList.add('progress-bar-striped', 'progress-bar-animated');
+      if (kind === 'error') {
+        barEl.classList.remove('progress-bar-animated');
+        barEl.classList.remove('progress-bar-striped');
+        barEl.classList.add('bg-danger');
+      } else if (kind === 'success') {
+        barEl.classList.remove('progress-bar-animated');
+        barEl.classList.remove('progress-bar-striped');
+        barEl.classList.add('bg-success');
+      } else if (kind === 'cancel') {
+        barEl.classList.remove('progress-bar-animated');
+        barEl.classList.remove('progress-bar-striped');
+        barEl.classList.add('bg-secondary');
+      }
+    }
+
+    function showResult(text) {
+      const t = String(text || '').trim();
+      if (!t) {
+        resultEl.style.display = 'none';
+        resultEl.textContent = '';
+        return;
+      }
+      resultEl.textContent = t;
+      resultEl.style.display = '';
+    }
+
+    function enterTerminalState() {
+      try { cancelBtn.disabled = true; } catch (e) {}
+      try { cancelBtn.style.display = 'none'; } catch (e) {}
+      try { closeBtn.style.display = ''; } catch (e) {}
+    }
+
+    form.addEventListener('submit', (ev) => {
+      try {
+        const file = (fileInput.files && fileInput.files[0]) ? fileInput.files[0] : null;
+        if (!file) return; // let browser validation handle it
+
+        ev.preventDefault();
+
+        const modal = bootstrap.Modal.getOrCreateInstance(modalEl, { backdrop: 'static', keyboard: false });
+        textEl.textContent = `Uploading ${file.name}…`;
+        showResult('');
+        setBarStyle('working');
+        setProgress(0, 0, file.size);
+        cancelBtn.disabled = false;
+        cancelBtn.style.display = '';
+        closeBtn.style.display = 'none';
+        modal.show();
+
+        const xhr = new XMLHttpRequest();
+        let cancelled = false;
+        let finished = false;
+
+        const onCancel = () => {
+          if (finished) return;
+          cancelled = true;
+          try { xhr.abort(); } catch (e) {}
+          textEl.textContent = 'Upload cancelled.';
+          setBarStyle('cancel');
+          showResult('Request aborted by user.');
+          enterTerminalState();
+        };
+        cancelBtn.addEventListener('click', onCancel, { once: true });
+
+        xhr.upload.onprogress = (e) => {
+          if (!e) return;
+          const total = e.total || file.size || 0;
+          const loaded = e.loaded || 0;
+          const pct = total ? (loaded / total) * 100 : 0;
+          setProgress(pct, loaded, total);
+        };
+
+        xhr.onload = () => {
+          try {
+            if (cancelled) return;
+            finished = true;
+            const status = xhr.status || 0;
+            const respText = xhr.responseText || '';
+            const contentType = (xhr.getResponseHeader && xhr.getResponseHeader('Content-Type')) ? (xhr.getResponseHeader('Content-Type') || '') : '';
+            let payload = null;
+            try { payload = respText ? JSON.parse(respText) : null; } catch (e) { payload = null; }
+
+            // Upload finished; server-side validation/install may still be happening.
+            setProgress(100, file.size, file.size);
+
+            if (status >= 200 && status < 300) {
+              if (contentType && contentType.indexOf('application/json') === -1) {
+                setBarStyle('error');
+                textEl.textContent = 'Upload failed (unexpected response).';
+                showResult(respText || 'Expected JSON response but got something else.');
+                enterTerminalState();
+                return;
+              }
+              setBarStyle('success');
+              textEl.textContent = 'Installed.';
+              showResult((payload && (payload.message || payload.detail)) ? (payload.message || payload.detail) : 'Upload succeeded.');
+              enterTerminalState();
+              // Reload the catalog to show the updated pack table.
+              window.setTimeout(() => { window.location.href = '{{ url_for('flag_catalog_page') }}'; }, 1200);
+              return;
+            }
+
+            setBarStyle('error');
+            textEl.textContent = `Upload failed (HTTP ${status || 'error'}).`;
+            const err = (payload && (payload.error || payload.message)) ? (payload.error || payload.message) : respText;
+            showResult(err || 'Upload failed.');
+            enterTerminalState();
+          } catch (e) {
+            setBarStyle('error');
+            textEl.textContent = 'Upload failed (unexpected error).';
+            showResult(String(e || 'Unexpected error'));
+            enterTerminalState();
+          }
+        };
+
+        xhr.onerror = () => {
+          if (cancelled) return;
+          finished = true;
+          textEl.textContent = 'Upload failed (network error).';
+          setBarStyle('error');
+          showResult('Network error while uploading. Check the Web UI server logs and your browser console.');
+          enterTerminalState();
+        };
+
+        xhr.onabort = () => {
+          if (cancelled) return;
+          // Abort that wasn't initiated via our Cancel button.
+          finished = true;
+          setBarStyle('error');
+          textEl.textContent = 'Upload aborted.';
+          showResult('Upload was aborted (not by user). If this repeats, check server logs and browser console.');
+          enterTerminalState();
+        };
+
+        const data = new FormData(form);
+        xhr.open('POST', form.action, true);
+        xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+        xhr.setRequestHeader('Accept', 'application/json');
+        xhr.send(data);
+      } catch (e) {
+        // Fall back to normal form submit
+      }
+    });
+  })();
+</script>
+{% endblock %}

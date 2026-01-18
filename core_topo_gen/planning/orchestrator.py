@@ -38,6 +38,46 @@ def compute_full_plan(
     density_base, weight_items, count_items, services_list = parse_node_info(xml_path, scenario)
     role_counts, node_breakdown = compute_node_plan(density_base, weight_items, count_items)
 
+    # --- Vulnerabilities ---
+    vuln_density, vuln_items_xml = parse_vulnerabilities_info(xml_path, scenario)
+    vuln_items: List[VulnerabilityItem] = []
+    for it in (vuln_items_xml or []):
+        if not hasattr(it, 'get'):
+            continue
+        selected = (it.get('selected') or '').strip() or 'Random'
+        # Normalize UI synonym.
+        if selected == 'Category':
+            selected = 'Type/Vector'
+
+        # Prefer stable, meaningful names for preview + flow.
+        if selected == 'Specific':
+            name = (it.get('v_name') or '').strip() or 'Specific'
+        elif selected == 'Type/Vector':
+            vt = (it.get('v_type') or '').strip()
+            vv = (it.get('v_vector') or '').strip()
+            name = f"{vt}:{vv}" if (vt or vv) else 'Type/Vector'
+        else:
+            name = selected or 'Random'
+
+        vm_raw = (it.get('v_metric') or '')
+        vm = str(vm_raw).strip() if vm_raw is not None else ''
+        if not vm:
+            # Specific defaults to Count when a count is provided.
+            vm = 'Count' if (selected == 'Specific' and it.get('v_count') not in (None, '')) else 'Weight'
+        abs_c = 0
+        if vm.lower() == 'count':
+            try:
+                abs_c = int(it.get('v_count') or 0)
+            except Exception:
+                abs_c = 0
+        try:
+            factor_val = float((it.get('factor') or 0.0)) if hasattr(it, 'get') else 0.0
+        except Exception:
+            factor_val = 0.0
+        kind = selected
+        vuln_items.append(VulnerabilityItem(name=name, density=vuln_density, abs_count=abs_c, kind=kind, factor=factor_val, metric=vm))
+    vulnerability_plan, vuln_breakdown = compute_vulnerability_plan(density_base, vuln_density, vuln_items)
+
     # --- Routing ---
     routing_density, routing_items = parse_routing_info(xml_path, scenario)
     routers_planned, router_breakdown = compute_router_plan(
@@ -64,31 +104,6 @@ def compute_full_plan(
     # --- Services ---
     svc_specs = [ServiceSpec(s.name, density=getattr(s, 'density', 0.0), abs_count=getattr(s, 'abs_count', 0)) for s in services_list]
     service_plan, service_breakdown = compute_service_plan(svc_specs, density_base)
-
-    # --- Vulnerabilities ---
-    vuln_density, vuln_items_xml, vuln_flag_type = parse_vulnerabilities_info(xml_path, scenario)
-    vuln_items: List[VulnerabilityItem] = []
-    for it in (vuln_items_xml or []):
-        name = (it.get('selected') or 'Item') if hasattr(it, 'get') else 'Item'
-        vm_raw = (it.get('v_metric') if hasattr(it, 'get') else '') or ''
-        vm = vm_raw.strip() or ('Count' if ((it.get('selected') or '').strip() == 'Specific' and (it.get('v_count') or '').strip()) else 'Weight')
-        abs_c = 0
-        if vm.lower() == 'count':
-            try:
-                abs_c = int(it.get('v_count') or 0)
-            except Exception:
-                abs_c = 0
-        try:
-            factor_val = float((it.get('factor') or 0.0)) if hasattr(it, 'get') else 0.0
-        except Exception:
-            factor_val = 0.0
-        kind = (it.get('selected') or name) if hasattr(it, 'get') else name
-        vuln_items.append(VulnerabilityItem(name=name, density=vuln_density, abs_count=abs_c, kind=kind, factor=factor_val, metric=vm))
-    vulnerability_plan, vuln_breakdown = compute_vulnerability_plan(density_base, vuln_density, vuln_items)
-    try:
-        vuln_breakdown['flag_type'] = vuln_flag_type
-    except Exception:
-        pass
 
     # --- Segmentation ---
     seg_density, seg_items = parse_segmentation_info(xml_path, scenario)

@@ -14,6 +14,15 @@
   .form-switch.form-switch-sm .form-check-label {
     padding-left: .35rem;
   }
+
+  /* Preview tables inside scroll containers */
+  .fp-scroll-table { overflow: auto; }
+  .fp-scroll-table .fp-sticky-head thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  .fp-vuln-cell { white-space: normal; word-break: break-word; }
 </style>
 {% endblock %}
 {% block content %}
@@ -67,14 +76,24 @@
   {%- endmacro %}
 
   <div class="d-flex align-items-center mb-2 gap-2">
-    <h2 class="me-auto mb-0">Full Preview {{ scenario or '' }}</h2>
-  <button id="executeRunBtn" class="btn btn-sm btn-warning" title="Execute this scenario now (invokes CLI)" data-preview-plan="{{ preview_plan_path or '' }}">Execute</button>
-    <form method="post" action="/plan/full_preview_page" class="d-flex align-items-center" id="rerollForm">
+    {% if not hide_chrome %}
+      <h2 class="me-auto mb-0">Full Preview {{ scenario or '' }}</h2>
+    {% else %}
+      {# In embedded mode, keep controls on the left (no spacer). #}
+    {% endif %}
+  {% if not hide_chrome %}
+    <button id="executeRunBtn" class="btn btn-sm btn-warning" title="Execute this scenario now (invokes CLI)" data-preview-plan="{{ preview_plan_path or '' }}">Execute</button>
+  {% else %}
+    <button id="executeRunBtn" class="d-none" type="button" aria-hidden="true" data-preview-plan="{{ preview_plan_path or '' }}"></button>
+  {% endif %}
+    <form method="post" action="{{ url_for('plan_full_preview_page', embed=1) if hide_chrome else url_for('plan_full_preview_page') }}" class="d-flex align-items-center" id="rerollForm">
       <input type="hidden" name="xml_path" value="{{ xml_path }}" />
       {% if scenario %}<input type="hidden" name="scenario" value="{{ scenario }}" />{% endif %}
+      {% if hide_chrome %}<input type="hidden" name="embed" value="1" />{% endif %}
+      <input type="hidden" name="force" value="1" />
       <div class="input-group input-group-sm me-2" style="width:160px;">
         <span class="input-group-text">Seed</span>
-        <input type="text" class="form-control" name="seed" value="" placeholder="random" />
+        <input type="text" class="form-control" name="seed" value="{{ seed }}" placeholder="random" />
       </div>
       <button class="btn btn-sm btn-outline-secondary" type="submit" title="Re-run preview with new / provided seed">Re-roll</button>
     </form>
@@ -119,24 +138,7 @@
   <div id="fp-side-services" class="collapse">
     <pre class="small bg-light p-2">{{ full_preview.services_preview | tojson(indent=2) }}</pre>
   </div>
-  <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
-    <h6 class="mb-0">Vulnerabilities Preview</h6>
-    <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-side-vuln" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
-  </div>
-  <div id="fp-side-vuln" class="collapse">
-  {% set vuln_prev = full_preview.vulnerabilities_preview or {} %}
-    {% set vuln_by_node = full_preview.vulnerabilities_by_node or {} %}
-  {% if vuln_prev %}
-  <pre class="small bg-light p-2">{
-{% set first = True %}
-{% for k,v in vuln_prev.items() %}
-{# '__density_pool__' legacy key no longer produced; conditional retained for backward safety #}
-{% if k != '__density_pool__' %}{% if not first %},\n{% endif %}"{{ k }}": {{ v }}{% set first = False %}{% endif %}
-{% endfor %}
-{% if first %}"_note": "(none)"{% endif %}
-}</pre>
-  {% else %}<div class="small text-muted fst-italic">(none)</div>{% endif %}
-  </div>
+  {% set vuln_by_node = full_preview.vulnerabilities_by_node or {} %}
   {% if vuln_by_node %}
   <div class="d-flex justify-content-between align-items-center mb-1 mt-3">
     <h6 class="mb-0">Vulnerabilities by Host</h6>
@@ -148,6 +150,7 @@
   {% endif %}
     </div>
     <div class="col-md-8">
+      <div id="fpFlowValidityAlert" class="alert alert-danger d-none mb-2" role="alert"></div>
       <ul class="nav nav-tabs" id="fpTabs" role="tablist">
         <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#fp-graph" type="button">Graph</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-routers" type="button">Routers</button></li>
@@ -157,6 +160,7 @@
     <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-interfaces" type="button">Interfaces</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-seg" type="button">Segmentation</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-traffic" type="button">Traffic</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-flag-sequence" type="button">Flag-Sequence</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-node-sections" type="button">Node Sections</button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#fp-json" type="button">Raw JSON</button></li>
       </ul>
@@ -178,22 +182,14 @@
           </div>
         </div>
   <div class="tab-pane fade" id="fp-routers">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <h6 class="mb-0">Routers</h6>
-            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-routers-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
-          </div>
-          <div id="fp-routers-body" class="collapse">
+          <div id="fp-routers-body">
             <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Primary IP</th><th>R2R Interfaces</th><th>Switch Links</th></tr></thead><tbody>
             {% for r in full_preview.routers %}<tr><td>{{ r.node_id }}</td><td>{{ r.name }}</td><td>{{ r.ip4 or '-' }}</td><td>{{ render_r2r_interfaces(r.node_id, full_preview.r2r_links_preview) }}</td><td>{{ render_router_switch_links(r.node_id, full_preview.switches_detail) }}</td></tr>{% endfor %}
             </tbody></table>
           </div>
         </div>
   <div class="tab-pane fade" id="fp-hosts">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <h6 class="mb-0">Hosts</h6>
-            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-hosts-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
-          </div>
-          <div id="fp-hosts-body" class="collapse">
+          <div id="fp-hosts-body">
             <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Role</th><th>IP</th><th>Router</th><th>Vulnerabilities</th></tr></thead><tbody>
             {% set hr = full_preview.host_router_map or {} %}
             {% for h in full_preview.hosts %}{% set vulns = h.vulnerabilities or [] %}<tr><td>{{ h.node_id }}</td><td>{{ h.name }}</td><td>{{ h.role }}</td><td>{{ h.ip4 }}</td><td>{{ hr[h.node_id|string] or hr[h.node_id] }}</td><td>{{ vulns|join(', ') if vulns else '-' }}</td></tr>{% endfor %}
@@ -201,19 +197,52 @@
           </div>
         </div>
   <div class="tab-pane fade" id="fp-vulnerabilities">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <h6 class="mb-0">Vulnerabilities</h6>
-            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-vuln-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
-          </div>
-          <div id="fp-vuln-body" class="collapse">
-          {% set vuln_plan = full_preview.vulnerabilities_preview or {} %}
+          <div id="fp-vuln-body">
+      {# vulnerabilities_plan: vulnerability name -> planned count #}
+      {% set vuln_plan = full_preview.vulnerabilities_plan or {} %}
           {% set vuln_assign = full_preview.vulnerabilities_by_node or {} %}
+
+          {# Summary totals #}
+          {% set planned_total = 0 %}
+          {% set planned_unique = 0 %}
+          {% if vuln_plan %}
+            {% set planned_unique = (vuln_plan|length) %}
+            {% for _k, _v in vuln_plan.items() %}
+              {% set planned_total = planned_total + (_v|int) %}
+            {% endfor %}
+          {% endif %}
+
+          {% set assigned_total = 0 %}
+          {% set assigned_unique = 0 %}
+          {% if vuln_assign %}
+            {% set uniq = namespace(v={}) %}
+            {% for _hid, _vv in vuln_assign.items() %}
+              {% if _vv is sequence and (_vv is not string) %}
+                {% set assigned_total = assigned_total + (_vv|length) %}
+                {% for _name in _vv %}
+                  {% set _s = _name|string %}
+                  {% if _s %}
+                    {% set _ = uniq.v.update({_s: True}) %}
+                  {% endif %}
+                {% endfor %}
+              {% endif %}
+            {% endfor %}
+            {% set assigned_unique = (uniq.v|length) %}
+          {% endif %}
+
+          <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+            <span class="badge text-bg-secondary">Planned total: {{ planned_total }}</span>
+            <span class="badge text-bg-secondary">Assigned total: {{ assigned_total }}</span>
+            <span class="badge text-bg-light border">Unique planned: {{ planned_unique }}</span>
+            <span class="badge text-bg-light border">Unique assigned: {{ assigned_unique }}</span>
+          </div>
+
           <div class="row g-3">
             <div class="col-md-4">
               <h6 class="mb-2">Planned Counts</h6>
               {% set plan_ns = namespace(has_rows=False) %}
-              <div class="table-responsive" style="max-height:220px;overflow:auto;">
-                <table class="table table-sm table-striped small align-middle">
+              <div class="table-responsive fp-scroll-table" style="max-height:220px;">
+                <table class="table table-sm table-striped table-bordered small align-middle mb-0 fp-sticky-head">
                   <thead class="table-light"><tr><th>Vulnerability</th><th class="text-end">Count</th></tr></thead>
                   <tbody>
                   {% for v_name, v_count in vuln_plan.items() %}
@@ -231,23 +260,43 @@
             </div>
             <div class="col-md-8">
               <h6 class="mb-2">Assignments by Host</h6>
-              {% set sorted_assign = vuln_assign|dictsort %}
-              {% if sorted_assign %}
-              <div class="table-responsive" style="max-height:220px;overflow:auto;">
-                <table class="table table-sm table-striped small align-middle">
+              {% set assign_rows_ns = namespace(rows=[]) %}
+              {% for node_id_str, vulns in (vuln_assign|dictsort) %}
+                {% if vulns %}
+                  {% set assign_rows_ns.rows = assign_rows_ns.rows + [{'node_id': (node_id_str|int), 'node_id_str': node_id_str, 'vulns': vulns}] %}
+                {% endif %}
+              {% endfor %}
+              {% set assign_rows = assign_rows_ns.rows|sort(attribute='node_id') %}
+              {% if assign_rows %}
+              <div class="table-responsive fp-scroll-table" style="max-height:220px;">
+                <table class="table table-sm table-striped table-bordered small align-middle mb-0 fp-sticky-head" style="table-layout: fixed;">
                   <thead class="table-light"><tr><th>Host ID</th><th>Name</th><th>Role</th><th>Vulnerabilities</th></tr></thead>
                   <tbody>
                   {% set assign_ns = namespace(has_rows=False) %}
-                  {% for node_id_str, vulns in sorted_assign %}
+                  {% for row in assign_rows %}
+                    {% set node_id_str = row.node_id_str %}
+                    {% set vulns = row.vulns %}
                     {% if vulns %}
                       {% set assign_ns.has_rows = True %}
-                      {% set node_id = node_id_str|int %}
+                      {% set node_id = row.node_id %}
                       {% set host = (full_preview.hosts | selectattr('node_id','equalto', node_id) | first) %}
                       <tr>
                         <td>{{ node_id }}</td>
                         <td>{{ host.name if host else 'Host ' ~ node_id }}</td>
                         <td>{{ host.role if host and host.role else 'host' }}</td>
-                        <td>{{ vulns|join(', ') }}</td>
+                        <td class="fp-vuln-cell">
+                          {% if vulns is string %}
+                            {{ vulns }}
+                          {% elif vulns is sequence %}
+                            <div class="d-flex flex-wrap gap-1">
+                              {% for v in (vulns|sort) %}
+                                <span class="badge text-bg-danger">{{ v }}</span>
+                              {% endfor %}
+                            </div>
+                          {% else %}
+                            {{ vulns }}
+                          {% endif %}
+                        </td>
                       </tr>
                     {% endif %}
                   {% endfor %}
@@ -265,22 +314,14 @@
           </div>
         </div>
   <div class="tab-pane fade" id="fp-switches">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <h6 class="mb-0">Switches</h6>
-            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-switches-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
-          </div>
-          <div id="fp-switches-body" class="collapse">
+          <div id="fp-switches-body">
             <table class="table table-sm table-striped small"><thead><tr><th>ID</th><th>Name</th><th>Router</th><th>Hosts</th><th>R/S Subnet</th><th>LAN Subnet</th></tr></thead><tbody>
             {% for sw in full_preview.switches_detail %}<tr><td>{{ sw.switch_id }}</td><td>sw-{{ sw.switch_id }}</td><td>{{ sw.router_id }}</td><td>{{ sw.hosts|join(',') }}</td><td>{{ sw.rsw_subnet }}</td><td>{{ sw.lan_subnet }}</td></tr>{% endfor %}
             </tbody></table>
           </div>
         </div>
   <div class="tab-pane fade" id="fp-interfaces">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <h6 class="mb-0">Interfaces</h6>
-            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-interfaces-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
-          </div>
-          <div id="fp-interfaces-body" class="collapse">
+          <div id="fp-interfaces-body">
           <div class="row g-3">
             <div class="col-12">
               <h6 class="mb-2">Router-to-Router Links</h6>
@@ -518,11 +559,7 @@
           </div>
         </div>
   <div class="tab-pane fade" id="fp-node-sections">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <h6 class="mb-0">Node Sections</h6>
-            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-node-sections-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
-          </div>
-          <div id="fp-node-sections-body" class="collapse">
+          <div id="fp-node-sections-body">
           <div class="table-responsive small">
             <table class="table table-sm table-bordered mb-0" id="nodeSectionsTable"><thead><tr>
               <th>Node ID</th><th>Name</th><th>Type</th><th>Primary IP</th><th>Interfaces</th><th>Services</th><th>Vulns</th><th>Seg Rules</th><th>Traffic S</th><th>Traffic R</th>
@@ -531,11 +568,7 @@
           </div>
         </div>
   <div class="tab-pane fade" id="fp-traffic">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <h6 class="mb-0">Traffic</h6>
-            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-traffic-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
-          </div>
-          <div id="fp-traffic-body" class="collapse">
+          <div id="fp-traffic-body">
           {% set tsummary = full_preview.traffic_summary or {} %}
           {% set flows = tsummary.flows or [] %}
           {% if flows %}
@@ -571,12 +604,15 @@
           {% endif %}
           </div>
         </div>
-  <div class="tab-pane fade" id="fp-json">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <h6 class="mb-0">Raw JSON</h6>
-            <button class="btn btn-sm btn-outline-secondary" type="button" data-preview-collapse="fp-json-body" data-label-collapse="Collapse" data-label-expand="Expand">Collapse</button>
+
+  <div class="tab-pane fade" id="fp-flag-sequence">
+          <div id="fp-flag-sequence-body">
+            <div class="small text-muted fst-italic">Loading flag sequence…</div>
           </div>
-          <div id="fp-json-body" class="collapse">
+        </div>
+
+  <div class="tab-pane fade" id="fp-json">
+          <div id="fp-json-body">
             <pre class="small bg-light p-2" style="max-height:440px;overflow:auto;">{{ preview_json }}</pre>
           </div>
         </div>
@@ -609,6 +645,24 @@
     </div>
   </div>
 </div>
+
+<!-- Flag Sequencing: node click (sequence badge) details modal -->
+<div class="modal fade" id="flowNodeFlagModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="flowNodeFlagModalTitle">Flag Details</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div id="flowNodeFlagModalBody" class="small text-muted">(no data)</div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
 {% block extra_scripts %}
 <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
 <script id="fpDataJson" type="application/json">{{ full_preview | tojson }}</script>
@@ -616,10 +670,417 @@
 <script id="fpScenarioMetaJson" type="application/json">{{ {'scenario': scenario, 'xml_basename': xml_basename} | tojson }}</script>
 <script>
 (function(){
+  const IS_EMBEDDED = {{ 'true' if hide_chrome else 'false' }};
   let previewData = {};
+
+  const flowNodeFlagModalEl = document.getElementById('flowNodeFlagModal');
+  const flowNodeFlagModalTitleEl = document.getElementById('flowNodeFlagModalTitle');
+  const flowNodeFlagModalBodyEl = document.getElementById('flowNodeFlagModalBody');
+
+  function toRoman(num){
+    const n = Number(num);
+    if(!Number.isFinite(n) || n <= 0 || n >= 4000) return '';
+    const parts = [
+      [1000,'M'],[900,'CM'],[500,'D'],[400,'CD'],
+      [100,'C'],[90,'XC'],[50,'L'],[40,'XL'],
+      [10,'X'],[9,'IX'],[5,'V'],[4,'IV'],[1,'I'],
+    ];
+    let x = Math.floor(n);
+    let out = '';
+    for(const [v,s] of parts){
+      while(x >= v){ out += s; x -= v; }
+    }
+    return out;
+  }
+
+  function openFlowNodeFlagModal(node){
+    try {
+      if(!flowNodeFlagModalEl || !flowNodeFlagModalBodyEl) return;
+
+      function collectHintTexts(fa){
+        const out = [];
+        try {
+          if(!fa || typeof fa !== 'object') return out;
+          const hs = Array.isArray(fa.hints) ? fa.hints : [];
+          hs.forEach((x)=>{ const s = String(x || '').trim(); if(s) out.push(s); });
+          if(typeof fa.hint === 'string'){
+            const s = fa.hint.trim();
+            if(s) out.push(s);
+          }
+          const dh = Array.isArray(fa.description_hints) ? fa.description_hints : [];
+          dh.forEach((x)=>{ const s = String(x || '').trim(); if(s) out.push(s); });
+        } catch(e) {}
+        return out;
+      }
+
+      // Ensure modal isn't clipped by embedded containers.
+      try {
+        if(!flowNodeFlagModalEl.__appendedToBody){
+          document.body.appendChild(flowNodeFlagModalEl);
+          flowNodeFlagModalEl.__appendedToBody = true;
+        }
+      } catch(e) {}
+
+      const nodeId = (node && node.id !== undefined && node.id !== null) ? String(node.id) : '';
+      const nodeName = (node && (node.label || node.name)) ? String(node.label || node.name) : (nodeId || 'Node');
+      const seq = (node && (node.sequence_index ?? node.sequenceIndex)) ? Number(node.sequence_index ?? node.sequenceIndex) : null;
+      const roman = (seq && Number.isFinite(seq)) ? toRoman(seq) : '';
+
+      if(flowNodeFlagModalTitleEl){
+        flowNodeFlagModalTitleEl.textContent = (roman ? (roman + '. ') : '') + nodeName;
+      }
+
+      // Pull flag assignments from flow metadata embedded in the preview plan.
+      const mdFlow = previewData && previewData.metadata && previewData.metadata.flow ? previewData.metadata.flow : null;
+      const flow = mdFlow || (previewData && previewData.flow ? previewData.flow : null) || null;
+      const scenario = (flow && flow.scenario) ? String(flow.scenario)
+        : (previewData && previewData.metadata && previewData.metadata.scenario ? String(previewData.metadata.scenario)
+        : (previewData && previewData.scenario ? String(previewData.scenario) : ''));
+      const fas = (flow && Array.isArray(flow.flag_assignments)) ? flow.flag_assignments : [];
+      const matches = nodeId ? fas.filter(a => a && String(a.node_id ?? a.nodeId ?? '') === nodeId) : [];
+
+      const tbl = document.createElement('table');
+      tbl.className = 'table table-sm table-borderless mb-0';
+      const tbody = document.createElement('tbody');
+      function addRow(label, valueElOrText){
+        const tr = document.createElement('tr');
+        const tdL = document.createElement('td');
+        tdL.className = 'text-muted';
+        tdL.style.whiteSpace = 'nowrap';
+        tdL.style.width = '1%';
+        tdL.textContent = String(label || '').trim() ? (String(label).trim() + ':') : '';
+        const tdV = document.createElement('td');
+        if(valueElOrText && typeof valueElOrText === 'object' && valueElOrText.nodeType){
+          tdV.appendChild(valueElOrText);
+        } else {
+          tdV.textContent = String(valueElOrText || '-');
+        }
+        tr.appendChild(tdL);
+        tr.appendChild(tdV);
+        tbody.appendChild(tr);
+      }
+
+      // Flag generator(s) on this node.
+      if(matches.length > 1){
+        const wrap = document.createElement('div');
+        const ol = document.createElement('ol');
+        ol.className = 'mb-0 ps-3';
+        matches.forEach((fa) => {
+          const li = document.createElement('li');
+          const genId = fa && fa.id ? String(fa.id) : '-';
+          const genName = fa && fa.name ? String(fa.name) : '-';
+          li.textContent = (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId;
+          ol.appendChild(li);
+        });
+        wrap.appendChild(ol);
+        addRow('flags', wrap);
+      } else if(matches.length === 1){
+        const fa = matches[0] || {};
+        const genId = fa && fa.id ? String(fa.id) : '-';
+        const genName = fa && fa.name ? String(fa.name) : '-';
+        addRow('flag', (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId);
+      } else {
+        addRow('flag', '-');
+      }
+
+      // Hints (prefer rendered runtime hints; fall back to static description hints).
+      const hints = [];
+      try {
+        matches.forEach((fa) => {
+          collectHintTexts(fa).forEach((s) => { if(s) hints.push(s); });
+        });
+      } catch(e) {}
+
+      const hintsUniq = Array.from(new Set(hints));
+      if(hintsUniq.length > 1){
+        const wrap = document.createElement('div');
+        const ol = document.createElement('ol');
+        ol.className = 'mb-0 ps-3';
+        hintsUniq.forEach((t) => {
+          const li = document.createElement('li');
+          li.textContent = t;
+          ol.appendChild(li);
+        });
+        wrap.appendChild(ol);
+        addRow('hints', wrap);
+      } else if(hintsUniq.length === 1){
+        addRow('hints', hintsUniq[0]);
+      } else {
+        addRow('hints', '-');
+      }
+
+      // Runtime flag value (only if present in the loaded data).
+      const flagValueCell = document.createElement('span');
+      flagValueCell.className = 'text-muted';
+      let fv = '';
+      try {
+        fv = (matches.length === 1 && typeof (matches[0] || {}).flag_value === 'string') ? String((matches[0] || {}).flag_value).trim() : '';
+      } catch(e) { fv = ''; }
+      if(fv){
+        const code = document.createElement('code');
+        code.className = 'font-monospace';
+        code.textContent = fv;
+        addRow('flag value', code);
+      } else {
+        flagValueCell.textContent = '-';
+        addRow('flag value', flagValueCell);
+      }
+
+      tbl.appendChild(tbody);
+      flowNodeFlagModalBodyEl.innerHTML = '';
+      flowNodeFlagModalBodyEl.className = 'small';
+      flowNodeFlagModalBodyEl.appendChild(tbl);
+
+      if(window.bootstrap && window.bootstrap.Modal){
+        const m = (window.bootstrap.Modal.getOrCreateInstance
+          ? window.bootstrap.Modal.getOrCreateInstance(flowNodeFlagModalEl)
+          : new window.bootstrap.Modal(flowNodeFlagModalEl));
+        m.show();
+      }
+
+      // If the flag value isn't in the loaded preview payload, fetch it on-demand.
+      try {
+        if(!fv && scenario && nodeId && matches.length){
+          flagValueCell.textContent = 'Loading…';
+          fetch(`/api/flag-sequencing/flag_values_for_node?scenario=${encodeURIComponent(scenario)}&node_id=${encodeURIComponent(nodeId)}`)
+            .then(r => r.json())
+            .then(d => {
+              if(!d || d.ok !== true){
+                flagValueCell.textContent = '-';
+                return;
+              }
+              const flags = Array.isArray(d.flags) ? d.flags : [];
+              const vals = flags.map(x => (x && typeof x.flag_value === 'string') ? x.flag_value.trim() : '').filter(Boolean);
+              if(!vals.length){
+                flagValueCell.textContent = '-';
+                return;
+              }
+              // If multiple, join with newline for readability.
+              const code = document.createElement('code');
+              code.className = 'font-monospace';
+              code.style.whiteSpace = 'pre-wrap';
+              code.textContent = vals.join('\n');
+              flagValueCell.textContent = '';
+              flagValueCell.replaceWith(code);
+            })
+            .catch(_e => { flagValueCell.textContent = '-'; });
+        }
+      } catch(e) {}
+    } catch(e) {}
+  }
+
+  function renderFlagSequenceTab(){
+    const body = document.getElementById('fp-flag-sequence-body');
+    if(!body) return;
+
+    function collectHintTexts(fa){
+      const out = [];
+      try {
+        if(!fa || typeof fa !== 'object') return out;
+        const hs = Array.isArray(fa.hints) ? fa.hints : [];
+        hs.forEach((x)=>{ const s = String(x || '').trim(); if(s) out.push(s); });
+        if(typeof fa.hint === 'string'){
+          const s = fa.hint.trim();
+          if(s) out.push(s);
+        }
+        const dh = Array.isArray(fa.description_hints) ? fa.description_hints : [];
+        dh.forEach((x)=>{ const s = String(x || '').trim(); if(s) out.push(s); });
+      } catch(e) {}
+      return out;
+    }
+
+    const mdFlow = previewData && previewData.metadata && previewData.metadata.flow ? previewData.metadata.flow : null;
+    const flow = mdFlow || (previewData && previewData.flow ? previewData.flow : null) || null;
+    const chain = (flow && Array.isArray(flow.chain)) ? flow.chain : [];
+    const fas = (flow && Array.isArray(flow.flag_assignments)) ? flow.flag_assignments : [];
+    const scenario = (flow && flow.scenario) ? String(flow.scenario)
+      : (previewData && previewData.metadata && previewData.metadata.scenario ? String(previewData.metadata.scenario)
+      : (previewData && previewData.scenario ? String(previewData.scenario) : ''));
+
+    body.innerHTML = '';
+    if(!chain.length){
+      const empty = document.createElement('div');
+      empty.className = 'small text-muted fst-italic';
+      empty.textContent = '(no flag sequence found in this preview plan)';
+      body.appendChild(empty);
+      return;
+    }
+
+    const tableWrap = document.createElement('div');
+    tableWrap.className = 'table-responsive';
+    tableWrap.style.maxHeight = '560px';
+    tableWrap.style.overflow = 'auto';
+
+    const tbl = document.createElement('table');
+    tbl.className = 'table table-sm table-bordered small align-middle mb-0';
+    const thead = document.createElement('thead');
+    thead.className = 'table-light';
+    thead.innerHTML = '<tr><th style="width:96px;">Sequence</th><th>Node</th><th style="width:260px;">Flag</th><th>Hints</th><th style="width:220px;">Flag value</th></tr>';
+    const tbody = document.createElement('tbody');
+
+    const faByNodeId = new Map();
+    fas.forEach(a => {
+      try{
+        if(!a) return;
+        const nid = String(a.node_id ?? a.nodeId ?? '').trim();
+        if(!nid) return;
+        if(!faByNodeId.has(nid)) faByNodeId.set(nid, []);
+        faByNodeId.get(nid).push(a);
+      } catch(e){}
+    });
+
+    chain.forEach((entry, idx) => {
+      const tr = document.createElement('tr');
+      const seq = document.createElement('td');
+      seq.className = 'text-muted fw-semibold';
+      seq.textContent = toRoman(idx + 1);
+
+      let nodeId = '';
+      let nodeName = '';
+      try {
+        if(entry && typeof entry === 'object'){
+          nodeId = String(entry.id ?? entry.node_id ?? entry.nodeId ?? entry.host_id ?? entry.hostId ?? '').trim();
+          nodeName = String(entry.name ?? entry.label ?? '').trim();
+        } else {
+          nodeId = String(entry ?? '').trim();
+        }
+      } catch(e){}
+
+      const nodeTd = document.createElement('td');
+      nodeTd.textContent = nodeName ? `${nodeName} (${nodeId || '-'})` : (nodeId || '-');
+
+      const flagsTd = document.createElement('td');
+      const matches = nodeId ? (faByNodeId.get(nodeId) || []) : [];
+      if(matches.length > 1){
+        const ol = document.createElement('ol');
+        ol.className = 'mb-0 ps-3';
+        matches.forEach((fa) => {
+          const li = document.createElement('li');
+          const genId = fa && fa.id ? String(fa.id) : '-';
+          const genName = fa && fa.name ? String(fa.name) : '-';
+          li.textContent = (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId;
+          ol.appendChild(li);
+        });
+        flagsTd.appendChild(ol);
+      } else if(matches.length === 1){
+        const fa = matches[0] || {};
+        const genId = fa && fa.id ? String(fa.id) : '-';
+        const genName = fa && fa.name ? String(fa.name) : '-';
+        flagsTd.textContent = (genName && genName !== '-' && genName !== genId) ? (genId + ' | ' + genName) : genId;
+      } else {
+        flagsTd.textContent = '-';
+      }
+
+      const descTd = document.createElement('td');
+      const hints = [];
+      try {
+        matches.forEach((fa) => {
+          collectHintTexts(fa).forEach((s) => { if(s) hints.push(s); });
+        });
+      } catch(e){}
+      const hintsUniq = Array.from(new Set(hints));
+      if(hintsUniq.length > 1){
+        const ol = document.createElement('ol');
+        ol.className = 'mb-0 ps-3';
+        hintsUniq.forEach((t) => {
+          const li = document.createElement('li');
+          li.textContent = t;
+          ol.appendChild(li);
+        });
+        descTd.appendChild(ol);
+      } else if(hintsUniq.length === 1){
+        descTd.textContent = hintsUniq[0];
+      } else {
+        descTd.textContent = '-';
+      }
+
+      const flagValTd = document.createElement('td');
+      let haveValue = false;
+      try {
+        const valsLocal = matches
+          .map(x => (x && typeof x.flag_value === 'string') ? x.flag_value.trim() : '')
+          .filter(Boolean);
+        if(valsLocal.length){
+          haveValue = true;
+          const code = document.createElement('code');
+          code.className = 'font-monospace';
+          code.style.whiteSpace = 'pre-wrap';
+          code.textContent = Array.from(new Set(valsLocal)).join('\n');
+          flagValTd.appendChild(code);
+        }
+      } catch(e) {}
+
+      if(!haveValue){
+        const status = document.createElement('span');
+        status.className = 'text-muted';
+        status.textContent = '-';
+        flagValTd.appendChild(status);
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-sm btn-outline-secondary ms-2';
+        btn.textContent = 'Fetch';
+        btn.disabled = !(scenario && nodeId && matches.length);
+        btn.addEventListener('click', ()=>{
+          if(btn.disabled) return;
+          status.textContent = 'Loading…';
+          fetch(`/api/flag-sequencing/flag_values_for_node?scenario=${encodeURIComponent(scenario)}&node_id=${encodeURIComponent(nodeId)}`)
+            .then(r => r.json())
+            .then(d => {
+              const flags = d && d.ok === true && Array.isArray(d.flags) ? d.flags : [];
+              const vals = flags.map(x => (x && typeof x.flag_value === 'string') ? x.flag_value.trim() : '').filter(Boolean);
+              if(!vals.length){ status.textContent = '(no flag value)'; return; }
+              const code = document.createElement('code');
+              code.className = 'font-monospace';
+              code.style.whiteSpace = 'pre-wrap';
+              code.textContent = vals.join('\n');
+              flagValTd.innerHTML = '';
+              flagValTd.appendChild(code);
+            })
+            .catch(_e => { status.textContent = '(no flag value)'; });
+        });
+        flagValTd.appendChild(btn);
+      }
+
+      tr.appendChild(seq);
+      tr.appendChild(nodeTd);
+      tr.appendChild(flagsTd);
+      tr.appendChild(descTd);
+      tr.appendChild(flagValTd);
+      tbody.appendChild(tr);
+    });
+
+    tbl.appendChild(thead);
+    tbl.appendChild(tbody);
+    tableWrap.appendChild(tbl);
+    body.appendChild(tableWrap);
+  }
   function init(){
     const dataEl = document.getElementById('fpDataJson');
     try { previewData = JSON.parse(dataEl.textContent); } catch(e) { console.warn('Failed parse preview json', e); previewData = {}; }
+
+    // Flow validity warning (non-blocking): if Flow recorded an invalid chain,
+    // show a red banner to clarify that no flags will be used.
+    try {
+      const flowAlertEl = document.getElementById('fpFlowValidityAlert');
+      const mdFlow = previewData && previewData.metadata && previewData.metadata.flow ? previewData.metadata.flow : null;
+      const flowValid = mdFlow && ('flow_valid' in mdFlow) ? !!mdFlow.flow_valid : true;
+      const flagsEnabled = mdFlow && ('flags_enabled' in mdFlow) ? !!mdFlow.flags_enabled : true;
+      const flowErrors = (mdFlow && Array.isArray(mdFlow.flow_errors)) ? mdFlow.flow_errors : [];
+      if(flowAlertEl){
+        if(flowValid && flagsEnabled){
+          flowAlertEl.classList.add('d-none');
+          flowAlertEl.textContent = '';
+        } else {
+          const base = 'Invalid flag dependency order: execution will NOT include flags.';
+          const details = flowErrors.length ? (' ' + flowErrors.join(' | ')) : '';
+          flowAlertEl.textContent = base + details;
+          flowAlertEl.classList.remove('d-none');
+        }
+      }
+    } catch(e) {}
+
+    try { renderFlagSequenceTab(); } catch(e) {}
 
     let hitlConfig = { enabled: false, interfaces: [] };
     const hitlEl = document.getElementById('fpHitlConfigJson');
@@ -660,20 +1121,22 @@
           : (xmlBaseNameRaw || '__default__'));
     hitlConfig.scenario_key = scenarioKey;
 
-    function buildScenarioUrl(basePath){
-      if(!basePath || typeof basePath !== 'string') return basePath;
-      const scen = (typeof scenarioMeta.scenario === 'string' ? scenarioMeta.scenario : '').trim();
-      if(!scen) return basePath;
-      try {
-        const isAbsolute = /^https?:/i.test(basePath);
-        const url = new URL(basePath, window.location.origin);
-        url.searchParams.set('scenario', scen);
-        return isAbsolute ? url.toString() : `${url.pathname}${url.search}${url.hash}`;
-      } catch(e) {
-        const sep = basePath.includes('?') ? '&' : '?';
-        return `${basePath}${sep}scenario=${encodeURIComponent(scen)}`;
-      }
-    }
+
+// Make buildScenarioUrl globally available for all scripts (including execute/redirect logic)
+function buildScenarioUrl(basePath){
+  if(!basePath || typeof basePath !== 'string') return basePath;
+  const scen = (typeof scenarioMeta?.scenario === 'string' ? scenarioMeta.scenario : '').trim();
+  if(!scen) return basePath;
+  try {
+    const isAbsolute = /^https?:/i.test(basePath);
+    const url = new URL(basePath, window.location.origin);
+    url.searchParams.set('scenario', scen);
+    return isAbsolute ? url.toString() : `${url.pathname}${url.search}${url.hash}`;
+  } catch(e) {
+    const sep = basePath.includes('?') ? '&' : '?';
+    return `${basePath}${sep}scenario=${encodeURIComponent(scen)}`;
+  }
+}
 
     // Simple graph using d3-force (assumes d3 is loaded in base template). Fallback to textual if not.
     function normalizeVulnerabilitiesByNode(source){
@@ -695,6 +1158,7 @@
   const ROUTER_NODE_TYPES = new Set(['router', 'prouter', 'mdr', 'core-router', 'gateway']);
   const SWITCH_NODE_TYPES = new Set(['switch', 'lanswitch', 'l3switch', 'bridge', 'core-switch']);
   const HOST_NODE_TYPES = new Set(['host', 'pc', 'server', 'workstation', 'client', 'desktop', 'lxc', 'xterm', 'generic', 'terminal', 'laptop']);
+  const VULNERABILITY_NODE_TYPES = new Set(['vulnerability', 'vuln']);
   const NETWORK_NODE_TYPES = new Set(['network', 'lan', 'wan']);
   const WIRELESS_NODE_TYPES = new Set(['wireless', 'wirelesslan', 'wireless-lan', 'wlan', 'wifi']);
   const RJ45_NODE_TYPES = new Set(['rj45']);
@@ -703,7 +1167,10 @@
     const NODE_TYPE_STYLE_PRESETS = {
       router: { label: 'Router', color: '#ff7043', radius: 11 },
       switch: { label: 'Switch', color: '#17a2b8', radius: 8 },
-      host: { label: 'Host', color: '#ffc107', radius: 5 },
+      // Distinguish Docker-role hosts vs non-docker hosts.
+      host: { label: 'Host (non-docker)', color: 'var(--bs-warning-bg-subtle)', radius: 5 },
+      docker: { label: 'Host (Docker)', color: 'var(--bs-warning)', radius: 6 },
+      vulnerability: { label: 'Vulnerability', color: '#ff0000', radius: 6 },
       network: { label: 'Network', color: '#6c757d', radius: 7 },
       hub: { label: 'Hub', color: '#7952b3', radius: 6 },
       rj45: { label: 'RJ45', color: '#20c997', radius: 6, shape: 'square' },
@@ -718,6 +1185,7 @@
       if(!key) return 'host';
       if(ROUTER_NODE_TYPES.has(key)) return 'router';
       if(SWITCH_NODE_TYPES.has(key)) return 'switch';
+      if(VULNERABILITY_NODE_TYPES.has(key)) return 'vulnerability';
       if(RJ45_NODE_TYPES.has(key)) return 'rj45';
       if(WIRELESS_NODE_TYPES.has(key)) return 'wireless';
       if(NETWORK_NODE_TYPES.has(key)) return 'network';
@@ -1712,8 +2180,15 @@
           };
           target.addEventListener('shown.bs.collapse', updateLabel);
           target.addEventListener('hidden.bs.collapse', updateLabel);
-          if(!target.classList.contains('show')){
-            instance.show();
+          // Default behavior:
+          // - Embedded (Preview tab): start collapsed.
+          // - Standalone full preview page: preserve prior behavior (auto-expand).
+          if(IS_EMBEDDED){
+            try { instance.hide(); } catch(e){}
+          } else {
+            if(!target.classList.contains('show')){
+              instance.show();
+            }
           }
           updateLabel();
           btn.addEventListener('click', ev => {
@@ -1728,7 +2203,11 @@
           const updateLabel = () => {
             btn.textContent = target.classList.contains('d-none') ? expandLabel : collapseLabel;
           };
-          target.classList.remove('d-none');
+          if(IS_EMBEDDED){
+            target.classList.add('d-none');
+          } else {
+            target.classList.remove('d-none');
+          }
           updateLabel();
           btn.addEventListener('click', ev => {
             ev.preventDefault();
@@ -1740,9 +2219,12 @@
     }
     function buildGraph(options){
     const labelToggle = document.getElementById('graphLabelsToggle');
-    const shouldShowLabels = !!(labelToggle && labelToggle.checked);
+    // In embedded Preview (iframe) mode, always show node labels so the graph
+    // mirrors the Details graph's on-node information.
+    const shouldShowLabels = IS_EMBEDDED ? true : !!(labelToggle && labelToggle.checked);
     if(labelToggle){
       labelToggle.dataset.graphLabelsState = shouldShowLabels ? 'on' : 'off';
+      if(IS_EMBEDDED) labelToggle.checked = true;
     }
     if(!window.d3){ document.getElementById('previewGraph').textContent='d3 not loaded'; return; }
     const wrap = d3.select('#previewGraph');
@@ -1766,35 +2248,41 @@
     const ensureLegendEntry = (canonicalType) => {
       if(!canonicalType || legendTypesSeen.has(canonicalType)) return;
       legendTypesSeen.add(canonicalType);
+
       const style = nodeStyleForType(canonicalType);
-      const radius = Math.max(4, Math.min((style.radius ?? 6), 12));
+      // Use a fixed-size swatch so all legend entries align consistently.
+      // (Previously this used the node radius, making routers appear larger.)
+      const swatch = 12;
       const entry = legend.append('g').attr('transform',`translate(0,${legendOffset})`);
       if(style.shape === 'square'){
-        const side = radius * 2;
         entry.append('rect')
           .attr('x', 0)
           .attr('y', 0)
-          .attr('width', side)
-          .attr('height', side)
+          .attr('width', swatch)
+          .attr('height', swatch)
           .attr('fill', style.color)
           .attr('stroke','#333')
           .attr('stroke-width',1);
       } else {
         entry.append('circle')
-          .attr('r', radius)
-          .attr('cx', radius)
-          .attr('cy', radius)
+          .attr('r', swatch / 2)
+          .attr('cx', swatch / 2)
+          .attr('cy', swatch / 2)
           .attr('fill', style.color)
           .attr('stroke','#333')
           .attr('stroke-width',1);
       }
       entry.append('text')
         .text(style.label)
-        .attr('x', radius * 2 + 6)
-        .attr('y', radius + 4)
+        .attr('x', swatch + 6)
+        .attr('y', 11)
         .attr('font-size','11px');
-      legendOffset += Math.max(radius * 2 + 6, 20);
+      legendOffset += 20;
     };
+
+    // Always include host-vs-docker distinction in the legend.
+    ensureLegendEntry('host');
+    ensureLegendEntry('docker');
 
     const registerLegendForNodes = (list) => {
       if(!Array.isArray(list)) return;
@@ -1835,7 +2323,8 @@
     svg.call(zoom).on('dblclick.zoom', null);
     const nodes = [];
   const linkDescriptors = [];
-    const vulnerabilityColor = '#28a745';
+    const vulnerabilityColor = '#ff0000';
+    const sequenceColor = '#ff0000';
     (previewData.routers||[]).forEach(r=>{
       const routerIdNum = Number(r.node_id);
       const isBridge = bridgeRouterId !== null && (routerIdNum === Number(bridgeRouterId));
@@ -1847,9 +2336,19 @@
       const assignment = Array.isArray(h.vulnerabilities) ? h.vulnerabilities : vulnerabilitiesByNode[keyStr] || vulnerabilitiesByNode[hostId] || [];
       const vulnList = Array.isArray(assignment) ? assignment : [];
       const hasVuln = vulnList.length > 0;
-      nodes.push({id:hostId, label:h.name, type:'host', ip4: h.ip4 || '', hasVuln: hasVuln, vulnerabilities: vulnList});
+      const roleRaw = (h && (h.role || h.kind || h.type)) ? String(h.role || h.kind || h.type) : '';
+      const isDockerRole = roleRaw.trim().toLowerCase() === 'docker';
+      const nodeType = hasVuln ? 'vulnerability' : (isDockerRole ? 'docker' : 'host');
+      nodes.push({id:hostId, label:h.name, type: nodeType, role: roleRaw, ip4: h.ip4 || '', hasVuln: hasVuln, vulnerabilities: vulnList});
     });
-    (previewData.switches_detail||[]).forEach(sw=>{ nodes.push({id:sw.switch_id, label:'sw-'+sw.switch_id, type:'switch'}); });
+    (previewData.switches_detail||[]).forEach(sw=>{
+      nodes.push({
+        id: sw.switch_id,
+        label: 'sw-' + sw.switch_id,
+        type: 'switch',
+        ip4: (sw && (sw.switch_ip || sw.router_ip)) ? (sw.switch_ip || sw.router_ip) : '',
+      });
+    });
     (previewData.r2r_edges_preview||[]).forEach(e=>{
       const a = Number(e[0]);
       const b = Number(e[1]);
@@ -2026,8 +2525,124 @@
       return;
     }
 
+    // Sequence node annotations (for Flag Sequencing / AttackFlow overlays).
+    // We try multiple possible payload shapes so this remains backwards-compatible.
+    let hasSequenceNodes = false;
+    try {
+      const nodeById = new Map();
+      nodes.forEach(n => { if(n && n.id !== undefined && n.id !== null) nodeById.set(String(n.id), n); });
+
+      // Only these node types should ever be considered sequence nodes.
+      const isSequenceEligible = (node) => {
+        try {
+          const t = canonicalNodeType(node && (node.type ?? node.kind ?? node.role));
+          return t === 'host' || t === 'docker' || t === 'vulnerability';
+        } catch(e){
+          return false;
+        }
+      };
+
+      // Secondary lookup by display name (only among eligible nodes, and only if unique).
+      const nodeByName = new Map();
+      const nameCounts = new Map();
+      nodes.forEach(n => {
+        if(!n || !isSequenceEligible(n)) return;
+        const nm = String(n.label ?? n.name ?? '').trim();
+        if(!nm) return;
+        const key = nm.toLowerCase();
+        nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
+        nodeByName.set(key, n);
+      });
+
+      const readChain = () => {
+        const mdFlow = previewData && previewData.metadata && previewData.metadata.flow ? previewData.metadata.flow : null;
+        const flow = previewData && previewData.flow ? previewData.flow : null;
+        const afPrev = previewData && previewData.attackflow_preview ? previewData.attackflow_preview : null;
+        const af = previewData && previewData.attackflow ? previewData.attackflow : null;
+        const direct = previewData && previewData.chain ? previewData.chain : null;
+        const candidates = [direct, mdFlow && mdFlow.chain, flow && flow.chain, afPrev && afPrev.chain, af && af.chain];
+        for(const c of candidates){
+          if(Array.isArray(c) && c.length) return c;
+        }
+        return null;
+      };
+
+      const chain = readChain();
+      if(Array.isArray(chain) && chain.length){
+        const chainLen = chain.length;
+        const resolveNodeForChainEntry = (entry) => {
+          let raw = entry;
+          if(entry && typeof entry === 'object'){
+            raw = entry.id ?? entry.node_id ?? entry.nodeId ?? entry.host_id ?? entry.hostId ?? entry;
+          }
+          if(raw === undefined || raw === null) return null;
+
+          // Prefer exact node id matches (avoid guessing by digits, which can mis-map to switches).
+          const key = String(raw).trim();
+          if(key && nodeById.has(key)){
+            const node = nodeById.get(key);
+            return (node && isSequenceEligible(node)) ? node : null;
+          }
+          if(/^\d+$/.test(key)){
+            const node = nodeById.get(String(Number(key)));
+            return (node && isSequenceEligible(node)) ? node : null;
+          }
+
+          // Fallback: match by label/name if unique.
+          const nameKey = key.toLowerCase();
+          if(nameCounts.get(nameKey) === 1 && nodeByName.has(nameKey)){
+            return nodeByName.get(nameKey);
+          }
+          return null;
+        };
+
+        const normalizeChainMeta = (entry) => {
+          if(entry && typeof entry === 'object'){
+            const rawId = entry.id ?? entry.node_id ?? entry.nodeId ?? entry.host_id ?? entry.hostId ?? null;
+            const rawName = entry.name ?? entry.label ?? entry.host_name ?? entry.hostName ?? null;
+            const id = rawId !== null && rawId !== undefined ? String(rawId) : '';
+            const name = rawName !== null && rawName !== undefined ? String(rawName) : '';
+            return { id, name };
+          }
+          return { id: entry !== undefined && entry !== null ? String(entry) : '', name: '' };
+        };
+
+        chain.forEach((entry, idx) => {
+          const target = resolveNodeForChainEntry(entry);
+          if(!target) return;
+          target.isSequence = true;
+          target.sequence_index = idx + 1;
+          target.sequence_chain_len = chainLen;
+          const prev = idx > 0 ? normalizeChainMeta(chain[idx - 1]) : null;
+          const next = idx < chainLen - 1 ? normalizeChainMeta(chain[idx + 1]) : null;
+          if(prev) target.sequence_prev = prev;
+          if(next) target.sequence_next = next;
+        });
+      }
+      hasSequenceNodes = nodes.some(n => n && (Number.isFinite(Number(n.sequence_index)) || Number.isFinite(Number(n.sequenceIndex))));
+    } catch(e){}
+
     registerLegendForNodes(nodes);
     addLegendSpacing();
+
+    if(hasSequenceNodes){
+      const g = legend.append('g').attr('transform',`translate(0,${legendOffset})`);
+      g.append('rect')
+        .attr('x', 0)
+        .attr('y', 0)
+        .attr('width', 12)
+        .attr('height', 12)
+        .attr('fill', 'none')
+        .attr('stroke', '#333')
+        .attr('stroke', sequenceColor)
+        .attr('stroke-width', 2);
+      g.append('text')
+        .text('Sequence Node')
+        .attr('x', 18)
+        .attr('y', 11)
+        .attr('font-size', '11px');
+      legendOffset += 20;
+    }
 
     if(baseBridgeInfo && baseBridgeInfo.attached){
       const g = legend.append('g').attr('transform',`translate(0,${legendOffset})`);
@@ -2221,19 +2836,42 @@
     const ifaceHints = buildIfaceHints(previewData);
 
     function nodeTitle(d){
-      const label = d.label || d.name || String(d.id);
-      const lines = [`${label} (${d.type || 'node'})`];
-      const ip4 = (d.ip4 || '').trim();
+      const id = (d && d.id !== undefined && d.id !== null) ? String(d.id) : '';
+      const label = (d && (d.label || d.name)) ? String(d.label || d.name) : (id || 'node');
+      const lines = [`${label} (${id || '-'})`];
+
+      const role = (d && (d.role || d.kind || d.type)) ? String(d.role || d.kind || d.type).trim() : '';
+      if(role) lines.push(`Role: ${role}`);
+
+      const ip4 = (d && typeof d.ip4 === 'string' ? d.ip4 : (d && d.ip4 ? String(d.ip4) : '')).trim();
       if(ip4) lines.push(`IP: ${ip4}`);
-      const extras = ifaceHints.get(String(d.id)) || [];
+
+      // Services (mirror details graph semantics)
+      try {
+        const svcMap = (previewData && typeof previewData.services_preview === 'object' && previewData.services_preview) ? previewData.services_preview : {};
+        const svc = (svcMap[id] || svcMap[Number(id)] || d.services || []);
+        const svcList = Array.isArray(svc) ? svc : [];
+        lines.push('Services:');
+        if(svcList.length){
+          svcList.forEach(s => { if(s) lines.push(`- ${s}`); });
+        } else {
+          lines.push('- (none)');
+        }
+      } catch(e){
+        lines.push('Services:');
+        lines.push('- (none)');
+      }
+
+      // Interfaces (all known interface hints; do not truncate)
+      const extras = (ifaceHints.get(String(d.id)) || []).slice();
       // HITL overlays: include any explicit peer/existing router IP hints
       if(d.peerRouterIp4) extras.unshift(`peer: ${d.peerRouterIp4}`);
       if(d.existingRouterIp4) extras.unshift(`uplink: ${d.existingRouterIp4}`);
+      lines.push('Interfaces:');
       if(extras.length){
-        lines.push('Interfaces:');
-        extras.slice(0, 12).forEach(x => lines.push(`- ${x}`));
+        extras.forEach(x => { if(x) lines.push(`- ${x}`); });
       } else {
-        lines.push('Interfaces: -');
+        lines.push('- (none)');
       }
       return lines.join('\n');
     }
@@ -2261,101 +2899,251 @@
   const node = container.selectAll('g.node').data(nodes).enter().append('g').attr('class','node');
   // Native SVG tooltip on hover
   node.insert('title', ':first-child').text(d => nodeTitle(d));
-    const hasVulnerableHosts = nodes.some(n => n.type === 'host' && n.hasVuln);
-    if(hasVulnerableHosts){
-      const vulnLegend = legend.append('g').attr('transform',`translate(0,${legendOffset})`);
-      const vulnLegendSymbol = d3.symbol().type(d3.symbolStar).size(80);
-      vulnLegend.append('path')
-        .attr('d', vulnLegendSymbol)
-        .attr('transform','translate(8,8)')
-        .attr('fill', vulnerabilityColor)
-        .attr('stroke', '#333')
-        .attr('stroke-width', 1);
-      vulnLegend.append('text')
-        .text('Host (vulnerable)')
-        .attr('x', 18)
-        .attr('y', 12)
-        .attr('font-size','11px');
-      legendOffset += 20;
-    }
-    const normalNode = node.filter(d => !(d.type === 'host' && d.hasVuln));
-    normalNode.each(function(d){
-      const nodeGroup = d3.select(this);
-      const style = nodeStyleForType(d.type);
-      if(style.shape === 'square'){
-        const side = (Number.isFinite(style.radius) ? style.radius : 6) * 2;
-        nodeGroup.append('rect')
-          .attr('x', -side / 2)
-          .attr('y', -side / 2)
-          .attr('width', side)
-          .attr('height', side)
-          .attr('rx', 2)
-          .attr('ry', 2)
-          .attr('fill', style.color)
-          .attr('stroke', (d.isBase || d.isBaseBridge) ? '#6f42c1' : '#333')
-          .attr('stroke-width', d.isBaseBridge ? 3 : d.isBase ? 2 : 1.1);
-      } else {
-        const radius = Number.isFinite(style.radius) ? style.radius : 6;
-        nodeGroup.append('circle')
-          .attr('r', radius)
-          .attr('fill', style.color)
-          .attr('stroke', (d.isBase || d.isBaseBridge) ? '#6f42c1' : '#333')
-          .attr('stroke-width', d.isBaseBridge ? 3 : d.isBase ? 2 : 1.1);
+    // Draw rectangle nodes (mirrors Details graph)
+    const servicesPreviewMap = (previewData && typeof previewData.services_preview === 'object' && previewData.services_preview) ? previewData.services_preview : {};
+    function nodeServices(d){
+      try {
+        const id = (d && d.id !== undefined && d.id !== null) ? String(d.id) : '';
+        const v = servicesPreviewMap[id] || servicesPreviewMap[Number(id)] || d.services || [];
+        return Array.isArray(v) ? v : [];
+      } catch(e){
+        return [];
       }
-    });
-    const vulnNode = node.filter(d => d.type === 'host' && d.hasVuln);
-    const vulnSymbol = d3.symbol().type(d3.symbolStar).size(140);
-    vulnNode.append('path')
-      .attr('d', vulnSymbol)
-      .attr('fill', vulnerabilityColor)
-      .attr('stroke', '#333')
-      .attr('stroke-width', 1);
-    const labelGroups = node.append('g').attr('class','node-label-wrapper').style('display', shouldShowLabels ? null : 'none');
+    }
+    function primaryIp(d){
+      try {
+        const ip = (d && d.ip4) ? String(d.ip4).trim() : '';
+        return ip;
+      } catch(e){
+        return '';
+      }
+    }
+    function nodeRectW(d){
+      const svc = nodeServices(d).length;
+      const base = 110 + Math.min(120, svc * 10);
+      const label = (d && (d.label || d.name)) ? String(d.label || d.name) : String(d && d.id !== undefined ? d.id : '');
+      const id = (d && d.id !== undefined && d.id !== null) ? String(d.id) : '';
+      const ip = primaryIp(d);
+      const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+      const seqPrefix = (seq && Number.isFinite(seq)) ? `${toRoman(seq)} ` : '';
+      const line1 = id ? `${seqPrefix}${label} (${id})` : `${seqPrefix}${label}`;
+      const maxLen = Math.max(String(line1 || '').length, String(ip || '').length);
+      const textNeed = (maxLen * 6.4) + 26;
+      return Math.max(base, Math.min(360, textNeed));
+    }
+    function nodeRectH(d){
+      const svc = nodeServices(d).length;
+      const base = 44 + Math.min(34, svc * 1.35);
+      return base + (primaryIp(d) ? 14 : 0);
+    }
+    function nodeFill(d){
+      // Keep preview colors, but render all nodes as rectangles.
+      if(d && (d.type === 'host' || d.type === 'pc' || d.type === 'server') && d.hasVuln) return vulnerabilityColor;
+      const style = nodeStyleForType(d && d.type);
+      return style && style.color ? style.color : '#adb5bd';
+    }
 
-    const computeLabelWidth = (d) => {
-      const text = d.label || d.name || String(d.id);
-      return Math.max(24, (String(text).length * 6 + 6));
+    node.append('rect')
+      .attr('width', d => nodeRectW(d))
+      .attr('height', d => nodeRectH(d))
+      .attr('x', d => -(nodeRectW(d)) / 2)
+      .attr('y', d => -(nodeRectH(d)) / 2)
+      .attr('rx', 6)
+      .attr('ry', 6)
+      .attr('fill', d => nodeFill(d))
+      .attr('stroke', d => {
+        const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+        if(seq && Number.isFinite(seq)) return sequenceColor;
+        return (d && (d.isBase || d.isBaseBridge)) ? '#6f42c1' : '#222';
+      })
+      .attr('stroke-width', d => {
+        const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+        if(seq && Number.isFinite(seq)) return 3;
+        return (d && d.isBaseBridge) ? 3 : (d && d.isBase) ? 2 : 1.2;
+      });
+
+    // Sequence index marker (Roman numerals) for sequence nodes
+    function toRoman(num){
+      const n = Number(num);
+      if(!Number.isFinite(n) || n <= 0 || n >= 4000) return '';
+      const parts = [
+        [1000,'M'],[900,'CM'],[500,'D'],[400,'CD'],
+        [100,'C'],[90,'XC'],[50,'L'],[40,'XL'],
+        [10,'X'],[9,'IX'],[5,'V'],[4,'IV'],[1,'I'],
+      ];
+      let x = Math.floor(n);
+      let out = '';
+      for(const [v,s] of parts){
+        while(x >= v){ out += s; x -= v; }
+      }
+      return out;
+    }
+
+    function sequenceBadgeTitle(d){
+      try {
+        const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+        if(!seq || !Number.isFinite(seq)) return '';
+        const roman = toRoman(seq);
+        const chainLen = (d && (d.sequence_chain_len ?? d.sequenceChainLen)) ? Number(d.sequence_chain_len ?? d.sequenceChainLen) : null;
+        const lines = [];
+        // Keep wording exactly as requested.
+        if(chainLen && Number.isFinite(chainLen)) lines.push(`Sequence ${roman} (${seq} of ${chainLen})`);
+        else lines.push(`Sequence ${roman} (${seq})`);
+
+        // Sequence name/description from flow metadata.
+        const mdFlow = previewData && previewData.metadata && previewData.metadata.flow ? previewData.metadata.flow : null;
+        const flow = mdFlow || (previewData && previewData.flow ? previewData.flow : null) || null;
+        const seqName = flow && (flow.name || flow.sequence_name || flow.title) ? String(flow.name || flow.sequence_name || flow.title) : '';
+        const seqScenario = flow && flow.scenario ? String(flow.scenario) : '';
+        const seqDesc = seqName ? seqName : (seqScenario ? `Flag Sequencing (${seqScenario})` : 'Flag Sequencing');
+        lines.push(seqDesc);
+
+        // requires/provides from flag assignments (if available)
+        const nodeId = (d && d.id !== undefined && d.id !== null) ? String(d.id) : '';
+        let fa = null;
+        try {
+          const fas = flow && Array.isArray(flow.flag_assignments) ? flow.flag_assignments : null;
+          if(fas && nodeId){
+            fa = fas.find(x => x && String(x.node_id ?? x.nodeId ?? x.id ?? '') === nodeId) || null;
+          }
+        } catch(e){}
+        const req = (fa && Array.isArray(fa.inputs) && fa.inputs.length) ? fa.inputs.join(', ') : '-';
+        const prov = (fa && Array.isArray(fa.outputs) && fa.outputs.length) ? fa.outputs.join(', ') : '-';
+        lines.push(`requires: ${req}`);
+        lines.push(`provides: ${prov}`);
+        return lines.join('\n');
+      } catch(e){
+        return '';
+      }
+    }
+
+    const seqBadge = node.append('g')
+      .attr('class','node-seq-badge')
+      .attr('pointer-events','all')
+      .style('display', d => {
+        const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+        return (seq && Number.isFinite(seq)) ? null : 'none';
+      })
+      .style('cursor', 'pointer')
+      .on('click', (event, d) => {
+        try { if(event && typeof event.stopPropagation === 'function') event.stopPropagation(); } catch(e) {}
+        try { openFlowNodeFlagModal(d); } catch(e) {}
+      });
+
+    // Tooltip specifically for the badge (so hovering the Roman numerals shows sequencing info).
+    seqBadge.insert('title', ':first-child').text(d => sequenceBadgeTitle(d));
+
+    const seqBadgeWidth = (d) => {
+      const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+      const roman = toRoman(seq);
+      const w = 10 + Math.max(1, roman.length) * 7;
+      return Math.min(46, Math.max(18, w));
     };
 
-    labelGroups.append('rect')
-      .attr('class','node-label-bg')
-      .attr('x', d => -computeLabelWidth(d) / 2)
-      .attr('y', 10)
-      .attr('width', d => computeLabelWidth(d))
-      .attr('height', 16)
-      .attr('rx', 3)
-      .attr('ry', 3)
-      .attr('fill', '#fff')
-      .attr('stroke', '#bbb')
-      .attr('stroke-width', 0.8)
-      .attr('opacity', 0.88);
+    // Place the badge just outside the node's top-right corner.
+    seqBadge.attr('transform', d => {
+      const w = nodeRectW(d);
+      const h = nodeRectH(d);
+      const bx = (w / 2) + 6;
+      const by = -(h / 2) - 22;
+      return `translate(${bx},${by})`;
+    });
 
-    labelGroups.append('text')
-      .attr('class','node-label-text')
-      .attr('text-anchor','middle')
+    seqBadge.append('rect')
       .attr('x', 0)
-      .attr('y', 21)
+      .attr('y', 0)
+      .attr('width', d => seqBadgeWidth(d))
+      .attr('height', 16)
+      .attr('rx', 4)
+      .attr('ry', 4)
+      .attr('fill', '#fff')
+      .attr('stroke', sequenceColor)
+      .attr('stroke-width', 2);
+
+    seqBadge.append('text')
+      .attr('class','node-seq-badge-text')
+      .attr('text-anchor','start')
+      .attr('x', 5)
+      .attr('y', 12)
+      .attr('font-size','11px')
+      .attr('font-weight','800')
+      .attr('fill', sequenceColor)
+      .text(d => {
+        const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+        return (seq && Number.isFinite(seq)) ? toRoman(seq) : '';
+      });
+
+    // On-node text: name (id) + first IP (mirrors Details graph)
+    const nodeLabel = node.append('text')
+      .attr('class','node-label-onnode node-label-onnode-line1')
+      .attr('text-anchor','middle')
+      .attr('y', -2)
       .attr('font-size','10px')
-      .attr('fill','#212529')
-      .text(d => d.label || d.name || String(d.id));
+      .attr('pointer-events','none')
+      .attr('fill', '#000')
+      .style('display', shouldShowLabels ? null : 'none')
+      .text(d => {
+        const label = (d && (d.label || d.name)) ? String(d.label || d.name) : String(d && d.id !== undefined ? d.id : '');
+        const id = (d && d.id !== undefined && d.id !== null) ? String(d.id) : '';
+        const seq = (d && (d.sequence_index ?? d.sequenceIndex)) ? Number(d.sequence_index ?? d.sequenceIndex) : null;
+        const seqPrefix = (seq && Number.isFinite(seq)) ? `${toRoman(seq)} ` : '';
+        return id ? `${seqPrefix}${label} (${id})` : `${seqPrefix}${label}`;
+      });
+
+    const nodeIp = node.append('text')
+      .attr('class','node-label-onnode node-label-onnode-line2')
+      .attr('text-anchor','middle')
+      .attr('y', 12)
+      .attr('font-size','9px')
+      .attr('pointer-events','none')
+      .attr('fill', '#000')
+      .style('display', shouldShowLabels ? null : 'none')
+      .text(d => primaryIp(d) || '');
+
+    // Cache node box sizes so collision/link spacing is stable and cheap.
+    const nodeBoxCache = new Map();
+    nodes.forEach(n => {
+      try {
+        const w = nodeRectW(n);
+        const h = nodeRectH(n);
+        const pad = usingLayout ? 24 : 34;
+        nodeBoxCache.set(String(n.id), { w, h, r: Math.max(w, h) / 2 + pad });
+      } catch(e) {
+        nodeBoxCache.set(String(n.id), { w: 120, h: 60, r: 90 });
+      }
+    });
+    const boxFor = (d) => nodeBoxCache.get(String(d && d.id !== undefined ? d.id : '')) || { w: 120, h: 60, r: 90 };
 
     const simulation = d3.forceSimulation(nodes)
       .force('link', d3.forceLink(simLinks).id(d=>d.id).distance(l=> {
-        if(l.kind === 'base-cluster') return 60;
-        if(l.kind === 'base-bridge' || l.kind === 'base-external') return 95;
-        if(l.kind === 'hitl' || l.kind === 'hitl-peer') return 70;
-        if(l.kind === 'hitl-network') return 55;
-        return l.kind==='r2r'? 80 : (l.kind==='r-sw'? 60 : 40);
+        // Base distance by link kind, then add an amount proportional to node size
+        // so wide rectangles don't stack/overlap.
+        let base = 60;
+        if(l.kind === 'base-cluster') base = 70;
+        else if(l.kind === 'base-bridge' || l.kind === 'base-external') base = 120;
+        else if(l.kind === 'hitl' || l.kind === 'hitl-peer') base = 90;
+        else if(l.kind === 'hitl-network') base = 75;
+        else if(l.kind === 'r2r') base = 110;
+        else if(l.kind === 'r-sw') base = 85;
+        else base = 70;
+
+        const s = (l && l.source && typeof l.source === 'object') ? l.source : null;
+        const t = (l && l.target && typeof l.target === 'object') ? l.target : null;
+        const sizeBoost = (s && t)
+          ? (Math.max(boxFor(s).w, boxFor(s).h) + Math.max(boxFor(t).w, boxFor(t).h)) / 4
+          : 0;
+        return base + Math.min(160, sizeBoost);
       }).strength(l => {
         if(l.kind === 'base-cluster') return 0.9;
-        if(l.kind === 'base-bridge' || l.kind === 'base-external') return 0.7;
-        if(l.kind === 'hitl' || l.kind === 'hitl-peer' || l.kind === 'hitl-network') return 0.6;
+        if(l.kind === 'base-bridge' || l.kind === 'base-external') return 0.75;
+        if(l.kind === 'hitl' || l.kind === 'hitl-peer' || l.kind === 'hitl-network') return 0.65;
         return 0.6;
       }))
-      .force('charge', d3.forceManyBody().strength(d => d.type === 'base' ? -160 : -210))
+      .force('charge', d3.forceManyBody().strength(d => (d && d.isBase) ? -220 : -360))
+      .force('collide', d3.forceCollide().radius(d => boxFor(d).r).iterations(2))
       .force('center', d3.forceCenter(width/2, height/2))
-      .force('layoutX', d3.forceX(d => Number.isFinite(d.layoutX) ? d.layoutX : width/2).strength(usingLayout ? 0.18 : 0.04))
-      .force('layoutY', d3.forceY(d => Number.isFinite(d.layoutY) ? d.layoutY : height/2).strength(usingLayout ? 0.18 : 0.04));
+      .force('layoutX', d3.forceX(d => Number.isFinite(d.layoutX) ? d.layoutX : width/2).strength(usingLayout ? 0.12 : 0.04))
+      .force('layoutY', d3.forceY(d => Number.isFinite(d.layoutY) ? d.layoutY : height/2).strength(usingLayout ? 0.12 : 0.04));
 
     simulation.alpha(1).alphaTarget(0.03).restart();
 
@@ -2371,6 +3159,55 @@
     });
 
     node.call(d3.drag().on('start', dragstarted).on('drag', dragged).on('end', dragended));
+
+    // Auto-fit: zoom out/in so all nodes are visible on initial render.
+    // We do this a couple times early since simulation positions settle over time.
+    let initialViewAllTransform = null;
+    const fitGraphToNodes = (opts) => {
+      try {
+        const forceCapture = !!(opts && opts.capture);
+        const b = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+        let found = 0;
+        for(const n of nodes){
+          if(!n) continue;
+          const x = Number(n.x);
+          const y = Number(n.y);
+          if(!Number.isFinite(x) || !Number.isFinite(y)) continue;
+          const box = (typeof boxFor === 'function') ? boxFor(n) : { w: 120, h: 60 };
+          const hw = Math.max(20, (Number(box.w) || 120) / 2);
+          const hh = Math.max(20, (Number(box.h) || 60) / 2);
+          b.minX = Math.min(b.minX, x - hw);
+          b.maxX = Math.max(b.maxX, x + hw);
+          b.minY = Math.min(b.minY, y - hh);
+          b.maxY = Math.max(b.maxY, y + hh);
+          found += 1;
+        }
+        if(found < 2) return;
+        const pad = 40;
+        b.minX -= pad; b.minY -= pad; b.maxX += pad; b.maxY += pad;
+        const bw = Math.max(1, b.maxX - b.minX);
+        const bh = Math.max(1, b.maxY - b.minY);
+
+        const sx = width / bw;
+        const sy = height / bh;
+        let k = Math.min(sx, sy);
+        // Respect zoom scale extent.
+        k = Math.max(0.2, Math.min(4, k));
+
+        const tx = (width / 2) - k * ((b.minX + b.maxX) / 2);
+        const ty = (height / 2) - k * ((b.minY + b.maxY) / 2);
+        const t = d3.zoomIdentity.translate(tx, ty).scale(k);
+        if(forceCapture || !initialViewAllTransform){
+          initialViewAllTransform = t;
+        }
+        svg.transition().duration(250).call(zoom.transform, t);
+      } catch(e){}
+    };
+
+    // Fit soon after initial draw (before/while settling).
+    setTimeout(()=>fitGraphToNodes({capture: true}), 60);
+    setTimeout(()=>fitGraphToNodes(), 320);
+    setTimeout(()=>fitGraphToNodes(), 900);
 
     let sim = simulation;
 
@@ -2535,8 +3372,19 @@
     if(zoomOutBtn){ zoomOutBtn.onclick = ()=> svg.transition().duration(200).call(zoom.scaleBy, 1/1.2); }
     if(zoomResetBtn){
       zoomResetBtn.onclick = ()=>{
-        svg.transition().duration(250).call(zoom.transform, d3.zoomIdentity);
+        // Reset should return to the initial "view all nodes" perspective.
         if(resetStaticPositions) resetStaticPositions();
+        const apply = () => {
+          try {
+            if(initialViewAllTransform){
+              svg.transition().duration(250).call(zoom.transform, initialViewAllTransform);
+            } else {
+              fitGraphToNodes({capture: true});
+            }
+          } catch(e){}
+        };
+        // If we reset static positions, give the simulation a moment to settle.
+        setTimeout(apply, 80);
       };
     }
     // Improve grab cursor feedback
@@ -2544,7 +3392,7 @@
     window.addEventListener('mouseup', ()=> svg.style('cursor','grab'));
   // Close buildGraph function before invoking it
   wrap.node().dataset.showLabels = shouldShowLabels ? 'on' : 'off';
-  wrap.selectAll('.node-label-wrapper').style('display', shouldShowLabels ? null : 'none');
+  wrap.selectAll('.node-label-wrapper, .node-label-onnode').style('display', shouldShowLabels ? null : 'none');
   try { sessionStorage.setItem('coretg_graph_labels_state', shouldShowLabels ? 'on' : 'off'); } catch(e){}
 
     wrap.node().dispatchEvent(new CustomEvent('coretg-graph-ready', {
@@ -2563,7 +3411,7 @@
       labelToggleEl.dataset.graphLabelsState = show ? 'on' : 'off';
       if(wrapNode){
         wrapNode.dataset.showLabels = show ? 'on' : 'off';
-        d3.select(wrapNode).selectAll('.node-label-wrapper').style('display', show ? null : 'none');
+        d3.select(wrapNode).selectAll('.node-label-wrapper, .node-label-onnode').style('display', show ? null : 'none');
       }
       try { sessionStorage.setItem(storageKey, show ? 'on' : 'off'); } catch(e){}
     });
@@ -2583,7 +3431,7 @@
     }
     if(wrapNode){
       wrapNode.dataset.showLabels = show ? 'on' : 'off';
-      d3.select(wrapNode).selectAll('.node-label-wrapper').style('display', show ? null : 'none');
+      d3.select(wrapNode).selectAll('.node-label-wrapper, .node-label-onnode').style('display', show ? null : 'none');
     }
   });
   setupPreviewCollapsers();
@@ -2870,26 +3718,49 @@
   if(executeRunBtn && !executeRunBtn.dataset.boundExecute){
     executeRunBtn.dataset.boundExecute = '1';
     let executing = false;
+    let dockerRetryAttempted = false;
     const originalLabel = executeRunBtn.textContent;
     executeRunBtn.addEventListener('click', async ()=>{
       if(executing) return;
+
+      // Always delegate to the Topology Execute flow so the UX and backend path are consistent.
+      try {
+        const scen = (typeof scenarioMeta?.scenario === 'string' ? scenarioMeta.scenario : '{{ (scenario or "")|e }}').trim();
+        const baseUrl = '{{ url_for("index") }}';
+        const url = baseUrl
+          + '?auto_execute=1'
+          + '&xml_path=' + encodeURIComponent('{{ xml_path }}')
+          + (scen ? ('&scenario=' + encodeURIComponent(scen)) : '');
+        (window.top || window).location.href = url;
+        return;
+      } catch(e) {}
+
       const confirmMsg = 'Execute scenario now? This will invoke the CLI and start a CORE session.';
       if(!window.confirm(confirmMsg)) return;
       executing = true;
+      dockerRetryAttempted = false;
       executeRunBtn.disabled = true;
       if(originalLabel){ executeRunBtn.textContent = 'Executing…'; }
       try {
         openExecuteProgress('Executing scenario…');
         appendExecuteProgressLog('Submitting run for {{ xml_path }}');
         cleanupExecuteProgress();
-        const form = new FormData();
-        form.append('xml_path', '{{ xml_path }}');
-        try {
-          const scen = (typeof scenarioMeta?.scenario === 'string' ? scenarioMeta.scenario : '').trim();
-          if(scen){ form.append('scenario', scen); }
-        } catch(e) {}
-        const planPath = executeRunBtn.getAttribute('data-preview-plan');
-        if(planPath){ form.append('preview_plan', planPath); }
+
+        function buildExecuteForm(opts){
+          const o = opts || {};
+          const form = new FormData();
+          form.append('xml_path', '{{ xml_path }}');
+          if(o.dockerRemoveConflicts){ form.append('docker_remove_conflicts', '1'); }
+          try {
+            const scen = (typeof scenarioMeta?.scenario === 'string' ? scenarioMeta.scenario : '').trim();
+            if(scen){ form.append('scenario', scen); }
+          } catch(e) {}
+          const planPath = executeRunBtn.getAttribute('data-preview-plan');
+          if(planPath){ form.append('preview_plan', planPath); }
+          return form;
+        }
+
+        let form = buildExecuteForm({ dockerRemoveConflicts: false });
         let res = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
         if(res.status === 423){
           let info = null;
@@ -2979,6 +3850,121 @@
               }
               return;
             } else {
+              const dc = data?.docker_conflicts;
+              const containers = Array.isArray(dc?.containers) ? dc.containers : [];
+              const images = Array.isArray(dc?.images) ? dc.images : [];
+              if((containers.length || images.length) && !dockerRetryAttempted){
+                dockerRetryAttempted = true;
+                const maxShow = 10;
+                const contLines = containers.slice(0, maxShow).map(x => `• ${x}`).join('\n');
+                const imgLines = images.slice(0, maxShow).map(x => `• ${x}`).join('\n');
+                const extraCont = containers.length > maxShow ? `\n(and ${containers.length - maxShow} more)` : '';
+                const extraImg = images.length > maxShow ? `\n(and ${images.length - maxShow} more)` : '';
+                const msgParts = [
+                  'Docker conflicts detected for compose-based Docker nodes.',
+                  '',
+                  (containers.length ? ('Conflicting containers:\n' + contLines + extraCont) : ''),
+                  (images.length ? ('Conflicting images:\n' + imgLines + extraImg) : ''),
+                ].filter(Boolean);
+                const proceed = window.confirm(msgParts.join('\n\n') + '\n\nRemove these now and retry?');
+                if(!proceed){
+                  appendExecuteProgressLog('Execution blocked by Docker conflicts; user declined removal.');
+                  setExecuteProgressUI({ status: 'Blocked by Docker conflicts', meta: '', barText: 'Blocked', animate: false });
+                  return;
+                }
+                appendExecuteProgressLog('Removing Docker conflicts and retrying…');
+                setExecuteProgressUI({ status: 'Retrying…', meta: 'Removing Docker conflicts', barText: 'Working…', animate: true });
+                cleanupExecuteProgress();
+                form = buildExecuteForm({ dockerRemoveConflicts: true });
+                let res2 = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+                if(res2.status === 423){
+                  // Preserve existing active-session kill flow for the retry as well.
+                  let info2 = null;
+                  try { info2 = await res2.json(); } catch(e) {}
+                  const hostPart = info2 && info2.core_host ? String(info2.core_host) : 'CORE host';
+                  const portPart = info2 && (info2.core_port || info2.core_port === 0) ? `:${info2.core_port}` : '';
+                  const sessions = Array.isArray(info2?.active_sessions) ? info2.active_sessions : [];
+                  const detailLines = sessions.slice(0, 3).map((entry) => {
+                    const sid = entry && entry.id !== undefined ? `#${entry.id}` : '#?';
+                    const state = entry && entry.state ? String(entry.state) : 'UNKNOWN';
+                    const file = entry && entry.file ? String(entry.file) : '';
+                    return `• Session ${sid} (${state}${file ? ` • ${file}` : ''})`;
+                  }).join('\n');
+                  const messageParts = [info2?.error || `A run is already active on ${hostPart}${portPart}. Finish the active CORE session before starting another.`];
+                  if(detailLines){ messageParts.push('', 'Active sessions:', detailLines); }
+                  const proceed2 = window.confirm(messageParts.join('\n') + '\n\nKill the active CORE session(s) and retry now?');
+                  if(!proceed2){
+                    appendExecuteProgressLog('Retry blocked by active CORE session(s); user declined kill.');
+                    setExecuteProgressUI({ status: 'Blocked by active session', meta: '', barText: 'Blocked', animate: false });
+                    return;
+                  }
+                  appendExecuteProgressLog('Killing active CORE session(s)…');
+                  const killRes = await fetch('/core/kill_active_sessions_api', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ kill_all: true })
+                  });
+                  let killInfo = null;
+                  try { killInfo = await killRes.json(); } catch(e) {}
+                  if(!killRes.ok || !killInfo || killInfo.ok === false){
+                    const errs = Array.isArray(killInfo?.errors) ? killInfo.errors.join('; ') : (killInfo?.error || 'Unknown error');
+                    appendExecuteProgressLog('Failed to kill active CORE session(s): ' + errs);
+                    setExecuteProgressUI({ status: 'Failed to kill active session(s)', meta: '', barText: 'Error', animate: false });
+                    return;
+                  }
+                  res2 = await fetch("{{ url_for('run_cli_async') }}", { method: 'POST', body: form });
+                }
+                if(!res2.ok){
+                  appendExecuteProgressLog('Failed to start retry run (HTTP '+res2.status+')');
+                  setExecuteProgressUI({ status: 'Failed to start retry', meta: 'HTTP '+res2.status, barText: 'Error', animate: false });
+                  return;
+                }
+                const initData2 = await res2.json();
+                const run_id2 = initData2?.run_id;
+                if(!run_id2){
+                  appendExecuteProgressLog('Retry start response missing run_id');
+                  setExecuteProgressUI({ status: 'Failed to start retry', meta: 'Missing run id', barText: 'Error', animate: false });
+                  return;
+                }
+                appendExecuteProgressLog('Retry Run ID: '+run_id2);
+                setExecuteProgressUI({ status: 'Running…', meta: 'Streaming logs…', barText: 'Working…', animate: true });
+                executeProgressRunId = run_id2;
+                executeProgressEvtSrc = new EventSource('/stream/' + run_id2);
+                executeProgressEvtSrc.onmessage = (ev)=>{
+                  if(ev && typeof ev.data === 'string'){
+                    appendExecuteProgressLog(ev.data);
+                  }
+                };
+                executeProgressEvtSrc.addEventListener('end', ()=>{
+                  appendExecuteProgressLog('Execution stream ended');
+                  cleanupExecuteProgress();
+                });
+                // Start a new poll loop for the retry.
+                (async function pollRetry(){
+                  try {
+                    const r2 = await fetch('/run_status/' + run_id2);
+                    if(!r2.ok){ setTimeout(pollRetry, 1200); return; }
+                    const data2 = await r2.json();
+                    if(!data2.done){ setTimeout(pollRetry, 1000); return; }
+                    cleanupExecuteProgress();
+                    if(data2.returncode===0){
+                      appendExecuteProgressLog('Execution complete: success; redirecting to Reports');
+                      setExecuteProgressUI({ status: 'Scenario started', meta: 'Completed', barText: 'Done', animate: false });
+                      try {
+                        const reportsHref = buildScenarioUrl("{{ url_for('reports_page') }}");
+                        setTimeout(()=>{ window.location.assign(reportsHref); }, 700);
+                      } catch(_) {}
+                      return;
+                    }
+                    appendExecuteProgressLog('Execution finished with errors (code '+data2.returncode+')');
+                    setExecuteProgressUI({ status: 'Finished with errors', meta: 'Code '+data2.returncode, barText: 'Error', animate: false });
+                  } catch(e){
+                    setTimeout(pollRetry, 1500);
+                  }
+                })();
+                return;
+              }
+
               appendExecuteProgressLog('Execution finished with errors (code '+data.returncode+')');
               setExecuteProgressUI({ status: 'Finished with errors', meta: 'Code '+data.returncode, barText: 'Error', animate: false });
               return;
@@ -3000,6 +3986,74 @@
       }
     });
   }
+})();
+</script>
+
+<script>
+(function(){
+  try {
+    const form = document.getElementById('rerollForm');
+    if(!form) return;
+    // Guard against duplicate bindings (e.g., embedded HTML re-injected).
+    if (form.dataset.rerollConfirmBound === '1') return;
+    form.dataset.rerollConfirmBound = '1';
+    const seedInput = form.querySelector('input[name="seed"]');
+    const currentSeed = String({{ seed|tojson }} || '').trim();
+    const scenarioName = String({{ (scenario or '')|tojson }} || '').trim();
+
+    function notifyParentSeed(seedStr){
+      try {
+        const p = (window.parent && window.parent !== window) ? window.parent : null;
+        if (!p) return;
+        const n = parseInt(String(seedStr || '').trim(), 10);
+        if (!Number.isFinite(n) || n <= 0) return;
+        try {
+          if (scenarioName && typeof p.coretgSetSeedForScenario === 'function') {
+            p.coretgSetSeedForScenario(scenarioName, n);
+          }
+        } catch (e) {}
+        try {
+          if (typeof p.coretgPreviewRefreshScenarioSeedBadges === 'function') {
+            p.coretgPreviewRefreshScenarioSeedBadges();
+          }
+        } catch (e) {}
+      } catch (e) {}
+    }
+
+    // In embedded mode, sync the displayed server seed back to the parent.
+    // This covers "random" rerolls where the user doesn't type a seed.
+    try {
+      if (scenarioName && currentSeed) {
+        notifyParentSeed(currentSeed);
+      }
+    } catch (e) {}
+
+    form.addEventListener('submit', (ev)=>{
+      // If multiple submit listeners exist for any reason, ensure the confirm
+      // prompt is only shown once per submission.
+      if (form.dataset.rerollConfirmInFlight === '1') return;
+      form.dataset.rerollConfirmInFlight = '1';
+      try {
+        const nextSeed = (seedInput && typeof seedInput.value === 'string') ? seedInput.value.trim() : '';
+        if(nextSeed && currentSeed && nextSeed !== currentSeed){
+          const ok = confirm('Changing the seed will re-roll the preview (IPs, node assignments, and derived values may change).\n\nContinue?');
+          if(!ok){
+            ev.preventDefault();
+            return;
+          }
+        }
+        if (scenarioName && nextSeed) {
+          notifyParentSeed(nextSeed);
+        }
+      } catch(e) {}
+      finally {
+        // Clear on next tick so future submissions still prompt as expected.
+        try { window.setTimeout(() => { try { delete form.dataset.rerollConfirmInFlight; } catch (_) { form.dataset.rerollConfirmInFlight = '0'; } }, 0); } catch (_) {
+          try { delete form.dataset.rerollConfirmInFlight; } catch (_) { form.dataset.rerollConfirmInFlight = '0'; }
+        }
+      }
+    });
+  } catch(e) {}
 })();
 </script>
 {% endblock %} {# end extra_scripts #}

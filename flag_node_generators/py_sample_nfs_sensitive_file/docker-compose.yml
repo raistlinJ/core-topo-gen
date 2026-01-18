@@ -1,0 +1,6 @@
+services:
+  generator:
+    build: .
+    volumes:
+      - ${INPUTS_DIR}:/inputs:ro
+      - ${OUTPUTS_DIR}:/outputs

@@ -23,7 +23,39 @@ class _DummyTunnel:
         return None
 
 
+class _DummyChannel:
+    def recv_exit_status(self):
+        return 0
+
+
+class _DummyStream:
+    def __init__(self, data: bytes = b''):
+        self._data = data
+        self.channel = _DummyChannel()
+
+    def read(self):
+        return self._data
+
+    def close(self):
+        return None
+
+
+class _DummyStdin:
+    def write(self, _data):
+        return None
+
+    def flush(self):
+        return None
+
+    def close(self):
+        return None
+
+
 class _DummySSHClient:
+    def exec_command(self, _cmd, timeout=None, get_pty=False):
+        # Provide empty stdout/stderr; caller uses recv_exit_status on stdout.channel.
+        return _DummyStdin(), _DummyStream(b''), _DummyStream(b'')
+
     def close(self):
         return None
 
@@ -120,6 +152,8 @@ def test_run_cli_async_blocks_when_sessions_present_and_no_adv_kill(tmp_path, mo
     }
     monkeypatch.setattr(backend, '_merge_core_configs', lambda *a, **k: dict(fake_core_cfg))
     monkeypatch.setattr(backend, '_require_core_ssh_credentials', lambda cfg: cfg)
+    monkeypatch.setattr(backend, '_SshTunnel', _DummyTunnel)
+    monkeypatch.setattr(backend, '_open_ssh_client', lambda _cfg: _DummySSHClient())
 
     monkeypatch.setattr(
         backend,

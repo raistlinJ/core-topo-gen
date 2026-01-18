@@ -40,11 +40,14 @@ The web UI uses cookie sessions. Script clients must authenticate once and reuse
 - [Health](#health)
 - [Scenario Lifecycle](#scenario-lifecycle)
 - [Planning Preview](#planning-preview)
+- [Flag Sequencing (Flow)](#flag-sequencing-flow)
 - [Run Execution & Reports](#run-execution--reports)
 - [Script Inspection](#script-inspection)
 - [Docker Helpers](#docker-helpers)
 - [CORE Session Management](#core-session-management)
 - [Data Sources & Vulnerability Catalog](#data-sources--vulnerability-catalog)
+- [Generator Builder](#generator-builder)
+- [Generator Packs & Installed Generators](#generator-packs--installed-generators)
 - [Diagnostics & Maintenance](#diagnostics--maintenance)
 - [User Administration](#user-administration)
 
@@ -137,6 +140,161 @@ Generates a deterministic planning preview without starting a CORE session.
 - `r2s_policy_preview.per_router_bounds` includes min/max bounds when NonUniform host grouping is requested via XML attributes (`r2s_hosts_min`/`r2s_hosts_max`).
 - Exact aggregation (`r2s_mode=Exact` and `r2s_edges=1`) collapses hosts behind a single switch and ignores bounds.
 - Preview responses are cached; purge `outputs/plan_cache.json` to invalidate.
+
+### Flag Sequencing (Flow)
+
+These endpoints power the **Flow** page (Flag Sequencing) in the Web UI.
+
+Important notes:
+- **STIX/AttackFlow bundle export has been removed.** Legacy STIX endpoints now return HTTP `410 Gone`.
+- The supported export format is **Attack Flow Builder native `.afb`**.
+
+`GET /api/flag-sequencing/attackflow_preview`
+: Returns a chain preview derived from the latest preview plan for the scenario. Response includes `chain`, `flag_assignments`, and validity metadata (`flow_valid`, `flow_errors`, `flags_enabled`).
+
+Common query params:
+- `scenario=<name>` (optional; best to provide explicitly)
+- `length=<int>` (default 5)
+- `preset=<name>` (optional; forces a fixed chain)
+- `best_effort=1` (optional; clamps to available eligible nodes)
+
+`POST /api/flag-sequencing/prepare_preview_for_execute`
+: Resolves hint placeholders and materializes generator outputs for a chain (used for “Resolve hint values…” in the Flow UI).
+
+Request JSON (typical):
+```json
+{
+	"scenario": "My Scenario",
+	"length": 5,
+	"preset": "",
+	"chain_ids": ["n1", "n2"],
+	"preview_plan": "/abs/path/to/outputs/plans/plan_from_preview_....json",
+	"mode": "hint",
+	"best_effort": true,
+	"timeout_s": 30
+}
+```
+
+`POST /api/flag-sequencing/afb_from_chain`
+: Generates an Attack Flow Builder export for a user-specified ordered chain.
+
+Request JSON:
+```json
+{
+	"scenario": "My Scenario",
+	"chain": [{"id": "n1", "name": "Node 1"}, {"id": "n2", "name": "Node 2"}]
+}
+```
+
+Response JSON includes `afb` (the export document) plus `flag_assignments` and validity metadata.
+
+Deprecated endpoints (removed):
+- `POST /api/flag-sequencing/bundle_from_chain` → returns `410 Gone`
+- `GET /api/flag-sequencing/attackflow` → returns `410 Gone`
+
+### Generator Builder
+
+These endpoints power the **Generator-Builder** page in the Web UI.
+
+`GET /generator_builder`
+: HTML page that helps scaffold new generators.
+
+`POST /api/generators/scaffold_meta`
+: JSON request describing the generator you want. Returns `{ ok, manifest_yaml, scaffold_paths }`.
+
+UI terminology:
+- The Generator Builder page labels artifact dependencies as **Inputs (artifacts)** and **Outputs (artifacts)**.
+- The API field names remain `requires` / `optional_requires` / `produces` to match generator manifest fields.
+
+Example request:
+
+```json
+{
+	"plugin_type": "flag-generator",
+	"plugin_id": "my_ssh_creds",
+	"folder_name": "py_my_ssh_creds",
+	"name": "SSH Credentials",
+	"description": "Emits deterministic SSH credentials.",
+	"requires": [
+		{"artifact": "ssh.username", "optional": true},
+		{"artifact": "ssh.password", "optional": false}
+	],
+	"optional_requires": [],
+	"produces": ["flag", "ssh_username", "ssh_password"],
+	"inputs": {"seed": true, "secret": true, "flag_prefix": true},
+	"hint_templates": ["Next: SSH using {{OUTPUT.ssh.username}} / {{OUTPUT.ssh.password}}"],
+	"inject_files": ["filesystem.file"],
+	"compose_text": "(optional full docker-compose.yml override)",
+	"readme_text": "(optional full README.md override)"
+}
+```
+
+Notes:
+- `requires` must be a list of objects `{ artifact, optional }`.
+- `inputs` is a list of runtime input definitions (name/type/required/etc) written into `manifest.yaml`.
+- `inject_files` is optional; when present it is written into `manifest.yaml` as `injects`.
+- Optional destination directory syntax: `inject_files: ["filesystem.file -> /opt/bin"]`. If omitted or invalid, files default to `/tmp`.
+
+`POST /api/generators/scaffold_zip`
+: Same JSON request body as `/api/generators/scaffold_meta`, but returns a ZIP you can unzip into the repo root.
+
+Registering the scaffolded generator:
+- The scaffold ZIP creates a folder under `flag_generators/<folder>/...` or `flag_node_generators/<folder>/...`.
+- Package/install workflow: add a `manifest.yaml` to the generator folder, zip it as a Generator Pack, and install it via the Flag Catalog page.
+
+### Generator Packs & Installed Generators
+
+These endpoints support Generator Packs (ZIP files) and the installed generator set used by the Web UI + Flow.
+
+Important behavior:
+- Installed generators live under `outputs/installed_generators/`.
+- On install, each generator is assigned a **new numeric ID** (string) and the installed `manifest.yaml` is rewritten to that ID.
+- Packs and generators can be disabled; disabled generators are rejected by Flow preview/execute.
+
+#### Pack lifecycle (HTML form endpoints)
+
+`POST /generator_packs/upload`
+: Multipart form with `zip_file` (a `.zip`). Installs a pack and redirects back to the Flag Catalog page. If called with `X-Requested-With: XMLHttpRequest`, returns JSON `{ ok, message|error }`.
+
+`POST /generator_packs/import_url`
+: Form field `zip_url` (HTTP/HTTPS URL to a `.zip`). Downloads and installs the pack.
+
+`POST /generator_packs/delete/<pack_id>`
+: Uninstalls the pack. Deletes installed generator directories recorded in the pack state (scoped to the installed-generators root).
+
+`POST /generator_packs/set_disabled/<pack_id>`
+: Toggles pack disabled state (form endpoint).
+
+`GET /generator_packs/download/<pack_id>`
+: Downloads a ZIP representing the installed pack (including installed manifests).
+
+`GET /generator_packs/export_all`
+: Downloads a bundle ZIP containing one ZIP per installed pack under `packs/<pack_id>.zip`.
+
+#### Pack/generator disable + delete (JSON endpoints)
+
+`POST /api/generator_packs/set_disabled`
+: JSON `{ "pack_id": "...", "disabled": true|false }`.
+
+`POST /api/flag_generators/set_disabled`
+: JSON `{ "generator_id": "...", "disabled": true|false }`.
+
+`POST /api/flag_node_generators/set_disabled`
+: JSON `{ "generator_id": "...", "disabled": true|false }`.
+
+`POST /api/flag_generators/delete`
+: JSON `{ "generator_id": "..." }`. Deletes an installed flag-generator.
+
+`POST /api/flag_node_generators/delete`
+: JSON `{ "generator_id": "..." }`. Deletes an installed flag-node-generator.
+
+#### Installed generator listings
+
+`GET /flag_generators_data`
+: Returns `{ "generators": [...], "errors": [...] }` for installed flag-generators (manifest-based). Generator entries may include `_pack_id`, `_pack_label`, and `_disabled`.
+
+`GET /flag_node_generators_data`
+: Returns `{ "generators": [...], "errors": [...] }` for installed flag-node-generators (manifest-based).
 
 ### Run Execution & Reports
 
@@ -261,43 +419,43 @@ Generates a deterministic planning preview without starting a CORE session.
 `POST /test_core`
 : Form or JSON body with `host` (string) and `port` (int). Returns `{ "ok": true }` when gRPC connectivity succeeds.
 
-### Data Sources & Vulnerability Catalog
-
-`GET /data_sources`
-: Renders the data sources administration page.
-
-`POST /data_sources/upload`
-: Multipart field `csv_file`. Adds a new data source.
-
-`POST /data_sources/toggle/<sid>`
-: Enables or disables a data source.
-
-`POST /data_sources/delete/<sid>`
-: Removes a data source.
-
-`POST /data_sources/refresh/<sid>`
-: Refreshes a source (implementation-specific).
-
-`GET /data_sources/download/<sid>`
-: Downloads a single source as CSV.
-
-`GET /data_sources/export_all`
-: Downloads all sources in a ZIP or bundled CSV.
-
-`GET /data_sources/edit/<sid>`
-: Renders the inline CSV editor.
-
-`POST /data_sources/save/<sid>`
-: JSON body `{ "rows": [["Header", "Value"], ...] }`. Normalizes and saves the CSV, then redirects back to the editor. Malformed payloads return HTTP 400.
-
 `GET /vuln_catalog`
-: Renders the vulnerability catalog view.
+: Returns the vulnerability catalog as JSON (types/vectors/items).
+
+`GET /vuln_catalog_page`
+: HTML page that mirrors the Flag Catalog pack UX, but for vulnerability catalog packs.
+
+`POST /vuln_catalog_packs/upload`
+: Form upload endpoint. Expects multipart field `zip_file` containing a ZIP with directories/subdirectories.
+	Each valid vulnerability directory must include `docker-compose.yml`. The server extracts the ZIP and
+	generates a `vuln_list_w_url.csv` for selection.
+
+`POST /vuln_catalog_packs/import_url`
+: Form endpoint. Field `zip_url` points to a ZIP containing compose directories.
+
+`GET /vuln_catalog_packs/download/<catalog_id>`
+: Downloads the previously uploaded ZIP.
+
+`GET /vuln_catalog_packs/browse/<catalog_id>`
+: HTML directory browser for the extracted pack content.
+
+`GET /vuln_catalog_packs/browse/<catalog_id>/<subpath>`
+: Browse a subdirectory under the extracted content.
+
+`GET /vuln_catalog_packs/file/<catalog_id>/<subpath>`
+: Download a specific extracted file.
+
+`POST /vuln_catalog_packs/set_active/<catalog_id>`
+: Marks the selected catalog pack as active.
+
+`POST /vuln_catalog_packs/delete/<catalog_id>`
+: Deletes the selected catalog pack.
 
 `POST /vuln_compose/status`
 : JSON `{ "items": [{ "Name": "Node1", "Path": "...", "compose"?: "docker-compose.yml" }] }`. Returns `{ "items": [...], "log": [...] }` with compose availability and Docker pull state.
 
 `POST /vuln_compose/download`
-: Same payload. Supports GitHub URLs (cloned via `git`) and direct download paths. Responds with `{ "items": [...], "log": [...] }` summarizing results.
+: Same payload. Supports GitHub URLs (cloned via `git`), direct download URLs, and local compose paths (as produced by installed vulnerability packs). Responds with `{ "items": [...], "log": [...] }` summarizing results.
 
 `POST /vuln_compose/pull`
 : Performs `docker compose pull` for each item. Requires Docker CLI access.

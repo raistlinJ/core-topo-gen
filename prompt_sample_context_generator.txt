@@ -1,0 +1,9 @@
+sure; also, let's remove and recreate "Sample: Binary Embed Text (network.ip)" as "Sample: Binary Embed Text"
+Use our AI scaffold to create it.
+As inputs, it should have: (optional) filename, (optional) seed, and (optional) flag.
+
+It will create an x64 binary file (named filename). If no filename is provided as input, it will be some random filename based on seed. The binary will have the flag embedded in it; so it can be found using, e.g., strings or a reverse engineering tool like ghidra.
+
+The output of this generator is the binary file (maybe we need to add file as a type/reserved if it's not there).
+
+Please auto generate description, hints, etc. for this generator.

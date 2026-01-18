@@ -1,0 +1,22 @@
+{
+  "plugin_id": "nodegen-py-ssh_flag_node",
+  "plugin_type": "flag-node-generator",
+  "version": "1.0",
+  "description": "Converted from generator id 'nodegen.py.ssh_flag_node'.",
+  "requires": ["seed", "node_name"],
+  "produces": [
+    {"artifact": "compose_path"},
+    {"artifact": "flag"},
+    {"artifact": "ssh_username"},
+    {"artifact": "ssh_password"},
+    {"artifact": "ssh_port"}
+  ],
+  "inputs": {
+    "seed": {"type": "text", "required": true},
+    "node_name": {"type": "text", "required": true},
+    "flag_prefix": {"type": "text", "required": false},
+    "ssh_port": {"type": "number", "required": false, "default": 22},
+    "ssh_username": {"type": "text", "required": false},
+    "ssh_password": {"type": "text", "required": false}
+  }
+}

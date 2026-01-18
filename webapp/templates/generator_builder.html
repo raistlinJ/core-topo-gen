@@ -1,0 +1,806 @@
+{% extends "layout.html" %}
+
+{% block title %}Generator Builder{% endblock %}
+{% block active_page %}{% set active_page = 'generator_builder' %}{% endblock %}
+
+{% block content %}
+<div class="container-fluid mt-2">
+  <div class="row">
+    <div class="col-12">
+      <ul class="nav nav-tabs mb-3" role="tablist">
+        <li class="nav-item" role="presentation">
+          <a class="nav-link" href="{{ url_for('flag_catalog_page') }}">Generator Sources</a>
+        </li>
+        <li class="nav-item" role="presentation">
+          <a class="nav-link" href="{{ url_for('flag_catalog_page') }}">Flag-Generators</a>
+        </li>
+        <li class="nav-item" role="presentation">
+          <a class="nav-link" href="{{ url_for('flag_catalog_page') }}">Flag-Node-Generators</a>
+        </li>
+        <li class="nav-item" role="presentation">
+          <a class="nav-link active" aria-current="page" href="{{ url_for('generator_builder_page') }}"><i class="bi bi-wrench-adjustable me-1"></i>Generator Builder</a>
+        </li>
+      </ul>
+      <div class="card shadow-sm mb-3">
+        <div class="card-header d-flex align-items-center justify-content-between">
+          <div class="fw-semibold"><i class="bi bi-wrench-adjustable"></i> Generator Builder</div>
+          <span class="badge text-bg-secondary">Scaffold + manifest</span>
+        </div>
+        <div class="card-body">
+          <div class="alert alert-info small mb-3">
+            Builds a ready-to-zip scaffold for creating new generators.
+            The scaffold includes <span class="font-monospace">manifest.yaml</span> for Generator Packs and follows the runtime contract used by the generator runner.
+            <div class="mt-2">
+              <div class="fw-semibold">Conventions</div>
+              <ul class="mb-0">
+                <li><span class="font-monospace">hint.txt</span> is optional; prefer <span class="font-monospace">hint_templates</span> in <span class="font-monospace">manifest.yaml</span>.</li>
+                <li>For file outputs: write under <span class="font-monospace">/outputs/artifacts/...</span> and reference in <span class="font-monospace">outputs.json</span> as <span class="font-monospace">artifacts/&lt;name&gt;</span>.</li>
+                <li>To stage files into scenarios, set an allowlist (prefer output keys like <span class="font-monospace">filesystem.file</span>) in <span class="font-monospace">manifest.yaml</span> under <span class="font-monospace">injects</span>.</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label">Generator type</label>
+            <select class="form-select" id="gbPluginType">
+              <option value="flag-generator">flag-generator (writes outputs.json)</option>
+              <option value="flag-node-generator">flag-node-generator (writes docker-compose.yml + outputs.json)</option>
+            </select>
+          </div>
+
+          <div class="row g-2">
+            <div class="col-12 col-md-6">
+              <label class="form-label">Source ID</label>
+              <input class="form-control" id="gbPluginId" placeholder="e.g. my_ssh_creds">
+              <div class="form-text">Used as the <span class="font-monospace">manifest.yaml</span> <code>id</code>. Installed Generator Packs are assigned a new numeric id at install time.</div>
+            </div>
+            <div class="col-12 col-md-6">
+              <label class="form-label">Folder name</label>
+              <input class="form-control" id="gbFolderName" placeholder="e.g. py_my_ssh_creds">
+              <div class="form-text">Created under <code>flag_generators/</code> or <code>flag_node_generators/</code>.</div>
+            </div>
+          </div>
+
+          <div class="mb-2 mt-2">
+            <label class="form-label">Display name</label>
+            <input class="form-control" id="gbName" placeholder="e.g. SSH Credentials">
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label">Description</label>
+            <textarea class="form-control" id="gbDescription" rows="2" placeholder="One sentence summary."></textarea>
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label">Inputs (artifacts)</label>
+            <div class="d-flex gap-2">
+              <button class="btn btn-sm btn-outline-primary" type="button" id="gbReqAddBtn"><i class="bi bi-plus-circle"></i> Add inputs</button>
+              <button class="btn btn-sm btn-outline-secondary" type="button" id="gbReqClearBtn">Clear</button>
+            </div>
+            <div class="form-text">Select artifact keys the generator reads. Mark any selected input as <span class="fw-semibold">required</span>; others default to optional.</div>
+            <div class="mt-2" id="gbRequiresList"></div>
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label">Outputs (artifacts)</label>
+            <div class="d-flex gap-2">
+              <button class="btn btn-sm btn-outline-primary" type="button" id="gbProdAddBtn"><i class="bi bi-plus-circle"></i> Add outputs</button>
+              <button class="btn btn-sm btn-outline-secondary" type="button" id="gbProdClearBtn">Clear</button>
+            </div>
+            <div class="form-text">These are artifact keys the generator will write into <code>outputs.json</code>.</div>
+            <div class="mt-2" id="gbProducesList"></div>
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label">Inject files (allowlist)</label>
+            <div class="d-flex gap-2">
+              <button class="btn btn-sm btn-outline-primary" type="button" id="gbInjAddBtn"><i class="bi bi-plus-circle"></i> Add inject_files</button>
+              <button class="btn btn-sm btn-outline-secondary" type="button" id="gbInjClearBtn">Clear</button>
+            </div>
+            <div class="form-text">Artifacts staged into scenarios under <code>injected/</code>. Prefer output keys (e.g. <code>filesystem.file</code>).</div>
+            <div class="mt-2" id="gbInjectFilesList"></div>
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label">Runtime inputs (config schema)</label>
+            <div class="d-flex flex-wrap gap-2">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="gbInSeed" checked>
+                <label class="form-check-label" for="gbInSeed">seed</label>
+              </div>
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="gbInSecret" checked>
+                <label class="form-check-label" for="gbInSecret">secret</label>
+              </div>
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="gbInNodeName">
+                <label class="form-check-label" for="gbInNodeName">node_name</label>
+              </div>
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="gbInFlagPrefix" checked>
+                <label class="form-check-label" for="gbInFlagPrefix">flag_prefix</label>
+              </div>
+            </div>
+            <div class="form-text">Flow-synthesized values must be modeled as runtime inputs, not artifact inputs.</div>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label">Hint templates (one per line)</label>
+            <textarea class="form-control" id="gbHintTemplates" rows="3" placeholder="Next: ... using {{ '{{OUTPUT.some_key}}' }}"></textarea>
+          </div>
+
+          <div class="mb-2">
+            <label class="form-label">docker-compose.yml (scaffold)</label>
+            <textarea class="form-control font-monospace" id="gbDockerCompose" rows="8"></textarea>
+            <div class="form-text">This compose is included in the scaffold folder to run <code>generator.py</code> in a container.</div>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label">README.md (scaffold)</label>
+            <textarea class="form-control font-monospace" id="gbReadme" rows="6"></textarea>
+          </div>
+
+          <div class="d-flex gap-2">
+            <button class="btn btn-outline-primary" id="gbBtnZip"><i class="bi bi-file-earmark-zip"></i> Download scaffold zip</button>
+          </div>
+
+          <div class="mt-2 small text-muted">
+            To install a generator, upload the ZIP as a Generator Pack on the <a href="{{ url_for('flag_catalog_page') }}" class="text-muted">Flag-Catalog</a> page.
+            For local dev, you can also unzip into the repo and run <span class="font-monospace">scripts/run_flag_generator.py</span> against it.
+          </div>
+
+          <div class="mt-3 small text-muted">
+            Reference: <span class="text-muted">docs/GENERATOR_AUTHORING.md</span> and <a href="{{ url_for('flag_catalog_page') }}" class="text-muted">Flag-Catalog</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="card shadow-sm mb-3">
+        <div class="card-header fw-semibold"><i class="bi bi-braces"></i> manifest.yaml (generated)</div>
+        <div class="card-body">
+          <div class="small text-muted mb-2">
+            This is the pack manifest generated from the form.
+          </div>
+          <textarea class="form-control font-monospace" id="gbManifestYaml" rows="12" readonly></textarea>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col-12">
+      <div class="card shadow-sm">
+        <div class="card-header fw-semibold"><i class="bi bi-folder2-open"></i> Scaffold files</div>
+        <div class="card-body">
+          <ul class="mb-0" id="gbFiles"></ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Artifact Selector Modal -->
+<div class="modal fade" id="gbArtifactModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="gbArtifactModalTitle">Select artifacts</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="card mb-3">
+          <div class="card-body py-2">
+            <div class="row g-2 align-items-end">
+              <div class="col-12 col-md-6">
+                <label class="form-label mb-1">Add custom artifact</label>
+                <input class="form-control" id="gbCustomArtifact" placeholder="e.g. ssh.private_key" />
+              </div>
+              <div class="col-12 col-md-4">
+                <label class="form-label mb-1">Type (optional)</label>
+                <input class="form-control" id="gbCustomArtifactType" placeholder="e.g. text" />
+              </div>
+              <div class="col-12 col-md-2">
+                <button type="button" class="btn btn-outline-primary w-100" id="gbCustomArtifactAddBtn">Add</button>
+              </div>
+            </div>
+            <div class="small text-muted mt-1">Custom artifacts are saved and will appear in this list for future generators.</div>
+          </div>
+        </div>
+
+        <div class="row g-2 align-items-center mb-2">
+          <div class="col-12 col-md-6">
+            <input class="form-control" id="gbArtifactFilter" placeholder="Filter (substring or regex)…" />
+          </div>
+          <div class="col-12 col-md-3">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" id="gbArtifactFilterRegex" />
+              <label class="form-check-label" for="gbArtifactFilterRegex">Regex</label>
+            </div>
+          </div>
+          <div class="col-12 col-md-3 text-md-end">
+            <span class="small text-muted" id="gbArtifactFilterMeta"></span>
+          </div>
+        </div>
+
+        <div class="alert alert-warning py-2 px-3 small d-none" id="gbArtifactRegexError"></div>
+
+        <div class="table-responsive">
+          <table class="table table-sm align-middle">
+            <thead>
+              <tr>
+                <th style="width: 56px;">Pick</th>
+                <th style="width: 110px;" id="gbArtifactRequiredHeader" class="d-none">Required</th>
+                <th>Artifact</th>
+                <th style="width: 160px;">Type</th>
+                <th>Description</th>
+                <th>Produced by</th>
+              </tr>
+            </thead>
+            <tbody id="gbArtifactBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="gbArtifactApplyBtn">Add selected</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  const SAMPLE_COMPOSE = (
+    "services:\n"+
+    "  generator:\n"+
+    "    image: python:3.12-slim\n"+
+    "    working_dir: /app\n"+
+    "    command: [\"python\", \"/app/generator.py\"]\n"+
+    "    environment:\n"+
+    "      INPUTS_DIR: ${INPUTS_DIR}\n"+
+    "      OUTPUTS_DIR: ${OUTPUTS_DIR}\n"+
+    "    volumes:\n"+
+    "      - ./generator.py:/app/generator.py:ro\n"+
+    "      - ${INPUTS_DIR}:/inputs:ro\n"+
+    "      - ${OUTPUTS_DIR}:/outputs\n"
+  );
+
+  function sampleReadme(displayName, pluginId, pluginType){
+    const dn = (displayName || '').trim() || (pluginId || '').trim() || 'My Generator';
+    const pid = (pluginId || '').trim() || 'my_generator';
+    const pt = (pluginType || '').trim() || 'flag-generator';
+    return `# ${dn}\n\nTODO: describe this generator.\n\n- plugin_id: \`${pid}\`\n- type: \`${pt}\`\n`;
+  }
+
+  function defaultFolder(pluginId){
+    const base = (pluginId || '').trim() || 'my_generator';
+    if(base.startsWith('py_')) return base;
+    return 'py_' + base;
+  }
+
+  function buildPayload(){
+    const plugin_type = document.getElementById('gbPluginType').value;
+    const plugin_id = document.getElementById('gbPluginId').value.trim();
+    const folder_name = (document.getElementById('gbFolderName').value.trim() || defaultFolder(plugin_id));
+    const name = document.getElementById('gbName').value.trim();
+    const description = document.getElementById('gbDescription').value.trim();
+
+    const requires = state.requires.slice();
+    const produces = state.produces.slice();
+    const inject_files = state.inject_files.slice();
+
+    const hint_templates = String(document.getElementById('gbHintTemplates').value || '')
+      .split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+
+    const compose_text = String(document.getElementById('gbDockerCompose').value || '');
+    const readme_text = String(document.getElementById('gbReadme').value || '');
+
+    const inputs = {
+      seed: document.getElementById('gbInSeed').checked,
+      secret: document.getElementById('gbInSecret').checked,
+      node_name: document.getElementById('gbInNodeName').checked,
+      flag_prefix: document.getElementById('gbInFlagPrefix').checked,
+    };
+
+    return { plugin_type, plugin_id, folder_name, name, description, requires, produces, inject_files, inputs, hint_templates, compose_text, readme_text };
+  }
+
+  const state = {
+    artifacts: [],
+    requires: [], // [{artifact, optional}]
+    produces: [], // ["artifact", ...]
+    inject_files: [], // ["artifact_or_output_key", ...]
+    modalMode: null, // 'requires'|'produces'|'inject_files'
+    artifactMeta: new Map(),
+  };
+
+  function escapeHtml(s){
+    return String(s).replace(/[&<>\"']/g, (c)=>({
+      '&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'
+    })[c] || c);
+  }
+
+  function uniq(arr){
+    const out = [];
+    const seen = new Set();
+    for(const x of (arr || [])){
+      const v = String(x || '').trim();
+      if(!v || seen.has(v)) continue;
+      seen.add(v);
+      out.push(v);
+    }
+    return out;
+  }
+
+  function refreshTooltips(root){
+    try {
+      if(!root || !window.bootstrap || !bootstrap.Tooltip) return;
+      const els = root.querySelectorAll('[data-bs-toggle="tooltip"]');
+      els.forEach((el)=>{
+        try { bootstrap.Tooltip.getInstance(el)?.dispose(); } catch(e) {}
+        try { new bootstrap.Tooltip(el, { trigger: 'hover', container: 'body' }); } catch(e) {}
+      });
+    } catch(e) {
+      // ignore
+    }
+  }
+
+  function tooltipTitleForMeta(meta){
+    const m = meta || {};
+    const desc = String(m.description || '').trim();
+    const tp = String(m.type || '').trim();
+    const parts = [];
+    if(desc) parts.push(desc);
+    if(tp) parts.push(`Type: ${tp}`);
+    if(m.sensitive === true) parts.push('Sensitive: yes');
+    else if(m.sensitive === false) parts.push('Sensitive: no');
+    const prodTxt = String(m.producers_text || '').trim();
+    if(prodTxt) parts.push(`Produced by: ${prodTxt}`);
+    return parts.join(' • ');
+  }
+
+  function renderRequires(){
+    const host = document.getElementById('gbRequiresList');
+    host.innerHTML = '';
+    if(!state.requires.length){
+      host.innerHTML = '<div class="small text-muted">(none)</div>';
+      return;
+    }
+    const ul = document.createElement('ul');
+    ul.className = 'list-group';
+    state.requires.forEach((item, idx)=>{
+      const li = document.createElement('li');
+      li.className = 'list-group-item d-flex align-items-center justify-content-between';
+      const left = document.createElement('div');
+      const meta = state.artifactMeta.get(item.artifact);
+      const title = tooltipTitleForMeta(meta);
+      left.innerHTML = title
+        ? `<span class="font-monospace" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(title)}">${escapeHtml(item.artifact)}</span>`
+        : `<span class="font-monospace">${escapeHtml(item.artifact)}</span>`;
+      const right = document.createElement('div');
+      right.className = 'd-flex align-items-center gap-2';
+
+      const optWrap = document.createElement('div');
+      optWrap.className = 'form-check form-switch mb-0';
+      const optId = `gbReqOpt_${idx}`;
+      optWrap.innerHTML = `
+        <input class="form-check-input" type="checkbox" id="${optId}" ${(!item.optional) ? 'checked' : ''}>
+        <label class="form-check-label small" for="${optId}">required</label>
+      `;
+      optWrap.querySelector('input').addEventListener('change', (ev)=>{
+        // UI is "required" but state stores "optional".
+        state.requires[idx].optional = !ev.target.checked;
+      });
+
+      const rm = document.createElement('button');
+      rm.className = 'btn btn-sm btn-outline-danger';
+      rm.type = 'button';
+      rm.textContent = 'Remove';
+      rm.addEventListener('click', ()=>{
+        state.requires.splice(idx, 1);
+        renderRequires();
+      });
+
+      right.appendChild(optWrap);
+      right.appendChild(rm);
+      li.appendChild(left);
+      li.appendChild(right);
+      ul.appendChild(li);
+    });
+    host.appendChild(ul);
+    refreshTooltips(host);
+  }
+
+  function renderProduces(){
+    const host = document.getElementById('gbProducesList');
+    host.innerHTML = '';
+    if(!state.produces.length){
+      host.innerHTML = '<div class="small text-muted">(none)</div>';
+      return;
+    }
+    const ul = document.createElement('ul');
+    ul.className = 'list-group';
+    state.produces.forEach((artifact, idx)=>{
+      const li = document.createElement('li');
+      li.className = 'list-group-item d-flex align-items-center justify-content-between';
+      const meta = state.artifactMeta.get(artifact);
+      const title = tooltipTitleForMeta(meta);
+      li.innerHTML = title
+        ? `<span class="font-monospace" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(title)}">${escapeHtml(artifact)}</span>`
+        : `<span class="font-monospace">${escapeHtml(artifact)}</span>`;
+      const rm = document.createElement('button');
+      rm.className = 'btn btn-sm btn-outline-danger';
+      rm.type = 'button';
+      rm.textContent = 'Remove';
+      rm.addEventListener('click', ()=>{
+        state.produces.splice(idx, 1);
+        renderProduces();
+      });
+      li.appendChild(rm);
+      ul.appendChild(li);
+    });
+    host.appendChild(ul);
+    refreshTooltips(host);
+  }
+
+  function renderInjectFiles(){
+    const host = document.getElementById('gbInjectFilesList');
+    host.innerHTML = '';
+    if(!state.inject_files.length){
+      host.innerHTML = '<div class="small text-muted">(none)</div>';
+      return;
+    }
+    const ul = document.createElement('ul');
+    ul.className = 'list-group';
+    state.inject_files.forEach((artifact, idx)=>{
+      const li = document.createElement('li');
+      li.className = 'list-group-item d-flex align-items-center justify-content-between';
+      const meta = state.artifactMeta.get(artifact);
+      const title = tooltipTitleForMeta(meta);
+      li.innerHTML = title
+        ? `<span class="font-monospace" data-bs-toggle="tooltip" data-bs-title="${escapeHtml(title)}">${escapeHtml(artifact)}</span>`
+        : `<span class="font-monospace">${escapeHtml(artifact)}</span>`;
+      const rm = document.createElement('button');
+      rm.className = 'btn btn-sm btn-outline-danger';
+      rm.type = 'button';
+      rm.textContent = 'Remove';
+      rm.addEventListener('click', ()=>{
+        state.inject_files.splice(idx, 1);
+        renderInjectFiles();
+      });
+      li.appendChild(rm);
+      ul.appendChild(li);
+    });
+    host.appendChild(ul);
+    refreshTooltips(host);
+  }
+
+  function normalizeSelected(){
+    state.requires = (state.requires || []).map(x=>({
+      artifact: String(x && x.artifact || '').trim(),
+      optional: !!(x && x.optional),
+    })).filter(x=>x.artifact);
+    // de-dupe requires by artifact (keep first; OR optional if any)
+    const map = new Map();
+    state.requires.forEach(x=>{
+      if(!map.has(x.artifact)) map.set(x.artifact, {artifact:x.artifact, optional:x.optional});
+      else if(x.optional) map.get(x.artifact).optional = true;
+    });
+    state.requires = Array.from(map.values()).sort((a,b)=>a.artifact.localeCompare(b.artifact));
+    state.produces = uniq(state.produces).sort((a,b)=>a.localeCompare(b));
+    state.inject_files = uniq(state.inject_files).sort((a,b)=>a.localeCompare(b));
+  }
+
+  async function loadArtifacts(){
+    const res = await fetch('/api/generators/artifacts_index', { method: 'GET' });
+    const data = await res.json().catch(()=>({ok:false, error:'Non-JSON response'}));
+    if(!res.ok || !data.ok) throw new Error((data && data.error) ? data.error : ('HTTP ' + res.status));
+    state.artifacts = Array.isArray(data.artifacts) ? data.artifacts : [];
+    state.artifactMeta = new Map();
+    (state.artifacts || []).forEach((a)=>{
+      const key = String(a && a.artifact || '').trim();
+      if(!key) return;
+      state.artifactMeta.set(key, a);
+    });
+  }
+
+  async function addCustomArtifact(){
+    const artEl = document.getElementById('gbCustomArtifact');
+    const tpEl = document.getElementById('gbCustomArtifactType');
+    const artifact = String(artEl.value || '').trim();
+    const type = String(tpEl.value || '').trim();
+    if(!artifact){
+      alert('Artifact is required.');
+      return;
+    }
+    const res = await fetch('/api/generators/artifacts_index/custom', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({artifact, type}),
+    });
+    const data = await res.json().catch(()=>({ok:false, error:'Non-JSON response'}));
+    if(!res.ok || !data.ok){
+      throw new Error((data && data.error) ? data.error : ('HTTP ' + res.status));
+    }
+    // Refresh index so it shows up immediately + for future selections.
+    await loadArtifacts();
+    document.getElementById('gbArtifactFilter').value = artifact;
+    document.getElementById('gbArtifactFilterRegex').checked = false;
+    renderArtifactTable();
+  }
+
+  function openArtifactModal(mode){
+    state.modalMode = mode;
+    document.getElementById('gbArtifactModalTitle').textContent = (mode === 'requires')
+      ? 'Select input artifacts'
+      : (mode === 'produces')
+        ? 'Select output artifacts'
+        : 'Select injected artifacts';
+    // Show/hide "Required" column only for Inputs.
+    const reqHeader = document.getElementById('gbArtifactRequiredHeader');
+    if(reqHeader){
+      if(mode === 'requires') reqHeader.classList.remove('d-none');
+      else reqHeader.classList.add('d-none');
+    }
+    document.getElementById('gbArtifactFilter').value = '';
+    document.getElementById('gbArtifactFilterRegex').checked = false;
+    document.getElementById('gbArtifactRegexError').classList.add('d-none');
+    renderArtifactTable();
+    const el = document.getElementById('gbArtifactModal');
+    bootstrap.Modal.getOrCreateInstance(el).show();
+  }
+
+  function filterArtifacts(all, query, useRegex){
+    const q = String(query || '').trim();
+    if(!q) return {items: all, error: null};
+    if(useRegex){
+      try {
+        const re = new RegExp(q, 'i');
+        return {
+          items: all.filter(a=>re.test(String(a.artifact||'')) || re.test(String((a.type||''))) || re.test(String((a.description||''))) || re.test(String((a.producers_text||'')))),
+          error: null,
+        };
+      } catch(e){
+        return {items: [], error: String(e && e.message ? e.message : e)};
+      }
+    }
+    const low = q.toLowerCase();
+    return {
+      items: all.filter(a=>{
+        const art = String(a.artifact||'').toLowerCase();
+        const typ = String(a.type||'').toLowerCase();
+        const desc = String(a.description||'').toLowerCase();
+        const prod = String(a.producers_text||'').toLowerCase();
+        return art.includes(low) || typ.includes(low) || desc.includes(low) || prod.includes(low);
+      }),
+      error: null,
+    };
+  }
+
+  function renderArtifactTable(){
+    const body = document.getElementById('gbArtifactBody');
+    const q = document.getElementById('gbArtifactFilter').value;
+    const useRegex = document.getElementById('gbArtifactFilterRegex').checked;
+    const all = (state.artifacts || []).map(a=>{
+      const producers = Array.isArray(a.producers) ? a.producers : [];
+      const producersText = producers.map(p=>p && (p.name || p.plugin_id) ? (p.name || p.plugin_id) : '').filter(Boolean).join(', ');
+      return {
+        ...a,
+        producers,
+        producers_text: producersText,
+      };
+    });
+
+    const {items, error} = filterArtifacts(all, q, useRegex);
+    const errEl = document.getElementById('gbArtifactRegexError');
+    if(error){
+      errEl.textContent = 'Invalid regex: ' + error;
+      errEl.classList.remove('d-none');
+    } else {
+      errEl.classList.add('d-none');
+    }
+    document.getElementById('gbArtifactFilterMeta').textContent = `${items.length} shown / ${all.length} total`;
+
+    body.innerHTML = '';
+    items.forEach((a, idx)=>{
+      const tr = document.createElement('tr');
+      const checkboxId = `gbArtPick_${idx}`;
+      const reqId = `gbArtReq_${idx}`;
+      const title = tooltipTitleForMeta(a);
+      const showRequired = (state.modalMode === 'requires');
+      tr.innerHTML = `
+        <td><input class="form-check-input" type="checkbox" id="${checkboxId}" data-role="pick" data-artifact="${escapeHtml(a.artifact)}"></td>
+        <td class="${showRequired ? '' : 'd-none'}">
+          <input class="form-check-input" type="checkbox" id="${reqId}" data-role="required" data-artifact="${escapeHtml(a.artifact)}" disabled>
+        </td>
+        <td class="font-monospace">${title ? `<span data-bs-toggle=\"tooltip\" data-bs-title=\"${escapeHtml(title)}\">${escapeHtml(a.artifact || '')}</span>` : escapeHtml(a.artifact || '')}</td>
+        <td>${escapeHtml(a.type || '')}</td>
+        <td class="small">${escapeHtml(a.description || '')}</td>
+        <td class="small">${escapeHtml(a.producers_text || '')}</td>
+      `;
+      body.appendChild(tr);
+
+      // Required checkbox only makes sense when picked.
+      try {
+        const pickEl = tr.querySelector('input[data-role="pick"]');
+        const reqEl = tr.querySelector('input[data-role="required"]');
+        if(pickEl && reqEl){
+          pickEl.addEventListener('change', ()=>{
+            const on = !!pickEl.checked;
+            reqEl.disabled = !on;
+            if(!on) reqEl.checked = false;
+          });
+        }
+      } catch(e) {}
+    });
+    refreshTooltips(body);
+  }
+
+  function applyArtifactSelections(){
+    const rows = Array.from(document.querySelectorAll('#gbArtifactBody tr'));
+    const picked = [];
+    rows.forEach((tr)=>{
+      const pickEl = tr.querySelector('input[data-role="pick"]');
+      if(!pickEl || !pickEl.checked) return;
+      const artifact = String(pickEl.getAttribute('data-artifact') || '').trim();
+      if(!artifact) return;
+      const reqEl = tr.querySelector('input[data-role="required"]');
+      const required = !!(reqEl && reqEl.checked);
+      picked.push({artifact, required});
+    });
+
+    if(state.modalMode === 'requires'){
+      // Default to optional unless explicitly marked required.
+      picked.forEach(({artifact, required})=>state.requires.push({artifact, optional: !required}));
+    } else if(state.modalMode === 'produces'){
+      picked.forEach(({artifact})=>state.produces.push(artifact));
+    } else if(state.modalMode === 'inject_files'){
+      picked.forEach(({artifact})=>state.inject_files.push(artifact));
+    }
+    normalizeSelected();
+    renderRequires();
+    renderProduces();
+    renderInjectFiles();
+    bootstrap.Modal.getOrCreateInstance(document.getElementById('gbArtifactModal')).hide();
+  }
+
+  async function postJson(url, payload){
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(()=>({ok:false, error:'Non-JSON response'}));
+    if(!res.ok || !data.ok){
+      const msg = data && data.error ? data.error : ('HTTP ' + res.status);
+      throw new Error(msg);
+    }
+    return data;
+  }
+
+  function renderResult(data){
+    document.getElementById('gbManifestYaml').value = String(data.manifest_yaml || '').trim() + '\n';
+    const ul = document.getElementById('gbFiles');
+    ul.innerHTML = '';
+    (data.scaffold_paths || []).forEach(p=>{
+      const li = document.createElement('li');
+      li.textContent = p;
+      ul.appendChild(li);
+    });
+  }
+
+  document.getElementById('gbPluginId').addEventListener('input', (ev)=>{
+    const pluginId = ev.target.value || '';
+    const folder = document.getElementById('gbFolderName');
+    if(!folder.value.trim()) folder.value = defaultFolder(pluginId);
+  });
+
+  document.getElementById('gbPluginType').addEventListener('change', ()=>{
+    const isNodeGen = document.getElementById('gbPluginType').value === 'flag-node-generator';
+    document.getElementById('gbInNodeName').checked = isNodeGen;
+    if(isNodeGen){
+      document.getElementById('gbInSecret').checked = false;
+    }
+
+    // Update README sample if it's still untouched.
+    try {
+      const readmeEl = document.getElementById('gbReadme');
+      if(readmeEl && !readmeEl.dataset.userEdited){
+        readmeEl.value = sampleReadme(document.getElementById('gbName').value, document.getElementById('gbPluginId').value, document.getElementById('gbPluginType').value);
+      }
+    } catch(e) {}
+  });
+
+  document.getElementById('gbDockerCompose').addEventListener('input', (ev)=>{ ev.target.dataset.userEdited = '1'; });
+  document.getElementById('gbReadme').addEventListener('input', (ev)=>{ ev.target.dataset.userEdited = '1'; });
+  document.getElementById('gbName').addEventListener('input', ()=>{
+    try {
+      const readmeEl = document.getElementById('gbReadme');
+      if(readmeEl && !readmeEl.dataset.userEdited){
+        readmeEl.value = sampleReadme(document.getElementById('gbName').value, document.getElementById('gbPluginId').value, document.getElementById('gbPluginType').value);
+      }
+    } catch(e) {}
+  });
+
+  document.getElementById('gbPluginId').addEventListener('input', ()=>{
+    try {
+      const readmeEl = document.getElementById('gbReadme');
+      if(readmeEl && !readmeEl.dataset.userEdited){
+        readmeEl.value = sampleReadme(document.getElementById('gbName').value, document.getElementById('gbPluginId').value, document.getElementById('gbPluginType').value);
+      }
+    } catch(e) {}
+  });
+
+  document.getElementById('gbReqAddBtn').addEventListener('click', async ()=>{
+    try { if(!state.artifacts.length) await loadArtifacts(); } catch(e){ alert('Failed loading artifacts: ' + e.message); return; }
+    openArtifactModal('requires');
+  });
+  document.getElementById('gbProdAddBtn').addEventListener('click', async ()=>{
+    try { if(!state.artifacts.length) await loadArtifacts(); } catch(e){ alert('Failed loading artifacts: ' + e.message); return; }
+    openArtifactModal('produces');
+  });
+  document.getElementById('gbInjAddBtn').addEventListener('click', async ()=>{
+    try { if(!state.artifacts.length) await loadArtifacts(); } catch(e){ alert('Failed loading artifacts: ' + e.message); return; }
+    openArtifactModal('inject_files');
+  });
+  document.getElementById('gbReqClearBtn').addEventListener('click', ()=>{ state.requires = []; renderRequires(); });
+  document.getElementById('gbProdClearBtn').addEventListener('click', ()=>{ state.produces = []; renderProduces(); });
+  document.getElementById('gbInjClearBtn').addEventListener('click', ()=>{ state.inject_files = []; renderInjectFiles(); });
+  document.getElementById('gbArtifactFilter').addEventListener('input', renderArtifactTable);
+  document.getElementById('gbArtifactFilterRegex').addEventListener('change', renderArtifactTable);
+  document.getElementById('gbArtifactApplyBtn').addEventListener('click', applyArtifactSelections);
+  document.getElementById('gbCustomArtifactAddBtn').addEventListener('click', async ()=>{
+    try {
+      await addCustomArtifact();
+    } catch(e){
+      alert('Failed: ' + (e && e.message ? e.message : e));
+    }
+  });
+
+  // Initialize defaults
+  try {
+    document.getElementById('gbDockerCompose').value = SAMPLE_COMPOSE;
+    document.getElementById('gbReadme').value = sampleReadme('', '', document.getElementById('gbPluginType').value);
+  } catch(e) {}
+  // Default produces includes 'flag'
+  state.produces = ['flag'];
+  normalizeSelected();
+  renderRequires();
+  renderProduces();
+  renderInjectFiles();
+
+  document.getElementById('gbBtnZip').addEventListener('click', async ()=>{
+    try {
+      const payload = buildPayload();
+      const res = await fetch('/api/generators/scaffold_zip', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      if(!res.ok){
+        const data = await res.json().catch(()=>null);
+        throw new Error((data && data.error) ? data.error : ('HTTP ' + res.status));
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const disp = res.headers.get('Content-Disposition') || '';
+      const m = disp.match(/filename="?([^";]+)"?/i);
+      a.download = (m && m[1]) ? m[1] : 'generator_scaffold.zip';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+
+      // Refresh derived metadata view (catalog JSON + scaffold paths)
+      const data = await postJson('/api/generators/scaffold_meta', payload);
+      renderResult(data);
+    } catch (e){
+      alert('Failed: ' + (e && e.message ? e.message : e));
+    }
+  });
+
+})();
+</script>
+{% endblock %}

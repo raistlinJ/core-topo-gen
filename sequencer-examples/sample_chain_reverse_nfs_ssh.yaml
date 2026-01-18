@@ -1,0 +1,28 @@
+challenges:
+  - challenge_id: reverse_binary_for_ip
+    kind: flag-generator
+    produces:
+      - name: discovered_ip
+        artifact: network.ip
+    generator:
+      plugin: binary_embed_text
+
+  - challenge_id: access_nfs_share
+    kind: flag-node-generator
+    requires:
+      - artifact: network.ip
+    produces:
+      - name: creds
+        artifact: credential.pair
+    generator:
+      plugin: nfs_sensitive_file
+
+  - challenge_id: ssh_password_dump
+    kind: flag-generator
+    requires:
+      - artifact: credential.pair
+    produces:
+      - name: secrets_file
+        artifact: filesystem.file
+    generator:
+      plugin: textfile_username_password

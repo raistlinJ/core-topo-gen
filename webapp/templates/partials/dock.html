@@ -8,7 +8,7 @@
   .dock-panel .tab-content { flex:1 1 auto; min-height:0; overflow:auto; }
   .dock-panel .tab-pane { height:100%; overflow:auto; }
   .dock-panel pre { height:auto; min-height:100%; overflow:auto; }
-  .dock-toggle-btn { position: fixed; right: 12px; bottom: 12px; z-index: 1040; }
+  .dock-toggle-btn { position: fixed; left: 12px; bottom: 12px; z-index: 1050; }
 </style>
 <div class="dock-panel d-none" id="dockPanel">
   <div class="dock-grip" id="dockGrip" title="Drag to resize"></div>
@@ -56,7 +56,7 @@
     {% endif %}
   </div>
 </div>
-<button class="btn btn-primary btn-sm dock-toggle-btn d-none" id="dockShowBtn" type="button">Advanced Information</button>
+<button class="btn btn-primary btn-sm dock-toggle-btn d-none" id="dockShowBtn" type="button">Show Dock ↑</button>
 <script>
 (function(){
   // Shared persistent logs/XML dock behavior with global logging helpers
@@ -113,6 +113,57 @@
   // Expose globally if not already defined
   if(!window.LOG_LEVELS) window.LOG_LEVELS = LOG_LEVELS;
   if(!window.logLine) { window.logLine = logLine; window.logDebug = logDebug; window.logInfo = logInfo; window.logWarn = logWarn; window.logError = logError; window._coretg_logBuffer = logBuffer; }
+
+  // Optional: attach the dock to a backend run log SSE stream.
+  // This allows pages that include the dock (but do not have run progress UI) to
+  // still show CLI/server logs in the Logs tab.
+  const ACTIVE_RUN_ID_KEY = 'coretg_active_run_id';
+  function inferLevelFromLine(raw){
+    const line = String(raw || '');
+    if(/\bERROR\b/.test(line)) return 'ERROR';
+    if(/\bWARN(ING)?\b/.test(line)) return 'WARN';
+    if(/\bDEBUG\b/.test(line)) return 'DEBUG';
+    return 'INFO';
+  }
+  function attachRunStream(runId, { auto = false } = {}){
+    const rid = String(runId || '').trim();
+    if(!rid) return false;
+    try {
+      if(window.__coretgDockRunEvtSrc){
+        try { window.__coretgDockRunEvtSrc.close(); } catch(e) {}
+      }
+    } catch(e) {}
+    try {
+      const es = new EventSource('/stream/' + encodeURIComponent(rid));
+      window.__coretgDockRunEvtSrc = es;
+      window.__coretgDockRunId = rid;
+      es.onmessage = (ev) => {
+        const raw = ev?.data || '';
+        const lvl = inferLevelFromLine(raw);
+        try { window.dispatchEvent(new CustomEvent('dock-log', { detail: { level: lvl, message: raw } })); } catch(e) {}
+      };
+      es.addEventListener('end', () => {
+        try { es.close(); } catch(e) {}
+        try {
+          const cur = localStorage.getItem(ACTIVE_RUN_ID_KEY);
+          if(cur && String(cur) === rid){ localStorage.removeItem(ACTIVE_RUN_ID_KEY); }
+        } catch(e) {}
+        try { window.__coretgDockRunEvtSrc = null; } catch(e) {}
+      });
+      es.addEventListener('error', () => {
+        // Best-effort: don't spam. Leave stream open; browser will retry.
+      });
+      if(!auto){
+        try { window.dispatchEvent(new CustomEvent('dock-log', { detail: { level: 'INFO', message: `[ui] Dock subscribed to run log stream (run_id=${rid})` } })); } catch(e) {}
+      }
+      return true;
+    } catch(e){
+      return false;
+    }
+  }
+  if(!window.coretgDockAttachRunStream){
+    window.coretgDockAttachRunStream = attachRunStream;
+  }
   if(!window.__dockLogListenerAttached){
     window.addEventListener('dock-log', (ev)=>{
       try {
@@ -128,15 +179,48 @@
   }
   function setupDock(){
     const dock = document.getElementById('dockPanel'); const grip = document.getElementById('dockGrip'); const hideBtn = document.getElementById('dockHideBtn'); const showBtn = document.getElementById('dockShowBtn'); if(!dock||!grip||!hideBtn||!showBtn) return;
-    const setBodyPad = (px) => { document.body.style.paddingBottom = Math.max(px, 0) + 'px'; };
-    const applyHeight = (px) => { dock.style.height = px + 'px'; setBodyPad(px + 12); try{ localStorage.setItem(DOCK_HEIGHT_KEY, String(px)); }catch(e){} };
+    const getExecBarPad = () => {
+      try {
+        const raw = getComputedStyle(document.documentElement).getPropertyValue('--coretg-execbar-height');
+        const v = parseInt((raw || '').toString().trim().replace('px',''), 10);
+        return Number.isFinite(v) ? v : 0;
+      } catch (e) {
+        return 0;
+      }
+    };
+    const setBodyPad = (px) => {
+      const extra = getExecBarPad();
+      document.body.style.paddingBottom = Math.max(px + extra, 0) + 'px';
+    };
+    const setDockCssHeight = (px) => {
+      try { document.documentElement.style.setProperty('--coretg-dock-height', Math.max(px, 0) + 'px'); } catch (e) {}
+    };
+    const applyHeight = (px) => {
+      dock.style.height = px + 'px';
+      setDockCssHeight(px);
+      setBodyPad(px + 12);
+      try{ localStorage.setItem(DOCK_HEIGHT_KEY, String(px)); }catch(e){}
+    };
     const savedH = parseInt(localStorage.getItem(DOCK_HEIGHT_KEY) || '0', 10); const initialH = (savedH > 100 ? savedH : (dock.offsetHeight||300)); applyHeight(initialH);
     let resizing=false, startY=0, startH=initialH;
     const onMove = (e) => { if(!resizing) return; const y = (e.touches? e.touches[0].clientY : e.clientY); const dy = startY - y; const nh = Math.min(Math.max(startH + dy, 120), window.innerHeight - 80); applyHeight(nh); };
     const onUp = () => { resizing=false; document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); document.removeEventListener('touchmove', onMove); document.removeEventListener('touchend', onUp); };
     grip.addEventListener('mousedown', (e)=>{resizing=true; startY=e.clientY; startH=dock.offsetHeight; document.addEventListener('mousemove', onMove); document.addEventListener('mouseup', onUp);});
     grip.addEventListener('touchstart', (e)=>{resizing=true; startY=e.touches[0].clientY; startH=dock.offsetHeight; document.addEventListener('touchmove', onMove); document.addEventListener('touchend', onUp);}, {passive:true});
-  const applyHidden = (hidden) => { if(hidden){ dock.classList.add('d-none'); showBtn.classList.remove('d-none'); setBodyPad(12);} else { dock.classList.remove('d-none'); showBtn.classList.add('d-none'); applyHeight(parseInt(localStorage.getItem(DOCK_HEIGHT_KEY) || String(initialH), 10)); if(followLogs){ if(typeof requestAnimationFrame === 'function'){ requestAnimationFrame(renderLogs); } else { renderLogs(); } } } try{ localStorage.setItem(DOCK_HIDDEN_KEY, hidden?'1':'0'); }catch(e){} };
+  const applyHidden = (hidden) => {
+    if(hidden){
+      dock.classList.add('d-none');
+      showBtn.classList.remove('d-none');
+      setDockCssHeight(0);
+      setBodyPad(12);
+    } else {
+      dock.classList.remove('d-none');
+      showBtn.classList.add('d-none');
+      applyHeight(parseInt(localStorage.getItem(DOCK_HEIGHT_KEY) || String(initialH), 10));
+      if(followLogs){ if(typeof requestAnimationFrame === 'function'){ requestAnimationFrame(renderLogs); } else { renderLogs(); } }
+    }
+    try{ localStorage.setItem(DOCK_HIDDEN_KEY, hidden?'1':'0'); }catch(e){}
+  };
     const savedHidden = localStorage.getItem(DOCK_HIDDEN_KEY); applyHidden(savedHidden ? savedHidden==='1' : true);
     hideBtn.addEventListener('click', () => applyHidden(true)); showBtn.addEventListener('click', () => applyHidden(false));
     // Tab persistence
@@ -167,7 +251,17 @@
     document.getElementById('logFilterInput')?.addEventListener('input', (ev)=>{ filterText = ev.target.value.trim(); try{ localStorage.setItem(LOG_FILTER_TEXT_KEY, filterText);}catch(_e){} compileFilter(); renderLogs(); });
     document.getElementById('logFilterRegex')?.addEventListener('change', (ev)=>{ filterIsRegex = !!ev.target.checked; try{ localStorage.setItem(LOG_FILTER_REGEX_KEY, filterIsRegex?'1':'0');}catch(_e){} compileFilter(); renderLogs(); });
     document.getElementById('logFilterClearBtn')?.addEventListener('click', ()=>{ filterText=''; filterIsRegex=false; const inp=document.getElementById('logFilterInput'); if(inp) inp.value=''; const cb=document.getElementById('logFilterRegex'); if(cb) cb.checked=false; try{ localStorage.removeItem(LOG_FILTER_TEXT_KEY); localStorage.removeItem(LOG_FILTER_REGEX_KEY);}catch(_e){} compileFilter(); renderLogs(); });
+
   }
   if(document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+
+  // Auto-attach to an active run stream on pages that don't already manage streaming.
+  try {
+    const rid = localStorage.getItem(ACTIVE_RUN_ID_KEY);
+    const pageAlreadyStreams = (typeof window.startLogStream === 'function') || (typeof window.runProgressLogLine === 'function');
+    if(rid && !pageAlreadyStreams){
+      attachRunStream(rid, { auto: true });
+    }
+  } catch(e) {}
 })();
 </script>

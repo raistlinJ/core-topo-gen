@@ -1,0 +1,13 @@
+ctf:
+  id: example-ctf
+  version: "1.0"
+  difficulty: medium
+  description: Base schema for a DAG-based CTF
+
+artifacts:
+  types:
+    network.ip: {}
+    filesystem.file: {}
+    credential.pair: {}
+
+challenges: []

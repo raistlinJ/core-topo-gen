@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import sys
 import re
 import shutil
@@ -29,8 +30,12 @@ import fnmatch
 import copy
 from urllib.parse import urlparse, parse_qs
 
+from collections import deque
+
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Iterator, TextIO, Iterable
+
+from core_topo_gen.utils.flow_seed import flow_generator_seed as _flow_generator_seed_impl
 
 try:
     import psutil  # type: ignore
@@ -183,6 +188,34 @@ _SESSION_HITL_CACHE: Dict[str, Dict[str, Any]] = {}
 _REPO_PUSH_PROGRESS: Dict[str, Dict[str, Any]] = {}
 _REPO_PUSH_PROGRESS_LOCK = threading.Lock()
 _REPO_PUSH_PROGRESS_TTL_SECONDS = 600.0
+
+# Best-effort cancellation context for long-running remote repo finalize.
+# Stored in-memory only; entries are removed when finalize completes/errors/cancels.
+_REPO_PUSH_CANCEL_CTX: Dict[str, Dict[str, Any]] = {}
+_REPO_PUSH_CANCEL_CTX_LOCK = threading.Lock()
+
+
+def _set_repo_push_cancel_ctx(progress_id: Optional[str], ctx: Dict[str, Any]) -> None:
+    if not progress_id:
+        return
+    with _REPO_PUSH_CANCEL_CTX_LOCK:
+        _REPO_PUSH_CANCEL_CTX[progress_id] = dict(ctx or {})
+
+
+def _get_repo_push_cancel_ctx(progress_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not progress_id:
+        return None
+    with _REPO_PUSH_CANCEL_CTX_LOCK:
+        payload = _REPO_PUSH_CANCEL_CTX.get(progress_id)
+        return dict(payload) if isinstance(payload, dict) else None
+
+
+def _pop_repo_push_cancel_ctx(progress_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not progress_id:
+        return None
+    with _REPO_PUSH_CANCEL_CTX_LOCK:
+        payload = _REPO_PUSH_CANCEL_CTX.pop(progress_id, None)
+        return dict(payload) if isinstance(payload, dict) else None
 
 
 def _schedule_repo_push_to_remote(progress_id: str, core_cfg: Dict[str, Any], *, logger: Optional[logging.Logger] = None) -> None:
@@ -616,7 +649,8 @@ def _exec_ssh_command(
     client: Any,
     command: str,
     *,
-    timeout: float = 120.0,
+    timeout: float | None = 120.0,
+    cancel_check: Any = None,
     check: bool = False,
 ) -> tuple[int, str, str]:
     """Execute a command over SSH and capture stdout/stderr.
@@ -645,6 +679,19 @@ def _exec_ssh_command(
             if channel is None:
                 break
             try:
+                if cancel_check is not None and bool(cancel_check()):
+                    try:
+                        if not channel.closed:
+                            channel.close()
+                    except Exception:
+                        pass
+                    raise TimeoutError('SSH command cancelled')
+            except TimeoutError:
+                raise
+            except Exception:
+                # Never allow cancel_check bugs to wedge execution.
+                pass
+            try:
                 if channel.recv_ready():
                     stdout_chunks.append(channel.recv(REMOTE_LOG_CHUNK_SIZE))
                 if channel.recv_stderr_ready():
@@ -661,13 +708,14 @@ def _exec_ssh_command(
             except Exception:
                 break
 
-            if (time.time() - start) >= max(0.1, float(timeout)):
-                try:
-                    if channel is not None and not channel.closed:
-                        channel.close()
-                except Exception:
-                    pass
-                raise TimeoutError(f'SSH command timed out after {timeout:.0f}s')
+            if timeout is not None:
+                if (time.time() - start) >= max(0.1, float(timeout)):
+                    try:
+                        if channel is not None and not channel.closed:
+                            channel.close()
+                    except Exception:
+                        pass
+                    raise TimeoutError(f'SSH command timed out after {timeout:.0f}s')
 
             time.sleep(0.15)
     finally:
@@ -704,6 +752,17 @@ def _exec_ssh_command(
         raise RuntimeError(f'SSH command failed: {detail}')
 
     return exit_code, stdout_text, stderr_text
+
+
+def _is_repo_push_cancel_requested(progress_id: Optional[str]) -> bool:
+    if not progress_id:
+        return False
+    payload = _get_repo_push_progress(progress_id)
+    if not payload:
+        return False
+    if payload.get('status') == 'cancelled':
+        return True
+    return bool(payload.get('cancel_requested'))
 
 
 def _open_ssh_client(core_cfg: Dict[str, Any]) -> Any:
@@ -846,7 +905,7 @@ def _push_repo_to_remote(
             f"rm -f {shlex.quote(remote_archive)}"
         )
         _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=60.0, detail='Extracting snapshot on CORE host…')
-        _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=600.0, check=True)
+        _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=None, check=True)
         _update_repo_push_progress(progress_id, status='finalizing', stage='remote', percent=95.0, detail='Cleaning temporary archive…')
         log.info('[remote-sync] Repository uploaded to %s', remote_repo)
         _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository ready on remote host.')
@@ -888,7 +947,7 @@ def _schedule_remote_repo_finalize(
         try:
             client = _open_ssh_client(core_cfg)
             try:
-                _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=600.0, check=True)
+                _exec_ssh_command(client, f"bash -lc {shlex.quote(extract_script)}", timeout=None, check=True)
             finally:
                 client.close()
         except Exception:
@@ -897,24 +956,107 @@ def _schedule_remote_repo_finalize(
 
     def _worker() -> None:
         client: Any | None = None
+        pidfile: Optional[str] = None
         try:
+            if _is_repo_push_cancel_requested(progress_id):
+                _update_repo_push_progress(progress_id, status='cancelled', stage='cancelled', detail='Cancelled by user.')
+                return
             _update_repo_push_progress(progress_id, status='finalizing', stage='cleanup', percent=55.0, detail='Removing previous repository…')
             client = _open_ssh_client(core_cfg)
-            _exec_ssh_command(client, f"mkdir -p {shlex.quote(remote_parent)}", timeout=180.0, check=True)
-            _exec_ssh_command(client, f"rm -rf {shlex.quote(remote_repo)}", timeout=240.0, check=True)
-            _update_repo_push_progress(progress_id, status='finalizing', stage='extract', percent=75.0, detail='Extracting new snapshot on CORE host…')
+
+            # Track the remote tar PID so a cancel request can kill it.
+            try:
+                pidfile = _remote_path_join(
+                    posixpath.dirname(remote_archive.rstrip('/')) or remote_parent or '/',
+                    f"coretg_finalize_{progress_id}.pid" if progress_id else f"coretg_finalize_{uuid.uuid4().hex}.pid",
+                )
+            except Exception:
+                pidfile = _remote_path_join(remote_parent, f"coretg_finalize_{uuid.uuid4().hex}.pid")
+
+            try:
+                _set_repo_push_cancel_ctx(
+                    progress_id,
+                    {
+                        'core_cfg': dict(core_cfg),
+                        'remote_pidfile': pidfile,
+                        'remote_archive': remote_archive,
+                        'remote_parent': remote_parent,
+                        'remote_repo': remote_repo,
+                    },
+                )
+            except Exception:
+                pass
+
             _exec_ssh_command(
                 client,
-                f"tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(remote_parent)}",
-                timeout=900.0,
+                f"mkdir -p {shlex.quote(remote_parent)}",
+                timeout=None,
+                cancel_check=lambda: _is_repo_push_cancel_requested(progress_id),
+                check=True,
+            )
+            _exec_ssh_command(
+                client,
+                f"rm -rf {shlex.quote(remote_repo)}",
+                timeout=None,
+                cancel_check=lambda: _is_repo_push_cancel_requested(progress_id),
+                check=True,
+            )
+            _update_repo_push_progress(progress_id, status='finalizing', stage='extract', percent=75.0, detail='Extracting new snapshot on CORE host…')
+
+            # Run tar under a tracked pidfile.
+            tar_script = (
+                "set -e; "
+                f"pidfile={shlex.quote(pidfile or '')}; "
+                "rm -f -- \"$pidfile\" 2>/dev/null || true; "
+                f"( tar -xzf {shlex.quote(remote_archive)} -C {shlex.quote(remote_parent)} ) & "
+                "pid=$!; "
+                "echo \"$pid\" > \"$pidfile\"; "
+                "wait \"$pid\"; "
+                "rc=$?; "
+                "rm -f -- \"$pidfile\" 2>/dev/null || true; "
+                "exit \"$rc\""
+            )
+            _exec_ssh_command(
+                client,
+                f"sh -lc {shlex.quote(tar_script)}",
+                timeout=None,
+                cancel_check=lambda: _is_repo_push_cancel_requested(progress_id),
                 check=True,
             )
             _update_repo_push_progress(progress_id, status='finalizing', stage='cleanup', percent=90.0, detail='Cleaning temporary archive…')
-            _exec_ssh_command(client, f"rm -f {shlex.quote(remote_archive)}", timeout=120.0, check=True)
+            _exec_ssh_command(
+                client,
+                f"rm -f {shlex.quote(remote_archive)}",
+                timeout=None,
+                cancel_check=lambda: _is_repo_push_cancel_requested(progress_id),
+                check=True,
+            )
             _update_repo_push_progress(progress_id, status='complete', stage='complete', percent=100.0, detail='Repository ready on remote host.')
             if logger:
                 logger.info('[remote-sync] Repository finalized at %s', remote_repo)
+        except TimeoutError as exc:
+            # Used both for true timeouts and cooperative cancel.
+            if 'cancelled' in str(exc).lower():
+                _update_repo_push_progress(progress_id, status='cancelled', stage='cancelled', detail='Cancelled by user.')
+                try:
+                    if client:
+                        _exec_ssh_command(client, f"rm -f {shlex.quote(remote_archive)}", timeout=30.0)
+                except Exception:
+                    pass
+                return
+            raise
         except Exception as exc:
+            try:
+                if _is_repo_push_cancel_requested(progress_id):
+                    _update_repo_push_progress(progress_id, status='cancelled', stage='cancelled', detail='Cancelled by user.')
+                    try:
+                        if client and pidfile:
+                            _exec_ssh_command(client, f"rm -f {shlex.quote(pidfile)}", timeout=10.0)
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
             if logger:
                 logger.exception('[remote-sync] finalize failed: %s', exc)
             _update_repo_push_progress(progress_id, status='error', stage='error', detail=str(exc))
@@ -924,6 +1066,10 @@ def _schedule_remote_repo_finalize(
             except Exception:
                 pass
         finally:
+            try:
+                _pop_repo_push_cancel_ctx(progress_id)
+            except Exception:
+                pass
             if client:
                 try:
                     client.close()
@@ -936,6 +1082,160 @@ def _schedule_remote_repo_finalize(
         _update_repo_push_progress(progress_id, status='error', stage='error', detail='Failed to schedule remote finalization')
 
 
+def _iter_values_by_key(obj: Any, keys: set[str]) -> Iterator[Any]:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in keys:
+                yield v
+            yield from _iter_values_by_key(v, keys)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _iter_values_by_key(item, keys)
+
+
+def _extract_flow_artifact_dirs_from_plan(preview_plan_path: str, *, prefer_mount_dir: bool = False) -> List[str]:
+    """Extract local artifact directories referenced by the plan.
+
+    By default we look for `artifacts_dir` keys.
+    When `prefer_mount_dir` is True, we first look for `mount_dir` keys (typically
+    pointing at a filtered `.../injected` directory). If none are found, we
+    fall back to `artifacts_dir` to preserve backwards compatibility.
+    """
+    try:
+        with open(preview_plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+    except Exception:
+        return []
+
+    full = payload.get('full_preview') if isinstance(payload, dict) else None
+    root = full if isinstance(full, dict) else payload
+
+    dirs: List[str] = []
+    if prefer_mount_dir:
+        for v in _iter_values_by_key(root, {'mount_dir'}):
+            if isinstance(v, str) and v:
+                dirs.append(v)
+        if not dirs:
+            for v in _iter_values_by_key(root, {'artifacts_dir'}):
+                if isinstance(v, str) and v:
+                    dirs.append(v)
+    else:
+        for v in _iter_values_by_key(root, {'artifacts_dir'}):
+            if isinstance(v, str) and v:
+                dirs.append(v)
+
+    seen: set[str] = set()
+    out: List[str] = []
+    for d in dirs:
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def _upload_flow_artifacts_for_plan_to_remote(
+    *,
+    client: Any,
+    sftp: Any,
+    preview_plan_path: str,
+    log_handle: Any,
+    upload_only_injected_artifacts: bool = False,
+) -> None:
+    """Upload any locally-generated flow artifacts to the CORE VM.
+
+    The preview plan references absolute paths (typically under /tmp/vulns/...).
+    When running the CLI on a remote CORE VM, those directories must exist on
+    the remote filesystem or bind mounts / docker cp will see nothing.
+    """
+    artifact_dirs = _extract_flow_artifact_dirs_from_plan(
+        preview_plan_path,
+        prefer_mount_dir=bool(upload_only_injected_artifacts),
+    )
+    if not artifact_dirs:
+        try:
+            log_handle.write('[remote] No flow artifact dirs referenced in preview plan\n')
+        except Exception:
+            pass
+        return
+
+    try:
+        if upload_only_injected_artifacts:
+            log_handle.write('[remote] Flow artifacts upload mode: mount_dir only (prefer injected)\n')
+    except Exception:
+        pass
+
+    allowed_prefixes = ('/tmp/vulns',)
+    upload_dirs = [d for d in artifact_dirs if any(d == p or d.startswith(p + '/') for p in allowed_prefixes)]
+    skipped = [d for d in artifact_dirs if d not in upload_dirs]
+    if skipped:
+        try:
+            log_handle.write(f"[remote] Skipping {len(skipped)} artifact dirs (outside /tmp/vulns)\n")
+        except Exception:
+            pass
+    if not upload_dirs:
+        return
+
+    made_dirs: set[str] = set()
+    copied_files = 0
+    copied_bytes = 0
+    for local_dir in upload_dirs:
+        if not os.path.isdir(local_dir):
+            try:
+                log_handle.write(f"[remote] flow.artifacts.upload skip (missing): {local_dir}\n")
+            except Exception:
+                pass
+            continue
+
+        for root, dirs, files in os.walk(local_dir):
+            rel = os.path.relpath(root, local_dir)
+            rel = '' if rel == '.' else rel
+            remote_root = local_dir if not rel else _remote_path_join(local_dir, rel)
+            if remote_root not in made_dirs:
+                try:
+                    _remote_mkdirs(client, remote_root)
+                    made_dirs.add(remote_root)
+                except Exception:
+                    pass
+
+            for dn in dirs:
+                rp_dir = _remote_path_join(remote_root, dn)
+                if rp_dir in made_dirs:
+                    continue
+                try:
+                    _remote_mkdirs(client, rp_dir)
+                    made_dirs.add(rp_dir)
+                except Exception:
+                    pass
+
+            for fn in files:
+                lp = os.path.join(root, fn)
+                if not os.path.isfile(lp):
+                    continue
+                rp = _remote_path_join(remote_root, fn)
+                try:
+                    sftp.put(lp, rp)
+                    copied_files += 1
+                    try:
+                        copied_bytes += int(os.path.getsize(lp))
+                    except Exception:
+                        pass
+                except Exception:
+                    try:
+                        log_handle.write(f"[remote] flow.artifacts.upload failed: {lp} -> {rp}\n")
+                    except Exception:
+                        pass
+
+        try:
+            log_handle.write(f"[remote] flow.artifacts.uploaded dir={local_dir}\n")
+        except Exception:
+            pass
+
+    try:
+        log_handle.write(f"[remote] flow.artifacts.upload complete files={copied_files} bytes={copied_bytes}\n")
+    except Exception:
+        pass
+
+
 def _prepare_remote_cli_context(
     *,
     client: Any,
@@ -943,6 +1243,7 @@ def _prepare_remote_cli_context(
     xml_path: str,
     preview_plan_path: str | None,
     log_handle: Any,
+    upload_only_injected_artifacts: bool = False,
 ) -> Dict[str, Any]:
     """Upload required artifacts before starting the remote CLI."""
 
@@ -976,6 +1277,15 @@ def _prepare_remote_cli_context(
         if preview_plan_path:
             remote_preview_plan = _remote_path_join(run_dir, os.path.basename(preview_plan_path))
             sftp.put(preview_plan_path, remote_preview_plan)
+            # If the preview/flow plan references local /tmp/vulns artifact directories,
+            # upload them to the CORE VM so the remote run can use them.
+            _upload_flow_artifacts_for_plan_to_remote(
+                client=client,
+                sftp=sftp,
+                preview_plan_path=preview_plan_path,
+                log_handle=log_handle,
+                upload_only_injected_artifacts=bool(upload_only_injected_artifacts),
+            )
         context = {
             'base_dir': base_dir,
             'run_dir': run_dir,
@@ -3048,6 +3358,7 @@ def _run_core_connection_advanced_checks(
     adv_run_core_cleanup: bool = False,
     adv_check_core_version: bool = False,
     adv_restart_core_daemon: bool = False,
+    adv_start_core_daemon: bool = False,
     adv_auto_kill_sessions: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """Run optional advanced checks against the CORE VM.
@@ -3078,6 +3389,7 @@ def _run_core_connection_advanced_checks(
             adv_run_core_cleanup,
             adv_check_core_version,
             adv_restart_core_daemon,
+            adv_start_core_daemon,
             adv_auto_kill_sessions,
         )
     )
@@ -3087,6 +3399,7 @@ def _run_core_connection_advanced_checks(
         _set('adv_fix_docker_daemon', enabled=False, ok=None, message='')
         _set('adv_run_core_cleanup', enabled=False, ok=None, message='')
         _set('adv_restart_core_daemon', enabled=False, ok=None, message='')
+        _set('adv_start_core_daemon', enabled=False, ok=None, message='')
         _set('adv_auto_kill_sessions', enabled=False, ok=None, message='')
         return results
 
@@ -3099,6 +3412,7 @@ def _run_core_connection_advanced_checks(
             ('adv_fix_docker_daemon', adv_fix_docker_daemon),
             ('adv_run_core_cleanup', adv_run_core_cleanup),
             ('adv_restart_core_daemon', adv_restart_core_daemon),
+            ('adv_start_core_daemon', adv_start_core_daemon),
             ('adv_auto_kill_sessions', adv_auto_kill_sessions),
         ):
             if enabled:
@@ -3294,6 +3608,27 @@ def _run_core_connection_advanced_checks(
                 raise RuntimeError('Restart core-daemon failed: sudo requires a password (none provided).')
             raise RuntimeError('Restart core-daemon failed')
 
+    def _maybe_start_core_daemon(client: Any) -> str:
+        """Try starting core-daemon if not running. Returns status message."""
+        # First check if daemon is running
+        exit_code, out, _err = _sudo_exec(client, 'systemctl is-active core-daemon', timeout=15.0)
+        if exit_code == 0 and (out or '').strip().lower() == 'active':
+            return 'already running'
+        
+        # Try to start it
+        exit_code, _out, err = _sudo_exec(client, 'systemctl start core-daemon', timeout=35.0)
+        if exit_code != 0:
+            err_lower = (err or '').lower()
+            if (not cfg.get('ssh_password')) and ('password' in err_lower or 'sudo' in err_lower):
+                raise RuntimeError('Start core-daemon failed: sudo requires a password (none provided).')
+            raise RuntimeError(f'Start core-daemon failed: {err or "unknown error"}')
+        
+        # Verify it started
+        exit_code, out, _err = _sudo_exec(client, 'systemctl is-active core-daemon', timeout=15.0)
+        if exit_code == 0 and (out or '').strip().lower() == 'active':
+            return 'started successfully'
+        return 'start attempted, status unclear'
+
     def _maybe_kill_active_sessions() -> tuple[list[int], list[str]]:
         deleted: list[int] = []
         errors: list[str] = []
@@ -3383,6 +3718,15 @@ def _run_core_connection_advanced_checks(
                 _set('adv_restart_core_daemon', enabled=True, ok=False, message=str(exc))
         else:
             _set('adv_restart_core_daemon', enabled=False, ok=None, message='')
+
+        if adv_start_core_daemon:
+            try:
+                status_msg = _maybe_start_core_daemon(client)
+                _set('adv_start_core_daemon', enabled=True, ok=True, message=status_msg)
+            except Exception as exc:
+                _set('adv_start_core_daemon', enabled=True, ok=False, message=str(exc))
+        else:
+            _set('adv_start_core_daemon', enabled=False, ok=None, message='')
 
     finally:
         try:
@@ -3636,9 +3980,17 @@ def _enrich_hitl_interfaces_with_ips(hitl_cfg: Dict[str, Any]) -> None:
             iface['rj45_ip4'] = ip_info.get('rj45_ip4')
             ipv4_current = iface.get('ipv4') if isinstance(iface.get('ipv4'), list) else []
             rj45_ip = iface.get('rj45_ip4')
+            # Keep any user-provided (real) interface IPs first; append predicted RJ45 IP as a fallback.
+            # This makes downstream "first valid ipv4" selection match what users typically expect
+            # (their actual interface IP), while still retaining the predicted link IP.
             if rj45_ip:
-                ordered = [rj45_ip] + [ip for ip in ipv4_current if ip != rj45_ip]
-                iface['ipv4'] = ordered
+                if not ipv4_current:
+                    iface['ipv4'] = [rj45_ip]
+                else:
+                    if rj45_ip not in ipv4_current:
+                        iface['ipv4'] = list(ipv4_current) + [rj45_ip]
+                    else:
+                        iface['ipv4'] = ipv4_current
         if attachment != 'new_router':
             continue
         if not ip_info:
@@ -4529,6 +4881,43 @@ def _reports_dir() -> str:
     return d
 
 
+def _try_resolve_latest_outputs_xml(xml_path: str) -> Optional[str]:
+    """Best-effort recovery for stale saved XML paths.
+
+    The web UI stores `result_path` pointing to an XML under `outputs/scenarios-<ts>/...`.
+    Those folders can be deleted or moved (e.g., scenario deletion/purge), leaving a stale
+    path in localStorage. When that happens, try to find the newest file with the same
+    basename under `outputs/scenarios-*`.
+
+    Returns an absolute path if found, else None.
+    """
+    try:
+        if not xml_path:
+            return None
+        abs_path = os.path.abspath(xml_path)
+        if os.path.exists(abs_path):
+            return abs_path
+        base = os.path.basename(abs_path)
+        if not base.lower().endswith('.xml'):
+            return None
+        outputs_dir = os.path.abspath(_outputs_dir())
+        import glob
+        candidates = glob.glob(os.path.join(outputs_dir, 'scenarios-*', base))
+        candidates = [p for p in candidates if p and os.path.exists(p)]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        best = os.path.abspath(candidates[0])
+        try:
+            if os.path.commonpath([best, outputs_dir]) != outputs_dir:
+                return None
+        except Exception:
+            return None
+        return best
+    except Exception:
+        return None
+
+
 def _derive_default_seed(xml_hash: str) -> int:
     try:
         seed_val = int(xml_hash[:12], 16)
@@ -4538,6 +4927,22 @@ def _derive_default_seed(xml_hash: str) -> int:
         return seed_val
     except Exception:
         return 1357911
+
+
+def _derive_seed_for_scenario(xml_hash: str, scenario: str | None) -> int:
+    """Derive a stable seed for a given scenario based on the XML hash.
+
+    This is used for UI hints (e.g., sidebar) when no explicit seed was provided.
+    It should be stable across refreshes and different clients.
+    """
+    scen = (scenario or '').strip()
+    if not scen:
+        return _derive_default_seed(xml_hash)
+    try:
+        digest = hashlib.sha256(f"{xml_hash}|{scen}".encode('utf-8', errors='ignore')).hexdigest()
+        return _derive_default_seed(digest)
+    except Exception:
+        return _derive_default_seed(xml_hash)
 
 # Additional helper dirs (stubs restored after accidental removal)
 def _traffic_dir() -> str:
@@ -5734,21 +6139,31 @@ def _inject_nav_participant_link() -> dict:
             return {
                 'nav_participant_url': url_value or '',
                 'nav_participant_scenario': scenario_label or '',
+                'nav_participant_enabled': bool(url_value),
             }
 
         # If the page is not scoped to a scenario (no `?scenario=`), avoid "guessing" a participant URL
         # for admin/builder views. Otherwise CORE/Reports can show Participant UI for an unrelated scenario.
         view_mode = getattr(g, 'ui_view_mode', _UI_VIEW_DEFAULT)
         if view_mode != 'participant':
-            return {'nav_participant_url': '', 'nav_participant_scenario': ''}
+            user = _current_user()
+            scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(None, user=user)
+            mapping = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
+            any_enabled = any(bool(v) for v in (mapping or {}).values())
+            return {
+                'nav_participant_url': '',
+                'nav_participant_scenario': '',
+                'nav_participant_enabled': bool(any_enabled),
+            }
 
         url_value, scenario_label = _resolve_participant_ui_target()
         return {
             'nav_participant_url': url_value,
             'nav_participant_scenario': scenario_label,
+            'nav_participant_enabled': bool(url_value),
         }
     except Exception:
-        return {'nav_participant_url': '', 'nav_participant_scenario': ''}
+        return {'nav_participant_url': '', 'nav_participant_scenario': '', 'nav_participant_enabled': False}
 
 
 @app.context_processor
@@ -6480,6 +6895,23 @@ def _live_core_session_status_for_scenario(
     # If there are active sessions but none match the selected scenario, prefer
     # Unknown (None) over incorrectly marking the selected scenario as Running.
     if active_sessions:
+        # Conservative fallback: if there is exactly one scenario in scope and
+        # there are active CORE sessions, treat the first active session as the
+        # selected scenario's session. This avoids reporting Unknown in fresh
+        # runs where session->scenario linkage isn't available yet.
+        try:
+            if isinstance(scenario_names, list) and len(scenario_names) == 1:
+                only_norm = _normalize_scenario_label(scenario_names[0])
+                if only_norm and only_norm == scenario_norm:
+                    first = active_sessions[0] if active_sessions else None
+                    if isinstance(first, dict):
+                        return {
+                            'running': True,
+                            'session_id': _session_id_int(first),
+                            'state': str(first.get('state') or '').strip().lower(),
+                        }
+        except Exception:
+            pass
         return {
             'running': None,
             'session_id': None,
@@ -6567,21 +6999,22 @@ def participant_ui_details_api():
     vulnerability_ips = _vulnerability_ipv4s_from_session_xml(session_xml_path) if session_xml_exists else []
 
     # Vulnerabilities count:
-    # - Prefer actual session XML-derived value when available.
-    # - Otherwise fall back to planned counts from the summary metadata.
+    # - Prefer actual session XML-derived value when we can parse a real file.
+    # - Otherwise fall back to the planned additive count from the summary.
     vuln_total: Optional[int] = None
-    if session_xml_exists:
+    xml_exists = False
+    try:
+        xml_exists = bool(session_xml_path and os.path.exists(str(session_xml_path)))
+    except Exception:
+        xml_exists = False
+    if xml_exists:
         vuln_total = len(vulnerability_ips)
     else:
-        planned = None
-        if isinstance(summary_meta, dict):
-            planned = summary_meta.get('vuln_total_planned_additive')
-            if planned is None:
-                planned = summary_meta.get('vuln_total_planned')
+        planned = summary_meta.get('vuln_total_planned_additive') if isinstance(summary_meta, dict) else None
         try:
-            vuln_total = int(planned) if planned is not None else 0
+            vuln_total = int(planned) if planned is not None else None
         except Exception:
-            vuln_total = 0
+            vuln_total = None
 
     # Gateway: prefer the scenario's last session XML (matches core.html HITL gateway logic)
     gateway = ''
@@ -6733,16 +7166,28 @@ def _core_xml_device_summaries(xml_path: str) -> list[dict[str, str]]:
                     type_val = str(type_el.text).strip()
             except Exception:
                 type_val = ''
+
+        try:
+            compose_val = str(dev.get('compose') or '').strip()
+        except Exception:
+            compose_val = ''
+        try:
+            compose_name_val = str(dev.get('compose_name') or '').strip()
+        except Exception:
+            compose_name_val = ''
+
         out.append({
             'id': did,
             'name': name_val or did,
             'type': type_val or '',
+            'compose': compose_val,
+            'compose_name': compose_name_val,
         })
     return out
 
 
 def _core_xml_network_summaries(xml_path: str) -> list[dict[str, str]]:
-    """Return a best-effort list of CORE network objects as {id,name,type} from CORE XML."""
+    """Return a best-effort list of {id,name,type} networks from CORE XML."""
     try:
         root = LET.parse(xml_path).getroot()
     except Exception:
@@ -6757,36 +7202,44 @@ def _core_xml_network_summaries(xml_path: str) -> list[dict[str, str]]:
 
     out: list[dict[str, str]] = []
     seen: set[str] = set()
-    for el in list(root.iter()):
+    for net in list(root.iter()):
         try:
-            lname = _local(getattr(el, 'tag', '')).lower()
+            lname = _local(getattr(net, 'tag', '')).lower()
         except Exception:
             lname = ''
         if lname != 'network':
             continue
-        nid = (el.get('id') or el.get('name') or '').strip()
+        nid = (net.get('id') or net.get('name') or '').strip()
         if not nid or nid in seen:
             continue
         seen.add(nid)
-        name_val = (el.get('name') or '').strip() or nid
-        type_val = (el.get('type') or '').strip()
+        name_val = (net.get('name') or '').strip()
+        if not name_val:
+            try:
+                name_el = net.find('./name')
+                if name_el is not None and getattr(name_el, 'text', None):
+                    name_val = str(name_el.text).strip()
+            except Exception:
+                name_val = ''
+        type_val = (net.get('type') or '').strip()
         if not type_val:
             try:
-                type_el = el.find('./type') or el.find('./model')
+                type_el = net.find('./type') or net.find('./model')
                 if type_el is not None and getattr(type_el, 'text', None):
                     type_val = str(type_el.text).strip()
             except Exception:
                 type_val = ''
-        out.append({'id': nid, 'name': name_val, 'type': type_val or ''})
+        out.append({'id': nid, 'name': name_val or nid, 'type': type_val or ''})
     return out
 
 
-def _core_xml_link_summaries(xml_path: str, id_to_name: dict[str, str] | None = None) -> list[dict[str, str]]:
-    """Return a best-effort list of link endpoints from CORE XML.
+def _core_xml_link_summaries(xml_path: str, *, id_to_name: dict[str, str] | None = None) -> list[dict[str, str]]:
+    """Return best-effort link endpoints from CORE XML.
 
-    Important: CORE often represents host↔LAN connections as node↔network links.
-    This helper keeps those endpoints rather than filtering to only device IDs.
+    Expected CORE session shape:
+      <links><link node1="1" node2="51">...</link></links>
     """
+    id_to_name = id_to_name or {}
     try:
         root = LET.parse(xml_path).getroot()
     except Exception:
@@ -6799,52 +7252,35 @@ def _core_xml_link_summaries(xml_path: str, id_to_name: dict[str, str] | None = 
             return tag.split('}', 1)[1]
         return tag
 
-    def _norm(value: Any) -> str:
-        return str(value).strip() if value is not None else ''
-
-    name_map = id_to_name or {}
     out: list[dict[str, str]] = []
     seen_pairs: set[tuple[str, str]] = set()
-
-    for link in list(root.iter()):
+    for el in list(root.iter()):
         try:
-            lname = _local(getattr(link, 'tag', '')).lower()
+            lname = _local(getattr(el, 'tag', '')).lower()
         except Exception:
             lname = ''
         if lname != 'link':
             continue
-
-        n1 = _norm(getattr(link, 'get', lambda *_: None)('node1') or getattr(link, 'get', lambda *_: None)('node1_id'))
-        n2 = _norm(getattr(link, 'get', lambda *_: None)('node2') or getattr(link, 'get', lambda *_: None)('node2_id'))
-        if not n1 or not n2:
-            try:
-                if not n1 and hasattr(link, 'find'):
-                    iface1 = link.find('.//iface1') or link.find('.//interface1')
-                    if iface1 is not None:
-                        n1 = _norm(iface1.get('node') or iface1.get('device') or iface1.get('node_id'))
-                if not n2 and hasattr(link, 'find'):
-                    iface2 = link.find('.//iface2') or link.find('.//interface2')
-                    if iface2 is not None:
-                        n2 = _norm(iface2.get('node') or iface2.get('device') or iface2.get('node_id'))
-            except Exception:
-                pass
-        if not n1 or not n2 or n1 == n2:
+        a = str(el.get('node1') or '').strip()
+        b = str(el.get('node2') or '').strip()
+        if not a or not b or a == b:
             continue
-        ordered = tuple(sorted((n1, n2)))
+        ordered = tuple(sorted((a, b)))
         if ordered in seen_pairs:
             continue
         seen_pairs.add(ordered)
         out.append({
             'node1': ordered[0],
             'node2': ordered[1],
-            'node1_name': str(name_map.get(ordered[0], ordered[0])),
-            'node2_name': str(name_map.get(ordered[1], ordered[1])),
+            'node1_name': id_to_name.get(ordered[0]) or ordered[0],
+            'node2_name': id_to_name.get(ordered[1]) or ordered[1],
         })
     return out
 
 
 @app.route('/participant-ui/topology')
 def participant_ui_topology_api():
+    """Return a graph-friendly topology summary for the Participant UI."""
     state = _participant_ui_state()
     scenario_norm = _normalize_scenario_label(request.args.get('scenario') or '')
     if not scenario_norm:
@@ -6853,302 +7289,70 @@ def participant_ui_topology_api():
     # Enforce assignment-based access for restricted users.
     try:
         if state.get('restrict_to_assigned'):
-            allowed_norms = {row.get('norm') for row in (state.get('listing') or []) if isinstance(row, dict) and row.get('norm')}
+            allowed_norms = {
+                row.get('norm')
+                for row in (state.get('listing') or [])
+                if isinstance(row, dict) and row.get('norm')
+            }
             if scenario_norm and scenario_norm not in allowed_norms:
                 return jsonify({'ok': False, 'error': 'Scenario not assigned.'}), 403
     except Exception:
         pass
 
-    # Resolve latest session XML.
+    flow_meta: dict[str, Any] | None = None
     try:
-        history = _load_run_history()
-        last_run = _latest_run_history_for_scenario(scenario_norm, history)
-    except Exception:
-        last_run = None
-    session_xml_path = None
-    if isinstance(last_run, dict):
-        session_xml_path = last_run.get('session_xml_path') or last_run.get('post_xml_path')
-
-    if not session_xml_path:
-        return jsonify({
-            'ok': True,
-            'scenario_norm': scenario_norm,
-            'status': 'No session XML available for this scenario yet.',
-            'nodes': [],
-            'links': [],
-            'subnets': [],
-            'vulnerability_ips': [],
-        })
-
-    try:
-        ap = os.path.abspath(str(session_xml_path))
-    except Exception:
-        ap = str(session_xml_path)
-
-    try:
-        app.logger.info("[participant-ui.topology] scenario=%s session_xml=%s", scenario_norm, ap)
-    except Exception:
-        pass
-    if not ap or not os.path.exists(ap):
-        return jsonify({
-            'ok': True,
-            'scenario_norm': scenario_norm,
-            'status': 'Session XML path missing on disk.',
-            'nodes': [],
-            'links': [],
-            'subnets': [],
-            'vulnerability_ips': [],
-        })
-
-    # Parse topology summary (used for enriched node details like services/interfaces).
-    try:
-        summary = _analyze_core_xml(ap)
-    except Exception:
-        summary = {}
-
-    raw_nodes = summary.get('nodes') if isinstance(summary, dict) else None
-    nodes_list: list[dict] = raw_nodes if isinstance(raw_nodes, list) else []
-
-    # IMPORTANT: do NOT use summary.links_detail here.
-    # The summary path intentionally filters/prunes to "important" nodes and can
-    # drop host↔LAN/switch edges, making it look like only routers are connected.
-    # Instead, extract raw links directly from the XML (including network nodes).
-    all_devices = _core_xml_device_summaries(ap)
-    all_networks = _core_xml_network_summaries(ap)
-    name_map: dict[str, str] = {}
-    type_map: dict[str, str] = {}
-    for row in (all_devices or []):
-        if not isinstance(row, dict):
-            continue
-        rid = str(row.get('id') or '').strip()
-        if not rid:
-            continue
-        name_map.setdefault(rid, str(row.get('name') or rid))
-        type_map.setdefault(rid, str(row.get('type') or ''))
-    for row in (all_networks or []):
-        if not isinstance(row, dict):
-            continue
-        rid = str(row.get('id') or '').strip()
-        if not rid:
-            continue
-        name_map.setdefault(rid, str(row.get('name') or rid))
-        type_map.setdefault(rid, str(row.get('type') or ''))
-    links_list: list[dict] = _core_xml_link_summaries(ap, id_to_name=name_map)
-
-    # Ensure we include *all* devices AND networks from the XML (even if filtered from summary).
-    by_id: dict[str, dict] = {}
-    for n in nodes_list:
-        if not isinstance(n, dict):
-            continue
-        nid = str(n.get('id') or '').strip()
-        if nid:
-            by_id[nid] = n
-    for dev in all_devices:
-        did = str(dev.get('id') or '').strip()
-        if not did or did in by_id:
-            continue
-        by_id[did] = {
-            'id': did,
-            'name': dev.get('name') or did,
-            'type': dev.get('type') or '',
-            'services': [],
-            'interfaces': [],
-            'linked_nodes': [],
-        }
-
-    # Add networks as graph nodes so node↔network links can be drawn.
-    for net in all_networks:
-        nid = str(net.get('id') or '').strip()
-        if not nid or nid in by_id:
-            continue
-        raw_type = str(net.get('type') or '').strip()
-        # Render network objects as "switch" by default to match graph styling.
-        type_hint = (raw_type or '').lower()
-        name_hint = str(net.get('name') or '').strip().lower()
-        is_hitl = False
-        # Preserve RJ45/HITL network objects so the graph can style them correctly.
-        # The Details page exposes these via summary.hitl_network_nodes.
-        try:
-            import re
-            name_looks_like_iface = bool(re.match(r'^(ens|enp|eth)\d', name_hint))
-        except Exception:
-            name_looks_like_iface = False
-
-        if name_looks_like_iface or 'rj45' in type_hint or 'rj-45' in type_hint or 'hitl' in type_hint or 'tap' in type_hint:
-            coerced_type = 'hitl'
-            is_hitl = True
-        elif 'wlan' in type_hint or 'wireless' in type_hint:
-            coerced_type = 'wlan'
+        if scenario_norm:
+            flow_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
         else:
-            coerced_type = 'switch'
-        by_id[nid] = {
-            'id': nid,
-            'name': net.get('name') or nid,
-            'type': coerced_type,
-            'services': [],
-            'interfaces': [],
-            'linked_nodes': [],
-            'is_hitl': bool(is_hitl),
+            flow_path = None
+        if flow_path:
+            with open(flow_path, 'r', encoding='utf-8') as f:
+                flow_payload = json.load(f) or {}
+            if isinstance(flow_payload, dict):
+                meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
+                fm = (meta or {}).get('flow') or flow_payload.get('flow')
+                if isinstance(fm, dict):
+                    flow_meta = fm
+    except Exception:
+        flow_meta = None
+
+    xml_path = None
+    try:
+        if scenario_norm:
+            xml_path = _latest_session_xml_for_scenario_norm(scenario_norm)
+    except Exception:
+        xml_path = None
+
+    if not xml_path or not os.path.exists(str(xml_path)):
+        out = {
+            'ok': True,
+            'scenario_norm': scenario_norm,
+            'status': 'No session XML found',
+            'nodes': [],
+            'links': [],
+            'subnets': [],
+            'vulnerability_ips': [],
         }
+        if isinstance(flow_meta, dict) and flow_meta:
+            out['flow'] = flow_meta
+        return jsonify(out)
 
-    # Vulnerability tagging: mark nodes whose ipv4 matches vulnerability IPs.
-    vuln_ips = _vulnerability_ipv4s_from_session_xml(ap)
-    vuln_set = {str(ip).strip() for ip in vuln_ips if ip}
+    nodes, links, _adj = _build_topology_graph_from_session_xml(str(xml_path))
+    subnets = _subnet_cidrs_from_session_xml(str(xml_path))
+    vuln_ips = _vulnerability_ipv4s_from_session_xml(str(xml_path))
 
-    # Subnet tagging.
-    subnets = _subnet_cidrs_from_session_xml(ap)
-
-    out_nodes: list[dict[str, Any]] = []
-    network_ids: set[str] = set()
-    try:
-        for net in (all_networks or []):
-            if isinstance(net, dict) and net.get('id'):
-                network_ids.add(str(net.get('id')).strip())
-    except Exception:
-        network_ids = set()
-    try:
-        import ipaddress
-    except Exception:
-        ipaddress = None
-
-    for nid, n in by_id.items():
-        name_val = str(n.get('name') or nid)
-        type_val = str(n.get('type') or '')
-        services_val = n.get('services') if isinstance(n.get('services'), list) else []
-        ifaces = n.get('interfaces') if isinstance(n.get('interfaces'), list) else []
-        ipv4s: list[str] = []
-        subnet_hits: set[str] = set()
-        for iface in ifaces:
-            if not isinstance(iface, dict):
-                continue
-            ip4 = (iface.get('ipv4') or '').strip() if isinstance(iface.get('ipv4'), str) else ''
-            mask = (iface.get('ipv4_mask') or '').strip() if isinstance(iface.get('ipv4_mask'), str) else ''
-            if ip4:
-                ip4_clean = ip4.split('/', 1)[0].strip()
-                if ip4_clean:
-                    ipv4s.append(ip4_clean)
-            if ipaddress is not None and ip4:
-                try:
-                    if '/' in ip4:
-                        net = ipaddress.ip_interface(ip4).network
-                    elif mask:
-                        net = ipaddress.ip_interface(f"{ip4}/{mask}").network
-                    else:
-                        net = None
-                    if net is not None and getattr(net, 'prefixlen', 32) < 32:
-                        subnet_hits.add(str(net))
-                except Exception:
-                    pass
-        ipv4s = [ip for ip in ipv4s if ip]
-        # stable unique
-        seen_ip: set[str] = set()
-        ipv4s_u: list[str] = []
-        for ip in ipv4s:
-            if ip in seen_ip:
-                continue
-            seen_ip.add(ip)
-            ipv4s_u.append(ip)
-        is_vuln = any(ip in vuln_set for ip in ipv4s_u)
-        out_nodes.append({
-            'id': nid,
-            'name': name_val,
-            'type': (type_val or '').strip() or 'node',
-            'services': services_val,
-            'interfaces': ifaces,
-            'ipv4s': ipv4s_u,
-            'subnets': sorted(subnet_hits) if subnet_hits else [],
-            'is_vulnerability': bool(is_vuln),
-            'is_hitl': bool(n.get('is_hitl')),
-        })
-
-    # Sort nodes for stable output.
-    def _type_rank(t: str) -> int:
-        tt = (t or '').lower()
-        if tt == 'router':
-            return 0
-        if tt == 'switch':
-            return 1
-        return 2
-
-    out_nodes.sort(key=lambda r: (_type_rank(str(r.get('type') or '')), str(r.get('name') or '').lower(), str(r.get('id') or '')))
-
-    out_links: list[dict[str, str]] = []
-    for l in links_list:
-        if not isinstance(l, dict):
-            continue
-        a = str(l.get('node1') or '').strip()
-        b = str(l.get('node2') or '').strip()
-        if not a or not b:
-            continue
-        # Only keep links whose endpoints exist in our node set.
-        if a not in by_id or b not in by_id:
-            continue
-        out_links.append({
-            'node1': a,
-            'node2': b,
-            'node1_name': str(l.get('node1_name') or name_map.get(a) or a),
-            'node2_name': str(l.get('node2_name') or name_map.get(b) or b),
-        })
-
-    # Improve readability: rename network/LAN nodes to their most common subnet (if any).
-    try:
-        id_to_node: dict[str, dict[str, Any]] = {str(n.get('id')): n for n in out_nodes if isinstance(n, dict) and n.get('id') is not None}
-        adj: dict[str, set[str]] = {}
-        for l in out_links:
-            a = str(l.get('node1') or '').strip()
-            b = str(l.get('node2') or '').strip()
-            if not a or not b:
-                continue
-            adj.setdefault(a, set()).add(b)
-            adj.setdefault(b, set()).add(a)
-        for net_id in (network_ids or set()):
-            if net_id not in id_to_node:
-                continue
-            # Never rename HITL/RJ45 network nodes to a subnet; keep interface label (e.g., ens19).
-            try:
-                if str(id_to_node[net_id].get('type') or '').strip().lower() == 'hitl':
-                    continue
-            except Exception:
-                pass
-            neighbor_ids = list(adj.get(net_id, set()))
-            if not neighbor_ids:
-                continue
-            counts: dict[str, int] = {}
-            for nbr in neighbor_ids:
-                node_obj = id_to_node.get(nbr)
-                if not node_obj:
-                    continue
-                # Routers often have interfaces in many subnets and are excluded from subnet boxes.
-                # If we use router subnets to rename LAN/switch nodes, the UI can show confusing
-                # "CIDR switch" nodes that appear to be alone in their subnet.
-                try:
-                    if str(node_obj.get('type') or '').strip().lower() == 'router':
-                        continue
-                except Exception:
-                    pass
-                for cidr in (node_obj.get('subnets') or []):
-                    c = str(cidr).strip()
-                    if not c:
-                        continue
-                    counts[c] = counts.get(c, 0) + 1
-            if not counts:
-                continue
-            best = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
-            net_obj = id_to_node[net_id]
-            net_obj['name'] = best
-            net_obj['subnets'] = [best]
-    except Exception:
-        pass
-
-    return jsonify({
+    out = {
         'ok': True,
         'scenario_norm': scenario_norm,
         'status': '',
-        'nodes': out_nodes,
-        'links': out_links,
+        'nodes': nodes,
+        'links': links,
         'subnets': subnets,
         'vulnerability_ips': vuln_ips,
-    })
+    }
+    if isinstance(flow_meta, dict) and flow_meta:
+        out['flow'] = flow_meta
+    return jsonify(out)
 
 
 _PARTICIPANT_UI_STATS_PATH = os.path.join(_outputs_dir(), 'participant_ui_stats.json')
@@ -7307,6 +7511,1551 @@ _LOGIN_EXEMPT_ENDPOINTS = {
 }
 
 
+# ---- Attack Flow / Flag Chain (Flow page) ----
+
+
+ATTACK_FLOW_EXTENSION_DEFINITION_ID = "extension-definition--fb9c968a-745b-4ade-9b25-c324172197f4"
+# NOTE: Some tools (including Attack Flow Builder) try to fetch `extension-definition.schema`.
+# The GitHub *web* URL returns HTML; use raw content so the URL is directly fetchable as JSON.
+# (The GitHub Pages URL referenced in the schema `$id` has been observed to 404.)
+ATTACK_FLOW_SCHEMA_URL = "https://raw.githubusercontent.com/center-for-threat-informed-defense/attack-flow/main/stix/attack-flow-schema-2.0.0.json"
+ATTACK_FLOW_SCHEMA_VERSION = "2.0.0"
+
+
+def _iso_now() -> str:
+    try:
+        # Attack Flow / STIX 2.1 common properties require timestamps with at least millisecond precision.
+        return datetime.datetime.now(datetime.UTC).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    except Exception:
+        return "1970-01-01T00:00:00Z"
+
+
+def _new_stix_id(stix_type: str) -> str:
+    return f"{stix_type}--{uuid.uuid4()}"
+
+
+def _new_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def _latest_session_xml_for_scenario_norm(scenario_norm: str) -> str | None:
+    try:
+        history = _load_run_history()
+        last_run = _latest_run_history_for_scenario(scenario_norm, history)
+    except Exception:
+        last_run = None
+
+    if isinstance(last_run, dict):
+        session_xml_path = last_run.get('session_xml_path') or last_run.get('post_xml_path')
+        if session_xml_path:
+            try:
+                ap = os.path.abspath(str(session_xml_path))
+            except Exception:
+                ap = str(session_xml_path)
+            if ap and os.path.exists(ap):
+                return ap
+
+    # Fallback: run history can become stale if artifacts under outputs/ are purged.
+    # Best-effort: pick the newest matching session XML under outputs/core-sessions/.
+    try:
+        base = os.path.join(_outputs_dir(), 'core-sessions')
+        if os.path.isdir(base) and scenario_norm:
+            prefix = str(scenario_norm).strip().lower() + '-'
+            best_path: str | None = None
+            best_mtime: float = -1.0
+            for name in os.listdir(base):
+                if not isinstance(name, str):
+                    continue
+                low = name.lower()
+                if not (low.startswith(prefix) and low.endswith('.xml')):
+                    continue
+                p = os.path.join(base, name)
+                try:
+                    m = os.path.getmtime(p)
+                except Exception:
+                    continue
+                if m > best_mtime:
+                    best_mtime = m
+                    best_path = p
+            if best_path and os.path.exists(best_path):
+                return os.path.abspath(best_path)
+    except Exception:
+        pass
+
+    return None
+
+
+def _build_topology_graph_from_session_xml(xml_path: str) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, set[str]]]:
+    """Return (nodes, links, adjacency) for a session XML.
+
+    Intended to mirror Participant UI topology semantics:
+    - includes network nodes (so host↔LAN links are visible)
+    - tags vulnerability nodes via ipv4 match
+    - preserves HITL nodes for distinct styling
+    """
+    try:
+        summary = _analyze_core_xml(xml_path)
+    except Exception:
+        summary = {}
+
+    raw_nodes = summary.get('nodes') if isinstance(summary, dict) else None
+    nodes_list: list[dict] = raw_nodes if isinstance(raw_nodes, list) else []
+
+    all_devices = _core_xml_device_summaries(xml_path)
+    all_networks = _core_xml_network_summaries(xml_path)
+
+    name_map: dict[str, str] = {}
+    device_compose_map: dict[str, dict[str, str]] = {}
+    for row in (all_devices or []):
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get('id') or '').strip()
+        if not rid:
+            continue
+        name_map.setdefault(rid, str(row.get('name') or rid))
+        try:
+            comp = str(row.get('compose') or '').strip()
+        except Exception:
+            comp = ''
+        try:
+            comp_name = str(row.get('compose_name') or '').strip()
+        except Exception:
+            comp_name = ''
+        if comp or comp_name:
+            device_compose_map[rid] = {'compose': comp, 'compose_name': comp_name}
+    for row in (all_networks or []):
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get('id') or '').strip()
+        if not rid:
+            continue
+        name_map.setdefault(rid, str(row.get('name') or rid))
+
+    # IMPORTANT: do NOT use summary.links_detail here (it can be pruned).
+    links_list: list[dict] = _core_xml_link_summaries(xml_path, id_to_name=name_map)
+
+    # Start with nodes from analysis, then ensure all devices & networks exist.
+    by_id: dict[str, dict[str, Any]] = {}
+    for n in nodes_list:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if nid:
+            by_id[nid] = n
+
+    for dev in (all_devices or []):
+        did = str(dev.get('id') or '').strip()
+        if not did or did in by_id:
+            continue
+        by_id[did] = {
+            'id': did,
+            'name': dev.get('name') or did,
+            'type': dev.get('type') or '',
+            'compose': (device_compose_map.get(did) or {}).get('compose') or '',
+            'compose_name': (device_compose_map.get(did) or {}).get('compose_name') or '',
+            'services': [],
+            'interfaces': [],
+            'linked_nodes': [],
+        }
+
+    for net in (all_networks or []):
+        nid = str(net.get('id') or '').strip()
+        if not nid or nid in by_id:
+            continue
+        raw_type = str(net.get('type') or '').strip()
+        type_hint = (raw_type or '').lower()
+        name_hint = str(net.get('name') or '').strip().lower()
+        is_hitl = False
+        try:
+            import re
+            name_looks_like_iface = bool(re.match(r'^(ens|enp|eth)\d', name_hint))
+        except Exception:
+            name_looks_like_iface = False
+
+        if name_looks_like_iface or 'rj45' in type_hint or 'rj-45' in type_hint or 'hitl' in type_hint or 'tap' in type_hint:
+            coerced_type = 'hitl'
+            is_hitl = True
+        elif 'wlan' in type_hint or 'wireless' in type_hint:
+            coerced_type = 'wlan'
+        else:
+            coerced_type = 'switch'
+
+        by_id[nid] = {
+            'id': nid,
+            'name': net.get('name') or nid,
+            'type': coerced_type,
+            'services': [],
+            'interfaces': [],
+            'linked_nodes': [],
+            'is_hitl': bool(is_hitl),
+        }
+
+    vuln_ips = _vulnerability_ipv4s_from_session_xml(xml_path)
+    vuln_set = {str(ip).strip() for ip in (vuln_ips or []) if ip}
+    subnets = _subnet_cidrs_from_session_xml(xml_path)
+
+    try:
+        import ipaddress
+    except Exception:
+        ipaddress = None
+
+    out_nodes: list[dict[str, Any]] = []
+    for nid, n in by_id.items():
+        name_val = str(n.get('name') or nid)
+        type_val = (str(n.get('type') or '').strip() or 'node')
+        ifaces = n.get('interfaces') if isinstance(n.get('interfaces'), list) else []
+        services_val = n.get('services') if isinstance(n.get('services'), list) else []
+
+        ipv4s: list[str] = []
+        subnet_hits: set[str] = set()
+        for iface in ifaces:
+            if not isinstance(iface, dict):
+                continue
+            ip4 = (iface.get('ipv4') or '').strip() if isinstance(iface.get('ipv4'), str) else ''
+            mask = (iface.get('ipv4_mask') or '').strip() if isinstance(iface.get('ipv4_mask'), str) else ''
+            if ip4:
+                ip4_clean = ip4.split('/', 1)[0].strip()
+                if ip4_clean:
+                    ipv4s.append(ip4_clean)
+            if ipaddress is not None and ip4:
+                try:
+                    if '/' in ip4:
+                        net_obj = ipaddress.ip_interface(ip4).network
+                    elif mask:
+                        net_obj = ipaddress.ip_interface(f"{ip4}/{mask}").network
+                    else:
+                        net_obj = None
+                    if net_obj is not None and getattr(net_obj, 'prefixlen', 32) < 32:
+                        subnet_hits.add(str(net_obj))
+                except Exception:
+                    pass
+
+        # stable unique ipv4s
+        seen_ip: set[str] = set()
+        ipv4s_u: list[str] = []
+        for ip in ipv4s:
+            if not ip or ip in seen_ip:
+                continue
+            seen_ip.add(ip)
+            ipv4s_u.append(ip)
+        is_vuln = any(ip in vuln_set for ip in ipv4s_u)
+
+        out_nodes.append({
+            'id': nid,
+            'name': name_val,
+            'type': type_val,
+            'services': services_val,
+            'interfaces': ifaces,
+            'ipv4s': ipv4s_u,
+            'subnets': sorted(subnet_hits) if subnet_hits else [],
+            'is_vulnerability': bool(is_vuln),
+            'is_hitl': bool(n.get('is_hitl')),
+            'compose': str(n.get('compose') or (device_compose_map.get(nid) or {}).get('compose') or ''),
+            'compose_name': str(n.get('compose_name') or (device_compose_map.get(nid) or {}).get('compose_name') or ''),
+        })
+
+    out_links: list[dict[str, str]] = []
+    for l in links_list:
+        if not isinstance(l, dict):
+            continue
+        a = str(l.get('node1') or '').strip()
+        b = str(l.get('node2') or '').strip()
+        if not a or not b or a == b:
+            continue
+        if a not in by_id or b not in by_id:
+            continue
+        out_links.append({
+            'node1': a,
+            'node2': b,
+            'node1_name': str(l.get('node1_name') or name_map.get(a) or a),
+            'node2_name': str(l.get('node2_name') or name_map.get(b) or b),
+        })
+
+    adj: dict[str, set[str]] = {nid: set() for nid in by_id.keys()}
+    for l in out_links:
+        a = str(l.get('node1') or '').strip()
+        b = str(l.get('node2') or '').strip()
+        if not a or not b:
+            continue
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+
+    # Attach top-level subnets for any caller that wants them later.
+    # (kept off the node objects to avoid bloating graph payload)
+    try:
+        for n in out_nodes:
+            if isinstance(subnets, list) and subnets:
+                n.setdefault('__subnets_all', subnets)
+    except Exception:
+        pass
+
+    return out_nodes, out_links, adj
+
+
+def _pick_flag_chain_nodes(nodes: list[dict[str, Any]], adj: dict[str, set[str]], *, length: int) -> list[dict[str, Any]]:
+    """Pick an ordered list of nodes to place flags on.
+
+    The chain is considered solvable if each consecutive pair is connected by
+    at least one path in the topology graph. We build the chain by:
+    - picking two far-apart endpoints (approx. diameter) in the full graph
+    - extracting eligible nodes along that path
+    """
+    length = max(1, min(int(length or 1), 50))
+
+    id_to_node: dict[str, dict[str, Any]] = {}
+    eligible_ids: list[str] = []
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if not nid:
+            continue
+        id_to_node[nid] = n
+        t = (str(n.get('type') or '').strip().lower())
+        # Flow placement eligibility:
+        # - flag-generators may be placed on vulnerability nodes and docker-role nodes
+        # - flag-node-generators require docker-role slots (enforced elsewhere)
+        is_docker = ('docker' in t) or (str(n.get('type') or '').strip().upper() == 'DOCKER')
+        is_vuln = bool(n.get('is_vuln'))
+        if is_docker or is_vuln:
+            eligible_ids.append(nid)
+
+    if not eligible_ids:
+        return []
+
+    def bfs_farthest(start: str) -> tuple[str, dict[str, str | None]]:
+        parent: dict[str, str | None] = {start: None}
+        q = deque([start])
+        last = start
+        while q:
+            cur = q.popleft()
+            last = cur
+            for nb in adj.get(cur, set()):
+                if nb in parent:
+                    continue
+                parent[nb] = cur
+                q.append(nb)
+        return last, parent
+
+    # Choose a start node that is likely connected.
+    start = eligible_ids[0]
+    far1, _p1 = bfs_farthest(start)
+    far2, parents = bfs_farthest(far1)
+
+    # Reconstruct full graph path far1 -> far2.
+    path_ids: list[str] = []
+    cur = far2
+    while cur is not None:
+        path_ids.append(cur)
+        cur = parents.get(cur)
+    path_ids.reverse()
+
+    # Extract eligible nodes along the path.
+    chain_ids: list[str] = [nid for nid in path_ids if nid in eligible_ids]
+
+    # If not enough eligible nodes on that path, fall back to a BFS walk over eligible nodes.
+    if len(chain_ids) < length:
+        seen = set()
+        q = deque([start])
+        chain_ids = []
+        while q and len(chain_ids) < length:
+            cur = q.popleft()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if cur in eligible_ids:
+                chain_ids.append(cur)
+            for nb in sorted(adj.get(cur, set())):
+                if nb not in seen:
+                    q.append(nb)
+
+    chain_ids = chain_ids[:length]
+    # Default ordering: randomize the sequence (user can tweak ordering in the UI).
+    try:
+        import random as _random
+        _random.Random().shuffle(chain_ids)
+    except Exception:
+        pass
+    return [id_to_node[nid] for nid in chain_ids if nid in id_to_node]
+
+
+def _pick_flag_chain_nodes_allow_duplicates(
+    nodes: list[dict[str, Any]],
+    adj: dict[str, set[str]],
+    *,
+    length: int,
+    seed: int = 0,
+) -> list[dict[str, Any]]:
+    """Pick an ordered list of eligible nodes, allowing repeats.
+
+    Used only when the caller explicitly opts into duplicates.
+    """
+    length = max(1, min(int(length or 1), 50))
+
+    id_to_node: dict[str, dict[str, Any]] = {}
+    eligible_ids: list[str] = []
+    for n in nodes or []:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if not nid:
+            continue
+        id_to_node[nid] = n
+        t = (str(n.get('type') or '').strip().lower())
+        is_docker = ('docker' in t) or (str(n.get('type') or '').strip().upper() == 'DOCKER')
+        is_vuln = bool(n.get('is_vuln'))
+        if is_docker or is_vuln:
+            eligible_ids.append(nid)
+
+    if not eligible_ids:
+        return []
+
+    # Start with a best-effort unique chain (keeps prior behavior when possible).
+    unique_target = min(length, len(list(dict.fromkeys(eligible_ids))))
+    base = _pick_flag_chain_nodes(nodes, adj, length=unique_target)
+    chain_ids: list[str] = [
+        str(n.get('id') or '').strip()
+        for n in (base or [])
+        if isinstance(n, dict) and str(n.get('id') or '').strip()
+    ]
+
+    if len(chain_ids) < length:
+        # Extend with repeats, deterministically when a seed is available.
+        try:
+            import random as _random
+            rnd = _random.Random(int(seed or 0) ^ 0xD00DCAFE)
+        except Exception:
+            rnd = None
+
+        pool = list(dict.fromkeys([x for x in eligible_ids if x]))
+        if not pool:
+            return []
+
+        while len(chain_ids) < length:
+            try:
+                pick = (rnd.choice(pool) if rnd is not None else pool[0])
+            except Exception:
+                pick = pool[0]
+            chain_ids.append(str(pick))
+
+        # Shuffle final order.
+        try:
+            if rnd is not None:
+                rnd.shuffle(chain_ids)
+            else:
+                import random as _random
+                _random.Random().shuffle(chain_ids)
+        except Exception:
+            pass
+
+    return [id_to_node[nid] for nid in chain_ids if nid in id_to_node]
+
+
+def _pick_flag_chain_nodes_for_preset(
+    nodes: list[dict[str, Any]],
+    adj: dict[str, set[str]],
+    *,
+    steps: list[dict[str, str]],
+) -> list[dict[str, Any]]:
+    """Pick a chain that satisfies preset step constraints.
+
+    Currently enforced:
+    - flag-generator steps: may be placed on vulnerability nodes OR docker-role nodes
+    - flag-node-generator steps: must be placed on a non-vulnerability docker-role node
+    """
+    try:
+        length = len(steps or [])
+    except Exception:
+        length = 0
+    length = max(1, min(int(length or 1), 50))
+
+    id_to_node: dict[str, dict[str, Any]] = {}
+    eligible_ids: list[str] = []
+    docker_ids: set[str] = set()
+    for n in nodes or []:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if not nid:
+            continue
+        id_to_node[nid] = n
+        t_raw = str(n.get('type') or '')
+        t = t_raw.strip().lower()
+        is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
+        is_vuln = bool(n.get('is_vuln'))
+        if is_docker or is_vuln:
+            eligible_ids.append(nid)
+        if is_docker and not is_vuln:
+            docker_ids.add(nid)
+
+    if not eligible_ids:
+        return []
+    if length > len(set(eligible_ids)):
+        return []
+
+    # Try to keep the chain in a single connected component, starting from a docker node if possible.
+    start = None
+    if docker_ids:
+        start = next(iter(sorted(docker_ids)))
+    else:
+        start = eligible_ids[0]
+
+    visited: list[str] = []
+    try:
+        seen: set[str] = set()
+        q = deque([start])
+        while q:
+            cur = q.popleft()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            visited.append(cur)
+            for nb in sorted(adj.get(cur, set())):
+                if nb not in seen:
+                    q.append(nb)
+    except Exception:
+        visited = list(dict.fromkeys(eligible_ids))
+
+    comp_eligible = [nid for nid in visited if nid in set(eligible_ids)]
+    if len(comp_eligible) < length:
+        # Fallback: allow selecting across components rather than erroring.
+        comp_eligible = list(dict.fromkeys(eligible_ids))
+
+    used: set[str] = set()
+    chosen: list[str] = []
+    for step in (steps or [])[:length]:
+        kind = str((step or {}).get('kind') or '').strip()
+        need_docker = (kind == 'flag-node-generator')
+        pool = [
+            nid for nid in comp_eligible
+            if nid not in used and (not need_docker or nid in docker_ids)
+        ]
+        if not pool:
+            return []
+        pick = pool[0]
+        used.add(pick)
+        chosen.append(pick)
+
+    if len(chosen) < length:
+        return []
+    return [id_to_node[nid] for nid in chosen if nid in id_to_node]
+
+
+def _flow_compose_docker_stats(nodes: list[dict[str, Any]]) -> dict[str, int]:
+    """Return counts for debugging Flow eligibility.
+
+    - docker_total: nodes that look like docker nodes
+    - compose_backed_total: docker nodes that carry compose metadata
+    - vuln_total: nodes that are vulnerability candidates
+    - eligible_total: nodes eligible for chain placement (docker role + vuln nodes)
+
+    Additional explicit metrics (new; kept alongside legacy keys):
+    - docker_nonvuln_total: docker nodes that are NOT vulnerability candidates
+    - flag_generator_eligible_total: nodes eligible for flag-generator steps (docker role + vuln nodes)
+    - flag_node_generator_eligible_total: nodes eligible for flag-node-generator steps (non-vuln docker role only)
+    """
+    docker_total = 0
+    docker_nonvuln_total = 0
+    vuln_total = 0
+    compose_backed_total = 0
+    eligible_total = 0
+    for n in nodes or []:
+        if not isinstance(n, dict):
+            continue
+        t_raw = str(n.get('type') or '')
+        t = t_raw.strip().lower()
+        is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
+        is_vuln = bool(n.get('is_vuln'))
+        if is_docker:
+            docker_total += 1
+            comp = str(n.get('compose') or '').strip()
+            comp_name = str(n.get('compose_name') or '').strip()
+            if comp or comp_name:
+                compose_backed_total += 1
+        if is_vuln:
+            vuln_total += 1
+        if is_docker and (not is_vuln):
+            docker_nonvuln_total += 1
+        if is_docker or is_vuln:
+            eligible_total += 1
+    return {
+        'docker_total': docker_total,
+        'docker_nonvuln_total': docker_nonvuln_total,
+        'vuln_total': vuln_total,
+        'compose_backed_total': compose_backed_total,
+        'eligible_total': eligible_total,
+        'flag_generator_eligible_total': eligible_total,
+        'flag_node_generator_eligible_total': docker_nonvuln_total,
+    }
+
+
+def _attack_flow_builder_afb_for_chain(
+    *,
+    chain_nodes: list[dict[str, Any]],
+    scenario_label: str,
+    flag_assignments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build an Attack Flow Builder .afb document for a linear chain.
+
+    Attack Flow Builder's native format is a UI graph JSON (".afb") with explicit
+    edge objects (e.g., dynamic_line source/target). This avoids tool warnings like
+    "edges must connect on both sides" when importing a STIX bundle.
+    """
+    now = _iso_now()
+
+    assignment_by_node_id: dict[str, dict[str, Any]] = {}
+    try:
+        for fa in (flag_assignments or []):
+            if not isinstance(fa, dict):
+                continue
+            nid = str(fa.get('node_id') or '').strip()
+            if nid and nid not in assignment_by_node_id:
+                assignment_by_node_id[nid] = fa
+    except Exception:
+        assignment_by_node_id = {}
+
+    # Attack Flow Builder v3 expects an OpenChart DiagramViewExport:
+    # - root {schema, objects, (optional) theme/layout/camera}
+    # - a single root canvas/group export (id="flow") with an `objects` list of child instances
+    # - actions are blocks (id="action") and MUST include an `anchors` map (can be empty)
+    flow_instance = _new_uuid()
+    objects: list[dict[str, Any]] = []
+    layout: dict[str, list[int]] = {}
+
+    flow_name = f"Flag Chain" + (f" - {scenario_label}" if scenario_label else '')
+    flow_children: list[str] = []
+    action_instances: list[str] = []
+
+    # Layout constants (tuned for non-overlap in Builder).
+    action_x = 600
+    action_y_cursor = 220
+    action_step_min = 260
+    side_x_offset = 340
+    side_y_offset = 150
+    side_row_gap = 110
+
+    # Track per-action anchors so we can wire lines between actions.
+    action_left_anchor: dict[str, str] = {}
+    action_right_anchor: dict[str, str] = {}
+    # Keep references to anchor export dicts so we can append latch instances.
+    anchor_obj_by_instance: dict[str, dict[str, Any]] = {}
+
+    # Create one action node per chain step.
+    for idx, node in enumerate(chain_nodes, start=1):
+        node_id = str(node.get('id') or '').strip()
+        node_name = str(node.get('name') or node_id)
+
+        node_ipv4 = _first_valid_ipv4((node or {}).get('ipv4'))
+
+        fa = assignment_by_node_id.get(node_id)
+        gen_id = str((fa or {}).get('id') or '').strip()
+        gen_name = str((fa or {}).get('name') or '').strip()
+        gen_kind = str((fa or {}).get('type') or '').strip()
+        gen_source = str((fa or {}).get('flag_generator') or '').strip()
+        gen_catalog = str((fa or {}).get('generator_catalog') or '').strip()
+
+        output_files: list[str] = ['outputs.json', 'hint.txt']
+        try:
+            outs = (fa or {}).get('outputs')
+            if isinstance(outs, list) and any(str(x).strip() == 'flag' for x in outs):
+                output_files.append('flag.txt')
+        except Exception:
+            pass
+        try:
+            actual = (fa or {}).get('actual_outputs')
+            if isinstance(actual, list) and any(str(x).strip() == 'flag' for x in actual):
+                if 'flag.txt' not in output_files:
+                    output_files.append('flag.txt')
+        except Exception:
+            pass
+
+        # Keep action description mostly human text; outputs are represented as asset nodes.
+        # Exception: when a realized flag value exists, include it here for convenience.
+        desc_lines: list[str] = []
+        artifacts_dir = ''
+        if fa:
+            try:
+                gen_desc = str((fa or {}).get('description') or '').strip()
+            except Exception:
+                gen_desc = ''
+            if gen_desc:
+                desc_lines.append(gen_desc)
+
+            # If the generator has already been executed (Flow runtime), embed the
+            # realized flag value (when present) directly in the action description.
+            try:
+                artifacts_dir = str((fa or {}).get('artifacts_dir') or (fa or {}).get('run_dir') or '').strip()
+            except Exception:
+                artifacts_dir = ''
+            try:
+                flag_val = _flow_read_flag_value_from_artifacts_dir(artifacts_dir) if artifacts_dir else ''
+            except Exception:
+                flag_val = ''
+            if flag_val:
+                if desc_lines:
+                    desc_lines.append('')
+                desc_lines.append(f"Flag: {flag_val}")
+
+        # Preload resolved output values for asset descriptions (best-effort).
+        try:
+            outputs_map = _flow_read_outputs_map_from_artifacts_dir(artifacts_dir) if artifacts_dir else {}
+        except Exception:
+            outputs_map = {}
+        if not desc_lines:
+            desc_lines = [f"Capture the flag on node '{node_name}'."]
+
+        description = "\n".join([x for x in desc_lines if x is not None])
+
+        # Action title: "<flag-*generator name>: <node-name>"
+        gen_label = (gen_name or gen_id or '').strip()
+        if not gen_label:
+            gen_label = 'Unassigned generator'
+        action_title = f"{gen_label}: {node_name}"
+
+        action_instance = _new_uuid()
+        flow_children.append(action_instance)
+        action_instances.append(action_instance)
+
+        # Create two anchors for this action, used for incoming/outgoing edges.
+        left_anchor_instance = _new_uuid()
+        right_anchor_instance = _new_uuid()
+        action_left_anchor[action_instance] = left_anchor_instance
+        action_right_anchor[action_instance] = right_anchor_instance
+
+        # Builder uses angle-keyed anchors (e.g., "0", "180") that refer to
+        # template IDs like horizontal_anchor/vertical_anchor.
+        left_anchor_obj = {
+            'id': 'horizontal_anchor',
+            'instance': left_anchor_instance,
+            'latches': [],
+        }
+        right_anchor_obj = {
+            'id': 'horizontal_anchor',
+            'instance': right_anchor_instance,
+            'latches': [],
+        }
+        anchor_obj_by_instance[left_anchor_instance] = left_anchor_obj
+        anchor_obj_by_instance[right_anchor_instance] = right_anchor_obj
+        objects.append(left_anchor_obj)
+        objects.append(right_anchor_obj)
+
+        objects.append({
+            'id': 'action',
+            'instance': action_instance,
+            # NOTE: OpenChart uses ordered entries (JsonEntries) not dicts.
+            'properties': [
+                ['name', action_title],
+                # The builder template exposes a nested "ttp" mapping. Keep it present
+                # but empty so the file loads without requiring ATT&CK mappings.
+                ['ttp', [['tactic', None], ['technique', None]]],
+                ['description', description],
+            ],
+            # Required for BlockExport; an empty map lets the importer create
+            # default anchors from the template.
+            # We provide anchors for the positions we actually use so the semantic
+            # analyzer can discover edges (via anchor -> latch -> line).
+            'anchors': {
+                # Keys must match Builder's expected anchor keys (angle degrees).
+                # "180" ≈ left, "0" ≈ right.
+                '180': left_anchor_instance,
+                '0': right_anchor_instance,
+            },
+        })
+
+        # Lay actions top-to-bottom.
+        action_y = int(action_y_cursor)
+        layout[action_instance] = [int(action_x), action_y]
+
+        # Add an IPV4_ADDR node (if available) and connect action -> IPV4_ADDR.
+        if node_ipv4:
+            ipv4_instance = _new_uuid()
+            flow_children.append(ipv4_instance)
+
+            ipv4_left_anchor_instance = _new_uuid()
+            ipv4_right_anchor_instance = _new_uuid()
+            ipv4_left_anchor_obj = {
+                'id': 'horizontal_anchor',
+                'instance': ipv4_left_anchor_instance,
+                'latches': [],
+            }
+            ipv4_right_anchor_obj = {
+                'id': 'horizontal_anchor',
+                'instance': ipv4_right_anchor_instance,
+                'latches': [],
+            }
+            anchor_obj_by_instance[ipv4_left_anchor_instance] = ipv4_left_anchor_obj
+            anchor_obj_by_instance[ipv4_right_anchor_instance] = ipv4_right_anchor_obj
+            objects.append(ipv4_left_anchor_obj)
+            objects.append(ipv4_right_anchor_obj)
+
+            objects.append({
+                'id': 'ipv4_addr',
+                'instance': ipv4_instance,
+                'properties': [
+                    # Use the actual IP in both name + description to ensure it is visible
+                    # regardless of which fields the Builder UI chooses to render.
+                    ['name', node_ipv4],
+                    ['description', node_ipv4],
+                    ['value', node_ipv4],
+                    ['address', node_ipv4],
+                ],
+                'anchors': {
+                    '180': ipv4_left_anchor_instance,
+                    '0': ipv4_right_anchor_instance,
+                },
+            })
+
+            # Place to the right of the action (slightly above the asset rows).
+            layout[ipv4_instance] = [int(action_x) + side_x_offset, int(action_y) - 60]
+
+            src_anchor = action_right_anchor.get(action_instance)
+            trg_anchor = ipv4_left_anchor_instance
+            if src_anchor and trg_anchor:
+                line_instance = _new_uuid()
+                src_latch_instance = _new_uuid()
+                trg_latch_instance = _new_uuid()
+                handle_instance = _new_uuid()
+
+                try:
+                    anchor_obj_by_instance[src_anchor]['latches'].append(src_latch_instance)
+                except Exception:
+                    pass
+                try:
+                    anchor_obj_by_instance[trg_anchor]['latches'].append(trg_latch_instance)
+                except Exception:
+                    pass
+
+                objects.append({'id': 'generic_latch', 'instance': src_latch_instance})
+                objects.append({'id': 'generic_latch', 'instance': trg_latch_instance})
+                objects.append({'id': 'generic_handle', 'instance': handle_instance})
+
+                try:
+                    src_pos = layout.get(action_instance)
+                    trg_pos = layout.get(ipv4_instance)
+                    if isinstance(src_pos, list) and len(src_pos) == 2 and isinstance(trg_pos, list) and len(trg_pos) == 2:
+                        src_x, src_y = int(src_pos[0]), int(src_pos[1])
+                        trg_x, trg_y = int(trg_pos[0]), int(trg_pos[1])
+                        layout[src_latch_instance] = [src_x + 140, src_y]
+                        layout[trg_latch_instance] = [trg_x - 140, trg_y]
+                except Exception:
+                    pass
+
+                objects.append({
+                    'id': 'dynamic_line',
+                    'instance': line_instance,
+                    'source': src_latch_instance,
+                    'target': trg_latch_instance,
+                    'handles': [handle_instance],
+                })
+                flow_children.append(line_instance)
+
+        # Add asset nodes for outputs that are provided to the chain.
+        # These correspond to the Flow UI "Outputs -> Provided to Chain".
+        provided: list[str] = []
+        try:
+            prod = (fa or {}).get('produces')
+            if isinstance(prod, list):
+                provided.extend([str(x or '').strip() for x in prod if str(x or '').strip()])
+        except Exception:
+            pass
+        try:
+            out_fields = (fa or {}).get('output_fields')
+            if isinstance(out_fields, list):
+                provided.extend([str(x or '').strip() for x in out_fields if str(x or '').strip()])
+        except Exception:
+            pass
+        # De-dupe while preserving order.
+        seen_out: set[str] = set()
+        provided2: list[str] = []
+        for k in provided:
+            if not k or k in seen_out:
+                continue
+            seen_out.add(k)
+            provided2.append(k)
+
+        # Injected files (inject_files allowlist) are represented as explicit artifact nodes.
+        injected2: list[str] = []
+        try:
+            inj = (fa or {}).get('inject_files')
+            if isinstance(inj, list):
+                seen_inj: set[str] = set()
+                for raw in inj:
+                    s = str(raw or '').strip()
+                    if not s or s in seen_inj:
+                        continue
+                    seen_inj.add(s)
+                    injected2.append(s)
+        except Exception:
+            injected2 = []
+
+        left_rows = 0
+        right_rows = 0
+
+        # Place injected artifacts to the left of the action.
+        if injected2:
+            for inj_idx, inj_path in enumerate(injected2):
+                art_instance = _new_uuid()
+                flow_children.append(art_instance)
+
+                # Anchors for the artifact.
+                art_left_anchor_instance = _new_uuid()
+                art_right_anchor_instance = _new_uuid()
+                art_left_anchor_obj = {
+                    'id': 'horizontal_anchor',
+                    'instance': art_left_anchor_instance,
+                    'latches': [],
+                }
+                art_right_anchor_obj = {
+                    'id': 'horizontal_anchor',
+                    'instance': art_right_anchor_instance,
+                    'latches': [],
+                }
+                anchor_obj_by_instance[art_left_anchor_instance] = art_left_anchor_obj
+                anchor_obj_by_instance[art_right_anchor_instance] = art_right_anchor_obj
+                objects.append(art_left_anchor_obj)
+                objects.append(art_right_anchor_obj)
+
+                objects.append({
+                    # Attack Flow Builder supports STIX cyber-observable style nodes;
+                    # represent injected files as explicit artifacts.
+                    'id': 'artifact',
+                    'instance': art_instance,
+                    'properties': [
+                        ['name', inj_path],
+                        ['description', 'Injected into container'],
+                    ],
+                    'anchors': {
+                        '180': art_left_anchor_instance,
+                        '0': art_right_anchor_instance,
+                    },
+                })
+
+                # Place in rows on the left side.
+                art_x = int(action_x) - side_x_offset - 220
+                art_y = int(action_y) + 60 + (inj_idx * side_row_gap)
+                layout[art_instance] = [art_x, art_y]
+                left_rows += 1
+
+                # Connect artifact -> action (inputs).
+                src_anchor = art_right_anchor_instance
+                trg_anchor = action_left_anchor.get(action_instance)
+                if not src_anchor or not trg_anchor:
+                    continue
+
+                line_instance = _new_uuid()
+                src_latch_instance = _new_uuid()
+                trg_latch_instance = _new_uuid()
+                handle_instance = _new_uuid()
+
+                try:
+                    anchor_obj_by_instance[src_anchor]['latches'].append(src_latch_instance)
+                except Exception:
+                    pass
+                try:
+                    anchor_obj_by_instance[trg_anchor]['latches'].append(trg_latch_instance)
+                except Exception:
+                    pass
+
+                objects.append({'id': 'generic_latch', 'instance': src_latch_instance})
+                objects.append({'id': 'generic_latch', 'instance': trg_latch_instance})
+                objects.append({'id': 'generic_handle', 'instance': handle_instance})
+
+                try:
+                    src_pos = layout.get(art_instance)
+                    trg_pos = layout.get(action_instance)
+                    if isinstance(src_pos, list) and len(src_pos) == 2 and isinstance(trg_pos, list) and len(trg_pos) == 2:
+                        src_x, src_y = int(src_pos[0]), int(src_pos[1])
+                        trg_x, trg_y = int(trg_pos[0]), int(trg_pos[1])
+                        layout[src_latch_instance] = [src_x + 140, src_y]
+                        layout[trg_latch_instance] = [trg_x - 140, trg_y]
+                except Exception:
+                    pass
+
+                objects.append({
+                    'id': 'dynamic_line',
+                    'instance': line_instance,
+                    'source': src_latch_instance,
+                    'target': trg_latch_instance,
+                    'handles': [handle_instance],
+                })
+                flow_children.append(line_instance)
+
+        if provided2:
+            for out_idx, out_key in enumerate(provided2):
+                asset_instance = _new_uuid()
+                flow_children.append(asset_instance)
+
+                # Anchors for the asset.
+                asset_left_anchor_instance = _new_uuid()
+                asset_right_anchor_instance = _new_uuid()
+
+                asset_left_anchor_obj = {
+                    'id': 'horizontal_anchor',
+                    'instance': asset_left_anchor_instance,
+                    'latches': [],
+                }
+                asset_right_anchor_obj = {
+                    'id': 'horizontal_anchor',
+                    'instance': asset_right_anchor_instance,
+                    'latches': [],
+                }
+                anchor_obj_by_instance[asset_left_anchor_instance] = asset_left_anchor_obj
+                anchor_obj_by_instance[asset_right_anchor_instance] = asset_right_anchor_obj
+                objects.append(asset_left_anchor_obj)
+                objects.append(asset_right_anchor_obj)
+
+                objects.append({
+                    'id': 'asset',
+                    'instance': asset_instance,
+                    'properties': [
+                        ['name', out_key],
+                        ['description', ''],
+                    ],
+                    'anchors': {
+                        '180': asset_left_anchor_instance,
+                        '0': asset_right_anchor_instance,
+                    },
+                })
+
+                # Populate asset description with resolved output values (best-effort).
+                try:
+                    resolved = None
+                    if isinstance(outputs_map, dict):
+                        if out_key in outputs_map:
+                            resolved = outputs_map.get(out_key)
+                        elif out_key == 'artifact.flag' and 'flag' in outputs_map:
+                            resolved = outputs_map.get('flag')
+
+                    if resolved is not None:
+                        if isinstance(resolved, str):
+                            resolved_text = resolved.strip()
+                        else:
+                            resolved_text = json.dumps(resolved, ensure_ascii=False)
+                        if resolved_text:
+                            if len(resolved_text) > 4096:
+                                resolved_text = resolved_text[:4096]
+                            props = objects[-1].get('properties')
+                            if isinstance(props, list):
+                                for pair in props:
+                                    if isinstance(pair, list) and len(pair) == 2 and pair[0] == 'description':
+                                        pair[1] = resolved_text
+                except Exception:
+                    pass
+
+                # Place assets alternating left/right, in rows, below the action.
+                side = 'left' if (out_idx % 2 == 0) else 'right'
+                if side == 'left':
+                    row = left_rows
+                    left_rows += 1
+                    asset_x = int(action_x) - side_x_offset
+                else:
+                    row = right_rows
+                    right_rows += 1
+                    asset_x = int(action_x) + side_x_offset
+
+                asset_y = int(action_y) + side_y_offset + (row * side_row_gap)
+                layout[asset_instance] = [asset_x, asset_y]
+
+                # Create an explicit edge (dynamic_line) from action -> asset.
+                if side == 'left':
+                    src_anchor = action_left_anchor.get(action_instance)
+                    trg_anchor = asset_right_anchor_instance
+                else:
+                    src_anchor = action_right_anchor.get(action_instance)
+                    trg_anchor = asset_left_anchor_instance
+                if not src_anchor or not trg_anchor:
+                    continue
+
+                line_instance = _new_uuid()
+                src_latch_instance = _new_uuid()
+                trg_latch_instance = _new_uuid()
+                handle_instance = _new_uuid()
+
+                try:
+                    anchor_obj_by_instance[src_anchor]['latches'].append(src_latch_instance)
+                except Exception:
+                    pass
+                try:
+                    anchor_obj_by_instance[trg_anchor]['latches'].append(trg_latch_instance)
+                except Exception:
+                    pass
+
+                objects.append({'id': 'generic_latch', 'instance': src_latch_instance})
+                objects.append({'id': 'generic_latch', 'instance': trg_latch_instance})
+                objects.append({'id': 'generic_handle', 'instance': handle_instance})
+
+                try:
+                    src_pos = layout.get(action_instance)
+                    trg_pos = layout.get(asset_instance)
+                    if isinstance(src_pos, list) and len(src_pos) == 2 and isinstance(trg_pos, list) and len(trg_pos) == 2:
+                        src_x, src_y = int(src_pos[0]), int(src_pos[1])
+                        trg_x, trg_y = int(trg_pos[0]), int(trg_pos[1])
+                        if side == 'left':
+                            layout[src_latch_instance] = [src_x - 140, src_y]
+                            layout[trg_latch_instance] = [trg_x + 140, trg_y]
+                        else:
+                            layout[src_latch_instance] = [src_x + 140, src_y]
+                            layout[trg_latch_instance] = [trg_x - 140, trg_y]
+                except Exception:
+                    pass
+
+                objects.append({
+                    'id': 'dynamic_line',
+                    'instance': line_instance,
+                    'source': src_latch_instance,
+                    'target': trg_latch_instance,
+                    'handles': [handle_instance],
+                })
+                flow_children.append(line_instance)
+
+        # Advance cursor by enough to avoid overlap with the widest side.
+        max_rows = max(left_rows, right_rows)
+        span = action_step_min
+        if max_rows:
+            span = max(span, side_y_offset + (max_rows * side_row_gap) + 80)
+        action_y_cursor += span
+
+    # Create explicit edges between consecutive actions.
+    # In OpenChart exports, a line references its source/target latches, and an
+    # anchor references linked latches. This is how Builder derives the graph.
+    for i in range(len(action_instances) - 1):
+        src_action = action_instances[i]
+        trg_action = action_instances[i + 1]
+
+        src_anchor = action_right_anchor.get(src_action)
+        trg_anchor = action_left_anchor.get(trg_action)
+        if not src_anchor or not trg_anchor:
+            continue
+
+        line_instance = _new_uuid()
+        src_latch_instance = _new_uuid()
+        trg_latch_instance = _new_uuid()
+        handle_instance = _new_uuid()
+
+        # Link latches to anchors.
+        try:
+            anchor_obj_by_instance[src_anchor]['latches'].append(src_latch_instance)
+        except Exception:
+            pass
+        try:
+            anchor_obj_by_instance[trg_anchor]['latches'].append(trg_latch_instance)
+        except Exception:
+            pass
+
+        # Create latches and handle.
+        objects.append({'id': 'generic_latch', 'instance': src_latch_instance})
+        objects.append({'id': 'generic_latch', 'instance': trg_latch_instance})
+        objects.append({'id': 'generic_handle', 'instance': handle_instance})
+
+        # Builder's exported layout includes latch positions (but not anchors/lines).
+        # Place latches near their respective actions.
+        try:
+            src_pos = layout.get(src_action)
+            trg_pos = layout.get(trg_action)
+            if isinstance(src_pos, list) and len(src_pos) == 2 and isinstance(trg_pos, list) and len(trg_pos) == 2:
+                src_x, src_y = int(src_pos[0]), int(src_pos[1])
+                trg_x, trg_y = int(trg_pos[0]), int(trg_pos[1])
+                layout[src_latch_instance] = [src_x + 140, src_y]
+                layout[trg_latch_instance] = [trg_x - 140, trg_y]
+        except Exception:
+            pass
+
+        # Create line connecting the two latches.
+        objects.append({
+            'id': 'dynamic_line',
+            'instance': line_instance,
+            'source': src_latch_instance,
+            'target': trg_latch_instance,
+            'handles': [handle_instance],
+        })
+        flow_children.append(line_instance)
+
+    # Root flow canvas/group export. Must reference children via `objects`.
+    objects.append({
+        'id': 'flow',
+        'instance': flow_instance,
+        'properties': [
+            ['name', flow_name],
+            ['description', 'A linear chain of flags placed on topology nodes.'],
+            ['author', [
+                ['name', 'CORE TopoGen'],
+                ['identity_class', 'organization'],
+                ['contact_information', ''],
+            ]],
+            ['scope', 'incident'],
+            ['external_references', []],
+            ['created', now],
+        ],
+        'objects': flow_children,
+    })
+    layout[flow_instance] = [160, 120]
+
+    return {
+        'schema': 'attack_flow_v2',
+        'theme': 'dark_theme',
+        'objects': objects,
+        'layout': layout,
+    }
+
+
+def _flow_strip_ids_from_hint(text: str) -> str:
+    """Strip any node id fragments from a rendered hint.
+
+    Historically, hints included "(id=...)" to help debugging. For the user-facing
+    experience, we now remove ids from the hint text while still keeping internal
+    next_node_id/this_node_id fields for chaining.
+    """
+    try:
+        s = str(text or '')
+    except Exception:
+        return ''
+    if not s.strip():
+        return ''
+    try:
+        # Remove patterns like " (id=abc123)" (case-insensitive, whitespace tolerant).
+        s = re.sub(r"\s*\(\s*id\s*=\s*[^)]*\)", "", s, flags=re.IGNORECASE)
+    except Exception:
+        pass
+    # If templates include optional fields (e.g., "({{NEXT_NODE_IP}})"),
+    # the placeholder may resolve to an empty string. Strip empty parens.
+    try:
+        s = re.sub(r"\s*\(\s*\)", "", s)
+    except Exception:
+        pass
+    # If templates include optional IP (e.g., "@ {{NEXT_NODE_IP}}") and the IP is
+    # unavailable, the placeholder resolves to empty and leaves a dangling '@'.
+    try:
+        s = re.sub(r"\s*@\s*$", "", s)
+    except Exception:
+        pass
+    # Remove any leftover unexpanded id placeholders.
+    for token in ('{{NEXT_NODE_ID}}', '{{THIS_NODE_ID}}'):
+        try:
+            s = s.replace(token, '')
+        except Exception:
+            continue
+    try:
+        s = re.sub(r"[\t ]{2,}", " ", s)
+    except Exception:
+        pass
+    return s.strip()
+
+
+def _flow_render_hint_template(
+    tpl: str,
+    *,
+    scenario_label: str,
+    id_to_name: dict[str, str],
+    id_to_ip: dict[str, str] | None = None,
+    this_id: str,
+    next_id: str,
+) -> str:
+    try:
+        raw_tpl = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}}'
+        text = raw_tpl
+        next_id_val = str(next_id or '').strip()
+        next_name_val = (id_to_name.get(next_id_val) or '').strip() if next_id_val else ''
+        next_ip_val = ''
+        this_ip_val = ''
+        try:
+            if isinstance(id_to_ip, dict):
+                next_ip_val = str(id_to_ip.get(next_id_val) or '').strip()
+                this_ip_val = str(id_to_ip.get(str(this_id or '').strip()) or '').strip()
+        except Exception:
+            next_ip_val = ''
+            this_ip_val = ''
+        if not next_id_val:
+            return "You've completed this sequence of challenges!"
+        if not next_name_val:
+            next_name_val = next_id_val
+
+        # If the template references NEXT_NODE_NAME but not NEXT_NODE_IP,
+        # append the IP address to the displayed name when available.
+        if ('{{NEXT_NODE_NAME}}' in raw_tpl) and ('{{NEXT_NODE_IP}}' not in raw_tpl) and next_ip_val:
+            next_name_val = f"{next_name_val} ({next_ip_val})"
+
+        repl = {
+            '{{SCENARIO}}': str(scenario_label or ''),
+            '{{THIS_NODE_ID}}': str(this_id or ''),
+            '{{THIS_NODE_NAME}}': id_to_name.get(str(this_id or '')) or str(this_id or ''),
+            '{{THIS_NODE_IP}}': this_ip_val,
+            '{{NEXT_NODE_ID}}': next_id_val,
+            '{{NEXT_NODE_NAME}}': next_name_val,
+            '{{NEXT_NODE_IP}}': next_ip_val,
+        }
+        for k, v in repl.items():
+            try:
+                text = text.replace(k, str(v))
+            except Exception:
+                continue
+        return _flow_strip_ids_from_hint(text)
+    except Exception:
+        return _flow_strip_ids_from_hint(str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}}')
+
+
+def _flow_hint_templates_from_generator(gen: dict[str, Any]) -> list[str]:
+    """Return ordered hint templates from a generator view.
+
+    Accepts:
+    - gen['hint_templates']: list[str]
+    - gen['hint_template']: str or list[str] (legacy / permissive)
+    """
+    out: list[str] = []
+    try:
+        ht = gen.get('hint_templates')
+        if isinstance(ht, list):
+            for x in ht:
+                s = str(x or '').strip()
+                if s:
+                    s2 = _flow_strip_ids_from_hint(s)
+                    if s2:
+                        out.append(s2)
+    except Exception:
+        pass
+    if out:
+        return out
+    try:
+        ht1 = gen.get('hint_template')
+        if isinstance(ht1, list):
+            for x in ht1:
+                s = str(x or '').strip()
+                if s:
+                    s2 = _flow_strip_ids_from_hint(s)
+                    if s2:
+                        out.append(s2)
+        else:
+            s = str(ht1 or '').strip()
+            if s:
+                s2 = _flow_strip_ids_from_hint(s)
+                if s2:
+                    out.append(s2)
+    except Exception:
+        pass
+    if not out:
+        out = ['Next: {{NEXT_NODE_NAME}}']
+    return out
+
+
+def _flow_preset_steps(preset: str) -> list[dict[str, str]]:
+    p = str(preset or '').strip().lower()
+    if p in {'sample_reverse_nfs_ssh', 'sample'}:
+        return [
+            {'id': 'binary_embed_text', 'kind': 'flag-generator', 'catalog': 'flag_generators'},
+            {'id': 'nfs_sensitive_file', 'kind': 'flag-node-generator', 'catalog': 'flag_node_generators'},
+            {'id': 'textfile_username_password', 'kind': 'flag-generator', 'catalog': 'flag_generators'},
+        ]
+    return []
+
+
+def _flow_compute_flag_assignments_for_preset(
+    preview: dict,
+    chain_nodes: list[dict[str, Any]],
+    scenario_label: str,
+    preset: str,
+) -> tuple[list[dict[str, Any]], str | None]:
+    steps = _flow_preset_steps(preset)
+    if not steps:
+        return [], 'unknown preset'
+
+    def _preset_stats() -> dict[str, int]:
+        try:
+            _nodes, _links, _adj = _build_topology_graph_from_preview_plan(preview)
+            st = _flow_compose_docker_stats(_nodes)
+            return st if isinstance(st, dict) else {}
+        except Exception:
+            return {}
+
+    def _requirement_message(*, required_total: int, required_nonvuln_docker: int) -> str:
+        st = _preset_stats()
+        docker_total = int(st.get('docker_total') or 0)
+        docker_nonvuln_total = int(st.get('docker_nonvuln_total') or 0)
+        vuln_total = int(st.get('vuln_total') or 0)
+        eligible_total = int(st.get('eligible_total') or 0)
+        required_any = max(0, int(required_total) - int(required_nonvuln_docker))
+        return (
+            f"Requires {required_any} Docker/Vuln and {int(required_nonvuln_docker)} Non-Vuln Docker. "
+            f"Current: Eligible: {eligible_total}, Docker: {docker_total} (Non-Vuln: {docker_nonvuln_total}), Vuln: {vuln_total}"
+        )
+
+    required_total = len(steps)
+    required_nonvuln_docker = sum(1 for s in steps if str((s or {}).get('kind') or '').strip() == 'flag-node-generator')
+
+    if len(chain_nodes) < required_total:
+        return [], _requirement_message(required_total=required_total, required_nonvuln_docker=required_nonvuln_docker)
+
+    try:
+        gens, _ = _flag_generators_from_enabled_sources()
+    except Exception:
+        gens = []
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        node_gens = []
+
+    by_id: dict[str, dict[str, Any]] = {}
+    for g in (gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid and gid not in by_id:
+            by_id[gid] = g
+    for g in (node_gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid and gid not in by_id:
+            by_id[gid] = g
+
+    chain_ids: list[str] = [str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()]
+    id_to_name: dict[str, str] = {}
+    id_to_ip: dict[str, str] = {}
+    for n in chain_nodes:
+        try:
+            nid = str(n.get('id') or '').strip()
+            nm = str(n.get('name') or '').strip()
+            if nid:
+                id_to_name[nid] = nm or nid
+                ip = ''
+                try:
+                    ip = _first_valid_ipv4(n.get('ip4') or n.get('ipv4') or n.get('ip') or '')
+                except Exception:
+                    ip = ''
+                if ip:
+                    id_to_ip[nid] = ip
+        except Exception:
+            pass
+
+    # Prefer v3 plugin contracts for artifact-level chaining semantics.
+    try:
+        plugins_by_id = _flow_enabled_plugin_contracts_by_id()
+    except Exception:
+        plugins_by_id = {}
+
+    out: list[dict[str, Any]] = []
+    for i, step in enumerate(steps):
+        cid = chain_ids[i] if i < len(chain_ids) else ''
+        next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
+        gen_id = str(step.get('id') or '').strip()
+        kind = str(step.get('kind') or '').strip() or 'flag-generator'
+        catalog = str(step.get('catalog') or '').strip() or ('flag_node_generators' if kind == 'flag-node-generator' else 'flag_generators')
+
+        # Mirror the existing rule: vuln nodes are only assigned flag-generators.
+        try:
+            node = chain_nodes[i] if i < len(chain_nodes) else {}
+            if kind == 'flag-node-generator' and isinstance(node, dict) and bool(node.get('is_vuln')):
+                return [], _requirement_message(required_total=required_total, required_nonvuln_docker=required_nonvuln_docker)
+        except Exception:
+            pass
+
+        gen = by_id.get(gen_id)
+        if not isinstance(gen, dict):
+            return [], f'generator not found/enabled: {gen_id}'
+
+        hint_templates = _flow_hint_templates_from_generator(gen)
+        hint_tpl = hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}}'
+
+        # Runtime IO (generator input/output fields).
+        # Show required + optional separately (UI), but only required participates in feasibility.
+        input_fields_all = sorted([
+            str(x.get('name') or '').strip()
+            for x in (gen.get('inputs') or [])
+            if isinstance(x, dict) and str(x.get('name') or '').strip()
+        ])
+        input_fields_required = sorted([
+            str(x.get('name') or '').strip()
+            for x in (gen.get('inputs') or [])
+            if isinstance(x, dict) and str(x.get('name') or '').strip() and x.get('required') is not False
+        ])
+        input_fields_optional = sorted([x for x in input_fields_all if x and x not in set(input_fields_required)])
+        output_fields = sorted([
+            str(x.get('name') or '').strip()
+            for x in (gen.get('outputs') or [])
+            if isinstance(x, dict) and str(x.get('name') or '').strip()
+        ])
+
+        # Artifact-level contracts (plugin requires/produces).
+        requires_artifacts: list[str] = []
+        produces_artifacts: list[str] = []
+        try:
+            plugin = plugins_by_id.get(gen_id)
+            if isinstance(plugin, dict):
+                req = plugin.get('requires')
+                if isinstance(req, list):
+                    requires_artifacts = sorted([str(x).strip() for x in req if str(x).strip()])
+                prod = plugin.get('produces')
+                if isinstance(prod, list):
+                    produces_artifacts = sorted([
+                        str(it.get('artifact') or '').strip()
+                        for it in prod
+                        if isinstance(it, dict) and str(it.get('artifact') or '').strip()
+                    ])
+        except Exception:
+            requires_artifacts = []
+            produces_artifacts = []
+
+        # If an artifact "requires" token also appears as an optional input field,
+        # treat it as optional (exclude from effective chaining requirements).
+        try:
+            optional_field_set = set(input_fields_optional)
+            requires_effective = sorted([x for x in (requires_artifacts or []) if x and x not in optional_field_set])
+        except Exception:
+            requires_effective = list(requires_artifacts or [])
+
+        # Effective chaining semantics used by ordering validation.
+        inputs_effective = sorted(set(requires_effective) | set(input_fields_required))
+        outputs_effective = sorted(set(produces_artifacts) | set(output_fields))
+
+        rendered_hints = [
+            _flow_render_hint_template(
+                t,
+                scenario_label=scenario_label,
+                id_to_name=id_to_name,
+                id_to_ip=id_to_ip,
+                this_id=str(cid),
+                next_id=str(next_id),
+            )
+            for t in (hint_templates or [])
+        ]
+        out.append({
+            'node_id': str(cid),
+            'id': gen_id,
+            'name': str(gen.get('name') or ''),
+            'description': str(gen.get('description') or ''),
+            'type': kind,
+            'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
+            'generator_catalog': catalog,
+            'language': str(gen.get('language') or ''),
+            'description_hints': list(gen.get('description_hints') or []) if isinstance(gen.get('description_hints'), list) else [],
+            'inject_files': list(gen.get('inject_files') or []) if isinstance(gen.get('inject_files'), list) else [],
+            # Effective union (used for chaining feasibility / ordering validation).
+            'inputs': inputs_effective,
+            'outputs': outputs_effective,
+
+            # Split-out views for UI transparency.
+            'requires': requires_artifacts,
+            'produces': produces_artifacts,
+            'input_fields': input_fields_all,
+            'input_fields_required': input_fields_required,
+            'input_fields_optional': input_fields_optional,
+            'output_fields': output_fields,
+            'hint_template': hint_tpl,
+            'hint_templates': hint_templates,
+            'hint': rendered_hints[0] if rendered_hints else _flow_render_hint_template(
+                hint_tpl,
+                scenario_label=scenario_label,
+                id_to_name=id_to_name,
+                id_to_ip=id_to_ip,
+                this_id=str(cid),
+                next_id=str(next_id),
+            ),
+            'hints': rendered_hints,
+            'next_node_id': str(next_id),
+            'next_node_name': str(id_to_name.get(str(next_id)) or ''),
+        })
+
+    return out, None
+
+
 @app.before_request
 def _require_login_redirect() -> None | Response:
     try:
@@ -7318,6 +9067,13 @@ def _require_login_redirect() -> None | Response:
         if endpoint in _LOGIN_EXEMPT_ENDPOINTS:
             return None
         if _current_user() is None:
+            # For API routes, return a JSON 401 instead of an HTML redirect.
+            # This prevents frontend fetch() calls from failing with non-JSON responses.
+            try:
+                if (request.path or '').startswith('/api/'):
+                    return jsonify({'ok': False, 'error': 'Login required'}), 401
+            except Exception:
+                pass
             return redirect(url_for('login'))
     except Exception:
         return None
@@ -7363,6 +9119,5879 @@ def login():
 def logout():
     _set_current_user(None)
     return redirect(url_for('login'))
+
+
+@app.route('/scenarios/flag-sequencing')
+def flow_page():
+    history = _load_run_history()
+    current_user = _current_user()
+    scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
+    scenario_participant_urls = _collect_scenario_participant_urls(scenario_paths, scenario_url_hints)
+    participant_url_flags = {
+        norm: bool(url)
+        for norm, url in scenario_participant_urls.items()
+        if isinstance(norm, str) and norm
+    }
+
+    scenario_query = request.args.get('scenario', '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_query)
+    # Enforce per-scenario view: default to the first available scenario when unset/invalid.
+    if scenario_names:
+        if not scenario_norm or not any(_normalize_scenario_label(n) == scenario_norm for n in scenario_names):
+            scenario_norm = _normalize_scenario_label(scenario_names[0])
+    active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
+
+    # Best-effort: provide the saved scenario XML path so the shared Preview button can work from this page.
+    active_scenario_xml_path = ''
+    try:
+        if scenario_norm and isinstance(scenario_paths, dict):
+            p = scenario_paths.get(scenario_norm) or scenario_paths.get(active_scenario) or ''
+            p2 = _select_existing_path(p)
+            if p2:
+                active_scenario_xml_path = os.path.abspath(p2)
+    except Exception:
+        active_scenario_xml_path = ''
+
+    xml_preview = ''
+    try:
+        if active_scenario_xml_path and os.path.isfile(active_scenario_xml_path):
+            with open(active_scenario_xml_path, 'r', encoding='utf-8', errors='ignore') as f:
+                xml_preview = f.read()
+    except Exception:
+        xml_preview = ''
+
+    return render_template(
+        'flow.html',
+        scenarios=scenario_names,
+        active_scenario=active_scenario,
+        participant_url_flags=participant_url_flags,
+        preview_xml_path=active_scenario_xml_path,
+        xml_preview=xml_preview,
+        active_page='scenarios',
+    )
+
+
+@app.route('/scenarios/preview')
+def scenarios_preview_page():
+    """Scenarios sub-tab: Preview.
+
+    This page renders a lightweight shell and loads the existing full preview page
+    into an iframe while showing a loading modal.
+    """
+    history = _load_run_history()
+    current_user = _current_user()
+    scenario_names, scenario_paths, scenario_url_hints = _scenario_catalog_for_user(history, user=current_user)
+
+    scenario_query = (request.args.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_query)
+    if scenario_names:
+        if not scenario_norm or not any(_normalize_scenario_label(n) == scenario_norm for n in scenario_names):
+            scenario_norm = _normalize_scenario_label(scenario_names[0])
+    active_scenario = _resolve_scenario_display(scenario_norm, scenario_names, scenario_query)
+
+    # Prefer explicit xml_path (e.g., coming from Topology editor save). Fallback to the catalog path for the active scenario.
+    xml_path = (request.args.get('xml_path') or '').strip()
+    xml_path_abs = ''
+    try:
+        if xml_path:
+            xml_path_abs = os.path.abspath(xml_path)
+            if not os.path.exists(xml_path_abs):
+                xml_path_abs = ''
+    except Exception:
+        xml_path_abs = ''
+    if not xml_path_abs:
+        try:
+            p = ''
+            if scenario_norm and isinstance(scenario_paths, dict):
+                p = scenario_paths.get(scenario_norm) or scenario_paths.get(active_scenario) or ''
+            p2 = _select_existing_path(p)
+            if p2:
+                xml_path_abs = os.path.abspath(p2)
+        except Exception:
+            xml_path_abs = ''
+
+    scenario_xml_by_name: dict[str, str] = {}
+    try:
+        if isinstance(scenario_names, list) and isinstance(scenario_paths, dict):
+            for nm in scenario_names:
+                try:
+                    nm_norm = _normalize_scenario_label(nm)
+                    raw_path = scenario_paths.get(nm_norm) or scenario_paths.get(nm) or ''
+                    chosen = _select_existing_path(raw_path) or ''
+                    scenario_xml_by_name[str(nm)] = os.path.abspath(chosen) if chosen else ''
+                except Exception:
+                    scenario_xml_by_name[str(nm)] = ''
+    except Exception:
+        scenario_xml_by_name = {}
+
+    return render_template(
+        'scenarios_preview.html',
+        scenarios=scenario_names,
+        active_scenario=active_scenario,
+        scenario_xml_by_name=scenario_xml_by_name,
+        scenario_tab=active_scenario,
+        preview_xml_path=xml_path_abs,
+        active_page='scenarios',
+    )
+
+
+def _latest_preview_plan_for_scenario_norm(scenario_norm: str, *, prefer_flow: bool = False) -> Optional[str]:
+    """Return absolute path to newest persisted plan for a scenario.
+
+    This is primarily used by Flag Sequencing. Two plan types exist:
+    - Preview plans: outputs/plans/plan_from_preview_*.json
+    - Flow-modified plans: outputs/plans/plan_from_flow*.json
+
+    By default, we prefer preview plans. Flow-modified plans may include
+    runtime/Flow-only mutations (e.g., promoting nodes to Docker role for
+    attachment) which should not affect the topology/eligibility counts
+    displayed in Flag Sequencing.
+
+    Important nuance: if a newer preview plan exists (scenario topology changed),
+    we return the newer preview plan even when prefer_flow=True. The caller can
+    still merge the latest flow metadata (chain/order/assignments) into the
+    newer preview payload.
+    """
+    try:
+        scenario_norm = _normalize_scenario_label(scenario_norm)
+        if not scenario_norm:
+            return None
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        if not plans_dir.is_dir():
+            return None
+        def _created_at_ts(meta: Any, *, fallback_path: Optional[Path] = None) -> float:
+            try:
+                if isinstance(meta, dict):
+                    raw = meta.get('created_at')
+                else:
+                    raw = None
+                s = str(raw or '').strip()
+                if s:
+                    # Handle ISO strings with Z suffix.
+                    if s.endswith('Z'):
+                        s = s[:-1] + '+00:00'
+                    try:
+                        from datetime import datetime as _dt
+                        dt = _dt.fromisoformat(s)
+                        return float(dt.timestamp())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                if fallback_path is not None:
+                    return float(fallback_path.stat().st_mtime)
+            except Exception:
+                pass
+            return 0.0
+
+        def _latest_matching(pattern: str) -> tuple[Optional[Path], float]:
+            scanned = 0
+            candidates = list(plans_dir.glob(pattern))
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            for p in candidates:
+                scanned += 1
+                if scanned > 250:
+                    return None, 0.0
+                try:
+                    with open(p, 'r', encoding='utf-8') as f:
+                        payload = json.load(f) or {}
+                    meta = payload.get('metadata') if isinstance(payload, dict) else None
+                    scen = str((meta or {}).get('scenario') or '').strip()
+                    if _normalize_scenario_label(scen) != scenario_norm:
+                        continue
+                    return p, _created_at_ts(meta, fallback_path=p)
+                except Exception:
+                    continue
+            return None, 0.0
+
+        latest_preview, preview_ts = _latest_matching('plan_from_preview_*.json')
+        latest_flow, flow_ts = _latest_matching('plan_from_flow*.json')
+
+        # Prefer flow plan only when no preview exists.
+        if prefer_flow and latest_preview is None and latest_flow is not None:
+            return str(latest_flow)
+
+        # prefer_flow=False (default): always prefer preview when available.
+        if latest_preview is not None:
+            return str(latest_preview)
+        if latest_flow is not None:
+            return str(latest_flow)
+        return None
+    except Exception:
+        return None
+
+
+def _latest_preview_plan_for_scenario_norm_origin(scenario_norm: str, *, origin: str) -> Optional[str]:
+    """Return newest preview-plan path for scenario with a specific metadata.origin."""
+    try:
+        scenario_norm = _normalize_scenario_label(scenario_norm)
+        origin_norm = str(origin or '').strip().lower()
+        if not scenario_norm or not origin_norm:
+            return None
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        if not plans_dir.is_dir():
+            return None
+
+        scanned = 0
+        candidates = list(plans_dir.glob('plan_from_preview_*.json'))
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for p in candidates:
+            scanned += 1
+            if scanned > 250:
+                return None
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    payload = json.load(f) or {}
+                meta = payload.get('metadata') if isinstance(payload, dict) else None
+                if not isinstance(meta, dict):
+                    continue
+                scen = str(meta.get('scenario') or '').strip()
+                if _normalize_scenario_label(scen) != scenario_norm:
+                    continue
+                o = str(meta.get('origin') or '').strip().lower()
+                if o != origin_norm:
+                    continue
+                return str(p)
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+def _attach_latest_flow_into_plan_payload(payload: dict[str, Any], *, scenario: str) -> None:
+    """Best-effort: merge saved flow metadata into a plan payload.
+
+    This is useful when the newest plan is a preview plan (topology updated) but
+    we still want to honor the user's saved Flow chain/order/assignments.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return
+        scenario_norm = _normalize_scenario_label(scenario or '')
+        if not scenario_norm:
+            return
+
+        full_prev = payload.get('full_preview')
+        if not isinstance(full_prev, dict):
+            return
+
+        flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
+        if not flow_plan_path:
+            return
+        try:
+            with open(flow_plan_path, 'r', encoding='utf-8') as f:
+                flow_payload = json.load(f) or {}
+        except Exception:
+            return
+
+        flow_meta = None
+        if isinstance(flow_payload, dict):
+            meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
+            flow_meta = (meta or {}).get('flow')
+            if not flow_meta:
+                flow_meta = flow_payload.get('flow')
+        if not isinstance(flow_meta, dict):
+            return
+
+        # Repair saved Flow metadata against the *current* full_preview topology.
+        # This prevents stale chains/assignments from pointing at nodes that are no
+        # longer eligible (e.g., non-docker/non-vuln hosts).
+        try:
+            repaired = _flow_repair_saved_flow_for_preview(full_prev, flow_meta)
+            if not isinstance(repaired, dict):
+                return
+            flow_meta = repaired
+        except Exception:
+            return
+
+        payload.setdefault('metadata', {})
+        if isinstance(payload.get('metadata'), dict):
+            payload['metadata']['flow'] = flow_meta
+            payload['metadata']['flow_plan_path'] = flow_plan_path
+
+        # Keep the same shape expected by the preview graph.
+        full_prev.setdefault('metadata', {})
+        if isinstance(full_prev.get('metadata'), dict):
+            full_prev['metadata']['flow'] = flow_meta
+            full_prev['metadata']['flow_plan_path'] = flow_plan_path
+        full_prev['flow'] = flow_meta
+    except Exception:
+        return
+
+
+def _latest_flow_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
+    """Return newest flow-modified plan path for scenario (or None)."""
+    try:
+        scenario_norm = _normalize_scenario_label(scenario_norm)
+        if not scenario_norm:
+            return None
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        if not plans_dir.is_dir():
+            return None
+        candidates = list(plans_dir.glob('plan_from_flow*.json'))
+        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for p in candidates[:250]:
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    payload = json.load(f) or {}
+                meta = payload.get('metadata') if isinstance(payload, dict) else None
+                scen = str((meta or {}).get('scenario') or '').strip()
+                if _normalize_scenario_label(scen) == scenario_norm:
+                    return str(p)
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+def _attach_latest_flow_into_full_preview(full_prev: dict, scenario: Optional[str]) -> None:
+    """Best-effort: merge saved Flag Sequencing (flow) metadata into a full_preview payload.
+
+    Preview plans generated from XML alone do not include flow/chain data; the user's
+    sequencing is stored in outputs/plans/plan_from_flow_*.json.
+
+    The Preview graph expects flow chain data under full_preview.metadata.flow (or
+    sometimes full_preview.flow) to mark sequence nodes.
+    """
+    try:
+        if not isinstance(full_prev, dict):
+            return
+        scenario_norm = _normalize_scenario_label(scenario or '')
+        if not scenario_norm:
+            return
+        flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
+        if not flow_plan_path:
+            return
+        try:
+            with open(flow_plan_path, 'r', encoding='utf-8') as f:
+                flow_payload = json.load(f) or {}
+        except Exception:
+            return
+        flow_meta = None
+        if isinstance(flow_payload, dict):
+            meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
+            flow_meta = (meta or {}).get('flow')
+            if not flow_meta:
+                flow_meta = flow_payload.get('flow')
+        if not isinstance(flow_meta, dict):
+            return
+
+        # Repair saved Flow metadata against the *current* full_preview topology.
+        # Preview plans can change over time; keep the UI from marking/assigning
+        # flags to nodes that are no longer eligible.
+        try:
+            repaired = _flow_repair_saved_flow_for_preview(full_prev, flow_meta)
+            if not isinstance(repaired, dict):
+                return
+            flow_meta = repaired
+        except Exception:
+            return
+
+        # Attach in the shape the front-end already understands.
+        full_prev.setdefault('metadata', {})
+        if isinstance(full_prev.get('metadata'), dict):
+            full_prev['metadata']['flow'] = flow_meta
+            full_prev['metadata']['flow_plan_path'] = flow_plan_path
+        # Back-compat: also provide top-level alias.
+        full_prev['flow'] = flow_meta
+    except Exception:
+        return
+
+
+def _flow_node_is_docker_role(node: dict[str, Any] | None) -> bool:
+    try:
+        if not isinstance(node, dict):
+            return False
+        t_raw = str(node.get('type') or '')
+        t = t_raw.strip().lower()
+        if ('docker' in t) or (t_raw.strip().upper() == 'DOCKER'):
+            return True
+        # Preview graph nodes also carry compose metadata for docker-role hosts.
+        comp = str(node.get('compose') or '').strip()
+        comp_name = str(node.get('compose_name') or '').strip()
+        return bool(comp or comp_name)
+    except Exception:
+        return False
+
+
+def _flow_node_is_vuln(node: dict[str, Any] | None) -> bool:
+    try:
+        if not isinstance(node, dict):
+            return False
+        return bool(node.get('is_vuln'))
+    except Exception:
+        return False
+
+
+def _flow_repair_saved_flow_for_preview(full_prev: dict, flow_meta: dict) -> dict | None:
+    """Best-effort: repair a persisted Flow chain/assignments against the current preview.
+
+    This is intentionally conservative: if we cannot build a valid chain of the same
+    length, we return None and the caller should skip attaching Flow.
+
+    Placement rules enforced:
+    - flag-generator: allowed on vuln nodes OR docker-role nodes
+    - flag-node-generator: allowed only on non-vuln docker-role nodes
+    """
+    if not isinstance(full_prev, dict) or not isinstance(flow_meta, dict):
+        return None
+
+    chain_in = flow_meta.get('chain')
+    if not isinstance(chain_in, list) or not chain_in:
+        return None
+
+    assignments_in = flow_meta.get('flag_assignments')
+    assignments: list[dict[str, Any]] | None = None
+    if isinstance(assignments_in, list) and assignments_in:
+        assignments = [a for a in assignments_in if isinstance(a, dict)]
+
+    nodes, _links, _adj = _build_topology_graph_from_preview_plan(full_prev)
+    id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
+    if not id_map:
+        return None
+
+    # Candidate pools.
+    eligible_any: list[dict[str, Any]] = []
+    eligible_nonvuln_docker: list[dict[str, Any]] = []
+    for n in nodes or []:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if not nid:
+            continue
+        is_docker = _flow_node_is_docker_role(n)
+        is_vuln = _flow_node_is_vuln(n)
+        if is_docker or is_vuln:
+            eligible_any.append(n)
+        if is_docker and (not is_vuln):
+            eligible_nonvuln_docker.append(n)
+    eligible_any.sort(key=lambda x: str(x.get('id') or ''))
+    eligible_nonvuln_docker.sort(key=lambda x: str(x.get('id') or ''))
+
+    # Saved chains may intentionally include duplicate nodes (e.g., when the user
+    # allows duplicates with different generator seeds). Only enforce uniqueness
+    # when the saved chain is itself unique.
+    try:
+        chain_in_ids = [
+            str((step or {}).get('id') or '').strip()
+            for step in (chain_in or [])
+            if isinstance(step, dict) and str((step or {}).get('id') or '').strip()
+        ]
+        enforce_unique = len(set(chain_in_ids)) == len(chain_in_ids)
+    except Exception:
+        enforce_unique = True
+
+    used: set[str] = set()
+    chain_out: list[dict[str, str]] = []
+    assignments_out: list[dict[str, Any]] | None = [] if assignments is not None else None
+
+    for i, step in enumerate(chain_in):
+        step_id = str((step or {}).get('id') or '').strip() if isinstance(step, dict) else ''
+
+        kind = 'flag-generator'
+        if assignments is not None and i < len(assignments):
+            try:
+                kind = str((assignments[i] or {}).get('type') or '').strip() or 'flag-generator'
+            except Exception:
+                kind = 'flag-generator'
+
+        need_nonvuln_docker = (kind == 'flag-node-generator')
+
+        cand = id_map.get(step_id) if step_id else None
+        if cand is not None:
+            nid = str(cand.get('id') or '').strip()
+            ok = bool(nid) and ((not enforce_unique) or (nid not in used))
+            if ok:
+                is_docker = _flow_node_is_docker_role(cand)
+                is_vuln = _flow_node_is_vuln(cand)
+                if need_nonvuln_docker:
+                    ok = bool(is_docker and (not is_vuln))
+                else:
+                    ok = bool(is_docker or is_vuln)
+            if not ok:
+                cand = None
+
+        if cand is None:
+            pool = eligible_nonvuln_docker if need_nonvuln_docker else eligible_any
+            pick = None
+            for n in pool:
+                nid = str(n.get('id') or '').strip()
+                if not nid:
+                    continue
+                if enforce_unique and nid in used:
+                    continue
+                pick = n
+                break
+            cand = pick
+
+        if not isinstance(cand, dict):
+            return None
+
+        nid = str(cand.get('id') or '').strip()
+        if not nid:
+            return None
+        if enforce_unique:
+            used.add(nid)
+
+        chain_out.append({
+            'id': nid,
+            'name': str(cand.get('name') or nid),
+            'type': str(cand.get('type') or 'node'),
+        })
+
+        if assignments is not None and assignments_out is not None and i < len(assignments):
+            a2 = dict(assignments[i] or {})
+            a2['node_id'] = nid
+            assignments_out.append(a2)
+
+    out = dict(flow_meta)
+    out['chain'] = chain_out
+    out['length'] = len(chain_out)
+    if assignments_out is not None:
+        out['flag_assignments'] = assignments_out
+    return out
+
+
+def _build_topology_graph_from_preview_plan(preview: Dict[str, Any]) -> Tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, set[str]]]:
+    """Build a lightweight graph from a full_preview payload.
+
+    This is used for Flow generation based on persisted preview artifacts
+    (no CORE session XML required).
+    """
+    nodes_out: list[dict[str, Any]] = []
+    links_out: list[dict[str, str]] = []
+    by_id: dict[str, dict[str, Any]] = {}
+
+    def _add_node(
+        nid: str,
+        name: str,
+        ntype: str,
+        *,
+        compose: str = '',
+        compose_name: str = '',
+        is_vuln: bool = False,
+        ip4: str = '',
+    ) -> None:
+        if not nid or nid in by_id:
+            return
+        rec = {
+            'id': nid,
+            'name': name or nid,
+            'type': ntype or 'node',
+            'compose': compose or '',
+            'compose_name': compose_name or '',
+            'is_vuln': bool(is_vuln),
+            'ip4': str(ip4 or '').strip(),
+            'interfaces': [],
+            'services': [],
+        }
+        by_id[nid] = rec
+        nodes_out.append(rec)
+
+    def _add_link(a: str, b: str) -> None:
+        a = str(a or '').strip()
+        b = str(b or '').strip()
+        if not a or not b or a == b:
+            return
+        if a not in by_id or b not in by_id:
+            return
+        links_out.append({'node1': a, 'node2': b})
+
+    # Add routers
+    for r in (preview.get('routers') or []):
+        if not isinstance(r, dict):
+            continue
+        rid = str(r.get('node_id') or '').strip()
+        if not rid:
+            continue
+        _add_node(rid, str(r.get('name') or f'router-{rid}'), 'router')
+
+    # Add switches
+    for s in (preview.get('switches') or []):
+        if not isinstance(s, dict):
+            continue
+        sid = str(s.get('node_id') or '').strip()
+        if not sid:
+            continue
+        _add_node(sid, str(s.get('name') or f'switch-{sid}'), 'switch')
+
+    vuln_ids: set[str] = set()
+    try:
+        vb = preview.get('vulnerabilities_by_node') if isinstance(preview, dict) else None
+        if isinstance(vb, dict):
+            for k, v in vb.items():
+                if not v:
+                    continue
+                kk = str(k or '').strip()
+                if kk:
+                    vuln_ids.add(kk)
+    except Exception:
+        vuln_ids = set()
+
+    # Add hosts
+    for h in (preview.get('hosts') or []):
+        if not isinstance(h, dict):
+            continue
+        hid = str(h.get('node_id') or '').strip()
+        if not hid:
+            continue
+        role = str(h.get('role') or 'Host')
+        role_norm = role.strip().lower()
+        is_docker_role = role_norm == 'docker'
+        vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
+        is_vuln = bool(vulns) or (hid in vuln_ids)
+        # IMPORTANT: vulnerabilities should not "take up" Docker node slots.
+        # Only Docker-role hosts are treated as docker nodes for Flow eligibility.
+        node_type = 'docker' if is_docker_role else 'host'
+        compose = ''
+        compose_name = ''
+        if is_docker_role:
+            compose_name = 'standard-ubuntu-docker-core'
+            compose = 'scripts/standard-ubuntu-docker-core/docker-compose.yml'
+        # Best-effort: pull an IPv4 address from host payload if present.
+        host_ip4 = ''
+        try:
+            host_ip4 = _first_valid_ipv4(h.get('ip4') or h.get('ipv4') or h.get('ip'))
+        except Exception:
+            host_ip4 = ''
+        if not host_ip4:
+            try:
+                ifaces = h.get('interfaces') if isinstance(h.get('interfaces'), list) else []
+                for iface in ifaces:
+                    if not isinstance(iface, dict):
+                        continue
+                    host_ip4 = _first_valid_ipv4(iface.get('ip4') or iface.get('ipv4') or iface.get('ip') or iface.get('address'))
+                    if host_ip4:
+                        break
+            except Exception:
+                host_ip4 = ''
+        _add_node(
+            hid,
+            str(h.get('name') or f'host-{hid}'),
+            node_type,
+            compose=compose,
+            compose_name=compose_name,
+            is_vuln=is_vuln,
+            ip4=host_ip4,
+        )
+
+    # Router-to-router links
+    for l in (preview.get('r2r_links_preview') or []):
+        if not isinstance(l, dict):
+            continue
+        routers = l.get('routers')
+        if not isinstance(routers, list) or len(routers) < 2:
+            continue
+        try:
+            a = str((routers[0] or {}).get('id') or '').strip()
+            b = str((routers[1] or {}).get('id') or '').strip()
+        except Exception:
+            continue
+        _add_link(a, b)
+
+    # Router-switch-host grouping
+    try:
+        for detail in (preview.get('switches_detail') or []):
+            if not isinstance(detail, dict):
+                continue
+            sid = str(detail.get('switch_id') or '').strip()
+            rid = str(detail.get('router_id') or '').strip()
+            if sid and rid:
+                _add_link(sid, rid)
+            for hid in (detail.get('hosts') or []):
+                _add_link(sid, str(hid))
+    except Exception:
+        pass
+
+    # Direct host-router attachment (when no switches)
+    try:
+        hrm = preview.get('host_router_map') or {}
+        if isinstance(hrm, dict):
+            for hid, rid in hrm.items():
+                _add_link(str(hid), str(rid))
+    except Exception:
+        pass
+
+    adj: dict[str, set[str]] = {nid: set() for nid in by_id.keys()}
+    for l in links_out:
+        a = str(l.get('node1') or '').strip()
+        b = str(l.get('node2') or '').strip()
+        if not a or not b:
+            continue
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+
+    return nodes_out, links_out, adj
+
+
+@app.route('/api/flag-sequencing/latest_preview_plan')
+def api_flow_latest_preview_plan():
+    scenario_label = (request.args.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+    plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+    if not plan_path:
+        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview from the Scenarios page first.'}), 404
+    try:
+        with open(plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+        meta = payload.get('metadata') if isinstance(payload, dict) else None
+    except Exception:
+        meta = None
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'preview_plan_path': plan_path,
+        'metadata': meta or {},
+    })
+
+
+def _flow_read_flag_value_from_artifacts_dir(artifacts_dir: str) -> str:
+    """Read a realized flag value from a generator artifacts directory.
+
+    Only reads from directories under /tmp/vulns to avoid arbitrary file access.
+    Returns empty string when not found.
+    """
+    try:
+        d = str(artifacts_dir or '').strip()
+        if not d:
+            return ''
+        base_dir = os.path.abspath(os.path.join('/tmp', 'vulns'))
+        dd = os.path.abspath(d)
+        if os.path.commonpath([dd, base_dir]) != base_dir:
+            return ''
+        if not os.path.isdir(dd):
+            return ''
+        flag_txt = os.path.join(dd, 'flag.txt')
+        if os.path.isfile(flag_txt):
+            with open(flag_txt, 'r', encoding='utf-8', errors='ignore') as f:
+                val = (f.read() or '').strip()
+                return val[:4096] if val else ''
+        outs_path = os.path.join(dd, 'outputs.json')
+        if os.path.isfile(outs_path):
+            try:
+                with open(outs_path, 'r', encoding='utf-8') as f:
+                    m = json.load(f) or {}
+                outs = m.get('outputs') if isinstance(m, dict) else None
+                if isinstance(outs, dict):
+                    v = outs.get('flag')
+                    if isinstance(v, str) and v.strip():
+                        vv = v.strip()
+                        return vv[:4096]
+            except Exception:
+                return ''
+    except Exception:
+        return ''
+    return ''
+
+
+def _flow_read_outputs_map_from_artifacts_dir(artifacts_dir: str) -> dict[str, Any]:
+    """Read realized output values from a generator artifacts directory.
+
+    Only reads from directories under /tmp/vulns to avoid arbitrary file access.
+    Returns an empty dict when not found.
+
+    Expected shape (best-effort): outputs.json contains {"outputs": {k: v, ...}}.
+    """
+    try:
+        d = str(artifacts_dir or '').strip()
+        if not d:
+            return {}
+        base_dir = os.path.abspath(os.path.join('/tmp', 'vulns'))
+        dd = os.path.abspath(d)
+        if os.path.commonpath([dd, base_dir]) != base_dir:
+            return {}
+        if not os.path.isdir(dd):
+            return {}
+        outs_path = os.path.join(dd, 'outputs.json')
+        if not os.path.isfile(outs_path):
+            return {}
+        with open(outs_path, 'r', encoding='utf-8') as f:
+            m = json.load(f) or {}
+        outs = m.get('outputs') if isinstance(m, dict) else None
+        return outs if isinstance(outs, dict) else {}
+    except Exception:
+        return {}
+
+
+def _first_valid_ipv4(value: Any) -> str:
+    """Return a best-effort IPv4 address string (no CIDR), or '' if not found."""
+    try:
+        import ipaddress
+
+        def _norm_one(v: Any) -> str:
+            s = str(v or '').strip()
+            if not s:
+                return ''
+            if '/' in s:
+                s = s.split('/', 1)[0].strip()
+            try:
+                ip = ipaddress.ip_address(s)
+            except Exception:
+                return ''
+            return s if ip.version == 4 else ''
+
+        if isinstance(value, list):
+            for item in value:
+                out = _norm_one(item)
+                if out:
+                    return out
+            return ''
+        return _norm_one(value)
+    except Exception:
+        return ''
+
+
+@app.route('/api/flag-sequencing/flag_values_for_node')
+def api_flow_flag_values_for_node():
+    """Return realized flag value(s) for a sequenced node (runtime-only).
+
+    Used by the Scenarios Preview tab graph popup to fetch flag values on-demand.
+    """
+    scenario_label = (request.args.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    node_id = str((request.args.get('node_id') or '').strip())
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+    if not node_id:
+        return jsonify({'ok': False, 'error': 'No node_id specified.'}), 400
+
+    plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+    if not plan_path or not os.path.exists(plan_path):
+        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario.'}), 404
+
+    try:
+        with open(plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+        meta = payload.get('metadata') if isinstance(payload, dict) else None
+        flow = (meta or {}).get('flow') if isinstance(meta, dict) else None
+        fas = flow.get('flag_assignments') if isinstance(flow, dict) else None
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
+
+    if not isinstance(fas, list) or not fas:
+        return jsonify({'ok': True, 'scenario': scenario_label or scenario_norm, 'node_id': node_id, 'flags': []})
+
+    matches = [a for a in fas if isinstance(a, dict) and str(a.get('node_id') or '').strip() == node_id]
+    out_flags: list[dict[str, Any]] = []
+    for a in (matches or []):
+        try:
+            artifacts_dir = str(a.get('artifacts_dir') or a.get('run_dir') or '').strip()
+            val = _flow_read_flag_value_from_artifacts_dir(artifacts_dir) if artifacts_dir else ''
+            out_flags.append({
+                'generator_id': str(a.get('id') or ''),
+                'generator_name': str(a.get('name') or ''),
+                'flag_value': val,
+            })
+        except Exception:
+            out_flags.append({
+                'generator_id': str(a.get('id') or ''),
+                'generator_name': str(a.get('name') or ''),
+                'flag_value': '',
+            })
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'node_id': node_id,
+        'flags': out_flags,
+    })
+
+
+def _flow_compute_flag_assignments(preview: dict, chain_nodes: list[dict[str, Any]], scenario_label: str) -> list[dict[str, Any]]:
+    """Return a per-position list of flag assignments aligned to chain_ids.
+
+    Each item includes node_id plus the fields used for metadata.flow_flag.
+    Deterministic-ish: shuffles eligible flags based on preview.seed.
+    """
+    if not isinstance(preview, dict) or not isinstance(chain_nodes, list) or not chain_nodes:
+        return []
+
+    chain_ids: list[str] = [str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()]
+    if not chain_ids:
+        return []
+
+    vuln_ids: set[str] = set()
+    try:
+        hosts = preview.get('hosts') if isinstance(preview, dict) else None
+        if isinstance(hosts, list):
+            for h in hosts:
+                if not isinstance(h, dict):
+                    continue
+                hid = str(h.get('node_id') or '').strip()
+                if not hid:
+                    continue
+                vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else []
+                if vulns:
+                    vuln_ids.add(hid)
+    except Exception:
+        vuln_ids = set()
+
+    # Use generator-catalog entries:
+    # - flag-generators: artifact/flag generation
+    # - flag-node-generators: node/docker-compose generation (Docker-role only)
+    try:
+        generators, _errors = _flag_generators_from_enabled_sources()
+    except Exception:
+        generators = []
+
+    try:
+        node_generators, _errors2 = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        node_generators = []
+
+    eligible_gens: list[dict[str, Any]] = []
+    for g in (generators or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if not gid:
+            continue
+        g2 = dict(g)
+        g2['_flow_kind'] = 'flag-generator'
+        g2['_flow_catalog'] = 'flag_generators'
+        eligible_gens.append(g2)
+
+    for g in (node_generators or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if not gid:
+            continue
+        g2 = dict(g)
+        g2['_flow_kind'] = 'flag-node-generator'
+        g2['_flow_catalog'] = 'flag_node_generators'
+        eligible_gens.append(g2)
+
+    if not eligible_gens:
+        return []
+
+    # Deterministic randomness for generator selection.
+    try:
+        import random as _random
+        try:
+            seed_val = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
+        except Exception:
+            seed_val = 0
+        rnd = _random.Random(seed_val ^ 0xC0FFEE)
+    except Exception:
+        rnd = None
+
+    # Map ids -> names for THIS/NEXT substitution.
+    id_to_name: dict[str, str] = {}
+    id_to_ip: dict[str, str] = {}
+    for n in chain_nodes:
+        try:
+            nid = str(n.get('id') or '').strip()
+            nm = str(n.get('name') or '').strip()
+            if nid:
+                id_to_name[nid] = nm or nid
+                ip = ''
+                try:
+                    ip = _first_valid_ipv4(n.get('ip4') or n.get('ipv4') or n.get('ip') or '')
+                except Exception:
+                    ip = ''
+                if ip:
+                    id_to_ip[nid] = ip
+        except Exception:
+            pass
+
+    id_to_node: dict[str, dict[str, Any]] = {}
+    for n in chain_nodes:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if nid:
+            id_to_node[nid] = n
+
+    # Prefer v3 plugin contracts for chaining semantics (requires/produces).
+    try:
+        plugins_by_id = _flow_enabled_plugin_contracts_by_id()
+    except Exception:
+        plugins_by_id = {}
+
+    def _render_hint(tpl: str, *, this_id: str, next_id: str) -> str:
+        try:
+            raw_tpl = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}}'
+            text = raw_tpl
+            next_id_val = str(next_id or '').strip()
+            next_name_val = (id_to_name.get(next_id_val) or '').strip() if next_id_val else ''
+            next_ip_val = str(id_to_ip.get(next_id_val) or '').strip() if next_id_val else ''
+            if not next_id_val:
+                return "You've completed this sequence of challenges!"
+            if not next_name_val:
+                next_name_val = next_id_val
+            if ('{{NEXT_NODE_NAME}}' in raw_tpl) and ('{{NEXT_NODE_IP}}' not in raw_tpl) and next_ip_val:
+                next_name_val = f"{next_name_val} ({next_ip_val})"
+            repl = {
+                '{{SCENARIO}}': str(scenario_label or ''),
+                '{{THIS_NODE_ID}}': this_id,
+                '{{THIS_NODE_NAME}}': id_to_name.get(this_id) or this_id,
+                '{{NEXT_NODE_ID}}': next_id_val,
+                '{{NEXT_NODE_NAME}}': next_name_val,
+                '{{NEXT_NODE_IP}}': next_ip_val,
+            }
+            for k, v in repl.items():
+                text = text.replace(k, str(v))
+            return _flow_strip_ids_from_hint(text)
+        except Exception:
+            return ''
+
+    out: list[dict[str, Any]] = []
+
+    def _artifact_requires_of(gen: dict[str, Any]) -> set[str]:
+        required: set[str] = set()
+        try:
+            pid = str(gen.get('id') or '').strip()
+            plugin = plugins_by_id.get(pid)
+            if isinstance(plugin, dict) and isinstance(plugin.get('requires'), list):
+                for x in (plugin.get('requires') or []):
+                    xx = str(x).strip()
+                    if xx:
+                        required.add(xx)
+        except Exception:
+            pass
+        # Synthesized inputs (e.g., seed/node_name) are *fields*, not chain artifacts.
+        # Filter them out even if a plugin contract mistakenly lists them in `requires`.
+        try:
+            required = {x for x in required if x not in _flow_synthesized_inputs()}
+        except Exception:
+            pass
+        return required
+
+    def _required_input_fields_of(gen: dict[str, Any]) -> set[str]:
+        """Return required input field names for a generator.
+
+        Optional inputs (required=False) are intentionally excluded.
+        """
+        required: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get('name') or '').strip()
+                    if not name:
+                        continue
+                    if inp.get('required') is False:
+                        continue
+                    required.add(name)
+        except Exception:
+            pass
+        return required
+
+    def _all_input_fields_of(gen: dict[str, Any]) -> set[str]:
+        fields: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get('name') or '').strip()
+                    if name:
+                        fields.add(name)
+        except Exception:
+            pass
+        return fields
+
+    def _required_inputs_of(gen: dict[str, Any]) -> set[str]:
+        # Effective union: artifact dependencies + required runtime input fields.
+        # If a plugin-level "requires" token is also present as an *optional* input
+        # field (required=False), treat it as optional and exclude it.
+        try:
+            req_fields = _required_input_fields_of(gen)
+            opt_fields = _all_input_fields_of(gen) - set(req_fields)
+            req_artifacts = _artifact_requires_of(gen)
+            if opt_fields:
+                req_artifacts = {r for r in req_artifacts if r not in opt_fields}
+            return req_artifacts | set(req_fields)
+        except Exception:
+            return set()
+
+    def _artifact_produces_of(gen: dict[str, Any]) -> set[str]:
+        provides: set[str] = set()
+        try:
+            pid = str(gen.get('id') or '').strip()
+            plugin = plugins_by_id.get(pid)
+            if isinstance(plugin, dict) and isinstance(plugin.get('produces'), list):
+                for item in (plugin.get('produces') or []):
+                    if not isinstance(item, dict):
+                        continue
+                    a = str(item.get('artifact') or '').strip()
+                    if a:
+                        provides.add(a)
+        except Exception:
+            pass
+        return provides
+
+    def _output_fields_of(gen: dict[str, Any]) -> set[str]:
+        out_fields: set[str] = set()
+        try:
+            outputs = gen.get('outputs')
+            if isinstance(outputs, list):
+                for outp in outputs:
+                    if not isinstance(outp, dict):
+                        continue
+                    nm = str(outp.get('name') or '').strip()
+                    if nm:
+                        out_fields.add(nm)
+        except Exception:
+            pass
+        return out_fields
+
+    def _provides_of(gen: dict[str, Any]) -> set[str]:
+        provides: set[str] = set()
+
+        # Plugin-level produces (artifact dependencies).
+        try:
+            provides |= _artifact_produces_of(gen)
+        except Exception:
+            pass
+
+        try:
+            prov = gen.get('provides')
+            if isinstance(prov, list):
+                for x in prov:
+                    s = str(x).strip()
+                    if s:
+                        provides.add(s)
+        except Exception:
+            pass
+        try:
+            provides |= _output_fields_of(gen)
+        except Exception:
+            pass
+        return provides
+
+    # Inputs we can always synthesize deterministically at preview time.
+    # Keep this in sync with _flow_default_generator_config() and common generator conventions.
+    available: set[str] = {
+        'seed',
+        'secret',
+        'env_name',
+        'challenge',
+        'flag_prefix',
+        'username_prefix',
+        'key_len',
+        'node_name',
+    }
+    prev_outputs: set[str] = set()
+
+    for i, cid in enumerate(chain_ids):
+        node = id_to_node.get(str(cid)) or {}
+        is_vuln_node = bool(node.get('is_vuln')) or (str(cid) in vuln_ids)
+        is_docker_node = _flow_node_is_docker_role(node)
+        # Enforce placement policy per node:
+        # - flag-generator: allowed on docker-role OR vuln nodes
+        # - flag-node-generator: allowed only on non-vuln docker-role nodes
+        def _eligible_for_node(g: dict[str, Any]) -> bool:
+            k = str(g.get('_flow_kind') or '').strip() or 'flag-generator'
+            if k == 'flag-node-generator':
+                return bool(is_docker_node and (not is_vuln_node))
+            return bool(is_docker_node or is_vuln_node)
+
+        pool = [g for g in eligible_gens if _eligible_for_node(g)]
+        if not pool:
+            pool = eligible_gens
+        # Enforce chainability:
+        # - prefer generators whose required inputs are satisfied by the previous step's outputs
+        #   (plus globally-available synthesized inputs)
+        if i == 0:
+            feasible = [g for g in pool if _required_inputs_of(g).issubset(available)]
+        else:
+            satisfied_now = prev_outputs | available
+            feasible = [g for g in pool if _required_inputs_of(g) and _required_inputs_of(g).issubset(satisfied_now)]
+            if not feasible:
+                feasible = [g for g in pool if _required_inputs_of(g).issubset(satisfied_now)]
+
+        if feasible:
+            if rnd is not None:
+                try:
+                    gen = rnd.choice(feasible)
+                except Exception:
+                    gen = feasible[0]
+            else:
+                gen = feasible[0]
+        else:
+            # If the catalog doesn't contain a seed (or no compatible step exists),
+            # fall back to a stable rotation.
+            gen = pool[i % len(pool)]
+
+        # Update outputs for the next hop.
+        try:
+            prev_outputs = _provides_of(gen)
+            available |= prev_outputs
+        except Exception:
+            pass
+
+        next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
+        hint_templates = _flow_hint_templates_from_generator(gen)
+        hint_tpl = hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}}'
+        rendered_hints = [
+            _render_hint(t, this_id=str(cid), next_id=str(next_id))
+            for t in (hint_templates or [])
+        ]
+
+        requires_artifacts = sorted(list(_artifact_requires_of(gen)))
+        produces_artifacts = sorted(list(_artifact_produces_of(gen)))
+        input_fields_required = sorted(list(_required_input_fields_of(gen)))
+        input_fields_all = sorted(list(_all_input_fields_of(gen)))
+        input_fields_optional = sorted([x for x in input_fields_all if x and x not in set(input_fields_required)])
+        output_fields = sorted(list(_output_fields_of(gen)))
+
+        # Preview-level input overrides are optional; these are primarily relevant
+        # for UI preview and are filtered to known inputs + synthesized fields.
+        raw_overrides = preview.get('config_overrides')
+        if not isinstance(raw_overrides, dict):
+            raw_overrides = preview.get('inputs_overrides')
+        if not isinstance(raw_overrides, dict):
+            raw_overrides = preview.get('input_overrides')
+
+        allowed_override_keys: set[str] = set(input_fields_all)
+        try:
+            allowed_override_keys |= set(_flow_synthesized_inputs())
+        except Exception:
+            pass
+
+        config_overrides: dict[str, Any] = {}
+        if isinstance(raw_overrides, dict):
+            for k, v in raw_overrides.items():
+                kk = str(k or '').strip()
+                if not kk:
+                    continue
+                if allowed_override_keys and kk not in allowed_override_keys:
+                    continue
+                # Preserve explicit clears (None/empty) as an override.
+                config_overrides[kk] = v
+
+        # If an artifact "requires" token also appears as an optional input field,
+        # treat it as optional (do not block chaining/validation on it).
+        try:
+            optional_field_set = set(input_fields_optional)
+            requires_artifacts = sorted([x for x in requires_artifacts if x and x not in optional_field_set])
+        except Exception:
+            pass
+
+        out.append({
+            'node_id': str(cid),
+            'id': str(gen.get('id') or ''),
+            'name': str(gen.get('name') or ''),
+            'description': str(gen.get('description') or ''),
+            'type': str(gen.get('_flow_kind') or 'flag-generator'),
+            'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
+            'generator_catalog': str(gen.get('_flow_catalog') or 'flag_generators'),
+            'language': str(gen.get('language') or ''),
+            'description_hints': list(gen.get('description_hints') or []) if isinstance(gen.get('description_hints'), list) else [],
+            'inject_files': list(gen.get('inject_files') or []) if isinstance(gen.get('inject_files'), list) else [],
+            # Effective union (used for chaining feasibility / ordering validation).
+            'inputs': sorted(list(_required_inputs_of(gen))),
+            'outputs': sorted(list(_provides_of(gen))),
+
+            # Split-out views for UI transparency.
+            'requires': requires_artifacts,
+            'produces': produces_artifacts,
+            'input_fields': input_fields_all,
+            'input_fields_required': input_fields_required,
+            'input_fields_optional': input_fields_optional,
+            'output_fields': output_fields,
+            'hint_template': hint_tpl,
+            'hint_templates': hint_templates,
+            'hint': rendered_hints[0] if rendered_hints else _render_hint(hint_tpl, this_id=str(cid), next_id=str(next_id)),
+            'hints': rendered_hints,
+            'next_node_id': str(next_id),
+            'next_node_name': str(id_to_name.get(str(next_id)) or ''),
+        })
+    return out
+
+
+def _flow_synthesized_inputs() -> set[str]:
+    """Inputs we can always synthesize deterministically at preview time.
+
+    Keep this in sync with _flow_compute_flag_assignments() and _flow_default_generator_config().
+    """
+    return {
+        'seed',
+        'secret',
+        'env_name',
+        'challenge',
+        'flag_prefix',
+        'username_prefix',
+        'key_len',
+        'node_name',
+
+        # Optional per-node context injected by Flow (may not be declared by a generator).
+        # These are safe to ignore in "dropped" input reporting.
+        'network.ip',
+        'host.ip',
+        'host_ip',
+        'target_ip',
+        'ip',
+        'ip4',
+        'ipv4',
+        'address',
+    }
+
+
+def _flow_generator_seed(*, base_seed: Any, scenario_norm: str, node_id: str, gen_id: str, occurrence_idx: int = 0) -> str:
+    """Build the deterministic generator seed for Flow.
+
+    NOTE: This seed intentionally includes an occurrence index so a Flow chain may repeat the
+    same (node_id, generator_id) without producing an *exact* duplicate configuration.
+    """
+    return _flow_generator_seed_impl(
+        base_seed=base_seed,
+        scenario_norm=scenario_norm,
+        node_id=node_id,
+        gen_id=gen_id,
+        occurrence_idx=occurrence_idx,
+    )
+
+
+
+def _flow_strip_runtime_sensitive_fields(flag_assignments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a copy of assignments safe to persist in preview-plan metadata.
+
+    NOTE: As of the "flags are required outputs" contract, realized flag strings are part
+    of the sequencing contract and are allowed to persist so the UI can display them.
+    """
+    if not isinstance(flag_assignments, list):
+        return flag_assignments
+    out: list[dict[str, Any]] = []
+    for a in (flag_assignments or []):
+        if not isinstance(a, dict):
+            continue
+        a2 = dict(a)
+        a2.pop('runtime_flags', None)
+        a2.pop('runtime_outputs', None)
+        a2.pop('resolved_inputs', None)
+        a2.pop('resolved_outputs', None)
+        # Effective generator config may include secrets and should not be persisted.
+        a2.pop('config', None)
+        out.append(a2)
+    return out
+
+
+def _flow_enrich_saved_flag_assignments(
+    flag_assignments: list[dict[str, Any]],
+    chain_nodes: list[dict[str, Any]],
+    *,
+    scenario_label: str,
+) -> list[dict[str, Any]]:
+    """Best-effort enrichment for persisted Flow assignments.
+
+    Older preview plans may persist `flag_assignments` that predate newer UI fields
+    (e.g., `description_hints`) or contain hints that still include ids.
+
+    We keep the chosen generator per node, but refresh:
+    - `description_hints` from current enabled catalogs
+    - `hint_templates`/`hint_template` from current enabled catalogs
+    - rendered `hints`/`hint` for the current chain order
+    - `next_node_id`/`next_node_name`
+    """
+    if not isinstance(flag_assignments, list) or not isinstance(chain_nodes, list):
+        return flag_assignments
+
+    # Map ids -> names for THIS/NEXT substitution.
+    id_to_name: dict[str, str] = {}
+    chain_ids: list[str] = []
+    for n in (chain_nodes or []):
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if not nid:
+            continue
+        chain_ids.append(nid)
+        nm = str(n.get('name') or '').strip()
+        id_to_name[nid] = nm or nid
+
+    # Build a by-id view of currently enabled generators.
+    by_id: dict[str, dict[str, Any]] = {}
+    try:
+        gens, _ = _flag_generators_from_enabled_sources()
+        for g in (gens or []):
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get('id') or '').strip()
+            if gid and gid not in by_id:
+                by_id[gid] = g
+    except Exception:
+        pass
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+        for g in (node_gens or []):
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get('id') or '').strip()
+            if gid and gid not in by_id:
+                by_id[gid] = g
+    except Exception:
+        pass
+
+    out: list[dict[str, Any]] = []
+    for i, a in enumerate(flag_assignments or []):
+        if not isinstance(a, dict):
+            continue
+        a2 = dict(a)
+        this_id = str(a2.get('node_id') or '').strip() or (chain_ids[i] if i < len(chain_ids) else '')
+        next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
+        a2['node_id'] = this_id
+        a2['next_node_id'] = str(next_id)
+        a2['next_node_name'] = str(id_to_name.get(str(next_id)) or '')
+
+        gen_id = str(a2.get('id') or '').strip()
+        gen_def = by_id.get(gen_id) if gen_id else None
+
+        # Backfill source label for older persisted assignments.
+        # Historically this was often the generic string "manifest"; now we prefer
+        # the containing pack/bundle label (or "repo") from the current catalog.
+        try:
+            existing_src = str(a2.get('flag_generator') or '').strip()
+        except Exception:
+            existing_src = ''
+        try:
+            catalog_src = str((gen_def or {}).get('_source_name') or '').strip() if isinstance(gen_def, dict) else ''
+        except Exception:
+            catalog_src = ''
+        if catalog_src and (not existing_src or existing_src.lower() == 'manifest'):
+            a2['flag_generator'] = catalog_src
+
+        # Backfill inject_files for older persisted assignments.
+        try:
+            existing_injects = a2.get('inject_files')
+            if not (isinstance(existing_injects, list) and any(str(x or '').strip() for x in existing_injects)):
+                if isinstance(gen_def, dict):
+                    inj = gen_def.get('inject_files')
+                    if isinstance(inj, list):
+                        a2['inject_files'] = [str(x or '').strip() for x in inj if str(x or '').strip()]
+        except Exception:
+            pass
+
+        # Ensure generator description exists (if the catalog provides it).
+        try:
+            existing_desc = str(a2.get('description') or '').strip()
+        except Exception:
+            existing_desc = ''
+        if (not existing_desc) and isinstance(gen_def, dict):
+            try:
+                a2['description'] = str(gen_def.get('description') or '')
+            except Exception:
+                pass
+
+        # Ensure description hints exist (if the catalog provides them).
+        try:
+            existing = a2.get('description_hints')
+            if not (isinstance(existing, list) and any(str(x or '').strip() for x in existing)):
+                dh = (gen_def or {}).get('description_hints') if isinstance(gen_def, dict) else None
+                if isinstance(dh, list):
+                    a2['description_hints'] = [str(x or '').strip() for x in dh if str(x or '').strip()]
+        except Exception:
+            pass
+
+        # Ensure input/output descriptors exist (if the catalog provides them).
+        try:
+            existing_in_defs = a2.get('input_defs')
+            if not (isinstance(existing_in_defs, list) and existing_in_defs):
+                if isinstance(gen_def, dict) and isinstance(gen_def.get('inputs'), list):
+                    a2['input_defs'] = list(gen_def.get('inputs') or [])
+        except Exception:
+            pass
+        try:
+            existing_out_defs = a2.get('output_defs')
+            if not (isinstance(existing_out_defs, list) and existing_out_defs):
+                if isinstance(gen_def, dict) and isinstance(gen_def.get('outputs'), list):
+                    a2['output_defs'] = list(gen_def.get('outputs') or [])
+        except Exception:
+            pass
+
+        # If hint overrides exist, treat them as authoritative.
+        try:
+            if 'hint_overrides' in a2:
+                if a2.get('hint_overrides') is None:
+                    a2.pop('hint_overrides', None)
+                elif isinstance(a2.get('hint_overrides'), list):
+                    ovr = [str(x or '').strip() for x in (a2.get('hint_overrides') or [])]
+                    ovr = [x for x in ovr if x]
+                    a2['hint_overrides'] = ovr
+                    a2['hints'] = ovr
+                    a2['hint'] = ovr[0] if ovr else ''
+        except Exception:
+            pass
+
+        # Normalize optional persisted flag override.
+        try:
+            if 'flag_override' in a2:
+                if a2.get('flag_override') is None:
+                    a2.pop('flag_override', None)
+                elif isinstance(a2.get('flag_override'), str):
+                    s = str(a2.get('flag_override') or '').strip()
+                    if s:
+                        a2['flag_override'] = s
+                    else:
+                        a2.pop('flag_override', None)
+                else:
+                    a2.pop('flag_override', None)
+        except Exception:
+            pass
+
+        # Normalize optional persisted output overrides (dict of output_key -> value).
+        try:
+            if 'output_overrides' in a2:
+                if a2.get('output_overrides') is None:
+                    a2.pop('output_overrides', None)
+                elif isinstance(a2.get('output_overrides'), dict):
+                    cleaned: dict[str, Any] = {}
+                    for k, v in (a2.get('output_overrides') or {}).items():
+                        kk = str(k or '').strip()
+                        if not kk:
+                            continue
+                        cleaned[kk] = v
+                    if cleaned:
+                        a2['output_overrides'] = cleaned
+                    else:
+                        a2.pop('output_overrides', None)
+                else:
+                    a2.pop('output_overrides', None)
+        except Exception:
+            pass
+
+        # Normalize optional persisted inject-files override (list of paths).
+        try:
+            if 'inject_files_override' in a2:
+                if a2.get('inject_files_override') is None:
+                    a2.pop('inject_files_override', None)
+                elif isinstance(a2.get('inject_files_override'), list):
+                    cleaned = [str(x or '').strip() for x in (a2.get('inject_files_override') or [])]
+                    cleaned = [x for x in cleaned if x]
+                    a2['inject_files_override'] = cleaned
+                    # Mirror into inject_files so the UI/runner sees the effective list.
+                    a2['inject_files'] = cleaned
+                else:
+                    a2.pop('inject_files_override', None)
+        except Exception:
+            pass
+
+        # Preserve persisted hint text when present (Flow persistence contract), but
+        # strip ids if they exist. Only regenerate hints from catalogs when missing.
+        has_hints = False
+        try:
+            if isinstance(a2.get('hints'), list) and any(str(x or '').strip() for x in (a2.get('hints') or [])):
+                has_hints = True
+            elif str(a2.get('hint') or '').strip():
+                has_hints = True
+        except Exception:
+            has_hints = False
+
+        if has_hints:
+            try:
+                if isinstance(a2.get('hints'), list) and a2.get('hints'):
+                    raw = [str(x or '') for x in (a2.get('hints') or [])]
+                    # Only mutate if the text actually contains ids/placeholders.
+                    if any(('(id=' in s.lower()) or ('{{NEXT_NODE_ID}}' in s) or ('{{THIS_NODE_ID}}' in s) for s in raw):
+                        a2['hints'] = [_flow_strip_ids_from_hint(s) for s in raw]
+                        a2['hints'] = [x for x in (a2.get('hints') or []) if str(x).strip()]
+                        if a2['hints']:
+                            a2['hint'] = a2['hints'][0]
+                elif a2.get('hint'):
+                    s = str(a2.get('hint') or '')
+                    if ('(id=' in s.lower()) or ('{{NEXT_NODE_ID}}' in s) or ('{{THIS_NODE_ID}}' in s):
+                        a2['hint'] = _flow_strip_ids_from_hint(s)
+            except Exception:
+                pass
+        elif isinstance(gen_def, dict):
+            # No saved hints: fall back to catalog templates and render for current chain order.
+            hint_templates: list[str] = []
+            try:
+                hint_templates = _flow_hint_templates_from_generator(gen_def)
+            except Exception:
+                hint_templates = []
+            hint_tpl = hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}}'
+            a2['hint_templates'] = hint_templates
+            a2['hint_template'] = hint_tpl
+            rendered = [
+                _flow_render_hint_template(t, scenario_label=scenario_label, id_to_name=id_to_name, this_id=str(this_id), next_id=str(next_id))
+                for t in (hint_templates or [hint_tpl])
+            ]
+            a2['hints'] = rendered
+            a2['hint'] = rendered[0] if rendered else _flow_render_hint_template(hint_tpl, scenario_label=scenario_label, id_to_name=id_to_name, this_id=str(this_id), next_id=str(next_id))
+
+        out.append(a2)
+    return out
+
+
+def _flow_parse_bool(value: Any, *, default: bool = False) -> bool:
+    """Parse a truthy/falsey value commonly used in query args/JSON."""
+    if value is None:
+        return default
+    try:
+        if isinstance(value, bool):
+            return bool(value)
+        s = str(value).strip().lower()
+    except Exception:
+        return default
+    if s in ('1', 'true', 'yes', 'y', 'on'):
+        return True
+    if s in ('0', 'false', 'no', 'n', 'off'):
+        return False
+    return default
+
+
+def _flow_validate_chain_order_by_requires_produces(
+    chain_nodes: list[dict[str, Any]],
+    flag_assignments: list[dict[str, Any]],
+    *,
+    scenario_label: str,
+    plugins_by_id_override: dict[str, dict[str, Any]] | None = None,
+) -> tuple[bool, list[str]]:
+    """Validate that the given chain order is solvable by requires/produces.
+
+    This is a strict, linear check in the *current* order:
+    - Each step's effective requires must be satisfied by synthesized inputs or prior produces.
+    - Effective requires/produces are derived from v3 plugin contracts, plus assignment-declared
+      inputs/outputs (best-effort) to support coarse catalogs.
+
+    Returns: (ok, errors)
+    """
+    errors: list[str] = []
+    if not isinstance(chain_nodes, list) or not chain_nodes:
+        return False, ['missing chain nodes']
+    if not isinstance(flag_assignments, list) or not flag_assignments:
+        return False, ['missing flag assignments']
+
+    chain_ids: list[str] = [
+        str(n.get('id') or '').strip()
+        for n in chain_nodes
+        if isinstance(n, dict) and str(n.get('id') or '').strip()
+    ]
+    if not chain_ids:
+        return False, ['empty chain']
+
+    assign_by_node: dict[str, dict[str, Any]] = {}
+    for a in flag_assignments:
+        if not isinstance(a, dict):
+            continue
+        nid = str(a.get('node_id') or '').strip()
+        if nid:
+            assign_by_node[nid] = a
+
+    if any(cid not in assign_by_node for cid in chain_ids):
+        return False, ['missing assignment for at least one chain node']
+
+    if isinstance(plugins_by_id_override, dict) and plugins_by_id_override:
+        plugins_by_id = plugins_by_id_override
+    else:
+        plugins_by_id = _flow_enabled_plugin_contracts_by_id()
+
+    # Best-effort: load enabled generator definitions so we can infer optional
+    # input fields even if the assignment payload doesn't include them.
+    gen_defs_by_id: dict[str, dict[str, Any]] = {}
+    try:
+        gens, _ = _flag_generators_from_enabled_sources()
+        for g in (gens or []):
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get('id') or '').strip()
+            if gid and gid not in gen_defs_by_id:
+                gen_defs_by_id[gid] = g
+    except Exception:
+        pass
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+        for g in (node_gens or []):
+            if not isinstance(g, dict):
+                continue
+            gid = str(g.get('id') or '').strip()
+            if gid and gid not in gen_defs_by_id:
+                gen_defs_by_id[gid] = g
+    except Exception:
+        pass
+
+    available: set[str] = set(_flow_synthesized_inputs())
+
+    for cid in chain_ids:
+        a = assign_by_node.get(cid) or {}
+        plugin_id = str(a.get('id') or '').strip()
+        if not plugin_id:
+            errors.append(f"{cid}: missing generator id")
+            continue
+
+        plugin = plugins_by_id.get(plugin_id)
+        if not isinstance(plugin, dict):
+            errors.append(f"{cid}: unknown plugin '{plugin_id}'")
+            continue
+
+        inferred_requires = {str(x).strip() for x in (a.get('inputs') or []) if str(x).strip()}
+        inferred_produces = {str(x).strip() for x in (a.get('outputs') or []) if str(x).strip()}
+
+        # Optional dependency tokens (do not block ordering). Prefer the assignment
+        # field when present; fall back to the generator catalog schema.
+        opt_set: set[str] = set()
+        try:
+            opt_fields = a.get('input_fields_optional') or []
+            if isinstance(opt_fields, list):
+                opt_set |= {str(x).strip() for x in opt_fields if str(x).strip()}
+        except Exception:
+            pass
+        if not opt_set:
+            try:
+                gen_def = gen_defs_by_id.get(plugin_id)
+                inputs = (gen_def or {}).get('inputs') if isinstance(gen_def, dict) else None
+                if isinstance(inputs, list):
+                    for inp in inputs:
+                        if not isinstance(inp, dict):
+                            continue
+                        if inp.get('required') is False:
+                            nm = str(inp.get('name') or '').strip()
+                            if nm:
+                                opt_set.add(nm)
+            except Exception:
+                pass
+
+        base_requires = {str(x).strip() for x in (plugin.get('requires') or []) if str(x).strip()} if isinstance(plugin.get('requires'), list) else set()
+        if opt_set:
+            base_requires = {r for r in base_requires if r not in opt_set}
+            inferred_requires = {r for r in inferred_requires if r not in opt_set}
+
+        requires = base_requires | inferred_requires
+
+        base_prod: set[str] = set()
+        try:
+            for p in (plugin.get('produces') or []):
+                if not isinstance(p, dict):
+                    continue
+                art = str(p.get('artifact') or '').strip()
+                if art:
+                    base_prod.add(art)
+        except Exception:
+            base_prod = set()
+        produces = base_prod | inferred_produces
+
+        missing = sorted(list({r for r in requires if r not in available}))
+        if missing:
+            errors.append(f"{cid}: requires {missing} before they are produced")
+
+        available |= produces
+
+    if errors:
+        # Include minimal context; callers may surface this in API error details.
+        return False, errors
+    return True, []
+
+
+def _flow_enabled_plugin_contracts_by_id() -> dict[str, dict[str, Any]]:
+    """Return generator plugin contracts indexed by plugin_id.
+
+    Strict: contracts are derived from per-generator YAML manifests.
+    """
+    plugins_by_id: dict[str, dict[str, Any]] = {}
+
+    # Important: Flow sequencing must NOT consider disabled generators.
+    # We filter plugin contracts to installed+enabled generators only.
+    try:
+        gens, fg_plugins, _errs = _flag_generators_from_manifests(kind='flag-generator')
+        allowed: set[str] = set()
+        for g in (gens or []):
+            if not isinstance(g, dict):
+                continue
+            if not _is_installed_generator_view(g):
+                continue
+            gid = str(g.get('id') or '').strip()
+            if not gid:
+                continue
+            if _is_installed_generator_disabled(kind='flag-generator', generator_id=gid):
+                continue
+            allowed.add(gid)
+        for k, v in (fg_plugins or {}).items():
+            if isinstance(k, str) and k in allowed and isinstance(v, dict):
+                plugins_by_id[k] = v
+    except Exception:
+        pass
+
+    try:
+        gens2, ng_plugins, _errs2 = _flag_generators_from_manifests(kind='flag-node-generator')
+        allowed2: set[str] = set()
+        for g in (gens2 or []):
+            if not isinstance(g, dict):
+                continue
+            if not _is_installed_generator_view(g):
+                continue
+            gid = str(g.get('id') or '').strip()
+            if not gid:
+                continue
+            if _is_installed_generator_disabled(kind='flag-node-generator', generator_id=gid):
+                continue
+            allowed2.add(gid)
+        for k, v in (ng_plugins or {}).items():
+            if isinstance(k, str) and k in allowed2 and k not in plugins_by_id and isinstance(v, dict):
+                plugins_by_id[k] = v
+    except Exception:
+        pass
+
+    return plugins_by_id
+
+
+def _flow_reorder_chain_by_generator_dag(
+    chain_nodes: list[dict[str, Any]],
+    flag_assignments: list[dict[str, Any]],
+    *,
+    scenario_label: str,
+    plugins_by_id_override: dict[str, dict[str, Any]] | None = None,
+    return_debug: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
+    """Best-effort: reorder the chain using generator artifact dependencies.
+
+    This does not change generator selection; it only reorders the existing
+    chain nodes + assignments so that inputs are satisfied by some producer.
+
+    If the DAG cannot be built, returns inputs unchanged.
+    """
+    try:
+        if not isinstance(chain_nodes, list) or not chain_nodes:
+            return chain_nodes, flag_assignments, None
+        if not isinstance(flag_assignments, list) or not flag_assignments:
+            return chain_nodes, flag_assignments, None
+
+        from core_topo_gen.sequencer.dag import build_dag
+        from core_topo_gen.sequencer.chain import validate_chain_doc, validate_linear_chain
+
+        node_by_id: dict[str, dict[str, Any]] = {}
+        for n in chain_nodes:
+            if not isinstance(n, dict):
+                continue
+            nid = str(n.get('id') or '').strip()
+            if nid:
+                node_by_id[nid] = n
+
+        assign_by_node: dict[str, dict[str, Any]] = {}
+        for a in flag_assignments:
+            if not isinstance(a, dict):
+                continue
+            nid = str(a.get('node_id') or '').strip()
+            if nid:
+                assign_by_node[nid] = a
+
+        # Only reorder when we have a 1:1 mapping.
+        chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()]
+        if not chain_ids:
+            return chain_nodes, flag_assignments, None
+        if any(cid not in assign_by_node for cid in chain_ids):
+            return chain_nodes, flag_assignments, None
+
+        plugins_by_id: dict[str, dict[str, Any]] = {}
+        if isinstance(plugins_by_id_override, dict) and plugins_by_id_override:
+            plugins_by_id = plugins_by_id_override
+        else:
+            plugins_by_id = _flow_enabled_plugin_contracts_by_id()
+
+        # Build a real sequencer chain instance (YAML-shape) from the current Flow chain.
+        #
+        # Important: some catalogs may omit requires/produces details or keep them coarse.
+        # For Flow ordering we also incorporate the assignment-derived inputs/outputs as
+        # additional requires/produces to avoid a no-op DAG.
+        chain_doc: dict[str, Any] = {
+            'ctf': {
+                'id': str(scenario_label or '').strip() or 'flow',
+                'version': 'flow',
+                'difficulty': 'unknown',
+                'description': 'Generated from Flow Sequencing assignments',
+            },
+            'challenges': [],
+        }
+
+        effective_plugins_by_id: dict[str, dict[str, Any]] = dict(plugins_by_id or {})
+        challenges: list[dict[str, Any]] = []
+        for cid in chain_ids:
+            a = assign_by_node.get(cid) or {}
+            plugin_id = str(a.get('id') or '').strip()
+            if not plugin_id:
+                return chain_nodes, flag_assignments, None
+            plugin = plugins_by_id.get(plugin_id)
+            if not isinstance(plugin, dict):
+                # Without the plugin contract we can't build a correct artifact DAG.
+                return chain_nodes, flag_assignments, None
+
+            inferred_requires = [str(x).strip() for x in (a.get('inputs') or []) if str(x).strip()]
+            inferred_produces = [str(x).strip() for x in (a.get('outputs') or []) if str(x).strip()]
+
+            # Build an "effective" plugin contract for DAG purposes.
+            try:
+                eff = dict(plugin)
+            except Exception:
+                eff = plugin
+
+            try:
+                base_req = [str(x).strip() for x in (eff.get('requires') or []) if str(x).strip()] if isinstance(eff, dict) else []
+            except Exception:
+                base_req = []
+            eff_requires = sorted(list({*base_req, *inferred_requires}))
+            if isinstance(eff, dict):
+                eff['requires'] = eff_requires
+
+            base_prod_set: set[str] = set()
+            try:
+                for p in (eff.get('produces') or []) if isinstance(eff, dict) else []:
+                    if not isinstance(p, dict):
+                        continue
+                    art = str(p.get('artifact') or '').strip()
+                    if art:
+                        base_prod_set.add(art)
+            except Exception:
+                base_prod_set = set()
+            eff_prod_set = {*(base_prod_set), *(set(inferred_produces))}
+            if isinstance(eff, dict):
+                eff['produces'] = [{'artifact': x} for x in sorted(list(eff_prod_set))]
+
+            effective_plugins_by_id[plugin_id] = eff
+
+            kind = str(plugin.get('plugin_type') or a.get('type') or 'flag-generator').strip() or 'flag-generator'
+
+            # Populate YAML-chain fields for validation/debug. Note: instance.requires is
+            # intentionally empty; plugin.requires drives dependencies.
+            produces_list: list[dict[str, str]] = []
+            try:
+                for p in (eff.get('produces') or []):
+                    if not isinstance(p, dict):
+                        continue
+                    art = str(p.get('artifact') or '').strip()
+                    if art:
+                        produces_list.append({'name': art, 'artifact': art})
+            except Exception:
+                produces_list = []
+
+            requires_list: list[dict[str, str]] = []
+            try:
+                for art in (eff.get('requires') or []):
+                    a2 = str(art or '').strip()
+                    if a2:
+                        requires_list.append({'artifact': a2})
+            except Exception:
+                requires_list = []
+
+            ch = {
+                'challenge_id': cid,
+                'kind': kind,
+                'generator': {'plugin': plugin_id},
+                'requires': requires_list,
+                'produces': produces_list,
+            }
+            chain_doc['challenges'].append(ch)
+
+            # Also build the challenge instances for build_dag (it reads generator.plugin).
+            challenges.append(ch)
+
+        chain_ok, chain_errors, chain_norm = validate_chain_doc(chain_doc)
+
+        dag, errors = build_dag(challenges, plugins_by_id=effective_plugins_by_id, initial_artifacts=sorted(list(_flow_synthesized_inputs())))
+        debug: dict[str, Any] | None = None
+        if return_debug:
+            try:
+                debug = {
+                    'ok': bool(dag is not None),
+                    'errors': list(errors or []),
+                    'initial_artifacts': sorted(list(_flow_synthesized_inputs())),
+                    'chain_ok': bool(chain_ok),
+                    'chain_errors': list(chain_errors or []),
+                }
+                if dag is not None:
+                    debug['order'] = list(dag.order)
+                    debug['edges'] = [
+                        {'src': e.src, 'dst': e.dst, 'artifact': e.artifact}
+                        for e in (dag.edges or ())
+                    ]
+            except Exception:
+                debug = None
+        if dag is None:
+            return chain_nodes, flag_assignments, debug
+
+        order = [str(x) for x in (dag.order or ()) if str(x).strip()]
+        if not order:
+            return chain_nodes, flag_assignments, debug
+        if set(order) != set(chain_ids):
+            return chain_nodes, flag_assignments, debug
+
+        # Reorder nodes + assignments.
+        new_chain_nodes = [node_by_id[cid] for cid in order if cid in node_by_id]
+        new_assignments = [assign_by_node[cid] for cid in order if cid in assign_by_node]
+        if len(new_chain_nodes) != len(chain_nodes) or len(new_assignments) != len(flag_assignments):
+            return chain_nodes, flag_assignments, debug
+
+        # Optional: validate that the new order is linearly solvable by the chain spec.
+        # This uses only instance produces/requires; since we keep instance.requires empty,
+        # this is expected to succeed (and is primarily a sanity check).
+        if debug is not None:
+            try:
+                reordered_doc = dict(chain_norm or {})
+                reordered_doc['challenges'] = [
+                    next((c for c in (chain_norm.get('challenges') or []) if isinstance(c, dict) and str(c.get('challenge_id') or '') == cid), None)
+                    for cid in order
+                ]
+                reordered_doc['challenges'] = [c for c in reordered_doc['challenges'] if isinstance(c, dict)]
+                lin_ok, lin_errors = validate_linear_chain(reordered_doc, initial_artifacts=sorted(list(_flow_synthesized_inputs())))
+                debug['linear_ok'] = bool(lin_ok)
+                debug['linear_errors'] = list(lin_errors or [])
+            except Exception:
+                pass
+
+        # Update NEXT placeholders in hints for the new order.
+        id_to_name: dict[str, str] = {}
+        for n in new_chain_nodes:
+            try:
+                nid = str(n.get('id') or '').strip()
+                nm = str(n.get('name') or '').strip()
+                if nid:
+                    id_to_name[nid] = nm or nid
+            except Exception:
+                continue
+
+        def _render_hint(tpl: str, *, this_id: str, next_id: str) -> str:
+            try:
+                text = str(tpl or '').strip() or 'Next: {{NEXT_NODE_NAME}}'
+                next_id_val = str(next_id or '').strip()
+                next_name_val = (id_to_name.get(next_id_val) or '').strip() if next_id_val else ''
+                if not next_id_val:
+                    return "You've completed this sequence of challenges!"
+                if not next_name_val:
+                    next_name_val = next_id_val
+                repl = {
+                    '{{SCENARIO}}': str(scenario_label or ''),
+                    '{{THIS_NODE_ID}}': this_id,
+                    '{{THIS_NODE_NAME}}': id_to_name.get(this_id) or this_id,
+                    '{{NEXT_NODE_ID}}': next_id_val,
+                    '{{NEXT_NODE_NAME}}': next_name_val,
+                }
+                for k, v in repl.items():
+                    text = text.replace(k, str(v))
+                return _flow_strip_ids_from_hint(text)
+            except Exception:
+                return ''
+
+        for i, a in enumerate(new_assignments):
+            try:
+                this_id = str(a.get('node_id') or '').strip()
+                next_id = order[i + 1] if (i + 1) < len(order) else ''
+                hint_templates: list[str] = []
+                try:
+                    ht = a.get('hint_templates')
+                    if isinstance(ht, list) and ht:
+                        hint_templates = [str(x or '').strip() for x in ht if str(x or '').strip()]
+                except Exception:
+                    hint_templates = []
+                tpl = str(a.get('hint_template') or '').strip() or (hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}}')
+                a['next_node_id'] = str(next_id)
+                a['next_node_name'] = str(id_to_name.get(str(next_id)) or '')
+                rendered = [_render_hint(t, this_id=this_id, next_id=str(next_id)) for t in (hint_templates or [tpl])]
+                a['hint'] = rendered[0] if rendered else _render_hint(tpl, this_id=this_id, next_id=str(next_id))
+                a['hints'] = rendered
+            except Exception:
+                continue
+
+        return new_chain_nodes, new_assignments, debug
+    except Exception:
+        return chain_nodes, flag_assignments, None
+
+
+@app.route('/api/flag-sequencing/attackflow_preview')
+def api_flow_attackflow_preview():
+    scenario_label = (request.args.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    preset = str(request.args.get('preset') or '').strip()
+    length_raw = request.args.get('length')
+    try:
+        length = int(length_raw) if length_raw is not None else 5
+    except Exception:
+        length = 5
+    preset_steps = _flow_preset_steps(preset)
+    if preset_steps:
+        length = len(preset_steps)
+    length = max(1, min(length, 50))
+    requested_length = length
+
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    prefer_preview = str(request.args.get('prefer_preview') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+    force_preview = str(request.args.get('force_preview') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+    best_effort_query = str(request.args.get('best_effort') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+    allow_node_duplicates = str(request.args.get('allow_node_duplicates') or request.args.get('allow_duplicates') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+    debug_mode = str(request.args.get('debug') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+
+    # When Generate forces preview selection, we still want to use the same *topology*
+    # that refresh would choose (to avoid eligible counts flipping), but we should not
+    # reuse a previously saved chain/assignments.
+    ignore_saved_flow = bool(force_preview)
+
+    selected_by = 'explicit'
+
+    preview_plan_path = (request.args.get('preview_plan') or '').strip() or None
+    if preview_plan_path:
+        try:
+            preview_plan_path = os.path.abspath(preview_plan_path)
+            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
+            if os.path.commonpath([preview_plan_path, plans_dir]) != plans_dir:
+                preview_plan_path = None
+            elif not os.path.exists(preview_plan_path):
+                preview_plan_path = None
+        except Exception:
+            preview_plan_path = None
+    if not preview_plan_path:
+        if force_preview:
+            # Generate button: use the same topology source as refresh (preview plan)
+            # so stats/topology do not flip, but ignore any saved chain/assignments.
+            selected_by = 'force_preview_best_plan'
+            preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+        elif prefer_preview:
+            selected_by = 'prefer_preview_preview_plan'
+            preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+        else:
+            selected_by = 'default_best_plan'
+            preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+
+    if not preview_plan_path:
+        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
+
+    try:
+        with open(preview_plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+        preview = payload.get('full_preview') if isinstance(payload, dict) else None
+        if not isinstance(preview, dict):
+            return jsonify({'ok': False, 'error': 'Preview plan is missing full_preview.'}), 422
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
+
+    def _docker_count_from_preview(full_preview: dict) -> int:
+        try:
+            hosts = full_preview.get('hosts') or []
+        except Exception:
+            hosts = []
+        if not isinstance(hosts, list):
+            return 0
+        total = 0
+        for host in hosts:
+            if not isinstance(host, dict):
+                continue
+            role = str(host.get('role') or '').strip().lower()
+            if role == 'docker':
+                total += 1
+        return total
+
+    def _docker_count_from_editor_snapshot(snapshot: dict, scen_norm: str) -> int:
+        try:
+            scenarios = snapshot.get('scenarios') or []
+        except Exception:
+            scenarios = []
+        if not isinstance(scenarios, list):
+            return 0
+        match = None
+        for scen in scenarios:
+            if not isinstance(scen, dict):
+                continue
+            nm = _normalize_scenario_label(scen.get('name') or '')
+            if nm and nm == scen_norm:
+                match = scen
+                break
+        if not isinstance(match, dict):
+            return 0
+        sec = (match.get('sections') or {}).get('Node Information')
+        if not isinstance(sec, dict):
+            return 0
+        items = sec.get('items') or []
+        if not isinstance(items, list):
+            return 0
+        total = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            metric = str(item.get('v_metric') or 'Weight').strip()
+            if metric != 'Count':
+                continue
+            sel = str(item.get('selected') or '').strip().lower()
+            if sel != 'docker':
+                continue
+            try:
+                total += max(0, int(item.get('v_count') or 0))
+            except Exception:
+                continue
+        return total
+
+    def _plan_epoch_seconds(plan_path: str, plan_payload: dict) -> float:
+        try:
+            meta = plan_payload.get('metadata') if isinstance(plan_payload, dict) else None
+            if isinstance(meta, dict):
+                ts = _parse_iso_ts(meta.get('created_at'))
+                if ts > 0:
+                    return ts
+        except Exception:
+            pass
+        try:
+            return float(os.path.getmtime(plan_path))
+        except Exception:
+            return 0.0
+
+    def _editor_snapshot_epoch_seconds(owner: Optional[dict]) -> float:
+        try:
+            snap_path = _editor_state_snapshot_path(owner)
+            if os.path.exists(snap_path):
+                return float(os.path.getmtime(snap_path))
+        except Exception:
+            pass
+        return 0.0
+
+    def _regenerate_preview_plan_from_snapshot(snapshot: dict, *, scenario_name: str, seed: Optional[int] = None) -> Optional[tuple[dict, str]]:
+        """Best-effort: render XML from snapshot, compute plan, persist new preview plan."""
+        try:
+            scenarios = snapshot.get('scenarios')
+            if not isinstance(scenarios, list) or not scenarios:
+                return None
+            core_meta = snapshot.get('core') if isinstance(snapshot.get('core'), dict) else None
+            tree = _build_scenarios_xml({'scenarios': scenarios, 'core': _normalize_core_config(core_meta, include_password=True) if core_meta else None})
+            ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+            out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
+            os.makedirs(out_dir, exist_ok=True)
+            stem = secure_filename((scenario_name or 'scenarios')).strip('_-.') or 'scenarios'
+            xml_path = os.path.join(out_dir, f"{stem}.xml")
+            # Pretty print if lxml available else fallback
+            try:
+                from lxml import etree as LET  # type: ignore
+                raw = ET.tostring(tree.getroot(), encoding='utf-8')
+                lroot = LET.fromstring(raw)
+                pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+                with open(xml_path, 'wb') as handle:
+                    handle.write(pretty)
+            except Exception:
+                tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+
+            from core_topo_gen.planning.orchestrator import compute_full_plan
+            from core_topo_gen.planning.plan_cache import hash_xml_file, try_get_cached_plan, save_plan_to_cache
+
+            xml_hash = hash_xml_file(xml_path)
+            plan = None
+            try:
+                plan = try_get_cached_plan(xml_hash, scenario_name, seed)
+            except Exception:
+                plan = None
+            if not plan:
+                plan = compute_full_plan(xml_path, scenario=scenario_name, seed=seed, include_breakdowns=True)
+                try:
+                    save_plan_to_cache(xml_hash, scenario_name, seed, plan)
+                except Exception:
+                    pass
+            if seed is None:
+                try:
+                    seed = plan.get('seed') or _derive_default_seed(xml_hash)
+                except Exception:
+                    seed = None
+            full_prev = _build_full_preview_from_plan(plan, seed, [], [])
+            try:
+                _attach_latest_flow_into_full_preview(full_prev, scenario_name)
+            except Exception:
+                pass
+
+            # Mirror Preview tab behavior: apply HITL sanitize/merge to keep topology/IP context consistent.
+            try:
+                xml_basename = os.path.basename(xml_path)
+            except Exception:
+                xml_basename = None
+            try:
+                raw_hitl_config = parse_hitl_info(xml_path, scenario_name)
+            except Exception:
+                raw_hitl_config = {"enabled": False, "interfaces": []}
+            try:
+                hitl_config = _sanitize_hitl_config(raw_hitl_config, scenario_name, xml_basename)
+            except Exception:
+                hitl_config = {"enabled": False, "interfaces": []}
+            try:
+                full_prev['hitl_interfaces'] = hitl_config.get('interfaces', [])
+                full_prev['hitl_enabled'] = bool(hitl_config.get('enabled'))
+                full_prev['hitl_scenario_key'] = hitl_config.get('scenario_key')
+                if hitl_config.get('core'):
+                    full_prev['hitl_core'] = hitl_config.get('core')
+            except Exception:
+                pass
+            try:
+                _merge_hitl_preview_with_full_preview(full_prev, hitl_config)
+            except Exception:
+                pass
+            plans_dir = os.path.join(_outputs_dir(), 'plans')
+            os.makedirs(plans_dir, exist_ok=True)
+            seed_tag = full_prev.get('seed') or (seed if seed is not None else 'preview')
+            unique_tag = f"{seed_tag}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+            new_plan_path = os.path.join(plans_dir, f"plan_from_preview_{unique_tag}.json")
+            plan_payload = {
+                'full_preview': full_prev,
+                'metadata': {
+                    'xml_path': xml_path,
+                    'scenario': scenario_name,
+                    'seed': full_prev.get('seed'),
+                    'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
+                },
+            }
+            with open(new_plan_path, 'w', encoding='utf-8') as handle:
+                json.dump(plan_payload, handle, indent=2, sort_keys=True)
+            return plan_payload, new_plan_path
+        except Exception:
+            return None
+
+    # If the editor snapshot requests Docker hosts but the selected plan has zero Docker hosts,
+    # regenerate a preview plan from the snapshot so Flag Sequencer reflects current edits.
+    try:
+        owner = _current_user()
+        snapshot = _load_editor_state_snapshot(owner)
+        if not snapshot and owner is None:
+            # Conservative fallback: if there is exactly one editor snapshot on disk,
+            # use it even without an authenticated session. This avoids Generate
+            # flipping to stale plans in single-user deployments.
+            try:
+                snap_dir = _editor_state_snapshot_dir()
+                candidates = [
+                    os.path.join(snap_dir, fn)
+                    for fn in (os.listdir(snap_dir) if os.path.isdir(snap_dir) else [])
+                    if fn.endswith('.json') and not fn.startswith('.')
+                ]
+                if len(candidates) == 1 and os.path.exists(candidates[0]):
+                    with open(candidates[0], 'r', encoding='utf-8') as handle:
+                        maybe = json.load(handle)
+                    if isinstance(maybe, dict) and isinstance(maybe.get('scenarios'), list):
+                        snapshot = maybe
+            except Exception:
+                snapshot = snapshot
+        if snapshot:
+            desired_docker = _docker_count_from_editor_snapshot(snapshot, scenario_norm)
+            have_docker = _docker_count_from_preview(preview)
+            if desired_docker > 0 and have_docker == 0:
+                seed_hint = None
+                try:
+                    meta = payload.get('metadata') if isinstance(payload, dict) else None
+                    if isinstance(meta, dict) and meta.get('seed') is not None:
+                        seed_hint = int(meta.get('seed'))
+                except Exception:
+                    seed_hint = None
+                regenerated = _regenerate_preview_plan_from_snapshot(
+                    snapshot,
+                    scenario_name=(scenario_label or scenario_norm),
+                    seed=seed_hint,
+                )
+                if regenerated:
+                    payload, preview_plan_path = regenerated
+                    preview = payload.get('full_preview') if isinstance(payload, dict) else preview
+    except Exception:
+        pass
+
+    # If we loaded a preview plan (topology) but the user has a saved Flow plan,
+    # merge that Flow metadata into this payload so saved chain/assignments still apply.
+    try:
+        meta0 = payload.get('metadata') if isinstance(payload, dict) else None
+        flow0 = (meta0 or {}).get('flow') if isinstance(meta0, dict) else None
+        if (not ignore_saved_flow) and (not isinstance(flow0, dict)):
+            _attach_latest_flow_into_plan_payload(payload, scenario=(scenario_label or scenario_norm))
+    except Exception:
+        pass
+
+    nodes, _links, adj = _build_topology_graph_from_preview_plan(preview)
+    stats = _flow_compose_docker_stats(nodes)
+
+    # If the latest plan is flow-modified, prefer the saved chain order.
+    chain_nodes: list[dict[str, Any]] = []
+    used_saved_chain = False
+    if (not ignore_saved_flow) and (not preset_steps):
+        try:
+            meta = payload.get('metadata') if isinstance(payload, dict) else None
+            flow_meta = meta.get('flow') if isinstance(meta, dict) else None
+            saved_chain = flow_meta.get('chain') if isinstance(flow_meta, dict) else None
+            saved_ids: list[str] = []
+            if isinstance(saved_chain, list) and saved_chain:
+                for entry in saved_chain:
+                    if not isinstance(entry, dict):
+                        continue
+                    cid = str(entry.get('id') or '').strip()
+                    if cid:
+                        saved_ids.append(cid)
+            if saved_ids:
+                id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
+                # Honor requested length (truncate) but do not try to auto-extend.
+                desired = saved_ids[:length]
+                chain_nodes = [id_map[cid] for cid in desired if cid in id_map]
+                if chain_nodes:
+                    # Drop saved chains that contain nodes that are neither docker-role nor vuln nodes.
+                    try:
+                        for n in chain_nodes:
+                            if not isinstance(n, dict):
+                                continue
+                            t_raw = str(n.get('type') or '')
+                            t = t_raw.strip().lower()
+                            is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
+                            is_vuln = bool(n.get('is_vuln'))
+                            if (not is_docker) and (not is_vuln):
+                                chain_nodes = []
+                                break
+                    except Exception:
+                        chain_nodes = []
+                if chain_nodes:
+                    used_saved_chain = True
+        except Exception:
+            chain_nodes = []
+
+    if not chain_nodes:
+        if preset_steps:
+            chain_nodes = _pick_flag_chain_nodes_for_preset(nodes, adj, steps=preset_steps)
+        else:
+            if allow_node_duplicates:
+                try:
+                    seed_val = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
+                except Exception:
+                    seed_val = 0
+                chain_nodes = _pick_flag_chain_nodes_allow_duplicates(nodes, adj, length=length, seed=seed_val)
+            else:
+                chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
+
+    warning: str | None = None
+
+    # If we loaded a saved chain that is shorter than the requested length (e.g. the UI
+    # reset its length input to the default on refresh), treat the saved chain as
+    # authoritative and respond with its effective length.
+    if used_saved_chain:
+        try:
+            eff = len(chain_nodes)
+            if eff > 0:
+                length = eff
+        except Exception:
+            pass
+
+    # Optional best-effort mode: if the user requests a longer chain than we can
+    # build from eligible nodes, clamp to available rather than returning 422.
+    if (not used_saved_chain) and (not preset_steps) and best_effort_query:
+        try:
+            available = len(chain_nodes)
+        except Exception:
+            available = 0
+        if available > 0 and available < length:
+            warning = f"Only {available} eligible nodes found; using chain length {available} instead of requested {length}."
+            length = available
+    # Prefer persisted assignments when the plan comes from a prior Flow save.
+    flag_assignments: list[dict[str, Any]] = []
+    try:
+        meta = payload.get('metadata') if isinstance(payload, dict) else None
+        flow_meta = meta.get('flow') if isinstance(meta, dict) else None
+        saved_assignments = flow_meta.get('flag_assignments') if isinstance(flow_meta, dict) else None
+        if (not ignore_saved_flow) and isinstance(saved_assignments, list) and saved_assignments:
+            # Saved assignments are persisted positionally, aligned to the saved chain.
+            # Do not re-key by node_id; chains may intentionally contain duplicates.
+            try:
+                desired_len = len(chain_nodes or [])
+            except Exception:
+                desired_len = 0
+            if desired_len and len(saved_assignments) >= desired_len:
+                ordered: list[dict[str, Any]] = []
+                for i in range(desired_len):
+                    a = saved_assignments[i]
+                    if not isinstance(a, dict):
+                        ordered.append({})
+                        continue
+                    a2 = dict(a)
+                    try:
+                        a2['node_id'] = str((chain_nodes[i] or {}).get('id') or '').strip()
+                    except Exception:
+                        pass
+                    ordered.append(a2)
+                if all(isinstance(a, dict) and str(a.get('id') or '').strip() for a in ordered):
+                    flag_assignments = ordered
+                    try:
+                        flag_assignments = _flow_enrich_saved_flag_assignments(
+                            flag_assignments,
+                            chain_nodes,
+                            scenario_label=(scenario_label or scenario_norm),
+                        )
+                    except Exception:
+                        pass
+    except Exception:
+        flag_assignments = []
+
+    if not flag_assignments:
+        if preset_steps and not used_saved_chain:
+            preset_assignments, preset_err = _flow_compute_flag_assignments_for_preset(preview, chain_nodes, scenario_label or scenario_norm, preset)
+            if preset_err:
+                return jsonify({'ok': False, 'error': f'Error: {preset_err}', 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
+            flag_assignments = preset_assignments
+        else:
+            flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+
+    # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
+    # Presets force an intended generator order and should not be reordered.
+    try:
+        _ids = [str(n.get('id') or '').strip() for n in (chain_nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()]
+        has_dupes = len(set(_ids)) != len(_ids)
+    except Exception:
+        has_dupes = False
+
+    if (not used_saved_chain) and (not preset_steps) and (not has_dupes):
+        debug_dag = str(request.args.get('debug_dag') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+        chain_nodes, flag_assignments, dag_debug = _flow_reorder_chain_by_generator_dag(
+            chain_nodes,
+            flag_assignments,
+            scenario_label=(scenario_label or scenario_norm),
+            return_debug=bool(debug_dag),
+        )
+    else:
+        debug_dag = str(request.args.get('debug_dag') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+        dag_debug = None
+
+    # Validate (non-blocking): if invalid, the UI should warn and execution should
+    # proceed without flags.
+    flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
+        chain_nodes,
+        flag_assignments,
+        scenario_label=(scenario_label or scenario_norm),
+    )
+
+    # Additional validation: any referenced generator must exist and be enabled.
+    # If not, disable flags and surface a clear error.
+    try:
+        gens_enabled, _ = _flag_generators_from_enabled_sources()
+    except Exception:
+        gens_enabled = []
+    try:
+        node_gens_enabled, _ = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        node_gens_enabled = []
+    enabled_ids: set[str] = set()
+    for g in (gens_enabled or []):
+        if isinstance(g, dict):
+            gid = str(g.get('id') or '').strip()
+            if gid:
+                enabled_ids.add(gid)
+    for g in (node_gens_enabled or []):
+        if isinstance(g, dict):
+            gid = str(g.get('id') or '').strip()
+            if gid:
+                enabled_ids.add(gid)
+
+    missing_refs: list[str] = []
+    try:
+        for fa in (flag_assignments or []):
+            if not isinstance(fa, dict):
+                continue
+            gid = str(fa.get('id') or fa.get('generator_id') or '').strip()
+            if not gid:
+                continue
+            if gid not in enabled_ids:
+                missing_refs.append(gid)
+    except Exception:
+        missing_refs = []
+
+    missing_refs = sorted(list(dict.fromkeys(missing_refs)))
+    if missing_refs:
+        flow_errors = list(flow_errors or []) + [f"generator not found/enabled: {gid}" for gid in missing_refs]
+        flow_valid = False
+
+    flags_enabled = bool(flow_valid)
+
+    if len(chain_nodes) < 1:
+        return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan (Docker role or vulnerability nodes).', 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
+    if (not used_saved_chain) and (not allow_node_duplicates) and len(chain_nodes) < length:
+        return jsonify({
+            'ok': False,
+            'error': f'Only {len(chain_nodes)} eligible nodes found for chain length {length}.',
+            'available': len(chain_nodes),
+            'stats': stats,
+            'preview_plan_path': preview_plan_path,
+        }), 422
+
+    out = {
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'length': length,
+        'requested_length': requested_length,
+        'preview_plan_path': preview_plan_path,
+        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or ''), 'is_vuln': bool(n.get('is_vuln'))} for n in chain_nodes],
+        'flag_assignments': flag_assignments,
+        'stats': stats,
+        'flow_valid': bool(flow_valid),
+        'flow_errors': list(flow_errors or []),
+        'flags_enabled': bool(flags_enabled),
+        'allow_node_duplicates': bool(allow_node_duplicates),
+    }
+    try:
+        meta_out = payload.get('metadata') if isinstance(payload, dict) else None
+        if isinstance(meta_out, dict):
+            fp = str(meta_out.get('flow_plan_path') or '').strip()
+            if fp:
+                out['flow_plan_path'] = fp
+    except Exception:
+        pass
+    if warning:
+        out['warning'] = warning
+    if debug_mode:
+        try:
+            meta_dbg = payload.get('metadata') if isinstance(payload, dict) else None
+        except Exception:
+            meta_dbg = None
+        out['debug'] = {
+            'selected_by': selected_by,
+            'prefer_preview': bool(prefer_preview),
+            'force_preview': bool(force_preview),
+            'ignore_saved_flow': bool(ignore_saved_flow),
+            'used_saved_chain': bool(used_saved_chain),
+            'preview_plan_path': preview_plan_path,
+            'metadata': (meta_dbg if isinstance(meta_dbg, dict) else {}),
+        }
+    if debug_dag:
+        out['sequencer_dag'] = dag_debug or {'ok': False, 'errors': ['not computed (saved chain)']}
+
+    # STIX/AttackFlow bundle export has been removed; keep this endpoint for chain preview only.
+    if (request.args.get('download') or '').strip() in {'1', 'true', 'yes'}:
+        return jsonify({
+            'ok': False,
+            'error': 'STIX bundle export has been removed. Use /api/flag-sequencing/afb_from_chain.',
+        }), 410
+
+    return jsonify(out)
+
+
+@app.route('/api/flag-sequencing/prepare_preview_for_execute', methods=['POST'])
+def api_flow_prepare_preview_for_execute():
+    j = request.get_json(silent=True) or {}
+    scenario_label = str(j.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    preset = str(j.get('preset') or '').strip()
+    mode = str(j.get('mode') or '').strip().lower()
+    best_effort = bool(j.get('best_effort')) or (mode in {'hint', 'hint_only', 'resolve_hints', 'preview'})
+    allow_node_duplicates = str(j.get('allow_node_duplicates') or j.get('allow_duplicates') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+    total_timeout_s: int | None = None
+    try:
+        total_timeout_s = int(j.get('timeout_s') or 0)
+    except Exception:
+        total_timeout_s = None
+    if total_timeout_s is not None and total_timeout_s <= 0:
+        total_timeout_s = None
+    if best_effort and total_timeout_s is None:
+        # UI hint resolution is optional; keep it bounded by default.
+        total_timeout_s = 30
+    try:
+        length = int(j.get('length') or 5)
+    except Exception:
+        length = 5
+    preset_steps = _flow_preset_steps(preset)
+    if preset_steps:
+        length = len(preset_steps)
+    length = max(1, min(length, 50))
+    requested_length = length
+
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    base_plan_path = str(j.get('preview_plan') or '').strip() or None
+    if base_plan_path:
+        try:
+            base_plan_path = os.path.abspath(base_plan_path)
+            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
+            if os.path.commonpath([base_plan_path, plans_dir]) != plans_dir:
+                base_plan_path = None
+            elif not os.path.exists(base_plan_path):
+                base_plan_path = None
+        except Exception:
+            base_plan_path = None
+    if not base_plan_path:
+        base_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm)
+
+    if not base_plan_path:
+        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
+
+    started_at = time.monotonic()
+    try:
+        plan_basename = os.path.basename(base_plan_path)
+    except Exception:
+        plan_basename = str(base_plan_path or '')
+    app.logger.info(
+        '[flow.prepare_preview_for_execute] start scenario=%s requested_length=%s preset=%s best_effort=%s timeout_s=%s base_plan=%s',
+        scenario_norm,
+        requested_length,
+        (preset or ''),
+        bool(best_effort),
+        (total_timeout_s if total_timeout_s is not None else 'none'),
+        plan_basename,
+    )
+
+    try:
+        with open(base_plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+        meta = payload.get('metadata') if isinstance(payload, dict) else {}
+        preview = payload.get('full_preview') if isinstance(payload, dict) else None
+        if not isinstance(preview, dict):
+            return jsonify({'ok': False, 'error': 'Preview plan is missing full_preview.'}), 422
+    except FileNotFoundError:
+        return jsonify({'ok': False, 'error': 'Preview plan file was not found. Generate a Full Preview again.'}), 404
+    except json.JSONDecodeError as e:
+        return jsonify({'ok': False, 'error': f'Preview plan file is not valid JSON: {e}'}), 422
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
+
+    # Best-effort guard: the UI expects JSON errors (avoid Flask HTML 500s).
+    try:
+        nodes, _links, adj = _build_topology_graph_from_preview_plan(preview)
+        stats = _flow_compose_docker_stats(nodes)
+
+        # Allow caller to provide an explicit ordered chain.
+        chain_ids_in = j.get('chain_ids')
+        chain_ids: list[str] = []
+        if isinstance(chain_ids_in, list) and chain_ids_in:
+            for cid in chain_ids_in:
+                c = str(cid or '').strip()
+                if c:
+                    chain_ids.append(c)
+            chain_ids = chain_ids[:length]
+
+        explicit_chain = bool(chain_ids)
+
+        if chain_ids:
+            id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict)}
+            # Preserve positional intent: keep placeholders for missing ids.
+            chain_nodes: list[Any] = []
+            missing_chain_ids: list[str] = []
+            for cid in chain_ids:
+                if cid in id_map:
+                    chain_nodes.append(id_map[cid])
+                else:
+                    chain_nodes.append(None)
+                    missing_chain_ids.append(cid)
+
+            # Best-effort repair: if some ids don't exist in the selected plan (common when a
+            # stale plan path is passed), fill missing positions with unused eligible nodes.
+            # If we cannot repair fully, fail loudly (prevents UI from collapsing chain length).
+            if missing_chain_ids:
+                try:
+                    used = {
+                        str(n.get('id') or '').strip()
+                        for n in chain_nodes
+                        if isinstance(n, dict) and str(n.get('id') or '').strip()
+                    }
+
+                    def _needs_nonvuln_docker(pos: int) -> bool:
+                        if not preset_steps:
+                            return False
+                        if pos < 0 or pos >= len(preset_steps):
+                            return False
+                        return (str((preset_steps[pos] or {}).get('kind') or '').strip() == 'flag-node-generator')
+
+                    def _eligible(cand: dict, pos: int) -> bool:
+                        try:
+                            cid0 = str(cand.get('id') or '').strip()
+                            if not cid0:
+                                return False
+                            if (not allow_node_duplicates) and cid0 in used:
+                                return False
+                            is_docker = _flow_node_is_docker_role(cand)
+                            is_vuln = bool(cand.get('is_vuln'))
+                            if _needs_nonvuln_docker(pos):
+                                return bool(is_docker) and (not is_vuln)
+                            return bool(is_docker) or bool(is_vuln)
+                        except Exception:
+                            return False
+
+                    for i, node in enumerate(chain_nodes):
+                        if isinstance(node, dict):
+                            continue
+                        replacement = None
+                        for cand in (nodes or []):
+                            if not isinstance(cand, dict):
+                                continue
+                            if not _eligible(cand, i):
+                                continue
+                            replacement = cand
+                            break
+                        if replacement is not None:
+                            rid = str(replacement.get('id') or '').strip()
+                            if rid:
+                                chain_nodes[i] = replacement
+                                chain_ids[i] = rid
+                                used.add(rid)
+
+                    # Drop any unrepaired placeholders.
+                    chain_nodes = [n for n in chain_nodes if isinstance(n, dict)]
+                    if len(chain_nodes) < length:
+                        return jsonify({
+                            'ok': False,
+                            'error': 'Provided chain_ids do not match the selected preview plan (stale preview_plan?) and could not be fully repaired.',
+                            'requested_length': requested_length,
+                            'matched_length': len(chain_nodes),
+                            'missing_chain_ids': missing_chain_ids,
+                            'stats': stats,
+                            'best_effort': bool(best_effort),
+                        }), 422
+                except Exception:
+                    # Conservative: don't silently shrink.
+                    return jsonify({
+                        'ok': False,
+                        'error': 'Provided chain_ids did not match the selected preview plan and repair failed.',
+                        'requested_length': requested_length,
+                        'missing_chain_ids': missing_chain_ids,
+                        'stats': stats,
+                        'best_effort': bool(best_effort),
+                    }), 422
+
+            # Presets require certain steps to run on non-vulnerability docker nodes.
+            # If the UI provided a chain that violates this (common when many vuln nodes exist),
+            # best-effort swap in an eligible docker node.
+            if preset_steps and chain_nodes:
+                try:
+                    used = {str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict)}
+                    for i, step in enumerate(preset_steps[:len(chain_nodes)]):
+                        if str((step or {}).get('kind') or '').strip() != 'flag-node-generator':
+                            continue
+                        node = chain_nodes[i] if i < len(chain_nodes) else None
+                        if not isinstance(node, dict):
+                            continue
+                        if not bool(node.get('is_vuln')):
+                            continue
+                        replacement = None
+                        for cand in (nodes or []):
+                            if not isinstance(cand, dict):
+                                continue
+                            cid = str(cand.get('id') or '').strip()
+                            if not cid:
+                                continue
+                            if (not allow_node_duplicates) and cid in used:
+                                continue
+                            t_raw = str(cand.get('type') or '')
+                            t = t_raw.strip().lower()
+                            is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
+                            if is_docker and not bool(cand.get('is_vuln')):
+                                replacement = cand
+                                break
+                        if replacement is not None:
+                            rid = str(replacement.get('id') or '').strip()
+                            if rid:
+                                chain_nodes[i] = replacement
+                                chain_ids[i] = rid
+                                used.add(rid)
+                except Exception:
+                    pass
+
+            # Enforce Flow placement rules:
+            # - flag-generators may be placed on vulnerability nodes OR docker-role nodes
+            # - flag-node-generators must be placed on non-vulnerability docker-role nodes
+            # If the caller provided a chain that violates this, best-effort replace nodes
+            # with unused eligible nodes; otherwise fail with a clear error.
+            if chain_nodes:
+                try:
+                    used = {str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()}
+                    for i, node in enumerate(chain_nodes):
+                        if not isinstance(node, dict):
+                            continue
+                        t_raw = str(node.get('type') or '')
+                        t = t_raw.strip().lower()
+                        is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
+                        is_vuln = bool(node.get('is_vuln'))
+
+                        need_nonvuln_docker = False
+                        if preset_steps and i < len(preset_steps):
+                            need_nonvuln_docker = (str((preset_steps[i] or {}).get('kind') or '').strip() == 'flag-node-generator')
+
+                        if need_nonvuln_docker:
+                            if is_docker and (not is_vuln):
+                                continue
+                        else:
+                            if is_docker or is_vuln:
+                                continue
+
+                        replacement = None
+                        for cand in (nodes or []):
+                            if not isinstance(cand, dict):
+                                continue
+                            cid = str(cand.get('id') or '').strip()
+                            if not cid:
+                                continue
+                            if (not allow_node_duplicates) and cid in used:
+                                continue
+                            ct_raw = str(cand.get('type') or '')
+                            ct = ct_raw.strip().lower()
+                            cand_is_docker = ('docker' in ct) or (ct_raw.strip().upper() == 'DOCKER')
+                            cand_is_vuln = bool(cand.get('is_vuln'))
+                            if need_nonvuln_docker:
+                                if not cand_is_docker:
+                                    continue
+                                if cand_is_vuln:
+                                    continue
+                            else:
+                                if not (cand_is_docker or cand_is_vuln):
+                                    continue
+                            replacement = cand
+                            break
+
+                        if replacement is None:
+                            return jsonify({
+                                'ok': False,
+                                'error': 'Not enough eligible nodes for the provided chain. Flag-generators require docker-role or vulnerability nodes; flag-node-generators require non-vulnerability docker-role nodes.',
+                                'stats': stats,
+                            }), 422
+
+                        rid = str(replacement.get('id') or '').strip()
+                        if rid:
+                            chain_nodes[i] = replacement
+                            chain_ids[i] = rid
+                            used.add(rid)
+                except Exception:
+                    pass
+            if len(chain_nodes) < 1:
+                return jsonify({'ok': False, 'error': 'Provided chain_ids did not match any nodes in the preview plan.', 'stats': stats}), 422
+        else:
+            if preset_steps:
+                chain_nodes = _pick_flag_chain_nodes_for_preset(nodes, adj, steps=preset_steps)
+            else:
+                if allow_node_duplicates:
+                    try:
+                        seed_val = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
+                    except Exception:
+                        seed_val = 0
+                    chain_nodes = _pick_flag_chain_nodes_allow_duplicates(nodes, adj, length=length, seed=seed_val)
+                else:
+                    chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
+            if len(chain_nodes) < 1:
+                return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan (Docker role or vulnerability nodes).', 'available': len(chain_nodes), 'stats': stats}), 422
+            if (not allow_node_duplicates) and len(chain_nodes) < length:
+                return jsonify({'ok': False, 'error': 'Not enough eligible nodes in preview plan to build the requested chain.', 'available': len(chain_nodes), 'stats': stats}), 422
+            chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if str(n.get('id') or '').strip()]
+    except Exception as e:
+        app.logger.exception('[flow.prepare_preview_for_execute] internal error: %s', e)
+        return jsonify({
+            'ok': False,
+            'error': f'Internal error preparing preview for execution: {e}',
+            'base_preview_plan_path': base_plan_path,
+        }), 500
+
+    # Caller may pass fewer ids than requested length; persist effective length.
+    try:
+        length = len(chain_nodes)
+    except Exception:
+        pass
+
+    # Inject generator metadata into chain nodes.
+    # Flag-generators should NOT create nodes/services; they generate artifacts/flags that can be
+    # inserted into existing Docker nodes.
+    flag_assignments: list[dict[str, Any]] = []
+    # Prefer saved Flow assignments if the caller passed a flow plan (or a plan payload that
+    # already includes metadata.flow) and it fully covers this chain.
+    try:
+        flow_meta = meta.get('flow') if isinstance(meta, dict) else None
+        saved_assignments = flow_meta.get('flag_assignments') if isinstance(flow_meta, dict) else None
+        if isinstance(saved_assignments, list) and saved_assignments:
+            # Saved assignments are persisted positionally, aligned with the saved chain.
+            # Do not re-key by node_id; chains may intentionally contain duplicates.
+            try:
+                desired_len = len(chain_nodes or [])
+            except Exception:
+                desired_len = 0
+            if desired_len and len(saved_assignments) >= desired_len:
+                ordered: list[dict[str, Any]] = []
+                for i in range(desired_len):
+                    a = saved_assignments[i]
+                    if not isinstance(a, dict):
+                        ordered.append({})
+                        continue
+                    a2 = dict(a)
+                    try:
+                        a2['node_id'] = str((chain_nodes[i] or {}).get('id') or '').strip()
+                    except Exception:
+                        pass
+                    ordered.append(a2)
+                if all(isinstance(a, dict) and str(a.get('id') or '').strip() for a in ordered):
+                    flag_assignments = ordered
+                try:
+                    flag_assignments = _flow_enrich_saved_flag_assignments(
+                        flag_assignments,
+                        chain_nodes,
+                        scenario_label=(scenario_label or scenario_norm),
+                    )
+                except Exception:
+                    pass
+
+                # Do not reuse saved assignments if they violate placement rules for
+                # the current chain nodes (prevents Preview from showing flags on
+                # non-docker/non-vuln nodes or flag-node-generators on vuln nodes).
+                try:
+                    if flag_assignments and len(flag_assignments) == len(chain_nodes):
+                        for i, n in enumerate(chain_nodes):
+                            a = flag_assignments[i] if i < len(flag_assignments) else {}
+                            if not isinstance(n, dict) or not isinstance(a, dict):
+                                raise ValueError('invalid chain/assignment')
+                            nid = str(n.get('id') or '').strip()
+                            aid = str(a.get('node_id') or '').strip()
+                            if nid and aid and nid != aid:
+                                raise ValueError('assignment node mismatch')
+                            is_docker = _flow_node_is_docker_role(n)
+                            is_vuln = bool(n.get('is_vuln'))
+                            kind = str(a.get('type') or '').strip() or 'flag-generator'
+                            if kind == 'flag-node-generator':
+                                if not (is_docker and (not is_vuln)):
+                                    raise ValueError('flag-node-generator on ineligible node')
+                            else:
+                                if not (is_docker or is_vuln):
+                                    raise ValueError('flag-generator on ineligible node')
+                except Exception:
+                    flag_assignments = []
+    except Exception:
+        flag_assignments = []
+
+    if not flag_assignments:
+        if preset_steps:
+            preset_assignments, preset_err = _flow_compute_flag_assignments_for_preset(preview, chain_nodes, scenario_label or scenario_norm, preset)
+            if preset_err:
+                return jsonify({'ok': False, 'error': f'Error: {preset_err}', 'stats': stats}), 422
+            flag_assignments = preset_assignments
+        else:
+            flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+
+    # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
+    # Note: chain_ids is populated for both explicit and auto-picked chains; use explicit_chain.
+    try:
+        _ids = [str(n.get('id') or '').strip() for n in (chain_nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()]
+        has_dupes = len(set(_ids)) != len(_ids)
+    except Exception:
+        has_dupes = False
+
+    if (not explicit_chain) and (not preset_steps) and (not has_dupes):
+        debug_dag = bool(j.get('debug_dag'))
+        chain_nodes, flag_assignments, dag_debug = _flow_reorder_chain_by_generator_dag(
+            chain_nodes,
+            flag_assignments,
+            scenario_label=(scenario_label or scenario_norm),
+            return_debug=bool(debug_dag),
+        )
+        try:
+            chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()]
+        except Exception:
+            pass
+    else:
+        debug_dag = bool(j.get('debug_dag'))
+        dag_debug = None
+
+    # Validate (non-blocking): if invalid, we still allow execution but we do not
+    # inject or run any flags.
+    flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
+        chain_nodes,
+        flag_assignments,
+        scenario_label=(scenario_label or scenario_norm),
+    )
+    flags_enabled = bool(flow_valid)
+
+    # Apply Flow modifications and run generators only when the flow is valid.
+    if flags_enabled:
+        # Promote chain nodes to Docker role (flag payloads attach to Docker nodes).
+        try:
+            hosts = preview.get('hosts') or []
+            if isinstance(hosts, list):
+                for h in hosts:
+                    if not isinstance(h, dict):
+                        continue
+                    hid = str(h.get('node_id') or '').strip()
+                    if hid and hid in chain_ids:
+                        h['role'] = 'Docker'
+        except Exception:
+            pass
+
+    # Load enabled generator catalogs once so we can prune config to declared inputs.
+    # We do this even when flags are disabled so the UI can still show resolved inputs.
+    try:
+        _gens_for_cfg, _ = _flag_generators_from_enabled_sources()
+    except Exception:
+        _gens_for_cfg = []
+    try:
+        _node_gens_for_cfg, _ = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        _node_gens_for_cfg = []
+
+    _gen_by_id: dict[str, dict[str, Any]] = {}
+    try:
+        for _g in (_gens_for_cfg or []):
+            if not isinstance(_g, dict):
+                continue
+            _gid = str(_g.get('id') or '').strip()
+            if _gid:
+                _gen_by_id[_gid] = _g
+        for _g in (_node_gens_for_cfg or []):
+            if not isinstance(_g, dict):
+                continue
+            _gid = str(_g.get('id') or '').strip()
+            if _gid and _gid not in _gen_by_id:
+                _gen_by_id[_gid] = _g
+    except Exception:
+        _gen_by_id = {}
+
+    def _flow_is_file_input_type(type_value: Any) -> bool:
+        try:
+            t = str(type_value or '').strip().lower()
+        except Exception:
+            return False
+        if not t:
+            return False
+        if t in {'file', 'file_list'}:
+            return True
+        if t in {'file', 'filepath', 'file_path', 'path', 'pathname'}:
+            return True
+        if 'file' in t:
+            return True
+        if 'path' in t:
+            return True
+        return False
+
+    def _flow_is_file_list_input_type(type_value: Any) -> bool:
+        try:
+            t = str(type_value or '').strip().lower()
+        except Exception:
+            return False
+        if not t:
+            return False
+        if t == 'file_list':
+            return True
+        # Back-compat heuristic.
+        if 'list' in t and ('file' in t or 'path' in t):
+            return True
+        return False
+
+    def _flow_is_allowed_upload_path(path_value: Any) -> bool:
+        """Only allow staging from known safe roots (outputs/flow_uploads and uploads/)."""
+        if not path_value:
+            return False
+        try:
+            ap = os.path.abspath(str(path_value))
+        except Exception:
+            return False
+        try:
+            if not os.path.isfile(ap):
+                return False
+        except Exception:
+            return False
+        try:
+            allowed_roots = [
+                os.path.abspath(os.path.join(_outputs_dir(), 'flow_uploads')),
+                os.path.abspath(_uploads_dir()),
+            ]
+            for root in allowed_roots:
+                try:
+                    if os.path.commonpath([ap, root]) == root:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
+    def _flow_unique_dest_filename(dir_path: str, filename: str) -> str:
+        base = secure_filename(filename) or 'upload'
+        cand = base
+        root, ext = os.path.splitext(base)
+        i = 1
+        while os.path.exists(os.path.join(dir_path, cand)):
+            cand = f"{root}_{i}{ext}"
+            i += 1
+            if i > 5000:
+                break
+        return cand
+
+    def _flow_stage_file_inputs_for_generator(cfg_to_pass: dict[str, Any], gen_def: dict[str, Any], *, run_dir: str) -> None:
+        if not isinstance(cfg_to_pass, dict) or not isinstance(gen_def, dict):
+            return
+        if not run_dir:
+            return
+        inputs = gen_def.get('inputs') if isinstance(gen_def, dict) else None
+        inputs_list = inputs if isinstance(inputs, list) else []
+
+        file_input_names: set[str] = set()
+        file_list_input_names: set[str] = set()
+        for inp in inputs_list:
+            if not isinstance(inp, dict):
+                continue
+            nm = str(inp.get('name') or '').strip()
+            if not nm:
+                continue
+            if _flow_is_file_list_input_type(inp.get('type')):
+                file_list_input_names.add(nm)
+                continue
+            if _flow_is_file_input_type(inp.get('type')):
+                file_input_names.add(nm)
+
+        if not file_input_names and not file_list_input_names:
+            return
+
+        inputs_dir = os.path.join(str(run_dir), 'inputs')
+        os.makedirs(inputs_dir, exist_ok=True)
+
+        for key in list(cfg_to_pass.keys()):
+            # file
+            if key in file_input_names:
+                val = cfg_to_pass.get(key)
+                if not isinstance(val, str):
+                    continue
+                raw = val.strip()
+                if not raw:
+                    continue
+                # Already a container path.
+                if raw.startswith('/inputs/'):
+                    continue
+                if not _flow_is_allowed_upload_path(raw):
+                    continue
+                try:
+                    src = os.path.abspath(raw)
+                except Exception:
+                    continue
+                try:
+                    base = os.path.basename(src) or f"{key}.upload"
+                except Exception:
+                    base = f"{key}.upload"
+                dest_name = _flow_unique_dest_filename(inputs_dir, base)
+                dest = os.path.join(inputs_dir, dest_name)
+                try:
+                    shutil.copyfile(src, dest)
+                    cfg_to_pass[key] = f"/inputs/{dest_name}"
+                except Exception:
+                    continue
+
+            # file_list
+            if key in file_list_input_names:
+                val = cfg_to_pass.get(key)
+                if not isinstance(val, list):
+                    continue
+                staged: list[str] = []
+                for item in (val or []):
+                    if not isinstance(item, str):
+                        continue
+                    raw = item.strip()
+                    if not raw:
+                        continue
+                    if raw.startswith('/inputs/'):
+                        staged.append(raw)
+                        continue
+                    if not _flow_is_allowed_upload_path(raw):
+                        continue
+                    try:
+                        src = os.path.abspath(raw)
+                    except Exception:
+                        continue
+                    try:
+                        base = os.path.basename(src) or f"{key}.upload"
+                    except Exception:
+                        base = f"{key}.upload"
+                    dest_name = _flow_unique_dest_filename(inputs_dir, base)
+                    dest = os.path.join(inputs_dir, dest_name)
+                    try:
+                        shutil.copyfile(src, dest)
+                        staged.append(f"/inputs/{dest_name}")
+                    except Exception:
+                        continue
+                if staged:
+                    cfg_to_pass[key] = staged
+
+    # Hard validation: if flags are enabled, every referenced generator must exist and be enabled.
+    # If not, fail with a clear error so the user can fix assignments.
+    if flags_enabled:
+        missing_or_disabled: list[dict[str, Any]] = []
+        try:
+            for i, fa in enumerate(flag_assignments or []):
+                if not isinstance(fa, dict):
+                    continue
+                generator_id = str(fa.get('id') or fa.get('generator_id') or '').strip()
+                if not generator_id:
+                    continue
+                assignment_type = str(fa.get('type') or '').strip() or 'flag-generator'
+                # Map assignment type to disable-kind.
+                kind = 'flag-node-generator' if assignment_type == 'flag-node-generator' else 'flag-generator'
+                exists_enabled = generator_id in _gen_by_id
+                disabled = _is_installed_generator_disabled(kind=kind, generator_id=generator_id)
+                if (not exists_enabled) or disabled:
+                    node_id = ''
+                    node_name = ''
+                    try:
+                        node_id = str(fa.get('node_id') or '').strip()
+                    except Exception:
+                        node_id = ''
+                    try:
+                        if i < len(chain_nodes or []):
+                            n = chain_nodes[i] if isinstance(chain_nodes[i], dict) else {}
+                            node_name = str(n.get('name') or '').strip()
+                    except Exception:
+                        node_name = ''
+                    reason = 'disabled' if disabled else 'not found/enabled'
+                    missing_or_disabled.append({
+                        'index': i,
+                        'node_id': node_id,
+                        'node_name': node_name,
+                        'generator_id': generator_id,
+                        'type': assignment_type,
+                        'reason': reason,
+                    })
+        except Exception:
+            missing_or_disabled = []
+
+        if missing_or_disabled:
+            bad = missing_or_disabled[0]
+            msg = f"Generator {bad.get('generator_id')} ({bad.get('type')}) is {bad.get('reason')}."
+            try:
+                nid = str(bad.get('node_id') or '').strip()
+                if nid:
+                    msg += f" Node: {nid}"
+                nm = str(bad.get('node_name') or '').strip()
+                if nm:
+                    msg += f" ({nm})"
+            except Exception:
+                pass
+            return jsonify({
+                'ok': False,
+                'error': msg,
+                'details': missing_or_disabled,
+                'scenario': scenario_label or scenario_norm,
+                'length': len(chain_nodes or []),
+                'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in (chain_nodes or []) if isinstance(n, dict)],
+                'flag_assignments': flag_assignments,
+            }), 422
+
+    def _all_input_names_of(gen: dict[str, Any]) -> set[str]:
+        names: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    nm = str(inp.get('name') or '').strip()
+                    if nm:
+                        names.add(nm)
+        except Exception:
+            pass
+        return names
+
+    def _required_input_names_of(gen: dict[str, Any]) -> set[str]:
+        names: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    nm = str(inp.get('name') or '').strip()
+                    if not nm:
+                        continue
+                    if inp.get('required') is False:
+                        continue
+                    names.add(nm)
+        except Exception:
+            pass
+        return names
+
+    def _flow_default_generator_config(assignment: dict[str, Any], *, seed_val: Any, occurrence_idx: int = 0) -> dict[str, Any]:
+        """Synthesize deterministic default inputs for the seeded generators."""
+        node_id = str(assignment.get('node_id') or '').strip()
+        gen_id = str(assignment.get('id') or '').strip()
+        base_seed = str(seed_val if seed_val not in (None, '') else '0')
+        return {
+            # Allow duplicates only when seeds differ per occurrence.
+            'seed': _flow_generator_seed(
+                base_seed=base_seed,
+                scenario_norm=scenario_norm,
+                node_id=node_id,
+                gen_id=gen_id,
+                occurrence_idx=int(occurrence_idx or 0),
+            ),
+            'flag_prefix': 'FLAG',
+            'secret': f"FLOWSECRET_{base_seed}_{scenario_norm}_{node_id}",
+            'env_name': f"env_{scenario_norm}_{node_id}",
+            'challenge': f"challenge_{scenario_norm}_{node_id}",
+            'username_prefix': 'user',
+            'key_len': 16,
+        }
+
+    def _flow_try_run_generator(
+        generator_id: str,
+        *,
+        out_dir: str,
+        config: dict[str, Any],
+        kind: str = 'flag-generator',
+        timeout_s: int = 120,
+        inject_files_override: list[str] | None = None,
+    ) -> tuple[bool, str, str | None]:
+        """Best-effort run of scripts/run_flag_generator.py.
+
+        Returns: (ok, note_or_error, manifest_path)
+        """
+        try:
+            repo_root = _get_repo_root()
+            runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
+            if not os.path.exists(runner_path):
+                return False, 'runner script not found', None
+
+            cmd = [
+                sys.executable or 'python',
+                runner_path,
+                '--kind',
+                str(kind or 'flag-generator'),
+                '--generator-id',
+                generator_id,
+                '--out-dir',
+                out_dir,
+                '--config',
+                json.dumps(config, ensure_ascii=False),
+                '--repo-root',
+                repo_root,
+            ]
+            env = None
+            try:
+                if isinstance(inject_files_override, list):
+                    env = dict(os.environ)
+                    env['CORETG_INJECT_FILES_JSON'] = json.dumps(list(inject_files_override))
+            except Exception:
+                env = None
+
+            p = subprocess.run(
+                cmd,
+                cwd=repo_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=max(1, int(timeout_s or 120)),
+                env=env,
+            )
+            manifest_path = os.path.join(out_dir, 'outputs.json')
+            if p.returncode != 0:
+                err = (p.stderr or p.stdout or '').strip()
+                if err:
+                    err = err[-800:]
+                return False, f'generator failed (rc={p.returncode}): {err}', (manifest_path if os.path.exists(manifest_path) else None)
+            if os.path.exists(manifest_path):
+                return True, 'ok', manifest_path
+            return True, 'ok (no outputs.json)', None
+        except subprocess.TimeoutExpired:
+            return False, 'generator timed out', None
+        except Exception as exc:
+            return False, f'generator exception: {exc}', None
+
+    def _redact_kv_for_ui(kv: Any) -> dict[str, Any]:
+        """Best-effort redaction for UI display.
+
+        The Flow UI is an organizer/admin surface, but we still avoid blasting obvious
+        secrets (and flag material) into the main chain tables by default.
+        """
+        if not isinstance(kv, dict) or not kv:
+            return {}
+
+        def _is_sensitive_key(k: str) -> bool:
+            kk = (k or '').strip().lower()
+            if not kk:
+                return False
+            # Explicit keys.
+            if kk in {'secret', 'password', 'passwd', 'token', 'api_key', 'apikey', 'private_key', 'ssh_private_key'}:
+                return True
+            # Common substrings.
+            for needle in ('secret', 'password', 'passwd', 'token', 'api_key', 'apikey', 'private', 'ssh'):
+                if needle in kk:
+                    return True
+            return False
+
+        def _redact_val(v: Any) -> Any:
+            if isinstance(v, str):
+                return '[redacted]'
+            return '[redacted]'
+
+        out0: dict[str, Any] = {}
+        for k, v in kv.items():
+            try:
+                ks = str(k)
+            except Exception:
+                continue
+            if not ks:
+                continue
+            if _is_sensitive_key(ks):
+                out0[ks] = _redact_val(v)
+            else:
+                out0[ks] = v
+        return out0
+    def _preview_host_ip4(host: dict) -> str:
+        """Best-effort: return the primary IPv4 address for a preview host."""
+        try:
+            ip4 = host.get('ip4')
+            if isinstance(ip4, str) and _first_valid_ipv4(ip4):
+                return _first_valid_ipv4(ip4)
+        except Exception:
+            pass
+        for key in ('ipv4', 'ip', 'ip_addr', 'address'):
+            try:
+                v = host.get(key)
+            except Exception:
+                v = None
+            ip_str = _first_valid_ipv4(v)
+            if ip_str:
+                return ip_str
+        return ''
+
+    host_by_id: dict[str, dict[str, Any]] = {}
+    try:
+        hosts = preview.get('hosts') or []
+        if isinstance(hosts, list):
+            for h in hosts:
+                if not isinstance(h, dict):
+                    continue
+                host_by_id[str(h.get('node_id') or '').strip()] = h
+    except Exception:
+        host_by_id = {}
+
+    if flags_enabled:
+        try:
+
+            # Flow has a "god-eye" view of generator outputs across the chain. As we run each
+            # generator, we capture outputs.json and feed those values into subsequent generator
+            # configs when they declare matching input names (e.g. network.ip, credential.pair).
+            flow_context: dict[str, Any] = {}
+
+            def _apply_outputs_to_hint_text(text_in: str, outs: dict[str, Any]) -> str:
+                """Replace {{OUTPUT.key}} and {{OUTPUT.key:transform}} placeholders."""
+                try:
+                    text = str(text_in or '')
+                except Exception:
+                    return str(text_in or '')
+                if not text or not isinstance(outs, dict) or not outs:
+                    return text
+                try:
+                    pattern = re.compile(r"\{\{OUTPUT\.([^}:]+?)(?::([^}]+?))?\}\}")
+                except Exception:
+                    return text
+
+                def _render_value(val: Any) -> str:
+                    if isinstance(val, (dict, list)):
+                        return json.dumps(val, ensure_ascii=False)
+                    return str(val)
+
+                def _transform(val: Any, tf: str) -> str:
+                    t = (tf or '').strip().lower()
+                    s = _render_value(val)
+                    if not t:
+                        return s
+                    if t in {'last_octet', 'octet4'}:
+                        try:
+                            parts = s.strip().split('.')
+                            if len(parts) == 4:
+                                return parts[3]
+                        except Exception:
+                            pass
+                        return s
+                    if t in {'subnet24', 'cidr24'}:
+                        try:
+                            parts = s.strip().split('.')
+                            if len(parts) == 4:
+                                return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+                        except Exception:
+                            pass
+                        return s
+                    if t in {'redact', 'masked'}:
+                        try:
+                            parts = s.strip().split('.')
+                            if len(parts) == 4:
+                                return f"{parts[0]}.{parts[1]}.{parts[2]}.x"
+                        except Exception:
+                            pass
+                        return s
+                    return s
+
+                def _repl(match: re.Match) -> str:
+                    key = (match.group(1) or '').strip()
+                    tf = (match.group(2) or '').strip()
+                    if not key:
+                        return match.group(0)
+                    if key not in outs:
+                        return match.group(0)
+                    return _transform(outs.get(key), tf)
+
+                try:
+                    return pattern.sub(_repl, text)
+                except Exception:
+                    return text
+
+            def _apply_node_placeholders(text_in: str, *, node_ip4: str) -> str:
+                """Replace legacy placeholders like <node-ip> with the preview host IP."""
+                try:
+                    text = str(text_in or '')
+                except Exception:
+                    return str(text_in or '')
+                if not text or not node_ip4:
+                    return text
+                for token in ('<node-ip>', '<node_ip>', '<host-ip>', '<host_ip>', '<target-ip>', '<target_ip>'):
+                    try:
+                        text = text.replace(token, node_ip4)
+                    except Exception:
+                        continue
+                return text
+
+            generation_failures: list[dict[str, Any]] = []
+            generation_skipped: list[dict[str, Any]] = []
+            created_run_dirs: list[str] = []
+            failed_run_dirs: list[str] = []
+
+            deadline = (started_at + float(total_timeout_s)) if total_timeout_s is not None else None
+            occurrence_ctr: dict[tuple[str, str], int] = {}
+            for fa in (flag_assignments or []):
+                if not isinstance(fa, dict):
+                    continue
+                cid = str(fa.get('node_id') or '').strip()
+                h = host_by_id.get(cid)
+                if not h or not isinstance(h, dict):
+                    continue
+                preview_ip4 = _preview_host_ip4(h)
+
+                meta_h = h.get('metadata')
+                if not isinstance(meta_h, dict):
+                    meta_h = {}
+                    h['metadata'] = meta_h
+
+                generator_id = str(fa.get('id') or '').strip()
+                assignment_type = str(fa.get('type') or '').strip() or 'flag-generator'
+                generator_catalog = str(fa.get('generator_catalog') or '').strip() or 'flag_generators'
+                seed_val = preview.get('seed') if isinstance(preview, dict) else None
+
+                occ_key = (cid, generator_id)
+                occ = int(occurrence_ctr.get(occ_key, 0) or 0)
+                occurrence_ctr[occ_key] = occ + 1
+
+                cfg_full = _flow_default_generator_config(fa, seed_val=seed_val, occurrence_idx=occ)
+
+                # Provide per-node network context. Some generators output network.ip and then
+                # hint templates reference it via {{OUTPUT.network.ip}}; make it match Preview.
+                try:
+                    if preview_ip4:
+                        cfg_full.setdefault('network.ip', preview_ip4)
+                        cfg_full.setdefault('target_ip', preview_ip4)
+                        cfg_full.setdefault('host_ip', preview_ip4)
+                        cfg_full.setdefault('ip4', preview_ip4)
+                        cfg_full.setdefault('ipv4', preview_ip4)
+                except Exception:
+                    pass
+
+                # Provide basic per-node context for generators that want it.
+                try:
+                    node_name_val = str(h.get('name') or '').strip()
+                    if node_name_val:
+                        cfg_full['node_name'] = node_name_val
+                except Exception:
+                    pass
+
+                # Apply any user-provided input overrides persisted in Flow metadata.
+                try:
+                    raw_overrides = fa.get('config_overrides') or fa.get('inputs_overrides') or fa.get('input_overrides')
+                    if isinstance(raw_overrides, dict) and raw_overrides:
+                        for k, v in raw_overrides.items():
+                            kk = str(k or '').strip()
+                            if not kk:
+                                continue
+                            # Preserve explicit clears; generators may treat empty/null specially.
+                            cfg_full[kk] = v
+                        # Ensure the UI sees a normalized dict.
+                        fa['config_overrides'] = dict(raw_overrides)
+                except Exception:
+                    pass
+
+                cfg = cfg_full
+                inputs_mismatch: dict[str, Any] = {}
+                try:
+                    gen_def = _gen_by_id.get(generator_id)
+                    if isinstance(gen_def, dict):
+                        allowed = _all_input_names_of(gen_def)
+
+                        declared_required = None
+                        try:
+                            if isinstance(fa.get('input_fields_required'), list):
+                                declared_required = {str(x).strip() for x in (fa.get('input_fields_required') or []) if str(x).strip()}
+                        except Exception:
+                            declared_required = None
+                        if declared_required is None:
+                            declared_required = _required_input_names_of(gen_def)
+
+                        # Inject prior outputs into this generator's config, but only for inputs it declares.
+                        try:
+                            if allowed and flow_context:
+                                for k in allowed:
+                                    if k in cfg_full:
+                                        continue
+                                    if k in flow_context:
+                                        cfg_full[k] = flow_context[k]
+                        except Exception:
+                            pass
+
+                        # If the generator declares inputs, only pass those (keeps Flow configs relevant).
+                        # HOWEVER: some catalogs/definitions can drift; if the assignment marks an input as
+                        # required (e.g., seed, node_name), ensure it is passed even if not in `allowed`.
+                        cfg_to_pass = cfg_full
+                        if allowed:
+                            keep = set(allowed)
+                            try:
+                                keep |= set(declared_required or set())
+                            except Exception:
+                                pass
+                            cfg_to_pass = {k: v for k, v in cfg_full.items() if k in keep}
+                        cfg = cfg_to_pass
+
+                        try:
+                            provided_keys = {str(k).strip() for k in (cfg_to_pass or {}).keys() if str(k).strip()}
+                        except Exception:
+                            provided_keys = set()
+
+                        missing_required = sorted([k for k in (declared_required or set()) if k not in provided_keys])
+
+                        unset_required: list[str] = []
+                        try:
+                            for k in sorted(list(declared_required or set())):
+                                if k not in (cfg_to_pass or {}):
+                                    continue
+                                v = (cfg_to_pass or {}).get(k)
+                                if v is None:
+                                    unset_required.append(k)
+                                elif isinstance(v, str) and (not v.strip()):
+                                    unset_required.append(k)
+                        except Exception:
+                            unset_required = []
+
+                        dropped_keys: list[str] = []
+                        try:
+                            if allowed:
+                                dropped_keys = sorted([k for k in (cfg_full or {}).keys() if k not in (cfg_to_pass or {})])
+                                # Many keys are synthesized by Flow and carried in cfg_full for
+                                # convenience (e.g., hint rendering). Generators only receive
+                                # inputs they declare, so these show up as "dropped" even though
+                                # it's expected. Don't surface them as mismatches.
+                                try:
+                                    synthesized = set(_flow_synthesized_inputs())
+                                except Exception:
+                                    synthesized = set()
+                                dropped_keys = [k for k in dropped_keys if str(k) not in synthesized]
+                        except Exception:
+                            dropped_keys = []
+
+                        inputs_mismatch = {
+                            'declared_required': sorted(list(declared_required or set())),
+                            'provided': sorted(list(provided_keys)),
+                            'missing_required': missing_required,
+                            'unset_required': unset_required,
+                            'dropped': dropped_keys,
+                            # Consider dropped keys a mismatch so the UI can surface it.
+                            'ok': (not missing_required and not unset_required and not dropped_keys),
+                        }
+                except Exception:
+                    cfg = cfg_full
+                    inputs_mismatch = {}
+
+                flow_out_dir = ''
+                ok_run = False
+                note = ''
+                manifest_path = None
+                actual_output_keys: list[str] = []
+                declared_output_keys: list[str] = []
+                try:
+                    # IMPORTANT: outputs.json is a runtime manifest of output KEYS.
+                    # Use output_fields (runtime) when available; fall back to legacy outputs.
+                    declared_src = (fa.get('output_fields') if isinstance(fa.get('output_fields'), list) else None)
+                    if declared_src is None:
+                        declared_src = (fa.get('outputs') if isinstance(fa.get('outputs'), list) else [])
+                    declared_output_keys = sorted([str(x) for x in (declared_src or []) if str(x).strip()])
+                except Exception:
+                    declared_output_keys = []
+                mismatch: dict[str, Any] = {}
+
+                # UI convenience: expose resolved inputs (redacted) even if generator execution
+                # is skipped or fails.
+                try:
+                    fa['resolved_inputs'] = _redact_kv_for_ui(cfg)
+                except Exception:
+                    pass
+
+                # Apply inject-files override early so downstream hint.txt allowlist uses it.
+                try:
+                    inj_ovr = (fa or {}).get('inject_files_override')
+                    if isinstance(inj_ovr, list):
+                        cleaned = [str(x or '').strip() for x in (inj_ovr or [])]
+                        cleaned = [x for x in cleaned if x]
+                        fa['inject_files'] = cleaned
+                except Exception:
+                    pass
+
+                # If the user provided an explicit FLAG override, expose it even before
+                # generator execution (so UI can show Resolved outputs / Flag).
+                try:
+                    flag_override = str((fa or {}).get('flag_override') or '').strip()
+                    if flag_override:
+                        fa['flag_value'] = flag_override
+                        fa['resolved_outputs'] = _redact_kv_for_ui({'flag': flag_override})
+                except Exception:
+                    pass
+
+                # If the user provided output overrides, expose them even before generator
+                # execution (useful when running best-effort or when generator outputs are unknown).
+                try:
+                    out_ovr = (fa or {}).get('output_overrides')
+                    if isinstance(out_ovr, dict) and out_ovr:
+                        cleaned: dict[str, Any] = {}
+                        for k, v in (out_ovr or {}).items():
+                            kk = str(k or '').strip()
+                            if not kk:
+                                continue
+                            cleaned[kk] = v
+                        if cleaned:
+                            fa['resolved_outputs'] = _redact_kv_for_ui(cleaned)
+                            # Prefer showing overridden flag value in the UI's Flag row.
+                            try:
+                                if isinstance(cleaned.get('flag'), str) and str(cleaned.get('flag') or '').strip():
+                                    fa['flag_value'] = str(cleaned.get('flag') or '').strip()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                try:
+                    if generator_id:
+                        if deadline is not None and time.monotonic() >= deadline:
+                            generation_skipped.append({
+                                'node_id': cid,
+                                'node_name': str(h.get('name') or ''),
+                                'generator_id': generator_id,
+                                'reason': 'time budget exceeded',
+                            })
+                            break
+
+                        flow_run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
+                        # IMPORTANT: stage under /tmp/vulns so the existing sync pipeline can ship
+                        # these artifacts to the CORE host (where docker-compose paths resolve).
+                        subdir = 'flag_node_generators_runs' if assignment_type == 'flag-node-generator' else 'flag_generators_runs'
+                        flow_out_dir = os.path.join('/tmp/vulns', subdir, f"flow-{scenario_norm}-{flow_run_id}")
+                        os.makedirs(flow_out_dir, exist_ok=True)
+                        try:
+                            created_run_dirs.append(str(flow_out_dir))
+                        except Exception:
+                            pass
+
+                        # If any config inputs are declared as file/path types, and the user provided
+                        # an override pointing to a previously-uploaded server file, stage it into
+                        # the run's inputs/ directory and rewrite the config to /inputs/<filename>.
+                        try:
+                            gen_def = _gen_by_id.get(generator_id)
+                            if isinstance(gen_def, dict) and isinstance(cfg, dict):
+                                _flow_stage_file_inputs_for_generator(cfg, gen_def, run_dir=str(flow_out_dir))
+                        except Exception:
+                            pass
+
+                        remaining = None
+                        if deadline is not None:
+                            try:
+                                remaining = int(max(1.0, deadline - time.monotonic()))
+                            except Exception:
+                                remaining = 1
+                        gen_timeout_s = 120
+                        if remaining is not None:
+                            gen_timeout_s = min(gen_timeout_s, remaining)
+
+                        def _split_inject_spec(raw: str) -> tuple[str, str]:
+                            text = str(raw or '').strip()
+                            if not text:
+                                return '', ''
+                            for sep in ('->', '=>'):
+                                if sep in text:
+                                    left, right = text.split(sep, 1)
+                                    return left.strip(), right.strip()
+                            return text, ''
+
+                        def _stage_inject_uploads(injects: list[str], run_dir: str) -> list[str]:
+                            if not injects:
+                                return []
+                            try:
+                                repo_root = _get_repo_root()
+                            except Exception:
+                                repo_root = os.getcwd()
+                            allowed_root = os.path.abspath(_flow_inject_uploads_dir())
+                            art_dir = os.path.join(run_dir, 'artifacts')
+                            os.makedirs(art_dir, exist_ok=True)
+
+                            out_list: list[str] = []
+                            for raw in injects:
+                                src_raw, dest_raw = _split_inject_spec(str(raw))
+                                src = str(src_raw or '').strip()
+                                if src.startswith('upload:'):
+                                    src = src[len('upload:'):].strip()
+                                if src:
+                                    try:
+                                        abs_src = os.path.abspath(src)
+                                    except Exception:
+                                        abs_src = ''
+                                else:
+                                    abs_src = ''
+
+                                if abs_src and os.path.exists(abs_src):
+                                    try:
+                                        if os.path.commonpath([allowed_root, abs_src]) == allowed_root:
+                                            base = os.path.basename(abs_src.rstrip('/')) or 'upload'
+                                            dest_path = os.path.join(art_dir, base)
+                                            if os.path.isdir(abs_src):
+                                                shutil.copytree(abs_src, dest_path, dirs_exist_ok=True)
+                                            else:
+                                                shutil.copy2(abs_src, dest_path)
+                                            new_src = f"artifacts/{base}"
+                                            if dest_raw:
+                                                out_list.append(f"{new_src} -> {dest_raw}")
+                                            else:
+                                                out_list.append(new_src)
+                                            continue
+                                    except Exception:
+                                        pass
+
+                                # Fallback: keep original entry.
+                                out_list.append(str(raw))
+                            return out_list
+
+                        effective_injects = None
+                        try:
+                            eff = fa.get('inject_files') if isinstance(fa, dict) else None
+                            if isinstance(eff, list) and eff:
+                                effective_injects = _stage_inject_uploads(list(eff), str(flow_out_dir))
+                                fa['inject_files'] = list(effective_injects)
+                        except Exception:
+                            effective_injects = None
+
+                        ok_run, note, manifest_path = _flow_try_run_generator(
+                            generator_id,
+                            out_dir=flow_out_dir,
+                            config=cfg,
+                            kind=assignment_type,
+                            timeout_s=gen_timeout_s,
+                            inject_files_override=effective_injects,
+                        )
+
+                        if not ok_run:
+                            generation_failures.append({
+                                'node_id': cid,
+                                'node_name': str(h.get('name') or ''),
+                                'generator_id': generator_id,
+                                'error': str(note or 'generator execution failed'),
+                                'run_dir': str(flow_out_dir or ''),
+                            })
+                            try:
+                                if flow_out_dir:
+                                    failed_run_dirs.append(str(flow_out_dir))
+                            except Exception:
+                                pass
+
+                        # If the generator produced a manifest, capture the actual output keys.
+                        if ok_run and manifest_path and os.path.exists(manifest_path):
+                            try:
+                                with open(manifest_path, 'r', encoding='utf-8') as f:
+                                    m = json.load(f) or {}
+                                outs = m.get('outputs') if isinstance(m, dict) else None
+                                if isinstance(outs, dict):
+                                    # Apply user override for FLAG value (if provided).
+                                    try:
+                                        flag_override = str((fa or {}).get('flag_override') or '').strip()
+                                        if flag_override:
+                                            outs['flag'] = flag_override
+                                    except Exception:
+                                        pass
+
+                                    # Apply user output overrides (if provided).
+                                    try:
+                                        out_ovr = (fa or {}).get('output_overrides')
+                                        if isinstance(out_ovr, dict) and out_ovr:
+                                            for k, v in (out_ovr or {}).items():
+                                                kk = str(k or '').strip()
+                                                if not kk:
+                                                    continue
+                                                outs[kk] = v
+                                    except Exception:
+                                        pass
+                                    # Ensure any IP-like outputs align with the preview host IP.
+                                    # This prevents resolved hints from drifting away from Preview
+                                    # even if a generator invents its own network.ip.
+                                    try:
+                                        if preview_ip4:
+                                            ip_keys = {
+                                                'network.ip',
+                                                'host.ip',
+                                                'host_ip',
+                                                'target_ip',
+                                                'ip',
+                                                'ip4',
+                                                'ipv4',
+                                                'address',
+                                            }
+                                            for k in list(outs.keys()):
+                                                kk = str(k)
+                                                if kk not in ip_keys:
+                                                    continue
+                                                old = outs.get(k)
+                                                old_ip = _first_valid_ipv4(old)
+                                                if old_ip and old_ip != preview_ip4:
+                                                    outs[k] = preview_ip4
+                                                    try:
+                                                        app.logger.info(
+                                                            '[flow.prepare_preview_for_execute] clamped %s=%s -> %s for node=%s',
+                                                            kk,
+                                                            old_ip,
+                                                            preview_ip4,
+                                                            cid,
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                    except Exception:
+                                        pass
+
+                                    actual_output_keys = sorted([str(k) for k in outs.keys() if str(k).strip()])
+
+                                    # Propagate outputs forward so later generators can consume concrete values.
+                                    try:
+                                        for k, v in outs.items():
+                                            kk = str(k)
+                                            if not kk:
+                                                continue
+                                            flow_context[kk] = v
+                                    except Exception:
+                                        pass
+
+                                    # UI convenience: expose resolved outputs (redacted).
+                                    try:
+                                        fa['resolved_outputs'] = _redact_kv_for_ui(outs)
+                                    except Exception:
+                                        pass
+
+                                    # Substitute output placeholders into hints (best-effort).
+                                    try:
+                                        if isinstance(fa.get('hints'), list) and fa.get('hints'):
+                                            new_hints = [_apply_outputs_to_hint_text(str(t), outs) for t in (fa.get('hints') or [])]
+                                            new_hints = [_apply_node_placeholders(str(t), node_ip4=preview_ip4) for t in new_hints]
+                                            fa['hints'] = new_hints
+                                            fa['hint'] = str(new_hints[0] or '') if new_hints else str(fa.get('hint') or '')
+                                        else:
+                                            hint_final = _apply_outputs_to_hint_text(str(fa.get('hint') or ''), outs)
+                                            hint_final = _apply_node_placeholders(str(hint_final), node_ip4=preview_ip4)
+                                            if hint_final and hint_final != str(fa.get('hint') or ''):
+                                                fa['hint'] = hint_final
+                                    except Exception:
+                                        pass
+
+                                    # Best-effort: if the generator emitted a top-level 'flag' value,
+                                    # also write a plain flag.txt for easier participant discovery.
+                                    try:
+                                        flag_val = outs.get('flag')
+                                        if ok_run and flow_out_dir and isinstance(flag_val, str) and flag_val.strip():
+                                            with open(os.path.join(flow_out_dir, 'flag.txt'), 'w', encoding='utf-8') as ff:
+                                                ff.write(flag_val.strip() + "\n")
+                                            # UI convenience: expose the realized flag value (runtime-only).
+                                            # IMPORTANT: this must not be persisted into saved plans.
+                                            try:
+                                                fa['flag_value'] = flag_val.strip()
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                actual_output_keys = []
+
+                        # Materialize a human-readable hint file in the artifacts directory.
+                        # IMPORTANT: do this after outputs.json has been applied to hints so
+                        # the CORE VM sees resolved template values.
+                        try:
+                            # Prefer staged injected artifacts when present (inject_files allowlist).
+                            # Fall back to artifacts/, then the run dir.
+                            flow_mount_dir = str(flow_out_dir or '')
+                            allow_hint_file = True
+                            try:
+                                if flow_out_dir:
+                                    injected = os.path.join(flow_out_dir, 'injected')
+                                    artifacts = os.path.join(flow_out_dir, 'artifacts')
+                                    if os.path.isdir(injected):
+                                        flow_mount_dir = injected
+                                    elif os.path.isdir(artifacts):
+                                        flow_mount_dir = artifacts
+                            except Exception:
+                                flow_mount_dir = str(flow_out_dir or '')
+
+                            # Respect inject_files allowlist: only place hint.txt into the
+                            # injected mount dir if the allowlist appears to include it.
+                            try:
+                                inj_list = fa.get('inject_files') if isinstance(fa, dict) else None
+                                if isinstance(inj_list, list) and inj_list:
+                                    allow_hint = False
+                                    for raw in inj_list:
+                                        s = str(raw or '').strip().replace('\\', '/')
+                                        for sep in ('->', '=>'):
+                                            if sep in s:
+                                                s = s.split(sep, 1)[0].strip()
+                                                break
+                                        if not s:
+                                            continue
+                                        if s == 'hint.txt' or s.endswith('/hint.txt'):
+                                            allow_hint = True
+                                            break
+                                    if not allow_hint:
+                                        allow_hint_file = False
+                            except Exception:
+                                pass
+
+                            if not allow_hint_file:
+                                raise RuntimeError('hint.txt not allowlisted')
+
+                            hint_texts: list[str] = []
+                            if isinstance(fa.get('hints'), list):
+                                hint_texts = [str(x or '').strip() for x in (fa.get('hints') or []) if str(x or '').strip()]
+                            if not hint_texts:
+                                single = str(fa.get('hint') or '').strip()
+                                if single:
+                                    hint_texts = [single]
+                            if flow_mount_dir and hint_texts:
+                                with open(os.path.join(flow_mount_dir, 'hint.txt'), 'w', encoding='utf-8') as hf:
+                                    if len(hint_texts) == 1:
+                                        hf.write(hint_texts[0] + "\n")
+                                    else:
+                                        for idx, ht in enumerate(hint_texts, start=1):
+                                            hf.write(f"Hint {idx}/{len(hint_texts)}: {ht}\n")
+                        except Exception:
+                            pass
+
+                        # Compare declared vs actual output keys (best-effort).
+                        try:
+                            if ok_run and actual_output_keys:
+                                # Some generators include metadata echo outputs (e.g., node_name).
+                                # These are not meaningful artifacts for Flow chaining and shouldn't
+                                # trigger contract mismatch warnings.
+                                ignore_actual = {
+                                    'node_name',
+                                    'nodename',
+                                    'nodeName',
+                                }
+                                declared_set = set(declared_output_keys or [])
+                                actual_set = set([k for k in (actual_output_keys or []) if k not in ignore_actual])
+                                missing = sorted(list(declared_set - actual_set))
+                                extra = sorted(list(actual_set - declared_set))
+                                mismatch = {
+                                    'declared': declared_output_keys,
+                                    'actual': actual_output_keys,
+                                    'missing': missing,
+                                    'extra': extra,
+                                    'ok': (not missing and not extra),
+                                }
+                        except Exception:
+                            mismatch = {}
+                except Exception as exc:
+                    ok_run, note, manifest_path = False, f'generator exception: {exc}', None
+                    if generator_id:
+                        generation_failures.append({
+                            'node_id': cid,
+                            'node_name': str(h.get('name') or ''),
+                            'generator_id': generator_id,
+                            'error': str(note or ''),
+                            'run_dir': str(flow_out_dir or ''),
+                        })
+
+                meta_h['flow_flag'] = {
+                    'type': assignment_type,
+                    'generator_catalog': generator_catalog,
+                    'generator_id': generator_id,
+                    'generator_name': str(fa.get('name') or ''),
+                    'generator_language': str(fa.get('language') or ''),
+                    'generator_source': str(fa.get('flag_generator') or ''),
+                    'artifacts_dir': str(flow_out_dir or ''),
+                    'mount_dir': str(
+                        os.path.join(flow_out_dir, 'injected')
+                        if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'injected'))
+                        else (
+                            os.path.join(flow_out_dir, 'artifacts')
+                            if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'artifacts'))
+                            else (flow_out_dir or '')
+                        )
+                    ),
+                    'inject_files': list(fa.get('inject_files') or []) if isinstance(fa.get('inject_files'), list) else [],
+                    'inputs': list(fa.get('inputs') or []) if isinstance(fa.get('inputs'), list) else [],
+                    'outputs': list(fa.get('outputs') or []) if isinstance(fa.get('outputs'), list) else [],
+                    'hint_template': str(fa.get('hint_template') or ''),
+                    'hint': str(fa.get('hint') or ''),
+                    'next_node_id': str(fa.get('next_node_id') or ''),
+                    'next_node_name': str(fa.get('next_node_name') or ''),
+                    'generated': bool(ok_run),
+                    'generation_note': str(note or ''),
+                    'run_dir': str(flow_out_dir or ''),
+                    'outputs_manifest': str(manifest_path or ''),
+                    'actual_outputs': actual_output_keys,
+                    'declared_outputs': declared_output_keys,
+                    'outputs_match': bool(mismatch.get('ok')) if isinstance(mismatch, dict) and mismatch else True,
+                    'outputs_mismatch': mismatch,
+                    'inputs_match': bool(inputs_mismatch.get('ok')) if isinstance(inputs_mismatch, dict) and inputs_mismatch else True,
+                    'inputs_mismatch': inputs_mismatch,
+                    'config': cfg,
+                }
+
+                # Also enrich the assignment itself for the Flow UI response.
+                try:
+                    fa['generated'] = bool(ok_run)
+                    fa['generation_note'] = str(note or '')
+                    fa['artifacts_dir'] = str(flow_out_dir or '')
+                    fa['mount_dir'] = str(
+                        os.path.join(flow_out_dir, 'injected')
+                        if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'injected'))
+                        else (
+                            os.path.join(flow_out_dir, 'artifacts')
+                            if flow_out_dir and os.path.isdir(os.path.join(flow_out_dir, 'artifacts'))
+                            else (flow_out_dir or '')
+                        )
+                    )
+                    fa['inject_files'] = list(fa.get('inject_files') or []) if isinstance(fa.get('inject_files'), list) else []
+                    fa['outputs_manifest'] = str(manifest_path or '')
+                    fa['declared_outputs'] = declared_output_keys
+                    fa['actual_outputs'] = actual_output_keys
+                    fa['outputs_match'] = bool(mismatch.get('ok')) if isinstance(mismatch, dict) and mismatch else True
+                    fa['outputs_mismatch'] = mismatch
+                    fa['inputs_match'] = bool(inputs_mismatch.get('ok')) if isinstance(inputs_mismatch, dict) and inputs_mismatch else True
+                    fa['inputs_mismatch'] = inputs_mismatch
+                    fa['config'] = cfg
+                except Exception:
+                    pass
+
+            if generation_failures:
+                # Cleanup partial artifacts so we don't leave confusing residues behind.
+                try:
+                    base_dir = os.path.abspath(os.path.join('/tmp', 'vulns'))
+                    to_rm = (created_run_dirs or [])
+                    if best_effort:
+                        to_rm = (failed_run_dirs or [])
+                    for d in to_rm:
+                        try:
+                            dd = os.path.abspath(str(d))
+                            if os.path.commonpath([dd, base_dir]) != base_dir:
+                                continue
+                            shutil.rmtree(dd, ignore_errors=True)
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                if not best_effort:
+                    return jsonify({
+                        'ok': False,
+                        'error': f"{len(generation_failures)} generator run(s) failed; cannot prepare preview for execute.",
+                        'scenario': scenario_label or scenario_norm,
+                        'length': length,
+                        'stats': stats,
+                        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+                        'flag_assignments': flag_assignments,
+                        'generation_failures': generation_failures,
+                        'generation_skipped': generation_skipped,
+                        'base_preview_plan_path': base_plan_path,
+                        'best_effort': bool(best_effort),
+                    }), 422
+        except Exception:
+            pass
+    else:
+        # Ensure the UI gets a consistent signal when flags are disabled.
+        try:
+            occurrence_ctr: dict[tuple[str, str], int] = {}
+            for fa in (flag_assignments or []):
+                if not isinstance(fa, dict):
+                    continue
+                cid = str(fa.get('node_id') or '').strip()
+                h = host_by_id.get(cid)
+                preview_ip4 = _preview_host_ip4(h) if isinstance(h, dict) else ''
+
+                generator_id = str(fa.get('id') or '').strip()
+                seed_val = preview.get('seed') if isinstance(preview, dict) else None
+
+                occ_key = (cid, generator_id)
+                occ = int(occurrence_ctr.get(occ_key, 0) or 0)
+                occurrence_ctr[occ_key] = occ + 1
+
+                # Compute a best-effort effective config so the UI can show resolved inputs
+                # even when dependency order is invalid.
+                try:
+                    cfg_full = _flow_default_generator_config(fa, seed_val=seed_val, occurrence_idx=occ)
+                    if preview_ip4:
+                        cfg_full.setdefault('network.ip', preview_ip4)
+                        cfg_full.setdefault('target_ip', preview_ip4)
+                        cfg_full.setdefault('host_ip', preview_ip4)
+                        cfg_full.setdefault('ip4', preview_ip4)
+                        cfg_full.setdefault('ipv4', preview_ip4)
+                    try:
+                        node_name_val = str((h or {}).get('name') or '').strip() if isinstance(h, dict) else ''
+                        if node_name_val:
+                            cfg_full['node_name'] = node_name_val
+                    except Exception:
+                        pass
+
+                    raw_overrides = fa.get('config_overrides') or fa.get('inputs_overrides') or fa.get('input_overrides')
+                    if isinstance(raw_overrides, dict) and raw_overrides:
+                        for k, v in raw_overrides.items():
+                            kk = str(k or '').strip()
+                            if not kk:
+                                continue
+                            cfg_full[kk] = v
+                        fa['config_overrides'] = dict(raw_overrides)
+
+                    cfg = cfg_full
+                    gen_def = _gen_by_id.get(generator_id)
+                    if isinstance(gen_def, dict):
+                        allowed = _all_input_names_of(gen_def)
+                        declared_required = _required_input_names_of(gen_def)
+                        if allowed:
+                            keep = set(allowed)
+                            try:
+                                keep |= set(declared_required or set())
+                            except Exception:
+                                pass
+                            cfg = {k: v for k, v in (cfg_full or {}).items() if k in keep}
+
+                    fa['config'] = cfg
+                    fa['resolved_inputs'] = _redact_kv_for_ui(cfg)
+                except Exception:
+                    pass
+
+                # Apply inject-files override even when flags are disabled.
+                try:
+                    inj_ovr = (fa or {}).get('inject_files_override')
+                    if isinstance(inj_ovr, list):
+                        cleaned = [str(x or '').strip() for x in (inj_ovr or [])]
+                        cleaned = [x for x in cleaned if x]
+                        fa['inject_files'] = cleaned
+                except Exception:
+                    pass
+
+                # Preserve FLAG override visibility even when flags are disabled.
+                try:
+                    flag_override = str((fa or {}).get('flag_override') or '').strip()
+                    if flag_override:
+                        fa['flag_value'] = flag_override
+                        fa['resolved_outputs'] = _redact_kv_for_ui({'flag': flag_override})
+                except Exception:
+                    pass
+
+                # Preserve output override visibility even when flags are disabled.
+                try:
+                    out_ovr = (fa or {}).get('output_overrides')
+                    if isinstance(out_ovr, dict) and out_ovr:
+                        cleaned: dict[str, Any] = {}
+                        for k, v in (out_ovr or {}).items():
+                            kk = str(k or '').strip()
+                            if not kk:
+                                continue
+                            cleaned[kk] = v
+                        if cleaned:
+                            fa['resolved_outputs'] = _redact_kv_for_ui(cleaned)
+                            try:
+                                if isinstance(cleaned.get('flag'), str) and str(cleaned.get('flag') or '').strip():
+                                    fa['flag_value'] = str(cleaned.get('flag') or '').strip()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                fa['generated'] = False
+                fa['generation_note'] = 'flags disabled (invalid dependency order)'
+        except Exception:
+            pass
+
+    try:
+        persisted_flag_assignments = _flow_strip_runtime_sensitive_fields(flag_assignments)
+        flow_meta = {
+            'source_preview_plan_path': base_plan_path,
+            'scenario': scenario_label or scenario_norm,
+            'length': length,
+            'requested_length': requested_length,
+            'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+            # Persist all Flow decisions so returning to Flag Sequencing shows the same
+            # chain and generator selections/hints.
+            'flag_assignments': persisted_flag_assignments,
+            'flags_enabled': bool(flags_enabled),
+            'flow_valid': bool(flow_valid),
+            'flow_errors': list(flow_errors or []),
+            'modified_at': _iso_now(),
+        }
+        if isinstance(meta, dict):
+            meta = dict(meta)
+            meta['flow'] = flow_meta
+        else:
+            meta = {'flow': flow_meta}
+    except Exception:
+        pass
+
+    # Persist a new plan artifact in outputs/plans so /run_cli_async can safely consume it.
+    try:
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        seed = None
+        try:
+            seed = int((preview.get('seed') if isinstance(preview, dict) else None) or (meta.get('seed') if isinstance(meta, dict) else None) or 0)
+        except Exception:
+            seed = 0
+        suffix = secrets.token_hex(3)
+        out_name = f"plan_from_flow_{seed}_{int(time.time())}_{suffix}.json"
+        out_path = str(plans_dir / out_name)
+        out_payload = {
+            'full_preview': preview,
+            'metadata': meta,
+        }
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(out_payload, f, indent=2)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to persist flow-modified preview plan: {e}'}), 500
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'length': length,
+        'requested_length': requested_length,
+        'stats': stats,
+        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or ''), 'is_vuln': bool(n.get('is_vuln'))} for n in chain_nodes],
+        'flag_assignments': flag_assignments,
+        'flags_enabled': bool(flags_enabled),
+        'flow_valid': bool(flow_valid),
+        'flow_errors': list(flow_errors or []),
+        'xml_path': str((meta or {}).get('xml_path') or ''),
+        'preview_plan_path': out_path,
+        'base_preview_plan_path': base_plan_path,
+        'best_effort': bool(best_effort),
+        'elapsed_s': round(float(time.monotonic() - started_at), 3),
+        **({'sequencer_dag': (dag_debug or {'ok': False, 'errors': ['not computed (explicit chain)']})} if debug_dag else {}),
+    })
+
+
+@app.route('/api/flag-sequencing/save_flow_substitutions', methods=['POST'])
+def api_flow_save_flow_substitutions():
+    """Persist a user-edited chain + generator assignments (no generator runs).
+
+    This writes a plan_from_flow_*.json that carries metadata.flow.chain and
+    metadata.flow.flag_assignments so future preview/prepare/execute honors the
+    user's substitutions.
+    """
+    j = request.get_json(silent=True) or {}
+    scenario_label = str(j.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    allow_node_duplicates = False
+    try:
+        allow_node_duplicates = str(j.get('allow_node_duplicates') or '').strip().lower() in {
+            '1', 'true', 't', 'yes', 'y', 'on'
+        }
+    except Exception:
+        allow_node_duplicates = False
+
+    chain_ids_in = j.get('chain_ids')
+    if not isinstance(chain_ids_in, list) or not chain_ids_in:
+        return jsonify({'ok': False, 'error': 'Missing chain_ids.'}), 400
+    chain_ids: list[str] = [str(x or '').strip() for x in chain_ids_in if str(x or '').strip()]
+    if not chain_ids:
+        return jsonify({'ok': False, 'error': 'Missing chain_ids.'}), 400
+
+    base_plan_path = str(j.get('preview_plan') or '').strip() or None
+    if base_plan_path:
+        try:
+            base_plan_path = os.path.abspath(base_plan_path)
+            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
+            if os.path.commonpath([base_plan_path, plans_dir]) != plans_dir:
+                base_plan_path = None
+            elif not os.path.exists(base_plan_path):
+                base_plan_path = None
+        except Exception:
+            base_plan_path = None
+    if not base_plan_path:
+        base_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+    if not base_plan_path or not os.path.exists(base_plan_path):
+        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
+
+    try:
+        with open(base_plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+        meta = payload.get('metadata') if isinstance(payload, dict) else {}
+        preview = payload.get('full_preview') if isinstance(payload, dict) else None
+        if not isinstance(preview, dict):
+            return jsonify({'ok': False, 'error': 'Preview plan is missing full_preview.'}), 422
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
+
+    # Build chain node dicts with vulnerability flags.
+    try:
+        nodes, _links, _adj = _build_topology_graph_from_preview_plan(preview)
+    except Exception:
+        nodes = []
+    id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
+    chain_nodes: list[dict[str, Any]] = []
+    for cid in chain_ids:
+        n = id_map.get(str(cid))
+        if not isinstance(n, dict):
+            return jsonify({'ok': False, 'error': f'Chain node not found in preview plan: {cid}'}), 422
+        chain_nodes.append(n)
+
+    # Parse requested assignments (one per chain position).
+    fas_in = j.get('flag_assignments')
+    if not isinstance(fas_in, list) or len(fas_in) != len(chain_nodes):
+        return jsonify({'ok': False, 'error': 'flag_assignments must be a list aligned to chain_ids (same length).'}), 400
+
+    try:
+        gens, _ = _flag_generators_from_enabled_sources()
+    except Exception:
+        gens = []
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        node_gens = []
+    gen_by_id: dict[str, dict[str, Any]] = {}
+    for g in (gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid and gid not in gen_by_id:
+            gg = dict(g)
+            gg['_flow_kind'] = 'flag-generator'
+            gg['_flow_catalog'] = 'flag_generators'
+            gen_by_id[gid] = gg
+    for g in (node_gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid and gid not in gen_by_id:
+            gg = dict(g)
+            gg['_flow_kind'] = 'flag-node-generator'
+            gg['_flow_catalog'] = 'flag_node_generators'
+            gen_by_id[gid] = gg
+
+    try:
+        plugins_by_id = _flow_enabled_plugin_contracts_by_id()
+    except Exception:
+        plugins_by_id = {}
+
+    id_to_name: dict[str, str] = {}
+    for n in chain_nodes:
+        try:
+            nid = str(n.get('id') or '').strip()
+            nm = str(n.get('name') or '').strip()
+            if nid:
+                id_to_name[nid] = nm or nid
+        except Exception:
+            pass
+
+    def _artifact_requires_of(gen: dict[str, Any]) -> set[str]:
+        required: set[str] = set()
+        try:
+            pid = str(gen.get('id') or '').strip()
+            plugin = plugins_by_id.get(pid)
+            if isinstance(plugin, dict) and isinstance(plugin.get('requires'), list):
+                for x in (plugin.get('requires') or []):
+                    xx = str(x).strip()
+                    if xx:
+                        required.add(xx)
+        except Exception:
+            pass
+        # Synthesized inputs (e.g., seed/node_name) are *fields*, not chain artifacts.
+        # Filter them out even if a plugin contract mistakenly lists them in `requires`.
+        try:
+            required = {x for x in required if x not in _flow_synthesized_inputs()}
+        except Exception:
+            pass
+        return required
+
+    def _artifact_produces_of(gen: dict[str, Any]) -> set[str]:
+        provides: set[str] = set()
+        try:
+            pid = str(gen.get('id') or '').strip()
+            plugin = plugins_by_id.get(pid)
+            if isinstance(plugin, dict) and isinstance(plugin.get('produces'), list):
+                for item in (plugin.get('produces') or []):
+                    if not isinstance(item, dict):
+                        continue
+                    a = str(item.get('artifact') or '').strip()
+                    if a:
+                        provides.add(a)
+        except Exception:
+            pass
+        return provides
+
+    def _required_input_fields_of(gen: dict[str, Any]) -> set[str]:
+        required: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get('name') or '').strip()
+                    if not name:
+                        continue
+                    if inp.get('required') is False:
+                        continue
+                    required.add(name)
+        except Exception:
+            pass
+        return required
+
+    def _all_input_fields_of(gen: dict[str, Any]) -> set[str]:
+        fields: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get('name') or '').strip()
+                    if name:
+                        fields.add(name)
+        except Exception:
+            pass
+        return fields
+
+    def _output_fields_of(gen: dict[str, Any]) -> set[str]:
+        out_fields: set[str] = set()
+        try:
+            outputs = gen.get('outputs')
+            if isinstance(outputs, list):
+                for outp in outputs:
+                    if not isinstance(outp, dict):
+                        continue
+                    nm = str(outp.get('name') or '').strip()
+                    if nm:
+                        out_fields.add(nm)
+        except Exception:
+            pass
+        return out_fields
+
+    def _provides_of(gen: dict[str, Any]) -> set[str]:
+        provides: set[str] = set()
+        try:
+            provides |= _artifact_produces_of(gen)
+        except Exception:
+            pass
+        try:
+            prov = gen.get('provides')
+            if isinstance(prov, list):
+                for x in prov:
+                    s = str(x).strip()
+                    if s:
+                        provides.add(s)
+        except Exception:
+            pass
+        try:
+            provides |= _output_fields_of(gen)
+        except Exception:
+            pass
+        return provides
+
+    out_assignments: list[dict[str, Any]] = []
+    for i, (cid, raw_a) in enumerate(zip(chain_ids, (fas_in or []))):
+        if not isinstance(raw_a, dict):
+            raw_a = {}
+
+        generator_id = str(raw_a.get('id') or raw_a.get('generator_id') or '').strip()
+        if not generator_id:
+            return jsonify({'ok': False, 'error': f'Missing generator id for position {i}.'}), 400
+
+        gen = gen_by_id.get(generator_id)
+        if not isinstance(gen, dict):
+            return jsonify({'ok': False, 'error': f'Generator not found/enabled: {generator_id}'}), 422
+
+        # Keep assignment aligned to the provided chain_ids order.
+        a2 = dict(raw_a)
+        a2['node_id'] = str(cid)
+        a2['id'] = str(generator_id)
+        a2['name'] = str(gen.get('name') or '')
+        a2['description'] = str(gen.get('description') or '')
+        a2['type'] = str(gen.get('_flow_kind') or a2.get('type') or 'flag-generator')
+        a2['flag_generator'] = str(gen.get('_source_name') or '').strip() or 'unknown'
+        a2['generator_catalog'] = str(gen.get('_flow_catalog') or a2.get('generator_catalog') or 'flag_generators')
+        a2['language'] = str(gen.get('language') or '')
+
+        hint_templates = _flow_hint_templates_from_generator(gen)
+        a2['hint_templates'] = hint_templates
+        a2['hint_template'] = str((hint_templates[0] if hint_templates else '') or '')
+
+        try:
+            next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
+        except Exception:
+            next_id = ''
+        a2['next_node_id'] = str(next_id)
+        a2['next_node_name'] = str(id_to_name.get(str(next_id)) or '')
+
+        # Chain semantics.
+        requires_artifacts = sorted(list(_artifact_requires_of(gen)))
+        produces_artifacts = sorted(list(_artifact_produces_of(gen)))
+        input_fields_required = sorted(list(_required_input_fields_of(gen)))
+        input_fields_all = sorted(list(_all_input_fields_of(gen)))
+        input_fields_optional = sorted([x for x in input_fields_all if x and x not in set(input_fields_required)])
+        output_fields = sorted(list(_output_fields_of(gen)))
+
+        # Filter config_overrides to declared inputs + synthesized inputs.
+        allowed_override_keys: set[str] = set(input_fields_all)
+        try:
+            allowed_override_keys |= set(_flow_synthesized_inputs())
+        except Exception:
+            pass
+
+        raw_overrides: Any = None
+        overrides_present = False
+        try:
+            if 'config_overrides' in a2:
+                overrides_present = True
+                raw_overrides = a2.get('config_overrides')
+            elif 'inputs_overrides' in a2:
+                overrides_present = True
+                raw_overrides = a2.get('inputs_overrides')
+            elif 'input_overrides' in a2:
+                overrides_present = True
+                raw_overrides = a2.get('input_overrides')
+        except Exception:
+            overrides_present = False
+            raw_overrides = None
+
+        if overrides_present:
+            if raw_overrides is None:
+                a2.pop('config_overrides', None)
+            elif isinstance(raw_overrides, dict):
+                config_overrides: dict[str, Any] = {}
+                for k, v in (raw_overrides or {}).items():
+                    kk = str(k or '').strip()
+                    if not kk:
+                        continue
+                    if kk not in allowed_override_keys:
+                        continue
+                    config_overrides[kk] = v
+                if config_overrides:
+                    a2['config_overrides'] = dict(config_overrides)
+                else:
+                    a2.pop('config_overrides', None)
+            else:
+                a2.pop('config_overrides', None)
+
+        # Drop legacy keys if present (we normalize into config_overrides).
+        a2.pop('inputs_overrides', None)
+        a2.pop('input_overrides', None)
+
+        a2['requires'] = requires_artifacts
+        a2['produces'] = produces_artifacts
+        a2['input_fields'] = input_fields_all
+        a2['input_fields_required'] = input_fields_required
+        a2['input_fields_optional'] = input_fields_optional
+        a2['output_fields'] = output_fields
+
+        a2['inputs'] = sorted(list((_artifact_requires_of(gen) | set(_required_input_fields_of(gen)))))
+        a2['outputs'] = sorted(list(_provides_of(gen)))
+
+        # Normalize persisted overrides / new fields.
+        out_assignments.append(a2)
+
+    try:
+        out_assignments = _flow_enrich_saved_flag_assignments(
+            out_assignments,
+            chain_nodes,
+            scenario_label=(scenario_label or scenario_norm),
+        )
+    except Exception:
+        pass
+
+    try:
+        flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
+            chain_nodes,
+            out_assignments,
+            scenario_label=(scenario_label or scenario_norm),
+        )
+    except Exception:
+        flow_valid, flow_errors = True, []
+    flags_enabled = bool(flow_valid)
+
+    # Persist as plan_from_flow_*.json
+    try:
+        persisted_flag_assignments = _flow_strip_runtime_sensitive_fields(out_assignments)
+        flow_meta = {
+            'source_preview_plan_path': base_plan_path,
+            'scenario': scenario_label or scenario_norm,
+            'length': len(chain_nodes),
+            'requested_length': len(chain_nodes),
+            'allow_node_duplicates': bool(allow_node_duplicates),
+            'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+            'flag_assignments': persisted_flag_assignments,
+            'flags_enabled': bool(flags_enabled),
+            'flow_valid': bool(flow_valid),
+            'flow_errors': list(flow_errors or []),
+            'modified_at': _iso_now(),
+        }
+        if isinstance(meta, dict):
+            meta2 = dict(meta)
+            meta2['flow'] = flow_meta
+        else:
+            meta2 = {'flow': flow_meta}
+    except Exception:
+        meta2 = meta
+
+    try:
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        seed = 0
+        try:
+            seed = int((preview.get('seed') if isinstance(preview, dict) else None) or (meta2.get('seed') if isinstance(meta2, dict) else None) or 0)
+        except Exception:
+            seed = 0
+        suffix = secrets.token_hex(3)
+        out_name = f"plan_from_flow_{seed}_{int(time.time())}_{suffix}.json"
+        out_path = str(plans_dir / out_name)
+        out_payload = {
+            'full_preview': preview,
+            'metadata': meta2,
+        }
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(out_payload, f, indent=2)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to persist flow-modified preview plan: {e}'}), 500
+
+    # Stats for UI.
+    try:
+        stats = _flow_compose_docker_stats(nodes)
+    except Exception:
+        stats = {}
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'length': len(chain_nodes),
+        'stats': stats,
+        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or ''), 'is_vuln': bool(n.get('is_vuln'))} for n in chain_nodes],
+        'flag_assignments': out_assignments,
+        'flags_enabled': bool(flags_enabled),
+        'flow_valid': bool(flow_valid),
+        'flow_errors': list(flow_errors or []),
+        'preview_plan_path': base_plan_path,
+        'flow_plan_path': out_path,
+        'base_preview_plan_path': base_plan_path,
+        'allow_node_duplicates': bool(allow_node_duplicates),
+    })
+
+
+def _flow_uploads_dir() -> str:
+    d = os.path.join(_outputs_dir(), 'flow_uploads')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _flow_inject_uploads_dir() -> str:
+    d = os.path.join(_outputs_dir(), 'flow_inject_uploads')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+@app.route('/api/flag-sequencing/upload_flow_input_file', methods=['POST'])
+def api_flow_upload_flow_input_file():
+    """Upload a file to be used as a Flow generator input override.
+
+    The Flow Value Override dialog can upload a file, store it under outputs/flow_uploads,
+    and persist the returned absolute path in config_overrides. During
+    /api/flag-sequencing/prepare_preview_for_execute, the server will stage the file into
+    the generator run's inputs/ directory and rewrite the config value to /inputs/<file>.
+    """
+    scenario_label = str(request.form.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    step_index_raw = str(request.form.get('step_index') or '').strip()
+    input_name = str(request.form.get('input_name') or '').strip()
+    generator_id = str(request.form.get('generator_id') or '').strip()
+
+    f = request.files.get('file')
+    if not f or not getattr(f, 'filename', ''):
+        return jsonify({'ok': False, 'error': 'No file provided.'}), 400
+
+    # Basic size guard (best-effort). Flask may not expose content_length reliably.
+    max_bytes = 10 * 1024 * 1024
+    try:
+        clen = request.content_length
+        if isinstance(clen, int) and clen > max_bytes:
+            return jsonify({'ok': False, 'error': 'File too large (max 10MB).'}), 413
+    except Exception:
+        pass
+
+    def _unique_dest_filename(dir_path: str, filename: str) -> str:
+        base = secure_filename(filename) or 'upload'
+        cand = base
+        root, ext = os.path.splitext(base)
+        i = 1
+        while os.path.exists(os.path.join(dir_path, cand)):
+            cand = f"{root}_{i}{ext}"
+            i += 1
+            if i > 5000:
+                break
+        return cand
+
+    original_filename = str(getattr(f, 'filename', '') or '')
+    safe_filename = secure_filename(original_filename) or 'upload'
+    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]
+    base_dir = os.path.join(_flow_uploads_dir(), scenario_norm, unique)
+    os.makedirs(base_dir, exist_ok=True)
+
+    prefix = (secure_filename(input_name) or 'input')
+    stored_name = _unique_dest_filename(base_dir, f"{prefix}__{safe_filename}")
+    stored_path = os.path.join(base_dir, stored_name)
+    try:
+        f.save(stored_path)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed saving upload: {e}'}), 400
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'scenario_norm': scenario_norm,
+        'step_index': step_index_raw,
+        'generator_id': generator_id,
+        'input_name': input_name,
+        'original_filename': original_filename,
+        'stored_filename': stored_name,
+        'stored_path': os.path.abspath(stored_path),
+    })
+
+
+@app.route('/api/flag-sequencing/upload_flow_inject_file', methods=['POST'])
+def api_flow_upload_flow_inject_file():
+    """Upload a file to be used as a Flow inject override.
+
+    Stores the file under outputs/flow_inject_uploads and returns an inject
+    reference token (upload:<abs_path>). At runtime, Flow stages these into
+    the run's artifacts/ directory and rewrites inject entries accordingly.
+    """
+    scenario_label = str(request.form.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    step_index_raw = str(request.form.get('step_index') or '').strip()
+    generator_id = str(request.form.get('generator_id') or '').strip()
+
+    f = request.files.get('file')
+    if not f or not getattr(f, 'filename', ''):
+        return jsonify({'ok': False, 'error': 'No file provided.'}), 400
+
+    max_bytes = 10 * 1024 * 1024
+    try:
+        clen = request.content_length
+        if isinstance(clen, int) and clen > max_bytes:
+            return jsonify({'ok': False, 'error': 'File too large (max 10MB).'}), 413
+    except Exception:
+        pass
+
+    def _unique_dest_filename(dir_path: str, filename: str) -> str:
+        base = secure_filename(filename) or 'upload'
+        cand = base
+        root, ext = os.path.splitext(base)
+        i = 1
+        while os.path.exists(os.path.join(dir_path, cand)):
+            cand = f"{root}_{i}{ext}"
+            i += 1
+            if i > 5000:
+                break
+        return cand
+
+    original_filename = str(getattr(f, 'filename', '') or '')
+    safe_filename = secure_filename(original_filename) or 'upload'
+    unique = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]
+    base_dir = os.path.join(_flow_inject_uploads_dir(), scenario_norm, unique)
+    os.makedirs(base_dir, exist_ok=True)
+
+    stored_name = _unique_dest_filename(base_dir, safe_filename)
+    stored_path = os.path.join(base_dir, stored_name)
+    try:
+        f.save(stored_path)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed saving upload: {e}'}), 400
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'scenario_norm': scenario_norm,
+        'step_index': step_index_raw,
+        'generator_id': generator_id,
+        'original_filename': original_filename,
+        'stored_filename': stored_name,
+        'stored_path': os.path.abspath(stored_path),
+        'inject_value': f"upload:{os.path.abspath(stored_path)}",
+    })
+
+    out_assignments: list[dict[str, Any]] = []
+    for i, cid in enumerate(chain_ids):
+        req = fas_in[i] if i < len(fas_in) else {}
+        if not isinstance(req, dict):
+            return jsonify({'ok': False, 'error': 'flag_assignments entries must be objects.'}), 400
+        node_id = str(req.get('node_id') or '').strip()
+        if node_id != str(cid):
+            return jsonify({'ok': False, 'error': 'flag_assignments must align to chain_ids (node_id mismatch).'}), 400
+        gen_id = str(req.get('id') or req.get('generator_id') or '').strip()
+        if not gen_id:
+            return jsonify({'ok': False, 'error': f'Missing generator id for node {node_id}.'}), 400
+        gen = gen_by_id.get(gen_id)
+        if not isinstance(gen, dict):
+            return jsonify({'ok': False, 'error': f'Generator not found/enabled: {gen_id}'}), 422
+
+        node = chain_nodes[i] if i < len(chain_nodes) else {}
+        is_vuln_node = bool(node.get('is_vuln'))
+        is_docker_node = False
+        try:
+            is_docker_node = bool(_flow_node_is_docker_role(node))
+        except Exception:
+            try:
+                t_raw = str(node.get('type') or '')
+                t = t_raw.strip().lower()
+                is_docker_node = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
+            except Exception:
+                is_docker_node = False
+
+        kind = str(gen.get('_flow_kind') or 'flag-generator')
+        if is_vuln_node and kind != 'flag-generator':
+            return jsonify({'ok': False, 'error': f'Generator {gen_id} is not compatible with vulnerability node {node_id} (must be flag-generator).'}), 422
+        if kind == 'flag-node-generator':
+            if is_vuln_node or (not is_docker_node):
+                return jsonify({'ok': False, 'error': f'Generator {gen_id} is not compatible with node {node_id} (flag-node-generator requires docker-role, non-vulnerability node).'}), 422
+        else:
+            # flag-generator
+            if not (is_docker_node or is_vuln_node):
+                return jsonify({'ok': False, 'error': f'Generator {gen_id} is not compatible with node {node_id} (flag-generator requires docker-role or vulnerability node).'}), 422
+
+        next_id = chain_ids[i + 1] if (i + 1) < len(chain_ids) else ''
+        hint_templates = _flow_hint_templates_from_generator(gen)
+        hint_tpl = hint_templates[0] if hint_templates else 'Next: {{NEXT_NODE_NAME}}'
+        rendered_hints = [
+            _flow_render_hint_template(t, scenario_label=(scenario_label or scenario_norm), id_to_name=id_to_name, this_id=str(node_id), next_id=str(next_id))
+            for t in (hint_templates or [])
+        ]
+
+        # Optional user overrides for hint text. Contract:
+        # - If key is absent: use generated hints.
+        # - If key is present and value is null: clear any override and use generated hints.
+        # - If key is present and value is a list (possibly empty): use it verbatim (after trimming).
+        hint_overrides_present = False
+        raw_hint_overrides: Any = None
+        try:
+            hint_overrides_present = 'hint_overrides' in req
+            raw_hint_overrides = req.get('hint_overrides')
+        except Exception:
+            hint_overrides_present = False
+            raw_hint_overrides = None
+
+        hint_overrides: list[str] | None = None
+        clear_hint_overrides = False
+        if hint_overrides_present:
+            if raw_hint_overrides is None:
+                clear_hint_overrides = True
+                hint_overrides = None
+            elif isinstance(raw_hint_overrides, list):
+                cleaned = [str(x or '').strip() for x in (raw_hint_overrides or [])]
+                cleaned = [x for x in cleaned if x]
+                hint_overrides = cleaned
+            elif isinstance(raw_hint_overrides, str):
+                s = str(raw_hint_overrides or '').strip()
+                hint_overrides = [s] if s else []
+            else:
+                # Unsupported type: ignore.
+                hint_overrides = None
+
+        # Optional user override for the realized FLAG value.
+        flag_override_present = False
+        raw_flag_override: Any = None
+        try:
+            flag_override_present = 'flag_override' in req
+            raw_flag_override = req.get('flag_override')
+        except Exception:
+            flag_override_present = False
+            raw_flag_override = None
+
+        flag_override: str | None = None
+        clear_flag_override = False
+        if flag_override_present:
+            if raw_flag_override is None:
+                clear_flag_override = True
+                flag_override = None
+            elif isinstance(raw_flag_override, str):
+                s = str(raw_flag_override or '').strip()
+                flag_override = s if s else None
+            else:
+                flag_override = None
+
+        # Optional user overrides for outputs (dict of output_key -> value).
+        output_overrides_present = False
+        raw_output_overrides: Any = None
+        try:
+            output_overrides_present = 'output_overrides' in req
+            raw_output_overrides = req.get('output_overrides')
+        except Exception:
+            output_overrides_present = False
+            raw_output_overrides = None
+
+        output_overrides: dict[str, Any] | None = None
+        clear_output_overrides = False
+        if output_overrides_present:
+            if raw_output_overrides is None:
+                clear_output_overrides = True
+                output_overrides = None
+            elif isinstance(raw_output_overrides, dict):
+                cleaned: dict[str, Any] = {}
+                for k, v in (raw_output_overrides or {}).items():
+                    kk = str(k or '').strip()
+                    if not kk:
+                        continue
+                    cleaned[kk] = v
+                output_overrides = cleaned
+            else:
+                output_overrides = None
+
+        # Optional override for inject_files allowlist.
+        inject_files_override_present = False
+        raw_inject_files_override: Any = None
+        try:
+            inject_files_override_present = 'inject_files_override' in req
+            raw_inject_files_override = req.get('inject_files_override')
+        except Exception:
+            inject_files_override_present = False
+            raw_inject_files_override = None
+
+        inject_files_override: list[str] | None = None
+        clear_inject_files_override = False
+        if inject_files_override_present:
+            if raw_inject_files_override is None:
+                clear_inject_files_override = True
+                inject_files_override = None
+            elif isinstance(raw_inject_files_override, list):
+                cleaned = [str(x or '').strip() for x in (raw_inject_files_override or [])]
+                cleaned = [x for x in cleaned if x]
+                inject_files_override = cleaned
+            else:
+                inject_files_override = None
+
+        requires_artifacts = sorted(list(_artifact_requires_of(gen)))
+        produces_artifacts = sorted(list(_artifact_produces_of(gen)))
+        input_fields_required = sorted(list(_required_input_fields_of(gen)))
+        input_fields_all = sorted(list(_all_input_fields_of(gen)))
+        input_fields_optional = sorted([x for x in input_fields_all if x and x not in set(input_fields_required)])
+        output_fields = sorted(list(_output_fields_of(gen)))
+
+        raw_overrides = req.get('config_overrides')
+        if not isinstance(raw_overrides, dict):
+            raw_overrides = req.get('inputs_overrides')
+        if not isinstance(raw_overrides, dict):
+            raw_overrides = req.get('input_overrides')
+
+        allowed_override_keys: set[str] = set(input_fields_all)
+        try:
+            allowed_override_keys |= set(_flow_synthesized_inputs())
+        except Exception:
+            pass
+
+        config_overrides: dict[str, Any] = {}
+        if isinstance(raw_overrides, dict):
+            for k, v in (raw_overrides or {}).items():
+                kk = str(k or '').strip()
+                if kk and kk in allowed_override_keys:
+                    config_overrides[kk] = v
+
+        # If an artifact "requires" token also appears as an optional input field,
+        # treat it as optional (exclude from effective chaining requirements).
+        try:
+            optional_field_set = set(input_fields_optional)
+            requires_effective = [x for x in (requires_artifacts or []) if x and x not in optional_field_set]
+        except Exception:
+            requires_effective = list(requires_artifacts or [])
+
+        # Effective union for chaining.
+        inputs_effective = sorted(list(set(requires_effective) | set(input_fields_required)))
+        outputs_effective = sorted(list(_provides_of(gen)))
+
+        out_a: dict[str, Any] = {
+            'node_id': str(node_id),
+            'id': str(gen.get('id') or ''),
+            'name': str(gen.get('name') or ''),
+            'type': kind,
+            'flag_generator': str(gen.get('_source_name') or '').strip() or 'unknown',
+            'generator_catalog': str(gen.get('_flow_catalog') or 'flag_generators'),
+            'language': str(gen.get('language') or ''),
+            'description_hints': list(gen.get('description_hints') or []) if isinstance(gen.get('description_hints'), list) else [],
+            'config_overrides': dict(config_overrides),
+            'inputs': inputs_effective,
+            'outputs': outputs_effective,
+            'requires': requires_artifacts,
+            'produces': produces_artifacts,
+            'input_fields': input_fields_all,
+            'input_fields_required': input_fields_required,
+            'input_fields_optional': input_fields_optional,
+            'output_fields': output_fields,
+            'input_defs': list(gen.get('inputs') or []) if isinstance(gen.get('inputs'), list) else [],
+            'output_defs': list(gen.get('outputs') or []) if isinstance(gen.get('outputs'), list) else [],
+            'hint_template': hint_tpl,
+            'hint_templates': hint_templates,
+            'hint': rendered_hints[0] if rendered_hints else _flow_render_hint_template(hint_tpl, scenario_label=(scenario_label or scenario_norm), id_to_name=id_to_name, this_id=str(node_id), next_id=str(next_id)),
+            'hints': rendered_hints,
+            'next_node_id': str(next_id),
+            'next_node_name': str(id_to_name.get(str(next_id)) or ''),
+        }
+
+        if hint_overrides_present:
+            if clear_hint_overrides:
+                # Explicit clear: do not persist overrides.
+                out_a.pop('hint_overrides', None)
+            elif hint_overrides is not None:
+                out_a['hint_overrides'] = list(hint_overrides)
+                out_a['hints'] = list(hint_overrides)
+                out_a['hint'] = hint_overrides[0] if hint_overrides else ''
+
+        if flag_override_present:
+            if clear_flag_override:
+                out_a.pop('flag_override', None)
+            elif flag_override is not None:
+                out_a['flag_override'] = str(flag_override)
+
+        if output_overrides_present:
+            if clear_output_overrides:
+                out_a.pop('output_overrides', None)
+            elif output_overrides is not None:
+                if output_overrides:
+                    out_a['output_overrides'] = dict(output_overrides)
+                else:
+                    out_a.pop('output_overrides', None)
+
+        if inject_files_override_present:
+            if clear_inject_files_override:
+                out_a.pop('inject_files_override', None)
+            elif inject_files_override is not None:
+                out_a['inject_files_override'] = list(inject_files_override)
+                # Mirror to inject_files for effective view.
+                out_a['inject_files'] = list(inject_files_override)
+
+        out_assignments.append(out_a)
+
+    # Validate (non-blocking)
+    try:
+        flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
+            chain_nodes,
+            out_assignments,
+            scenario_label=(scenario_label or scenario_norm),
+        )
+    except Exception:
+        flow_valid, flow_errors = True, []
+    flags_enabled = bool(flow_valid)
+
+    # Persist as plan_from_flow_*.json
+    try:
+        persisted_flag_assignments = _flow_strip_runtime_sensitive_fields(out_assignments)
+        flow_meta = {
+            'source_preview_plan_path': base_plan_path,
+            'scenario': scenario_label or scenario_norm,
+            'length': len(chain_nodes),
+            'requested_length': len(chain_nodes),
+            'allow_node_duplicates': bool(allow_node_duplicates),
+            'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+            'flag_assignments': persisted_flag_assignments,
+            'flags_enabled': bool(flags_enabled),
+            'flow_valid': bool(flow_valid),
+            'flow_errors': list(flow_errors or []),
+            'modified_at': _iso_now(),
+        }
+        if isinstance(meta, dict):
+            meta2 = dict(meta)
+            meta2['flow'] = flow_meta
+        else:
+            meta2 = {'flow': flow_meta}
+    except Exception:
+        meta2 = meta
+
+    try:
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        seed = 0
+        try:
+            seed = int((preview.get('seed') if isinstance(preview, dict) else None) or (meta2.get('seed') if isinstance(meta2, dict) else None) or 0)
+        except Exception:
+            seed = 0
+        suffix = secrets.token_hex(3)
+        out_name = f"plan_from_flow_{seed}_{int(time.time())}_{suffix}.json"
+        out_path = str(plans_dir / out_name)
+        out_payload = {
+            'full_preview': preview,
+            'metadata': meta2,
+        }
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(out_payload, f, indent=2)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to persist flow-modified preview plan: {e}'}), 500
+
+    # Stats for UI.
+    try:
+        stats = _flow_compose_docker_stats(nodes)
+    except Exception:
+        stats = {}
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'length': len(chain_nodes),
+        'stats': stats,
+        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or ''), 'is_vuln': bool(n.get('is_vuln'))} for n in chain_nodes],
+        'flag_assignments': out_assignments,
+        'flags_enabled': bool(flags_enabled),
+        'flow_valid': bool(flow_valid),
+        'flow_errors': list(flow_errors or []),
+        'preview_plan_path': base_plan_path,
+        'flow_plan_path': out_path,
+        'base_preview_plan_path': base_plan_path,
+        'allow_node_duplicates': bool(allow_node_duplicates),
+    })
+
+
+@app.route('/api/flag-sequencing/substitution_candidates', methods=['POST'])
+def api_flow_substitution_candidates():
+    """Return candidate generators with per-position compatibility info.
+
+    The client uses this to gray out incompatible generators and show why.
+    Compatibility here means: for the chain *prefix* (positions < index), the
+    candidate's required artifacts/fields are satisfied.
+    """
+    j = request.get_json(silent=True) or {}
+    scenario_label = str(j.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    index_raw = j.get('index')
+    try:
+        index = int(index_raw)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Invalid index.'}), 400
+    if index < 0:
+        return jsonify({'ok': False, 'error': 'Invalid index.'}), 400
+
+    chain_ids_in = j.get('chain_ids')
+    if not isinstance(chain_ids_in, list) or not chain_ids_in:
+        return jsonify({'ok': False, 'error': 'Missing chain_ids.'}), 400
+    chain_ids: list[str] = [str(x or '').strip() for x in chain_ids_in if str(x or '').strip()]
+    if not chain_ids:
+        return jsonify({'ok': False, 'error': 'Missing chain_ids.'}), 400
+    if index >= len(chain_ids):
+        return jsonify({'ok': False, 'error': 'Index out of range.'}), 400
+
+    kind = str(j.get('kind') or 'flag-generator').strip() or 'flag-generator'
+    if kind not in {'flag-generator', 'flag-node-generator'}:
+        kind = 'flag-generator'
+
+    allow_node_duplicates = False
+    try:
+        allow_node_duplicates = str(j.get('allow_node_duplicates') or '').strip().lower() in {
+            '1', 'true', 't', 'yes', 'y', 'on'
+        }
+    except Exception:
+        allow_node_duplicates = False
+
+    base_plan_path = str(j.get('preview_plan') or '').strip() or None
+    if base_plan_path:
+        try:
+            base_plan_path = os.path.abspath(base_plan_path)
+            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
+            if os.path.commonpath([base_plan_path, plans_dir]) != plans_dir:
+                base_plan_path = None
+            elif not os.path.exists(base_plan_path):
+                base_plan_path = None
+        except Exception:
+            base_plan_path = None
+    if not base_plan_path:
+        base_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+    if not base_plan_path or not os.path.exists(base_plan_path):
+        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
+
+    try:
+        with open(base_plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+        preview = payload.get('full_preview') if isinstance(payload, dict) else None
+        if not isinstance(preview, dict):
+            return jsonify({'ok': False, 'error': 'Preview plan is missing full_preview.'}), 422
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
+
+    # Build chain nodes and check the target node vulnerability.
+    try:
+        nodes, _links, _adj = _build_topology_graph_from_preview_plan(preview)
+    except Exception:
+        nodes = []
+    id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
+    chain_nodes: list[dict[str, Any]] = []
+    for cid in chain_ids:
+        n = id_map.get(str(cid))
+        if not isinstance(n, dict):
+            return jsonify({'ok': False, 'error': f'Chain node not found in preview plan: {cid}'}), 422
+        chain_nodes.append(n)
+    is_vuln_node = bool((chain_nodes[index] if index < len(chain_nodes) else {}).get('is_vuln'))
+    if is_vuln_node:
+        kind = 'flag-generator'
+
+    # Node candidates for the selected chain position.
+    # The Flow UI can optionally allow changing the *node* at this step, but only to nodes
+    # compatible with the selected generator kind.
+    def _node_is_docker_role(n: dict[str, Any]) -> bool:
+        try:
+            t_raw = str(n.get('type') or '')
+            t = t_raw.strip().lower()
+            return ('docker' in t) or (t_raw.strip().upper() == 'DOCKER') or bool(_flow_node_is_docker_role(n))
+        except Exception:
+            try:
+                return bool(_flow_node_is_docker_role(n))
+            except Exception:
+                return False
+
+    def _node_compatible_for_kind(n: dict[str, Any], desired_kind: str) -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        try:
+            is_vuln = bool(n.get('is_vuln'))
+            is_docker = _node_is_docker_role(n)
+            if desired_kind == 'flag-node-generator':
+                if not is_docker:
+                    reasons.append('requires docker-role node')
+                if is_vuln:
+                    reasons.append('requires non-vulnerability node')
+                return (bool(is_docker) and (not is_vuln)), reasons
+            # flag-generator
+            if not (is_docker or is_vuln):
+                reasons.append('requires docker-role or vulnerability node')
+                return False, reasons
+            return True, []
+        except Exception:
+            return False, ['compatibility check failed']
+
+    node_candidates: list[dict[str, Any]] = []
+    try:
+        cur_node = chain_nodes[index] if index < len(chain_nodes) else None
+        cur_id = str((cur_node or {}).get('id') or '').strip() if isinstance(cur_node, dict) else ''
+        used: set[str] = set()
+        if not allow_node_duplicates:
+            used = {str(cid).strip() for cid in (chain_ids or []) if str(cid).strip()}
+            # Allow re-selecting the current node.
+            if cur_id and cur_id in used:
+                used.remove(cur_id)
+
+        desired_kind = kind
+        # If the current node is vuln, force flag-generator regardless.
+        if isinstance(cur_node, dict) and bool(cur_node.get('is_vuln')):
+            desired_kind = 'flag-generator'
+
+        # Include current node (even if incompatible) so the UI can show it.
+        if isinstance(cur_node, dict) and cur_id:
+            ok, blocked = _node_compatible_for_kind(cur_node, desired_kind)
+            node_candidates.append({
+                'id': cur_id,
+                'name': str(cur_node.get('name') or '').strip(),
+                'type': str(cur_node.get('type') or '').strip(),
+                'is_vuln': bool(cur_node.get('is_vuln')),
+                'is_docker': bool(_node_is_docker_role(cur_node)),
+                'compatible': bool(ok),
+                'blocked_by': blocked,
+                'current': True,
+            })
+
+        # Add other eligible nodes not already in the chain.
+        for n in (nodes or []):
+            if not isinstance(n, dict):
+                continue
+            nid = str(n.get('id') or '').strip()
+            if not nid or nid in used:
+                continue
+            ok, blocked = _node_compatible_for_kind(n, desired_kind)
+            if not ok:
+                continue
+            node_candidates.append({
+                'id': nid,
+                'name': str(n.get('name') or '').strip(),
+                'type': str(n.get('type') or '').strip(),
+                'is_vuln': bool(n.get('is_vuln')),
+                'is_docker': bool(_node_is_docker_role(n)),
+                'compatible': True,
+                'blocked_by': [],
+                'current': False,
+            })
+
+        # Sort: current first, then name/id.
+        def _node_sort_key(x: dict[str, Any]) -> tuple[int, str, str]:
+            cur = 0 if bool(x.get('current')) else 1
+            name = str(x.get('name') or '').lower()
+            nid = str(x.get('id') or '')
+            return (cur, name, nid)
+
+        node_candidates.sort(key=_node_sort_key)
+    except Exception:
+        node_candidates = []
+
+    # Parse the current chain assignments (ids only) so we can compute prefix outputs.
+    fas_in = j.get('flag_assignments')
+    if not isinstance(fas_in, list) or len(fas_in) != len(chain_nodes):
+        return jsonify({'ok': False, 'error': 'flag_assignments must be a list aligned to chain_ids (same length).'}), 400
+    try:
+        from core_topo_gen.utils.flow_substitution import flow_assignment_ids_by_position
+        cur_ids_by_pos = flow_assignment_ids_by_position(fas_in)
+    except Exception:
+        cur_ids_by_pos = ['' for _ in range(len(chain_ids))]
+        for pos in range(len(chain_ids)):
+            req = fas_in[pos] if pos < len(fas_in) else {}
+            if not isinstance(req, dict):
+                continue
+            gen_id = str(req.get('id') or req.get('generator_id') or '').strip()
+            if gen_id:
+                cur_ids_by_pos[pos] = gen_id
+
+    # Candidate generator ids (client-filtered).
+    cand_ids_in = j.get('candidate_ids')
+    candidate_ids: list[str] = []
+    if isinstance(cand_ids_in, list) and cand_ids_in:
+        for x in cand_ids_in:
+            s = str(x or '').strip()
+            if s:
+                candidate_ids.append(s)
+    candidate_ids = list(dict.fromkeys(candidate_ids))
+
+    try:
+        gens, _ = _flag_generators_from_enabled_sources()
+    except Exception:
+        gens = []
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        node_gens = []
+
+    # Build generator index by id, annotated with kind.
+    gen_by_id: dict[str, dict[str, Any]] = {}
+    for g in (gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid and gid not in gen_by_id:
+            gg = dict(g)
+            gg['_flow_kind'] = 'flag-generator'
+            gen_by_id[gid] = gg
+    for g in (node_gens or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if gid and gid not in gen_by_id:
+            gg = dict(g)
+            gg['_flow_kind'] = 'flag-node-generator'
+            gen_by_id[gid] = gg
+
+    try:
+        plugins_by_id = _flow_enabled_plugin_contracts_by_id()
+    except Exception:
+        plugins_by_id = {}
+
+    def _artifact_requires_of(gen: dict[str, Any]) -> set[str]:
+        required: set[str] = set()
+        try:
+            pid = str(gen.get('id') or '').strip()
+            plugin = plugins_by_id.get(pid)
+            if isinstance(plugin, dict) and isinstance(plugin.get('requires'), list):
+                for x in (plugin.get('requires') or []):
+                    xx = str(x).strip()
+                    if xx:
+                        required.add(xx)
+        except Exception:
+            pass
+        # Synthesized inputs (e.g., seed/node_name) are *fields*, not chain artifacts.
+        # Filter them out even if a plugin contract mistakenly lists them in `requires`.
+        try:
+            required = {x for x in required if x not in _flow_synthesized_inputs()}
+        except Exception:
+            pass
+        return required
+
+    def _artifact_produces_of(gen: dict[str, Any]) -> set[str]:
+        provides: set[str] = set()
+        try:
+            pid = str(gen.get('id') or '').strip()
+            plugin = plugins_by_id.get(pid)
+            if isinstance(plugin, dict) and isinstance(plugin.get('produces'), list):
+                for item in (plugin.get('produces') or []):
+                    if not isinstance(item, dict):
+                        continue
+                    a = str(item.get('artifact') or '').strip()
+                    if a:
+                        provides.add(a)
+        except Exception:
+            pass
+        return provides
+
+    def _required_input_fields_of(gen: dict[str, Any]) -> set[str]:
+        required: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get('name') or '').strip()
+                    if not name:
+                        continue
+                    if inp.get('required') is False:
+                        continue
+                    required.add(name)
+        except Exception:
+            pass
+        return required
+
+    def _all_input_fields_of(gen: dict[str, Any]) -> set[str]:
+        fields: set[str] = set()
+        try:
+            inputs = gen.get('inputs')
+            if isinstance(inputs, list):
+                for inp in inputs:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get('name') or '').strip()
+                    if name:
+                        fields.add(name)
+        except Exception:
+            pass
+        return fields
+
+    def _output_fields_of(gen: dict[str, Any]) -> set[str]:
+        out_fields: set[str] = set()
+        try:
+            outputs = gen.get('outputs')
+            if isinstance(outputs, list):
+                for outp in outputs:
+                    if not isinstance(outp, dict):
+                        continue
+                    nm = str(outp.get('name') or '').strip()
+                    if nm:
+                        out_fields.add(nm)
+        except Exception:
+            pass
+        return out_fields
+
+    # Compute prefix availability (artifacts + fields) from current assignments.
+    # Fields the sequencer provides regardless of earlier chain outputs.
+    synthesized_fields = {
+        'seed',
+        'secret',
+        'env_name',
+        'challenge',
+        'flag_prefix',
+        'username_prefix',
+        'key_len',
+        'node_name',
+    }
+    have_artifacts: set[str] = set()
+    have_fields: set[str] = set(synthesized_fields)
+
+    for pos in range(0, max(0, index)):
+        gen_id = cur_ids_by_pos[pos] if pos < len(cur_ids_by_pos) else ''
+        if not gen_id:
+            continue
+        g = gen_by_id.get(gen_id)
+        if not isinstance(g, dict):
+            continue
+        try:
+            have_artifacts |= _artifact_produces_of(g)
+        except Exception:
+            pass
+        try:
+            have_fields |= _output_fields_of(g)
+        except Exception:
+            pass
+
+    def _blocked_reasons(gen: dict[str, Any]) -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        try:
+            gkind = str(gen.get('_flow_kind') or '').strip() or 'flag-generator'
+            if is_vuln_node and gkind != 'flag-generator':
+                reasons.append('Flag-Generator type')
+        except Exception:
+            pass
+        req_a = sorted([x for x in _artifact_requires_of(gen) if x])
+        req_f = sorted([x for x in _required_input_fields_of(gen) if x])
+
+        # If an artifact requirement is also present as an *optional* input field,
+        # treat it as optional (do not block compatibility on it). This helps
+        # avoid flagging things like credential.pair as a hard missing dependency
+        # when the generator can operate without it.
+        try:
+            all_in = _all_input_fields_of(gen)
+            req_in = _required_input_fields_of(gen)
+            optional_in = set(all_in) - set(req_in)
+        except Exception:
+            optional_in = set()
+        req_a_effective = [x for x in req_a if x not in optional_in]
+
+        missing_a = [x for x in req_a_effective if x not in have_artifacts]
+        # Never report sequencer-provided fields as missing.
+        missing_f = [x for x in req_f if x not in have_fields and x not in synthesized_fields]
+        if missing_a:
+            reasons.append('missing inputs (artifacts): ' + ', '.join(missing_a))
+        if missing_f:
+            reasons.append('missing inputs (fields): ' + ', '.join(missing_f))
+        return (len(reasons) == 0), reasons
+
+    out: list[dict[str, Any]] = []
+    ids_to_eval = candidate_ids if candidate_ids else list(gen_by_id.keys())
+    for gid in ids_to_eval:
+        gen = gen_by_id.get(str(gid))
+        if not isinstance(gen, dict):
+            continue
+        gkind = str(gen.get('_flow_kind') or '').strip() or 'flag-generator'
+        if gkind != kind:
+            continue
+        ok, reasons = _blocked_reasons(gen)
+        out.append({
+            'id': str(gen.get('id') or ''),
+            'name': str(gen.get('name') or ''),
+            'type': gkind,
+            'source': str(gen.get('_source_name') or '').strip() or 'unknown',
+            'compatible': bool(ok),
+            'blocked_by': reasons,
+        })
+
+    out.sort(key=lambda e: (
+        0 if bool(e.get('compatible')) else 1,
+        str(e.get('name') or '').lower(),
+        str(e.get('id') or ''),
+    ))
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'kind': kind,
+        'index': index,
+        'is_vuln': bool(is_vuln_node),
+        'candidates': out,
+        'node_candidates': node_candidates,
+        'preview_plan_path': base_plan_path,
+        'allow_node_duplicates': bool(allow_node_duplicates),
+    })
+
+
+@app.route('/api/flag-sequencing/bundle_from_chain', methods=['POST'])
+def api_flow_bundle_from_chain():
+    """Deprecated: STIX bundle export has been removed in favor of .afb."""
+    return jsonify({
+        'ok': False,
+        'error': 'STIX bundle export has been removed. Use /api/flag-sequencing/afb_from_chain.',
+    }), 410
+
+
+@app.route('/api/flag-sequencing/afb_from_chain', methods=['POST'])
+def api_flow_afb_from_chain():
+    """Build an Attack Flow Builder .afb document from a user-specified ordered chain."""
+    j = request.get_json(silent=True) or {}
+    scenario_label = str(j.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    chain = j.get('chain')
+    if not isinstance(chain, list) or not chain:
+        return jsonify({'ok': False, 'error': 'Missing chain.'}), 400
+
+    chain_nodes: list[dict[str, Any]] = []
+    for n in chain:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if not nid:
+            continue
+        chain_nodes.append({
+            'id': nid,
+            'name': str(n.get('name') or nid),
+            'type': str(n.get('type') or ''),
+            'compose': str(n.get('compose') or ''),
+            'compose_name': str(n.get('compose_name') or ''),
+        })
+    if not chain_nodes:
+        return jsonify({'ok': False, 'error': 'Chain contained no valid nodes.'}), 400
+
+    flag_assignments: list[dict[str, Any]] = []
+    preview: dict[str, Any] | None = None
+    try:
+        plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm)
+        if plan_path and os.path.exists(plan_path):
+            with open(plan_path, 'r', encoding='utf-8') as f:
+                payload = json.load(f) or {}
+
+            # Merge latest Flow metadata (including runtime artifacts_dir) into the
+            # preview payload so export can include realized flag values.
+            try:
+                if isinstance(payload, dict):
+                    _attach_latest_flow_into_plan_payload(payload, scenario=(scenario_label or scenario_norm))
+            except Exception:
+                pass
+
+            # Prefer saved flow assignments if present (they may include artifacts_dir).
+            try:
+                meta = payload.get('metadata') if isinstance(payload, dict) else None
+                flow = (meta or {}).get('flow') if isinstance(meta, dict) else None
+                fas = flow.get('flag_assignments') if isinstance(flow, dict) else None
+                if isinstance(fas, list) and fas:
+                    flag_assignments = fas
+            except Exception:
+                pass
+
+            preview = payload.get('full_preview') if isinstance(payload, dict) else None
+            if isinstance(preview, dict):
+                # Enrich chain_nodes with resolved IPv4 (if present in preview hosts).
+                try:
+                    id_to_ipv4: dict[str, str] = {}
+                    hosts = preview.get('hosts') if isinstance(preview.get('hosts'), list) else []
+                    for h in hosts:
+                        if not isinstance(h, dict):
+                            continue
+                        hid = str(h.get('node_id') or h.get('id') or '').strip()
+                        if not hid:
+                            continue
+                        ip_val = h.get('ipv4')
+                        if ip_val is None:
+                            ip_val = h.get('ip4')
+                        if ip_val is None:
+                            ip_val = h.get('ip')
+                        ip_str = _first_valid_ipv4(ip_val)
+                        if ip_str:
+                            id_to_ipv4[hid] = ip_str
+                    if id_to_ipv4:
+                        for n in chain_nodes:
+                            if not isinstance(n, dict):
+                                continue
+                            nid2 = str(n.get('id') or '').strip()
+                            if not nid2:
+                                continue
+                            if not str(n.get('ipv4') or '').strip() and nid2 in id_to_ipv4:
+                                n['ipv4'] = id_to_ipv4[nid2]
+                except Exception:
+                    pass
+                if not flag_assignments:
+                    flag_assignments = _flow_compute_flag_assignments(preview, chain_nodes, scenario_label or scenario_norm)
+    except Exception:
+        flag_assignments = []
+
+    try:
+        flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
+            chain_nodes,
+            flag_assignments,
+            scenario_label=(scenario_label or scenario_norm),
+        )
+    except Exception:
+        flow_valid, flow_errors = True, []
+    flags_enabled = bool(flow_valid)
+
+    afb = _attack_flow_builder_afb_for_chain(
+        chain_nodes=chain_nodes,
+        scenario_label=scenario_label or scenario_norm,
+        flag_assignments=flag_assignments,
+    )
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'length': len(chain_nodes),
+        'chain': chain_nodes,
+        'flag_assignments': flag_assignments,
+        'afb': afb,
+        'flow_valid': bool(flow_valid),
+        'flow_errors': list(flow_errors or []),
+        'flags_enabled': bool(flags_enabled),
+    })
+
+
+@app.route('/api/flag-sequencing/attackflow')
+def api_flow_attackflow():
+    return jsonify({
+        'ok': False,
+        'error': 'STIX/AttackFlow bundle export has been removed. Use /api/flag-sequencing/attackflow_preview for chain preview and /api/flag-sequencing/afb_from_chain for Attack Flow Builder export.',
+    }), 410
 
 
 @app.route('/users', methods=['GET'])
@@ -7579,6 +15208,13 @@ def me_password():
 @app.route('/healthz')
 def healthz():
     return Response('ok', mimetype='text/plain')
+
+
+@app.route('/favicon.ico')
+def favicon():
+    # The UI uses an inline data-URL favicon in the base template, but some browsers
+    # still request /favicon.ico. Return a no-content response to avoid noisy 404s.
+    return ('', 204)
 
 
 # Environment-configurable CORE daemon location (useful inside Docker)
@@ -8220,6 +15856,329 @@ def _persist_scenario_catalog(
                 os.remove(tmp_path)
         except Exception:
             pass
+
+
+def _remove_scenarios_from_catalog(names_to_remove: Iterable[Any]) -> Dict[str, Any]:
+    """Remove scenario names from outputs/scenario_catalog.json.
+
+    This is the server-side source of truth for which scenarios are listed on
+    refresh, so UI-only deletion must update this file.
+    """
+    catalog_path = _scenario_catalog_file()
+    try:
+        if not os.path.exists(catalog_path):
+            return {'removed': 0, 'remaining': 0}
+    except Exception:
+        return {'removed': 0, 'remaining': 0}
+
+    norms_to_remove: set[str] = set()
+    for raw in names_to_remove or []:
+        norm = _normalize_scenario_label(raw)
+        if norm:
+            norms_to_remove.add(norm)
+    if not norms_to_remove:
+        return {'removed': 0, 'remaining': 0}
+
+    tmp_path = catalog_path + '.tmp'
+    try:
+        with open(catalog_path, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict):
+            return {'removed': 0, 'remaining': 0}
+
+        existing_names = payload.get('names')
+        if not isinstance(existing_names, list):
+            existing_names = []
+        before = list(existing_names)
+        kept_names: list[str] = []
+        kept_norms: set[str] = set()
+        for name in before:
+            norm = _normalize_scenario_label(name)
+            if not norm:
+                continue
+            if norm in norms_to_remove:
+                continue
+            if norm in kept_norms:
+                continue
+            kept_norms.add(norm)
+            kept_names.append(str(name))
+        removed = max(0, len(before) - len(kept_names))
+
+        payload['names'] = kept_names
+        # Keep sources aligned to names length (list form).
+        existing_sources = payload.get('sources')
+        if isinstance(existing_sources, list):
+            payload['sources'] = [existing_sources[0] if existing_sources else '' for _ in kept_names]
+        elif isinstance(existing_sources, dict):
+            # Filter dict-form sources.
+            payload['sources'] = {
+                key: val
+                for key, val in existing_sources.items()
+                if _normalize_scenario_label(key) in kept_norms
+            }
+
+        # Prune hint maps keyed by scenario norm.
+        for hint_key in ('participant_urls', 'hitl_validation', 'hitl_config'):
+            hint_map = payload.get(hint_key)
+            if isinstance(hint_map, dict):
+                payload[hint_key] = {
+                    key: val
+                    for key, val in hint_map.items()
+                    if _normalize_scenario_label(key) in kept_norms
+                }
+
+        payload['updated_at'] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+
+        os.makedirs(os.path.dirname(catalog_path), exist_ok=True)
+        with open(tmp_path, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, indent=2)
+        os.replace(tmp_path, catalog_path)
+        return {'removed': removed, 'remaining': len(kept_names)}
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def _delete_saved_scenario_xml_artifacts(names_to_remove: Iterable[Any]) -> Dict[str, Any]:
+    """Delete saved scenario XML artifacts under outputs/scenarios-*/.
+
+    These artifacts are re-discovered on page load by _collect_scenario_catalog(),
+    so UI deletion must remove them to prevent the scenario from reappearing.
+    """
+    stems: set[str] = set()
+    match_keys: set[str] = set()
+    for raw in names_to_remove or []:
+        try:
+            name = str(raw).strip()
+        except Exception:
+            name = ''
+        if not name:
+            continue
+        mk = _scenario_match_key(name)
+        if mk:
+            match_keys.add(mk)
+        try:
+            stem = secure_filename(name).strip('_-.')
+        except Exception:
+            stem = ''
+        if stem:
+            stems.add(stem)
+    if not stems and not match_keys:
+        return {'artifacts_removed': 0}
+
+    outputs_root = os.path.abspath(_outputs_dir())
+    removed = 0
+    try:
+        if not outputs_root or not os.path.isdir(outputs_root):
+            return {'artifacts_removed': 0}
+    except Exception:
+        return {'artifacts_removed': 0}
+
+    # Mirror discovery logic: scan outputs/scenarios-* folders (newest first, bounded).
+    dirs: list[tuple[float, str]] = []
+    try:
+        for entry in os.listdir(outputs_root):
+            if not entry.startswith('scenarios-'):
+                continue
+            folder = os.path.join(outputs_root, entry)
+            if not os.path.isdir(folder):
+                continue
+            try:
+                mtime = os.path.getmtime(folder)
+            except Exception:
+                mtime = 0.0
+            dirs.append((mtime, folder))
+    except Exception:
+        dirs = []
+    dirs.sort(key=lambda t: t[0], reverse=True)
+
+    for _mtime, folder in dirs[:500]:
+        # Fast path: attempt stem-based delete when possible.
+        # NOTE: Some deployments (and some macOS volumes) can be case-sensitive.
+        # The UI typically writes files like "Scenario_1.xml" but secure_filename()
+        # yields "scenario_1". Use a case-insensitive match within the folder.
+        try:
+            folder_entries = os.listdir(folder)
+        except Exception:
+            folder_entries = []
+
+        stem_targets = {f"{stem}.xml".lower() for stem in stems if stem}
+        if stem_targets and folder_entries:
+            for fname in list(folder_entries):
+                try:
+                    if fname.lower() not in stem_targets:
+                        continue
+                    path = os.path.join(folder, fname)
+                    if not os.path.isfile(path):
+                        continue
+                    p_abs = os.path.abspath(path)
+                    if not p_abs.startswith(outputs_root + os.sep):
+                        continue
+                    os.remove(p_abs)
+                    removed += 1
+                except Exception:
+                    continue
+
+        # Robust path: scan XML contents and delete any matching scenario(s).
+        if match_keys and folder_entries:
+            for fname in list(folder_entries):
+                try:
+                    if not fname.lower().endswith('.xml'):
+                        continue
+                    # Skip CORE pre/post captures; only include user-authored scenario XML.
+                    if fname.lower().startswith('core-'):
+                        continue
+                    # Mirror discovery behavior for scenario editor saves (case-insensitive).
+                    if not fname.lower().startswith('scenario_'):
+                        continue
+                    path = os.path.join(folder, fname)
+                    if not os.path.isfile(path):
+                        continue
+                    try:
+                        names_in_file = _scenario_names_from_xml(path)
+                    except Exception:
+                        names_in_file = []
+                    if not names_in_file:
+                        continue
+                    if not any(_scenario_match_key(nm) in match_keys for nm in names_in_file):
+                        continue
+                    p_abs = os.path.abspath(path)
+                    if not p_abs.startswith(outputs_root + os.sep):
+                        continue
+                    try:
+                        os.remove(p_abs)
+                        removed += 1
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+        # Best-effort cleanup of empty folders
+        try:
+            if folder.startswith(outputs_root + os.sep) and os.path.isdir(folder) and not os.listdir(folder):
+                os.rmdir(folder)
+        except Exception:
+            pass
+
+    return {'artifacts_removed': removed}
+
+
+def _remove_scenarios_from_all_editor_snapshots(names_to_remove: Iterable[Any]) -> Dict[str, Any]:
+    """Remove scenario entries from all editor snapshots in outputs/editor_snapshots.
+
+    _collect_scenario_catalog() merges names from all snapshots and treats them as
+    protected, so we must purge deleted scenarios from these snapshots.
+    """
+    remove_norms: set[str] = set()
+    remove_match: set[str] = set()
+    for raw in names_to_remove or []:
+        try:
+            s = raw if isinstance(raw, str) else str(raw)
+        except Exception:
+            s = ''
+        s = s.strip() if isinstance(s, str) else ''
+        if not s:
+            continue
+        norm = _normalize_scenario_label(s)
+        if norm:
+            remove_norms.add(norm)
+        mk = _scenario_match_key(s)
+        if mk:
+            remove_match.add(mk)
+    if not remove_norms:
+        return {'snapshots_updated': 0, 'snapshots_deleted': 0, 'snapshot_scenarios_removed': 0}
+
+    snap_dir = _editor_state_snapshot_dir()
+    try:
+        entries = [n for n in os.listdir(snap_dir) if n.endswith('.json')]
+    except Exception:
+        entries = []
+
+    updated = 0
+    deleted = 0
+    scenarios_removed = 0
+    for fname in entries:
+        path = os.path.join(snap_dir, fname)
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                snap = json.load(fh)
+        except Exception:
+            continue
+        if not isinstance(snap, dict):
+            continue
+        scen_list = snap.get('scenarios')
+        if not isinstance(scen_list, list) or not scen_list:
+            # Still clear scenario_query if it targets a deleted scenario.
+            try:
+                q = snap.get('scenario_query')
+                if q and (_normalize_scenario_label(q) in remove_norms or _scenario_match_key(q) in remove_match):
+                    snap['scenario_query'] = ''
+                    tmp = path + '.tmp'
+                    with open(tmp, 'w', encoding='utf-8') as fh:
+                        json.dump(snap, fh, indent=2)
+                    os.replace(tmp, path)
+                    updated += 1
+            except Exception:
+                pass
+            continue
+        kept: list[Any] = []
+        removed_here = 0
+        for idx, scen in enumerate(scen_list, start=1):
+            if not isinstance(scen, dict):
+                kept.append(scen)
+                continue
+            raw_name = scen.get('name')
+            display = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else f"Scenario {idx}"
+            norm = _normalize_scenario_label(display)
+            mk = _scenario_match_key(display)
+            if (norm and norm in remove_norms) or (mk and mk in remove_match):
+                removed_here += 1
+                continue
+            kept.append(scen)
+        if not removed_here:
+            # Still clear scenario_query if it targets a deleted scenario.
+            try:
+                q = snap.get('scenario_query')
+                if q and (_normalize_scenario_label(q) in remove_norms or _scenario_match_key(q) in remove_match):
+                    snap['scenario_query'] = ''
+                    tmp = path + '.tmp'
+                    with open(tmp, 'w', encoding='utf-8') as fh:
+                        json.dump(snap, fh, indent=2)
+                    os.replace(tmp, path)
+                    updated += 1
+            except Exception:
+                pass
+            continue
+        scenarios_removed += removed_here
+        snap['scenarios'] = kept
+        # Clear scenario_query if it targets a deleted scenario.
+        try:
+            q = snap.get('scenario_query')
+            if q and (_normalize_scenario_label(q) in remove_norms or _scenario_match_key(q) in remove_match):
+                snap['scenario_query'] = ''
+        except Exception:
+            pass
+        try:
+            if not kept:
+                os.remove(path)
+                deleted += 1
+            else:
+                tmp = path + '.tmp'
+                with open(tmp, 'w', encoding='utf-8') as fh:
+                    json.dump(snap, fh, indent=2)
+                os.replace(tmp, path)
+                updated += 1
+        except Exception:
+            continue
+
+    return {
+        'snapshots_updated': updated,
+        'snapshots_deleted': deleted,
+        'snapshot_scenarios_removed': scenarios_removed,
+    }
 
 
 def _merge_participant_urls_into_scenario_catalog(participant_urls: Dict[str, Any]) -> None:
@@ -10484,6 +18443,40 @@ def _extract_summary_path_from_text(text: str, *, require_exists: bool = True) -
     return None
 
 
+def _extract_docker_conflicts_from_text(text: str) -> dict | None:
+    """Parse CLI logs for machine-readable Docker conflict info.
+
+    Expected line emitted by core_topo_gen.cli:
+        DOCKER_CONFLICTS_JSON: {"containers": [...], "images": [...]} 
+    """
+
+    if not text:
+        return None
+    try:
+        matches = list(re.finditer(r"DOCKER_CONFLICTS_JSON:\s*(\{.*\})\s*$", text, flags=re.MULTILINE))
+        if not matches:
+            return None
+        raw = matches[-1].group(1)
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return None
+        containers = obj.get('containers')
+        images = obj.get('images')
+        if not isinstance(containers, list):
+            containers = []
+        if not isinstance(images, list):
+            images = []
+        containers = [str(x) for x in containers if str(x).strip()]
+        images = [str(x) for x in images if str(x).strip()]
+        containers = list(dict.fromkeys(containers))
+        images = list(dict.fromkeys(images))
+        if not containers and not images:
+            return None
+        return {'containers': containers, 'images': images}
+    except Exception:
+        return None
+
+
 def _find_latest_summary_path(since_ts: float | None = None) -> str | None:
     try:
         report_dir = _reports_dir()
@@ -11153,185 +19146,491 @@ def _build_full_scenario_archive(out_dir: str, scenario_xml_path: str | None, re
     except Exception:
         return None
 
-# Data sources state
-DATA_SOURCES_DIR = os.path.abspath(os.path.join('..', 'data_sources'))
-DATA_STATE_PATH = os.path.join(DATA_SOURCES_DIR, '_state.json')
-os.makedirs(DATA_SOURCES_DIR, exist_ok=True)
+# Reserved artifact keys (starter set). These are always offered in the Generator
+# Builder artifact picker to encourage consistent naming, while still allowing
+# custom artifact keys.
+_RESERVED_ARTIFACTS: dict[str, dict[str, Any]] = {
+    # Core contract
+    'flag': {'type': 'flag', 'description': 'Captured flag value.', 'sensitive': True},
 
-def _load_data_sources_state():
-    try:
-        if not os.path.exists(DATA_STATE_PATH):
-            return {"sources": []}
-        with open(DATA_STATE_PATH, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        # Legacy format
-        if isinstance(data, dict) and 'enabled' in data and 'sources' not in data:
-            return {"sources": []}
-        if 'sources' not in data:
-            data['sources'] = []
-        return data
-    except Exception:
-        return {"sources": []}
+    # Filesystem
+    'filesystem.file': {'type': 'file', 'description': 'Relative path to a file a participant should inspect.'},
+    'filesystem.dir': {'type': 'dir', 'description': 'Relative path to a directory a participant should inspect.'},
+    'filesystem.path': {'type': 'path', 'description': 'Generic filesystem path (file or directory).'},
+    'filesystem.filename': {'type': 'text', 'description': 'Filename only (no directory).'},
+    'filesystem.sha256': {'type': 'text', 'description': 'SHA-256 of a file (hex).'},
+    'filesystem.md5': {'type': 'text', 'description': 'MD5 of a file (hex).'},
 
-def _save_data_sources_state(state):
-    tmp = DATA_STATE_PATH + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp, DATA_STATE_PATH)
+    # Network
+    'network.ip': {'type': 'ip', 'description': 'IP address (usually IPv4) relevant to the next step.'},
+    'network.ipv4': {'type': 'ip', 'description': 'IPv4 address relevant to the next step.'},
+    'network.ipv6': {'type': 'ip', 'description': 'IPv6 address relevant to the next step.'},
+    'network.host': {'type': 'host', 'description': 'Hostname or node identifier.'},
+    'network.hostname': {'type': 'host', 'description': 'Hostname (DNS label).'},
+    'network.port': {'type': 'port', 'description': 'TCP/UDP port number.'},
+    'network.proto': {'type': 'text', 'description': 'Transport/application protocol name (e.g., tcp, udp, http, ssh).'},
+    'network.subnet': {'type': 'subnet', 'description': 'Subnet/CIDR (e.g., 10.0.0.0/24).'},
+    'network.cidr': {'type': 'subnet', 'description': 'CIDR (alias for network.subnet).'},
+    'network.url': {'type': 'url', 'description': 'Network URL/URI (generic).'},
 
-def _validate_csv(file_path: str, max_bytes: int = 2_000_000):
-    try:
-        st = os.stat(file_path)
-        if st.st_size > max_bytes:
-            return False, f"File too large (> {max_bytes} bytes)"
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            reader = csv.reader(f)
-            rows = []
-            for i, row in enumerate(reader):
-                if i > 10000:
-                    break
-                rows.append(row)
-        if len(rows) < 2:
-            return False, "CSV must have header + at least one data row"
-        widths = {len(r) for r in rows}
-        if len(widths) != 1:
-            return False, "Inconsistent column counts"
-        return True, f"{len(rows)-1} rows"
-    except Exception as e:
-        return False, str(e)
+    # Web
+    'web.url': {'type': 'url', 'description': 'HTTP(S) URL (e.g., a login page).'},
+    'web.base_url': {'type': 'url', 'description': 'Base URL (scheme://host[:port]).'},
+    'web.path': {'type': 'text', 'description': 'HTTP path (e.g., /login).'},
+    'web.username': {'type': 'text', 'description': 'Web username.'},
+    'web.password': {'type': 'text', 'description': 'Web password.', 'sensitive': True},
+    'web.token': {'type': 'text', 'description': 'Web/API bearer token.', 'sensitive': True},
+    'web.cookie': {'type': 'text', 'description': 'Cookie header value.', 'sensitive': True},
 
-# --- Data Source CSV schema enforcement ---
-REQUIRED_DS_COLUMNS = ["Name", "Path", "Type", "Startup", "Vector"]
-OPTIONAL_DS_DEFAULTS = {
-    "CVE": "n/a",
-    "Description": "n/a",
-    "References": "n/a",
+    # Credentials (generic)
+    'credential.pair': {'type': 'credential', 'description': 'Combined credential pair (format defined by the generator).', 'sensitive': True},
+    'credential.username': {'type': 'text', 'description': 'Username value.'},
+    'credential.password': {'type': 'text', 'description': 'Password value.', 'sensitive': True},
+    'credential.token': {'type': 'text', 'description': 'Token value.', 'sensitive': True},
+    'credential.secret': {'type': 'text', 'description': 'Secret value.', 'sensitive': True},
+
+    # SSH
+    'ssh.host': {'type': 'host', 'description': 'SSH host (hostname/IP).'},
+    'ssh.port': {'type': 'port', 'description': 'SSH port.'},
+    'ssh.username': {'type': 'text', 'description': 'SSH username.'},
+    'ssh.password': {'type': 'text', 'description': 'SSH password.', 'sensitive': True},
+    'ssh.private_key': {'type': 'text', 'description': 'SSH private key (PEM/OpenSSH).', 'sensitive': True},
+    'ssh.public_key': {'type': 'text', 'description': 'SSH public key (OpenSSH format).'},
+    'ssh.known_hosts': {'type': 'file', 'description': 'Known hosts file path.'},
+
+    # TLS
+    'tls.ca': {'type': 'file', 'description': 'CA certificate bundle path.'},
+    'tls.cert': {'type': 'file', 'description': 'Certificate path.'},
+    'tls.key': {'type': 'file', 'description': 'Private key path.', 'sensitive': True},
+    'tls.fingerprint': {'type': 'text', 'description': 'Certificate fingerprint (e.g., SHA-256).'},
+
+    # Database
+    'db.host': {'type': 'host', 'description': 'Database host (hostname/IP).'},
+    'db.port': {'type': 'port', 'description': 'Database port.'},
+    'db.name': {'type': 'text', 'description': 'Database name.'},
+    'db.username': {'type': 'text', 'description': 'Database username.'},
+    'db.password': {'type': 'text', 'description': 'Database password.', 'sensitive': True},
+    'db.uri': {'type': 'url', 'description': 'Database connection URI.', 'sensitive': True},
+
+    # Service discovery / endpoints
+    'service.name': {'type': 'text', 'description': 'Service name identifier.'},
+    'service.protocol': {'type': 'text', 'description': 'Protocol name (e.g., http, ssh, nfs).'},
+    'service.endpoint': {'type': 'text', 'description': 'Service endpoint identifier or URI.'},
+    'service.url': {'type': 'url', 'description': 'Service URL.'},
+
+    # API
+    'api.base_url': {'type': 'url', 'description': 'Base URL for an API.'},
+    'api.key': {'type': 'text', 'description': 'API key.', 'sensitive': True},
+    'api.token': {'type': 'text', 'description': 'API token.', 'sensitive': True},
+
+    # Host / OS context
+    'host.name': {'type': 'host', 'description': 'Host/node name identifier.'},
+    'host.ip': {'type': 'ip', 'description': 'Host IPv4/IPv6 address.'},
+    'host.ipv4': {'type': 'ip', 'description': 'Host IPv4 address.'},
+    'host.ipv6': {'type': 'ip', 'description': 'Host IPv6 address.'},
+    'host.port': {'type': 'port', 'description': 'Host port number.'},
+    'host.os': {'type': 'text', 'description': 'Operating system identifier (e.g., linux, windows).'},
+    'host.distro': {'type': 'text', 'description': 'Linux distribution (e.g., ubuntu).'},
+    'host.version': {'type': 'text', 'description': 'OS/version string.'},
+    'host.arch': {'type': 'text', 'description': 'CPU architecture (e.g., amd64, arm64).'},
+    'host.user': {'type': 'text', 'description': 'Username on the host.'},
+    'host.group': {'type': 'text', 'description': 'Group on the host.'},
+    'host.home': {'type': 'dir', 'description': 'Home directory path.'},
+    'host.shell': {'type': 'text', 'description': 'Shell path (e.g., /bin/bash).'},
+    'host.process': {'type': 'text', 'description': 'Process name/identifier.'},
+    'host.pid': {'type': 'text', 'description': 'Process id.'},
+    'host.service': {'type': 'text', 'description': 'Service name.'},
+
+    # Linux
+    'linux.passwd': {'type': 'file', 'description': 'Path to /etc/passwd (or equivalent).'},
+    'linux.shadow': {'type': 'file', 'description': 'Path to /etc/shadow (or equivalent).', 'sensitive': True},
+    'linux.sudoers': {'type': 'file', 'description': 'Path to sudoers configuration.'},
+    'linux.authorized_keys': {'type': 'file', 'description': 'SSH authorized_keys file path.'},
+    'linux.ssh_config': {'type': 'file', 'description': 'SSH client config file path.'},
+    'linux.sshd_config': {'type': 'file', 'description': 'SSH server config file path.'},
+    'linux.env_file': {'type': 'file', 'description': 'Environment file path (e.g., .env).', 'sensitive': True},
+    'linux.log_file': {'type': 'file', 'description': 'Log file path.'},
+    'linux.core_dump': {'type': 'file', 'description': 'Core dump file path.'},
+
+    # Windows
+    'windows.domain': {'type': 'text', 'description': 'Windows domain name.'},
+    'windows.username': {'type': 'text', 'description': 'Windows username.'},
+    'windows.password': {'type': 'text', 'description': 'Windows password.', 'sensitive': True},
+    'windows.ntlm': {'type': 'text', 'description': 'NTLM hash.', 'sensitive': True},
+    'windows.lm': {'type': 'text', 'description': 'LM hash.', 'sensitive': True},
+    'windows.share': {'type': 'text', 'description': 'SMB share name.'},
+    'windows.path': {'type': 'path', 'description': 'Windows filesystem path.'},
+
+    # HTTP(S)
+    'http.url': {'type': 'url', 'description': 'HTTP URL.'},
+    'http.base_url': {'type': 'url', 'description': 'HTTP base URL.'},
+    'http.host': {'type': 'host', 'description': 'HTTP host.'},
+    'http.port': {'type': 'port', 'description': 'HTTP port.'},
+    'http.path': {'type': 'text', 'description': 'HTTP path.'},
+    'http.method': {'type': 'text', 'description': 'HTTP method.'},
+    'http.header': {'type': 'text', 'description': 'HTTP header (name/value).', 'sensitive': True},
+    'http.authorization': {'type': 'text', 'description': 'HTTP Authorization header value.', 'sensitive': True},
+    'http.cookie': {'type': 'text', 'description': 'HTTP Cookie header value.', 'sensitive': True},
+    'http.csrf': {'type': 'text', 'description': 'CSRF token value.', 'sensitive': True},
+    'http.session': {'type': 'text', 'description': 'Session identifier or token.', 'sensitive': True},
+    'http.user_agent': {'type': 'text', 'description': 'HTTP User-Agent string.'},
+
+    'https.url': {'type': 'url', 'description': 'HTTPS URL.'},
+    'https.base_url': {'type': 'url', 'description': 'HTTPS base URL.'},
+    'https.host': {'type': 'host', 'description': 'HTTPS host.'},
+    'https.port': {'type': 'port', 'description': 'HTTPS port.'},
+
+    # DNS
+    'dns.server': {'type': 'ip', 'description': 'DNS server address.'},
+    'dns.domain': {'type': 'text', 'description': 'DNS domain name.'},
+    'dns.record': {'type': 'text', 'description': 'DNS record name/type/value.'},
+    'dns.zone': {'type': 'text', 'description': 'DNS zone name.'},
+
+    # Email
+    'email.address': {'type': 'text', 'description': 'Email address.'},
+    'email.username': {'type': 'text', 'description': 'Email username.'},
+    'email.password': {'type': 'text', 'description': 'Email password.', 'sensitive': True},
+    'smtp.host': {'type': 'host', 'description': 'SMTP host.'},
+    'smtp.port': {'type': 'port', 'description': 'SMTP port.'},
+    'imap.host': {'type': 'host', 'description': 'IMAP host.'},
+    'imap.port': {'type': 'port', 'description': 'IMAP port.'},
+    'pop3.host': {'type': 'host', 'description': 'POP3 host.'},
+    'pop3.port': {'type': 'port', 'description': 'POP3 port.'},
+
+    # FTP
+    'ftp.host': {'type': 'host', 'description': 'FTP host.'},
+    'ftp.port': {'type': 'port', 'description': 'FTP port.'},
+    'ftp.username': {'type': 'text', 'description': 'FTP username.'},
+    'ftp.password': {'type': 'text', 'description': 'FTP password.', 'sensitive': True},
+    'ftps.host': {'type': 'host', 'description': 'FTPS host.'},
+    'ftps.port': {'type': 'port', 'description': 'FTPS port.'},
+
+    # SMB / NFS
+    'smb.host': {'type': 'host', 'description': 'SMB host.'},
+    'smb.port': {'type': 'port', 'description': 'SMB port.'},
+    'smb.share': {'type': 'text', 'description': 'SMB share name.'},
+    'smb.username': {'type': 'text', 'description': 'SMB username.'},
+    'smb.password': {'type': 'text', 'description': 'SMB password.', 'sensitive': True},
+    'nfs.host': {'type': 'host', 'description': 'NFS host.'},
+    'nfs.port': {'type': 'port', 'description': 'NFS port.'},
+    'nfs.export': {'type': 'text', 'description': 'NFS export path.'},
+    'nfs.mount': {'type': 'dir', 'description': 'Mounted NFS directory path.'},
+
+    # Remote access
+    'rdp.host': {'type': 'host', 'description': 'RDP host.'},
+    'rdp.port': {'type': 'port', 'description': 'RDP port.'},
+    'vnc.host': {'type': 'host', 'description': 'VNC host.'},
+    'vnc.port': {'type': 'port', 'description': 'VNC port.'},
+    'vnc.password': {'type': 'text', 'description': 'VNC password.', 'sensitive': True},
+    'telnet.host': {'type': 'host', 'description': 'Telnet host.'},
+    'telnet.port': {'type': 'port', 'description': 'Telnet port.'},
+    'winrm.host': {'type': 'host', 'description': 'WinRM host.'},
+    'winrm.port': {'type': 'port', 'description': 'WinRM port.'},
+
+    # Databases / caches / queues
+    'mysql.host': {'type': 'host', 'description': 'MySQL host.'},
+    'mysql.port': {'type': 'port', 'description': 'MySQL port.'},
+    'mysql.db': {'type': 'text', 'description': 'MySQL database name.'},
+    'mysql.username': {'type': 'text', 'description': 'MySQL username.'},
+    'mysql.password': {'type': 'text', 'description': 'MySQL password.', 'sensitive': True},
+    'mysql.uri': {'type': 'url', 'description': 'MySQL connection URI.', 'sensitive': True},
+
+    'postgres.host': {'type': 'host', 'description': 'PostgreSQL host.'},
+    'postgres.port': {'type': 'port', 'description': 'PostgreSQL port.'},
+    'postgres.db': {'type': 'text', 'description': 'PostgreSQL database name.'},
+    'postgres.username': {'type': 'text', 'description': 'PostgreSQL username.'},
+    'postgres.password': {'type': 'text', 'description': 'PostgreSQL password.', 'sensitive': True},
+    'postgres.uri': {'type': 'url', 'description': 'PostgreSQL connection URI.', 'sensitive': True},
+
+    'redis.host': {'type': 'host', 'description': 'Redis host.'},
+    'redis.port': {'type': 'port', 'description': 'Redis port.'},
+    'redis.password': {'type': 'text', 'description': 'Redis password.', 'sensitive': True},
+    'redis.uri': {'type': 'url', 'description': 'Redis URI.', 'sensitive': True},
+
+    'mongodb.host': {'type': 'host', 'description': 'MongoDB host.'},
+    'mongodb.port': {'type': 'port', 'description': 'MongoDB port.'},
+    'mongodb.db': {'type': 'text', 'description': 'MongoDB database name.'},
+    'mongodb.username': {'type': 'text', 'description': 'MongoDB username.'},
+    'mongodb.password': {'type': 'text', 'description': 'MongoDB password.', 'sensitive': True},
+    'mongodb.uri': {'type': 'url', 'description': 'MongoDB URI.', 'sensitive': True},
+
+    'rabbitmq.host': {'type': 'host', 'description': 'RabbitMQ host.'},
+    'rabbitmq.port': {'type': 'port', 'description': 'RabbitMQ port.'},
+    'rabbitmq.username': {'type': 'text', 'description': 'RabbitMQ username.'},
+    'rabbitmq.password': {'type': 'text', 'description': 'RabbitMQ password.', 'sensitive': True},
+    'rabbitmq.vhost': {'type': 'text', 'description': 'RabbitMQ virtual host name.'},
+    'rabbitmq.uri': {'type': 'url', 'description': 'RabbitMQ URI.', 'sensitive': True},
+
+    # LDAP / Kerberos
+    'ldap.host': {'type': 'host', 'description': 'LDAP host.'},
+    'ldap.port': {'type': 'port', 'description': 'LDAP port.'},
+    'ldap.base_dn': {'type': 'text', 'description': 'LDAP base DN.'},
+    'ldap.bind_dn': {'type': 'text', 'description': 'LDAP bind DN.'},
+    'ldap.bind_password': {'type': 'text', 'description': 'LDAP bind password.', 'sensitive': True},
+    'kerberos.realm': {'type': 'text', 'description': 'Kerberos realm.'},
+    'kerberos.kdc': {'type': 'host', 'description': 'Kerberos KDC host.'},
+    'kerberos.ticket': {'type': 'file', 'description': 'Kerberos ticket cache file path.', 'sensitive': True},
+
+    # Containers / orchestration
+    'docker.image': {'type': 'text', 'description': 'Docker image name.'},
+    'docker.container': {'type': 'text', 'description': 'Docker container name/id.'},
+    'docker.network': {'type': 'text', 'description': 'Docker network name.'},
+    'docker.volume': {'type': 'text', 'description': 'Docker volume name.'},
+    'k8s.namespace': {'type': 'text', 'description': 'Kubernetes namespace.'},
+    'k8s.pod': {'type': 'text', 'description': 'Kubernetes pod name.'},
+    'k8s.service': {'type': 'text', 'description': 'Kubernetes service name.'},
+    'k8s.configmap': {'type': 'text', 'description': 'Kubernetes ConfigMap name.'},
+    'k8s.secret': {'type': 'text', 'description': 'Kubernetes Secret name.', 'sensitive': True},
+
+    # Crypto / secrets
+    'crypto.private_key': {'type': 'text', 'description': 'Private key material (format-specific).', 'sensitive': True},
+    'crypto.public_key': {'type': 'text', 'description': 'Public key material (format-specific).'},
+    'crypto.key': {'type': 'text', 'description': 'Symmetric key material.', 'sensitive': True},
+    'crypto.salt': {'type': 'text', 'description': 'Salt value.'},
+    'crypto.hash': {'type': 'text', 'description': 'Hash value (format-specific).', 'sensitive': True},
+    'crypto.jwt': {'type': 'text', 'description': 'JWT string.', 'sensitive': True},
+    'crypto.jwk': {'type': 'text', 'description': 'JWK JSON.', 'sensitive': True},
+
+    # Vulnerability / exploit metadata
+    'vuln.cve': {'type': 'text', 'description': 'CVE identifier (e.g., CVE-2024-12345).'},
+    'vuln.type': {'type': 'text', 'description': 'Vulnerability category/type.'},
+    'vuln.vector': {'type': 'text', 'description': 'Vulnerability vector/classification.'},
+    'vuln.severity': {'type': 'text', 'description': 'Vulnerability severity (e.g., low/med/high/critical).'},
+    'exploit.command': {'type': 'text', 'description': 'Exploit command line (if applicable).', 'sensitive': True},
+    'exploit.url': {'type': 'url', 'description': 'Exploit/reference URL.'},
+
+    # Generic service targets (preferred, tight namespace)
+    'service.host': {'type': 'host', 'description': 'Service host.'},
+    'service.ip': {'type': 'ip', 'description': 'Service IP address.'},
+    'service.port': {'type': 'port', 'description': 'Service port.'},
+    'service.base_url': {'type': 'url', 'description': 'Service base URL.'},
+    'service.health_url': {'type': 'url', 'description': 'Health check URL.'},
+    'service.version': {'type': 'text', 'description': 'Service version string.'},
+    'service.banner': {'type': 'text', 'description': 'Service banner string.'},
+    'service.config': {'type': 'file', 'description': 'Service configuration file path.'},
+
+    # Generic credentials (preferred, tight namespace)
+    'credential.userpass': {'type': 'text', 'description': 'Combined username:password credential.', 'sensitive': True},
+    'credential.api_key': {'type': 'text', 'description': 'Generic API key.', 'sensitive': True},
+    'credential.client_id': {'type': 'text', 'description': 'OAuth client_id or similar identifier.'},
+    'credential.client_secret': {'type': 'text', 'description': 'OAuth client_secret or similar secret.', 'sensitive': True},
+    'credential.refresh_token': {'type': 'text', 'description': 'OAuth refresh token.', 'sensitive': True},
+    'credential.access_token': {'type': 'text', 'description': 'OAuth access token.', 'sensitive': True},
+    'credential.bearer': {'type': 'text', 'description': 'Bearer token value.', 'sensitive': True},
+    'credential.cookie': {'type': 'text', 'description': 'Cookie value used for auth/session.', 'sensitive': True},
+    'credential.session': {'type': 'text', 'description': 'Session identifier.', 'sensitive': True},
+    'credential.csrf': {'type': 'text', 'description': 'CSRF token.', 'sensitive': True},
+    'credential.mfa_code': {'type': 'text', 'description': 'MFA/OTP code.', 'sensitive': True},
+    'credential.pin': {'type': 'text', 'description': 'PIN code.', 'sensitive': True},
+
+    'credential.private_key': {'type': 'text', 'description': 'Private key material.', 'sensitive': True},
+    'credential.public_key': {'type': 'text', 'description': 'Public key material.'},
+    'credential.ssh_private_key': {'type': 'file', 'description': 'Path to SSH private key file.', 'sensitive': True},
+    'credential.ssh_public_key': {'type': 'file', 'description': 'Path to SSH public key file.'},
+    'credential.ssh_known_hosts': {'type': 'file', 'description': 'Path to known_hosts file.'},
+    'credential.ssh_authorized_keys': {'type': 'file', 'description': 'Path to authorized_keys file.'},
+    'credential.keytab': {'type': 'file', 'description': 'Kerberos keytab file.', 'sensitive': True},
+    'credential.cert': {'type': 'file', 'description': 'Certificate file (PEM/DER).' },
+    'credential.ca_cert': {'type': 'file', 'description': 'CA certificate bundle file.'},
+    'credential.cert_key': {'type': 'file', 'description': 'Certificate private key file.', 'sensitive': True},
+    'credential.pfx': {'type': 'file', 'description': 'PKCS#12 / PFX bundle file.', 'sensitive': True},
+
+    # Web app context (preferred, tight namespace)
+    'web.host': {'type': 'host', 'description': 'Web host.'},
+    'web.port': {'type': 'port', 'description': 'Web port.'},
+    'web.login_url': {'type': 'url', 'description': 'Web login URL.'},
+    'web.logout_url': {'type': 'url', 'description': 'Web logout URL.'},
+    'web.register_url': {'type': 'url', 'description': 'Web registration URL.'},
+    'web.admin_url': {'type': 'url', 'description': 'Web admin URL.'},
+    'web.session': {'type': 'text', 'description': 'Web session id.', 'sensitive': True},
+    'web.csrf': {'type': 'text', 'description': 'Web CSRF token.', 'sensitive': True},
+    'web.header': {'type': 'text', 'description': 'Web request header (name/value).', 'sensitive': True},
+    'web.user_agent': {'type': 'text', 'description': 'Web User-Agent string.'},
+    'web.form_field': {'type': 'text', 'description': 'Web form field name.'},
+    'web.form_value': {'type': 'text', 'description': 'Web form field value.', 'sensitive': True},
+    'web.jwt': {'type': 'text', 'description': 'JWT used for web auth.', 'sensitive': True},
+
+    # Auth flows (preferred, tight namespace)
+    'auth.type': {'type': 'text', 'description': 'Authentication type (e.g., basic, bearer, cookie).'},
+    'auth.realm': {'type': 'text', 'description': 'Authentication realm (if applicable).'},
+    'auth.basic': {'type': 'text', 'description': 'Basic auth header or user:pass.', 'sensitive': True},
+    'auth.bearer': {'type': 'text', 'description': 'Bearer token string.', 'sensitive': True},
+    'auth.header': {'type': 'text', 'description': 'Auth header value.', 'sensitive': True},
+    'auth.cookie': {'type': 'text', 'description': 'Auth cookie value.', 'sensitive': True},
+    'auth.csrf': {'type': 'text', 'description': 'CSRF token.', 'sensitive': True},
+    'auth.redirect_uri': {'type': 'url', 'description': 'OAuth redirect URI.'},
+    'auth.scope': {'type': 'text', 'description': 'OAuth scope string.'},
+    'auth.state': {'type': 'text', 'description': 'OAuth state value.', 'sensitive': True},
+    'auth.code': {'type': 'text', 'description': 'OAuth authorization code.', 'sensitive': True},
+    'auth.issuer': {'type': 'url', 'description': 'OIDC issuer URL.'},
+    'auth.jwks_url': {'type': 'url', 'description': 'OIDC JWKS URL.'},
+    'auth.id_token': {'type': 'text', 'description': 'OIDC id_token JWT.', 'sensitive': True},
+
+    # Cloud/provider credentials (preferred, tight namespace)
+    'cloud.provider': {'type': 'text', 'description': 'Cloud provider identifier (aws/gcp/azure).'},
+    'cloud.region': {'type': 'text', 'description': 'Cloud region (e.g., us-east-1).'},
+    'cloud.account_id': {'type': 'text', 'description': 'Cloud account/subscription id.'},
+    'cloud.project_id': {'type': 'text', 'description': 'Cloud project id.'},
+
+    'cloud.aws.access_key_id': {'type': 'text', 'description': 'AWS access key id.', 'sensitive': True},
+    'cloud.aws.secret_access_key': {'type': 'text', 'description': 'AWS secret access key.', 'sensitive': True},
+    'cloud.aws.session_token': {'type': 'text', 'description': 'AWS session token.', 'sensitive': True},
+    'cloud.aws.profile': {'type': 'text', 'description': 'AWS credential profile name.'},
+
+    'cloud.gcp.service_account_json': {'type': 'file', 'description': 'GCP service account JSON file.', 'sensitive': True},
+    'cloud.gcp.access_token': {'type': 'text', 'description': 'GCP access token.', 'sensitive': True},
+
+    'cloud.azure.tenant_id': {'type': 'text', 'description': 'Azure tenant id.'},
+    'cloud.azure.client_id': {'type': 'text', 'description': 'Azure client id.'},
+    'cloud.azure.client_secret': {'type': 'text', 'description': 'Azure client secret.', 'sensitive': True},
+    'cloud.azure.subscription_id': {'type': 'text', 'description': 'Azure subscription id.'},
+
+    # VPN / tunnels (preferred, tight namespace)
+    'vpn.type': {'type': 'text', 'description': 'VPN type (wireguard, openvpn, ipsec).'},
+    'vpn.server': {'type': 'host', 'description': 'VPN server host.'},
+    'vpn.port': {'type': 'port', 'description': 'VPN server port.'},
+    'vpn.config': {'type': 'file', 'description': 'VPN config file path.', 'sensitive': True},
+    'vpn.psk': {'type': 'text', 'description': 'VPN pre-shared key.', 'sensitive': True},
+    'vpn.client_key': {'type': 'file', 'description': 'VPN client private key file.', 'sensitive': True},
+    'vpn.client_cert': {'type': 'file', 'description': 'VPN client cert file.'},
+
+    # Monitoring / observability (preferred, tight namespace)
+    'monitoring.url': {'type': 'url', 'description': 'Monitoring system URL.'},
+    'monitoring.api_key': {'type': 'text', 'description': 'Monitoring API key.', 'sensitive': True},
+    'monitoring.token': {'type': 'text', 'description': 'Monitoring token.', 'sensitive': True},
+    'monitoring.datasource': {'type': 'text', 'description': 'Monitoring datasource name.'},
+    'monitoring.dashboard': {'type': 'text', 'description': 'Monitoring dashboard identifier.'},
+    'monitoring.alert': {'type': 'text', 'description': 'Monitoring alert name/id.'},
+
+    'monitoring.prometheus.url': {'type': 'url', 'description': 'Prometheus base URL.'},
+    'monitoring.grafana.url': {'type': 'url', 'description': 'Grafana base URL.'},
+    'monitoring.grafana.api_key': {'type': 'text', 'description': 'Grafana API key.', 'sensitive': True},
+
+    # Logging (preferred, tight namespace)
+    'logging.url': {'type': 'url', 'description': 'Logging system URL.'},
+    'logging.token': {'type': 'text', 'description': 'Logging token.', 'sensitive': True},
+    'logging.index': {'type': 'text', 'description': 'Logging index name.'},
+    'logging.query': {'type': 'text', 'description': 'Logging query string.'},
+    'logging.log_file': {'type': 'file', 'description': 'Log file path.'},
+    'logging.trace_id': {'type': 'text', 'description': 'Trace id/correlation id.'},
 }
-ALLOWED_TYPE_VALUES = {"artifact", "docker", "docker-compose", "misconfig", "incompetence"}
-ALLOWED_VECTOR_VALUES = {"local", "remote"}
 
-def _validate_and_normalize_data_source_csv(file_path: str, max_bytes: int = 2_000_000, *, skip_invalid: bool = False):
-    """Validate uploaded CSV for Data Sources and normalize optional columns.
 
-    Rules:
-    - Must be under max size, have header + at least one data row, and consistent row widths (after normalization step below).
-    - Must include all REQUIRED_DS_COLUMNS (exact names).
-    - Optional columns from OPTIONAL_DS_DEFAULTS will be appended to header if missing, and populated per-row with defaults if empty/missing.
-    - Type values must be one of ALLOWED_TYPE_VALUES (case-insensitive), Vector values one of ALLOWED_VECTOR_VALUES (case-insensitive).
-    - Name, Path, Startup must be non-empty strings.
-
-        Parameters:
-            file_path: path to CSV file
-            max_bytes: size cap
-            skip_invalid: if True, invalid data rows are skipped instead of failing the whole import.
-
-        Returns: (ok: bool, note_or_error: str, rows: list[list[str]]|None, skipped_rows: list[int])
-            ok: overall success
-            note_or_error: description / counts; if skip_invalid True may include skip summary
-            rows: normalized rows including header (only valid rows if skipping)
-            skipped_rows: list of 1-based data row indices (relative to first data line after header) that were skipped
-    """
+def _coerce_flaggen_io_type(name: str) -> str:
+    n = (name or '').strip().lower()
+    if not n:
+        return 'text'
     try:
-        st = os.stat(file_path)
-        if st.st_size > max_bytes:
-            return False, f"File too large (> {max_bytes} bytes)", None
-        # Load CSV
-        rows: list[list[str]] = []
-        with open(file_path, 'r', encoding='utf-8', errors='replace', newline='') as f:
-            rdr = csv.reader(f)
-            for i, row in enumerate(rdr):
-                if i > 10000:
-                    break
-                rows.append([str(c) if c is not None else '' for c in row])
-        if len(rows) < 2:
-            return False, "CSV must have header + at least one data row", None, []
-        header = rows[0]
-        # Strip UTF-8 BOM if present in first cell
-        if header and header[0].startswith('\ufeff'):
-            header[0] = header[0].lstrip('\ufeff')
-        # Ensure required headers exist
-        # Case-insensitive match for required headers
-        header_lower_map = {h.lower(): h for h in header}
-        missing = [h for h in REQUIRED_DS_COLUMNS if h.lower() not in header_lower_map]
-        # Normalize header casing to canonical names (only for required columns)
-        if not missing:
-            for req in REQUIRED_DS_COLUMNS:
-                real = header_lower_map.get(req.lower())
-                if real != req:
-                    # rename in place
-                    idx = header.index(real)
-                    header[idx] = req
-        if missing:
-            return False, f"Missing required column(s): {', '.join(missing)}", None, []
-        # Append optional headers if missing
-        for opt_col, default in OPTIONAL_DS_DEFAULTS.items():
-            if opt_col not in header:
-                header.append(opt_col)
-        # Normalize all rows to header length
-        width = len(header)
-        norm_rows: list[list[str]] = [header]
-        # Build column index map
-        col_idx = {name: header.index(name) for name in header}
-        # Validate and fill rows
-        errs: list[str] = []
-        skipped_rows: list[int] = []
-        for data_idx, row in enumerate(rows[1:], start=1):  # data_idx: 1-based index of data row (excluding header)
-            r = list(row)
-            if len(r) < width:
-                r = r + [''] * (width - len(r))
-            elif len(r) > width:
-                r = r[:width]
-            # Pull fields
-            name = (r[col_idx['Name']]).strip()
-            path = (r[col_idx['Path']]).strip()
-            typ = (r[col_idx['Type']]).strip()
-            startup = (r[col_idx['Startup']]).strip()
-            vector = (r[col_idx['Vector']]).strip()
-            row_err = False
-            if not name:
-                errs.append(f"row {data_idx}: Name is required"); row_err = True
-            if not path:
-                errs.append(f"row {data_idx}: Path is required"); row_err = True
-            if not startup:
-                errs.append(f"row {data_idx}: Startup is required"); row_err = True
-            if typ:
-                if typ.lower() not in ALLOWED_TYPE_VALUES:
-                    errs.append(f"row {data_idx}: Type '{typ}' not in {sorted(ALLOWED_TYPE_VALUES)}"); row_err = True
-                else:
-                    # Normalize to lower
-                    r[col_idx['Type']] = typ.lower()
-            else:
-                errs.append(f"row {data_idx}: Type is required"); row_err = True
-            if vector:
-                if vector.lower() not in ALLOWED_VECTOR_VALUES:
-                    errs.append(f"row {data_idx}: Vector '{vector}' not in {sorted(ALLOWED_VECTOR_VALUES)}"); row_err = True
-                else:
-                    r[col_idx['Vector']] = vector.lower()
-            else:
-                errs.append(f"row {data_idx}: Vector is required"); row_err = True
-            # Fill optionals with defaults if empty
-            for opt_col, default in OPTIONAL_DS_DEFAULTS.items():
-                if not r[col_idx[opt_col]].strip():
-                    r[col_idx[opt_col]] = default
-            if row_err and skip_invalid:
-                skipped_rows.append(data_idx)
-                continue
-            norm_rows.append(r)
-        if skip_invalid:
-            if len(norm_rows) == 1:
-                return False, "All data rows invalid", None, skipped_rows
-            note_parts = [f"{len(norm_rows)-1} rows"]
-            if skipped_rows:
-                listed = ','.join(str(i) for i in skipped_rows[:20])
-                extra = '' if len(skipped_rows) <= 20 else '...'
-                note_parts.append(f"skipped {len(skipped_rows)} invalid row(s): {listed}{extra}")
-            return True, ' | '.join(note_parts), norm_rows, skipped_rows
-        else:
-            if errs:
-                return False, "; ".join(errs[:20]) + (" ..." if len(errs)>20 else ''), None, []
-            return True, f"{len(norm_rows)-1} rows", norm_rows, []
-    except Exception as e:
-        return False, str(e), None, []
+        meta = _RESERVED_ARTIFACTS.get(n)
+        if isinstance(meta, dict):
+            tp0 = str(meta.get('type') or '').strip()
+            if tp0:
+                return tp0
+    except Exception:
+        pass
+    if n.startswith('filesystem.'):
+        if n.endswith('.dir'):
+            return 'dir'
+        if n.endswith('.file'):
+            return 'file'
+        if n.endswith('.path'):
+            return 'path'
+        return 'file'
+    if n.startswith('network.'):
+        if n.endswith('.port') or n == 'port':
+            return 'port'
+        if 'subnet' in n or 'cidr' in n:
+            return 'subnet'
+        if n.endswith('.ip') or n.endswith('.ipv4') or n.endswith('.ipv6') or '.ip' in n:
+            return 'ip'
+        if n.endswith('.host') or n.endswith('.hostname'):
+            return 'host'
+    if n.endswith('.url') or 'url' in n or n.startswith('web.') or n.startswith('http.'):
+        return 'url'
+    if n.startswith('credential.'):
+        return 'credential'
+    if 'private_key' in n or n.endswith('.key'):
+        return 'text'
+    if 'password' in n or 'secret' in n:
+        return 'text'
+    if 'token' in n:
+        return 'text'
+    if 'flag' in n:
+        return 'flag'
+    return 'text'
+
+
+def _coerce_flaggen_io_sensitive(name: str, tp: str) -> bool:
+    n = (name or '').strip().lower()
+    t = (tp or '').strip().lower()
+    try:
+        meta = _RESERVED_ARTIFACTS.get(n)
+        if isinstance(meta, dict) and meta.get('sensitive') is True:
+            return True
+    except Exception:
+        pass
+    if t == 'flag':
+        return True
+    if any(k in n for k in ('password', 'secret', 'token', 'private_key', 'ssh.private_key')):
+        return True
+    return False
+
+
+def _generator_defs_from_flag_catalog_items(items: list[dict]) -> list[dict]:
+    """Deprecated: no longer converting flag-catalog templates into generators."""
+    return []
+
+
+def _coerce_bool(val, default: bool = False) -> bool:
+    try:
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return bool(val)
+        if isinstance(val, str):
+            v = val.strip().lower()
+            if v in {'true', '1', 'yes', 'y', 'on'}:
+                return True
+            if v in {'false', '0', 'no', 'n', 'off'}:
+                return False
+    except Exception:
+        pass
+    return default
+
+
+def _normalize_generator_id(val: str) -> str:
+    raw = (val or '').strip().lower()
+    if not raw:
+        return ''
+    # Keep it simple and stable: allow a-z0-9._-
+    out = []
+    for ch in raw:
+        if ch.isalnum() or ch in {'.', '_', '-'}:
+            out.append(ch)
+        elif ch.isspace():
+            out.append('-')
+    return ''.join(out).strip('-')
+
+
+def _coerce_str(val: object, default: str = '') -> str:
+    try:
+        if val is None:
+            return default
+        s = str(val)
+        return s
+    except Exception:
+        return default
+
+
+def _coerce_stripped(val: object, default: str = '') -> str:
+    return _coerce_str(val, default=default).strip()
+def _flag_base_dir() -> str:
+    """Base directory for downloaded flag compose assets."""
+    try:
+        return os.path.abspath(os.path.join(_outputs_dir(), 'flags'))
+    except Exception:
+        return os.path.abspath(os.path.join('outputs', 'flags'))
+
 
 def _default_scenarios_payload():
     return _default_scenarios_payload_for_names(["Scenario 1"])
@@ -11951,6 +20250,7 @@ def api_proxmox_validate():
     except Exception:
         timeout = 5.0
     timeout = max(1.0, min(timeout, 30.0))
+    # Persist credentials only if explicitly requested.
     remember_credentials = bool(payload.get('remember_credentials', True))
     prox_kwargs = {
         'host': host,
@@ -12003,16 +20303,8 @@ def api_proxmox_validate():
         'verify_ssl': verify_ssl,
     }
     secret_identifier: Optional[str] = None
+    stored_at_val: Optional[str] = None
     if remember_credentials:
-        secret_payload = {
-            'scenario_name': scenario_name,
-            'scenario_index': scenario_index,
-            'url': url_raw,
-            'port': port,
-            'username': username,
-            'password': password,
-            'verify_ssl': verify_ssl,
-        }
         try:
             stored_meta = _save_proxmox_credentials(secret_payload)
         except RuntimeError as exc:
@@ -12020,35 +20312,43 @@ def api_proxmox_validate():
         except Exception as exc:
             app.logger.exception('[proxmox] failed to persist credentials: %s', exc)
             return jsonify({'success': False, 'error': 'Credentials validated but could not be stored'}), 500
+        stored_at_val = stored_meta.get('stored_at')
         summary = {
             'url': stored_meta['url'],
             'port': stored_meta['port'],
             'username': stored_meta['username'],
             'verify_ssl': stored_meta['verify_ssl'],
-            'stored_at': stored_meta['stored_at'],
+            'stored_at': stored_at_val,
         }
         secret_identifier = stored_meta['identifier']
+    else:
+        summary = {
+            'url': url_raw,
+            'port': port,
+            'username': username,
+            'verify_ssl': verify_ssl,
+            'stored_at': None,
+        }
     message = f"Validated Proxmox access for {username} at {host}:{port}"
     # Persist a safe shared hint so builders/participants can see the validated state.
     # This is the non-secret subset (no password/token material).
-    if remember_credentials:
-        try:
-            if scenario_name:
-                _merge_hitl_validation_into_scenario_catalog(
-                    scenario_name,
-                    proxmox={
-                        'url': summary.get('url'),
-                        'port': summary.get('port'),
-                        'verify_ssl': summary.get('verify_ssl'),
-                        'secret_id': secret_identifier,
-                        'validated': bool(secret_identifier),
-                        'last_validated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
-                        'stored_at': summary.get('stored_at'),
-                        'last_message': message,
-                    },
-                )
-        except Exception:
-            pass
+    try:
+        if scenario_name:
+            _merge_hitl_validation_into_scenario_catalog(
+                scenario_name,
+                proxmox={
+                    'url': summary.get('url'),
+                    'port': summary.get('port'),
+                    'verify_ssl': summary.get('verify_ssl'),
+                    'secret_id': secret_identifier if remember_credentials else None,
+                    'validated': bool(secret_identifier) if remember_credentials else False,
+                    'last_validated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                    'stored_at': summary.get('stored_at'),
+                    'last_message': message,
+                },
+            )
+    except Exception:
+        pass
     return jsonify({
         'success': True,
         'message': message,
@@ -12939,6 +21239,184 @@ if __name__ == '__main__':
     ).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
 
 
+def _remote_copy_flow_artifacts_into_containers_script(sudo_password: str | None = None) -> str:
+    """Remote script to copy Flow generator artifacts into vuln containers.
+
+    This supports CORETG_FLOW_ARTIFACTS_MODE=copy where compose files contain
+    labels describing src/dest paths instead of bind mounts.
+    """
+    sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else "")
+    return (
+        r"""
+import json, os, re, subprocess, time
+
+SUDO_PASSWORD = __SUDO_PASSWORD_LITERAL__
+
+
+def _run_docker(cmd, timeout=30, capture=True):
+    stdout = subprocess.PIPE if capture else subprocess.DEVNULL
+    stderr = subprocess.STDOUT if capture else subprocess.DEVNULL
+    try:
+        p = subprocess.run(['sudo', '-n', 'docker'] + list(cmd), stdout=stdout, stderr=stderr, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        if SUDO_PASSWORD:
+            return subprocess.run(
+                ['sudo', '-S', '-k', '-p', '', 'docker'] + list(cmd),
+                input=str(SUDO_PASSWORD) + "\n",
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+                timeout=timeout,
+            )
+        return p
+    except Exception as e:
+        class _P:
+            returncode = 1
+            stdout = str(e)
+        return _P()
+
+
+def _first_existing(path_candidates):
+    for p in path_candidates:
+        if not p:
+            continue
+        try:
+            if os.path.exists(p):
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def _read_json(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _docker_names():
+    p = _run_docker(['ps', '-a', '--format', '{{.Names}}'], timeout=20, capture=True)
+    if getattr(p, 'returncode', 1) != 0:
+        return set(), (getattr(p, 'stdout', '') or '').strip()
+    return set(ln.strip() for ln in (p.stdout or '').splitlines() if ln.strip()), ''
+
+
+def _parse_flow_labels(txt: str):
+    # YAML-ish key:value, possibly quoted.
+    src = None
+    dest = None
+    m1 = re.search(r"coretg\.flow_artifacts\.src\s*:\s*(['\"]?)([^\n'\"]+)\1", txt)
+    if m1:
+        src = (m1.group(2) or '').strip()
+    m2 = re.search(r"coretg\.flow_artifacts\.dest\s*:\s*(['\"]?)([^\n'\"]+)\1", txt)
+    if m2:
+        dest = (m2.group(2) or '').strip()
+    return src, dest
+
+
+def _parse_flow_bind_mount(txt: str):
+    # Fallback: parse a volumes entry like /tmp/vulns/flag_generators_runs/...:/flow_artifacts:ro
+    m = re.search(r"(/tmp/vulns/(?:flag_generators_runs|flag_node_generators_runs)/[^:\s\"\']+)\s*:\s*([^:\s\"\']+)", txt)
+    if not m:
+        return None, None
+    return (m.group(1) or '').strip(), (m.group(2) or '').strip()
+
+
+def _compose_container_ids(project: str, yml: str):
+    p = _run_docker(['compose', '-p', project, '-f', yml, 'ps', '-q'], timeout=25, capture=True)
+    if getattr(p, 'returncode', 1) != 0:
+        return []
+    return [ln.strip() for ln in (p.stdout or '').splitlines() if ln.strip()]
+
+
+def main():
+    base = os.environ.get('CORE_REMOTE_BASE_DIR', '/tmp/core-topo-gen')
+    candidates = [
+        os.path.join(base, 'vulns', 'compose_assignments.json'),
+        os.path.join(base, 'outputs', 'vulns', 'compose_assignments.json'),
+        os.path.join(base, 'compose_assignments.json'),
+        '/tmp/vulns/compose_assignments.json',
+    ]
+    assignments_path = _first_existing(candidates)
+    if not assignments_path:
+        print(json.dumps({'ok': False, 'items': [], 'error': 'compose_assignments.json not found on CORE VM'}))
+        return
+
+    try:
+        data = _read_json(assignments_path)
+    except Exception as e:
+        print(json.dumps({'ok': False, 'items': [], 'error': f'failed reading assignments: {e}'}))
+        return
+
+    assignments = data.get('assignments', {}) if isinstance(data, dict) else {}
+    if not isinstance(assignments, dict):
+        assignments = {}
+
+    assign_dir = os.path.dirname(assignments_path)
+    items = []
+    for node_name in sorted(assignments.keys()):
+        yml = os.path.join(assign_dir, f'docker-compose-{node_name}.yml')
+        if not os.path.exists(yml):
+            continue
+        try:
+            txt = open(yml, 'r', encoding='utf-8', errors='ignore').read()
+        except Exception:
+            txt = ''
+
+        src, dest = _parse_flow_labels(txt)
+        if not src or not dest:
+            src2, dest2 = _parse_flow_bind_mount(txt)
+            src = src or src2
+            dest = dest or dest2
+
+        if not src or not dest:
+            continue
+
+        if not os.path.isdir(src):
+            items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'ok': False, 'error': 'src dir missing'})
+            continue
+
+        # Find container targets: prefer container named node_name; else use compose project containers.
+        targets = []
+        last_err = ''
+        for _ in range(6):
+            names, err = _docker_names()
+            last_err = err or last_err
+            if node_name in names:
+                targets = [node_name]
+                break
+            project = f"{node_name}conf" if node_name else 'coretg'
+            ids = _compose_container_ids(project, yml)
+            if ids:
+                targets = ids
+                break
+            time.sleep(2)
+
+        if not targets:
+            items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'ok': False, 'error': 'container not found', 'docker_error': last_err})
+            continue
+
+        copied_any = False
+        errs = []
+        for t in targets:
+            # Copy directory contents into dest.
+            p = _run_docker(['cp', src.rstrip('/') + '/.', f"{t}:{dest}"], timeout=60, capture=True)
+            if getattr(p, 'returncode', 1) == 0:
+                copied_any = True
+            else:
+                out = (getattr(p, 'stdout', '') or '').strip()
+                errs.append(out)
+        items.append({'node': node_name, 'compose': yml, 'src': src, 'dest': dest, 'targets': targets, 'ok': bool(copied_any), 'errors': errs})
+
+    print(json.dumps({'ok': True, 'items': items, 'timestamp': int(time.time())}))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
+
+
 def _sync_local_vulns_to_remote(
     core_cfg: Dict[str, Any],
     *,
@@ -12978,6 +21456,29 @@ def _sync_local_vulns_to_remote(
         if os.path.exists(yml):
             local_files.append(yml)
 
+    # Flow flag artifacts: bind-mounted into docker-compose services (e.g., to /flow_artifacts).
+    # These directories live under /tmp/vulns/* on the webapp host and must be present on the
+    # CORE VM too; otherwise the container sees an empty mount.
+    local_dirs: List[str] = []
+    try:
+        import re
+
+        for yml in [p for p in local_files if p.endswith('.yml') or p.endswith('.yaml')]:
+            try:
+                txt = ''
+                with open(yml, 'r', encoding='utf-8', errors='ignore') as f:
+                    txt = f.read()
+                # Match the source side of a bind mount that points into /tmp/vulns.
+                # Example: /tmp/vulns/flag_generators_runs/flow-...:/flow_artifacts:ro
+                for m in re.findall(r'(/tmp/vulns/(?:flag_generators_runs|flag_node_generators_runs)/[^:\s\"\']+)', txt):
+                    pth = str(m).strip().strip('"').strip("'")
+                    if pth and os.path.isdir(pth):
+                        local_dirs.append(pth)
+            except Exception:
+                continue
+    except Exception:
+        local_dirs = []
+
     if not local_files:
         return False
 
@@ -12989,6 +21490,7 @@ def _sync_local_vulns_to_remote(
         sftp = client.open_sftp()
         remote_dir_resolved = _remote_expand_path(sftp, remote_dir)
         _remote_mkdirs(client, remote_dir_resolved)
+        made_dirs: set[str] = set()
         for lp in local_files:
             rp = _remote_path_join(remote_dir_resolved, os.path.basename(lp))
             try:
@@ -12996,6 +21498,63 @@ def _sync_local_vulns_to_remote(
                 uploaded += 1
             except Exception:
                 log.exception("[sync] Failed uploading %s -> %s", lp, rp)
+
+        # Upload any referenced Flow generator run directories, preserving relative paths.
+        # Example local:  /tmp/vulns/flag_generators_runs/flow-.../outputs.json
+        # Example remote: /tmp/vulns/flag_generators_runs/flow-.../outputs.json
+        for d in sorted(set(local_dirs)):
+            try:
+                rel = os.path.relpath(d, local_dir)
+            except Exception:
+                rel = None
+            if not rel or rel.startswith('..'):
+                continue
+            remote_d = _remote_path_join(remote_dir_resolved, rel)
+            try:
+                if remote_d not in made_dirs:
+                    _remote_mkdirs(client, remote_d)
+                    made_dirs.add(remote_d)
+            except Exception:
+                pass
+            for root, dirs, files in os.walk(d):
+                # Create directories first.
+                for dn in dirs:
+                    lp_dir = os.path.join(root, dn)
+                    try:
+                        rel_dir = os.path.relpath(lp_dir, local_dir)
+                    except Exception:
+                        continue
+                    if not rel_dir or rel_dir.startswith('..'):
+                        continue
+                    rp_dir = _remote_path_join(remote_dir_resolved, rel_dir)
+                    if rp_dir in made_dirs:
+                        continue
+                    try:
+                        _remote_mkdirs(client, rp_dir)
+                        made_dirs.add(rp_dir)
+                    except Exception:
+                        pass
+                for fn in files:
+                    lp_file = os.path.join(root, fn)
+                    try:
+                        rel_file = os.path.relpath(lp_file, local_dir)
+                    except Exception:
+                        continue
+                    if not rel_file or rel_file.startswith('..'):
+                        continue
+                    rp_file = _remote_path_join(remote_dir_resolved, rel_file)
+                    rp_parent = os.path.dirname(rp_file)
+                    try:
+                        if rp_parent and rp_parent not in made_dirs:
+                            _remote_mkdirs(client, rp_parent)
+                            made_dirs.add(rp_parent)
+                    except Exception:
+                        pass
+                    try:
+                        sftp.put(lp_file, rp_file)
+                        uploaded += 1
+                    except Exception:
+                        log.exception("[sync] Failed uploading %s -> %s", lp_file, rp_file)
         if uploaded:
             log.info("[sync] Uploaded %d vuln artifact(s) to CORE host dir=%s", uploaded, remote_dir_resolved)
         return uploaded > 0
@@ -13089,6 +21648,171 @@ if __name__ == '__main__':
     ).replace('__NAMES_LITERAL__', names_literal).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
 
 
+def _remote_docker_remove_wrapper_images_script(sudo_password: str | None = None) -> str:
+    sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else "")
+    return (
+        """
+import json, subprocess
+
+SUDO_PASSWORD = __SUDO_PASSWORD_LITERAL__
+
+
+def _run_docker(cmd, timeout=30):
+    try:
+        p = subprocess.run(['sudo', '-n', 'docker'] + list(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        if SUDO_PASSWORD:
+            return subprocess.run(
+                ['sudo', '-S', '-k', '-p', '', 'docker'] + list(cmd),
+                input=str(SUDO_PASSWORD) + "\\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+            )
+        return p
+    except Exception as e:
+        class _P:
+            returncode = 1
+            stdout = str(e)
+        return _P()
+
+
+def main():
+    # List all tool-generated wrapper images. We scope these under the "coretg" repo prefix.
+    # Only remove images whose tag begins with "iproute2" (our wrapper tag).
+    listed = []
+    removed = []
+    errors = []
+    p = _run_docker(['images', '--format', '{{.Repository}}:{{.Tag}}', '--filter', 'reference=coretg/*'], timeout=30)
+    out = (getattr(p, 'stdout', '') or '').strip()
+    if out:
+        for line in out.splitlines():
+            ref = (line or '').strip()
+            if not ref or ':' not in ref:
+                continue
+            listed.append(ref)
+    targets = []
+    for ref in listed:
+        try:
+            repo, tag = ref.rsplit(':', 1)
+        except Exception:
+            continue
+        if tag.startswith('iproute2'):
+            targets.append(ref)
+    for ref in targets:
+        try:
+            pr = _run_docker(['image', 'rm', '-f', ref], timeout=60)
+            if getattr(pr, 'returncode', 1) == 0:
+                removed.append(ref)
+            else:
+                errors.append({'ref': ref, 'output': (getattr(pr, 'stdout', '') or '').strip()})
+        except Exception as e:
+            errors.append({'ref': ref, 'output': str(e)})
+    print(json.dumps({'ok': True, 'listed': listed, 'targets': targets, 'removed': removed, 'errors': errors}))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
+
+
+def _remote_docker_remove_all_containers_script(sudo_password: str | None = None) -> str:
+    """Remote script to delete ALL docker containers on the CORE VM (does not remove images)."""
+
+    sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else "")
+    return (
+        """
+import json, subprocess
+
+SUDO_PASSWORD = __SUDO_PASSWORD_LITERAL__
+
+
+def _run_docker(cmd, timeout=60):
+    try:
+        p = subprocess.run(['sudo', '-n', 'docker'] + list(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        if SUDO_PASSWORD:
+            return subprocess.run(
+                ['sudo', '-S', '-k', '-p', '', 'docker'] + list(cmd),
+                input=str(SUDO_PASSWORD) + "\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+            )
+        return p
+    except Exception as e:
+        class _P:
+            returncode = 1
+            stdout = str(e)
+        return _P()
+
+
+def _list_ids(args, timeout=30):
+    p = _run_docker(args, timeout=timeout)
+    if getattr(p, 'returncode', 1) != 0:
+        return [], (getattr(p, 'stdout', '') or '').strip()
+    out = (getattr(p, 'stdout', '') or '').strip()
+    ids = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    return ids, ''
+
+
+def _chunks(seq, n=40):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def main():
+    errors = []
+
+    container_ids, cerr = _list_ids(['ps', '-aq'], timeout=30)
+    if cerr:
+        errors.append({'stage': 'list_containers', 'output': cerr})
+    stopped_attempted = 0
+    removed_attempted = 0
+    if container_ids:
+        for chunk in _chunks(container_ids, 25):
+            p = _run_docker(['stop'] + list(chunk), timeout=120)
+            if getattr(p, 'returncode', 1) != 0:
+                out = (getattr(p, 'stdout', '') or '').strip()
+                if out:
+                    errors.append({'stage': 'stop_containers', 'output': out[:4000]})
+            else:
+                stopped_attempted += len(chunk)
+        for chunk in _chunks(container_ids, 25):
+            p = _run_docker(['rm', '-f'] + list(chunk), timeout=120)
+            if getattr(p, 'returncode', 1) != 0:
+                out = (getattr(p, 'stdout', '') or '').strip()
+                if out:
+                    errors.append({'stage': 'rm_containers', 'output': out[:4000]})
+            else:
+                removed_attempted += len(chunk)
+
+    print(json.dumps({
+        'ok': True,
+        'containers': {
+            'found': len(container_ids),
+            'stopped_attempted': stopped_attempted,
+            'removed_attempted': removed_attempted,
+        },
+        'images': {
+            'removed_attempted': 0,
+            'skipped': True,
+        },
+        'errors': errors,
+    }))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal)
+
+
 @app.route('/docker/status', methods=['GET'])
 def docker_status():
     # Use the scenario-selected CORE VM (remote) to populate docker status.
@@ -13133,6 +21857,8 @@ def docker_cleanup():
                     arr = json.loads(raw)
                     if isinstance(arr, list):
                         names = [str(x) for x in arr]
+                    else:
+                        names = [str(raw)]
                 except Exception:
                     names = [str(raw)]
         # Use the scenario-selected CORE VM (remote) to cleanup docker containers.
@@ -13567,7 +22293,10 @@ def _parse_scenario_editor(se):
             if name == "Vulnerabilities":
                 # Extra attributes for Vulnerabilities section
                 sel = (d.get("selected") or "").strip()
-                if sel == "Type/Vector":
+                # UI historically uses "Category" while XML schema uses "Type/Vector".
+                # Normalize to UI label "Category" so round-trips are stable.
+                if sel in ("Type/Vector", "Category"):
+                    d["selected"] = "Category"
                     d["v_type"] = item.get("v_type", "Random")
                     d["v_vector"] = item.get("v_vector", "Random")
                 elif sel == "Specific":
@@ -13868,7 +22597,11 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
 
             for item in items_list:
                 it = ET.SubElement(sec_el, "item")
-                it.set("selected", str(item.get('selected', 'Random')))
+                sel_for_xml = str(item.get('selected', 'Random'))
+                # UI label "Category" maps to schema label "Type/Vector".
+                if name == 'Vulnerabilities' and sel_for_xml == 'Category':
+                    sel_for_xml = 'Type/Vector'
+                it.set("selected", sel_for_xml)
                 try:
                     it.set("factor", f"{float(item.get('factor', 1.0)):.3f}")
                 except Exception:
@@ -13932,8 +22665,8 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                     if ct:
                         it.set('content_type', ct)
                 if name == 'Vulnerabilities':
-                    sel = str(item.get('selected', 'Random'))
-                    if sel == 'Type/Vector':
+                    sel = sel_for_xml
+                    if sel in ('Type/Vector', 'Category'):
                         vt = item.get('v_type')
                         vv = item.get('v_vector')
                         if vt:
@@ -14693,6 +23426,29 @@ def save_xml():
         client_project_hint = (request.form.get('project_key_hint') or '').strip()
         client_scenario_query = (request.form.get('scenario_query') or '').strip()
         normalized_core = _normalize_core_config(core_meta, include_password=True) if core_meta else None
+        # Enforce unique scenario names (case-insensitive, trimmed) to prevent confusing overwrites.
+        try:
+            scenarios_list = data.get('scenarios') or []
+            seen: set[str] = set()
+            dupes: list[str] = []
+            if isinstance(scenarios_list, list):
+                for idx, sc in enumerate(scenarios_list):
+                    if not isinstance(sc, dict):
+                        continue
+                    raw_name = (sc.get('name') or '').strip()
+                    name = raw_name or f"Scenario {idx + 1}"
+                    key = name.casefold()
+                    if key in seen:
+                        dupes.append(name)
+                    else:
+                        seen.add(key)
+            if dupes:
+                pretty = ', '.join(sorted(set(dupes)))
+                flash(f'Duplicate scenario names are not allowed: {pretty}')
+                return redirect(url_for('index'))
+        except Exception:
+            # If validation fails unexpectedly, fall through to existing error handling.
+            pass
         scenario_count = len(data.get('scenarios') or []) if isinstance(data.get('scenarios'), list) else 0
         scenario_names_desc = []
         try:
@@ -14821,6 +23577,26 @@ def save_xml_api():
             active_index = None
         if not isinstance(scenarios, list):
             return jsonify({ 'ok': False, 'error': 'Invalid payload (scenarios list required)' }), 400
+        # Enforce unique scenario names (case-insensitive, trimmed).
+        try:
+            seen: set[str] = set()
+            dupes: list[str] = []
+            for idx, sc in enumerate(scenarios):
+                if not isinstance(sc, dict):
+                    continue
+                raw_name = (sc.get('name') or '').strip()
+                name = raw_name or f"Scenario {idx + 1}"
+                key = name.casefold()
+                if key in seen:
+                    dupes.append(name)
+                else:
+                    seen.add(key)
+            if dupes:
+                pretty = ', '.join(sorted(set(dupes)))
+                return jsonify({ 'ok': False, 'error': f'Duplicate scenario names are not allowed: {pretty}' }), 400
+        except Exception:
+            # Best-effort validation; if it fails, continue with existing behavior.
+            pass
         scenario_names: list[str] = []
         try:
             scenario_names = [str((s or {}).get('name') or '').strip() for s in scenarios if isinstance(s, dict)]
@@ -14894,6 +23670,34 @@ def save_xml_api():
         return jsonify({ 'ok': False, 'error': str(e) }), 500
 
 
+@app.route('/render_xml_api', methods=['POST'])
+def render_xml_api():
+    """Render scenario XML for preview without persisting to disk."""
+    try:
+        data = request.get_json(silent=True) or {}
+        scenarios = data.get('scenarios')
+        core_meta = data.get('core')
+        normalized_core = _normalize_core_config(core_meta, include_password=True) if isinstance(core_meta, (dict, list)) or core_meta else None
+        if not isinstance(scenarios, list):
+            return jsonify({ 'ok': False, 'error': 'Invalid payload (scenarios list required)' }), 400
+        tree = _build_scenarios_xml({ 'scenarios': scenarios, 'core': normalized_core })
+        # Pretty print when possible
+        try:
+            raw = ET.tostring(tree.getroot(), encoding='utf-8')
+            lroot = LET.fromstring(raw)
+            pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+            return Response(pretty, mimetype='application/xml')
+        except Exception:
+            out = ET.tostring(tree.getroot(), encoding='utf-8', xml_declaration=True)
+            return Response(out, mimetype='application/xml')
+    except Exception as e:
+        try:
+            app.logger.exception('[render_xml_api] failed: %s', e)
+        except Exception:
+            pass
+        return jsonify({ 'ok': False, 'error': str(e) }), 500
+
+
 @app.route('/run_cli', methods=['POST'])
 def run_cli():
     user = _current_user()
@@ -14911,6 +23715,14 @@ def run_cli():
             if alt != xml_path and os.path.exists(alt):
                 app.logger.info("[sync] Remapped XML path %s -> %s", xml_path, alt)
                 xml_path = alt
+        except Exception:
+            pass
+    if not os.path.exists(xml_path):
+        try:
+            recovered = _try_resolve_latest_outputs_xml(xml_path)
+            if recovered and os.path.exists(recovered):
+                app.logger.warning('[sync] XML path missing; recovered to newest match: %s -> %s', xml_path, recovered)
+                xml_path = recovered
         except Exception:
             pass
     if not os.path.exists(xml_path):
@@ -14933,6 +23745,10 @@ def run_cli():
     except Exception:
         scenario_core_override = None
     scenario_name_hint = request.form.get('scenario') or request.form.get('scenario_name') or None
+    docker_cleanup_before_run = _coerce_bool(request.form.get('docker_cleanup_before_run'))
+    docker_remove_all_containers = _coerce_bool(
+        request.form.get('docker_remove_all_containers')
+    ) or _coerce_bool(request.form.get('docker_nuke_all'))
     scenario_index_hint: Optional[int] = None
     try:
         raw_index = request.form.get('scenario_index')
@@ -15023,6 +23839,9 @@ def run_cli():
         py_exec = _select_python_interpreter(cli_venv_bin)
         cli_env = _prepare_cli_env(preferred_venv_bin=cli_venv_bin)
         cli_env.setdefault('PYTHONUNBUFFERED', '1')
+        # Deliver Flow generator artifacts into vuln containers by copying files in,
+        # rather than bind-mounting directories from the host.
+        cli_env.setdefault('CORETG_FLOW_ARTIFACTS_MODE', 'copy')
         app.logger.info("[sync] Using python interpreter: %s", py_exec)
         # Determine active scenario name (prefer explicit hint, fallback to first in XML)
         active_scenario_name = None
@@ -15037,6 +23856,20 @@ def run_cli():
                     active_scenario_name = names_for_cli[0]
             except Exception:
                 active_scenario_name = None
+
+        # Scope tool-generated wrapper images by upload/scenario to prevent cross-scenario image reuse.
+        try:
+            out_dir_for_tag = os.path.dirname(xml_path) if xml_path else ''
+            upload_base = os.path.basename(out_dir_for_tag) if out_dir_for_tag else ''
+            parts = []
+            if upload_base:
+                parts.append(upload_base)
+            if active_scenario_name:
+                parts.append(active_scenario_name)
+            scenario_tag = _safe_name('-'.join(parts) if parts else (active_scenario_name or 'scenario'))
+            cli_env.setdefault('CORETG_SCENARIO_TAG', scenario_tag)
+        except Exception:
+            pass
         with _core_connection(core_cfg) as (conn_host, conn_port):
             forwarded_desc = f"{conn_host}:{conn_port}"
             app.logger.info(
@@ -15045,6 +23878,64 @@ def run_cli():
                 forwarded_desc,
                 xml_path,
             )
+
+            # Optional: best-effort cleanup of tool-managed Docker state before execution.
+            # This is conservative: it only targets vuln docker-compose node containers derived
+            # from compose_assignments.json plus tool-generated wrapper images under coretg/*.
+
+            # Optional: very destructive cleanup.
+            # Stops/removes ALL containers on the remote CORE VM.
+            if docker_remove_all_containers:
+                try:
+                    app.logger.warning('[sync] Pre-run: docker remove-all-containers requested')
+                    _run_remote_python_json(
+                        core_cfg,
+                        _remote_docker_remove_all_containers_script(core_cfg.get('ssh_password')),
+                        logger=app.logger,
+                        label='docker.remove_all_containers(prerun)',
+                        timeout=900.0,
+                    )
+                except Exception as exc:
+                    try:
+                        app.logger.warning('[sync] Pre-run docker remove-all-containers skipped/failed: %s', exc)
+                    except Exception:
+                        pass
+            if docker_cleanup_before_run:
+                try:
+                    app.logger.info('[sync] Pre-run: docker cleanup requested (containers + wrapper images)')
+                    status_payload = _run_remote_python_json(
+                        core_cfg,
+                        _remote_docker_status_script(core_cfg.get('ssh_password')),
+                        logger=app.logger,
+                        label='docker.status(for prerun cleanup)',
+                        timeout=60.0,
+                    )
+                    names: list[str] = []
+                    if isinstance(status_payload, dict) and isinstance(status_payload.get('items'), list):
+                        for it in status_payload.get('items') or []:
+                            if isinstance(it, dict) and it.get('name'):
+                                names.append(str(it.get('name')))
+                    if names:
+                        _run_remote_python_json(
+                            core_cfg,
+                            _remote_docker_cleanup_script(names, core_cfg.get('ssh_password')),
+                            logger=app.logger,
+                            label='docker.cleanup(prerun)',
+                            timeout=120.0,
+                        )
+                    _run_remote_python_json(
+                        core_cfg,
+                        _remote_docker_remove_wrapper_images_script(core_cfg.get('ssh_password')),
+                        logger=app.logger,
+                        label='docker.wrapper_images.cleanup(prerun)',
+                        timeout=180.0,
+                    )
+                except Exception as exc:
+                    try:
+                        app.logger.warning('[sync] Pre-run docker cleanup skipped/failed: %s', exc)
+                    except Exception:
+                        pass
+
             cli_args = [
                 py_exec,
                 '-m',
@@ -15065,10 +23956,44 @@ def run_cli():
 
         # If the CLI generated vulnerability compose artifacts locally, copy them to the CORE VM
         # so the remote Docker Compose card and DockerComposeService can access them.
+        uploaded_vuln_artifacts = False
         try:
-            _sync_local_vulns_to_remote(core_cfg, logger=app.logger)
+            uploaded_vuln_artifacts = bool(_sync_local_vulns_to_remote(core_cfg, logger=app.logger))
+        except Exception as exc:
+            uploaded_vuln_artifacts = False
+            try:
+                app.logger.warning('[sync] Vuln artifact upload failed: %s', exc)
+            except Exception:
+                pass
+        try:
+            app.logger.info('[sync] Vuln artifact upload complete uploaded=%s', bool(uploaded_vuln_artifacts))
         except Exception:
             pass
+
+        # Flow flag artifacts: copy them into running/stopped vuln containers on the CORE VM.
+        # This is used when CORETG_FLOW_ARTIFACTS_MODE=copy (no bind mounts).
+        try:
+            payload = _run_remote_python_json(
+                core_cfg,
+                _remote_copy_flow_artifacts_into_containers_script(core_cfg.get('ssh_password')),
+                logger=app.logger,
+                label='docker.copy_flow_artifacts(postrun)',
+                timeout=180.0,
+            )
+            try:
+                copied_ok = 0
+                copied_total = 0
+                if isinstance(payload, dict) and isinstance(payload.get('items'), list):
+                    copied_total = len(payload.get('items') or [])
+                    copied_ok = sum(1 for it in (payload.get('items') or []) if isinstance(it, dict) and it.get('ok'))
+                app.logger.info('[sync] docker cp flow artifacts results ok=%s total=%s', int(copied_ok), int(copied_total))
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                app.logger.warning('[sync] docker cp flow artifacts skipped/failed: %s', exc)
+            except Exception:
+                pass
 
         # Report path (if generated by CLI): parse logs or fallback to latest under reports/
         report_md = _extract_report_path_from_text(logs) or _find_latest_report_path()
@@ -15206,6 +24131,51 @@ def run_cli():
 # ----------------------- Planning (Preview / Run) -----------------------
 
 
+@app.route('/api/seed_hints', methods=['POST'])
+def api_seed_hints():
+    """Return deterministic seed hints for one or more scenarios.
+
+    Request JSON: { xml_path: "/abs/scenarios.xml", scenarios: ["Scenario 1", ...] }
+    Response JSON: { ok: true, xml_path, xml_hash, seeds: { "scenario 1": 123, ... } }
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        xml_path = (payload.get('xml_path') or '').strip()
+        scenarios = payload.get('scenarios') or []
+        if not xml_path:
+            return jsonify({'ok': False, 'error': 'xml_path missing'}), 400
+        xml_path = os.path.abspath(xml_path)
+        if not os.path.exists(xml_path):
+            return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
+
+        try:
+            from core_topo_gen.planning.plan_cache import hash_xml_file
+            xml_hash = hash_xml_file(xml_path)
+        except Exception as exc:
+            return jsonify({'ok': False, 'error': f'Failed to hash XML: {exc}'}), 500
+
+        seeds: dict[str, int] = {}
+        if isinstance(scenarios, list):
+            for raw in scenarios:
+                try:
+                    name = (str(raw) if raw is not None else '').strip()
+                    if not name:
+                        continue
+                    key = name.lower()
+                    if key in seeds:
+                        continue
+                    seeds[key] = _derive_seed_for_scenario(xml_hash, name)
+                except Exception:
+                    continue
+        return jsonify({'ok': True, 'xml_path': xml_path, 'xml_hash': xml_hash, 'seeds': seeds})
+    except Exception as e:
+        try:
+            app.logger.exception('[seed_hints] error: %s', e)
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
 
 @app.route('/api/plan/preview_full', methods=['POST'])
 def api_plan_preview_full():
@@ -15218,6 +24188,8 @@ def api_plan_preview_full():
     try:
         payload = request.get_json(silent=True) or {}
         xml_path = payload.get('xml_path')
+        scenarios_inline = payload.get('scenarios')
+        core_inline = payload.get('core')
         scenario = payload.get('scenario') or None
         seed = payload.get('seed')
         r2s_hosts_min_list = payload.get('r2s_hosts_min_list') or []
@@ -15228,7 +24200,41 @@ def api_plan_preview_full():
         except Exception:
             seed = None
         if not xml_path:
-            return jsonify({'ok': False, 'error': 'xml_path missing'}), 400
+            # Builder/participant roles may preview without saving by posting scenarios/core.
+            if isinstance(scenarios_inline, list):
+                try:
+                    normalized_core = _normalize_core_config(core_inline, include_password=True) if isinstance(core_inline, dict) else None
+                    tree = _build_scenarios_xml({ 'scenarios': scenarios_inline, 'core': normalized_core })
+                    ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+                    tag = str(uuid.uuid4())[:8]
+                    out_dir = os.path.join(_outputs_dir(), f'tmp-preview-{ts}-{tag}')
+                    os.makedirs(out_dir, exist_ok=True)
+                    stem_raw = scenario or None
+                    if not stem_raw:
+                        try:
+                            first_name = None
+                            for sc in scenarios_inline:
+                                if isinstance(sc, dict) and sc.get('name'):
+                                    first_name = sc.get('name')
+                                    break
+                            stem_raw = first_name or 'scenarios'
+                        except Exception:
+                            stem_raw = 'scenarios'
+                    stem = secure_filename(str(stem_raw)).strip('_-.') or 'scenarios'
+                    xml_path = os.path.join(out_dir, f"{stem}.xml")
+                    try:
+                        from lxml import etree as LET  # type: ignore
+                        raw = ET.tostring(tree.getroot(), encoding='utf-8')
+                        lroot = LET.fromstring(raw)
+                        pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+                        with open(xml_path, 'wb') as f:
+                            f.write(pretty)
+                    except Exception:
+                        tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+                except Exception as exc:
+                    return jsonify({'ok': False, 'error': f'Failed to render XML for preview: {exc}'}), 400
+            else:
+                return jsonify({'ok': False, 'error': 'xml_path missing'}), 400
         xml_path = os.path.abspath(xml_path)
         if not os.path.exists(xml_path):
             return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
@@ -15269,10 +24275,139 @@ def api_plan_preview_full():
             _merge_hitl_preview_with_full_preview(full_prev, hitl_config)
         except Exception:
             pass
+        try:
+            _attach_latest_flow_into_full_preview(full_prev, scenario)
+        except Exception:
+            pass
         return jsonify({'ok': True, 'full_preview': full_prev, 'plan': plan, 'breakdowns': plan.get('breakdowns')})
     except Exception as e:
         app.logger.exception('[plan.preview_full] error: %s', e)
         return jsonify({'ok': False, 'error': str(e) }), 500
+
+
+@app.route('/api/plan/persist_preview_plan', methods=['POST'])
+def api_plan_persist_preview_plan():
+    """Compute a full preview and persist it as a plan artifact under outputs/plans.
+
+    Request JSON: { xml_path: "/abs/path.xml", scenario: "name" (optional), seed: int (optional) }
+    Response JSON: { ok, xml_path, scenario, seed, preview_plan_path }
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        xml_path = (payload.get('xml_path') or '').strip()
+        scenario = (payload.get('scenario') or '').strip() or None
+        seed = payload.get('seed')
+        try:
+            if seed is not None:
+                seed = int(seed)
+        except Exception:
+            seed = None
+
+        if not xml_path:
+            return jsonify({'ok': False, 'error': 'xml_path missing'}), 400
+        xml_path = os.path.abspath(xml_path)
+        if not os.path.exists(xml_path):
+            return jsonify({'ok': False, 'error': f'XML not found: {xml_path}'}), 404
+
+        from core_topo_gen.planning.orchestrator import compute_full_plan
+        from core_topo_gen.planning.plan_cache import hash_xml_file, try_get_cached_plan, save_plan_to_cache
+
+        xml_hash = hash_xml_file(xml_path)
+        plan = None
+        try:
+            plan = try_get_cached_plan(xml_hash, scenario, seed)
+        except Exception:
+            plan = None
+        if not plan:
+            plan = compute_full_plan(xml_path, scenario=scenario, seed=seed, include_breakdowns=True)
+            try:
+                save_plan_to_cache(xml_hash, scenario, seed, plan)
+            except Exception:
+                pass
+
+        if seed is None:
+            try:
+                seed = plan.get('seed') or _derive_default_seed(xml_hash)
+            except Exception:
+                seed = None
+
+        full_prev = _build_full_preview_from_plan(plan, seed, [], [])
+        # Keep Flow UI consistent when it later loads the plan.
+        try:
+            _attach_latest_flow_into_full_preview(full_prev, scenario)
+        except Exception:
+            pass
+
+        # Mirror Preview tab behavior: merge HITL-derived preview routers/links into full_preview
+        # so any downstream Flow IP/node selection reflects Topology/HITL rules.
+        try:
+            xml_basename = os.path.basename(xml_path)
+        except Exception:
+            xml_basename = None
+        scenario_name = scenario or None
+        if not scenario_name:
+            try:
+                names_for_cli = _scenario_names_from_xml(xml_path)
+                if names_for_cli:
+                    scenario_name = names_for_cli[0]
+            except Exception:
+                scenario_name = None
+        try:
+            raw_hitl_config = parse_hitl_info(xml_path, scenario_name)
+        except Exception as hitl_exc:
+            try:
+                app.logger.debug('[plan.persist_preview_plan] hitl parse failed: %s', hitl_exc)
+            except Exception:
+                pass
+            raw_hitl_config = {"enabled": False, "interfaces": []}
+        try:
+            hitl_config = _sanitize_hitl_config(raw_hitl_config, scenario_name, xml_basename)
+        except Exception:
+            hitl_config = {"enabled": False, "interfaces": []}
+        try:
+            full_prev['hitl_interfaces'] = hitl_config.get('interfaces', [])
+            full_prev['hitl_enabled'] = bool(hitl_config.get('enabled'))
+            full_prev['hitl_scenario_key'] = hitl_config.get('scenario_key')
+            if hitl_config.get('core'):
+                full_prev['hitl_core'] = hitl_config.get('core')
+        except Exception:
+            pass
+        try:
+            _merge_hitl_preview_with_full_preview(full_prev, hitl_config)
+        except Exception:
+            pass
+
+        plans_dir = os.path.join(_outputs_dir(), 'plans')
+        os.makedirs(plans_dir, exist_ok=True)
+        seed_tag = full_prev.get('seed') or (seed if seed is not None else 'preview')
+        unique_tag = f"{seed_tag}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        preview_plan_path = os.path.join(plans_dir, f"plan_from_preview_{unique_tag}.json")
+        plan_payload = {
+            'full_preview': full_prev,
+            'metadata': {
+                'xml_path': xml_path,
+                'scenario': scenario_name or scenario,
+                'seed': full_prev.get('seed'),
+                'origin': 'flow',
+                'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
+            },
+        }
+        with open(preview_plan_path, 'w', encoding='utf-8') as pf:
+            json.dump(plan_payload, pf, indent=2, sort_keys=True)
+
+        return jsonify({
+            'ok': True,
+            'xml_path': xml_path,
+            'scenario': scenario_name or scenario,
+            'seed': full_prev.get('seed'),
+            'preview_plan_path': preview_plan_path,
+        })
+    except Exception as e:
+        try:
+            app.logger.exception('[plan.persist_preview_plan] error: %s', e)
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 @app.route('/plan/full_preview_page', methods=['POST'])
 def plan_full_preview_page():
@@ -15281,8 +24416,12 @@ def plan_full_preview_page():
     Form fields: xml_path, optional scenario, seed
     """
     try:
+        embed_raw = request.args.get('embed') or request.form.get('embed') or ''
+        embed = str(embed_raw).strip().lower() in ['1', 'true', 'yes', 'y', 'on']
         xml_path = request.form.get('xml_path')
         scenario = request.form.get('scenario') or None
+        force_raw = request.form.get('force') or request.form.get('force_recompute') or ''
+        force_recompute = str(force_raw).strip().lower() in ['1', 'true', 'yes', 'y', 'on']
         seed_raw = request.form.get('seed') or ''
         seed = None
         try:
@@ -15291,12 +24430,128 @@ def plan_full_preview_page():
                 if s>0: seed = s
         except Exception:
             seed = None
+        # Prefer the most recent Flow-generated snapshot for this scenario so Preview matches
+        # Flag Sequencing (which persists the preview plan before resolving).
+        try:
+            scen_norm = _normalize_scenario_label(scenario or '')
+        except Exception:
+            scen_norm = ''
+        if (not force_recompute) and scen_norm:
+            try:
+                flow_plan = _latest_preview_plan_for_scenario_norm_origin(scen_norm, origin='flow')
+            except Exception:
+                flow_plan = None
+            if flow_plan:
+                try:
+                    with open(flow_plan, 'r', encoding='utf-8') as f:
+                        payload = json.load(f) or {}
+                    full_prev = payload.get('full_preview') if isinstance(payload, dict) else None
+                    meta = payload.get('metadata') if isinstance(payload, dict) else None
+                    if isinstance(full_prev, dict):
+                        if not isinstance(meta, dict):
+                            meta = {}
+                        xml_path0 = str(meta.get('xml_path') or '')
+                        scenario0 = str(meta.get('scenario') or '') or (scenario or None)
+                        seed0 = meta.get('seed')
+                        try:
+                            seed0 = int(seed0) if seed0 is not None else full_prev.get('seed')
+                        except Exception:
+                            seed0 = full_prev.get('seed')
+
+                        display_artifacts = full_prev.get('display_artifacts')
+                        if not display_artifacts:
+                            try:
+                                display_artifacts = _attach_display_artifacts(full_prev)
+                            except Exception:
+                                display_artifacts = {
+                                    'segmentation': {
+                                        'rows': [],
+                                        'table_rows': [],
+                                        'tableRows': [],
+                                        'json': {'rules_count': 0, 'types_summary': {}, 'rules': [], 'metadata': None},
+                                    },
+                                    '__version': FULL_PREVIEW_ARTIFACT_VERSION,
+                                }
+                        segmentation_artifacts = (display_artifacts or {}).get('segmentation')
+
+                        # Reconstruct hitl_config for template display from embedded full_preview fields.
+                        hitl_config = {
+                            'enabled': bool(full_prev.get('hitl_enabled')),
+                            'interfaces': full_prev.get('hitl_interfaces') or [],
+                            'scenario_key': full_prev.get('hitl_scenario_key') or (scenario0 or None),
+                        }
+                        try:
+                            if full_prev.get('hitl_core'):
+                                hitl_config['core'] = full_prev.get('hitl_core')
+                        except Exception:
+                            pass
+
+                        import json as _json
+                        preview_json_str = _json.dumps(full_prev, indent=2, default=str)
+                        xml_basename = None
+                        try:
+                            if xml_path0:
+                                xml_basename = os.path.basename(xml_path0)
+                        except Exception:
+                            xml_basename = None
+
+                        app.logger.info('[plan.full_preview_page] using flow snapshot plan=%s scenario=%s', os.path.basename(flow_plan), scen_norm)
+                        return render_template(
+                            'full_preview.html',
+                            full_preview=full_prev,
+                            preview_json=preview_json_str,
+                            xml_path=xml_path0,
+                            scenario=scenario0,
+                            seed=seed0,
+                            preview_plan_path=flow_plan,
+                            display_artifacts=display_artifacts,
+                            segmentation_artifacts=segmentation_artifacts,
+                            hitl_config=hitl_config,
+                            xml_basename=xml_basename,
+                            hide_chrome=embed,
+                        )
+                except Exception:
+                    pass
+
         if not xml_path:
+            if embed:
+                return Response(
+                    '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">'
+                    'Save XML first to preview (missing xml_path).'
+                    '</div>',
+                    mimetype='text/html',
+                )
             flash('xml_path missing (full preview page)')
             return redirect(url_for('index'))
         xml_path = os.path.abspath(xml_path)
         xml_basename = os.path.splitext(os.path.basename(xml_path))[0] if xml_path else ''
+        # Path fallback: handle container/volume mapping differences (e.g., /app/outputs vs /app/webapp/outputs)
+        if not os.path.exists(xml_path) and '/outputs/' in xml_path:
+            try:
+                alt = xml_path.replace('/app/outputs', '/app/webapp/outputs')
+                if alt != xml_path and os.path.exists(alt):
+                    app.logger.info('[full_preview] remapped xml_path %s -> %s', xml_path, alt)
+                    xml_path = alt
+            except Exception:
+                pass
+        if not os.path.exists(xml_path) and '/outputs/' in xml_path:
+            try:
+                alt = xml_path.replace('/app/webapp/outputs', '/app/outputs')
+                if alt != xml_path and os.path.exists(alt):
+                    app.logger.info('[full_preview] remapped xml_path %s -> %s', xml_path, alt)
+                    xml_path = alt
+            except Exception:
+                pass
         if not os.path.exists(xml_path):
+            if embed:
+                safe = (xml_path or '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                return Response(
+                    '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">'
+                    'Save XML first to preview (XML not found):<br><code style="color:#495057;">'
+                    + safe +
+                    '</code></div>',
+                    mimetype='text/html',
+                )
             flash(f'XML not found: {xml_path}')
             return redirect(url_for('index'))
         from core_topo_gen.planning.orchestrator import compute_full_plan
@@ -15375,6 +24630,10 @@ def plan_full_preview_page():
             _merge_hitl_preview_with_full_preview(full_prev, hitl_config)
         except Exception:
             pass
+        try:
+            _attach_latest_flow_into_full_preview(full_prev, scenario_name)
+        except Exception:
+            pass
         # Persist preview payload for downstream execution wiring
         preview_plan_path = None
         try:
@@ -15390,6 +24649,7 @@ def plan_full_preview_page():
                     'xml_path': xml_path,
                     'scenario': scenario_name,
                     'seed': full_prev.get('seed'),
+                    'origin': 'preview',
                     'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
                 },
             }
@@ -15416,10 +24676,116 @@ def plan_full_preview_page():
             segmentation_artifacts=segmentation_artifacts,
             hitl_config=hitl_config,
             xml_basename=xml_basename,
+            hide_chrome=embed,
         )
     except Exception as e:
         app.logger.exception('[plan.full_preview_page] error: %s', e)
         flash(f'Full preview page error: {e}')
+        return redirect(url_for('index'))
+
+
+@app.route('/plan/full_preview_from_plan', methods=['POST'])
+def plan_full_preview_from_plan():
+    """Render Full Preview from an existing persisted preview plan under outputs/plans.
+
+    Form fields: preview_plan (absolute or relative path), optional embed=1
+    """
+    try:
+        embed_raw = request.args.get('embed') or request.form.get('embed') or ''
+        embed = str(embed_raw).strip().lower() in ['1', 'true', 'yes', 'y', 'on']
+        plan_path = (request.form.get('preview_plan') or '').strip()
+        if not plan_path:
+            return redirect(url_for('index'))
+        try:
+            plan_path = os.path.abspath(plan_path)
+            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
+            if os.path.commonpath([plan_path, plans_dir]) != plans_dir:
+                flash('Invalid preview plan path')
+                return redirect(url_for('index'))
+            if not os.path.exists(plan_path):
+                flash('Preview plan not found')
+                return redirect(url_for('index'))
+        except Exception:
+            flash('Invalid preview plan path')
+            return redirect(url_for('index'))
+
+        try:
+            with open(plan_path, 'r', encoding='utf-8') as f:
+                payload = json.load(f) or {}
+        except Exception as e:
+            flash(f'Failed to load preview plan: {e}')
+            return redirect(url_for('index'))
+
+        full_prev = payload.get('full_preview') if isinstance(payload, dict) else None
+        if not isinstance(full_prev, dict):
+            flash('Preview plan missing full_preview')
+            return redirect(url_for('index'))
+        meta = payload.get('metadata') if isinstance(payload, dict) else None
+        if not isinstance(meta, dict):
+            meta = {}
+
+        xml_path = str(meta.get('xml_path') or '')
+        scenario_name = str(meta.get('scenario') or '') or None
+        seed_val = meta.get('seed')
+        try:
+            seed_val = int(seed_val) if seed_val is not None else full_prev.get('seed')
+        except Exception:
+            seed_val = full_prev.get('seed')
+
+        # Reconstruct hitl_config for template display from embedded full_preview fields.
+        hitl_config = {
+            'enabled': bool(full_prev.get('hitl_enabled')),
+            'interfaces': full_prev.get('hitl_interfaces') or [],
+            'scenario_key': full_prev.get('hitl_scenario_key') or (scenario_name or None),
+        }
+        try:
+            if full_prev.get('hitl_core'):
+                hitl_config['core'] = full_prev.get('hitl_core')
+        except Exception:
+            pass
+
+        display_artifacts = full_prev.get('display_artifacts')
+        if not display_artifacts:
+            try:
+                display_artifacts = _attach_display_artifacts(full_prev)
+            except Exception:
+                display_artifacts = {
+                    'segmentation': {
+                        'rows': [],
+                        'table_rows': [],
+                        'tableRows': [],
+                        'json': {'rules_count': 0, 'types_summary': {}, 'rules': [], 'metadata': None},
+                    },
+                    '__version': FULL_PREVIEW_ARTIFACT_VERSION,
+                }
+        segmentation_artifacts = (display_artifacts or {}).get('segmentation')
+
+        import json as _json
+        preview_json_str = _json.dumps(full_prev, indent=2, default=str)
+        xml_basename = None
+        try:
+            if xml_path:
+                xml_basename = os.path.basename(xml_path)
+        except Exception:
+            xml_basename = None
+
+        return render_template(
+            'full_preview.html',
+            full_preview=full_prev,
+            preview_json=preview_json_str,
+            xml_path=xml_path,
+            scenario=scenario_name,
+            seed=seed_val,
+            preview_plan_path=plan_path,
+            display_artifacts=display_artifacts,
+            segmentation_artifacts=segmentation_artifacts,
+            hitl_config=hitl_config,
+            xml_basename=xml_basename,
+            hide_chrome=embed,
+        )
+    except Exception as e:
+        app.logger.exception('[plan.full_preview_from_plan] error: %s', e)
+        flash(f'Full preview error: {e}')
         return redirect(url_for('index'))
 
 def _plan_summary_from_full_preview(full_prev: dict) -> dict:
@@ -15431,7 +24797,24 @@ def _plan_summary_from_full_preview(full_prev: dict) -> dict:
     routers_planned = len(full_prev.get('routers') or [])
     switches = full_prev.get('switches_detail') or []
     services_plan = full_prev.get('services_plan') or full_prev.get('services_preview') or {}
-    vuln_plan = full_prev.get('vulnerabilities_plan') or full_prev.get('vulnerabilities_preview') or {}
+    vuln_plan = full_prev.get('vulnerabilities_plan') or {}
+    if not vuln_plan:
+        # Backwards/compat: some payloads only have assignments-by-host.
+        # Derive planned counts by counting occurrences.
+        try:
+            vp = full_prev.get('vulnerabilities_preview') or {}
+            if isinstance(vp, dict):
+                counts: dict[str, int] = {}
+                for _hid, vv in vp.items():
+                    if isinstance(vv, list):
+                        for name in vv:
+                            s = str(name or '').strip()
+                            if s:
+                                counts[s] = counts.get(s, 0) + 1
+                if counts:
+                    vuln_plan = counts
+        except Exception:
+            pass
     r2r_policy = full_prev.get('r2r_policy_preview') or {}
     r2s_policy = full_prev.get('r2s_policy_preview') or {}
     summary = {
@@ -16116,6 +25499,446 @@ def _close_async_run_tunnel(meta: Dict[str, Any]) -> None:
             pass
 
 
+def _append_async_run_log_line(meta: Dict[str, Any] | None, line: str) -> None:
+    if not meta:
+        return
+    lp = meta.get('log_path')
+    if not lp:
+        return
+    try:
+        with open(lp, 'a', encoding='utf-8', buffering=1) as _f:
+            _f.write(line.rstrip('\n') + "\n")
+    except Exception:
+        pass
+
+
+def _maybe_copy_flow_artifacts_into_containers(meta: Dict[str, Any] | None, *, stage: str, log_prefix: str = '[remote] ') -> None:
+    if not meta:
+        return
+    if not meta.get('remote'):
+        return
+    if meta.get('flow_artifacts_copied'):
+        return
+    cfg = meta.get('core_cfg')
+    if not isinstance(cfg, dict):
+        return
+
+    try:
+        _log_remote_vulns_inventory(meta, stage=f'before_copy.{stage}', log_prefix=log_prefix)
+    except Exception:
+        pass
+
+    _append_async_run_log_line(meta, f"{log_prefix}=== docker.copy_flow_artifacts({stage}) ===")
+    try:
+        payload = _run_remote_python_json(
+            cfg,
+            _remote_copy_flow_artifacts_into_containers_script(cfg.get('ssh_password')),
+            logger=app.logger,
+            label=f'docker.copy_flow_artifacts({stage})',
+            timeout=180.0,
+        )
+        items = payload.get('items') if isinstance(payload, dict) else None
+        copied_total = len(items or []) if isinstance(items, list) else 0
+        copied_ok = (
+            sum(1 for it in (items or []) if isinstance(it, dict) and it.get('ok'))
+            if isinstance(items, list)
+            else 0
+        )
+        _append_async_run_log_line(
+            meta,
+            f"{log_prefix}docker.copy_flow_artifacts({stage}) complete ok={int(copied_ok)} total={int(copied_total)}",
+        )
+        if isinstance(items, list) and items:
+            for it in items[:25]:
+                if not isinstance(it, dict):
+                    continue
+                node = it.get('node')
+                ok = bool(it.get('ok'))
+                src = it.get('src')
+                dest = it.get('dest')
+                targets = it.get('targets')
+                err = it.get('error') or ''
+                errs = it.get('errors') or []
+                err_tail = ''
+                try:
+                    if err:
+                        err_tail = str(err)
+                    elif isinstance(errs, list) and errs:
+                        err_tail = _summarize_for_log(str(errs[0]))
+                except Exception:
+                    err_tail = ''
+                target_desc = None
+                try:
+                    if isinstance(targets, list) and targets:
+                        target_desc = ','.join(str(x) for x in targets[:3])
+                except Exception:
+                    target_desc = None
+                detail = f"node={node} ok={ok} src={src} dest={dest}"
+                if target_desc:
+                    detail += f" targets={target_desc}"
+                if err_tail:
+                    detail += f" error={err_tail}"
+                _append_async_run_log_line(meta, f"{log_prefix}{detail}")
+
+        # Verify: list /flow_artifacts inside target container(s) so logs prove the copy worked.
+        try:
+            verify_targets: List[str] = []
+            if isinstance(items, list):
+                for it in items:
+                    if not isinstance(it, dict) or not it.get('ok'):
+                        continue
+                    targets = it.get('targets')
+                    if isinstance(targets, list):
+                        for t in targets:
+                            name = str(t or '').strip()
+                            if name:
+                                verify_targets.append(name)
+            seen: set[str] = set()
+            uniq: List[str] = []
+            for t in verify_targets:
+                if t in seen:
+                    continue
+                seen.add(t)
+                uniq.append(t)
+                if len(uniq) >= 5:
+                    break
+
+            if uniq:
+                _append_async_run_log_line(meta, f"{log_prefix}=== docker.exec.verify_flow_artifacts({stage}) ===")
+                verify_payload = _run_remote_python_json(
+                    cfg,
+                    _remote_docker_exec_flow_artifacts_listing_script(
+                        containers=uniq,
+                        sudo_password=cfg.get('ssh_password'),
+                        max_find=200,
+                    ),
+                    logger=app.logger,
+                    label=f'docker.exec.verify_flow_artifacts({stage})',
+                    timeout=90.0,
+                )
+                vitems = verify_payload.get('items') if isinstance(verify_payload, dict) else None
+                if isinstance(vitems, list):
+                    for vit in vitems[:5]:
+                        if not isinstance(vit, dict):
+                            continue
+                        container = vit.get('container')
+                        ok2 = bool(vit.get('ok'))
+                        rc2 = vit.get('rc')
+                        out2 = vit.get('output') or ''
+                        _append_async_run_log_line(meta, f"{log_prefix}docker.exec.verify container={container} ok={ok2} rc={rc2}")
+                        for line in str(out2).splitlines()[:60]:
+                            _append_async_run_log_line(meta, f"{log_prefix}{line}")
+        except Exception as exc_verify:
+            _append_async_run_log_line(meta, f"{log_prefix}docker.exec.verify_flow_artifacts({stage}) failed: {exc_verify}")
+        meta['flow_artifacts_copied'] = True
+    except Exception as exc:
+        _append_async_run_log_line(meta, f"{log_prefix}docker.copy_flow_artifacts({stage}) failed: {exc}")
+
+
+def _remote_vulns_inventory_script(base_dir: str | None) -> str:
+    base_dir_literal = json.dumps(str(base_dir) if base_dir else '')
+    return (
+        r"""
+import glob, json, os
+
+BASE_DIR = __BASE_DIR_LITERAL__
+
+
+def _safe_exists(p: str) -> bool:
+    try:
+        return bool(p) and os.path.exists(p)
+    except Exception:
+        return False
+
+
+def _first_existing(paths):
+    for p in paths:
+        if not p:
+            continue
+        if _safe_exists(p):
+            return p
+    return None
+
+
+def _list_dirs(pattern: str, limit: int = 10):
+    out = []
+    try:
+        for p in sorted(glob.glob(pattern)):
+            try:
+                if os.path.isdir(p):
+                    out.append(p)
+            except Exception:
+                continue
+            if len(out) >= limit:
+                break
+    except Exception:
+        return []
+    return out
+
+
+def _count_files_under(path: str, limit: int = 2000) -> int:
+    count = 0
+    try:
+        for _, _, files in os.walk(path):
+            count += len(files or [])
+            if count >= limit:
+                return limit
+    except Exception:
+        return -1
+    return count
+
+
+def main():
+    base = BASE_DIR or os.environ.get('CORE_REMOTE_BASE_DIR') or '/tmp/core-topo-gen'
+    base = os.path.abspath(base)
+    candidates = {
+        'base_dir': base,
+        'tmp_vulns': '/tmp/vulns',
+        'base_vulns': os.path.join(base, 'vulns'),
+        'base_outputs_vulns': os.path.join(base, 'outputs', 'vulns'),
+    }
+
+    assignments_candidates = [
+        os.path.join(base, 'vulns', 'compose_assignments.json'),
+        os.path.join(base, 'outputs', 'vulns', 'compose_assignments.json'),
+        os.path.join(base, 'compose_assignments.json'),
+        '/tmp/vulns/compose_assignments.json',
+    ]
+    assignments_path = _first_existing(assignments_candidates)
+
+    run_dirs = []
+    for root in (candidates.get('tmp_vulns'), candidates.get('base_vulns'), candidates.get('base_outputs_vulns')):
+        if not root:
+            continue
+        run_dirs.extend(_list_dirs(os.path.join(root, 'flag_generators_runs', '*'), limit=10))
+        run_dirs.extend(_list_dirs(os.path.join(root, 'flag_node_generators_runs', '*'), limit=10))
+
+    run_dir_summaries = []
+    for p in run_dirs[:10]:
+        run_dir_summaries.append({
+            'path': p,
+            'files': _count_files_under(p, limit=2000),
+        })
+
+    payload = {
+        'ok': True,
+        'base_dir': base,
+        'paths': {k: {'path': v, 'exists': _safe_exists(v)} for k, v in candidates.items()},
+        'compose_assignments': {
+            'candidates': assignments_candidates,
+            'found': assignments_path,
+            'found_exists': bool(assignments_path and _safe_exists(assignments_path)),
+        },
+        'run_dirs': run_dir_summaries,
+    }
+    print(json.dumps(payload))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__BASE_DIR_LITERAL__', base_dir_literal)
+
+
+def _log_remote_vulns_inventory(meta: Dict[str, Any] | None, *, stage: str, log_prefix: str = '[remote] ') -> None:
+    if not meta or not meta.get('remote'):
+        return
+    cfg = meta.get('core_cfg')
+    if not isinstance(cfg, dict):
+        return
+    base_dir = meta.get('remote_base_dir') or (meta.get('remote_context') or {}).get('base_dir')
+
+    _append_async_run_log_line(meta, f"{log_prefix}=== remote.vulns_inventory({stage}) ===")
+    try:
+        payload = _run_remote_python_json(
+            cfg,
+            _remote_vulns_inventory_script(str(base_dir) if base_dir else None),
+            logger=app.logger,
+            label=f'remote.vulns_inventory({stage})',
+            timeout=60.0,
+        )
+    except Exception as exc:
+        _append_async_run_log_line(meta, f"{log_prefix}remote.vulns_inventory({stage}) failed: {exc}")
+        return
+
+    try:
+        base = payload.get('base_dir') if isinstance(payload, dict) else None
+        if base:
+            _append_async_run_log_line(meta, f"{log_prefix}CORE_REMOTE_BASE_DIR={base}")
+    except Exception:
+        pass
+    try:
+        paths = payload.get('paths') if isinstance(payload, dict) else None
+        if isinstance(paths, dict):
+            for key in ('tmp_vulns', 'base_vulns', 'base_outputs_vulns'):
+                entry = paths.get(key)
+                if isinstance(entry, dict):
+                    _append_async_run_log_line(
+                        meta,
+                        f"{log_prefix}{key} path={entry.get('path')} exists={bool(entry.get('exists'))}",
+                    )
+    except Exception:
+        pass
+    try:
+        ca = payload.get('compose_assignments') if isinstance(payload, dict) else None
+        if isinstance(ca, dict):
+            _append_async_run_log_line(
+                meta,
+                f"{log_prefix}compose_assignments found={ca.get('found')} exists={bool(ca.get('found_exists'))}",
+            )
+    except Exception:
+        pass
+    try:
+        runs = payload.get('run_dirs') if isinstance(payload, dict) else None
+        if isinstance(runs, list) and runs:
+            _append_async_run_log_line(meta, f"{log_prefix}run_dirs found={len(runs)} (showing up to 10)")
+            for it in runs[:10]:
+                if not isinstance(it, dict):
+                    continue
+                _append_async_run_log_line(meta, f"{log_prefix}run_dir path={it.get('path')} files={it.get('files')}")
+        else:
+            _append_async_run_log_line(meta, f"{log_prefix}run_dirs found=0")
+    except Exception:
+        pass
+
+
+def _log_remote_vulns_inventory_to_handle(
+    *,
+    core_cfg: Dict[str, Any],
+    log_handle: Any,
+    stage: str,
+    base_dir: str | None = None,
+    log_prefix: str = '[remote] ',
+) -> None:
+    """Write the same inventory info as _log_remote_vulns_inventory, but without requiring RUNS meta.
+
+    This is useful for early-run diagnostics before RUNS[run_id] is populated, or
+    in failure paths where we never reach the postrun copy stage.
+    """
+    try:
+        log_handle.write(f"{log_prefix}=== remote.vulns_inventory({stage}) ===\n")
+    except Exception:
+        return
+
+    try:
+        payload = _run_remote_python_json(
+            core_cfg,
+            _remote_vulns_inventory_script(str(base_dir) if base_dir else None),
+            logger=app.logger,
+            label=f'remote.vulns_inventory({stage})',
+            timeout=60.0,
+        )
+    except Exception as exc:
+        try:
+            log_handle.write(f"{log_prefix}remote.vulns_inventory({stage}) failed: {exc}\n")
+        except Exception:
+            pass
+        return
+
+    def _w(line: str) -> None:
+        try:
+            log_handle.write(line.rstrip('\n') + "\n")
+        except Exception:
+            pass
+
+    try:
+        base = payload.get('base_dir') if isinstance(payload, dict) else None
+        if base:
+            _w(f"{log_prefix}CORE_REMOTE_BASE_DIR={base}")
+    except Exception:
+        pass
+    try:
+        paths = payload.get('paths') if isinstance(payload, dict) else None
+        if isinstance(paths, dict):
+            for key in ('tmp_vulns', 'base_vulns', 'base_outputs_vulns'):
+                entry = paths.get(key)
+                if isinstance(entry, dict):
+                    _w(f"{log_prefix}{key} path={entry.get('path')} exists={bool(entry.get('exists'))}")
+    except Exception:
+        pass
+    try:
+        ca = payload.get('compose_assignments') if isinstance(payload, dict) else None
+        if isinstance(ca, dict):
+            _w(f"{log_prefix}compose_assignments found={ca.get('found')} exists={bool(ca.get('found_exists'))}")
+    except Exception:
+        pass
+    try:
+        runs = payload.get('run_dirs') if isinstance(payload, dict) else None
+        if isinstance(runs, list) and runs:
+            _w(f"{log_prefix}run_dirs found={len(runs)} (showing up to 10)")
+            for it in runs[:10]:
+                if not isinstance(it, dict):
+                    continue
+                _w(f"{log_prefix}run_dir path={it.get('path')} files={it.get('files')}")
+        else:
+            _w(f"{log_prefix}run_dirs found=0")
+    except Exception:
+        pass
+
+
+def _remote_docker_exec_flow_artifacts_listing_script(
+    *,
+    containers: List[str],
+    sudo_password: str | None = None,
+    max_find: int = 200,
+) -> str:
+    containers_literal = json.dumps([str(x) for x in (containers or [])])
+    sudo_password_literal = json.dumps(str(sudo_password) if sudo_password else "")
+    max_find_literal = json.dumps(int(max_find))
+    return (
+        r"""
+import json, subprocess
+
+CONTAINERS = __CONTAINERS_LITERAL__
+SUDO_PASSWORD = __SUDO_PASSWORD_LITERAL__
+MAX_FIND = __MAX_FIND_LITERAL__
+
+
+def _run(cmd, timeout=25):
+    try:
+        p = subprocess.run(['sudo', '-n'] + list(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        if SUDO_PASSWORD:
+            return subprocess.run(
+                ['sudo', '-S', '-k', '-p', ''] + list(cmd),
+                input=str(SUDO_PASSWORD) + "\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout,
+            )
+        return p
+    except Exception as e:
+        return subprocess.CompletedProcess(cmd, 127, stdout=str(e))
+
+
+def main():
+    items = []
+    for c in CONTAINERS:
+        c = str(c or '').strip()
+        if not c:
+            continue
+        shell = (
+            'set -e; '
+            'echo "--- ls -la /flow_artifacts ---"; '
+            'ls -la /flow_artifacts 2>&1 || true; '
+            'echo "--- find /flow_artifacts (files) ---"; '
+            f"find /flow_artifacts -maxdepth 3 -type f -print 2>/dev/null | head -n {MAX_FIND} || true; "
+        )
+        p = _run(['docker', 'exec', c, 'sh', '-lc', shell], timeout=25)
+        items.append({'container': c, 'ok': p.returncode == 0, 'rc': int(p.returncode), 'output': (p.stdout or '')})
+    print(json.dumps({'ok': True, 'items': items}))
+
+
+if __name__ == '__main__':
+    main()
+"""
+    ).replace('__CONTAINERS_LITERAL__', containers_literal) \
+     .replace('__SUDO_PASSWORD_LITERAL__', sudo_password_literal) \
+     .replace('__MAX_FIND_LITERAL__', max_find_literal)
+
+
 @app.route('/run_cli_async', methods=['POST'])
 def run_cli_async():
     seed = None
@@ -16130,7 +25953,14 @@ def run_cli_async():
     adv_run_core_cleanup = False
     adv_check_core_version = False
     adv_restart_core_daemon = False
+    adv_start_core_daemon = False
     adv_auto_kill_sessions = False
+    docker_remove_conflicts = False
+    docker_cleanup_before_run = False
+    docker_remove_all_containers = False
+    overwrite_existing_images = False
+    upload_only_injected_artifacts = False
+    scenarios_inline = None
     # Prefer form fields (existing UI) but fall back to JSON
     if request.form:
         xml_path = request.form.get('xml_path')
@@ -16164,11 +25994,23 @@ def run_cli_async():
         adv_run_core_cleanup = _coerce_bool(request.form.get('adv_run_core_cleanup'))
         adv_check_core_version = _coerce_bool(request.form.get('adv_check_core_version'))
         adv_restart_core_daemon = _coerce_bool(request.form.get('adv_restart_core_daemon'))
+        adv_start_core_daemon = _coerce_bool(request.form.get('adv_start_core_daemon'))
         adv_auto_kill_sessions = _coerce_bool(request.form.get('adv_auto_kill_sessions'))
+        docker_remove_conflicts = _coerce_bool(request.form.get('docker_remove_conflicts'))
+        docker_cleanup_before_run = _coerce_bool(request.form.get('docker_cleanup_before_run'))
+        docker_remove_all_containers = _coerce_bool(
+            request.form.get('docker_remove_all_containers')
+        ) or _coerce_bool(request.form.get('docker_nuke_all'))
+        overwrite_existing_images = _coerce_bool(request.form.get('overwrite_existing_images'))
+        upload_only_injected_artifacts = _coerce_bool(
+            request.form.get('upload_only_injected_artifacts')
+            or request.form.get('upload_only_injected')
+        )
     if not xml_path:
         try:
             j = request.get_json(silent=True) or {}
             xml_path = j.get('xml_path')
+            scenarios_inline = j.get('scenarios')
             if 'seed' in j:
                 try: seed = int(j.get('seed'))
                 except Exception: seed = None
@@ -16191,11 +26033,65 @@ def run_cli_async():
             adv_run_core_cleanup = _coerce_bool(j.get('adv_run_core_cleanup'))
             adv_check_core_version = _coerce_bool(j.get('adv_check_core_version'))
             adv_restart_core_daemon = _coerce_bool(j.get('adv_restart_core_daemon'))
+            adv_start_core_daemon = _coerce_bool(j.get('adv_start_core_daemon'))
             adv_auto_kill_sessions = _coerce_bool(j.get('adv_auto_kill_sessions'))
+            docker_remove_conflicts = _coerce_bool(j.get('docker_remove_conflicts'))
+            docker_cleanup_before_run = _coerce_bool(j.get('docker_cleanup_before_run'))
+            docker_remove_all_containers = _coerce_bool(
+                j.get('docker_remove_all_containers')
+            ) or _coerce_bool(j.get('docker_nuke_all'))
+            overwrite_existing_images = _coerce_bool(j.get('overwrite_existing_images'))
+            upload_only_injected_artifacts = _coerce_bool(
+                j.get('upload_only_injected_artifacts')
+                or j.get('upload_only_injected')
+            )
         except Exception:
             pass
     if not xml_path:
-        return jsonify({"error": "XML path missing. Save XML first."}), 400
+        # Builder/participant roles may execute without saving by posting scenarios/core.
+        if isinstance(scenarios_inline, list):
+            try:
+                # Build a temporary XML for this run.
+                core_meta = core_override if isinstance(core_override, dict) else None
+                normalized_core = _normalize_core_config(core_meta, include_password=True) if core_meta else None
+                tree = _build_scenarios_xml({ 'scenarios': scenarios_inline, 'core': normalized_core })
+                ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+                run_tag = str(uuid.uuid4())[:8]
+                out_dir = os.path.join(_outputs_dir(), f'tmp-exec-{ts}-{run_tag}')
+                os.makedirs(out_dir, exist_ok=True)
+                # Filename hint: active scenario name if available, else generic.
+                stem_raw = None
+                try:
+                    if scenario_name_hint:
+                        stem_raw = str(scenario_name_hint)
+                except Exception:
+                    stem_raw = None
+                if not stem_raw:
+                    try:
+                        first_name = None
+                        for sc in scenarios_inline:
+                            if isinstance(sc, dict) and sc.get('name'):
+                                first_name = sc.get('name')
+                                break
+                        stem_raw = first_name or 'scenarios'
+                    except Exception:
+                        stem_raw = 'scenarios'
+                stem = secure_filename(str(stem_raw)).strip('_-.') or 'scenarios'
+                xml_path = os.path.join(out_dir, f"{stem}.xml")
+                # Pretty print when possible
+                try:
+                    from lxml import etree as LET  # type: ignore
+                    raw = ET.tostring(tree.getroot(), encoding='utf-8')
+                    lroot = LET.fromstring(raw)
+                    pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+                    with open(xml_path, 'wb') as f:
+                        f.write(pretty)
+                except Exception:
+                    tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+            except Exception as exc:
+                return jsonify({"error": f"Failed to render XML for execution: {exc}"}), 400
+        else:
+            return jsonify({"error": "XML path missing. Save XML first."}), 400
     xml_path = os.path.abspath(xml_path)
     if not os.path.exists(xml_path) and '/outputs/' in xml_path:
         try:
@@ -16203,6 +26099,14 @@ def run_cli_async():
             if alt != xml_path and os.path.exists(alt):
                 app.logger.info("[async] Remapped XML path %s -> %s", xml_path, alt)
                 xml_path = alt
+        except Exception:
+            pass
+    if not os.path.exists(xml_path):
+        try:
+            recovered = _try_resolve_latest_outputs_xml(xml_path)
+            if recovered and os.path.exists(recovered):
+                app.logger.warning('[async] XML path missing; recovered to newest match: %s -> %s', xml_path, recovered)
+                xml_path = recovered
         except Exception:
             pass
     if not os.path.exists(xml_path):
@@ -16214,12 +26118,41 @@ def run_cli_async():
             plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
             if os.path.commonpath([preview_plan_path, plans_dir]) != plans_dir:
                 app.logger.warning('[async] preview plan outside allowed directory: %s', preview_plan_path)
+                try:
+                    log_f.write(f"[async] preview plan rejected (outside outputs/plans): {preview_plan_path}\n")
+                except Exception:
+                    pass
                 preview_plan_path = None
             elif not os.path.exists(preview_plan_path):
                 app.logger.warning('[async] preview plan path missing: %s', preview_plan_path)
+                try:
+                    log_f.write(f"[async] preview plan rejected (missing): {preview_plan_path}\n")
+                except Exception:
+                    pass
                 preview_plan_path = None
         except Exception:
             preview_plan_path = None
+
+    # If no preview plan path was provided (or it was rejected), but the user has
+    # saved a Flag Sequencing (flow) plan for this scenario, use it automatically.
+    # Without a plan, the CLI will execute with 0 flows (no flags/generators).
+    if not preview_plan_path:
+        try:
+            scenario_norm = None
+            if scenario_name_hint:
+                scenario_norm = _normalize_scenario_label(str(scenario_name_hint))
+            if not scenario_norm and isinstance(scenario_payload, dict) and isinstance(scenario_payload.get('name'), str):
+                scenario_norm = _normalize_scenario_label(str(scenario_payload.get('name') or ''))
+            if scenario_norm:
+                flow_plan = _latest_flow_plan_for_scenario_norm(scenario_norm)
+                if flow_plan and os.path.exists(flow_plan):
+                    preview_plan_path = os.path.abspath(flow_plan)
+                    try:
+                        log_f.write(f"[async] Auto-selected flow plan for scenario={scenario_norm}: {preview_plan_path}\n")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     # Skip schema validation: format differs from CORE XML
     run_id = str(uuid.uuid4())
     out_dir = os.path.dirname(xml_path)
@@ -16279,6 +26212,44 @@ def run_cli_async():
         scenario_core_override if isinstance(scenario_core_override, dict) else None,
         include_password=True,
     )
+    # Flag Sequencing (flow.html) invokes /run_cli_async via JSON without sending core config.
+    # In that case, we must honor the "Select CORE VM" dialog (including ssh_port) rather than
+    # defaulting to backend/env values.
+    try:
+        request_provided_core = bool(
+            (isinstance(core_override, dict) and core_override)
+            or (isinstance(scenario_core_override, dict) and scenario_core_override)
+        )
+        history = _load_run_history()
+        scenario_for_secret = None
+        try:
+            scenario_for_secret = _normalize_scenario_label(str(scenario_name_hint or '').strip())
+        except Exception:
+            scenario_for_secret = None
+        if not scenario_for_secret:
+            try:
+                if isinstance(scenario_payload, dict) and isinstance(scenario_payload.get('name'), str):
+                    scenario_for_secret = _normalize_scenario_label(str(scenario_payload.get('name') or '').strip())
+            except Exception:
+                scenario_for_secret = None
+
+        selected_cfg = None
+        if scenario_for_secret:
+            selected_cfg = _select_core_config_for_page(scenario_for_secret, history, include_password=True)
+
+        pw_raw = core_cfg.get('ssh_password') if isinstance(core_cfg, dict) else None
+        pw_ok = bool(str(pw_raw).strip()) if pw_raw not in (None, '') else False
+
+        if request_provided_core:
+            # Only fill missing secrets; do not override request-provided host/ports.
+            if selected_cfg and not pw_ok:
+                core_cfg = _merge_core_configs(selected_cfg, core_cfg, include_password=True)
+        else:
+            # Only auto-select a saved CORE config when we have a scenario label.
+            if selected_cfg:
+                core_cfg = _merge_core_configs(core_cfg, selected_cfg, include_password=True)
+    except Exception:
+        pass
     try:
         core_cfg = _require_core_ssh_credentials(core_cfg)
     except _SSHTunnelError as exc:
@@ -16387,43 +26358,10 @@ def run_cli_async():
             blocking.append(entry)
         return blocking
 
-    blocking_sessions = _collect_blocking_sessions()
-    if blocking_sessions and not adv_auto_kill_sessions:
-        count = len(blocking_sessions)
-        message = (
-            f"CORE VM {remote_desc} already has {count} active session(s); finish or stop the running scenario before starting another."
-        )
-        try:
-            log_f.write(f"[remote] {message}\n")
-        except Exception:
-            pass
-        try:
-            log_f.close()
-        except Exception:
-            pass
-        payload = {
-            "error": message,
-            "session_count": count,
-            "core_host": core_host,
-            "core_port": core_port,
-            "active_sessions": [
-                {
-                    "id": entry.get('id'),
-                    "state": entry.get('state'),
-                    "nodes": entry.get('nodes'),
-                    "file": entry.get('file'),
-                }
-                for entry in blocking_sessions[:5]
-            ],
-        }
-        return jsonify(payload), 423
-    if blocking_sessions and adv_auto_kill_sessions:
-        try:
-            log_f.write(
-                f"[remote] NOTE: CORE VM {remote_desc} has {len(blocking_sessions)} active session(s); Advanced option will attempt to delete them before running.\n"
-            )
-        except Exception:
-            pass
+    # Check for active session conflicts early so we can block quickly without requiring SSH
+    # tunnel or remote docker access.
+    # NOTE: Active-session checks are performed later, after SSH is confirmed and any
+    # selected cleanup actions are executed.
     app.logger.info("[async] CORE remote=%s (ssh_enabled=%s)", remote_desc, core_cfg.get('ssh_enabled'))
     pre_saved = None
     # Establish SSH tunnel so CLI subprocess can reach CORE
@@ -16571,6 +26509,7 @@ def run_cli_async():
             except Exception:
                 pass
 
+    # (Scenario tag + Docker existing-image precheck runs later, after cleanup actions.)
     def _check_core_version(required: str = '9.2.1') -> None:
         candidates = [
             "sh -c 'timeout 6s core-daemon --version 2>/dev/null || true'",
@@ -16826,6 +26765,10 @@ def run_cli_async():
             except Exception as exc:
                 errors.append(f"Failed deleting session {sid}: {exc}")
         return deleted, errors
+
+    # These are populated during preflight; initialize so later code can safely reference them.
+    active_scenario_name = None
+    scenario_tag = _safe_name('scenario')
     try:
         log_f.write(f"{log_prefix}=== CORE services startup (core-daemon) ===\n")
         _write_sse_marker(
@@ -16851,17 +26794,7 @@ def run_cli_async():
             )
         except Exception:
             pass
-        if adv_check_core_version:
-            try:
-                log_f.write(f"{log_prefix}=== Advanced: Check CORE version (expected 9.2.1) ===\n")
-            except Exception:
-                pass
-            _check_core_version('9.2.1')
-            try:
-                log_f.write(f"{log_prefix}CORE version check passed.\n")
-            except Exception:
-                pass
-
+        # Cleanup actions MUST run before any checks.
         if adv_fix_docker_daemon:
             try:
                 log_f.write(f"{log_prefix}=== Advanced: Fix docker daemon for CORE ===\n")
@@ -16881,6 +26814,303 @@ def run_cli_async():
             _maybe_core_cleanup()
             try:
                 log_f.write(f"{log_prefix}CORE cleanup complete.\n")
+            except Exception:
+                pass
+
+        if docker_remove_all_containers:
+            try:
+                log_f.write(f"{log_prefix}=== Docker: REMOVE ALL containers (DANGEROUS) ===\n")
+                _write_sse_marker(
+                    log_f,
+                    'phase',
+                    {
+                        'stage': 'docker.remove_all_containers.prerun',
+                        'detail': 'Removing ALL docker containers',
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                payload = _run_remote_python_json(
+                    core_cfg,
+                    _remote_docker_remove_all_containers_script(core_cfg.get('ssh_password')),
+                    logger=app.logger,
+                    label='docker.remove_all_containers(prerun)',
+                    timeout=900.0,
+                )
+                try:
+                    if isinstance(payload, dict):
+                        c = payload.get('containers') or {}
+                        log_f.write(
+                            f"{log_prefix}Remove-all summary: containers_found={c.get('found')} removed_attempted={c.get('removed_attempted')}\n"
+                        )
+                except Exception:
+                    pass
+            except Exception as exc:
+                try:
+                    log_f.write(f"{log_prefix}Docker remove-all-containers skipped/failed: {exc}\n")
+                except Exception:
+                    pass
+
+        if docker_cleanup_before_run:
+            try:
+                log_f.write(f"{log_prefix}=== Docker: cleanup before run (containers + wrapper images) ===\n")
+                _write_sse_marker(
+                    log_f,
+                    'phase',
+                    {
+                        'stage': 'docker.cleanup.prerun',
+                        'detail': 'Stopping/removing vuln containers and wrapper images',
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                status_payload = _run_remote_python_json(
+                    core_cfg,
+                    _remote_docker_status_script(core_cfg.get('ssh_password')),
+                    logger=app.logger,
+                    label='docker.status(for prerun cleanup)',
+                    timeout=60.0,
+                )
+                names: list[str] = []
+                if isinstance(status_payload, dict) and isinstance(status_payload.get('items'), list):
+                    for it in status_payload.get('items') or []:
+                        if isinstance(it, dict) and it.get('name'):
+                            names.append(str(it.get('name')))
+                if names:
+                    try:
+                        log_f.write(f"{log_prefix}Docker containers to cleanup: {', '.join(names[:20])}{' ...' if len(names) > 20 else ''}\n")
+                    except Exception:
+                        pass
+                    _run_remote_python_json(
+                        core_cfg,
+                        _remote_docker_cleanup_script(names, core_cfg.get('ssh_password')),
+                        logger=app.logger,
+                        label='docker.cleanup(prerun)',
+                        timeout=120.0,
+                    )
+                else:
+                    try:
+                        log_f.write(f"{log_prefix}No vuln docker-compose node names found for cleanup.\n")
+                    except Exception:
+                        pass
+
+                payload = _run_remote_python_json(
+                    core_cfg,
+                    _remote_docker_remove_wrapper_images_script(core_cfg.get('ssh_password')),
+                    logger=app.logger,
+                    label='docker.wrapper_images.cleanup(prerun)',
+                    timeout=180.0,
+                )
+                try:
+                    removed = payload.get('removed') if isinstance(payload, dict) else None
+                    if isinstance(removed, list) and removed:
+                        log_f.write(f"{log_prefix}Removed wrapper images: {', '.join(str(x) for x in removed[:12])}{' ...' if len(removed) > 12 else ''}\n")
+                    else:
+                        log_f.write(f"{log_prefix}No wrapper images removed (or none found).\n")
+                except Exception:
+                    pass
+            except Exception as exc:
+                try:
+                    log_f.write(f"{log_prefix}Pre-run docker cleanup skipped/failed: {exc}\n")
+                except Exception:
+                    pass
+
+        # Determine active scenario name for tag scoping and CLI args.
+        active_scenario_name = None
+        if scenario_name_hint:
+            active_scenario_name = scenario_name_hint
+        elif scen_names and len(scen_names) > 0:
+            active_scenario_name = scen_names[0]
+
+        # Scope wrapper images by upload/scenario to avoid cross-scenario image reuse.
+        try:
+            out_dir_for_tag = os.path.dirname(xml_path) if xml_path else ''
+            upload_base = os.path.basename(out_dir_for_tag) if out_dir_for_tag else ''
+            parts = []
+            if upload_base:
+                parts.append(upload_base)
+            if active_scenario_name:
+                parts.append(active_scenario_name)
+            if run_id:
+                parts.append(str(run_id)[:8])
+            scenario_tag = _safe_name('-'.join(parts) if parts else (active_scenario_name or 'scenario'))
+        except Exception:
+            scenario_tag = _safe_name(active_scenario_name or 'scenario')
+
+        # Pre-run safety check: existing scenario-scoped images -> prompt abort/overwrite.
+        existing_images: list[str] = []
+        try:
+            prefix_repo = f"coretg/{scenario_tag}-"
+            cmd = "docker images --format '{{.Repository}}:{{.Tag}}'"
+            rc, out, _err = _exec_sudo(cmd, timeout=35.0, stage='docker.images.check')
+            if rc == 0:
+                for ln in (out or '').splitlines():
+                    ln = (ln or '').strip()
+                    if not ln or ln.startswith('<none>:'):
+                        continue
+                    if ln.startswith(prefix_repo):
+                        existing_images.append(ln)
+        except Exception:
+            existing_images = []
+        if existing_images:
+            try:
+                log_f.write(
+                    f"{log_prefix}Found {len(existing_images)} existing scenario image(s) on CORE VM for tag '{scenario_tag}'.\n"
+                )
+                log_f.write(
+                    f"{log_prefix}Existing images: {', '.join(existing_images[:8])}{' ...' if len(existing_images) > 8 else ''}\n"
+                )
+            except Exception:
+                pass
+            if not overwrite_existing_images:
+                try:
+                    _write_sse_marker(
+                        log_f,
+                        'phase',
+                        {
+                            'stage': 'docker.images.precheck',
+                            'detail': 'Existing scenario images detected; awaiting overwrite confirmation',
+                            'scenario_tag': scenario_tag,
+                            'existing_images': existing_images[:25],
+                        },
+                    )
+                except Exception:
+                    pass
+                try:
+                    remote_client.close()
+                except Exception:
+                    pass
+                try:
+                    log_f.close()
+                except Exception:
+                    pass
+                _close_async_run_tunnel({'ssh_tunnel': ssh_tunnel})
+                return jsonify({
+                    'error': 'Existing scenario-scoped Docker images detected on the CORE VM.',
+                    'kind': 'existing_images',
+                    'scenario_tag': scenario_tag,
+                    'existing_images': existing_images,
+                    'can_overwrite': True,
+                }), 412
+
+            # Overwrite: remove any containers using these images, then remove the images.
+            try:
+                log_f.write(f"{log_prefix}Overwrite confirmed; removing existing scenario images…\n")
+                _write_sse_marker(
+                    log_f,
+                    'phase',
+                    {
+                        'stage': 'docker.images.overwrite',
+                        'detail': 'Removing existing scenario images before execution',
+                        'scenario_tag': scenario_tag,
+                        'count': len(existing_images),
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                images_json = json.dumps(existing_images)
+                py_rm = (
+                    "import os, json, subprocess\n"
+                    "imgs=json.loads(os.environ.get('IMAGES_JSON','[]'))\n"
+                    "removed=[]\nfailed=[]\n"
+                    "for img in imgs:\n"
+                    "  if not img or '<none>' in img: continue\n"
+                    "  try:\n"
+                    "    ids=subprocess.check_output(['docker','ps','-aq','--filter',f'ancestor={img}'], text=True, stderr=subprocess.STDOUT).split()\n"
+                    "  except Exception:\n"
+                    "    ids=[]\n"
+                    "  if ids:\n"
+                    "    try:\n"
+                    "      subprocess.run(['docker','rm','-f']+ids, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\n"
+                    "    except Exception:\n"
+                    "      pass\n"
+                    "  p=subprocess.run(['docker','rmi','-f',img], check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\n"
+                    "  if int(p.returncode or 0)==0:\n"
+                    "    removed.append(img)\n"
+                    "  else:\n"
+                    "    failed.append({'image':img,'out':(p.stdout or '').strip()})\n"
+                    "print('removed=' + str(len(removed)) + ' failed=' + str(len(failed)))\n"
+                    "for item in failed[:5]:\n"
+                    "  print('FAIL ' + item.get('image','') + ' ' + (item.get('out','')[:200]))\n"
+                )
+                cmd = f"IMAGES_JSON={shlex.quote(images_json)} python3 -c {shlex.quote(py_rm)}"
+                _exec_sudo(cmd, timeout=180.0, stage='docker.images.overwrite')
+            except Exception as exc:
+                try:
+                    log_f.write(f"{log_prefix}Failed removing existing scenario images: {exc}\n")
+                except Exception:
+                    pass
+                try:
+                    remote_client.close()
+                except Exception:
+                    pass
+                try:
+                    log_f.close()
+                except Exception:
+                    pass
+                _close_async_run_tunnel({'ssh_tunnel': ssh_tunnel})
+                return jsonify({
+                    'error': f'Failed removing existing scenario images on CORE VM: {exc}',
+                    'kind': 'existing_images_overwrite_failed',
+                    'scenario_tag': scenario_tag,
+                }), 500
+
+        # Now that SSH is confirmed and cleanup has run, block on active session conflicts.
+        blocking_sessions = _collect_blocking_sessions()
+        if blocking_sessions and not adv_auto_kill_sessions:
+            count = len(blocking_sessions)
+            message = (
+                f"CORE VM {remote_desc} already has {count} active session(s); finish or stop the running scenario before starting another."
+            )
+            try:
+                log_f.write(f"[remote] {message}\n")
+            except Exception:
+                pass
+            try:
+                remote_client.close()
+            except Exception:
+                pass
+            try:
+                log_f.close()
+            except Exception:
+                pass
+            _close_async_run_tunnel({'ssh_tunnel': ssh_tunnel})
+            payload = {
+                "error": message,
+                "session_count": count,
+                "core_host": core_host,
+                "core_port": core_port,
+                "active_sessions": [
+                    {
+                        "id": entry.get('id'),
+                        "state": entry.get('state'),
+                        "nodes": entry.get('nodes'),
+                        "file": entry.get('file'),
+                    }
+                    for entry in blocking_sessions[:5]
+                ],
+            }
+            return jsonify(payload), 423
+        if blocking_sessions and adv_auto_kill_sessions:
+            try:
+                log_f.write(
+                    f"[remote] NOTE: CORE VM {remote_desc} has {len(blocking_sessions)} active session(s); Advanced option will attempt to delete them before running.\n"
+                )
+            except Exception:
+                pass
+
+        # Checks run after cleanup actions.
+        if adv_check_core_version:
+            try:
+                log_f.write(f"{log_prefix}=== Advanced: Check CORE version (expected 9.2.1) ===\n")
+            except Exception:
+                pass
+            _check_core_version('9.2.1')
+            try:
+                log_f.write(f"{log_prefix}CORE version check passed.\n")
             except Exception:
                 pass
 
@@ -17012,6 +27242,13 @@ def run_cli_async():
             }
             return jsonify(payload), 423
 
+    # Always emit a remote filesystem inventory early so Execute logs show whether
+    # /tmp/vulns artifacts exist on the CORE VM even if the run fails before postrun.
+    try:
+        _log_remote_vulns_inventory_to_handle(core_cfg=core_cfg, log_handle=log_f, stage='pre_run')
+    except Exception:
+        pass
+
     try:
         remote_ctx = _prepare_remote_cli_context(
             client=remote_client,
@@ -17019,6 +27256,7 @@ def run_cli_async():
             xml_path=xml_path,
             preview_plan_path=preview_plan_path,
             log_handle=log_f,
+            upload_only_injected_artifacts=bool(upload_only_injected_artifacts),
         )
         try:
             log_f.write(f"{log_prefix}Workspace: repo={remote_ctx.get('repo_dir')} run_dir={remote_ctx.get('run_dir')}\n")
@@ -17127,14 +27365,7 @@ def run_cli_async():
             pass
         _close_async_run_tunnel({'ssh_tunnel': ssh_tunnel})
         return jsonify({"error": str(exc)}), 500
-    # Determine active scenario name and pass to CLI
-    active_scenario_name = None
-    if scenario_name_hint:
-        active_scenario_name = scenario_name_hint
-    elif scenario_payload and isinstance(scenario_payload.get('name'), str):
-        active_scenario_name = scenario_payload.get('name')
-    elif scen_names and len(scen_names) > 0:
-        active_scenario_name = scen_names[0]
+    # NOTE: docker cleanup steps are executed earlier in the run (before checks).
     cli_args = [
         remote_python,
         '-u',
@@ -17148,6 +27379,8 @@ def run_cli_async():
         str(core_port),
         '--verbose',
     ]
+    if docker_remove_conflicts:
+        cli_args.append('--docker-remove-conflicts')
     if seed is not None:
         cli_args.extend(['--seed', str(seed)])
     if active_scenario_name:
@@ -17164,9 +27397,41 @@ def run_cli_async():
     if venv_bin_remote:
         activate_path = posixpath.join(venv_bin_remote.rstrip('/'), 'activate')
         activate_prefix = f". {shlex.quote(activate_path)} >/dev/null 2>&1 || true; "
-    remote_command = f"{activate_prefix}cd {shlex.quote(work_dir)} && PYTHONUNBUFFERED=1 {cli_cmd}"
+    # In remote CORE VM mode, docker operations happen on the remote host.
+    # Many CORE VMs require sudo for docker access (no docker group membership).
+    # We enable sudo mode for docker commands and, when a password is available,
+    # provide it via stdin to avoid leaking secrets in the command line.
+    docker_env_parts: list[str] = []
+    try:
+        if _coerce_bool(core_cfg.get('ssh_enabled')):
+            docker_env_parts.append('CORETG_DOCKER_USE_SUDO=1')
+            # Fail fast if docker compose pull fails (we surface the error and cancel the run).
+            docker_env_parts.append('CORETG_DOCKER_STRICT_PULL=1')
+            if core_cfg.get('ssh_password'):
+                docker_env_parts.append('CORETG_DOCKER_SUDO_PASSWORD_STDIN=1')
+    except Exception:
+        docker_env_parts = []
+    docker_env_prefix = (' '.join(docker_env_parts) + ' ') if docker_env_parts else ''
+    flow_env_parts: list[str] = []
+    # Deliver Flow generator artifacts into vuln containers by copying files in,
+    # rather than bind-mounting directories from the host.
+    flow_env_parts.append('CORETG_FLOW_ARTIFACTS_MODE=copy')
+    try:
+        if remote_ctx and remote_ctx.get('base_dir'):
+            flow_env_parts.append(f"CORE_REMOTE_BASE_DIR={shlex.quote(str(remote_ctx.get('base_dir')))}")
+    except Exception:
+        pass
+    flow_env_prefix = (' '.join(flow_env_parts) + ' ') if flow_env_parts else ''
+    remote_command = (
+        f"{activate_prefix}cd {shlex.quote(work_dir)} && "
+        f"CORETG_SCENARIO_TAG={shlex.quote(scenario_tag)} {flow_env_prefix}{docker_env_prefix}PYTHONUNBUFFERED=1 {cli_cmd}"
+    )
     try:
         log_f.write(f"{log_prefix}Launching CLI in {work_dir}\n")
+        try:
+            log_f.write(f"{log_prefix}Flow artifacts mode: copy (docker cp into containers)\n")
+        except Exception:
+            pass
         _write_sse_marker(
             log_f,
             'phase',
@@ -17174,6 +27439,7 @@ def run_cli_async():
                 'stage': 'remote.cli.launch',
                 'work_dir': work_dir,
                 'command': cli_cmd,
+                'scenario_tag': scenario_tag,
                 'venv_bin': venv_bin_remote or None,
             },
         )
@@ -17186,6 +27452,14 @@ def run_cli_async():
         channel = transport.open_session()
         channel.set_combine_stderr(True)
         channel.exec_command(f"bash -lc {shlex.quote(remote_command)}")
+
+        # If configured, send sudo password for docker helpers via stdin (single line).
+        try:
+            pw = core_cfg.get('ssh_password')
+            if pw and _coerce_bool(core_cfg.get('ssh_enabled')):
+                channel.send(str(pw) + "\n")
+        except Exception:
+            pass
         output_thread = threading.Thread(
             target=_relay_remote_channel_to_log,
             args=(channel, log_f),
@@ -17244,6 +27518,7 @@ def run_cli_async():
         'remote_xml_path': (remote_ctx or {}).get('xml_path'),
         'remote_base_dir': (remote_ctx or {}).get('base_dir'),
         'remote_preview_plan_path': (remote_ctx or {}).get('preview_plan_path'),
+        'flow_artifacts_copied': False,
     }
     # Start a background finalizer so history is appended even if the UI does not poll /run_status
     def _wait_and_finalize_async(run_id_local: str):
@@ -17258,6 +27533,11 @@ def run_cli_async():
             rc = p.wait()
             meta['done'] = True
             meta['returncode'] = rc
+
+            try:
+                _maybe_copy_flow_artifacts_into_containers(meta, stage='postrun')
+            except Exception:
+                pass
             try:
                 _sync_remote_artifacts(meta)
             except Exception:
@@ -17410,6 +27690,10 @@ def run_status(run_id: str):
             meta['done'] = True
             meta['returncode'] = rc
             try:
+                _maybe_copy_flow_artifacts_into_containers(meta, stage='postrun')
+            except Exception:
+                pass
+            try:
                 _sync_remote_artifacts(meta)
             except Exception:
                 pass
@@ -17560,6 +27844,8 @@ def run_status(run_id: str):
             report_md = _extract_report_path_from_text(txt)
     except Exception:
         report_md = None
+
+    docker_conflicts = _extract_docker_conflicts_from_text(txt)
     summary_json = _extract_summary_path_from_text(txt)
     if not summary_json:
         summary_json = _derive_summary_from_report(report_md)
@@ -17574,6 +27860,7 @@ def run_status(run_id: str):
     return jsonify({
         'done': bool(meta.get('done')),
         'returncode': meta.get('returncode'),
+        'docker_conflicts': docker_conflicts,
         'report_path': report_md if (report_md and os.path.exists(report_md)) else None,
         'summary_path': summary_json if (summary_json and os.path.exists(summary_json)) else None,
         'xml_path': (meta.get('post_xml_path') if meta.get('post_xml_path') and os.path.exists(meta.get('post_xml_path')) else None),
@@ -17665,7 +27952,6 @@ def base_details():
     summary = _analyze_core_xml(xml_path) if ok else {'error': errs}
     return render_template('base_details.html', xml_path=xml_path, valid=ok, errors=errs, summary=summary)
 
-
 # ---------------- CORE Management (sessions and XMLs) ----------------
 
 def _core_sessions_store_path() -> str:
@@ -17682,7 +27968,6 @@ def _load_core_sessions_store() -> dict:
     except Exception:
         pass
     return {}
-
 
 def _session_store_entry_session_id(value: Any) -> Optional[int]:
     candidate: Any
@@ -19090,6 +29375,110 @@ def core_push_repo_status(progress_id: str):
     return jsonify(response)
 
 
+@app.route('/core/push_repo/cancel/<progress_id>', methods=['POST'])
+def core_push_repo_cancel(progress_id: str):
+    payload = _get_repo_push_progress(progress_id)
+    if not payload:
+        return jsonify({'progress_id': progress_id, 'status': 'unknown'}), 404
+    status = (payload.get('status') or '').strip().lower()
+    if status in ('complete', 'error', 'cancelled'):
+        return jsonify({'ok': True, 'progress_id': progress_id, 'status': status, 'noop': True})
+    _update_repo_push_progress(
+        progress_id,
+        cancel_requested=True,
+        status='cancelled',
+        stage='cancelled',
+        detail='Cancelled by user.',
+    )
+
+    # Best-effort: attempt to stop any in-flight remote finalize by killing its PID.
+    kill_info: Dict[str, Any] = {
+        'attempted': False,
+        'pidfile': None,
+        'pidfile_found': False,
+        'pid': None,
+        'term_sent': False,
+        'kill_sent': False,
+        'pidfile_removed': False,
+        'archive': None,
+        'archive_existed_before': None,
+        'archive_exists_after': None,
+    }
+    try:
+        ctx = _get_repo_push_cancel_ctx(progress_id)
+        if isinstance(ctx, dict):
+            core_cfg = ctx.get('core_cfg')
+            pidfile = ctx.get('remote_pidfile')
+            remote_archive = ctx.get('remote_archive')
+            if isinstance(core_cfg, dict):
+                kill_info['attempted'] = True
+                if isinstance(pidfile, str) and pidfile.strip():
+                    kill_info['pidfile'] = pidfile
+                if isinstance(remote_archive, str) and remote_archive.strip():
+                    kill_info['archive'] = remote_archive
+
+                client = _open_ssh_client(core_cfg)
+                try:
+                    kill_script = (
+                        "set -e; "
+                        f"pidfile={shlex.quote(pidfile or '')}; "
+                        f"archive={shlex.quote(remote_archive or '')}; "
+                        "pidfile_found=0; pid=''; "
+                        "if [ -n \"$pidfile\" ] && [ -f \"$pidfile\" ]; then pidfile_found=1; pid=$(cat \"$pidfile\" 2>/dev/null || true); fi; "
+                        "term_sent=0; kill_sent=0; "
+                        "if [ -n \"$pid\" ]; then "
+                        "kill -TERM \"$pid\" 2>/dev/null && term_sent=1 || term_sent=0; "
+                        "sleep 0.5; "
+                        "kill -KILL \"$pid\" 2>/dev/null && kill_sent=1 || kill_sent=0; "
+                        "fi; "
+                        "pidfile_removed=0; "
+                        "if [ -n \"$pidfile\" ]; then rm -f -- \"$pidfile\" 2>/dev/null && pidfile_removed=1 || pidfile_removed=0; fi; "
+                        "archive_existed_before=''; archive_exists_after=''; "
+                        "if [ -n \"$archive\" ]; then "
+                        "if [ -f \"$archive\" ]; then archive_existed_before=1; else archive_existed_before=0; fi; "
+                        "rm -f -- \"$archive\" 2>/dev/null || true; "
+                        "if [ -f \"$archive\" ]; then archive_exists_after=1; else archive_exists_after=0; fi; "
+                        "fi; "
+                        "echo PIDFILE_FOUND=\"$pidfile_found\"; "
+                        "echo PID=\"$pid\"; "
+                        "echo TERM_SENT=\"$term_sent\"; "
+                        "echo KILL_SENT=\"$kill_sent\"; "
+                        "echo PIDFILE_REMOVED=\"$pidfile_removed\"; "
+                        "echo ARCHIVE_EXISTED_BEFORE=\"$archive_existed_before\"; "
+                        "echo ARCHIVE_EXISTS_AFTER=\"$archive_exists_after\""
+                    )
+                    _code, out, _err = _exec_ssh_command(client, f"sh -lc {shlex.quote(kill_script)}", timeout=25.0)
+                    for line in (out or '').splitlines():
+                        if '=' not in line:
+                            continue
+                        k, v = line.split('=', 1)
+                        k = k.strip().upper()
+                        v = v.strip().strip('"')
+                        if k == 'PIDFILE_FOUND':
+                            kill_info['pidfile_found'] = v == '1'
+                        elif k == 'PID':
+                            kill_info['pid'] = v or None
+                        elif k == 'TERM_SENT':
+                            kill_info['term_sent'] = v == '1'
+                        elif k == 'KILL_SENT':
+                            kill_info['kill_sent'] = v == '1'
+                        elif k == 'PIDFILE_REMOVED':
+                            kill_info['pidfile_removed'] = v == '1'
+                        elif k == 'ARCHIVE_EXISTED_BEFORE':
+                            kill_info['archive_existed_before'] = None if v == '' else (v == '1')
+                        elif k == 'ARCHIVE_EXISTS_AFTER':
+                            kill_info['archive_exists_after'] = None if v == '' else (v == '1')
+                finally:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return jsonify({'ok': True, 'progress_id': progress_id, 'status': 'cancelled', 'remote': kill_info})
+
+
 @app.route('/core/start', methods=['POST'])
 def core_start():
     xml_path = request.form.get('path')
@@ -19188,7 +29577,64 @@ def core_stop():
     core_cfg = _core_config_for_request(include_password=True)
     try:
         _execute_remote_core_session_action(core_cfg, 'stop', sid_int, logger=app.logger)
-        flash(f'Stopped session {sid_int}.')
+        # Best-effort: cleanup Docker artifacts generated by this tool after stopping a session.
+        # - Containers are derived from compose_assignments.json on the CORE VM (vuln docker-compose nodes).
+        # - Images are limited to tool wrapper images under coretg/*:iproute2*.
+        cleanup_containers = 0
+        cleanup_images = 0
+        cleanup_notes: list[str] = []
+        try:
+            status_payload = _run_remote_python_json(
+                core_cfg,
+                _remote_docker_status_script(core_cfg.get('ssh_password')),
+                logger=app.logger,
+                label='docker.status(for stop cleanup)',
+                timeout=60.0,
+            )
+            names: list[str] = []
+            if isinstance(status_payload, dict) and isinstance(status_payload.get('items'), list):
+                for it in status_payload.get('items') or []:
+                    if isinstance(it, dict) and it.get('name'):
+                        names.append(str(it.get('name')))
+            if names:
+                payload = _run_remote_python_json(
+                    core_cfg,
+                    _remote_docker_cleanup_script(names, core_cfg.get('ssh_password')),
+                    logger=app.logger,
+                    label='docker.cleanup(on stop)',
+                    timeout=120.0,
+                )
+                if isinstance(payload, dict) and isinstance(payload.get('results'), list):
+                    cleanup_containers = len(payload.get('results') or [])
+            else:
+                cleanup_notes.append('no docker-compose node containers to cleanup')
+        except Exception as exc:
+            cleanup_notes.append(f'container cleanup skipped/failed: {exc}')
+
+        try:
+            payload = _run_remote_python_json(
+                core_cfg,
+                _remote_docker_remove_wrapper_images_script(core_cfg.get('ssh_password')),
+                logger=app.logger,
+                label='docker.wrapper_images.cleanup(on stop)',
+                timeout=180.0,
+            )
+            if isinstance(payload, dict) and isinstance(payload.get('removed'), list):
+                cleanup_images = len(payload.get('removed') or [])
+        except Exception as exc:
+            cleanup_notes.append(f'wrapper image cleanup skipped/failed: {exc}')
+
+        msg = f'Stopped session {sid_int}.'
+        extra = []
+        if cleanup_containers:
+            extra.append(f'docker containers cleaned={cleanup_containers}')
+        if cleanup_images:
+            extra.append(f'wrapper images removed={cleanup_images}')
+        if cleanup_notes:
+            extra.append('; '.join(cleanup_notes)[:240])
+        if extra:
+            msg = msg + ' ' + ' · '.join(extra)
+        flash(msg)
     except Exception as exc:
         flash(f'Failed to stop session: {exc}')
     return _redirect_core_page_with_scenario()
@@ -19260,6 +29706,82 @@ def core_kill_active_sessions_api():
         'core_host': core_host,
         'core_port': core_port,
     }), 200
+
+
+@app.route('/core/stop_duplicate_daemons_api', methods=['POST'])
+def core_stop_duplicate_daemons_api():
+    """Stop duplicate core-daemon processes and restart core-daemon.
+
+    Intended for the Execute flow: when a run is blocked due to multiple core-daemon
+    processes, the UI can prompt the user to stop them and retry.
+
+    Notes:
+    - Requires SSH access and sudo privileges on the CORE VM.
+    - If specific PIDs are provided, they are targeted first, but we still
+      perform a best-effort cleanup (systemctl stop + pkill) to ensure a single daemon.
+    """
+    payload = request.get_json(silent=True) or {}
+    pids_raw = payload.get('pids')
+    requested_pids: list[int] = []
+    if isinstance(pids_raw, list):
+        for item in pids_raw:
+            try:
+                requested_pids.append(int(str(item).strip()))
+            except Exception:
+                continue
+
+    core_cfg = _core_config_for_request(include_password=True)
+    ssh_password = core_cfg.get('ssh_password')
+    if not ssh_password:
+        return jsonify({
+            'ok': False,
+            'error': 'Stopping core-daemon requires sudo; provide an SSH password.',
+            'can_stop_daemons': False,
+        }), 400
+    if paramiko is None:
+        return jsonify({'ok': False, 'error': 'Paramiko unavailable; cannot SSH to CORE VM.'}), 500
+    _ensure_paramiko_available()
+
+    ssh_client = paramiko.SSHClient()  # type: ignore[assignment]
+    ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # type: ignore[attr-defined]
+    try:
+        ssh_client.connect(
+            hostname=str(core_cfg.get('ssh_host') or core_cfg.get('host') or 'localhost'),
+            port=int(core_cfg.get('ssh_port') or 22),
+            username=str(core_cfg.get('ssh_username') or ''),
+            password=ssh_password,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=10.0,
+            banner_timeout=10.0,
+            auth_timeout=10.0,
+        )
+        before = _collect_remote_core_daemon_pids(ssh_client)
+        # Prefer requested pids (e.g. from conflict error), else operate on what we see.
+        target = requested_pids or before
+        _stop_remote_core_daemon_conflict(
+            ssh_client,
+            sudo_password=ssh_password,
+            pids=target,
+            logger=app.logger,
+        )
+        try:
+            time.sleep(1.0)
+        except Exception:
+            pass
+        after = _collect_remote_core_daemon_pids(ssh_client)
+        return jsonify({
+            'ok': True,
+            'daemon_pids_before': before,
+            'daemon_pids_after': after,
+        }), 200
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+    finally:
+        try:
+            ssh_client.close()
+        except Exception:
+            pass
 
 
 @app.route('/core/start_session', methods=['POST'])
@@ -19348,6 +29870,9 @@ def core_details():
     classification = None  # 'scenario' | 'session' | 'unknown' | 'planner'
     container_flag = False
     planner_bundle = False
+    graph_nodes: list[dict[str, Any]] | None = None
+    graph_links: list[dict[str, Any]] | None = None
+    flow_meta: dict[str, Any] | None = None
     # If no XML path given but we have a session id, attempt to export the session XML so we can show details
     if not xml_path and sid:
         try:
@@ -19426,6 +29951,29 @@ def core_details():
                     xml_summary = xml_summary or None
         except Exception as _e:
             errors = errors or f'XML inspection failed: {_e}'
+
+    # For session XML exports, prefer the full topology payload (includes networks + vuln tagging).
+    if xml_path and os.path.exists(xml_path) and classification == 'session':
+        try:
+            graph_nodes, graph_links, _adj = _build_topology_graph_from_session_xml(xml_path)
+        except Exception:
+            graph_nodes, graph_links = None, None
+
+    # Best-effort attach saved Flow chain metadata so we can annotate sequence nodes.
+    try:
+        scenario_norm_for_flow = _normalize_scenario_label(scenario_norm)
+        if scenario_norm_for_flow:
+            flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm_for_flow)
+            if flow_plan_path:
+                with open(flow_plan_path, 'r', encoding='utf-8') as f:
+                    flow_payload = json.load(f) or {}
+                if isinstance(flow_payload, dict):
+                    meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
+                    candidate = (meta or {}).get('flow') or flow_payload.get('flow')
+                    if isinstance(candidate, dict):
+                        flow_meta = candidate
+    except Exception:
+        flow_meta = None
     session_info = None
     if sid:
         try:
@@ -19465,7 +30013,103 @@ def core_details():
         classification=classification,
         container_flag=container_flag,
         scenario_label=scenario_label,
+        scenario_norm=scenario_norm,
+        graph_nodes=graph_nodes,
+        graph_links=graph_links,
+        flow_meta=flow_meta,
     )
+
+
+@app.route('/api/core-details/topology')
+def api_core_details_topology():
+    """Best-effort topology payload for Scenario Details.
+
+    Priority:
+    1) Latest session XML for scenario (most enriched: interfaces/ipv4 + vuln tagging)
+    2) Latest preview plan for scenario (pre-execute: docker/vuln role semantics)
+    """
+    scenario_norm = _normalize_scenario_label(request.args.get('scenario') or '')
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'Missing scenario.'}), 400
+
+    # Enforce assignment-based access for restricted roles.
+    try:
+        allowed_norms = _builder_allowed_norms(_current_user())
+        if allowed_norms is not None and scenario_norm not in allowed_norms:
+            return jsonify({'ok': False, 'error': 'Scenario not assigned.'}), 403
+    except Exception:
+        pass
+
+    nodes: list[dict[str, Any]] = []
+    links: list[dict[str, Any]] = []
+    status = ''
+    source = ''
+
+    # 1) Prefer latest session XML for the scenario.
+    session_xml_path = _latest_session_xml_for_scenario_norm(scenario_norm)
+    if session_xml_path and os.path.exists(session_xml_path):
+        try:
+            nodes, links, _adj = _build_topology_graph_from_session_xml(session_xml_path)
+            status = 'ok'
+            source = 'session_xml'
+        except Exception as e:
+            status = f'Failed building session topology: {e}'
+            nodes, links = [], []
+
+    # 2) Fallback: build from latest preview plan.
+    if not nodes:
+        try:
+            plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+        except Exception:
+            plan_path = None
+        if plan_path and os.path.exists(plan_path):
+            try:
+                with open(plan_path, 'r', encoding='utf-8') as f:
+                    payload = json.load(f) or {}
+                full_prev = None
+                if isinstance(payload, dict):
+                    full_prev = payload.get('full_preview') if isinstance(payload.get('full_preview'), dict) else None
+                    if full_prev is None and isinstance(payload.get('preview'), dict):
+                        full_prev = payload.get('preview')
+                if isinstance(full_prev, dict):
+                    nodes2, links2, _adj2 = _build_topology_graph_from_preview_plan(full_prev)
+                    # Normalize vuln hint field to what core_graph.js understands.
+                    for n in nodes2 or []:
+                        if not isinstance(n, dict):
+                            continue
+                        if n.get('is_vulnerability') is None:
+                            n['is_vulnerability'] = bool(n.get('is_vuln'))
+                    nodes = nodes2 or []
+                    links = links2 or []
+                    status = 'ok'
+                    source = 'preview_plan'
+            except Exception as e:
+                status = f'Failed building preview topology: {e}'
+
+    # Best-effort attach flow metadata for sequence indices.
+    flow_meta: dict[str, Any] | None = None
+    try:
+        flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
+        if flow_plan_path and os.path.exists(flow_plan_path):
+            with open(flow_plan_path, 'r', encoding='utf-8') as f:
+                flow_payload = json.load(f) or {}
+            if isinstance(flow_payload, dict):
+                meta = flow_payload.get('metadata') if isinstance(flow_payload.get('metadata'), dict) else {}
+                candidate = (meta or {}).get('flow') or flow_payload.get('flow')
+                if isinstance(candidate, dict):
+                    flow_meta = candidate
+    except Exception:
+        flow_meta = None
+
+    return jsonify({
+        'ok': True,
+        'scenario_norm': scenario_norm,
+        'status': status,
+        'source': source,
+        'nodes': nodes,
+        'links': links,
+        'flow': flow_meta or None,
+    })
 
 
 @app.route('/admin/cleanup_pycore', methods=['POST'])
@@ -19729,6 +30373,7 @@ def test_core():
         adv_run_core_cleanup = bool(cfg.get('adv_run_core_cleanup'))
         adv_check_core_version = bool(cfg.get('adv_check_core_version'))
         adv_restart_core_daemon = bool(cfg.get('adv_restart_core_daemon'))
+        adv_start_core_daemon = bool(cfg.get('adv_start_core_daemon'))
         adv_auto_kill_sessions = bool(cfg.get('adv_auto_kill_sessions'))
         is_pytest = bool(os.environ.get('PYTEST_CURRENT_TEST') or ('pytest' in sys.modules))
         daemon_pids: List[int] = []
@@ -19736,7 +30381,7 @@ def test_core():
 
         advanced_checks: Dict[str, Dict[str, Any]] = {}
         advanced_warnings: List[str] = []
-        if (adv_fix_docker_daemon or adv_run_core_cleanup or adv_check_core_version or adv_restart_core_daemon or adv_auto_kill_sessions):
+        if (adv_fix_docker_daemon or adv_run_core_cleanup or adv_check_core_version or adv_restart_core_daemon or adv_start_core_daemon or adv_auto_kill_sessions):
             # These checks require remote access.
             if is_pytest:
                 app.logger.info('[core] advanced checks enabled but skipping remote execution (pytest)')
@@ -19746,6 +30391,7 @@ def test_core():
                     adv_run_core_cleanup=False,
                     adv_check_core_version=False,
                     adv_restart_core_daemon=False,
+                    adv_start_core_daemon=False,
                     adv_auto_kill_sessions=False,
                 )
             else:
@@ -19755,6 +30401,7 @@ def test_core():
                     adv_run_core_cleanup=adv_run_core_cleanup,
                     adv_check_core_version=adv_check_core_version,
                     adv_restart_core_daemon=adv_restart_core_daemon,
+                    adv_start_core_daemon=adv_start_core_daemon,
                     adv_auto_kill_sessions=adv_auto_kill_sessions,
                 )
                 failures = [
@@ -20264,6 +30911,18 @@ def stream_logs(run_id: str):
                     meta['returncode'] = rc
                     meta['done'] = True
             if meta.get('done'):
+                # Drain any remaining buffered log lines before ending so late
+                # cleanup markers are visible to the client.
+                try:
+                    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f_final:
+                        f_final.seek(last_pos)
+                        tail = f_final.read()
+                        if tail:
+                            last_pos = f_final.tell()
+                            for line in tail.splitlines():
+                                yield from _emit_line(line)
+                except FileNotFoundError:
+                    pass
                 # Signal end regardless; client will stop listening
                 yield "event: end\ndata: done\n\n"
                 break
@@ -20276,6 +30935,118 @@ def stream_logs(run_id: str):
         'Connection': 'keep-alive',
     }
     return Response(generate(), headers=headers)
+
+
+@app.route('/flag_generators_test/cleanup/<run_id>', methods=['POST'])
+def flag_generators_test_cleanup(run_id: str):
+    """Delete all artifacts for a flag-generator test run.
+
+    This is intentionally scoped to outputs/ to avoid deleting arbitrary paths.
+    """
+    t0 = time.time()
+    app.logger.info("[flaggen_test] POST /flag_generators_test/cleanup run_id=%s", run_id)
+    meta = RUNS.get(run_id)
+    if meta and meta.get('kind') != 'flag_generator_test':
+        app.logger.info("[flaggen_test] cleanup refusing: kind=%r", meta.get('kind'))
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+
+    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+    if not isinstance(run_dir, str) or not run_dir:
+        run_dir = _flaggen_run_dir_for_id(run_id)
+    if not isinstance(run_dir, str) or not run_dir:
+        app.logger.warning("[flaggen_test] cleanup missing run dir run_id=%s", run_id)
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
+
+    abs_run_dir = os.path.abspath(run_dir)
+    outputs_root = os.path.abspath(_outputs_dir())
+    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+        app.logger.warning(
+            "[flaggen_test] cleanup refusing run_id=%s abs_run_dir=%s outputs_root=%s",
+            run_id,
+            abs_run_dir,
+            outputs_root,
+        )
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+
+    app.logger.info(
+        "[flaggen_test] cleanup resolved run_id=%s run_dir=%s exists=%s",
+        run_id,
+        abs_run_dir,
+        os.path.isdir(abs_run_dir),
+    )
+
+    # Best-effort: stop any still-running runner process.
+    try:
+        if isinstance(meta, dict):
+            meta['cleanup_requested'] = True
+        proc = meta.get('proc') if isinstance(meta, dict) else None
+        if proc and hasattr(proc, 'poll') and proc.poll() is None:
+            try:
+                app.logger.info("[flaggen_test] cleanup terminating runner run_id=%s", run_id)
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    app.logger.info("[flaggen_test] cleanup killing runner run_id=%s", run_id)
+                    proc.kill()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Emit cleanup markers to the log if possible.
+    try:
+        lp = meta.get('log_path') if isinstance(meta, dict) else os.path.join(abs_run_dir, 'run.log')
+        if isinstance(lp, str) and lp:
+            with open(lp, 'a', encoding='utf-8') as log_f:
+                _write_sse_marker(log_f, 'phase', {'phase': 'cleanup_start', 'run_id': run_id})
+    except Exception:
+        pass
+
+    removed = False
+    try:
+        if os.path.isdir(abs_run_dir):
+            shutil.rmtree(abs_run_dir, ignore_errors=True)
+        removed = True
+    except Exception:
+        removed = False
+
+    app.logger.info(
+        "[flaggen_test] cleanup removed=%s run_id=%s elapsed_ms=%d",
+        removed,
+        run_id,
+        int((time.time() - t0) * 1000),
+    )
+
+    try:
+        if isinstance(meta, dict):
+            meta['done'] = True
+    except Exception:
+        pass
+
+    try:
+        if isinstance(meta, dict):
+            lp = meta.get('log_path')
+        else:
+            lp = os.path.join(abs_run_dir, 'run.log')
+        if isinstance(lp, str) and lp and os.path.exists(lp):
+            with open(lp, 'a', encoding='utf-8') as log_f2:
+                _write_sse_marker(log_f2, 'phase', {'phase': 'cleanup_done', 'run_id': run_id, 'removed': removed})
+    except Exception:
+        pass
+
+    try:
+        RUNS.pop(run_id, None)
+    except Exception:
+        pass
+
+    app.logger.info(
+        "[flaggen_test] cleanup complete run_id=%s elapsed_ms=%d",
+        run_id,
+        int((time.time() - t0) * 1000),
+    )
+
+    return jsonify({'ok': True, 'removed': removed}), 200
 
 
 @app.route('/cancel_run/<run_id>', methods=['POST'])
@@ -20310,185 +31081,4233 @@ def cancel_run(run_id: str):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------- Data Sources -----------------
+
+# ---------------- Flag Catalog / Generator Packs -----------------
+
+
+def _require_builder_or_admin() -> None:
+    user = _current_user()
+    if not user or not _is_admin_view_role(user.get('role')):
+        abort(403)
+
+
+def _split_lines(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out: list[str] = []
+        for v in value:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s:
+                out.append(s)
+        return out
+    text = str(value)
+    return [s.strip() for s in text.splitlines() if s.strip()]
+
+
+def _split_artifact_list(value: Any) -> list[str]:
+    """Coerce an artifact list.
+
+    Accepts:
+      - list[str]
+      - list[dict] with {'artifact': '...'}
+      - newline-delimited str
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, dict):
+                s = str(item.get('artifact') or '').strip()
+            else:
+                s = str(item).strip()
+            if s:
+                out.append(s)
+        return out
+    return _split_lines(value)
+
+
+def _normalize_requires_with_optional(payload: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Return (required_requires, optional_requires)."""
+    # Generator Builder UI shape: requires = [{artifact, optional}, ...]
+    req_items = payload.get('requires')
+    if not (isinstance(req_items, list) and all(isinstance(x, dict) for x in req_items)):
+        raise ValueError('requires must be a list of {artifact, optional} objects')
+
+    if isinstance(req_items, list):
+        required: list[str] = []
+        optional: list[str] = []
+        for item in req_items:
+            art = str(item.get('artifact') or '').strip()
+            if not art:
+                continue
+            is_opt = _coerce_bool(item.get('optional'), False)
+            if is_opt:
+                optional.append(art)
+            else:
+                required.append(art)
+        # De-dupe, prefer required if both appear.
+        required_set = {x for x in required if x}
+        optional_set = {x for x in optional if x and x not in required_set}
+        return sorted(required_set), sorted(optional_set)
+
+
+def _normalize_plugin_type(raw: Any) -> str:
+    value = (str(raw or '')).strip()
+    if value not in {'flag-generator', 'flag-node-generator'}:
+        return 'flag-generator'
+    return value
+
+
+def _sanitize_id(raw: Any) -> str:
+    value = (str(raw or '')).strip()
+    value = re.sub(r'[^a-zA-Z0-9_.\-]+', '_', value)
+    value = re.sub(r'_+', '_', value).strip('_')
+    return value
+
+
+def _sanitize_folder(raw: Any) -> str:
+    value = (str(raw or '')).strip()
+    value = value.replace('\\', '/').strip('/')
+    value = re.sub(r'[^a-zA-Z0-9_\-/\.]+', '_', value)
+    value = value.split('/', 1)[0]
+    value = value.strip().strip('.')
+    value = re.sub(r'_+', '_', value)
+    return value
+
+
+def _inputs_schema_from_flags(flags: dict[str, Any], *, plugin_type: str) -> dict[str, Any]:
+    inputs: dict[str, Any] = {}
+
+    def _add(name: str, *, sensitive: bool = False, required: bool = True) -> None:
+        inputs[name] = {'type': 'string', 'required': bool(required)}
+        if sensitive:
+            inputs[name]['sensitive'] = True
+
+    if flags.get('seed'):
+        _add('seed', required=True)
+    if flags.get('secret') and plugin_type == 'flag-generator':
+        _add('secret', sensitive=True, required=True)
+    if flags.get('node_name') and plugin_type == 'flag-node-generator':
+        _add('node_name', required=True)
+    if flags.get('flag_prefix'):
+        _add('flag_prefix', required=False)
+    return inputs
+
+
+def _build_generator_scaffold(payload: dict[str, Any]) -> tuple[dict[str, str], str, str]:
+    plugin_type = _normalize_plugin_type(payload.get('plugin_type'))
+    plugin_id = _sanitize_id(payload.get('plugin_id'))
+    if not plugin_id:
+        raise ValueError('plugin_id is required')
+
+    folder_name = _sanitize_folder(payload.get('folder_name'))
+    if not folder_name:
+        folder_name = f"py_{plugin_id}"
+    if folder_name.startswith('py__'):
+        folder_name = folder_name.replace('py__', 'py_', 1)
+    if folder_name == 'py_':
+        folder_name = f"py_{plugin_id}"
+
+    display_name = str(payload.get('name') or '').strip() or plugin_id
+    description = str(payload.get('description') or '').strip() or f"Generator {plugin_id}"
+
+    requires, optional_requires = _normalize_requires_with_optional(payload)
+    produces = _split_artifact_list(payload.get('produces'))
+    hint_templates = _split_lines(payload.get('hint_templates'))
+    inject_files_raw = payload.get('inject_files')
+    inject_files = []
+    if isinstance(inject_files_raw, list):
+        for x in inject_files_raw:
+            s = str(x or '').strip()
+            if s:
+                inject_files.append(s)
+
+    if 'flag' not in produces:
+        produces = ['flag'] + produces
+
+    inputs_flags = payload.get('inputs') if isinstance(payload.get('inputs'), dict) else {}
+    inputs_schema = _inputs_schema_from_flags(inputs_flags, plugin_type=plugin_type)
+
+    # Manifest v1: preferred workflow for installed Generator Packs.
+    inputs_manifest: list[dict[str, Any]] = []
+    try:
+        for name, meta in (inputs_schema or {}).items():
+            nm = str(name or '').strip()
+            if not nm:
+                continue
+            rec: dict[str, Any] = {'name': nm, 'type': str((meta or {}).get('type') or 'string')}
+            if isinstance(meta, dict):
+                if 'required' in meta:
+                    rec['required'] = bool(meta.get('required'))
+                if meta.get('sensitive') is True:
+                    rec['sensitive'] = True
+            inputs_manifest.append(rec)
+    except Exception:
+        inputs_manifest = []
+
+    manifest_yaml = (
+        "manifest_version: 1\n"
+        f"id: {plugin_id}\n"
+        f"kind: {plugin_type}\n"
+        f"name: {display_name}\n"
+        f"description: {description}\n"
+        "version: 1.0\n"
+        "\n"
+        "runtime:\n"
+        "  type: docker-compose\n"
+        "  compose_file: docker-compose.yml\n"
+        "  service: generator\n"
+    )
+    if inputs_manifest:
+        manifest_yaml += "\ninputs:\n"
+        for inp in inputs_manifest:
+            try:
+                nm = str(inp.get('name') or '').strip()
+                if not nm:
+                    continue
+                manifest_yaml += f"  - name: {nm}\n"
+                tp = str(inp.get('type') or 'string').strip() or 'string'
+                manifest_yaml += f"    type: {tp}\n"
+                if 'required' in inp:
+                    manifest_yaml += f"    required: {'true' if bool(inp.get('required')) else 'false'}\n"
+                if inp.get('sensitive') is True:
+                    manifest_yaml += "    sensitive: true\n"
+            except Exception:
+                continue
+
+    # Artifacts for Flow chaining.
+    manifest_yaml += "\nartifacts:\n"
+    manifest_yaml += "  requires:\n"
+    for a in (requires or []):
+        s = str(a or '').strip()
+        if s:
+            manifest_yaml += f"    - {s}\n"
+
+    if optional_requires:
+        manifest_yaml += "  optional_requires:\n"
+        for a in (optional_requires or []):
+            s = str(a or '').strip()
+            if s:
+                manifest_yaml += f"    - {s}\n"
+
+    manifest_yaml += "  produces:\n"
+    for a in (produces or []):
+        s = str(a or '').strip()
+        if s:
+            manifest_yaml += f"    - {s}\n"
+
+    # Hints
+    if hint_templates:
+        manifest_yaml += "\nhint_templates:\n"
+        for t in hint_templates:
+            s = str(t or '').strip()
+            if not s:
+                continue
+            s2 = s.replace('"', '\\"')
+            manifest_yaml += f"  - \"{s2}\"\n"
+
+    # Injected artifacts allowlist for safe mounting.
+    if inject_files:
+        manifest_yaml += "\ninjects:\n"
+        for x in inject_files:
+            s = str(x or '').strip()
+            if s:
+                manifest_yaml += f"  - {s}\n"
+
+    # Fixed env vars.
+    gen_env = payload.get('env')
+    if isinstance(gen_env, dict) and gen_env:
+        manifest_yaml += "\nenv:\n"
+        for k, v in gen_env.items():
+            kk = str(k or '').strip()
+            if not kk:
+                continue
+            vv = str(v if v is not None else '')
+            vv2 = vv.replace('"', '\\"')
+            manifest_yaml += f"  {kk}: \"{vv2}\"\n"
+
+    base_dir = 'flag_generators' if plugin_type == 'flag-generator' else 'flag_node_generators'
+    folder_path = f"{base_dir}/{folder_name}"
+
+    compose_yaml = (
+        "services:\n"
+        "  generator:\n"
+        "    image: python:3.12-slim\n"
+        "    working_dir: /app\n"
+        "    command: [\"python\", \"/app/generator.py\"]\n"
+        "    environment:\n"
+        "      INPUTS_DIR: ${INPUTS_DIR}\n"
+        "      OUTPUTS_DIR: ${OUTPUTS_DIR}\n"
+        "    volumes:\n"
+        "      - ./generator.py:/app/generator.py:ro\n"
+        "      - ${INPUTS_DIR}:/inputs:ro\n"
+        "      - ${OUTPUTS_DIR}:/outputs\n"
+    )
+
+    compose_override = str(payload.get('compose_text') or '').strip('\n')
+    if compose_override.strip():
+        compose_yaml = compose_override + ("\n" if not compose_override.endswith("\n") else "")
+
+    if plugin_type == 'flag-generator':
+        generator_py = f"""import hashlib
+import json
+from pathlib import Path
+
+
+def _read_config() -> dict:
+    try:
+        return json.loads(Path('/inputs/config.json').read_text('utf-8'))
+    except Exception:
+        return {{}}
+
+
+def _flag(seed: str, secret: str, flag_prefix: str = 'FLAG') -> str:
+    digest = hashlib.sha256(f"{{seed}}|{{secret}}|flag".encode('utf-8', 'replace')).hexdigest()[:24]
+    prefix = (flag_prefix or 'FLAG').strip() or 'FLAG'
+    return f"{{prefix}}{{{{{{digest}}}}}}"
+
+
+def main() -> None:
+    cfg = _read_config()
+    seed = str(cfg.get('seed') or '').strip()
+    secret = str(cfg.get('secret') or '').strip()
+    flag_prefix = str(cfg.get('flag_prefix') or 'FLAG').strip() or 'FLAG'
+
+    if not seed:
+        raise SystemExit('Missing seed in /inputs/config.json')
+    if not secret:
+        raise SystemExit('Missing secret in /inputs/config.json')
+
+    # TODO: implement your generator logic and add additional outputs.
+    flag_value = _flag(seed, secret, flag_prefix)
+
+    out_dir = Path('/outputs')
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    outputs = {{
+        'generator_id': {json.dumps(plugin_id)},
+        'outputs': {{
+            'flag': flag_value,
+        }},
+    }}
+
+    (out_dir / 'outputs.json').write_text(json.dumps(outputs, indent=2) + '\n', encoding='utf-8')
+    # Optional: write /outputs/hint.txt if you need a standalone hint file.
+    # Prefer hint_templates in the catalog for Flow.
+
+
+if __name__ == '__main__':
+    main()
+"""
+    else:
+        generator_py = f"""import hashlib
+import json
+from pathlib import Path
+
+
+def _read_config() -> dict:
+    try:
+        return json.loads(Path('/inputs/config.json').read_text('utf-8'))
+    except Exception:
+        return {{}}
+
+
+def _flag(seed: str, node_name: str, flag_prefix: str = 'FLAG') -> str:
+    digest = hashlib.sha256(f"{{seed}}|{{node_name}}|flag".encode('utf-8', 'replace')).hexdigest()[:16]
+    prefix = (flag_prefix or 'FLAG').strip() or 'FLAG'
+    return f"{{prefix}}{{{{{{digest}}}}}}"
+
+
+def main() -> None:
+    cfg = _read_config()
+    seed = str(cfg.get('seed') or '').strip()
+    node_name = str(cfg.get('node_name') or '').strip()
+    flag_prefix = str(cfg.get('flag_prefix') or 'FLAG').strip() or 'FLAG'
+
+    if not seed:
+        raise SystemExit('Missing seed in /inputs/config.json')
+    if not node_name:
+        raise SystemExit('Missing node_name in /inputs/config.json')
+
+    # TODO: implement your per-node compose generation.
+    flag_value = _flag(seed, node_name, flag_prefix)
+    compose_text = (
+        "services:\n"
+        "  node:\n"
+        "    image: alpine:3.19\n"
+        "    command: [\\"sh\\", \\"-lc\\", \\"echo \\\\\"$FLAG\\\\\" > /flag.txt && tail -f /dev/null\\"]\n"
+        "    environment:\n"
+        f"      FLAG: {{json.dumps(flag_value)}}\n"
+    )
+
+    out_dir = Path('/outputs')
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / 'docker-compose.yml').write_text(compose_text, encoding='utf-8')
+
+    outputs = {{
+        'generator_id': {json.dumps(plugin_id)},
+        'outputs': {{
+            'compose_path': 'docker-compose.yml',
+            'flag': flag_value,
+        }},
+    }}
+    (out_dir / 'outputs.json').write_text(json.dumps(outputs, indent=2) + '\n', encoding='utf-8')
+
+
+if __name__ == '__main__':
+    main()
+"""
+
+    readme_override = str(payload.get('readme_text') or '')
+    if readme_override and not readme_override.endswith('\n'):
+        readme_override = readme_override + '\n'
+
+    scaffold_files: dict[str, str] = {
+        f"{folder_path}/docker-compose.yml": compose_yaml,
+        f"{folder_path}/generator.py": generator_py,
+        f"{folder_path}/README.md": readme_override or f"# {display_name}\n\nTODO: describe this generator.\n\n- plugin_id: `{plugin_id}`\n- type: `{plugin_type}`\n",
+        f"{folder_path}/manifest.yaml": manifest_yaml,
+    }
+
+    return scaffold_files, manifest_yaml, folder_path
+
+
+@app.route('/generator_builder')
+def generator_builder_page():
+    _require_builder_or_admin()
+    return render_template('generator_builder.html', active_page='generator_builder')
+
+
+def _custom_artifacts_path() -> str:
+    return os.path.abspath(os.path.join(_outputs_dir(), 'artifacts_custom.json'))
+
+
+def _load_custom_artifacts() -> dict[str, dict[str, Any]]:
+    """Load persisted custom artifact definitions.
+
+    Stored as a mapping artifact -> {type?: str}.
+    """
+    path = _custom_artifacts_path()
+    try:
+        if not os.path.exists(path):
+            return {}
+        with open(path, 'r', encoding='utf-8') as fh:
+            doc = json.load(fh)
+        if not isinstance(doc, dict):
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for k, v in doc.items():
+            art = str(k or '').strip()
+            if not art:
+                continue
+            meta: dict[str, Any] = {}
+            if isinstance(v, dict):
+                tp = str(v.get('type') or '').strip()
+                if tp:
+                    meta['type'] = tp
+            out[art] = meta
+        return out
+    except Exception:
+        return {}
+
+
+def _save_custom_artifacts(doc: dict[str, dict[str, Any]]) -> None:
+    path = _custom_artifacts_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(doc, fh, indent=2)
+        fh.write('\n')
+    os.replace(tmp, path)
+
+
+def _upsert_custom_artifact(artifact: str, *, type_value: str | None = None) -> dict[str, Any]:
+    art = str(artifact or '').strip()
+    if not art:
+        raise ValueError('artifact is required')
+    if len(art) > 200:
+        raise ValueError('artifact too long')
+
+    tp = str(type_value or '').strip()
+    custom = _load_custom_artifacts()
+    meta = dict(custom.get(art) or {})
+    if tp:
+        meta['type'] = tp
+    custom[art] = meta
+    _save_custom_artifacts(custom)
+    return {'artifact': art, **meta}
+
+
+@app.route('/api/generators/artifacts_index')
+def api_generators_artifacts_index():
+    """Return known artifact keys (from enabled generator sources) + producer metadata."""
+    _require_builder_or_admin()
+    try:
+        flag_gens, _errs1 = _flag_generators_from_enabled_sources()
+        node_gens, _errs2 = _flag_node_generators_from_enabled_sources()
+
+        idx: dict[str, dict[str, Any]] = {}
+
+        def _add_from(gens: list[dict], plugin_type: str) -> None:
+            for g in gens:
+                if not isinstance(g, dict):
+                    continue
+                gid = str(g.get('id') or '').strip()
+                gname = str(g.get('name') or '').strip() or gid
+                outs = g.get('outputs') if isinstance(g.get('outputs'), list) else []
+                for o in outs:
+                    if not isinstance(o, dict):
+                        continue
+                    art = str(o.get('name') or '').strip()
+                    if not art:
+                        continue
+                    tp = str(o.get('type') or '').strip()
+                    desc = str(o.get('description') or '').strip()
+                    sensitive = o.get('sensitive') is True
+                    entry = idx.get(art)
+                    if not entry:
+                        entry = {'artifact': art, 'type': tp, 'description': desc, 'sensitive': sensitive, 'producers': []}
+                        idx[art] = entry
+                    if not entry.get('type') and tp:
+                        entry['type'] = tp
+                    if not str(entry.get('description') or '').strip() and desc:
+                        entry['description'] = desc
+                    if entry.get('sensitive') is not True and sensitive is True:
+                        entry['sensitive'] = True
+                    producers = entry.get('producers') if isinstance(entry.get('producers'), list) else []
+                    if not any((p.get('plugin_id') == gid and p.get('plugin_type') == plugin_type) for p in producers if isinstance(p, dict)):
+                        producers.append({'plugin_id': gid, 'plugin_type': plugin_type, 'name': gname})
+                    entry['producers'] = producers
+
+        _add_from(flag_gens, 'flag-generator')
+        _add_from(node_gens, 'flag-node-generator')
+
+        # Always include reserved artifact keys as a starting point.
+        # These can be used in Requires/Produces even if no generator currently
+        # advertises them in enabled sources.
+        try:
+            for art, meta in _RESERVED_ARTIFACTS.items():
+                if art not in idx:
+                    idx[art] = {
+                        'artifact': art,
+                        'type': str(meta.get('type') or '').strip(),
+                        'description': str(meta.get('description') or '').strip(),
+                        'sensitive': meta.get('sensitive') is True,
+                        'producers': [{'plugin_id': '(reserved)', 'plugin_type': 'reserved', 'name': 'Reserved'}],
+                    }
+                else:
+                    if not str(idx[art].get('type') or '').strip() and str(meta.get('type') or '').strip():
+                        idx[art]['type'] = str(meta.get('type') or '').strip()
+                    if not str(idx[art].get('description') or '').strip() and str(meta.get('description') or '').strip():
+                        idx[art]['description'] = str(meta.get('description') or '').strip()
+                    if idx[art].get('sensitive') is not True and meta.get('sensitive') is True:
+                        idx[art]['sensitive'] = True
+        except Exception:
+            pass
+
+        # Merge in persisted custom artifacts (no producers).
+        try:
+            custom = _load_custom_artifacts()
+            for art, meta in custom.items():
+                if art not in idx:
+                    idx[art] = {'artifact': art, 'type': str(meta.get('type') or '').strip(), 'producers': []}
+                else:
+                    # Prefer existing type; fill missing type from custom.
+                    if not str(idx[art].get('type') or '').strip() and str(meta.get('type') or '').strip():
+                        idx[art]['type'] = str(meta.get('type') or '').strip()
+        except Exception:
+            pass
+
+        artifacts = sorted(idx.values(), key=lambda x: str(x.get('artifact') or ''))
+        return jsonify({'ok': True, 'artifacts': artifacts})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+
+
+@app.route('/api/generators/artifacts_index/custom', methods=['POST'])
+def api_generators_artifacts_index_custom_add():
+    """Persist a custom artifact key so it appears in the selector going forward."""
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    try:
+        artifact = str(payload.get('artifact') or '').strip()
+        type_value = str(payload.get('type') or '').strip() or None
+        item = _upsert_custom_artifact(artifact, type_value=type_value)
+        return jsonify({'ok': True, 'artifact': item})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+
+
+@app.route('/api/generators/scaffold_meta', methods=['POST'])
+def api_generators_scaffold_meta():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    try:
+        scaffold_files, manifest_yaml, _folder_path = _build_generator_scaffold(payload)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+    return jsonify({
+        'ok': True,
+        'manifest_yaml': manifest_yaml,
+        'scaffold_paths': sorted(scaffold_files.keys()),
+    })
+
+
+@app.route('/api/generators/scaffold_zip', methods=['POST'])
+def api_generators_scaffold_zip():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    try:
+        scaffold_files, _manifest_yaml, _folder_path = _build_generator_scaffold(payload)
+        plugin_id = _sanitize_id(payload.get('plugin_id')) or 'generator'
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 400
+
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for path, content in scaffold_files.items():
+            zf.writestr(path, content)
+    mem.seek(0)
+    return send_file(
+        mem,
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name=f'generator_scaffold_{plugin_id}.zip',
+    )
+
+
+@app.route('/flag_catalog')
+def flag_catalog_page():
+    packs_state = _load_installed_generator_packs_state()
+    # Render-time quality-of-life: group installed entries by kind so the UI
+    # doesn't repeat labels like "flag-generator" multiple times.
+    try:
+        packs = packs_state.get('packs', []) if isinstance(packs_state, dict) else []
+        for p in packs:
+            if not isinstance(p, dict):
+                continue
+            installed = p.get('installed')
+            if not isinstance(installed, list):
+                continue
+            grouped: dict[str, list[str]] = {}
+            for it in installed:
+                if not isinstance(it, dict):
+                    continue
+                kind = str(it.get('kind') or '').strip()
+                gid = str(it.get('id') or '').strip()
+                if not kind or not gid:
+                    continue
+                grouped.setdefault(kind, []).append(gid)
+            installed_grouped = []
+            for kind, ids in grouped.items():
+                # Preserve original order from the installed list.
+                uniq_ids = []
+                seen = set()
+                for x in ids:
+                    if x in seen:
+                        continue
+                    seen.add(x)
+                    uniq_ids.append(x)
+                installed_grouped.append({'kind': kind, 'ids': uniq_ids, 'count': len(uniq_ids)})
+            if installed_grouped:
+                p['installed_grouped'] = installed_grouped
+    except Exception:
+        # Never fail page render due to cosmetic grouping.
+        pass
+    return render_template(
+        'flag_catalog.html',
+        packs=packs_state.get('packs', []),
+        active_page='flag_catalog',
+    )
+
+
 @app.route('/data_sources')
 def data_sources_page():
-    state = _load_data_sources_state()
-    return render_template('data_sources.html', sources=state.get('sources', []))
+    """Legacy page removed.
 
-@app.route('/data_sources/upload', methods=['POST'])
-def data_sources_upload():
-    f = request.files.get('csv_file')
-    if not f or f.filename == '':
-        flash('No file selected.')
-        return redirect(url_for('data_sources_page'))
-    filename = secure_filename(f.filename)
-    if not filename.lower().endswith('.csv'):
-        flash('Only .csv allowed.')
-        return redirect(url_for('data_sources_page'))
-    unique = datetime.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
-    dest_dir = os.path.join(DATA_SOURCES_DIR)
-    os.makedirs(dest_dir, exist_ok=True)
-    path = os.path.join(dest_dir, f"{unique}-{filename}")
-    f.save(path)
-    ok, note, norm_rows, skipped = _validate_and_normalize_data_source_csv(path, skip_invalid=True)
-    if not ok:
-        try: os.remove(path)
-        except Exception: pass
-        flash(f'Invalid CSV: {note}')
-        return redirect(url_for('data_sources_page'))
-    # Write back normalized CSV to ensure required/optional columns are present
+    Keep a tombstone route so old bookmarks don't throw 500s.
+    """
+    # Not linked from the UI anymore; intentionally excluded from OpenAPI.
+    return render_template('data_sources.html', active_page='')
+
+
+def _validate_and_normalize_data_source_csv(csv_path: str, *, skip_invalid: bool = False) -> tuple[bool, str, list[list[str]], list[int]]:
+    """Validate and normalize a legacy data-sources CSV.
+
+    This is a small helper primarily used by tests. The legacy Data Sources UI
+    has been removed, but we keep the parser behavior stable.
+
+    Returns:
+      (ok, note, normalized_rows, skipped_row_numbers)
+
+    Normalization:
+      - Strips UTF-8 BOM from the first header cell.
+      - Canonicalizes standard headers to: Name, Path, Type, Startup, Vector.
+      - Lowercases/strips known enum-ish fields.
+
+    Validation (best-effort):
+      - Requires non-empty Name and Path.
+      - Requires Type in a small allowed set (currently includes 'artifact').
+      - Startup accepts yes/no/true/false/1/0 and normalizes to yes|no.
+      - Vector accepts local|remote (and a few aliases).
+    """
+    import csv
+
+    path = str(csv_path or '').strip()
+    if not path:
+        return False, 'Missing csv path', [], []
+    if not os.path.exists(path) or not os.path.isfile(path):
+        return False, f'CSV not found: {path}', [], []
+
+    allowed_types = {
+        # Minimal set (legacy + tests).
+        'artifact',
+        # A few pragmatic extras for backward compatibility.
+        'file', 'path', 'url', 'text', 'json',
+    }
+    startup_true = {'1', 'true', 'yes', 'y', 'on'}
+    startup_false = {'0', 'false', 'no', 'n', 'off'}
+    vector_alias = {
+        'local': 'local',
+        'localhost': 'local',
+        'host': 'local',
+        'remote': 'remote',
+        'network': 'remote',
+    }
+
+    normalized_rows: list[list[str]] = []
+    skipped: list[int] = []
+    try:
+        with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+    except Exception as exc:
+        return False, f'Failed reading CSV: {exc}', [], []
+
+    if not rows:
+        return False, 'Empty CSV', [], []
+
+    raw_header = [str(x or '').strip() for x in (rows[0] or [])]
+    if raw_header:
+        # utf-8-sig should remove BOM, but be defensive.
+        raw_header[0] = raw_header[0].lstrip('\ufeff').strip()
+
+    # Canonicalize standard headers.
+    canon_map = {
+        'name': 'Name',
+        'path': 'Path',
+        'type': 'Type',
+        'startup': 'Startup',
+        'vector': 'Vector',
+    }
+    header = []
+    for h in raw_header:
+        k = str(h or '').strip()
+        header.append(canon_map.get(k.lower(), k))
+
+    # Determine column indices (case-insensitive).
+    idx: dict[str, int] = {}
+    for i, h in enumerate(header):
+        hl = str(h or '').strip().lower()
+        if hl and hl not in idx:
+            idx[hl] = i
+
+    required_cols = ['name', 'path', 'type', 'startup', 'vector']
+    missing = [c for c in required_cols if c not in idx]
+    if missing:
+        msg = f"Missing required columns: {', '.join(missing)}"
+        return (False, msg, [header], []) if not skip_invalid else (True, msg + ' (skipped all rows)', [header], list(range(2, 2 + max(0, len(rows) - 1))))
+
+    normalized_rows.append(header)
+
+    invalid_count = 0
+    for row_i, row in enumerate(rows[1:], start=2):
+        # row_i is 1-based line number in the CSV file.
+        values = [str(x or '').strip() for x in (row or [])]
+        # Pad to header length to avoid IndexError.
+        while len(values) < len(header):
+            values.append('')
+
+        name = values[idx['name']].strip()
+        path_value = values[idx['path']].strip()
+        type_value = values[idx['type']].strip().lower()
+        startup_value = values[idx['startup']].strip().lower()
+        vector_value = values[idx['vector']].strip().lower()
+
+        ok_row = True
+        if not name or not path_value:
+            ok_row = False
+        if type_value not in allowed_types:
+            ok_row = False
+
+        if startup_value in startup_true:
+            startup_norm = 'yes'
+        elif startup_value in startup_false:
+            startup_norm = 'no'
+        else:
+            ok_row = False
+            startup_norm = startup_value or ''
+
+        vector_norm = vector_alias.get(vector_value, '')
+        if not vector_norm:
+            ok_row = False
+
+        if not ok_row:
+            invalid_count += 1
+            if skip_invalid:
+                skipped.append(row_i)
+                continue
+            return False, f'Invalid row at line {row_i}', normalized_rows, [row_i]
+
+        # Apply normalized enums back into the row.
+        values[idx['type']] = type_value
+        values[idx['startup']] = startup_norm
+        values[idx['vector']] = vector_norm
+        normalized_rows.append(values)
+
+    note = f'OK ({len(normalized_rows) - 1} row(s))'
+    if invalid_count:
+        note += f'; skipped {invalid_count} invalid row(s)'
+    return True, note, normalized_rows, skipped
+
+
+
+
+# ---------------- Flag Generators (manifest) -----------------
+
+
+def _flag_generators_from_manifests(*, kind: str) -> tuple[list[dict], dict[str, dict[str, Any]], list[dict]]:
+    """Load generators + plugin contracts from strict YAML manifests.
+
+    Returns: (generator_views, plugins_by_id, errors)
+    """
+    try:
+        from core_topo_gen.generator_manifests import discover_generator_manifests
+    except Exception as exc:
+        return [], {}, [{'error': f'failed to import manifest loader: {exc}'}]
+
+    try:
+        repo_root = _get_repo_root()
+    except Exception:
+        repo_root = os.getcwd()
+
+    gens, plugins_by_id, errs = discover_generator_manifests(repo_root=repo_root, kind=kind)
+    errors: list[dict] = []
+    for e in (errs or []):
+        try:
+            errors.append({'path': getattr(e, 'path', ''), 'error': getattr(e, 'error', str(e))})
+        except Exception:
+            continue
+    return gens, plugins_by_id, errors
+
+
+def _flag_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
+    """Return enabled flag-generators.
+
+    Enabled means:
+      - installed under outputs/installed_generators (installed-only policy)
+      - not disabled (pack-level or generator-level)
+    """
+    gens, _plugins_by_id, errors = _flag_generators_from_manifests(kind='flag-generator')
+    out: list[dict] = []
+    for g in (gens or []):
+        if not isinstance(g, dict):
+            continue
+        if not _is_installed_generator_view(g):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if not gid:
+            continue
+        if _is_installed_generator_disabled(kind='flag-generator', generator_id=gid):
+            continue
+        out.append(g)
+    return out, errors
+
+
+def _flag_node_generators_from_enabled_sources() -> tuple[list[dict], list[dict]]:
+    """Return enabled flag-node-generators.
+
+    Enabled means:
+      - installed under outputs/installed_generators (installed-only policy)
+      - not disabled (pack-level or generator-level)
+    """
+    gens, _plugins_by_id, errors = _flag_generators_from_manifests(kind='flag-node-generator')
+    out: list[dict] = []
+    for g in (gens or []):
+        if not isinstance(g, dict):
+            continue
+        if not _is_installed_generator_view(g):
+            continue
+        gid = str(g.get('id') or '').strip()
+        if not gid:
+            continue
+        if _is_installed_generator_disabled(kind='flag-node-generator', generator_id=gid):
+            continue
+        out.append(g)
+    return out, errors
+
+
+@app.route('/flag_generators_data')
+def flag_generators_data():
+    try:
+        generators, errors = _flag_generators_from_enabled_sources()
+        generators = [g for g in (generators or []) if isinstance(g, dict) and _is_installed_generator_view(g)]
+        generators = _annotate_disabled_state(generators, kind='flag-generator')
+        return jsonify({'generators': generators, 'errors': errors})
+    except Exception as e:
+        return jsonify({'generators': [], 'errors': [{'error': str(e)}]}), 500
+
+
+@app.route('/flag_node_generators_data')
+def flag_node_generators_data():
+    try:
+        generators, errors = _flag_node_generators_from_enabled_sources()
+        generators = [g for g in (generators or []) if isinstance(g, dict) and _is_installed_generator_view(g)]
+        generators = _annotate_disabled_state(generators, kind='flag-node-generator')
+        return jsonify({'generators': generators, 'errors': errors})
+    except Exception as e:
+        return jsonify({'generators': [], 'errors': [{'error': str(e)}]}), 500
+
+
+def _installed_generators_root() -> str:
+    """Root directory for installed generator packs.
+
+    Defaults to ./outputs/installed_generators under repo root.
+    Overridable via CORETG_INSTALLED_GENERATORS_DIR for tests/dev.
+    """
+    env = str(os.environ.get('CORETG_INSTALLED_GENERATORS_DIR') or '').strip()
+    if env:
+        root = os.path.abspath(os.path.expanduser(env))
+    else:
+        try:
+            repo_root = _get_repo_root()
+        except Exception:
+            repo_root = os.getcwd()
+        root = os.path.join(repo_root, 'outputs', 'installed_generators')
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _installed_generator_packs_state_path() -> str:
+    return os.path.join(_installed_generators_root(), '_packs_state.json')
+
+
+def _load_installed_generator_packs_state() -> dict:
+    path = _installed_generator_packs_state_path()
+    try:
+        if not os.path.exists(path):
+            state = {'packs': []}
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(state, fh, indent=2)
+            os.replace(tmp, path)
+            return state
+        with open(path, 'r', encoding='utf-8') as fh:
+            state = json.load(fh)
+        if not isinstance(state, dict):
+            return {'packs': []}
+        if not isinstance(state.get('packs'), list):
+            state['packs'] = []
+        return state
+    except Exception:
+        return {'packs': []}
+
+
+def _save_installed_generator_packs_state(state: dict) -> None:
+    path = _installed_generator_packs_state_path()
     try:
         tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8', newline='') as f:
-            w = csv.writer(f)
-            for r in norm_rows:
-                w.writerow(r)
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(state if isinstance(state, dict) else {'packs': []}, fh, indent=2)
         os.replace(tmp, path)
     except Exception:
         pass
-    state = _load_data_sources_state()
-    entry = {
-        "id": uuid.uuid4().hex[:12],
-        "name": filename,
-        "path": path,
-        "enabled": True,
-        "rows": note,
-        "uploaded": datetime.datetime.utcnow().isoformat() + 'Z'
-    }
-    state['sources'].append(entry)
-    _save_data_sources_state(state)
-    if ok and skipped:
-        flash(f'CSV imported with {len(skipped)} invalid row(s) skipped.')
-    else:
-        flash('CSV imported.')
-    return redirect(url_for('data_sources_page'))
 
-@app.route('/data_sources/toggle/<sid>', methods=['POST'])
-def data_sources_toggle(sid):
-    state = _load_data_sources_state()
-    for s in state.get('sources', []):
-        if s.get('id') == sid:
-            s['enabled'] = not s.get('enabled', False)
-            break
-    _save_data_sources_state(state)
-    return redirect(url_for('data_sources_page'))
 
-@app.route('/data_sources/delete/<sid>', methods=['POST'])
-def data_sources_delete(sid):
-    state = _load_data_sources_state()
-    new_sources = []
-    for s in state.get('sources', []):
-        if s.get('id') == sid:
+def _normalize_installed_source_path(p: str) -> str:
+    return str(p or '').replace('\\', '/').strip().lower()
+
+
+def _is_installed_generator_view(gen: dict) -> bool:
+    """Best-effort check that a generator came from outputs/installed_generators."""
+    try:
+        src = ''
+        if isinstance(gen.get('source'), dict):
+            src = str(gen.get('source', {}).get('path') or '')
+        norm = _normalize_installed_source_path(src)
+        if 'outputs/installed_generators' in norm:
+            return True
+
+        mp = str(gen.get('_source_path') or '').strip()
+        if mp:
+            installed_root = os.path.abspath(_installed_generators_root())
+            abs_mp = os.path.abspath(mp)
+            return os.path.commonpath([installed_root, abs_mp]) == installed_root
+    except Exception:
+        return False
+    return False
+
+
+def _build_installed_disable_maps() -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
+    """Return (pack_by_id, gen_by_kind_id) maps from the installed packs state."""
+    state = _load_installed_generator_packs_state()
+    packs = state.get('packs') if isinstance(state, dict) else None
+    if not isinstance(packs, list):
+        packs = []
+
+    pack_by_id: dict[str, dict[str, Any]] = {}
+    gen_by_kind_id: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for p in packs:
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get('id') or '').strip()
+        if not pid:
+            continue
+        pack_disabled = bool(p.get('disabled') is True)
+        pack_label = str(p.get('label') or '').strip() or pid
+        pack_by_id[pid] = {
+            'id': pid,
+            'label': pack_label,
+            'disabled': pack_disabled,
+            'origin': str(p.get('origin') or '').strip(),
+        }
+        for it in (p.get('installed') or []):
+            if not isinstance(it, dict):
+                continue
+            gid = str(it.get('id') or '').strip()
+            kind = str(it.get('kind') or '').strip()
+            if not gid or not kind:
+                continue
+            item_disabled = bool(it.get('disabled') is True)
+            info_obj = {
+                'pack_id': pid,
+                'pack_label': pack_label,
+                'pack_disabled': pack_disabled,
+                'disabled': pack_disabled or item_disabled,
+                'item_disabled': item_disabled,
+            }
+
+            # Back-compat: generator packs may use numeric ids in the packs state,
+            # but Flow/UI operate on stable `source_generator_id`. If we can
+            # resolve a source id from the installed pack marker, map both.
+            gen_by_kind_id[(kind, gid)] = info_obj
             try:
-                if os.path.exists(s.get('path','')):
-                    os.remove(s['path'])
+                pack_path = str(it.get('path') or '').strip()
+                if pack_path:
+                    marker_path = os.path.join(pack_path, '.coretg_pack.json')
+                    if os.path.exists(marker_path) and os.path.isfile(marker_path):
+                        with open(marker_path, 'r', encoding='utf-8') as fh:
+                            marker = json.load(fh)
+                        if isinstance(marker, dict):
+                            src_id = str(marker.get('source_generator_id') or '').strip()
+                            if src_id:
+                                gen_by_kind_id.setdefault((kind, src_id), info_obj)
             except Exception:
                 pass
-            continue
-        new_sources.append(s)
-    state['sources'] = new_sources
-    _save_data_sources_state(state)
-    flash('Deleted.')
-    return redirect(url_for('data_sources_page'))
 
-@app.route('/data_sources/refresh/<sid>', methods=['POST'])
-def data_sources_refresh(sid):
-    state = _load_data_sources_state()
-    for s in state.get('sources', []):
-        if s.get('id') == sid:
-            ok, note, norm_rows, skipped = _validate_and_normalize_data_source_csv(s.get('path',''), skip_invalid=True)
-            if ok and norm_rows:
-                # Write back normalized CSV
+    return pack_by_id, gen_by_kind_id
+
+
+def _annotate_disabled_state(generators: list[dict], *, kind: str) -> list[dict]:
+    """Annotate generator views with _disabled/_pack_* fields using pack state."""
+    _pack_by_id, gen_by_kind_id = _build_installed_disable_maps()
+    out: list[dict] = []
+    for g in (generators or []):
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get('id') or '').strip()
+        info = gen_by_kind_id.get((kind, gid)) if gid else None
+        g['_installed'] = True
+        if info:
+            g['_pack_id'] = info.get('pack_id')
+            g['_pack_label'] = info.get('pack_label')
+            g['_pack_disabled'] = bool(info.get('pack_disabled'))
+            g['_disabled'] = bool(info.get('disabled'))
+            g['_item_disabled'] = bool(info.get('item_disabled'))
+        else:
+            g['_disabled'] = False
+        out.append(g)
+    return out
+
+
+def _is_installed_generator_disabled(*, kind: str, generator_id: str) -> bool:
+    gid = str(generator_id or '').strip()
+    if not gid:
+        return False
+    _pack_by_id, gen_by_kind_id = _build_installed_disable_maps()
+    info = gen_by_kind_id.get((str(kind or '').strip(), gid))
+    return bool(info and info.get('disabled') is True)
+
+
+def _is_safe_remote_zip_url(url: str) -> tuple[bool, str]:
+    """Basic SSRF guard: only allow http(s) and block private/reserved IPs."""
+    try:
+        from urllib.parse import urlparse
+        import ipaddress
+        import socket
+
+        u = str(url or '').strip()
+        if not u:
+            return False, 'Missing URL'
+        parsed = urlparse(u)
+        if parsed.scheme not in ('http', 'https'):
+            return False, 'Only http(s) URLs are allowed'
+        host = parsed.hostname
+        if not host:
+            return False, 'Invalid URL host'
+        if host.lower() in ('localhost',):
+            return False, 'Blocked host'
+
+        infos = socket.getaddrinfo(host, None)
+        ips: set[str] = set()
+        for info in infos:
+            try:
+                ips.add(str(info[4][0]))
+            except Exception:
+                continue
+        if not ips:
+            return False, 'Could not resolve host'
+        for ip_s in ips:
+            try:
+                ip = ipaddress.ip_address(ip_s)
+            except Exception:
+                return False, f'Invalid resolved IP: {ip_s}'
+            if (
+                ip.is_loopback
+                or ip.is_private
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                return False, f'Blocked IP: {ip}'
+        return True, ''
+    except Exception:
+        # Fail closed.
+        return False, 'URL validation failed'
+
+
+def _download_zip_from_url(url: str, *, max_bytes: int = 50_000_000) -> bytes:
+    ok, reason = _is_safe_remote_zip_url(url)
+    if not ok:
+        raise ValueError(reason)
+
+    u = str(url or '').strip()
+    try:
+        import requests  # type: ignore
+
+        resp = requests.get(u, stream=True, timeout=20)
+        resp.raise_for_status()
+        buf = bytearray()
+        for chunk in resp.iter_content(chunk_size=1024 * 64):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if len(buf) > max_bytes:
+                raise ValueError('Download too large')
+        return bytes(buf)
+    except Exception:
+        # Fallback to urllib
+        from urllib.request import urlopen
+
+        with urlopen(u, timeout=20) as r:  # nosec - guarded by _is_safe_remote_zip_url
+            buf = r.read(max_bytes + 1)
+        if len(buf) > max_bytes:
+            raise ValueError('Download too large')
+        return buf
+
+
+# ---------------- Vulnerability Catalog Packs -----------------
+
+
+def _installed_vuln_catalogs_root() -> str:
+    return os.path.join(_outputs_dir(), 'installed_vuln_catalogs')
+
+
+def _vuln_catalogs_state_path() -> str:
+    return os.path.join(_installed_vuln_catalogs_root(), '_catalogs_state.json')
+
+
+def _load_vuln_catalogs_state() -> dict:
+    try:
+        p = _vuln_catalogs_state_path()
+        if not os.path.exists(p):
+            return {'catalogs': [], 'active_id': ''}
+        with open(p, 'r', encoding='utf-8') as f:
+            obj = json.load(f)
+        if not isinstance(obj, dict):
+            return {'catalogs': [], 'active_id': ''}
+        obj.setdefault('catalogs', [])
+        obj.setdefault('active_id', '')
+        return obj
+    except Exception:
+        return {'catalogs': [], 'active_id': ''}
+
+
+def _write_vuln_catalogs_state(state: dict) -> None:
+    os.makedirs(_installed_vuln_catalogs_root(), exist_ok=True)
+    p = _vuln_catalogs_state_path()
+    tmp = p + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, p)
+
+
+def _vuln_catalog_pack_dir(catalog_id: str) -> str:
+    return os.path.join(_installed_vuln_catalogs_root(), str(catalog_id))
+
+
+def _vuln_catalog_pack_zip_path(catalog_id: str) -> str:
+    return os.path.join(_vuln_catalog_pack_dir(catalog_id), 'catalog.zip')
+
+
+def _vuln_catalog_pack_content_dir(catalog_id: str) -> str:
+    return os.path.join(_vuln_catalog_pack_dir(catalog_id), 'content')
+
+
+def _safe_path_under(base_dir: str, subpath: str) -> str:
+    """Resolve a user-provided subpath under base_dir safely."""
+    base_abs = os.path.abspath(base_dir)
+    rel = str(subpath or '').replace('\\', '/').strip()
+    rel = rel.lstrip('/')
+    parts = [p for p in rel.split('/') if p not in ('', '.')]
+    if any(p == '..' for p in parts):
+        raise ValueError('Invalid path')
+    out = os.path.abspath(os.path.join(base_abs, *parts))
+    if out == base_abs:
+        return out
+    if not out.startswith(base_abs + os.sep):
+        raise ValueError('Path escaped base directory')
+    return out
+
+
+def _pick_vuln_csv_from_zip(zf: zipfile.ZipFile) -> str | None:
+    names = [n for n in (zf.namelist() or []) if isinstance(n, str)]
+    preferred = [n for n in names if n.lower().endswith('/vuln_list_w_url.csv') or n.lower() == 'vuln_list_w_url.csv']
+    if preferred:
+        preferred.sort(key=lambda s: (s.count('/'), len(s)))
+        return preferred[0]
+    alt = [n for n in names if n.lower().endswith('/vuln_list.csv') or n.lower() == 'vuln_list.csv']
+    if alt:
+        alt.sort(key=lambda s: (s.count('/'), len(s)))
+        return alt[0]
+    return None
+
+
+def _install_vuln_catalog_zip_bytes(*, zip_bytes: bytes, label: str, origin: str) -> dict:
+    os.makedirs(_installed_vuln_catalogs_root(), exist_ok=True)
+    catalog_id = time.strftime('%Y%m%d-%H%M%S') + '-' + secrets.token_hex(3)
+    pack_dir = _vuln_catalog_pack_dir(catalog_id)
+    os.makedirs(pack_dir, exist_ok=True)
+
+    zip_path = _vuln_catalog_pack_zip_path(catalog_id)
+    with open(zip_path, 'wb') as f:
+        f.write(zip_bytes or b'')
+
+    csv_rel_paths: list[str] = []
+    compose_items: list[dict[str, Any]] = []
+    try:
+        # Extract the entire ZIP directory tree so compose directories (and their
+        # support files) are preserved.
+        content_dir = _vuln_catalog_pack_content_dir(catalog_id)
+        _safe_extract_zip_to_dir(zip_path, content_dir)
+
+        # Discover all directories containing docker-compose.yml (required).
+        compose_paths: list[tuple[str, str]] = []
+        for dirpath, _dirnames, filenames in os.walk(content_dir):
+            if '__MACOSX' in dirpath:
+                continue
+            if not filenames:
+                continue
+            if 'docker-compose.yml' not in filenames:
+                continue
+            compose_path = os.path.join(dirpath, 'docker-compose.yml')
+            if not os.path.isfile(compose_path):
+                continue
+            rel_dir = os.path.relpath(dirpath, content_dir).replace('\\', '/')
+            name = rel_dir if rel_dir not in ('.', '') else 'root'
+            compose_paths.append((name, compose_path))
+
+        if not compose_paths:
+            raise ValueError('ZIP must contain at least one directory with docker-compose.yml')
+
+        # Build item metadata (stable numeric id; UI name uses the parent folder name).
+        norm_label = str(label or '').strip()
+        for idx, (rel_name, compose_path) in enumerate(sorted(compose_paths, key=lambda t: t[0]), start=1):
+            rel_dir = rel_name
+            # Display name should include the parent folder when nested: <parent>/<leaf>.
+            if rel_dir in ('', '.', 'root'):
+                display_name = 'root'
+            else:
+                parts = [p for p in str(rel_dir).replace('\\', '/').split('/') if p]
+                if len(parts) >= 2:
+                    display_name = f"{parts[-2]}/{parts[-1]}"
+                else:
+                    display_name = parts[-1] if parts else 'root'
+            compose_rel = os.path.relpath(compose_path, content_dir).replace('\\', '/')
+            dir_rel = os.path.relpath(os.path.dirname(compose_path), content_dir).replace('\\', '/')
+            compose_items.append({
+                'id': idx,
+                'name': display_name,
+                'rel_dir': rel_dir,
+                'dir_rel': dir_rel,
+                'compose_rel': compose_rel,
+                # Keep repo-relative paths for convenience / compatibility.
+                'compose_path': os.path.relpath(compose_path, _get_repo_root()).replace('\\', '/'),
+                'dir': os.path.relpath(os.path.dirname(compose_path), _get_repo_root()).replace('\\', '/'),
+                'from_source': norm_label,
+                'disabled': False,
+            })
+
+        # Generate a catalog CSV from discovered compose directories.
+        out_path = os.path.join(pack_dir, 'vuln_list_w_url.csv')
+        with open(out_path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            w.writerow(['Name', 'Path', 'Type', 'Vector', 'Startup', 'CVE', 'Description', 'References'])
+            for it in compose_items:
+                abs_compose = os.path.abspath(os.path.join(content_dir, str(it.get('compose_rel') or 'docker-compose.yml')))
+                w.writerow([str(it.get('name') or ''), abs_compose, 'docker-compose', '', '', '', '', ''])
+
+        # Validate generated CSV is parseable and non-empty.
+        try:
+            from core_topo_gen.utils.vuln_process import _read_csv as _read_vuln_csv
+            if not _read_vuln_csv(out_path):
+                raise ValueError('Generated catalog CSV parsed as empty')
+        except Exception as exc:
+            raise ValueError(f'Invalid vulnerability catalog CSV: {exc}')
+
+        csv_rel_paths = [os.path.relpath(out_path, _get_repo_root())]
+    except Exception:
+        shutil.rmtree(pack_dir, ignore_errors=True)
+        raise
+
+    entry = {
+        'id': catalog_id,
+        'label': str(label or '').strip() or catalog_id,
+        'from_source': str(label or '').strip() or catalog_id,
+        'origin': str(origin or '').strip(),
+        'installed_at': datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'csv_paths': csv_rel_paths,
+        'content_dir': os.path.relpath(_vuln_catalog_pack_content_dir(catalog_id), _get_repo_root()).replace('\\', '/'),
+        'compose_items': compose_items,
+        'compose_count': len(compose_items),
+    }
+
+    state = _load_vuln_catalogs_state()
+    catalogs = state.get('catalogs')
+    if not isinstance(catalogs, list):
+        catalogs = []
+    catalogs.append(entry)
+    state['catalogs'] = catalogs
+    if not str(state.get('active_id') or '').strip():
+        state['active_id'] = catalog_id
+    _write_vuln_catalogs_state(state)
+    return entry
+
+
+@app.route('/vuln_catalog_page')
+def vuln_catalog_page():
+    _require_builder_or_admin()
+    state = _load_vuln_catalogs_state()
+    catalogs = [c for c in (state.get('catalogs') or []) if isinstance(c, dict)]
+    active_id = str(state.get('active_id') or '').strip()
+    active_label = None
+    for c in catalogs:
+        if str(c.get('id') or '').strip() == active_id:
+            active_label = str(c.get('label') or '').strip() or active_id
+            break
+    items_count = None
+    try:
+        from core_topo_gen.utils.vuln_process import load_vuln_catalog
+        items_count = len(load_vuln_catalog(_get_repo_root()))
+    except Exception:
+        items_count = None
+    return render_template(
+        'vuln_catalog.html',
+        catalogs=catalogs,
+        active_id=active_id,
+        active_label=active_label,
+        items_count=items_count,
+        active_page='vuln_catalog',
+    )
+
+
+@app.route('/vuln_catalog_packs/upload', methods=['POST'])
+def vuln_catalog_packs_upload():
+    _require_builder_or_admin()
+    f = request.files.get('zip_file')
+    is_ajax = str(request.headers.get('X-Requested-With') or '').lower() == 'xmlhttprequest' or 'application/json' in str(request.headers.get('Accept') or '')
+    if not f:
+        if is_ajax:
+            return jsonify({'ok': False, 'error': 'Missing zip_file'}), 400
+        flash('Missing zip_file')
+        return redirect(url_for('vuln_catalog_page'))
+    try:
+        data = f.read() or b''
+        label = secure_filename(getattr(f, 'filename', '') or '') or 'vuln-catalog'
+        entry = _install_vuln_catalog_zip_bytes(zip_bytes=data, label=label, origin='upload')
+        if is_ajax:
+            return jsonify({'ok': True, 'message': 'Vulnerability catalog pack installed.', 'catalog_id': str(entry.get('id') or '')})
+        flash('Vulnerability catalog pack installed.')
+    except Exception as exc:
+        if is_ajax:
+            return jsonify({'ok': False, 'error': f'Failed to install vulnerability catalog pack: {exc}'}), 400
+        flash(f'Failed to install vulnerability catalog pack: {exc}')
+    return redirect(url_for('vuln_catalog_page'))
+
+
+@app.route('/vuln_catalog_packs/import_url', methods=['POST'])
+def vuln_catalog_packs_import_url():
+    _require_builder_or_admin()
+    url = str(request.form.get('zip_url') or '').strip()
+    ok, msg = _is_safe_remote_zip_url(url)
+    if not ok:
+        flash(f'Blocked URL: {msg}')
+        return redirect(url_for('vuln_catalog_page'))
+    try:
+        data = _download_zip_from_url(url)
+        label = os.path.basename(urlparse(url).path) or 'vuln-catalog'
+        _install_vuln_catalog_zip_bytes(zip_bytes=data, label=label, origin=url)
+        flash('Vulnerability catalog pack installed from URL.')
+    except Exception as exc:
+        flash(f'Failed to import vulnerability catalog pack: {exc}')
+    return redirect(url_for('vuln_catalog_page'))
+
+
+@app.route('/vuln_catalog_packs/download/<catalog_id>')
+def vuln_catalog_packs_download(catalog_id: str):
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    if not cid:
+        abort(404)
+    zip_path = _vuln_catalog_pack_zip_path(cid)
+    if not os.path.exists(zip_path):
+        abort(404)
+    return send_file(zip_path, as_attachment=True, download_name=f'vuln_catalog_{cid}.zip')
+
+
+@app.route('/vuln_catalog_packs/browse/<catalog_id>')
+@app.route('/vuln_catalog_packs/browse/<catalog_id>/<path:subpath>')
+def vuln_catalog_packs_browse(catalog_id: str, subpath: str = ''):
+    """Browse extracted files for an installed vulnerability catalog pack."""
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    if not cid:
+        abort(404)
+    base_dir = _vuln_catalog_pack_content_dir(cid)
+    if not os.path.isdir(base_dir):
+        abort(404)
+
+    try:
+        cur_abs = _safe_path_under(base_dir, subpath or '')
+    except Exception:
+        abort(400)
+
+    if os.path.isfile(cur_abs):
+        rel = os.path.relpath(cur_abs, base_dir).replace('\\', '/')
+        return redirect(url_for('vuln_catalog_packs_file', catalog_id=cid, subpath=rel))
+    if not os.path.isdir(cur_abs):
+        abort(404)
+
+    rel_dir = os.path.relpath(cur_abs, base_dir).replace('\\', '/')
+    if rel_dir in ('.', ''):
+        rel_dir = ''
+
+    entries: list[dict[str, Any]] = []
+    try:
+        for nm in sorted(os.listdir(cur_abs)):
+            if nm in ('.', '..'):
+                continue
+            p = os.path.join(cur_abs, nm)
+            kind = 'dir' if os.path.isdir(p) else 'file'
+            entries.append({'name': nm, 'kind': kind})
+    except Exception:
+        entries = []
+
+    crumbs: list[dict[str, str]] = [{'name': 'root', 'href': url_for('vuln_catalog_packs_browse', catalog_id=cid)}]
+    if rel_dir:
+        acc: list[str] = []
+        for part in [p for p in rel_dir.split('/') if p]:
+            acc.append(part)
+            crumbs.append({
+                'name': part,
+                'href': url_for('vuln_catalog_packs_browse', catalog_id=cid, subpath='/'.join(acc)),
+            })
+
+    return render_template(
+        'vuln_catalog_browse.html',
+        catalog_id=cid,
+        rel_dir=rel_dir,
+        entries=entries,
+        crumbs=crumbs,
+        active_page='vuln_catalog',
+    )
+
+
+@app.route('/vuln_catalog_packs/file/<catalog_id>/<path:subpath>')
+def vuln_catalog_packs_file(catalog_id: str, subpath: str):
+    """Download a single extracted file from an installed vulnerability catalog pack."""
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    if not cid:
+        abort(404)
+    base_dir = _vuln_catalog_pack_content_dir(cid)
+    if not os.path.isdir(base_dir):
+        abort(404)
+    try:
+        abs_p = _safe_path_under(base_dir, subpath or '')
+    except Exception:
+        abort(400)
+    if not os.path.isfile(abs_p):
+        abort(404)
+    return send_file(abs_p, as_attachment=True, download_name=os.path.basename(abs_p))
+
+
+@app.route('/vuln_catalog_packs/view/<catalog_id>/<path:subpath>')
+def vuln_catalog_packs_view(catalog_id: str, subpath: str):
+    """View a single extracted file inline (no forced download).
+
+    Used for README links in the Vulnerability Catalog UI.
+    """
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    if not cid:
+        abort(404)
+    base_dir = _vuln_catalog_pack_content_dir(cid)
+    if not os.path.isdir(base_dir):
+        abort(404)
+    try:
+        abs_p = _safe_path_under(base_dir, subpath or '')
+    except Exception:
+        abort(400)
+    if not os.path.isfile(abs_p):
+        abort(404)
+    # Let Flask infer mimetype; keep it inline.
+    return send_file(abs_p, as_attachment=False, download_name=os.path.basename(abs_p))
+
+
+@app.route('/vuln_catalog_packs/readme/<catalog_id>/<path:subpath>')
+def vuln_catalog_packs_readme(catalog_id: str, subpath: str):
+    """Render a README file nicely (Markdown -> sanitized HTML; txt -> preformatted).
+
+    This is used by the Vuln-Catalog "Description" column.
+    """
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    if not cid:
+        abort(404)
+    base_dir = _vuln_catalog_pack_content_dir(cid)
+    if not os.path.isdir(base_dir):
+        abort(404)
+    try:
+        abs_p = _safe_path_under(base_dir, subpath or '')
+    except Exception:
+        abort(400)
+    if not os.path.isfile(abs_p):
+        abort(404)
+
+    ext = os.path.splitext(abs_p)[1].lower().lstrip('.')
+    if ext not in ('md', 'markdown', 'txt'):
+        abort(404)
+
+    try:
+        with open(abs_p, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except Exception:
+        abort(404)
+
+    readme_title = os.path.basename(abs_p)
+    readme_rel = os.path.relpath(abs_p, base_dir).replace('\\', '/')
+
+    def _rewrite_pack_relative_urls(*, html_in: str, readme_rel_path: str) -> str:
+        """Rewrite relative URLs in rendered HTML to point at pack routes.
+
+        This makes relative image/link references inside README.md work, e.g. "1.png".
+        """
+        import html as _html
+        import posixpath as _posixpath
+        from html.parser import HTMLParser as _HTMLParser
+        from urllib.parse import urlparse as _urlparse
+
+        base_rel_dir = _posixpath.dirname(readme_rel_path or '')
+
+        def _is_relative_url(u: str) -> bool:
+            u = (u or '').strip()
+            if not u:
+                return False
+            if u.startswith('#'):
+                return False
+            # Absolute-path URLs ("/foo") are already rooted.
+            if u.startswith('/'):
+                return False
+            parsed = _urlparse(u)
+            return not bool(parsed.scheme)
+
+        def _resolve_rel(u: str) -> str | None:
+            # Prevent escaping out of pack content.
+            u = (u or '').strip().replace('\\', '/')
+            if not u or u.startswith('/'):
+                return None
+            resolved = _posixpath.normpath(_posixpath.join(base_rel_dir, u))
+            # normpath can return '.'
+            if resolved in ('', '.'):
+                return None
+            if resolved.startswith('..'):
+                return None
+            return resolved
+
+        def _rewrite_href(u: str) -> str:
+            if not _is_relative_url(u):
+                return u
+            resolved = _resolve_rel(u)
+            if not resolved:
+                return u
+            ext = os.path.splitext(resolved)[1].lower().lstrip('.')
+            if ext in ('md', 'markdown', 'txt'):
+                return url_for('vuln_catalog_packs_readme', catalog_id=cid, subpath=resolved)
+            return url_for('vuln_catalog_packs_view', catalog_id=cid, subpath=resolved)
+
+        def _rewrite_src(u: str) -> str:
+            if not _is_relative_url(u):
+                return u
+            resolved = _resolve_rel(u)
+            if not resolved:
+                return u
+            return url_for('vuln_catalog_packs_view', catalog_id=cid, subpath=resolved)
+
+        class _Rewriter(_HTMLParser):
+            def __init__(self) -> None:
+                super().__init__(convert_charrefs=False)
+                self._out: list[str] = []
+
+            def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                self._emit_tag(tag, attrs, closed=False)
+
+            def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                self._emit_tag(tag, attrs, closed=True)
+
+            def _emit_tag(self, tag: str, attrs: list[tuple[str, str | None]], *, closed: bool) -> None:
+                tag_l = (tag or '').lower()
+                new_attrs: list[tuple[str, str | None]] = []
+                for k, v in (attrs or []):
+                    if not k:
+                        continue
+                    k_l = k.lower()
+                    if v is not None and tag_l == 'a' and k_l == 'href':
+                        v = _rewrite_href(v)
+                    elif v is not None and tag_l == 'img' and k_l == 'src':
+                        v = _rewrite_src(v)
+                    new_attrs.append((k, v))
+
+                self._out.append('<')
+                self._out.append(tag)
+                for k, v in new_attrs:
+                    if v is None:
+                        self._out.append(f' {k}')
+                    else:
+                        self._out.append(f' {k}="{_html.escape(str(v), quote=True)}"')
+                self._out.append(' />' if closed else '>')
+
+            def handle_endtag(self, tag: str) -> None:
+                self._out.append(f'</{tag}>')
+
+            def handle_data(self, data: str) -> None:
+                self._out.append(data)
+
+            def handle_entityref(self, name: str) -> None:
+                self._out.append(f'&{name};')
+
+            def handle_charref(self, name: str) -> None:
+                self._out.append(f'&#{name};')
+
+            def handle_comment(self, data: str) -> None:
+                self._out.append(f'<!--{data}-->')
+
+            def handle_decl(self, decl: str) -> None:
+                self._out.append(f'<!{decl}>')
+
+        p = _Rewriter()
+        try:
+            p.feed(html_in or '')
+            p.close()
+        except Exception:
+            return html_in
+        return ''.join(p._out)
+
+    rendered_html = ''
+    plain_text = ''
+    render_warning = ''
+    if ext == 'txt':
+        plain_text = content
+    else:
+        # Render markdown and sanitize it.
+        try:
+            import markdown as _markdown  # type: ignore
+        except Exception:
+            _markdown = None
+        try:
+            import bleach as _bleach  # type: ignore
+        except Exception:
+            _bleach = None
+
+        if _markdown is None or _bleach is None:
+            plain_text = content
+            missing = []
+            if _markdown is None:
+                missing.append('Markdown')
+            if _bleach is None:
+                missing.append('bleach')
+            try:
+                import sys as _sys
+                py_exe = str(getattr(_sys, 'executable', '') or '').strip()
+            except Exception:
+                py_exe = ''
+            if missing:
+                render_warning = f"Markdown rendering unavailable (missing: {', '.join(missing)})."
+            else:
+                render_warning = 'Markdown rendering unavailable.'
+            if py_exe:
+                render_warning += f" Python: {py_exe}."
+            render_warning += ' Showing plain text.'
+        else:
+            html = _markdown.markdown(
+                content,
+                extensions=['fenced_code', 'tables', 'sane_lists'],
+                output_format='html5',
+            )
+            html = _rewrite_pack_relative_urls(html_in=html, readme_rel_path=readme_rel)
+            allowed_tags = [
+                'a', 'p', 'br', 'hr',
+                'strong', 'em', 'code', 'pre', 'blockquote',
+                'ul', 'ol', 'li',
+                'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+                'table', 'thead', 'tbody', 'tr', 'th', 'td',
+                'img',
+            ]
+            allowed_attrs = {
+                'a': ['href', 'title', 'target', 'rel'],
+                'code': ['class'],
+                'pre': ['class'],
+                'th': ['align'],
+                'td': ['align'],
+                'img': ['src', 'alt', 'title'],
+            }
+            cleaned = _bleach.clean(
+                html,
+                tags=allowed_tags,
+                attributes=allowed_attrs,
+                protocols=['http', 'https', 'mailto'],
+                strip=True,
+            )
+            rendered_html = cleaned
+
+    return render_template(
+        'vuln_catalog_readme.html',
+        active_page='vuln_catalog',
+        catalog_id=cid,
+        readme_title=readme_title,
+        readme_rel=readme_rel,
+        rendered_html=rendered_html,
+        plain_text=plain_text,
+        render_warning=render_warning,
+    )
+
+
+@app.route('/vuln_catalog_packs/item_files/<catalog_id>/<int:item_id>')
+def vuln_catalog_pack_item_files(catalog_id: str, item_id: int):
+    """Return a list of files for a single vulnerability item directory.
+
+    Used by the Topology "Select Vulnerability" modal to populate a Files dropdown.
+    """
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    if not cid:
+        return jsonify({'ok': False, 'error': 'Missing catalog id'}), 404
+
+    state = _load_vuln_catalogs_state()
+    entry = None
+    for c in (state.get('catalogs') or []):
+        if isinstance(c, dict) and str(c.get('id') or '').strip() == cid:
+            entry = c
+            break
+    if not entry:
+        return jsonify({'ok': False, 'error': 'Unknown catalog id'}), 404
+
+    items = _normalize_vuln_catalog_items(entry)
+    target = None
+    for it in items:
+        try:
+            if int(it.get('id') or 0) == int(item_id):
+                target = it
+                break
+        except Exception:
+            continue
+    if not target:
+        return jsonify({'ok': False, 'error': 'Unknown item id'}), 404
+
+    base_dir = _vuln_catalog_pack_content_dir(cid)
+    if not os.path.isdir(base_dir):
+        return jsonify({'ok': False, 'error': 'Pack content missing'}), 404
+
+    rel_dir = str(target.get('rel_dir') or target.get('dir_rel') or '').strip().replace('\\', '/')
+    try:
+        abs_dir = _safe_path_under(base_dir, rel_dir)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Invalid item path'}), 400
+    if not os.path.isdir(abs_dir):
+        return jsonify({'ok': False, 'error': 'Item directory missing'}), 404
+
+    files: list[dict[str, str]] = []
+    try:
+        for nm in sorted(os.listdir(abs_dir)):
+            if nm in ('.', '..'):
+                continue
+            ap = os.path.join(abs_dir, nm)
+            if not os.path.isfile(ap):
+                continue
+            rel = os.path.relpath(ap, base_dir).replace('\\', '/')
+            files.append({
+                'name': nm,
+                'url': url_for('vuln_catalog_packs_file', catalog_id=cid, subpath=rel),
+            })
+    except Exception:
+        files = []
+
+    return jsonify({'ok': True, 'catalog_id': cid, 'item_id': int(item_id), 'files': files})
+
+
+@app.route('/vuln_catalog_packs/set_active/<catalog_id>', methods=['POST'])
+def vuln_catalog_packs_set_active(catalog_id: str):
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    state = _load_vuln_catalogs_state()
+    catalogs = [c for c in (state.get('catalogs') or []) if isinstance(c, dict)]
+    if not any(str(c.get('id') or '').strip() == cid for c in catalogs):
+        flash('Unknown catalog id')
+        return redirect(url_for('vuln_catalog_page'))
+    state['active_id'] = cid
+    _write_vuln_catalogs_state(state)
+    flash('Active vulnerability catalog updated.')
+    return redirect(url_for('vuln_catalog_page'))
+
+
+@app.route('/vuln_catalog_packs/delete/<catalog_id>', methods=['POST'])
+def vuln_catalog_packs_delete(catalog_id: str):
+    _require_builder_or_admin()
+    cid = str(catalog_id or '').strip()
+    state = _load_vuln_catalogs_state()
+    catalogs = [c for c in (state.get('catalogs') or []) if isinstance(c, dict)]
+    kept = [c for c in catalogs if str(c.get('id') or '').strip() != cid]
+    state['catalogs'] = kept
+    if str(state.get('active_id') or '').strip() == cid:
+        state['active_id'] = str((kept[0].get('id') if kept else '') or '').strip()
+    _write_vuln_catalogs_state(state)
+    shutil.rmtree(_vuln_catalog_pack_dir(cid), ignore_errors=True)
+    flash('Vulnerability catalog pack deleted.')
+    return redirect(url_for('vuln_catalog_page'))
+
+
+def _get_active_vuln_catalog_entry(state: dict) -> dict | None:
+    active_id = str((state or {}).get('active_id') or '').strip()
+    catalogs = [c for c in ((state or {}).get('catalogs') or []) if isinstance(c, dict)]
+    for c in catalogs:
+        if str(c.get('id') or '').strip() == active_id:
+            return c
+    return None
+
+
+def _normalize_vuln_catalog_items(entry: dict) -> list[dict[str, Any]]:
+    items = entry.get('compose_items')
+    if not isinstance(items, list):
+        items = []
+    out: list[dict[str, Any]] = []
+    next_id = 1
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        it = dict(raw)
+        iid = it.get('id')
+        try:
+            iid_int = int(iid)
+        except Exception:
+            iid_int = next_id
+        if iid_int < 1:
+            iid_int = next_id
+        next_id = max(next_id, iid_int + 1)
+        it['id'] = iid_int
+        it['disabled'] = bool(it.get('disabled', False))
+        it['name'] = str(it.get('name') or '').strip() or 'root'
+        it['rel_dir'] = str(it.get('rel_dir') or '').strip()
+        it['dir_rel'] = str(it.get('dir_rel') or '').strip()
+        it['compose_rel'] = str(it.get('compose_rel') or '').strip()
+        out.append(it)
+    out.sort(key=lambda d: int(d.get('id') or 0))
+    return out
+
+
+def _vuln_catalog_item_abs_compose_path(*, catalog_id: str, item: dict[str, Any]) -> str:
+    content_dir = _vuln_catalog_pack_content_dir(catalog_id)
+    rel = str(item.get('compose_rel') or '').strip()
+    if rel:
+        return _safe_path_under(content_dir, rel)
+    # Back-compat: older items may only have repo-relative compose_path
+    repo_rel = str(item.get('compose_path') or '').strip().replace('\\', '/')
+    if not repo_rel:
+        raise ValueError('Missing compose path')
+    abs_p = os.path.abspath(os.path.join(_get_repo_root(), repo_rel))
+    repo_root = os.path.abspath(_get_repo_root())
+    if os.path.commonpath([repo_root, abs_p]) != repo_root:
+        raise ValueError('Compose path escaped repo root')
+    return abs_p
+
+
+def _write_vuln_catalog_csv_from_items(*, catalog_id: str, items: list[dict[str, Any]]) -> list[str]:
+    """Rewrite vuln_list_w_url.csv for a pack based on enabled items."""
+    pack_dir = _vuln_catalog_pack_dir(catalog_id)
+    content_dir = _vuln_catalog_pack_content_dir(catalog_id)
+    os.makedirs(pack_dir, exist_ok=True)
+    os.makedirs(content_dir, exist_ok=True)
+
+    enabled = [it for it in (items or []) if not bool(it.get('disabled', False))]
+    out_path = os.path.join(pack_dir, 'vuln_list_w_url.csv')
+    with open(out_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(['Name', 'Path', 'Type', 'Vector', 'Startup', 'CVE', 'Description', 'References'])
+        for it in enabled:
+            abs_compose = _vuln_catalog_item_abs_compose_path(catalog_id=catalog_id, item=it)
+            w.writerow([str(it.get('name') or ''), os.path.abspath(abs_compose), 'docker-compose', '', '', '', '', ''])
+
+    return [os.path.relpath(out_path, _get_repo_root()).replace('\\', '/')]
+
+
+@app.route('/vuln_catalog_items_data')
+def vuln_catalog_items_data():
+    _require_builder_or_admin()
+    state = _load_vuln_catalogs_state()
+    entry = _get_active_vuln_catalog_entry(state)
+    if not entry:
+        return jsonify({'ok': True, 'active': None, 'items': []})
+    cid = str(entry.get('id') or '').strip()
+    items = _normalize_vuln_catalog_items(entry)
+    from_source = str(entry.get('from_source') or entry.get('label') or '').strip()
+    def _display_name(it: dict[str, Any]) -> str:
+        # Prefer stored name, but for deeper folders compute <parent>/<leaf> from rel_dir/dir_rel.
+        base = str(it.get('name') or '').strip() or 'root'
+        rel_dir = str(it.get('rel_dir') or it.get('dir_rel') or '').strip()
+        if not rel_dir or rel_dir in ('', '.', 'root'):
+            return base
+        parts = [p for p in rel_dir.replace('\\', '/').split('/') if p]
+        if len(parts) >= 2:
+            return f"{parts[-2]}/{parts[-1]}"
+        return parts[-1] if parts else base
+
+    base_dir = _vuln_catalog_pack_content_dir(cid)
+    out_items: list[dict[str, Any]] = []
+    for it in items:
+        readme_url = ''
+        try:
+            rel_dir = str(it.get('dir_rel') or it.get('rel_dir') or '').strip().replace('\\', '/')
+            abs_dir = _safe_path_under(base_dir, rel_dir)
+            if os.path.isdir(abs_dir):
+                # Look for a README (case-insensitive) in the item directory.
+                # Prefer the canonical names first, then fall back to README.*.md/markdown/txt.
+                best_nm = None
+                best_rank = 10**9
+                for nm in os.listdir(abs_dir):
+                    if not isinstance(nm, str):
+                        continue
+                    low = nm.lower().strip()
+                    if not low.startswith('readme'):
+                        continue
+                    ext = os.path.splitext(low)[1].lstrip('.')
+                    if ext not in ('md', 'markdown', 'txt'):
+                        continue
+                    # Rank exact matches highest.
+                    if low in ('readme.md', 'readme.markdown', 'readme.txt'):
+                        rank = 0
+                    # Prefer English-ish before localized variants if present.
+                    elif low.startswith('readme.en'):
+                        rank = 1
+                    else:
+                        rank = 2
+                    if rank < best_rank:
+                        best_rank = rank
+                        best_nm = nm
+
+                if best_nm:
+                    rel = os.path.relpath(os.path.join(abs_dir, best_nm), base_dir).replace('\\', '/')
+                    readme_url = url_for('vuln_catalog_packs_readme', catalog_id=cid, subpath=rel)
+        except Exception:
+            readme_url = ''
+        out_items.append({
+            'id': int(it.get('id') or 0),
+            'name': _display_name(it),
+            'type': 'docker-compose',
+            'from_source': from_source,
+            'disabled': bool(it.get('disabled', False)),
+            'readme_url': readme_url,
+        })
+    return jsonify({
+        'ok': True,
+        'active': {
+            'id': cid,
+            'label': str(entry.get('label') or '').strip() or cid,
+            'from_source': from_source,
+        },
+        'items': out_items,
+    })
+
+
+@app.route('/vuln_catalog_items/set_disabled', methods=['POST'])
+def vuln_catalog_items_set_disabled():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    item_id_raw = payload.get('item_id')
+    disabled = bool(payload.get('disabled', False))
+    try:
+        item_id = int(item_id_raw)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Invalid item_id'}), 400
+
+    state = _load_vuln_catalogs_state()
+    entry = _get_active_vuln_catalog_entry(state)
+    if not entry:
+        return jsonify({'ok': False, 'error': 'No active catalog pack'}), 404
+    cid = str(entry.get('id') or '').strip()
+    catalogs = [c for c in (state.get('catalogs') or []) if isinstance(c, dict)]
+
+    updated = False
+    for c in catalogs:
+        if str(c.get('id') or '').strip() != cid:
+            continue
+        items = _normalize_vuln_catalog_items(c)
+        for it in items:
+            if int(it.get('id') or 0) == item_id:
+                it['disabled'] = disabled
+                updated = True
+                break
+        c['compose_items'] = items
+        c['csv_paths'] = _write_vuln_catalog_csv_from_items(catalog_id=cid, items=items)
+        break
+    if not updated:
+        return jsonify({'ok': False, 'error': 'Unknown item id'}), 404
+
+    state['catalogs'] = catalogs
+    _write_vuln_catalogs_state(state)
+    return jsonify({'ok': True})
+
+
+@app.route('/vuln_catalog_items/delete', methods=['POST'])
+def vuln_catalog_items_delete():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    item_id_raw = payload.get('item_id')
+    try:
+        item_id = int(item_id_raw)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Invalid item_id'}), 400
+
+    state = _load_vuln_catalogs_state()
+    entry = _get_active_vuln_catalog_entry(state)
+    if not entry:
+        return jsonify({'ok': False, 'error': 'No active catalog pack'}), 404
+    cid = str(entry.get('id') or '').strip()
+    catalogs = [c for c in (state.get('catalogs') or []) if isinstance(c, dict)]
+
+    removed = False
+    for c in catalogs:
+        if str(c.get('id') or '').strip() != cid:
+            continue
+        items = _normalize_vuln_catalog_items(c)
+        kept = [it for it in items if int(it.get('id') or 0) != item_id]
+        removed = len(kept) != len(items)
+        c['compose_items'] = kept
+        c['compose_count'] = len(kept)
+        c['csv_paths'] = _write_vuln_catalog_csv_from_items(catalog_id=cid, items=kept)
+        break
+    if not removed:
+        return jsonify({'ok': False, 'error': 'Unknown item id'}), 404
+
+    state['catalogs'] = catalogs
+    _write_vuln_catalogs_state(state)
+    return jsonify({'ok': True})
+
+
+@app.route('/vuln_catalog_items/test', methods=['POST'])
+def vuln_catalog_items_test():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    item_id_raw = payload.get('item_id')
+    try:
+        item_id = int(item_id_raw)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'Invalid item_id'}), 400
+
+    state = _load_vuln_catalogs_state()
+    entry = _get_active_vuln_catalog_entry(state)
+    if not entry:
+        return jsonify({'ok': False, 'error': 'No active catalog pack'}), 404
+    cid = str(entry.get('id') or '').strip()
+    items = _normalize_vuln_catalog_items(entry)
+    target = None
+    for it in items:
+        if int(it.get('id') or 0) == item_id:
+            target = it
+            break
+    if not target:
+        return jsonify({'ok': False, 'error': 'Unknown item id'}), 404
+
+    try:
+        compose_path = _vuln_catalog_item_abs_compose_path(catalog_id=cid, item=target)
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': f'Invalid compose path: {exc}'}), 400
+    if not os.path.isfile(compose_path):
+        return jsonify({'ok': False, 'error': 'docker-compose.yml not found'}), 404
+
+    log_lines: list[str] = []
+    log_lines.append(f"compose: {os.path.relpath(compose_path, _get_repo_root())}")
+
+    try:
+        proc = subprocess.run(
+            ['docker', 'compose', '-f', compose_path, 'config'],
+            cwd=os.path.dirname(compose_path),
+            capture_output=True,
+            text=True,
+            timeout=25,
+            check=False,
+        )
+        out = (proc.stdout or '') + (('\n' + proc.stderr) if proc.stderr else '')
+        out = out.strip()
+        if len(out) > 12000:
+            out = out[:12000] + "\n…(truncated)…"
+        if out:
+            log_lines.append(out)
+        return jsonify({'ok': proc.returncode == 0, 'log': '\n'.join(log_lines)})
+    except FileNotFoundError:
+        log_lines.append('docker not found on host')
+        return jsonify({'ok': False, 'log': '\n'.join(log_lines)})
+    except Exception as exc:
+        log_lines.append(str(exc))
+        return jsonify({'ok': False, 'log': '\n'.join(log_lines)})
+
+
+def _zip_entry_is_symlink(info) -> bool:
+    try:
+        # ZipInfo.external_attr: upper 16 bits are unix mode if created on unix.
+        import stat
+
+        mode = (int(getattr(info, 'external_attr', 0)) >> 16) & 0o170000
+        return mode == stat.S_IFLNK
+    except Exception:
+        return False
+
+
+def _safe_extract_zip_to_dir(zip_path: str, dest_dir: str) -> None:
+    import zipfile
+
+    os.makedirs(dest_dir, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        for info in z.infolist():
+            name = str(info.filename or '')
+            if not name:
+                continue
+            if name.startswith('/') or name.startswith('\\'):
+                raise ValueError('Zip contains absolute paths')
+            parts = [p for p in name.replace('\\', '/').split('/') if p not in ('', '.')]
+            if any(p == '..' for p in parts):
+                raise ValueError('Zip contains parent directory traversal')
+            if _zip_entry_is_symlink(info):
+                raise ValueError('Zip contains symlinks (not allowed)')
+            out_path = os.path.abspath(os.path.join(dest_dir, *parts))
+            if not out_path.startswith(os.path.abspath(dest_dir) + os.sep):
+                raise ValueError('Zip extraction escaped destination')
+            if name.endswith('/'):
+                os.makedirs(out_path, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            with z.open(info, 'r') as src, open(out_path, 'wb') as dst:
+                dst.write(src.read())
+
+
+def _validate_generator_pack_tree(extracted_dir: str) -> tuple[bool, str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Validate generator pack contents.
+
+    Returns (ok, note, items) where items are generator dirs to install.
+    Validation includes:
+      - manifest.yaml syntax and required fields
+      - docker-compose.yml yaml syntax + referenced service exists
+      - python file syntax checks via ast.parse
+    """
+    try:
+        from pathlib import Path
+        import ast
+        import yaml  # type: ignore
+    except Exception as exc:
+        return False, f'Missing validator dependency: {exc}', []
+
+    root = Path(extracted_dir)
+    if not root.exists() or not root.is_dir():
+        return False, 'Empty pack', [], []
+
+    # Find all manifest files.
+    manifests: list[Path] = []
+    for p in root.rglob('manifest.yaml'):
+        if '__MACOSX' in str(p):
+            continue
+        manifests.append(p)
+    for p in root.rglob('manifest.yml'):
+        if '__MACOSX' in str(p):
+            continue
+        manifests.append(p)
+    # De-dupe
+    manifests = sorted({m.resolve() for m in manifests})
+    if not manifests:
+        return False, 'No manifest.yaml found in zip', [], []
+
+    items: list[dict[str, Any]] = []
+    errors: list[str] = []
+    warnings: list[dict[str, Any]] = []
+
+    canonical_types = {
+        'string', 'int', 'float', 'number', 'boolean', 'json', 'file', 'string_list', 'file_list'
+    }
+
+    def _normalize_input_type_for_warning(type_value: Any) -> tuple[str, bool]:
+        """Return (canonical_type, used_fallback).
+
+        used_fallback=True means we could not map the provided type (or it was missing)
+        and defaulted to "string".
+        """
+        try:
+            t0 = str(type_value or '').strip().lower()
+        except Exception:
+            t0 = ''
+        if not t0:
+            return 'string', True
+
+        t = t0
+        is_list = False
+        try:
+            is_list = ('list' in t) or t.endswith('[]')
+        except Exception:
+            is_list = False
+
+        if t in canonical_types:
+            return t, False
+
+        # Common aliases.
+        if t in {'text', 'str'}:
+            return 'string', False
+        if t in {'integer'}:
+            return 'int', False
+        if t in {'double'}:
+            return 'float', False
+        if t in {'bool'}:
+            return 'boolean', False
+        if t in {'object', 'dict', 'map'}:
+            return 'json', False
+        if t in {'filepath', 'file_path', 'path', 'pathname'}:
+            return 'file', False
+        if t in {'strings'}:
+            return 'string_list', False
+        if t in {'files'}:
+            return 'file_list', False
+        if is_list and ('file' in t or 'path' in t):
+            return 'file_list', False
+        if is_list and ('string' in t or 'text' in t or 'str' in t):
+            return 'string_list', False
+        if t.endswith('[]'):
+            return 'string_list', False
+
+        return 'string', True
+    for mp in manifests:
+        try:
+            doc = yaml.safe_load(mp.read_text('utf-8', errors='ignore'))
+        except Exception as exc:
+            errors.append(f'{mp}: invalid yaml: {exc}')
+            continue
+        if not isinstance(doc, dict):
+            errors.append(f'{mp}: manifest must be a mapping')
+            continue
+        mv = int(doc.get('manifest_version') or 0)
+        if mv != 1:
+            errors.append(f'{mp}: manifest_version must be 1')
+            continue
+        manifest_id = str(doc.get('id') or '').strip()
+        source_id = manifest_id
+
+        # If this generator was exported from an installed pack, it may carry a
+        # marker with the original stable source id. Prefer that over the
+        # (numeric) installed manifest id so export/import roundtrips preserve ids.
+        try:
+            marker_path = mp.parent / '.coretg_pack.json'
+            if marker_path.exists() and marker_path.is_file():
+                marker = json.loads(marker_path.read_text('utf-8', errors='ignore') or '{}')
+                if isinstance(marker, dict):
+                    marker_source_id = str(marker.get('source_generator_id') or '').strip()
+                    if marker_source_id and len(marker_source_id) <= 256:
+                        source_id = marker_source_id
+        except Exception:
+            pass
+
+        # Allow packs to omit ids; we will assign numeric ids on install.
+        gen_id = source_id
+        if not gen_id:
+            try:
+                import uuid
+
+                gen_id = f"gen-{uuid.uuid4().hex[:10]}"
+            except Exception:
+                gen_id = 'gen-unknown'
+        kind = str(doc.get('kind') or '').strip()
+        if kind not in ('flag-generator', 'flag-node-generator'):
+            errors.append(f'{mp}: kind must be flag-generator or flag-node-generator')
+            continue
+
+        # Warn on missing/unknown input types (they will fall back to string at runtime).
+        try:
+            raw_inputs = doc.get('inputs')
+            if isinstance(raw_inputs, list):
+                for idx, inp in enumerate(raw_inputs):
+                    if not isinstance(inp, dict):
+                        continue
+                    nm = str(inp.get('name') or '').strip()
+                    if not nm:
+                        continue
+                    raw_t = inp.get('type')
+                    normalized, used_fallback = _normalize_input_type_for_warning(raw_t)
+                    if raw_t is None:
+                        warnings.append({
+                            'manifest_path': str(mp),
+                            'input_name': nm,
+                            'raw_type': None,
+                            'normalized_type': normalized,
+                            'warning': 'inputs[].type is missing; defaulting to string',
+                        })
+                    elif used_fallback:
+                        warnings.append({
+                            'manifest_path': str(mp),
+                            'input_name': nm,
+                            'raw_type': str(raw_t),
+                            'normalized_type': normalized,
+                            'warning': f'Unknown input type "{raw_t}"; defaulting to string',
+                        })
+        except Exception:
+            pass
+
+        gen_dir = mp.parent
+        runtime = doc.get('runtime') if isinstance(doc.get('runtime'), dict) else {}
+        runtime_type = str(runtime.get('type') or 'docker-compose').strip().lower()
+        if runtime_type in ('docker-compose', 'compose'):
+            compose_file = str(runtime.get('compose_file') or runtime.get('file') or 'docker-compose.yml')
+            compose_service = str(runtime.get('service') or 'generator')
+            compose_path = (gen_dir / compose_file).resolve()
+            if not compose_path.exists() or not compose_path.is_file():
+                errors.append(f'{mp}: missing compose file: {compose_file}')
+                continue
+            try:
+                compose_doc = yaml.safe_load(compose_path.read_text('utf-8', errors='ignore'))
+            except Exception as exc:
+                errors.append(f'{compose_path}: invalid yaml: {exc}')
+                continue
+            if not isinstance(compose_doc, dict):
+                errors.append(f'{compose_path}: compose must be a mapping')
+                continue
+            services = compose_doc.get('services')
+            if not isinstance(services, dict) or not services:
+                errors.append(f'{compose_path}: compose missing services')
+                continue
+            if compose_service not in services:
+                errors.append(f'{compose_path}: missing service "{compose_service}"')
+                continue
+
+        # Basic Python syntax check for any .py file in the generator dir.
+        try:
+            for py in gen_dir.rglob('*.py'):
+                if py.is_file():
+                    ast.parse(py.read_text('utf-8', errors='ignore'))
+        except Exception as exc:
+            errors.append(f'{mp}: python syntax error: {exc}')
+            continue
+
+        items.append({
+            'id': gen_id,
+            'kind': kind,
+            'path': str(gen_dir),
+            'source_id': source_id,
+            'manifest_id': manifest_id,
+            'manifest_path': str(mp),
+        })
+
+    if errors:
+        # Show first few errors.
+        return False, '; '.join(errors[:4]) + (f' (+{len(errors)-4} more)' if len(errors) > 4 else ''), [], warnings
+    return True, f'Validated {len(items)} generator(s)', items, warnings
+
+
+def _compute_next_numeric_generator_id(*, repo_root: str) -> int:
+    """Return the next numeric generator id across installed packs.
+
+    Generator packs use numeric ids for uniqueness, but manifest discovery may
+    remap ids to stable source ids for UI/Flow. To avoid collisions, derive the
+    numeric max from installed pack markers.
+    """
+    max_numeric = 0
+    try:
+        root = _installed_generators_root()
+        for dirpath, _dirnames, filenames in os.walk(root):
+            if '.coretg_pack.json' not in filenames:
+                continue
+            marker_path = os.path.join(dirpath, '.coretg_pack.json')
+            try:
+                with open(marker_path, 'r', encoding='utf-8') as fh:
+                    marker = json.load(fh)
+                if not isinstance(marker, dict):
+                    continue
+                gid = str(marker.get('generator_id') or '').strip()
+                if gid.isdigit():
+                    max_numeric = max(max_numeric, int(gid))
+            except Exception:
+                continue
+    except Exception:
+        max_numeric = 0
+
+    return max_numeric + 1
+
+
+def _install_generator_pack_payload(
+    *,
+    zip_path: str,
+    pack_id: str,
+    safe_label: str,
+    pack_origin: str,
+    next_numeric: int,
+) -> tuple[bool, str, list[dict[str, Any]], int, list[dict[str, Any]]]:
+    """Install a pack zip payload and return installed items.
+
+    This does not write to the packs state file; callers decide how to record grouping.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    try:
+        import yaml  # type: ignore
+    except Exception as exc:
+        return False, f'Pack install requires PyYAML: {exc}', [], next_numeric, []
+
+    root = _installed_generators_root()
+    tmp_dir = tempfile.mkdtemp(prefix='coretg_pack_')
+    try:
+        _safe_extract_zip_to_dir(zip_path, tmp_dir)
+        ok, note, items, warnings = _validate_generator_pack_tree(tmp_dir)
+        if not ok:
+            return False, note, [], next_numeric, warnings
+
+        installed: list[dict[str, Any]] = []
+        for it in items:
+            kind = str(it.get('kind') or '')
+            src_dir = str(it.get('path') or '')
+            source_gid = str(it.get('source_id') or it.get('id') or '')
+            assigned_gid = str(next_numeric)
+            next_numeric += 1
+
+            if kind == 'flag-node-generator':
+                dest_base = os.path.join(root, 'flag_node_generators')
+            else:
+                dest_base = os.path.join(root, 'flag_generators')
+            os.makedirs(dest_base, exist_ok=True)
+
+            dir_name = secure_filename(f"p_{pack_id}__{assigned_gid}") or f"p_{pack_id}__generator"
+            dest_dir = os.path.join(dest_base, dir_name)
+            suffix = 2
+            while os.path.exists(dest_dir):
+                dest_dir = os.path.join(dest_base, f"{dir_name}_{suffix}")
+                suffix += 1
+
+            shutil.copytree(src_dir, dest_dir)
+
+            # Rewrite installed manifest id and avoid overriding installed source path.
+            try:
+                manifest_path = None
+                for nm in ('manifest.yaml', 'manifest.yml'):
+                    p = os.path.join(dest_dir, nm)
+                    if os.path.exists(p) and os.path.isfile(p):
+                        manifest_path = p
+                        break
+                if manifest_path is None:
+                    for rp in Path(dest_dir).rglob('manifest.yaml'):
+                        if '__MACOSX' in str(rp):
+                            continue
+                        manifest_path = str(rp)
+                        break
+                if manifest_path is None:
+                    for rp in Path(dest_dir).rglob('manifest.yml'):
+                        if '__MACOSX' in str(rp):
+                            continue
+                        manifest_path = str(rp)
+                        break
+
+                if manifest_path:
+                    doc = yaml.safe_load(Path(manifest_path).read_text('utf-8', errors='ignore'))
+                    if isinstance(doc, dict):
+                        doc['id'] = assigned_gid
+                        doc.pop('source_path', None)
+                        if isinstance(doc.get('source'), dict):
+                            doc.pop('source', None)
+                        Path(manifest_path).write_text(yaml.safe_dump(doc, sort_keys=False), encoding='utf-8')
+            except Exception:
+                pass
+
+            # Marker for debugging/traceability.
+            try:
+                marker = {
+                    'pack_id': pack_id,
+                    'pack_label': safe_label,
+                    'origin': pack_origin,
+                    'installed_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                    'generator_id': assigned_gid,
+                    'kind': kind,
+                    'source_generator_id': source_gid,
+                }
+                with open(os.path.join(dest_dir, '.coretg_pack.json'), 'w', encoding='utf-8') as fh:
+                    json.dump(marker, fh, indent=2)
+            except Exception:
+                pass
+
+            installed.append({'id': assigned_gid, 'kind': kind, 'path': dest_dir})
+
+        return True, note, installed, next_numeric, warnings
+    finally:
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _install_generator_pack(*, zip_path: str, pack_label: str, pack_origin: str) -> tuple[bool, str]:
+    try:
+        try:
+            repo_root = _get_repo_root()
+        except Exception:
+            repo_root = os.getcwd()
+
+        safe_label = secure_filename(pack_label or 'pack') or 'pack'
+        pack_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
+        next_numeric = _compute_next_numeric_generator_id(repo_root=repo_root)
+
+        ok, note, installed, _next, warnings = _install_generator_pack_payload(
+            zip_path=zip_path,
+            pack_id=pack_id,
+            safe_label=safe_label,
+            pack_origin=pack_origin,
+            next_numeric=next_numeric,
+        )
+        if not ok:
+            return False, note
+
+        state = _load_installed_generator_packs_state()
+        state.setdefault('packs', [])
+        state['packs'].append({
+            'id': pack_id,
+            'label': safe_label,
+            'origin': pack_origin,
+            'note': note,
+            'warnings': warnings,
+            'installed_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+            'installed': installed,
+        })
+        _save_installed_generator_packs_state(state)
+        warn_note = ''
+        try:
+            if isinstance(warnings, list) and warnings:
+                warn_note = f" (warnings: {len(warnings)})"
+        except Exception:
+            warn_note = ''
+        return True, f"Installed {len(installed)} generator(s) from {safe_label}" + warn_note
+    except ValueError as ve:
+        return False, str(ve)
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _install_generator_pack_or_bundle(*, zip_path: str, pack_label: str, pack_origin: str) -> tuple[bool, str]:
+    """Install either a single generator-pack ZIP, or a bundle ZIP produced by export_all.
+
+    A bundle is a ZIP that contains one or more nested pack ZIPs. By convention,
+    export_all writes them under packs/*.zip, but we also accept nested *.zip files
+    anywhere in the archive.
+    """
+    import tempfile
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            names = [str(n or '') for n in z.namelist()]
+
+            has_manifest = any(n.endswith('/manifest.yaml') or n.endswith('/manifest.yml') for n in names)
+            nested_all = [
+                n for n in names
+                if n and (not n.endswith('/')) and n.lower().endswith('.zip') and (not n.startswith('__MACOSX/'))
+            ]
+            # Prefer the export_all convention, but accept bundles created by users too.
+            nested = [n for n in nested_all if n.startswith('packs/')]
+            if not nested:
+                nested = nested_all
+
+            if (not has_manifest) and nested:
+                # Bundle import: install all nested pack ZIPs under a single pack label/state row.
+                safe_label = secure_filename(pack_label or 'bundle') or 'bundle'
+                pack_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
                 try:
-                    p = s.get('path','')
-                    tmp = p + '.tmp'
-                    with open(tmp, 'w', encoding='utf-8', newline='') as f:
-                        w = csv.writer(f)
-                        for r in norm_rows:
-                            w.writerow(r)
-                    os.replace(tmp, p)
+                    repo_root = _get_repo_root()
+                except Exception:
+                    repo_root = os.getcwd()
+                next_numeric = _compute_next_numeric_generator_id(repo_root=repo_root)
+
+                successes = 0
+                failures: list[str] = []
+                installed_all: list[dict[str, Any]] = []
+                warnings_all: list[dict[str, Any]] = []
+
+                for inner_name in sorted(set(nested)):
+                    try:
+                        inner_bytes = z.read(inner_name)
+                    except Exception as exc:
+                        failures.append(f'{inner_name}: read failed ({exc})')
+                        continue
+
+                    fd, inner_tmp = tempfile.mkstemp(prefix='coretg_pack_bundle_', suffix='-' + os.path.basename(inner_name))
+                    os.close(fd)
+                    try:
+                        with open(inner_tmp, 'wb') as fh:
+                            fh.write(inner_bytes)
+
+                        ok_inner, note_inner, installed_inner, next_numeric, warnings_inner = _install_generator_pack_payload(
+                            zip_path=inner_tmp,
+                            pack_id=pack_id,
+                            safe_label=safe_label,
+                            pack_origin=pack_origin,
+                            next_numeric=next_numeric,
+                        )
+                        if ok_inner:
+                            installed_all.extend(installed_inner)
+                            if isinstance(warnings_inner, list) and warnings_inner:
+                                warnings_all.extend(warnings_inner)
+                            successes += 1
+                        else:
+                            failures.append(f'{inner_name}: {note_inner}')
+                    finally:
+                        try:
+                            os.remove(inner_tmp)
+                        except Exception:
+                            pass
+
+                # Record one combined bundle pack state row.
+                try:
+                    state = _load_installed_generator_packs_state()
+                    state.setdefault('packs', [])
+                    state['packs'].append({
+                        'id': pack_id,
+                        'label': safe_label,
+                        'origin': pack_origin,
+                        'note': f'Imported {successes} pack(s) from bundle' + (f'; {failures[0]}' if failures else ''),
+                        'warnings': warnings_all,
+                        'installed_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+                        'installed': installed_all,
+                    })
+                    _save_installed_generator_packs_state(state)
                 except Exception:
                     pass
-            if ok and skipped:
-                note = note + f" (skipped {len(skipped)} invalid)"
-            s['rows'] = note if ok else f"ERR: {note}"
+
+                warn_note = ''
+                try:
+                    if warnings_all:
+                        warn_note = f" (warnings: {len(warnings_all)})"
+                except Exception:
+                    warn_note = ''
+                if failures:
+                    return successes > 0, f'Imported {successes} pack(s) from bundle as {safe_label}{warn_note}; {failures[0]}'
+                return True, f'Imported {successes} pack(s) from bundle as {safe_label}{warn_note}'
+
+    except Exception as exc:
+        return False, f'Invalid zip: {exc}'
+
+    return _install_generator_pack(zip_path=zip_path, pack_label=pack_label, pack_origin=pack_origin)
+
+
+@app.route('/generator_packs/upload', methods=['POST'])
+def generator_packs_upload():
+    is_xhr = (request.headers.get('X-Requested-With') == 'XMLHttpRequest')
+    f = request.files.get('zip_file')
+    if not f or f.filename == '':
+        if is_xhr:
+            return jsonify({'ok': False, 'error': 'No zip selected.'}), 400
+        flash('No zip selected.')
+        return redirect(url_for('flag_catalog_page'))
+    filename = secure_filename(f.filename)
+    if not filename.lower().endswith('.zip'):
+        if is_xhr:
+            return jsonify({'ok': False, 'error': 'Only .zip allowed.'}), 400
+        flash('Only .zip allowed.')
+        return redirect(url_for('flag_catalog_page'))
+
+    import tempfile
+
+    fd, tmp_path = tempfile.mkstemp(prefix='coretg_pack_', suffix='-' + filename)
+    os.close(fd)
+    try:
+        f.save(tmp_path)
+        label = filename
+        if label.lower().endswith('.zip'):
+            label = label[:-4]
+        ok, note = _install_generator_pack_or_bundle(zip_path=tmp_path, pack_label=label, pack_origin='upload')
+        if is_xhr:
+            if ok:
+                # Include warnings (best-effort) by reading the latest pack state entry.
+                warnings: list[dict[str, Any]] = []
+                try:
+                    state = _load_installed_generator_packs_state()
+                    packs = state.get('packs') if isinstance(state, dict) else None
+                    if isinstance(packs, list) and packs:
+                        last = packs[-1] if isinstance(packs[-1], dict) else {}
+                        ww = last.get('warnings') if isinstance(last, dict) else None
+                        if isinstance(ww, list):
+                            warnings = ww
+                except Exception:
+                    warnings = []
+                return jsonify({'ok': True, 'message': note, 'warnings': warnings}), 200
+            return jsonify({'ok': False, 'error': f'Pack install failed: {note}'}), 400
+
+        flash(note if ok else f'Pack install failed: {note}')
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/generator_packs/import_url', methods=['POST'])
+def generator_packs_import_url():
+    url = str(request.form.get('zip_url') or '').strip()
+    if not url:
+        flash('Missing URL.')
+        return redirect(url_for('flag_catalog_page'))
+
+    import tempfile
+
+    try:
+        data = _download_zip_from_url(url)
+        fd, tmp_path = tempfile.mkstemp(prefix='coretg_pack_url_', suffix='.zip')
+        os.close(fd)
+        try:
+            with open(tmp_path, 'wb') as fh:
+                fh.write(data)
+            ok, note = _install_generator_pack_or_bundle(zip_path=tmp_path, pack_label=url, pack_origin='url')
+            flash(note if ok else f'Pack install failed: {note}')
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+    except Exception as exc:
+        flash(f'URL import failed: {exc}')
+
+    return redirect(url_for('flag_catalog_page'))
+
+
+@app.route('/generator_packs/delete/<pack_id>', methods=['POST'])
+def generator_packs_delete(pack_id: str):
+    """Uninstall a previously installed generator pack.
+
+    Deletes the installed generator directories recorded in the pack state,
+    but only if they reside under the installed-generators root.
+    """
+    import shutil
+
+    pid = str(pack_id or '').strip()
+    if not pid:
+        flash('Missing pack id')
+        return redirect(url_for('flag_catalog_page'))
+
+    installed_root = os.path.abspath(_installed_generators_root())
+    state = _load_installed_generator_packs_state()
+    packs = state.get('packs') or []
+    if not isinstance(packs, list):
+        packs = []
+
+    target = None
+    kept = []
+    for p in packs:
+        if isinstance(p, dict) and str(p.get('id') or '') == pid:
+            target = p
+            continue
+        kept.append(p)
+
+    if not target:
+        flash('Pack not found')
+        return redirect(url_for('flag_catalog_page'))
+
+    removed = 0
+    failures: list[str] = []
+    for it in (target.get('installed') or []):
+        if not isinstance(it, dict):
+            continue
+        path = str(it.get('path') or '').strip()
+        if not path:
+            continue
+        abs_path = os.path.abspath(path)
+        try:
+            # Ensure deletion stays within the installed root.
+            if os.path.commonpath([installed_root, abs_path]) != installed_root:
+                failures.append(f"refused to delete outside installed root: {abs_path}")
+                continue
+        except Exception:
+            failures.append(f"refused to delete path: {abs_path}")
+            continue
+
+        try:
+            if os.path.isdir(abs_path):
+                shutil.rmtree(abs_path, ignore_errors=False)
+                removed += 1
+            elif os.path.exists(abs_path):
+                os.remove(abs_path)
+                removed += 1
+        except Exception as exc:
+            failures.append(f"failed deleting {abs_path}: {exc}")
+
+    state['packs'] = kept
+    _save_installed_generator_packs_state(state)
+
+    if failures:
+        flash(f"Uninstalled pack {pid} with warnings: removed={removed}; {failures[0]}")
+    else:
+        flash(f"Uninstalled pack {pid} (removed {removed} item(s))")
+    return redirect(url_for('flag_catalog_page'))
+
+
+def _set_pack_disabled_state(*, pack_id: str, disabled: bool) -> tuple[bool, str]:
+    pid = str(pack_id or '').strip()
+    if not pid:
+        return False, 'Missing pack id'
+    state = _load_installed_generator_packs_state()
+    packs = state.get('packs') if isinstance(state, dict) else None
+    if not isinstance(packs, list):
+        packs = []
+    for p in packs:
+        if not isinstance(p, dict):
+            continue
+        if str(p.get('id') or '').strip() != pid:
+            continue
+        p['disabled'] = bool(disabled)
+        state['packs'] = packs
+        _save_installed_generator_packs_state(state)
+        return True, ('Disabled' if disabled else 'Enabled') + f' pack {pid}'
+    return False, 'Pack not found'
+
+
+def _set_generator_disabled_state(*, kind: str, generator_id: str, disabled: bool) -> tuple[bool, str]:
+    gid = str(generator_id or '').strip()
+    if not gid:
+        return False, 'Missing generator id'
+    k = str(kind or '').strip().lower().replace('_', '-')
+    if k not in ('flag-generator', 'flag-node-generator'):
+        return False, f'Invalid kind: {kind}'
+
+    state = _load_installed_generator_packs_state()
+    packs = state.get('packs') if isinstance(state, dict) else None
+    if not isinstance(packs, list):
+        packs = []
+
+    for p in packs:
+        if not isinstance(p, dict):
+            continue
+        items = p.get('installed')
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            if str(it.get('kind') or '').strip().lower().replace('_', '-') != k:
+                continue
+            if str(it.get('id') or '').strip() != gid:
+                continue
+            it['disabled'] = bool(disabled)
+            state['packs'] = packs
+            _save_installed_generator_packs_state(state)
+            return True, ('Disabled' if disabled else 'Enabled') + f' {k} {gid}'
+
+    return False, 'Installed generator not found'
+
+
+@app.route('/generator_packs/set_disabled/<pack_id>', methods=['POST'])
+def generator_packs_set_disabled(pack_id: str):
+    _require_builder_or_admin()
+    disabled = str(request.form.get('disabled') or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+    ok, msg = _set_pack_disabled_state(pack_id=pack_id, disabled=disabled)
+    flash(msg if ok else f'Failed: {msg}')
+    return redirect(url_for('flag_catalog_page'))
+
+
+def _pack_to_zip_bytes(pack: dict) -> bytes:
+    """Build a ZIP archive for a single installed pack."""
+    import io
+    import zipfile
+
+    mem = io.BytesIO()
+    installed = pack.get('installed') if isinstance(pack, dict) else []
+    with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+        # Pack metadata
+        try:
+            meta = json.dumps(pack, indent=2)
+        except Exception:
+            meta = '{}'
+        z.writestr('pack.json', meta + '\n')
+
+        for it in (installed or []):
+            if not isinstance(it, dict):
+                continue
+            kind = str(it.get('kind') or '').strip()
+            src = str(it.get('path') or '').strip()
+            if not src or not os.path.exists(src):
+                continue
+
+            base = 'flag_generators'
+            if kind == 'flag-node-generator':
+                base = 'flag_node_generators'
+
+            root_name = os.path.basename(src.rstrip('/')) or 'generator'
+            if os.path.isdir(src):
+                for dirpath, _dirnames, filenames in os.walk(src):
+                    for fn in filenames:
+                        abs_p = os.path.join(dirpath, fn)
+                        rel_p = os.path.relpath(abs_p, src)
+                        arc = '/'.join([base, root_name, rel_p.replace('\\', '/')])
+                        try:
+                            z.write(abs_p, arcname=arc)
+                        except Exception:
+                            continue
+            else:
+                arc = '/'.join([base, root_name])
+                try:
+                    z.write(src, arcname=arc)
+                except Exception:
+                    pass
+
+    mem.seek(0)
+    return mem.read()
+
+
+def _delete_installed_generator(*, kind: str, generator_id: str) -> tuple[bool, str]:
+    """Delete a single installed generator directory by manifest id.
+
+    Safety: only deletes directories under outputs/installed_generators.
+    """
+    import shutil
+    from pathlib import Path
+
+    try:
+        import yaml  # type: ignore
+    except Exception as exc:
+        return False, f'PyYAML required: {exc}'
+
+    gid = str(generator_id or '').strip()
+    if not gid:
+        return False, 'Missing generator_id'
+
+    k = str(kind or '').strip().lower().replace('_', '-')
+    if k not in ('flag-generator', 'flag-node-generator'):
+        return False, f'Invalid kind: {kind}'
+
+    installed_root = os.path.abspath(_installed_generators_root())
+    base = os.path.join(installed_root, 'flag_node_generators' if k == 'flag-node-generator' else 'flag_generators')
+    if not os.path.isdir(base):
+        return False, 'No installed generators directory'
+
+    target_dir: str | None = None
+    for child in sorted(Path(base).iterdir()):
+        if not child.is_dir():
+            continue
+        manifest_path = None
+        for nm in ('manifest.yaml', 'manifest.yml'):
+            p = child / nm
+            if p.exists() and p.is_file():
+                manifest_path = p
+                break
+        if manifest_path is None:
+            continue
+        try:
+            doc = yaml.safe_load(manifest_path.read_text('utf-8', errors='ignore'))
+        except Exception:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        mid = str(doc.get('id') or '').strip()
+        if mid == gid:
+            target_dir = str(child)
             break
-    _save_data_sources_state(state)
-    return redirect(url_for('data_sources_page'))
 
-@app.route('/data_sources/download/<sid>')
-def data_sources_download(sid):
-    state = _load_data_sources_state()
-    for s in state.get('sources', []):
-        if s.get('id') == sid and os.path.exists(s.get('path','')):
-            return send_file(s['path'], as_attachment=True, download_name=os.path.basename(s['name']))
-    flash('Not found')
-    return redirect(url_for('data_sources_page'))
+    if not target_dir:
+        return False, f'Installed generator not found: {gid}'
 
-@app.route('/data_sources/export_all')
-def data_sources_export_all():
-    import io, zipfile
-    state = _load_data_sources_state()
+    abs_target = os.path.abspath(target_dir)
+    try:
+        if os.path.commonpath([installed_root, abs_target]) != installed_root:
+            return False, f'Refused to delete outside installed root: {abs_target}'
+    except Exception:
+        return False, f'Refused to delete path: {abs_target}'
+
+    try:
+        shutil.rmtree(abs_target, ignore_errors=False)
+    except Exception as exc:
+        return False, f'Failed deleting {abs_target}: {exc}'
+
+    # Update pack state: remove references to this generator.
+    try:
+        state = _load_installed_generator_packs_state()
+        packs = state.get('packs') or []
+        if not isinstance(packs, list):
+            packs = []
+        kept_packs = []
+        removed_refs = 0
+        for p in packs:
+            if not isinstance(p, dict):
+                continue
+            installed = p.get('installed') or []
+            if not isinstance(installed, list):
+                installed = []
+            new_installed = []
+            for it in installed:
+                if not isinstance(it, dict):
+                    continue
+                it_id = str(it.get('id') or '').strip()
+                it_kind = str(it.get('kind') or '').strip().lower().replace('_', '-')
+                it_path = str(it.get('path') or '').strip()
+                if it_id == gid and it_kind == k:
+                    removed_refs += 1
+                    continue
+                if it_path and os.path.abspath(it_path) == abs_target:
+                    removed_refs += 1
+                    continue
+                new_installed.append(it)
+
+            if new_installed:
+                p2 = dict(p)
+                p2['installed'] = new_installed
+                kept_packs.append(p2)
+            else:
+                # Drop pack row if no installed generators remain.
+                continue
+        state['packs'] = kept_packs
+        _save_installed_generator_packs_state(state)
+    except Exception:
+        removed_refs = 0
+
+    note = f'Deleted installed {k} {gid}'
+    if removed_refs:
+        note += f' (updated {removed_refs} pack reference(s))'
+    return True, note
+
+
+@app.route('/api/flag_generators/delete', methods=['POST'])
+def api_flag_generators_delete():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    gid = str(payload.get('generator_id') or payload.get('id') or '').strip()
+    ok, note = _delete_installed_generator(kind='flag-generator', generator_id=gid)
+    return jsonify({'ok': ok, 'message': note} if ok else {'ok': False, 'error': note}), (200 if ok else 400)
+
+
+@app.route('/api/flag_node_generators/delete', methods=['POST'])
+def api_flag_node_generators_delete():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    gid = str(payload.get('generator_id') or payload.get('id') or '').strip()
+    ok, note = _delete_installed_generator(kind='flag-node-generator', generator_id=gid)
+    return jsonify({'ok': ok, 'message': note} if ok else {'ok': False, 'error': note}), (200 if ok else 400)
+
+
+@app.route('/api/generator_packs/set_disabled', methods=['POST'])
+def api_generator_packs_set_disabled():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    pid = str(payload.get('pack_id') or '').strip()
+    disabled = bool(payload.get('disabled') is True)
+    ok, note = _set_pack_disabled_state(pack_id=pid, disabled=disabled)
+    return jsonify({'ok': ok, 'message': note} if ok else {'ok': False, 'error': note}), (200 if ok else 400)
+
+
+@app.route('/api/flag_generators/set_disabled', methods=['POST'])
+def api_flag_generators_set_disabled():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    gid = str(payload.get('generator_id') or payload.get('id') or '').strip()
+    disabled = bool(payload.get('disabled') is True)
+    ok, note = _set_generator_disabled_state(kind='flag-generator', generator_id=gid, disabled=disabled)
+    return jsonify({'ok': ok, 'message': note} if ok else {'ok': False, 'error': note}), (200 if ok else 400)
+
+
+@app.route('/api/flag_node_generators/set_disabled', methods=['POST'])
+def api_flag_node_generators_set_disabled():
+    _require_builder_or_admin()
+    payload = request.get_json(silent=True) or {}
+    gid = str(payload.get('generator_id') or payload.get('id') or '').strip()
+    disabled = bool(payload.get('disabled') is True)
+    ok, note = _set_generator_disabled_state(kind='flag-node-generator', generator_id=gid, disabled=disabled)
+    return jsonify({'ok': ok, 'message': note} if ok else {'ok': False, 'error': note}), (200 if ok else 400)
+
+
+@app.route('/generator_packs/download/<pack_id>')
+def generator_packs_download(pack_id: str):
+    pid = str(pack_id or '').strip()
+    state = _load_installed_generator_packs_state()
+    packs = state.get('packs') or []
+    if not isinstance(packs, list):
+        packs = []
+    target = None
+    for p in packs:
+        if isinstance(p, dict) and str(p.get('id') or '') == pid:
+            target = p
+            break
+    if not target:
+        flash('Pack not found')
+        return redirect(url_for('flag_catalog_page'))
+
+    data = _pack_to_zip_bytes(target)
+    label = secure_filename(str(target.get('label') or '')).strip() or 'pack'
+    download_name = f"generator-pack-{pid}-{label}.zip"
+    import io
+
+    return send_file(io.BytesIO(data), as_attachment=True, download_name=download_name)
+
+
+@app.route('/generator_packs/export_all')
+def generator_packs_export_all():
+    """Export all installed packs.
+
+    Returns a ZIP containing one ZIP per pack under packs/<pack_id>.zip.
+    """
+    import io
+    import zipfile
+
+    state = _load_installed_generator_packs_state()
+    packs = state.get('packs') or []
+    if not isinstance(packs, list):
+        packs = []
+
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
-        for s in state.get('sources', []):
-            p = s.get('path')
-            if p and os.path.exists(p):
-                z.write(p, arcname=os.path.basename(p))
+        for p in packs:
+            if not isinstance(p, dict):
+                continue
+            pid = str(p.get('id') or '').strip()
+            if not pid:
+                continue
+            label = secure_filename(str(p.get('label') or '')).strip() or 'pack'
+            arcname = f"packs/{pid}-{label}.zip"
+            try:
+                z.writestr(arcname, _pack_to_zip_bytes(p))
+            except Exception:
+                continue
     mem.seek(0)
-    return send_file(mem, as_attachment=True, download_name='data_sources.zip')
+    return send_file(mem, as_attachment=True, download_name='generator_packs.zip')
+
+
+def _flag_generators_runs_dir() -> str:
+    d = os.path.join(_outputs_dir(), 'flag_generators_runs')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _flaggen_run_dir_for_id(run_id: str) -> str:
+    """Resolve a local flag generator run directory for a run_id.
+
+    This allows artifact browsing/downloading even if the webapp restarted and
+    the in-memory RUNS registry was lost.
+    """
+    rid = (run_id or '').strip()
+    # Basic sanitization: avoid path traversal.
+    rid = rid.replace('..', '').replace('\\', '/').strip('/').strip()
+    return os.path.join(_flag_generators_runs_dir(), rid)
+
+
+def _flag_node_generators_runs_dir() -> str:
+    d = os.path.join(_outputs_dir(), 'flag_node_generators_runs')
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _flagnodegen_run_dir_for_id(run_id: str) -> str:
+    rid = (run_id or '').strip()
+    rid = rid.replace('..', '').replace('\\', '/').strip('/').strip()
+    return os.path.join(_flag_node_generators_runs_dir(), rid)
+
+
+def _find_enabled_node_generator_by_id(generator_id: str) -> Optional[dict]:
+    gid = (generator_id or '').strip()
+    if not gid:
+        return None
+    try:
+        generators, _errors = _flag_node_generators_from_enabled_sources()
+    except Exception:
+        return None
+    for g in generators:
+        try:
+            if str(g.get('id') or '').strip() == gid:
+                return g
+        except Exception:
+            continue
+    return None
+
+
+def _find_enabled_generator_by_id(generator_id: str) -> Optional[dict]:
+    gid = (generator_id or '').strip()
+    if not gid:
+        return None
+    try:
+        generators, _errors = _flag_generators_from_enabled_sources()
+    except Exception:
+        return None
+    for g in generators:
+        try:
+            if str(g.get('id') or '').strip() == gid:
+                return g
+        except Exception:
+            continue
+    return None
+
+
+@app.route('/flag_generators_test/run', methods=['POST'])
+def flag_generators_test_run():
+    """Start a generator test run.
+
+    Accepts text inputs and file uploads based on the generator's declared inputs.
+    Writes a run log and streams it via /stream/<run_id>.
+    """
+    t0 = time.time()
+    generator_id = (request.form.get('generator_id') or '').strip()
+    try:
+        app.logger.info("[flaggen_test] POST /flag_generators_test/run generator_id=%s", generator_id)
+    except Exception:
+        pass
+    gen = _find_enabled_generator_by_id(generator_id)
+    if not gen:
+        try:
+            app.logger.warning("[flaggen_test] generator not found: %s", generator_id)
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': 'Generator not found (must be in an enabled source).'}), 404
+
+    # Respect disabled state for installed generators.
+    try:
+        if isinstance(gen, dict) and _is_installed_generator_view(gen) and _is_installed_generator_disabled(kind='flag-generator', generator_id=generator_id):
+            return jsonify({'ok': False, 'error': f'Generator {generator_id} is disabled.'}), 400
+    except Exception:
+        pass
+
+    run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
+    run_dir = os.path.join(_flag_generators_runs_dir(), run_id)
+    inputs_dir = os.path.join(run_dir, 'inputs')
+    os.makedirs(inputs_dir, exist_ok=True)
+    log_path = os.path.join(run_dir, 'run.log')
+
+    # Build config object from declared inputs.
+    # Two-pass: load all text fields first, then save uploads (so uploads can
+    # consult optional filename inputs).
+    cfg: dict[str, Any] = {}
+    saved_uploads: dict[str, dict[str, Any]] = {}
+    inputs = gen.get('inputs') if isinstance(gen, dict) else None
+    inputs_list = inputs if isinstance(inputs, list) else []
+
+    for inp in inputs_list:
+        if not isinstance(inp, dict):
+            continue
+        name = str(inp.get('name') or '').strip()
+        if not name:
+            continue
+        # Only record text values in pass 1.
+        raw_val = request.form.get(name)
+        if raw_val is not None:
+            cfg[name] = raw_val
+
+    def _unique_dest_filename(dir_path: str, filename: str) -> str:
+        base = secure_filename(filename) or 'upload'
+        # Ensure a stable file name but avoid overwriting.
+        cand = base
+        root, ext = os.path.splitext(base)
+        i = 1
+        while os.path.exists(os.path.join(dir_path, cand)):
+            cand = f"{root}_{i}{ext}"
+            i += 1
+            if i > 5000:
+                break
+        return cand
+
+    for inp in inputs_list:
+        if not isinstance(inp, dict):
+            continue
+        name = str(inp.get('name') or '').strip()
+        if not name:
+            continue
+        f = request.files.get(name)
+        if not (f and getattr(f, 'filename', '')):
+            continue
+
+        original_filename = str(getattr(f, 'filename', '') or '')
+
+        # Default behavior: store under <name>__<original>
+        safe_uploaded = secure_filename(original_filename) or 'upload'
+        stored = f"{name}__{safe_uploaded}"
+
+        # Special-case convenience: if the user provides a desired filename
+        # for an uploaded file, respect it. This is primarily used by the
+        # sample generator (binary_embed_text) where the input file's name is
+        # meaningful.
+        desired = None
+        try:
+            if name == 'input_file':
+                desired = cfg.get('filesystem.filename')
+        except Exception:
+            desired = None
+        requested_filename = None
+        used_requested = False
+        if isinstance(desired, str) and desired.strip():
+            requested_filename = desired.strip()
+            stored = _unique_dest_filename(inputs_dir, requested_filename)
+            used_requested = True
+        else:
+            stored = _unique_dest_filename(inputs_dir, stored)
+
+        dest = os.path.join(inputs_dir, stored)
+        try:
+            f.save(dest)
+            # Expose the in-container path.
+            cfg[name] = f"/inputs/{stored}"
+            saved_uploads[name] = {
+                'original_filename': original_filename,
+                'requested_filename': requested_filename,
+                'stored_filename': stored,
+                'stored_path': f"inputs/{stored}",
+                'container_path': f"/inputs/{stored}",
+                'used_requested_filename': used_requested,
+            }
+        except Exception:
+            return jsonify({'ok': False, 'error': f"Failed saving file input: {name}"}), 400
+
+    try:
+        app.logger.info("[flaggen_test] inputs keys=%s", sorted(list(cfg.keys())))
+    except Exception:
+        pass
+
+    # Validate required inputs minimally (only presence).
+    missing: list[str] = []
+    for inp in inputs_list:
+        if not isinstance(inp, dict):
+            continue
+        try:
+            if not inp.get('required'):
+                continue
+            name = str(inp.get('name') or '').strip()
+            if not name:
+                continue
+            val = cfg.get(name)
+            if val is None or (isinstance(val, str) and not val.strip()):
+                missing.append(name)
+        except Exception:
+            continue
+    if missing:
+        try:
+            app.logger.warning("[flaggen_test] missing required inputs: %s", missing)
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': f"Missing required input(s): {', '.join(missing)}"}), 400
+
+    # Launch runner.
+    repo_root = _get_repo_root()
+    runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
+    cmd = [
+        sys.executable or 'python',
+        runner_path,
+        '--kind',
+        'flag-generator',
+        '--generator-id',
+        generator_id,
+        '--out-dir',
+        run_dir,
+        '--config',
+        json.dumps(cfg, ensure_ascii=False),
+        '--repo-root',
+        repo_root,
+    ]
+
+    try:
+        with open(log_path, 'a', encoding='utf-8') as log_f:
+            log_f.write(f"[flaggen] starting {generator_id}\n")
+            _write_sse_marker(log_f, 'phase', {'phase': 'starting', 'generator_id': generator_id, 'run_id': run_id})
+    except Exception:
+        pass
+
+    try:
+        log_handle = open(log_path, 'a', encoding='utf-8')
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=log_handle,
+            stderr=log_handle,
+            text=True,
+        )
+    except Exception as exc:
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_f:
+                log_f.write(f"[flaggen] failed to start: {exc}\n")
+                _write_sse_marker(log_f, 'phase', {'phase': 'error', 'error': str(exc)})
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': f"Failed launching generator: {exc}"}), 500
+
+    try:
+        app.logger.info(
+            "[flaggen_test] spawned pid=%s run_id=%s run_dir=%s elapsed_ms=%s",
+            getattr(proc, 'pid', None),
+            run_id,
+            run_dir,
+            int((time.time() - t0) * 1000),
+        )
+    except Exception:
+        pass
+
+    RUNS[run_id] = {
+        'proc': proc,
+        'log_path': log_path,
+        'done': False,
+        'returncode': None,
+        'run_dir': run_dir,
+        'kind': 'flag_generator_test',
+        'generator_id': generator_id,
+    }
+
+    def _finalize_flaggen(run_id_local: str, log_handle_local: Any):
+        try:
+            meta = RUNS.get(run_id_local)
+            if not meta:
+                return
+            p = meta.get('proc')
+            if not p:
+                return
+            rc = p.wait()
+            meta['done'] = True
+            meta['returncode'] = rc
+            try:
+                with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
+                    _write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
+            except Exception:
+                pass
+        finally:
+            try:
+                log_handle_local.close()
+            except Exception:
+                pass
+
+    threading.Thread(
+        target=_finalize_flaggen,
+        args=(run_id, log_handle),
+        name=f'flaggen-{run_id[:8]}',
+        daemon=True,
+    ).start()
+
+    try:
+        app.logger.info(
+            "[flaggen_test] responding ok run_id=%s elapsed_ms=%s",
+            run_id,
+            int((time.time() - t0) * 1000),
+        )
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads})
+
+
+@app.route('/flag_node_generators_test/run', methods=['POST'])
+def flag_node_generators_test_run():
+    """Start a node-generator test run."""
+    t0 = time.time()
+    generator_id = (request.form.get('generator_id') or '').strip()
+    try:
+        app.logger.info("[flagnodegen_test] POST /flag_node_generators_test/run generator_id=%s", generator_id)
+    except Exception:
+        pass
+
+    gen = _find_enabled_node_generator_by_id(generator_id)
+    if not gen:
+        return jsonify({'ok': False, 'error': 'Generator not found (must be installed and enabled).'}), 404
+
+    try:
+        if isinstance(gen, dict) and _is_installed_generator_view(gen) and _is_installed_generator_disabled(kind='flag-node-generator', generator_id=generator_id):
+            return jsonify({'ok': False, 'error': f'Node-generator {generator_id} is disabled.'}), 400
+    except Exception:
+        pass
+
+    run_id = datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:10]
+    run_dir = os.path.join(_flag_node_generators_runs_dir(), run_id)
+    inputs_dir = os.path.join(run_dir, 'inputs')
+    os.makedirs(inputs_dir, exist_ok=True)
+    log_path = os.path.join(run_dir, 'run.log')
+
+    cfg: dict[str, Any] = {}
+    saved_uploads: dict[str, dict[str, Any]] = {}
+    inputs = gen.get('inputs') if isinstance(gen, dict) else None
+    inputs_list = inputs if isinstance(inputs, list) else []
+    for inp in inputs_list:
+        if not isinstance(inp, dict):
+            continue
+        name = str(inp.get('name') or '').strip()
+        if not name:
+            continue
+        f = request.files.get(name)
+        if f and getattr(f, 'filename', ''):
+            original_filename = str(getattr(f, 'filename', '') or '')
+            safe_name = secure_filename(original_filename) or 'upload'
+            stored = f"{name}__{safe_name}"
+            dest = os.path.join(inputs_dir, stored)
+            try:
+                f.save(dest)
+                cfg[name] = f"/inputs/{stored}"
+                saved_uploads[name] = {
+                    'original_filename': original_filename,
+                    'requested_filename': None,
+                    'stored_filename': stored,
+                    'stored_path': f"inputs/{stored}",
+                    'container_path': f"/inputs/{stored}",
+                    'used_requested_filename': False,
+                }
+            except Exception:
+                return jsonify({'ok': False, 'error': f"Failed saving file input: {name}"}), 400
+            continue
+        raw_val = request.form.get(name)
+        if raw_val is not None:
+            cfg[name] = raw_val
+
+    missing: list[str] = []
+    for inp in inputs_list:
+        if not isinstance(inp, dict):
+            continue
+        try:
+            if not inp.get('required'):
+                continue
+            name = str(inp.get('name') or '').strip()
+            if not name:
+                continue
+            val = cfg.get(name)
+            if val is None or (isinstance(val, str) and not val.strip()):
+                missing.append(name)
+        except Exception:
+            continue
+    if missing:
+        return jsonify({'ok': False, 'error': f"Missing required input(s): {', '.join(missing)}"}), 400
+
+    repo_root = _get_repo_root()
+    runner_path = os.path.join(repo_root, 'scripts', 'run_flag_generator.py')
+    cmd = [
+        sys.executable or 'python',
+        runner_path,
+        '--kind',
+        'flag-node-generator',
+        '--generator-id',
+        generator_id,
+        '--out-dir',
+        run_dir,
+        '--config',
+        json.dumps(cfg, ensure_ascii=False),
+        '--repo-root',
+        repo_root,
+    ]
+
+    try:
+        with open(log_path, 'a', encoding='utf-8') as log_f:
+            log_f.write(f"[flagnodegen] starting {generator_id}\n")
+            _write_sse_marker(log_f, 'phase', {'phase': 'starting', 'generator_id': generator_id, 'run_id': run_id})
+    except Exception:
+        pass
+
+    try:
+        log_handle = open(log_path, 'a', encoding='utf-8')
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=log_handle,
+            stderr=log_handle,
+            text=True,
+        )
+    except Exception as exc:
+        try:
+            with open(log_path, 'a', encoding='utf-8') as log_f:
+                log_f.write(f"[flagnodegen] failed to start: {exc}\n")
+                _write_sse_marker(log_f, 'phase', {'phase': 'error', 'error': str(exc)})
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': f"Failed launching generator: {exc}"}), 500
+
+    RUNS[run_id] = {
+        'proc': proc,
+        'log_path': log_path,
+        'done': False,
+        'returncode': None,
+        'run_dir': run_dir,
+        'kind': 'flag_node_generator_test',
+        'generator_id': generator_id,
+    }
+
+    def _finalize(run_id_local: str, log_handle_local: Any):
+        try:
+            meta = RUNS.get(run_id_local)
+            if not meta:
+                return
+            p = meta.get('proc')
+            if not p:
+                return
+            rc = p.wait()
+            meta['done'] = True
+            meta['returncode'] = rc
+            try:
+                with open(meta.get('log_path'), 'a', encoding='utf-8') as log_f:
+                    _write_sse_marker(log_f, 'phase', {'phase': 'done', 'returncode': rc})
+            except Exception:
+                pass
+        finally:
+            try:
+                log_handle_local.close()
+            except Exception:
+                pass
+
+    threading.Thread(
+        target=_finalize,
+        args=(run_id, log_handle),
+        name=f'flagnodegen-{run_id[:8]}',
+        daemon=True,
+    ).start()
+
+    try:
+        app.logger.info(
+            "[flagnodegen_test] spawned pid=%s run_id=%s run_dir=%s elapsed_ms=%s",
+            getattr(proc, 'pid', None),
+            run_id,
+            run_dir,
+            int((time.time() - t0) * 1000),
+        )
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'run_id': run_id, 'saved_uploads': saved_uploads})
+
+
+@app.route('/flag_node_generators_test/outputs/<run_id>')
+def flag_node_generators_test_outputs(run_id: str):
+    meta = RUNS.get(run_id)
+    if meta and meta.get('kind') != 'flag_node_generator_test':
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+    if not isinstance(run_dir, str) or not run_dir:
+        run_dir = _flagnodegen_run_dir_for_id(run_id)
+    if not isinstance(run_dir, str) or not run_dir:
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
+    abs_run_dir = os.path.abspath(run_dir)
+    outputs_root = os.path.abspath(_outputs_dir())
+    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+    if not os.path.isdir(abs_run_dir):
+        done = bool(meta.get('done')) if isinstance(meta, dict) else False
+        returncode = meta.get('returncode') if isinstance(meta, dict) else None
+        return jsonify({'ok': True, 'files': [], 'done': done, 'returncode': returncode}), 200
+
+    input_files: list[dict[str, Any]] = []
+    output_files: list[dict[str, Any]] = []
+    misc_files: list[dict[str, Any]] = []
+    for root, _dirs, filenames in os.walk(abs_run_dir):
+        rel_root = os.path.relpath(root, abs_run_dir).replace('\\', '/')
+        for fn in filenames:
+            abs_path = os.path.join(root, fn)
+            try:
+                st = os.stat(abs_path)
+                rel = os.path.relpath(abs_path, abs_run_dir).replace('\\', '/')
+                entry = {'path': rel, 'name': fn, 'size': st.st_size}
+            except Exception:
+                continue
+            if rel_root == 'inputs' or rel_root.startswith('inputs/'):
+                input_files.append(entry)
+            elif rel == 'run.log':
+                misc_files.append(entry)
+            else:
+                output_files.append(entry)
+
+    input_files.sort(key=lambda x: x.get('path') or '')
+    output_files.sort(key=lambda x: x.get('path') or '')
+    misc_files.sort(key=lambda x: x.get('path') or '')
+    done = bool(meta.get('done')) if isinstance(meta, dict) else True
+    returncode = meta.get('returncode') if isinstance(meta, dict) else None
+    return jsonify({'ok': True, 'inputs': input_files, 'outputs': output_files, 'misc': misc_files, 'done': done, 'returncode': returncode}), 200
+
+
+@app.route('/flag_node_generators_test/download/<run_id>')
+def flag_node_generators_test_download(run_id: str):
+    meta = RUNS.get(run_id)
+    if meta and meta.get('kind') != 'flag_node_generator_test':
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+    if not isinstance(run_dir, str) or not run_dir:
+        run_dir = _flagnodegen_run_dir_for_id(run_id)
+    if not isinstance(run_dir, str) or not run_dir:
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
+    rel = (request.args.get('p') or '').strip().lstrip('/').replace('\\', '/')
+    if not rel:
+        return jsonify({'ok': False, 'error': 'invalid path'}), 400
+    abs_run_dir = os.path.abspath(run_dir)
+    outputs_root = os.path.abspath(_outputs_dir())
+    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+    abs_path = os.path.abspath(os.path.join(abs_run_dir, rel))
+    if not (abs_path == abs_run_dir or abs_path.startswith(abs_run_dir + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+    if not os.path.exists(abs_path) or not os.path.isfile(abs_path):
+        return jsonify({'ok': False, 'error': 'missing file'}), 404
+    return send_file(abs_path, as_attachment=True, download_name=os.path.basename(abs_path))
+
+
+@app.route('/flag_node_generators_test/cleanup/<run_id>', methods=['POST'])
+def flag_node_generators_test_cleanup(run_id: str):
+    """Delete all artifacts for a flag-node-generator test run (scoped to outputs/)."""
+    meta = RUNS.get(run_id)
+    if meta and meta.get('kind') != 'flag_node_generator_test':
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+    if not isinstance(run_dir, str) or not run_dir:
+        run_dir = _flagnodegen_run_dir_for_id(run_id)
+    if not isinstance(run_dir, str) or not run_dir:
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
+    abs_run_dir = os.path.abspath(run_dir)
+    outputs_root = os.path.abspath(_outputs_dir())
+    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+
+    try:
+        proc = meta.get('proc') if isinstance(meta, dict) else None
+        if proc and hasattr(proc, 'poll') and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    removed = False
+    try:
+        if os.path.isdir(abs_run_dir):
+            shutil.rmtree(abs_run_dir, ignore_errors=True)
+        removed = True
+    except Exception:
+        removed = False
+
+    try:
+        RUNS.pop(run_id, None)
+    except Exception:
+        pass
+    return jsonify({'ok': True, 'removed': removed}), 200
+
+
+@app.route('/flag_generators_test/outputs/<run_id>')
+def flag_generators_test_outputs(run_id: str):
+    meta = RUNS.get(run_id)
+    if meta and meta.get('kind') != 'flag_generator_test':
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+
+    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+    if not isinstance(run_dir, str) or not run_dir:
+        run_dir = _flaggen_run_dir_for_id(run_id)
+    if not isinstance(run_dir, str) or not run_dir:
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
+    abs_run_dir = os.path.abspath(run_dir)
+    outputs_root = os.path.abspath(_outputs_dir())
+    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+    if not os.path.isdir(abs_run_dir):
+        done = bool(meta.get('done')) if isinstance(meta, dict) else False
+        returncode = meta.get('returncode') if isinstance(meta, dict) else None
+        return jsonify({'ok': True, 'files': [], 'done': done, 'returncode': returncode}), 200
+
+    input_files: list[dict[str, Any]] = []
+    output_files: list[dict[str, Any]] = []
+    misc_files: list[dict[str, Any]] = []
+
+    for root, _dirs, filenames in os.walk(abs_run_dir):
+        rel_root = os.path.relpath(root, abs_run_dir).replace('\\', '/')
+        for fn in filenames:
+            abs_path = os.path.join(root, fn)
+            try:
+                st = os.stat(abs_path)
+                rel = os.path.relpath(abs_path, abs_run_dir).replace('\\', '/')
+                entry = {'path': rel, 'name': fn, 'size': st.st_size}
+            except Exception:
+                continue
+
+            if rel_root == 'inputs' or rel_root.startswith('inputs/'):
+                input_files.append(entry)
+            elif rel == 'run.log':
+                misc_files.append(entry)
+            else:
+                output_files.append(entry)
+
+    input_files.sort(key=lambda x: x.get('path') or '')
+    output_files.sort(key=lambda x: x.get('path') or '')
+    misc_files.sort(key=lambda x: x.get('path') or '')
+    done = bool(meta.get('done')) if isinstance(meta, dict) else True
+    returncode = meta.get('returncode') if isinstance(meta, dict) else None
+    return jsonify({
+        'ok': True,
+        'inputs': input_files,
+        'outputs': output_files,
+        'misc': misc_files,
+        'done': done,
+        'returncode': returncode,
+    }), 200
+
+
+@app.route('/flag_generators_test/download/<run_id>')
+def flag_generators_test_download(run_id: str):
+    meta = RUNS.get(run_id)
+    if meta and meta.get('kind') != 'flag_generator_test':
+        return jsonify({'ok': False, 'error': 'not found'}), 404
+    run_dir = meta.get('run_dir') if isinstance(meta, dict) else None
+    if not isinstance(run_dir, str) or not run_dir:
+        run_dir = _flaggen_run_dir_for_id(run_id)
+    if not isinstance(run_dir, str) or not run_dir:
+        return jsonify({'ok': False, 'error': 'missing run dir'}), 500
+    rel = (request.args.get('p') or '').strip().lstrip('/').replace('\\', '/')
+    if not rel:
+        return jsonify({'ok': False, 'error': 'invalid path'}), 400
+    abs_run_dir = os.path.abspath(run_dir)
+    outputs_root = os.path.abspath(_outputs_dir())
+    if not (abs_run_dir == outputs_root or abs_run_dir.startswith(outputs_root + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+    abs_path = os.path.abspath(os.path.join(abs_run_dir, rel))
+    if not (abs_path == abs_run_dir or abs_path.startswith(abs_run_dir + os.sep)):
+        return jsonify({'ok': False, 'error': 'refusing'}), 400
+    if not os.path.exists(abs_path) or not os.path.isfile(abs_path):
+        return jsonify({'ok': False, 'error': 'missing file'}), 404
+    return send_file(abs_path, as_attachment=True, download_name=os.path.basename(abs_path))
+
+
+@app.route('/flag_generators_test/bundle/<run_id>')
+def flag_generators_test_bundle(run_id: str):
+    return jsonify({'ok': False, 'error': 'bundle.zip output disabled'}), 404
+
+
+def _flag_resolve_path(raw_path: str) -> str:
+    """Resolve a flag path that may be repo-relative."""
+    p = (raw_path or '').strip()
+    if not p:
+        return ''
+    try:
+        if p.startswith('file://'):
+            p = p[len('file://'):]
+    except Exception:
+        pass
+    if os.path.isabs(p):
+        return p
+    try:
+        return os.path.abspath(os.path.join(_get_repo_root(), p))
+    except Exception:
+        return os.path.abspath(p)
+
+
+@app.route('/flag_compose/status', methods=['POST'])
+def flag_compose_status():
+    """Return status for a list of flag catalog items."""
+    try:
+        data = request.get_json(silent=True) or {}
+        items = data.get('items') or []
+        out = []
+        logs: list[str] = []
+        base_out = os.path.abspath(_flag_base_dir())
+        os.makedirs(base_out, exist_ok=True)
+        for it in items:
+            name = (it.get('name') or it.get('Name') or '').strip()
+            path_raw = (it.get('path') or it.get('Path') or '').strip()
+            compose_name = (it.get('compose_name') or it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
+            safe = _safe_name(name or 'flag')
+            fdir = os.path.join(base_out, safe)
+            gh = _parse_github_url(path_raw)
+            compose_file = None
+            base_dir = fdir
+            exists = False
+
+            # Local file path support (repo-relative)
+            local_path = _flag_resolve_path(path_raw)
+            if local_path and os.path.exists(local_path) and local_path.lower().endswith(('.yml', '.yaml')):
+                compose_file = local_path
+                base_dir = os.path.dirname(local_path)
+                exists = True
+                try:
+                    logs.append(f"[status] {name}: local compose={compose_file}")
+                except Exception:
+                    pass
+            elif gh.get('is_github'):
+                repo_dir = os.path.join(fdir, _vuln_repo_subdir())
+                sub = gh.get('subpath') or ''
+                is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                if is_file_sub:
+                    compose_file = os.path.join(repo_dir, sub)
+                    base_dir = os.path.dirname(compose_file)
+                    exists = os.path.exists(compose_file)
+                else:
+                    base_dir = os.path.join(repo_dir, sub) if sub else repo_dir
+                    exists = os.path.isdir(base_dir)
+                if exists and compose_name and not compose_file:
+                    p = os.path.join(base_dir, compose_name)
+                    if os.path.exists(p):
+                        compose_file = p
+                if not compose_file:
+                    cand = _compose_candidates(base_dir)
+                    compose_file = cand[0] if cand else None
+                try:
+                    logs.append(f"[status] {name}: github base={base_dir} exists={exists} compose={compose_name}")
+                except Exception:
+                    pass
+            else:
+                # Legacy direct download into outputs/flags/<safe>/compose_name
+                compose_file = os.path.join(fdir, compose_name)
+                exists = os.path.exists(compose_file)
+                base_dir = fdir
+
+            pulled = False
+            if exists and compose_file and shutil.which('docker'):
+                try:
+                    proc = subprocess.run(['docker', 'compose', '-f', compose_file, 'config', '--images'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=30)
+                    if proc.returncode == 0:
+                        images = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
+                        if images:
+                            present = []
+                            for img in images:
+                                p2 = subprocess.run(['docker', 'image', 'inspect', img], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                present.append(p2.returncode == 0)
+                            pulled = all(present)
+                except Exception:
+                    pulled = False
+            out.append({
+                'name': name,
+                'path': path_raw,
+                'compose_name': compose_name,
+                'compose_path': compose_file,
+                'exists': bool(exists),
+                'pulled': bool(pulled),
+                'dir': base_dir,
+            })
+        return jsonify({'items': out, 'log': logs})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/flag_compose/download', methods=['POST'])
+def flag_compose_download():
+    """Download/clone docker-compose assets for the given flag catalog items."""
+    try:
+        data = request.get_json(silent=True) or {}
+        items = data.get('items') or []
+        out = []
+        logs: list[str] = []
+        base_out = os.path.abspath(_flag_base_dir())
+        os.makedirs(base_out, exist_ok=True)
+
+        try:
+            from core_topo_gen.utils.vuln_process import _github_tree_to_raw as _to_raw
+        except Exception:
+            def _to_raw(base_url: str, filename: str) -> str | None:
+                try:
+                    from urllib.parse import urlparse
+                    u = urlparse(base_url)
+                    if u.netloc.lower() != 'github.com':
+                        return None
+                    parts = [p for p in u.path.strip('/').split('/') if p]
+                    if len(parts) < 4 or parts[2] != 'tree':
+                        return None
+                    owner, repo, _tree, branch = parts[:4]
+                    rest = '/'.join(parts[4:])
+                    return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rest}/{filename}"
+                except Exception:
+                    return None
+
+        import urllib.request
+        import shlex
+        for it in items:
+            name = (it.get('name') or it.get('Name') or '').strip()
+            path_raw = (it.get('path') or it.get('Path') or '').strip()
+            compose_name = (it.get('compose_name') or it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
+            safe = _safe_name(name or 'flag')
+            fdir = os.path.join(base_out, safe)
+            os.makedirs(fdir, exist_ok=True)
+
+            # Local compose path support: nothing to download.
+            local_path = _flag_resolve_path(path_raw)
+            if local_path and os.path.exists(local_path) and local_path.lower().endswith(('.yml', '.yaml')):
+                out.append({'name': name, 'path': path_raw, 'ok': True, 'dir': os.path.dirname(local_path), 'message': 'local compose file'})
+                continue
+
+            gh = _parse_github_url(path_raw)
+            if gh.get('is_github'):
+                if not shutil.which('git'):
+                    logs.append(f"[download] {name}: git not available in PATH")
+                    out.append({'name': name, 'path': path_raw, 'ok': False, 'dir': fdir, 'message': 'git not available'})
+                    continue
+                repo_dir = os.path.join(fdir, _vuln_repo_subdir())
+                if os.path.isdir(os.path.join(repo_dir, '.git')):
+                    base_dir = os.path.join(repo_dir, gh.get('subpath') or '') if gh.get('subpath') else repo_dir
+                    out.append({'name': name, 'path': path_raw, 'ok': True, 'dir': base_dir, 'message': 'already downloaded'})
+                    continue
+                try:
+                    if os.path.exists(repo_dir):
+                        shutil.rmtree(repo_dir)
+                except Exception:
+                    pass
+                cmd = ['git', 'clone', '--depth', '1']
+                if gh.get('branch'):
+                    cmd += ['--branch', gh.get('branch')]
+                cmd += [gh.get('git_url'), repo_dir]
+                try:
+                    logs.append(f"[download] {name}: running: {' '.join(shlex.quote(c) for c in cmd)}")
+                    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+                    if proc.returncode == 0 and os.path.isdir(repo_dir):
+                        base_dir = os.path.join(repo_dir, gh.get('subpath') or '') if gh.get('subpath') else repo_dir
+                        out.append({'name': name, 'path': path_raw, 'ok': True, 'dir': base_dir, 'message': 'downloaded'})
+                    else:
+                        msg = (proc.stdout or '').strip()
+                        out.append({'name': name, 'path': path_raw, 'ok': False, 'dir': fdir, 'message': msg[-1000:] if msg else 'git clone failed'})
+                except Exception as e:
+                    out.append({'name': name, 'path': path_raw, 'ok': False, 'dir': fdir, 'message': str(e)})
+            else:
+                raw = _to_raw(path_raw, compose_name) or (path_raw.rstrip('/') + '/' + compose_name)
+                yml_path = os.path.join(fdir, compose_name)
+                try:
+                    logs.append(f"[download] {name}: GET {raw}")
+                    with urllib.request.urlopen(raw, timeout=30) as resp:
+                        data_bin = resp.read(1_000_000)
+                    with open(yml_path, 'wb') as fh:
+                        fh.write(data_bin)
+                    out.append({'name': name, 'path': path_raw, 'ok': True, 'dir': fdir, 'message': 'downloaded', 'compose_name': compose_name})
+                except Exception as e:
+                    out.append({'name': name, 'path': path_raw, 'ok': False, 'dir': fdir, 'message': str(e), 'compose_name': compose_name})
+        return jsonify({'items': out, 'log': logs})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/flag_compose/pull', methods=['POST'])
+def flag_compose_pull():
+    """Run docker compose pull for the given flag catalog items."""
+    try:
+        data = request.get_json(silent=True) or {}
+        items = data.get('items') or []
+        out = []
+        logs: list[str] = []
+        base_out = os.path.abspath(_flag_base_dir())
+        for it in items:
+            name = (it.get('name') or it.get('Name') or '').strip()
+            path_raw = (it.get('path') or it.get('Path') or '').strip()
+            compose_name = (it.get('compose_name') or it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
+            safe = _safe_name(name or 'flag')
+            fdir = os.path.join(base_out, safe)
+
+            local_path = _flag_resolve_path(path_raw)
+            if local_path and os.path.exists(local_path) and local_path.lower().endswith(('.yml', '.yaml')):
+                yml_path = local_path
+            else:
+                gh = _parse_github_url(path_raw)
+                if gh.get('is_github'):
+                    repo_dir = os.path.join(fdir, _vuln_repo_subdir())
+                    sub = gh.get('subpath') or ''
+                    is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                    base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
+                    yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
+                    if not os.path.exists(yml_path):
+                        cand = _compose_candidates(base_dir)
+                        yml_path = cand[0] if cand else None
+                else:
+                    yml_path = os.path.join(fdir, compose_name)
+
+            if not yml_path or not os.path.exists(yml_path):
+                out.append({'name': name, 'path': path_raw, 'ok': False, 'message': 'compose file missing', 'compose_name': compose_name})
+                continue
+            if not shutil.which('docker'):
+                out.append({'name': name, 'path': path_raw, 'ok': False, 'message': 'docker not available', 'compose_name': compose_name})
+                continue
+            try:
+                proc = subprocess.run(['docker', 'compose', '-f', yml_path, 'pull'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                logs.append(f"[pull] {name}: rc={proc.returncode} file={yml_path}")
+                ok = proc.returncode == 0
+                msg = 'ok' if ok else ((proc.stdout or '')[-1000:] if proc.stdout else 'failed')
+                out.append({'name': name, 'path': path_raw, 'ok': ok, 'message': msg, 'compose_name': compose_name})
+            except Exception as e:
+                out.append({'name': name, 'path': path_raw, 'ok': False, 'message': str(e), 'compose_name': compose_name})
+        return jsonify({'items': out, 'log': logs})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/flag_compose/remove', methods=['POST'])
+def flag_compose_remove():
+    """Remove compose assets and any local outputs for the given flag catalog items."""
+    try:
+        data = request.get_json(silent=True) or {}
+        items = data.get('items') or []
+        out = []
+        logs: list[str] = []
+        base_out = os.path.abspath(_flag_base_dir())
+        for it in items:
+            name = (it.get('name') or it.get('Name') or '').strip()
+            path_raw = (it.get('path') or it.get('Path') or '').strip()
+            compose_name = (it.get('compose_name') or it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
+            safe = _safe_name(name or 'flag')
+            fdir = os.path.join(base_out, safe)
+
+            # Prefer local compose file if path points at one.
+            local_path = _flag_resolve_path(path_raw)
+            yml_path = None
+            if local_path and os.path.exists(local_path) and local_path.lower().endswith(('.yml', '.yaml')):
+                yml_path = local_path
+            else:
+                gh = _parse_github_url(path_raw)
+                if gh.get('is_github'):
+                    repo_dir = os.path.join(fdir, _vuln_repo_subdir())
+                    sub = gh.get('subpath') or ''
+                    is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                    base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
+                    yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
+                    if not os.path.exists(yml_path):
+                        cand = _compose_candidates(base_dir)
+                        yml_path = cand[0] if cand else None
+                else:
+                    yml_path = os.path.join(fdir, compose_name)
+
+            if yml_path and os.path.exists(yml_path) and shutil.which('docker'):
+                try:
+                    logs.append(f"[remove] {name}: docker compose down file={yml_path}")
+                except Exception:
+                    pass
+                try:
+                    subprocess.run(['docker', 'compose', '-f', yml_path, 'down', '--volumes', '--remove-orphans'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                except Exception:
+                    pass
+
+            # Remove downloaded dirs under outputs/flags only (never delete repo-local templates)
+            try:
+                gh = _parse_github_url(path_raw)
+                if gh.get('is_github'):
+                    repo_dir = os.path.join(fdir, _vuln_repo_subdir())
+                    if os.path.isdir(repo_dir):
+                        shutil.rmtree(repo_dir, ignore_errors=True)
+                        logs.append(f"[remove] {name}: deleted {repo_dir}")
+                else:
+                    yml = os.path.join(fdir, compose_name)
+                    if os.path.exists(yml):
+                        try:
+                            os.remove(yml)
+                            logs.append(f"[remove] {name}: deleted {yml}")
+                        except Exception:
+                            pass
+                try:
+                    if os.path.isdir(fdir) and not os.listdir(fdir):
+                        os.rmdir(fdir)
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    logs.append(f"[remove] cleanup error: {e}")
+                except Exception:
+                    pass
+
+            out.append({'name': name, 'path': path_raw, 'ok': True, 'message': 'removed', 'compose_name': compose_name})
+        return jsonify({'items': out, 'log': logs})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/vuln_catalog')
 def vuln_catalog():
-    """Return vulnerability catalog built from enabled data source CSVs.
+    """Return vulnerability catalog.
 
-    Response JSON:
-      {
-        "types": [str],
-        "vectors": [str],
-        "items": [ {"Name","Path","Type","Startup","Vector","CVE","Description","References"} ]
-      }
-    Only includes rows from enabled data sources that validate.
+    The Topology tab uses this for the "Select Vulnerability" modal.
+
+     Source priority (strict for Web UI):
+     1) Active installed Vulnerability Pack (Web UI state in outputs/installed_vuln_catalogs)
+         - respects disabled/deleted items
+         - uses UI-style display names (e.g. <parent>/<leaf>)
+
+     Note: We intentionally do NOT fall back to repo defaults here. If the user
+     has an empty/absent catalog pack, the Topology picker should show no items.
     """
     try:
-        state = _load_data_sources_state()
-        types = set()
-        vectors = set()
-        items = []
-        for s in state.get('sources', []):
-            if not s.get('enabled'): continue
-            p = s.get('path')
-            if not p or not os.path.exists(p): continue
-            ok, note, norm_rows, _skipped = _validate_and_normalize_data_source_csv(p, skip_invalid=True)
-            if not ok or not norm_rows or len(norm_rows) < 2: continue
-            header = norm_rows[0]
-            idx = {name: header.index(name) for name in header if name in header}
-            for r in norm_rows[1:]:
+        # Prefer the new vulnerability-pack-backed catalog when present.
+        try:
+            state = _load_vuln_catalogs_state()
+            entry = _get_active_vuln_catalog_entry(state)
+        except Exception:
+            state = {}
+            entry = None
+
+        if entry and isinstance(entry, dict):
+            cid = str(entry.get('id') or '').strip()
+            norm_items = _normalize_vuln_catalog_items(entry)
+            from_source = str(entry.get('from_source') or entry.get('label') or '').strip()
+
+            def _display_name(it: dict[str, Any]) -> str:
+                base = str(it.get('name') or '').strip() or 'root'
+                rel_dir = str(it.get('rel_dir') or it.get('dir_rel') or '').strip()
+                if not rel_dir or rel_dir in ('', '.', 'root'):
+                    return base
+                parts = [p for p in rel_dir.replace('\\', '/').split('/') if p]
+                if len(parts) >= 2:
+                    return f"{parts[-2]}/{parts[-1]}"
+                return parts[-1] if parts else base
+
+            items: list[dict[str, str]] = []
+            for it in norm_items:
+                if bool(it.get('disabled', False)):
+                    continue
                 try:
-                    rec = {
-                        'Name': r[idx.get('Name')],
-                        'Path': r[idx.get('Path')],
-                        'Type': r[idx.get('Type')],
-                        'Startup': r[idx.get('Startup')],
-                        'Vector': r[idx.get('Vector')],
-                        'CVE': r[idx.get('CVE')] if 'CVE' in idx else 'n/a',
-                        'Description': r[idx.get('Description')] if 'Description' in idx else 'n/a',
-                        'References': r[idx.get('References')] if 'References' in idx else 'n/a',
-                    }
-                    # keep only non-empty mandatory values
-                    if not rec['Name'] or not rec['Path']:
-                        continue
-                    items.append(rec)
-                    if rec['Type']: types.add(rec['Type'])
-                    if rec['Vector']: vectors.add(rec['Vector'])
+                    abs_compose = _vuln_catalog_item_abs_compose_path(catalog_id=cid, item=it)
                 except Exception:
                     continue
-        return jsonify({
-            'types': sorted(types),
-            'vectors': sorted(vectors),
-            'items': items,
-        })
+                rel_dir = str(it.get('rel_dir') or it.get('dir_rel') or '').strip().replace('\\', '/')
+                files_api_url = ''
+                try:
+                    files_api_url = url_for('vuln_catalog_pack_item_files', catalog_id=cid, item_id=int(it.get('id') or 0))
+                except Exception:
+                    files_api_url = ''
+                items.append({
+                    'Name': _display_name(it),
+                    'Path': os.path.abspath(abs_compose),
+                    'Type': 'docker-compose',
+                    'Vector': '',
+                    'Startup': '',
+                    'CVE': '',
+                    'Description': '',
+                    'References': '',
+                    'id': str(it.get('id') or '').strip(),
+                    'from_source': from_source,
+                    'files_api_url': files_api_url,
+                })
+        else:
+            items = []
+
+        types = sorted({str(it.get('Type') or '').strip() for it in items if str(it.get('Type') or '').strip()})
+        vectors = sorted({str(it.get('Vector') or '').strip() for it in items if str(it.get('Vector') or '').strip()})
+        return jsonify({'types': types, 'vectors': vectors, 'items': items})
     except Exception as e:
         return jsonify({'error': str(e), 'types': [], 'vectors': [], 'items': []}), 500
 
@@ -20546,6 +35365,29 @@ def _compose_candidates(base_dir: str):
         pass
     return out
 
+
+def _vuln_resolve_local_path(path_raw: str) -> str | None:
+    """Resolve a local vuln compose path (file or directory).
+
+    Safety: only allow paths under the repo root.
+    """
+    try:
+        p = str(path_raw or '').strip()
+        if not p:
+            return None
+        abs_p = os.path.abspath(os.path.expanduser(p))
+        if not os.path.exists(abs_p):
+            return None
+        repo_root = os.path.abspath(_get_repo_root())
+        try:
+            if os.path.commonpath([repo_root, abs_p]) != repo_root:
+                return None
+        except Exception:
+            return None
+        return abs_p
+    except Exception:
+        return None
+
 @app.route('/vuln_compose/status', methods=['POST'])
 def vuln_compose_status():
     """Return status for a list of catalog items: whether compose file is downloaded and images pulled.
@@ -20566,53 +35408,72 @@ def vuln_compose_status():
             compose_name = (it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
             safe = _safe_name(name or 'vuln')
             vdir = os.path.join(base_out, safe)
-            gh = _parse_github_url(path)
             base_dir = vdir
             compose_file = None
-            if gh.get('is_github'):
-                try:
-                    logs.append(f"[status] {name}: Path={path}")
-                    logs.append(f"[status] {name}: git_url={gh.get('git_url')} branch={gh.get('branch')} subpath={gh.get('subpath')} mode={gh.get('mode')}")
-                except Exception:
-                    pass
-                repo_dir = os.path.join(vdir, _vuln_repo_subdir())
-                sub = gh.get('subpath') or ''
-                # If subpath looks like a compose file, resolve directly
-                is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
-                if is_file_sub:
-                    compose_file = os.path.join(repo_dir, sub)
-                    base_dir = os.path.dirname(compose_file)
-                    exists = os.path.exists(compose_file)
+            exists = False
+
+            local = _vuln_resolve_local_path(path)
+            if local:
+                if os.path.isdir(local):
+                    base_dir = local
+                    pref = os.path.join(base_dir, compose_name)
+                    if os.path.exists(pref):
+                        compose_file = pref
+                    else:
+                        cand = _compose_candidates(base_dir)
+                        compose_file = cand[0] if cand else None
+                    exists = bool(compose_file and os.path.exists(compose_file))
                 else:
-                    base_dir = os.path.join(repo_dir, sub) if sub else repo_dir
-                    exists = os.path.isdir(base_dir)
-                try:
-                    logs.append(f"[status] {name}: base={base_dir} exists={exists} compose={compose_name}")
-                except Exception:
-                    pass
-                # prefer provided compose name
-                if exists and compose_name and not compose_file:
-                    p = os.path.join(base_dir, compose_name)
-                    if os.path.exists(p):
-                        compose_file = p
-                # log compose candidates
-                try:
-                    cands = _compose_candidates(base_dir) if exists else []
-                    logs.append(f"[status] {name}: compose candidates={cands[:4]}")
-                except Exception:
-                    pass
-                if not compose_file:
-                    # find compose candidates within base_dir
-                    cand = _compose_candidates(base_dir)
-                    compose_file = cand[0] if cand else None
+                    compose_file = local
+                    base_dir = os.path.dirname(local)
+                    exists = os.path.exists(compose_file)
             else:
-                # legacy direct download to vdir/docker-compose.yml
-                compose_file = os.path.join(vdir, compose_name or 'docker-compose.yml')
-                exists = os.path.exists(compose_file)
-                try:
-                    logs.append(f"[status] {name}: non-github Path={path} compose_path={compose_file} exists={exists}")
-                except Exception:
-                    pass
+                gh = _parse_github_url(path)
+                if gh.get('is_github'):
+                    try:
+                        logs.append(f"[status] {name}: Path={path}")
+                        logs.append(f"[status] {name}: git_url={gh.get('git_url')} branch={gh.get('branch')} subpath={gh.get('subpath')} mode={gh.get('mode')}")
+                    except Exception:
+                        pass
+                    repo_dir = os.path.join(vdir, _vuln_repo_subdir())
+                    sub = gh.get('subpath') or ''
+                    # If subpath looks like a compose file, resolve directly
+                    is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                    if is_file_sub:
+                        compose_file = os.path.join(repo_dir, sub)
+                        base_dir = os.path.dirname(compose_file)
+                        exists = os.path.exists(compose_file)
+                    else:
+                        base_dir = os.path.join(repo_dir, sub) if sub else repo_dir
+                        exists = os.path.isdir(base_dir)
+                        # prefer provided compose name
+                        if exists and compose_name:
+                            p = os.path.join(base_dir, compose_name)
+                            if os.path.exists(p):
+                                compose_file = p
+                        if not compose_file and exists:
+                            cand = _compose_candidates(base_dir)
+                            compose_file = cand[0] if cand else None
+                        exists = bool(compose_file and os.path.exists(compose_file)) if compose_file else bool(exists)
+                    try:
+                        logs.append(f"[status] {name}: base={base_dir} exists={exists} compose={compose_name}")
+                    except Exception:
+                        pass
+                    # log compose candidates
+                    try:
+                        cands = _compose_candidates(base_dir) if os.path.isdir(base_dir) else []
+                        logs.append(f"[status] {name}: compose candidates={cands[:4]}")
+                    except Exception:
+                        pass
+                else:
+                    # legacy / direct download case: vdir/docker-compose.yml
+                    compose_file = os.path.join(vdir, compose_name or 'docker-compose.yml')
+                    base_dir = vdir
+                    exists = os.path.exists(compose_file)
+                    try:
+                        logs.append(f"[status] {name}: non-github Path={path} compose_path={compose_file} exists={exists}")
+                    except Exception:
+                        pass
             pulled = False
             if exists and compose_file and shutil.which('docker'):
                 try:
@@ -20642,6 +35503,170 @@ def vuln_compose_status():
                     pulled = False
             out.append({'Name': name, 'Path': path, 'compose': compose_name, 'compose_path': compose_file, 'exists': bool(exists), 'pulled': bool(pulled), 'dir': base_dir})
         return jsonify({'items': out, 'log': logs})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/vuln_compose/status_images', methods=['POST'])
+def vuln_compose_status_images():
+    """Fast-ish status for a list of catalog items: whether compose is downloaded and images exist locally.
+
+    This endpoint is optimized for UI gating (vuln picker):
+    - Resolve the compose file path similarly to `/vuln_compose/status`.
+    - Prefer parsing docker-compose YAML (`services.*.image`) to avoid invoking `docker compose config`.
+    - Check local images via `docker image inspect`.
+    - Fallback to `docker compose -f <file> config --images` only when YAML parsing yields no images.
+
+    Payload: { items: [{Name, Path}] }
+    Returns: { items: [{Name, Path, exists: bool, pulled: bool, compose_path: str|None, images: [str], missing_images: [str]}] }
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        items = data.get('items') or []
+        out: list[dict] = []
+
+        base_out = os.path.abspath(_vuln_base_dir())
+        docker_ok = bool(shutil.which('docker'))
+
+        # Optional dependency (pinned in requirements, but keep best-effort).
+        try:
+            import yaml  # type: ignore
+        except Exception:  # pragma: no cover
+            yaml = None  # type: ignore
+
+        def _resolve_compose_path(name: str, path: str, compose_name: str) -> tuple[bool, str | None]:
+            safe = _safe_name(name or 'vuln')
+            vdir = os.path.join(base_out, safe)
+            compose_file: str | None = None
+            exists = False
+
+            local = _vuln_resolve_local_path(path)
+            if local:
+                if os.path.isdir(local):
+                    pref = os.path.join(local, compose_name)
+                    if os.path.exists(pref):
+                        compose_file = pref
+                    else:
+                        cand = _compose_candidates(local)
+                        compose_file = cand[0] if cand else None
+                    return bool(compose_file and os.path.exists(compose_file)), compose_file
+                return bool(os.path.exists(local)), local
+
+            gh = _parse_github_url(path)
+
+            if gh.get('is_github'):
+                repo_dir = os.path.join(vdir, _vuln_repo_subdir())
+                sub = gh.get('subpath') or ''
+                is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                if is_file_sub:
+                    compose_file = os.path.join(repo_dir, sub)
+                    exists = os.path.exists(compose_file)
+                else:
+                    base_dir = os.path.join(repo_dir, sub) if sub else repo_dir
+                    exists = os.path.isdir(base_dir)
+                    if exists:
+                        preferred = os.path.join(base_dir, compose_name)
+                        if os.path.exists(preferred):
+                            compose_file = preferred
+                        else:
+                            cand = _compose_candidates(base_dir)
+                            compose_file = cand[0] if cand else None
+                return bool(exists and compose_file and os.path.exists(compose_file)), compose_file
+
+            # Non-github: legacy direct download
+            compose_file = os.path.join(vdir, compose_name)
+            exists = os.path.exists(compose_file)
+            return bool(exists), compose_file if exists else compose_file
+
+        def _images_from_compose_yaml(compose_path: str) -> list[str]:
+            if not yaml:
+                return []
+            try:
+                with open(compose_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    doc = yaml.safe_load(f) or {}
+                if not isinstance(doc, dict):
+                    return []
+                services = doc.get('services')
+                if not isinstance(services, dict):
+                    return []
+                images: list[str] = []
+                for _svc_name, svc in services.items():
+                    if not isinstance(svc, dict):
+                        continue
+                    img = svc.get('image')
+                    if isinstance(img, str) and img.strip():
+                        images.append(img.strip())
+                # preserve stable order but dedupe
+                seen: set[str] = set()
+                out_imgs: list[str] = []
+                for img in images:
+                    if img in seen:
+                        continue
+                    seen.add(img)
+                    out_imgs.append(img)
+                return out_imgs
+            except Exception:
+                return []
+
+        for it in items:
+            name = (it.get('Name') or '').strip()
+            path = (it.get('Path') or '').strip()
+            compose_name = (it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
+
+            exists, compose_path = _resolve_compose_path(name, path, compose_name)
+            images: list[str] = []
+            missing: list[str] = []
+            pulled = False
+
+            if exists and compose_path and docker_ok:
+                images = _images_from_compose_yaml(compose_path)
+
+                # Fallback: ask docker compose to render images list (slower).
+                if not images:
+                    try:
+                        proc = subprocess.run(
+                            ['docker', 'compose', '-f', compose_path, 'config', '--images'],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            timeout=20,
+                        )
+                        if proc.returncode == 0:
+                            images = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
+                    except Exception:
+                        images = []
+
+                if images:
+                    for img in images:
+                        try:
+                            p2 = subprocess.run(
+                                ['docker', 'image', 'inspect', img],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                            if p2.returncode != 0:
+                                missing.append(img)
+                        except Exception:
+                            missing.append(img)
+                    pulled = len(missing) == 0
+                else:
+                    # No images declared (common with build-only compose files). Treat as ready
+                    # so the UI doesn't perpetually show Download/Pull.
+                    pulled = True
+
+            out.append({
+                'Name': name,
+                'Path': path,
+                'compose': compose_name,
+                'compose_path': compose_path,
+                'exists': bool(exists),
+                'pulled': bool(pulled),
+                'images': images,
+                'missing_images': missing,
+                'docker_available': docker_ok,
+            })
+
+        return jsonify({'items': out})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -20690,6 +35715,19 @@ def vuln_compose_download():
             safe = _safe_name(name or 'vuln')
             vdir = os.path.join(base_out, safe)
             os.makedirs(vdir, exist_ok=True)
+
+            local = _vuln_resolve_local_path(path)
+            if local:
+                if os.path.isdir(local):
+                    pref = os.path.join(local, compose_name)
+                    if os.path.exists(pref):
+                        out.append({'Name': name, 'Path': path, 'ok': True, 'dir': local, 'message': 'local compose directory'})
+                    else:
+                        out.append({'Name': name, 'Path': path, 'ok': False, 'dir': local, 'message': 'compose file missing in local directory'})
+                else:
+                    out.append({'Name': name, 'Path': path, 'ok': True, 'dir': os.path.dirname(local), 'message': 'local compose file'})
+                continue
+
             gh = _parse_github_url(path)
             if gh.get('is_github'):
                 # Clone the repo; use branch if provided
@@ -20815,34 +35853,47 @@ def vuln_compose_pull():
             compose_name = (it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
             safe = _safe_name(name or 'vuln')
             vdir = os.path.join(base_out, safe)
-            gh = _parse_github_url(path)
-            if gh.get('is_github'):
-                repo_dir = os.path.join(vdir, _vuln_repo_subdir())
-                sub = gh.get('subpath') or ''
-                # blob file path -> direct compose path
-                is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
-                base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
-                try:
-                    logs.append(
-                        f"[pull] {name}: git_url={gh.get('git_url')} branch={gh.get('branch')} subpath={gh.get('subpath')} base_dir={base_dir}"
-                    )
-                except Exception:
-                    pass
-                # prefer provided compose name
-                yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
-                if not os.path.exists(yml_path):
-                    cand = _compose_candidates(base_dir)
-                    yml_path = cand[0] if cand else None
-                try:
-                    logs.append(f"[pull] {name}: yml_path={yml_path}")
-                except Exception:
-                    pass
+
+            local = _vuln_resolve_local_path(path)
+            if local:
+                if os.path.isdir(local):
+                    pref = os.path.join(local, compose_name)
+                    if os.path.exists(pref):
+                        yml_path = pref
+                    else:
+                        cand = _compose_candidates(local)
+                        yml_path = cand[0] if cand else None
+                else:
+                    yml_path = local
             else:
-                yml_path = os.path.join(vdir, compose_name)
-                try:
-                    logs.append(f"[pull] {name}: non-github base_dir={vdir}")
-                except Exception:
-                    pass
+                gh = _parse_github_url(path)
+                if gh.get('is_github'):
+                    repo_dir = os.path.join(vdir, _vuln_repo_subdir())
+                    sub = gh.get('subpath') or ''
+                    # blob file path -> direct compose path
+                    is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                    base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
+                    try:
+                        logs.append(
+                            f"[pull] {name}: git_url={gh.get('git_url')} branch={gh.get('branch')} subpath={gh.get('subpath')} base_dir={base_dir}"
+                        )
+                    except Exception:
+                        pass
+                    # prefer provided compose name
+                    yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
+                    if not os.path.exists(yml_path):
+                        cand = _compose_candidates(base_dir)
+                        yml_path = cand[0] if cand else None
+                    try:
+                        logs.append(f"[pull] {name}: yml_path={yml_path}")
+                    except Exception:
+                        pass
+                else:
+                    yml_path = os.path.join(vdir, compose_name)
+                    try:
+                        logs.append(f"[pull] {name}: non-github base_dir={vdir}")
+                    except Exception:
+                        pass
             if not yml_path or not os.path.exists(yml_path):
                 out.append({'Name': name, 'Path': path, 'ok': False, 'message': 'compose file missing', 'compose': compose_name})
                 continue
@@ -20892,24 +35943,41 @@ def vuln_compose_remove():
             compose_name = (it.get('compose') or 'docker-compose.yml').strip() or 'docker-compose.yml'
             safe = _safe_name(name or 'vuln')
             vdir = os.path.join(base_out, safe)
-            gh = _parse_github_url(path)
             yml_path = None
             base_dir = vdir
+            is_local = False
             try:
                 logs.append(f"[remove] {name}: Path={path}")
             except Exception:
                 pass
-            if gh.get('is_github'):
-                repo_dir = os.path.join(vdir, _vuln_repo_subdir())
-                sub = gh.get('subpath') or ''
-                is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
-                base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
-                yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
-                if not os.path.exists(yml_path):
-                    cand = _compose_candidates(base_dir)
-                    yml_path = cand[0] if cand else None
+
+            local = _vuln_resolve_local_path(path)
+            if local:
+                is_local = True
+                if os.path.isdir(local):
+                    base_dir = local
+                    pref = os.path.join(base_dir, compose_name)
+                    if os.path.exists(pref):
+                        yml_path = pref
+                    else:
+                        cand = _compose_candidates(base_dir)
+                        yml_path = cand[0] if cand else None
+                else:
+                    yml_path = local
+                    base_dir = os.path.dirname(local)
             else:
-                yml_path = os.path.join(vdir, compose_name)
+                gh = _parse_github_url(path)
+                if gh.get('is_github'):
+                    repo_dir = os.path.join(vdir, _vuln_repo_subdir())
+                    sub = gh.get('subpath') or ''
+                    is_file_sub = bool(sub) and sub.lower().endswith(('.yml', '.yaml'))
+                    base_dir = os.path.join(repo_dir, os.path.dirname(sub)) if is_file_sub else (os.path.join(repo_dir, sub) if sub else repo_dir)
+                    yml_path = os.path.join(repo_dir, sub) if is_file_sub else os.path.join(base_dir, compose_name)
+                    if not os.path.exists(yml_path):
+                        cand = _compose_candidates(base_dir)
+                        yml_path = cand[0] if cand else None
+                else:
+                    yml_path = os.path.join(vdir, compose_name)
             # Bring down compose stack
             if yml_path and os.path.exists(yml_path) and shutil.which('docker'):
                 try:
@@ -20941,27 +36009,32 @@ def vuln_compose_remove():
                     pass
             # Remove downloaded files/dirs under outputs for this item
             try:
-                if gh.get('is_github'):
-                    repo_dir = os.path.join(vdir, _vuln_repo_subdir())
-                    if os.path.isdir(repo_dir):
-                        shutil.rmtree(repo_dir, ignore_errors=True)
-                        logs.append(f"[remove] {name}: deleted {repo_dir}")
-                else:
-                    # legacy direct compose path
-                    yml = os.path.join(vdir, compose_name)
-                    if os.path.exists(yml):
-                        try:
-                            os.remove(yml)
-                            logs.append(f"[remove] {name}: deleted {yml}")
-                        except Exception:
-                            pass
-                # Remove vdir if empty
-                try:
-                    if os.path.isdir(vdir) and not os.listdir(vdir):
-                        os.rmdir(vdir)
-                        logs.append(f"[remove] {name}: cleaned empty {vdir}")
-                except Exception:
+                if is_local:
+                    # Never delete repo-local installed templates.
                     pass
+                else:
+                    gh = _parse_github_url(path)
+                    if gh.get('is_github'):
+                        repo_dir = os.path.join(vdir, _vuln_repo_subdir())
+                        if os.path.isdir(repo_dir):
+                            shutil.rmtree(repo_dir, ignore_errors=True)
+                            logs.append(f"[remove] {name}: deleted {repo_dir}")
+                    else:
+                        # legacy direct compose path
+                        yml = os.path.join(vdir, compose_name)
+                        if os.path.exists(yml):
+                            try:
+                                os.remove(yml)
+                                logs.append(f"[remove] {name}: deleted {yml}")
+                            except Exception:
+                                pass
+                    # Remove vdir if empty
+                    try:
+                        if os.path.isdir(vdir) and not os.listdir(vdir):
+                            os.rmdir(vdir)
+                            logs.append(f"[remove] {name}: cleaned empty {vdir}")
+                    except Exception:
+                        pass
             except Exception as e:
                 try: logs.append(f"[remove] cleanup error: {e}")
                 except Exception: pass
@@ -20969,95 +36042,6 @@ def vuln_compose_remove():
         return jsonify({'items': out, 'log': logs})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-@app.route('/data_sources/edit/<sid>')
-def data_sources_edit(sid):
-    """Render an editable view of the CSV source in a simple table.
-    """
-    state = _load_data_sources_state()
-    target = None
-    for s in state.get('sources', []):
-        if s.get('id') == sid:
-            target = s
-            break
-    if not target:
-        flash('Source not found')
-        return redirect(url_for('data_sources_page'))
-    path = target.get('path')
-    if not path or not os.path.exists(path):
-        flash('File missing')
-        return redirect(url_for('data_sources_page'))
-    # Read CSV safely
-    rows = []
-    with open(path, 'r', encoding='utf-8', errors='replace', newline='') as f:
-        rdr = csv.reader(f)
-        for r in rdr:
-            rows.append(r)
-    name = target.get('name') or os.path.basename(path)
-    return render_template('data_source_edit.html', sid=sid, name=name, path=path, rows=rows)
-
-@app.route('/data_sources/save/<sid>', methods=['POST'])
-def data_sources_save(sid):
-    """Save edited CSV content coming from the editor page.
-    Expects JSON payload: { rows: string[][] }
-    """
-    try:
-        data = request.get_json(silent=True)
-        if not isinstance(data, dict) or 'rows' not in data:
-            return jsonify({"ok": False, "error": "Invalid payload"}), 400
-        rows = data.get('rows')
-        if not isinstance(rows, list) or any(not isinstance(r, list) for r in rows):
-            return jsonify({"ok": False, "error": "Rows must be a list of lists"}), 400
-        # Basic row length normalization (pad shorter rows to header length)
-        maxw = max((len(r) for r in rows), default=0)
-        norm = []
-        for r in rows:
-            if len(r) < maxw:
-                r = r + [''] * (maxw - len(r))
-            norm.append([str(c) if c is not None else '' for c in r])
-        state = _load_data_sources_state()
-        target = None
-        for s in state.get('sources', []):
-            if s.get('id') == sid:
-                target = s
-                break
-        if not target:
-            return jsonify({"ok": False, "error": "Source not found"}), 404
-        path = target.get('path')
-        if not path:
-            return jsonify({"ok": False, "error": "Missing file path"}), 400
-        # Validate and normalize according to schema
-        # Write temp to validate with the same function used for uploads
-        tmp_preview = path + '.editpreview'
-        try:
-            with open(tmp_preview, 'w', encoding='utf-8', newline='') as f:
-                w = csv.writer(f)
-                for r in norm:
-                    w.writerow(r)
-            ok2, note2, norm_rows2, skipped2 = _validate_and_normalize_data_source_csv(tmp_preview, skip_invalid=True)
-        finally:
-            try: os.remove(tmp_preview)
-            except Exception: pass
-        if not ok2:
-            return jsonify({"ok": False, "error": note2}), 200
-        # Atomic write normalized rows
-        tmp = path + '.tmp'
-        with open(tmp, 'w', encoding='utf-8', newline='') as f:
-            w = csv.writer(f)
-            for r in (norm_rows2 or norm):
-                w.writerow(r)
-        os.replace(tmp, path)
-        # Update state row count
-        ok, note = _validate_csv(path)
-        if ok2 and skipped2:
-            note_extra = f" (skipped {len(skipped2)} invalid)"
-        else:
-            note_extra = ''
-        target['rows'] = (note if ok else f"ERR: {note}") + note_extra
-        _save_data_sources_state(state)
-        return jsonify({"ok": True, "skipped": len(skipped2) if ok2 else 0})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
 
 def _purge_run_history_for_scenario(scenario_name: str, delete_artifacts: bool = True) -> int:
     """Remove any run history entries whose scenario_names contains scenario_name.
@@ -21073,6 +36057,11 @@ def _purge_run_history_for_scenario(scenario_name: str, delete_artifacts: bool =
             return 0
         kept = []
         removed = 0
+        target_key = ''
+        try:
+            target_key = _scenario_match_key(scenario_name)
+        except Exception:
+            target_key = ''
         for entry in hist:
             scen_list = []
             try:
@@ -21082,7 +36071,19 @@ def _purge_run_history_for_scenario(scenario_name: str, delete_artifacts: bool =
                     scen_list = _scenario_names_from_xml(entry.get('xml_path'))
             except Exception:
                 scen_list = []
-            if scenario_name in scen_list:
+            match = False
+            if target_key and scen_list:
+                try:
+                    for nm in scen_list:
+                        if _scenario_match_key(nm) == target_key:
+                            match = True
+                            break
+                except Exception:
+                    match = False
+            else:
+                match = bool(scenario_name in (scen_list or []))
+
+            if match:
                 removed += 1
                 if delete_artifacts:
                     for key in ('xml_path','report_path','pre_xml_path','post_xml_path','scenario_xml_path'):
@@ -21090,7 +36091,7 @@ def _purge_run_history_for_scenario(scenario_name: str, delete_artifacts: bool =
                         if p and isinstance(p,str) and os.path.exists(p):
                             # Only delete if inside outputs directory for safety
                             try:
-                                out_abs = os.path.abspath('outputs')
+                                out_abs = os.path.abspath(_outputs_dir())
                                 p_abs = os.path.abspath(p)
                                 if p_abs.startswith(out_abs):
                                     try: os.remove(p_abs)
@@ -21126,6 +36127,48 @@ def purge_history_for_scenario():
         return jsonify({'removed': removed})
     except Exception as e:
         return jsonify({'removed': 0, 'error': str(e)}), 200
+
+
+@app.route('/delete_scenarios', methods=['POST'])
+def delete_scenarios():
+    """Persist scenario deletions across refresh.
+
+    This updates outputs/scenario_catalog.json, which seeds the Scenario Editor list
+    on initial page load.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        raw_names = data.get('names')
+        if isinstance(raw_names, str):
+            names = [raw_names]
+        elif isinstance(raw_names, list):
+            names = [n for n in raw_names if isinstance(n, (str, int, float))]
+        else:
+            names = []
+        names = [str(n).strip() for n in names if str(n).strip()]
+        if not names:
+            return jsonify({'ok': False, 'error': 'Missing scenario names'}), 400
+        result = _remove_scenarios_from_catalog(names)
+        # Also delete any saved Scenario_*.xml artifacts and remove the scenario(s)
+        # from all editor snapshots, otherwise they will be re-discovered on refresh.
+        artifacts = _delete_saved_scenario_xml_artifacts(names)
+        snapshots = _remove_scenarios_from_all_editor_snapshots(names)
+        history_removed = 0
+        try:
+            for nm in names:
+                try:
+                    history_removed += _purge_run_history_for_scenario(str(nm), delete_artifacts=True)
+                except Exception:
+                    continue
+        except Exception:
+            history_removed = history_removed
+        return jsonify({'ok': True, **result, **artifacts, **snapshots, 'history_removed': history_removed})
+    except Exception as e:
+        try:
+            app.logger.exception('[delete_scenarios] failed: %s', e)
+        except Exception:
+            pass
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
     try:

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Core Topology Generator Web API
-  version: "2026-01-01"
+  version: "2026-01-13"
   description: >-
     OpenAPI specification for the CORE topology generator web backend. The API
     combines JSON endpoints used by the web UI with a set of HTML form
@@ -20,6 +20,8 @@ tags:
     description: Uploading, downloading, and saving Scenario Editor XML payloads.
   - name: Planning
     description: Deterministic plan previews and related planning helpers.
+  - name: Flag Sequencing
+    description: Flag sequencing (Flow) endpoints for generating a chain and exporting Attack Flow Builder (.afb).
   - name: Runs
     description: Synchronous and asynchronous CLI execution routes.
   - name: Reports
@@ -34,8 +36,10 @@ tags:
     description: Introspection and health endpoints.
   - name: Admin
     description: Administrative helpers and cleanup tasks.
-  - name: Data Sources
-    description: Vulnerability/data source CSV management endpoints.
+  - name: Generator Builder
+    description: Helpers for scaffolding new flag-generators and flag-node-generators.
+  - name: Generator Packs
+    description: Install/manage Generator Packs and installed generators (manifest-based).
   - name: Vulnerabilities
     description: Compose download/pull helpers for vulnerability catalog entries.
   - name: Users
@@ -49,6 +53,396 @@ tags:
 security:
   - sessionCookie: []
 paths:
+  /generator_builder:
+    get:
+      tags:
+        - Generator Builder
+        - UI Pages
+      summary: Render the Generator Builder page
+      description: >-
+        HTML page for downloading a scaffold ZIP for new generator implementations.
+      responses:
+        '200':
+          description: Generator Builder HTML.
+          content:
+            text/html:
+              schema:
+                type: string
+        '302':
+          description: Redirect to /login when not authenticated.
+
+  /api/generators/scaffold_meta:
+    post:
+      tags:
+        - Generator Builder
+      summary: Generate scaffold metadata
+      description: >-
+        Returns the generated manifest YAML plus the list of scaffold file paths for the requested
+        generator. Used by the Generator Builder UI to preview the manifest and file list.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GeneratorBuilderRequest'
+      responses:
+        '200':
+          description: Scaffold metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeneratorScaffoldMetaResponse'
+        '400':
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Login required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Builder/admin role required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/generators/scaffold_zip:
+    post:
+      tags:
+        - Generator Builder
+      summary: Download a scaffold ZIP for a generator
+      description: >-
+        Returns a ZIP archive containing a ready-to-unzip scaffold.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GeneratorBuilderRequest'
+      responses:
+        '200':
+          description: ZIP archive.
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Login required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Builder/admin role required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /generator_packs/upload:
+    post:
+      tags:
+        - Generator Packs
+        - UI Pages
+      summary: Upload and install a Generator Pack ZIP
+      description: >-
+        Upload a `.zip` file containing one or more generators under `flag_generators/` and/or
+        `flag_node_generators/`. Installs them under `outputs/installed_generators/`.
+
+        When called as an XMLHttpRequest (`X-Requested-With: XMLHttpRequest`), responds with JSON.
+        Otherwise, redirects back to the Flag Catalog page.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                zip_file:
+                  type: string
+                  format: binary
+      responses:
+        '302':
+          description: Redirect back to catalog page (HTML form submission).
+        '200':
+          description: JSON response (XHR).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  message:
+                    type: string
+                  error:
+                    type: string
+
+  /generator_packs/import_url:
+    post:
+      tags:
+        - Generator Packs
+        - UI Pages
+      summary: Install a Generator Pack from a URL
+      description: Downloads a `.zip` from the provided URL and installs it.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                zip_url:
+                  type: string
+      responses:
+        '302':
+          description: Redirect back to catalog page.
+
+  /generator_packs/delete/{pack_id}:
+    post:
+      tags:
+        - Generator Packs
+        - UI Pages
+      summary: Uninstall a Generator Pack
+      parameters:
+        - name: pack_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect back to catalog page.
+
+  /generator_packs/set_disabled/{pack_id}:
+    post:
+      tags:
+        - Generator Packs
+        - UI Pages
+      summary: Toggle disabled state for a pack (form endpoint)
+      parameters:
+        - name: pack_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                disabled:
+                  type: string
+                  description: Treats 'true' as disabled.
+      responses:
+        '302':
+          description: Redirect back to catalog page.
+
+  /api/generator_packs/set_disabled:
+    post:
+      tags:
+        - Generator Packs
+      summary: Toggle disabled state for a pack (JSON endpoint)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pack_id]
+              properties:
+                pack_id:
+                  type: string
+                disabled:
+                  type: boolean
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  message:
+                    type: string
+                  error:
+                    type: string
+
+  /api/flag_generators/set_disabled:
+    post:
+      tags:
+        - Generator Packs
+      summary: Toggle disabled state for an installed flag-generator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [generator_id]
+              properties:
+                generator_id:
+                  type: string
+                disabled:
+                  type: boolean
+      responses:
+        '200':
+          description: OK.
+
+  /api/flag_node_generators/set_disabled:
+    post:
+      tags:
+        - Generator Packs
+      summary: Toggle disabled state for an installed flag-node-generator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [generator_id]
+              properties:
+                generator_id:
+                  type: string
+                disabled:
+                  type: boolean
+      responses:
+        '200':
+          description: OK.
+
+  /api/flag_generators/delete:
+    post:
+      tags:
+        - Generator Packs
+      summary: Delete an installed flag-generator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [generator_id]
+              properties:
+                generator_id:
+                  type: string
+      responses:
+        '200':
+          description: OK.
+
+  /api/flag_node_generators/delete:
+    post:
+      tags:
+        - Generator Packs
+      summary: Delete an installed flag-node-generator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [generator_id]
+              properties:
+                generator_id:
+                  type: string
+      responses:
+        '200':
+          description: OK.
+
+  /generator_packs/download/{pack_id}:
+    get:
+      tags:
+        - Generator Packs
+        - UI Pages
+      summary: Download a ZIP for an installed pack
+      parameters:
+        - name: pack_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: ZIP archive.
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+
+  /generator_packs/export_all:
+    get:
+      tags:
+        - Generator Packs
+        - UI Pages
+      summary: Export all installed packs as a bundle ZIP
+      responses:
+        '200':
+          description: ZIP archive containing one ZIP per pack under packs/*.zip.
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+
+  /flag_generators_data:
+    get:
+      tags:
+        - Generator Packs
+      summary: List installed flag-generators (manifest-based)
+      responses:
+        '200':
+          description: Generator list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  generators:
+                    type: array
+                    items:
+                      type: object
+                  errors:
+                    type: array
+                    items:
+                      type: object
+
+  /flag_node_generators_data:
+    get:
+      tags:
+        - Generator Packs
+      summary: List installed flag-node-generators (manifest-based)
+      responses:
+        '200':
+          description: Generator list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  generators:
+                    type: array
+                    items:
+                      type: object
+                  errors:
+                    type: array
+                    items:
+                      type: object
   /login:
     get:
       tags:
@@ -313,6 +707,213 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PlanPreviewResponse'
+
+  /api/flag-sequencing/attackflow_preview:
+    get:
+      tags:
+        - Flag Sequencing
+      summary: Generate a flag-sequencing chain preview
+      description: >-
+        Computes an ordered chain of eligible nodes (Docker/vulnerability candidates) from the latest
+        preview plan and returns flag generator assignments plus validity metadata used by the Flow UI.
+
+        Note: legacy STIX/AttackFlow bundle export has been removed. The `download=1` query parameter
+        returns HTTP 410.
+      parameters:
+        - name: scenario
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Scenario label (defaults to latest run-history scenario when omitted).
+        - name: length
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 5
+        - name: preset
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional preset (forces a fixed chain shape/length).
+        - name: prefer_preview
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['0', '1']
+        - name: force_preview
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['0', '1']
+        - name: best_effort
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['0', '1']
+          description: Clamp to available eligible nodes instead of returning 422.
+        - name: debug
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['0', '1']
+        - name: debug_dag
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['0', '1']
+        - name: download
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ['0', '1', 'true', 'false', 'yes', 'no']
+          description: Deprecated legacy STIX export toggle (always returns 410).
+      responses:
+        '200':
+          description: Chain preview.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttackflowPreviewResponse'
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No preview plan available.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '410':
+          description: Legacy STIX export removed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Not enough eligible nodes to satisfy requested length.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/flag-sequencing/prepare_preview_for_execute:
+    post:
+      tags:
+        - Flag Sequencing
+      summary: Prepare a preview plan for hint resolution/execution
+      description: >-
+        Runs best-effort preparation steps (e.g., resolving hint placeholders) using the provided chain
+        and preview plan path. This endpoint is used by the Flow UI to materialize `hint.txt` after
+        generator outputs are available.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PreparePreviewForExecuteRequest'
+      responses:
+        '200':
+          description: Preparation results.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreparePreviewForExecuteResponse'
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Missing preview plan.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Preparation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/flag-sequencing/afb_from_chain:
+    post:
+      tags:
+        - Flag Sequencing
+      summary: Export Attack Flow Builder (.afb) from a chain
+      description: >-
+        Returns an Attack Flow Builder native export document (OpenChart DiagramViewExport) for the
+        ordered chain. This is the supported export format.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AfbFromChainRequest'
+      responses:
+        '200':
+          description: AFB export.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AfbFromChainResponse'
+        '400':
+          description: Validation error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Invalid chain or generator assignment error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/flag-sequencing/bundle_from_chain:
+    post:
+      tags:
+        - Flag Sequencing
+      summary: (Deprecated) STIX bundle export from a chain
+      description: STIX bundle export has been removed in favor of the Attack Flow Builder (.afb) export.
+      deprecated: true
+      responses:
+        '410':
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/flag-sequencing/attackflow:
+    get:
+      tags:
+        - Flag Sequencing
+      summary: (Deprecated) STIX AttackFlow export
+      description: STIX/AttackFlow bundle export has been removed in favor of the Attack Flow Builder (.afb) export.
+      deprecated: true
+      responses:
+        '410':
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /api/open_scripts:
     get:
       tags:
@@ -1084,146 +1685,39 @@ paths:
       responses:
         '302':
           description: Redirect to index with flash status.
-  /data_sources:
-    get:
-      tags:
-        - Data Sources
-        - UI Pages
-      summary: Render the data sources dashboard
-      responses:
-        '200':
-          description: Data sources HTML page.
-          content:
-            text/html:
-              schema:
-                type: string
-  /data_sources/upload:
-    post:
-      tags:
-        - Data Sources
-      summary: Upload a new vulnerability/data source CSV file
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required:
-                - csv_file
-              properties:
-                csv_file:
-                  type: string
-                  format: binary
-      responses:
-        '302':
-          description: Redirect to data sources page with flash status.
-  /data_sources/toggle/{sid}:
-    post:
-      tags:
-        - Data Sources
-      summary: Toggle enabled/disabled state for a data source
-      parameters:
-        - name: sid
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '302':
-          description: Redirect to data sources page.
-  /data_sources/delete/{sid}:
-    post:
-      tags:
-        - Data Sources
-      summary: Delete a data source and its CSV file
-      parameters:
-        - name: sid
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '302':
-          description: Redirect with flash status.
-  /data_sources/refresh/{sid}:
-    post:
-      tags:
-        - Data Sources
-      summary: Re-validate a data source CSV
-      parameters:
-        - name: sid
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '302':
-          description: Redirect with flash message summarizing refresh.
-  /data_sources/download/{sid}:
-    get:
-      tags:
-        - Data Sources
-      summary: Download a data source CSV file
-      parameters:
-        - name: sid
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: CSV stream.
-          content:
-            text/csv:
-              schema:
-                type: string
-                format: binary
-        '404':
-          description: Data source not found.
-          content:
-            text/plain:
-              schema:
-                type: string
-  /data_sources/export_all:
-    get:
-      tags:
-        - Data Sources
-      summary: Download all data sources as a combined archive
-      responses:
-        '200':
-          description: CSV bundle download.
-          content:
-            application/zip:
-              schema:
-                type: string
-                format: binary
-  /data_sources/edit/{sid}:
-    get:
-      tags:
-        - Data Sources
-        - UI Pages
-      summary: Render the inline CSV editor
-      parameters:
-        - name: sid
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: CSV editor HTML page.
-          content:
-            text/html:
-              schema:
-                type: string
-        '302':
-          description: Redirect when source not found.
   /vuln_catalog:
     get:
       tags:
         - Vulnerabilities
+      summary: Return the vulnerability catalog (JSON)
+      responses:
+        '200':
+          description: Vulnerability catalog JSON.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  types:
+                    type: array
+                    items:
+                      type: string
+                  vectors:
+                    type: array
+                    items:
+                      type: string
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+
+  /vuln_catalog_page:
+    get:
+      tags:
+        - Vulnerabilities
         - UI Pages
-      summary: Render the vulnerability catalog dashboard
+      summary: Render the vulnerability catalog page
       responses:
         '200':
           description: Vulnerability catalog HTML page.
@@ -1231,6 +1725,172 @@ paths:
             text/html:
               schema:
                 type: string
+
+  /vuln_catalog_packs/upload:
+    post:
+      tags:
+        - Vulnerabilities
+        - UI Pages
+      summary: Upload and install a Vulnerability Catalog Pack ZIP
+      description: >-
+        Upload a `.zip` file containing directories/subdirectories. Each valid vulnerability directory
+        must include a `docker-compose.yml`. The server extracts all files under
+        `outputs/installed_vuln_catalogs/<id>/content/` and generates a `vuln_list_w_url.csv`
+        that points to the extracted compose files.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                zip_file:
+                  type: string
+                  format: binary
+      responses:
+        '302':
+          description: Redirect back to vulnerability catalog page.
+
+  /vuln_catalog_packs/import_url:
+    post:
+      tags:
+        - Vulnerabilities
+        - UI Pages
+      summary: Install a Vulnerability Catalog Pack from a URL
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                zip_url:
+                  type: string
+      responses:
+        '302':
+          description: Redirect back to vulnerability catalog page.
+
+  /vuln_catalog_packs/download/{catalog_id}:
+    get:
+      tags:
+        - Vulnerabilities
+      summary: Download a previously uploaded Vulnerability Catalog Pack ZIP
+      parameters:
+        - name: catalog_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: ZIP archive.
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+
+  /vuln_catalog_packs/browse/{catalog_id}:
+    get:
+      tags:
+        - Vulnerabilities
+        - UI Pages
+      summary: Browse extracted vulnerability pack files (root)
+      parameters:
+        - name: catalog_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: HTML directory listing.
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /vuln_catalog_packs/browse/{catalog_id}/{subpath}:
+    get:
+      tags:
+        - Vulnerabilities
+        - UI Pages
+      summary: Browse extracted vulnerability pack files (subpath)
+      parameters:
+        - name: catalog_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: subpath
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: HTML directory listing (or redirects to file download).
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /vuln_catalog_packs/file/{catalog_id}/{subpath}:
+    get:
+      tags:
+        - Vulnerabilities
+      summary: Download a single extracted file from a vulnerability pack
+      parameters:
+        - name: catalog_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: subpath
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: File download.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+
+  /vuln_catalog_packs/set_active/{catalog_id}:
+    post:
+      tags:
+        - Vulnerabilities
+        - UI Pages
+      summary: Mark a Vulnerability Catalog Pack as active
+      parameters:
+        - name: catalog_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect back to vulnerability catalog page.
+
+  /vuln_catalog_packs/delete/{catalog_id}:
+    post:
+      tags:
+        - Vulnerabilities
+        - UI Pages
+      summary: Delete a Vulnerability Catalog Pack
+      parameters:
+        - name: catalog_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect back to vulnerability catalog page.
   /stream/{run_id}:
     get:
       tags:
@@ -1352,55 +2012,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AdminCleanupPycoreResponse'
-  /data_sources/save/{sid}:
-    post:
-      tags:
-        - Data Sources
-      summary: Persist edited data source CSV rows
-      parameters:
-        - name: sid
-          in: path
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                rows:
-                  type: array
-                  items:
-                    type: array
-                    items:
-                      type: string
-      responses:
-        '200':
-          description: Save result with optional skipped count.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DataSourceSaveResponse'
-        '400':
-          description: Invalid payload.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '404':
-          description: Data source id not found.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '500':
-          description: Failed to persist edited CSV.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DataSourceSaveResponse'
   /vuln_compose/status:
     post:
       tags:
@@ -2151,8 +2762,281 @@ components:
     ErrorResponse:
       type: object
       properties:
+        ok:
+          type: boolean
+          nullable: true
         error:
           type: string
+
+    GeneratorBuilderInputsFlags:
+      type: object
+      description: Convenience flags indicating which standard inputs to include in the generated catalog schema.
+      additionalProperties: false
+      properties:
+        seed:
+          type: boolean
+        secret:
+          type: boolean
+        node_name:
+          type: boolean
+        flag_prefix:
+          type: boolean
+
+    GeneratorArtifactRequirement:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact
+      properties:
+        artifact:
+          type: string
+        optional:
+          type: boolean
+          description: When true, the artifact is treated as optional input.
+
+    GeneratorBuilderRequest:
+      type: object
+      required:
+        - plugin_type
+        - plugin_id
+      properties:
+        plugin_type:
+          type: string
+          enum: ['flag-generator', 'flag-node-generator']
+        plugin_id:
+          type: string
+          description: Unique generator plugin identifier.
+        folder_name:
+          type: string
+          nullable: true
+          description: Folder to scaffold under flag_generators/ or flag_node_generators/.
+        name:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+        requires:
+          description: Artifact inputs. Accepts either legacy string list (all required) or the UI object list (per-artifact optional flag).
+          oneOf:
+            - type: array
+              items:
+                type: string
+            - type: array
+              items:
+                $ref: '#/components/schemas/GeneratorArtifactRequirement'
+        optional_requires:
+          type: array
+          nullable: true
+          description: Optional artifact keys that may be present in the chain if available.
+          items:
+            type: string
+        produces:
+          type: array
+          items:
+            type: string
+        inputs:
+          $ref: '#/components/schemas/GeneratorBuilderInputsFlags'
+        hint_templates:
+          type: array
+          items:
+            type: string
+        inject_files:
+          type: array
+          nullable: true
+          description: Allowlist of injected files/dirs (or output keys) to stage into injected/.
+          items:
+            type: string
+        compose_text:
+          type: string
+          nullable: true
+          description: Optional full docker-compose.yml override used in the scaffold.
+        readme_text:
+          type: string
+          nullable: true
+          description: Optional full README.md override used in the scaffold.
+
+    GeneratorScaffoldMetaResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        manifest_yaml:
+          type: string
+          description: Generated `manifest.yaml` (YAML text).
+        scaffold_paths:
+          type: array
+          items:
+            type: string
+
+    FlowChainNode:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+          nullable: true
+        type:
+          type: string
+          nullable: true
+        is_vuln:
+          type: boolean
+          nullable: true
+      additionalProperties: true
+
+    FlagAssignment:
+      type: object
+      description: Flag generator assignment metadata (best-effort, UI-oriented).
+      additionalProperties: true
+
+    AttackflowPreviewResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        scenario:
+          type: string
+          nullable: true
+        length:
+          type: integer
+          nullable: true
+        requested_length:
+          type: integer
+          nullable: true
+        preview_plan_path:
+          type: string
+          nullable: true
+        chain:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlowChainNode'
+        flag_assignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlagAssignment'
+        stats:
+          type: object
+          nullable: true
+          additionalProperties: true
+        flow_valid:
+          type: boolean
+          nullable: true
+        flow_errors:
+          type: array
+          items:
+            type: string
+        flags_enabled:
+          type: boolean
+          nullable: true
+        warning:
+          type: string
+          nullable: true
+        debug:
+          type: object
+          nullable: true
+          additionalProperties: true
+        sequencer_dag:
+          type: object
+          nullable: true
+          additionalProperties: true
+      additionalProperties: true
+
+    PreparePreviewForExecuteRequest:
+      type: object
+      required:
+        - scenario
+      properties:
+        scenario:
+          type: string
+        length:
+          type: integer
+          nullable: true
+        preset:
+          type: string
+          nullable: true
+        chain_ids:
+          type: array
+          items:
+            type: string
+        preview_plan:
+          type: string
+          nullable: true
+        mode:
+          type: string
+          nullable: true
+        best_effort:
+          type: boolean
+          nullable: true
+        timeout_s:
+          type: integer
+          nullable: true
+      additionalProperties: true
+
+    PreparePreviewForExecuteResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+      additionalProperties: true
+
+    AfbFromChainRequest:
+      type: object
+      required:
+        - scenario
+        - chain
+      properties:
+        scenario:
+          type: string
+        chain:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlowChainNode'
+      additionalProperties: true
+
+    AfbFromChainResponse:
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+        scenario:
+          type: string
+          nullable: true
+        length:
+          type: integer
+          nullable: true
+        chain:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        flag_assignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlagAssignment'
+        afb:
+          type: object
+          description: Attack Flow Builder .afb export document.
+          additionalProperties: true
+        flow_valid:
+          type: boolean
+          nullable: true
+        flow_errors:
+          type: array
+          items:
+            type: string
+        flags_enabled:
+          type: boolean
+          nullable: true
+      additionalProperties: true
     DataSourceSaveResponse:
       type: object
       properties:

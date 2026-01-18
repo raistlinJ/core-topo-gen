@@ -1,0 +1,738 @@
+{% extends "layout.html" %}
+
+{% block title %}Vulnerability Catalog{% endblock %}
+{% block header_icon %}<i class="bi bi-bug-fill fs-4"></i>{% endblock %}
+{% block header_title %}Vulnerability Catalog{% endblock %}
+{% block active_page %}{% set active_page = 'vuln_catalog' %}{% endblock %}
+
+{% block content %}
+<div class="container-fluid">
+  <div class="row">
+    <div class="col-12">
+      <ul class="nav nav-tabs" role="tablist">
+        <li class="nav-item" role="presentation">
+          <button class="nav-link active" id="vulnPacksTab" data-bs-toggle="tab" data-bs-target="#vulnPacks" type="button" role="tab">Vulnerability Packs</button>
+        </li>
+        <li class="nav-item" role="presentation">
+          <button class="nav-link" id="vulnCatalogTab" data-bs-toggle="tab" data-bs-target="#vulnCatalog" type="button" role="tab">Vulnerability Catalog</button>
+        </li>
+      </ul>
+
+      <div class="tab-content mt-3">
+        <div class="tab-pane fade show active" id="vulnPacks" role="tabpanel">
+          <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 mb-2">
+            <h5 class="mb-0">Vulnerability Catalog Packs (ZIP)</h5>
+            <div class="small text-muted">
+              Active catalog: <strong>{{ active_label or 'repo default (raw_datasources)' }}</strong>
+              {% if active_id %}<span class="text-muted">({{ active_id }})</span>{% endif %}
+              {% if items_count is not none %}<span class="text-muted">• {{ items_count }} entries</span>{% endif %}
+            </div>
+          </div>
+
+          <div class="card mb-3">
+            <div class="card-body">
+              <div class="small text-muted mb-2">
+                Upload a ZIP (or import from a URL) that contains directories/subdirectories.
+                Every <em>valid vulnerability directory</em> must include a <code>docker-compose.yml</code>.
+                All other files in those directories are stored and can be browsed/downloaded from this page.
+                The active catalog is used by the Web UI and CLI when listing/selecting vulnerabilities.
+              </div>
+
+              <form class="row g-2 align-items-center" action="{{ url_for('vuln_catalog_packs_upload') }}" method="post" enctype="multipart/form-data">
+                <div class="col-auto">
+                  <input class="form-control" type="file" name="zip_file" accept="application/zip,.zip" required>
+                </div>
+                <div class="col-auto">
+                  <button class="btn btn-primary" type="submit">Upload ZIP</button>
+                </div>
+              </form>
+
+              <form class="row g-2 mt-2 align-items-center" action="{{ url_for('vuln_catalog_packs_import_url') }}" method="post">
+                <div class="col-md-6">
+                  <input class="form-control" type="url" name="zip_url" placeholder="https://example.com/vuln-catalog.zip" required>
+                </div>
+                <div class="col-auto">
+                  <button class="btn btn-outline-primary" type="submit">Import from URL</button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-body">
+              <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                  <thead>
+                    <tr>
+                      <th>Label</th>
+                      <th>Origin</th>
+                      <th>Installed</th>
+                      <th>Files</th>
+                      <th style="width: 550px;">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for c in catalogs %}
+                    <tr class="{{ 'table-success' if c.id == active_id else '' }}">
+                      <td>
+                        <div>
+                          <strong>{{ c.label or c.id }}</strong>
+                          {% if c.id == active_id %}
+                            <span class="badge bg-success ms-2">Active</span>
+                          {% endif %}
+                        </div>
+                        <div class="small text-muted">{{ c.id }}</div>
+                      </td>
+                      <td class="small">{{ c.origin or '' }}</td>
+                      <td class="small">{{ c.installed_at or '' }}</td>
+                      <td class="small" style="max-width: 720px; word-break: break-word;">
+                        {% if c.compose_count %}
+                          <div><span class="text-muted">Compose dirs:</span> <strong>{{ c.compose_count }}</strong></div>
+                        {% endif %}
+                      </td>
+                      <td>
+                        <div class="d-flex gap-2 flex-wrap">
+                          <a class="btn btn-sm btn-outline-primary" href="{{ url_for('vuln_catalog_packs_browse', catalog_id=c.id) }}">Browse Files</a>
+                          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('vuln_catalog_packs_download', catalog_id=c.id) }}">Download ZIP</a>
+                          <form action="{{ url_for('vuln_catalog_packs_set_active', catalog_id=c.id) }}" method="post">
+                            <button class="btn btn-sm btn-outline-success" type="submit" {% if c.id == active_id %}disabled{% endif %}>Set Active</button>
+                          </form>
+                          <form action="{{ url_for('vuln_catalog_packs_delete', catalog_id=c.id) }}" method="post" onsubmit="return confirm('Delete this vulnerability catalog pack?');">
+                            <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+                          </form>
+                        </div>
+                      </td>
+                    </tr>
+                    {% endfor %}
+                    {% if not catalogs %}
+                    <tr><td colspan="5" class="text-muted">No vulnerability catalog packs installed yet. The system will use the repo default under <code>raw_datasources/</code>.</td></tr>
+                    {% endif %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        <div class="tab-pane fade" id="vulnCatalog" role="tabpanel">
+          <div class="card mb-3">
+            <div class="card-body">
+              <div class="row g-2 align-items-center">
+                <div class="col-md-6">
+                  <input id="vulnCatalogFilter" class="form-control" placeholder="Filter vulnerabilities…" />
+                </div>
+              </div>
+              <div class="small text-muted mt-2" id="vulnCatalogMeta"></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-body">
+              <div class="table-responsive">
+                <table class="table table-sm align-middle" id="vulnCatalogTable">
+                  <thead class="fw-semibold">
+                    <tr>
+                      <th style="width: 60px;">#</th>
+                      <th>Name</th>
+                      <th>Description</th>
+                      <th>From Source</th>
+                      <th style="width: 160px;">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="vulnCatalogBody"></tbody>
+                </table>
+              </div>
+              <pre class="mt-3 small" id="vulnCatalogLog" style="max-height: 240px; overflow: auto;"></pre>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- Vulnerability Pack Upload Progress Modal -->
+<div class="modal fade" id="vulnPackUploadProgressModal" tabindex="-1" aria-hidden="true" data-bs-backdrop="static" data-bs-keyboard="false">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Uploading Vulnerability Pack…</h5>
+      </div>
+      <div class="modal-body">
+        <div class="small text-muted mb-2" id="vulnPackUploadProgressText">Preparing upload…</div>
+        <div class="progress" role="progressbar" aria-label="Upload progress" aria-valuemin="0" aria-valuemax="100">
+          <div class="progress-bar progress-bar-striped progress-bar-animated" id="vulnPackUploadProgressBar" style="width: 0%">0%</div>
+        </div>
+        <div class="small text-muted mt-2" id="vulnPackUploadProgressBytes"></div>
+        <pre class="small bg-light p-2 mt-3" id="vulnPackUploadResult" style="max-height: 180px; overflow: auto; display:none;"></pre>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" id="vulnPackUploadCloseBtn" data-bs-dismiss="modal" style="display:none;">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Vulnerability Test Modal -->
+<div class="modal fade" id="vulnTestModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Test Vulnerability</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-2">
+          <div><strong id="vulnTestName"></strong></div>
+          <div class="small text-muted" id="vulnTestId"></div>
+        </div>
+
+        <div class="mt-3" id="vulnTestInputsBlock" style="display:none;">
+          <div class="small text-muted mb-1">Inputs</div>
+          <form id="vulnTestForm">
+            <input type="hidden" name="item_id" id="vulnTestItemId" />
+            <div id="vulnTestInputs"></div>
+          </form>
+          <div class="small text-muted">Fields marked with <strong>*</strong> are required.</div>
+        </div>
+
+        <div class="mt-3">
+          <div class="small text-muted mb-1">Progress / Log</div>
+          <pre class="small bg-light p-2" id="vulnTestLog" style="max-height: 220px; overflow: auto;"></pre>
+        </div>
+
+        <div class="mt-3">
+          <div class="small text-muted mb-1">Result</div>
+          <div id="vulnTestStatus" class="small text-muted mb-2" style="display:none;">
+            <span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>
+            <span id="vulnTestStatusText">Working…</span>
+          </div>
+          <div id="vulnTestResult" class="small"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+        <button type="button" class="btn btn-primary" id="vulnTestRunBtn">Run</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const _vulnCatalogState = {
+    active: null,
+    items: [],
+    selectedItem: null,
+    sortKey: 'name',
+    sortDir: 'asc',
+  };
+
+  function escapeHtml(s) {
+    try {
+      return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function normalizeForSort(v) {
+    try {
+      return String(v ?? '').toLowerCase();
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function compareForSort(a, b) {
+    const ax = normalizeForSort(a);
+    const bx = normalizeForSort(b);
+    if (ax < bx) return -1;
+    if (ax > bx) return 1;
+    return 0;
+  }
+
+  function stableSorted(items, keyFn, dir) {
+    const direction = (dir === 'desc') ? -1 : 1;
+    const decorated = (Array.isArray(items) ? items : []).map((item, idx) => ({ item, idx }));
+    decorated.sort((x, y) => {
+      const c = compareForSort(keyFn(x.item), keyFn(y.item));
+      if (c !== 0) return c * direction;
+      return x.idx - y.idx;
+    });
+    return decorated.map(d => d.item);
+  }
+
+  function updateSortIndicators(tableId, state, columns) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+    const ths = table.querySelectorAll('thead th');
+    ths.forEach((th, idx) => {
+      const col = columns[idx];
+      if (!col) return;
+      const base = col.label || th.getAttribute('data-base-label') || th.textContent || '';
+      if (!th.getAttribute('data-base-label')) {
+        th.setAttribute('data-base-label', base);
+      }
+      if (col.key && state.sortKey === col.key) {
+        const arrow = (state.sortDir === 'desc') ? '▼' : '▲';
+        th.textContent = `${base} ${arrow}`;
+      } else {
+        th.textContent = base;
+      }
+    });
+  }
+
+  function enableTableSorting(tableId, state, columns, renderFn) {
+    const table = document.getElementById(tableId);
+    if (!table) return;
+    const ths = table.querySelectorAll('thead th');
+    ths.forEach((th, idx) => {
+      const col = columns[idx];
+      if (!col || !col.key) return;
+      if (th.getAttribute('data-sort-init') === '1') return;
+      th.setAttribute('data-sort-init', '1');
+      th.style.cursor = 'pointer';
+      th.title = 'Click to sort';
+      th.classList.add('user-select-none');
+      th.addEventListener('click', () => {
+        if (state.sortKey === col.key) {
+          state.sortDir = (state.sortDir === 'asc') ? 'desc' : 'asc';
+        } else {
+          state.sortKey = col.key;
+          state.sortDir = 'asc';
+        }
+        try { renderFn(); } catch (e) {}
+        updateSortIndicators(tableId, state, columns);
+      });
+    });
+    updateSortIndicators(tableId, state, columns);
+  }
+
+  function _fmtBytes(n) {
+    const v = Number(n || 0);
+    if (!isFinite(v) || v <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let idx = 0;
+    let cur = v;
+    while (cur >= 1024 && idx < units.length - 1) { cur /= 1024; idx++; }
+    return `${cur.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`;
+  }
+
+  function _qs(id) { return document.getElementById(id); }
+
+  function _setText(id, txt) {
+    const el = _qs(id);
+    if (!el) return;
+    el.textContent = String(txt || '');
+  }
+
+  function _isNearBottom(el, thresholdPx) {
+    const thr = (typeof thresholdPx === 'number' && isFinite(thresholdPx)) ? thresholdPx : 24;
+    try {
+      return (el.scrollTop + el.clientHeight) >= (el.scrollHeight - thr);
+    } catch (e) {
+      return true;
+    }
+  }
+
+  function _appendLog(id, line) {
+    const el = _qs(id);
+    if (!el) return;
+    const shouldStick = _isNearBottom(el, 24);
+    const cur = el.textContent || '';
+    el.textContent = (cur ? (cur + '\n') : '') + String(line || '');
+    if (shouldStick) {
+      try { el.scrollTop = el.scrollHeight; } catch (e) {}
+    }
+  }
+
+  async function _fetchJson(url, opts) {
+    const resp = await fetch(url, Object.assign({
+      headers: { 'Accept': 'application/json' },
+      credentials: 'same-origin',
+    }, opts || {}));
+    const text = await resp.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (e) { /* ignore */ }
+    if (!resp.ok) {
+      const msg = (data && data.error) ? data.error : (text || resp.statusText);
+      throw new Error(msg);
+    }
+    return data;
+  }
+
+  async function _postJson(url, payload) {
+    return _fetchJson(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(payload || {}),
+    });
+  }
+
+  function _isRequiredInput(inp) {
+    if (!inp || typeof inp !== 'object') return false;
+    if (Object.prototype.hasOwnProperty.call(inp, 'required')) {
+      return inp.required !== false;
+    }
+    return true; // required by default
+  }
+
+  function _isFileInputType(t) {
+    const v = String(t || '').toLowerCase();
+    return v === 'file' || v === 'path' || v === 'artifact' || v === 'binary';
+  }
+
+  function _buildVulnTestInputRow(inp) {
+    const name = inp && inp.name ? String(inp.name) : '';
+    if (!name) return '';
+    const required = _isRequiredInput(inp);
+    const type = inp && inp.type ? String(inp.type) : 'string';
+    const desc = inp && inp.description ? String(inp.description) : '';
+    const hasDefault = !!(inp && Object.prototype.hasOwnProperty.call(inp, 'default'));
+    const defaultVal = hasDefault ? String(inp.default) : '';
+    const label = `${name}${required ? ' *' : ''}`;
+    const help = desc ? `<div class="form-text">${escapeHtml(desc)}</div>` : '';
+
+    if (_isFileInputType(type)) {
+      // Vulnerability tests currently don't accept uploads server-side, but we
+      // render this for consistency and potential future use.
+      return `
+        <div class="mb-3">
+          <label class="form-label">${escapeHtml(label)}</label>
+          <input class="form-control" type="file" name="${escapeHtml(name)}" ${required ? 'required' : ''} />
+          ${help}
+        </div>
+      `;
+    }
+
+    const inputType = String(type || '').toLowerCase() === 'number' ? 'number' : 'text';
+    const valueAttr = hasDefault && defaultVal !== '' ? ` value="${escapeHtml(defaultVal)}"` : '';
+    return `
+      <div class="mb-3">
+        <label class="form-label">${escapeHtml(label)}</label>
+        <input class="form-control" type="${escapeHtml(inputType)}" name="${escapeHtml(name)}"${valueAttr} ${required ? 'required' : ''} />
+        ${help}
+      </div>
+    `;
+  }
+
+  function _collectVulnTestInputs(item) {
+    const inputs = Array.isArray(item && item.inputs) ? item.inputs : [];
+    const out = {};
+    inputs.forEach((inp) => {
+      if (!inp || typeof inp !== 'object') return;
+      const name = String(inp.name || '').trim();
+      if (!name) return;
+      const el = document.querySelector(`#vulnTestForm [name="${CSS.escape(name)}"]`);
+      if (!el) return;
+      if (el.type === 'file') {
+        // Not currently supported by backend; skip.
+        return;
+      }
+      out[name] = el.value;
+    });
+    return out;
+  }
+
+  function _renderVulnCatalogTable() {
+    const body = _qs('vulnCatalogBody');
+    if (!body) return;
+    body.innerHTML = '';
+
+    const filter = String((_qs('vulnCatalogFilter') && _qs('vulnCatalogFilter').value) || '').trim().toLowerCase();
+    const items = Array.isArray(_vulnCatalogState.items) ? _vulnCatalogState.items.slice() : [];
+
+    const rows = items.filter(it => {
+      if (!filter) return true;
+      const nm = String(it.name || '').toLowerCase();
+      const src = String(it.from_source || '').toLowerCase();
+      return nm.includes(filter) || src.includes(filter) || String(it.id || '').includes(filter);
+    });
+
+    const sortKey = _vulnCatalogState.sortKey || 'name';
+    const sortDir = _vulnCatalogState.sortDir || 'asc';
+    const sorted = stableSorted(rows, (it) => {
+      if (!it || typeof it !== 'object') return '';
+      if (sortKey === 'name') return it.name || '';
+      if (sortKey === 'from_source') return it.from_source || '';
+      if (sortKey === 'id') return String(it.id || '');
+      return it[sortKey] || '';
+    }, sortDir);
+
+    sorted.forEach((it, idx) => {
+      const tr = document.createElement('tr');
+      if (it.disabled) tr.classList.add('table-secondary');
+      tr.innerHTML = `
+        <td class="text-muted">${idx + 1}</td>
+        <td>
+          <div>
+            <strong>${escapeHtml(it.name || '')}</strong>
+            ${it.disabled ? `<span class="badge bg-warning text-dark ms-2">Disabled</span>` : ''}
+          </div>
+          <div class="small text-muted">ID: ${escapeHtml(it.id ?? '')}</div>
+        </td>
+        <td class="small">
+          ${it.readme_url ? `<a href="${escapeHtml(it.readme_url)}" target="_blank" rel="noopener">README</a>` : '<span class="text-muted">—</span>'}
+        </td>
+        <td class="small">${escapeHtml(it.from_source || '')}</td>
+        <td>
+          <div class="btn-group btn-group-sm" role="group">
+            <button class="btn btn-sm btn-outline-primary" data-action="test" type="button" ${it.disabled ? 'disabled' : ''} title="${it.disabled ? 'Disabled' : 'Test vulnerability'}">Test</button>
+            <button class="btn btn-sm btn-outline-warning" data-action="toggle" type="button" title="${it.disabled ? 'Enable vulnerability' : 'Disable vulnerability'}">${it.disabled ? 'Enable' : 'Disable'}</button>
+            <button class="btn btn-sm btn-outline-danger" data-action="delete" type="button" title="Delete vulnerability">Delete</button>
+          </div>
+        </td>
+      `;
+
+      tr.querySelector('[data-action="test"]').addEventListener('click', () => openVulnTestModal(it));
+      tr.querySelector('[data-action="toggle"]').addEventListener('click', async () => {
+        try {
+          _setText('vulnCatalogLog', '');
+          _appendLog('vulnCatalogLog', `Toggling disabled for #${it.id} (${it.name})…`);
+          await _postJson('/vuln_catalog_items/set_disabled', { item_id: it.id, disabled: !it.disabled });
+          await loadVulnCatalogItems();
+        } catch (e) {
+          _appendLog('vulnCatalogLog', `Error: ${e}`);
+        }
+      });
+      tr.querySelector('[data-action="delete"]').addEventListener('click', async () => {
+        if (!confirm(`Delete vulnerability #${it.id} (${it.name}) from the active catalog?`)) return;
+        try {
+          _setText('vulnCatalogLog', '');
+          _appendLog('vulnCatalogLog', `Deleting #${it.id} (${it.name})…`);
+          await _postJson('/vuln_catalog_items/delete', { item_id: it.id });
+          await loadVulnCatalogItems();
+        } catch (e) {
+          _appendLog('vulnCatalogLog', `Error: ${e}`);
+        }
+      });
+
+      body.appendChild(tr);
+    });
+
+    if (!rows.length) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td colspan="5" class="text-muted">No vulnerabilities found.</td>`;
+      body.appendChild(tr);
+    }
+  }
+
+  async function loadVulnCatalogItems() {
+    const metaEl = _qs('vulnCatalogMeta');
+    if (metaEl) metaEl.textContent = 'Loading…';
+
+    const data = await _fetchJson('/vuln_catalog_items_data');
+    if (!data || data.ok === false) {
+      const err = data && data.error ? data.error : 'Failed to load vulnerability catalog items';
+      if (metaEl) metaEl.textContent = err;
+      _vulnCatalogState.items = [];
+      _renderVulnCatalogTable();
+      return;
+    }
+    _vulnCatalogState.active = data.active || null;
+    _vulnCatalogState.items = Array.isArray(data.items) ? data.items : [];
+    const src = _vulnCatalogState.active && _vulnCatalogState.active.from_source ? String(_vulnCatalogState.active.from_source) : '';
+    const activeLabel = _vulnCatalogState.active && _vulnCatalogState.active.label ? String(_vulnCatalogState.active.label) : 'repo default';
+    if (metaEl) metaEl.textContent = `${_vulnCatalogState.items.length} items • Active: ${activeLabel}${src ? ' • From: ' + src : ''}`;
+    _renderVulnCatalogTable();
+  }
+
+  function openVulnTestModal(item) {
+    _vulnCatalogState.selectedItem = item || null;
+    _setText('vulnTestName', item && item.name ? item.name : '');
+    _setText('vulnTestId', item && item.id ? `#${item.id}` : '');
+    _setText('vulnTestLog', '');
+
+    try {
+      const itemIdEl = _qs('vulnTestItemId');
+      if (itemIdEl) itemIdEl.value = item && item.id ? String(item.id) : '';
+      const inputsBlock = _qs('vulnTestInputsBlock');
+      const inputsEl = _qs('vulnTestInputs');
+      const inputs = Array.isArray(item && item.inputs) ? item.inputs : [];
+      if (inputsBlock && inputsEl) {
+        if (inputs.length) {
+          inputsEl.innerHTML = inputs.map(_buildVulnTestInputRow).join('');
+          inputsBlock.style.display = '';
+        } else {
+          inputsEl.innerHTML = '';
+          inputsBlock.style.display = 'none';
+        }
+      }
+    } catch (e) {}
+
+    try {
+      const res = _qs('vulnTestResult');
+      if (res) res.innerHTML = '';
+      const st = _qs('vulnTestStatus');
+      if (st) st.style.display = 'none';
+      _setText('vulnTestStatusText', 'Working…');
+      const btn = _qs('vulnTestRunBtn');
+      if (btn) btn.disabled = false;
+    } catch (e) {}
+    const modal = new bootstrap.Modal(_qs('vulnTestModal'));
+    modal.show();
+  }
+
+  async function runVulnTest() {
+    const it = _vulnCatalogState.selectedItem;
+    if (!it) return;
+    const btn = _qs('vulnTestRunBtn');
+    if (btn) btn.disabled = true;
+    _setText('vulnTestLog', '');
+    try {
+      const res = _qs('vulnTestResult');
+      if (res) res.innerHTML = '';
+      const st = _qs('vulnTestStatus');
+      if (st) st.style.display = '';
+      _setText('vulnTestStatusText', 'Running docker compose config…');
+    } catch (e) {}
+
+    _appendLog('vulnTestLog', `[ui] Testing #${it.id} (${it.name})…`);
+    try {
+      // Client-side validation for rendered inputs.
+      try {
+        const form = _qs('vulnTestForm');
+        if (form && typeof form.reportValidity === 'function') {
+          if (!form.reportValidity()) {
+            _appendLog('vulnTestLog', '[ui] Missing required inputs.');
+            return;
+          }
+        }
+      } catch (e) {}
+
+      const inputs = _collectVulnTestInputs(it);
+      const data = await _postJson('/vuln_catalog_items/test', { item_id: it.id, inputs });
+      if (data && data.log) {
+        String(data.log).split('\n').forEach(line => _appendLog('vulnTestLog', line));
+      }
+      const ok = !!(data && data.ok);
+      try {
+        const res = _qs('vulnTestResult');
+        if (res) {
+          res.innerHTML = ok
+            ? '<span class="badge text-bg-success">OK</span>'
+            : '<span class="badge text-bg-danger">FAILED</span>';
+        }
+      } catch (e) {}
+      _appendLog('vulnTestLog', ok ? '[ui] Result: OK' : '[ui] Result: FAILED');
+    } catch (e) {
+      _appendLog('vulnTestLog', `[ui] ERROR: ${e}`);
+      try {
+        const res = _qs('vulnTestResult');
+        if (res) res.innerHTML = `<span class="badge text-bg-danger">ERROR</span> <span class="text-danger">${escapeHtml(String(e))}</span>`;
+      } catch (e2) {}
+    } finally {
+      try {
+        const st = _qs('vulnTestStatus');
+        if (st) st.style.display = 'none';
+        _setText('vulnTestStatusText', 'Working…');
+      } catch (e) {}
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    // Vulnerability Pack ZIP upload progress
+    const packsPane = document.getElementById('vulnPacks');
+    const uploadForm = packsPane ? packsPane.querySelector('form[action$="/vuln_catalog_packs/upload"]') : null;
+    const uploadModalEl = document.getElementById('vulnPackUploadProgressModal');
+    const uploadModal = uploadModalEl ? new bootstrap.Modal(uploadModalEl) : null;
+
+    async function runVulnPackUploadWithProgress(form) {
+      if (!form || !uploadModal) return;
+      const fileInput = form.querySelector('input[type="file"][name="zip_file"]');
+      const file = fileInput && fileInput.files ? fileInput.files[0] : null;
+      if (!file) return;
+
+      const progressText = document.getElementById('vulnPackUploadProgressText');
+      const progressBar = document.getElementById('vulnPackUploadProgressBar');
+      const progressBytes = document.getElementById('vulnPackUploadProgressBytes');
+      const resultPre = document.getElementById('vulnPackUploadResult');
+      const closeBtn = document.getElementById('vulnPackUploadCloseBtn');
+
+      if (resultPre) { resultPre.style.display = 'none'; resultPre.textContent = ''; }
+      if (closeBtn) closeBtn.style.display = 'none';
+      if (progressText) progressText.textContent = `Uploading ${file.name}…`;
+      if (progressBytes) progressBytes.textContent = `0 / ${_fmtBytes(file.size)}`;
+      if (progressBar) { progressBar.style.width = '0%'; progressBar.textContent = '0%'; }
+
+      uploadModal.show();
+
+      const fd = new FormData(form);
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', form.action, true);
+      xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+
+      xhr.upload.onprogress = (ev) => {
+        if (!ev.lengthComputable) return;
+        const pct = Math.max(0, Math.min(100, Math.round((ev.loaded / ev.total) * 100)));
+        if (progressBar) { progressBar.style.width = `${pct}%`; progressBar.textContent = `${pct}%`; }
+        if (progressBytes) progressBytes.textContent = `${_fmtBytes(ev.loaded)} / ${_fmtBytes(ev.total)}`;
+      };
+
+      xhr.onreadystatechange = () => {
+        if (xhr.readyState !== 4) return;
+        const ok = xhr.status >= 200 && xhr.status < 300;
+        let msg = '';
+        try {
+          const obj = JSON.parse(xhr.responseText || '{}');
+          if (obj && obj.message) msg = String(obj.message);
+          else if (obj && obj.error) msg = String(obj.error);
+        } catch (e) {
+          msg = (xhr.responseText || '').trim();
+        }
+        if (!msg) msg = ok ? 'Upload complete.' : `Upload failed (HTTP ${xhr.status}).`;
+        if (progressText) progressText.textContent = msg;
+        if (progressBar) {
+          progressBar.classList.remove('progress-bar-animated');
+          progressBar.classList.remove('progress-bar-striped');
+        }
+        if (resultPre) {
+          const txt = (xhr.responseText || '').trim();
+          if (txt) {
+            resultPre.style.display = 'block';
+            resultPre.textContent = txt.length > 6000 ? (txt.slice(0, 6000) + '\n…(truncated)…') : txt;
+          }
+        }
+        if (closeBtn) closeBtn.style.display = 'inline-block';
+        // Refresh to show newly installed pack + flash messages.
+        setTimeout(() => { window.location.reload(); }, ok ? 700 : 1200);
+      };
+
+      xhr.send(fd);
+    }
+
+    if (uploadForm) {
+      uploadForm.addEventListener('submit', (ev) => {
+        ev.preventDefault();
+        runVulnPackUploadWithProgress(uploadForm);
+      });
+    }
+
+    const filter = _qs('vulnCatalogFilter');
+    if (filter) filter.addEventListener('input', _renderVulnCatalogTable);
+
+    // Mirror Flag-Generators: click header to sort + arrows
+    enableTableSorting('vulnCatalogTable', _vulnCatalogState, [
+      { label: '#', key: null },
+      { label: 'Name', key: 'name' },
+      { label: 'Description', key: null },
+      { label: 'From Source', key: 'from_source' },
+      { label: 'Actions', key: null },
+    ], _renderVulnCatalogTable);
+    const tab = _qs('vulnCatalogTab');
+    if (tab) tab.addEventListener('shown.bs.tab', async () => {
+      try { await loadVulnCatalogItems(); } catch (e) { _setText('vulnCatalogMeta', String(e)); }
+    });
+    const runBtn = _qs('vulnTestRunBtn');
+    if (runBtn) runBtn.addEventListener('click', runVulnTest);
+  });
+</script>
+{% endblock %}

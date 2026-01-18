@@ -16,6 +16,8 @@ Generate reproducible CORE network topologies from scenario XML files using a ri
 	- [Router connectivity & aggregation](#router-connectivity--aggregation)
 	- [Traffic, segmentation, and services](#traffic-segmentation-and-services)
 	- [Reports & artifacts](#reports--artifacts)
+	- [Generator packs & manifests](#generator-packs--manifests)
+	- [Vulnerability catalog packs](#vulnerability-catalog-packs)
 - [Architecture overview](#architecture-overview)
 - [Troubleshooting](#troubleshooting)
 - [Additional documentation](#additional-documentation)
@@ -103,6 +105,21 @@ Popular options:
 - Run history is persisted in `outputs/run_history.json` for the Reports page.
 - Safe deletion keeps reports while purging associated outputs under `outputs/` when scenarios are removed via the GUI.
 
+### Generator packs & manifests
+- The Web UI treats **installed generators** as the source of truth: it discovers generators from `manifest.yaml`/`manifest.yml` under `outputs/installed_generators/`.
+- Installed generators are managed as **Generator Packs** (ZIP files). You can upload/import packs from the Flag Catalog page.
+- Disable semantics:
+	- Packs and individual generators can be disabled.
+	- Disabled generators are hidden from Flow substitution and are rejected at preview/execute time.
+
+### Vulnerability catalog packs
+- The Web UI exposes a **Vuln-Catalog** page that mirrors the Flag Catalog pack UX.
+- You can upload/import a ZIP containing directories/subdirectories.
+	- Any directory that contains a `docker-compose.yml` is treated as a valid vulnerability template.
+	- All other files in those directories are preserved.
+	- The UI provides a per-pack file browser so users can download/view the extracted files.
+	- The server generates a `vuln_list_w_url.csv` internally so downstream vulnerability selection/processing remains unchanged.
+
 ## Architecture overview
 | Folder | Purpose |
 | --- | --- |
@@ -125,6 +142,9 @@ Popular options:
 
 ## Additional documentation
 - [API.md](./API.md) – REST endpoints exposed by the Web UI backend
+- Flag Sequencing (Flow) endpoints and Attack Flow Builder `.afb` export are documented in [API.md](./API.md) and the OpenAPI spec at [`docs/openapi.yaml`](docs/openapi.yaml).
+- Generator authoring (flag-generators and flag-node-generators) is documented in [docs/GENERATOR_AUTHORING.md](docs/GENERATOR_AUTHORING.md).
+- AI prompt templates for generator authoring (copy/paste) are in [docs/AI_PROMPT_TEMPLATES.md](docs/AI_PROMPT_TEMPLATES.md).
 - [SCENARIO_XML_SCHEMA.md](./SCENARIO_XML_SCHEMA.md) – Schema walkthrough and examples
 
 ## Contributing

@@ -1,0 +1,372 @@
+{% extends "layout.html" %}
+
+{% block title %}Preview{% endblock %}
+{% block active_page %}{% set active_page='scenarios' %}{% endblock %}
+{% block header_icon %}<i class="bi bi-eye fs-4"></i>{% endblock %}
+{% block header_title %}Preview{% endblock %}
+
+{% block extra_head %}
+<style>
+  body { padding-bottom: 0; }
+  #previewLayoutRow { min-height: calc(100vh - 200px); }
+  #previewLayoutRow > [class*='col-'] { min-width: 0; }
+  @media (max-width: 992px) {
+    #previewLayoutRow { min-height: 0; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+{% set scenario_tab = (active_scenario or scenario_tab or request.args.get('scenario','')) %}
+{% set scenarios_active_tab = 'preview' %}
+{% include 'partials/scenarios_tabs.html' with context %}
+
+<div class="container-fluid mt-3 d-flex flex-column" id="previewPageWrap">
+  <div class="row g-3 flex-grow-1 align-items-stretch" id="previewLayoutRow">
+    <div class="col-12 col-lg-3 d-flex">
+      <div class="card shadow-sm mb-3 flex-fill d-flex flex-column">
+        <div class="card-header d-flex justify-content-between align-items-center flex-nowrap gap-2">
+          <span class="fw-bold">Scenarios</span>
+          <div class="btn-toolbar gap-1 align-items-center flex-nowrap">
+            <button type="button" class="btn btn-sm btn-outline-secondary py-0 px-1" id="toggleScenarioSeedBtn" title="Show seeds" aria-label="Toggle seed visibility">
+              <i class="bi bi-eye" aria-hidden="true"></i>
+            </button>
+            <button class="btn btn-sm btn-outline-secondary {% if not active_scenario %}d-none{% endif %}" id="previewScenarioFilterClear" type="button" title="Clear">Clear</button>
+          </div>
+        </div>
+        <div class="list-group list-group-flush flex-grow-1 overflow-auto" id="previewScenarioList" style="min-height:0;">
+          {% if scenarios %}
+            {% for s in scenarios %}
+            <button
+              type="button"
+              class="list-group-item list-group-item-action py-1 {% if active_scenario and active_scenario==s %}active bg-primary text-white{% endif %}"
+              data-scen-name="{{ s }}"
+              data-xml-path="{{ (scenario_xml_by_name or {}).get(s, '') }}"
+            >
+              <div class="d-flex align-items-center">
+                <span class="flex-grow-1 text-truncate">{{ s }}</span>
+                <span class="badge text-bg-light border ms-2 d-none" data-seed-badge="1"></span>
+              </div>
+            </button>
+            {% endfor %}
+          {% else %}
+            <div class="p-3 text-muted small">No scenarios yet</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <div class="col-12 col-lg-9 d-flex">
+      <div class="flex-fill d-flex flex-column">
+        <div class="small text-muted mb-2">Generating a full preview can take a moment.</div>
+        <iframe
+          id="scenariosPreviewFrame"
+          name="scenariosPreviewFrame"
+          title="Full preview"
+          style="width: 100%; height: calc(100vh - 260px); border: 1px solid var(--bs-border-color); border-radius: .25rem; background: white;"
+        ></iframe>
+
+        <form id="scenariosPreviewLoadForm" method="post" action="{{ url_for('plan_full_preview_page', embed=1) }}" target="scenariosPreviewFrame" class="d-none">
+          <input type="hidden" name="xml_path" id="scenariosPreviewLoadXmlPath" value="{{ preview_xml_path or request.args.get('xml_path','') }}">
+          <input type="hidden" name="scenario" id="scenariosPreviewLoadScenario" value="{{ scenario_tab }}">
+          <input type="hidden" name="seed" id="scenariosPreviewLoadSeed" value="">
+          <input type="hidden" name="preview_plan" id="scenariosPreviewLoadPreviewPlan" value="">
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal" tabindex="-1" id="scenariosPreviewLoadingModal" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-body d-flex align-items-center gap-3">
+        <div class="spinner-border" role="status" aria-label="Loading"></div>
+        <div>
+          <div class="fw-semibold">Loading preview…</div>
+          <div class="small text-muted">Generating plan and rendering preview page.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block body_container %}
+{{ super() }}
+{% set xml_preview_enabled = True %}
+{% include 'partials/dock.html' %}
+<script>
+(function(){
+  const SIDEBAR_SEED_VISIBILITY_STORAGE_KEY = 'coretg_sidebar_show_seed';
+
+  function getSidebarShowSeed() {
+    try {
+      return (localStorage.getItem(SIDEBAR_SEED_VISIBILITY_STORAGE_KEY) || '') === '1';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function setSidebarShowSeed(value) {
+    try {
+      localStorage.setItem(SIDEBAR_SEED_VISIBILITY_STORAGE_KEY, value ? '1' : '0');
+    } catch (e) {}
+  }
+
+  function syncSidebarSeedToggleButton() {
+    const btn = document.getElementById('toggleScenarioSeedBtn');
+    if (!btn) return;
+    const show = getSidebarShowSeed();
+    const icon = btn.querySelector('i');
+    if (icon) {
+      icon.classList.remove('bi-eye', 'bi-eye-slash');
+      icon.classList.add(show ? 'bi-eye-slash' : 'bi-eye');
+    }
+    btn.title = show ? 'Hide seeds' : 'Show seeds';
+  }
+
+  function updateScenarioSeedBadges() {
+    const list = document.getElementById('previewScenarioList');
+    if (!list) return;
+    const show = getSidebarShowSeed();
+    const badges = list.querySelectorAll('[data-seed-badge="1"]');
+    badges.forEach((badge) => {
+      const btn = badge && badge.closest ? badge.closest('button[data-scen-name]') : null;
+      const scen = (btn && btn.getAttribute) ? (btn.getAttribute('data-scen-name') || '').toString().trim() : '';
+      let seed = null;
+      try {
+        if (show && scen && typeof window.coretgEnsureSeedForScenario === 'function') {
+          seed = window.coretgEnsureSeedForScenario(scen);
+        }
+      } catch (e) {
+        seed = null;
+      }
+
+      if (show && seed) {
+        badge.textContent = 'seed=' + String(seed);
+        badge.classList.remove('d-none');
+      } else {
+        badge.classList.add('d-none');
+      }
+    });
+  }
+
+  // Allow the embedded Full Preview iframe to request a sidebar refresh after a re-roll.
+  try {
+    window.coretgPreviewRefreshScenarioSeedBadges = updateScenarioSeedBadges;
+  } catch (e) {}
+
+  function showLoading(){
+    try {
+      const el = document.getElementById('scenariosPreviewLoadingModal');
+      if(!el || !window.bootstrap || !window.bootstrap.Modal) return null;
+      const modal = window.bootstrap.Modal.getOrCreateInstance(el, { backdrop: 'static', keyboard: false });
+      modal.show();
+      return modal;
+    } catch(e){ return null; }
+  }
+
+  function loadPreview(){
+    const params = new URLSearchParams(window.location.search || '');
+    // Prefer server-validated hidden inputs over query params. If a stale/invalid
+    // xml_path is present in the URL, the backend will intentionally clear it and
+    // provide a safe fallback in the hidden field.
+    let xmlPath = (document.getElementById('scenariosPreviewLoadXmlPath')?.value || params.get('xml_path') || '').trim();
+    const scenario = (params.get('scenario') || document.getElementById('scenariosPreviewLoadScenario')?.value || '').trim();
+
+    // If another page (Topology/Flow) saved XML more recently, prefer that snapshot
+    // for this scenario to avoid IP/seed mismatches between Preview and resolved hints.
+    try {
+      if (scenario && typeof window.coretgGetLatestXmlPathForScenario === 'function') {
+        const latest = (window.coretgGetLatestXmlPathForScenario(scenario) || '').toString().trim();
+        if (latest) xmlPath = latest;
+      }
+    } catch(e) {}
+
+    const frame = document.getElementById('scenariosPreviewFrame');
+    const form = document.getElementById('scenariosPreviewLoadForm');
+    const inXml = document.getElementById('scenariosPreviewLoadXmlPath');
+    const inSc = document.getElementById('scenariosPreviewLoadScenario');
+    const inSeed = document.getElementById('scenariosPreviewLoadSeed');
+    const inPlan = document.getElementById('scenariosPreviewLoadPreviewPlan');
+
+    if(!xmlPath){
+      if(frame){
+        frame.srcdoc = '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">Save XML first to preview.</div>';
+      }
+      return;
+    }
+
+    if(inXml) inXml.value = xmlPath;
+    if(inSc) inSc.value = scenario;
+
+    // Use a stable per-scenario seed unless the user explicitly changes it on the embedded page.
+    try {
+      if (scenario && typeof window.coretgEnsureSeedForScenario === 'function') {
+        const seed = window.coretgEnsureSeedForScenario(scenario);
+        if (inSeed && seed !== null && seed !== undefined) inSeed.value = String(seed);
+      }
+    } catch(e) {}
+
+    // If we have a persisted preview_plan_path for this scenario (e.g., from Flag Sequencing Generate),
+    // render directly from it so Preview matches the exact snapshot Flow used.
+    let planPath = '';
+    try {
+      if (scenario && typeof window.coretgGetPreviewPlanPathForScenario === 'function') {
+        planPath = (window.coretgGetPreviewPlanPathForScenario(scenario) || '').toString().trim();
+      }
+    } catch(e) { planPath = ''; }
+
+    try {
+      if (inPlan) inPlan.value = planPath;
+      if (planPath) {
+        form.action = '{{ url_for('plan_full_preview_from_plan', embed=1) }}';
+      } else {
+        form.action = '{{ url_for('plan_full_preview_page', embed=1) }}';
+      }
+    } catch(e) {}
+
+    const modal = showLoading();
+    if(frame){
+      // Clear previous content for immediate feedback.
+      try { frame.srcdoc = '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">Loading preview…</div>'; } catch(e){}
+      frame.addEventListener('load', async ()=>{
+        try { modal && modal.hide(); } catch(e){}
+        // Best-effort: if the user has a saved Flag Sequencing chain for this scenario,
+        // persist it now that the preview plan has been generated.
+        try {
+          const scenarioNow = (scenario || '').toString().trim();
+          if(!scenarioNow) return;
+          if(typeof window.coretgGetSavedFlowStateForScenario !== 'function') return;
+          if(typeof window.coretgPostJson !== 'function') return;
+          const flow = window.coretgGetSavedFlowStateForScenario(scenarioNow);
+          if(!flow) return;
+          await window.coretgPostJson('/api/flag-sequencing/prepare_preview_for_execute', {
+            scenario: scenarioNow,
+            preset: flow.preset || '',
+            length: flow.length || (Array.isArray(flow.chain_ids) ? flow.chain_ids.length : 5),
+            chain_ids: flow.chain_ids || [],
+          });
+        } catch(e) {
+          // Non-fatal; preview is still usable.
+          try { console.warn('Flow save failed (non-fatal):', e); } catch(_e) {}
+        }
+      }, { once: true });
+    }
+
+    try { form && form.submit(); } catch(e){ try { modal && modal.hide(); } catch(_e){} }
+  }
+
+  document.addEventListener('DOMContentLoaded', ()=>{
+    try {
+      const params = new URLSearchParams(window.location.search || '');
+      const scenario = (params.get('scenario') || document.getElementById('scenariosPreviewLoadScenario')?.value || '').trim();
+      if (scenario && typeof window.coretgSetActiveScenarioForNav === 'function') {
+        window.coretgSetActiveScenarioForNav(scenario);
+      }
+    } catch (e) {}
+
+    try {
+      const btn = document.getElementById('toggleScenarioSeedBtn');
+      if (btn && btn.dataset.boundSeedToggle !== '1') {
+        btn.addEventListener('click', (ev) => {
+          try { ev.preventDefault(); } catch (e) {}
+          setSidebarShowSeed(!getSidebarShowSeed());
+          syncSidebarSeedToggleButton();
+          updateScenarioSeedBadges();
+        });
+        btn.dataset.boundSeedToggle = '1';
+      }
+      syncSidebarSeedToggleButton();
+      updateScenarioSeedBadges();
+    } catch (e) {}
+
+    // Shared Scenarios Execute button: hand off to Topology execution flow.
+    try {
+      document.getElementById('scenariosExecuteBtn')?.addEventListener('click', (ev)=>{
+        try {
+          ev.preventDefault();
+          const params = new URLSearchParams(window.location.search || '');
+          const xmlPath = (document.getElementById('scenariosPreviewLoadXmlPath')?.value || params.get('xml_path') || '').trim();
+          const scenario = (params.get('scenario') || document.getElementById('scenariosPreviewLoadScenario')?.value || '').trim();
+          try {
+            if (scenario && typeof window.coretgSetActiveScenarioForNav === 'function') {
+              window.coretgSetActiveScenarioForNav(scenario);
+            }
+          } catch (e) {}
+          if(!xmlPath){
+            alert('Save XML first to execute.');
+            return;
+          }
+          const base = '/';
+          const url = base + '?xml_path=' + encodeURIComponent(xmlPath)
+            + (scenario ? ('&scenario=' + encodeURIComponent(scenario)) : '')
+            + '&auto_execute=1';
+          window.location.href = url;
+        } catch(e){}
+      });
+    } catch(e){}
+
+    // Sidebar scenario list: navigate to the selected scenario + known xml_path.
+    try {
+      const listEl = document.getElementById('previewScenarioList');
+      const clearBtn = document.getElementById('previewScenarioFilterClear');
+      const scenarios = {{ (scenarios or [])|tojson }};
+      const xmlByName = {{ (scenario_xml_by_name or {})|tojson }};
+      const baseUrl = '/scenarios/preview';
+      function goScenario(name){
+        const scen = (name || '').toString().trim();
+        try {
+          if (scen && typeof window.coretgSetActiveScenarioForNav === 'function') {
+            window.coretgSetActiveScenarioForNav(scen);
+          }
+        } catch (e) {}
+        let xml = (xmlByName && scen && xmlByName[scen]) ? String(xmlByName[scen]) : '';
+        try {
+          if (scen && typeof window.coretgGetLatestXmlPathForScenario === 'function') {
+            const latest = (window.coretgGetLatestXmlPathForScenario(scen) || '').toString().trim();
+            if (latest) xml = latest;
+          }
+        } catch(e) {}
+        if(!xml){
+          alert('No saved XML found for that scenario.');
+          return;
+        }
+        window.location.href = baseUrl + '?xml_path=' + encodeURIComponent(xml) + '&scenario=' + encodeURIComponent(scen);
+      }
+      if(listEl){
+        listEl.addEventListener('click', (ev)=>{
+          const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-scen-name]') : null;
+          if(!btn) return;
+          const scen = btn.getAttribute('data-scen-name') || '';
+          goScenario(scen);
+        });
+      }
+      if(clearBtn){
+        clearBtn.addEventListener('click', ()=>{
+          if(Array.isArray(scenarios) && scenarios.length){
+            goScenario(String(scenarios[0] || ''));
+          } else {
+            window.location.href = baseUrl;
+          }
+        });
+      }
+    } catch(e){}
+
+    // Clicking the Preview tab while already on Preview should reload.
+    const previewTab = document.getElementById('scenariosPreviewTabLink');
+    if(previewTab){
+      previewTab.addEventListener('click', (ev)=>{
+        try {
+          ev.preventDefault();
+          loadPreview();
+        } catch(e){}
+      });
+    }
+
+    loadPreview();
+  });
+})();
+</script>
+{% endblock %}

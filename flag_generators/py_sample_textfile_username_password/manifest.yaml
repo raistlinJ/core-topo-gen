@@ -1,0 +1,24 @@
+manifest_version: 1
+id: textfile_username_password
+kind: flag-generator
+name: "Sample: Textfile Username/Password"
+description: "Emit a secrets text file and a deterministic flag."
+hint_template: "Next: {{NEXT_NODE_NAME}} @ {{NEXT_NODE_IP}}"
+runtime:
+  type: docker-compose
+  compose_file: docker-compose.yml
+  service: generator
+inputs:
+  - name: seed
+    type: string
+    required: false
+  - name: flag_prefix
+    type: string
+    required: false
+artifacts:
+  requires: []
+  produces:
+    - flag
+    - filesystem.file
+injects:
+  - filesystem.file

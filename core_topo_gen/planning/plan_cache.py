@@ -9,6 +9,10 @@ import os, json, hashlib, threading, time
 
 _lock = threading.Lock()
 
+# Bump this whenever the structure/meaning of the cached plan changes.
+# This ensures older cached plans don't mask code fixes (e.g. vulnerability parsing).
+_CACHE_VERSION = 3
+
 def _default_cache_path() -> str:
     env = os.environ.get('TOPO_PLAN_CACHE_PATH')
     if env:
@@ -20,15 +24,18 @@ def _default_cache_path() -> str:
 
 def _load_cache(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
-        return { 'version': 1, 'entries': {} }
+        return { 'version': _CACHE_VERSION, 'entries': {} }
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         if not isinstance(data, dict) or 'entries' not in data:
-            return { 'version': 1, 'entries': {} }
+            return { 'version': _CACHE_VERSION, 'entries': {} }
+        if int(data.get('version') or 0) != _CACHE_VERSION:
+            # Hard invalidate on version mismatch.
+            return { 'version': _CACHE_VERSION, 'entries': {} }
         return data
     except Exception:
-        return { 'version': 1, 'entries': {} }
+        return { 'version': _CACHE_VERSION, 'entries': {} }
 
 def _write_cache(path: str, data: Dict[str, Any]) -> None:
     tmp = path + '.tmp'
@@ -62,6 +69,7 @@ def save_plan_to_cache(xml_hash: str, scenario: Optional[str], seed: Optional[in
     path = _default_cache_path()
     with _lock:
         data = _load_cache(path)
+        data['version'] = _CACHE_VERSION
         data['entries'][key] = {
             'saved_at': int(time.time()),
             'plan': plan,

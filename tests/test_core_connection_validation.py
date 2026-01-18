@@ -477,6 +477,7 @@ def test_test_core_advanced_checks_fail_as_warning(client, monkeypatch):
             'adv_fix_docker_daemon': {'enabled': False, 'ok': None, 'message': ''},
             'adv_run_core_cleanup': {'enabled': True, 'ok': True, 'message': 'completed'},
             'adv_restart_core_daemon': {'enabled': False, 'ok': None, 'message': ''},
+            'adv_start_core_daemon': {'enabled': False, 'ok': None, 'message': ''},
             'adv_auto_kill_sessions': {'enabled': False, 'ok': None, 'message': ''},
         }
 

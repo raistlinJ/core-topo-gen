@@ -1,0 +1,26 @@
+services:
+  standard-ubuntu-docker-core:
+    image: ubuntu:22.04
+    tty: true
+    network_mode: "none"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    command: |
+      bash -lc '
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+
+        # Best-effort safety net: if baseline tooling is missing at runtime, attempt
+        # to install it. (On offline CORE docker nodes this may still fail; prefer
+        # wrapper-build + host-side preflight where possible.)
+        if ! command -v ip >/dev/null 2>&1; then
+          apt-get update -y
+          apt-get install -y --no-install-recommends ca-certificates curl iproute2 ethtool iptables iputils-ping net-tools procps python3
+          rm -rf /var/lib/apt/lists/*
+        fi
+
+        sleep infinity
+      '

@@ -1,0 +1,19 @@
+{
+  "note": "This directory contains generator plugin contract docs. This mapping links generator ids to Flow plugin ids (historical/compat).",
+  "plugin_id_by_generator_id": {
+    "gen.cpp.basic_binary": "gen-cpp-basic_binary",
+    "gen.c.basic_binary": "gen-c-basic_binary",
+    "gen.py.basic_artifact": "gen-py-basic_artifact",
+    "gen.py.env_setup": "gen-py-env_setup",
+    "gen.py.chain_output": "gen-py-chain_output",
+    "gen.c.hidden_text_binary": "gen-c-hidden_text_binary",
+    "gen.py.shared_drive_config": "gen-py-shared_drive_config",
+    "gen.py.ssh_creds": "gen-py-ssh_creds",
+    "gen.py.web_creds": "gen-py-web_creds",
+    "gen.py.xor": "gen-py-xor",
+    "nodegen.py.compose_flag_node": "nodegen-py-compose_flag_node",
+    "nodegen.py.ssh_flag_node": "nodegen-py-ssh_flag_node",
+    "nodegen.py.https_flag_node": "nodegen-py-https_flag_node",
+    "nodegen.py.nfs_flag_node": "nodegen-py-nfs_flag_node"
+  }
+}
