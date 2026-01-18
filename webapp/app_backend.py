@@ -3187,7 +3187,14 @@ def _execute_remote_core_session_action(
     cfg = _normalize_core_config(core_cfg, include_password=True)
     ssh_user = (cfg.get('ssh_username') or '').strip() or '<unknown>'
     ssh_host = cfg.get('ssh_host') or cfg.get('host') or 'localhost'
-    address = f"{cfg.get('host') or CORE_HOST}:{cfg.get('port') or CORE_PORT}"
+    # This script runs on the SSH host. For docker-compose deployments, CORE is often
+    # the *host machine* and the container uses host.docker.internal to reach it.
+    # But host.docker.internal is not resolvable on the host itself, so we must
+    # translate that to a loopback address for the remote execution.
+    remote_target_host = str(cfg.get('host') or CORE_HOST or 'localhost').strip() or 'localhost'
+    if remote_target_host in {'host.docker.internal', 'localhost', '127.0.0.1', '::1'}:
+        remote_target_host = '127.0.0.1'
+    address = f"{remote_target_host}:{cfg.get('port') or CORE_PORT}"
     script = _remote_core_session_action_script(address, action, session_id)
     command_desc = (
         f"remote ssh {ssh_user}@{ssh_host} -> CoreGrpcClient.{action}_session {address} (session={session_id})"
@@ -3221,11 +3228,16 @@ def _list_active_core_sessions_via_remote_python(
     log = logger or getattr(app, 'logger', logging.getLogger(__name__))
     ssh_user = (cfg.get('ssh_username') or '').strip() or '<unknown>'
     ssh_host = cfg.get('ssh_host') or cfg.get('host') or 'localhost'
-    target_host = cfg.get('host') or 'localhost'
+    target_host = str(cfg.get('host') or 'localhost').strip() or 'localhost'
     try:
         target_port = int(cfg.get('port') or CORE_PORT)
     except Exception:
         target_port = CORE_PORT
+
+    # This remote script executes on ssh_host, so translate docker-only hostnames
+    # to a loopback address that is correct from the SSH host's perspective.
+    if target_host in {'host.docker.internal', 'localhost', '127.0.0.1', '::1'}:
+        target_host = '127.0.0.1'
     if meta is not None:
         meta['grpc_command'] = (
             f"remote ssh {ssh_user}@{ssh_host} -> CoreGrpcClient.get_sessions {target_host}:{target_port}"
@@ -5065,7 +5077,7 @@ def _save_proxmox_credentials(payload: Dict[str, Any]) -> Dict[str, Any]:
         'username': username,
         'password': encrypted_password,
         'verify_ssl': verify_ssl,
-        'stored_at': datetime.datetime.now(datetime.UTC).isoformat(),
+        'stored_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     path = _proxmox_secret_path(identifier)
     tmp_path = path + '.tmp'
@@ -5253,7 +5265,7 @@ def _save_core_credentials(payload: Dict[str, Any]) -> Dict[str, Any]:
     'vmid': vmid if vmid else None,
         'proxmox_secret_id': prox_secret_id,
         'proxmox_target': prox_target,
-        'stored_at': datetime.datetime.now(datetime.UTC).isoformat(),
+        'stored_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
     path = os.path.join(_core_secret_dir(), f"{identifier}.json")
     tmp_path = path + '.tmp'
@@ -5535,7 +5547,7 @@ def _enumerate_proxmox_vms(identifier: str) -> Dict[str, Any]:
                 'interfaces': interfaces,
             })
     return {
-        'fetched_at': datetime.datetime.now(datetime.UTC).isoformat(),
+        'fetched_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'url': record.get('url'),
         'username': record.get('username'),
         'verify_ssl': record.get('verify_ssl', True),
@@ -5597,7 +5609,7 @@ def _save_base_upload_state(meta: Dict[str, Any]) -> None:
     if not clean:
         return
     clean = dict(clean)
-    clean['updated_at'] = datetime.datetime.now(datetime.UTC).isoformat()
+    clean['updated_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     try:
         with open(_base_upload_state_path(), 'w', encoding='utf-8') as f:
             json.dump(clean, f, indent=2)
@@ -6860,6 +6872,25 @@ def _live_core_session_status_for_scenario(
             'state': state_raw,
         }
 
+    # If there is exactly one active CORE session and the catalog only contains
+    # one scenario (common in small deployments/tests), assume that session
+    # belongs to the selected scenario.
+    if len(active_sessions) == 1:
+        try:
+            only_catalog = [_normalize_scenario_label(n) for n in (scenario_names or [])]
+            only_catalog = [n for n in only_catalog if n]
+        except Exception:
+            only_catalog = []
+        if len(only_catalog) == 1 and only_catalog[0] == scenario_norm:
+            sess = active_sessions[0]
+            state_raw = str(sess.get('state') or '').strip().lower()
+            sid_int = _session_id_int(sess)
+            return {
+                'running': True,
+                'session_id': sid_int,
+                'state': state_raw,
+            }
+
     # Queried successfully but no matching active sessions.
     # If there are active sessions but none match the selected scenario, prefer
     # Unknown (None) over incorrectly marking the selected scenario as Running.
@@ -6962,9 +6993,10 @@ def participant_ui_details_api():
     session_xml_path = None
     if isinstance(last_run, dict):
         session_xml_path = last_run.get('session_xml_path') or last_run.get('post_xml_path')
-    subnetworks = _subnet_cidrs_from_session_xml(session_xml_path)
+    session_xml_exists = bool(session_xml_path and os.path.exists(str(session_xml_path)))
+    subnetworks = _subnet_cidrs_from_session_xml(session_xml_path) if session_xml_exists else []
 
-    vulnerability_ips = _vulnerability_ipv4s_from_session_xml(session_xml_path)
+    vulnerability_ips = _vulnerability_ipv4s_from_session_xml(session_xml_path) if session_xml_exists else []
 
     # Vulnerabilities count:
     # - Prefer actual session XML-derived value when we can parse a real file.
@@ -7414,7 +7446,7 @@ def participant_ui_record_open_api():
     if not href:
         # Do not record meaningless events.
         return jsonify({'ok': False, 'error': 'missing href'}), 400
-    now = datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+    now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
     stats = _load_participant_ui_stats()
     totals = stats.get('totals') if isinstance(stats.get('totals'), dict) else {}
     totals['open_count'] = int(totals.get('open_count') or 0) + 1
@@ -19611,15 +19643,21 @@ def _default_scenario_payload(name: str) -> Dict[str, Any]:
         "Events", "Vulnerabilities", "Segmentation", "HITL"
     ]
     display_name = str(name or '').strip() or "Scenario"
+    sections_dict: Dict[str, Any] = {}
+    for sec_name in sections:
+        entry: Dict[str, Any] = {
+            "density": 0.5 if sec_name not in ("Node Information", "HITL") else None,
+            "total_nodes": 1 if sec_name == "Node Information" else None,
+            "items": [],
+        }
+        if sec_name == "Vulnerabilities":
+            entry["flag_type"] = "text"
+        sections_dict[sec_name] = entry
     return {
         "name": display_name,
         "base": {"filepath": ""},
         "hitl": {"enabled": False, "interfaces": [], "core": None},
-        "sections": {sec_name: {
-            "density": 0.5 if sec_name not in ("Node Information", "HITL") else None,
-            "total_nodes": 1 if sec_name == "Node Information" else None,
-            "items": []
-        } for sec_name in sections},
+        "sections": sections_dict,
         "notes": ""
     }
 
@@ -19724,7 +19762,7 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
         'Services': {'density': 0.5},
         'Traffic': {'density': 0.5},
         'Events': {'density': 0.5},
-        'Vulnerabilities': {'density': 0.5},
+        'Vulnerabilities': {'density': 0.5, 'flag_type': 'text'},
         'Segmentation': {'density': 0.5},
         'HITL': {},
     }
@@ -20235,23 +20273,35 @@ def api_proxmox_validate():
             app.logger.warning('[proxmox] authentication failed: %s', exc)
         except Exception:
             pass
-        return jsonify({'success': False, 'error': f'Authentication failed: {exc}'}), 401
+        msg = str(exc)
+        lowered = msg.lower()
+        # In docker-compose deployments, common failures are reachability/DNS/TLS/proxy.
+        # If we see strong signals of a network/proxy error, report 502 (Bad Gateway)
+        # instead of 401 (credentials).
+        if any(tok in lowered for tok in (
+            'bad gateway', '502', 'connection refused', 'name or service not known',
+            'temporary failure in name resolution', 'timed out', 'timeout',
+            'max retries exceeded', 'connection error', 'proxyerror',
+            'ssLError'.lower(), 'certificate verify failed',
+        )):
+            detail = (
+                'Unable to reach Proxmox API from this server (network/proxy/TLS issue). '
+                f'Detail: {msg}'
+            )
+            return jsonify({'success': False, 'error': detail}), 502
+        return jsonify({'success': False, 'error': f'Authentication failed: {msg}'}), 401
     try:
         app.logger.info('[proxmox] authentication succeeded for %s@%s:%s', username, host, port)
     except Exception:
         pass
     scenario_index = payload.get('scenario_index')
     scenario_name = str(payload.get('scenario_name') or '').strip()
-    secret_payload = {
-        'scenario_name': scenario_name,
-        'scenario_index': scenario_index,
+    summary: Dict[str, Any] = {
         'url': url_raw,
         'port': port,
         'username': username,
-        'password': password,
         'verify_ssl': verify_ssl,
     }
-    summary: Dict[str, Any]
     secret_identifier: Optional[str] = None
     stored_at_val: Optional[str] = None
     if remember_credentials:
@@ -20303,7 +20353,7 @@ def api_proxmox_validate():
         'success': True,
         'message': message,
         'summary': summary,
-        'secret_id': secret_identifier,
+        'secret_id': secret_identifier if remember_credentials else None,
         'scenario_index': scenario_index,
         'scenario_name': scenario_name,
     })
@@ -22190,6 +22240,8 @@ def _parse_scenario_editor(se):
         else:
             dens = sec.get("density")
             entry["density"] = float(dens) if dens is not None else 0.5
+        if name == "Vulnerabilities":
+            entry["flag_type"] = (sec.get("flag_type") or "text").strip() or "text"
         for item in sec.findall("item"):
             d = {
                 "selected": item.get("selected", "Random"),
@@ -22445,6 +22497,8 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                 continue
             sec_el = ET.SubElement(se, "section", name=name)
             items_list = sec.get("items", []) or []
+            if name == "Vulnerabilities":
+                sec_el.set("flag_type", str(sec.get("flag_type") or "text"))
             weight_rows = [it for it in items_list if (it.get('v_metric') or (it.get('selected')=='Specific' and name=='Vulnerabilities') or 'Weight') == 'Weight']
             count_rows = [it for it in items_list if (it.get('v_metric') == 'Count') or (name == 'Vulnerabilities' and it.get('selected') == 'Specific')]
             weight_sum = sum(float(it.get('factor', 0) or 0) for it in weight_rows) if weight_rows else 0.0
@@ -23255,7 +23309,48 @@ def index():
             payload['project_key_hint'] = snapshot.get('project_key_hint')
         if snapshot.get('scenario_query') and not payload.get('scenario_query'):
             payload['scenario_query'] = snapshot.get('scenario_query')
-    return render_template('index.html', payload=payload, logs="", xml_preview="")
+
+    # Populate XML preview on initial load so the dock isn't blank after refresh.
+    xml_text = ""
+    try:
+        # Prefer reading an existing persisted XML file if we have a path.
+        result_path = payload.get('result_path') if isinstance(payload, dict) else None
+        if isinstance(result_path, str) and result_path.strip() and result_path.lower().endswith('.xml'):
+            rp = os.path.expanduser(result_path.strip())
+            rp = os.path.normpath(rp)
+            candidates = [rp]
+            try:
+                repo_root = _get_repo_root()
+                if not os.path.isabs(rp):
+                    candidates.append(os.path.abspath(os.path.join(repo_root, rp)))
+                if rp.startswith('outputs' + os.sep):
+                    candidates.append(os.path.abspath(os.path.join(_outputs_dir(), rp.split(os.sep, 1)[-1])))
+            except Exception:
+                pass
+            chosen = next((p for p in candidates if p and os.path.exists(p)), None)
+            if chosen:
+                with open(chosen, 'r', encoding='utf-8', errors='ignore') as f:
+                    xml_text = f.read()
+
+        # Otherwise, generate a best-effort preview from the in-memory editor state.
+        if not xml_text:
+            scenarios = payload.get('scenarios') if isinstance(payload, dict) else None
+            if isinstance(scenarios, list) and scenarios:
+                core_meta = payload.get('core') if isinstance(payload.get('core'), dict) else None
+                tree = _build_scenarios_xml({'scenarios': scenarios, 'core': core_meta})
+                try:
+                    from lxml import etree as LET  # type: ignore
+
+                    raw = ET.tostring(tree.getroot(), encoding='utf-8')
+                    lroot = LET.fromstring(raw)
+                    pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+                    xml_text = pretty.decode('utf-8', errors='ignore')
+                except Exception:
+                    xml_text = ET.tostring(tree.getroot(), encoding='unicode')
+    except Exception:
+        xml_text = ""
+
+    return render_template('index.html', payload=payload, logs="", xml_preview=xml_text)
 
 
 @app.route('/load_xml', methods=['POST'])

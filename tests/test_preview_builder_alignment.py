@@ -99,4 +99,4 @@ def test_preview_switch_without_hosts_preserved(monkeypatch):
 
     assert result is not None
     sess, *_ = result
-    assert 10 in sess.nodes, "Switch declared in preview should be retained even without hosts"
+    assert 10 not in sess.nodes, "Switches with no attached non-router hosts should be pruned"

@@ -89,6 +89,11 @@ Vulnerabilities attributes (mode-dependent):
 | `v_type`, `v_vector` | `selected="Type/Vector"` |
 | `v_name`, `v_path` | `selected="Specific"` |
 
+Vulnerabilities section attributes:
+| Attribute | Meaning |
+|-----------|---------|
+| `flag_type` | Flag/artifact type for CTF-style injection (`text | image | file | custom`). Currently only `text` is implemented. |
+
 Events attributes:
 | Attribute | Meaning |
 |-----------|---------|
@@ -114,7 +119,7 @@ Segmentation items currently use only `selected`, `factor`, and optional Count s
       <section name="Services" density="0.500" />
       <section name="Traffic" density="0.500" />
       <section name="Events" density="0.500" />
-      <section name="Vulnerabilities" density="0.500" />
+      <section name="Vulnerabilities" density="0.500" flag_type="text" />
       <section name="Segmentation" density="0.500" />
       <section name="Notes">
         <notes/>

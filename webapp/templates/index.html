@@ -1518,7 +1518,7 @@ function defaultScenario(name) {
             'Services': { density: 0.5, items: [] },
             'Traffic': { density: 0.5, items: [] },
             'Events': { density: 0.5, items: [] },
-            'Vulnerabilities': { density: 0.5, items: [] },
+            'Vulnerabilities': { density: 0.5, items: [], flag_type: 'text' },
             'Segmentation': { density: 0.5, items: [] }
         },
         notes: ''
@@ -13289,6 +13289,26 @@ function renderMain() {
                                                                                                                                                                                                                 : '';
                                                                                                                                                                                                     let info = '';
                                                                                                                                                                                                     // Density tooltip removed
+                                                                                                                                                                                                    if (name === 'Vulnerabilities') {
+                                                                                                                                                                                                        const flagTypeVal = (sec && typeof sec.flag_type === 'string' && sec.flag_type.trim()) ? sec.flag_type.trim() : 'text';
+                                                                                                                                                                                                        const flagTypeCtrl = '<div class="d-flex align-items-center gap-2">'
+                                                                                                                                                                                                            + '<span>Flag type</span>'
+                                                                                                                                                                                                            + '<select class="form-select form-select-sm" style="width:140px" data-scen-idx="' + activeIdx + '" data-sec="' + name + '" data-field="flag_type">'
+                                                                                                                                                                                                            + '<option value="text" ' + (flagTypeVal === 'text' ? 'selected' : '') + '>text</option>'
+                                                                                                                                                                                                            + '<option value="image" disabled>image</option>'
+                                                                                                                                                                                                            + '<option value="file" disabled>file</option>'
+                                                                                                                                                                                                            + '<option value="custom" disabled>custom</option>'
+                                                                                                                                                                                                            + '</select>'
+                                                                                                                                                                                                        + '</div>';
+                                                                                                                                                                                                        return '<div class="d-flex align-items-center justify-content-end gap-3">'
+                                                                                                                                                                                                            + '<div class="d-flex align-items-center gap-2">'
+                                                                                                                                                                                                                + '<span>Density</span>'
+                                                                                                                                                                                                                + info
+                                                                                                                                                                                                                + '<input type="number" step="0.01" min="0" max="1" class="form-control form-control-sm" style="width:100px" value="' + densVal + '" data-scen-idx="' + activeIdx + '" data-sec="' + name + '" data-field="density">'
+                                                                                                                                                                                                            + '</div>'
+                                                                                                                                                                                                            + flagTypeCtrl
+                                                                                                                                                                                                        + '</div>';
+                                                                                                                                                                                                    }
                                                                                                                                                                                                     return '<div class="d-flex align-items-center justify-content-end gap-2">'
                                                                                                                                                                                                         + '<span>Density</span>'
                                                                                                                                                                                                         + info

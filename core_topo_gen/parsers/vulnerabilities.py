@@ -2,31 +2,36 @@ from __future__ import annotations
 import os
 import logging
 import xml.etree.ElementTree as ET
-from typing import List, Optional, Tuple, Dict, Union
+from typing import List, Optional, Tuple
 from .common import find_scenario
 
 logger = logging.getLogger(__name__)
 
 
-def parse_vulnerabilities_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[float, List[dict]]:
+def parse_vulnerabilities_info(xml_path: str, scenario_name: Optional[str]) -> Tuple[float, List[dict], str]:
     density = 0.0
     items: List[dict] = []
+    flag_type = "text"
     if not os.path.exists(xml_path):
         logger.warning("XML not found for vulnerabilities parse: %s", xml_path)
-        return density, items
+        return density, items, flag_type
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
     except Exception as e:
         logger.warning("Failed to parse XML for vulnerabilities (%s)", e)
-        return density, items
+        return density, items, flag_type
     scenario = find_scenario(root, scenario_name)
     if scenario is None:
         logger.warning("No <Scenario> found for vulnerabilities parse")
-        return density, items
+        return density, items, flag_type
     section = scenario.find(".//section[@name='Vulnerabilities']")
     if section is None:
-        return density, items
+        return density, items, flag_type
+
+    flag_raw = (section.get("flag_type") or "").strip()
+    if flag_raw:
+        flag_type = flag_raw
     den_raw = (section.get("density") or "").strip()
     if den_raw:
         try:
@@ -71,4 +76,4 @@ def parse_vulnerabilities_info(xml_path: str, scenario_name: Optional[str]) -> T
                 rec["v_path"] = vp
         items.append(rec)
     logger.debug("Parsed vulnerabilities: density=%s items=%s", density, items)
-    return density, items
+    return density, items, flag_type
