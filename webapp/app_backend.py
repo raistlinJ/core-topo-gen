@@ -8484,7 +8484,7 @@ def _attack_flow_builder_afb_for_chain(
                 except Exception:
                     txt = str(resolved_val)
                 return txt[:4096] if txt else ''
-            return f"Provided output: {k}"
+            return ''
         if not desc_lines:
             desc_lines = [f"Capture the flag on node '{node_name}'."]
 
@@ -8523,8 +8523,9 @@ def _attack_flow_builder_afb_for_chain(
         objects.append(left_anchor_obj)
         objects.append(right_anchor_obj)
 
+        action_node_id = 'vulnerability' if bool(node.get('is_vuln')) else 'action'
         objects.append({
-            'id': 'action',
+            'id': action_node_id,
             'instance': action_instance,
             # NOTE: OpenChart uses ordered entries (JsonEntries) not dicts.
             'properties': [
@@ -8699,23 +8700,16 @@ def _attack_flow_builder_afb_for_chain(
                 objects.append(art_left_anchor_obj)
                 objects.append(art_right_anchor_obj)
 
-                inject_desc = 'Injected into container'
-                try:
-                    if '->' in inj_path:
-                        _left, _right = inj_path.split('->', 1)
-                        dest = str(_right or '').strip()
-                        if dest:
-                            inject_desc = f"Injected into {dest}"
-                except Exception:
-                    pass
+                resolved_inject_desc = _asset_description_for_key(inj_path)
                 objects.append({
-                    # Attack Flow Builder supports STIX cyber-observable style nodes;
-                    # represent injected files as explicit artifacts.
-                    'id': 'artifact',
+                    # Represent injected files as key artifact notes.
+                    'id': 'note',
                     'instance': art_instance,
                     'properties': [
-                        ['name', inj_path],
-                        ['description', inject_desc],
+                        ['name', f"Key Artifact: {inj_path}"],
+                        ['abstract', f"Key Artifact: {inj_path}"],
+                        ['content', resolved_inject_desc or inj_path],
+                        ['injects', [inj_path]],
                     ],
                     'anchors': {
                         '180': art_left_anchor_instance,
@@ -8809,31 +8803,6 @@ def _attack_flow_builder_afb_for_chain(
                         '0': asset_right_anchor_instance,
                     },
                 })
-
-                # Populate asset description with resolved output values (best-effort).
-                try:
-                    resolved = None
-                    if isinstance(outputs_map, dict):
-                        if out_key in outputs_map:
-                            resolved = outputs_map.get(out_key)
-                        elif out_key == 'artifact.flag' and ('Flag(flag_id)' in outputs_map or 'flag' in outputs_map):
-                            resolved = outputs_map.get('Flag(flag_id)') or outputs_map.get('flag')
-
-                    if resolved is not None:
-                        if isinstance(resolved, str):
-                            resolved_text = resolved.strip()
-                        else:
-                            resolved_text = json.dumps(resolved, ensure_ascii=False)
-                        if resolved_text:
-                            if len(resolved_text) > 4096:
-                                resolved_text = resolved_text[:4096]
-                            props = objects[-1].get('properties')
-                            if isinstance(props, list):
-                                for pair in props:
-                                    if isinstance(pair, list) and len(pair) == 2 and pair[0] == 'description':
-                                        pair[1] = resolved_text
-                except Exception:
-                    pass
 
                 # Place assets alternating left/right, in rows, below the action.
                 side = 'left' if (out_idx % 2 == 0) else 'right'
