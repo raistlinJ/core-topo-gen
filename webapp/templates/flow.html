@@ -96,14 +96,6 @@
               </div>
             </div>
             <div class="small text-muted mt-2">Current rule: <span class="font-monospace">flag-generator</span> steps are placed on vulnerability nodes only. Non-vulnerability Docker nodes use <span class="font-monospace">flag-node-generator</span>. Default chain order is randomized; you can tweak it below.</div>
-            <details class="small text-muted mt-2">
-              <summary>Examples</summary>
-              <div class="mt-2">
-                <div>Overrides: <span class="font-monospace">Flag(flag_id)=FLAG{OVERRIDE}</span></div>
-                <div>Injects: <span class="font-monospace">File(path) -> /opt/bin</span></div>
-                <div>Hints: <span class="font-monospace">Next: {{ '{{OUTPUT.Knowledge(ip)}}' }}</span></div>
-              </div>
-            </details>
           </div>
         </div>
 
@@ -357,7 +349,6 @@
   }
 
   function rememberActiveScenario(){
-    let usedBestEffort = false;
     try {
       if (activeScenario && typeof window.coretgSetActiveScenarioForNav === 'function') {
         window.coretgSetActiveScenarioForNav(activeScenario);
@@ -5814,6 +5805,7 @@
     if(jsonEl) jsonEl.textContent = '';
 
     let resolvedOk = false;
+    let usedBestEffort = false;
     try {
       if(runSavePreviewResolve){
         const scenLabel = (scenario || activeScenario || '').toString().trim();

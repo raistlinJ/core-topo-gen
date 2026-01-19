@@ -12315,6 +12315,8 @@ def api_flow_attackflow_preview():
                     if cid:
                         saved_ids.append(cid)
             if saved_ids:
+                if (not allow_node_duplicates) and (len(set(saved_ids)) != len(saved_ids)):
+                    saved_ids = []
                 id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
                 # Honor requested length (truncate) but do not try to auto-extend.
                 desired = saved_ids[:length]
