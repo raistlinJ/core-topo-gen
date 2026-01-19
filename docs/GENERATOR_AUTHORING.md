@@ -67,7 +67,7 @@ inputs:
 artifacts:
   requires: []
   produces:
-    - flag
+    - Flag(flag_id)
     - Credential(user)
     - Credential(user, password)
 
@@ -134,7 +134,7 @@ Minimum valid `outputs.json`:
 {
   "generator_id": "<some string>",
   "outputs": {
-    "flag": "FLAG{...}"
+    "Flag(flag_id)": "FLAG{...}"
   }
 }
 ```
@@ -143,6 +143,9 @@ Practical guidance on `generator_id`:
 - The schema requires it, but it is currently treated as provenance/metadata.
 - If your generator can know the invoked generator ID, write that.
 - Otherwise, writing your source manifest ID is acceptable.
+
+Notes:
+- `outputs.json.outputs.Flag(flag_id)` is **required** by the schema.
 
 ---
 
@@ -181,6 +184,7 @@ Flow substitutions include:
 
 - `{{THIS_NODE_NAME}}`, `{{THIS_NODE_ID}}`
 - `{{NEXT_NODE_NAME}}`, `{{NEXT_NODE_ID}}`
+- `{{NEXT_NODE_IP}}` (when available)
 - `{{SCENARIO}}`
 - `{{OUTPUT.<key>}}` where `<key>` comes from `outputs.json.outputs`
 
@@ -189,6 +193,9 @@ Example:
 ```
 Next: SSH to {{NEXT_NODE_NAME}} using {{OUTPUT.Credential(user)}} / {{OUTPUT.Credential(user,password)}}
 ```
+
+Note:
+- Flow will automatically append an IP to `{{NEXT_NODE_NAME}}` when a next-node IP is known, even if `{{NEXT_NODE_IP}}` is not explicitly present.
 
 ---
 

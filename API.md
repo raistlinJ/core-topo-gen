@@ -148,6 +148,9 @@ These endpoints power the **Flow** page (Flag Sequencing) in the Web UI.
 Important notes:
 - **STIX/AttackFlow bundle export has been removed.** Legacy STIX endpoints now return HTTP `410 Gone`.
 - The supported export format is **Attack Flow Builder native `.afb`**.
+- **Eligibility rules:** `flag-generators` are placed on vulnerability nodes only; `flag-node-generators` require non-vulnerability Docker-role nodes.
+- **Initial Facts / Goal Facts:** Flow accepts optional `initial_facts` and `goal_facts` overrides (artifacts + fields). Flag facts (`Flag(...)`) are filtered out.
+- **Sequencing algorithm:** Goal-aware scoring with pruning/backtracking (bounded by a 30s timeout) is used to select feasible generator assignments.
 
 `GET /api/flag-sequencing/attackflow_preview`
 : Returns a chain preview derived from the latest preview plan for the scenario. Response includes `chain`, `flag_assignments`, and validity metadata (`flow_valid`, `flow_errors`, `flags_enabled`).
@@ -157,6 +160,7 @@ Common query params:
 - `length=<int>` (default 5)
 - `preset=<name>` (optional; forces a fixed chain)
 - `best_effort=1` (optional; clamps to available eligible nodes)
+- `debug_dag=1` (optional; include sequencing DAG diagnostics)
 
 `POST /api/flag-sequencing/prepare_preview_for_execute`
 : Resolves hint placeholders and materializes generator outputs for a chain (used for “Resolve hint values…” in the Flow UI).
@@ -171,6 +175,7 @@ Request JSON (typical):
 	"preview_plan": "/abs/path/to/outputs/plans/plan_from_preview_....json",
 	"mode": "hint",
 	"best_effort": true,
+	"allow_node_duplicates": false,
 	"timeout_s": 30
 }
 ```
@@ -186,7 +191,47 @@ Request JSON:
 }
 ```
 
-Response JSON includes `afb` (the export document) plus `flag_assignments` and validity metadata.
+Response JSON includes:
+- `afb` (an OpenChart DiagramViewExport document)
+- `attack_graph` (simple node/edge JSON derived from the chain)
+- `attack_graph_dot` (Graphviz DOT for the attack graph)
+- `attack_graph_pdf_base64` (base64-encoded PDF; requires Graphviz `dot`)
+- `flag_assignments` and validity metadata
+
+`POST /api/flag-sequencing/save_flow_substitutions`
+: Persists a user-edited chain + generator overrides into a `plan_from_flow_*.json` plan. This is used by “Save Overrides” and the Flow tab state persistence.
+
+Request JSON (typical):
+```json
+{
+	"scenario": "My Scenario",
+	"chain_ids": ["n1", "n2"],
+	"preview_plan": "/abs/path/to/outputs/plans/plan_from_preview_....json",
+	"allow_node_duplicates": false,
+	"flag_assignments": [
+		{
+			"node_id": "n1",
+			"id": "123",
+			"config_overrides": {"host_ip": "10.0.0.5"},
+			"output_overrides": {"Credential(user)": "alice"},
+			"inject_files_override": ["File(path) -> /opt/bin"],
+			"hint_overrides": ["Next: ..."],
+			"flag_override": "FLAG{OVERRIDE}",
+			"resolved_inputs": {"host_ip": "10.0.0.5"},
+			"resolved_outputs": {"Credential(user)": "alice"},
+			"flag_value": "FLAG{OVERRIDE}"
+		}
+	],
+	"initial_facts": {"artifacts": ["Knowledge(ip)"], "fields": ["host_ip"]},
+	"goal_facts": {"artifacts": ["Credential(user,password)"], "fields": []}
+}
+```
+
+`POST /api/flag-sequencing/upload_flow_input_file`
+: Uploads a file for a generator input override. Returns a stored file path to reference in `config_overrides`.
+
+`POST /api/flag-sequencing/upload_flow_inject_file`
+: Uploads a file for `inject_files_override`. Returns an `inject_value` token (`upload:<abs_path>`) that can be used in the override list.
 
 Deprecated endpoints (removed):
 - `POST /api/flag-sequencing/bundle_from_chain` → returns `410 Gone`

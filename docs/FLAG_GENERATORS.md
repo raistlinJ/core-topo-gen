@@ -8,6 +8,11 @@ The Flow system treats each generator as a small contract:
 - **outputs**: keys the generator provides
 - **hint_template**: a human-readable hint that tells the user where to go next
 
+Flow also supports **Initial Facts** and **Goal Facts** to steer sequencing. Initial facts are treated
+as already-known inputs (including synthesized fields like `seed`, `node_name`, `flag_prefix`), while
+Goal facts bias the sequencing algorithm toward outputs that satisfy them. Flag facts (`Flag(...)`) are
+filtered from Initial/Goal facts.
+
 ## Standard Key Vocabulary
 
 Use these keys consistently so chains can be validated and composed.
@@ -42,6 +47,7 @@ Every generator should include a `hint_template`.
 Flow will substitute these placeholders (if present):
 - `{{THIS_NODE_NAME}}`, `{{THIS_NODE_ID}}`
 - `{{NEXT_NODE_NAME}}`, `{{NEXT_NODE_ID}}`
+- `{{NEXT_NODE_IP}}` (when available)
 - `{{SCENARIO}}`
 
 Example:
@@ -49,7 +55,7 @@ Example:
 `Next: SSH to {{NEXT_NODE_NAME}} (id={{NEXT_NODE_ID}}) using {{OUTPUT.Credential(user,password)}}.`
 
 Notes:
-- At the moment, Flow provides **node name/id** as the “address-like” hint. If you later want real IPs, we can extend the preview pipeline to compute and expose them.
+- Flow will automatically append an IP to `{{NEXT_NODE_NAME}}` when a next-node IP is known (e.g., `web01 (10.0.0.5)`), even if `{{NEXT_NODE_IP}}` is not explicitly present.
 - For templates that expose files, we recommend including a `hint.txt` in the payload (served over HTTP or mounted into the container) that contains the rendered hint.
 
 ## Schemas (Generator Authors)

@@ -112,6 +112,11 @@ Popular options:
 	- Packs and individual generators can be disabled.
 	- Disabled generators are hidden from Flow substitution and are rejected at preview/execute time.
 
+### Flag sequencing (Flow) highlights
+- Initial/Goal facts steer sequencing (flag facts are filtered out); synthesized inputs like `seed`, `node_name`, and `flag_prefix` are treated as known inputs.
+- Sequencing uses goal-aware scoring with pruning/backtracking (bounded by a 30s timeout) to find feasible generator assignments.
+- Attack Flow Builder export is the native `.afb` format (OpenChart DiagramViewExport).
+
 ### Vulnerability catalog packs
 - The Web UI exposes a **Vuln-Catalog** page that mirrors the Flag Catalog pack UX.
 - You can upload/import a ZIP containing directories/subdirectories.

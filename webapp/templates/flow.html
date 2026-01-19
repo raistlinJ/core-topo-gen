@@ -75,7 +75,17 @@
               <div class="col-md-6">
                 <div class="d-flex gap-2 flex-nowrap">
                   <button id="flowGenerateBtn" class="btn btn-primary text-nowrap" type="button">Generate</button>
-                  <a id="flowAfbDownloadLink" class="btn btn-outline-secondary text-nowrap" href="#" role="button">Download Attack Flow Builder (.afb)</a>
+                  <div class="dropdown">
+                    <button class="btn btn-outline-secondary dropdown-toggle text-nowrap" type="button" id="flowDownloadDropdown" data-bs-toggle="dropdown" aria-expanded="false">
+                      Download
+                    </button>
+                    <ul class="dropdown-menu" aria-labelledby="flowDownloadDropdown">
+                      <li><a class="dropdown-item" href="#" id="flowDownloadAfb">Attack Flow (afb)</a></li>
+                      <li><a class="dropdown-item" href="#" id="flowDownloadAttackGraphDot">Attack Graph (dot)</a></li>
+                      <li><a class="dropdown-item" href="#" id="flowDownloadAttackGraphJson">Attack Graph (json)</a></li>
+                      <li><a class="dropdown-item" href="#" id="flowDownloadAttackGraphPdf">Attack Graph (pdf)</a></li>
+                    </ul>
+                  </div>
                 </div>
               </div>
               <div class="col-md-4">
@@ -276,7 +286,10 @@
   const substituteDialogEl = document.getElementById('flowSubstituteDialog');
   const substituteTitleEl = document.getElementById('flowSubstituteTitle');
   const substituteBodyEl = document.getElementById('flowSubstituteBody');
-  const afbDownloadLink = document.getElementById('flowAfbDownloadLink');
+  const downloadAfbLink = document.getElementById('flowDownloadAfb');
+  const downloadAttackGraphDotLink = document.getElementById('flowDownloadAttackGraphDot');
+  const downloadAttackGraphJsonLink = document.getElementById('flowDownloadAttackGraphJson');
+  const downloadAttackGraphPdfLink = document.getElementById('flowDownloadAttackGraphPdf');
   const scenarioListEl = document.getElementById('flowScenarioList');
   const clearScenarioBtn = document.getElementById('flowScenarioFilterClear');
   const seedToggleBtn = document.getElementById('toggleScenarioSeedBtn');
@@ -790,6 +803,46 @@
     const haveFieldsSequencer = new Set(synthesizedFields);
     const haveArtifacts = new Set(sequencerArtifacts);
     const haveFields = new Set(synthesizedFields);
+    try{
+      const initOverride = normalizeFactsOverride(flowInitialFactsOverride);
+      const initArts = (initOverride && Array.isArray(initOverride.artifacts)) ? initOverride.artifacts : [];
+      const initFields = (initOverride && Array.isArray(initOverride.fields)) ? initOverride.fields : [];
+      initArts.map(String).forEach((k)=>{
+        const kk = String(k || '').trim();
+        if(!kk || isFlagFactName(kk)) return;
+        haveArtifacts.add(kk);
+        haveArtifactsChain.add(kk);
+        haveEffective.add(kk);
+        if(haveArtifactsSequencer.has(kk)) haveArtifactsSequencer.delete(kk);
+      });
+      initFields.map(String).forEach((k)=>{
+        const kk = String(k || '').trim();
+        if(!kk || isFlagFactName(kk)) return;
+        haveFields.add(kk);
+        haveFieldsChain.add(kk);
+        haveEffective.add(kk);
+        if(haveFieldsSequencer.has(kk)) haveFieldsSequencer.delete(kk);
+      });
+    } catch(e) {}
+    try{
+      if(Array.isArray(assignments) && assignments.length){
+        const a0 = assignments[0] || {};
+        const ri = (a0 && typeof a0.resolved_inputs === 'object' && a0.resolved_inputs && !Array.isArray(a0.resolved_inputs))
+          ? a0.resolved_inputs
+          : null;
+        if(ri){
+          Object.keys(ri).forEach((k)=>{
+            const kk = String(k || '').trim();
+            if(!kk || isFlagFactName(kk)) return;
+            if(kk.startsWith('Knowledge(') || haveArtifactsSequencer.has(kk)) return;
+            haveFields.add(kk);
+            haveFieldsChain.add(kk);
+            haveEffective.add(kk);
+            if(haveFieldsSequencer.has(kk)) haveFieldsSequencer.delete(kk);
+          });
+        }
+      }
+    } catch(e) {}
     if(!Array.isArray(assignments)) return out;
     for(let i=0;i<assignments.length;i++){
       const a = assignments[i] || {};
@@ -812,8 +865,23 @@
         const providedBySequencerArtifacts = reqArtifactsEffective.filter(k => k && haveArtifactsSequencer.has(k));
         const missingArtifacts = reqArtifactsEffective.filter(k => k && !haveArtifacts.has(k));
 
-        const providedByChainFields = reqFields.filter(k => k && haveFieldsChain.has(k));
-        const providedBySequencerFields = reqFields.filter(k => k && haveFieldsSequencer.has(k));
+        let displayFields = reqFields.slice();
+        try{
+          const ri = (a && typeof a.resolved_inputs === 'object' && a.resolved_inputs && !Array.isArray(a.resolved_inputs))
+            ? a.resolved_inputs
+            : null;
+          if(ri){
+            Object.keys(ri).forEach(k => {
+              const kk = String(k || '').trim();
+              if(!kk) return;
+              displayFields.push(kk);
+            });
+          }
+        } catch(e) {}
+        displayFields = Array.from(new Set(displayFields.map(String).filter(Boolean)));
+
+        const providedByChainFields = displayFields.filter(k => k && haveFieldsChain.has(k));
+        const providedBySequencerFields = displayFields.filter(k => k && haveFieldsSequencer.has(k));
         const missingFields = reqFields.filter(k => k && !haveFields.has(k));
 
         const missing = missingArtifacts.concat(missingFields);
@@ -861,6 +929,110 @@
       }
     }
     return out;
+  }
+
+  function chainFeasibilityFinal(assignments){
+    // Returns the final provider sets after the full chain executes.
+    // Shape: {providing_artifacts_chain, providing_artifacts_sequencer, providing_fields_chain, providing_fields_sequencer}
+    const synthesizedFields = ['seed','secret','env_name','challenge','flag_prefix','username_prefix','key_len','node_name'];
+    const synthesizedSet = new Set(synthesizedFields);
+    const sequencerArtifacts = ['Knowledge(ip)'];
+    const haveEffective = new Set(synthesizedFields);
+    const haveArtifactsChain = new Set();
+    const haveArtifactsSequencer = new Set(sequencerArtifacts);
+    const haveFieldsChain = new Set();
+    const haveFieldsSequencer = new Set(synthesizedFields);
+    const haveArtifacts = new Set(sequencerArtifacts);
+    const haveFields = new Set(synthesizedFields);
+    try{
+      const initOverride = normalizeFactsOverride(flowInitialFactsOverride);
+      const initArts = (initOverride && Array.isArray(initOverride.artifacts)) ? initOverride.artifacts : [];
+      const initFields = (initOverride && Array.isArray(initOverride.fields)) ? initOverride.fields : [];
+      initArts.map(String).forEach((k)=>{
+        const kk = String(k || '').trim();
+        if(!kk || isFlagFactName(kk)) return;
+        haveArtifacts.add(kk);
+        haveArtifactsChain.add(kk);
+        haveEffective.add(kk);
+        if(haveArtifactsSequencer.has(kk)) haveArtifactsSequencer.delete(kk);
+      });
+      initFields.map(String).forEach((k)=>{
+        const kk = String(k || '').trim();
+        if(!kk || isFlagFactName(kk)) return;
+        haveFields.add(kk);
+        haveFieldsChain.add(kk);
+        haveEffective.add(kk);
+        if(haveFieldsSequencer.has(kk)) haveFieldsSequencer.delete(kk);
+      });
+    } catch(e) {}
+
+    try{
+      if(Array.isArray(assignments) && assignments.length){
+        const a0 = assignments[0] || {};
+        const ri = (a0 && typeof a0.resolved_inputs === 'object' && a0.resolved_inputs && !Array.isArray(a0.resolved_inputs))
+          ? a0.resolved_inputs
+          : null;
+        if(ri){
+          Object.keys(ri).forEach((k)=>{
+            const kk = String(k || '').trim();
+            if(!kk || isFlagFactName(kk)) return;
+            if(kk.startsWith('Knowledge(') || haveArtifactsSequencer.has(kk)) return;
+            haveFields.add(kk);
+            haveFieldsChain.add(kk);
+            haveEffective.add(kk);
+            if(haveFieldsSequencer.has(kk)) haveFieldsSequencer.delete(kk);
+          });
+        }
+      }
+    } catch(e) {}
+
+    if(Array.isArray(assignments)){
+      for(let i=0;i<assignments.length;i++){
+        const a = assignments[i] || {};
+        const hasSplit = Array.isArray(a.requires) || Array.isArray(a.input_fields_required) || Array.isArray(a.input_fields);
+        if(hasSplit){
+          const reqArtifactsRaw = Array.isArray(a.requires) ? a.requires.map(String) : [];
+          const reqArtifacts = reqArtifactsRaw.filter(k => k && !synthesizedSet.has(k));
+          const reqFieldsBase = Array.isArray(a.input_fields_required)
+            ? a.input_fields_required.map(String)
+            : (Array.isArray(a.input_fields) ? a.input_fields.map(String) : []);
+          const reqFields = reqFieldsBase.concat(reqArtifactsRaw.filter(k => k && synthesizedSet.has(k)));
+          const optFields = Array.isArray(a.input_fields_optional) ? a.input_fields_optional.map(String) : [];
+          const optSet = new Set(optFields.filter(Boolean));
+          const reqArtifactsEffective = reqArtifacts.filter(k => k && !optSet.has(k));
+          reqArtifactsEffective.forEach(k => { if(k) haveArtifacts.add(k); });
+          reqFields.forEach(k => { if(k) haveFields.add(k); });
+        } else {
+          const reqEffective = Array.isArray(a.inputs) ? a.inputs.map(String) : [];
+          reqEffective.forEach(k => { if(k) haveEffective.add(k); });
+        }
+
+        const provEffective = Array.isArray(a.outputs) ? a.outputs.map(String) : [];
+        provEffective.forEach(k => { if(k) haveEffective.add(k); });
+
+        if(Array.isArray(a.produces)){
+          a.produces.map(String).forEach(k => {
+            if(!k) return;
+            haveArtifacts.add(k);
+            haveArtifactsChain.add(k);
+          });
+        }
+        if(Array.isArray(a.output_fields)){
+          a.output_fields.map(String).forEach(k => {
+            if(!k) return;
+            haveFields.add(k);
+            haveFieldsChain.add(k);
+          });
+        }
+      }
+    }
+
+    return {
+      providing_artifacts_chain: Array.from(haveArtifactsChain),
+      providing_artifacts_sequencer: Array.from(haveArtifactsSequencer),
+      providing_fields_chain: Array.from(haveFieldsChain),
+      providing_fields_sequencer: Array.from(haveFieldsSequencer),
+    };
   }
 
   function renderChainEditor(){
@@ -2370,36 +2542,32 @@
         const h1 = (faLast && typeof faLast.hint === 'string') ? String(faLast.hint).trim() : '';
         goalHints = hlist.length ? hlist : (h1 ? [h1] : []);
         goalHints = goalHints.map(h => _applyHintNodeIps(h, _hintNodeIpMap));
-        const ri = (faLast && typeof faLast.resolved_inputs === 'object' && faLast.resolved_inputs && !Array.isArray(faLast.resolved_inputs))
-          ? faLast.resolved_inputs
+        const ro = (faLast && typeof faLast.resolved_outputs === 'object' && faLast.resolved_outputs && !Array.isArray(faLast.resolved_outputs))
+          ? faLast.resolved_outputs
           : null;
-        const stepGoal = (chainFeas && chainFeas[lastIdx]) ? chainFeas[lastIdx] : null;
-        const reqArtifacts = (faLast && Array.isArray(faLast.requires)) ? faLast.requires.map(String).filter(Boolean) : [];
-        const inReq = (faLast && Array.isArray(faLast.input_fields_required)) ? faLast.input_fields_required.map(String).filter(Boolean) : [];
-        const inOpt = (faLast && Array.isArray(faLast.input_fields_optional)) ? faLast.input_fields_optional.map(String).filter(Boolean) : [];
-        const inAll = (faLast && Array.isArray(faLast.input_fields)) ? faLast.input_fields.map(String).filter(Boolean) : [];
-        const defFields = (inReq.length || inOpt.length) ? inReq.concat(inOpt) : inAll;
-        const providedArtifactsChain = (stepGoal && Array.isArray(stepGoal.providing_artifacts_chain)) ? stepGoal.providing_artifacts_chain.map(String).filter(Boolean) : [];
-        const providedArtifactsSeq = (stepGoal && Array.isArray(stepGoal.providing_artifacts_sequencer)) ? stepGoal.providing_artifacts_sequencer.map(String).filter(Boolean) : [];
-        const missingArtifacts = (stepGoal && Array.isArray(stepGoal.missing_artifacts)) ? stepGoal.missing_artifacts.map(String).filter(Boolean) : [];
-        const providedFieldsChain = (stepGoal && Array.isArray(stepGoal.providing_fields_chain)) ? stepGoal.providing_fields_chain.map(String).filter(Boolean) : [];
-        const providedFieldsSeq = (stepGoal && Array.isArray(stepGoal.providing_fields_sequencer)) ? stepGoal.providing_fields_sequencer.map(String).filter(Boolean) : [];
-        const missingFields = (stepGoal && Array.isArray(stepGoal.missing_fields)) ? stepGoal.missing_fields.map(String).filter(Boolean) : [];
+        const finalFeas = chainFeasibilityFinal(currentFlagAssignments);
+        const goalArtifactsEffective = goalOverride ? goalOverride.artifacts : goalArtifacts;
+        const goalFieldsEffective = goalOverride ? goalOverride.fields : goalFields;
+        const reqArtifacts = Array.isArray(goalArtifactsEffective) ? goalArtifactsEffective.map(String).filter(Boolean) : [];
+        const defFields = Array.isArray(goalFieldsEffective) ? goalFieldsEffective.map(String).filter(Boolean) : [];
+        const providedArtifactsChain = (finalFeas && Array.isArray(finalFeas.providing_artifacts_chain)) ? finalFeas.providing_artifacts_chain.map(String).filter(Boolean) : [];
+        const providedArtifactsSeq = (finalFeas && Array.isArray(finalFeas.providing_artifacts_sequencer)) ? finalFeas.providing_artifacts_sequencer.map(String).filter(Boolean) : [];
+        const providedFieldsChain = (finalFeas && Array.isArray(finalFeas.providing_fields_chain)) ? finalFeas.providing_fields_chain.map(String).filter(Boolean) : [];
+        const providedFieldsSeq = (finalFeas && Array.isArray(finalFeas.providing_fields_sequencer)) ? finalFeas.providing_fields_sequencer.map(String).filter(Boolean) : [];
 
         const rows = [];
         const reqArtifactSet = new Set(reqArtifacts);
         const provArtChainSet = new Set(providedArtifactsChain);
         const provArtSeqSet = new Set(providedArtifactsSeq);
-        const missArtSet = new Set(missingArtifacts);
         reqArtifacts.map(String).filter(Boolean).sort().forEach((name)=>{
           const n = String(name || '').trim();
           if(!n || isFlagFactName(n)) return;
           rows.push({
             name: n,
-            resolved: ri ? ri[n] : undefined,
+            resolved: ro ? ro[n] : undefined,
             fromChain: provArtChainSet.has(n),
             fromSeq: provArtSeqSet.has(n),
-            missing: missArtSet.has(n),
+            missing: !(provArtChainSet.has(n) || provArtSeqSet.has(n)),
             required: reqArtifactSet.has(n),
           });
         });
@@ -2410,20 +2578,18 @@
             Object.keys(ri).forEach(k => { if(String(k || '').trim()) fieldNameSet.add(String(k).trim()); });
           }
         } catch(e) {}
-        const reqFieldSet = new Set(inReq.map(String).filter(Boolean));
         const provFldChainSet = new Set(providedFieldsChain);
         const provFldSeqSet = new Set(providedFieldsSeq);
-        const missFldSet = new Set(missingFields);
         Array.from(fieldNameSet).sort().forEach((name)=>{
           const n = String(name || '').trim();
           if(!n || isFlagFactName(n)) return;
           rows.push({
             name: n,
-            resolved: ri ? ri[n] : undefined,
+            resolved: ro ? ro[n] : undefined,
             fromChain: provFldChainSet.has(n),
             fromSeq: provFldSeqSet.has(n),
-            missing: missFldSet.has(n),
-            required: reqFieldSet.has(n),
+            missing: !(provFldChainSet.has(n) || provFldSeqSet.has(n)),
+            required: true,
           });
         });
         goalInputs = rows;
@@ -4167,6 +4333,7 @@
           currentFlagAssignments = next;
         }
         if(res && res.flow_plan_path) lastFlowPlanPath = String(res.flow_plan_path);
+        try { persistFlowState(); } catch(e) {}
         updateMeta();
         renderChainEditor();
         return res;
@@ -4695,6 +4862,7 @@
           currentFlagAssignments = next;
         }
         if(res && res.flow_plan_path) lastFlowPlanPath = String(res.flow_plan_path);
+        try { persistFlowState(); } catch(e) {}
         renderChainEditor();
         try { if(typeof inputsDialogEl.close === 'function') inputsDialogEl.close(); } catch(e) {}
       } finally {
@@ -5634,7 +5802,7 @@
     }
 
     const buildAttackflowPreviewUrl = (p) => '/api/flag-sequencing/attackflow_preview?' + (p ? p.toString() : params.toString());
-    if(afbDownloadLink) afbDownloadLink.href = '#';
+    if(downloadAfbLink) downloadAfbLink.href = '#';
 
     setStatus('Generating…', false);
     setLoginLinkVisible(false);
@@ -6310,8 +6478,8 @@
   // Handlers for Save/Preview are registered above.
   if(downloadXmlEl) downloadXmlEl.addEventListener('click', (e)=>{ e.preventDefault(); downloadXml(); });
 
-  if(afbDownloadLink){
-    afbDownloadLink.addEventListener('click', async (e)=>{
+  if(downloadAfbLink){
+    downloadAfbLink.addEventListener('click', async (e)=>{
       try{
         e.preventDefault();
         if(!Array.isArray(currentChain) || currentChain.length === 0){
@@ -6334,6 +6502,124 @@
         const norm = normalizeScenarioNorm(scenario).replace(/\s+/g,'_') || 'scenario';
         const fname = 'attackflow_builder_' + norm + '_' + String(Array.isArray(currentChain)?currentChain.length:0) + '.afb';
         const blob = new Blob([JSON.stringify(afb, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(()=>URL.revokeObjectURL(url), 1000);
+        setStatus('Ready.', false);
+      } catch(err){
+        setStatus(String(err && err.message || err), true);
+      }
+    });
+  }
+
+  if(downloadAttackGraphJsonLink){
+    downloadAttackGraphJsonLink.addEventListener('click', async (e)=>{
+      try{
+        e.preventDefault();
+        if(!Array.isArray(currentChain) || currentChain.length === 0){
+          setStatus('Nothing to download yet (generate first).', true);
+          return;
+        }
+
+        // Keep UI validity state in sync before exporting.
+        try{ await refreshAssignmentsFromChain(); } catch(err) {}
+
+        setStatus('Building attack graph…', false);
+        const data = await postJson('/api/flag-sequencing/afb_from_chain', { scenario: activeScenario, chain: currentChain });
+        setFlowValidityFromPayload(data);
+        const graph = data && data.attack_graph ? data.attack_graph : null;
+        if(!graph){
+          setStatus('No attack graph returned by server.', true);
+          return;
+        }
+        const scenario = (scenarioEl && scenarioEl.value || activeScenario || 'scenario').toString().trim();
+        const norm = normalizeScenarioNorm(scenario).replace(/\s+/g,'_') || 'scenario';
+        const fname = 'attack_graph_' + norm + '_' + String(Array.isArray(currentChain)?currentChain.length:0) + '.json';
+        const blob = new Blob([JSON.stringify(graph, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(()=>URL.revokeObjectURL(url), 1000);
+        setStatus('Ready.', false);
+      } catch(err){
+        setStatus(String(err && err.message || err), true);
+      }
+    });
+  }
+
+  if(downloadAttackGraphDotLink){
+    downloadAttackGraphDotLink.addEventListener('click', async (e)=>{
+      try{
+        e.preventDefault();
+        if(!Array.isArray(currentChain) || currentChain.length === 0){
+          setStatus('Nothing to download yet (generate first).', true);
+          return;
+        }
+
+        // Keep UI validity state in sync before exporting.
+        try{ await refreshAssignmentsFromChain(); } catch(err) {}
+
+        setStatus('Building attack graph (.dot)…', false);
+        const data = await postJson('/api/flag-sequencing/afb_from_chain', { scenario: activeScenario, chain: currentChain });
+        setFlowValidityFromPayload(data);
+        const dot = data && data.attack_graph_dot ? String(data.attack_graph_dot) : '';
+        if(!dot){
+          setStatus('No attack graph .dot returned by server.', true);
+          return;
+        }
+        const scenario = (scenarioEl && scenarioEl.value || activeScenario || 'scenario').toString().trim();
+        const norm = normalizeScenarioNorm(scenario).replace(/\s+/g,'_') || 'scenario';
+        const fname = 'attack_graph_' + norm + '_' + String(Array.isArray(currentChain)?currentChain.length:0) + '.dot';
+        const blob = new Blob([dot], { type: 'text/vnd.graphviz' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(()=>URL.revokeObjectURL(url), 1000);
+        setStatus('Ready.', false);
+      } catch(err){
+        setStatus(String(err && err.message || err), true);
+      }
+    });
+  }
+
+  if(downloadAttackGraphPdfLink){
+    downloadAttackGraphPdfLink.addEventListener('click', async (e)=>{
+      try{
+        e.preventDefault();
+        if(!Array.isArray(currentChain) || currentChain.length === 0){
+          setStatus('Nothing to download yet (generate first).', true);
+          return;
+        }
+
+        // Keep UI validity state in sync before exporting.
+        try{ await refreshAssignmentsFromChain(); } catch(err) {}
+
+        setStatus('Building attack graph (.pdf)…', false);
+        const data = await postJson('/api/flag-sequencing/afb_from_chain', { scenario: activeScenario, chain: currentChain });
+        setFlowValidityFromPayload(data);
+        const b64 = data && data.attack_graph_pdf_base64 ? String(data.attack_graph_pdf_base64) : '';
+        if(!b64){
+          setStatus('Attack graph PDF unavailable (Graphviz not installed).', true);
+          return;
+        }
+        const scenario = (scenarioEl && scenarioEl.value || activeScenario || 'scenario').toString().trim();
+        const norm = normalizeScenarioNorm(scenario).replace(/\s+/g,'_') || 'scenario';
+        const fname = 'attack_graph_' + norm + '_' + String(Array.isArray(currentChain)?currentChain.length:0) + '.pdf';
+        const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        const blob = new Blob([bin], { type: 'application/pdf' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;

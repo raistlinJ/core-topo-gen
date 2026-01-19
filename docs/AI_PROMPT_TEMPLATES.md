@@ -30,7 +30,7 @@ Tell the AI these are strict requirements:
 {
   "generator_id": "<SOME STABLE STRING>",
   "outputs": {
-    "flag": "FLAG{...}",
+    "Flag(flag_id)": "FLAG{...}",
     "<other_artifact_keys>": "..."
   }
 }
@@ -40,6 +40,7 @@ Tell the AI these are strict requirements:
   - If you are using a legacy v3 JSON catalog, set `generator_id` to the catalog `plugin_id`.
   - If you are using `manifest.yaml` / Generator Packs, the Web UI assigns a *new numeric installed ID* at install time, so don’t hardcode the installed ID into your generator; using your source manifest `id` is acceptable.
 - Outputs should be **deterministic** for the same inputs.
+- `outputs.json.outputs` must always include `Flag(flag_id)` (required by schema).
 - `hint.txt` is optional. Prefer `hint_templates` in the catalog; only write `/outputs/hint.txt` if you explicitly need a standalone hint file.
 - Treat Flow-synthesized values as **inputs**, not artifacts:
   - Never put `seed`, `secret`, `node_name`, `flag_prefix` into artifact inputs (aka `requires`).

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import base64
 import hashlib
 import sys
 import re
@@ -89,6 +90,287 @@ def _write_sse_marker(log_handle, event: str, payload) -> None:
         log_handle.write(f"{_SSE_MARKER_PREFIX} {safe_event} {data}\n")
     except Exception:
         return
+
+
+def _attack_graph_for_chain(
+    *,
+    chain_nodes: list[dict[str, Any]],
+    scenario_label: str,
+    flag_assignments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build a simple attack-graph JSON for a linear chain.
+
+    Format (v1):
+    {
+      "schema_version": 1,
+      "scenario": "...",
+      "nodes": [{"id","label","type","is_vuln","ipv4","generator":{...}}],
+      "edges": [{"source","target","artifacts"}]
+    }
+    """
+    assignment_by_node_id: dict[str, dict[str, Any]] = {}
+    try:
+        for fa in (flag_assignments or []):
+            if not isinstance(fa, dict):
+                continue
+            nid = str(fa.get('node_id') or '').strip()
+            if nid and nid not in assignment_by_node_id:
+                assignment_by_node_id[nid] = fa
+    except Exception:
+        assignment_by_node_id = {}
+
+    nodes_out: list[dict[str, Any]] = []
+    edges_out: list[dict[str, Any]] = []
+
+    def _node_ipv4(n: dict[str, Any]) -> str:
+        try:
+            return _first_valid_ipv4(n.get('ipv4') or n.get('ip4') or n.get('ip') or '')
+        except Exception:
+            return ''
+
+    def _outputs_for_assignment(a: dict[str, Any] | None) -> list[str]:
+        if not isinstance(a, dict):
+            return []
+        out: list[str] = []
+        try:
+            outs = a.get('outputs')
+            if isinstance(outs, list):
+                out.extend([str(x or '').strip() for x in outs if str(x or '').strip()])
+        except Exception:
+            pass
+        try:
+            prod = a.get('produces')
+            if isinstance(prod, list):
+                out.extend([str(x or '').strip() for x in prod if str(x or '').strip()])
+        except Exception:
+            pass
+        try:
+            fields = a.get('output_fields')
+            if isinstance(fields, list):
+                out.extend([str(x or '').strip() for x in fields if str(x or '').strip()])
+        except Exception:
+            pass
+        # De-dupe
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for k in out:
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            uniq.append(k)
+        return uniq
+
+    def _resolved_map(a: dict[str, Any] | None, key: str) -> dict[str, Any]:
+        if not isinstance(a, dict):
+            return {}
+        try:
+            val = a.get(key)
+            return val if isinstance(val, dict) else {}
+        except Exception:
+            return {}
+
+    def _resolved_kv_list(resolved_map: dict[str, Any]) -> list[str]:
+        items: list[str] = []
+        if not isinstance(resolved_map, dict):
+            return items
+        for k, v in resolved_map.items():
+            try:
+                if isinstance(v, str):
+                    vs = v.strip()
+                else:
+                    vs = json.dumps(v, ensure_ascii=False)
+            except Exception:
+                vs = str(v)
+            kk = str(k or '').strip()
+            if not kk:
+                continue
+            if vs:
+                items.append(f"{kk}={vs}")
+            else:
+                items.append(kk)
+        return items
+
+    for node in (chain_nodes or []):
+        if not isinstance(node, dict):
+            continue
+        nid = str(node.get('id') or '').strip()
+        if not nid:
+            continue
+        fa = assignment_by_node_id.get(nid)
+        gen = {}
+        if isinstance(fa, dict):
+            gen = {
+                'id': str(fa.get('id') or ''),
+                'name': str(fa.get('name') or ''),
+                'kind': str(fa.get('type') or ''),
+                'source': str(fa.get('flag_generator') or ''),
+                'catalog': str(fa.get('generator_catalog') or ''),
+                'resolved_inputs': _resolved_map(fa, 'resolved_inputs'),
+                'resolved_outputs': _resolved_map(fa, 'resolved_outputs'),
+                'flag_value': fa.get('flag_value'),
+            }
+        nodes_out.append({
+            'id': nid,
+            'label': str(node.get('name') or nid),
+            'type': str(node.get('type') or ''),
+            'is_vuln': bool(node.get('is_vuln')),
+            'ipv4': _node_ipv4(node) or None,
+            'generator': gen or None,
+        })
+
+    for i in range(len(chain_nodes) - 1):
+        src = chain_nodes[i]
+        tgt = chain_nodes[i + 1]
+        if not isinstance(src, dict) or not isinstance(tgt, dict):
+            continue
+        src_id = str(src.get('id') or '').strip()
+        tgt_id = str(tgt.get('id') or '').strip()
+        if not src_id or not tgt_id:
+            continue
+        fa = assignment_by_node_id.get(src_id)
+        resolved_out = _resolved_map(fa, 'resolved_outputs')
+        edges_out.append({
+            'source': src_id,
+            'target': tgt_id,
+            'artifacts': _outputs_for_assignment(fa),
+            'artifacts_resolved': resolved_out,
+            'artifacts_resolved_kv': _resolved_kv_list(resolved_out),
+        })
+
+    return {
+        'schema_version': 1,
+        'scenario': str(scenario_label or ''),
+        'nodes': nodes_out,
+        'edges': edges_out,
+    }
+
+
+def _attack_graph_dot(attack_graph: dict[str, Any]) -> str:
+    """Return a Graphviz DOT representation of the attack graph."""
+    nodes = attack_graph.get('nodes') if isinstance(attack_graph, dict) else None
+    edges = attack_graph.get('edges') if isinstance(attack_graph, dict) else None
+    if not isinstance(nodes, list):
+        nodes = []
+    if not isinstance(edges, list):
+        edges = []
+
+    def _esc(text: Any) -> str:
+        s = str(text or '')
+        s = s.replace('"', '\\"')
+        s = s.replace('\n', '\\n')
+        return s
+
+    lines: list[str] = ['digraph attack_graph {']
+    lines.append('  rankdir=LR;')
+    lines.append('  node [shape=box, fontsize=10];')
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get('id') or '').strip()
+        if not nid:
+            continue
+        label = str(n.get('label') or nid)
+        gen = n.get('generator') if isinstance(n.get('generator'), dict) else None
+        gen_name = str((gen or {}).get('name') or '').strip()
+        gen_kind = str((gen or {}).get('kind') or '').strip()
+        ip = str(n.get('ipv4') or '').strip()
+        parts = [label]
+        if ip:
+            parts.append(f"@ {ip}")
+        if gen_name or gen_kind:
+            gline = gen_name if gen_name else ''
+            if gen_kind:
+                gline = f"{gline} [{gen_kind}]" if gline else f"[{gen_kind}]"
+            parts.append(gline)
+        try:
+            rin = (gen or {}).get('resolved_inputs') if isinstance(gen, dict) else None
+            if isinstance(rin, dict) and rin:
+                items = []
+                for k, v in list(rin.items())[:3]:
+                    try:
+                        vs = v.strip() if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+                    except Exception:
+                        vs = str(v)
+                    kk = str(k or '').strip()
+                    if kk:
+                        items.append(f"{kk}={vs}" if vs else kk)
+                if items:
+                    parts.append("in: " + ", ".join(items))
+        except Exception:
+            pass
+        try:
+            rout = (gen or {}).get('resolved_outputs') if isinstance(gen, dict) else None
+            if isinstance(rout, dict) and rout:
+                items = []
+                for k, v in list(rout.items())[:3]:
+                    try:
+                        vs = v.strip() if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+                    except Exception:
+                        vs = str(v)
+                    kk = str(k or '').strip()
+                    if kk:
+                        items.append(f"{kk}={vs}" if vs else kk)
+                if items:
+                    parts.append("out: " + ", ".join(items))
+        except Exception:
+            pass
+        node_label = "\\n".join([p for p in parts if p])
+        lines.append(f"  \"{_esc(nid)}\" [label=\"{_esc(node_label)}\"];" )
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        src = str(e.get('source') or '').strip()
+        tgt = str(e.get('target') or '').strip()
+        if not src or not tgt:
+            continue
+        artifacts = e.get('artifacts') if isinstance(e.get('artifacts'), list) else []
+        resolved_kv = e.get('artifacts_resolved_kv') if isinstance(e.get('artifacts_resolved_kv'), list) else []
+        label = ""
+        try:
+            items = [str(x or '').strip() for x in artifacts if str(x or '').strip()]
+            items = items + [str(x or '').strip() for x in resolved_kv if str(x or '').strip()]
+            if items:
+                label = "\\n".join(items[:6])
+                if len(items) > 6:
+                    label = label + "\\n..."
+        except Exception:
+            label = ""
+        if label:
+            lines.append(f"  \"{_esc(src)}\" -> \"{_esc(tgt)}\" [label=\"{_esc(label)}\"];" )
+        else:
+            lines.append(f"  \"{_esc(src)}\" -> \"{_esc(tgt)}\";" )
+    lines.append('}')
+    return "\n".join(lines)
+
+
+def _attack_graph_pdf_base64(dot_text: str) -> str | None:
+    """Return base64-encoded PDF for a DOT string, or None if unavailable."""
+    try:
+        if not dot_text.strip():
+            return None
+    except Exception:
+        return None
+    try:
+        if not shutil.which('dot'):
+            return None
+    except Exception:
+        return None
+    try:
+        proc = subprocess.run(
+            ['dot', '-Tpdf'],
+            input=dot_text.encode('utf-8'),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return None
+        if not proc.stdout:
+            return None
+        return base64.b64encode(proc.stdout).decode('ascii')
+    except Exception:
+        return None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -8127,11 +8409,82 @@ def _attack_flow_builder_afb_for_chain(
                     desc_lines.append('')
                 desc_lines.append(f"Flag: {flag_val}")
 
+            try:
+                rin = (fa or {}).get('resolved_inputs')
+                if isinstance(rin, dict) and rin:
+                    items = []
+                    for k, v in list(rin.items())[:6]:
+                        try:
+                            vs = v.strip() if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+                        except Exception:
+                            vs = str(v)
+                        kk = str(k or '').strip()
+                        if kk:
+                            items.append(f"{kk}={vs}" if vs else kk)
+                    if items:
+                        if desc_lines:
+                            desc_lines.append('')
+                        desc_lines.append("Resolved inputs: " + ", ".join(items))
+            except Exception:
+                pass
+            try:
+                rout = (fa or {}).get('resolved_outputs')
+                if isinstance(rout, dict) and rout:
+                    items = []
+                    for k, v in list(rout.items())[:6]:
+                        try:
+                            vs = v.strip() if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+                        except Exception:
+                            vs = str(v)
+                        kk = str(k or '').strip()
+                        if kk:
+                            items.append(f"{kk}={vs}" if vs else kk)
+                    if items:
+                        if desc_lines:
+                            desc_lines.append('')
+                        desc_lines.append("Resolved outputs: " + ", ".join(items))
+            except Exception:
+                pass
+
         # Preload resolved output values for asset descriptions (best-effort).
         try:
             outputs_map = _flow_read_outputs_map_from_artifacts_dir(artifacts_dir) if artifacts_dir else {}
         except Exception:
             outputs_map = {}
+        def _asset_description_for_key(key: str) -> str:
+            k = str(key or '').strip()
+            if not k:
+                return ''
+            resolved_val = None
+            try:
+                if isinstance(outputs_map, dict):
+                    if k in outputs_map:
+                        resolved_val = outputs_map.get(k)
+                    elif k == 'artifact.flag' and ('Flag(flag_id)' in outputs_map or 'flag' in outputs_map):
+                        resolved_val = outputs_map.get('Flag(flag_id)') or outputs_map.get('flag')
+            except Exception:
+                resolved_val = None
+            if resolved_val is None:
+                try:
+                    if isinstance(fa, dict):
+                        ro = fa.get('resolved_outputs') if isinstance(fa.get('resolved_outputs'), dict) else None
+                        if isinstance(ro, dict):
+                            if k in ro:
+                                resolved_val = ro.get(k)
+                            elif k == 'artifact.flag' and ('Flag(flag_id)' in ro or 'flag' in ro):
+                                resolved_val = ro.get('Flag(flag_id)') or ro.get('flag')
+                except Exception:
+                    resolved_val = None
+            if resolved_val is not None:
+                try:
+                    if isinstance(resolved_val, str):
+                        txt = resolved_val.strip()
+                    else:
+                        txt = json.dumps(resolved_val, ensure_ascii=False)
+                except Exception:
+                    txt = str(resolved_val)
+                return txt[:4096] if txt else ''
+            return f"Provided output: {k}"
         if not desc_lines:
             desc_lines = [f"Capture the flag on node '{node_name}'."]
 
@@ -8346,6 +8699,15 @@ def _attack_flow_builder_afb_for_chain(
                 objects.append(art_left_anchor_obj)
                 objects.append(art_right_anchor_obj)
 
+                inject_desc = 'Injected into container'
+                try:
+                    if '->' in inj_path:
+                        _left, _right = inj_path.split('->', 1)
+                        dest = str(_right or '').strip()
+                        if dest:
+                            inject_desc = f"Injected into {dest}"
+                except Exception:
+                    pass
                 objects.append({
                     # Attack Flow Builder supports STIX cyber-observable style nodes;
                     # represent injected files as explicit artifacts.
@@ -8353,7 +8715,7 @@ def _attack_flow_builder_afb_for_chain(
                     'instance': art_instance,
                     'properties': [
                         ['name', inj_path],
-                        ['description', 'Injected into container'],
+                        ['description', inject_desc],
                     ],
                     'anchors': {
                         '180': art_left_anchor_instance,
@@ -8440,7 +8802,7 @@ def _attack_flow_builder_afb_for_chain(
                     'instance': asset_instance,
                     'properties': [
                         ['name', out_key],
-                        ['description', ''],
+                        ['description', _asset_description_for_key(out_key)],
                     ],
                     'anchors': {
                         '180': asset_left_anchor_instance,
@@ -15613,6 +15975,13 @@ def api_flow_afb_from_chain():
         scenario_label=scenario_label or scenario_norm,
         flag_assignments=flag_assignments,
     )
+    attack_graph = _attack_graph_for_chain(
+        chain_nodes=chain_nodes,
+        scenario_label=scenario_label or scenario_norm,
+        flag_assignments=flag_assignments,
+    )
+    attack_graph_dot = _attack_graph_dot(attack_graph)
+    attack_graph_pdf_base64 = _attack_graph_pdf_base64(attack_graph_dot or '')
     return jsonify({
         'ok': True,
         'scenario': scenario_label or scenario_norm,
@@ -15620,6 +15989,9 @@ def api_flow_afb_from_chain():
         'chain': chain_nodes,
         'flag_assignments': flag_assignments,
         'afb': afb,
+        'attack_graph': attack_graph,
+        'attack_graph_dot': attack_graph_dot,
+        'attack_graph_pdf_base64': attack_graph_pdf_base64,
         'flow_valid': bool(flow_valid),
         'flow_errors': list(flow_errors or []),
         'flags_enabled': bool(flags_enabled),
