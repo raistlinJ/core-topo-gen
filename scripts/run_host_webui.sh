@@ -16,8 +16,8 @@ choose_python() {
     if ! command -v "$cmd" >/dev/null 2>&1; then
       continue
     fi
-    # Prefer an interpreter that can actually start the Web UI.
-    if "$cmd" -c 'import flask' >/dev/null 2>&1; then
+    # Prefer an interpreter that can actually start the Web UI and render Markdown.
+    if "$cmd" -c 'import flask, markdown, bleach' >/dev/null 2>&1; then
       echo "$cmd"; return 0
     fi
   done

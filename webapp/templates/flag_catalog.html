@@ -426,7 +426,7 @@
     genTestState.testBase = '/flag_generators_test';
     genTestState.savedUploads = {};
     clearTestLog();
-    setOutputsHtml('');
+    setOutputsHtml('<div class="text-muted">Waiting… press Run button.</div>');
     setOutputsStatus(false);
     const btn = document.getElementById('genTestRunBtn');
     if (btn) btn.disabled = false;
@@ -1210,7 +1210,7 @@
     document.getElementById('genTestInputs').innerHTML = inputsHtml;
 
     clearTestLog();
-    setOutputsHtml('');
+    setOutputsHtml('<div class="text-muted">Waiting… press Run button.</div>');
     setOutputsStatus(false);
 
     const btn = document.getElementById('genTestRunBtn');

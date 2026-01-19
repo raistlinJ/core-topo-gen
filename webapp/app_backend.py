@@ -8434,6 +8434,12 @@ def _attack_flow_builder_afb_for_chain(
     # Keep references to anchor export dicts so we can append latch instances.
     anchor_obj_by_instance: dict[str, dict[str, Any]] = {}
 
+    # Active vulnerability catalog label (used as Source in AFB vuln nodes).
+    try:
+        active_vuln_pack_label = _active_vuln_catalog_label()
+    except Exception:
+        active_vuln_pack_label = ''
+
     # Create one action node per chain step.
     for idx, node in enumerate(chain_nodes, start=1):
         node_id = str(node.get('id') or '').strip()
@@ -8571,11 +8577,11 @@ def _attack_flow_builder_afb_for_chain(
 
         description = "\n".join([x for x in desc_lines if x is not None])
 
-        # Action title: "<flag-*generator name>: <node-name>"
+        # Action title: "Find Flag -- <flag-*generator name>: <node-name>"
         gen_label = (gen_name or gen_id or '').strip()
         if not gen_label:
             gen_label = 'Unassigned generator'
-        action_title = f"{gen_label}: {node_name}"
+        action_title = f"Find Flag -- {gen_label}: {node_name}"
 
         action_instance = _new_uuid()
         flow_children.append(action_instance)
@@ -8604,7 +8610,10 @@ def _attack_flow_builder_afb_for_chain(
         objects.append(left_anchor_obj)
         objects.append(right_anchor_obj)
 
-        action_node_id = 'vulnerability' if bool(node.get('is_vuln')) else 'action'
+        # Lay actions top-to-bottom.
+        action_y = int(action_y_cursor)
+
+        action_node_id = 'action'
         objects.append({
             'id': action_node_id,
             'instance': action_instance,
@@ -8628,8 +8637,142 @@ def _attack_flow_builder_afb_for_chain(
             },
         })
 
-        # Lay actions top-to-bottom.
-        action_y = int(action_y_cursor)
+        # If this is a vulnerability node, attach an explicit Vulnerability node
+        # with the vuln name and source details.
+        is_vuln_node = False
+        try:
+            is_vuln_node = _flow_node_is_vuln(node)
+        except Exception:
+            is_vuln_node = bool(node.get('is_vuln')) or bool(node.get('vulnerabilities'))
+        if is_vuln_node:
+            vuln_name = ''
+            vuln_source = ''
+            try:
+                vulns = node.get('vulnerabilities')
+                if isinstance(vulns, list) and vulns:
+                    for v in vulns:
+                        if isinstance(v, dict):
+                            if not vuln_name:
+                                for key in ('name', 'title', 'id', 'vuln', 'cve', 'cve_id', 'slug'):
+                                    vv = str(v.get(key) or '').strip()
+                                    if vv:
+                                        vuln_name = vv
+                                        break
+                            if not vuln_source:
+                                for key in ('source', 'provider', 'catalog', 'origin', 'repo', 'repository', 'dataset', 'url'):
+                                    ss = str(v.get(key) or '').strip()
+                                    if ss:
+                                        vuln_source = ss
+                                        break
+                        elif isinstance(v, str) and v.strip() and not vuln_name:
+                            vuln_name = v.strip()
+                        if vuln_name and vuln_source:
+                            break
+            except Exception:
+                pass
+            if not vuln_name:
+                try:
+                    for key in ('vulnerability_name', 'vuln_name', 'vulnerability', 'vuln', 'cve', 'cve_id'):
+                        vv = str(node.get(key) or '').strip()
+                        if vv:
+                            vuln_name = vv
+                            break
+                except Exception:
+                    pass
+            if not vuln_source:
+                try:
+                    for key in ('vulnerability_source', 'vuln_source', 'source', 'provider', 'catalog'):
+                        ss = str(node.get(key) or '').strip()
+                        if ss:
+                            vuln_source = ss
+                            break
+                except Exception:
+                    pass
+            if (not vuln_source) and active_vuln_pack_label:
+                vuln_source = active_vuln_pack_label
+            if not vuln_name:
+                vuln_name = 'Vulnerability'
+            if not vuln_source:
+                vuln_source = 'unknown'
+
+            vuln_instance = _new_uuid()
+            flow_children.append(vuln_instance)
+
+            vuln_left_anchor_instance = _new_uuid()
+            vuln_right_anchor_instance = _new_uuid()
+            vuln_left_anchor_obj = {
+                'id': 'horizontal_anchor',
+                'instance': vuln_left_anchor_instance,
+                'latches': [],
+            }
+            vuln_right_anchor_obj = {
+                'id': 'horizontal_anchor',
+                'instance': vuln_right_anchor_instance,
+                'latches': [],
+            }
+            anchor_obj_by_instance[vuln_left_anchor_instance] = vuln_left_anchor_obj
+            anchor_obj_by_instance[vuln_right_anchor_instance] = vuln_right_anchor_obj
+            objects.append(vuln_left_anchor_obj)
+            objects.append(vuln_right_anchor_obj)
+
+            objects.append({
+                'id': 'vulnerability',
+                'instance': vuln_instance,
+                'properties': [
+                    ['name', vuln_name],
+                    ['description', f"Source: {vuln_source}"],
+                ],
+                'anchors': {
+                    '180': vuln_left_anchor_instance,
+                    '0': vuln_right_anchor_instance,
+                },
+            })
+
+            # Place to the left of the action, slightly above.
+            layout[vuln_instance] = [int(action_x) - side_x_offset, int(action_y) - 60]
+
+            # Connect vulnerability -> action.
+            src_anchor = vuln_right_anchor_instance
+            trg_anchor = action_left_anchor.get(action_instance)
+            if src_anchor and trg_anchor:
+                line_instance = _new_uuid()
+                src_latch_instance = _new_uuid()
+                trg_latch_instance = _new_uuid()
+                handle_instance = _new_uuid()
+
+                try:
+                    anchor_obj_by_instance[src_anchor]['latches'].append(src_latch_instance)
+                except Exception:
+                    pass
+                try:
+                    anchor_obj_by_instance[trg_anchor]['latches'].append(trg_latch_instance)
+                except Exception:
+                    pass
+
+                objects.append({'id': 'generic_latch', 'instance': src_latch_instance})
+                objects.append({'id': 'generic_latch', 'instance': trg_latch_instance})
+                objects.append({'id': 'generic_handle', 'instance': handle_instance})
+
+                try:
+                    src_pos = layout.get(vuln_instance)
+                    trg_pos = layout.get(action_instance)
+                    if isinstance(src_pos, list) and len(src_pos) == 2 and isinstance(trg_pos, list) and len(trg_pos) == 2:
+                        src_x, src_y = int(src_pos[0]), int(src_pos[1])
+                        trg_x, trg_y = int(trg_pos[0]), int(trg_pos[1])
+                        layout[src_latch_instance] = [src_x + 140, src_y]
+                        layout[trg_latch_instance] = [trg_x - 140, trg_y]
+                except Exception:
+                    pass
+
+                objects.append({
+                    'id': 'dynamic_line',
+                    'instance': line_instance,
+                    'source': src_latch_instance,
+                    'target': trg_latch_instance,
+                    'handles': [handle_instance],
+                })
+                flow_children.append(line_instance)
+
         layout[action_instance] = [int(action_x), action_y]
 
         # Add an IPV4_ADDR node (if available) and connect action -> IPV4_ADDR.
@@ -16041,9 +16184,10 @@ def api_flow_afb_from_chain():
 
             preview = payload.get('full_preview') if isinstance(payload, dict) else None
             if isinstance(preview, dict):
-                # Enrich chain_nodes with resolved IPv4 (if present in preview hosts).
+                # Enrich chain_nodes with resolved IPv4 + vulnerability info (if present in preview hosts).
                 try:
                     id_to_ipv4: dict[str, str] = {}
+                    id_to_vuln: dict[str, dict[str, Any]] = {}
                     hosts = preview.get('hosts') if isinstance(preview.get('hosts'), list) else []
                     for h in hosts:
                         if not isinstance(h, dict):
@@ -16059,7 +16203,20 @@ def api_flow_afb_from_chain():
                         ip_str = _first_valid_ipv4(ip_val)
                         if ip_str:
                             id_to_ipv4[hid] = ip_str
-                    if id_to_ipv4:
+                        try:
+                            vulns = h.get('vulnerabilities') if isinstance(h.get('vulnerabilities'), list) else None
+                        except Exception:
+                            vulns = None
+                        try:
+                            is_vuln = bool(h.get('is_vuln')) or bool(h.get('is_vulnerability')) or bool(h.get('is_vulnerable')) or bool(vulns)
+                        except Exception:
+                            is_vuln = bool(vulns)
+                        if is_vuln or vulns:
+                            id_to_vuln[hid] = {
+                                'is_vuln': bool(is_vuln),
+                                'vulnerabilities': list(vulns or []),
+                            }
+                    if id_to_ipv4 or id_to_vuln:
                         for n in chain_nodes:
                             if not isinstance(n, dict):
                                 continue
@@ -16068,6 +16225,12 @@ def api_flow_afb_from_chain():
                                 continue
                             if not str(n.get('ipv4') or '').strip() and nid2 in id_to_ipv4:
                                 n['ipv4'] = id_to_ipv4[nid2]
+                            if nid2 in id_to_vuln:
+                                meta = id_to_vuln.get(nid2) or {}
+                                if 'is_vuln' not in n:
+                                    n['is_vuln'] = bool(meta.get('is_vuln'))
+                                if 'vulnerabilities' not in n and meta.get('vulnerabilities'):
+                                    n['vulnerabilities'] = list(meta.get('vulnerabilities') or [])
                 except Exception:
                     pass
                 if not flag_assignments:
@@ -33143,6 +33306,27 @@ def _vuln_catalog_pack_zip_path(catalog_id: str) -> str:
 
 def _vuln_catalog_pack_content_dir(catalog_id: str) -> str:
     return os.path.join(_vuln_catalog_pack_dir(catalog_id), 'content')
+
+
+def _active_vuln_catalog_label() -> str:
+    """Return the active vulnerability catalog pack label (best-effort)."""
+    try:
+        state = _load_vuln_catalogs_state()
+        active_id = str(state.get('active_id') or '').strip() if isinstance(state, dict) else ''
+        catalogs = state.get('catalogs') if isinstance(state, dict) else None
+        if not active_id or not isinstance(catalogs, list):
+            return ''
+        for c in catalogs:
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get('id') or '').strip()
+            if cid != active_id:
+                continue
+            label = str(c.get('label') or c.get('name') or '').strip()
+            return label or cid
+    except Exception:
+        return ''
+    return ''
 
 
 def _safe_path_under(base_dir: str, subpath: str) -> str:
