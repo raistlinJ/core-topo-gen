@@ -8013,6 +8013,12 @@ def _pick_flag_chain_nodes(nodes: list[dict[str, Any]], adj: dict[str, set[str]]
     length = max(1, min(int(length or 1), 50))
 
     id_to_node: dict[str, dict[str, Any]] = {}
+    allow_nonvuln_docker = False
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+        allow_nonvuln_docker = bool(node_gens)
+    except Exception:
+        allow_nonvuln_docker = False
     eligible_ids: list[str] = []
     for n in nodes:
         if not isinstance(n, dict):
@@ -8026,12 +8032,63 @@ def _pick_flag_chain_nodes(nodes: list[dict[str, Any]], adj: dict[str, set[str]]
         # - flag-generators may be placed on vulnerability nodes only
         # - flag-node-generators require non-vulnerability docker-role nodes (enforced elsewhere)
         is_docker = ('docker' in t) or (str(n.get('type') or '').strip().upper() == 'DOCKER')
-        is_vuln = bool(n.get('is_vuln')) or bool(n.get('vulnerabilities'))
-        if is_vuln:
+        is_vuln = _flow_node_is_vuln(n)
+        if is_vuln or (allow_nonvuln_docker and is_docker and (not is_vuln)):
             eligible_ids.append(nid)
+
+    # De-dupe eligible ids to avoid accidental repeats.
+    try:
+        eligible_ids = list(dict.fromkeys(eligible_ids))
+    except Exception:
+        pass
 
     if not eligible_ids:
         return []
+
+    # If any connected component has enough eligible nodes, pick within that component.
+    try:
+        comp_by_node: dict[str, int] = {}
+        comps: list[list[str]] = []
+        for nid in id_to_node.keys():
+            if nid in comp_by_node:
+                continue
+            comp_nodes: list[str] = []
+            q = deque([nid])
+            comp_by_node[nid] = len(comps)
+            while q:
+                cur = q.popleft()
+                comp_nodes.append(cur)
+                for nb in adj.get(cur, set()):
+                    if nb in comp_by_node:
+                        continue
+                    comp_by_node[nb] = len(comps)
+                    q.append(nb)
+            comps.append(comp_nodes)
+
+        eligible_by_comp: dict[int, list[str]] = {}
+        for nid in eligible_ids:
+            cidx = comp_by_node.get(nid)
+            if cidx is None:
+                continue
+            eligible_by_comp.setdefault(cidx, []).append(nid)
+        if eligible_by_comp:
+            best_comp = max(eligible_by_comp.items(), key=lambda kv: len(kv[1]))
+            if len(best_comp[1]) >= length:
+                try:
+                    import random as _random
+                    picks = list(best_comp[1])
+                    _random.Random().shuffle(picks)
+                except Exception:
+                    picks = list(best_comp[1])
+                chain_ids = picks[:length]
+                try:
+                    import random as _random
+                    _random.Random().shuffle(chain_ids)
+                except Exception:
+                    pass
+                return [id_to_node[nid] for nid in chain_ids if nid in id_to_node]
+    except Exception:
+        pass
 
     def bfs_farthest(start: str) -> tuple[str, dict[str, str | None]]:
         parent: dict[str, str | None] = {start: None}
@@ -8079,6 +8136,18 @@ def _pick_flag_chain_nodes(nodes: list[dict[str, Any]], adj: dict[str, set[str]]
                 if nb not in seen:
                     q.append(nb)
 
+    # If we still don't have enough, fill from remaining eligible nodes (random order).
+    if len(chain_ids) < length and len(eligible_ids) >= length:
+        try:
+            import random as _random
+            remaining = [nid for nid in eligible_ids if nid not in set(chain_ids)]
+            _random.Random().shuffle(remaining)
+        except Exception:
+            remaining = [nid for nid in eligible_ids if nid not in set(chain_ids)]
+        need = max(0, length - len(chain_ids))
+        if need:
+            chain_ids.extend(remaining[:need])
+
     chain_ids = chain_ids[:length]
     # Default ordering: randomize the sequence (user can tweak ordering in the UI).
     try:
@@ -8103,6 +8172,12 @@ def _pick_flag_chain_nodes_allow_duplicates(
     length = max(1, min(int(length or 1), 50))
 
     id_to_node: dict[str, dict[str, Any]] = {}
+    allow_nonvuln_docker = False
+    try:
+        node_gens, _ = _flag_node_generators_from_enabled_sources()
+        allow_nonvuln_docker = bool(node_gens)
+    except Exception:
+        allow_nonvuln_docker = False
     eligible_ids: list[str] = []
     for n in nodes or []:
         if not isinstance(n, dict):
@@ -8113,9 +8188,15 @@ def _pick_flag_chain_nodes_allow_duplicates(
         id_to_node[nid] = n
         t = (str(n.get('type') or '').strip().lower())
         is_docker = ('docker' in t) or (str(n.get('type') or '').strip().upper() == 'DOCKER')
-        is_vuln = bool(n.get('is_vuln')) or bool(n.get('vulnerabilities'))
-        if is_vuln:
+        is_vuln = _flow_node_is_vuln(n)
+        if is_vuln or (allow_nonvuln_docker and is_docker and (not is_vuln)):
             eligible_ids.append(nid)
+
+    # De-dupe eligible ids to avoid accidental repeats.
+    try:
+        eligible_ids = list(dict.fromkeys(eligible_ids))
+    except Exception:
+        pass
 
     if not eligible_ids:
         return []
@@ -9857,7 +9938,7 @@ def _flow_node_is_vuln(node: dict[str, Any] | None) -> bool:
     try:
         if not isinstance(node, dict):
             return False
-        return bool(node.get('is_vuln')) or bool(node.get('vulnerabilities'))
+        return bool(node.get('is_vuln')) or bool(node.get('is_vulnerability')) or bool(node.get('is_vulnerable')) or bool(node.get('vulnerabilities'))
     except Exception:
         return False
 
@@ -10740,7 +10821,7 @@ def _flow_compute_flag_assignments(
     pool_by_pos: list[list[dict[str, Any]]] = []
     for cid in chain_ids:
         node = id_to_node.get(str(cid)) or {}
-        is_vuln_node = bool(node.get('is_vuln')) or bool(node.get('vulnerabilities')) or (str(cid) in vuln_ids)
+        is_vuln_node = _flow_node_is_vuln(node) or (str(cid) in vuln_ids)
         is_docker_node = _flow_node_is_docker_role(node)
         def _eligible_for_node(g: dict[str, Any]) -> bool:
             k = str(g.get('_flow_kind') or '').strip() or 'flag-generator'
@@ -12247,7 +12328,7 @@ def api_flow_attackflow_preview():
                             t_raw = str(n.get('type') or '')
                             t = t_raw.strip().lower()
                             is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
-                            is_vuln = bool(n.get('is_vuln'))
+                            is_vuln = _flow_node_is_vuln(n)
                             if (not is_docker) and (not is_vuln):
                                 chain_nodes = []
                                 break
@@ -12524,6 +12605,7 @@ def api_flow_attackflow_preview():
         flow_valid = False
 
     flags_enabled = bool(flow_valid)
+    run_generators = bool(flags_enabled or (mode in {'resolve', 'resolve_hints', 'hint', 'hint_only'}))
 
     if len(chain_nodes) < 1:
         return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan (vulnerability nodes only for flag-generators).', 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
@@ -12599,6 +12681,7 @@ def api_flow_prepare_preview_for_execute():
     preset = str(j.get('preset') or '').strip()
     mode = str(j.get('mode') or '').strip().lower()
     best_effort = bool(j.get('best_effort')) or (mode in {'hint', 'hint_only', 'resolve_hints', 'preview'})
+    run_generators_request = bool(mode in {'resolve', 'resolve_hints', 'hint', 'hint_only'})
     allow_node_duplicates = str(j.get('allow_node_duplicates') or j.get('allow_duplicates') or '').strip().lower() in ('1', 'true', 'yes', 'y')
     total_timeout_s: int | None = None
     try:
@@ -12679,6 +12762,7 @@ def api_flow_prepare_preview_for_execute():
         return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 500
 
     # Best-effort guard: the UI expects JSON errors (avoid Flask HTML 500s).
+    warning: str | None = None
     try:
         nodes, _links, adj = _build_topology_graph_from_preview_plan(preview)
         stats = _flow_compose_docker_stats(nodes)
@@ -12827,13 +12911,15 @@ def api_flow_prepare_preview_for_execute():
             if chain_nodes:
                 try:
                     used = {str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()}
+                    reselect_chain = False
+                    reselect_reason = ''
                     for i, node in enumerate(chain_nodes):
                         if not isinstance(node, dict):
                             continue
                         t_raw = str(node.get('type') or '')
                         t = t_raw.strip().lower()
                         is_docker = ('docker' in t) or (t_raw.strip().upper() == 'DOCKER')
-                        is_vuln = bool(node.get('is_vuln'))
+                        is_vuln = _flow_node_is_vuln(node)
 
                         need_nonvuln_docker = False
                         if preset_steps and i < len(preset_steps):
@@ -12858,7 +12944,7 @@ def api_flow_prepare_preview_for_execute():
                             ct_raw = str(cand.get('type') or '')
                             ct = ct_raw.strip().lower()
                             cand_is_docker = ('docker' in ct) or (ct_raw.strip().upper() == 'DOCKER')
-                            cand_is_vuln = bool(cand.get('is_vuln')) or bool(cand.get('vulnerabilities'))
+                            cand_is_vuln = _flow_node_is_vuln(cand)
                             if need_nonvuln_docker:
                                 if not cand_is_docker:
                                     continue
@@ -12871,6 +12957,10 @@ def api_flow_prepare_preview_for_execute():
                             break
 
                         if replacement is None:
+                            if best_effort or (mode in {'resolve', 'resolve_hints', 'hint', 'hint_only', 'preview'}):
+                                reselect_chain = True
+                                reselect_reason = 'Provided chain was incompatible with placement rules; selected a new valid chain.'
+                                break
                             return jsonify({
                                 'ok': False,
                                 'error': 'Not enough eligible nodes for the provided chain. Flag-generators require vulnerability nodes; flag-node-generators require non-vulnerability docker-role nodes.',
@@ -12882,8 +12972,64 @@ def api_flow_prepare_preview_for_execute():
                             chain_nodes[i] = replacement
                             chain_ids[i] = rid
                             used.add(rid)
+
+                    if reselect_chain:
+                        if preset_steps:
+                            chain_nodes = _pick_flag_chain_nodes_for_preset(nodes, adj, steps=preset_steps)
+                        else:
+                            if allow_node_duplicates:
+                                try:
+                                    seed_val = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
+                                except Exception:
+                                    seed_val = 0
+                                chain_nodes = _pick_flag_chain_nodes_allow_duplicates(nodes, adj, length=length, seed=seed_val)
+                            else:
+                                chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
+                        if len(chain_nodes) < 1:
+                            return jsonify({
+                                'ok': False,
+                                'error': 'No eligible nodes found in preview plan (vulnerability nodes only for flag-generators).',
+                                'available': len(chain_nodes),
+                                'stats': stats,
+                            }), 422
+                        if (not allow_node_duplicates) and len(chain_nodes) < length:
+                            return jsonify({
+                                'ok': False,
+                                'error': 'Not enough eligible nodes in preview plan to build the requested chain.',
+                                'available': len(chain_nodes),
+                                'stats': stats,
+                            }), 422
+                        chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()]
+                        explicit_chain = False
+                        warning = reselect_reason or warning
                 except Exception:
                     pass
+
+            # Enforce no-duplicates when requested (even for saved chains).
+            if (not allow_node_duplicates) and chain_nodes:
+                try:
+                    seen = set()
+                    unique_nodes: list[dict[str, Any]] = []
+                    for n in chain_nodes:
+                        if not isinstance(n, dict):
+                            continue
+                        nid = str(n.get('id') or '').strip()
+                        if not nid or nid in seen:
+                            continue
+                        seen.add(nid)
+                        unique_nodes.append(n)
+                    if len(unique_nodes) != len(chain_nodes):
+                        chain_nodes = unique_nodes
+                        used_saved_chain = False
+                except Exception:
+                    pass
+
+            # If de-duping reduced length, reselect a fresh chain to fill to requested length.
+            if (not allow_node_duplicates) and len(chain_nodes) < length:
+                if preset_steps:
+                    chain_nodes = _pick_flag_chain_nodes_for_preset(nodes, adj, steps=preset_steps)
+                else:
+                    chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
             if len(chain_nodes) < 1:
                 return jsonify({'ok': False, 'error': 'Provided chain_ids did not match any nodes in the preview plan.', 'stats': stats}), 422
         else:
@@ -13031,9 +13177,10 @@ def api_flow_prepare_preview_for_execute():
         scenario_label=(scenario_label or scenario_norm),
     )
     flags_enabled = bool(flow_valid)
+    run_generators = bool(flags_enabled or run_generators_request)
 
-    # Apply Flow modifications and run generators only when the flow is valid.
-    if flags_enabled:
+    # Apply Flow modifications and run generators when requested (resolve/hint) or valid.
+    if run_generators:
         # Promote chain nodes to Docker role (flag payloads attach to Docker nodes).
         try:
             hosts = preview.get('hosts') or []
@@ -13463,7 +13610,7 @@ def api_flow_prepare_preview_for_execute():
     except Exception:
         host_by_id = {}
 
-    if flags_enabled:
+    if run_generators:
         try:
 
             # Flow has a "god-eye" view of generator outputs across the chain. As we run each
@@ -14464,6 +14611,7 @@ def api_flow_save_flow_substitutions():
     user's substitutions.
     """
     j = request.get_json(silent=True) or {}
+    warning: str | None = None
     scenario_label = str(j.get('scenario') or '').strip()
     scenario_norm = _normalize_scenario_label(scenario_label)
     if not scenario_norm:
@@ -14916,6 +15064,7 @@ def api_flow_save_flow_substitutions():
         'flow_plan_path': out_path,
         'base_preview_plan_path': base_plan_path,
         'allow_node_duplicates': bool(allow_node_duplicates),
+        **({'warning': warning} if warning else {}),
         **({'initial_facts': initial_facts_override} if initial_facts_override else {}),
         **({'goal_facts': goal_facts_override} if goal_facts_override else {}),
     })

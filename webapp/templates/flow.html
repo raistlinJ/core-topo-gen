@@ -5813,6 +5813,7 @@
     if(metaStatsEl) metaStatsEl.textContent = '';
     if(jsonEl) jsonEl.textContent = '';
 
+    let resolvedOk = false;
     try {
       if(runSavePreviewResolve){
         const scenLabel = (scenario || activeScenario || '').toString().trim();
@@ -5961,9 +5962,9 @@
                 // Using a stale flow plan can cause chain_ids to mismatch and collapse.
                 preview_plan: (lastPreviewPlanPath || ''),
                 allow_node_duplicates: !!allowDupes,
-                mode: usedBestEffort ? 'resolve' : 'hint',
-                best_effort: usedBestEffort,
-                timeout_s: usedBestEffort ? 120 : 30
+                mode: 'resolve',
+                best_effort: true,
+                timeout_s: usedBestEffort ? 120 : 60
               },
               { timeoutMs: 35000 }
             );
@@ -5993,10 +5994,11 @@
             try{
               if(prepData && Array.isArray(prepData.flag_assignments)){
                 const persistPlan = (prepData.preview_plan_path || lastPreviewPlanPath || '');
-                if(persistPlan){
+                const chainIdsResolved = (Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : chainIds);
+                if(persistPlan && chainIdsResolved.length){
                   const saveRes2 = await postJson('/api/flag-sequencing/save_flow_substitutions', {
                     scenario,
-                    chain_ids: chainIds,
+                    chain_ids: chainIdsResolved,
                     preview_plan: persistPlan,
                     flag_assignments: prepData.flag_assignments,
                     allow_node_duplicates: !!allowDupes,
@@ -6020,6 +6022,7 @@
               const diagram2 = buildMermaid(currentChain);
               await renderMermaid(diagram2);
             }
+            resolvedOk = true;
           }
         } catch(e) {
           // Non-fatal: the flow UI is still usable even if hints aren't resolved.
@@ -6029,6 +6032,36 @@
           } catch(_) {}
         }
       }
+
+      // Safety net: if Generate returned a chain but no resolved values, force one resolve pass.
+      try{
+        const hasResolved = Array.isArray(currentFlagAssignments)
+          ? currentFlagAssignments.some(a => (a && (a.resolved_inputs || a.resolved_outputs || a.hint || (Array.isArray(a.hints) && a.hints.length))))
+          : false;
+        if(usePreview && Array.isArray(currentChain) && currentChain.length && (!hasResolved || !resolvedOk)){
+          const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+          if(chainIds.length){
+            showLoading('Resolving hint values…');
+            const prepData2 = await postJson('/api/flag-sequencing/prepare_preview_for_execute', {
+              scenario,
+              length: chainIds.length,
+              preset,
+              chain_ids: chainIds,
+              preview_plan: (lastFlowPlanPath || lastPreviewPlanPath || ''),
+              allow_node_duplicates: !!allowDupes,
+              mode: 'resolve',
+              best_effort: true,
+              timeout_s: 120,
+            }, { timeoutMs: 35000 });
+            setFlowValidityFromPayload(prepData2);
+            if(prepData2 && Array.isArray(prepData2.flag_assignments)){
+              currentFlagAssignments = prepData2.flag_assignments.slice();
+              renderChainEditor();
+            }
+            resolvedOk = true;
+          }
+        }
+      } catch(e) {}
 
       setStatus('Ready.', false);
     } catch(err){
@@ -6290,8 +6323,17 @@
                 chain_ids: chainIds,
                 preview_plan: (lastFlowPlanPath || planPath),
                 allow_node_duplicates: !!allowNodeDuplicates,
+                mode: 'resolve',
+                best_effort: true,
+                timeout_s: 120,
               });
               setFlowValidityFromPayload(prepData);
+              try{
+                const newChain = (prepData && Array.isArray(prepData.chain)) ? prepData.chain.slice() : null;
+                if(newChain && newChain.length){
+                  currentChain = newChain;
+                }
+              } catch(e) {}
               if(prepData && Array.isArray(prepData.flag_assignments)){
                 currentFlagAssignments = prepData.flag_assignments.slice();
               }
@@ -6453,6 +6495,11 @@
   // Generate options dialog.
   try{
     if(generateOptionsDialogEl){
+      try{
+        if(generateNoDuplicatesEl){
+          generateNoDuplicatesEl.checked = !allowNodeDuplicates;
+        }
+      } catch(e) {}
       generateOptionsDialogEl.addEventListener('close', ()=>{
         try{
           const rv = String(generateOptionsDialogEl.returnValue || '');
