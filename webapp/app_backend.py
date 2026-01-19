@@ -12640,6 +12640,15 @@ def api_flow_prepare_preview_for_execute():
     if not base_plan_path:
         return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
 
+    initial_facts_override: dict[str, list[str]] | None = None
+    goal_facts_override: dict[str, list[str]] | None = None
+    try:
+        initial_facts_override = _flow_normalize_fact_override(j.get('initial_facts'))
+        goal_facts_override = _flow_normalize_fact_override(j.get('goal_facts'))
+    except Exception:
+        initial_facts_override = None
+        goal_facts_override = None
+
     started_at = time.monotonic()
     try:
         plan_basename = os.path.basename(base_plan_path)

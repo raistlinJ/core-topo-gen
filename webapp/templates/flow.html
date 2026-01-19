@@ -357,6 +357,7 @@
   }
 
   function rememberActiveScenario(){
+    let usedBestEffort = false;
     try {
       if (activeScenario && typeof window.coretgSetActiveScenarioForNav === 'function') {
         window.coretgSetActiveScenarioForNav(activeScenario);
@@ -5885,6 +5886,7 @@
           params2.set('best_effort', '1');
           const retryUrl = buildAttackflowPreviewUrl(params2);
           data = await fetchJson(retryUrl);
+          usedBestEffort = true;
         } else {
           throw err;
         }
@@ -5959,9 +5961,9 @@
                 // Using a stale flow plan can cause chain_ids to mismatch and collapse.
                 preview_plan: (lastPreviewPlanPath || ''),
                 allow_node_duplicates: !!allowDupes,
-                mode: 'hint',
-                best_effort: true,
-                timeout_s: 30
+                mode: usedBestEffort ? 'resolve' : 'hint',
+                best_effort: usedBestEffort,
+                timeout_s: usedBestEffort ? 120 : 30
               },
               { timeoutMs: 35000 }
             );
