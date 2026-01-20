@@ -514,6 +514,7 @@
     const flowValid = p && ('flow_valid' in p) ? !!p.flow_valid : true;
     const flagsEnabled = p && ('flags_enabled' in p) ? !!p.flags_enabled : true;
     const flowErrors = (p && Array.isArray(p.flow_errors)) ? p.flow_errors.slice() : [];
+    const flowErrorsDetail = (p && typeof p.flow_errors_detail === 'string') ? p.flow_errors_detail : '';
     lastFlowValid = flowValid;
     lastFlagsEnabled = flagsEnabled;
     lastFlowErrors = flowErrors;
@@ -533,7 +534,8 @@
     }
     const base = 'Invalid flag dependency order: execution will NOT include flags.';
     const details = flowErrors.length ? (' ' + flowErrors.join(' | ')) : '';
-    validityAlertEl.textContent = base + details;
+    const detail2 = flowErrorsDetail ? (' | ' + flowErrorsDetail) : '';
+    validityAlertEl.textContent = base + details + detail2;
     validityAlertEl.classList.remove('d-none');
   }
 
@@ -1479,10 +1481,34 @@
       let initOutputs = [];
       try{
         const faFirst = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[0]) ? currentFlagAssignments[0] : null;
-        const hlist = (faFirst && Array.isArray(faFirst.hints) && faFirst.hints.length) ? faFirst.hints : [];
-        const h1 = (faFirst && typeof faFirst.hint === 'string') ? String(faFirst.hint).trim() : '';
-        initHints = hlist.length ? hlist : (h1 ? [h1] : []);
-        initHints = initHints.map(h => _applyHintNodeIps(h, _hintNodeIpMap));
+        const firstNode = (Array.isArray(currentChain) && currentChain.length) ? currentChain[0] : null;
+        const firstName = (firstNode && firstNode.name) ? String(firstNode.name).trim() : '';
+        let firstIp = '';
+        try{
+          const ips = [];
+          const pushIps = (val) => {
+            if(!val) return;
+            if(Array.isArray(val)) { val.forEach(v => pushIps(v)); return; }
+            const s = String(val || '').trim();
+            if(!s) return;
+            s.split(',').forEach(part => { const p = String(part || '').trim(); if(p) ips.push(p); });
+          };
+          pushIps(firstNode && (firstNode.ip4 || firstNode.ipv4 || firstNode.ip || firstNode.address));
+          pushIps(firstNode && firstNode.ips);
+          pushIps(firstNode && firstNode.addresses);
+          pushIps(firstNode && firstNode.ipv4s);
+          const ifaces = firstNode && Array.isArray(firstNode.interfaces) ? firstNode.interfaces : [];
+          ifaces.forEach(iface => { if(iface && typeof iface === 'object') pushIps(iface.ip4 || iface.ipv4 || iface.ip || iface.address); });
+          const uniq = Array.from(new Set(ips));
+          if(uniq.length) firstIp = uniq.join(', ');
+        } catch(e) {}
+        if(!firstIp && firstName && _hintNodeIpMap && _hintNodeIpMap.get(firstName)) firstIp = _hintNodeIpMap.get(firstName);
+        if(firstName){
+          const suffix = firstIp ? (' @ ' + firstIp) : '';
+          initHints = [`Start: ${firstName}${suffix}`];
+        } else {
+          initHints = [];
+        }
         const ri = (faFirst && typeof faFirst.resolved_inputs === 'object' && faFirst.resolved_inputs && !Array.isArray(faFirst.resolved_inputs))
           ? faFirst.resolved_inputs
           : null;
@@ -2585,6 +2611,8 @@
           });
         });
         goalInputs = rows;
+        // Do not reuse generator hints for Goal Facts.
+        goalHints = [];
       } catch(e) { goalHints = []; }
       renderFactSummaryRow({
         seq: 'Goal',
@@ -6193,36 +6221,6 @@
         throw new Error('Failed to persist preview plan');
       }
 
-      // Persist the current chain into a flow-modified plan immediately.
-      const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
-      const chainIds = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
-      if(chainIds.length){
-        setStatus('Saving Flag Sequencing…', false);
-        showLoading('Saving Flag Sequencing…');
-        const saveRes = await window.coretgPostJson('/api/flag-sequencing/save_flow_substitutions', {
-          scenario,
-          chain_ids: chainIds,
-          preview_plan: previewPlan,
-          flag_assignments: buildPersistAssignments(chainIds),
-          allow_node_duplicates: !!allowNodeDuplicates,
-          initial_facts: flowInitialFactsOverride,
-          goal_facts: flowGoalFactsOverride,
-        });
-        try {
-          if(saveRes && saveRes.flow_plan_path) lastFlowPlanPath = String(saveRes.flow_plan_path);
-          if(saveRes && Array.isArray(saveRes.flag_assignments)) currentFlagAssignments = saveRes.flag_assignments.slice();
-        } catch(e) {}
-
-        await window.coretgPostJson('/api/flag-sequencing/prepare_preview_for_execute', {
-          scenario,
-          preset,
-          length: chainIds.length,
-          chain_ids: chainIds,
-          preview_plan: (lastFlowPlanPath || previewPlan),
-          allow_node_duplicates: !!allowNodeDuplicates,
-        });
-      }
-
       // Navigate to Preview tab.
       const baseUrl = String(document.getElementById('scenariosPreviewTabLink')?.dataset?.previewBaseUrl || '/scenarios/preview');
       const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + '&scenario=' + encodeURIComponent(scenario);
@@ -6287,69 +6285,6 @@
           if(previewPlan) lastPreviewPlanPath = previewPlan;
         } catch(e) {}
 
-        // Best-effort: if a chain is already generated, resolve templates/hints now.
-        // This mirrors Generate's "save + resolve" behavior.
-        try {
-          if(scenario && Array.isArray(currentChain) && currentChain.length){
-            const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-            const planPath = (lastPreviewPlanPath || '');
-            if(chainIds.length && planPath){
-              showLoading('Saving Flag Sequencing…');
-              const saveRes = await postJson('/api/flag-sequencing/save_flow_substitutions', {
-                scenario,
-                chain_ids: chainIds,
-                preview_plan: planPath,
-                flag_assignments: buildPersistAssignments(chainIds),
-                allow_node_duplicates: !!allowNodeDuplicates,
-                initial_facts: flowInitialFactsOverride,
-                goal_facts: flowGoalFactsOverride,
-              });
-              if(saveRes && saveRes.flow_plan_path) lastFlowPlanPath = String(saveRes.flow_plan_path);
-              if(saveRes && Array.isArray(saveRes.flag_assignments)) currentFlagAssignments = saveRes.flag_assignments.slice();
-
-              showLoading('Resolving hint values…');
-              const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', {
-                scenario,
-                length,
-                preset,
-                chain_ids: chainIds,
-                preview_plan: (lastFlowPlanPath || planPath),
-                allow_node_duplicates: !!allowNodeDuplicates,
-                mode: 'resolve',
-                best_effort: true,
-                timeout_s: 120,
-              });
-              setFlowValidityFromPayload(prepData);
-              try{
-                const newChain = (prepData && Array.isArray(prepData.chain)) ? prepData.chain.slice() : null;
-                if(newChain && newChain.length){
-                  currentChain = newChain;
-                }
-              } catch(e) {}
-              if(prepData && Array.isArray(prepData.flag_assignments)){
-                currentFlagAssignments = prepData.flag_assignments.slice();
-              }
-              try {
-                if(scenario && typeof window.coretgSetFlowDirtyForScenario === 'function') {
-                  window.coretgSetFlowDirtyForScenario(scenario, false);
-                }
-              } catch(e) {}
-              try {
-                if(prepData && prepData.preview_plan_path) lastPreviewPlanPath = String(prepData.preview_plan_path);
-              } catch(e) {}
-              try {
-                if(prepData && prepData.flow_plan_path) lastFlowPlanPath = String(prepData.flow_plan_path);
-              } catch(e) {}
-              updateMeta();
-              renderChainEditor();
-            }
-          }
-        } catch(e) {
-          // Non-fatal: XML save succeeded.
-          hintResolveFailed = true;
-          setStatus('Saved XML, but hint resolution failed: ' + String(e && e.message || e), true);
-        }
-
         if(!hintResolveFailed){
           setStatus('Saved XML: ' + basenameFromPath(xmlPath), false);
         }
@@ -6395,30 +6330,14 @@
       return '';
     }
     if(saveXmlEl) saveXmlEl.disabled = true;
-    setStatus('Preparing preview and saving XML…', false);
+    setStatus('Saving XML…', false);
     setLoginLinkVisible(false);
-    showLoading('Resolving hint values…');
+    showLoading('Saving XML…');
     try{
-      if(!Array.isArray(currentChain) || currentChain.length === 0){
-        throw new Error('Generate a chain first.');
+      const xmlPath = await window.coretgSaveXmlViaApi();
+      if(!xmlPath){
+        throw new Error('Save did not return xml_path');
       }
-      const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-      const planPath = (lastFlowPlanPath || lastPreviewPlanPath || '');
-      const prepData = await postJson('/api/flag-sequencing/prepare_preview_for_execute', { scenario, length, preset, chain_ids: chainIds, preview_plan: planPath, allow_node_duplicates: !!allowNodeDuplicates });
-      setFlowValidityFromPayload(prepData);
-      if(prepData && Array.isArray(prepData.flag_assignments)){
-        currentFlagAssignments = prepData.flag_assignments.slice();
-        renderChainEditor();
-      }
-      const xmlPath = (prepData && prepData.xml_path) ? String(prepData.xml_path) : '';
-      const previewPlan = (prepData && prepData.preview_plan_path) ? String(prepData.preview_plan_path) : '';
-      if(!xmlPath || !previewPlan){
-        throw new Error('Prepare step did not return xml_path/preview_plan_path');
-      }
-      lastPreviewPlanPath = previewPlan;
-      try {
-        if(prepData && prepData.flow_plan_path) lastFlowPlanPath = String(prepData.flow_plan_path);
-      } catch(e) {}
       updateMeta();
       try {
         const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');

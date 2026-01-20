@@ -7296,6 +7296,17 @@ def participant_ui_details_api():
         except Exception:
             session_id = None
 
+    try:
+        app.logger.info(
+            '[flow.prepare_preview_for_execute] done scenario=%s chain_len=%s flow_valid=%s flow_errors=%s',
+            scenario_norm,
+            len(chain_nodes or []),
+            bool(flow_valid),
+            (flow_errors or []),
+        )
+    except Exception:
+        pass
+
     return jsonify({
         'ok': True,
         'scenario_norm': scenario_norm,
@@ -10995,6 +11006,10 @@ def _flow_compute_flag_assignments(
         ]
         if not candidates:
             candidates = [g for g in pool if _requires_cached(g).issubset(state)]
+        if not candidates:
+            # Best-effort fallback: allow assignment even if requires are not yet met.
+            # Validation will surface missing dependencies, but we avoid empty assignments.
+            candidates = list(pool)
         return candidates
 
     def _score_order(cands: list[dict[str, Any]], state: set[str]) -> list[dict[str, Any]]:
@@ -11084,7 +11099,9 @@ def _flow_compute_flag_assignments(
             if not candidates:
                 candidates = [g for g in pool if _requires_cached(g).issubset(state_known)]
             if not candidates:
-                return []
+                # Best-effort fallback: allow assignment even if requires are not yet met.
+                # Validation will surface missing dependencies, but we avoid empty assignments.
+                candidates = list(pool)
 
             remaining_goal = set(goal_facts) - set(state_known)
             if remaining_goal:
@@ -11696,7 +11713,42 @@ def _flow_validate_chain_order_by_requires_produces(
     if not isinstance(chain_nodes, list) or not chain_nodes:
         return False, ['missing chain nodes']
     if not isinstance(flag_assignments, list) or not flag_assignments:
-        return False, ['missing flag assignments']
+        try:
+            chain_count = len(chain_nodes or []) if isinstance(chain_nodes, list) else 0
+        except Exception:
+            chain_count = 0
+        try:
+            vuln_nodes = len([n for n in (chain_nodes or []) if isinstance(n, dict) and _flow_node_is_vuln(n)])
+        except Exception:
+            vuln_nodes = 0
+        try:
+            docker_nodes = len([n for n in (chain_nodes or []) if isinstance(n, dict) and _flow_node_is_docker_role(n)])
+        except Exception:
+            docker_nodes = 0
+        try:
+            gens_enabled, _ = _flag_generators_from_enabled_sources()
+        except Exception:
+            gens_enabled = []
+        try:
+            node_gens_enabled, _ = _flag_node_generators_from_enabled_sources()
+        except Exception:
+            node_gens_enabled = []
+        try:
+            eligible_flag_gens = len([g for g in (gens_enabled or []) if isinstance(g, dict)])
+        except Exception:
+            eligible_flag_gens = 0
+        try:
+            eligible_node_gens = len([g for g in (node_gens_enabled or []) if isinstance(g, dict)])
+        except Exception:
+            eligible_node_gens = 0
+        return False, [
+            'missing flag assignments',
+            f"assignments=0 chain_nodes={chain_count}",
+            f"chain_vuln_nodes={vuln_nodes}",
+            f"chain_docker_nodes={docker_nodes}",
+            f"eligible_flag_generators={eligible_flag_gens}",
+            f"eligible_flag_node_generators={eligible_node_gens}",
+        ]
 
     chain_ids: list[str] = [
         str(n.get('id') or '').strip()
@@ -11721,8 +11773,25 @@ def _flow_validate_chain_order_by_requires_produces(
         if nid:
             assign_by_node[nid] = a
 
-    if any(cid not in assign_by_node for cid in chain_ids):
-        return False, ['missing assignment for at least one chain node']
+    # If assignments are positionally aligned but missing node_id fields, map by position.
+    try:
+        if any(cid not in assign_by_node for cid in chain_ids):
+            if len(flag_assignments) == len(chain_ids):
+                for i, cid in enumerate(chain_ids):
+                    if cid in assign_by_node:
+                        continue
+                    a = flag_assignments[i]
+                    if isinstance(a, dict):
+                        assign_by_node[cid] = a
+    except Exception:
+        pass
+
+    missing_assignments = [cid for cid in chain_ids if cid not in assign_by_node]
+    if missing_assignments:
+        return False, [
+            'missing assignment for at least one chain node',
+            f"missing_assignment_nodes={','.join(missing_assignments)}",
+        ]
 
     if isinstance(plugins_by_id_override, dict) and plugins_by_id_override:
         plugins_by_id = plugins_by_id_override
@@ -12171,6 +12240,9 @@ def api_flow_attackflow_preview():
     selected_by = 'explicit'
 
     preview_plan_path = (request.args.get('preview_plan') or '').strip() or None
+    explicit_preview_plan = bool(preview_plan_path)
+    flow_plan_path: str | None = None
+    flow_meta_from_plan: dict[str, Any] | None = None
     if preview_plan_path:
         try:
             preview_plan_path = os.path.abspath(preview_plan_path)
@@ -12184,7 +12256,8 @@ def api_flow_attackflow_preview():
     if not preview_plan_path:
         if prefer_flow:
             selected_by = 'prefer_flow_plan'
-            preview_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
+            flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
+            preview_plan_path = flow_plan_path
         if not preview_plan_path:
             if force_preview:
                 # Generate button: use the same topology source as refresh (preview plan)
@@ -12201,9 +12274,56 @@ def api_flow_attackflow_preview():
     if not preview_plan_path:
         return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
 
+    # If we're preferring Flow, load flow metadata from the flow plan, but keep
+    # topology in sync with the latest preview plan for this scenario.
+    if flow_plan_path and not explicit_preview_plan:
+        try:
+            with open(flow_plan_path, 'r', encoding='utf-8') as f:
+                flow_payload = json.load(f) or {}
+            meta_flow = flow_payload.get('metadata') if isinstance(flow_payload, dict) else None
+            flow_meta = (meta_flow or {}).get('flow') if isinstance(meta_flow, dict) else None
+            if not flow_meta and isinstance(flow_payload, dict):
+                flow_meta = flow_payload.get('flow')
+            if isinstance(flow_meta, dict):
+                flow_meta_from_plan = flow_meta
+        except Exception:
+            flow_meta_from_plan = None
+        try:
+            latest_preview = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+            if latest_preview and flow_plan_path and os.path.abspath(latest_preview) != os.path.abspath(flow_plan_path):
+                preview_plan_path = latest_preview
+                selected_by = f"{selected_by}+latest_preview_topology"
+        except Exception:
+            pass
+
+    payload = {}
+    preview = None
     try:
-        with open(preview_plan_path, 'r', encoding='utf-8') as f:
-            payload = json.load(f) or {}
+        # If a preview_plan was supplied but does not match the requested scenario,
+        # ignore it and fall back to the latest plan for this scenario.
+        attempts = 0
+        while attempts < 2:
+            attempts += 1
+            with open(preview_plan_path, 'r', encoding='utf-8') as f:
+                payload = json.load(f) or {}
+            meta_chk = payload.get('metadata') if isinstance(payload, dict) else None
+            scen_chk = ''
+            if isinstance(meta_chk, dict):
+                scen_chk = str(meta_chk.get('scenario') or '').strip()
+                flow_chk = meta_chk.get('flow') if isinstance(meta_chk.get('flow'), dict) else None
+                if not scen_chk and isinstance(flow_chk, dict):
+                    scen_chk = str(flow_chk.get('scenario') or '').strip()
+            if scen_chk:
+                scen_chk_norm = _normalize_scenario_label(scen_chk)
+            else:
+                scen_chk_norm = ''
+            if scen_chk_norm and scen_chk_norm != scenario_norm:
+                # Mismatch: pick the latest plan for this scenario.
+                preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+                if not preview_plan_path:
+                    return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
+                continue
+            break
         preview = payload.get('full_preview') if isinstance(payload, dict) else None
         if not isinstance(preview, dict):
             return jsonify({'ok': False, 'error': 'Preview plan is missing full_preview.'}), 422
@@ -12681,6 +12801,58 @@ def api_flow_attackflow_preview():
                 goal_facts_override=goal_facts_override,
             )
 
+    # Fallback: if no assignments could be computed, pick the first eligible
+    # generator per node so the UI can proceed and provide a clearer error.
+    if not flag_assignments and chain_nodes:
+        try:
+            gens_enabled, _ = _flag_generators_from_enabled_sources()
+        except Exception:
+            gens_enabled = []
+        try:
+            node_gens_enabled, _ = _flag_node_generators_from_enabled_sources()
+        except Exception:
+            node_gens_enabled = []
+
+        try:
+            gens_enabled = [g for g in (gens_enabled or []) if isinstance(g, dict) and str(g.get('id') or '').strip()]
+            node_gens_enabled = [g for g in (node_gens_enabled or []) if isinstance(g, dict) and str(g.get('id') or '').strip()]
+        except Exception:
+            gens_enabled = []
+            node_gens_enabled = []
+
+        fallback: list[dict[str, Any]] = []
+        if gens_enabled or node_gens_enabled:
+            for n in (chain_nodes or []):
+                if not isinstance(n, dict):
+                    continue
+                nid = str(n.get('id') or '').strip()
+                if not nid:
+                    continue
+                is_vuln = _flow_node_is_vuln(n)
+                is_docker = _flow_node_is_docker_role(n)
+                if is_vuln and gens_enabled:
+                    g = gens_enabled[0]
+                    fallback.append({
+                        'node_id': nid,
+                        'id': str(g.get('id') or ''),
+                        'name': str(g.get('name') or ''),
+                        'type': 'flag-generator',
+                        'flag_generator': str(g.get('_source_name') or g.get('source') or '').strip() or 'unknown',
+                        'generator_catalog': 'flag_generators',
+                    })
+                elif (not is_vuln) and is_docker and node_gens_enabled:
+                    g = node_gens_enabled[0]
+                    fallback.append({
+                        'node_id': nid,
+                        'id': str(g.get('id') or ''),
+                        'name': str(g.get('name') or ''),
+                        'type': 'flag-node-generator',
+                        'flag_generator': str(g.get('_source_name') or g.get('source') or '').strip() or 'unknown',
+                        'generator_catalog': 'flag_node_generators',
+                    })
+        if fallback and len(fallback) == len(chain_nodes):
+            flag_assignments = fallback
+
     # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
     # Presets force an intended generator order and should not be reordered.
     try:
@@ -12701,13 +12873,84 @@ def api_flow_attackflow_preview():
         debug_dag = str(request.args.get('debug_dag') or '').strip().lower() in ('1', 'true', 'yes', 'y')
         dag_debug = None
 
+    # Ensure assignments are aligned to the chain (node_id + length).
+    try:
+        if isinstance(flag_assignments, list) and isinstance(chain_nodes, list):
+            desired_len = len(chain_nodes)
+            if desired_len:
+                if len(flag_assignments) != desired_len:
+                    flag_assignments = list(flag_assignments[:desired_len])
+                    while len(flag_assignments) < desired_len:
+                        flag_assignments.append({})
+                for i in range(desired_len):
+                    a = flag_assignments[i]
+                    if not isinstance(a, dict):
+                        a = {}
+                        flag_assignments[i] = a
+                    try:
+                        nid = str((chain_nodes[i] or {}).get('id') or '').strip()
+                    except Exception:
+                        nid = ''
+                    if nid:
+                        a.setdefault('node_id', nid)
+    except Exception:
+        pass
+
     # Validate (non-blocking): if invalid, the UI should warn and execution should
     # proceed without flags.
-    flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
-        chain_nodes,
-        flag_assignments,
-        scenario_label=(scenario_label or scenario_norm),
-    )
+    if not flag_assignments:
+        flow_valid = False
+        flow_errors = ['missing flag assignments']
+        try:
+            gens_enabled, _ = _flag_generators_from_enabled_sources()
+        except Exception:
+            gens_enabled = []
+        try:
+            node_gens_enabled, _ = _flag_node_generators_from_enabled_sources()
+        except Exception:
+            node_gens_enabled = []
+        try:
+            eligible_flag_gens = len([g for g in (gens_enabled or []) if isinstance(g, dict)])
+        except Exception:
+            eligible_flag_gens = 0
+        try:
+            eligible_node_gens = len([g for g in (node_gens_enabled or []) if isinstance(g, dict)])
+        except Exception:
+            eligible_node_gens = 0
+        try:
+            vuln_nodes = len([n for n in (chain_nodes or []) if isinstance(n, dict) and _flow_node_is_vuln(n)])
+        except Exception:
+            vuln_nodes = 0
+        try:
+            docker_nodes = len([n for n in (chain_nodes or []) if isinstance(n, dict) and _flow_node_is_docker_role(n)])
+        except Exception:
+            docker_nodes = 0
+        flow_errors.extend([
+            f"eligible_flag_generators={eligible_flag_gens}",
+            f"eligible_flag_node_generators={eligible_node_gens}",
+            f"chain_nodes={len(chain_nodes or [])}",
+            f"chain_vuln_nodes={vuln_nodes}",
+            f"chain_docker_nodes={docker_nodes}",
+        ])
+    else:
+        flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
+            chain_nodes,
+            flag_assignments,
+            scenario_label=(scenario_label or scenario_norm),
+        )
+
+        # Attach diagnostic details to help UI surface why validation failed.
+        try:
+            assign_ids = [str(a.get('id') or a.get('generator_id') or '').strip() for a in (flag_assignments or []) if isinstance(a, dict)]
+            chain_ids_dbg = [str(n.get('id') or '').strip() for n in (chain_nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()]
+            flow_errors_detail = (
+                f"assignments={len(flag_assignments or [])} "
+                f"assignments_with_id={len([x for x in assign_ids if x])} "
+                f"chain_nodes={len(chain_nodes or [])} "
+                f"chain_ids={','.join(chain_ids_dbg)}"
+            )
+        except Exception:
+            flow_errors_detail = None
 
     # Additional validation: any referenced generator must exist and be enabled.
     # If not, disable flags and surface a clear error.
@@ -12752,6 +12995,89 @@ def api_flow_attackflow_preview():
     flags_enabled = bool(flow_valid)
     run_generators = bool(flags_enabled or (mode in {'resolve', 'resolve_hints', 'hint', 'hint_only'}))
 
+    # Ensure preview IP context is aligned to the current chain order so the UI
+    # shows Knowledge(ip) for the correct sequence node.
+    try:
+        host_by_id: dict[str, dict[str, Any]] = {}
+        hosts = preview.get('hosts') if isinstance(preview, dict) else None
+        if isinstance(hosts, list):
+            for h in hosts:
+                if not isinstance(h, dict):
+                    continue
+                hid = str(h.get('node_id') or '').strip()
+                if hid:
+                    host_by_id[hid] = h
+    except Exception:
+        host_by_id = {}
+
+    def _preview_host_ip4(host: dict) -> str:
+        try:
+            ip4 = host.get('ip4')
+            if isinstance(ip4, str) and _first_valid_ipv4(ip4):
+                return _first_valid_ipv4(ip4)
+        except Exception:
+            pass
+        for key in ('ipv4', 'ip', 'ip_addr', 'address'):
+            try:
+                v = host.get(key)
+            except Exception:
+                v = None
+            ip_str = _first_valid_ipv4(v)
+            if ip_str:
+                return ip_str
+        # Some previews store IPs under lists or interfaces.
+        try:
+            for key in ('ips', 'addresses', 'ip4s', 'ipv4s'):
+                v = host.get(key)
+                ip_str = _first_valid_ipv4(v)
+                if ip_str:
+                    return ip_str
+        except Exception:
+            pass
+        try:
+            ifaces = host.get('interfaces')
+            if isinstance(ifaces, list):
+                for iface in ifaces:
+                    if not isinstance(iface, dict):
+                        continue
+                    for key in ('ip4', 'ipv4', 'ip', 'ip_addr', 'address'):
+                        ip_str = _first_valid_ipv4(iface.get(key))
+                        if ip_str:
+                            return ip_str
+        except Exception:
+            pass
+        return ''
+
+    try:
+        for fa in (flag_assignments or []):
+            if not isinstance(fa, dict):
+                continue
+            nid = str(fa.get('node_id') or '').strip()
+            if not nid:
+                continue
+            host = host_by_id.get(nid)
+            preview_ip4 = _preview_host_ip4(host) if isinstance(host, dict) else ''
+            if not preview_ip4:
+                try:
+                    node = next((n for n in (chain_nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip() == nid), None)
+                except Exception:
+                    node = None
+                if isinstance(node, dict):
+                    preview_ip4 = _first_valid_ipv4(node.get('ip4') or node.get('ipv4') or node.get('ip') or '')
+            if not preview_ip4:
+                continue
+            ri = fa.get('resolved_inputs') if isinstance(fa.get('resolved_inputs'), dict) else None
+            if ri is None:
+                ri = {}
+                fa['resolved_inputs'] = ri
+            ri['Knowledge(ip)'] = preview_ip4
+            ri['target_ip'] = preview_ip4
+            ri['host_ip'] = preview_ip4
+            ri['ip4'] = preview_ip4
+            ri['ipv4'] = preview_ip4
+    except Exception:
+        pass
+
     if len(chain_nodes) < 1:
         return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan (vulnerability nodes only for flag-generators).', 'stats': stats, 'preview_plan_path': preview_plan_path}), 422
     if (not used_saved_chain) and (not allow_node_duplicates) and len(chain_nodes) < length:
@@ -12774,9 +13100,20 @@ def api_flow_attackflow_preview():
         'stats': stats,
         'flow_valid': bool(flow_valid),
         'flow_errors': list(flow_errors or []),
+        **({'flow_errors_detail': flow_errors_detail} if flow_errors_detail else {}),
         'flags_enabled': bool(flags_enabled),
         'allow_node_duplicates': bool(allow_node_duplicates),
     }
+    if flow_errors_detail:
+        out['flow_errors_detail'] = flow_errors_detail
+    try:
+        if not flow_valid:
+            app.logger.warning(
+                '[flow.attackflow_preview] invalid flow: %s',
+                (flow_errors_detail or (flow_errors or [])),
+            )
+    except Exception:
+        pass
     if initial_facts_override:
         out['initial_facts'] = initial_facts_override
     if goal_facts_override:
@@ -12814,6 +13151,17 @@ def api_flow_attackflow_preview():
             'ok': False,
             'error': 'STIX bundle export has been removed. Use /api/flag-sequencing/afb_from_chain.',
         }), 410
+
+    try:
+        app.logger.info(
+            '[flow.attackflow_preview] scenario=%s chain_len=%s flow_valid=%s flow_errors=%s',
+            scenario_norm,
+            len(chain_nodes or []),
+            bool(flow_valid),
+            (flow_errors or []),
+        )
+    except Exception:
+        pass
 
     return jsonify(out)
 
@@ -12912,8 +13260,54 @@ def api_flow_prepare_preview_for_execute():
         nodes, _links, adj = _build_topology_graph_from_preview_plan(preview)
         stats = _flow_compose_docker_stats(nodes)
 
+        def _eligible_debug_summary(all_nodes: list[Any], max_items: int = 50) -> dict[str, Any]:
+            vuln_nodes: list[dict[str, str]] = []
+            nonvuln_docker_nodes: list[dict[str, str]] = []
+            try:
+                for n in (all_nodes or []):
+                    if not isinstance(n, dict):
+                        continue
+                    nid = str(n.get('id') or '').strip()
+                    name = str(n.get('name') or nid).strip()
+                    if not nid:
+                        continue
+                    is_vuln = _flow_node_is_vuln(n)
+                    is_docker = _flow_node_is_docker_role(n)
+                    if is_vuln:
+                        if len(vuln_nodes) < max_items:
+                            vuln_nodes.append({'id': nid, 'name': name})
+                        continue
+                    if is_docker:
+                        if len(nonvuln_docker_nodes) < max_items:
+                            nonvuln_docker_nodes.append({'id': nid, 'name': name})
+            except Exception:
+                pass
+            return {
+                'vuln_nodes_count': sum(1 for n in (all_nodes or []) if isinstance(n, dict) and _flow_node_is_vuln(n)),
+                'nonvuln_docker_nodes_count': sum(1 for n in (all_nodes or []) if isinstance(n, dict) and _flow_node_is_docker_role(n) and (not _flow_node_is_vuln(n))),
+                'vuln_nodes_sample': vuln_nodes,
+                'nonvuln_docker_nodes_sample': nonvuln_docker_nodes,
+            }
+        eligible_debug = _eligible_debug_summary(nodes)
+
         # Allow caller to provide an explicit ordered chain.
         chain_ids_in = j.get('chain_ids')
+        if (not chain_ids_in) and (not preset_steps):
+            try:
+                flow_meta = meta.get('flow') if isinstance(meta, dict) else None
+                saved_chain = flow_meta.get('chain') if isinstance(flow_meta, dict) else None
+                saved_ids: list[str] = []
+                if isinstance(saved_chain, list) and saved_chain:
+                    for entry in saved_chain:
+                        if not isinstance(entry, dict):
+                            continue
+                        cid = str(entry.get('id') or '').strip()
+                        if cid:
+                            saved_ids.append(cid)
+                if saved_ids:
+                    chain_ids_in = saved_ids
+            except Exception:
+                pass
         chain_ids: list[str] = []
         if isinstance(chain_ids_in, list) and chain_ids_in:
             for cid in chain_ids_in:
@@ -13110,6 +13504,7 @@ def api_flow_prepare_preview_for_execute():
                                 'ok': False,
                                 'error': 'Not enough eligible nodes for the provided chain. Flag-generators require vulnerability nodes; flag-node-generators require non-vulnerability docker-role nodes.',
                                 'stats': stats,
+                                'eligible': eligible_debug,
                             }), 422
 
                         rid = str(replacement.get('id') or '').strip()
@@ -13143,6 +13538,7 @@ def api_flow_prepare_preview_for_execute():
                                 'error': 'Not enough eligible nodes in preview plan to build the requested chain.',
                                 'available': len(chain_nodes),
                                 'stats': stats,
+                                'eligible': eligible_debug,
                             }), 422
                         chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if isinstance(n, dict) and str(n.get('id') or '').strip()]
                         explicit_chain = False
@@ -13190,9 +13586,9 @@ def api_flow_prepare_preview_for_execute():
                 else:
                     chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
             if len(chain_nodes) < 1:
-                return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan (vulnerability nodes only for flag-generators).', 'available': len(chain_nodes), 'stats': stats}), 422
+                return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan (vulnerability nodes only for flag-generators).', 'available': len(chain_nodes), 'stats': stats, 'eligible': eligible_debug}), 422
             if (not allow_node_duplicates) and len(chain_nodes) < length:
-                return jsonify({'ok': False, 'error': 'Not enough eligible nodes in preview plan to build the requested chain.', 'available': len(chain_nodes), 'stats': stats}), 422
+                return jsonify({'ok': False, 'error': 'Not enough eligible nodes in preview plan to build the requested chain.', 'available': len(chain_nodes), 'stats': stats, 'eligible': eligible_debug}), 422
             chain_ids = [str(n.get('id') or '').strip() for n in chain_nodes if str(n.get('id') or '').strip()]
     except Exception as e:
         app.logger.exception('[flow.prepare_preview_for_execute] internal error: %s', e)
@@ -13316,13 +13712,77 @@ def api_flow_prepare_preview_for_execute():
 
     # Validate (non-blocking): if invalid, we still allow execution but we do not
     # inject or run any flags.
-    flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
-        chain_nodes,
-        flag_assignments,
-        scenario_label=(scenario_label or scenario_norm),
-    )
+    has_assignment_ids = False
+    try:
+        has_assignment_ids = any(
+            isinstance(a, dict) and str(a.get('id') or a.get('generator_id') or '').strip()
+            for a in (flag_assignments or [])
+        )
+    except Exception:
+        has_assignment_ids = False
+
+    if (not flag_assignments) or (not has_assignment_ids):
+        flow_valid = False
+        flow_errors = ['missing flag assignments']
+        try:
+            gens_enabled, _ = _flag_generators_from_enabled_sources()
+        except Exception:
+            gens_enabled = []
+        try:
+            node_gens_enabled, _ = _flag_node_generators_from_enabled_sources()
+        except Exception:
+            node_gens_enabled = []
+        try:
+            eligible_flag_gens = len([g for g in (gens_enabled or []) if isinstance(g, dict)])
+        except Exception:
+            eligible_flag_gens = 0
+        try:
+            eligible_node_gens = len([g for g in (node_gens_enabled or []) if isinstance(g, dict)])
+        except Exception:
+            eligible_node_gens = 0
+        try:
+            vuln_nodes = len([n for n in (chain_nodes or []) if isinstance(n, dict) and _flow_node_is_vuln(n)])
+        except Exception:
+            vuln_nodes = 0
+        try:
+            docker_nodes = len([n for n in (chain_nodes or []) if isinstance(n, dict) and _flow_node_is_docker_role(n)])
+        except Exception:
+            docker_nodes = 0
+        flow_errors.extend([
+            f"eligible_flag_generators={eligible_flag_gens}",
+            f"eligible_flag_node_generators={eligible_node_gens}",
+            f"chain_nodes={len(chain_nodes or [])}",
+            f"chain_vuln_nodes={vuln_nodes}",
+            f"chain_docker_nodes={docker_nodes}",
+        ])
+    else:
+        flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
+            chain_nodes,
+            flag_assignments,
+            scenario_label=(scenario_label or scenario_norm),
+        )
+    # Provide detailed diagnostics for UI display.
+    try:
+        assign_ids = [str(a.get('id') or a.get('generator_id') or '').strip() for a in (flag_assignments or []) if isinstance(a, dict)]
+        chain_ids_dbg = [str(n.get('id') or '').strip() for n in (chain_nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()]
+        flow_errors_detail = (
+            f"assignments={len(flag_assignments or [])} "
+            f"assignments_with_id={len([x for x in assign_ids if x])} "
+            f"chain_nodes={len(chain_nodes or [])} "
+            f"chain_ids={','.join(chain_ids_dbg)}"
+        )
+    except Exception:
+        flow_errors_detail = None
     flags_enabled = bool(flow_valid)
     run_generators = bool(flags_enabled or run_generators_request)
+    try:
+        if not flow_valid:
+            app.logger.warning(
+                '[flow.prepare_preview_for_execute] invalid flow: %s',
+                (flow_errors_detail or (flow_errors or [])),
+            )
+    except Exception:
+        pass
 
     # Apply Flow modifications and run generators when requested (resolve/hint) or valid.
     if run_generators:
@@ -14727,6 +15187,18 @@ def api_flow_prepare_preview_for_execute():
     except Exception as e:
         return jsonify({'ok': False, 'error': f'Failed to persist flow-modified preview plan: {e}'}), 500
 
+    try:
+        app.logger.info(
+            '[flow.prepare_preview_for_execute] done scenario=%s chain_len=%s flow_valid=%s flow_errors=%s detail=%s',
+            scenario_norm,
+            len(chain_nodes or []),
+            bool(flow_valid),
+            (flow_errors or []),
+            (flow_errors_detail or ''),
+        )
+    except Exception:
+        pass
+
     return jsonify({
         'ok': True,
         'scenario': scenario_label or scenario_norm,
@@ -14738,6 +15210,7 @@ def api_flow_prepare_preview_for_execute():
         'flags_enabled': bool(flags_enabled),
         'flow_valid': bool(flow_valid),
         'flow_errors': list(flow_errors or []),
+        **({'flow_errors_detail': flow_errors_detail} if flow_errors_detail else {}),
         'xml_path': str((meta or {}).get('xml_path') or ''),
         'preview_plan_path': out_path,
         'base_preview_plan_path': base_plan_path,
@@ -15139,6 +15612,32 @@ def api_flow_save_flow_substitutions():
         )
     except Exception:
         flow_valid, flow_errors = True, []
+    try:
+        assign_ids = [str(a.get('id') or a.get('generator_id') or '').strip() for a in (out_assignments or []) if isinstance(a, dict)]
+        chain_ids_dbg = [str(n.get('id') or '').strip() for n in (chain_nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()]
+        vuln_nodes_dbg = len([n for n in (chain_nodes or []) if isinstance(n, dict) and _flow_node_is_vuln(n)])
+        docker_nodes_dbg = len([n for n in (chain_nodes or []) if isinstance(n, dict) and _flow_node_is_docker_role(n)])
+        flow_errors_detail = (
+            f"assignments={len(out_assignments or [])} "
+            f"assignments_with_id={len([x for x in assign_ids if x])} "
+            f"chain_nodes={len(chain_nodes or [])} "
+            f"chain_vuln_nodes={vuln_nodes_dbg} "
+            f"chain_docker_nodes={docker_nodes_dbg} "
+            f"chain_ids={','.join(chain_ids_dbg)} "
+            f"base_plan={os.path.basename(str(base_plan_path or ''))}"
+        )
+    except Exception:
+        flow_errors_detail = None
+    try:
+        app.logger.info(
+            '[flow.save_flow_substitutions] scenario=%s flow_valid=%s flow_errors=%s detail=%s',
+            scenario_norm,
+            bool(flow_valid),
+            (flow_errors or []),
+            (flow_errors_detail or ''),
+        )
+    except Exception:
+        pass
     flags_enabled = bool(flow_valid)
 
     # Persist as plan_from_flow_*.json
@@ -15205,6 +15704,7 @@ def api_flow_save_flow_substitutions():
         'flags_enabled': bool(flags_enabled),
         'flow_valid': bool(flow_valid),
         'flow_errors': list(flow_errors or []),
+        **({'flow_errors_detail': flow_errors_detail} if flow_errors_detail else {}),
         'preview_plan_path': base_plan_path,
         'flow_plan_path': out_path,
         'base_preview_plan_path': base_plan_path,
@@ -16146,15 +16646,79 @@ def api_flow_afb_from_chain():
         nid = str(n.get('id') or '').strip()
         if not nid:
             continue
+        is_vuln = False
+        try:
+            is_vuln = bool(n.get('is_vuln')) or bool(n.get('is_vulnerability')) or bool(n.get('is_vulnerable'))
+        except Exception:
+            is_vuln = False
+        try:
+            vulns = n.get('vulnerabilities') if isinstance(n.get('vulnerabilities'), list) else None
+        except Exception:
+            vulns = None
         chain_nodes.append({
             'id': nid,
             'name': str(n.get('name') or nid),
             'type': str(n.get('type') or ''),
             'compose': str(n.get('compose') or ''),
             'compose_name': str(n.get('compose_name') or ''),
+            'is_vuln': bool(is_vuln),
+            **({'vulnerabilities': list(vulns or [])} if vulns else {}),
         })
     if not chain_nodes:
         return jsonify({'ok': False, 'error': 'Chain contained no valid nodes.'}), 400
+
+    # Prefer latest saved Flow assignments (from plan_from_flow_*.json) when available.
+    flow_plan_path: str | None = None
+    flow_assignments_from_plan: list[dict[str, Any]] = []
+    try:
+        flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
+    except Exception:
+        flow_plan_path = None
+    if flow_plan_path:
+        try:
+            with open(flow_plan_path, 'r', encoding='utf-8') as f:
+                flow_payload = json.load(f) or {}
+            meta_flow = flow_payload.get('metadata') if isinstance(flow_payload, dict) else None
+            flow_meta = (meta_flow or {}).get('flow') if isinstance(meta_flow, dict) else None
+            saved_chain = (flow_meta or {}).get('chain') if isinstance(flow_meta, dict) else None
+            saved_assignments = (flow_meta or {}).get('flag_assignments') if isinstance(flow_meta, dict) else None
+            if isinstance(saved_assignments, list) and saved_assignments:
+                desired_len = len(chain_nodes)
+                ordered: list[dict[str, Any]] = []
+                if desired_len and len(saved_assignments) >= desired_len:
+                    for i in range(desired_len):
+                        a = saved_assignments[i]
+                        if not isinstance(a, dict):
+                            ordered.append({})
+                            continue
+                        a2 = dict(a)
+                        try:
+                            a2['node_id'] = str((chain_nodes[i] or {}).get('id') or '').strip()
+                        except Exception:
+                            pass
+                        ordered.append(a2)
+                else:
+                    assign_by_node: dict[str, dict[str, Any]] = {}
+                    for a in saved_assignments:
+                        if not isinstance(a, dict):
+                            continue
+                        nid = str(a.get('node_id') or '').strip()
+                        if nid:
+                            assign_by_node[nid] = a
+                    if assign_by_node:
+                        for n in chain_nodes:
+                            nid = str((n or {}).get('id') or '').strip()
+                            a = assign_by_node.get(nid)
+                            if isinstance(a, dict):
+                                a2 = dict(a)
+                                a2['node_id'] = nid
+                                ordered.append(a2)
+                            else:
+                                ordered.append({})
+                if ordered and all(isinstance(a, dict) and str(a.get('id') or a.get('generator_id') or '').strip() for a in ordered):
+                    flow_assignments_from_plan = ordered
+        except Exception:
+            flow_assignments_from_plan = []
 
     flag_assignments: list[dict[str, Any]] = []
     preview: dict[str, Any] | None = None
@@ -16182,6 +16746,15 @@ def api_flow_afb_from_chain():
             except Exception:
                 pass
 
+            # If we have flow metadata from a flow plan, inject it so saved chain/
+            # assignments apply to this preview topology.
+            if flow_meta_from_plan and isinstance(payload, dict):
+                meta_out = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+                meta_out = dict(meta_out or {})
+                meta_out['flow'] = flow_meta_from_plan
+                if flow_plan_path:
+                    meta_out['flow_plan_path'] = flow_plan_path
+                payload['metadata'] = meta_out
             preview = payload.get('full_preview') if isinstance(payload, dict) else None
             if isinstance(preview, dict):
                 # Enrich chain_nodes with resolved IPv4 + vulnerability info (if present in preview hosts).
@@ -16252,6 +16825,9 @@ def api_flow_afb_from_chain():
     except Exception:
         flag_assignments = []
 
+    if (not flag_assignments) and flow_assignments_from_plan:
+        flag_assignments = flow_assignments_from_plan
+
     try:
         flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
             chain_nodes,
@@ -16260,7 +16836,30 @@ def api_flow_afb_from_chain():
         )
     except Exception:
         flow_valid, flow_errors = True, []
+    try:
+        assign_ids = [str(a.get('id') or a.get('generator_id') or '').strip() for a in (flag_assignments or []) if isinstance(a, dict)]
+        chain_ids_dbg = [str(n.get('id') or '').strip() for n in (chain_nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()]
+        flow_errors_detail = (
+            f"assignments={len(flag_assignments or [])} "
+            f"assignments_with_id={len([x for x in assign_ids if x])} "
+            f"chain_nodes={len(chain_nodes or [])} "
+            f"chain_ids={','.join(chain_ids_dbg)}"
+        )
+    except Exception:
+        flow_errors_detail = None
     flags_enabled = bool(flow_valid)
+
+    try:
+        app.logger.info(
+            '[flow.afb_from_chain] scenario=%s chain_len=%s flow_valid=%s flow_errors=%s detail=%s',
+            scenario_norm,
+            len(chain_nodes or []),
+            bool(flow_valid),
+            (flow_errors or []),
+            (flow_errors_detail or ''),
+        )
+    except Exception:
+        pass
 
     afb = _attack_flow_builder_afb_for_chain(
         chain_nodes=chain_nodes,
@@ -16287,6 +16886,7 @@ def api_flow_afb_from_chain():
         'flow_valid': bool(flow_valid),
         'flow_errors': list(flow_errors or []),
         'flags_enabled': bool(flags_enabled),
+        **({'flow_errors_detail': flow_errors_detail} if flow_errors_detail else {}),
     })
 
 
