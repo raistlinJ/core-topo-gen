@@ -167,7 +167,7 @@
     } catch(e){ return null; }
   }
 
-  function loadPreview(){
+  async function loadPreview(){
     const params = new URLSearchParams(window.location.search || '');
     // Prefer server-validated hidden inputs over query params. If a stale/invalid
     // xml_path is present in the URL, the backend will intentionally clear it and
@@ -175,28 +175,12 @@
     let xmlPath = (document.getElementById('scenariosPreviewLoadXmlPath')?.value || params.get('xml_path') || '').trim();
     const scenario = (params.get('scenario') || document.getElementById('scenariosPreviewLoadScenario')?.value || '').trim();
 
-    // If another page (Topology/Flow) saved XML more recently, prefer that snapshot
-    // for this scenario to avoid IP/seed mismatches between Preview and resolved hints.
-    try {
-      if (scenario && typeof window.coretgGetLatestXmlPathForScenario === 'function') {
-        const latest = (window.coretgGetLatestXmlPathForScenario(scenario) || '').toString().trim();
-        if (latest) xmlPath = latest;
-      }
-    } catch(e) {}
-
     const frame = document.getElementById('scenariosPreviewFrame');
     const form = document.getElementById('scenariosPreviewLoadForm');
     const inXml = document.getElementById('scenariosPreviewLoadXmlPath');
     const inSc = document.getElementById('scenariosPreviewLoadScenario');
     const inSeed = document.getElementById('scenariosPreviewLoadSeed');
     const inPlan = document.getElementById('scenariosPreviewLoadPreviewPlan');
-
-    if(!xmlPath){
-      if(frame){
-        frame.srcdoc = '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">Save XML first to preview.</div>';
-      }
-      return;
-    }
 
     if(inXml) inXml.value = xmlPath;
     if(inSc) inSc.value = scenario;
@@ -218,13 +202,28 @@
       }
     } catch(e) { planPath = ''; }
 
+    if(!planPath){
+      try {
+        const resp = await fetch('/api/flag-sequencing/latest_preview_plan?scenario=' + encodeURIComponent(scenario), { credentials: 'same-origin' });
+        if(resp && resp.ok){
+          const data = await resp.json();
+          if(data && typeof data.preview_plan_path === 'string'){
+            planPath = data.preview_plan_path.trim();
+          }
+        }
+      } catch(e) {}
+    }
+
+    if(!planPath){
+      if(frame){
+        frame.srcdoc = '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">Preview plan not available. Use Topology → Save XML or Flag Sequencing → Generate/Change Node/Value Override first.</div>';
+      }
+      return;
+    }
+
     try {
       if (inPlan) inPlan.value = planPath;
-      if (planPath) {
-        form.action = '{{ url_for('plan_full_preview_from_plan', embed=1) }}';
-      } else {
-        form.action = '{{ url_for('plan_full_preview_page', embed=1) }}';
-      }
+      form.action = '{{ url_for('plan_full_preview_from_plan', embed=1) }}';
     } catch(e) {}
 
     const modal = showLoading();
@@ -233,25 +232,6 @@
       try { frame.srcdoc = '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">Loading preview…</div>'; } catch(e){}
       frame.addEventListener('load', async ()=>{
         try { modal && modal.hide(); } catch(e){}
-        // Best-effort: if the user has a saved Flag Sequencing chain for this scenario,
-        // persist it now that the preview plan has been generated.
-        try {
-          const scenarioNow = (scenario || '').toString().trim();
-          if(!scenarioNow) return;
-          if(typeof window.coretgGetSavedFlowStateForScenario !== 'function') return;
-          if(typeof window.coretgPostJson !== 'function') return;
-          const flow = window.coretgGetSavedFlowStateForScenario(scenarioNow);
-          if(!flow) return;
-          await window.coretgPostJson('/api/flag-sequencing/prepare_preview_for_execute', {
-            scenario: scenarioNow,
-            preset: flow.preset || '',
-            length: flow.length || (Array.isArray(flow.chain_ids) ? flow.chain_ids.length : 5),
-            chain_ids: flow.chain_ids || [],
-          });
-        } catch(e) {
-          // Non-fatal; preview is still usable.
-          try { console.warn('Flow save failed (non-fatal):', e); } catch(_e) {}
-        }
       }, { once: true });
     }
 

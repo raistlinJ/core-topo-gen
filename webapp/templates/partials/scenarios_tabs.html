@@ -725,7 +725,9 @@
     return { scenarios, core, active_index, project_key_hint, scenario_query };
   }
 
-  async function saveXmlViaApi(){
+  async function saveXmlViaApi(opts){
+    const options = (opts && typeof opts === 'object') ? opts : {};
+    const persistPreviewPlan = (options.persistPreviewPlan !== false) && (options.skipPreviewPlan !== true);
     let progressShown = false;
     let hideTimer = null;
     const safeHideProgress = (immediate) => {
@@ -862,49 +864,51 @@
       if (scenarioName) ensureSeedForScenario(scenarioName);
     } catch (e) {}
 
-    // Always persist a fresh preview plan after Save XML so the Preview tab cannot
-    // display stale cached results from an older XML snapshot.
-    try {
+    if (persistPreviewPlan) {
+      // Always persist a fresh preview plan after Save XML so the Preview tab cannot
+      // display stale cached results from an older XML snapshot.
       try {
-        if (typeof window.coretgUpdateProgress === 'function') {
-          window.coretgUpdateProgress({ title: 'Saving XML', message: 'Persisting preview plan…', percent: 95 });
-        }
-      } catch (e) {}
-      const scenarioName = resolveScenarioNameForSave();
-      if (scenarioName && typeof window.coretgPostJson === 'function') {
-        let seed = null;
         try {
-          if (typeof window.coretgGetSeedForScenario === 'function') {
-            seed = window.coretgGetSeedForScenario(scenarioName);
-          }
-        } catch (e) { seed = null; }
-
-        const persisted = await window.coretgPostJson('/api/plan/persist_preview_plan', {
-          xml_path: xmlPath,
-          scenario: scenarioName,
-          seed,
-        });
-
-        try {
-          if (persisted && persisted.seed !== undefined && typeof window.coretgSetSeedForScenario === 'function') {
-            window.coretgSetSeedForScenario(scenarioName, persisted.seed);
+          if (typeof window.coretgUpdateProgress === 'function') {
+            window.coretgUpdateProgress({ title: 'Saving XML', message: 'Persisting preview plan…', percent: 95 });
           }
         } catch (e) {}
-
-        const previewPlan = (persisted && persisted.preview_plan_path) ? String(persisted.preview_plan_path) : '';
-        if (typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
-          window.coretgSetPreviewPlanPathForScenario(scenarioName, previewPlan);
-        }
-      }
-    } catch (e) {
-      // Best-effort: if preview-plan persistence failed, clear any stored preview plan
-      // path so Preview will fall back to re-rendering from the latest XML path.
-      try {
         const scenarioName = resolveScenarioNameForSave();
-        if (scenarioName && typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
-          window.coretgSetPreviewPlanPathForScenario(scenarioName, '');
+        if (scenarioName && typeof window.coretgPostJson === 'function') {
+          let seed = null;
+          try {
+            if (typeof window.coretgGetSeedForScenario === 'function') {
+              seed = window.coretgGetSeedForScenario(scenarioName);
+            }
+          } catch (e) { seed = null; }
+
+          const persisted = await window.coretgPostJson('/api/plan/persist_preview_plan', {
+            xml_path: xmlPath,
+            scenario: scenarioName,
+            seed,
+          });
+
+          try {
+            if (persisted && persisted.seed !== undefined && typeof window.coretgSetSeedForScenario === 'function') {
+              window.coretgSetSeedForScenario(scenarioName, persisted.seed);
+            }
+          } catch (e) {}
+
+          const previewPlan = (persisted && persisted.preview_plan_path) ? String(persisted.preview_plan_path) : '';
+          if (typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
+            window.coretgSetPreviewPlanPathForScenario(scenarioName, previewPlan);
+          }
         }
-      } catch (_) {}
+      } catch (e) {
+        // Best-effort: if preview-plan persistence failed, clear any stored preview plan
+        // path so Preview will fall back to re-rendering from the latest XML path.
+        try {
+          const scenarioName = resolveScenarioNameForSave();
+          if (scenarioName && typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
+            window.coretgSetPreviewPlanPathForScenario(scenarioName, '');
+          }
+        } catch (_) {}
+      }
     }
 
     // If a saved Flag Sequencing chain exists, persist it against the latest preview plan.

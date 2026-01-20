@@ -5852,7 +5852,7 @@
 
         setStatus('Saving XML…', false);
         showLoading('Saving XML…');
-        const xmlPath = await window.coretgSaveXmlViaApi();
+        const xmlPath = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
         if(!xmlPath){
           throw new Error('Save did not return xml_path');
         }
@@ -6196,29 +6196,9 @@
       if(execEl) execEl.disabled = true;
       setStatus('Saving XML…', false);
       showLoading('Saving XML…');
-      const xmlPath = await window.coretgSaveXmlViaApi();
+      const xmlPath = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
       if(!xmlPath){
         throw new Error('Save did not return xml_path');
-      }
-
-      // Ensure we have a persisted preview plan artifact to base Flow changes on.
-      setStatus('Preparing preview plan…', false);
-      showLoading('Preparing preview plan…');
-      let seed = null;
-      try {
-        if (scenario && typeof window.coretgEnsureSeedForScenario === 'function') {
-          seed = window.coretgEnsureSeedForScenario(scenario);
-        }
-      } catch(e) { seed = null; }
-      const persisted = await window.coretgPostJson('/api/plan/persist_preview_plan', { xml_path: xmlPath, scenario, seed });
-      try {
-        if (scenario && persisted && persisted.seed !== undefined && typeof window.coretgSetSeedForScenario === 'function') {
-          window.coretgSetSeedForScenario(scenario, persisted.seed);
-        }
-      } catch(e) {}
-      const previewPlan = (persisted && persisted.preview_plan_path) ? String(persisted.preview_plan_path) : '';
-      if(!previewPlan){
-        throw new Error('Failed to persist preview plan');
       }
 
       // Navigate to Preview tab.
@@ -6255,7 +6235,7 @@
       const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
       const length = (Array.isArray(currentChain) && currentChain.length) ? currentChain.length : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
 
-      const xmlPath = await window.coretgSaveXmlViaApi();
+      const xmlPath = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
       if(xmlPath){
         let hintResolveFailed = false;
         try {
@@ -6267,22 +6247,6 @@
             downloadXmlEl.disabled = false;
             downloadXmlEl.removeAttribute('title');
           }
-        } catch(e) {}
-
-        // Persist a fresh preview plan for the saved XML.
-        try {
-          let seed = null;
-          try {
-            if (scenario && typeof window.coretgEnsureSeedForScenario === 'function') {
-              seed = window.coretgEnsureSeedForScenario(scenario);
-            }
-          } catch(e) { seed = null; }
-          const persisted = await window.coretgPostJson('/api/plan/persist_preview_plan', { xml_path: xmlPath, scenario, seed });
-          if (scenario && persisted && persisted.seed !== undefined && typeof window.coretgSetSeedForScenario === 'function') {
-            window.coretgSetSeedForScenario(scenario, persisted.seed);
-          }
-          const previewPlan = (persisted && persisted.preview_plan_path) ? String(persisted.preview_plan_path) : '';
-          if(previewPlan) lastPreviewPlanPath = previewPlan;
         } catch(e) {}
 
         if(!hintResolveFailed){
