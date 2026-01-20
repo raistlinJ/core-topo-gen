@@ -706,8 +706,19 @@
         const core = (typeof window.getCoreConfig === 'function') ? window.getCoreConfig(true) : (window.state.core || null);
         const project_key_hint = (window.currentProjectKey || '').toString().trim();
         const scenario_query = (typeof window.resolveScenarioQueryHint === 'function') ? window.resolveScenarioQueryHint() : '';
+        const scenariosOut = Array.isArray(window.state.scenarios) ? window.state.scenarios.map(s => (s && typeof s === 'object') ? s : {}) : [];
+        try {
+          if (typeof window.coretgGetSavedFlowStateForScenario === 'function') {
+            scenariosOut.forEach((sc) => {
+              const nm = (sc && sc.name) ? String(sc.name).trim() : '';
+              if(!nm) return;
+              const flowState = window.coretgGetSavedFlowStateForScenario(nm);
+              if(flowState) sc.flow_state = flowState;
+            });
+          }
+        } catch (e) {}
         return {
-          scenarios: window.state.scenarios,
+          scenarios: scenariosOut,
           core: core,
           active_index,
           project_key_hint,
@@ -717,7 +728,17 @@
     } catch (e) {}
 
     const snap = getCurrentProjectSnapshot();
-    const scenarios = Array.isArray(snap?.scenarios) ? snap.scenarios : [];
+    const scenarios = Array.isArray(snap?.scenarios) ? snap.scenarios.map(s => (s && typeof s === 'object') ? s : {}) : [];
+    try {
+      if (typeof window.coretgGetSavedFlowStateForScenario === 'function') {
+        scenarios.forEach((sc) => {
+          const nm = (sc && sc.name) ? String(sc.name).trim() : '';
+          if(!nm) return;
+          const flowState = window.coretgGetSavedFlowStateForScenario(nm);
+          if(flowState) sc.flow_state = flowState;
+        });
+      }
+    } catch (e) {}
     const core = (snap && typeof snap === 'object') ? (snap.core || null) : null;
     const active_index = Number.isInteger(snap?.active_index) ? snap.active_index : null;
     const project_key_hint = (snap && typeof snap === 'object' && snap.project_key_hint) ? String(snap.project_key_hint) : '';

@@ -205,7 +205,18 @@ def _attack_graph_for_chain(
                 'kind': str(fa.get('type') or ''),
                 'source': str(fa.get('flag_generator') or ''),
                 'catalog': str(fa.get('generator_catalog') or ''),
-                'resolved_inputs': _resolved_map(fa, 'resolved_inputs'),
+                'chain': [
+                    {
+                        'id': str(n.get('id') or ''),
+                        'name': str(n.get('name') or ''),
+                        'type': str(n.get('type') or ''),
+                        'is_vuln': bool(n.get('is_vuln')),
+                        'ip4': str(n.get('ip4') or ''),
+                        'ipv4': str(n.get('ipv4') or ''),
+                        'interfaces': list(n.get('interfaces') or []) if isinstance(n.get('interfaces'), list) else [],
+                    }
+                    for n in chain_nodes
+                ],
                 'resolved_outputs': _resolved_map(fa, 'resolved_outputs'),
                 'flag_value': fa.get('flag_value'),
             }
@@ -7576,6 +7587,29 @@ def participant_ui_topology_api():
     return jsonify(out)
 
 
+@app.route('/api/flag-sequencing/save_flow_state_to_xml', methods=['POST'])
+def api_flow_save_flow_state_to_xml():
+    j = request.get_json(silent=True) or {}
+    xml_path = str(j.get('xml_path') or '').strip()
+    scenario_label = str(j.get('scenario') or '').strip()
+    flow_state = j.get('flow_state') if isinstance(j.get('flow_state'), dict) else None
+
+    if not xml_path:
+        return jsonify({'ok': False, 'error': 'xml_path required'}), 400
+    if not flow_state:
+        return jsonify({'ok': False, 'error': 'flow_state required'}), 400
+
+    try:
+        xml_path = os.path.abspath(xml_path)
+    except Exception:
+        return jsonify({'ok': False, 'error': 'invalid xml_path'}), 400
+
+    ok, msg = _update_flow_state_in_xml(xml_path, scenario_label, flow_state)
+    if not ok:
+        return jsonify({'ok': False, 'error': msg}), 422
+    return jsonify({'ok': True, 'xml_path': xml_path})
+
+
 _PARTICIPANT_UI_STATS_PATH = os.path.join(_outputs_dir(), 'participant_ui_stats.json')
 
 
@@ -9724,10 +9758,24 @@ def flow_page():
         active_scenario_xml_path = ''
 
     xml_preview = ''
+    flow_state_by_scenario: dict[str, Any] = {}
     try:
         if active_scenario_xml_path and os.path.isfile(active_scenario_xml_path):
             with open(active_scenario_xml_path, 'r', encoding='utf-8', errors='ignore') as f:
                 xml_preview = f.read()
+            try:
+                parsed = _parse_scenarios_xml(active_scenario_xml_path)
+                scen_list = parsed.get('scenarios') if isinstance(parsed, dict) else None
+                if isinstance(scen_list, list):
+                    for sc in scen_list:
+                        if not isinstance(sc, dict):
+                            continue
+                        nm = str(sc.get('name') or '').strip()
+                        fs = sc.get('flow_state')
+                        if nm and isinstance(fs, dict) and fs:
+                            flow_state_by_scenario[_normalize_scenario_label(nm)] = fs
+            except Exception:
+                flow_state_by_scenario = {}
     except Exception:
         xml_preview = ''
 
@@ -9738,6 +9786,7 @@ def flow_page():
         participant_url_flags=participant_url_flags,
         preview_xml_path=active_scenario_xml_path,
         xml_preview=xml_preview,
+        flow_state_by_scenario=flow_state_by_scenario,
         active_page='scenarios',
     )
 
@@ -10517,6 +10566,47 @@ def _first_valid_ipv4(value: Any) -> str:
         return ''
 
 
+def _preview_host_ip4_any(host: dict[str, Any] | None) -> str:
+    """Best-effort: return primary IPv4 from a preview host payload."""
+    if not isinstance(host, dict):
+        return ''
+    try:
+        ip4 = host.get('ip4')
+        if isinstance(ip4, str) and _first_valid_ipv4(ip4):
+            return _first_valid_ipv4(ip4)
+    except Exception:
+        pass
+    for key in ('ipv4', 'ip', 'ip_addr', 'address'):
+        try:
+            v = host.get(key)
+        except Exception:
+            v = None
+        ip_str = _first_valid_ipv4(v)
+        if ip_str:
+            return ip_str
+    try:
+        for key in ('ips', 'addresses', 'ip4s', 'ipv4s'):
+            v = host.get(key)
+            ip_str = _first_valid_ipv4(v)
+            if ip_str:
+                return ip_str
+    except Exception:
+        pass
+    try:
+        ifaces = host.get('interfaces')
+        if isinstance(ifaces, list):
+            for iface in ifaces:
+                if not isinstance(iface, dict):
+                    continue
+                for key in ('ip4', 'ipv4', 'ip', 'ip_addr', 'address'):
+                    ip_str = _first_valid_ipv4(iface.get(key))
+                    if ip_str:
+                        return ip_str
+    except Exception:
+        pass
+    return ''
+
+
 @app.route('/api/flag-sequencing/flag_values_for_node')
 def api_flow_flag_values_for_node():
     """Return realized flag value(s) for a sequenced node (runtime-only).
@@ -10580,6 +10670,7 @@ def _flow_compute_flag_assignments(
     *,
     initial_facts_override: dict[str, list[str]] | None = None,
     goal_facts_override: dict[str, list[str]] | None = None,
+    seed_override: int | None = None,
 ) -> list[dict[str, Any]]:
     """Return a per-position list of flag assignments aligned to chain_ids.
 
@@ -10717,7 +10808,10 @@ def _flow_compute_flag_assignments(
     try:
         import random as _random
         try:
-            seed_val = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
+            if seed_override is not None:
+                seed_val = int(seed_override)
+            else:
+                seed_val = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
         except Exception:
             seed_val = 0
         rnd = _random.Random(seed_val ^ 0xC0FFEE)
@@ -12640,13 +12734,97 @@ def api_flow_attackflow_preview():
         if available > 0 and available < length:
             warning = f"Only {available} eligible nodes found; using chain length {available} instead of requested {length}."
             length = available
+
+    # Inject preview host IPv4/interface details onto chain nodes for UI display.
+    try:
+        host_by_id: dict[str, dict[str, Any]] = {}
+        hosts = preview.get('hosts') if isinstance(preview, dict) else None
+        if isinstance(hosts, list):
+            for h in hosts:
+                if not isinstance(h, dict):
+                    continue
+                hid = str(h.get('node_id') or h.get('id') or '').strip()
+                if hid:
+                    host_by_id[hid] = h
+        if host_by_id:
+            for n in (chain_nodes or []):
+                if not isinstance(n, dict):
+                    continue
+                nid = str(n.get('id') or '').strip()
+                if not nid:
+                    continue
+                h = host_by_id.get(nid)
+                if not isinstance(h, dict):
+                    continue
+                try:
+                    ip_val = _preview_host_ip4_any(h)
+                except Exception:
+                    ip_val = ''
+                if ip_val:
+                    if not (n.get('ip4') or n.get('ipv4') or n.get('ip') or n.get('address')):
+                        n['ip4'] = ip_val
+                        n['ipv4'] = ip_val
+                try:
+                    ifaces = h.get('interfaces') if isinstance(h.get('interfaces'), list) else None
+                except Exception:
+                    ifaces = None
+                if ifaces and not n.get('interfaces'):
+                    n['interfaces'] = ifaces
+    except Exception:
+        pass
+
+    # Build a stable node-id -> ip map for UI consumption.
+    host_ip_map: dict[str, str] = {}
+    try:
+        for hid, h in (host_by_id or {}).items():
+            ip_val = _preview_host_ip4_any(h)
+            if ip_val:
+                host_ip_map[str(hid)] = ip_val
+    except Exception:
+        host_ip_map = {}
     # Prefer persisted assignments when the plan comes from a prior Flow save.
     flag_assignments: list[dict[str, Any]] = []
+    flow_state_from_xml: dict[str, Any] | None = None
+    try:
+        if not ignore_saved_flow:
+            flow_state_from_xml = _flow_state_from_latest_xml(scenario_norm)
+        if flow_state_from_xml and isinstance(flow_state_from_xml.get('chain_ids'), list):
+            saved_ids = [str(x).strip() for x in (flow_state_from_xml.get('chain_ids') or []) if str(x).strip()]
+            if saved_ids:
+                id_map = {str(n.get('id') or '').strip(): n for n in (nodes or []) if isinstance(n, dict) and str(n.get('id') or '').strip()}
+                chain_nodes = [id_map[cid] for cid in saved_ids if cid in id_map]
+                if chain_nodes:
+                    # Use saved assignments from XML (resolved values) if provided.
+                    fas = flow_state_from_xml.get('flag_assignments') if isinstance(flow_state_from_xml, dict) else None
+                    if isinstance(fas, list) and fas:
+                        ordered: list[dict[str, Any]] = []
+                        for i in range(len(chain_nodes)):
+                            a = fas[i] if i < len(fas) else {}
+                            if not isinstance(a, dict):
+                                ordered.append({})
+                                continue
+                            a2 = dict(a)
+                            try:
+                                a2['node_id'] = str((chain_nodes[i] or {}).get('id') or '').strip()
+                            except Exception:
+                                pass
+                            ordered.append(a2)
+                        flag_assignments = ordered
+                        try:
+                            flag_assignments = _flow_enrich_saved_flag_assignments(
+                                flag_assignments,
+                                chain_nodes,
+                                scenario_label=(scenario_label or scenario_norm),
+                            )
+                        except Exception:
+                            pass
+    except Exception:
+        flow_state_from_xml = None
     try:
         meta = payload.get('metadata') if isinstance(payload, dict) else None
         flow_meta = meta.get('flow') if isinstance(meta, dict) else None
         saved_assignments = flow_meta.get('flag_assignments') if isinstance(flow_meta, dict) else None
-        if (not ignore_saved_flow) and isinstance(saved_assignments, list) and saved_assignments:
+        if (not flag_assignments) and (not ignore_saved_flow) and isinstance(saved_assignments, list) and saved_assignments:
             # Saved assignments are persisted positionally, aligned to the saved chain.
             # Do not re-key by node_id; chains may intentionally contain duplicates.
             try:
@@ -13153,17 +13331,298 @@ def api_flow_attackflow_preview():
         }), 410
 
     try:
+        try:
+            plan_basename = os.path.basename(str(preview_plan_path or ''))
+        except Exception:
+            plan_basename = str(preview_plan_path or '')
+        try:
+            preview_seed = (payload.get('metadata') or {}).get('seed') if isinstance(payload, dict) else None
+        except Exception:
+            preview_seed = None
+        if preview_seed is None:
+            try:
+                preview_seed = preview.get('seed') if isinstance(preview, dict) else None
+            except Exception:
+                preview_seed = None
         app.logger.info(
-            '[flow.attackflow_preview] scenario=%s chain_len=%s flow_valid=%s flow_errors=%s',
+            '[flow.attackflow_preview] scenario=%s chain_len=%s flow_valid=%s flow_errors=%s selected_by=%s plan=%s seed=%s',
             scenario_norm,
             len(chain_nodes or []),
             bool(flow_valid),
             (flow_errors or []),
+            selected_by,
+            plan_basename,
+            preview_seed,
         )
     except Exception:
         pass
 
     return jsonify(out)
+
+
+@app.route('/api/flag-sequencing/sequence_preview_plan', methods=['POST'])
+def api_flow_sequence_preview_plan():
+    """Generate a Flow chain from an existing preview plan and persist sequence metadata.
+
+    This does NOT regenerate topology/IPs; it only selects chain nodes and assigns generators.
+    """
+    j = request.get_json(silent=True) or {}
+    scenario_label = str(j.get('scenario') or '').strip()
+    scenario_norm = _normalize_scenario_label(scenario_label)
+    preset = str(j.get('preset') or '').strip()
+    allow_node_duplicates = str(j.get('allow_node_duplicates') or j.get('allow_duplicates') or '').strip().lower() in ('1', 'true', 'yes', 'y')
+    length = 5
+    try:
+        length = int(j.get('length') or 5)
+    except Exception:
+        length = 5
+    preset_steps = _flow_preset_steps(preset)
+    if preset_steps:
+        length = len(preset_steps)
+    length = max(1, min(length, 50))
+    requested_length = length
+    best_effort = bool(j.get('best_effort'))
+
+    if not scenario_norm:
+        return jsonify({'ok': False, 'error': 'No scenario specified.'}), 400
+
+    preview_plan_path = str(j.get('preview_plan') or '').strip() or None
+    if preview_plan_path:
+        try:
+            preview_plan_path = os.path.abspath(preview_plan_path)
+            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
+            if os.path.commonpath([preview_plan_path, plans_dir]) != plans_dir:
+                preview_plan_path = None
+            elif not os.path.exists(preview_plan_path):
+                preview_plan_path = None
+        except Exception:
+            preview_plan_path = None
+    if not preview_plan_path:
+        preview_plan_path = _latest_preview_plan_for_scenario_norm(scenario_norm, prefer_flow=False)
+
+    if not preview_plan_path:
+        return jsonify({'ok': False, 'error': 'No preview plan found for this scenario.'}), 404
+
+    try:
+        with open(preview_plan_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f) or {}
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to load preview plan: {e}'}), 422
+
+    preview = payload.get('full_preview') if isinstance(payload, dict) else None
+    if not isinstance(preview, dict):
+        return jsonify({'ok': False, 'error': 'Preview plan is missing full_preview.'}), 422
+
+    nodes, _links, adj = _build_topology_graph_from_preview_plan(preview)
+    stats = _flow_compose_docker_stats(nodes)
+
+    # Select chain nodes from preview topology only.
+    if preset_steps:
+        chain_nodes = _pick_flag_chain_nodes_for_preset(nodes, adj, steps=preset_steps)
+    else:
+        if allow_node_duplicates:
+            try:
+                seed_val = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
+            except Exception:
+                seed_val = 0
+            chain_nodes = _pick_flag_chain_nodes_allow_duplicates(nodes, adj, length=length, seed=seed_val)
+        else:
+            chain_nodes = _pick_flag_chain_nodes(nodes, adj, length=length)
+
+    if not chain_nodes:
+        return jsonify({'ok': False, 'error': 'No eligible nodes found in preview plan.', 'available': 0, 'requested_length': requested_length, 'stats': stats}), 422
+
+    warning: str | None = None
+
+    if (not preset_steps) and (not allow_node_duplicates) and len(chain_nodes) < length:
+        if best_effort:
+            warning = f"Only {len(chain_nodes)} eligible nodes found; using chain length {len(chain_nodes)} instead of requested {length}."
+            length = len(chain_nodes)
+        else:
+            return jsonify({
+                'ok': False,
+                'error': 'Not enough eligible nodes in preview plan to build the requested chain.',
+                'available': len(chain_nodes),
+                'requested_length': requested_length,
+                'stats': stats,
+            }), 422
+
+    # Inject preview host IP/interface details onto chain nodes for UI display.
+    host_by_id: dict[str, dict[str, Any]] = {}
+    try:
+        hosts = preview.get('hosts') if isinstance(preview, dict) else None
+        if isinstance(hosts, list):
+            for h in hosts:
+                if not isinstance(h, dict):
+                    continue
+                hid = str(h.get('node_id') or h.get('id') or '').strip()
+                if hid:
+                    host_by_id[hid] = h
+    except Exception:
+        host_by_id = {}
+    try:
+        if host_by_id:
+            for n in (chain_nodes or []):
+                if not isinstance(n, dict):
+                    continue
+                nid = str(n.get('id') or '').strip()
+                if not nid:
+                    continue
+                h = host_by_id.get(nid)
+                if not isinstance(h, dict):
+                    continue
+                ip_val = _preview_host_ip4_any(h)
+                if ip_val:
+                    if not (n.get('ip4') or n.get('ipv4') or n.get('ip') or n.get('address')):
+                        n['ip4'] = ip_val
+                        n['ipv4'] = ip_val
+                ifaces = h.get('interfaces') if isinstance(h.get('interfaces'), list) else None
+                if ifaces and not n.get('interfaces'):
+                    n['interfaces'] = ifaces
+    except Exception:
+        pass
+
+    initial_facts_override = _flow_normalize_fact_override(j.get('initial_facts'))
+    goal_facts_override = _flow_normalize_fact_override(j.get('goal_facts'))
+    retry_index = 0
+    try:
+        retry_index = int(j.get('retry_index') or 0)
+    except Exception:
+        retry_index = 0
+
+    if preset_steps:
+        flag_assignments, preset_err = _flow_compute_flag_assignments_for_preset(preview, chain_nodes, scenario_label or scenario_norm, preset)
+        if preset_err:
+            return jsonify({'ok': False, 'error': f'Error: {preset_err}', 'stats': stats}), 422
+    else:
+        seed_override = None
+        try:
+            if retry_index:
+                base_seed = int((preview.get('seed') if isinstance(preview, dict) else None) or 0)
+                seed_override = base_seed ^ (retry_index * 0x9E3779B1)
+        except Exception:
+            seed_override = None
+        flag_assignments = _flow_compute_flag_assignments(
+            preview,
+            chain_nodes,
+            scenario_label or scenario_norm,
+            initial_facts_override=initial_facts_override,
+            goal_facts_override=goal_facts_override,
+            seed_override=seed_override,
+        )
+
+    try:
+        flow_valid, flow_errors = _flow_validate_chain_order_by_requires_produces(
+            chain_nodes,
+            flag_assignments,
+            scenario_label=(scenario_label or scenario_norm),
+        )
+    except Exception:
+        flow_valid, flow_errors = True, []
+
+    host_ip_map: dict[str, str] = {}
+    try:
+        for hid, h in (host_by_id or {}).items():
+            ip_val = _preview_host_ip4_any(h)
+            if ip_val:
+                host_ip_map[str(hid)] = ip_val
+    except Exception:
+        host_ip_map = {}
+
+    # Persist updated preview plan with sequence metadata (no topology mutation).
+    try:
+        meta = payload.get('metadata') if isinstance(payload, dict) else {}
+        flow_meta = {
+            'source_preview_plan_path': preview_plan_path,
+            'scenario': scenario_label or scenario_norm,
+            'length': len(chain_nodes),
+            'requested_length': requested_length,
+            'allow_node_duplicates': bool(allow_node_duplicates),
+            'chain': [
+                {
+                    'id': str(n.get('id') or ''),
+                    'name': str(n.get('name') or ''),
+                    'type': str(n.get('type') or ''),
+                    'is_vuln': bool(n.get('is_vuln')),
+                    'ip4': str(n.get('ip4') or ''),
+                    'ipv4': str(n.get('ipv4') or ''),
+                    'interfaces': list(n.get('interfaces') or []) if isinstance(n.get('interfaces'), list) else [],
+                }
+                for n in chain_nodes
+            ],
+            'flag_assignments': _flow_strip_runtime_sensitive_fields(flag_assignments),
+            'flags_enabled': bool(flow_valid),
+            'flow_valid': bool(flow_valid),
+            'flow_errors': list(flow_errors or []),
+            'modified_at': _iso_now(),
+        }
+        if initial_facts_override:
+            flow_meta['initial_facts'] = initial_facts_override
+        if goal_facts_override:
+            flow_meta['goal_facts'] = goal_facts_override
+        if warning:
+            flow_meta['warning'] = warning
+        if isinstance(meta, dict):
+            meta = dict(meta)
+            meta['flow'] = flow_meta
+        else:
+            meta = {'flow': flow_meta}
+        payload['metadata'] = meta
+        if isinstance(preview, dict):
+            preview['flow'] = flow_meta
+            preview.setdefault('metadata', {})
+            if isinstance(preview.get('metadata'), dict):
+                preview['metadata']['flow'] = flow_meta
+    except Exception:
+        pass
+
+    try:
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        seed = 0
+        try:
+            seed = int((preview.get('seed') if isinstance(preview, dict) else None) or (meta.get('seed') if isinstance(meta, dict) else None) or 0)
+        except Exception:
+            seed = 0
+        suffix = secrets.token_hex(3)
+        out_name = f"plan_from_preview_seq_{seed}_{int(time.time())}_{suffix}.json"
+        out_path = str(plans_dir / out_name)
+        out_payload = {
+            'full_preview': preview,
+            'metadata': meta,
+        }
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(out_payload, f, indent=2)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': f'Failed to persist sequence plan: {e}'}), 500
+
+    return jsonify({
+        'ok': True,
+        'scenario': scenario_label or scenario_norm,
+        'length': len(chain_nodes),
+        'requested_length': requested_length,
+        'stats': stats,
+        'chain': [
+            {
+                'id': str(n.get('id') or ''),
+                'name': str(n.get('name') or ''),
+                'type': str(n.get('type') or ''),
+                'is_vuln': bool(n.get('is_vuln')),
+                'ip4': str(n.get('ip4') or ''),
+                'ipv4': str(n.get('ipv4') or ''),
+                'interfaces': list(n.get('interfaces') or []) if isinstance(n.get('interfaces'), list) else [],
+            }
+            for n in chain_nodes
+        ],
+        'flag_assignments': flag_assignments,
+        'flags_enabled': bool(flow_valid),
+        'flow_valid': bool(flow_valid),
+        'flow_errors': list(flow_errors or []),
+        'preview_plan_path': out_path,
+        'base_preview_plan_path': preview_plan_path,
+        **({'warning': warning} if warning else {}),
+        **({'host_ip_map': host_ip_map} if host_ip_map else {}),
+    })
 
 
 @app.route('/api/flag-sequencing/prepare_preview_for_execute', methods=['POST'])
@@ -15199,18 +15658,39 @@ def api_flow_prepare_preview_for_execute():
     except Exception:
         pass
 
+    host_ip_map: dict[str, str] = {}
+    try:
+        for hid, h in (host_by_id or {}).items():
+            ip_val = _preview_host_ip4(h) if isinstance(h, dict) else ''
+            if ip_val:
+                host_ip_map[str(hid)] = ip_val
+    except Exception:
+        host_ip_map = {}
+
     return jsonify({
         'ok': True,
         'scenario': scenario_label or scenario_norm,
         'length': length,
         'requested_length': requested_length,
         'stats': stats,
-        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or ''), 'is_vuln': bool(n.get('is_vuln'))} for n in chain_nodes],
+        'chain': [
+            {
+                'id': str(n.get('id') or ''),
+                'name': str(n.get('name') or ''),
+                'type': str(n.get('type') or ''),
+                'is_vuln': bool(n.get('is_vuln')),
+                'ip4': str(n.get('ip4') or ''),
+                'ipv4': str(n.get('ipv4') or ''),
+                'interfaces': list(n.get('interfaces') or []) if isinstance(n.get('interfaces'), list) else [],
+            }
+            for n in chain_nodes
+        ],
         'flag_assignments': flag_assignments,
         'flags_enabled': bool(flags_enabled),
         'flow_valid': bool(flow_valid),
         'flow_errors': list(flow_errors or []),
         **({'flow_errors_detail': flow_errors_detail} if flow_errors_detail else {}),
+        **({'host_ip_map': host_ip_map} if host_ip_map else {}),
         'xml_path': str((meta or {}).get('xml_path') or ''),
         'preview_plan_path': out_path,
         'base_preview_plan_path': base_plan_path,
@@ -15694,17 +16174,45 @@ def api_flow_save_flow_substitutions():
     except Exception:
         stats = {}
 
+    host_ip_map: dict[str, str] = {}
+    try:
+        hosts = preview.get('hosts') if isinstance(preview, dict) else None
+        if isinstance(hosts, list):
+            for h in hosts:
+                if not isinstance(h, dict):
+                    continue
+                hid = str(h.get('node_id') or h.get('id') or '').strip()
+                if not hid:
+                    continue
+                ip_val = _preview_host_ip4_any(h)
+                if ip_val:
+                    host_ip_map[hid] = ip_val
+    except Exception:
+        host_ip_map = {}
+
     return jsonify({
         'ok': True,
         'scenario': scenario_label or scenario_norm,
         'length': len(chain_nodes),
         'stats': stats,
-        'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or ''), 'is_vuln': bool(n.get('is_vuln'))} for n in chain_nodes],
+        'chain': [
+            {
+                'id': str(n.get('id') or ''),
+                'name': str(n.get('name') or ''),
+                'type': str(n.get('type') or ''),
+                'is_vuln': bool(n.get('is_vuln')),
+                'ip4': str(n.get('ip4') or ''),
+                'ipv4': str(n.get('ipv4') or ''),
+                'interfaces': list(n.get('interfaces') or []) if isinstance(n.get('interfaces'), list) else [],
+            }
+            for n in chain_nodes
+        ],
         'flag_assignments': out_assignments,
         'flags_enabled': bool(flags_enabled),
         'flow_valid': bool(flow_valid),
         'flow_errors': list(flow_errors or []),
         **({'flow_errors_detail': flow_errors_detail} if flow_errors_detail else {}),
+        **({'host_ip_map': host_ip_map} if host_ip_map else {}),
         'preview_plan_path': base_plan_path,
         'flow_plan_path': out_path,
         'base_preview_plan_path': base_plan_path,
@@ -23782,6 +24290,84 @@ def _parse_scenarios_xml(path):
     return data
 
 
+def _flow_state_from_latest_xml(scenario_norm: str) -> dict[str, Any] | None:
+    try:
+        scen_norm = _normalize_scenario_label(scenario_norm)
+        if not scen_norm:
+            return None
+        current_user = _current_user()
+        scenario_names, scenario_paths, _scenario_url_hints = _scenario_catalog_for_user(None, user=current_user)
+        if not scenario_names or not isinstance(scenario_paths, dict):
+            return None
+        path_candidates = scenario_paths.get(scen_norm) or scenario_paths.get(_resolve_scenario_display(scen_norm, scenario_names, scen_norm)) or None
+        xml_path = _select_existing_path(path_candidates)
+        if not xml_path:
+            return None
+        parsed = _parse_scenarios_xml(xml_path)
+        scen_list = parsed.get('scenarios') if isinstance(parsed, dict) else None
+        if not isinstance(scen_list, list):
+            return None
+        for sc in scen_list:
+            if not isinstance(sc, dict):
+                continue
+            nm = str(sc.get('name') or '').strip()
+            if _normalize_scenario_label(nm) != scen_norm:
+                continue
+            fs = sc.get('flow_state')
+            return fs if isinstance(fs, dict) else None
+        return None
+    except Exception:
+        return None
+
+
+def _update_flow_state_in_xml(xml_path: str, scenario_label: str | None, flow_state: dict[str, Any]) -> tuple[bool, str]:
+    """Update (or create) FlagSequencing/FlowState within a scenarios XML file."""
+    if not xml_path or not os.path.exists(xml_path):
+        return False, 'xml_path not found'
+    if not isinstance(flow_state, dict) or not flow_state:
+        return False, 'flow_state empty'
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception as e:
+        return False, f'failed to parse xml: {e}'
+
+    scenario_norm = _normalize_scenario_label(scenario_label or '')
+    se_target = None
+
+    try:
+        if root.tag == 'ScenarioEditor':
+            se_target = root
+        elif root.tag == 'Scenarios':
+            for scen_el in root.findall('Scenario'):
+                nm = str(scen_el.get('name') or '').strip()
+                if scenario_norm and _normalize_scenario_label(nm) != scenario_norm:
+                    continue
+                se_target = scen_el.find('ScenarioEditor')
+                if se_target is not None:
+                    break
+    except Exception:
+        se_target = None
+
+    if se_target is None:
+        return False, 'ScenarioEditor not found'
+
+    try:
+        fs_el = se_target.find('FlagSequencing')
+        if fs_el is None:
+            fs_el = ET.SubElement(se_target, 'FlagSequencing')
+        # Clear existing FlowState children.
+        for child in list(fs_el):
+            if child.tag == 'FlowState':
+                fs_el.remove(child)
+        st_el = ET.SubElement(fs_el, 'FlowState')
+        st_el.text = json.dumps(flow_state, separators=(',', ':'), ensure_ascii=False)
+        tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+        return True, 'ok'
+    except Exception as e:
+        return False, f'failed to update xml: {e}'
+
+
 def _parse_scenario_editor(se):
     scen = {"base": {"filepath": ""}, "sections": {}, "notes": ""}
     # If parent <Scenario> carries scenario-level density_count attribute, capture it.
@@ -23847,6 +24433,24 @@ def _parse_scenario_editor(se):
             if core_cfg:
                 hitl_info["core"] = core_cfg
     scen["hitl"] = hitl_info
+
+    # Flag Sequencing flow state (resolved values, chain selections).
+    try:
+        fs_el = se.find("FlagSequencing")
+        if fs_el is not None:
+            flow_el = fs_el.find("FlowState")
+            raw = None
+            if flow_el is not None and flow_el.text:
+                raw = flow_el.text
+            elif fs_el.text:
+                raw = fs_el.text
+            if raw:
+                try:
+                    scen["flow_state"] = json.loads(raw)
+                except Exception:
+                    scen["flow_state"] = {"raw": str(raw)}
+    except Exception:
+        pass
     # Sections
     for sec in se.findall("section"):
         name = sec.get("name", "")
@@ -24099,6 +24703,16 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                     joined6 = ",".join(str(p) for p in ipv6_vals if p)
                     if joined6:
                         iface_el.set("ipv6", joined6)
+
+        # Flag Sequencing flow state (resolved values, chain selections).
+        try:
+            flow_state = scen.get('flow_state')
+            if isinstance(flow_state, dict) and flow_state:
+                fs_el = ET.SubElement(se, "FlagSequencing")
+                st_el = ET.SubElement(fs_el, "FlowState")
+                st_el.text = json.dumps(flow_state, separators=(',', ':'), ensure_ascii=False)
+        except Exception:
+            pass
 
         order = [
             "Node Information", "Routing", "Services", "Traffic",
@@ -26392,6 +27006,16 @@ def plan_full_preview_from_plan():
         except Exception:
             xml_basename = None
 
+        try:
+            app.logger.info(
+                '[plan.full_preview_from_plan] plan=%s scenario=%s seed=%s xml=%s',
+                os.path.basename(plan_path),
+                scenario_name or '',
+                seed_val,
+                os.path.basename(xml_path) if xml_path else '',
+            )
+        except Exception:
+            pass
         return render_template(
             'full_preview.html',
             full_preview=full_prev,

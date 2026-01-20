@@ -73,8 +73,14 @@
                 </select>
               </div>
               <div class="col-md-6">
-                <div class="d-flex gap-2 flex-nowrap">
-                  <button id="flowGenerateBtn" class="btn btn-primary text-nowrap" type="button">Generate</button>
+                <div class="d-flex gap-2 flex-nowrap align-items-end">
+                  <div>
+                    <button id="flowGenerateBtn" class="btn btn-primary text-nowrap" type="button">Generate</button>
+                  </div>
+                  <div>
+                    <label class="form-label small text-muted mb-1" for="flowGenerateMaxRetries">Max retries</label>
+                    <input id="flowGenerateMaxRetries" class="form-control form-control-sm" type="number" min="0" max="10" value="2" style="width: 90px;">
+                  </div>
                   <div class="dropdown">
                     <button class="btn btn-outline-secondary dropdown-toggle text-nowrap" type="button" id="flowDownloadDropdown" data-bs-toggle="dropdown" aria-expanded="false">
                       Download
@@ -220,7 +226,9 @@
       <div class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></div>
       <div class="fw-semibold" id="flowLoadingText">Loading…</div>
     </div>
-    <div class="small text-muted mt-2">This can take a few seconds while generators run and hints resolve.</div>
+    <ul id="flowLoadingSteps" class="small text-muted mt-2 mb-0 d-none"></ul>
+    <ul id="flowLoadingLog" class="small text-muted mt-2 mb-0 d-none"></ul>
+    <div class="small text-muted mt-2">This can take a few seconds while preview plans and sequencing run.</div>
   </div>
 </div>
 
@@ -258,6 +266,7 @@
   const lengthEl = document.getElementById('flowLength');
   const presetEl = document.getElementById('flowPreset');
   const btnEl = document.getElementById('flowGenerateBtn');
+  const generateMaxRetriesEl = document.getElementById('flowGenerateMaxRetries');
   const saveXmlEl = document.getElementById('saveXmlBtn');
   const execEl = document.getElementById('scenariosExecuteBtn');
   const downloadXmlEl = document.getElementById('downloadXmlBtn');
@@ -288,10 +297,13 @@
   const validityAlertEl = document.getElementById('flowValidityAlert');
   const loadingOverlayEl = document.getElementById('flowLoadingOverlay');
   const loadingTextEl = document.getElementById('flowLoadingText');
+  const loadingStepsEl = document.getElementById('flowLoadingSteps');
+  const loadingLogEl = document.getElementById('flowLoadingLog');
   const generateOptionsDialogEl = document.getElementById('flowGenerateOptionsDialog');
   const generateNoDuplicatesEl = document.getElementById('flowGenerateNoDuplicates');
 
   const participantUrlFlags = {{ (participant_url_flags or {})|tojson }};
+  const flowStateByScenario = {{ (flow_state_by_scenario or {})|tojson }};
   const scenarioNamesCache = {{ (scenarios or [])|tojson }};
   const initialScenario = {{ (active_scenario or '')|tojson }};
   let activeScenario = (initialScenario || (Array.isArray(scenarioNamesCache) && scenarioNamesCache.length ? String(scenarioNamesCache[0]) : '')).trim();
@@ -367,6 +379,7 @@
   let lastFlowValid = true;
   let lastFlowErrors = [];
   let lastFlagsEnabled = true;
+  let lastHostIpMap = new Map();
   let allowNodeDuplicates = false;
   let heldChainIndices = new Set();
   let heldFactRows = new Set();
@@ -475,6 +488,75 @@
     });
   }
 
+  function getFlowStateForScenario(scenarioName){
+    try{
+      const key = normalizeScenarioNorm(scenarioName);
+      if(!key) return null;
+      const fs = (flowStateByScenario && typeof flowStateByScenario === 'object') ? flowStateByScenario[key] : null;
+      if(fs && typeof fs === 'object') return fs;
+    } catch(e) {}
+    return null;
+  }
+
+  function mergeResolvedFromFlowState(flowState, chainNodes){
+    try{
+      if(!flowState || typeof flowState !== 'object') return;
+      const savedAssignments = Array.isArray(flowState.flag_assignments) ? flowState.flag_assignments : [];
+      if(!savedAssignments.length) return;
+      const chainIds = Array.isArray(chainNodes) ? chainNodes.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+      if(!chainIds.length) return;
+
+      const byIndex = savedAssignments.slice();
+      const nextAssignments = Array.isArray(currentFlagAssignments) ? currentFlagAssignments.map(a => (a && typeof a === 'object') ? a : {}) : [];
+      for(let i = 0; i < chainIds.length; i++){
+        const savedA = byIndex[i];
+        if(!savedA || typeof savedA !== 'object') continue;
+        const curA = nextAssignments[i] && typeof nextAssignments[i] === 'object' ? nextAssignments[i] : {};
+        const hasInputs = curA.resolved_inputs && typeof curA.resolved_inputs === 'object' && !Array.isArray(curA.resolved_inputs) && Object.keys(curA.resolved_inputs).length > 0;
+        const hasOutputs = curA.resolved_outputs && typeof curA.resolved_outputs === 'object' && !Array.isArray(curA.resolved_outputs) && Object.keys(curA.resolved_outputs).length > 0;
+        if(savedA.resolved_inputs && (!hasInputs)) curA.resolved_inputs = savedA.resolved_inputs;
+        if(savedA.resolved_outputs && (!hasOutputs)) curA.resolved_outputs = savedA.resolved_outputs;
+        if(savedA.flag_value && (!curA.flag_value || !String(curA.flag_value).trim())) curA.flag_value = savedA.flag_value;
+        nextAssignments[i] = curA;
+      }
+      currentFlagAssignments = nextAssignments;
+    } catch(e) {}
+  }
+
+  function mergeResolvedFromSavedState(scenarioName, chainNodes){
+    try{
+      if(typeof window.coretgGetSavedFlowStateForScenario !== 'function') return;
+      const saved = window.coretgGetSavedFlowStateForScenario(scenarioName);
+      if(!saved || !Array.isArray(saved.flag_assignments)) return;
+      const savedByNode = new Map();
+      const savedAssignments = saved.flag_assignments;
+      savedAssignments.forEach((a, idx)=>{
+        if(!a || typeof a !== 'object') return;
+        const nid = String(a.node_id || '').trim();
+        if(nid) savedByNode.set(nid, a);
+        else savedByNode.set(String(idx), a);
+      });
+
+      const chainIds = Array.isArray(chainNodes) ? chainNodes.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+      if(!chainIds.length) return;
+
+      const nextAssignments = Array.isArray(currentFlagAssignments) ? currentFlagAssignments.map(a => (a && typeof a === 'object') ? a : {}) : [];
+      for(let i = 0; i < chainIds.length; i++){
+        const nid = chainIds[i];
+        const savedA = savedByNode.get(nid) || savedByNode.get(String(i));
+        if(!savedA || typeof savedA !== 'object') continue;
+        const curA = nextAssignments[i] && typeof nextAssignments[i] === 'object' ? nextAssignments[i] : {};
+        const hasInputs = curA.resolved_inputs && typeof curA.resolved_inputs === 'object' && !Array.isArray(curA.resolved_inputs) && Object.keys(curA.resolved_inputs).length > 0;
+        const hasOutputs = curA.resolved_outputs && typeof curA.resolved_outputs === 'object' && !Array.isArray(curA.resolved_outputs) && Object.keys(curA.resolved_outputs).length > 0;
+        if(savedA.resolved_inputs && (!hasInputs)) curA.resolved_inputs = savedA.resolved_inputs;
+        if(savedA.resolved_outputs && (!hasOutputs)) curA.resolved_outputs = savedA.resolved_outputs;
+        if(savedA.flag_value && (!curA.flag_value || !String(curA.flag_value).trim())) curA.flag_value = savedA.flag_value;
+        nextAssignments[i] = curA;
+      }
+      currentFlagAssignments = nextAssignments;
+    } catch(e) {}
+  }
+
   function toRoman(n){
     const num = parseInt(n, 10);
     if(!Number.isFinite(num) || num <= 0) return '';
@@ -502,10 +584,91 @@
     } catch(e) {}
   }
 
+  function escapeHtml(text){
+    try{
+      return String(text || '').replace(/[&<>"']/g, (c)=>({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      })[c] || c);
+    } catch(e){
+      return String(text || '');
+    }
+  }
+
+  function setLoadingSteps(steps, activeIndex){
+    try{
+      if(!loadingStepsEl) return;
+      if(!Array.isArray(steps) || steps.length === 0){
+        loadingStepsEl.innerHTML = '';
+        loadingStepsEl.classList.add('d-none');
+        return;
+      }
+      loadingStepsEl.classList.remove('d-none');
+      const idx = Number.isFinite(+activeIndex) ? (+activeIndex) : -1;
+      loadingStepsEl.innerHTML = steps.map((s, i)=>{
+        const cls = (i === idx) ? 'fw-semibold text-body' : '';
+        return `<li class="${cls}">${escapeHtml(s)}</li>`;
+      }).join('');
+    } catch(e) {}
+  }
+
+  function summarizeChainForLog(chain, assignments){
+    try{
+      if(!Array.isArray(chain) || chain.length === 0){
+        return { chain: 'Chain: (empty)', gens: 'Generators: (none)' };
+      }
+      const ids = chain.map((n)=>{
+        const id = (n && n.id) ? String(n.id) : '';
+        const name = (n && n.name) ? String(n.name) : '';
+        return name ? `${id}:${name}` : id;
+      }).filter(Boolean);
+      const chainLine = ids.length ? `Chain IDs: ${ids.join(', ')}` : 'Chain IDs: (missing)';
+
+      let genLine = 'Generators: (none)';
+      if(Array.isArray(assignments) && assignments.length){
+        const parts = assignments.map((a, i)=>{
+          const gid = a && (a.generator_id || a.generator || a.generator_slug || a.generator_name) ? String(a.generator_id || a.generator || a.generator_slug || a.generator_name) : '';
+          if(!gid) return `#${i+1}:?`;
+          const redacted = gid.length > 8 ? `…${gid.slice(-8)}` : gid;
+          return `#${i+1}:${redacted}`;
+        });
+        genLine = `Generators: ${parts.join(', ')}`;
+      }
+      return { chain: chainLine, gens: genLine };
+    } catch(e){
+      return { chain: 'Chain: (unavailable)', gens: 'Generators: (unavailable)' };
+    }
+  }
+
+  function appendLoadingLog(message){
+    try{
+      if(!loadingLogEl) return;
+      const msg = String(message || '').trim();
+      if(!msg) return;
+      loadingLogEl.classList.remove('d-none');
+      const item = document.createElement('li');
+      item.textContent = msg;
+      loadingLogEl.appendChild(item);
+    } catch(e) {}
+  }
+
+  function clearLoadingLog(){
+    try{
+      if(!loadingLogEl) return;
+      loadingLogEl.innerHTML = '';
+      loadingLogEl.classList.add('d-none');
+    } catch(e) {}
+  }
+
   function hideLoading(){
     try{
       if(!loadingOverlayEl) return;
       loadingOverlayEl.classList.add('d-none');
+      setLoadingSteps([], -1);
+      clearLoadingLog();
     } catch(e) {}
   }
 
@@ -515,6 +678,12 @@
     const flagsEnabled = p && ('flags_enabled' in p) ? !!p.flags_enabled : true;
     const flowErrors = (p && Array.isArray(p.flow_errors)) ? p.flow_errors.slice() : [];
     const flowErrorsDetail = (p && typeof p.flow_errors_detail === 'string') ? p.flow_errors_detail : '';
+    try {
+      if(p && p.host_ip_map && typeof p.host_ip_map === 'object'){
+        const entries = Object.entries(p.host_ip_map).map(([k, v]) => [String(k), String(v || '')]);
+        lastHostIpMap = new Map(entries.filter(([k, v]) => k && v));
+      }
+    } catch(e) {}
     lastFlowValid = flowValid;
     lastFlagsEnabled = flagsEnabled;
     lastFlowErrors = flowErrors;
@@ -1093,6 +1262,12 @@
         (Array.isArray(currentChain) ? currentChain : []).forEach((node, idx) => {
           const name = (node && node.name) ? String(node.name) : '';
           if(!name || nameToIp.has(name)) return;
+          const nid = node && node.id !== undefined && node.id !== null ? String(node.id) : '';
+          if(nid && lastHostIpMap && lastHostIpMap.has(nid)){
+            const ipText = String(lastHostIpMap.get(nid) || '').trim();
+            if(ipText) nameToIp.set(name, ipText);
+            return;
+          }
           const ips = [];
           const pushIps = (val) => {
             if(!val) return;
@@ -1118,19 +1293,34 @@
               pushIps(iface.ip4 || iface.ipv4 || iface.ip || iface.address);
             });
           } catch(e) {}
-          try{
-            const fa0 = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
-            const ri = fa0 && fa0.resolved_inputs ? fa0.resolved_inputs : null;
-            if(ri && typeof ri === 'object'){
-              pushIps(ri['Knowledge(ip)'] || ri['host_ip'] || ri['target_ip'] || ri['ip4'] || ri['ipv4']);
-            }
-          } catch(e) {}
           const uniq = Array.from(new Set(ips)).filter(Boolean);
           const ipText = uniq.length ? uniq.join(', ') : '';
           if(ipText) nameToIp.set(name, ipText);
         });
       } catch(e) {}
       return nameToIp;
+    }
+
+    function _firstValidIpFromNode(node){
+      try{
+        if(!node || typeof node !== 'object') return '';
+        const ips = [];
+        const pushIps = (val) => {
+          if(!val) return;
+          if(Array.isArray(val)) { val.forEach(v => pushIps(v)); return; }
+          const s = String(val || '').trim();
+          if(!s) return;
+          s.split(',').forEach(part => { const p = String(part || '').trim(); if(p) ips.push(p); });
+        };
+        pushIps(node.ip4 || node.ipv4 || node.ip || node.address);
+        pushIps(node.ips || node.addresses || node.ipv4s);
+        const ifaces = Array.isArray(node.interfaces) ? node.interfaces : [];
+        ifaces.forEach(iface => { if(iface && typeof iface === 'object') pushIps(iface.ip4 || iface.ipv4 || iface.ip || iface.address); });
+        const uniq = Array.from(new Set(ips));
+        return uniq.length ? uniq.join(', ') : '';
+      } catch(e){
+        return '';
+      }
     }
 
     function _applyHintNodeIps(text, nameToIp){
@@ -1604,6 +1794,10 @@
       const baseName = (node && node.name) ? String(node.name) : ('Node ' + (idx+1));
       let ipText = '';
       try{
+        const nid = node && node.id !== undefined && node.id !== null ? String(node.id) : '';
+        if(nid && lastHostIpMap && lastHostIpMap.has(nid)){
+          ipText = String(lastHostIpMap.get(nid) || '').trim();
+        } else {
         const ips = [];
         const pushIps = (val) => {
           if(!val) return;
@@ -1629,19 +1823,12 @@
             pushIps(iface.ip4 || iface.ipv4 || iface.ip || iface.address);
           });
         } catch(e) {}
-        try{
-          const fa0 = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
-          const ri = fa0 && fa0.resolved_inputs ? fa0.resolved_inputs : null;
-          if(ri && typeof ri === 'object'){
-            pushIps(ri['Knowledge(ip)'] || ri['host_ip'] || ri['target_ip'] || ri['ip4'] || ri['ipv4']);
-          }
-        } catch(e) {}
         const uniq = Array.from(new Set(ips));
         if(uniq.length){
           ipText = uniq.join(', ');
-        } else {
-          ipText = 'unknown';
         }
+        }
+        if(!ipText) ipText = 'unknown';
       } catch(e) {}
       let titleSuffix = '';
       try{
@@ -1812,14 +1999,25 @@
       // Realized flag value (populated after prepare_preview_for_execute).
       try{
         const fv = (fa && typeof fa.flag_value === 'string') ? fa.flag_value.trim() : '';
-        if(fv){
+        let resolvedFlag = fv;
+        if(!resolvedFlag){
+          try{
+            const ro = (fa && typeof fa.resolved_outputs === 'object' && fa.resolved_outputs && !Array.isArray(fa.resolved_outputs)) ? fa.resolved_outputs : null;
+            if(ro){
+              const rf = ro['Flag(flag_id)'] || ro['flag'] || ro['FLAG'] || '';
+              if(typeof rf === 'string' && rf.trim()) resolvedFlag = rf.trim();
+            }
+          } catch(e) {}
+        }
+        if(resolvedFlag){
           const code = document.createElement('code');
           code.className = 'font-monospace';
           code.style.whiteSpace = 'pre-wrap';
-          code.textContent = fv;
+          code.textContent = resolvedFlag;
           addRow('Flag', code);
         }
       } catch(e) {}
+
 
       const descList = (fa && Array.isArray(fa.description_hints) && fa.description_hints.length)
         ? fa.description_hints.map(x => String(x || '').trim()).filter(Boolean)
@@ -5797,10 +5995,10 @@
     const usePreview = !!preferPreview;
     const scenario = (scenarioEl && scenarioEl.value || '').trim();
     const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
-    const length = preset ? 3 : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
+    let length = preset ? 3 : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
 
     // User-click Generate should be deterministic: save current settings, produce a fresh
-    // preview plan, then build + resolve the flow from that exact snapshot.
+    // preview plan, then build the flow chain from that exact snapshot.
     const runSavePreviewResolve = !!(usePreview && options && options.savePreviewResolve);
 
     const params = new URLSearchParams();
@@ -5832,14 +6030,15 @@
     if(metaStatsEl) metaStatsEl.textContent = '';
     if(jsonEl) jsonEl.textContent = '';
 
+    const progressSteps = ['Saving XML', 'Generating preview plan', 'Sequencing chain', 'Resolving values'];
     let resolvedOk = false;
     let usedBestEffort = false;
     try {
       if(runSavePreviewResolve){
         const scenLabel = (scenario || activeScenario || '').toString().trim();
         const msg = scenLabel
-          ? ('Generate will save current Topology / VM Access settings for scenario "' + scenLabel + '" and then resolve Flag Sequencing hints.\n\nContinue?')
-          : 'Generate will save current Topology / VM Access settings and then resolve Flag Sequencing hints.\n\nContinue?';
+          ? ('Generate will save current Topology / VM Access settings for scenario "' + scenLabel + '" and then build a Flag Sequencing chain.\n\nContinue?')
+          : 'Generate will save current Topology / VM Access settings and then build a Flag Sequencing chain.\n\nContinue?';
         const ok = confirm(msg);
         if(!ok){
           hideLoading();
@@ -5852,13 +6051,22 @@
 
         setStatus('Saving XML…', false);
         showLoading('Saving XML…');
+        setLoadingSteps(progressSteps, 0);
+        clearLoadingLog();
+        appendLoadingLog(`Preset: ${preset || 'Random'} | Length: ${length}`);
         const xmlPath = await window.coretgSaveXmlViaApi({ persistPreviewPlan: false });
         if(!xmlPath){
           throw new Error('Save did not return xml_path');
         }
+        try {
+          const xmlPathInput = document.getElementById('scenariosPreviewXmlPath');
+          if(xmlPathInput) xmlPathInput.value = String(xmlPath);
+        } catch(e) {}
 
-        setStatus('Preparing preview plan…', false);
-        showLoading('Preparing preview plan…');
+        setStatus('Generating preview plan…', false);
+        showLoading('Generating preview plan…');
+        setLoadingSteps(progressSteps, 1);
+        appendLoadingLog('Persisting preview plan');
         let seed = null;
         try {
           if (scenario && typeof window.coretgEnsureSeedForScenario === 'function') {
@@ -5890,33 +6098,120 @@
       }
 
       let data;
+      let retriesRemaining = 0;
       try{
-        data = await fetchJson(buildAttackflowPreviewUrl(params));
-      } catch(err){
-        // If Generate requested a longer chain than available, ask user whether to
-        // retry in best-effort mode (clamp to available) or cancel.
-        const offer = usePreview ? shouldOfferBestEffort(err) : null;
-        if(offer){
-          const want = confirm(`Only ${offer.available} eligible nodes are available for this scenario.\n\nRun Generate in best-effort mode (use ${offer.available})?`);
-          if(!want){
-            hideLoading();
-            setStatus('Generate cancelled.', false);
-            return;
+        if(runSavePreviewResolve && generateMaxRetriesEl){
+          retriesRemaining = Math.max(0, Math.min(10, parseInt(generateMaxRetriesEl.value || '0', 10) || 0));
+        }
+      } catch(e) { retriesRemaining = 0; }
+      let attemptedRetries = 0;
+      let retryIndex = 0;
+      while(true){
+        try{
+          if(runSavePreviewResolve){
+            setStatus('Sequencing chain…', false);
+            showLoading('Sequencing chain…');
+            setLoadingSteps(progressSteps, 2);
+            appendLoadingLog(`Sequencing attempt ${retryIndex + 1}`);
+            data = await postJson('/api/flag-sequencing/sequence_preview_plan', {
+              scenario,
+              length,
+              preset,
+              preview_plan: (lastPreviewPlanPath || ''),
+              allow_node_duplicates: !!allowDupes,
+              retry_index: retryIndex,
+              initial_facts: flowInitialFactsOverride,
+              goal_facts: flowGoalFactsOverride,
+            }, { timeoutMs: 60000 });
+          } else {
+            data = await fetchJson(buildAttackflowPreviewUrl(params));
           }
-          const params2 = new URLSearchParams(params.toString());
-          params2.set('best_effort', '1');
-          const retryUrl = buildAttackflowPreviewUrl(params2);
-          data = await fetchJson(retryUrl);
-          usedBestEffort = true;
-        } else {
+          break;
+        } catch(err){
+          // If Generate requested a longer chain than available, ask user whether to
+          // retry in best-effort mode (clamp to available) or cancel.
+          const offer = usePreview ? shouldOfferBestEffort(err) : null;
+          if(offer){
+            appendLoadingLog(`Eligible nodes: ${offer.available}; requested ${offer.requested || length}`);
+            const want = confirm(`Only ${offer.available} eligible nodes are available for this scenario.\n\nRun Generate in best-effort mode (use ${offer.available})?`);
+            if(!want){
+              hideLoading();
+              setStatus('Generate cancelled.', false);
+              return;
+            }
+            if(runSavePreviewResolve){
+              appendLoadingLog(`Retrying best-effort length ${offer.available}`);
+              data = await postJson('/api/flag-sequencing/sequence_preview_plan', {
+                scenario,
+                length,
+                preset,
+                preview_plan: (lastPreviewPlanPath || ''),
+                allow_node_duplicates: !!allowDupes,
+                best_effort: true,
+                initial_facts: flowInitialFactsOverride,
+                goal_facts: flowGoalFactsOverride,
+              }, { timeoutMs: 60000 });
+            } else {
+              const params2 = new URLSearchParams(params.toString());
+              params2.set('best_effort', '1');
+              const retryUrl = buildAttackflowPreviewUrl(params2);
+              data = await fetchJson(retryUrl);
+            }
+            usedBestEffort = true;
+            break;
+          }
+
+          if(retriesRemaining > 0){
+            attemptedRetries += 1;
+            retriesRemaining -= 1;
+            retryIndex += 1;
+            setStatus(`Generate failed; retrying (${attemptedRetries})…`, true);
+            showLoading('Retrying generate…');
+            appendLoadingLog(`Retrying (${attemptedRetries}) after error: ${String(err && err.message || err)}`);
+            continue;
+          }
+
+          const reduce = confirm('Generate failed after retries. Reduce chain length and retry?');
+          if(reduce){
+            const nextLenRaw = prompt('New chain length:', String(Math.max(1, (parseInt(length, 10) || 1) - 1)));
+            const nextLen = parseInt(nextLenRaw || '', 10);
+            if(Number.isFinite(nextLen) && nextLen > 0){
+              length = Math.max(1, Math.min(50, nextLen));
+              if(lengthEl) lengthEl.value = String(length);
+              params.set('length', String(length));
+              retriesRemaining = 0;
+              attemptedRetries = 0;
+              retryIndex = 0;
+              appendLoadingLog(`Reduced chain length to ${length} and retrying`);
+              continue;
+            }
+          }
           throw err;
         }
       }
       currentChain = Array.isArray(data.chain) ? data.chain.slice() : [];
       currentFlagAssignments = Array.isArray(data.flag_assignments) ? data.flag_assignments.slice() : [];
+      if(!runSavePreviewResolve){
+        const fs = getFlowStateForScenario(scenario);
+        if(fs){
+          mergeResolvedFromFlowState(fs, currentChain);
+        } else {
+          mergeResolvedFromSavedState(scenario, currentChain);
+        }
+      }
       setFlowValidityFromPayload(data);
       lastStats = data.stats || null;
       lastPreviewPlanPath = data.preview_plan_path || '';
+      try {
+        const summary = summarizeChainForLog(currentChain, currentFlagAssignments);
+        appendLoadingLog(summary.chain);
+        appendLoadingLog(summary.gens);
+      } catch(e) {}
+      try {
+        if (scenario && lastPreviewPlanPath && typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
+          window.coretgSetPreviewPlanPathForScenario(scenario, lastPreviewPlanPath);
+        }
+      } catch(e) {}
       // IMPORTANT: never carry a stale flow-plan path across runs.
       // If the backend doesn't return a flow plan path for this preview, clear it.
       lastFlowPlanPath = data.flow_plan_path || '';
@@ -5931,21 +6226,101 @@
       renderChainEditor();
       persistFlowState();
 
+      // Resolve values immediately after sequencing so hints/IPs appear on this page.
+      if(runSavePreviewResolve && Array.isArray(currentChain) && currentChain.length){
+        try{
+          setStatus('Resolving values…', false);
+          showLoading('Resolving values…');
+          setLoadingSteps(['Saving XML', 'Generating preview plan', 'Sequencing chain', 'Resolving values'], 3);
+          appendLoadingLog('Resolving values via prepare_preview_for_execute');
+          const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+          const prepData = await postJson(
+            '/api/flag-sequencing/prepare_preview_for_execute',
+            {
+              scenario,
+              length: chainIds.length,
+              preset,
+              chain_ids: chainIds,
+              preview_plan: (lastPreviewPlanPath || ''),
+              allow_node_duplicates: !!allowDupes,
+              mode: 'resolve',
+              best_effort: true,
+              timeout_s: 120,
+              initial_facts: flowInitialFactsOverride,
+              goal_facts: flowGoalFactsOverride,
+            },
+            { timeoutMs: 120000 }
+          );
+          setFlowValidityFromPayload(prepData);
+          if(prepData && Array.isArray(prepData.chain)){
+            currentChain = prepData.chain.slice();
+          }
+          if(prepData && Array.isArray(prepData.flag_assignments)){
+            currentFlagAssignments = prepData.flag_assignments.slice();
+          }
+          if(prepData && prepData.preview_plan_path){
+            lastPreviewPlanPath = String(prepData.preview_plan_path);
+            try {
+              if (scenario && typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
+                window.coretgSetPreviewPlanPathForScenario(scenario, lastPreviewPlanPath);
+              }
+            } catch(e) {}
+          }
+          if(prepData && prepData.flow_plan_path){
+            lastFlowPlanPath = String(prepData.flow_plan_path);
+          }
+          updateMeta();
+          renderChainEditor();
+          try {
+            let resolvedInputsCount = 0;
+            let resolvedOutputsCount = 0;
+            for(const a of (currentFlagAssignments || [])){
+              if(a && typeof a === 'object'){
+                const ri = (a.resolved_inputs && typeof a.resolved_inputs === 'object' && !Array.isArray(a.resolved_inputs)) ? Object.keys(a.resolved_inputs).length : 0;
+                const ro = (a.resolved_outputs && typeof a.resolved_outputs === 'object' && !Array.isArray(a.resolved_outputs)) ? Object.keys(a.resolved_outputs).length : 0;
+                resolvedInputsCount += ri;
+                resolvedOutputsCount += ro;
+              }
+            }
+            appendLoadingLog(`Resolved inputs: ${resolvedInputsCount}, outputs: ${resolvedOutputsCount}`);
+            if(resolvedInputsCount === 0 && resolvedOutputsCount === 0){
+              setStatus('Resolve completed, but no resolved values were returned.', true);
+            }
+          } catch(e) {}
+          if(jsonEl){
+            jsonEl.textContent = JSON.stringify({
+              scenario: (prepData && prepData.scenario) ? prepData.scenario : (activeScenario || scenario),
+              length: (prepData && Number.isFinite(+prepData.length)) ? (+prepData.length) : (Array.isArray(currentChain) ? currentChain.length : 0),
+              chain: Array.isArray(currentChain) ? currentChain : [],
+              flag_assignments: Array.isArray(currentFlagAssignments) ? currentFlagAssignments : [],
+              flow_valid: !!(prepData && prepData.flow_valid),
+              flow_errors: Array.isArray(prepData && prepData.flow_errors) ? prepData.flow_errors : [],
+              flags_enabled: !!(prepData && prepData.flags_enabled),
+            }, null, 2);
+          }
+          const diagram2 = buildMermaid(currentChain);
+          await renderMermaid(diagram2);
+        } catch(e) {
+          try {
+            setStatus('Resolve failed: ' + String(e && e.message || e), true);
+          } catch(_) {}
+        }
+      }
+
       // Persist the generated chain so hard refresh restores it (best-effort).
       try{
         const scenario = (scenarioEl && scenarioEl.value || '').trim();
         const chainIds = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
-        const planPath = (lastPreviewPlanPath || lastFlowPlanPath || '');
-        if(scenario && chainIds.length && planPath){
-          await postJson('/api/flag-sequencing/save_flow_substitutions', {
-            scenario,
+        if(scenario && chainIds.length && typeof window.coretgSetSavedFlowStateForScenario === 'function'){
+          window.coretgSetSavedFlowStateForScenario(scenario, {
+            preset,
+            length: chainIds.length,
             chain_ids: chainIds,
-            preview_plan: planPath,
             flag_assignments: buildPersistAssignments(chainIds),
             allow_node_duplicates: !!allowNodeDuplicates,
             initial_facts: flowInitialFactsOverride,
             goal_facts: flowGoalFactsOverride,
-          }, { timeoutMs: 60000 });
+          });
         }
       } catch(e) {}
 
@@ -5960,128 +6335,43 @@
           flags_enabled: !!(data && data.flags_enabled),
         }, null, 2);
       }
+          try {
+            const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+            const flowStatePayload = {
+              scenario,
+              preset,
+              length: chainIds.length,
+              chain_ids: chainIds,
+              flag_assignments: buildPersistAssignments(chainIds),
+              allow_node_duplicates: !!allowNodeDuplicates,
+              initial_facts: flowInitialFactsOverride,
+              goal_facts: flowGoalFactsOverride,
+              updated_at: Date.now(),
+            };
+            let xmlPath = (prepData && prepData.xml_path) ? String(prepData.xml_path) : (document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
+            if(!xmlPath && typeof window.coretgGetLatestXmlPathForScenario === 'function'){
+              try {
+                xmlPath = String(window.coretgGetLatestXmlPathForScenario(scenario) || '').trim();
+              } catch(e) {}
+            }
+            if(xmlPath){
+              await postJson('/api/flag-sequencing/save_flow_state_to_xml', {
+                xml_path: xmlPath,
+                scenario,
+                flow_state: flowStatePayload,
+              });
+            }
+            try{
+              const key = normalizeScenarioNorm(scenario);
+              if(key && flowStateByScenario && typeof flowStateByScenario === 'object'){
+                flowStateByScenario[key] = flowStatePayload;
+              }
+            } catch(e) {}
+          } catch(e) {}
       const diagram = buildMermaid(currentChain);
       await renderMermaid(diagram);
 
-      // Optional (user-click only): run the prepare step so generator outputs can resolve
-      // hint templates immediately (e.g., IPs/ports/usernames) without requiring a refresh.
-      if(usePreview){
-        try{
-          if(Array.isArray(currentChain) && currentChain.length){
-            showLoading('Resolving hint values…');
-            setStatus('Resolving hint values…', false);
-            const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-            const prepData = await postJson(
-              '/api/flag-sequencing/prepare_preview_for_execute',
-              {
-                scenario,
-                length: currentChain.length,
-                preset,
-                chain_ids: chainIds,
-                // Use the preview plan that produced the current chain.
-                // Using a stale flow plan can cause chain_ids to mismatch and collapse.
-                preview_plan: (lastPreviewPlanPath || ''),
-                allow_node_duplicates: !!allowDupes,
-                mode: 'resolve',
-                best_effort: true,
-                timeout_s: usedBestEffort ? 120 : 60
-              },
-              { timeoutMs: 35000 }
-            );
-            setFlowValidityFromPayload(prepData);
-
-            // If the server adjusted the chain (rare, e.g. preset repair), keep UI in sync.
-            const oldIds = chainIds.join('|');
-            const newChain = (prepData && Array.isArray(prepData.chain)) ? prepData.chain.slice() : null;
-            const newIds = (newChain || []).map(n => (n && n.id) ? String(n.id) : '').filter(Boolean).join('|');
-            if(newChain && newChain.length){
-              currentChain = newChain;
-            }
-
-            if(prepData && Array.isArray(prepData.flag_assignments)){
-              currentFlagAssignments = prepData.flag_assignments.slice();
-              renderChainEditor();
-            }
-            if(prepData && prepData.preview_plan_path){
-              lastPreviewPlanPath = String(prepData.preview_plan_path);
-              updateMeta();
-            }
-            if(prepData && prepData.flow_plan_path){
-              lastFlowPlanPath = String(prepData.flow_plan_path);
-            }
-
-            // Persist resolved values from the prepare step so Generate both saves and resolves.
-            try{
-              if(prepData && Array.isArray(prepData.flag_assignments)){
-                const persistPlan = (prepData.preview_plan_path || lastPreviewPlanPath || '');
-                const chainIdsResolved = (Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : chainIds);
-                if(persistPlan && chainIdsResolved.length){
-                  const saveRes2 = await postJson('/api/flag-sequencing/save_flow_substitutions', {
-                    scenario,
-                    chain_ids: chainIdsResolved,
-                    preview_plan: persistPlan,
-                    flag_assignments: prepData.flag_assignments,
-                    allow_node_duplicates: !!allowDupes,
-                    initial_facts: flowInitialFactsOverride,
-                    goal_facts: flowGoalFactsOverride,
-                  }, { timeoutMs: 60000 });
-                  if(saveRes2 && saveRes2.flow_plan_path){
-                    lastFlowPlanPath = String(saveRes2.flow_plan_path);
-                  }
-                }
-              }
-            } catch(e) {}
-
-            // If chain changed, regenerate computed assignments to match (keep resolved hints in UI).
-            if(newChain && newIds && oldIds !== newIds){
-              await refreshAssignmentsFromChain();
-              if(prepData && Array.isArray(prepData.flag_assignments)){
-                currentFlagAssignments = prepData.flag_assignments.slice();
-                renderChainEditor();
-              }
-              const diagram2 = buildMermaid(currentChain);
-              await renderMermaid(diagram2);
-            }
-            resolvedOk = true;
-          }
-        } catch(e) {
-          // Non-fatal: the flow UI is still usable even if hints aren't resolved.
-          try {
-            const msg = (e && e.message) ? String(e.message) : String(e || 'prepare failed');
-            setStatus('Hint resolution failed: ' + msg, true);
-          } catch(_) {}
-        }
-      }
-
-      // Safety net: if Generate returned a chain but no resolved values, force one resolve pass.
-      try{
-        const hasResolved = Array.isArray(currentFlagAssignments)
-          ? currentFlagAssignments.some(a => (a && (a.resolved_inputs || a.resolved_outputs || a.hint || (Array.isArray(a.hints) && a.hints.length))))
-          : false;
-        if(usePreview && Array.isArray(currentChain) && currentChain.length && (!hasResolved || !resolvedOk)){
-          const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-          if(chainIds.length){
-            showLoading('Resolving hint values…');
-            const prepData2 = await postJson('/api/flag-sequencing/prepare_preview_for_execute', {
-              scenario,
-              length: chainIds.length,
-              preset,
-              chain_ids: chainIds,
-              preview_plan: (lastFlowPlanPath || lastPreviewPlanPath || ''),
-              allow_node_duplicates: !!allowDupes,
-              mode: 'resolve',
-              best_effort: true,
-              timeout_s: 120,
-            }, { timeoutMs: 35000 });
-            setFlowValidityFromPayload(prepData2);
-            if(prepData2 && Array.isArray(prepData2.flag_assignments)){
-              currentFlagAssignments = prepData2.flag_assignments.slice();
-              renderChainEditor();
-            }
-            resolvedOk = true;
-          }
-        }
-      } catch(e) {}
+      // New flow: no automatic resolve step on Generate.
 
       setStatus('Ready.', false);
     } catch(err){
