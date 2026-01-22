@@ -562,6 +562,81 @@
     return null;
   }
 
+  function getSavedFlowStateForScenario(scenarioName){
+    try{
+      const fromServer = getFlowStateForScenario(scenarioName);
+      if(fromServer && Array.isArray(fromServer.chain_ids) && fromServer.chain_ids.length){
+        return fromServer;
+      }
+    } catch(e) {}
+    try{
+      if(typeof window.coretgGetSavedFlowStateForScenario === 'function'){
+        const saved = window.coretgGetSavedFlowStateForScenario(scenarioName);
+        if(saved && Array.isArray(saved.chain_ids) && saved.chain_ids.length){
+          return saved;
+        }
+      }
+    } catch(e) {}
+    return null;
+  }
+
+  async function restoreSavedFlowForScenario(scenarioName){
+    const saved = getSavedFlowStateForScenario(scenarioName);
+    if(!saved || !Array.isArray(saved.chain_ids) || !saved.chain_ids.length){
+      return false;
+    }
+    const chainLen = saved.chain_ids.length;
+    try { if(lengthEl) lengthEl.value = String(chainLen); } catch(e) {}
+
+    const params = new URLSearchParams();
+    if(scenarioName) params.set('scenario', scenarioName);
+    params.set('length', String(chainLen));
+    params.set('prefer_flow', '1');
+
+    setStatus('Restoring saved flow…', false);
+    setLoginLinkVisible(false);
+    showLoading('Restoring saved flow…');
+    try {
+      const data = await fetchJson('/api/flag-sequencing/attackflow_preview?' + params.toString());
+      currentChain = Array.isArray(data.chain) ? data.chain.slice() : [];
+      currentFlagAssignments = Array.isArray(data.flag_assignments) ? data.flag_assignments.slice() : [];
+      currentFlagAssignments = alignAssignmentsToChain(currentChain, currentFlagAssignments);
+      mergeResolvedFromFlowState(saved, currentChain);
+      currentFlagAssignments = alignAssignmentsToChain(currentChain, currentFlagAssignments);
+      setFlowValidityFromPayload(data);
+      lastStats = data.stats || null;
+      lastPreviewPlanPath = data.preview_plan_path || '';
+      updateMeta();
+      selectedChainIndex = -1;
+      renderChainEditor();
+      try {
+        const diagram = buildMermaid(currentChain);
+        await renderMermaid(diagram);
+      } catch(e) {}
+      if(jsonEl){
+        jsonEl.textContent = JSON.stringify({
+          scenario: (data && data.scenario) ? data.scenario : activeScenario,
+          length: (data && Number.isFinite(+data.length)) ? (+data.length) : (Array.isArray(currentChain) ? currentChain.length : 0),
+          chain: Array.isArray(currentChain) ? currentChain : [],
+          flag_assignments: Array.isArray(currentFlagAssignments) ? currentFlagAssignments : [],
+          flow_valid: !!(data && data.flow_valid),
+          flow_errors: Array.isArray(data && data.flow_errors) ? data.flow_errors : [],
+          flags_enabled: !!(data && data.flags_enabled),
+        }, null, 2);
+      }
+      showRestoreBadge('Restored saved flow state');
+      persistFlowState();
+      setStatus('Ready.', false);
+      return true;
+    } catch(err){
+      setStatus('Restore failed: ' + String(err && err.message || err), true);
+      setLoginLinkVisible(!!(err && err.loginRequired));
+      return false;
+    } finally {
+      hideLoading();
+    }
+  }
+
   function mergeResolvedFromFlowState(flowState, chainNodes){
     try{
       if(!flowState || typeof flowState !== 'object') return;
@@ -961,8 +1036,19 @@
     updateScenarioSeedBadges();
     clearPreviewPlanCacheForScenario(activeScenario);
     await refreshLatestPreviewPlanPathForScenario(activeScenario);
-    // When switching scenarios (or loading after refresh), prefer any saved Flow state.
-    await generate(false);
+    // When switching scenarios (or loading after refresh), restore any saved Flow state.
+    const restored = await restoreSavedFlowForScenario(activeScenario);
+    if(!restored){
+      currentChain = [];
+      currentFlagAssignments = [];
+      selectedChainIndex = -1;
+      renderChainEditor();
+      try {
+        const diagram = buildMermaid([]);
+        await renderMermaid(diagram);
+      } catch(e) {}
+      setStatus('No saved flow chain. Click Generate to start.', false);
+    }
   }
 
   function setStatus(msg, isError){
@@ -6631,6 +6717,26 @@
         throw new Error('Save did not return xml_path');
       }
 
+      // Persist chain + assignments into the plan so Preview can render sequence numerals.
+      try {
+        const chainIds = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+        const assignments = chainIds.length ? buildPersistAssignments(chainIds) : [];
+        const missingGen = assignments.some(a => !a || !a.id || !String(a.id).trim());
+        if(chainIds.length && !missingGen){
+          await postJson('/api/flag-sequencing/save_flow_substitutions', {
+            scenario,
+            chain_ids: chainIds,
+            preview_plan: previewPlanForRequest(),
+            flag_assignments: assignments,
+            allow_node_duplicates: !!allowNodeDuplicates,
+            initial_facts: flowInitialFactsOverride,
+            goal_facts: flowGoalFactsOverride,
+          }, { timeoutMs: 60000 });
+        }
+      } catch(e) {
+        try { console.warn('Failed to persist flow substitutions before preview', e); } catch(_e) {}
+      }
+
       // Navigate to Preview tab.
       const baseUrl = String(document.getElementById('scenariosPreviewTabLink')?.dataset?.previewBaseUrl || '/scenarios/preview');
       const url = baseUrl + '?xml_path=' + encodeURIComponent(xmlPath) + '&scenario=' + encodeURIComponent(scenario);
@@ -7032,7 +7138,10 @@
   try { refreshXmlDockPreview({ force: false }); } catch(e) {}
   clearPreviewPlanCacheForScenario(activeScenario);
   await refreshLatestPreviewPlanPathForScenario(activeScenario);
-  generate(false);
+  const restored = await restoreSavedFlowForScenario(activeScenario);
+  if(!restored){
+    setStatus('No saved flow chain. Click Generate to start.', false);
+  }
 })();
 </script>
 {% endblock %}
