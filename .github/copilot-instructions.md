@@ -35,6 +35,7 @@ Purpose: Generate CORE network topologies from XML scenarios via CLI or a Web GU
     - A scenario-level aggregate attribute `scenario_total_nodes` (on `<Scenario>`) represents the sum of all planned hosts (node roles + routers + vulnerability additive targets, etc.) written by the web UI.
   - Items use attributes `selected`, `factor`, and section-specific extras (e.g., `pattern`, `rate_kbps`).
 - Report location: always under repo `./reports/`. The CLI logs an absolute path; the web app converts relative paths to absolute.
+- Plan storage: single per-scenario plan at `outputs/plans/plan_<scenario>.json`. Flow sequencing metadata lives only in `metadata.flow` (no duplication in `full_preview`).
 - Logs: Web async run tails `cli-<run_id>.log` and emits SSE at `/stream/<run_id>`.
 - Safe deletes: Artifact deletion is scoped to `outputs/` only (XML/reports/pre-session captures). Reports in `./reports/` are not deleted.
 

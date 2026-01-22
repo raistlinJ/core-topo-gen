@@ -70,9 +70,7 @@ def test_flag_sequencing_attackflow_preview_reuses_saved_flow_assignments(tmp_pa
         },
     }
 
-    plans_dir = os.path.join(app_backend._outputs_dir(), 'plans')
-    os.makedirs(plans_dir, exist_ok=True)
-    plan_path = os.path.join(plans_dir, f"plan_from_flow_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
+    plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
     with open(plan_path, 'w', encoding='utf-8') as f:
         json.dump(plan_payload, f)
 
@@ -169,9 +167,7 @@ def test_flag_sequencing_reload_with_default_length_does_not_break_saved_chain(t
         },
     }
 
-    plans_dir = os.path.join(app_backend._outputs_dir(), 'plans')
-    os.makedirs(plans_dir, exist_ok=True)
-    plan_path = os.path.join(plans_dir, f"plan_from_flow_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
+    plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
     with open(plan_path, 'w', encoding='utf-8') as f:
         json.dump(plan_payload, f)
 

@@ -375,7 +375,6 @@
   let currentChain = [];
   let lastStats = null;
   let lastPreviewPlanPath = '';
-  let lastFlowPlanPath = '';
   let currentFlagAssignments = [];
   let selectedChainIndex = -1;
   let lastFlowValid = true;
@@ -903,7 +902,6 @@
     const scen = (scenarioName || '').toString().trim();
     if(!scen) return;
     lastPreviewPlanPath = '';
-    lastFlowPlanPath = '';
     try {
       if (typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
         window.coretgSetPreviewPlanPathForScenario(scen, '');
@@ -4671,7 +4669,7 @@
           } catch(e) {}
           currentFlagAssignments = next;
         }
-        if(res && res.flow_plan_path) lastFlowPlanPath = String(res.flow_plan_path);
+        // flow_plan_path no longer used
         try { persistFlowState(); } catch(e) {}
         updateMeta();
         renderChainEditor();
@@ -5200,7 +5198,7 @@
           } catch(e) {}
           currentFlagAssignments = next;
         }
-        if(res && res.flow_plan_path) lastFlowPlanPath = String(res.flow_plan_path);
+        // flow_plan_path no longer used
         try { persistFlowState(); } catch(e) {}
         renderChainEditor();
         try { if(typeof inputsDialogEl.close === 'function') inputsDialogEl.close(); } catch(e) {}
@@ -5955,7 +5953,7 @@
           setFlowValidityFromPayload(res);
           if(res && Array.isArray(res.chain)) currentChain = res.chain.slice();
           if(res && Array.isArray(res.flag_assignments)) currentFlagAssignments = res.flag_assignments.slice();
-          if(res && res.flow_plan_path) lastFlowPlanPath = String(res.flow_plan_path);
+          // flow_plan_path no longer used
           updateMeta();
           renderChainEditor();
           setStatus('Edits saved. Saving XML…', false);
@@ -6339,9 +6337,7 @@
           window.coretgSetPreviewPlanPathForScenario(scenario, lastPreviewPlanPath);
         }
       } catch(e) {}
-      // IMPORTANT: never carry a stale flow-plan path across runs.
-      // If the backend doesn't return a flow plan path for this preview, clear it.
-      lastFlowPlanPath = data.flow_plan_path || '';
+      // flow_plan_path no longer used
       try {
         // If the backend loaded a saved chain whose effective length differs from the
         // current input value (e.g. page reload reset to default), keep the UI in sync.
@@ -6394,9 +6390,7 @@
               }
             } catch(e) {}
           }
-          if(prepData && prepData.flow_plan_path){
-            lastFlowPlanPath = String(prepData.flow_plan_path);
-          }
+          // flow_plan_path no longer used
           updateMeta();
           renderChainEditor();
           try {
@@ -6509,7 +6503,7 @@
       setFlowValidityFromPayload(payload);
       lastStats = payload && payload.stats ? payload.stats : null;
       lastPreviewPlanPath = payload && payload.preview_plan_path ? String(payload.preview_plan_path) : '';
-      lastFlowPlanPath = payload && payload.flow_plan_path ? String(payload.flow_plan_path) : lastFlowPlanPath;
+      // flow_plan_path no longer used
       updateMeta();
       currentChain = [];
       currentFlagAssignments = [];
@@ -6567,13 +6561,11 @@
       }
       const xmlPath = (prepData && prepData.xml_path) ? String(prepData.xml_path) : '';
       const previewPlan = (prepData && prepData.preview_plan_path) ? String(prepData.preview_plan_path) : '';
-      const flowPlan = (prepData && prepData.flow_plan_path) ? String(prepData.flow_plan_path) : '';
       if(!xmlPath || !previewPlan){
         throw new Error('Prepare step did not return xml_path/preview_plan_path');
       }
-      if(flowPlan) lastFlowPlanPath = flowPlan;
       setStatus('Starting async execution…', false);
-      const runData = await postJson('/run_cli_async', { xml_path: xmlPath, preview_plan: (flowPlan || previewPlan), scenario });
+      const runData = await postJson('/run_cli_async', { xml_path: xmlPath, preview_plan: previewPlan, scenario });
       const runId = runData && runData.run_id ? String(runData.run_id) : '';
       if(runId){
         setStatus('Run started: ' + runId + ' (see Core/Reports pages).', false);

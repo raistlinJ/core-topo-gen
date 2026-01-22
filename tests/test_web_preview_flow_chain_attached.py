@@ -76,26 +76,19 @@ def test_preview_full_attaches_latest_flow_chain_when_present():
             },
         }
 
-        plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-        os.makedirs(plans_dir, exist_ok=True)
-        plan_path = os.path.join(plans_dir, f"plan_from_flow_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
+        plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
         with open(plan_path, "w", encoding="utf-8") as f:
             json.dump(plan_payload, f)
 
         try:
-            # Second request: should attach the latest flow chain into full_preview metadata.
+            # Second request: should return flow metadata alongside full_preview.
             second = client.post("/api/plan/preview_full", json={"xml_path": xml_path, "scenario": scenario})
             assert second.status_code == 200
             payload2 = second.get_json() or {}
             assert payload2.get("ok"), payload2
 
-            full_preview2 = payload2.get("full_preview") or {}
-            md = full_preview2.get("metadata") or {}
-            flow = md.get("flow") or {}
+            flow = payload2.get("flow_meta") or {}
             assert flow.get("chain") == chain
-
-            # Back-compat alias is also present.
-            assert (full_preview2.get("flow") or {}).get("chain") == chain
         finally:
             try:
                 os.remove(plan_path)
@@ -171,9 +164,7 @@ def test_preview_full_repairs_saved_flow_chain_that_points_to_non_docker_host():
             },
         }
 
-        plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-        os.makedirs(plans_dir, exist_ok=True)
-        plan_path = os.path.join(plans_dir, f"plan_from_flow_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
+        plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
         with open(plan_path, "w", encoding="utf-8") as f:
             json.dump(plan_payload, f)
 
@@ -183,9 +174,7 @@ def test_preview_full_repairs_saved_flow_chain_that_points_to_non_docker_host():
             payload2 = second.get_json() or {}
             assert payload2.get("ok"), payload2
 
-            full_preview2 = payload2.get("full_preview") or {}
-            md = full_preview2.get("metadata") or {}
-            flow = md.get("flow") or {}
+            flow = payload2.get("flow_meta") or {}
 
             repaired_chain = flow.get("chain") or []
             assert isinstance(repaired_chain, list) and repaired_chain

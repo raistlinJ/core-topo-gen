@@ -31,9 +31,7 @@ def test_save_flow_substitutions_persists_config_overrides(monkeypatch):
         "r2r_links_preview": [],
     }
 
-    plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-    os.makedirs(plans_dir, exist_ok=True)
-    plan_path = os.path.join(plans_dir, f"plan_from_preview_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
+    plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
     with open(plan_path, "w", encoding="utf-8") as f:
         json.dump({"full_preview": full_preview, "metadata": {"xml_path": "/tmp/does-not-matter.xml", "scenario": scenario, "seed": 123}}, f)
 
@@ -135,9 +133,7 @@ def test_prepare_preview_applies_config_overrides_into_effective_config(monkeypa
         },
     }
 
-    plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-    os.makedirs(plans_dir, exist_ok=True)
-    plan_path = os.path.join(plans_dir, f"plan_from_flow_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
+    plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
     with open(plan_path, "w", encoding="utf-8") as f:
         json.dump(plan_payload, f)
 
@@ -227,9 +223,7 @@ def test_save_flow_substitutions_persists_hint_overrides_and_can_clear(monkeypat
         "r2r_links_preview": [],
     }
 
-    plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-    os.makedirs(plans_dir, exist_ok=True)
-    plan_path = os.path.join(plans_dir, f"plan_from_preview_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
+    plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
     with open(plan_path, "w", encoding="utf-8") as f:
         json.dump({"full_preview": full_preview, "metadata": {"xml_path": "/tmp/does-not-matter.xml", "scenario": scenario, "seed": 123}}, f)
 
@@ -249,7 +243,6 @@ def test_save_flow_substitutions_persists_hint_overrides_and_can_clear(monkeypat
     monkeypatch.setattr(app_backend, "_flow_enabled_plugin_contracts_by_id", lambda: {})
     monkeypatch.setattr(app_backend, "_flow_validate_chain_order_by_requires_produces", lambda *args, **kwargs: (True, []))
 
-    flow_plan_path = None
     try:
         # Set overrides
         resp = client.post(
@@ -274,9 +267,9 @@ def test_save_flow_substitutions_persists_hint_overrides_and_can_clear(monkeypat
         assert fas[0].get("hints") == ["custom one", "custom two"]
         assert fas[0].get("hint") == "custom one"
 
-        flow_plan_path = data.get("flow_plan_path")
-        assert flow_plan_path
-        with open(flow_plan_path, "r", encoding="utf-8") as f:
+        plan_path_out = data.get("preview_plan_path") or plan_path
+        assert plan_path_out
+        with open(plan_path_out, "r", encoding="utf-8") as f:
             payload = json.load(f) or {}
         flow_meta = (((payload.get("metadata") or {}).get("flow")) if isinstance(payload, dict) else None) or {}
         saved_fas = flow_meta.get("flag_assignments") or []
@@ -310,11 +303,7 @@ def test_save_flow_substitutions_persists_hint_overrides_and_can_clear(monkeypat
             os.remove(plan_path)
         except Exception:
             pass
-        if flow_plan_path:
-            try:
-                os.remove(flow_plan_path)
-            except Exception:
-                pass
+        # plan_path removed above
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -339,9 +328,7 @@ def test_save_flow_substitutions_persists_flag_override_and_can_clear(monkeypatc
         "r2r_links_preview": [],
     }
 
-    plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-    os.makedirs(plans_dir, exist_ok=True)
-    plan_path = os.path.join(plans_dir, f"plan_from_preview_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
+    plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
     with open(plan_path, "w", encoding="utf-8") as f:
         json.dump({"full_preview": full_preview, "metadata": {"xml_path": "/tmp/does-not-matter.xml", "scenario": scenario, "seed": 123}}, f)
 
@@ -361,7 +348,6 @@ def test_save_flow_substitutions_persists_flag_override_and_can_clear(monkeypatc
     monkeypatch.setattr(app_backend, "_flow_enabled_plugin_contracts_by_id", lambda: {})
     monkeypatch.setattr(app_backend, "_flow_validate_chain_order_by_requires_produces", lambda *args, **kwargs: (True, []))
 
-    flow_plan_path = None
     try:
         # Set override
         resp = client.post(
@@ -384,9 +370,9 @@ def test_save_flow_substitutions_persists_flag_override_and_can_clear(monkeypatc
         assert fas[0].get("id") == "zz_flag_override"
         assert fas[0].get("flag_override") == "FLAG{CUSTOM}"
 
-        flow_plan_path = data.get("flow_plan_path")
-        assert flow_plan_path
-        with open(flow_plan_path, "r", encoding="utf-8") as f:
+        plan_path_out = data.get("preview_plan_path") or plan_path
+        assert plan_path_out
+        with open(plan_path_out, "r", encoding="utf-8") as f:
             payload = json.load(f) or {}
         flow_meta = (((payload.get("metadata") or {}).get("flow")) if isinstance(payload, dict) else None) or {}
         saved_fas = flow_meta.get("flag_assignments") or []
@@ -416,11 +402,7 @@ def test_save_flow_substitutions_persists_flag_override_and_can_clear(monkeypatc
             os.remove(plan_path)
         except Exception:
             pass
-        if flow_plan_path:
-            try:
-                os.remove(flow_plan_path)
-            except Exception:
-                pass
+        # plan_path removed above
 
 
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -445,9 +427,7 @@ def test_save_flow_substitutions_persists_output_overrides_and_inject_override_a
         "r2r_links_preview": [],
     }
 
-    plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-    os.makedirs(plans_dir, exist_ok=True)
-    plan_path = os.path.join(plans_dir, f"plan_from_preview_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
+    plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
     with open(plan_path, "w", encoding="utf-8") as f:
         json.dump({"full_preview": full_preview, "metadata": {"xml_path": "/tmp/does-not-matter.xml", "scenario": scenario, "seed": 123}}, f)
 
@@ -467,7 +447,6 @@ def test_save_flow_substitutions_persists_output_overrides_and_inject_override_a
     monkeypatch.setattr(app_backend, "_flow_enabled_plugin_contracts_by_id", lambda: {})
     monkeypatch.setattr(app_backend, "_flow_validate_chain_order_by_requires_produces", lambda *args, **kwargs: (True, []))
 
-    flow_plan_path = None
     try:
         # Set overrides
         resp = client.post(
@@ -498,9 +477,9 @@ def test_save_flow_substitutions_persists_output_overrides_and_inject_override_a
         assert fas[0].get("inject_files_override") == ["hint.txt", "notes.txt"]
         assert fas[0].get("inject_files") == ["hint.txt", "notes.txt"]
 
-        flow_plan_path = data.get("flow_plan_path")
-        assert flow_plan_path
-        with open(flow_plan_path, "r", encoding="utf-8") as f:
+        plan_path_out = data.get("preview_plan_path") or plan_path
+        assert plan_path_out
+        with open(plan_path_out, "r", encoding="utf-8") as f:
             payload = json.load(f) or {}
         flow_meta = (((payload.get("metadata") or {}).get("flow")) if isinstance(payload, dict) else None) or {}
         saved_fas = flow_meta.get("flag_assignments") or []
@@ -537,8 +516,4 @@ def test_save_flow_substitutions_persists_output_overrides_and_inject_override_a
             os.remove(plan_path)
         except Exception:
             pass
-        if flow_plan_path:
-            try:
-                os.remove(flow_plan_path)
-            except Exception:
-                pass
+        # plan_path removed above

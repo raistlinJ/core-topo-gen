@@ -9933,11 +9933,7 @@ def _canonical_plan_path_for_scenario(scenario: Optional[str], *, xml_path: Opti
 
 
 def _latest_preview_plan_for_scenario_norm(scenario_norm: str, *, prefer_flow: bool = True) -> Optional[str]:
-    """Return absolute path to newest persisted plan for a scenario.
-
-    Plans are now consolidated to a single per-scenario artifact. Legacy
-    plan_from_flow/plan_from_preview files are only used as a fallback.
-    """
+    """Return absolute path to the canonical plan for a scenario."""
     try:
         scenario_norm = _normalize_scenario_label(scenario_norm)
         if not scenario_norm:
@@ -9945,76 +9941,13 @@ def _latest_preview_plan_for_scenario_norm(scenario_norm: str, *, prefer_flow: b
         canonical_path = _canonical_plan_path_for_scenario_norm(scenario_norm)
         if os.path.exists(canonical_path):
             return canonical_path
-
-        plans_dir = Path(_outputs_dir()) / 'plans'
-        if not plans_dir.is_dir():
-            return None
-
-        def _created_at_ts(meta: Any, *, fallback_path: Optional[Path] = None) -> float:
-            try:
-                if isinstance(meta, dict):
-                    raw = meta.get('created_at')
-                else:
-                    raw = None
-                s = str(raw or '').strip()
-                if s:
-                    # Handle ISO strings with Z suffix.
-                    if s.endswith('Z'):
-                        s = s[:-1] + '+00:00'
-                    try:
-                        from datetime import datetime as _dt
-                        dt = _dt.fromisoformat(s)
-                        return float(dt.timestamp())
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            try:
-                if fallback_path is not None:
-                    return float(fallback_path.stat().st_mtime)
-            except Exception:
-                pass
-            return 0.0
-
-        def _latest_matching(pattern: str) -> tuple[Optional[Path], float]:
-            scanned = 0
-            candidates = list(plans_dir.glob(pattern))
-            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            for p in candidates:
-                scanned += 1
-                if scanned > 250:
-                    return None, 0.0
-                try:
-                    with open(p, 'r', encoding='utf-8') as f:
-                        payload = json.load(f) or {}
-                    meta = payload.get('metadata') if isinstance(payload, dict) else None
-                    scen = str((meta or {}).get('scenario') or '').strip()
-                    if _normalize_scenario_label(scen) != scenario_norm:
-                        continue
-                    return p, _created_at_ts(meta, fallback_path=p)
-                except Exception:
-                    continue
-            return None, 0.0
-
-        latest_preview, _preview_ts = _latest_matching('plan_from_preview_*.json')
-        latest_flow, _flow_ts = _latest_matching('plan_from_flow*.json')
-
-        if prefer_flow and latest_flow is not None:
-            return str(latest_flow)
-        if latest_preview is not None:
-            return str(latest_preview)
-        if latest_flow is not None:
-            return str(latest_flow)
         return None
     except Exception:
         return None
 
 
 def _latest_preview_plan_for_scenario_norm_origin(scenario_norm: str, *, origin: str) -> Optional[str]:
-    """Return newest plan path for scenario with a specific metadata.origin.
-
-    Searches both flow and legacy preview plan artifacts.
-    """
+    """Return canonical plan path for scenario with a specific metadata.origin."""
     try:
         scenario_norm = _normalize_scenario_label(scenario_norm)
         origin_norm = str(origin or '').strip().lower()
@@ -10034,32 +9967,6 @@ def _latest_preview_plan_for_scenario_norm_origin(scenario_norm: str, *, origin:
                             return canonical_path
             except Exception:
                 pass
-        plans_dir = Path(_outputs_dir()) / 'plans'
-        if not plans_dir.is_dir():
-            return None
-
-        scanned = 0
-        candidates = list(plans_dir.glob('plan_from_flow*.json')) + list(plans_dir.glob('plan_from_preview_*.json'))
-        candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        for p in candidates:
-            scanned += 1
-            if scanned > 250:
-                return None
-            try:
-                with open(p, 'r', encoding='utf-8') as f:
-                    payload = json.load(f) or {}
-                meta = payload.get('metadata') if isinstance(payload, dict) else None
-                if not isinstance(meta, dict):
-                    continue
-                scen = str(meta.get('scenario') or '').strip()
-                if _normalize_scenario_label(scen) != scenario_norm:
-                    continue
-                o = str(meta.get('origin') or '').strip().lower()
-                if o != origin_norm:
-                    continue
-                return str(p)
-            except Exception:
-                continue
         return None
     except Exception:
         return None
@@ -10677,7 +10584,6 @@ def api_flow_latest_preview_plan():
         'ok': True,
         'scenario': scenario_label or scenario_norm,
         'preview_plan_path': plan_path,
-        'flow_plan_path': plan_path,
         'metadata': meta or {},
     })
 
@@ -12615,8 +12521,6 @@ def api_flow_attackflow_preview():
 
     preview_plan_path = (request.args.get('preview_plan') or '').strip() or None
     explicit_preview_plan = bool(preview_plan_path)
-    flow_plan_path: str | None = None
-    flow_meta_from_plan: dict[str, Any] | None = None
     if preview_plan_path:
         try:
             preview_plan_path = os.path.abspath(preview_plan_path)
@@ -12653,45 +12557,22 @@ def api_flow_attackflow_preview():
     if not preview_plan_path:
         if prefer_flow:
             selected_by = 'prefer_flow_plan'
-            flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
-            if flow_plan_path and not explicit_preview_plan:
-                preview_plan_path = flow_plan_path
-        if not preview_plan_path:
-            if force_preview:
-                # Generate button: use the same topology source as refresh (preview plan)
-                # so stats/topology do not flip, but ignore any saved chain/assignments.
-                selected_by = 'force_preview_best_plan'
-                preview_plan_path = _latest_preview_plan_for_scenario_norm_origin(scenario_norm, origin='planner')
-            elif prefer_preview:
-                selected_by = 'prefer_preview_preview_plan'
-                preview_plan_path = _latest_preview_plan_for_scenario_norm_origin(scenario_norm, origin='planner')
-            else:
-                selected_by = 'default_best_plan'
-                preview_plan_path = _latest_preview_plan_for_scenario_norm_origin(scenario_norm, origin='planner')
+        if force_preview:
+            # Generate button: use the same topology source as refresh (preview plan)
+            # so stats/topology do not flip, but ignore any saved chain/assignments.
+            selected_by = 'force_preview_best_plan'
+            preview_plan_path = _latest_preview_plan_for_scenario_norm_origin(scenario_norm, origin='planner')
+        elif prefer_preview:
+            selected_by = 'prefer_preview_preview_plan'
+            preview_plan_path = _latest_preview_plan_for_scenario_norm_origin(scenario_norm, origin='planner')
+        else:
+            selected_by = 'default_best_plan'
+            preview_plan_path = _latest_preview_plan_for_scenario_norm_origin(scenario_norm, origin='planner')
 
     if not preview_plan_path:
         return jsonify({'ok': False, 'error': 'No preview plan found for this scenario. Generate a Full Preview first.'}), 404
 
-    # If we're preferring Flow, load flow metadata from the canonical plan. Keep
-    # topology aligned with that same plan unless the caller explicitly chose
-    # another preview plan.
-    if flow_plan_path and not explicit_preview_plan:
-        try:
-            with open(flow_plan_path, 'r', encoding='utf-8') as f:
-                flow_payload = json.load(f) or {}
-            meta_flow = flow_payload.get('metadata') if isinstance(flow_payload, dict) else None
-            flow_meta = (meta_flow or {}).get('flow') if isinstance(meta_flow, dict) else None
-            if not flow_meta and isinstance(flow_payload, dict):
-                flow_meta = flow_payload.get('flow')
-            if isinstance(flow_meta, dict):
-                flow_meta_from_plan = flow_meta
-        except Exception:
-            flow_meta_from_plan = None
-        try:
-            if flow_plan_path:
-                preview_plan_path = flow_plan_path
-        except Exception:
-            pass
+    # Prefer the canonical plan; flow metadata is stored in metadata.flow.
 
     payload = {}
     preview = None
@@ -13518,14 +13399,6 @@ def api_flow_attackflow_preview():
         out['initial_facts'] = initial_facts_override
     if goal_facts_override:
         out['goal_facts'] = goal_facts_override
-    try:
-        meta_out = payload.get('metadata') if isinstance(payload, dict) else None
-        if isinstance(meta_out, dict):
-            fp = str(meta_out.get('flow_plan_path') or '').strip()
-            if fp:
-                out['flow_plan_path'] = fp
-    except Exception:
-        pass
     if warning:
         out['warning'] = warning
     if debug_mode:
@@ -16566,7 +16439,6 @@ def api_flow_save_flow_substitutions():
         **({'flow_errors_detail': flow_errors_detail} if flow_errors_detail else {}),
         **({'host_ip_map': host_ip_map} if host_ip_map else {}),
         'preview_plan_path': out_path,
-        'flow_plan_path': out_path,
         'base_preview_plan_path': base_plan_path,
         'allow_node_duplicates': bool(allow_node_duplicates),
         **({'warning': warning} if warning else {}),
@@ -17041,7 +16913,6 @@ def api_flow_upload_flow_inject_file():
         'flow_valid': bool(flow_valid),
         'flow_errors': list(flow_errors or []),
         'preview_plan_path': out_path,
-        'flow_plan_path': out_path,
         'base_preview_plan_path': base_plan_path,
         'allow_node_duplicates': bool(allow_node_duplicates),
     })
@@ -17534,7 +17405,6 @@ def api_flow_afb_from_chain():
         return jsonify({'ok': False, 'error': 'Chain contained no valid nodes.'}), 400
 
     # Prefer latest saved Flow assignments (from the per-scenario plan) when available.
-    flow_plan_path: str | None = None
     flow_assignments_from_plan: list[dict[str, Any]] = []
     try:
         flow_plan_path = _latest_flow_plan_for_scenario_norm(scenario_norm)
@@ -17628,8 +17498,6 @@ def api_flow_afb_from_chain():
                 meta_out = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
                 meta_out = dict(meta_out or {})
                 meta_out['flow'] = flow_meta_from_plan
-                if flow_plan_path:
-                    meta_out['flow_plan_path'] = flow_plan_path
                 payload['metadata'] = meta_out
             preview = payload.get('full_preview') if isinstance(payload, dict) else None
             if isinstance(preview, dict):
@@ -26976,7 +26844,7 @@ def api_plan_persist_flow_plan():
     """Compute a full preview and persist it as a canonical plan artifact under outputs/plans.
 
     Request JSON: { xml_path: "/abs/path.xml", scenario: "name" (optional), seed: int (optional) }
-    Response JSON: { ok, xml_path, scenario, seed, preview_plan_path, flow_plan_path }
+    Response JSON: { ok, xml_path, scenario, seed, preview_plan_path }
     """
     try:
         payload = request.get_json(silent=True) or {}
@@ -27006,7 +26874,6 @@ def api_plan_persist_flow_plan():
             'scenario': result.get('scenario'),
             'seed': result.get('seed'),
             'preview_plan_path': result.get('preview_plan_path'),
-            'flow_plan_path': result.get('preview_plan_path'),
         })
     except Exception as e:
         try:
@@ -29115,8 +28982,8 @@ def run_cli_async():
                     "error": "Flow/preview plan mismatch with XML-derived plan.",
                     "detail": detail_text,
                     "mismatch": {
-                        "flow_plan_path": preview_plan_path,
-                        "flow_plan_scenario": flow_scen,
+                        "plan_path": preview_plan_path,
+                        "plan_scenario": flow_scen,
                         "xml_path": xml_path,
                         "xml_scenario": scenario_for_plan,
                         "xml_seed": xml_seed,

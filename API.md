@@ -172,7 +172,7 @@ Request JSON (typical):
 	"length": 5,
 	"preset": "",
 	"chain_ids": ["n1", "n2"],
-	"preview_plan": "/abs/path/to/outputs/plans/plan_from_preview_....json",
+	"preview_plan": "/abs/path/to/outputs/plans/plan_<scenario>.json",
 	"mode": "hint",
 	"best_effort": true,
 	"allow_node_duplicates": false,
@@ -199,14 +199,14 @@ Response JSON includes:
 - `flag_assignments` and validity metadata
 
 `POST /api/flag-sequencing/save_flow_substitutions`
-: Persists a user-edited chain + generator overrides into a `plan_from_flow_*.json` plan. This is used by “Save Overrides” and the Flow tab state persistence.
+: Persists a user-edited chain + generator overrides into the canonical per-scenario plan `outputs/plans/plan_<scenario>.json`.
 
 Request JSON (typical):
 ```json
 {
 	"scenario": "My Scenario",
 	"chain_ids": ["n1", "n2"],
-	"preview_plan": "/abs/path/to/outputs/plans/plan_from_preview_....json",
+	"preview_plan": "/abs/path/to/outputs/plans/plan_<scenario>.json",
 	"allow_node_duplicates": false,
 	"flag_assignments": [
 		{

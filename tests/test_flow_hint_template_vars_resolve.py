@@ -33,9 +33,7 @@ def test_prepare_preview_resolves_chain_and_output_template_vars(monkeypatch):
         "r2r_links_preview": [],
     }
 
-    plans_dir = os.path.join(app_backend._outputs_dir(), "plans")
-    os.makedirs(plans_dir, exist_ok=True)
-    plan_path = os.path.join(plans_dir, f"plan_from_preview_test_{int(time.time())}_{uuid.uuid4().hex[:6]}.json")
+    plan_path = app_backend._canonical_plan_path_for_scenario(scenario, create_dir=True)
     with open(plan_path, "w", encoding="utf-8") as f:
         json.dump({"full_preview": full_preview, "metadata": {"xml_path": "/tmp/does-not-matter.xml", "scenario": scenario, "seed": 123}}, f)
 

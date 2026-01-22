@@ -859,8 +859,8 @@ paths:
         - Flag Sequencing
       summary: Persist Flow substitutions and overrides
       description: >-
-        Persists user-edited chain positions plus generator overrides into a flow plan
-        (plan_from_flow_*.json). Used by the Flow UI “Save Overrides” action.
+        Persists user-edited chain positions plus generator overrides into the canonical
+        per-scenario plan (plan_<scenario>.json). Used by the Flow UI “Save Overrides” action.
       requestBody:
         required: true
         content:
@@ -3172,8 +3172,9 @@ components:
         goal_facts:
           $ref: '#/components/schemas/FlowFactsOverride'
         flow_plan_path:
-          type: string
+          deprecated: true
           nullable: true
+          description: Deprecated. The API now uses a single canonical plan file.
         warning:
           type: string
           nullable: true
@@ -3364,8 +3365,9 @@ components:
           type: string
           nullable: true
         flow_plan_path:
-          type: string
+          deprecated: true
           nullable: true
+          description: Deprecated. The API now uses a single canonical plan file.
         allow_node_duplicates:
           type: boolean
           nullable: true
