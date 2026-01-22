@@ -221,37 +221,16 @@
   }
 
   function getPreviewPlanPathForScenario(scenarioName){
-    try {
-      const key = normalizeScenarioKey(scenarioName);
-      if (!key) return '';
-      const map = readPreviewPlanMap();
-      const entry = (map && typeof map === 'object') ? map[key] : null;
-      const path = entry && typeof entry === 'object' ? (entry.preview_plan_path || entry.previewPlanPath || '') : '';
-      return (path || '').toString().trim();
-    } catch (e) {
-      return '';
-    }
+    return '';
   }
 
   function setPreviewPlanPathForScenario(scenarioName, previewPlanPath){
     try {
       const key = normalizeScenarioKey(scenarioName);
-      const path = (previewPlanPath || '').toString().trim();
       if (!key) return;
       const map = readPreviewPlanMap();
       const next = (map && typeof map === 'object') ? map : {};
-
-      // Allow clearing the stored preview plan.
-      if (!path) {
-        try { delete next[key]; } catch (e) {}
-        localStorage.setItem(PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY, JSON.stringify(next));
-        return;
-      }
-      next[key] = {
-        scenario: (scenarioName || '').toString().trim(),
-        preview_plan_path: path,
-        updated_at: Date.now(),
-      };
+      try { delete next[key]; } catch (e) {}
       localStorage.setItem(PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY, JSON.stringify(next));
     } catch (e) {}
   }
@@ -886,12 +865,12 @@
     } catch (e) {}
 
     if (persistPreviewPlan) {
-      // Always persist a fresh preview plan after Save XML so the Preview tab cannot
-      // display stale cached results from an older XML snapshot.
+      // Always persist a fresh flow plan after Save XML so Preview/Flow stay aligned
+      // and cannot display stale cached results from an older XML snapshot.
       try {
         try {
           if (typeof window.coretgUpdateProgress === 'function') {
-            window.coretgUpdateProgress({ title: 'Saving XML', message: 'Persisting preview plan…', percent: 95 });
+            window.coretgUpdateProgress({ title: 'Saving XML', message: 'Persisting flow plan…', percent: 95 });
           }
         } catch (e) {}
         const scenarioName = resolveScenarioNameForSave();
@@ -903,7 +882,7 @@
             }
           } catch (e) { seed = null; }
 
-          const persisted = await window.coretgPostJson('/api/plan/persist_preview_plan', {
+          const persisted = await window.coretgPostJson('/api/plan/persist_flow_plan', {
             xml_path: xmlPath,
             scenario: scenarioName,
             seed,
@@ -921,8 +900,8 @@
           }
         }
       } catch (e) {
-        // Best-effort: if preview-plan persistence failed, clear any stored preview plan
-        // path so Preview will fall back to re-rendering from the latest XML path.
+        // Best-effort: if flow-plan persistence failed, clear any stored plan path so
+        // Preview will fall back to re-rendering from the latest XML path.
         try {
           const scenarioName = resolveScenarioNameForSave();
           if (scenarioName && typeof window.coretgSetPreviewPlanPathForScenario === 'function') {

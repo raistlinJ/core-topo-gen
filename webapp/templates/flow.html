@@ -97,6 +97,7 @@
               <div class="col-md-4">
                 <div class="small">
                   <span id="flowStatus" class="text-muted" style="white-space: pre-line;"></span>
+                  <span id="flowRestoreBadge" class="ms-2 text-success d-none">Restored saved flow state</span>
                   <a id="flowLoginLink" class="ms-2 d-none" href="/login">Login</a>
                 </div>
               </div>
@@ -256,7 +257,7 @@
 </dialog>
 
 <script>
-(function(){
+(async function(){
   const SIDEBAR_SEED_VISIBILITY_STORAGE_KEY = 'coretg_sidebar_show_seed';
 
   const statusEl = document.getElementById('flowStatus');
@@ -267,6 +268,7 @@
   const presetEl = document.getElementById('flowPreset');
   const btnEl = document.getElementById('flowGenerateBtn');
   const generateMaxRetriesEl = document.getElementById('flowGenerateMaxRetries');
+  const restoreBadgeEl = document.getElementById('flowRestoreBadge');
   const saveXmlEl = document.getElementById('saveXmlBtn');
   const execEl = document.getElementById('scenariosExecuteBtn');
   const downloadXmlEl = document.getElementById('downloadXmlBtn');
@@ -449,6 +451,42 @@
     } catch(e) {}
   }
 
+  function alignAssignmentsToChain(chain, assignments){
+    try{
+      if(!Array.isArray(chain) || !Array.isArray(assignments)) return assignments;
+      const pools = new Map();
+      assignments.forEach((a)=>{
+        if(!a || typeof a !== 'object') return;
+        const nid = (a.node_id !== undefined && a.node_id !== null) ? String(a.node_id) : '';
+        if(!nid) return;
+        const list = pools.get(nid) || [];
+        list.push(a);
+        pools.set(nid, list);
+      });
+      const out = [];
+      chain.forEach((n, i)=>{
+        const nid = (n && n.id !== undefined && n.id !== null) ? String(n.id) : '';
+        let a = null;
+        if(nid && pools.has(nid)){
+          const list = pools.get(nid) || [];
+          if(list.length){
+            a = list.shift();
+            pools.set(nid, list);
+          }
+        }
+        if(!a && i < assignments.length){
+          a = assignments[i];
+        }
+        if(!a || typeof a !== 'object') a = {};
+        if(nid) a.node_id = nid;
+        out.push(a);
+      });
+      return out;
+    } catch(e){
+      return assignments;
+    }
+  }
+
   function buildPersistAssignments(chainIds){
     const ids = Array.isArray(chainIds) ? chainIds : [];
     return ids.map((nid, j)=>{
@@ -468,11 +506,34 @@
       const hintOvr = (curA && Array.isArray(curA.hint_overrides)) ? curA.hint_overrides : undefined;
       const flagOvr = (curA && typeof curA.flag_override === 'string' && curA.flag_override.trim()) ? String(curA.flag_override).trim() : undefined;
 
+      const typeVal = (curA && typeof curA.type === 'string' && curA.type.trim()) ? String(curA.type).trim() : undefined;
+      const genLabel = (curA && typeof curA.flag_generator === 'string' && curA.flag_generator.trim()) ? String(curA.flag_generator).trim() : undefined;
+      const inputFields = (curA && Array.isArray(curA.input_fields)) ? curA.input_fields.map(String).filter(Boolean) : undefined;
+      const inputFieldsReq = (curA && Array.isArray(curA.input_fields_required)) ? curA.input_fields_required.map(String).filter(Boolean) : undefined;
+      const inputFieldsOpt = (curA && Array.isArray(curA.input_fields_optional)) ? curA.input_fields_optional.map(String).filter(Boolean) : undefined;
+      const outputFields = (curA && Array.isArray(curA.output_fields)) ? curA.output_fields.map(String).filter(Boolean) : undefined;
+      const produces = (curA && Array.isArray(curA.produces)) ? curA.produces.map(String).filter(Boolean) : undefined;
+      const requires = (curA && Array.isArray(curA.requires)) ? curA.requires.map(String).filter(Boolean) : undefined;
+      const hintVal = (curA && typeof curA.hint === 'string' && curA.hint.trim()) ? String(curA.hint).trim() : undefined;
+      const hintsVal = (curA && Array.isArray(curA.hints)) ? curA.hints.map(String).filter(Boolean) : undefined;
+      const descHints = (curA && Array.isArray(curA.description_hints)) ? curA.description_hints.map(String).filter(Boolean) : undefined;
+
       if(ovr !== undefined) out.config_overrides = ovr;
       if(outOvr !== undefined) out.output_overrides = outOvr;
       if(injOvr !== undefined) out.inject_files_override = injOvr;
       if(hintOvr !== undefined) out.hint_overrides = hintOvr;
       if(flagOvr !== undefined) out.flag_override = flagOvr;
+      if(typeVal !== undefined) out.type = typeVal;
+      if(genLabel !== undefined) out.flag_generator = genLabel;
+      if(inputFields !== undefined) out.input_fields = inputFields;
+      if(inputFieldsReq !== undefined) out.input_fields_required = inputFieldsReq;
+      if(inputFieldsOpt !== undefined) out.input_fields_optional = inputFieldsOpt;
+      if(outputFields !== undefined) out.output_fields = outputFields;
+      if(produces !== undefined) out.produces = produces;
+      if(requires !== undefined) out.requires = requires;
+      if(hintVal !== undefined) out.hint = hintVal;
+      if(hintsVal !== undefined) out.hints = hintsVal;
+      if(descHints !== undefined) out.description_hints = descHints;
       try{
         if(curA && typeof curA.resolved_inputs === 'object' && !Array.isArray(curA.resolved_inputs)){
           out.resolved_inputs = curA.resolved_inputs;
@@ -501,6 +562,14 @@
   function mergeResolvedFromFlowState(flowState, chainNodes){
     try{
       if(!flowState || typeof flowState !== 'object') return;
+      try{
+        if(flowState.initial_facts && !flowInitialFactsOverride){
+          flowInitialFactsOverride = normalizeFactsOverride(flowState.initial_facts);
+        }
+        if(flowState.goal_facts && !flowGoalFactsOverride){
+          flowGoalFactsOverride = normalizeFactsOverride(flowState.goal_facts);
+        }
+      } catch(e) {}
       const savedAssignments = Array.isArray(flowState.flag_assignments) ? flowState.flag_assignments : [];
       if(!savedAssignments.length) return;
       const chainIds = Array.isArray(chainNodes) ? chainNodes.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
@@ -551,6 +620,17 @@
         if(savedA.resolved_inputs && (!hasInputs)) curA.resolved_inputs = savedA.resolved_inputs;
         if(savedA.resolved_outputs && (!hasOutputs)) curA.resolved_outputs = savedA.resolved_outputs;
         if(savedA.flag_value && (!curA.flag_value || !String(curA.flag_value).trim())) curA.flag_value = savedA.flag_value;
+        if(savedA.type && (!curA.type || !String(curA.type).trim())) curA.type = savedA.type;
+        if(savedA.flag_generator && (!curA.flag_generator || !String(curA.flag_generator).trim())) curA.flag_generator = savedA.flag_generator;
+        if(savedA.input_fields && (!Array.isArray(curA.input_fields) || !curA.input_fields.length)) curA.input_fields = savedA.input_fields;
+        if(savedA.input_fields_required && (!Array.isArray(curA.input_fields_required) || !curA.input_fields_required.length)) curA.input_fields_required = savedA.input_fields_required;
+        if(savedA.input_fields_optional && (!Array.isArray(curA.input_fields_optional) || !curA.input_fields_optional.length)) curA.input_fields_optional = savedA.input_fields_optional;
+        if(savedA.output_fields && (!Array.isArray(curA.output_fields) || !curA.output_fields.length)) curA.output_fields = savedA.output_fields;
+        if(savedA.produces && (!Array.isArray(curA.produces) || !curA.produces.length)) curA.produces = savedA.produces;
+        if(savedA.requires && (!Array.isArray(curA.requires) || !curA.requires.length)) curA.requires = savedA.requires;
+        if(savedA.hint && (!curA.hint || !String(curA.hint).trim())) curA.hint = savedA.hint;
+        if(savedA.hints && (!Array.isArray(curA.hints) || !curA.hints.length)) curA.hints = savedA.hints;
+        if(savedA.description_hints && (!Array.isArray(curA.description_hints) || !curA.description_hints.length)) curA.description_hints = savedA.description_hints;
         nextAssignments[i] = curA;
       }
       currentFlagAssignments = nextAssignments;
@@ -801,6 +881,10 @@
     } catch(e) {}
   }
 
+  function previewPlanForRequest(){
+    return '';
+  }
+
   function refreshParticipantNavForScenario(scenarioName){
     try {
       const scen = (scenarioName || '').toString().trim();
@@ -815,6 +899,39 @@
     } catch(e) {}
   }
 
+  function clearPreviewPlanCacheForScenario(scenarioName){
+    const scen = (scenarioName || '').toString().trim();
+    if(!scen) return;
+    lastPreviewPlanPath = '';
+    lastFlowPlanPath = '';
+    try {
+      if (typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
+        window.coretgSetPreviewPlanPathForScenario(scen, '');
+      }
+    } catch(e) {}
+    updateMeta();
+  }
+
+  async function refreshLatestPreviewPlanPathForScenario(scenarioName){
+    const scen = (scenarioName || '').toString().trim();
+    if(!scen) return '';
+    try {
+      const data = await fetchJson('/api/flag-sequencing/latest_preview_plan?scenario=' + encodeURIComponent(scen));
+      const path = (data && typeof data.preview_plan_path === 'string') ? data.preview_plan_path.trim() : '';
+      if(path){
+        lastPreviewPlanPath = path;
+        try {
+          if (typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
+            window.coretgSetPreviewPlanPathForScenario(scen, path);
+          }
+        } catch(e) {}
+        updateMeta();
+        return path;
+      }
+    } catch(e) {}
+    return '';
+  }
+
   async function setScenario(value){
     activeScenario = (value || defaultScenarioName() || '').toString().trim();
     if(scenarioEl) scenarioEl.value = activeScenario;
@@ -824,6 +941,8 @@
     refreshParticipantNavForScenario(activeScenario);
     rememberActiveScenario();
     updateScenarioSeedBadges();
+    clearPreviewPlanCacheForScenario(activeScenario);
+    await refreshLatestPreviewPlanPathForScenario(activeScenario);
     // When switching scenarios (or loading after refresh), prefer any saved Flow state.
     await generate(false);
   }
@@ -841,6 +960,15 @@
     statusEl.textContent = out;
     statusEl.classList.toggle('text-danger', !!isError);
     statusEl.classList.toggle('text-muted', !isError);
+  }
+
+  function showRestoreBadge(message){
+    try{
+      if(!restoreBadgeEl) return;
+      restoreBadgeEl.textContent = message || 'Restored saved flow state';
+      restoreBadgeEl.classList.remove('d-none');
+      setTimeout(()=>{ try{ restoreBadgeEl.classList.add('d-none'); } catch(e) {} }, 5000);
+    } catch(e) {}
   }
 
   function setLoginLinkVisible(visible){
@@ -1293,6 +1421,20 @@
               pushIps(iface.ip4 || iface.ipv4 || iface.ip || iface.address);
             });
           } catch(e) {}
+          if(!ips.length){
+            try{
+              const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
+              const rin = (fa && typeof fa.resolved_inputs === 'object' && fa.resolved_inputs && !Array.isArray(fa.resolved_inputs)) ? fa.resolved_inputs : null;
+              if(rin){
+                const ipVal = rin['Knowledge(ip)'] || rin['target_ip'] || rin['host_ip'] || rin['ip4'] || rin['ipv4'] || '';
+                pushIps(ipVal);
+                const nodeName = rin['node_name'] || rin['node'] || '';
+                if(nodeName && ipVal && !nameToIp.has(String(nodeName))){
+                  nameToIp.set(String(nodeName), String(ipVal));
+                }
+              }
+            } catch(e) {}
+          }
           const uniq = Array.from(new Set(ips)).filter(Boolean);
           const ipText = uniq.length ? uniq.join(', ') : '';
           if(ipText) nameToIp.set(name, ipText);
@@ -1794,41 +1936,20 @@
       const baseName = (node && node.name) ? String(node.name) : ('Node ' + (idx+1));
       let ipText = '';
       try{
-        const nid = node && node.id !== undefined && node.id !== null ? String(node.id) : '';
-        if(nid && lastHostIpMap && lastHostIpMap.has(nid)){
-          ipText = String(lastHostIpMap.get(nid) || '').trim();
-        } else {
-        const ips = [];
-        const pushIps = (val) => {
-          if(!val) return;
-          if(Array.isArray(val)){
-            val.forEach(v => pushIps(v));
-            return;
-          }
-          const s = String(val || '').trim();
-          if(!s) return;
-          s.split(',').forEach(part => {
-            const p = String(part || '').trim();
-            if(p) ips.push(p);
+        const faIp = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
+        const ri = (faIp && typeof faIp.resolved_inputs === 'object' && faIp.resolved_inputs && !Array.isArray(faIp.resolved_inputs))
+          ? faIp.resolved_inputs
+          : null;
+        if(ri){
+          ['Knowledge(ip)', 'target_ip', 'host_ip', 'ip4', 'ipv4', 'ip'].some((k)=>{
+            const v = ri[k];
+            if(v !== undefined && v !== null && String(v).trim()){
+              ipText = String(v).trim();
+              return true;
+            }
+            return false;
           });
-        };
-        pushIps(node && (node.ip4 || node.ipv4 || node.ip || node.address));
-        pushIps(node && node.ips);
-        pushIps(node && node.addresses);
-        pushIps(node && node.ipv4s);
-        try{
-          const ifaces = node && Array.isArray(node.interfaces) ? node.interfaces : [];
-          ifaces.forEach(iface => {
-            if(!iface || typeof iface !== 'object') return;
-            pushIps(iface.ip4 || iface.ipv4 || iface.ip || iface.address);
-          });
-        } catch(e) {}
-        const uniq = Array.from(new Set(ips));
-        if(uniq.length){
-          ipText = uniq.join(', ');
         }
-        }
-        if(!ipText) ipText = 'unknown';
       } catch(e) {}
       let titleSuffix = '';
       try{
@@ -4497,7 +4618,7 @@
         const res = await postJson('/api/flag-sequencing/save_flow_substitutions', {
           scenario: activeScenario,
           chain_ids: chainIds,
-          preview_plan: (lastPreviewPlanPath || lastFlowPlanPath || ''),
+          preview_plan: previewPlanForRequest(),
           flag_assignments: reqAssignments,
           allow_node_duplicates: !!allowNodeDuplicates,
           initial_facts: flowInitialFactsOverride,
@@ -5035,7 +5156,7 @@
         const res = await postJson('/api/flag-sequencing/save_flow_substitutions', {
           scenario: activeScenario,
           chain_ids: chainIds,
-          preview_plan: (lastPreviewPlanPath || lastFlowPlanPath || ''),
+          preview_plan: previewPlanForRequest(),
           flag_assignments: reqAssignments,
           initial_facts: flowInitialFactsOverride,
           goal_facts: flowGoalFactsOverride,
@@ -5637,7 +5758,7 @@
           try {
             const res = await postJson('/api/flag-sequencing/substitution_candidates', {
               scenario: activeScenario,
-              preview_plan: (lastPreviewPlanPath || lastFlowPlanPath || ''),
+              preview_plan: previewPlanForRequest(),
               chain_ids: chainIds,
               flag_assignments: reqAssignments,
               index: i,
@@ -5825,7 +5946,7 @@
           const res = await postJson('/api/flag-sequencing/save_flow_substitutions', {
             scenario: activeScenario,
             chain_ids: chainIds,
-            preview_plan: (lastPreviewPlanPath || lastFlowPlanPath || ''),
+            preview_plan: previewPlanForRequest(),
             flag_assignments: reqAssignments,
             initial_facts: flowInitialFactsOverride,
             goal_facts: flowGoalFactsOverride,
@@ -6012,6 +6133,9 @@
     } else {
       // Auto-load should prefer the saved Flow plan when available.
       params.set('prefer_flow', '1');
+      if(lastPreviewPlanPath){
+        params.delete('preview_plan');
+      }
     }
 
     const allowDupes = !!options.allow_node_duplicates;
@@ -6066,14 +6190,14 @@
         setStatus('Generating preview plan…', false);
         showLoading('Generating preview plan…');
         setLoadingSteps(progressSteps, 1);
-        appendLoadingLog('Persisting preview plan');
+        appendLoadingLog('Ensuring planner plan');
         let seed = null;
         try {
           if (scenario && typeof window.coretgEnsureSeedForScenario === 'function') {
             seed = window.coretgEnsureSeedForScenario(scenario);
           }
         } catch(e) { seed = null; }
-        const persisted = await window.coretgPostJson('/api/plan/persist_preview_plan', { xml_path: xmlPath, scenario, seed });
+        const persisted = await window.coretgPostJson('/api/planner/ensure_plan', { xml_path: xmlPath, scenario, seed });
         try {
           if (scenario && persisted && persisted.seed !== undefined && typeof window.coretgSetSeedForScenario === 'function') {
             window.coretgSetSeedForScenario(scenario, persisted.seed);
@@ -6094,7 +6218,7 @@
           }
         } catch(e) {}
         lastPreviewPlanPath = previewPlan;
-        params.set('preview_plan', previewPlan);
+        params.delete('preview_plan');
       }
 
       let data;
@@ -6117,7 +6241,7 @@
               scenario,
               length,
               preset,
-              preview_plan: (lastPreviewPlanPath || ''),
+              preview_plan: previewPlanForRequest(),
               allow_node_duplicates: !!allowDupes,
               retry_index: retryIndex,
               initial_facts: flowInitialFactsOverride,
@@ -6145,7 +6269,7 @@
                 scenario,
                 length,
                 preset,
-                preview_plan: (lastPreviewPlanPath || ''),
+                preview_plan: previewPlanForRequest(),
                 allow_node_duplicates: !!allowDupes,
                 best_effort: true,
                 initial_facts: flowInitialFactsOverride,
@@ -6191,14 +6315,17 @@
       }
       currentChain = Array.isArray(data.chain) ? data.chain.slice() : [];
       currentFlagAssignments = Array.isArray(data.flag_assignments) ? data.flag_assignments.slice() : [];
+      currentFlagAssignments = alignAssignmentsToChain(currentChain, currentFlagAssignments);
       if(!runSavePreviewResolve){
         const fs = getFlowStateForScenario(scenario);
         if(fs){
           mergeResolvedFromFlowState(fs, currentChain);
+          showRestoreBadge('Restored saved flow state');
         } else {
           mergeResolvedFromSavedState(scenario, currentChain);
         }
       }
+      currentFlagAssignments = alignAssignmentsToChain(currentChain, currentFlagAssignments);
       setFlowValidityFromPayload(data);
       lastStats = data.stats || null;
       lastPreviewPlanPath = data.preview_plan_path || '';
@@ -6241,7 +6368,7 @@
               length: chainIds.length,
               preset,
               chain_ids: chainIds,
-              preview_plan: (lastPreviewPlanPath || ''),
+              preview_plan: previewPlanForRequest(),
               allow_node_duplicates: !!allowDupes,
               mode: 'resolve',
               best_effort: true,
@@ -6257,6 +6384,7 @@
           }
           if(prepData && Array.isArray(prepData.flag_assignments)){
             currentFlagAssignments = prepData.flag_assignments.slice();
+            currentFlagAssignments = alignAssignmentsToChain(currentChain, currentFlagAssignments);
           }
           if(prepData && prepData.preview_plan_path){
             lastPreviewPlanPath = String(prepData.preview_plan_path);
@@ -6417,7 +6545,7 @@
         throw new Error('Generate a chain first.');
       }
       const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-      const planPath = (lastFlowPlanPath || lastPreviewPlanPath || '');
+      const planPath = '';
       const prepData = await postJson(
         '/api/flag-sequencing/prepare_preview_for_execute',
         {
@@ -6425,7 +6553,7 @@
           length,
           preset,
           chain_ids: chainIds,
-          preview_plan: planPath,
+          preview_plan: previewPlanForRequest(),
           allow_node_duplicates: !!allowNodeDuplicates,
         },
         { timeoutMs: 480000 }
@@ -6445,7 +6573,7 @@
       }
       if(flowPlan) lastFlowPlanPath = flowPlan;
       setStatus('Starting async execution…', false);
-      const runData = await postJson('/run_cli_async', { xml_path: xmlPath, preview_plan: (flowPlan || planPath || previewPlan), scenario });
+      const runData = await postJson('/run_cli_async', { xml_path: xmlPath, preview_plan: (flowPlan || previewPlan), scenario });
       const runId = runData && runData.run_id ? String(runData.run_id) : '';
       if(runId){
         setStatus('Run started: ' + runId + ' (see Core/Reports pages).', false);
@@ -6890,6 +7018,8 @@
   updateScenarioSeedBadges();
   // Auto-generate on load (prefer any saved Flow state).
   try { refreshXmlDockPreview({ force: false }); } catch(e) {}
+  clearPreviewPlanCacheForScenario(activeScenario);
+  await refreshLatestPreviewPlanPathForScenario(activeScenario);
   generate(false);
 })();
 </script>

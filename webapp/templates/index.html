@@ -1275,6 +1275,24 @@ if ((!currentProjectKey || currentProjectKey === DEFAULT_PROJECT_KEY) && legacyP
     currentProjectKey = legacyProjectKeyHint;
 }
 let activeIdxMap = readJsonFromLocalStorage(PROJECT_ACTIVE_IDX_STORAGE_KEY, {});
+const serverCatalogEmpty = !!(initialPayload && initialPayload.scenario_catalog_empty);
+const serverCatalogForceEmpty = !!(initialPayload && initialPayload.scenario_catalog_force_empty);
+if (serverCatalogForceEmpty) {
+    try {
+        localStorage.removeItem(LEGACY_EDITOR_STATE_STORAGE_KEY);
+        localStorage.removeItem(PROJECT_STATE_STORAGE_KEY);
+        localStorage.removeItem(PROJECT_ACTIVE_IDX_STORAGE_KEY);
+        localStorage.removeItem(LAST_PROJECT_KEY_STORAGE_KEY);
+        localStorage.removeItem(DELETED_SCENARIO_IDS_STORAGE_KEY);
+        localStorage.removeItem(DELETED_SCENARIO_NAME_KEYS_STORAGE_KEY);
+    } catch (e) {}
+    projectStateMap = {};
+    legacyEditorState = null;
+    activeIdxMap = {};
+    deletedScenarioIds = new Set();
+    deletedScenarioNameKeys = new Set();
+    currentProjectKey = DEFAULT_PROJECT_KEY;
+}
 
 // Persisted collapse state (shared across cards/sections).
 // Must be in the outer scope because multiple handlers (including the generic
@@ -6717,7 +6735,7 @@ async function autoSaveXml(){
                 // Persist again so the new result_path becomes the active project key
                 persistEditorState();
             };
-            const persistPreviewPlanAfterSave = async () => {
+            const persistFlowPlanAfterSave = async () => {
                 try {
                     const rp = String(state?.result_path || '').trim();
                     if (!rp || !rp.endsWith('.xml')) return;
@@ -6729,7 +6747,7 @@ async function autoSaveXml(){
                     if (Number.isInteger(activeScenarioSeedForSave) && activeScenarioSeedForSave > 0) {
                         payload.seed = activeScenarioSeedForSave;
                     }
-                    const res = await fetch('/api/plan/persist_preview_plan', {
+                    const res = await fetch('/api/plan/persist_flow_plan', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         credentials: 'same-origin',
@@ -6747,8 +6765,8 @@ async function autoSaveXml(){
                     } catch (e) {}
                 } catch (err) {
                     const message = err instanceof Error ? err.message : String(err || 'persist preview plan failed');
-                    console.warn('persist_preview_plan after save failed', err);
-                    try { showToast(`Saved XML, but preview plan persistence failed (${message}).`, { autohide: true, delay: 6000 }); } catch (_) {}
+                    console.warn('persist_flow_plan after save failed', err);
+                    try { showToast(`Saved XML, but flow plan persistence failed (${message}).`, { autohide: true, delay: 6000 }); } catch (_) {}
                 }
             };
 
@@ -6757,8 +6775,8 @@ async function autoSaveXml(){
                 try { updatePlanButtons(); } catch(err) {}
                 // Keep the dock's XML Preview in sync for all save paths (auto-save + modal saves).
                 try { refreshXmlDockPreview({ force: true, preferSavedPath: true }); } catch (e) {}
-                // Persist a concrete preview plan artifact so Flag Sequencing has inputs without extra clicks.
-                try { await persistPreviewPlanAfterSave(); } catch (e) {}
+                // Persist a concrete flow plan artifact so Flag Sequencing/Preview stay in sync.
+                try { await persistFlowPlanAfterSave(); } catch (e) {}
                 resolve();
             };
             const legacySave = () => {
@@ -18916,7 +18934,7 @@ async function saveXmlAjax(){
                 await refreshXmlDockPreview({ force: true, preferSavedPath: true });
             } catch(e){}
 
-            // Persist a concrete preview plan artifact so Flag Sequencing has inputs.
+            // Persist a concrete flow plan artifact so Flag Sequencing/Preview stay in sync.
             try {
                 const rp = String(state?.result_path || '').trim();
                 const activeScenario = state?.scenarios?.[activeIdx];
@@ -18926,7 +18944,7 @@ async function saveXmlAjax(){
                     if (Number.isInteger(activeScenarioSeedForSave) && activeScenarioSeedForSave > 0) {
                         planPayload.seed = activeScenarioSeedForSave;
                     }
-                    const pres = await fetch('/api/plan/persist_preview_plan', {
+                    const pres = await fetch('/api/plan/persist_flow_plan', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         credentials: 'same-origin',
@@ -18935,7 +18953,7 @@ async function saveXmlAjax(){
                     const pdata = await pres.json().catch(() => null);
                     if (!pres.ok || !pdata || pdata.ok === false) {
                         const detail = (pdata && (pdata.error || pdata.message)) || `HTTP ${pres.status}`;
-                        try { showToast(`Saved XML, but preview plan persistence failed (${detail}).`, { autohide: true, delay: 6000 }); } catch (_) {}
+                        try { showToast(`Saved XML, but flow plan persistence failed (${detail}).`, { autohide: true, delay: 6000 }); } catch (_) {}
                     } else {
                         try {
                             if (pdata.seed) {

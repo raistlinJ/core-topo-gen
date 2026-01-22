@@ -193,26 +193,17 @@
       }
     } catch(e) {}
 
-    // If we have a persisted preview_plan_path for this scenario (e.g., from Flag Sequencing Generate),
-    // render directly from it so Preview matches the exact snapshot Flow used.
+    // Always use the latest flow plan for this scenario to keep Preview aligned.
     let planPath = '';
     try {
-      if (scenario && typeof window.coretgGetPreviewPlanPathForScenario === 'function') {
-        planPath = (window.coretgGetPreviewPlanPathForScenario(scenario) || '').toString().trim();
-      }
-    } catch(e) { planPath = ''; }
-
-    if(!planPath){
-      try {
-        const resp = await fetch('/api/flag-sequencing/latest_preview_plan?scenario=' + encodeURIComponent(scenario), { credentials: 'same-origin' });
-        if(resp && resp.ok){
-          const data = await resp.json();
-          if(data && typeof data.preview_plan_path === 'string'){
-            planPath = data.preview_plan_path.trim();
-          }
+      const resp = await fetch('/api/flag-sequencing/latest_preview_plan?scenario=' + encodeURIComponent(scenario), { credentials: 'same-origin' });
+      if(resp && resp.ok){
+        const data = await resp.json();
+        if(data && typeof data.preview_plan_path === 'string'){
+          planPath = data.preview_plan_path.trim();
         }
-      } catch(e) {}
-    }
+      }
+    } catch(e) {}
 
     if(!planPath){
       if(frame){
