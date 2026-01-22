@@ -227,8 +227,10 @@
       <div class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></div>
       <div class="fw-semibold" id="flowLoadingText">Loading…</div>
     </div>
-    <ul id="flowLoadingSteps" class="small text-muted mt-2 mb-0 d-none"></ul>
-    <ul id="flowLoadingLog" class="small text-muted mt-2 mb-0 d-none"></ul>
+    <div class="small text-muted mt-2" id="flowLoadingStepsLabel">Progress steps</div>
+    <ul id="flowLoadingSteps" class="small mt-1 mb-0 d-none"></ul>
+    <div class="small text-muted mt-2 d-none" id="flowLoadingLogLabel">Details</div>
+    <ul id="flowLoadingLog" class="small text-muted mt-1 mb-0 d-none"></ul>
     <div class="small text-muted mt-2">This can take a few seconds while preview plans and sequencing run.</div>
   </div>
 </div>
@@ -299,7 +301,9 @@
   const validityAlertEl = document.getElementById('flowValidityAlert');
   const loadingOverlayEl = document.getElementById('flowLoadingOverlay');
   const loadingTextEl = document.getElementById('flowLoadingText');
+  const loadingStepsLabelEl = document.getElementById('flowLoadingStepsLabel');
   const loadingStepsEl = document.getElementById('flowLoadingSteps');
+  const loadingLogLabelEl = document.getElementById('flowLoadingLogLabel');
   const loadingLogEl = document.getElementById('flowLoadingLog');
   const generateOptionsDialogEl = document.getElementById('flowGenerateOptionsDialog');
   const generateNoDuplicatesEl = document.getElementById('flowGenerateNoDuplicates');
@@ -683,13 +687,24 @@
       if(!Array.isArray(steps) || steps.length === 0){
         loadingStepsEl.innerHTML = '';
         loadingStepsEl.classList.add('d-none');
+        if(loadingStepsLabelEl) loadingStepsLabelEl.classList.add('d-none');
         return;
       }
+      if(loadingStepsLabelEl) loadingStepsLabelEl.classList.remove('d-none');
       loadingStepsEl.classList.remove('d-none');
       const idx = Number.isFinite(+activeIndex) ? (+activeIndex) : -1;
       loadingStepsEl.innerHTML = steps.map((s, i)=>{
-        const cls = (i === idx) ? 'fw-semibold text-body' : '';
-        return `<li class="${cls}">${escapeHtml(s)}</li>`;
+        const state = (i === idx) ? 'active' : (i < idx ? 'done' : 'pending');
+        const cls = state === 'active' ? 'fw-semibold text-body' : (state === 'done' ? 'text-success' : 'text-muted');
+        const badgeCls = state === 'active' ? 'text-bg-primary' : (state === 'done' ? 'text-bg-success' : 'text-bg-secondary');
+        const status = state === 'active' ? 'Working' : (state === 'done' ? 'Done' : 'Pending');
+        return `
+          <li class="d-flex align-items-center gap-2 ${cls}">
+            <span class="badge ${badgeCls}">${i + 1}</span>
+            <span>${escapeHtml(s)}</span>
+            <span class="ms-auto small text-muted">${status}</span>
+          </li>
+        `;
       }).join('');
     } catch(e) {}
   }
@@ -709,12 +724,15 @@
       let genLine = 'Generators: (none)';
       if(Array.isArray(assignments) && assignments.length){
         const parts = assignments.map((a, i)=>{
-          const gid = a && (a.generator_id || a.generator || a.generator_slug || a.generator_name) ? String(a.generator_id || a.generator || a.generator_slug || a.generator_name) : '';
-          if(!gid) return `#${i+1}:?`;
-          const redacted = gid.length > 8 ? `…${gid.slice(-8)}` : gid;
-          return `#${i+1}:${redacted}`;
+          const label = a && (a.flag_generator || a.generator_label || a.generator_display_name || a.generator_name || a.generator_slug || a.generator_id || a.generator)
+            ? String(a.flag_generator || a.generator_label || a.generator_display_name || a.generator_name || a.generator_slug || a.generator_id || a.generator)
+            : '';
+          if(!label) return `Generator ${i + 1}: unresolved`;
+          const trimmed = label.trim();
+          const safe = trimmed.length > 36 ? `${trimmed.slice(0, 16)}…${trimmed.slice(-12)}` : trimmed;
+          return `Generator ${i + 1}: ${safe}`;
         });
-        genLine = `Generators: ${parts.join(', ')}`;
+        genLine = `Generators: ${parts.join(' · ')}`;
       }
       return { chain: chainLine, gens: genLine };
     } catch(e){
@@ -727,6 +745,7 @@
       if(!loadingLogEl) return;
       const msg = String(message || '').trim();
       if(!msg) return;
+      if(loadingLogLabelEl) loadingLogLabelEl.classList.remove('d-none');
       loadingLogEl.classList.remove('d-none');
       const item = document.createElement('li');
       item.textContent = msg;
@@ -739,6 +758,7 @@
       if(!loadingLogEl) return;
       loadingLogEl.innerHTML = '';
       loadingLogEl.classList.add('d-none');
+      if(loadingLogLabelEl) loadingLogLabelEl.classList.add('d-none');
     } catch(e) {}
   }
 
