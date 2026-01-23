@@ -49,7 +49,12 @@
         <button id="saveXmlBtn" class="btn btn-outline-success px-4 py-2 shadow-sm" type="button">Save XML</button>
         <button id="downloadXmlBtn" class="btn btn-outline-info px-4 py-2 shadow-sm" type="button" {% if not preview_xml_path %}disabled title="Save XML first"{% endif %}>Download XML</button>
       {% endif %}
-      <button id="scenariosExecuteBtn" class="btn btn-success px-4 py-2 shadow-sm" type="button">{% if scenarios_active_tab == 'preview' %}Execute{% else %}Preview{% endif %}</button>
+      <button
+        id="scenariosExecuteBtn"
+        class="btn btn-success px-4 py-2 shadow-sm"
+        type="button"
+        {% if scenarios_active_tab == 'topology' %}data-coretg-action="continue" data-coretg-scenario="{{ scenario_tab }}" title="Continue to Flag Sequencing"{% endif %}
+      >{% if scenarios_active_tab == 'preview' %}Execute{% elif scenarios_active_tab == 'topology' %}Continue{% else %}Preview{% endif %}</button>
     </div>
   </div>
 </div>
@@ -119,7 +124,14 @@
       btn.removeAttribute('title');
       // Let other logic decide enablement; only fix the label here.
       const activeTab = getActiveTabName();
-      btn.textContent = (activeTab === 'preview') ? 'Execute' : 'Preview';
+      if (activeTab === 'topology') {
+        btn.textContent = 'Continue';
+        btn.dataset.coretgAction = 'continue';
+        btn.dataset.coretgScenario = (scenarioName || '').toString();
+        btn.setAttribute('title', 'Continue to Flag Sequencing');
+      } else {
+        btn.textContent = (activeTab === 'preview') ? 'Execute' : 'Preview';
+      }
     } catch (e) {}
   }
 

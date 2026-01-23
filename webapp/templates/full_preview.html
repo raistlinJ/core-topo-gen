@@ -3791,7 +3791,9 @@ function buildScenarioUrl(basePath){
             if(scen){ form.append('scenario', scen); }
           } catch(e) {}
           const planPath = executeRunBtn.getAttribute('data-preview-plan');
-          if(planPath){ form.append('preview_plan', planPath); }
+          if(planPath && String(planPath).trim().toLowerCase().endsWith('.xml')){
+            form.append('preview_plan', planPath);
+          }
           return form;
         }
 

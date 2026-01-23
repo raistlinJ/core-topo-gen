@@ -1455,6 +1455,17 @@ if (USE_LOCAL_EDITOR_STATE) {
         persistedState = keyedStateForCurrentProject;
     }
 }
+// Admin fallback: if no local snapshot matches the current project key (common when
+// XML-forced loads derive a new key), use the server snapshot so HITL/VM access
+// edits still persist across refreshes.
+if (USE_LOCAL_EDITOR_STATE && !persistedState && serverEditorSnapshot && typeof serverEditorSnapshot === 'object') {
+    try {
+        const cloned = JSON.parse(JSON.stringify(serverEditorSnapshot));
+        persistedState = scrubSnapshotTransientErrors(cloned);
+    } catch (e) {
+        persistedState = serverEditorSnapshot;
+    }
+}
 const CORE_DEFAULT_VENV_BIN = (initialPayload && typeof initialPayload.core === 'object' && typeof initialPayload.core.venv_bin === 'string' && initialPayload.core.venv_bin.trim())
     ? initialPayload.core.venv_bin.trim()
     : '/opt/core/venv/bin';
@@ -4402,7 +4413,11 @@ if (USE_LOCAL_EDITOR_STATE && !XML_FORCED_SOURCE && persistedState && Array.isAr
                 'cached_vm_status',
             ];
             coreServerKeys.forEach((k) => {
-                if (Object.prototype.hasOwnProperty.call(serverCore, k) && hasMeaningfulValue(serverCore[k])) {
+                if (!Object.prototype.hasOwnProperty.call(serverCore, k) || !hasMeaningfulValue(serverCore[k])) {
+                    return;
+                }
+                const shouldOverride = !XML_FORCED_SOURCE || !hasMeaningfulValue(localCore[k]);
+                if (shouldOverride) {
                     coreMerged[k] = serverCore[k];
                 }
             });
@@ -4421,7 +4436,11 @@ if (USE_LOCAL_EDITOR_STATE && !XML_FORCED_SOURCE && persistedState && Array.isAr
                 'inventory_error',
             ];
             proxServerKeys.forEach((k) => {
-                if (Object.prototype.hasOwnProperty.call(serverProx, k) && hasMeaningfulValue(serverProx[k])) {
+                if (!Object.prototype.hasOwnProperty.call(serverProx, k) || !hasMeaningfulValue(serverProx[k])) {
+                    return;
+                }
+                const shouldOverride = !XML_FORCED_SOURCE || !hasMeaningfulValue(localProx[k]);
+                if (shouldOverride) {
                     proxMerged[k] = serverProx[k];
                 }
             });
@@ -4483,7 +4502,9 @@ if (USE_LOCAL_EDITOR_STATE && !XML_FORCED_SOURCE && persistedState && Array.isAr
     } catch (err) {}
 }
 
-if (USE_LOCAL_EDITOR_STATE && !XML_FORCED_SOURCE && persistedState && Array.isArray(persistedState.scenarios) && Array.isArray(state.scenarios)) {
+if (USE_LOCAL_EDITOR_STATE && persistedState && Array.isArray(persistedState.scenarios) && Array.isArray(state.scenarios)) {
+    // Even when XML is forced, allow HITL/VM access settings to survive refresh by
+    // merging only HITL state from the local snapshot.
     mergePersistedHitlStateIntoScenarios(state.scenarios, persistedState.scenarios);
 }
 // Final fallback: ensure scenarios are present to avoid blank editor.
@@ -8964,6 +8985,7 @@ async function verifyScenarioCoreSetup(sidx, options = {}) {
             verifyModal.finalAlertEl.classList.remove('alert-success', 'alert-danger', 'alert-warning', 'alert-info');
             const resolvedTone = tone || (ok ? 'success' : 'danger');
             verifyModal.finalAlertEl.classList.add(`alert-${resolvedTone}`);
+            verifyModal.finalAlertEl.style.whiteSpace = 'pre-wrap';
             verifyModal.finalAlertEl.textContent = message || (ok ? 'Verification succeeded.' : 'Verification failed.');
         }
         if (verifyModal.statusEl) {
@@ -9172,21 +9194,59 @@ async function verifyScenarioCoreSetup(sidx, options = {}) {
             }
 
             let hasAdvancedFailures = false;
+            const formatAdvancedCheckLines = (advObj) => {
+                if (!advObj || typeof advObj !== 'object') return [];
+                const rows = [
+                    { key: 'adv_check_core_version', label: 'Check CORE version (9.2.1)' },
+                    { key: 'adv_fix_docker_daemon', label: 'Fix Docker daemon' },
+                    { key: 'adv_run_core_cleanup', label: 'Run core-cleanup' },
+                    { key: 'adv_restart_core_daemon', label: 'Restart core-daemon' },
+                    { key: 'adv_auto_kill_sessions', label: 'Auto-kill running sessions' },
+                ];
+                const out = [];
+                rows.forEach((row) => {
+                    const entry = advObj[row.key];
+                    if (!entry || typeof entry !== 'object') return;
+                    if (!entry.enabled) return;
+                    const ok = entry.ok === true;
+                    const msg = (entry.message || '').toString().trim();
+                    out.push(`Advanced: ${row.label}: ${ok ? 'OK' : 'FAILED'}${msg ? ` (${msg})` : ''}`);
+                });
+                return out;
+            };
+            const formatWarningLines = (warnings) => {
+                if (!Array.isArray(warnings)) return [];
+                return warnings.map((w) => String(w || '').trim()).filter(Boolean);
+            };
+            let warningLines = [];
             try {
                 const advObj = result.data && result.data.advanced_checks;
                 if (advObj && typeof advObj === 'object') {
+                    const advLines = formatAdvancedCheckLines(advObj);
+                    warningLines = warningLines.concat(advLines);
                     hasAdvancedFailures = Object.values(advObj).some((entry) => {
                         return entry && typeof entry === 'object' && entry.enabled && entry.ok === false;
                     });
+                }
+            } catch (e) {}
+            try {
+                const serverWarnings = formatWarningLines(result.data && result.data.warnings);
+                if (serverWarnings.length) {
+                    warningLines = warningLines.concat(serverWarnings.map(w => `Warning: ${w}`));
                 }
             } catch (e) {}
             const msg = (result.data && (result.data.message || result.data.core_message))
                 ? (result.data.message || result.data.core_message)
                 : 'CORE connection verified.';
             verifyLog(`SUCCESS: ${msg}`);
-            if (hasAdvancedFailures) {
-                verifyLog('Completed with warnings (advanced checks failed).');
-                verifyFinish({ ok: true, message: `${msg} (with warnings)`, tone: 'warning' });
+            if (warningLines.length) {
+                verifyLog('Warnings:');
+                warningLines.forEach((line) => verifyLog(`- ${line}`));
+            }
+            if (hasAdvancedFailures || warningLines.length) {
+                verifyLog('Completed with warnings.');
+                const warningText = warningLines.length ? `\nWarnings:\n- ${warningLines.join('\n- ')}` : '';
+                verifyFinish({ ok: true, message: `${msg} (with warnings)${warningText}`, tone: 'warning' });
             } else {
                 verifyFinish({ ok: true, message: msg });
             }
@@ -10174,6 +10234,10 @@ async function validateCoreConnection(sidx, options = {}) {
             });
             return out;
         };
+        const _formatCoreWarnings = (warnings) => {
+            if (!Array.isArray(warnings)) return [];
+            return warnings.map((w) => String(w || '').trim()).filter(Boolean);
+        };
         if (data && data.ok) {
             const buildSummary = () => {
                 const lines = [];
@@ -10213,6 +10277,11 @@ async function validateCoreConnection(sidx, options = {}) {
                 const advLines = _formatAdvancedCheckLines(data.advanced_checks);
                 if (advLines.length) {
                     lines.push(...advLines);
+                }
+                const warnLines = _formatCoreWarnings(data.warnings);
+                if (warnLines.length) {
+                    lines.push('Warnings:');
+                    warnLines.forEach((line) => lines.push(`- ${line}`));
                 }
                 lines.push('Credentials: stored securely after verification.');
                 return lines.join('\n');
@@ -10275,16 +10344,16 @@ async function validateCoreConnection(sidx, options = {}) {
                     });
                 }
             } catch (e) {}
+            const warningLines = _formatCoreWarnings(data?.warnings);
+            const hasWarnings = hasAdvancedFailures || warningLines.length > 0;
 
             if (typeof setCoreConnectionHint === 'function') {
-                if (showSummaryOnSuccess) {
-                    const tone = hasAdvancedFailures ? 'warning' : (rememberCredentials ? 'success' : 'warning');
+                const tone = hasWarnings ? 'warning' : (rememberCredentials ? 'success' : 'warning');
+                if (showSummaryOnSuccess || hasWarnings) {
                     setCoreConnectionHint(buildSummary(), tone);
                 } else if (hintOnSuccess) {
-                    const tone = hasAdvancedFailures ? 'warning' : (rememberCredentials ? 'success' : 'warning');
                     setCoreConnectionHint(hintOnSuccess, tone);
                 } else if (hintOnStart) {
-                    const tone = hasAdvancedFailures ? 'warning' : (rememberCredentials ? 'success' : 'warning');
                     setCoreConnectionHint(
                         rememberCredentials ? 'Validation successful.' : 'Validated without storing credentials. Re-enter password next time.',
                         tone,
@@ -10294,7 +10363,7 @@ async function validateCoreConnection(sidx, options = {}) {
             if (!suppressToasts) {
                 try {
                     let toastMessage = successToastMessage || data.message || 'CORE connection verified and stored securely.';
-                    if (hasAdvancedFailures) {
+                    if (hasWarnings) {
                         toastMessage = `${toastMessage} (with warnings)`;
                     }
                     showToast(toastMessage, { autohide: true, delay: 2500 });
@@ -15361,6 +15430,7 @@ function wireHandlers() {
         if (!coreConnectionHint) return;
         coreConnectionHint.textContent = message || '';
         coreConnectionHint.style.display = message ? '' : 'none';
+        coreConnectionHint.style.whiteSpace = 'pre-wrap';
         coreConnectionHint.classList.toggle('d-none', !message);
         coreConnectionHint.classList.remove('alert-info', 'alert-success', 'alert-warning', 'alert-danger');
         const klass = tone === 'success'
@@ -18477,7 +18547,7 @@ function buildRunFormData(xmlPath, options = {}) {
     } catch (err) { /* ignore */ }
     try {
         const previewPlanPath = options && typeof options.previewPlanPath === 'string' ? options.previewPlanPath.trim() : '';
-        if (previewPlanPath) {
+        if (previewPlanPath && previewPlanPath.toLowerCase().endsWith('.xml')) {
             form.append('preview_plan', previewPlanPath);
         }
     } catch (err) { /* ignore */ }

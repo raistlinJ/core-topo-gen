@@ -4,6 +4,7 @@ import json
 import logging
 import random
 import os
+from xml.etree import ElementTree as ET
 from typing import Any, Dict, Tuple
 
 try:  # pragma: no cover - exercised indirectly via CLI subprocess tests
@@ -47,15 +48,63 @@ except ModuleNotFoundError:
     pass
 
 
-def _load_preview_plan(preview_plan_path: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Load a persisted preview/flow plan JSON.
+def _load_preview_plan_from_xml(preview_plan_path: str, scenario_label: str | None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Load a preview/flow plan from ScenarioEditor/PlanPreview embedded in XML."""
+    if not os.path.exists(preview_plan_path):
+        raise ValueError(f"preview plan XML not found: {preview_plan_path}")
+    try:
+        tree = ET.parse(preview_plan_path)
+        root = tree.getroot()
+    except Exception as exc:
+        raise ValueError(f"failed to parse preview plan XML: {exc}")
 
-    The web UI persists plans with the outer shape:
-      {"full_preview": {...}, "metadata": {...}}
+    scenario_norm = (scenario_label or '').strip().lower()
+    se_target = None
+    try:
+        if root.tag == 'ScenarioEditor':
+            se_target = root
+        elif root.tag == 'Scenario':
+            se_target = root.find('ScenarioEditor')
+        elif root.tag == 'Scenarios':
+            for scen_el in root.findall('Scenario'):
+                name = (scen_el.get('name') or '').strip()
+                if scenario_norm and name.strip().lower() != scenario_norm:
+                    continue
+                se_target = scen_el.find('ScenarioEditor')
+                if se_target is not None:
+                    break
+    except Exception:
+        se_target = None
 
-    For backward compatibility, we also accept a raw full_preview dict.
-    Returns (plan_payload, full_preview).
-    """
+    if se_target is None:
+        raise ValueError('ScenarioEditor not found in preview plan XML')
+    plan_el = se_target.find('PlanPreview')
+    raw = (plan_el.text or '').strip() if plan_el is not None else ''
+    if not raw:
+        raise ValueError('PlanPreview missing in preview plan XML')
+    try:
+        payload = json.loads(raw)
+    except Exception as exc:
+        raise ValueError(f"PlanPreview invalid JSON: {exc}")
+    if not isinstance(payload, dict):
+        raise ValueError('preview plan must be a JSON object')
+
+    full_preview = payload.get('full_preview')
+    if isinstance(full_preview, dict):
+        return payload, full_preview
+
+    # Backward-compat: treat the whole JSON object as a full_preview payload.
+    if any(k in payload for k in ('nodes', 'links', 'display_artifacts', 'flow', 'metadata')):
+        wrapped = {'full_preview': payload, 'metadata': {}}
+        return wrapped, payload
+
+    raise ValueError('unrecognized preview plan format (expected {"full_preview": {...}})')
+
+
+def _load_preview_plan(preview_plan_path: str, scenario_label: str | None = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Load a persisted preview/flow plan JSON or embedded PlanPreview from XML."""
+    if preview_plan_path.lower().endswith('.xml'):
+        return _load_preview_plan_from_xml(preview_plan_path, scenario_label)
     with open(preview_plan_path, 'r', encoding='utf-8') as f:
         payload = json.load(f)
     if not isinstance(payload, dict):
@@ -294,7 +343,7 @@ def main():
     if args.preview_plan:
         preview_plan_path = os.path.abspath(args.preview_plan)
         try:
-            preview_payload, preview_full = _load_preview_plan(preview_plan_path)
+            preview_payload, preview_full = _load_preview_plan(preview_plan_path, args.scenario)
             logging.getLogger(__name__).info("Loaded preview plan from %s", preview_plan_path)
         except Exception as e:
             logging.getLogger(__name__).error("Failed loading preview plan %s: %s", preview_plan_path, e)

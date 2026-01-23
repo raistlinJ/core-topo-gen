@@ -10358,10 +10358,11 @@ def _latest_flow_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
         scenario_norm = _normalize_scenario_label(scenario_norm)
         if not scenario_norm:
             return None
-        canonical_path = _canonical_plan_path_for_scenario_norm(scenario_norm)
-        if os.path.exists(canonical_path):
-            return canonical_path
-        return _latest_plan_for_scenario_norm(scenario_norm)
+        xml_path = _latest_xml_path_for_scenario(scenario_norm)
+        if not xml_path:
+            return None
+        payload = _load_plan_preview_from_xml(xml_path, scenario_norm)
+        return xml_path if payload else None
     except Exception:
         return None
 
@@ -14000,17 +14001,50 @@ def api_flow_sequence_preview_plan():
         if isinstance(meta, dict):
             meta = dict(meta)
             meta['updated_at'] = _iso_now()
-        out_path = _canonical_plan_path_for_scenario(scenario_label or scenario_norm, xml_path=str((meta or {}).get('xml_path') or ''), create_dir=True)
-        out_payload = {
+        xml_path_for_plan = None
+        try:
+            if preview_plan_path and str(preview_plan_path).lower().endswith('.xml'):
+                xml_path_for_plan = os.path.abspath(preview_plan_path)
+        except Exception:
+            xml_path_for_plan = None
+        if not xml_path_for_plan:
+            try:
+                meta_xml = str((meta or {}).get('xml_path') or '').strip()
+                if meta_xml:
+                    xml_path_for_plan = os.path.abspath(meta_xml)
+            except Exception:
+                xml_path_for_plan = None
+        if not xml_path_for_plan and xml_hint:
+            try:
+                xml_hint_abs = os.path.abspath(xml_hint)
+                if xml_hint_abs.lower().endswith('.xml'):
+                    xml_path_for_plan = xml_hint_abs
+            except Exception:
+                xml_path_for_plan = None
+        if not xml_path_for_plan:
+            try:
+                xml_path_for_plan = _latest_xml_path_for_scenario(scenario_norm)
+            except Exception:
+                xml_path_for_plan = None
+        if not xml_path_for_plan or not os.path.exists(xml_path_for_plan):
+            return jsonify({'ok': False, 'error': 'Failed to persist sequence plan: XML path not found.'}), 500
+
+        plan_payload = {
             'full_preview': preview,
             'metadata': meta,
         }
-        with open(out_path, 'w', encoding='utf-8') as f:
-            json.dump(out_payload, f, indent=2)
+        ok, err = _update_plan_preview_in_xml(xml_path_for_plan, scenario_label or scenario_norm, plan_payload)
+        if not ok:
+            return jsonify({'ok': False, 'error': f'Failed to persist sequence plan: {err}'}), 500
         try:
-            _planner_set_plan(scenario_norm, plan_path=out_path, xml_path=str((meta or {}).get('xml_path') or ''), seed=(meta or {}).get('seed'))
+            _update_flow_state_in_xml(xml_path_for_plan, scenario_label or scenario_norm, flow_meta)
         except Exception:
             pass
+        try:
+            _planner_set_plan(scenario_norm, plan_path=xml_path_for_plan, xml_path=xml_path_for_plan, seed=(meta or {}).get('seed'))
+        except Exception:
+            pass
+        out_path = xml_path_for_plan
     except Exception as e:
         return jsonify({'ok': False, 'error': f'Failed to persist sequence plan: {e}'}), 500
 
@@ -28360,8 +28394,8 @@ def _diff_plan_summaries(flow_summary: dict[str, Any], xml_summary: dict[str, An
     return diffs
 
 
-def _summary_from_preview_plan_path(plan_path: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    payload = _load_preview_payload_from_path(plan_path, None)
+def _summary_from_preview_plan_path(plan_path: str, scenario_label: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload = _load_preview_payload_from_path(plan_path, scenario_label)
     if not isinstance(payload, dict):
         raise ValueError('preview plan not embedded in XML')
     meta = payload.get('metadata') if isinstance(payload, dict) else {}
@@ -29740,18 +29774,18 @@ def run_cli_async():
     if preview_plan_path:
         try:
             preview_plan_path = os.path.abspath(preview_plan_path)
-            plans_dir = os.path.abspath(os.path.join(_outputs_dir(), 'plans'))
-            if os.path.commonpath([preview_plan_path, plans_dir]) != plans_dir:
-                app.logger.warning('[async] preview plan outside allowed directory: %s', preview_plan_path)
+            if preview_plan_path.lower().endswith('.xml'):
+                if not os.path.exists(preview_plan_path):
+                    app.logger.warning('[async] preview plan path missing: %s', preview_plan_path)
+                    try:
+                        log_f.write(f"[async] preview plan rejected (missing): {preview_plan_path}\n")
+                    except Exception:
+                        pass
+                    preview_plan_path = None
+            else:
+                app.logger.warning('[async] preview plan rejected (non-xml): %s', preview_plan_path)
                 try:
-                    log_f.write(f"[async] preview plan rejected (outside outputs/plans): {preview_plan_path}\n")
-                except Exception:
-                    pass
-                preview_plan_path = None
-            elif not os.path.exists(preview_plan_path):
-                app.logger.warning('[async] preview plan path missing: %s', preview_plan_path)
-                try:
-                    log_f.write(f"[async] preview plan rejected (missing): {preview_plan_path}\n")
+                    log_f.write(f"[async] preview plan rejected (non-xml): {preview_plan_path}\n")
                 except Exception:
                     pass
                 preview_plan_path = None
@@ -29793,6 +29827,13 @@ def run_cli_async():
     if preview_plan_path and scenario_for_plan:
         try:
             plan_payload = _load_preview_payload_from_path(preview_plan_path, scenario_for_plan)
+            if not (isinstance(plan_payload, dict) and plan_payload):
+                try:
+                    if str(preview_plan_path).lower().endswith('.xml'):
+                        _planner_persist_flow_plan(xml_path=preview_plan_path, scenario=scenario_for_plan, seed=seed, persist_plan_file=False)
+                        plan_payload = _load_preview_payload_from_path(preview_plan_path, scenario_for_plan)
+                except Exception:
+                    pass
             if isinstance(plan_payload, dict) and plan_payload:
                 _update_plan_preview_in_xml(xml_path, scenario_for_plan, plan_payload)
                 try:
@@ -29806,7 +29847,7 @@ def run_cli_async():
             pass
     try:
         if preview_plan_path:
-            flow_summary, flow_meta = _summary_from_preview_plan_path(preview_plan_path)
+            flow_summary, flow_meta = _summary_from_preview_plan_path(preview_plan_path, scenario_for_plan)
             xml_summary, xml_seed = _summary_from_xml_plan(xml_path, scenario_for_plan, seed)
             diffs = _diff_plan_summaries(flow_summary, xml_summary)
             if diffs:
