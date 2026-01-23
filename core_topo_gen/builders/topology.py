@@ -1215,12 +1215,13 @@ def _flow_flag_record_from_host_metadata(hdata: Any) -> Optional[Dict[str, str]]
                 except Exception:
                     pass
             hint_text = str(flow_flag.get('hint') or '').strip()
+            mount_path = str(flow_flag.get('mount_path') or flow_flag.get('artifacts_mount_path') or flow_flag.get('artifacts_mount') or '').strip() or '/flow_artifacts'
             rec2: Dict[str, str] = {
                 **_standard_docker_compose_record(),
                 'Vector': 'flag',
                 # Extra fields consumed by prepare_compose_for_assignments to mount artifacts.
                 'ArtifactsDir': artifacts_dir,
-                'ArtifactsMountPath': '/flow_artifacts',
+                'ArtifactsMountPath': mount_path,
             }
             if hint_text:
                 rec2['HintText'] = hint_text
@@ -1258,9 +1259,10 @@ def _flow_flag_artifacts_overlay_from_host_metadata(hdata: Any) -> Optional[Dict
             except Exception:
                 pass
         hint_text = str(flow_flag.get('hint') or '').strip()
+        mount_path = str(flow_flag.get('mount_path') or flow_flag.get('artifacts_mount_path') or flow_flag.get('artifacts_mount') or '').strip() or '/flow_artifacts'
         overlay: Dict[str, str] = {
             'ArtifactsDir': artifacts_dir,
-            'ArtifactsMountPath': '/flow_artifacts',
+            'ArtifactsMountPath': mount_path,
         }
         if hint_text:
             overlay['HintText'] = hint_text

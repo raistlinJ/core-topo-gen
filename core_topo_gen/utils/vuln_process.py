@@ -1596,18 +1596,18 @@ def _inject_service_labels(compose_obj: dict, labels: Dict[str, str], prefer_ser
 
 
 def _flow_artifacts_mode() -> str:
-	"""How Flow generator artifacts should be delivered into compose services.
+		"""How Flow generator artifacts should be delivered into compose services.
 
-	- mount: bind-mount ArtifactsDir into the service (default)
-	- copy: do not mount; emit labels so a caller can docker-cp the directory in
-	"""
+		- copy: do not mount; emit labels so a caller can docker-cp the directory in (default)
+		- mount: bind-mount ArtifactsDir into the service
+		"""
 	try:
-		val = str(os.getenv('CORETG_FLOW_ARTIFACTS_MODE') or '').strip().lower()
-		if val in ('copy', 'cp'):
+			val = str(os.getenv('CORETG_FLOW_ARTIFACTS_MODE') or '').strip().lower()
+			if val in ('mount', 'bind', 'bind-mount'):
+				return 'mount'
 			return 'copy'
-		return 'mount'
 	except Exception:
-		return 'mount'
+			return 'copy'
 
 
 def _ensure_list_field_has(value: object, item: str) -> List[str]:
