@@ -195,6 +195,7 @@
 
     // Always use the latest flow plan for this scenario to keep Preview aligned.
     let planPath = '';
+    let previewSource = '';
     try {
       const resp = await fetch('/api/flag-sequencing/latest_preview_plan?scenario=' + encodeURIComponent(scenario), { credentials: 'same-origin' });
       if(resp && resp.ok){
@@ -202,10 +203,14 @@
         if(data && typeof data.preview_plan_path === 'string'){
           planPath = data.preview_plan_path.trim();
         }
+        if (data && typeof data.preview_source === 'string') {
+          previewSource = data.preview_source.trim();
+        }
       }
     } catch(e) {}
 
-    if(!planPath){
+    const useXmlPreview = (!!xmlPath && (!planPath || previewSource === 'xml' || /\.xml$/i.test(planPath)));
+    if(!planPath && !useXmlPreview){
       if(frame){
         frame.srcdoc = '<div style="font-family: system-ui; padding: 16px; color: #6c757d;">Preview plan not available. Use Topology → Save XML or Flag Sequencing → Generate/Change Node/Value Override first.</div>';
       }
@@ -213,8 +218,10 @@
     }
 
     try {
-      if (inPlan) inPlan.value = planPath;
-      form.action = '{{ url_for('plan_full_preview_from_plan', embed=1) }}';
+      if (inPlan) inPlan.value = useXmlPreview ? '' : planPath;
+      form.action = useXmlPreview
+        ? '{{ url_for('plan_full_preview_from_xml', embed=1) }}'
+        : '{{ url_for('plan_full_preview_from_plan', embed=1) }}';
     } catch(e) {}
 
     const modal = showLoading();

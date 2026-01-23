@@ -10337,7 +10337,7 @@ def _latest_flow_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
         canonical_path = _canonical_plan_path_for_scenario_norm(scenario_norm)
         if os.path.exists(canonical_path):
             return canonical_path
-        return None
+        return _latest_plan_for_scenario_norm(scenario_norm)
     except Exception:
         return None
 
@@ -10727,6 +10727,21 @@ def api_flow_latest_preview_plan():
     except Exception:
         plan_path = None
     if not plan_path:
+        try:
+            xml_path = _latest_xml_path_for_scenario(scenario_norm)
+            if xml_path:
+                payload = _load_plan_preview_from_xml(xml_path, scenario_label or scenario_norm)
+                if payload and isinstance(payload, dict):
+                    meta = payload.get('metadata') if isinstance(payload.get('metadata'), dict) else {}
+                    return jsonify({
+                        'ok': True,
+                        'scenario': scenario_label or scenario_norm,
+                        'preview_plan_path': xml_path,
+                        'preview_source': 'xml',
+                        'metadata': meta or {},
+                    })
+        except Exception:
+            pass
         return jsonify({'ok': False, 'error': 'No plan found for this scenario. Generate a Preview/Flow first.'}), 404
     try:
         with open(plan_path, 'r', encoding='utf-8') as f:
@@ -24937,6 +24952,45 @@ def _update_plan_preview_in_xml(
         return False, f'failed to update xml: {e}'
 
 
+def _load_plan_preview_from_xml(xml_path: str, scenario_label: str | None) -> dict[str, Any] | None:
+    """Load embedded PlanPreview JSON payload from a scenarios XML file."""
+    if not xml_path or not os.path.exists(xml_path):
+        return None
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception:
+        return None
+
+    scenario_norm = _normalize_scenario_label(scenario_label or '')
+    se_target = None
+    try:
+        if root.tag == 'ScenarioEditor':
+            se_target = root
+        elif root.tag == 'Scenarios':
+            for scen_el in root.findall('Scenario'):
+                nm = str(scen_el.get('name') or '').strip()
+                if scenario_norm and _normalize_scenario_label(nm) != scenario_norm:
+                    continue
+                se_target = scen_el.find('ScenarioEditor')
+                if se_target is not None:
+                    break
+    except Exception:
+        se_target = None
+
+    if se_target is None:
+        return None
+    try:
+        plan_el = se_target.find('PlanPreview')
+        raw = (plan_el.text or '').strip() if plan_el is not None else ''
+        if not raw:
+            return None
+        payload = json.loads(raw)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
 def _parse_scenario_editor(se):
     scen = {"base": {"filepath": ""}, "sections": {}, "notes": ""}
     # If parent <Scenario> carries scenario-level density_count attribute, capture it.
@@ -27348,6 +27402,12 @@ def _planner_persist_flow_plan(*, xml_path: str, scenario: str | None, seed: int
             'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
         },
     }
+    try:
+        _update_plan_preview_in_xml(xml_path, scenario_name or scenario, plan_payload)
+        if isinstance(flow_meta, dict) and flow_meta:
+            _update_flow_state_in_xml(xml_path, scenario_name or scenario, flow_meta)
+    except Exception:
+        pass
     with open(preview_plan_path, 'w', encoding='utf-8') as pf:
         json.dump(plan_payload, pf, indent=2, sort_keys=True)
 
@@ -27826,6 +27886,134 @@ def plan_full_preview_from_plan():
         flash(f'Full preview error: {e}')
         return redirect(url_for('index'))
 
+@app.route('/plan/full_preview_from_xml', methods=['POST'])
+def plan_full_preview_from_xml():
+    """Render Full Preview from PlanPreview embedded in a scenarios XML file.
+
+    Form fields: xml_path, optional scenario, optional embed=1
+    """
+    try:
+        embed_raw = request.args.get('embed') or request.form.get('embed') or ''
+        embed = str(embed_raw).strip().lower() in ['1', 'true', 'yes', 'y', 'on']
+        xml_path = (request.form.get('xml_path') or '').strip()
+        scenario = (request.form.get('scenario') or '').strip() or None
+        if not xml_path:
+            return redirect(url_for('index'))
+        try:
+            xml_path = os.path.abspath(xml_path)
+            repo_root = os.path.abspath(_get_repo_root())
+            if os.path.commonpath([xml_path, repo_root]) != repo_root:
+                flash('Invalid XML path')
+                return redirect(url_for('index'))
+            if not os.path.exists(xml_path):
+                flash('XML not found')
+                return redirect(url_for('index'))
+        except Exception:
+            flash('Invalid XML path')
+            return redirect(url_for('index'))
+
+        payload = _load_plan_preview_from_xml(xml_path, scenario)
+        if not payload:
+            flash('PlanPreview not found in XML')
+            return redirect(url_for('index'))
+
+        full_prev = payload.get('full_preview') if isinstance(payload, dict) else None
+        if not isinstance(full_prev, dict):
+            flash('PlanPreview missing full_preview')
+            return redirect(url_for('index'))
+        meta = payload.get('metadata') if isinstance(payload, dict) else None
+        if not isinstance(meta, dict):
+            meta = {}
+
+        scenario_name = str(meta.get('scenario') or '') or scenario or None
+        seed_val = meta.get('seed')
+        try:
+            seed_val = int(seed_val) if seed_val is not None else full_prev.get('seed')
+        except Exception:
+            seed_val = full_prev.get('seed')
+
+        flow_meta = None
+        try:
+            meta_flow = meta.get('flow') if isinstance(meta, dict) else None
+            if isinstance(meta_flow, dict):
+                flow_meta = meta_flow
+        except Exception:
+            flow_meta = None
+        if flow_meta is None:
+            try:
+                scen_norm = _normalize_scenario_label(scenario_name or '')
+                if scen_norm:
+                    parsed = _parse_scenarios_xml(xml_path)
+                    scen_list = parsed.get('scenarios') if isinstance(parsed, dict) else None
+                    if isinstance(scen_list, list):
+                        for sc in scen_list:
+                            if not isinstance(sc, dict):
+                                continue
+                            nm = str(sc.get('name') or '').strip()
+                            if _normalize_scenario_label(nm) != scen_norm:
+                                continue
+                            fs = sc.get('flow_state')
+                            if isinstance(fs, dict):
+                                flow_meta = fs
+                                break
+            except Exception:
+                flow_meta = None
+
+        hitl_config = {
+            'enabled': bool(full_prev.get('hitl_enabled')),
+            'interfaces': full_prev.get('hitl_interfaces') or [],
+            'scenario_key': full_prev.get('hitl_scenario_key') or (scenario_name or None),
+        }
+        try:
+            if full_prev.get('hitl_core'):
+                hitl_config['core'] = full_prev.get('hitl_core')
+        except Exception:
+            pass
+
+        display_artifacts = full_prev.get('display_artifacts')
+        if not display_artifacts:
+            try:
+                display_artifacts = _attach_display_artifacts(full_prev)
+            except Exception:
+                display_artifacts = {
+                    'segmentation': {
+                        'rows': [],
+                        'table_rows': [],
+                        'tableRows': [],
+                        'json': {'rules_count': 0, 'types_summary': {}, 'rules': [], 'metadata': None},
+                    },
+                    '__version': FULL_PREVIEW_ARTIFACT_VERSION,
+                }
+        segmentation_artifacts = (display_artifacts or {}).get('segmentation')
+
+        import json as _json
+        preview_json_str = _json.dumps(full_prev, indent=2, default=str)
+        xml_basename = None
+        try:
+            xml_basename = os.path.basename(xml_path)
+        except Exception:
+            xml_basename = None
+
+        return render_template(
+            'full_preview.html',
+            full_preview=full_prev,
+            preview_json=preview_json_str,
+            xml_path=xml_path,
+            scenario=scenario_name,
+            seed=seed_val,
+            flow_meta=flow_meta or {},
+            preview_plan_path=xml_path,
+            display_artifacts=display_artifacts,
+            segmentation_artifacts=segmentation_artifacts,
+            hitl_config=hitl_config,
+            xml_basename=xml_basename,
+            hide_chrome=embed,
+        )
+    except Exception as e:
+        app.logger.exception('[plan.full_preview_from_xml] error: %s', e)
+        flash(f'Full preview error: {e}')
+        return redirect(url_for('index'))
+
 def _plan_summary_from_full_preview(full_prev: dict) -> dict:
     try:
         role_counts = full_prev.get('role_counts') or {}
@@ -27963,6 +28151,41 @@ def _summary_from_preview_plan_path(plan_path: str) -> tuple[dict[str, Any], dic
 
 
 def _summary_from_xml_plan(xml_path: str, scenario: str | None, seed: int | None) -> tuple[dict[str, Any], int | None]:
+    # Prefer embedded PlanPreview in XML if available to keep flow/preview aligned.
+    try:
+        if xml_path and os.path.exists(xml_path):
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+            scenario_norm = _normalize_scenario_label(scenario or '')
+            se_target = None
+            if root.tag == 'ScenarioEditor':
+                se_target = root
+            elif root.tag == 'Scenarios':
+                for scen_el in root.findall('Scenario'):
+                    nm = str(scen_el.get('name') or '').strip()
+                    if scenario_norm and _normalize_scenario_label(nm) != scenario_norm:
+                        continue
+                    se_target = scen_el.find('ScenarioEditor')
+                    if se_target is not None:
+                        break
+            if se_target is not None:
+                plan_el = se_target.find('PlanPreview')
+                if plan_el is not None and (plan_el.text or '').strip():
+                    plan_payload = json.loads(plan_el.text) or {}
+                    full_prev = plan_payload.get('full_preview') if isinstance(plan_payload, dict) else None
+                    meta = plan_payload.get('metadata') if isinstance(plan_payload, dict) else None
+                    if isinstance(full_prev, dict):
+                        summary = _plan_summary_from_full_preview(full_prev)
+                        effective_seed = seed
+                        if effective_seed is None and isinstance(meta, dict):
+                            try:
+                                effective_seed = int(meta.get('seed')) if meta.get('seed') is not None else full_prev.get('seed')
+                            except Exception:
+                                effective_seed = full_prev.get('seed')
+                        return summary, effective_seed
+    except Exception:
+        pass
+
     from core_topo_gen.planning.orchestrator import compute_full_plan
     from core_topo_gen.planning.plan_cache import hash_xml_file, try_get_cached_plan, save_plan_to_cache
 

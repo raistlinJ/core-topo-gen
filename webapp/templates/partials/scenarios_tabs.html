@@ -951,7 +951,8 @@
           }
         } catch (e) {}
         const scenarioName = resolveScenarioNameForSave();
-        if (scenarioName && typeof window.coretgPostJson === 'function') {
+        const postFn = (typeof window.coretgPostJson === 'function') ? window.coretgPostJson : postJson;
+        if (scenarioName && typeof postFn === 'function') {
           let seed = null;
           try {
             if (typeof window.coretgGetSeedForScenario === 'function') {
@@ -959,7 +960,7 @@
             }
           } catch (e) { seed = null; }
 
-          const persisted = await window.coretgPostJson('/api/plan/persist_flow_plan', {
+          const persisted = await postFn('/api/plan/persist_flow_plan', {
             xml_path: xmlPath,
             scenario: scenarioName,
             seed,
@@ -975,6 +976,9 @@
           if (typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
             window.coretgSetPreviewPlanPathForScenario(scenarioName, previewPlan);
           }
+          try { logInfoSafe(`[xml-save] Persisted flow plan for scenario ${scenarioName}`); } catch (e) {}
+        } else {
+          try { logWarnSafe('[xml-save] Skipped flow plan persistence (scenario or postJson unavailable)'); } catch (e) {}
         }
       } catch (e) {
         // Best-effort: if flow-plan persistence failed, clear any stored plan path so

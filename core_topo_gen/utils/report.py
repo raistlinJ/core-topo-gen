@@ -140,6 +140,18 @@ def write_report(
             lines.append("")
     except Exception:
         pass
+    # Artifact pointers (XML + Flow/Preview plan) for comparison
+    try:
+        if metadata and (metadata.get('xml_path') or metadata.get('preview_plan_path')):
+            lines.append("### Artifacts")
+            lines.append("| XML Path | Flow/Preview Plan |")
+            lines.append("| --- | --- |")
+            xml_path = metadata.get('xml_path') or ''
+            preview_plan_path = metadata.get('preview_plan_path') or ''
+            lines.append(f"| {xml_path or 'n/a'} | {preview_plan_path or 'n/a'} |")
+            lines.append("")
+    except Exception:
+        pass
     lines.append(f"- Total nodes: {total_nodes}")
     # Preview parity (only shown when metadata provides these fields)
     try:
