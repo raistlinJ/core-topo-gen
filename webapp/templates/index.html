@@ -5263,16 +5263,18 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('scenariosPreviewTabLink')?.addEventListener('click', async (ev)=>{
         try {
             ev.preventDefault();
+            const linkEl = document.getElementById('scenariosPreviewTabLink');
+            const href = (linkEl && linkEl.getAttribute('href')) ? linkEl.getAttribute('href') : '/scenarios/preview';
             if (IS_BUILDER_VIEW) {
                 // Builder view: show a preview of the current configuration without saving.
                 try { await computeFullPlanPreview(); } catch(e) { /* ignore */ }
                 return;
             }
-            if (typeof window.coretgSaveAllAndGoPreview !== 'function') {
-                alert('Save helper unavailable; refresh and try again.');
+            if (hasUnsavedChanges()) {
+                showUnsavedChangesModal(href);
                 return;
             }
-            await window.coretgSaveAllAndGoPreview();
+            window.location.href = href;
         } catch(e){
             try { ev.preventDefault(); } catch(_e){}
         }
