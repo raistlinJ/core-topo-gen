@@ -674,10 +674,12 @@
   const IS_EMBEDDED = {{ 'true' if hide_chrome else 'false' }};
   let previewData = {};
   let planFlow = null;
+  let flowSourceOk = true;
 
   const flowNodeFlagModalEl = document.getElementById('flowNodeFlagModal');
   const flowNodeFlagModalTitleEl = document.getElementById('flowNodeFlagModalTitle');
   const flowNodeFlagModalBodyEl = document.getElementById('flowNodeFlagModalBody');
+  const flowAlertEl = document.getElementById('fpFlowValidityAlert');
 
   function toRoman(num){
     const n = Number(num);
@@ -870,6 +872,12 @@
     } catch(e) {}
   }
 
+  function showFlowMissingAlert(){
+    if(!flowAlertEl) return;
+    flowAlertEl.classList.remove('d-none');
+    flowAlertEl.textContent = 'Flag sequence missing in XML. Save XML from Flag Sequencing, then reopen Preview.';
+  }
+
   function renderFlagSequenceTab(){
     const body = document.getElementById('fp-flag-sequence-body');
     if(!body) return;
@@ -891,17 +899,42 @@
     }
 
     const flow = planFlow && typeof planFlow === 'object' ? planFlow : null;
-    const chain = (flow && Array.isArray(flow.chain)) ? flow.chain : [];
     const fas = (flow && Array.isArray(flow.flag_assignments)) ? flow.flag_assignments : [];
+    let chain = (flow && Array.isArray(flow.chain)) ? flow.chain : [];
     const scenario = (flow && flow.scenario) ? String(flow.scenario)
       : (previewData && previewData.metadata && previewData.metadata.scenario ? String(previewData.metadata.scenario)
       : (previewData && previewData.scenario ? String(previewData.scenario) : ''));
 
     body.innerHTML = '';
     if(!chain.length){
+      try {
+        const chain_ids = (flow && Array.isArray(flow.chain_ids)) ? flow.chain_ids : [];
+        if(chain_ids.length && previewData && typeof previewData === 'object'){
+          const nodeMap = new Map();
+          const addNodes = (list) => {
+            if(!Array.isArray(list)) return;
+            list.forEach(n => {
+              const id = (n && n.node_id !== undefined && n.node_id !== null) ? String(n.node_id) : '';
+              if(!id || nodeMap.has(id)) return;
+              const name = (n && (n.name || n.label)) ? String(n.name || n.label) : id;
+              nodeMap.set(id, { id, name });
+            });
+          };
+          addNodes(previewData.routers);
+          addNodes(previewData.hosts);
+          addNodes(previewData.switches);
+          chain = chain_ids.map((cid) => {
+            const key = String(cid ?? '').trim();
+            return nodeMap.get(key) || { id: key, name: key };
+          }).filter(entry => entry && String(entry.id || '').trim());
+        }
+      } catch(e) {}
+    }
+    if(!chain.length){
+      showFlowMissingAlert();
       const empty = document.createElement('div');
       empty.className = 'small text-muted fst-italic';
-      empty.textContent = '(no flag sequence found in this preview plan)';
+      empty.textContent = '(no flag sequence found in XML flow state)';
       body.appendChild(empty);
       return;
     }
@@ -920,9 +953,8 @@
 
     const faByNodeId = new Map();
     fas.forEach(a => {
-      try{
-        if(!a) return;
-        const nid = String(a.node_id ?? a.nodeId ?? '').trim();
+      try {
+        const nid = String(a?.node_id ?? a?.nodeId ?? '').trim();
         if(!nid) return;
         if(!faByNodeId.has(nid)) faByNodeId.set(nid, []);
         faByNodeId.get(nid).push(a);
@@ -2562,8 +2594,9 @@ function buildScenarioUrl(basePath){
         const afPrev = previewData && previewData.attackflow_preview ? previewData.attackflow_preview : null;
         const af = previewData && previewData.attackflow ? previewData.attackflow : null;
         const direct = previewData && previewData.chain ? previewData.chain : null;
+        const flowIds = flow && Array.isArray(flow.chain_ids) ? flow.chain_ids : null;
         // Prefer plan metadata flow ordering when present to keep preview + sequencing aligned.
-        const candidates = [flow && flow.chain, afPrev && afPrev.chain, af && af.chain, direct];
+        const candidates = [flow && flow.chain, flowIds, afPrev && afPrev.chain, af && af.chain, direct];
         for(const c of candidates){
           if(Array.isArray(c) && c.length) return c;
         }

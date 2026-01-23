@@ -391,6 +391,12 @@
   let flowInitialFactsOverride = null;
   let flowGoalFactsOverride = null;
 
+  function isAutosaveXmlPath(value){
+    if(!value || typeof value !== 'string') return false;
+    const normalized = value.replace(/\\/g, '/');
+    return normalized.includes('/outputs/autosave/') || /\bautosave[-_]/i.test(normalized);
+  }
+
   let _flagGeneratorsCatalog = null;
   let _flagNodeGeneratorsCatalog = null;
 
@@ -439,14 +445,14 @@
       const scenario = (scenarioEl && scenarioEl.value || '').trim();
       if(!scenario) return;
       const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
-      const chainIds = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
-      if(!chainIds.length) return;
+      const chain_ids = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+      if(!chain_ids.length) return;
       if(typeof window.coretgSetSavedFlowStateForScenario !== 'function') return;
       window.coretgSetSavedFlowStateForScenario(scenario, {
         preset,
-        length: chainIds.length,
-        chain_ids: chainIds,
-        flag_assignments: buildPersistAssignments(chainIds),
+        length: chain_ids.length,
+        chain_ids: chain_ids,
+        flag_assignments: buildPersistAssignments(chain_ids),
         allow_node_duplicates: !!allowNodeDuplicates,
         initial_facts: flowInitialFactsOverride,
         goal_facts: flowGoalFactsOverride,
@@ -490,8 +496,8 @@
     }
   }
 
-  function buildPersistAssignments(chainIds){
-    const ids = Array.isArray(chainIds) ? chainIds : [];
+  function buildPersistAssignments(chain_ids){
+    const ids = Array.isArray(chain_ids) ? chain_ids : [];
     return ids.map((nid, j)=>{
       const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
       const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
@@ -592,6 +598,10 @@
     if(scenarioName) params.set('scenario', scenarioName);
     params.set('length', String(chainLen));
     params.set('prefer_flow', '1');
+    try {
+      const xmlPath = (typeof window.coretgGetLatestXmlPathForScenario === 'function') ? window.coretgGetLatestXmlPathForScenario(scenarioName) : '';
+      if(xmlPath) params.set('xml_path', String(xmlPath));
+    } catch(e) {}
 
     setStatus('Restoring saved flow…', false);
     setLoginLinkVisible(false);
@@ -650,12 +660,12 @@
       } catch(e) {}
       const savedAssignments = Array.isArray(flowState.flag_assignments) ? flowState.flag_assignments : [];
       if(!savedAssignments.length) return;
-      const chainIds = Array.isArray(chainNodes) ? chainNodes.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
-      if(!chainIds.length) return;
+      const chain_ids = Array.isArray(chainNodes) ? chainNodes.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+      if(!chain_ids.length) return;
 
       const byIndex = savedAssignments.slice();
       const nextAssignments = Array.isArray(currentFlagAssignments) ? currentFlagAssignments.map(a => (a && typeof a === 'object') ? a : {}) : [];
-      for(let i = 0; i < chainIds.length; i++){
+      for(let i = 0; i < chain_ids.length; i++){
         const savedA = byIndex[i];
         if(!savedA || typeof savedA !== 'object') continue;
         const curA = nextAssignments[i] && typeof nextAssignments[i] === 'object' ? nextAssignments[i] : {};
@@ -684,12 +694,12 @@
         else savedByNode.set(String(idx), a);
       });
 
-      const chainIds = Array.isArray(chainNodes) ? chainNodes.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
-      if(!chainIds.length) return;
+      const chain_ids = Array.isArray(chainNodes) ? chainNodes.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+      if(!chain_ids.length) return;
 
       const nextAssignments = Array.isArray(currentFlagAssignments) ? currentFlagAssignments.map(a => (a && typeof a === 'object') ? a : {}) : [];
-      for(let i = 0; i < chainIds.length; i++){
-        const nid = chainIds[i];
+      for(let i = 0; i < chain_ids.length; i++){
+        const nid = chain_ids[i];
         const savedA = savedByNode.get(nid) || savedByNode.get(String(i));
         if(!savedA || typeof savedA !== 'object') continue;
         const curA = nextAssignments[i] && typeof nextAssignments[i] === 'object' ? nextAssignments[i] : {};
@@ -1009,7 +1019,14 @@
     const scen = (scenarioName || '').toString().trim();
     if(!scen) return '';
     try {
-      const data = await fetchJson('/api/flag-sequencing/latest_preview_plan?scenario=' + encodeURIComponent(scen));
+      let url = '/api/flag-sequencing/latest_preview_plan?scenario=' + encodeURIComponent(scen);
+      try{
+        const xmlPath = (typeof window.coretgGetLatestXmlPathForScenario === 'function') ? window.coretgGetLatestXmlPathForScenario(scen) : '';
+        if(xmlPath){
+          url += '&xml_path=' + encodeURIComponent(String(xmlPath));
+        }
+      } catch(e) {}
+      const data = await fetchJson(url);
       const path = (data && typeof data.preview_plan_path === 'string') ? data.preview_plan_path.trim() : '';
       if(path){
         lastPreviewPlanPath = path;
@@ -4555,11 +4572,11 @@
         if(!Array.isArray(currentChain) || !currentChain.length) throw new Error('Generate a chain first.');
         const scenario = (scenarioEl && scenarioEl.value || '').trim();
         if(!scenario) throw new Error('No scenario selected.');
-        const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-        if(!chainIds.length) throw new Error('Missing chain ids.');
+        const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+        if(!chain_ids.length) throw new Error('Missing chain ids.');
 
         let stepFlagOverride = undefined;
-        const reqAssignments = chainIds.map((nid, j)=>{
+        const reqAssignments = chain_ids.map((nid, j)=>{
           const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
           const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
 
@@ -4721,7 +4738,7 @@
         showLoading('Saving overrides…');
         const res = await postJson('/api/flag-sequencing/save_flow_substitutions', {
           scenario: activeScenario,
-          chain_ids: chainIds,
+          chain_ids: chain_ids,
           preview_plan: previewPlanForRequest(),
           flag_assignments: reqAssignments,
           allow_node_duplicates: !!allowNodeDuplicates,
@@ -5192,8 +5209,8 @@
       if(!Array.isArray(currentChain) || !currentChain.length) return;
       const scenario = (scenarioEl && scenarioEl.value || '').trim();
       if(!scenario) return;
-      const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-      if(!chainIds.length) return;
+      const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+      if(!chain_ids.length) return;
 
       const targetIdx = (k === 'goal')
         ? Math.max(0, (Array.isArray(currentFlagAssignments) ? currentFlagAssignments.length : 0) - 1)
@@ -5210,7 +5227,7 @@
       const overridePairs = Object.assign({}, overrideArtifactMap || {}, overrideFieldMap || {});
       const overrideKeys = Object.keys(overridePairs || {});
 
-      const reqAssignments = chainIds.map((nid, j)=>{
+      const reqAssignments = chain_ids.map((nid, j)=>{
         const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
         const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
         const out = { node_id: nid, id: curId };
@@ -5259,7 +5276,7 @@
       try{
         const res = await postJson('/api/flag-sequencing/save_flow_substitutions', {
           scenario: activeScenario,
-          chain_ids: chainIds,
+          chain_ids: chain_ids,
           preview_plan: previewPlanForRequest(),
           flag_assignments: reqAssignments,
           initial_facts: flowInitialFactsOverride,
@@ -5499,7 +5516,7 @@
         try { return !!(heldChainIndices && heldChainIndices.has(i)); } catch(e) { return false; }
       }
 
-      function chainIdsWithSelectedNode(){
+      function chain_ids_with_selected_node(){
         const base = Array.isArray(currentChain)
           ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean)
           : [];
@@ -5836,8 +5853,8 @@
         }
 
         // Ask server to compute compatibility against the current chain context.
-        const chainIds = chainIdsWithSelectedNode();
-        const reqAssignments = chainIds.map((nid, j)=>{
+        const chain_ids = chain_ids_with_selected_node();
+        const reqAssignments = chain_ids.map((nid, j)=>{
           const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
           const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
           return { node_id: nid, id: curId };
@@ -5863,7 +5880,7 @@
             const res = await postJson('/api/flag-sequencing/substitution_candidates', {
               scenario: activeScenario,
               preview_plan: previewPlanForRequest(),
-              chain_ids: chainIds,
+              chain_ids: chain_ids,
               flag_assignments: reqAssignments,
               index: i,
               kind,
@@ -5991,11 +6008,11 @@
           if(!Array.isArray(currentChain) || currentChain.length === 0){
             throw new Error('Generate a chain first.');
           }
-          const chainIds = chainIdsWithSelectedNode();
-          if(!chainIds.length) throw new Error('Missing chain ids.');
+          const chain_ids = chain_ids_with_selected_node();
+          if(!chain_ids.length) throw new Error('Missing chain ids.');
 
           const currentNodeId = (Array.isArray(currentChain) && currentChain[i] && currentChain[i].id) ? String(currentChain[i].id) : '';
-          const reqAssignments = chainIds.map((nid, j)=>{
+          const reqAssignments = chain_ids.map((nid, j)=>{
             const curA = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[j]) ? currentFlagAssignments[j] : {};
             const curId = String((curA && (curA.id || curA.generator_id)) || '').trim();
             const idOut = (j === i) ? chosenId : curId;
@@ -6049,7 +6066,7 @@
           showLoading('Saving substitution…');
           const res = await postJson('/api/flag-sequencing/save_flow_substitutions', {
             scenario: activeScenario,
-            chain_ids: chainIds,
+            chain_ids: chain_ids,
             preview_plan: previewPlanForRequest(),
             flag_assignments: reqAssignments,
             initial_facts: flowInitialFactsOverride,
@@ -6247,7 +6264,14 @@
       params.set('allow_node_duplicates', '1');
     }
 
-    const buildAttackflowPreviewUrl = (p) => '/api/flag-sequencing/attackflow_preview?' + (p ? p.toString() : params.toString());
+    const buildAttackflowPreviewUrl = (p) => {
+      const base = new URLSearchParams(p ? p.toString() : params.toString());
+      try{
+        const xmlPath = (typeof window.coretgGetLatestXmlPathForScenario === 'function') ? window.coretgGetLatestXmlPathForScenario(activeScenario) : '';
+        if(xmlPath) base.set('xml_path', String(xmlPath));
+      } catch(e) {}
+      return '/api/flag-sequencing/attackflow_preview?' + base.toString();
+    };
     if(downloadAfbLink) downloadAfbLink.href = '#';
 
     setStatus('Generating…', false);
@@ -6348,6 +6372,7 @@
               preview_plan: previewPlanForRequest(),
               allow_node_duplicates: !!allowDupes,
               retry_index: retryIndex,
+              xml_path: (typeof window.coretgGetLatestXmlPathForScenario === 'function') ? window.coretgGetLatestXmlPathForScenario(scenario) : '',
               initial_facts: flowInitialFactsOverride,
               goal_facts: flowGoalFactsOverride,
             }, { timeoutMs: 60000 });
@@ -6376,6 +6401,7 @@
                 preview_plan: previewPlanForRequest(),
                 allow_node_duplicates: !!allowDupes,
                 best_effort: true,
+                xml_path: (typeof window.coretgGetLatestXmlPathForScenario === 'function') ? window.coretgGetLatestXmlPathForScenario(scenario) : '',
                 initial_facts: flowInitialFactsOverride,
                 goal_facts: flowGoalFactsOverride,
               }, { timeoutMs: 60000 });
@@ -6462,14 +6488,14 @@
           showLoading('Resolving values…');
           setLoadingSteps(['Saving XML', 'Generating preview plan', 'Sequencing chain', 'Resolving values'], 3);
           appendLoadingLog('Resolving values via prepare_preview_for_execute');
-          const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+          const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
           const prepData = await postJson(
             '/api/flag-sequencing/prepare_preview_for_execute',
             {
               scenario,
-              length: chainIds.length,
+              length: chain_ids.length,
               preset,
-              chain_ids: chainIds,
+              chain_ids: chain_ids,
               preview_plan: previewPlanForRequest(),
               allow_node_duplicates: !!allowDupes,
               mode: 'resolve',
@@ -6538,13 +6564,13 @@
       // Persist the generated chain so hard refresh restores it (best-effort).
       try{
         const scenario = (scenarioEl && scenarioEl.value || '').trim();
-        const chainIds = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
-        if(scenario && chainIds.length && typeof window.coretgSetSavedFlowStateForScenario === 'function'){
+        const chain_ids = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+        if(scenario && chain_ids.length && typeof window.coretgSetSavedFlowStateForScenario === 'function'){
           window.coretgSetSavedFlowStateForScenario(scenario, {
             preset,
-            length: chainIds.length,
-            chain_ids: chainIds,
-            flag_assignments: buildPersistAssignments(chainIds),
+            length: chain_ids.length,
+            chain_ids: chain_ids,
+            flag_assignments: buildPersistAssignments(chain_ids),
             allow_node_duplicates: !!allowNodeDuplicates,
             initial_facts: flowInitialFactsOverride,
             goal_facts: flowGoalFactsOverride,
@@ -6564,13 +6590,13 @@
         }, null, 2);
       }
           try {
-            const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+            const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
             const flowStatePayload = {
               scenario,
               preset,
-              length: chainIds.length,
-              chain_ids: chainIds,
-              flag_assignments: buildPersistAssignments(chainIds),
+              length: chain_ids.length,
+              chain_ids: chain_ids,
+              flag_assignments: buildPersistAssignments(chain_ids),
               allow_node_duplicates: !!allowNodeDuplicates,
               initial_facts: flowInitialFactsOverride,
               goal_facts: flowGoalFactsOverride,
@@ -6644,7 +6670,7 @@
       if(!Array.isArray(currentChain) || currentChain.length === 0){
         throw new Error('Generate a chain first.');
       }
-      const chainIds = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+      const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
       const planPath = '';
       const prepData = await postJson(
         '/api/flag-sequencing/prepare_preview_for_execute',
@@ -6652,7 +6678,7 @@
           scenario,
           length,
           preset,
-          chain_ids: chainIds,
+          chain_ids: chain_ids,
           preview_plan: previewPlanForRequest(),
           allow_node_duplicates: !!allowNodeDuplicates,
         },
@@ -6719,13 +6745,13 @@
 
       // Persist chain + assignments into the plan so Preview can render sequence numerals.
       try {
-        const chainIds = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
-        const assignments = chainIds.length ? buildPersistAssignments(chainIds) : [];
+        const chain_ids = Array.isArray(currentChain) ? currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean) : [];
+        const assignments = chain_ids.length ? buildPersistAssignments(chain_ids) : [];
         const missingGen = assignments.some(a => !a || !a.id || !String(a.id).trim());
-        if(chainIds.length && !missingGen){
+        if(chain_ids.length && !missingGen){
           await postJson('/api/flag-sequencing/save_flow_substitutions', {
             scenario,
-            chain_ids: chainIds,
+            chain_ids: chain_ids,
             preview_plan: previewPlanForRequest(),
             flag_assignments: assignments,
             allow_node_duplicates: !!allowNodeDuplicates,
@@ -7136,11 +7162,21 @@
   updateScenarioSeedBadges();
   // Auto-generate on load (prefer any saved Flow state).
   try { refreshXmlDockPreview({ force: false }); } catch(e) {}
+  try {
+    const xmlPath = (document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
+    if(xmlPath && !isAutosaveXmlPath(xmlPath) && typeof window.coretgSetLatestXmlPathForScenario === 'function'){
+      window.coretgSetLatestXmlPathForScenario(activeScenario, xmlPath);
+    }
+  } catch(e) {}
   clearPreviewPlanCacheForScenario(activeScenario);
   await refreshLatestPreviewPlanPathForScenario(activeScenario);
   const restored = await restoreSavedFlowForScenario(activeScenario);
   if(!restored){
-    setStatus('No saved flow chain. Click Generate to start.', false);
+    try {
+      await generate(false, { autoLoad: true });
+    } catch(e) {
+      setStatus('No saved flow chain. Click Generate to start.', false);
+    }
   }
 })();
 </script>

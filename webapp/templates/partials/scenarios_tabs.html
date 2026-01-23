@@ -520,6 +520,12 @@
   function syncScenarioTabLinks(scenarioName){
     try {
       const scen = (scenarioName || '').toString().trim();
+      let xmlPath = '';
+      try {
+        if (scen && typeof getLatestXmlPathForScenario === 'function') {
+          xmlPath = (getLatestXmlPathForScenario(scen) || '').toString().trim();
+        }
+      } catch (e) { xmlPath = ''; }
 
       // Keep shared hidden field in sync for Preview handoff logic.
       try {
@@ -536,6 +542,11 @@
           const url = new URL(href, window.location.origin);
           if (scen) url.searchParams.set('scenario', scen);
           else url.searchParams.delete('scenario');
+          if (xmlPath && (url.pathname.includes('/scenarios/flag-sequencing') || url.pathname.includes('/scenarios/preview'))){
+            url.searchParams.set('xml_path', xmlPath);
+          } else if (url.pathname.includes('/scenarios/flag-sequencing') || url.pathname.includes('/scenarios/preview')) {
+            url.searchParams.delete('xml_path');
+          }
           const next = url.pathname + (url.search ? url.search : '') + (url.hash || '');
           a.setAttribute('href', next);
         } catch (e) {
@@ -918,7 +929,10 @@
     // can refer to the same snapshot.
     try {
       const scenarioName = resolveScenarioNameForSave();
-      if (scenarioName) setLatestXmlPathForScenario(scenarioName, xmlPath);
+      if (scenarioName) {
+        setLatestXmlPathForScenario(scenarioName, xmlPath);
+        try { syncScenarioTabLinks(scenarioName); } catch (e) {}
+      }
     } catch (e) {}
 
     // Topology workflow: after saving from Topology, turn the fixed "Preview" button into "Continue"

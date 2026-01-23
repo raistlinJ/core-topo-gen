@@ -1091,6 +1091,9 @@ function rememberDeletedScenarioMarks({ ids, names } = {}) {
 
 function pruneDeletedScenariosInState() {
     try {
+        if (typeof XML_FORCED_SOURCE !== 'undefined' && XML_FORCED_SOURCE) {
+            return;
+        }
         const hasIds = !!(deletedScenarioIds && deletedScenarioIds.size);
         const hasNames = !!(deletedScenarioNameKeys && deletedScenarioNameKeys.size);
         if (!hasIds && !hasNames) return;
@@ -1417,6 +1420,7 @@ if (!currentProjectKey) currentProjectKey = DEFAULT_PROJECT_KEY;
 const serverResultPath = (initialPayload && typeof initialPayload.result_path === 'string')
     ? initialPayload.result_path.trim()
     : '';
+const XML_FORCED_SOURCE = !!(initialPayload && initialPayload._xml_forced);
 if (serverResultPath) {
     try {
         const keyProbe = {
@@ -4327,7 +4331,7 @@ const serverScenarioBases = Array.isArray(initialPayload?.scenarios)
         return Object.keys(meta).length ? meta : undefined;
     })
     : [];
-if (USE_LOCAL_EDITOR_STATE && persistedState && Array.isArray(persistedState.scenarios) && persistedState.scenarios.length) {
+if (USE_LOCAL_EDITOR_STATE && !XML_FORCED_SOURCE && persistedState && Array.isArray(persistedState.scenarios) && persistedState.scenarios.length) {
     // Admin UX: prefer the server-rendered scenario list (catalog-driven) so scenarios like
     // "Scenario 1b" appear consistently. Then append any local-only scenarios so unsaved
     // work in localStorage isn't lost.
@@ -4479,9 +4483,38 @@ if (USE_LOCAL_EDITOR_STATE && persistedState && Array.isArray(persistedState.sce
     } catch (err) {}
 }
 
-if (USE_LOCAL_EDITOR_STATE && persistedState && Array.isArray(persistedState.scenarios) && Array.isArray(state.scenarios)) {
+if (USE_LOCAL_EDITOR_STATE && !XML_FORCED_SOURCE && persistedState && Array.isArray(persistedState.scenarios) && Array.isArray(state.scenarios)) {
     mergePersistedHitlStateIntoScenarios(state.scenarios, persistedState.scenarios);
 }
+// Final fallback: ensure scenarios are present to avoid blank editor.
+try {
+    if (!Array.isArray(state.scenarios) || !state.scenarios.length) {
+        const fallbackScenarios = (Array.isArray(serverEditorSnapshot?.scenarios) && serverEditorSnapshot.scenarios.length)
+            ? serverEditorSnapshot.scenarios
+            : (Array.isArray(persistedState?.scenarios) && persistedState.scenarios.length)
+                ? persistedState.scenarios
+                : (Array.isArray(initialPayload?.scenarios) && initialPayload.scenarios.length)
+                    ? initialPayload.scenarios
+                    : null;
+        if (fallbackScenarios) {
+            state.scenarios = fallbackScenarios;
+            try { logWarn(`[topology] Recovered scenarios from fallback snapshot (count=${fallbackScenarios.length}).`); } catch (e) {}
+        } else {
+            state.scenarios = [ defaultScenario('Scenario 1') ];
+            try { logWarn('[topology] No scenarios found; inserted default scenario.'); } catch (e) {}
+        }
+    }
+} catch (e) {
+    try { logWarn(`[topology] Scenario recovery failed: ${e?.message || e}`); } catch (_) {}
+}
+
+try {
+    if (Array.isArray(state.scenarios) && state.scenarios.length) {
+        if (!Number.isInteger(activeIdx) || activeIdx < 0 || activeIdx >= state.scenarios.length) {
+            activeIdx = Math.max(0, Math.min(state.scenarios.length - 1, Number(activeIdx) || 0));
+        }
+    }
+} catch (e) {}
 const serverBaseUpload = normalizeBaseUpload(initialPayload?.base_upload);
 const persistedBaseUpload = USE_LOCAL_EDITOR_STATE ? normalizeBaseUpload(persistedState?.base_upload) : null;
 if (USE_LOCAL_EDITOR_STATE && !serverHasResult && persistedBaseUpload && (!state.base_upload || !state.base_upload.path)) {
@@ -11372,6 +11405,51 @@ function renderSidebar() {
 }
 
 function renderMain() {
+    try {
+        const count = Array.isArray(state?.scenarios) ? state.scenarios.length : 0;
+        const names = Array.isArray(state?.scenarios) ? state.scenarios.map(s => (s && s.name) ? String(s.name) : '').filter(Boolean).join(', ') : '';
+        logInfo(`[topology] renderMain: scenarios=${count} activeIdx=${String(activeIdx ?? '')} names=${names || '(none)'} xml_forced=${String(XML_FORCED_SOURCE)} use_local=${String(USE_LOCAL_EDITOR_STATE)} tab=${String(SCENARIOS_ACTIVE_TAB)}`);
+        try {
+            const scen = Array.isArray(state?.scenarios) ? (state.scenarios[activeIdx] || state.scenarios[0]) : null;
+            const sections = (scen && typeof scen === 'object') ? scen.sections : null;
+            if (sections && typeof sections === 'object') {
+                const summary = Object.entries(sections).map(([k, v]) => {
+                    const items = (v && typeof v === 'object' && Array.isArray(v.items)) ? v.items.length : 0;
+                    return `${k}:${items}`;
+                }).join(', ');
+                logInfo(`[topology] sections: ${summary || '(none)'}`);
+                const detail = Object.entries(sections).map(([k, v]) => {
+                    const items = (v && typeof v === 'object' && Array.isArray(v.items)) ? v.items : [];
+                    const first = items && items.length ? items[0] : null;
+                    if (!first || typeof first !== 'object') return `${k}:${items.length}`;
+                    const sample = {
+                        selected: first.selected,
+                        factor: first.factor,
+                        v_metric: first.v_metric,
+                        v_count: first.v_count,
+                        pattern: first.pattern,
+                        rate_kbps: first.rate_kbps,
+                        r2r_mode: first.r2r_mode,
+                        r2r_edges: first.r2r_edges,
+                        r2s_mode: first.r2s_mode,
+                        r2s_edges: first.r2s_edges,
+                        v_type: first.v_type,
+                        v_vector: first.v_vector,
+                    };
+                    return `${k}:${items.length}:${JSON.stringify(sample)}`;
+                }).join(' | ');
+                logInfo(`[topology] section_samples: ${detail || '(none)'}`);
+            } else {
+                logWarn('[topology] sections missing');
+            }
+            if (scen && typeof scen === 'object') {
+                const basePath = (scen.base && typeof scen.base === 'object' && typeof scen.base.filepath === 'string') ? scen.base.filepath : '';
+                logInfo(`[topology] scen_meta: name=${String(scen.name || '')} density_count=${String(scen.density_count ?? '')} base=${basePath || '(none)'}`);
+            } else {
+                logWarn('[topology] scenario missing');
+            }
+        } catch (e) {}
+    } catch (e) {}
     // Dispose any tooltips attached to scenario-specific UI before re-rendering.
     try {
         _hideDisposeTooltip(document.getElementById('configHitlBtnWrap'));
@@ -19255,12 +19333,38 @@ async function refreshXmlDockPreview({ force = false, preferSavedPath = false, o
         if (!raw || !raw.endsWith('.xml') || isAutosaveXmlPath(raw)) return '';
         return raw;
     })();
-    const preferredPath = forcedPath || getScenarioSavedPath() || fallbackResultPath || fallbackLastSavedPath;
+    const fallbackLatestXmlPath = (() => {
+        try {
+            if (typeof window.coretgGetLatestXmlPathForScenario !== 'function') return '';
+            const scenName = getActiveScenarioName();
+            const path = window.coretgGetLatestXmlPathForScenario(scenName || '') || '';
+            const resolved = String(path || '').trim();
+            if (!resolved || !resolved.endsWith('.xml') || isAutosaveXmlPath(resolved)) return '';
+            return resolved;
+        } catch (e) {
+            return '';
+        }
+    })();
+
+    const preferredPath = forcedPath || getScenarioSavedPath() || fallbackResultPath || fallbackLatestXmlPath || fallbackLastSavedPath;
     const hasSaved = !!preferredPath;
     const lastPath = xmlPre.dataset.xmlPreviewPath || '';
 
     try {
+        const scenName = getActiveScenarioName();
+        const scenKey = scenarioNameKey(scenName || '');
+        const scen = Array.isArray(state?.scenarios) ? state.scenarios[activeIdx] : null;
+        const savedXmlPath = (scen && typeof scen === 'object') ? (scen.saved_xml_path || scen.savedXmlPath || '') : '';
+        const savedByIndex = Array.isArray(state?.saved_xml_paths_by_index) ? (state.saved_xml_paths_by_index[activeIdx] || '') : '';
+        const resultPath = (state?.result_path || '').toString().trim();
+        const resultScenario = (state?.result_path_scenario || '').toString().trim();
+        const lastSavedPath = (() => {
+            const entry = window.__lastSavedXml || null;
+            return entry && typeof entry === 'object' ? (entry.path || '') : '';
+        })();
         logInfo(`[xml-preview] Refresh requested (force=${force}, preferSavedPath=${preferSavedPath}, awaitReady=${awaitReady}, retry=${retry})`);
+        logInfo(`[xml-preview] Active scenario: name=${scenName || '(none)'} key=${scenKey || '(none)'} idx=${String(activeIdx ?? '')}`);
+        logInfo(`[xml-preview] Sources: saved_xml_path=${savedXmlPath || '(none)'} saved_xml_paths_by_index=${savedByIndex || '(none)'} result_path=${resultPath || '(none)'} result_path_scenario=${resultScenario || '(none)'} latest_xml=${fallbackLatestXmlPath || '(none)'} lastSaved=${lastSavedPath || '(none)'} override=${forcedPath || '(none)'}`);
         logInfo(`[xml-preview] Selected path: ${preferredPath || '(none)'} (last=${lastPath || '(none)'})`);
     } catch (e) {}
 
