@@ -1828,8 +1828,8 @@ function ensureHitlStateForScenario(scen) {
         const parsedPort = parseInt(prox.port, 10);
         prox.port = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 8006;
         prox.username = (prox.username ?? '').toString().trim();
-        if ('password' in prox) {
-            delete prox.password;
+        if (!('password' in prox)) {
+            prox.password = prox.password ?? '';
         }
         prox.verify_ssl = prox.verify_ssl === false ? false : true;
         if (typeof prox.secret_id === 'string') {
@@ -3799,7 +3799,7 @@ function normalizeCoreState(raw, includePassword = true) {
 }
 
 function sanitizeCoreForPersist(coreState) {
-    return normalizeCoreState(coreState, false);
+    return normalizeCoreState(coreState, true);
 }
 
 function mergeCoreSnapshots(primary, secondary) {
@@ -4287,15 +4287,17 @@ if (!USE_LOCAL_EDITOR_STATE && serverEditorSnapshot && typeof serverEditorSnapsh
             state.scenarios = snapScenarios;
         } else if (serverScenarios.length && snapScenarios.length) {
             const snapByKey = new Map();
-            snapScenarios.forEach((snapScen) => {
+            const snapByIndex = new Map();
+            snapScenarios.forEach((snapScen, idx) => {
                 if (!snapScen || typeof snapScen !== 'object') return;
                 const k = _scenarioMatchKey(snapScen.name);
                 if (k && !snapByKey.has(k)) snapByKey.set(k, snapScen);
+                snapByIndex.set(idx, snapScen);
             });
-            state.scenarios = serverScenarios.map((serverScen) => {
+            state.scenarios = serverScenarios.map((serverScen, idx) => {
                 if (!serverScen || typeof serverScen !== 'object') return serverScen;
                 const k = _scenarioMatchKey(serverScen.name);
-                const snapScen = k ? snapByKey.get(k) : null;
+                const snapScen = (k && snapByKey.has(k)) ? snapByKey.get(k) : snapByIndex.get(idx);
                 if (!snapScen || typeof snapScen !== 'object') return serverScen;
                 const out = { ...serverScen, ...snapScen };
                 out.name = (serverScen.name || snapScen.name || '').toString();
@@ -4351,6 +4353,12 @@ if (USE_LOCAL_EDITOR_STATE && persistedState && Array.isArray(persistedState.sce
             const serverObj = (serverHitl && typeof serverHitl === 'object') ? serverHitl : {};
             const localObj = (localHitl && typeof localHitl === 'object') ? localHitl : {};
 
+            const hasMeaningfulValue = (value) => {
+                if (value === undefined || value === null) return false;
+                if (typeof value === 'string') return value.trim() !== '';
+                return true;
+            };
+
             // Start by allowing local edits to overlay, but then re-apply server authority
             // for admin-managed fields so stale localStorage cannot wipe them.
             const merged = { ...serverObj, ...localObj };
@@ -4390,7 +4398,7 @@ if (USE_LOCAL_EDITOR_STATE && persistedState && Array.isArray(persistedState.sce
                 'cached_vm_status',
             ];
             coreServerKeys.forEach((k) => {
-                if (Object.prototype.hasOwnProperty.call(serverCore, k)) {
+                if (Object.prototype.hasOwnProperty.call(serverCore, k) && hasMeaningfulValue(serverCore[k])) {
                     coreMerged[k] = serverCore[k];
                 }
             });
@@ -4409,7 +4417,7 @@ if (USE_LOCAL_EDITOR_STATE && persistedState && Array.isArray(persistedState.sce
                 'inventory_error',
             ];
             proxServerKeys.forEach((k) => {
-                if (Object.prototype.hasOwnProperty.call(serverProx, k)) {
+                if (Object.prototype.hasOwnProperty.call(serverProx, k) && hasMeaningfulValue(serverProx[k])) {
                     proxMerged[k] = serverProx[k];
                 }
             });
@@ -4418,11 +4426,11 @@ if (USE_LOCAL_EDITOR_STATE && persistedState && Array.isArray(persistedState.sce
             merged.proxmox = proxMerged;
 
             // HITL config is admin-managed; keep server as source-of-truth.
-            if (Object.prototype.hasOwnProperty.call(serverObj, 'enabled')) {
+            if (Object.prototype.hasOwnProperty.call(serverObj, 'enabled') && hasMeaningfulValue(serverObj.enabled)) {
                 merged.enabled = !!serverObj.enabled;
             }
-            if (Object.prototype.hasOwnProperty.call(serverObj, 'interfaces')) {
-                merged.interfaces = Array.isArray(serverObj.interfaces) ? serverObj.interfaces : [];
+            if (Object.prototype.hasOwnProperty.call(serverObj, 'interfaces') && Array.isArray(serverObj.interfaces) && serverObj.interfaces.length) {
+                merged.interfaces = serverObj.interfaces;
             }
             // Participant URL hints should not disappear.
             ['participant_proxmox_url', 'participant_ui_url', 'participant_url', 'participant'].forEach((k) => {
@@ -4548,43 +4556,7 @@ let serverSnapshotTimerId = null;
 let serverSnapshotDisabled = false;
 
 function scrubHitlForServerSnapshot(snapshotPayload) {
-    if (!snapshotPayload || typeof snapshotPayload !== 'object') return;
-    const scenarios = Array.isArray(snapshotPayload.scenarios) ? snapshotPayload.scenarios : [];
-    scenarios.forEach((scen) => {
-        if (!scen || typeof scen !== 'object') return;
-        const hitl = (scen.hitl && typeof scen.hitl === 'object') ? scen.hitl : null;
-        if (!hitl) return;
-
-        const prox = (hitl.proxmox && typeof hitl.proxmox === 'object') ? hitl.proxmox : null;
-        const proxValidated = !!(prox && prox.validated && prox.secret_id);
-        if (!proxValidated) {
-            delete hitl.proxmox;
-        } else {
-            // Ensure no secret material is ever sent in snapshots.
-            if (prox && 'password' in prox) delete prox.password;
-        }
-
-        const core = (hitl.core && typeof hitl.core === 'object') ? hitl.core : null;
-        const coreValidated = !!(core && core.validated && (core.core_secret_id || core.secret_id));
-        if (!coreValidated) {
-            delete hitl.core;
-        } else {
-            if (core && core.ssh_password) delete core.ssh_password;
-        }
-
-        const bridgeValidated = !!hitl.bridge_validated;
-        if (!bridgeValidated) {
-            hitl.enabled = false;
-            delete hitl.interfaces;
-            delete hitl.participant_proxmox_url;
-            delete hitl.participant_ui_url;
-            delete hitl.participant_url;
-            if (core && typeof core === 'object') {
-                delete core.internal_bridge;
-                delete core.internal_bridge_owner;
-            }
-        }
-    });
+    return;
 }
 
 async function transmitEditorSnapshotToServer(payload) {
@@ -4681,6 +4653,73 @@ let previewState = {
     coreTested: false
 };
 const FULL_PREVIEW_ARTIFACT_VERSION = 2;
+
+let xmlPreviewSavedSignature = null;
+function buildXmlPreviewSignature(source = null) {
+    try {
+        const scenarios = (source && Array.isArray(source.scenarios)) ? source.scenarios : (state.scenarios || []);
+        const activeIndex = Number.isInteger(source?.active_index)
+            ? source.active_index
+            : (Number.isInteger(activeIdx) ? activeIdx : 0);
+        const core = (source && source.core !== undefined) ? source.core : getCoreConfig(true);
+        return JSON.stringify({ scenarios, active_index: activeIndex, core });
+    } catch (e) {
+        return null;
+    }
+}
+
+function noteXmlPreviewSavedSignature(source = null) {
+    try {
+        xmlPreviewSavedSignature = buildXmlPreviewSignature(source);
+    } catch (e) {
+        xmlPreviewSavedSignature = null;
+    }
+}
+
+try {
+    if (previewState.xmlSaved) {
+        noteXmlPreviewSavedSignature();
+    }
+} catch (e) {}
+
+function _extractPlanPreviewPayload(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    if (raw.full_preview && typeof raw.full_preview === 'object') return raw;
+    if (raw.fullPreview && typeof raw.fullPreview === 'object') return { full_preview: raw.fullPreview };
+    if (raw.preview && typeof raw.preview === 'object') return { full_preview: raw.preview };
+    if (raw.full && typeof raw.full === 'object') return { full_preview: raw.full };
+    if (raw.routers || raw.hosts || raw.switches) return { full_preview: raw };
+    return null;
+}
+
+function _applyPlanPreviewToUi(fullPreview) {
+    if (!fullPreview || typeof fullPreview !== 'object') return false;
+    previewState.fullPreview = fullPreview;
+    previewState.xmlSaved = true;
+    previewState.dirty = false;
+    try { buildFullPreviewArtifacts(previewState.fullPreview); } catch (e) {}
+    try { renderFullPreviewStructured(); } catch (e) {}
+    try { updatePlanButtons(); } catch (e) {}
+    return true;
+}
+
+function restorePlanPreviewFromScenario(idx, options = {}) {
+    const scen = state?.scenarios?.[idx];
+    if (!scen || typeof scen !== 'object') return false;
+    const force = !!options.force;
+    if (previewState.fullPreview && !force) return false;
+    const payload = _extractPlanPreviewPayload(scen.plan_preview || scen.planPreview || scen.full_preview || scen.fullPreview);
+    if (!payload) {
+        if (force) {
+            previewState.fullPreview = null;
+            previewState.dirty = false;
+            try { updatePlanButtons(); } catch (e) {}
+        }
+        return false;
+    }
+    const full = payload.full_preview || payload.fullPreview || payload.preview || payload.full || payload;
+    return _applyPlanPreviewToUi(full);
+}
 
 function safeClone(value){
     if(value === null || typeof value !== 'object') return value;
@@ -5106,6 +5145,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     } catch (e) {}
     try { updatePlanButtons(); } catch(e){}
+    try { restorePlanPreviewFromScenario(activeIdx); } catch (e) {}
 });
 
 async function computeFullPlanPreview(){
@@ -5192,6 +5232,19 @@ async function computeFullPlanPreview(){
                     localStorage.setItem(LAST_PREVIEW_SEED_STORAGE_KEY, String(s));
                 }
             } catch (e) {}
+            try {
+                const activeScenario = state?.scenarios?.[activeIdx];
+                if (activeScenario && typeof activeScenario === 'object') {
+                    activeScenario.plan_preview = {
+                        full_preview: previewState.fullPreview,
+                        plan: data.plan || null,
+                        breakdowns: data.breakdowns || null,
+                        flow_meta: data.flow_meta || null,
+                        saved_at: new Date().toISOString(),
+                    };
+                }
+            } catch (e) {}
+            try { persistEditorState(); } catch (e) {}
             buildFullPreviewArtifacts(previewState.fullPreview);
             if (pre) pre.textContent = JSON.stringify(previewState.fullPreview, null, 2);
             renderFullPreviewStructured();
@@ -6697,13 +6750,77 @@ async function autoSaveXml(){
                 }
                 storeCorePasswordInSession();
             };
-            const applyResultPath = (resultPath) => {
+            const isAutosaveXmlPath = (value) => {
+                if (!value || typeof value !== 'string') return false;
+                const normalized = value.replace(/\\/g, '/');
+                return normalized.includes('/outputs/autosave/') || /\bautosave[-_]/i.test(normalized);
+            };
+            const applyScenarioSavedPaths = (pathMap) => {
+                if (!pathMap) return;
+                const scenarios = Array.isArray(state.scenarios) ? state.scenarios : [];
+                if (Array.isArray(pathMap)) {
+                    state.saved_xml_paths_by_index = pathMap.slice();
+                    scenarios.forEach((scen, idx) => {
+                        if (!scen || typeof scen !== 'object') return;
+                        const path = (pathMap[idx] || '').toString().trim();
+                        if (!path || !path.endsWith('.xml') || isAutosaveXmlPath(path)) return;
+                        scen.saved_xml_path = path;
+                    });
+                    return;
+                }
+                if (typeof pathMap !== 'object') return;
+                const lookup = new Map();
+                Object.entries(pathMap).forEach(([key, val]) => {
+                    const nameKey = scenarioNameKey(key || '');
+                    const path = (typeof val === 'string') ? val.trim() : '';
+                    if (nameKey && path && path.endsWith('.xml') && !isAutosaveXmlPath(path)) {
+                        lookup.set(nameKey, path);
+                    }
+                });
+                if (!lookup.size) return;
+                const indexPaths = Array.isArray(state.saved_xml_paths_by_index) ? state.saved_xml_paths_by_index.slice() : [];
+                scenarios.forEach((scen, idx) => {
+                    if (!scen || typeof scen !== 'object') return;
+                    const nameKey = scenarioNameKey(scen.name || '');
+                    if (!nameKey || !lookup.has(nameKey)) return;
+                    const path = lookup.get(nameKey);
+                    scen.saved_xml_path = path;
+                    indexPaths[idx] = path;
+                });
+                if (indexPaths.length) {
+                    state.saved_xml_paths_by_index = indexPaths;
+                }
+            };
+            const applyResultPath = (resultPath, scenarioNameOverride = '') => {
                 if (!resultPath) return;
+                try { logInfo(`[xml-save] applyResultPath(${resultPath})`); } catch (e) {}
                 const previousProjectKey = currentProjectKey;
                 const previousSnapshot = USE_LOCAL_EDITOR_STATE
                     ? { ...(projectStateMap[previousProjectKey] || legacyEditorState || {}) }
                     : {};
                 state.result_path = resultPath;
+                try {
+                    const activeScenarioName = (scenarioNameOverride || getActiveScenarioName() || '').toString().trim();
+                    if (activeScenarioName) {
+                        state.result_path_scenario = activeScenarioName;
+                        window.__lastSavedXml = { scenario: activeScenarioName, path: resultPath };
+                    }
+                } catch (e) {}
+                try {
+                    if (resultPath && typeof resultPath === 'string' && resultPath.endsWith('.xml') && !isAutosaveXmlPath(resultPath)) {
+                        const activeScenario = state?.scenarios?.[activeIdx];
+                        if (activeScenario && typeof activeScenario === 'object') {
+                            activeScenario.saved_xml_path = resultPath;
+                            if (Array.isArray(state.saved_xml_paths_by_index)) {
+                                state.saved_xml_paths_by_index[activeIdx] = resultPath;
+                            } else {
+                                state.saved_xml_paths_by_index = [];
+                                state.saved_xml_paths_by_index[activeIdx] = resultPath;
+                            }
+                        }
+                    }
+                } catch (e) {}
+                try { refreshXmlDockPreview({ force: true, preferSavedPath: true, overridePath: resultPath }); } catch (e) {}
                 try { updateDownloadButtonState(); } catch (err) {}
                 try {
                     const projectKeyProbe = {
@@ -6773,6 +6890,7 @@ async function autoSaveXml(){
             const finalizeSuccess = async () => {
                 previewState.xmlSaved = true;
                 try { updatePlanButtons(); } catch(err) {}
+                try { noteXmlPreviewSavedSignature(); } catch (e) {}
                 // Keep the dock's XML Preview in sync for all save paths (auto-save + modal saves).
                 try { refreshXmlDockPreview({ force: true, preferSavedPath: true }); } catch (e) {}
                 // Persist a concrete flow plan artifact so Flag Sequencing/Preview stay in sync.
@@ -6813,6 +6931,7 @@ async function autoSaveXml(){
                     .catch(err => reject(err));
             };
             const apiSave = () => {
+                try { logInfo('[xml-save] Saving XML (JSON API, modal save)'); } catch (e) {}
                 return fetch('/save_xml_api', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -6835,13 +6954,23 @@ async function autoSaveXml(){
                         applyCoreUpdate(data.core);
                     }
                     if (data.result_path) {
-                        applyResultPath(data.result_path);
+                        applyResultPath(data.result_path, data.active_scenario || '');
+                        try { logInfo(`[xml-save] Saved XML path: ${data.result_path}`); } catch (e) {}
+                    }
+                    if (data.scenario_paths_by_index) {
+                        try { applyScenarioSavedPaths(data.scenario_paths_by_index); } catch (e) {}
+                        try { logInfo('[xml-save] Applied per-scenario saved XML paths (by index)'); } catch (e) {}
+                    }
+                    if (data.scenario_paths) {
+                        try { applyScenarioSavedPaths(data.scenario_paths); } catch (e) {}
+                        try { logInfo('[xml-save] Applied per-scenario saved XML paths (by name)'); } catch (e) {}
                     }
                     await finalizeSuccess();
                 });
             };
             apiSave().catch(err => {
                 console.warn('save_xml_api failed, falling back to legacy save_xml', err);
+                try { logWarn(`[xml-save] save_xml_api failed; falling back to legacy save (${err?.message || err})`); } catch (e) {}
                 legacySave();
             });
         } catch(e){ reject(e); }
@@ -7080,7 +7209,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 state.core = restoreCorePasswordFromSession(state.core);
 if (USE_LOCAL_EDITOR_STATE && persistedState && persistedState.core) {
-    const persistedCore = normalizeCoreState(persistedState.core, false);
+    const persistedCore = normalizeCoreState(persistedState.core, true);
     state.core = {
         ...state.core,
         ...persistedCore,
@@ -7106,8 +7235,117 @@ try {
 try { ensureScenarioIds(); } catch (e) {}
 try { pruneDeletedScenariosInState(); } catch (e) {}
 
-function persistEditorState(){
+// Seed saved XML path for the active scenario when a non-autosave result exists.
+try {
+    const isAutosaveXmlPath = (value) => {
+        if (!value || typeof value !== 'string') return false;
+        const normalized = value.replace(/\\/g, '/');
+        return normalized.includes('/outputs/autosave/') || /\bautosave[-_]/i.test(normalized);
+    };
+    const rp = (state?.result_path || '').toString().trim();
+    const scen = Array.isArray(state?.scenarios) ? state.scenarios[activeIdx] : null;
+    if (scen && typeof scen === 'object' && rp && rp.endsWith('.xml') && !isAutosaveXmlPath(rp)) {
+        if (!scen.saved_xml_path) {
+            scen.saved_xml_path = rp;
+        }
+        if (!state.result_path_scenario) {
+            const activeName = (scen.name || '').toString().trim();
+            if (activeName) {
+                state.result_path_scenario = activeName;
+            }
+        }
+    }
+} catch (e) {}
+
+let autoSaveXmlTimerId = null;
+let autoSaveXmlPending = null;
+let autoSaveXmlInFlight = false;
+let autoSaveXmlLastSignature = null;
+let autoSaveXmlSkipNext = false;
+
+function buildAutosaveSignature(payload) {
     try {
+        return JSON.stringify(payload);
+    } catch (e) {
+        return null;
+    }
+}
+
+function applyAutosaveResultPath(path) {
+    const resolved = (typeof path === 'string') ? path.trim() : '';
+    if (!resolved) return;
+    if (state.result_path && state.result_path === resolved) return;
+    state.result_path = resolved;
+    previewState.xmlSaved = true;
+    try { updatePlanButtons(); } catch (e) {}
+    autoSaveXmlSkipNext = true;
+    try { persistEditorState({ skipXml: true }); } catch (e) {}
+}
+
+async function flushAutoSaveXmlNow() {
+    if (autoSaveXmlInFlight) return { ok: false, skipped: true };
+    const pending = autoSaveXmlPending;
+    if (!pending || !pending.payload) return { ok: true, skipped: true };
+    autoSaveXmlPending = null;
+    autoSaveXmlInFlight = true;
+    try {
+        const res = await fetch('/save_xml_api', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify(pending.payload),
+        });
+        let data = null;
+        try { data = await res.json(); } catch (e) { data = null; }
+        if (!res.ok || !data || data.ok !== true) {
+            return { ok: false, error: (data && data.error) ? data.error : `HTTP ${res.status}` };
+        }
+        if (data.result_path) {
+            applyAutosaveResultPath(data.result_path);
+        }
+        try { noteXmlPreviewSavedSignature(pending.payload); } catch (e) {}
+        autoSaveXmlLastSignature = pending.signature || autoSaveXmlLastSignature;
+        return { ok: true, result_path: data.result_path || null };
+    } catch (err) {
+        return { ok: false, error: err && err.message ? err.message : 'Autosave failed' };
+    } finally {
+        autoSaveXmlInFlight = false;
+        if (autoSaveXmlPending) {
+            try { flushAutoSaveXmlNow(); } catch (e) {}
+        }
+    }
+}
+
+function scheduleAutoSaveXml(snapshot, coreState, scenarios) {
+    if (!ALLOW_LOCAL_EDITOR_PERSISTENCE) return;
+    if (!snapshot || !Array.isArray(scenarios) || scenarios.length === 0) return;
+    if (autoSaveXmlSkipNext) {
+        autoSaveXmlSkipNext = false;
+        return;
+    }
+    const payload = {
+        scenarios,
+        core: coreState || null,
+        active_index: Number.isInteger(activeIdx) ? activeIdx : 0,
+        project_key_hint: snapshot.project_key_hint || null,
+        scenario_query: snapshot.scenario_query || null,
+        autosave: true,
+    };
+    const signature = buildAutosaveSignature(payload);
+    if (signature && autoSaveXmlLastSignature === signature) return;
+    autoSaveXmlPending = { payload, signature };
+    if (autoSaveXmlTimerId) {
+        clearTimeout(autoSaveXmlTimerId);
+    }
+    autoSaveXmlTimerId = window.setTimeout(() => {
+        autoSaveXmlTimerId = null;
+        flushAutoSaveXmlNow();
+    }, 1200);
+}
+
+function persistEditorState(options = {}){
+    try {
+        const skipXml = !!(options && options.skipXml);
         try {
             state.active_index = Number.isInteger(activeIdx) ? activeIdx : 0;
             window.state = state;
@@ -7154,6 +7392,11 @@ function persistEditorState(){
         // newly-created state for users who don't use local persistence (e.g. builder view).
         try { scheduleServerSnapshotPersist(snapshot); } catch (_) {}
         try { storeCorePasswordInSession(); } catch (_) {}
+        try {
+            if (!skipXml) {
+                scheduleAutoSaveXml(snapshot, coreForPersist || state.core || null, scenariosForSnapshot);
+            }
+        } catch (_) {}
 
         // Local persistence is admin-only (and disabled in builder view).
         if (!ALLOW_LOCAL_EDITOR_PERSISTENCE) return;
@@ -7176,6 +7419,10 @@ persistEditorState();
 try {
     window.addEventListener('pagehide', () => { try { flushServerSnapshotPersistNow(); } catch (_) {} }, { capture: true });
     window.addEventListener('beforeunload', () => { try { flushServerSnapshotPersistNow(); } catch (_) {} }, { capture: true });
+} catch (e) {}
+try {
+    window.addEventListener('pagehide', () => { try { flushAutoSaveXmlNow(); } catch (_) {} }, { capture: true });
+    window.addEventListener('beforeunload', () => { try { flushAutoSaveXmlNow(); } catch (_) {} }, { capture: true });
 } catch (e) {}
 
 const dropdownsBySection = {
@@ -9966,14 +10213,13 @@ async function validateCoreConnection(sidx, options = {}) {
                 }
             }
             syncGlobalCoreConnection(coreState, coreState.last_tested_host, coreState.last_tested_port);
-            coreState.ssh_password = '';
             persistEditorState();
             const hidden = document.getElementById('scenarios_json');
             if (hidden) hidden.value = JSON.stringify({ scenarios: state.scenarios, active_index: activeIdx });
             const pwdInput = document.querySelector(`[data-hitl-core-field="ssh_password"][data-scen-idx="${sidx}"]`);
-            if (pwdInput) {
-                pwdInput.value = '';
-                pwdInput.setAttribute('placeholder', 'Stored securely');
+            if (pwdInput && coreState.ssh_password) {
+                pwdInput.value = coreState.ssh_password;
+                pwdInput.removeAttribute('placeholder');
             }
             updateProxmoxSummary(sidx);
             renderMain();
@@ -10994,6 +11240,7 @@ function renderSidebar() {
         a.onclick = (e) => {
             e.preventDefault();
             activeIdx = idx;
+            try { restorePlanPreviewFromScenario(activeIdx, { force: true }); } catch (err) {}
             try {
                 if (name && typeof window.coretgSetActiveScenarioForNav === 'function') {
                     window.coretgSetActiveScenarioForNav(name);
@@ -11036,6 +11283,7 @@ function renderSidebar() {
             try { if (typeof flushServerSnapshotPersistNow === 'function') flushServerSnapshotPersistNow(); } catch (_) {}
             try { previewState.dirty = true; updatePlanButtons(); } catch(e){}
             render();
+            try { refreshXmlDockPreview({ force: true }); } catch (e) {}
         };
     }
     if (importBtn) importBtn.onclick = (e) => { e.preventDefault(); logInfo('Import scenarios clicked'); hiddenLoadInput.click(); };
@@ -17386,9 +17634,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             }
             hitlState.proxmox = updatedProx;
-            if ('password' in hitlState.proxmox) {
-                delete hitlState.proxmox.password;
-            }
+            hitlState.proxmox.password = passVal;
             updateProxmoxSummary(sidx);
             persistEditorState();
             const hidden = document.getElementById('scenarios_json');
@@ -18151,7 +18397,47 @@ function buildRunFormData(xmlPath, options = {}) {
         if (adv && adv.autoKillSessions) form.append('adv_auto_kill_sessions', '1');
         if (adv && adv.uploadOnlyInjectedArtifacts) form.append('upload_only_injected_artifacts', '1');
     } catch (err) { /* ignore */ }
+    try {
+        const previewPlanPath = options && typeof options.previewPlanPath === 'string' ? options.previewPlanPath.trim() : '';
+        if (previewPlanPath) {
+            form.append('preview_plan', previewPlanPath);
+        }
+    } catch (err) { /* ignore */ }
+    try {
+        const seedVal = options && options.seed !== undefined && options.seed !== null ? Number(options.seed) : null;
+        if (Number.isFinite(seedVal) && seedVal > 0) {
+            form.append('seed', String(Math.trunc(seedVal)));
+        }
+    } catch (err) { /* ignore */ }
     return form;
+}
+
+async function ensurePersistedFlowPlanForRun({ xmlPath, scenarioName, seed } = {}) {
+    if (!xmlPath || typeof xmlPath !== 'string') {
+        return null;
+    }
+    const payload = { xml_path: xmlPath };
+    if (typeof scenarioName === 'string' && scenarioName.trim()) {
+        payload.scenario = scenarioName.trim();
+    }
+    const seedNum = Number(seed);
+    if (Number.isFinite(seedNum) && seedNum > 0) {
+        payload.seed = Math.trunc(seedNum);
+    }
+    try {
+        const res = await fetch('/api/plan/persist_flow_plan', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data || data.ok !== true) {
+            return null;
+        }
+        return data;
+    } catch (err) {
+        return null;
+    }
 }
 
 async function parseResponseJson(response) {
@@ -18907,20 +19193,105 @@ async function saveXmlAjax(){
         if (state.base_upload) {
             payload.base_upload = state.base_upload;
         }
+        try { logInfo('[xml-save] Saving XML (JSON API)'); } catch (e) {}
         const res = await fetch('/save_xml_api', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
-        if (!res.ok) { try { const err = await res.json(); logWarn('Save failed: ' + (err?.error || res.status)); } catch(e){ logWarn('Save failed'); } return false; }
+        if (!res.ok) { try { const err = await res.json(); logWarn('[xml-save] Save failed: ' + (err?.error || res.status)); } catch(e){ logWarn('[xml-save] Save failed'); } return false; }
         const data = await res.json();
         if (data && data.ok) {
             if (data.core) {
                 state.core = normalizeCoreState(data.core, true);
                 storeCorePasswordInSession();
             }
+            const isAutosaveXmlPath = (value) => {
+                if (!value || typeof value !== 'string') return false;
+                const normalized = value.replace(/\\/g, '/');
+                return normalized.includes('/outputs/autosave/') || /\bautosave[-_]/i.test(normalized);
+            };
+            const applyScenarioSavedPaths = (pathMap) => {
+                if (!pathMap) return;
+                const scenarios = Array.isArray(state.scenarios) ? state.scenarios : [];
+                if (Array.isArray(pathMap)) {
+                    state.saved_xml_paths_by_index = pathMap.slice();
+                    scenarios.forEach((scen, idx) => {
+                        if (!scen || typeof scen !== 'object') return;
+                        const path = (pathMap[idx] || '').toString().trim();
+                        if (!path || !path.endsWith('.xml') || isAutosaveXmlPath(path)) return;
+                        scen.saved_xml_path = path;
+                    });
+                    return;
+                }
+                if (typeof pathMap !== 'object') return;
+                const lookup = new Map();
+                Object.entries(pathMap).forEach(([key, val]) => {
+                    const nameKey = scenarioNameKey(key || '');
+                    const path = (typeof val === 'string') ? val.trim() : '';
+                    if (nameKey && path && path.endsWith('.xml') && !isAutosaveXmlPath(path)) {
+                        lookup.set(nameKey, path);
+                    }
+                });
+                if (!lookup.size) return;
+                const indexPaths = Array.isArray(state.saved_xml_paths_by_index) ? state.saved_xml_paths_by_index.slice() : [];
+                scenarios.forEach((scen, idx) => {
+                    if (!scen || typeof scen !== 'object') return;
+                    const nameKey = scenarioNameKey(scen.name || '');
+                    if (!nameKey || !lookup.has(nameKey)) return;
+                    const path = lookup.get(nameKey);
+                    scen.saved_xml_path = path;
+                    indexPaths[idx] = path;
+                });
+                if (indexPaths.length) {
+                    state.saved_xml_paths_by_index = indexPaths;
+                }
+            };
+            const applyResultPath = (resultPath, scenarioNameOverride = '') => {
+                if (!resultPath) return;
+                state.result_path = resultPath;
+                try {
+                    const scenarioName = (scenarioNameOverride || getActiveScenarioName() || '').toString().trim();
+                    if (scenarioName) {
+                        state.result_path_scenario = scenarioName;
+                        window.__lastSavedXml = { scenario: scenarioName, path: resultPath };
+                    }
+                } catch (e) {}
+                try {
+                    if (resultPath && typeof resultPath === 'string' && resultPath.endsWith('.xml') && !isAutosaveXmlPath(resultPath)) {
+                        const activeScenario = state?.scenarios?.[activeIdx];
+                        if (activeScenario && typeof activeScenario === 'object') {
+                            activeScenario.saved_xml_path = resultPath;
+                            if (Array.isArray(state.saved_xml_paths_by_index)) {
+                                state.saved_xml_paths_by_index[activeIdx] = resultPath;
+                            } else {
+                                state.saved_xml_paths_by_index = [];
+                                state.saved_xml_paths_by_index[activeIdx] = resultPath;
+                            }
+                        }
+                    }
+                } catch (e) {}
+            };
+            try {
+                const rp = (data.result_path || '').toString().trim();
+                const byIndexCount = Array.isArray(data.scenario_paths_by_index) ? data.scenario_paths_by_index.length : 0;
+                const byNameCount = data.scenario_paths && typeof data.scenario_paths === 'object'
+                    ? Object.keys(data.scenario_paths).length
+                    : 0;
+                logInfo(`[xml-save] Response ok; result_path=${rp || '(none)'}; scenario_paths_by_index=${byIndexCount}; scenario_paths=${byNameCount}`);
+            } catch (e) {}
+
             if (data.result_path) {
-                state.result_path = data.result_path;
+                applyResultPath(data.result_path, data.active_scenario || '');
+                try { logInfo(`[xml-save] Saved XML path: ${data.result_path}`); } catch (e) {}
+            }
+            if (data.scenario_paths_by_index) {
+                try { applyScenarioSavedPaths(data.scenario_paths_by_index); } catch (e) {}
+                try { logInfo('[xml-save] Applied per-scenario saved XML paths (by index)'); } catch (e) {}
+            }
+            if (data.scenario_paths) {
+                try { applyScenarioSavedPaths(data.scenario_paths); } catch (e) {}
+                try { logInfo('[xml-save] Applied per-scenario saved XML paths (by name)'); } catch (e) {}
             }
             try { updateDownloadButtonState(); } catch (err) {}
             persistEditorState();
@@ -18931,7 +19302,8 @@ async function saveXmlAjax(){
             }
             // Refresh XML preview lazily
             try {
-                await refreshXmlDockPreview({ force: true, preferSavedPath: true });
+                try { logInfo('[xml-preview] Triggering refresh after save'); } catch (e) {}
+                await refreshXmlDockPreview({ force: true, preferSavedPath: true, overridePath: data.result_path || '', awaitReady: true });
             } catch(e){}
 
             // Persist a concrete flow plan artifact so Flag Sequencing/Preview stay in sync.
@@ -18978,9 +19350,60 @@ async function saveXmlAjax(){
     } catch(e) { logError('Save threw an exception'); return false; }
 }
 
-async function refreshXmlDockPreview({ force = false, preferSavedPath = false } = {}) {
+async function refreshXmlDockPreview({ force = false, preferSavedPath = false, overridePath = '', retry = false, awaitReady = false } = {}) {
     const xmlPre = document.getElementById('xmlPre');
-    if (!xmlPre) return;
+    if (!xmlPre) {
+        try { logWarn('[xml-preview] xmlPre not found; skipping preview refresh'); } catch (e) {}
+        return;
+    }
+
+    const isAutosaveXmlPath = (value) => {
+        if (!value || typeof value !== 'string') return false;
+        const normalized = value.replace(/\\/g, '/');
+        return normalized.includes('/outputs/autosave/') || /\bautosave[-_]/i.test(normalized);
+    };
+    const getScenarioSavedPath = () => {
+        try {
+            const scen = Array.isArray(state?.scenarios) ? state.scenarios[activeIdx] : null;
+            if (!scen || typeof scen !== 'object') return '';
+            const raw = scen.saved_xml_path || scen.savedXmlPath || '';
+            const resolved = (typeof raw === 'string') ? raw.trim() : '';
+            if (resolved && resolved.endsWith('.xml') && !isAutosaveXmlPath(resolved)) return resolved;
+            const fallbackByIndex = Array.isArray(state?.saved_xml_paths_by_index)
+                ? (state.saved_xml_paths_by_index[activeIdx] || '').toString().trim()
+                : '';
+            if (!fallbackByIndex || !fallbackByIndex.endsWith('.xml') || isAutosaveXmlPath(fallbackByIndex)) return '';
+            return fallbackByIndex;
+        } catch (e) {
+            return '';
+        }
+    };
+
+    const activeScenarioKey = scenarioNameKey(getActiveScenarioName());
+    const fallbackResultPath = (() => {
+        try {
+            const rp = (state?.result_path || '').toString().trim();
+            if (!rp || !rp.endsWith('.xml') || isAutosaveXmlPath(rp)) return '';
+            const savedFor = scenarioNameKey(state?.result_path_scenario || '');
+            if (!savedFor || !activeScenarioKey || savedFor !== activeScenarioKey) return '';
+            return rp;
+        } catch (e) {
+            return '';
+        }
+    })();
+    const fallbackLastSavedPath = (() => {
+        try {
+            const entry = window.__lastSavedXml || null;
+            if (!entry || typeof entry !== 'object') return '';
+            const path = (entry.path || '').toString().trim();
+            if (!path || !path.endsWith('.xml') || isAutosaveXmlPath(path)) return '';
+            const savedFor = scenarioNameKey(entry.scenario || entry.scenarioKey || '');
+            if (!savedFor || !activeScenarioKey || savedFor !== activeScenarioKey) return '';
+            return path;
+        } catch (e) {
+            return '';
+        }
+    })();
 
     if (typeof window.__xmlDockPreviewReq !== 'number') window.__xmlDockPreviewReq = 0;
     const reqId = ++window.__xmlDockPreviewReq;
@@ -18994,39 +19417,79 @@ async function refreshXmlDockPreview({ force = false, preferSavedPath = false } 
         } catch (e) {}
     };
 
-    const rp = String(state?.result_path || '');
-    const hasSaved = rp && rp.endsWith('.xml');
+    const forcedPath = (() => {
+        const raw = (overridePath || '').toString().trim();
+        if (!raw || !raw.endsWith('.xml') || isAutosaveXmlPath(raw)) return '';
+        return raw;
+    })();
+    const preferredPath = forcedPath || getScenarioSavedPath() || fallbackResultPath || fallbackLastSavedPath;
+    const hasSaved = !!preferredPath;
     const lastPath = xmlPre.dataset.xmlPreviewPath || '';
+
+    try {
+        logInfo(`[xml-preview] Refresh requested (force=${force}, preferSavedPath=${preferSavedPath}, awaitReady=${awaitReady}, retry=${retry})`);
+        logInfo(`[xml-preview] Selected path: ${preferredPath || '(none)'} (last=${lastPath || '(none)'})`);
+    } catch (e) {}
+
+    if (!hasSaved) {
+        try { logInfo('[xml-preview] No saved XML for active scenario; showing placeholder'); } catch (e) {}
+        applyIfLatest('Scenario not yet saved.', { path: '' });
+        return;
+    }
 
     // Prefer showing the persisted XML when available (except in builder view, where the
     // preview should always reflect the current unsaved configuration).
-    if (!IS_BUILDER_VIEW && hasSaved && (preferSavedPath || force || !xmlPre.textContent.trim() || lastPath !== rp)) {
-        try {
-            const txt = await (await fetch('/download_report?path=' + encodeURIComponent(rp), { credentials: 'same-origin' })).text();
-            applyIfLatest(txt, { path: rp });
-            return;
-        } catch (e) {
-            // fall through to render API
+    if (!IS_BUILDER_VIEW && hasSaved && (preferSavedPath || force || !xmlPre.textContent.trim() || lastPath !== preferredPath)) {
+        const tryFetch = async (attempts = 1, delayMs = 250) => {
+            const bust = `t=${Date.now()}`;
+            const url = `/download_report?path=${encodeURIComponent(preferredPath)}&${bust}`;
+            for (let i = 0; i < attempts; i += 1) {
+                try {
+                    if (i === 0) {
+                        try { logInfo(`[xml-preview] Fetching saved XML (attempt ${i + 1}/${attempts}) for ${preferredPath}`); } catch (e) {}
+                    } else {
+                        try { logInfo(`[xml-preview] Retrying saved XML fetch (attempt ${i + 1}/${attempts}) for ${preferredPath}`); } catch (e) {}
+                    }
+                    const txt = await (await fetch(url, { credentials: 'same-origin', cache: 'no-store' })).text();
+                    if (txt && txt.trim()) {
+                        try { logInfo(`[xml-preview] Loaded ${txt.trim().length} chars from ${preferredPath}`); } catch (e) {}
+                        applyIfLatest(txt, { path: preferredPath });
+                        return true;
+                    }
+                    try { logWarn(`[xml-preview] Empty response for ${preferredPath}`); } catch (e) {}
+                } catch (e) {
+                    try { logWarn(`[xml-preview] Fetch failed for ${preferredPath}: ${e?.message || e}`); } catch (_) {}
+                }
+                if (i < attempts - 1) {
+                    await new Promise(resolve => setTimeout(resolve, delayMs));
+                }
+            }
+            return false;
+        };
+
+        if (awaitReady) {
+            try { logInfo('[xml-preview] Waiting for saved XML to become readable'); } catch (e) {}
+            applyIfLatest('Fetching XML…', { path: preferredPath });
         }
+        try {
+            const attempts = awaitReady ? 8 : 1;
+            const ok = await tryFetch(attempts, 300);
+            if (ok) return;
+        } catch (e) {}
+
+        if (!retry) {
+            setTimeout(() => {
+                try { refreshXmlDockPreview({ force: true, preferSavedPath: true, overridePath: preferredPath, retry: true, awaitReady: true }); } catch (_) {}
+            }, 400);
+        }
+        // fall through to render API
     }
 
-    // No saved XML yet (or download failed): render a preview from current editor state.
-    if (!force && xmlPre.textContent.trim()) return;
-    try {
-        const res = await fetch('/render_xml_api', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'same-origin',
-            body: JSON.stringify({
-                scenarios: state.scenarios,
-                core: getCoreConfig(true),
-                active_index: activeIdx,
-            }),
-        });
-        if (!res.ok) return;
-        const txt = await res.text();
-        applyIfLatest(txt, { path: '' });
-    } catch (e) {}
+    // Only show saved XML. If none is available, show a placeholder message.
+    if (force || !xmlPre.textContent.trim()) {
+        try { logInfo('[xml-preview] No readable saved XML yet; keeping placeholder'); } catch (e) {}
+        applyIfLatest('Scenario not yet saved.', { path: '' });
+    }
 }
 
 let __xmlDockPreviewDebounceTimer = null;
@@ -19816,6 +20279,56 @@ async function runSyncWithModal(arg){
             return false;
         }
     }
+    let previewPlanPath = null;
+    let seedForRun = null;
+    try {
+        const activeScenario = getScenarioByIndex(scenarioIndexForRun);
+        if (previewState && previewState.fullPreview && previewState.fullPreview.seed !== undefined) {
+            seedForRun = previewState.fullPreview.seed;
+        } else if (activeScenario && activeScenario.plan_preview && activeScenario.plan_preview.full_preview) {
+            seedForRun = activeScenario.plan_preview.full_preview.seed;
+        }
+        const scenarioName = (activeScenario && typeof activeScenario.name === 'string')
+            ? activeScenario.name
+            : activeScenarioCtx.name;
+        if (!IS_BUILDER_VIEW && rp && rp.endsWith('.xml')) {
+            appendExecuteDialogLog('Syncing flow/preview plan with XML…');
+            const persisted = await ensurePersistedFlowPlanForRun({
+                xmlPath: rp,
+                scenarioName,
+                seed: seedForRun,
+            });
+            if (persisted && persisted.preview_plan_path) {
+                previewPlanPath = String(persisted.preview_plan_path);
+                if (persisted.seed !== undefined && persisted.seed !== null) {
+                    seedForRun = persisted.seed;
+                }
+                appendExecuteDialogLog('Flow/preview plan synchronized.');
+                try {
+                    if (activeScenario) {
+                        activeScenario.plan_preview_path = previewPlanPath;
+                        if (activeScenario.plan_preview && typeof activeScenario.plan_preview === 'object') {
+                            activeScenario.plan_preview.preview_plan_path = previewPlanPath;
+                        }
+                        persistEditorState();
+                    }
+                } catch (e) {}
+            } else {
+                appendExecuteDialogLog('Failed to refresh flow/preview plan; aborting run to avoid mismatch.');
+                updateRunStatus('Flow plan sync failed', 'Regenerate full preview or retry.');
+                if (executeProgressState.active) {
+                    completeExecuteProgressPanel(false, 'Flow plan sync failed', 'Regenerate full preview or retry.');
+                } else if (showProgressModal) {
+                    const bar = document.getElementById('runProgressBar');
+                    if (bar) {
+                        bar.classList.remove('progress-bar-animated');
+                        bar.textContent = 'Error';
+                    }
+                }
+                return false;
+            }
+        }
+    } catch (e) {}
     try {
         // Ensure dock is visible
         try {
@@ -19828,6 +20341,12 @@ async function runSyncWithModal(arg){
         const formOptions = { updateRemoteRepo };
         if (Number.isInteger(scenarioIndexForRun)) {
             formOptions.scenarioIndex = scenarioIndexForRun;
+        }
+        if (previewPlanPath) {
+            formOptions.previewPlanPath = previewPlanPath;
+        }
+        if (seedForRun !== null && seedForRun !== undefined && seedForRun !== '') {
+            formOptions.seed = seedForRun;
         }
         if (confirmResult && typeof confirmResult === 'object' && confirmResult.advanced) {
             formOptions.advanced = confirmResult.advanced;

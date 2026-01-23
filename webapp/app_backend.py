@@ -1594,6 +1594,56 @@ def _prepare_remote_cli_context(
             pass
 
 
+def _build_python_probe_command(
+    host: str,
+    port: int,
+    timeout: float,
+    *,
+    interpreter: str = 'python3',
+) -> str:
+    host_literal = json.dumps(host)
+    interpreter_safe = shlex.quote(interpreter)
+    script = textwrap.dedent(
+        f"""{interpreter_safe} - <<'PY'
+import socket
+import sys
+host = {host_literal}
+port = {int(port)}
+timeout = {timeout:.2f}
+try:
+    sock = socket.create_connection((host, port), timeout=timeout)
+except Exception as exc:
+    print("ERROR:", exc)
+    sys.exit(1)
+else:
+    sock.close()
+    print("OK")
+PY
+"""
+    )
+    return script
+
+
+def _candidate_remote_python_interpreters(core_cfg: Dict[str, Any]) -> List[str]:
+    venv_bin = _sanitize_venv_bin_path((core_cfg or {}).get('venv_bin'))
+    candidates: List[str] = []
+    if venv_bin:
+        sanitized = venv_bin.rstrip('/\\')
+        if sanitized:
+            for exe_name in PYTHON_EXECUTABLE_NAMES:
+                candidates.append(posixpath.join(sanitized, exe_name))
+    candidates.extend(PYTHON_EXECUTABLE_NAMES)
+    ordered: List[str] = []
+    seen: set[str] = set()
+    for entry in candidates:
+        normalized = str(entry or '').strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
 def _select_remote_python_interpreter(client: Any, core_cfg: Dict[str, Any]) -> str:
     candidates = _candidate_remote_python_interpreters(core_cfg)
     if not candidates:
@@ -1754,6 +1804,29 @@ def _core_connection_via_ssh(core_cfg: Dict[str, Any]) -> Iterator[Tuple[str, in
             tunnel.close()
 
 
+@contextlib.contextmanager
+def _core_connection(core_cfg: Dict[str, Any]) -> Iterator[Tuple[str, int]]:
+    """Yield a host/port tuple for connecting to CORE.
+
+    If SSH is enabled, open a temporary tunnel; otherwise return the raw host/port.
+    """
+
+    cfg = _normalize_core_config(core_cfg, include_password=True)
+    ssh_enabled = _coerce_bool(cfg.get('ssh_enabled'))
+    if ssh_enabled:
+        cfg = _require_core_ssh_credentials(cfg)
+        with _core_connection_via_ssh(cfg) as forwarded:
+            yield forwarded
+        return
+
+    host = str(cfg.get('host') or '127.0.0.1')
+    try:
+        port = int(cfg.get('port') or CORE_PORT)
+    except Exception:
+        port = CORE_PORT
+    yield host, port
+
+
 def _coerce_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -1818,6 +1891,20 @@ def _normalize_core_config(raw: Any, *, include_password: bool = True) -> Dict[s
     }
     if include_password:
         cfg['ssh_password'] = ssh_password_val or ''
+    return cfg
+
+
+def _require_core_ssh_credentials(core_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = _normalize_core_config(core_cfg, include_password=True)
+    ssh_host = str(cfg.get('ssh_host') or cfg.get('host') or '').strip()
+    if not ssh_host:
+        raise RuntimeError('SSH host is required for CORE VM connection.')
+    ssh_user = str(cfg.get('ssh_username') or '').strip()
+    if not ssh_user:
+        raise RuntimeError('SSH username is required for CORE VM connection.')
+    ssh_password = cfg.get('ssh_password')
+    if ssh_password is None or str(ssh_password).strip() == '':
+        raise RuntimeError('SSH password is required for CORE VM connection.')
     return cfg
 
 
@@ -9929,7 +10016,66 @@ def _canonical_plan_path_for_scenario(scenario: Optional[str], *, xml_path: Opti
         except Exception:
             base = ''
         scenario_norm = _normalize_scenario_label(base or '') or 'default'
-    return _canonical_plan_path_for_scenario_norm(scenario_norm, create_dir=create_dir)
+    plans_dir = Path(_outputs_dir()) / 'plans'
+    if create_dir:
+        try:
+            plans_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+    suffix = ''
+    if xml_path:
+        try:
+            from core_topo_gen.planning.plan_cache import hash_xml_file
+            xml_hash = hash_xml_file(xml_path)
+            if xml_hash:
+                suffix = f"__{xml_hash[:12]}"
+        except Exception:
+            suffix = ''
+    return str(plans_dir / f"plan_{scenario_norm}{suffix}.json")
+
+
+def _latest_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
+    """Locate the most recent plan file for a scenario (handles hashed variants)."""
+    try:
+        scenario_norm = _normalize_scenario_label(scenario_norm)
+        if not scenario_norm:
+            return None
+        plans_dir = Path(_outputs_dir()) / 'plans'
+        if not plans_dir.is_dir():
+            return None
+        candidates = []
+        prefix = f"plan_{scenario_norm}"
+        for p in plans_dir.glob(f"{prefix}*.json"):
+            try:
+                if not p.is_file():
+                    continue
+                candidates.append(p)
+            except Exception:
+                continue
+        if not candidates:
+            return None
+        def _candidate_ts(path: Path) -> float:
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    payload = json.load(f) or {}
+                meta = payload.get('metadata') if isinstance(payload, dict) else None
+                if isinstance(meta, dict):
+                    scenario_val = str(meta.get('scenario') or '').strip()
+                    if _normalize_scenario_label(scenario_val) != scenario_norm:
+                        return 0.0
+                    updated = meta.get('updated_at') or meta.get('created_at')
+                    if isinstance(updated, str) and updated:
+                        return _parse_iso_ts(updated)
+            except Exception:
+                pass
+            try:
+                return path.stat().st_mtime
+            except Exception:
+                return 0.0
+        best = max(candidates, key=_candidate_ts, default=None)
+        return str(best) if best else None
+    except Exception:
+        return None
 
 
 def _latest_preview_plan_for_scenario_norm(scenario_norm: str, *, prefer_flow: bool = True) -> Optional[str]:
@@ -9941,7 +10087,7 @@ def _latest_preview_plan_for_scenario_norm(scenario_norm: str, *, prefer_flow: b
         canonical_path = _canonical_plan_path_for_scenario_norm(scenario_norm)
         if os.path.exists(canonical_path):
             return canonical_path
-        return None
+        return _latest_plan_for_scenario_norm(scenario_norm)
     except Exception:
         return None
 
@@ -9981,7 +10127,7 @@ def _latest_flow_plan_for_scenario_norm(scenario_norm: str) -> Optional[str]:
         canonical_path = _canonical_plan_path_for_scenario_norm(scenario_norm)
         if os.path.exists(canonical_path):
             return canonical_path
-        return None
+        return _latest_plan_for_scenario_norm(scenario_norm)
     except Exception:
         return None
 
@@ -10046,6 +10192,14 @@ def _planner_get_plan(scenario_norm: str) -> dict[str, Any] | None:
         if os.path.exists(canonical_path):
             return {
                 'plan_path': canonical_path,
+                'xml_path': str((entry or {}).get('xml_path') or ''),
+                'seed': (entry or {}).get('seed'),
+                'updated_at': int(time.time()),
+            }
+        latest_path = _latest_plan_for_scenario_norm(key)
+        if latest_path and os.path.exists(latest_path):
+            return {
+                'plan_path': latest_path,
                 'xml_path': str((entry or {}).get('xml_path') or ''),
                 'seed': (entry or {}).get('seed'),
                 'updated_at': int(time.time()),
@@ -18087,49 +18241,9 @@ def _sanitize_snapshot_scenario(raw: Any) -> Optional[Dict[str, Any]]:
     scenario = copy.deepcopy(raw)
     hitl_meta = scenario.get('hitl') if isinstance(scenario.get('hitl'), dict) else None
     if hitl_meta is not None:
-        # Only persist HITL fields after verification.
-        # Credentials and HITL mappings are saved via explicit validation/apply endpoints.
-
-        prox_meta = hitl_meta.get('proxmox') if isinstance(hitl_meta.get('proxmox'), dict) else None
-        prox_validated = False
-        if prox_meta is not None:
-            secret_id = (prox_meta.get('secret_id') or '').strip() if isinstance(prox_meta.get('secret_id'), str) else ''
-            prox_validated = bool(prox_meta.get('validated')) and bool(secret_id)
-            if prox_validated:
-                prox_clean = {
-                    k: v
-                    for k, v in prox_meta.items()
-                    if k not in {'password', 'token_secret', 'api_secret', 'api_token_secret', 'inventory_error'}
-                }
-                hitl_meta['proxmox'] = prox_clean
-            else:
-                hitl_meta.pop('proxmox', None)
-
-        core_meta_raw = hitl_meta.get('core') if isinstance(hitl_meta.get('core'), dict) else None
-        core_meta = _extract_optional_core_config(core_meta_raw, include_password=False)
-        core_validated = False
-        if core_meta:
-            secret_id = (core_meta.get('core_secret_id') or '').strip() if isinstance(core_meta.get('core_secret_id'), str) else ''
-            core_validated = bool(core_meta.get('validated')) and bool(secret_id)
-            if core_validated:
-                hitl_meta['core'] = core_meta
-            else:
-                hitl_meta.pop('core', None)
-        else:
-            hitl_meta.pop('core', None)
-
-        bridge_validated = bool(hitl_meta.get('bridge_validated'))
-        if not bridge_validated:
-            # Steps 3–5 are not persisted until HITL bridge verification/apply succeeds.
-            hitl_meta.pop('interfaces', None)
-            hitl_meta.pop('participant_proxmox_url', None)
-            hitl_meta.pop('participant_ui_url', None)
-            hitl_meta.pop('participant_url', None)
-            hitl_meta['enabled'] = False
-        else:
-            interfaces = hitl_meta.get('interfaces')
-            if isinstance(interfaces, list):
-                hitl_meta['interfaces'] = [iface for iface in interfaces if isinstance(iface, dict)]
+        # Keep HITL fields as-is in snapshots (including draft/credential values).
+        # Do not scrub or gate on validation so refresh preserves the user's inputs.
+        pass
     return scenario
 
 
@@ -18147,7 +18261,7 @@ def _build_editor_snapshot_payload(raw_state: Any) -> Optional[Dict[str, Any]]:
     if not sanitized_scenarios:
         return None
     snapshot: Dict[str, Any] = {'scenarios': sanitized_scenarios}
-    core_meta = _normalize_core_config(raw_state.get('core'), include_password=False)
+    core_meta = _normalize_core_config(raw_state.get('core'), include_password=True)
     if core_meta:
         snapshot['core'] = core_meta
     result_path = raw_state.get('result_path') or raw_state.get('resultPath')
@@ -18483,7 +18597,7 @@ def _load_scenario_catalog_from_disk() -> tuple[list[str], dict[str, set[str]], 
 
 def _persist_scenario_catalog(
     names: Iterable[Any],
-    source_path: Optional[str] = None,
+    source_path: Optional[Any] = None,
     participant_urls: Optional[Dict[str, Any]] = None,
 ) -> None:
     catalog_path = _scenario_catalog_file()
@@ -18509,15 +18623,52 @@ def _persist_scenario_catalog(
             if normalized_url:
                 participant_by_norm[norm] = normalized_url
     try:
-        abs_source = ''
+        sources_out: Any = None
         if source_path:
-            candidate = str(source_path).strip()
-            if candidate:
-                try:
-                    abs_source = os.path.abspath(candidate)
-                except Exception:
-                    abs_source = candidate
-        sources_out = [abs_source for _ in ordered]
+            # Accept dict/list/str for per-scenario source paths.
+            if isinstance(source_path, dict):
+                mapped: dict[str, str] = {}
+                for key, value in source_path.items():
+                    norm = _normalize_scenario_label(key)
+                    if not norm:
+                        continue
+                    try:
+                        val = os.path.abspath(str(value))
+                    except Exception:
+                        val = str(value)
+                    if val:
+                        mapped[key] = val
+                sources_out = mapped
+            elif isinstance(source_path, (list, tuple)):
+                raw_list = list(source_path)
+                if raw_list:
+                    if len(raw_list) == 1:
+                        candidate = raw_list[0]
+                        try:
+                            abs_source = os.path.abspath(str(candidate))
+                        except Exception:
+                            abs_source = str(candidate)
+                        sources_out = [abs_source for _ in ordered]
+                    else:
+                        out_list: list[str] = []
+                        for idx, _name in enumerate(ordered):
+                            candidate = raw_list[idx] if idx < len(raw_list) else ''
+                            try:
+                                abs_source = os.path.abspath(str(candidate)) if candidate else ''
+                            except Exception:
+                                abs_source = str(candidate)
+                            out_list.append(abs_source)
+                        sources_out = out_list
+            else:
+                candidate = str(source_path).strip()
+                if candidate:
+                    try:
+                        abs_source = os.path.abspath(candidate)
+                    except Exception:
+                        abs_source = candidate
+                    sources_out = [abs_source for _ in ordered]
+        if sources_out is None:
+            sources_out = ['' for _ in ordered]
         payload = {
             'names': ordered,
             'sources': sources_out,
@@ -20490,6 +20641,53 @@ def _resolve_ui_view_redirect_target(candidate: Optional[str]) -> str:
     return fallback
 
 
+def _select_single_scenario_path(candidates, scenario_norm: str) -> Optional[str]:
+    """Prefer a path that contains exactly one matching scenario."""
+    if not candidates:
+        return None
+    best_path: Optional[str] = None
+    best_mtime = float('-inf')
+    scen_norm = _normalize_scenario_label(scenario_norm)
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            ap = os.path.abspath(str(candidate))
+        except Exception:
+            ap = str(candidate)
+        if not os.path.exists(ap):
+            continue
+        try:
+            tree = ET.parse(ap)
+            root = tree.getroot()
+        except Exception:
+            continue
+        try:
+            if root.tag == 'ScenarioEditor':
+                name = str(root.get('name') or '').strip()
+                if scen_norm and _normalize_scenario_label(name) != scen_norm:
+                    continue
+            elif root.tag == 'Scenarios':
+                scen_elems = root.findall('Scenario')
+                if len(scen_elems) != 1:
+                    continue
+                name = str(scen_elems[0].get('name') or '').strip()
+                if scen_norm and _normalize_scenario_label(name) != scen_norm:
+                    continue
+            else:
+                continue
+        except Exception:
+            continue
+        try:
+            mt = os.path.getmtime(ap)
+        except Exception:
+            mt = 0.0
+        if best_path is None or mt > best_mtime:
+            best_path = ap
+            best_mtime = mt
+    return best_path
+
+
 def _select_existing_path(candidates) -> Optional[str]:
     """Return the newest existing file path from an iterable of candidates."""
     best_path: Optional[str] = None
@@ -22150,7 +22348,7 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
     defaults = _default_scenarios_payload()
 
     # --- Core connection defaults ---
-    core_meta = _normalize_core_config(payload.get('core'), include_password=False)
+    core_meta = _normalize_core_config(payload.get('core'), include_password=True)
     core_defaults = defaults['core']
     if not core_meta.get('host'):
         core_meta['host'] = core_defaults.get('host')
@@ -22259,7 +22457,7 @@ def _prepare_payload_for_index(payload: Optional[Dict[str, Any]], *, user: Optio
                         iface_norm[addr_key] = [str(v).strip() for v in vals if v is not None and str(v).strip()]
                 interfaces_norm.append(iface_norm)
         hitl_norm['interfaces'] = interfaces_norm
-        hitl_norm['core'] = _extract_optional_core_config(hitl_norm.get('core'), include_password=False)
+        hitl_norm['core'] = _extract_optional_core_config(hitl_norm.get('core'), include_password=True)
         scen_norm['hitl'] = hitl_norm
 
         normalized_scenarios.append(scen_norm)
@@ -22724,6 +22922,15 @@ def api_proxmox_validate():
     }
     secret_identifier: Optional[str] = None
     stored_at_val: Optional[str] = None
+    secret_payload = {
+        'scenario_name': scenario_name,
+        'scenario_index': scenario_index,
+        'url': url_raw,
+        'username': username,
+        'password': password,
+        'port': port,
+        'verify_ssl': verify_ssl,
+    }
     if remember_credentials:
         try:
             stored_meta = _save_proxmox_credentials(secret_payload)
@@ -24614,9 +24821,26 @@ def _latest_xml_path_for_scenario(scenario_norm: str) -> str | None:
         if not scenario_names or not isinstance(scenario_paths, dict):
             return None
         path_candidates = scenario_paths.get(scen_norm) or scenario_paths.get(_resolve_scenario_display(scen_norm, scenario_names, scen_norm)) or None
-        return _select_existing_path(path_candidates)
+        preferred = _select_single_scenario_path(path_candidates, scen_norm)
+        # Only return a single-scenario XML. Avoid aggregate files.
+        return preferred
     except Exception:
         return None
+
+
+@app.route('/api/scenario/latest_xml', methods=['GET'])
+def api_latest_xml_for_scenario():
+    scenario = (request.args.get('scenario') or '').strip()
+    if not scenario:
+        return jsonify({'ok': False, 'error': 'scenario required'}), 400
+    try:
+        scen_norm = _normalize_scenario_label(scenario)
+        xml_path = _latest_xml_path_for_scenario(scen_norm)
+        if not xml_path:
+            return jsonify({'ok': False, 'error': 'No XML found'}), 404
+        return jsonify({'ok': True, 'scenario': scenario, 'xml_path': xml_path})
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 500
 
 
 def _update_flow_state_in_xml(xml_path: str, scenario_label: str | None, flow_state: dict[str, Any]) -> tuple[bool, str]:
@@ -24661,6 +24885,52 @@ def _update_flow_state_in_xml(xml_path: str, scenario_label: str | None, flow_st
                 fs_el.remove(child)
         st_el = ET.SubElement(fs_el, 'FlowState')
         st_el.text = json.dumps(flow_state, separators=(',', ':'), ensure_ascii=False)
+        tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+        return True, 'ok'
+    except Exception as e:
+        return False, f'failed to update xml: {e}'
+
+
+def _update_plan_preview_in_xml(
+    xml_path: str,
+    scenario_label: str | None,
+    plan_payload: dict[str, Any],
+) -> tuple[bool, str]:
+    """Update (or create) ScenarioEditor/PlanPreview within a scenarios XML file."""
+    if not xml_path or not os.path.exists(xml_path):
+        return False, 'xml_path not found'
+    if not isinstance(plan_payload, dict) or not plan_payload:
+        return False, 'plan payload empty'
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception as e:
+        return False, f'failed to parse xml: {e}'
+
+    scenario_norm = _normalize_scenario_label(scenario_label or '')
+    se_target = None
+    try:
+        if root.tag == 'ScenarioEditor':
+            se_target = root
+        elif root.tag == 'Scenarios':
+            for scen_el in root.findall('Scenario'):
+                nm = str(scen_el.get('name') or '').strip()
+                if scenario_norm and _normalize_scenario_label(nm) != scenario_norm:
+                    continue
+                se_target = scen_el.find('ScenarioEditor')
+                if se_target is not None:
+                    break
+    except Exception:
+        se_target = None
+
+    if se_target is None:
+        return False, 'ScenarioEditor not found'
+
+    try:
+        plan_el = se_target.find('PlanPreview')
+        if plan_el is None:
+            plan_el = ET.SubElement(se_target, 'PlanPreview')
+        plan_el.text = json.dumps(plan_payload, separators=(',', ':'), ensure_ascii=False)
         tree.write(xml_path, encoding='utf-8', xml_declaration=True)
         return True, 'ok'
     except Exception as e:
@@ -24748,6 +25018,17 @@ def _parse_scenario_editor(se):
                     scen["flow_state"] = json.loads(raw)
                 except Exception:
                     scen["flow_state"] = {"raw": str(raw)}
+    except Exception:
+        pass
+    # Plan preview payload (full preview + plan/breakdowns metadata) for UI round-trip.
+    try:
+        plan_el = se.find("PlanPreview")
+        if plan_el is not None and plan_el.text:
+            raw_plan = plan_el.text
+            try:
+                scen["plan_preview"] = json.loads(raw_plan)
+            except Exception:
+                scen["plan_preview"] = {"raw": str(raw_plan)}
     except Exception:
         pass
     # Sections
@@ -25010,6 +25291,15 @@ def _build_scenarios_xml(data_dict: dict) -> ET.ElementTree:
                 fs_el = ET.SubElement(se, "FlagSequencing")
                 st_el = ET.SubElement(fs_el, "FlowState")
                 st_el.text = json.dumps(flow_state, separators=(',', ':'), ensure_ascii=False)
+        except Exception:
+            pass
+
+        # Plan preview payload (full preview + plan/breakdowns metadata) for UI round-trip.
+        try:
+            plan_preview = scen.get('plan_preview') or scen.get('planPreview')
+            if isinstance(plan_preview, dict) and plan_preview:
+                pp_el = ET.SubElement(se, "PlanPreview")
+                pp_el.text = json.dumps(plan_preview, separators=(',', ':'), ensure_ascii=False)
         except Exception:
             pass
 
@@ -26009,38 +26299,62 @@ def save_xml():
             )
         except Exception:
             pass
-        tree = _build_scenarios_xml({ 'scenarios': data.get('scenarios'), 'core': normalized_core })
+        scenarios_list = data.get('scenarios') if isinstance(data.get('scenarios'), list) else []
         ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
         os.makedirs(out_dir, exist_ok=True)
-        # Determine filename: <scenario-name>.xml (no timestamp in filename)
         try:
-            scen_names = [s.get('name') for s in (data.get('scenarios') or []) if isinstance(s, dict) and s.get('name')]
-        except Exception:
-            scen_names = []
-        chosen_name = None
-        try:
-            if active_index is not None and 0 <= active_index < len(scen_names):
-                chosen_name = scen_names[active_index]
-        except Exception:
-            chosen_name = None
-        stem_raw = (chosen_name or (scen_names[0] if scen_names else 'scenarios')) or 'scenarios'
-        stem = secure_filename(stem_raw).strip('_-.') or 'scenarios'
-        out_path = os.path.join(out_dir, f"{stem}.xml")
-        try:
-            app.logger.info('[save_xml] writing xml out_path=%s stem=%s', out_path, stem)
+            legacy_bundle = os.path.join(out_dir, 'scenarios.xml')
+            if os.path.exists(legacy_bundle):
+                os.remove(legacy_bundle)
         except Exception:
             pass
-        # Pretty print if lxml available else fallback
+        scenario_paths_map: dict[str, str] = {}
+        active_out_path = None
+        if scenarios_list:
+            for idx, scen in enumerate(scenarios_list):
+                if not isinstance(scen, dict):
+                    continue
+                raw_name = (scen.get('name') or '').strip()
+                display_name = raw_name or f"Scenario {idx + 1}"
+                stem = secure_filename(display_name).strip('_-.') or f"Scenario_{idx + 1}"
+                out_path = os.path.join(out_dir, f"{stem}.xml")
+                # Ensure unique filename in this save directory.
+                if os.path.exists(out_path):
+                    suffix = 2
+                    base = stem
+                    while os.path.exists(out_path):
+                        stem = f"{base}-{suffix}"
+                        out_path = os.path.join(out_dir, f"{stem}.xml")
+                        suffix += 1
+                try:
+                    tree = _build_scenarios_xml({ 'scenarios': [scen], 'core': normalized_core })
+                    from lxml import etree as LET  # type: ignore
+                    raw = ET.tostring(tree.getroot(), encoding='utf-8')
+                    lroot = LET.fromstring(raw)
+                    pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+                    with open(out_path, 'wb') as f:
+                        f.write(pretty)
+                except Exception:
+                    try:
+                        tree = _build_scenarios_xml({ 'scenarios': [scen], 'core': normalized_core })
+                        tree.write(out_path, encoding='utf-8', xml_declaration=True)
+                    except Exception:
+                        continue
+                scenario_paths_map[display_name] = out_path
+                if active_index is not None and active_index == idx:
+                    active_out_path = out_path
+            if active_out_path is None and scenario_paths_map:
+                # Default to first scenario when active_index is missing/invalid.
+                active_out_path = next(iter(scenario_paths_map.values()))
+        else:
+            flash('No scenarios to save.')
+            return redirect(url_for('index'))
+        out_path = active_out_path
         try:
-            from lxml import etree as LET  # type: ignore
-            raw = ET.tostring(tree.getroot(), encoding='utf-8')
-            lroot = LET.fromstring(raw)
-            pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
-            with open(out_path, 'wb') as f:
-                f.write(pretty)
+            app.logger.info('[save_xml] wrote %s scenario xml files under %s', len(scenario_paths_map) or 1, out_dir)
         except Exception:
-            tree.write(out_path, encoding='utf-8', xml_declaration=True)
+            pass
         # Read back XML content for preview
         xml_text = ""
         try:
@@ -26051,20 +26365,18 @@ def save_xml():
         try:
             names_for_catalog = [name for name in scenario_names_desc if isinstance(name, str) and name.strip()]
             if names_for_catalog:
-                _persist_scenario_catalog(names_for_catalog, source_path=out_path)
+                _persist_scenario_catalog(names_for_catalog, source_path=scenario_paths_map or out_path)
         except Exception:
             pass
-        flash(f'Scenarios saved as {os.path.basename(out_path)}')
-        # Re-parse the saved XML to ensure the UI reflects exactly what was persisted
-        try:
-            payload = _parse_scenarios_xml(out_path)
-            if "core" not in payload:
-                payload["core"] = _default_core_dict()
-            payload["result_path"] = out_path
-            if normalized_core:
-                payload['core'] = _normalize_core_config(normalized_core, include_password=False)
-        except Exception:
-            payload = {"scenarios": data.get("scenarios", []), "result_path": out_path, "core": _normalize_core_config(normalized_core or {}, include_password=False) if normalized_core else _default_core_dict()}
+        if out_path:
+            flash(f'Scenarios saved (per-scenario). Active XML: {os.path.basename(out_path)}')
+        else:
+            flash('Scenarios saved (per-scenario).')
+        payload = {
+            'scenarios': data.get('scenarios', []),
+            'result_path': out_path,
+            'core': _normalize_core_config(normalized_core or {}, include_password=False) if normalized_core else _default_core_dict(),
+        }
         payload['host_interfaces'] = _enumerate_host_interfaces()
         _attach_base_upload(payload)
         _hydrate_base_upload_from_disk(payload)
@@ -26162,37 +26474,79 @@ def save_xml_api():
             )
         except Exception:
             pass
-        tree = _build_scenarios_xml({ 'scenarios': scenarios, 'core': normalized_core })
+        autosave = _coerce_bool(data.get('autosave'))
         ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
+        if autosave:
+            out_dir = os.path.join(_outputs_dir(), 'autosave')
+        else:
+            out_dir = os.path.join(_outputs_dir(), f'scenarios-{ts}')
         os.makedirs(out_dir, exist_ok=True)
-        # Determine filename: <scenario-name>.xml
         try:
-            scen_names = [s.get('name') for s in scenarios if isinstance(s, dict) and s.get('name')]
-        except Exception:
-            scen_names = []
-        chosen_name = None
-        try:
-            if active_index is not None and 0 <= active_index < len(scen_names):
-                chosen_name = scen_names[active_index]
-        except Exception:
-            chosen_name = None
-        stem_raw = (chosen_name or (scen_names[0] if scen_names else 'scenarios')) or 'scenarios'
-        stem = secure_filename(stem_raw).strip('_-.') or 'scenarios'
-        out_path = os.path.join(out_dir, f"{stem}.xml")
-        try:
-            app.logger.info('[save_xml_api] writing xml out_path=%s stem=%s', out_path, stem)
+            legacy_bundle = os.path.join(out_dir, 'scenarios.xml' if not autosave else 'autosave.xml')
+            if os.path.exists(legacy_bundle):
+                os.remove(legacy_bundle)
         except Exception:
             pass
-        # Pretty print when possible
+        scenario_paths_map: dict[str, str] = {}
+        scenario_paths_by_index: list[str | None] = []
+        active_out_path = None
+        if scenarios:
+            for idx, scen in enumerate(scenarios):
+                if not isinstance(scen, dict):
+                    scenario_paths_by_index.append(None)
+                    continue
+                raw_name = (scen.get('name') or '').strip()
+                display_name = raw_name or f"Scenario {idx + 1}"
+                stem_raw = display_name
+                if autosave:
+                    # Always include index and scenario name so autosave never collapses
+                    # multiple scenarios into a single file.
+                    stem_raw = f"autosave-{idx + 1}-{display_name or f'Scenario_{idx + 1}'}"
+                stem = secure_filename(stem_raw).strip('_-.') or (f"autosave-{idx + 1}" if autosave else f"Scenario_{idx + 1}")
+                out_path = os.path.join(out_dir, f"{stem}.xml")
+                if os.path.exists(out_path):
+                    suffix = 2
+                    base = stem
+                    while os.path.exists(out_path):
+                        stem = f"{base}-{suffix}"
+                        out_path = os.path.join(out_dir, f"{stem}.xml")
+                        suffix += 1
+                try:
+                    tree = _build_scenarios_xml({ 'scenarios': [scen], 'core': normalized_core })
+                    raw = ET.tostring(tree.getroot(), encoding='utf-8')
+                    lroot = LET.fromstring(raw)
+                    pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
+                    with open(out_path, 'wb') as f:
+                        f.write(pretty)
+                except Exception:
+                    try:
+                        tree = _build_scenarios_xml({ 'scenarios': [scen], 'core': normalized_core })
+                        tree.write(out_path, encoding='utf-8', xml_declaration=True)
+                    except Exception:
+                        continue
+                # Defensive: ensure each file contains exactly one <Scenario>.
+                try:
+                    parsed = ET.parse(out_path)
+                    root = parsed.getroot()
+                    scenario_count = len(root.findall('Scenario'))
+                    if scenario_count != 1:
+                        tree = _build_scenarios_xml({ 'scenarios': [scen], 'core': normalized_core })
+                        tree.write(out_path, encoding='utf-8', xml_declaration=True)
+                except Exception:
+                    pass
+                scenario_paths_map[display_name] = out_path
+                scenario_paths_by_index.append(out_path)
+                if active_index is not None and active_index == idx:
+                    active_out_path = out_path
+            if active_out_path is None and scenario_paths_map:
+                active_out_path = next(iter(scenario_paths_map.values()))
+        else:
+            return jsonify({ 'ok': False, 'error': 'No scenarios to save' }), 400
+        out_path = active_out_path
         try:
-            raw = ET.tostring(tree.getroot(), encoding='utf-8')
-            lroot = LET.fromstring(raw)
-            pretty = LET.tostring(lroot, pretty_print=True, xml_declaration=True, encoding='utf-8')
-            with open(out_path, 'wb') as f:
-                f.write(pretty)
+            app.logger.info('[save_xml_api] wrote %s scenario xml files under %s', len(scenario_paths_map) or 1, out_dir)
         except Exception:
-            tree.write(out_path, encoding='utf-8', xml_declaration=True)
+            pass
         resp_core = _normalize_core_config(normalized_core or core_meta or {}, include_password=False) if (normalized_core or core_meta) else _default_core_dict()
         snapshot_source = {
             'scenarios': scenarios,
@@ -26208,13 +26562,26 @@ def save_xml_api():
             app.logger.info('[save_xml_api] success user=%s xml=%s scen_count=%s', username or 'anonymous', out_path, len(scenarios))
         except Exception:
             pass
-        try:
-            names_for_catalog = [name for name in scenario_names if isinstance(name, str) and name.strip()]
-            if names_for_catalog:
-                _persist_scenario_catalog(names_for_catalog, source_path=out_path)
-        except Exception:
-            pass
-        return jsonify({ 'ok': True, 'result_path': out_path, 'core': resp_core })
+        if not autosave:
+            try:
+                names_for_catalog = [name for name in scenario_names if isinstance(name, str) and name.strip()]
+                if names_for_catalog:
+                    _persist_scenario_catalog(names_for_catalog, source_path=scenario_paths_map or out_path)
+            except Exception:
+                pass
+        response_payload = { 'ok': True, 'result_path': out_path, 'core': resp_core }
+        if scenario_paths_map:
+            response_payload['scenario_paths'] = scenario_paths_map
+        if scenario_paths_by_index:
+            response_payload['scenario_paths_by_index'] = scenario_paths_by_index
+        if active_index is not None and 0 <= active_index < len(scenarios):
+            try:
+                active_name = str((scenarios[active_index] or {}).get('name') or '').strip()
+            except Exception:
+                active_name = ''
+            if active_name:
+                response_payload['active_scenario'] = active_name
+        return jsonify(response_payload)
     except Exception as e:
         try:
             app.logger.exception("[save_xml_api] failed: %s", e)
@@ -28846,10 +29213,25 @@ def run_cli_async():
         # Builder/participant roles may execute without saving by posting scenarios/core.
         if isinstance(scenarios_inline, list):
             try:
-                # Build a temporary XML for this run.
+                # Build a temporary XML for this run (single scenario for isolation).
                 core_meta = core_override if isinstance(core_override, dict) else None
                 normalized_core = _normalize_core_config(core_meta, include_password=True) if core_meta else None
-                tree = _build_scenarios_xml({ 'scenarios': scenarios_inline, 'core': normalized_core })
+                scenario_pick = None
+                if scenario_name_hint:
+                    for sc in scenarios_inline:
+                        if isinstance(sc, dict) and str(sc.get('name') or '').strip() == str(scenario_name_hint).strip():
+                            scenario_pick = sc
+                            break
+                if scenario_pick is None and scenario_index_hint is not None:
+                    if 0 <= scenario_index_hint < len(scenarios_inline):
+                        candidate = scenarios_inline[scenario_index_hint]
+                        if isinstance(candidate, dict):
+                            scenario_pick = candidate
+                if scenario_pick is None:
+                    scenario_pick = next((sc for sc in scenarios_inline if isinstance(sc, dict)), None)
+                if scenario_pick is None:
+                    return jsonify({"error": "No valid scenario supplied for execution."}), 400
+                tree = _build_scenarios_xml({ 'scenarios': [scenario_pick], 'core': normalized_core })
                 ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
                 run_tag = str(uuid.uuid4())[:8]
                 out_dir = os.path.join(_outputs_dir(), f'tmp-exec-{ts}-{run_tag}')
@@ -28864,14 +29246,12 @@ def run_cli_async():
                 if not stem_raw:
                     try:
                         first_name = None
-                        for sc in scenarios_inline:
-                            if isinstance(sc, dict) and sc.get('name'):
-                                first_name = sc.get('name')
-                                break
-                        stem_raw = first_name or 'scenarios'
+                        if isinstance(scenario_pick, dict) and scenario_pick.get('name'):
+                            first_name = scenario_pick.get('name')
+                        stem_raw = first_name or 'scenario'
                     except Exception:
-                        stem_raw = 'scenarios'
-                stem = secure_filename(str(stem_raw)).strip('_-.') or 'scenarios'
+                        stem_raw = 'scenario'
+                stem = secure_filename(str(stem_raw)).strip('_-.') or 'scenario'
                 xml_path = os.path.join(out_dir, f"{stem}.xml")
                 # Pretty print when possible
                 try:
@@ -28883,6 +29263,11 @@ def run_cli_async():
                         f.write(pretty)
                 except Exception:
                     tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+                if not scenario_name_hint:
+                    try:
+                        scenario_name_hint = str((scenario_pick or {}).get('name') or '').strip() or scenario_name_hint
+                    except Exception:
+                        pass
             except Exception as exc:
                 return jsonify({"error": f"Failed to render XML for execution: {exc}"}), 400
         else:
@@ -28948,20 +29333,35 @@ def run_cli_async():
                         pass
         except Exception:
             pass
+    scenario_for_plan: str | None = None
+    try:
+        scenario_for_plan = str(scenario_name_hint or '').strip() or None
+    except Exception:
+        scenario_for_plan = None
+    if not scenario_for_plan:
+        try:
+            names_for_cli = _scenario_names_from_xml(xml_path)
+            if names_for_cli:
+                scenario_for_plan = names_for_cli[0]
+        except Exception:
+            scenario_for_plan = None
+    if preview_plan_path and scenario_for_plan:
+        try:
+            with open(preview_plan_path, 'r', encoding='utf-8') as pf:
+                plan_payload = json.load(pf) or {}
+            if isinstance(plan_payload, dict) and plan_payload:
+                _update_plan_preview_in_xml(xml_path, scenario_for_plan, plan_payload)
+                try:
+                    meta = plan_payload.get('metadata') if isinstance(plan_payload.get('metadata'), dict) else {}
+                    flow_meta = meta.get('flow') if isinstance(meta.get('flow'), dict) else None
+                    if isinstance(flow_meta, dict) and flow_meta:
+                        _update_flow_state_in_xml(xml_path, scenario_for_plan, flow_meta)
+                except Exception:
+                    pass
+        except Exception:
+            pass
     try:
         if preview_plan_path:
-            scenario_for_plan: str | None = None
-            try:
-                scenario_for_plan = str(scenario_name_hint or '').strip() or None
-            except Exception:
-                scenario_for_plan = None
-            if not scenario_for_plan:
-                try:
-                    names_for_cli = _scenario_names_from_xml(xml_path)
-                    if names_for_cli:
-                        scenario_for_plan = names_for_cli[0]
-                except Exception:
-                    scenario_for_plan = None
             flow_summary, flow_meta = _summary_from_preview_plan_path(preview_plan_path)
             xml_summary, xml_seed = _summary_from_xml_plan(xml_path, scenario_for_plan, seed)
             diffs = _diff_plan_summaries(flow_summary, xml_summary)

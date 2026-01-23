@@ -730,6 +730,63 @@
     const persistPreviewPlan = (options.persistPreviewPlan !== false) && (options.skipPreviewPlan !== true);
     let progressShown = false;
     let hideTimer = null;
+    const logInfoSafe = (msg) => {
+      try {
+        if (typeof window.logInfo === 'function') window.logInfo(msg);
+        else if (typeof logInfo === 'function') logInfo(msg);
+      } catch (e) {}
+    };
+    const logWarnSafe = (msg) => {
+      try {
+        if (typeof window.logWarn === 'function') window.logWarn(msg);
+        else if (typeof logWarn === 'function') logWarn(msg);
+      } catch (e) {}
+    };
+    const isAutosaveXmlPath = (value) => {
+      if (!value || typeof value !== 'string') return false;
+      const normalized = value.replace(/\\/g, '/');
+      return normalized.includes('/outputs/autosave/') || /\bautosave[-_]/i.test(normalized);
+    };
+    const applyScenarioSavedPaths = (pathMap) => {
+      try {
+        if (!pathMap || !window.state || !Array.isArray(window.state.scenarios)) return;
+        const scenarios = window.state.scenarios;
+        if (Array.isArray(pathMap)) {
+          window.state.saved_xml_paths_by_index = pathMap.slice();
+          scenarios.forEach((scen, idx) => {
+            if (!scen || typeof scen !== 'object') return;
+            const path = (pathMap[idx] || '').toString().trim();
+            if (!path || !path.endsWith('.xml') || isAutosaveXmlPath(path)) return;
+            scen.saved_xml_path = path;
+          });
+          return;
+        }
+        if (typeof pathMap !== 'object') return;
+        const lookup = new Map();
+        Object.entries(pathMap).forEach(([key, val]) => {
+          const nameKey = normalizeScenarioKey(key || '');
+          const path = (typeof val === 'string') ? val.trim() : '';
+          if (nameKey && path && path.endsWith('.xml') && !isAutosaveXmlPath(path)) {
+            lookup.set(nameKey, path);
+          }
+        });
+        if (!lookup.size) return;
+        const indexPaths = Array.isArray(window.state.saved_xml_paths_by_index)
+          ? window.state.saved_xml_paths_by_index.slice()
+          : [];
+        scenarios.forEach((scen, idx) => {
+          if (!scen || typeof scen !== 'object') return;
+          const nameKey = normalizeScenarioKey(scen.name || '');
+          if (!nameKey || !lookup.has(nameKey)) return;
+          const path = lookup.get(nameKey);
+          scen.saved_xml_path = path;
+          indexPaths[idx] = path;
+        });
+        if (indexPaths.length) {
+          window.state.saved_xml_paths_by_index = indexPaths;
+        }
+      } catch (e) {}
+    };
     const safeHideProgress = (immediate) => {
       try {
         if (!progressShown || typeof window.coretgHideProgress !== 'function') return;
@@ -750,6 +807,16 @@
     } catch (e) {}
 
     try {
+
+    try {
+      const scen = resolveScenarioNameForSave();
+      logInfoSafe(`[xml-save] Save requested via API${scen ? ` (scenario: ${scen})` : ''}`);
+    } catch (e) {}
+    try {
+      if (typeof window.refreshXmlDockPreview === 'function') {
+        window.refreshXmlDockPreview({ force: true, preferSavedPath: true, awaitReady: true, reason: 'save-start' });
+      }
+    } catch (e) {}
 
     // If we're on the Topology page, we can concretize directly against live in-memory state.
     try {
@@ -836,6 +903,16 @@
     const data = await postJson('/save_xml_api', payload);
     const xmlPath = (data && data.result_path) ? String(data.result_path) : '';
     if (!xmlPath) throw new Error('Save succeeded but returned no result_path.');
+
+    try { logInfoSafe(`[xml-save] save_xml_api ok; result_path=${xmlPath}`); } catch (e) {}
+    if (data && data.scenario_paths_by_index) {
+      try { applyScenarioSavedPaths(data.scenario_paths_by_index); } catch (e) {}
+      try { logInfoSafe('[xml-save] Applied per-scenario saved XML paths (by index)'); } catch (e) {}
+    }
+    if (data && data.scenario_paths) {
+      try { applyScenarioSavedPaths(data.scenario_paths); } catch (e) {}
+      try { logInfoSafe('[xml-save] Applied per-scenario saved XML paths (by name)'); } catch (e) {}
+    }
 
     // Remember the latest saved XML path for this scenario so other tabs (Preview/Flow)
     // can refer to the same snapshot.
@@ -991,9 +1068,15 @@
         window.coretgUpdateProgress({ title: 'Saving XML', message: 'Done.', percent: 100 });
       }
     } catch (e) {}
+    try {
+      if (typeof window.refreshXmlDockPreview === 'function') {
+        window.refreshXmlDockPreview({ force: true, preferSavedPath: true, reason: 'save-complete' });
+      }
+    } catch (e) {}
     safeHideProgress(false);
     return xmlPath;
     } catch (err) {
+      try { logWarnSafe(`[xml-save] Save failed: ${err?.message || err}`); } catch (e) {}
       safeHideProgress(true);
       throw err;
     }
