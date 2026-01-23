@@ -53,8 +53,8 @@
         id="scenariosExecuteBtn"
         class="btn btn-success px-4 py-2 shadow-sm"
         type="button"
-        {% if scenarios_active_tab == 'topology' %}data-coretg-action="continue" data-coretg-scenario="{{ scenario_tab }}" title="Continue to Flag Sequencing"{% endif %}
-      >{% if scenarios_active_tab == 'preview' %}Execute{% elif scenarios_active_tab == 'topology' %}Continue{% else %}Preview{% endif %}</button>
+        {% if scenarios_active_tab == 'topology' %}data-coretg-action="continue" data-coretg-scenario="{{ scenario_tab }}" title="Continue to Flag Sequencing"{% elif scenarios_active_tab == 'connection-setup' %}data-coretg-action="continue-topology" data-coretg-scenario="{{ scenario_tab }}" title="Continue to Topology"{% endif %}
+      >{% if scenarios_active_tab == 'preview' %}Execute{% elif scenarios_active_tab in ['topology', 'connection-setup'] %}Continue{% else %}Preview{% endif %}</button>
     </div>
   </div>
 </div>
@@ -85,6 +85,7 @@
   const SEED_BY_SCENARIO_STORAGE_KEY = 'coretg_seed_by_scenario_v1';
   const PREVIEW_PLAN_BY_SCENARIO_STORAGE_KEY = 'coretg_preview_plan_by_scenario_v1';
   const FLOW_DIRTY_BY_SCENARIO_STORAGE_KEY = 'coretg_flow_dirty_by_scenario_v1';
+  const TOPOLOGY_SIGNATURE_BY_SCENARIO_STORAGE_KEY = 'coretg_topology_signature_by_scenario_v1';
   const TOPOLOGY_CONTINUE_STORAGE_KEY = 'coretg_topology_continue_after_save_v1';
   const LAST_SELECTED_SCENARIO_STORAGE_KEY = 'coretg_last_selected_scenario_v1';
 
@@ -116,6 +117,14 @@
         btn.setAttribute('title', 'Continue to Flag Sequencing');
         return;
       }
+      if (m === 'continue-topology') {
+        btn.textContent = 'Continue';
+        btn.dataset.coretgAction = 'continue-topology';
+        btn.dataset.coretgScenario = (scenarioName || '').toString();
+        btn.disabled = false;
+        btn.setAttribute('title', 'Continue to Topology');
+        return;
+      }
       // default: return to normal label
       btn.dataset.coretgAction = '';
       btn.dataset.coretgScenario = '';
@@ -129,6 +138,11 @@
         btn.dataset.coretgAction = 'continue';
         btn.dataset.coretgScenario = (scenarioName || '').toString();
         btn.setAttribute('title', 'Continue to Flag Sequencing');
+      } else if (activeTab === 'connection-setup') {
+        btn.textContent = 'Continue';
+        btn.dataset.coretgAction = 'continue-topology';
+        btn.dataset.coretgScenario = (scenarioName || '').toString();
+        btn.setAttribute('title', 'Continue to Topology');
       } else {
         btn.textContent = (activeTab === 'preview') ? 'Execute' : 'Preview';
       }
@@ -230,6 +244,39 @@
 
   function readFlowDirtyMap(){
     return readJsonFromLocalStorage(FLOW_DIRTY_BY_SCENARIO_STORAGE_KEY, {});
+  }
+
+  function readTopologySignatureMap(){
+    return readJsonFromLocalStorage(TOPOLOGY_SIGNATURE_BY_SCENARIO_STORAGE_KEY, {});
+  }
+
+  function getTopologySignatureForScenario(scenarioName){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      if (!key) return null;
+      const map = readTopologySignatureMap();
+      const entry = (map && typeof map === 'object') ? map[key] : null;
+      const sig = entry && typeof entry === 'object' ? (entry.signature ?? null) : null;
+      return (typeof sig === 'string' && sig) ? sig : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function setTopologySignatureForScenario(scenarioName, signature){
+    try {
+      const key = normalizeScenarioKey(scenarioName);
+      if (!key) return;
+      if (!signature || typeof signature !== 'string') return;
+      const map = readTopologySignatureMap();
+      const next = (map && typeof map === 'object') ? map : {};
+      next[key] = {
+        scenario: (scenarioName || '').toString().trim(),
+        signature: signature,
+        updated_at: Date.now(),
+      };
+      localStorage.setItem(TOPOLOGY_SIGNATURE_BY_SCENARIO_STORAGE_KEY, JSON.stringify(next));
+    } catch (e) {}
   }
 
   function getPreviewPlanPathForScenario(scenarioName){
@@ -748,6 +795,35 @@
     return { scenarios, core, active_index, project_key_hint, scenario_query };
   }
 
+  function buildTopologySignature(payload){
+    try {
+      if (!payload || typeof payload !== 'object') return null;
+      const cloned = JSON.parse(JSON.stringify(payload));
+      if (cloned && Array.isArray(cloned.scenarios)) {
+        cloned.scenarios.forEach((sc) => {
+          if (!sc || typeof sc !== 'object') return;
+          try { delete sc.flow_state; } catch (e) {}
+          try { delete sc.plan_preview; } catch (e) {}
+          try { delete sc.planPreview; } catch (e) {}
+          try { delete sc.preview_plan; } catch (e) {}
+          try { delete sc.previewPlan; } catch (e) {}
+          try { delete sc.preview_plan_path; } catch (e) {}
+          try { delete sc.previewPlanPath; } catch (e) {}
+          try { delete sc.full_preview; } catch (e) {}
+          try { delete sc.fullPreview; } catch (e) {}
+          try { delete sc.preview; } catch (e) {}
+        });
+      }
+      return JSON.stringify({
+        scenarios: cloned.scenarios || [],
+        core: cloned.core || null,
+        active_index: cloned.active_index ?? null,
+      });
+    } catch (e) {
+      return null;
+    }
+  }
+
   async function saveXmlViaApi(opts){
     const options = (opts && typeof opts === 'object') ? opts : {};
     const persistPreviewPlan = (options.persistPreviewPlan !== false) && (options.skipPreviewPlan !== true);
@@ -914,6 +990,24 @@
     } catch (e) {}
 
     const payload = buildSaveXmlApiPayload();
+    const scenarioNameForSig = resolveScenarioNameForSave();
+    const topologySignature = buildTopologySignature(payload);
+    let topologyChanged = null;
+    try {
+      if (typeof previewState !== 'undefined' && previewState && typeof previewState.dirty === 'boolean') {
+        topologyChanged = !!previewState.dirty;
+      }
+    } catch (e) {}
+    if (topologyChanged === null) {
+      try {
+        const prevSig = scenarioNameForSig ? getTopologySignatureForScenario(scenarioNameForSig) : null;
+        if (prevSig && topologySignature) {
+          topologyChanged = prevSig !== topologySignature;
+        } else {
+          topologyChanged = false;
+        }
+      } catch (e) { topologyChanged = false; }
+    }
     if (!Array.isArray(payload.scenarios) || !payload.scenarios.length) {
       throw new Error('No scenarios available to save.');
     }
@@ -1060,9 +1154,17 @@
         const flowState = (typeof window.coretgGetSavedFlowStateForScenario === 'function')
           ? window.coretgGetSavedFlowStateForScenario(scenarioName)
           : null;
-        if (flowState && typeof flowState === 'object') {
+        if (flowState && typeof flowState === 'object' && topologyChanged === true) {
           setFlowDirtyForScenario(scenarioName, true, 'topology_saved_after_flow', xmlPath);
         }
+      }
+    } catch (e) {}
+
+    // Record the latest topology signature for this scenario.
+    try {
+      const scenarioName = resolveScenarioNameForSave();
+      if (scenarioName && topologySignature) {
+        setTopologySignatureForScenario(scenarioName, topologySignature);
       }
     } catch (e) {}
 

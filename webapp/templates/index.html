@@ -494,6 +494,26 @@
 <!-- Toast container (used only for explicit, forced prompts). -->
 <div id="coretgToastContainer" class="toast-container position-fixed top-0 end-0 p-3" style="z-index: 2000;"></div>
 
+<!-- Unsaved changes modal (explicit save/discard on navigation). -->
+<div class="modal fade" id="unsavedChangesModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Unsaved changes</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                Changes are not saved. Save before leaving this page?
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-outline-secondary" id="unsavedChangesDiscardBtn">Discard</button>
+                <button type="button" class="btn btn-primary" id="unsavedChangesSaveBtn">Save</button>
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Toast helper: keep legacy behavior (no toasts) unless explicitly forced. -->
 <script>
     function showToast(message, opts){
@@ -4736,6 +4756,121 @@ try {
     }
 } catch (e) {}
 
+let _unsavedNavPendingHref = null;
+let _unsavedNavAllowOnce = false;
+
+function hasUnsavedChanges() {
+    try {
+        if (previewState && previewState.dirty === true) return true;
+    } catch (e) {}
+    try {
+        const currentSig = buildXmlPreviewSignature();
+        if (xmlPreviewSavedSignature && currentSig && xmlPreviewSavedSignature !== currentSig) {
+            return true;
+        }
+    } catch (e) {}
+    return false;
+}
+
+function showUnsavedChangesModal(href) {
+    _unsavedNavPendingHref = href || null;
+    const modalEl = document.getElementById('unsavedChangesModal');
+    if (!modalEl) return;
+    if (window.bootstrap && bootstrap.Modal) {
+        const inst = bootstrap.Modal.getOrCreateInstance(modalEl);
+        inst.show();
+    } else {
+        modalEl.classList.add('show');
+        modalEl.setAttribute('aria-hidden', 'false');
+        modalEl.style.display = 'block';
+    }
+}
+
+function hideUnsavedChangesModal() {
+    const modalEl = document.getElementById('unsavedChangesModal');
+    if (!modalEl) return;
+    if (window.bootstrap && bootstrap.Modal) {
+        const inst = bootstrap.Modal.getOrCreateInstance(modalEl);
+        inst.hide();
+    } else {
+        modalEl.classList.remove('show');
+        modalEl.setAttribute('aria-hidden', 'true');
+        modalEl.style.display = 'none';
+    }
+}
+
+function proceedUnsavedNavigation() {
+    const href = _unsavedNavPendingHref;
+    _unsavedNavPendingHref = null;
+    if (!href) return;
+    _unsavedNavAllowOnce = true;
+    window.location.href = href;
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const saveBtn = document.getElementById('unsavedChangesSaveBtn');
+    const discardBtn = document.getElementById('unsavedChangesDiscardBtn');
+
+    if (saveBtn) {
+        saveBtn.addEventListener('click', async () => {
+            const originalText = saveBtn.textContent;
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Saving…';
+            try {
+                if (typeof window.coretgSaveXmlViaApi === 'function') {
+                    await window.coretgSaveXmlViaApi();
+                } else if (typeof window.autoSaveXml === 'function') {
+                    await window.autoSaveXml();
+                }
+                hideUnsavedChangesModal();
+                proceedUnsavedNavigation();
+            } catch (e) {
+                const msg = (e && e.message) ? e.message : String(e || 'Save failed');
+                try { showToast(`Save failed: ${msg}`, { force: true, autohide: false }); } catch (_) {}
+            } finally {
+                saveBtn.disabled = false;
+                saveBtn.textContent = originalText || 'Save';
+            }
+        });
+    }
+
+    if (discardBtn) {
+        discardBtn.addEventListener('click', () => {
+            hideUnsavedChangesModal();
+            proceedUnsavedNavigation();
+        });
+    }
+});
+
+document.addEventListener('click', (event) => {
+    try {
+        if (_unsavedNavAllowOnce) {
+            _unsavedNavAllowOnce = false;
+            return;
+        }
+        const target = event.target;
+        const link = target && target.closest ? target.closest('a[href]') : null;
+        if (!link) return;
+        if (link.dataset && link.dataset.coretgBypassUnsaved === '1') return;
+        const href = link.getAttribute('href') || '';
+        if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+        if (link.target && link.target.toLowerCase() === '_blank') return;
+        if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        if (!hasUnsavedChanges()) return;
+        event.preventDefault();
+        showUnsavedChangesModal(href);
+    } catch (e) {}
+}, true);
+
+window.addEventListener('beforeunload', (event) => {
+    try {
+        if (_unsavedNavAllowOnce) return;
+        if (!hasUnsavedChanges()) return;
+        event.preventDefault();
+        event.returnValue = '';
+    } catch (e) {}
+});
+
 function _extractPlanPreviewPayload(raw) {
     if (!raw || typeof raw !== 'object') return null;
     if (raw.full_preview && typeof raw.full_preview === 'object') return raw;
@@ -5154,6 +5289,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 // Clear the post-save continue state so returning to Topology doesn't stay "Continue" forever.
                 try { sessionStorage.removeItem('coretg_topology_continue_after_save_v1'); } catch (e) {}
                 const url = '/scenarios/flag-sequencing' + (scenario ? ('?scenario=' + encodeURIComponent(scenario)) : '');
+                window.location.href = url;
+                return;
+            }
+            if (action === 'continue-topology') {
+                const scenario = (btn?.dataset?.coretgScenario || '').toString().trim();
+                const url = '/scenarios' + (scenario ? ('?scenario=' + encodeURIComponent(scenario)) : '');
                 window.location.href = url;
                 return;
             }
@@ -7446,11 +7587,7 @@ function persistEditorState(options = {}){
         // newly-created state for users who don't use local persistence (e.g. builder view).
         try { scheduleServerSnapshotPersist(snapshot); } catch (_) {}
         try { storeCorePasswordInSession(); } catch (_) {}
-        try {
-            if (!skipXml) {
-                scheduleAutoSaveXml(snapshot, coreForPersist || state.core || null, scenariosForSnapshot);
-            }
-        } catch (_) {}
+        // Auto-save disabled: only explicit Save actions should write XML.
 
         // Local persistence is admin-only (and disabled in builder view).
         if (!ALLOW_LOCAL_EDITOR_PERSISTENCE) return;
@@ -7473,10 +7610,6 @@ persistEditorState();
 try {
     window.addEventListener('pagehide', () => { try { flushServerSnapshotPersistNow(); } catch (_) {} }, { capture: true });
     window.addEventListener('beforeunload', () => { try { flushServerSnapshotPersistNow(); } catch (_) {} }, { capture: true });
-} catch (e) {}
-try {
-    window.addEventListener('pagehide', () => { try { flushAutoSaveXmlNow(); } catch (_) {} }, { capture: true });
-    window.addEventListener('beforeunload', () => { try { flushAutoSaveXmlNow(); } catch (_) {} }, { capture: true });
 } catch (e) {}
 
 const dropdownsBySection = {
