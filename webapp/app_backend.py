@@ -12730,6 +12730,7 @@ def api_flow_attackflow_preview():
     scenario_label = (request.args.get('scenario') or '').strip()
     scenario_norm = _normalize_scenario_label(scenario_label)
     preset = str(request.args.get('preset') or '').strip()
+    mode = str(request.args.get('mode') or '').strip().lower()
     xml_hint = (request.args.get('xml_path') or '').strip()
     length_raw = request.args.get('length')
     try:
@@ -13462,6 +13463,31 @@ def api_flow_attackflow_preview():
         missing_refs = []
 
     missing_refs = sorted(list(dict.fromkeys(missing_refs)))
+    if missing_refs:
+        # Attempt to recover by recomputing assignments without missing generators.
+        try:
+            if not preset_steps:
+                flag_assignments = _flow_compute_flag_assignments(
+                    preview,
+                    chain_nodes,
+                    scenario_label or scenario_norm,
+                    initial_facts_override=initial_facts_override,
+                    goal_facts_override=goal_facts_override,
+                )
+                # Re-evaluate missing refs after recompute.
+                missing_refs = []
+                try:
+                    for fa in (flag_assignments or []):
+                        if not isinstance(fa, dict):
+                            continue
+                        gid = str(fa.get('id') or fa.get('generator_id') or '').strip()
+                        if gid and gid not in enabled_ids:
+                            missing_refs.append(gid)
+                except Exception:
+                    missing_refs = []
+                missing_refs = sorted(list(dict.fromkeys(missing_refs)))
+        except Exception:
+            pass
     if missing_refs:
         flow_errors = list(flow_errors or []) + [f"generator not found/enabled: {gid}" for gid in missing_refs]
         flow_valid = False

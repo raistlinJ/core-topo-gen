@@ -194,16 +194,13 @@
         <div class="card mb-3">
           <div class="card-header d-flex align-items-center justify-content-between">
             <div class="fw-semibold">Chain Order</div>
-            <div class="small text-muted">Use ↑/↓ to reorder</div>
           </div>
           <div class="card-body">
-            <div class="small text-muted mb-1" aria-hidden="true" style="display:grid;grid-template-columns:84px 1fr 76px;gap:.5rem;align-items:center;">
+            <div class="small text-muted mb-1" aria-hidden="true" style="display:grid;grid-template-columns:84px 1fr;gap:.5rem;align-items:center;">
               <div class="pe-2" style="border-right: 1px solid var(--bs-border-color, #dee2e6);">Sequence</div>
               <div>Details</div>
-              <div class="text-end">Reorder</div>
             </div>
             <div id="flowChainList" class="list-group"></div>
-            <div class="small text-muted mt-2">Reordering updates the export and download.</div>
           </div>
         </div>
 
@@ -1648,6 +1645,8 @@
           ovBtn.type = 'button';
           ovBtn.className = 'btn btn-outline-secondary';
           ovBtn.textContent = 'Value Override';
+          ovBtn.disabled = true;
+          ovBtn.title = 'Disabled';
           ovBtn.addEventListener('click', (ev)=>{
             try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
             try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
@@ -1662,6 +1661,8 @@
           holdBtn.className = held ? 'btn btn-warning' : 'btn btn-outline-warning';
           holdBtn.textContent = 'Hold';
           holdBtn.title = held ? 'Facts held' : 'Hold facts';
+          holdBtn.disabled = true;
+          holdBtn.title = 'Disabled';
           holdBtn.addEventListener('click', (ev)=>{
             try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
             try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
@@ -2134,6 +2135,8 @@
         inputsBtn.type = 'button';
         inputsBtn.className = 'btn btn-outline-secondary';
         inputsBtn.textContent = 'Value Override';
+        inputsBtn.disabled = true;
+        inputsBtn.title = 'Disabled';
         inputsBtn.addEventListener('click', (ev)=>{
           try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
           try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
@@ -2145,6 +2148,8 @@
         subBtn.type = 'button';
         subBtn.className = 'btn btn-outline-primary';
         subBtn.textContent = 'Change Node';
+        subBtn.disabled = true;
+        subBtn.title = 'Disabled';
         subBtn.addEventListener('click', (ev)=>{
           try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
           try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
@@ -2159,6 +2164,8 @@
         holdBtn.title = (heldChainIndices && heldChainIndices.has(idx))
           ? 'Node held (generator changes will not change this chain position)'
           : 'Hold node (generator changes will not change this chain position)';
+        holdBtn.disabled = true;
+        holdBtn.title = 'Disabled';
         holdBtn.addEventListener('click', (ev)=>{
           try { ev && ev.preventDefault && ev.preventDefault(); } catch(e) {}
           try { ev && ev.stopPropagation && ev.stopPropagation(); } catch(e) {}
@@ -2947,43 +2954,8 @@
 
       // (Per-step action buttons moved to title row.)
 
-      const right = document.createElement('div');
-      right.className = 'btn-group btn-group-sm';
-      right.style.justifySelf = 'end';
-      const up = document.createElement('button');
-      up.type = 'button';
-      up.className = 'btn btn-outline-secondary';
-      up.textContent = '↑';
-      up.disabled = idx === 0;
-      up.addEventListener('click', async () => {
-        if(idx === 0) return;
-        const tmp = currentChain[idx-1];
-        currentChain[idx-1] = currentChain[idx];
-        currentChain[idx] = tmp;
-        renderChainEditor();
-        persistFlowState();
-        await refreshAssignmentsFromChain();
-      });
-      const down = document.createElement('button');
-      down.type = 'button';
-      down.className = 'btn btn-outline-secondary';
-      down.textContent = '↓';
-      down.disabled = idx === currentChain.length - 1;
-      down.addEventListener('click', async () => {
-        if(idx === currentChain.length - 1) return;
-        const tmp = currentChain[idx+1];
-        currentChain[idx+1] = currentChain[idx];
-        currentChain[idx] = tmp;
-        renderChainEditor();
-        persistFlowState();
-        await refreshAssignmentsFromChain();
-      });
-      right.appendChild(up);
-      right.appendChild(down);
-
       item.appendChild(seq);
       item.appendChild(left);
-      item.appendChild(right);
       wrap.appendChild(item);
     });
 
