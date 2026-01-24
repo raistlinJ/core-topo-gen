@@ -30,11 +30,6 @@
         title="Generate a full preview for the selected scenario"
       >Preview</a>
     </li>
-    {% if nav_participant_url %}
-    <li class="nav-item">
-      <a class="nav-link" href="{{ url_for('participant_ui_page', scenario=scenario_tab) if scenario_tab else url_for('participant_ui_page') }}" title="Participant-UI">Participant-UI</a>
-    </li>
-    {% endif %}
   </ul>
 
   {# Defaults used by JS; Preview tab can override with live editor state. #}

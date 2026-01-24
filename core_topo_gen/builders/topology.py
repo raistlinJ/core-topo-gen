@@ -991,7 +991,10 @@ def _apply_docker_compose_meta(node, rec, session=None):
         vname = None
         try:
             if rec:
-                vname = rec.get('Name') or rec.get('name') or rec.get('Title') or rec.get('title')
+                # Prefer explicit compose service name when available.
+                vname = rec.get('compose_service') or rec.get('compose_service_name')
+                if not vname:
+                    vname = rec.get('Name') or rec.get('name') or rec.get('Title') or rec.get('title')
         except Exception:
             vname = None
         if not vname:

@@ -122,6 +122,39 @@ def load_vuln_catalog(repo_root: str) -> List[Dict[str, str]]:
 	fall back to raw_datasources CSVs shipped with the repo.
 	Returns a list of dicts with at least Name, Path, and optional Type/Vector.
 	"""
+	def _normalize_catalog_path(root: str, raw_path: str) -> str:
+		p = (raw_path or '').strip()
+		if not p:
+			return p
+		# Preserve URLs as-is.
+		try:
+			if re.match(r'^https?://', p, re.IGNORECASE):
+				return p
+		except Exception:
+			pass
+		# Relative paths resolve against repo root.
+		if not os.path.isabs(p):
+			try:
+				return os.path.abspath(os.path.join(root, p))
+			except Exception:
+				return p
+		# Absolute path exists: keep it.
+		try:
+			if os.path.exists(p):
+				return p
+		except Exception:
+			pass
+		# Remap installed catalog absolute paths from another machine.
+		try:
+			norm = p.replace('\\', '/')
+			marker = '/outputs/installed_vuln_catalogs/'
+			if marker in norm:
+				suffix = norm.split(marker, 1)[1]
+				candidate = os.path.join(root, 'outputs', 'installed_vuln_catalogs', suffix)
+				return os.path.abspath(candidate)
+		except Exception:
+			pass
+		return p
 	def _installed_state_path(root: str) -> str:
 		return os.path.join(root, 'outputs', 'installed_vuln_catalogs', '_catalogs_state.json')
 
@@ -192,6 +225,17 @@ def load_vuln_catalog(repo_root: str) -> List[Dict[str, str]]:
 	]:
 		if os.path.exists(p):
 			items.extend(_read_csv(p))
+	# Normalize Path entries for portability between local GUI and remote CORE host.
+	try:
+		for it in items:
+			try:
+				path_val = it.get('Path') if isinstance(it, dict) else None
+				if path_val:
+					it['Path'] = _normalize_catalog_path(repo_root, str(path_val))
+			except Exception:
+				continue
+	except Exception:
+		pass
 	# Deduplicate by (Name, Path)
 	seen = set()
 	out: List[Dict[str, str]] = []
@@ -343,6 +387,56 @@ def _compose_candidates(base_dir: str) -> List[str]:
 	except Exception:
 		pass
 	return out
+
+
+def _normalize_vuln_record_path(rec: Dict[str, str], repo_root: Optional[str] = None) -> None:
+	"""Best-effort normalize a vulnerability record Path for the local runtime host.
+
+	- Remaps absolute paths that reference outputs/installed_vuln_catalogs to the local repo root.
+	- Resolves relative paths against repo_root.
+	- Leaves URLs untouched.
+	"""
+	try:
+		if not isinstance(rec, dict):
+			return
+		raw = rec.get('Path') or rec.get('path')
+		if not raw:
+			return
+		p = str(raw).strip()
+		if not p:
+			return
+		try:
+			if re.match(r'^https?://', p, re.IGNORECASE):
+				return
+		except Exception:
+			pass
+		if repo_root is None:
+			try:
+				repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+			except Exception:
+				repo_root = None
+		if repo_root:
+			# Remap installed catalog absolute paths from a different host.
+			try:
+				norm = p.replace('\\', '/')
+				marker = '/outputs/installed_vuln_catalogs/'
+				if marker in norm:
+					suffix = norm.split(marker, 1)[1]
+					candidate = os.path.join(repo_root, 'outputs', 'installed_vuln_catalogs', suffix)
+					rec['Path'] = os.path.abspath(candidate)
+					return
+			except Exception:
+				pass
+			# Resolve relative path to repo root.
+			try:
+				if not os.path.isabs(p):
+					rec['Path'] = os.path.abspath(os.path.join(repo_root, p))
+					return
+			except Exception:
+				pass
+		return
+	except Exception:
+		return
 
 
 def _compose_path_from_download(rec: Dict[str, str], out_base: str = "/tmp/vulns", compose_name: str = 'docker-compose.yml') -> Optional[str]:
@@ -605,6 +699,16 @@ def assign_compose_to_nodes(node_names: List[str], density: float, items_cfg: Li
 		if (it2.get('selected') or '') == 'Category':
 			it2['selected'] = 'Type/Vector'
 		norm_items.append(it2)
+
+	# Normalize catalog record paths (important for remote CORE VM).
+	try:
+		for r in catalog or []:
+			try:
+				_normalize_vuln_record_path(r)
+			except Exception:
+				continue
+	except Exception:
+		pass
 
 	count_items: List[dict] = []
 	weight_items: List[dict] = []
@@ -1960,6 +2064,11 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 	for node_name, rec in name_to_vuln.items():
 		if not _is_docker_compose_record(rec):
 			continue
+		# Normalize any catalog paths embedded from another host (e.g., GUI machine).
+		try:
+			_normalize_vuln_record_path(rec)
+		except Exception:
+			pass
 		try:
 			logger.info(
 				"[vuln] preparing docker-compose for node=%s name=%s path=%s",
@@ -2348,6 +2457,44 @@ def prepare_compose_for_assignments(name_to_vuln: Dict[str, Dict[str, str]], out
 				logger.warning("[vuln] compose not generated for node=%s", node_name)
 			except Exception:
 				pass
+	try:
+		# Verification summary for Execute progress dialog.
+		expected: Dict[str, str] = {}
+		for node_name, rec in (name_to_vuln or {}).items():
+			try:
+				if not _is_docker_compose_record(rec):
+					continue
+			except Exception:
+				continue
+			expected[node_name] = os.path.join(out_base, f"docker-compose-{node_name}.yml")
+		if expected:
+			present = [n for n, p in expected.items() if os.path.exists(p)]
+			missing = [n for n, p in expected.items() if not os.path.exists(p)]
+			logger.info(
+				"[vuln] compose verification: expected=%d present=%d missing=%d",
+				len(expected),
+				len(present),
+				len(missing),
+			)
+			if missing:
+				for n in missing:
+					rec = name_to_vuln.get(n, {}) if isinstance(name_to_vuln, dict) else {}
+					name_val = (rec.get('Name') or rec.get('name') or '').strip()
+					path_val = (rec.get('Path') or rec.get('path') or '').strip()
+					try:
+						src_hint = _compose_path_from_download(rec, out_base=out_base, compose_name=compose_name)
+					except Exception:
+						src_hint = None
+					logger.warning(
+						"[vuln] compose missing node=%s name=%s path=%s expected=%s source=%s",
+						n,
+						name_val or '-',
+						path_val or '-',
+						expected.get(n),
+						src_hint or 'unresolved',
+					)
+	except Exception:
+		pass
 	return created
 
 

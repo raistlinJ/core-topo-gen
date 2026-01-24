@@ -1124,6 +1124,30 @@ def _should_exclude_repo_member(rel_path: str) -> bool:
     parts = [part for part in Path(rel_path).parts if part not in ('', '.')]
     if not parts:
         return False
+    # Allow required subsets of outputs/ to be pushed to the remote host.
+    # Keep repo sync lean while ensuring execute has the needed artifacts.
+    try:
+        rel_norm = rel_path.replace('\\', '/').lstrip('/')
+        if rel_norm.startswith('outputs'):
+            if rel_norm == 'outputs':
+                return False
+            allowed_outputs = (
+                'outputs/installed_vuln_catalogs',
+                'outputs/installed_generators',
+                'outputs/scenarios-',
+                'outputs/tmp-exec-',
+                'outputs/plans',
+            )
+            if any(
+                rel_norm == p
+                or rel_norm.startswith(p + '/')
+                or (p.endswith('-') and rel_norm.startswith(p))
+                for p in allowed_outputs
+            ):
+                return False
+            return True
+    except Exception:
+        pass
     for part in parts:
         if part in REPO_PUSH_EXCLUDE_DIRS:
             return True
@@ -30058,6 +30082,68 @@ def run_cli_async():
                 log_f.write(f"[remote] Repo upload complete{detail}\n")
             except Exception:
                 pass
+            # Verify installed vuln catalogs arrived on the CORE VM when present locally.
+            try:
+                local_catalog_root = _installed_vuln_catalogs_root()
+                local_has_catalogs = False
+                if os.path.isdir(local_catalog_root):
+                    try:
+                        for _entry in os.scandir(local_catalog_root):
+                            local_has_catalogs = True
+                            break
+                    except Exception:
+                        local_has_catalogs = True
+                if local_has_catalogs and repo_path and core_cfg.get('ssh_enabled'):
+                    client = None
+                    try:
+                        client = _open_ssh_client(core_cfg)
+                        remote_catalog_root = _remote_path_join(repo_path, 'outputs', 'installed_vuln_catalogs')
+                        check_cmd = (
+                            f"if [ -d {shlex.quote(remote_catalog_root)} ] && "
+                            f"[ \"$(ls -A {shlex.quote(remote_catalog_root)} 2>/dev/null)\" ]; then "
+                            f"echo OK; else echo MISSING; fi"
+                        )
+                        _rc, out_text, _err_text = _exec_ssh_command(client, check_cmd, timeout=30.0, check=False)
+                        if 'OK' not in (out_text or ''):
+                            try:
+                                log_f.write(
+                                    "[remote] ERROR: outputs/installed_vuln_catalogs missing after repo upload. "
+                                    "Compose-based vulnerabilities may fail to resolve.\n"
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                log_f.close()
+                            except Exception:
+                                pass
+                            try:
+                                os.remove(log_path)
+                            except Exception:
+                                pass
+                            return jsonify({"error": "Repo upload missing outputs/installed_vuln_catalogs on CORE VM."}), 500
+                        else:
+                            try:
+                                log_f.write("[remote] Verified outputs/installed_vuln_catalogs on CORE VM\n")
+                            except Exception:
+                                pass
+                    except Exception as exc:
+                        try:
+                            log_f.write(f"[remote] WARN: failed to verify installed catalogs: {exc}\n")
+                        except Exception:
+                            pass
+                    finally:
+                        try:
+                            if client is not None:
+                                client.close()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+    else:
+        try:
+            log_f.write("[remote] Repo upload skipped; remote repository may be stale.\n")
+        except Exception:
+            pass
     core_host = core_cfg.get('host', '127.0.0.1')
     try:
         core_port = int(core_cfg.get('port', 50051))

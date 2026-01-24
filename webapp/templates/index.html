@@ -17307,6 +17307,41 @@ function handleExecuteProgressLog(line) {
     stopExecuteProgressHeartbeat();
     appendExecuteProgressLog(line);
     if (!line) return;
+    const composeReadyLine = /\[vuln\]\s+compose file ready for node=([^\s]+)\s+compose=([^\s]+)/i.exec(line);
+    if (composeReadyLine) {
+        const nodeName = composeReadyLine[1] || 'node';
+        const dest = composeReadyLine[2] || '';
+        setExecuteProgressStatus('Prepared docker-compose files…', dest ? `${nodeName}: ${dest}` : nodeName);
+        setExecuteProgressPercent(55, 'Compose ready');
+        return;
+    }
+    const composeWriteLine = /\[vuln\]\s+wrote compose yaml\s+node=([^\s]+)\s+services=.*\s+dest=([^\s]+)/i.exec(line);
+    if (composeWriteLine) {
+        const nodeName = composeWriteLine[1] || 'node';
+        const dest = composeWriteLine[2] || '';
+        setExecuteProgressStatus('Writing docker-compose files…', dest ? `${nodeName}: ${dest}` : nodeName);
+        setExecuteProgressPercent(50, 'Compose');
+        return;
+    }
+    const composeMissingLine = /\[vuln\]\s+compose missing\s+node=([^\s]+)\s+name=([^\s]*)\s+path=([^\s]*)\s+expected=([^\s]+)\s+source=([^\s]+)/i.exec(line);
+    if (composeMissingLine) {
+        const nodeName = composeMissingLine[1] || 'unknown';
+        const expected = composeMissingLine[4] || 'unknown';
+        const source = composeMissingLine[5] || 'unresolved';
+        executeProgressState.composeMissingCount = (executeProgressState.composeMissingCount || 0) + 1;
+        const msg = `Compose missing for ${nodeName}. Expected ${expected}. Source ${source}.`;
+        updateExecuteConfirmAlert(msg, 'danger');
+        setExecuteProgressStatus('Missing docker-compose file', msg);
+        setExecuteProgressPercent(0, 'Error');
+        return;
+    }
+    if (/\[vuln\]\s+unable to retrieve compose for key=/i.test(line)) {
+        executeProgressState.composeMissingCount = (executeProgressState.composeMissingCount || 0) + 1;
+        updateExecuteConfirmAlert('Compose retrieval failed. Check vulnerability catalog sync to the CORE VM.', 'danger');
+        setExecuteProgressStatus('Compose retrieval failed', 'Catalog files missing on remote host.');
+        setExecuteProgressPercent(0, 'Error');
+        return;
+    }
     if (/\[remote\]\s+Repo upload starting/i.test(line)) {
         setExecuteProgressStatus('Copying repository…', line.replace('[remote]', '').trim());
         setExecuteProgressPercent(1, 'Starting…');
@@ -17329,6 +17364,20 @@ function handleExecuteProgressLog(line) {
     if (/\[remote\]\s+Workspace:/i.test(line)) {
         setExecuteProgressStatus('Remote workspace ready', line.replace('[remote]', '').trim());
         setExecuteProgressPercent(100, 'Workspace ready');
+        return;
+    }
+    const composeVerify = /\[vuln\]\s+compose verification:\s+expected=(\d+)\s+present=(\d+)\s+missing=(\d+)/i.exec(line);
+    if (composeVerify) {
+        const expected = Number(composeVerify[1] || 0);
+        const present = Number(composeVerify[2] || 0);
+        const missing = Number(composeVerify[3] || 0);
+        const meta = `present ${present} / expected ${expected}${missing ? ` (missing ${missing})` : ''}`;
+        setExecuteProgressStatus('Verifying docker-compose files…', meta);
+        setExecuteProgressPercent(60, 'Verify');
+        if (missing > 0) {
+            executeProgressState.composeMissingCount = missing;
+            updateExecuteConfirmAlert('Missing docker-compose files after repo sync. Check outputs/installed_vuln_catalogs on the CORE VM.', 'danger');
+        }
         return;
     }
 }
