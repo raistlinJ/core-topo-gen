@@ -66,6 +66,7 @@ inputs:
 
 artifacts:
   requires: []
+  optional_requires: []
   produces:
     - Flag(flag_id)
     - Credential(user)
@@ -85,8 +86,8 @@ env:
 
 Notes:
 - `kind` must be `flag-generator` or `flag-node-generator`.
-- `inputs` is a list of input descriptors (used by UI forms and Flow).
-- `artifacts.requires` / `artifacts.produces` drive Flow dependency chaining.
+- `inputs` is a list of input descriptors (used by UI forms and Flow). If `required` is omitted, it defaults to `true`.
+- `artifacts.requires` / `artifacts.optional_requires` / `artifacts.produces` drive Flow dependency chaining.
 
 ### Input types (mandatory convention)
 Generator input `type` values are normalized to a small canonical set. If your manifest omits `type` or uses an unknown value, it **falls back to** `string`.

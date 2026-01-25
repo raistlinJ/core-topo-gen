@@ -31,13 +31,13 @@ Purpose: Generate CORE network topologies from XML scenarios via CLI or a Web GU
 - XML schema:
   - Root `<Scenarios>` with one or more `<Scenario>` containing a `<ScenarioEditor>`.
   - Sections: `Node Information`, `Routing`, `Services`, `Traffic`, `Segmentation`, optional `Notes`.
-    - Legacy attribute `total_nodes` (section-level) has been removed. Host counts are now purely additive at the role row level.
     - A scenario-level aggregate attribute `scenario_total_nodes` (on `<Scenario>`) represents the sum of all planned hosts (node roles + routers + vulnerability additive targets, etc.) written by the web UI.
   - Items use attributes `selected`, `factor`, and section-specific extras (e.g., `pattern`, `rate_kbps`).
 - Report location: always under repo `./reports/`. The CLI logs an absolute path; the web app converts relative paths to absolute.
 - Plan storage: single per-scenario plan at `outputs/plans/plan_<scenario>.json`. Flow sequencing metadata lives only in `metadata.flow` (no duplication in `full_preview`).
 - Logs: Web async run tails `cli-<run_id>.log` and emits SSE at `/stream/<run_id>`.
 - Safe deletes: Artifact deletion is scoped to `outputs/` only (XML/reports/pre-session captures). Reports in `./reports/` are not deleted.
+- Flow UI: required inputs are derived from manifest `inputs.required` and `artifacts.requires` (optional artifacts are `optional_requires`); Goal Facts show per-variable sequence badges.
 
 ## Dev Setup & Commands
 - Install deps:
@@ -80,7 +80,7 @@ pytest -q
 
 ## File Map (jump starts)
 - Entry points: `core_topo_gen/cli.py`, `webapp/app_backend.py`.
-- Parsing: per-section modules (`node_info`, `routing`, `traffic`, `segmentation`, `services`, `vulnerabilities`, `planning_metadata`). The legacy `xml_parser.py` was removed and now raises ImportError.
+- Parsing: per-section modules (`node_info`, `routing`, `traffic`, `segmentation`, `services`, `vulnerabilities`, `planning_metadata`).
 - Builders: `core_topo_gen/builders/topology.py`.
 - Utils: `core_topo_gen/utils/{traffic.py,segmentation.py,services.py,report.py}`.
 - Tests: `tests/`.

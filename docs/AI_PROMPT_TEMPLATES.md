@@ -37,22 +37,21 @@ Tell the AI these are strict requirements:
 ```
 
 - `generator_id` is required by schema and used as provenance.
-  - If you are using a legacy v3 JSON catalog, set `generator_id` to the catalog `plugin_id`.
-  - If you are using `manifest.yaml` / Generator Packs, the Web UI assigns a *new numeric installed ID* at install time, so don’t hardcode the installed ID into your generator; using your source manifest `id` is acceptable.
+  - Generator Packs: the Web UI assigns a *new numeric installed ID* at install time, so don’t hardcode the installed ID into your generator; using your source manifest `id` is acceptable.
 - Outputs should be **deterministic** for the same inputs.
 - `outputs.json.outputs` must always include `Flag(flag_id)` (required by schema).
 - `hint.txt` is optional. Prefer `hint_templates` in the catalog; only write `/outputs/hint.txt` if you explicitly need a standalone hint file.
 - Treat Flow-synthesized values as **inputs**, not artifacts:
   - Never put `seed`, `secret`, `node_name`, `flag_prefix` into artifact inputs (aka `requires`).
+- Input descriptors default to `required: true` when omitted. Set `required: false` for optional runtime inputs.
 
 If the generator needs to deliver a file/binary to participants:
 
 - Write the file(s) under `/outputs/artifacts/...` (so they appear under `<out_dir>/artifacts/...`).
 - Allowlist injected files:
   - Manifest workflow: declare `injects` in `manifest.yaml`.
-  - Legacy v3 JSON workflow: declare `inject_files` in the implementation.
-  - Prefer referencing an **output artifact key** so the allowlist stays stable, e.g. `inject_files: ["File(path)"]`.
-  - `inject_files` supports resolving output keys via `outputs.json` (e.g. `File(path)` -> `artifacts/my_binary`).
+  - Prefer referencing an **output artifact key** so the allowlist stays stable, e.g. `injects: ["File(path)"]`.
+  - `injects` supports resolving output keys via `outputs.json` (e.g. `File(path)` -> `artifacts/my_binary`).
 
 ---
 
@@ -77,8 +76,7 @@ Hard requirements (do not violate):
     }
   }
 - generator_id requirements:
-  - If using legacy v3 JSON catalogs, set generator_id == plugin_id.
-  - If using manifest/packs, do not assume the installed numeric ID is stable; using SOURCE_ID is acceptable.
+  - Do not assume the installed numeric ID is stable; using SOURCE_ID is acceptable.
 - Do NOT write /outputs/hint.txt unless I explicitly ask; prefer hint_templates in the catalog.
 - Deterministic outputs: same (seed, secret, flag_prefix) => same outputs.
 - Inputs (NOT artifacts): seed (required), secret (required), flag_prefix (optional).
@@ -94,6 +92,7 @@ Catalog intent:
 Artifact input strictness:
 - Default to optional inputs.
 - Mark any input as required only if the generator truly cannot run without it.
+- For artifact inputs, put optional ones in `artifacts.optional_requires` and required ones in `artifacts.requires`.
 
 Task:
 - Modify ONLY generator.py to implement this behavior: <describe behavior>.
@@ -133,8 +132,7 @@ Hard requirements (do not violate):
     }
   }
 - generator_id requirements:
-  - If using legacy v3 JSON catalogs, set generator_id == plugin_id.
-  - If using manifest/packs, do not assume the installed numeric ID is stable; using SOURCE_ID is acceptable.
+  - Do not assume the installed numeric ID is stable; using SOURCE_ID is acceptable.
 - Deterministic outputs: same (seed, node_name, flag_prefix) => same outputs and compose.
 - Inputs (NOT artifacts): seed (required), node_name (required), flag_prefix (optional).
 

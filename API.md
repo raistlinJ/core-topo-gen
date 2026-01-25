@@ -69,7 +69,7 @@ The web UI uses cookie sessions. Script clients must authenticate once and reuse
 : JSON body `{ "scenarios": [...], "active_index"?: int }`. Returns `{ "ok": true, "result_path": ".../scenarios.xml" }` on success or `{ "ok": false, "error": "..." }` with HTTP 400/500 on failure.
 
 `GET /api/host_interfaces`
-: Returns `{ "interfaces": [...] }` describing host NICs on the web host (`name`, `mac`, `ipv4`, `ipv6`, `mtu`, `speed`, `flags`, `is_up`). Requires `psutil`; if unavailable, returns an empty list with a warning in logs. Primarily a legacy/debug fallback when CORE credentials are not configured.
+: Returns `{ "interfaces": [...] }` describing host NICs on the web host (`name`, `mac`, `ipv4`, `ipv6`, `mtu`, `speed`, `flags`, `is_up`). Requires `psutil`; if unavailable, returns an empty list with a warning in logs.
 
 `POST /api/host_interfaces`
 : JSON body `{ "core_secret_id": "...", "core_vm": { "vm_key": "node::vmid", "vm_name": "...", "vm_node": "...", "vmid": "...", "interfaces": [...] }, "include_down"?: bool }`. Enumerates network interfaces from the selected CORE VM over SSH using stored credentials. Response `{ "success": true, "interfaces": [...], "source": "core_vm", "metadata": { ... }, "fetched_at": "<iso8601>" }` includes Proxmox VM/interface metadata when MAC addresses match the supplied `core_vm.interfaces`. Only physical adapters (those backed by `/sys/class/net/<iface>/device`) are returned. Errors return `{ "success": false, "error": "..." }` with HTTP 4xx/5xx.
@@ -146,7 +146,7 @@ Generates a deterministic planning preview without starting a CORE session.
 These endpoints power the **Flow** page (Flag Sequencing) in the Web UI.
 
 Important notes:
-- **STIX/AttackFlow bundle export has been removed.** Legacy STIX endpoints now return HTTP `410 Gone`.
+- **STIX/AttackFlow bundle export has been removed.** STIX endpoints return HTTP `410 Gone`.
 - The supported export format is **Attack Flow Builder native `.afb`**.
 - **Eligibility rules:** `flag-generators` are placed on vulnerability nodes only; `flag-node-generators` require non-vulnerability Docker-role nodes.
 - **Initial Facts / Goal Facts:** Flow accepts optional `initial_facts` and `goal_facts` overrides (artifacts + fields). Flag facts (`Flag(...)`) are filtered out.
@@ -275,8 +275,8 @@ Example request:
 ```
 
 Notes:
-- `requires` must be a list of objects `{ artifact, optional }`.
-- `inputs` is a list of runtime input definitions (name/type/required/etc) written into `manifest.yaml`.
+- `requires` must be a list of objects `{ artifact, optional }`; items with `optional: true` are written into `artifacts.optional_requires` in the manifest.
+- `inputs` is a boolean flag map for standard runtime fields (e.g., `seed`, `secret`, `node_name`, `flag_prefix`). The scaffold converts these into `manifest.yaml` inputs with required defaults (`seed`/`secret`/`node_name` required, `flag_prefix` optional).
 - `inject_files` is optional; when present it is written into `manifest.yaml` as `injects`.
 - Optional destination directory syntax: `inject_files: ["File(path) -> /opt/bin"]`. If omitted or invalid, files default to `/tmp`.
 
@@ -625,8 +625,6 @@ meta = parse_planning_metadata("outputs/scenarios-123/scenarios.xml", "Scenario 
 print(meta["node_info"]["combined_nodes"])
 ```
 
-- The legacy `core_topo_gen.parsers.xml_parser` module was removed in 2025-10; import section-specific parsers instead.
-- When attributes are absent (legacy XML), parsing gracefully recomputes approximate values.
 
 ### Experimental Sections (Services / Traffic / Segmentation)
 

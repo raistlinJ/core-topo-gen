@@ -60,7 +60,7 @@ docker compose up -d --build
 - Visit `https://localhost`.
 - First launch seeds a `coreadmin / coreadmin` account; change it immediately under **Profile → Change Password**.
 - Dev certs are generated automatically inside the nginx container (mounted under `nginx/certs/`).
-- HITL editor note: the “Attach to” dropdown now offers `Existing Router`, `Existing Switch`, or `New Router`. The legacy `New Switch` choice was removed to prevent hidden switch fan-out; saved scenarios using it are normalized to `Existing Router` during load. Once Proxmox credentials and VM selections are validated, use **Apply Internal Bridge** to create/update a Proxmox bridge and retarget both the CORE VM and external VM interfaces in one step.
+- HITL editor note: the “Attach to” dropdown offers `Existing Router`, `Existing Switch`, or `New Router`. Once Proxmox credentials and VM selections are validated, use **Apply Internal Bridge** to create/update a Proxmox bridge and retarget both the CORE VM and external VM interfaces in one step.
 
 ### Run the CLI
 ```bash
@@ -87,10 +87,10 @@ Popular options:
 - Router and vulnerability planning capture derived vs explicit counts via `explicit_count`, `derived_count`, and `total_planned`.
 - Scenario-level `scenario_total_nodes` summarises planned hosts, routers, and vulnerability targets.
 - Parser helpers expose metadata programmatically: `core_topo_gen.parsers.planning_metadata.parse_planning_metadata()`.
-- Hardware-in-the-Loop plans persist per-scenario preferences (enabled state, interface list, attachment choice). Attachments normalize to `existing_router`, `existing_switch`, `new_router`, or `proxmox_vm`; legacy `new_switch` values are coerced to `existing_router` so previews remain deterministic and switch overlays aren’t synthesized implicitly. When interfaces map to Proxmox VMs, the apply flow ensures the selected bridge exists on the node (creating it if needed) and rewrites the CORE/external VM adapters to land on that bridge.
+- Hardware-in-the-Loop plans persist per-scenario preferences (enabled state, interface list, attachment choice). Attachments normalize to `existing_router`, `existing_switch`, `new_router`, or `proxmox_vm`. When interfaces map to Proxmox VMs, the apply flow ensures the selected bridge exists on the node (creating it if needed) and rewrites the CORE/external VM adapters to land on that bridge.
 
 ### Router connectivity & aggregation
-- Per-routing-item `r2r_mode` supports `Exact`, `Uniform`, `NonUniform`, `Min`, `Max`, and legacy meshes tied to `--router-mesh-style`.
+- Per-routing-item `r2r_mode` supports `Exact`, `Uniform`, `NonUniform`, `Min`, `Max`.
 - R2S policies (`r2s_mode`, `r2s_edges`, optional `r2s_hosts_min/max`) regroup hosts behind dedicated switches, with “Exact=1” aggregating all hosts per router into a single switch.
 - Preview JSON and runtime stats capture router degrees, aggregation counts, and Gini coefficients for quick balance checks.
 
@@ -116,6 +116,9 @@ Popular options:
 - Initial/Goal facts steer sequencing (flag facts are filtered out); synthesized inputs like `seed`, `node_name`, and `flag_prefix` are treated as known inputs.
 - Sequencing uses goal-aware scoring with pruning/backtracking (bounded by a 30s timeout) to find feasible generator assignments.
 - Attack Flow Builder export is the native `.afb` format (OpenChart DiagramViewExport).
+- The Flow UI marks required inputs with `*` based on manifest inputs (`required: true`) and artifact `requires` (optional artifacts live in `optional_requires`).
+- Goal Facts list shows per-variable source badges (e.g., `Seq I`) derived from the chain assignments.
+- If a chain length exceeds unique eligible generators, the UI prompts to allow generator reuse; declining clears the chain.
 
 ### Vulnerability catalog packs
 - The Web UI exposes a **Vuln-Catalog** page that mirrors the Flag Catalog pack UX.

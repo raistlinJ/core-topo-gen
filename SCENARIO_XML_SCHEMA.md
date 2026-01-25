@@ -6,8 +6,8 @@ This document summarizes the structure of the scenario editor XML consumed and p
 
 Two root forms are accepted:
 
-1. `<Scenarios>` (preferred) containing one or more `<Scenario>` elements.
-2. A lone `<ScenarioEditor>` root (legacy / single-scenario quick files).
+1. `<Scenarios>` containing one or more `<Scenario>` elements.
+2. A lone `<ScenarioEditor>` root (single-scenario files).
 
 ### `<Scenario>` Attributes
 
@@ -15,7 +15,6 @@ Two root forms are accepted:
 |-----------|------|---------|
 | `name` | string (required) | Scenario display / selection name. |
 | `scenario_total_nodes` | non-negative int (optional) | Aggregate planned nodes (hosts + routers + vulnerability explicit targets + future additive categories). Written by UI; not required for parsing. |
-| `density_count` | non-negative int (optional) | Alias for base host pool (legacy). Prefer section-level attributes instead. |
 
 ### `<ScenarioEditor>`
 Wraps a base scenario reference and a sequence of planning sections.
@@ -30,11 +29,10 @@ Child elements:
 All sections share a common element name `<section>` and are distinguished by `name`:
 `Node Information | Routing | Services | Traffic | Events | Vulnerabilities | Segmentation | Notes`
 
-Common / legacy attributes:
+Common attributes:
 | Attribute | Applies | Meaning |
 |-----------|--------|---------|
 | `name` | all (required) | Section discriminator. |
-| `total_nodes` | Node Information (legacy) | Deprecated; historical base host pool field. Retained for backward compatibility. |
 | `density` | Node Information (unused), Routing, Services, Traffic, Vulnerabilities, Segmentation | Fraction or absolute ( >1.0 ) count meaning depends on section (see README). |
 
 Additive planning metadata (optional – written by UI for round‑trip):

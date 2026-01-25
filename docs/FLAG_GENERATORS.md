@@ -4,14 +4,18 @@ A **flag generator** is a runnable workload (currently `docker-compose`) that pr
 
 The Flow system treats each generator as a small contract:
 
-- **inputs**: keys the user must already have (from earlier generators)
-- **outputs**: keys the generator provides
-- **hint_template**: a human-readable hint that tells the user where to go next
+- **inputs**: runtime config fields defined in `manifest.yaml` (`inputs[]`). These are not artifacts; `required: false` marks them optional.
+- **artifacts.requires** / **artifacts.optional_requires**: artifact keys the generator needs (required vs optional for chaining).
+- **artifacts.produces**: artifact keys the generator provides.
+- **hint_template**: a human-readable hint that tells the user where to go next.
 
 Flow also supports **Initial Facts** and **Goal Facts** to steer sequencing. Initial facts are treated
 as already-known inputs (including synthesized fields like `seed`, `node_name`, `flag_prefix`), while
 Goal facts bias the sequencing algorithm toward outputs that satisfy them. Flag facts (`Flag(...)`) are
 filtered from Initial/Goal facts.
+
+UI note: the Flow Inputs table renders a `*` next to required items. Runtime inputs are required unless
+`required: false` is explicitly set; artifact inputs are required when listed under `artifacts.requires`.
 
 ## Standard Key Vocabulary
 
