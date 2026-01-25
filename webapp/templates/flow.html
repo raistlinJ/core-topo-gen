@@ -1476,6 +1476,71 @@
     };
   }
 
+  function buildGoalFactSourceMap(assignments){
+    const outArtifacts = new Map();
+    const outFields = new Map();
+    if(!Array.isArray(assignments)) return { artifacts: outArtifacts, fields: outFields };
+    for(let i = 0; i < assignments.length; i++){
+      const a = assignments[i] || {};
+      const artNames = [];
+      const fieldNames = [];
+      if(Array.isArray(a.produces)) artNames.push(...a.produces);
+      if(Array.isArray(a.output_fields)) fieldNames.push(...a.output_fields);
+
+      const artSet = new Set(artNames.map(String).map(s => String(s || '').trim()).filter(Boolean));
+      const fieldSet = new Set(fieldNames.map(String).map(s => String(s || '').trim()).filter(Boolean));
+
+      artSet.forEach((n)=>{
+        if(!n || isFlagFactName(n)) return;
+        if(!outArtifacts.has(n)) outArtifacts.set(n, i);
+      });
+      fieldSet.forEach((n)=>{
+        if(!n || isFlagFactName(n)) return;
+        outFields.set(n, i);
+      });
+
+      if(Array.isArray(a.outputs)){
+        a.outputs.map(String).forEach((raw)=>{
+          const n = String(raw || '').trim();
+          if(!n || isFlagFactName(n)) return;
+          if(artSet.has(n)) {
+            if(!outArtifacts.has(n)) outArtifacts.set(n, i);
+            return;
+          }
+          if(fieldSet.has(n)) {
+            outFields.set(n, i);
+            return;
+          }
+          // Untyped outputs default to fields to avoid duplicating artifact sources.
+          outFields.set(n, i);
+        });
+      }
+    }
+    return { artifacts: outArtifacts, fields: outFields };
+  }
+
+  function goalFactBadgeFor(name, row, sourceMap){
+    const n = String(name || '').trim();
+    if(!n) return null;
+    let idx = null;
+    try{
+      if(sourceMap){
+        const isField = row && String(row.kind || '').toLowerCase() === 'field';
+        const map = isField ? sourceMap.fields : sourceMap.artifacts;
+        if(map && map.has(n)) idx = map.get(n);
+      }
+    } catch(e) {}
+    if(Number.isFinite(+idx) && idx >= 0){
+      const roman = toRoman(idx + 1);
+      const label = roman ? ('Seq ' + roman) : ('Seq ' + (idx + 1));
+      return { text: label, className: 'badge text-bg-primary' };
+    }
+    if(row && row.fromSeq) return { text: 'Sequencer', className: 'badge text-bg-info' };
+    if(row && row.fromChain) return { text: 'Init', className: 'badge text-bg-secondary' };
+    if(row && row.missing) return { text: 'Missing', className: 'badge text-bg-danger' };
+    return { text: 'Unknown', className: 'badge text-bg-secondary' };
+  }
+
   function renderChainEditor(){
     const wrap = document.getElementById('flowChainList');
     if(!wrap) return;
@@ -1830,7 +1895,31 @@
           const code = document.createElement('code');
           code.className = 'font-monospace';
           code.textContent = String(row.name || '-');
-          tdVar.appendChild(code);
+          const reqMark = document.createElement('span');
+          reqMark.className = 'ms-1 text-danger fw-semibold';
+          reqMark.textContent = '*';
+          reqMark.title = 'Required input';
+          if(row.sourceBadge && row.sourceBadge.text){
+            const wrap = document.createElement('div');
+            wrap.className = 'd-flex align-items-center gap-2';
+            wrap.appendChild(code);
+            if(row.required) wrap.appendChild(reqMark);
+            const badge = document.createElement('span');
+            badge.className = row.sourceBadge.className || 'badge text-bg-secondary';
+            badge.textContent = String(row.sourceBadge.text || '').trim();
+            wrap.appendChild(badge);
+            tdVar.appendChild(wrap);
+          } else {
+            if(row.required){
+              const wrap = document.createElement('div');
+              wrap.className = 'd-flex align-items-center gap-1';
+              wrap.appendChild(code);
+              wrap.appendChild(reqMark);
+              tdVar.appendChild(wrap);
+            } else {
+              tdVar.appendChild(code);
+            }
+          }
 
           const tdRes = document.createElement('td');
           tdRes.className = 'small';
@@ -2389,6 +2478,8 @@
         const inReq = (fa && Array.isArray(fa.input_fields_required)) ? fa.input_fields_required.map(String).filter(Boolean) : [];
         const inOpt = (fa && Array.isArray(fa.input_fields_optional)) ? fa.input_fields_optional.map(String).filter(Boolean) : [];
         const inAll = (fa && Array.isArray(fa.input_fields)) ? fa.input_fields.map(String).filter(Boolean) : [];
+        const useAllAsRequired = !(inReq.length || inOpt.length) && inAll.length;
+        const reqFields = useAllAsRequired ? inAll : inReq;
         const inputsDisplay = (inReq.length || inOpt.length)
           ? (inReq.concat(inOpt).join(', '))
           : (inAll.length ? inAll.join(', ') : '-');
@@ -2403,7 +2494,6 @@
           const providedArtifactsSeq = (step && Array.isArray(step.providing_artifacts_sequencer)) ? step.providing_artifacts_sequencer.map(String).filter(Boolean) : [];
           const missingArtifacts = (step && Array.isArray(step.missing_artifacts)) ? step.missing_artifacts.map(String).filter(Boolean) : [];
 
-          const reqFields = inReq;
           const defFields = (inReq.length || inOpt.length)
             ? inReq.concat(inOpt)
             : inAll;
@@ -2688,6 +2778,8 @@
             const missFldSet = new Set(missingFields);
 
             if(isInputs){
+              const hasExplicitInputSplit = (inReq.length || inOpt.length);
+              const markAllFieldsRequired = !hasExplicitInputSplit;
               const rows = [];
               Array.from(defArtifactSet).sort().forEach((name) => {
                 const n = String(name || '').trim();
@@ -2732,7 +2824,7 @@
                 rows.push({
                   name: n,
                   kind: 'Field',
-                  required: reqFieldSet.has(n),
+                  required: reqFieldSet.has(n) || markAllFieldsRequired,
                   fromChain: provFldChainSet.has(n),
                   fromSeq: provFldSeqSet.has(n),
                   missing: missFldSet.has(n),
@@ -3062,6 +3154,8 @@
         const providedFieldsChain = (finalFeas && Array.isArray(finalFeas.providing_fields_chain)) ? finalFeas.providing_fields_chain.map(String).filter(Boolean) : [];
         const providedFieldsSeq = (finalFeas && Array.isArray(finalFeas.providing_fields_sequencer)) ? finalFeas.providing_fields_sequencer.map(String).filter(Boolean) : [];
 
+        const goalSourceMap = buildGoalFactSourceMap(currentFlagAssignments);
+
         const rows = [];
         const reqArtifactSet = new Set(reqArtifacts);
         const provArtChainSet = new Set(providedArtifactsChain);
@@ -3071,6 +3165,7 @@
           if(!n || isFlagFactName(n)) return;
           rows.push({
             name: n,
+            kind: 'Artifact',
             resolved: ro ? ro[n] : undefined,
             fromChain: provArtChainSet.has(n),
             fromSeq: provArtSeqSet.has(n),
@@ -3092,6 +3187,7 @@
           if(!n || isFlagFactName(n)) return;
           rows.push({
             name: n,
+            kind: 'Field',
             resolved: ro ? ro[n] : undefined,
             fromChain: provFldChainSet.has(n),
             fromSeq: provFldSeqSet.has(n),
@@ -3099,7 +3195,10 @@
             required: true,
           });
         });
-        goalInputs = rows;
+        goalInputs = rows.map((row)=>{
+          const badge = goalFactBadgeFor(row && row.name, row, goalSourceMap);
+          return Object.assign({}, row, { sourceBadge: badge });
+        });
         // Do not reuse generator hints for Goal Facts.
         goalHints = [];
       } catch(e) { goalHints = []; }
