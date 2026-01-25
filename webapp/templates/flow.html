@@ -3,7 +3,6 @@
 {% block active_page %}{% set active_page='scenarios' %}{% endblock %}
 {% block header_icon %}<i class="bi bi-bezier2 fs-4"></i>{% endblock %}
 {% block header_title %}Flag Sequencing{% endblock %}
-
 {% block extra_head %}
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 <style>
@@ -79,7 +78,7 @@
                   </div>
                   <div>
                     <label class="form-label small text-muted mb-1" for="flowGenerateMaxRetries">Max retries</label>
-                    <input id="flowGenerateMaxRetries" class="form-control form-control-sm" type="number" min="0" max="10" value="2" style="width: 90px;">
+                    <input id="flowGenerateMaxRetries" class="form-control form-control-sm" type="number" min="0" max="50" value="5" style="width: 90px;">
                   </div>
                   <div class="dropdown">
                     <button class="btn btn-outline-secondary dropdown-toggle text-nowrap" type="button" id="flowDownloadDropdown" data-bs-toggle="dropdown" aria-expanded="false">
@@ -241,11 +240,11 @@
     </div>
     <div class="p-3">
       <div class="form-check">
-        <input class="form-check-input" type="checkbox" id="flowGenerateNoDuplicates" checked>
-        <label class="form-check-label" for="flowGenerateNoDuplicates">No duplicates allowed</label>
+        <input class="form-check-input" type="checkbox" id="flowGenerateNoDuplicates">
+        <label class="form-check-label" for="flowGenerateNoDuplicates">Allow duplicates</label>
       </div>
       <div class="small text-muted mt-2">
-        If unchecked, the chain may repeat nodes; repeated rows are highlighted and generator seeds will differ per occurrence.
+        If checked, the chain may repeat nodes; repeated rows are highlighted and generator seeds will differ per occurrence.
       </div>
     </div>
     <div class="p-3 border-top d-flex justify-content-end gap-2">
@@ -493,6 +492,41 @@
     }
   }
 
+  function clearFlowState(message){
+    try{
+      currentChain = [];
+      currentFlagAssignments = [];
+      selectedChainIndex = -1;
+      updateMeta();
+      renderChainEditor();
+      if(jsonEl){
+        jsonEl.textContent = JSON.stringify({
+          scenario: activeScenario,
+          length: 0,
+          chain: [],
+          flag_assignments: [],
+          flow_valid: false,
+          flow_errors: [],
+          flags_enabled: false,
+        }, null, 2);
+      }
+      const diagram = buildMermaid([]);
+      renderMermaid(diagram);
+      if(message) setStatus(message, true);
+    } catch(e) {}
+  }
+
+  function shouldAllowGeneratorReuse(warningText){
+    try{
+      const msg = String(warningText || '');
+      if(!msg) return true;
+      if(!msg.toLowerCase().includes('generator reuse')) return true;
+      return confirm('Not enough unique generators for this chain length. Allow generator reuse?');
+    } catch(e) {
+      return true;
+    }
+  }
+
   function buildPersistAssignments(chain_ids){
     const ids = Array.isArray(chain_ids) ? chain_ids : [];
     return ids.map((nid, j)=>{
@@ -670,7 +704,6 @@
         const hasOutputs = curA.resolved_outputs && typeof curA.resolved_outputs === 'object' && !Array.isArray(curA.resolved_outputs) && Object.keys(curA.resolved_outputs).length > 0;
         if(savedA.resolved_inputs && (!hasInputs)) curA.resolved_inputs = savedA.resolved_inputs;
         if(savedA.resolved_outputs && (!hasOutputs)) curA.resolved_outputs = savedA.resolved_outputs;
-        if(savedA.flag_value && (!curA.flag_value || !String(curA.flag_value).trim())) curA.flag_value = savedA.flag_value;
         nextAssignments[i] = curA;
       }
       currentFlagAssignments = nextAssignments;
@@ -704,7 +737,6 @@
         const hasOutputs = curA.resolved_outputs && typeof curA.resolved_outputs === 'object' && !Array.isArray(curA.resolved_outputs) && Object.keys(curA.resolved_outputs).length > 0;
         if(savedA.resolved_inputs && (!hasInputs)) curA.resolved_inputs = savedA.resolved_inputs;
         if(savedA.resolved_outputs && (!hasOutputs)) curA.resolved_outputs = savedA.resolved_outputs;
-        if(savedA.flag_value && (!curA.flag_value || !String(curA.flag_value).trim())) curA.flag_value = savedA.flag_value;
         if(savedA.type && (!curA.type || !String(curA.type).trim())) curA.type = savedA.type;
         if(savedA.flag_generator && (!curA.flag_generator || !String(curA.flag_generator).trim())) curA.flag_generator = savedA.flag_generator;
         if(savedA.input_fields && (!Array.isArray(curA.input_fields) || !curA.input_fields.length)) curA.input_fields = savedA.input_fields;
@@ -1467,8 +1499,8 @@
 
     const idCounts = {};
     const idFirstIdx = {};
-    const genCounts = {};
-    const genFirstIdx = {};
+    const flagCounts = {};
+    const flagFirstIdx = {};
     let chainFeas = [];
     try { chainFeas = chainFeasibility(currentFlagAssignments) || []; } catch(e) { chainFeas = []; }
     try{
@@ -1479,13 +1511,27 @@
         if(idFirstIdx[id] === undefined) idFirstIdx[id] = idx;
       });
 
-      // Generator ids by position.
+      // Flag values by position (resolved when available).
       currentChain.forEach((_n, idx) => {
         const fa = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
-        const gid = fa && (fa.id || fa.generator_id) ? String(fa.id || fa.generator_id).trim() : '';
-        if(!gid) return;
-        genCounts[gid] = (genCounts[gid] || 0) + 1;
-        if(genFirstIdx[gid] === undefined) genFirstIdx[gid] = idx;
+        const isRealized = !!(fa && (fa.generated === true || (typeof fa.flag_override === 'string' && fa.flag_override.trim()) || (fa.output_overrides && typeof fa.output_overrides === 'object')));
+        if(!isRealized) return;
+        let flagVal = '';
+        try{
+          if(fa && typeof fa.flag_value === 'string' && fa.flag_value.trim()) flagVal = fa.flag_value.trim();
+        } catch(e) {}
+        if(!flagVal){
+          try{
+            const ro = (fa && typeof fa.resolved_outputs === 'object' && fa.resolved_outputs && !Array.isArray(fa.resolved_outputs)) ? fa.resolved_outputs : null;
+            if(ro){
+              const rf = ro['Flag(flag_id)'] || ro['flag'] || ro['FLAG'] || '';
+              if(typeof rf === 'string' && rf.trim()) flagVal = rf.trim();
+            }
+          } catch(e) {}
+        }
+        if(!flagVal) return;
+        flagCounts[flagVal] = (flagCounts[flagVal] || 0) + 1;
+        if(flagFirstIdx[flagVal] === undefined) flagFirstIdx[flagVal] = idx;
       });
     } catch(e) {}
 
@@ -2011,9 +2057,9 @@
       const item = document.createElement('div');
       item.className = 'list-group-item';
       let isDupNode = false;
-      let isDupGen = false;
+      let isDupFlag = false;
       let dupNodeFirstIdx = -1;
-      let dupGenFirstIdx = -1;
+      let dupFlagFirstIdx = -1;
       try{
         const nid = (node && node.id) ? String(node.id).trim() : '';
         if(nid && idCounts[nid] > 1){
@@ -2023,14 +2069,24 @@
         }
       } catch(e) {}
 
-      // Generator duplication is informational but still flagged.
+      // Flag duplication is always flagged when resolved.
       try{
         const fa0 = (Array.isArray(currentFlagAssignments) && currentFlagAssignments[idx]) ? currentFlagAssignments[idx] : null;
-        const gid0 = fa0 && (fa0.id || fa0.generator_id) ? String(fa0.id || fa0.generator_id).trim() : '';
-        if(gid0 && genCounts[gid0] > 1){
+        const isRealized = !!(fa0 && (fa0.generated === true || (typeof fa0.flag_override === 'string' && fa0.flag_override.trim()) || (fa0.output_overrides && typeof fa0.output_overrides === 'object')));
+        if(!isRealized) throw new Error('not realized');
+        let flagVal = '';
+        if(fa0 && typeof fa0.flag_value === 'string' && fa0.flag_value.trim()) flagVal = fa0.flag_value.trim();
+        if(!flagVal){
+          const ro = (fa0 && typeof fa0.resolved_outputs === 'object' && fa0.resolved_outputs && !Array.isArray(fa0.resolved_outputs)) ? fa0.resolved_outputs : null;
+          if(ro){
+            const rf = ro['Flag(flag_id)'] || ro['flag'] || ro['FLAG'] || '';
+            if(typeof rf === 'string' && rf.trim()) flagVal = rf.trim();
+          }
+        }
+        if(flagVal && flagCounts[flagVal] > 1){
           item.classList.add('list-group-item-warning');
-          isDupGen = true;
-          dupGenFirstIdx = (genFirstIdx[gid0] !== undefined) ? parseInt(String(genFirstIdx[gid0]), 10) : -1;
+          isDupFlag = true;
+          dupFlagFirstIdx = (flagFirstIdx[flagVal] !== undefined) ? parseInt(String(flagFirstIdx[flagVal]), 10) : -1;
         }
       } catch(e) {}
       item.style.cursor = 'default';
@@ -2117,12 +2173,12 @@
         badge.textContent = 'Duplicate node' + sameAs;
         titleRow.appendChild(badge);
       }
-      if(isDupGen){
+      if(isDupFlag){
         const badge = document.createElement('span');
         badge.className = 'badge text-bg-warning';
-        const isFirst = (dupGenFirstIdx >= 0 && dupGenFirstIdx === idx);
-        const sameAs = (!isFirst && dupGenFirstIdx >= 0) ? (' (same as ' + toRoman(dupGenFirstIdx + 1) + ')') : '';
-        badge.textContent = 'Duplicate generator' + sameAs;
+        const isFirst = (dupFlagFirstIdx >= 0 && dupFlagFirstIdx === idx);
+        const sameAs = (!isFirst && dupFlagFirstIdx >= 0) ? (' (same as ' + toRoman(dupFlagFirstIdx + 1) + ')') : '';
+        badge.textContent = 'Duplicate flag' + sameAs;
         titleRow.appendChild(badge);
       }
 
@@ -2244,9 +2300,30 @@
           addRow('Notice', 'Duplicate generator assignment (' + sameAs + ').');
         }
       } catch(e) {}
+      try{
+        const isRealized = !!(fa && (fa.generated === true || (typeof fa.flag_override === 'string' && fa.flag_override.trim()) || (fa.output_overrides && typeof fa.output_overrides === 'object')));
+        if(!isRealized) throw new Error('not realized');
+        let flagVal = '';
+        if(fa && typeof fa.flag_value === 'string' && fa.flag_value.trim()) flagVal = fa.flag_value.trim();
+        if(!flagVal){
+          const ro = (fa && typeof fa.resolved_outputs === 'object' && fa.resolved_outputs && !Array.isArray(fa.resolved_outputs)) ? fa.resolved_outputs : null;
+          if(ro){
+            const rf = ro['Flag(flag_id)'] || ro['flag'] || ro['FLAG'] || '';
+            if(typeof rf === 'string' && rf.trim()) flagVal = rf.trim();
+          }
+        }
+        if(flagVal && flagCounts[flagVal] > 1){
+          const firstIdx = (flagFirstIdx[flagVal] !== undefined) ? parseInt(String(flagFirstIdx[flagVal]), 10) : -1;
+          const isFirst = (firstIdx >= 0 && firstIdx === idx);
+          const sameAs = (!isFirst && firstIdx >= 0) ? ('same as ' + toRoman(firstIdx + 1)) : 'reused in chain';
+          addRow('Notice', 'Duplicate flag value (' + sameAs + ').');
+        }
+      } catch(e) {}
 
       // Realized flag value (populated after prepare_preview_for_execute).
       try{
+        const isRealized = !!(fa && (fa.generated === true || (typeof fa.flag_override === 'string' && fa.flag_override.trim()) || (fa.output_overrides && typeof fa.output_overrides === 'object')));
+        if(!isRealized) throw new Error('not realized');
         const fv = (fa && typeof fa.flag_value === 'string') ? fa.flag_value.trim() : '';
         let resolvedFlag = fv;
         if(!resolvedFlag){
@@ -6210,10 +6287,14 @@
     const scenario = (scenarioEl && scenarioEl.value || '').trim();
     const preset = (presetEl && presetEl.value) ? String(presetEl.value).trim() : '';
     let length = preset ? 3 : (parseInt((lengthEl && lengthEl.value) || '5', 10) || 5);
+    let lastResolvePayload = null;
 
     // User-click Generate should be deterministic: save current settings, produce a fresh
     // preview plan, then build the flow chain from that exact snapshot.
     const runSavePreviewResolve = !!(usePreview && options && options.savePreviewResolve);
+    const resolveOnGenerate = (options && options.resolveOnGenerate !== undefined)
+      ? !!options.resolveOnGenerate
+      : !!runSavePreviewResolve;
 
     const params = new URLSearchParams();
     if(scenario) params.set('scenario', scenario);
@@ -6324,14 +6405,55 @@
       let data;
       let retriesRemaining = 0;
       try{
-        if(runSavePreviewResolve && generateMaxRetriesEl){
-          retriesRemaining = Math.max(0, Math.min(10, parseInt(generateMaxRetriesEl.value || '0', 10) || 0));
+        if(generateMaxRetriesEl){
+          retriesRemaining = Math.max(0, Math.min(50, parseInt(generateMaxRetriesEl.value || '0', 10) || 0));
         }
       } catch(e) { retriesRemaining = 0; }
       let attemptedRetries = 0;
       let retryIndex = 0;
+      const _resolvedFlagValue = (fa) => {
+        try{
+          if(fa && typeof fa.flag_value === 'string' && fa.flag_value.trim()) return fa.flag_value.trim();
+        } catch(e) {}
+        try{
+          const ro = (fa && typeof fa.resolved_outputs === 'object' && fa.resolved_outputs && !Array.isArray(fa.resolved_outputs)) ? fa.resolved_outputs : null;
+          if(ro){
+            const rf = ro['Flag(flag_id)'] || ro['flag'] || ro['FLAG'] || '';
+            if(typeof rf === 'string' && rf.trim()) return rf.trim();
+          }
+        } catch(e) {}
+        return '';
+      };
+      const _hasDuplicates = (chain, assigns) => {
+        try{
+          const nodeIds = chain.map(n => String((n && n.id) || '').trim()).filter(Boolean);
+          if(new Set(nodeIds).size !== nodeIds.length) return true;
+          const flags = assigns.map(a => _resolvedFlagValue(a)).filter(Boolean);
+          if(new Set(flags).size !== flags.length) return true;
+        } catch(e) {}
+        return false;
+      };
+      const _isDuplicateFlagError = (err) => {
+        try{
+          const msg = String(err && err.message || '').toLowerCase();
+          if(msg.includes('duplicate flag')) return true;
+        } catch(e) {}
+        try{
+          const payload = err && err.payload;
+          if(payload && Array.isArray(payload.generation_failures)){
+            return payload.generation_failures.some((x)=>{
+              const em = String((x && x.error) || '').toLowerCase();
+              return em.includes('duplicate flag');
+            });
+          }
+        } catch(e) {}
+        return false;
+      };
       while(true){
         try{
+          if(!allowDupes){
+            params.set('retry_index', String(retryIndex));
+          }
           if(runSavePreviewResolve){
             setStatus('Sequencing chain…', false);
             showLoading('Sequencing chain…');
@@ -6351,6 +6473,32 @@
           } else {
             data = await fetchJson(buildAttackflowPreviewUrl(params));
           }
+          if(!allowDupes){
+            const chainData = Array.isArray(data && data.chain) ? data.chain : [];
+            let assignsData = Array.isArray(data && data.flag_assignments) ? data.flag_assignments : [];
+            try { assignsData = alignAssignmentsToChain(chainData, assignsData); } catch(e) {}
+            if(_hasDuplicates(chainData, assignsData)){
+              if(retriesRemaining > 0){
+                attemptedRetries += 1;
+                retriesRemaining -= 1;
+                retryIndex += 1;
+                setStatus(`Generate produced duplicates; retrying (${attemptedRetries})…`, true);
+                showLoading('Retrying generate…');
+                appendLoadingLog(`Retrying (${attemptedRetries}) due to duplicates in chain`);
+                continue;
+              }
+            }
+          }
+          try{
+            if(data && data.warning){
+              const okReuse = shouldAllowGeneratorReuse(data.warning);
+              if(!okReuse){
+                clearFlowState('Generation cancelled (generator reuse declined).');
+                hideLoading();
+                return;
+              }
+            }
+          } catch(e) {}
           break;
         } catch(err){
           // If Generate requested a longer chain than available, ask user whether to
@@ -6453,83 +6601,139 @@
       renderChainEditor();
       persistFlowState();
 
-      // Resolve values immediately after sequencing so hints/IPs appear on this page.
-      if(runSavePreviewResolve && Array.isArray(currentChain) && currentChain.length){
-        try{
-          setStatus('Resolving values…', false);
-          showLoading('Resolving values…');
-          setLoadingSteps(['Saving XML', 'Generating preview plan', 'Sequencing chain', 'Resolving values'], 3);
-          appendLoadingLog('Resolving values via prepare_preview_for_execute');
-          const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-          const prepData = await postJson(
-            '/api/flag-sequencing/prepare_preview_for_execute',
-            {
-              scenario,
-              length: chain_ids.length,
-              preset,
-              chain_ids: chain_ids,
-              preview_plan: previewPlanForRequest(),
-              allow_node_duplicates: !!allowDupes,
-              mode: 'resolve',
-              best_effort: true,
-              timeout_s: 120,
-              initial_facts: flowInitialFactsOverride,
-              goal_facts: flowGoalFactsOverride,
-            },
-            { timeoutMs: 120000 }
-          );
-          setFlowValidityFromPayload(prepData);
-          if(prepData && Array.isArray(prepData.chain)){
-            currentChain = prepData.chain.slice();
-          }
-          if(prepData && Array.isArray(prepData.flag_assignments)){
-            currentFlagAssignments = prepData.flag_assignments.slice();
-            currentFlagAssignments = alignAssignmentsToChain(currentChain, currentFlagAssignments);
-          }
-          if(prepData && prepData.preview_plan_path){
-            lastPreviewPlanPath = String(prepData.preview_plan_path);
-            try {
-              if (scenario && typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
-                window.coretgSetPreviewPlanPathForScenario(scenario, lastPreviewPlanPath);
+      // Resolve values immediately after sequencing so hints/IPs/flags appear on this page.
+      if(resolveOnGenerate && Array.isArray(currentChain) && currentChain.length){
+        let resolved = false;
+        let resolveAttempts = 0;
+        let resolveRetriesRemaining = Math.max(0, retriesRemaining || 0);
+        while(!resolved){
+          resolveAttempts += 1;
+          try{
+            setStatus('Resolving values…', false);
+            showLoading('Resolving values…');
+            setLoadingSteps(['Saving XML', 'Generating preview plan', 'Sequencing chain', 'Resolving values'], 3);
+            appendLoadingLog(`Resolving values via prepare_preview_for_execute (attempt ${resolveAttempts})`);
+            const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+            const prepData = await postJson(
+              '/api/flag-sequencing/prepare_preview_for_execute',
+              {
+                scenario,
+                length: chain_ids.length,
+                preset,
+                chain_ids: chain_ids,
+                preview_plan: previewPlanForRequest(),
+                allow_node_duplicates: !!allowDupes,
+                mode: 'resolve',
+                best_effort: true,
+                timeout_s: 120,
+                initial_facts: flowInitialFactsOverride,
+                goal_facts: flowGoalFactsOverride,
+              },
+              { timeoutMs: 120000 }
+            );
+            lastResolvePayload = prepData;
+            setFlowValidityFromPayload(prepData);
+            if(prepData && Array.isArray(prepData.chain)){
+              currentChain = prepData.chain.slice();
+            }
+            if(prepData && Array.isArray(prepData.flag_assignments)){
+              currentFlagAssignments = prepData.flag_assignments.slice();
+            try{
+              if(prepData && prepData.warning){
+                const okReuse = shouldAllowGeneratorReuse(prepData.warning);
+                if(!okReuse){
+                  clearFlowState('Resolve cancelled (generator reuse declined).');
+                  hideLoading();
+                  break;
+                }
               }
             } catch(e) {}
-          }
-          // flow_plan_path no longer used
-          updateMeta();
-          renderChainEditor();
-          try {
-            let resolvedInputsCount = 0;
-            let resolvedOutputsCount = 0;
-            for(const a of (currentFlagAssignments || [])){
-              if(a && typeof a === 'object'){
-                const ri = (a.resolved_inputs && typeof a.resolved_inputs === 'object' && !Array.isArray(a.resolved_inputs)) ? Object.keys(a.resolved_inputs).length : 0;
-                const ro = (a.resolved_outputs && typeof a.resolved_outputs === 'object' && !Array.isArray(a.resolved_outputs)) ? Object.keys(a.resolved_outputs).length : 0;
-                resolvedInputsCount += ri;
-                resolvedOutputsCount += ro;
+              currentFlagAssignments = alignAssignmentsToChain(currentChain, currentFlagAssignments);
+            }
+            if(prepData && prepData.preview_plan_path){
+              lastPreviewPlanPath = String(prepData.preview_plan_path);
+              try {
+                if (scenario && typeof window.coretgSetPreviewPlanPathForScenario === 'function') {
+                  window.coretgSetPreviewPlanPathForScenario(scenario, lastPreviewPlanPath);
+                }
+              } catch(e) {}
+            }
+            // flow_plan_path no longer used
+            updateMeta();
+            renderChainEditor();
+            try {
+              let resolvedInputsCount = 0;
+              let resolvedOutputsCount = 0;
+              for(const a of (currentFlagAssignments || [])){
+                if(a && typeof a === 'object'){
+                  const ri = (a.resolved_inputs && typeof a.resolved_inputs === 'object' && !Array.isArray(a.resolved_inputs)) ? Object.keys(a.resolved_inputs).length : 0;
+                  const ro = (a.resolved_outputs && typeof a.resolved_outputs === 'object' && !Array.isArray(a.resolved_outputs)) ? Object.keys(a.resolved_outputs).length : 0;
+                  resolvedInputsCount += ri;
+                  resolvedOutputsCount += ro;
+                }
               }
+              appendLoadingLog(`Resolved inputs: ${resolvedInputsCount}, outputs: ${resolvedOutputsCount}`);
+              if(resolvedInputsCount === 0 && resolvedOutputsCount === 0){
+                setStatus('Resolve completed, but no resolved values were returned.', true);
+              }
+            } catch(e) {}
+            if(jsonEl){
+              jsonEl.textContent = JSON.stringify({
+                scenario: (prepData && prepData.scenario) ? prepData.scenario : (activeScenario || scenario),
+                length: (prepData && Number.isFinite(+prepData.length)) ? (+prepData.length) : (Array.isArray(currentChain) ? currentChain.length : 0),
+                chain: Array.isArray(currentChain) ? currentChain : [],
+                flag_assignments: Array.isArray(currentFlagAssignments) ? currentFlagAssignments : [],
+                flow_valid: !!(prepData && prepData.flow_valid),
+                flow_errors: Array.isArray(prepData && prepData.flow_errors) ? prepData.flow_errors : [],
+                flags_enabled: !!(prepData && prepData.flags_enabled),
+              }, null, 2);
             }
-            appendLoadingLog(`Resolved inputs: ${resolvedInputsCount}, outputs: ${resolvedOutputsCount}`);
-            if(resolvedInputsCount === 0 && resolvedOutputsCount === 0){
-              setStatus('Resolve completed, but no resolved values were returned.', true);
+            const diagram2 = buildMermaid(currentChain);
+            await renderMermaid(diagram2);
+            resolved = true;
+          } catch(e) {
+            if(_isDuplicateFlagError(e) && resolveRetriesRemaining > 0){
+              resolveRetriesRemaining -= 1;
+              attemptedRetries += 1;
+              retryIndex += 1;
+              setStatus(`Resolve hit duplicate flags; retrying (${attemptedRetries})…`, true);
+              showLoading('Retrying resolve…');
+              appendLoadingLog(`Duplicate flags during resolve; resequencing attempt ${retryIndex + 1}`);
+              const data2 = await postJson('/api/flag-sequencing/sequence_preview_plan', {
+                scenario,
+                length,
+                preset,
+                preview_plan: previewPlanForRequest(),
+                allow_node_duplicates: !!allowDupes,
+                retry_index: retryIndex,
+                xml_path: (typeof window.coretgGetLatestXmlPathForScenario === 'function') ? window.coretgGetLatestXmlPathForScenario(scenario) : '',
+                initial_facts: flowInitialFactsOverride,
+                goal_facts: flowGoalFactsOverride,
+              }, { timeoutMs: 60000 });
+              currentChain = Array.isArray(data2.chain) ? data2.chain.slice() : [];
+              currentFlagAssignments = Array.isArray(data2.flag_assignments) ? data2.flag_assignments.slice() : [];
+              currentFlagAssignments = alignAssignmentsToChain(currentChain, currentFlagAssignments);
+              setFlowValidityFromPayload(data2);
+              lastStats = data2.stats || null;
+              lastPreviewPlanPath = data2.preview_plan_path || '';
+              updateMeta();
+              renderChainEditor();
+              continue;
             }
-          } catch(e) {}
-          if(jsonEl){
-            jsonEl.textContent = JSON.stringify({
-              scenario: (prepData && prepData.scenario) ? prepData.scenario : (activeScenario || scenario),
-              length: (prepData && Number.isFinite(+prepData.length)) ? (+prepData.length) : (Array.isArray(currentChain) ? currentChain.length : 0),
-              chain: Array.isArray(currentChain) ? currentChain : [],
-              flag_assignments: Array.isArray(currentFlagAssignments) ? currentFlagAssignments : [],
-              flow_valid: !!(prepData && prepData.flow_valid),
-              flow_errors: Array.isArray(prepData && prepData.flow_errors) ? prepData.flow_errors : [],
-              flags_enabled: !!(prepData && prepData.flags_enabled),
-            }, null, 2);
-          }
-          const diagram2 = buildMermaid(currentChain);
-          await renderMermaid(diagram2);
-        } catch(e) {
-          try {
+            try{
+              const payload = e && e.payload ? e.payload : null;
+              const msg = String((payload && (payload.error || payload.message)) || (e && e.message) || e || 'Resolve failed');
+              appendLoadingLog(`Resolve error: ${msg}`);
+              if(payload && payload.flag_assignments && Array.isArray(payload.flag_assignments)){
+                const ids = payload.flag_assignments.map(a => String((a && (a.id || a.generator_id)) || '').trim()).filter(Boolean);
+                if(ids.length){
+                  appendLoadingLog(`Generators: ${ids.join(', ')}`);
+                }
+              }
+            } catch(_) {}
             setStatus('Resolve failed: ' + String(e && e.message || e), true);
-          } catch(_) {}
+            break;
+          }
         }
       }
 
@@ -6561,39 +6765,41 @@
           flags_enabled: !!(data && data.flags_enabled),
         }, null, 2);
       }
-          try {
-            const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
-            const flowStatePayload = {
-              scenario,
-              preset,
-              length: chain_ids.length,
-              chain_ids: chain_ids,
-              flag_assignments: buildPersistAssignments(chain_ids),
-              allow_node_duplicates: !!allowNodeDuplicates,
-              initial_facts: flowInitialFactsOverride,
-              goal_facts: flowGoalFactsOverride,
-              updated_at: Date.now(),
-            };
-            let xmlPath = (prepData && prepData.xml_path) ? String(prepData.xml_path) : (document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
-            if(!xmlPath && typeof window.coretgGetLatestXmlPathForScenario === 'function'){
-              try {
-                xmlPath = String(window.coretgGetLatestXmlPathForScenario(scenario) || '').trim();
-              } catch(e) {}
-            }
-            if(xmlPath){
-              await postJson('/api/flag-sequencing/save_flow_state_to_xml', {
-                xml_path: xmlPath,
-                scenario,
-                flow_state: flowStatePayload,
-              });
-            }
-            try{
-              const key = normalizeScenarioNorm(scenario);
-              if(key && flowStateByScenario && typeof flowStateByScenario === 'object'){
-                flowStateByScenario[key] = flowStatePayload;
-              }
+      try {
+        if(lastResolvePayload){
+          const chain_ids = currentChain.map(n => (n && n.id) ? String(n.id) : '').filter(Boolean);
+          const flowStatePayload = {
+            scenario,
+            preset,
+            length: chain_ids.length,
+            chain_ids: chain_ids,
+            flag_assignments: buildPersistAssignments(chain_ids),
+            allow_node_duplicates: !!allowNodeDuplicates,
+            initial_facts: flowInitialFactsOverride,
+            goal_facts: flowGoalFactsOverride,
+            updated_at: Date.now(),
+          };
+          let xmlPath = (lastResolvePayload && lastResolvePayload.xml_path) ? String(lastResolvePayload.xml_path) : (document.getElementById('scenariosPreviewXmlPath')?.value || '').trim();
+          if(!xmlPath && typeof window.coretgGetLatestXmlPathForScenario === 'function'){
+            try {
+              xmlPath = String(window.coretgGetLatestXmlPathForScenario(scenario) || '').trim();
             } catch(e) {}
+          }
+          if(xmlPath){
+            await postJson('/api/flag-sequencing/save_flow_state_to_xml', {
+              xml_path: xmlPath,
+              scenario,
+              flow_state: flowStatePayload,
+            });
+          }
+          try{
+            const key = normalizeScenarioNorm(scenario);
+            if(key && flowStateByScenario && typeof flowStateByScenario === 'object'){
+              flowStateByScenario[key] = flowStatePayload;
+            }
           } catch(e) {}
+        }
+      } catch(e) {}
       const diagram = buildMermaid(currentChain);
       await renderMermaid(diagram);
 
@@ -6906,16 +7112,16 @@
     if(generateOptionsDialogEl){
       try{
         if(generateNoDuplicatesEl){
-          generateNoDuplicatesEl.checked = !allowNodeDuplicates;
+          generateNoDuplicatesEl.checked = !!allowNodeDuplicates;
         }
       } catch(e) {}
       generateOptionsDialogEl.addEventListener('close', ()=>{
         try{
           const rv = String(generateOptionsDialogEl.returnValue || '');
           if(rv !== 'generate') return;
-          const noDupes = generateNoDuplicatesEl ? !!generateNoDuplicatesEl.checked : true;
-          allowNodeDuplicates = !noDupes;
-          generate(true, { savePreviewResolve: true, allow_node_duplicates: !!allowNodeDuplicates });
+          const allowDupes = generateNoDuplicatesEl ? !!generateNoDuplicatesEl.checked : false;
+          allowNodeDuplicates = !!allowDupes;
+          generate(true, { savePreviewResolve: true, allow_node_duplicates: !!allowNodeDuplicates, resolveOnGenerate: true });
         } catch(e) {}
       });
     }
@@ -6931,7 +7137,7 @@
     } catch(_) {}
     // Fallback: behave like old Generate (no duplicates).
     allowNodeDuplicates = false;
-    generate(true, { savePreviewResolve: true, allow_node_duplicates: false });
+    generate(true, { savePreviewResolve: true, allow_node_duplicates: false, resolveOnGenerate: true });
   });
   // Handlers for Save/Preview are registered above.
   if(downloadXmlEl) downloadXmlEl.addEventListener('click', (e)=>{ e.preventDefault(); downloadXml(); });
@@ -7145,7 +7351,7 @@
   const restored = await restoreSavedFlowForScenario(activeScenario);
   if(!restored){
     try {
-      await generate(false, { autoLoad: true });
+      await generate(false, { autoLoad: true, resolveOnGenerate: false });
     } catch(e) {
       setStatus('No saved flow chain. Click Generate to start.', false);
     }

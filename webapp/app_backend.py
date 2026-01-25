@@ -136,8 +136,22 @@ def _attack_graph_for_chain(
             outs = a.get('outputs')
             if isinstance(outs, list):
                 out.extend([str(x or '').strip() for x in outs if str(x or '').strip()])
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                app.logger.exception('[flow.prepare_preview_for_execute] generator run failure: %s', exc)
+            except Exception:
+                pass
+            return jsonify({
+                'ok': False,
+                'error': f'Generator execution failed during resolve: {exc}',
+                'scenario': scenario_label or scenario_norm,
+                'length': length,
+                'stats': stats,
+                'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+                'flag_assignments': flag_assignments,
+                'base_preview_plan_path': base_plan_path,
+                'best_effort': bool(best_effort),
+            }), 500
         try:
             prod = a.get('produces')
             if isinstance(prod, list):
@@ -7443,6 +7457,31 @@ def participant_ui_details_api():
     except Exception:
         pass
 
+    try:
+        realized_flags: list[str] = []
+        for fa in (flag_assignments or []):
+            if not isinstance(fa, dict):
+                continue
+            ro = fa.get('resolved_outputs') if isinstance(fa.get('resolved_outputs'), dict) else {}
+            flag_val = None
+            if isinstance(ro, dict):
+                flag_val = ro.get('Flag(flag_id)') or ro.get('flag')
+            if not flag_val:
+                flag_val = fa.get('flag_value')
+            if isinstance(flag_val, str) and flag_val.strip():
+                realized_flags.append(flag_val.strip())
+        if realized_flags and len(set(realized_flags)) != len(realized_flags):
+            return jsonify({
+                'ok': False,
+                'error': 'Duplicate flag value detected during resolve; retry with a different chain.',
+                'scenario': scenario_label or scenario_norm,
+                'length': length,
+                'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+                'flag_assignments': flag_assignments,
+            }), 422
+    except Exception:
+        pass
+
     return jsonify({
         'ok': True,
         'scenario_norm': scenario_norm,
@@ -11040,6 +11079,7 @@ def _flow_compute_flag_assignments(
     initial_facts_override: dict[str, list[str]] | None = None,
     goal_facts_override: dict[str, list[str]] | None = None,
     seed_override: int | None = None,
+    disallow_generator_reuse: bool = False,
 ) -> list[dict[str, Any]]:
     """Return a per-position list of flag assignments aligned to chain_ids.
 
@@ -11468,9 +11508,11 @@ def _flow_compute_flag_assignments(
             g for g in pool
             if _requires_cached(g).issubset(state) and str(g.get('id') or '').strip() not in deployed_ids
         ]
-        if not candidates:
+        if (not candidates) and (not disallow_generator_reuse):
             candidates = [g for g in pool if _requires_cached(g).issubset(state)]
         if not candidates:
+            if disallow_generator_reuse:
+                return []
             # Best-effort fallback: allow assignment even if requires are not yet met.
             # Validation will surface missing dependencies, but we avoid empty assignments.
             candidates = list(pool)
@@ -11560,9 +11602,11 @@ def _flow_compute_flag_assignments(
                 g for g in pool
                 if _requires_cached(g).issubset(state_known) and str(g.get('id') or '').strip() not in deployed
             ]
-            if not candidates:
+            if (not candidates) and (not disallow_generator_reuse):
                 candidates = [g for g in pool if _requires_cached(g).issubset(state_known)]
             if not candidates:
+                if disallow_generator_reuse:
+                    return []
                 # Best-effort fallback: allow assignment even if requires are not yet met.
                 # Validation will surface missing dependencies, but we avoid empty assignments.
                 candidates = list(pool)
@@ -11714,10 +11758,12 @@ def _flow_synthesized_inputs() -> set[str]:
     """
     return {
         'seed',
+        'seed_ts',
         'secret',
         'env_name',
         'challenge',
         'flag_prefix',
+        'flag_seed',
         'username_prefix',
         'key_len',
         'node_name',
@@ -13274,7 +13320,22 @@ def api_flow_attackflow_preview():
                 scenario_label or scenario_norm,
                 initial_facts_override=initial_facts_override,
                 goal_facts_override=goal_facts_override,
+                disallow_generator_reuse=(not allow_node_duplicates),
             )
+            if (not flag_assignments) and (not allow_node_duplicates):
+                flag_assignments = _flow_compute_flag_assignments(
+                    preview,
+                    chain_nodes,
+                    scenario_label or scenario_norm,
+                    initial_facts_override=initial_facts_override,
+                    goal_facts_override=goal_facts_override,
+                    disallow_generator_reuse=False,
+                )
+                if flag_assignments:
+                    try:
+                        warning = warning or 'Not enough unique generators for this chain length; generator reuse was enabled.'
+                    except Exception:
+                        pass
 
     # Fallback: if no assignments could be computed, pick the first eligible
     # generator per node so the UI can proceed and provide a clearer error.
@@ -13926,7 +13987,21 @@ def api_flow_sequence_preview_plan():
             initial_facts_override=initial_facts_override,
             goal_facts_override=goal_facts_override,
             seed_override=seed_override,
+            disallow_generator_reuse=(not allow_node_duplicates),
         )
+        if (not flag_assignments) and (not allow_node_duplicates):
+            # Fallback: allow generator reuse if unique generators are insufficient.
+            flag_assignments = _flow_compute_flag_assignments(
+                preview,
+                chain_nodes,
+                scenario_label or scenario_norm,
+                initial_facts_override=initial_facts_override,
+                goal_facts_override=goal_facts_override,
+                seed_override=seed_override,
+                disallow_generator_reuse=False,
+            )
+            if flag_assignments:
+                warning = warning or 'Not enough unique generators for this chain length; generator reuse was enabled.'
 
     # For auto-generated (non-preset) chains only, prefer a dependency-consistent ordering.
     # Presets force an intended generator order and should not be reordered.
@@ -13956,6 +14031,22 @@ def api_flow_sequence_preview_plan():
         )
     except Exception:
         flow_valid, flow_errors = True, []
+
+    if not allow_node_duplicates:
+        try:
+            gen_ids = [str(a.get('id') or a.get('generator_id') or '').strip() for a in (flag_assignments or []) if isinstance(a, dict)]
+            gen_ids = [g for g in gen_ids if g]
+            if len(set(gen_ids)) != len(gen_ids):
+                return jsonify({
+                    'ok': False,
+                    'error': 'Duplicate generators detected while duplicates are disabled. Reduce chain length or enable duplicates.',
+                    'scenario': scenario_label or scenario_norm,
+                    'length': len(chain_nodes or []),
+                    'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in (chain_nodes or []) if isinstance(n, dict)],
+                    'flag_assignments': flag_assignments,
+                }), 422
+        except Exception:
+            pass
 
     host_ip_map: dict[str, str] = {}
     try:
@@ -15020,6 +15111,34 @@ def api_flow_prepare_preview_for_execute():
                 'flag_assignments': flag_assignments,
             }), 422
 
+    flag_seed_epoch: int | None = None
+    try:
+        candidate_paths: list[str] = []
+        if base_plan_path:
+            candidate_paths.append(str(base_plan_path))
+        if preview_plan_path:
+            candidate_paths.append(str(preview_plan_path))
+        for path in candidate_paths:
+            if not path:
+                continue
+            try:
+                abs_path = os.path.abspath(path)
+            except Exception:
+                abs_path = path
+            if abs_path and os.path.exists(abs_path):
+                try:
+                    flag_seed_epoch = int(os.path.getmtime(abs_path))
+                    break
+                except Exception:
+                    continue
+    except Exception:
+        flag_seed_epoch = None
+    if flag_seed_epoch is None:
+        try:
+            flag_seed_epoch = int(time.time())
+        except Exception:
+            flag_seed_epoch = None
+
     def _all_input_names_of(gen: dict[str, Any]) -> set[str]:
         names: set[str] = set()
         try:
@@ -15058,6 +15177,11 @@ def api_flow_prepare_preview_for_execute():
         node_id = str(assignment.get('node_id') or '').strip()
         gen_id = str(assignment.get('id') or '').strip()
         base_seed = str(seed_val if seed_val not in (None, '') else '0')
+        flag_seed = str(flag_seed_epoch if flag_seed_epoch not in (None, '') else '0')
+        try:
+            base_seed = f"{base_seed}:{flag_seed}"
+        except Exception:
+            pass
         return {
             # Allow duplicates only when seeds differ per occurrence.
             'seed': _flow_generator_seed(
@@ -15068,7 +15192,8 @@ def api_flow_prepare_preview_for_execute():
                 occurrence_idx=int(occurrence_idx or 0),
             ),
             'flag_prefix': 'FLAG',
-            'secret': f"FLOWSECRET_{base_seed}_{scenario_norm}_{node_id}",
+            'flag_seed': f"{flag_seed}",
+            'secret': f"FLOWSECRET_{base_seed}_{scenario_norm}_{node_id}_{flag_seed}",
             'env_name': f"env_{scenario_norm}_{node_id}",
             'challenge': f"challenge_{scenario_norm}_{node_id}",
             'username_prefix': 'user',
@@ -15133,6 +15258,15 @@ def api_flow_prepare_preview_for_execute():
                 return False, f'generator failed (rc={p.returncode}): {err}', (manifest_path if os.path.exists(manifest_path) else None)
             if os.path.exists(manifest_path):
                 return True, 'ok', manifest_path
+            try:
+                app.logger.warning('[flow.generator] outputs.json missing for generator=%s kind=%s out_dir=%s stdout_tail=%s stderr_tail=%s',
+                                   generator_id,
+                                   kind,
+                                   out_dir,
+                                   (p.stdout or '').strip()[-400:],
+                                   (p.stderr or '').strip()[-400:])
+            except Exception:
+                pass
             return True, 'ok (no outputs.json)', None
         except subprocess.TimeoutExpired:
             return False, 'generator timed out', None
@@ -15271,6 +15405,7 @@ def api_flow_prepare_preview_for_execute():
             generation_skipped: list[dict[str, Any]] = []
             created_run_dirs: list[str] = []
             failed_run_dirs: list[str] = []
+            seen_flag_values: set[str] = set()
 
             deadline = (started_at + float(total_timeout_s)) if total_timeout_s is not None else None
             occurrence_ctr: dict[tuple[str, str], int] = {}
@@ -15298,6 +15433,19 @@ def api_flow_prepare_preview_for_execute():
                 occurrence_ctr[occ_key] = occ + 1
 
                 cfg_full = _flow_default_generator_config(fa, seed_val=seed_val, occurrence_idx=occ)
+
+                # Ensure per-use uniqueness by mixing a runtime timestamp into the seed/secret.
+                try:
+                    seed_ts = int(time.time() * 1000.0)
+                except Exception:
+                    seed_ts = None
+                if seed_ts is not None:
+                    try:
+                        cfg_full['seed_ts'] = seed_ts
+                        cfg_full['seed'] = f"{cfg_full.get('seed')}:{seed_ts}"
+                        cfg_full['secret'] = f"{cfg_full.get('secret')}:{seed_ts}"
+                    except Exception:
+                        pass
 
                 # Provide per-node network context. Some generators output Knowledge(ip) and then
                 # hint templates reference it via {{OUTPUT.Knowledge(ip)}}; make it match Preview.
@@ -15373,8 +15521,11 @@ def api_flow_prepare_preview_for_execute():
                         # Inject prior outputs into this generator's config, but only for inputs it declares.
                         try:
                             if allowed and flow_context:
+                                blocked_keys = {'Flag(flag_id)', 'flag'}
                                 for k in allowed:
                                     if k in cfg_full:
+                                        continue
+                                    if k in blocked_keys and k not in (declared_required or set()):
                                         continue
                                     if k in flow_context:
                                         cfg_full[k] = flow_context[k]
@@ -15389,6 +15540,10 @@ def api_flow_prepare_preview_for_execute():
                             keep = set(allowed)
                             try:
                                 keep |= set(declared_required or set())
+                            except Exception:
+                                pass
+                            try:
+                                keep |= set(_flow_synthesized_inputs())
                             except Exception:
                                 pass
                             cfg_to_pass = {k: v for k, v in cfg_full.items() if k in keep}
@@ -15759,6 +15914,22 @@ def api_flow_prepare_preview_for_execute():
                                     # also write a plain flag.txt for easier participant discovery.
                                     try:
                                         flag_val = outs.get('Flag(flag_id)') or outs.get('flag')
+                                        if not (isinstance(flag_val, str) and flag_val.strip()):
+                                            try:
+                                                app.logger.warning(
+                                                    '[flow.generator] no flag output for generator=%s node=%s out_dir=%s keys=%s',
+                                                    generator_id,
+                                                    cid,
+                                                    flow_out_dir,
+                                                    sorted(list(outs.keys())) if isinstance(outs, dict) else [],
+                                                )
+                                            except Exception:
+                                                pass
+                                        if isinstance(flag_val, str) and flag_val.strip():
+                                            flag_val_clean = flag_val.strip()
+                                            if flag_val_clean in seen_flag_values:
+                                                raise RuntimeError(f'duplicate flag value: {flag_val_clean}')
+                                            seen_flag_values.add(flag_val_clean)
                                         if ok_run and flow_out_dir and isinstance(flag_val, str) and flag_val.strip():
                                             with open(os.path.join(flow_out_dir, 'flag.txt'), 'w', encoding='utf-8') as ff:
                                                 ff.write(flag_val.strip() + "\n")
@@ -15768,8 +15939,12 @@ def api_flow_prepare_preview_for_execute():
                                                 fa['flag_value'] = flag_val.strip()
                                             except Exception:
                                                 pass
+                                    except RuntimeError:
+                                        raise
                                     except Exception:
                                         pass
+                            except RuntimeError:
+                                raise
                             except Exception:
                                 actual_output_keys = []
 
@@ -15859,6 +16034,8 @@ def api_flow_prepare_preview_for_execute():
                         except Exception:
                             mismatch = {}
                 except Exception as exc:
+                    if 'duplicate flag value' in str(exc):
+                        raise
                     ok_run, note, manifest_path = False, f'generator exception: {exc}', None
                     if generator_id:
                         generation_failures.append({
@@ -15932,7 +16109,44 @@ def api_flow_prepare_preview_for_execute():
                 except Exception:
                     pass
 
+            try:
+                realized_flags: list[str] = []
+                for fa in (flag_assignments or []):
+                    if not isinstance(fa, dict):
+                        continue
+                    ro = fa.get('resolved_outputs') if isinstance(fa.get('resolved_outputs'), dict) else {}
+                    flag_val = None
+                    if isinstance(ro, dict):
+                        flag_val = ro.get('Flag(flag_id)') or ro.get('flag')
+                    if not flag_val:
+                        flag_val = fa.get('flag_value')
+                    if not flag_val:
+                        try:
+                            manifest_path = str(fa.get('outputs_manifest') or '').strip()
+                            if manifest_path and os.path.exists(manifest_path):
+                                with open(manifest_path, 'r', encoding='utf-8') as mf:
+                                    m = json.load(mf) or {}
+                                outs = m.get('outputs') if isinstance(m, dict) else None
+                                if isinstance(outs, dict):
+                                    flag_val = outs.get('Flag(flag_id)') or outs.get('flag')
+                        except Exception:
+                            flag_val = None
+                    if isinstance(flag_val, str) and flag_val.strip():
+                        realized_flags.append(flag_val.strip())
+                if realized_flags:
+                    if len(set(realized_flags)) != len(realized_flags):
+                        raise RuntimeError('duplicate flag value detected after resolve')
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+
             if generation_failures:
+                force_fail = False
+                try:
+                    force_fail = any('duplicate flag value' in str(x.get('error', '') or '') for x in (generation_failures or []) if isinstance(x, dict))
+                except Exception:
+                    force_fail = False
                 # Cleanup partial artifacts so we don't leave confusing residues behind.
                 try:
                     base_dir = os.path.abspath(os.path.join('/tmp', 'vulns'))
@@ -15949,7 +16163,7 @@ def api_flow_prepare_preview_for_execute():
                             continue
                 except Exception:
                     pass
-                if not best_effort:
+                if (not best_effort) or force_fail:
                     return jsonify({
                         'ok': False,
                         'error': f"{len(generation_failures)} generator run(s) failed; cannot prepare preview for execute.",
@@ -15987,6 +16201,19 @@ def api_flow_prepare_preview_for_execute():
                 # even when dependency order is invalid.
                 try:
                     cfg_full = _flow_default_generator_config(fa, seed_val=seed_val, occurrence_idx=occ)
+
+                    # Ensure per-use uniqueness by mixing a runtime timestamp into the seed/secret.
+                    try:
+                        seed_ts = int(time.time() * 1000.0)
+                    except Exception:
+                        seed_ts = None
+                    if seed_ts is not None:
+                        try:
+                            cfg_full['seed_ts'] = seed_ts
+                            cfg_full['seed'] = f"{cfg_full.get('seed')}:{seed_ts}"
+                            cfg_full['secret'] = f"{cfg_full.get('secret')}:{seed_ts}"
+                        except Exception:
+                            pass
                     if preview_ip4:
                         cfg_full.setdefault('Knowledge(ip)', preview_ip4)
                         cfg_full.setdefault('target_ip', preview_ip4)
@@ -16036,6 +16263,10 @@ def api_flow_prepare_preview_for_execute():
                             keep = set(allowed)
                             try:
                                 keep |= set(declared_required or set())
+                            except Exception:
+                                pass
+                            try:
+                                keep |= set(_flow_synthesized_inputs())
                             except Exception:
                                 pass
                             cfg = {k: v for k, v in (cfg_full or {}).items() if k in keep}
@@ -16134,7 +16365,21 @@ def api_flow_prepare_preview_for_execute():
 
     # Persist flow_state into the latest scenario XML so refresh restores resolved values.
     try:
-        xml_path = _latest_xml_path_for_scenario(scenario_norm)
+        xml_path = None
+        try:
+            if base_plan_path and str(base_plan_path).lower().endswith('.xml') and os.path.exists(base_plan_path):
+                xml_path = base_plan_path
+        except Exception:
+            xml_path = None
+        if not xml_path:
+            try:
+                meta_xml = str((meta or {}).get('xml_path') or '').strip()
+                if meta_xml and meta_xml.lower().endswith('.xml') and os.path.exists(meta_xml):
+                    xml_path = meta_xml
+            except Exception:
+                xml_path = None
+        if not xml_path:
+            xml_path = _latest_xml_path_for_scenario(scenario_norm)
         if xml_path:
             flow_state_payload = {
                 'scenario': scenario_label or scenario_norm,
@@ -16191,6 +16436,31 @@ def api_flow_prepare_preview_for_execute():
     except Exception:
         host_ip_map = {}
 
+    try:
+        realized_flags: list[str] = []
+        for fa in (flag_assignments or []):
+            if not isinstance(fa, dict):
+                continue
+            ro = fa.get('resolved_outputs') if isinstance(fa.get('resolved_outputs'), dict) else {}
+            flag_val = None
+            if isinstance(ro, dict):
+                flag_val = ro.get('Flag(flag_id)') or ro.get('flag')
+            if not flag_val:
+                flag_val = fa.get('flag_value')
+            if isinstance(flag_val, str) and flag_val.strip():
+                realized_flags.append(flag_val.strip())
+        if realized_flags and len(set(realized_flags)) != len(realized_flags):
+            return jsonify({
+                'ok': False,
+                'error': 'Duplicate flag value detected during resolve; retry with a different chain.',
+                'scenario': scenario_label or scenario_norm,
+                'length': length,
+                'chain': [{'id': str(n.get('id') or ''), 'name': str(n.get('name') or ''), 'type': str(n.get('type') or '')} for n in chain_nodes],
+                'flag_assignments': flag_assignments,
+            }), 422
+    except Exception:
+        pass
+
     return jsonify({
         'ok': True,
         'scenario': scenario_label or scenario_norm,
@@ -16221,6 +16491,7 @@ def api_flow_prepare_preview_for_execute():
         'best_effort': bool(best_effort),
         'elapsed_s': round(float(time.monotonic() - started_at), 3),
         **({'sequencer_dag': (dag_debug or {'ok': False, 'errors': ['not computed (explicit chain)']})} if debug_dag else {}),
+        **({'warning': warning} if warning else {}),
     })
 
 
@@ -29890,11 +30161,117 @@ def run_cli_async():
                     meta = plan_payload.get('metadata') if isinstance(plan_payload.get('metadata'), dict) else {}
                     flow_meta = meta.get('flow') if isinstance(meta.get('flow'), dict) else None
                     if isinstance(flow_meta, dict) and flow_meta:
-                        _update_flow_state_in_xml(xml_path, scenario_for_plan, flow_meta)
+                        def _flow_has_runtime_values(flow_obj: dict[str, Any]) -> bool:
+                            try:
+                                fas = flow_obj.get('flag_assignments') if isinstance(flow_obj.get('flag_assignments'), list) else None
+                                if not isinstance(fas, list) or not fas:
+                                    return False
+                                for fa in fas:
+                                    if not isinstance(fa, dict):
+                                        continue
+                                    flag_val = str(fa.get('flag_value') or '').strip()
+                                    outs = fa.get('resolved_outputs') if isinstance(fa.get('resolved_outputs'), dict) else None
+                                    if not flag_val and isinstance(outs, dict):
+                                        flag_val = str(outs.get('Flag(flag_id)') or outs.get('flag') or '').strip()
+                                    if flag_val:
+                                        return True
+                                    if str(fa.get('artifacts_dir') or fa.get('run_dir') or '').strip():
+                                        return True
+                                return False
+                            except Exception:
+                                return False
+                        if _flow_has_runtime_values(flow_meta):
+                            _update_flow_state_in_xml(xml_path, scenario_for_plan, flow_meta)
                 except Exception:
                     pass
         except Exception:
             pass
+    # Enforce that Flow-generated values already exist before Execute runs.
+    try:
+        if preview_plan_path and scenario_for_plan:
+            plan_payload = _load_preview_payload_from_path(preview_plan_path, scenario_for_plan)
+            meta = plan_payload.get('metadata') if isinstance(plan_payload, dict) else None
+            flow_meta = meta.get('flow') if isinstance(meta, dict) else None
+            flag_assignments = flow_meta.get('flag_assignments') if isinstance(flow_meta, dict) else None
+            def _flow_assignments_have_runtime(fas: list[dict[str, Any]] | None) -> bool:
+                if not isinstance(fas, list) or not fas:
+                    return False
+                for fa in fas:
+                    if not isinstance(fa, dict):
+                        continue
+                    flag_val = str(fa.get('flag_value') or '').strip()
+                    outs = fa.get('resolved_outputs') if isinstance(fa.get('resolved_outputs'), dict) else None
+                    if not flag_val and isinstance(outs, dict):
+                        flag_val = str(outs.get('Flag(flag_id)') or outs.get('flag') or '').strip()
+                    if flag_val:
+                        return True
+                    if str(fa.get('artifacts_dir') or fa.get('run_dir') or '').strip():
+                        return True
+                return False
+
+            if ((not isinstance(flag_assignments, list)) or (not flag_assignments) or (not _flow_assignments_have_runtime(flag_assignments))) and xml_path:
+                try:
+                    parsed = _parse_scenarios_xml(xml_path)
+                    scen_list = parsed.get('scenarios') if isinstance(parsed, dict) else None
+                    if isinstance(scen_list, list):
+                        for sc in scen_list:
+                            if not isinstance(sc, dict):
+                                continue
+                            nm = str(sc.get('name') or '').strip()
+                            if scenario_for_plan and _normalize_scenario_label(nm) != _normalize_scenario_label(scenario_for_plan):
+                                continue
+                            fs = sc.get('flow_state') if isinstance(sc.get('flow_state'), dict) else None
+                            if isinstance(fs, dict):
+                                flag_assignments = fs.get('flag_assignments') if isinstance(fs.get('flag_assignments'), list) else flag_assignments
+                            break
+                except Exception:
+                    pass
+            if not isinstance(flag_assignments, list) or not flag_assignments:
+                return jsonify({
+                    'error': 'No Flow flag assignments found. Generate the chain and resolve flags before Execute.',
+                }), 422
+            missing_values: list[dict[str, Any]] = []
+            for idx, fa in enumerate(flag_assignments or []):
+                if not isinstance(fa, dict):
+                    continue
+                gen_id = str(fa.get('id') or fa.get('generator_id') or '').strip()
+                node_id = str(fa.get('node_id') or '').strip()
+                outputs = fa.get('resolved_outputs') if isinstance(fa.get('resolved_outputs'), dict) else None
+                flag_val = str(fa.get('flag_value') or '').strip()
+                if not flag_val and isinstance(outputs, dict):
+                    try:
+                        flag_val = str(outputs.get('Flag(flag_id)') or outputs.get('flag') or '').strip()
+                    except Exception:
+                        flag_val = ''
+                art_dir = str(fa.get('artifacts_dir') or fa.get('run_dir') or '').strip()
+                has_outputs = False
+                if art_dir:
+                    try:
+                        has_outputs = bool(_flow_read_outputs_map_from_artifacts_dir(art_dir))
+                    except Exception:
+                        has_outputs = False
+                if not flag_val and not has_outputs:
+                    missing_values.append({
+                        'index': idx,
+                        'node_id': node_id,
+                        'generator_id': gen_id,
+                        'reason': 'missing flag outputs',
+                    })
+                elif art_dir and (not os.path.isdir(art_dir)):
+                    missing_values.append({
+                        'index': idx,
+                        'node_id': node_id,
+                        'generator_id': gen_id,
+                        'reason': 'artifacts_dir missing',
+                        'artifacts_dir': art_dir,
+                    })
+            if missing_values:
+                return jsonify({
+                    'error': 'Execute requires pre-generated Flow values. Run Generate (with resolve) first.',
+                    'details': missing_values,
+                }), 422
+    except Exception:
+        pass
     try:
         if preview_plan_path:
             flow_summary, flow_meta = _summary_from_preview_plan_path(preview_plan_path, scenario_for_plan)

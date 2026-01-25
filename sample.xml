@@ -1,13 +1,13 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version='1.0' encoding='utf-8'?>
 <Scenarios>
   <Scenario name="Sample Scenario" scenario_total_nodes="0">
     <ScenarioEditor>
-      <BaseScenario filepath="core_default.xml"/>
+      <BaseScenario filepath="core_default.xml" />
   <section name="Node Information" density="0.0" />
   <section name="Routing" density="0.0" />
   <section name="Services" density="0.0" />
   <section name="Traffic" density="0.0" />
   <section name="Segmentation" density="0.0" />
-    </ScenarioEditor>
+    <PlanPreview>{"full_preview":{"routers":[],"hosts":[],"switches":[],"switches_detail":[],"host_router_map":{},"services_preview":{},"vulnerabilities_preview":{},"vulnerabilities_by_node":{},"r2r_policy_preview":{"mode":"None","target_degree":0},"r2r_edges_preview":[],"r2r_links_preview":[],"r2r_degree_preview":{},"r2r_stats_preview":{},"r2s_policy_preview":{"mode":"none","target_per_router":0,"note":"No routers planned; preview uses a single-switch star topology."},"segmentation_preview":{"density":0.0,"planned":[],"rules":[],"source":"runtime_planner"},"segmentation_rules_preview":[],"segmentation_items_resolved":[],"traffic_plan":null,"traffic_summary":{},"traffic_scripts_preview":{},"ptp_subnets":[],"router_switch_subnets":[],"lan_subnets":[],"r2r_subnets":[],"routing_plan":{},"services_plan":{},"vulnerabilities_plan":{},"base_scenario_reference":{"filepath_raw":"core_default.xml","filepath":"/Users/jcacosta/Documents/core-topo-gen/core_default.xml","exists":false},"base_bridge_preview":{"filepath":"/Users/jcacosta/Documents/core-topo-gen/core_default.xml","filepath_raw":"core_default.xml","exists":false,"attached":false,"reason":"missing-file"},"role_counts":{},"seed":1862282660,"seed_generated":false,"r2s_hosts_min_list":[],"r2s_hosts_max_list":[],"r2s_grouping_preview":[{"mode":"star","router_id":null,"switches":0,"hosts":0}],"ip_allocation_mode":"lan_subnet","router_plan_stats":{"router_count_input":0},"layout_positions":{"routers":{},"switches":{},"hosts":{}},"router_plan":{"density_raw":0.0,"density_component":0,"count_based_component":0,"effective_base":10,"final_router_count":0,"has_weight_based":false,"items":[],"random_weight_factor":0.0,"random_defaults":["RIP","RIPNG","BGP","OSPFv2","OSPFv3"],"routing_density_input":0.0,"routing_items_count":0,"simple_plan":{}},"display_artifacts":{"segmentation":{"rows":[],"table_rows":[],"tableRows":[],"json":{"rules_count":0,"types_summary":{},"rules":[],"metadata":{"density":0.0,"planned":[],"source":"runtime_planner"}}},"__version":2},"display_artifacts_version":2,"hitl_interfaces":[],"hitl_enabled":false,"hitl_scenario_key":"Sample Scenario"},"metadata":{"xml_path":"/Users/jcacosta/Documents/core-topo-gen/sample.xml","scenario":"Sample Scenario","seed":1862282660,"origin":"planner","flow":{},"created_at":"2026-01-25T03:46:21.788313Z","updated_at":"2026-01-25T03:46:21.788473Z"}}</PlanPreview></ScenarioEditor>
   </Scenario>
 </Scenarios>
